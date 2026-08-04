@@ -60,8 +60,8 @@ def _read_nd2_plane(nd2_path: str) -> np.ndarray:
     """Materialize channel-0's 2D uint16 plane via the dask interface (``read_frame``
     segfaults on some files; ``to_dask`` is the safe path). Computed while the file
     is open (nd2 dask arrays reference the open handle)."""
-    import nd2
-    with nd2.ND2File(nd2_path) as f:
+    from nodelab_v2.nd2_compat import import_nd2
+    with import_nd2().ND2File(nd2_path) as f:
         sub = f.to_dask()
         while sub.ndim > 2:
             sub = sub[0]                            # first channel / plane

@@ -1,7 +1,9 @@
 """Structure-table export (Phase 6 / V2.00 §10 — "the export path reads from here").
 
-Takes the per-``(domain, layer)`` tables that :func:`nodelab_v2.spreadsheet.structure_tables`
-produces off a pulled Dataset and writes them to disk. Qt-free (a caller supplies the
+Takes the per-``(domain, layer)`` tables that :func:`nodelab_v2.spreadsheet.all_tables`
+produces off a pulled Dataset and writes them to disk — the detected structures AND (since
+V2.17) the coarse lattice attributes, so anything the spreadsheet can show is also
+exportable. Reading through the same one function is what keeps those two in step. Qt-free (a caller supplies the
 path); numpy + stdlib for CSV, pyarrow **lazily imported** for Arrow/Parquet so the
 core has no hard pyarrow dependency.
 
@@ -18,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from nodelab_v2.spreadsheet import _ordered_columns, structure_tables
+from nodelab_v2.spreadsheet import _ordered_columns, all_tables, structure_tables
 
 Tables = Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]
 
@@ -83,15 +85,22 @@ def export_arrow(tables: Tables, path: str) -> int:
 
 
 def export_dataset(dataset, path: str) -> int:
-    """Export a pulled Dataset's structure tables to ``path`` (extension picks the
-    format). Raises :class:`ValueError` if the Dataset has no structures to export."""
-    tables = structure_tables(dataset)
+    """Export a pulled Dataset's tabulatable attributes to ``path`` (extension picks the
+    format) — structure tables and coarse lattice attributes alike. Raises
+    :class:`ValueError` if the Dataset carries neither."""
+    tables = all_tables(dataset)
     if not tables:
-        raise ValueError("no structure tables on this output to export")
+        raise ValueError(
+            "nothing tabulatable on this output to export — it carries no structure "
+            "tables (Label / Point / Track / Mesh) and no coarse lattice attributes "
+            "(Frame / Plane / Timepoint / Multipoint / Channel / Global). Per-voxel image "
+            "layers are not exported here; view them in the Viewer, or move one to a "
+            "coarser domain with transform.transfer_domain first.")
     lower = path.lower()
     if lower.endswith((".parquet", ".arrow")):
         return export_arrow(tables, path)
     return export_csv(tables, path)
 
 
-__all__ = ["export_dataset", "export_csv", "export_arrow", "structure_tables"]
+__all__ = ["export_dataset", "export_csv", "export_arrow", "structure_tables",
+           "all_tables"]

@@ -313,7 +313,7 @@ Fixes from v1
 - Fixed logger name: was "serialtrack.matching", now "serialtrack.outliers".
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 import numpy as np
 from scipy.spatial import cKDTree
 import logging
@@ -325,12 +325,23 @@ log = logging.getLogger("serialtrack.outliers")
 #  Westerweel universal outlier detection
 # ═══════════════════════════════════════════════════════════════
 
+#: ``(n_neighbors, epsilon)`` for the universal outlier test, per dimensionality.
+#: Upstream ships two different constant sets and they are NOT interchangeable:
+#: ``removeOutlierTPT.m:27,45`` (3-D) uses 27 neighbours and a 0.075 px
+#: fluctuation floor; ``removeOutlierTPT2.m:31,49`` (2-D) uses **40** and **0.1**.
+#: Applying the 3-D pair to 2-D data makes the test roughly twice as aggressive
+#: on a sub-pixel field, because the floor is what keeps the normalised residual
+#: finite when the true displacement is comparable to the localisation noise.
+_OUTLIER_CONSTANTS = {2: (40, 0.1), 3: (27, 0.075)}
+
+
 def remove_outliers(
     coords_a: np.ndarray,
     coords_b: np.ndarray,
     track_a2b: np.ndarray,
     threshold: float = 5.0,
-    n_neighbors: int = 27,
+    n_neighbors: Optional[int] = None,
+    eps: Optional[float] = None,
 ) -> np.ndarray:
     """Universal outlier detection for PTV data.
 
@@ -338,15 +349,17 @@ def remove_outliers(
         Westerweel & Scarano, "Universal outlier detection for PIV data",
         Exp. Fluids 39(6), 2005.
 
-    Replaces ``removeOutlierTPT.m``.
+    Ports ``removeOutlierTPT.m`` (3-D) / ``removeOutlierTPT2.m`` (2-D).
 
     Parameters
     ----------
     coords_a    : (Na, D) — reference positions
     coords_b    : (Nb, D) — deformed positions
     track_a2b   : (Na,) int64 — index map (-1 = untracked)
-    threshold   : float — normalised residual cutoff (typ. 2–5)
-    n_neighbors : int — neighbors for median computation (typ. 27)
+    threshold   : float — normalised residual cutoff (2 in 2-D, 5 in 3-D upstream)
+    n_neighbors : neighbours (incl. self) for the median; ``None`` ⇒ per-dimension
+                  upstream value, see :data:`_OUTLIER_CONSTANTS`
+    eps         : fluctuation floor [px]; ``None`` ⇒ per-dimension upstream value
 
     Returns
     -------
@@ -356,22 +369,32 @@ def remove_outliers(
     tracked_mask = track >= 0
     tracked_idx = np.where(tracked_mask)[0]
 
-    if len(tracked_idx) < n_neighbors + 1:
-        return track  # too few points for statistics
+    ndim = coords_a.shape[1]
+    dflt_n, dflt_eps = _OUTLIER_CONSTANTS.get(ndim, (27, 0.075))
+    n_neighbors = dflt_n if n_neighbors is None else int(n_neighbors)
+    eps = dflt_eps if eps is None else float(eps)
+
+    # Need a handful of points for a median to mean anything.  MATLAB has no
+    # explicit guard — `knnsearch` with k > N raises and `funCompDisp2`'s bare
+    # try/catch swallows it, silently skipping the test.  Clamping k instead
+    # keeps the test working on small groups, which matters here because callers
+    # partition detections per (position, channel, plane) and those groups are
+    # routinely far smaller than 40 objects; skipping would make the threshold
+    # parameter inert exactly where it is most needed.
+    if len(tracked_idx) < 4:
+        return track
 
     # Positions and displacements of tracked particles
     x0 = coords_a[tracked_idx]
     x1 = coords_b[track[tracked_idx]]
     u = x1 - x0  # (M, D)
-    ndim = u.shape[1]
 
-    # KNN among tracked particles
+    # KNN among tracked particles.  MATLAB's `knnsearch(x,x,'k',nNeigh)` returns
+    # nNeigh columns *including* self (its `idx(:,2:end)` line is commented out),
+    # so the column count — not the neighbour count — is what must match.
     tree = cKDTree(x0)
-    K = min(n_neighbors, len(x0) - 1)
-    _, knn_idx = tree.query(x0, k=K + 1)  # includes self at col 0
-
-    # Fluctuation floor (Westerweel: epsilon ≈ 0.1 px)
-    eps = 0.075
+    _, knn_idx = tree.query(x0, k=min(n_neighbors, len(x0)))
+    knn_idx = np.atleast_2d(knn_idx)
 
     is_outlier = np.zeros(len(tracked_idx), dtype=np.bool_)
 
@@ -450,38 +473,44 @@ def find_not_missing(
 
 def update_f_o_s(
     disp_update: np.ndarray,
-    f_o_s_current: float = 60.0,
+    f_o_s_floor: float = 60.0,
 ) -> float:
-    """Shrink field-of-search based on displacement quantiles.
+    """Re-derive the field-of-search between ADMM iterations.
 
-    Replaces the MATLAB quantile-based f_o_s update in the ADMM loop.
-    Uses median + 0.5*IQR per component; takes the max across components.
+    Ports ``f_track_serial_match3D.m:302-308`` / ``…2D.m:277-281``::
 
-    The floor is the larger of 2 px and 10% of the current f_o_s,
-    preventing the search window from collapsing to zero while still
-    allowing meaningful shrinkage.
+        f_o_s = max([ 60 ;  median(u) + 0.5*IQR(u) ;  ... per component ])
+
+    The leading literal is the **configured** ``MPTPara.f_o_s`` (60 in every 3-D
+    example, 30 in every 2-D one), so this update can only ever *raise* the
+    search window — it is a "the motion is larger than you told me" escape
+    hatch, never a shrink. Pass ``f_o_s_floor = cfg.f_o_s``.
+
+    A floor of ``max(2, 0.1 * f_o_s_current)`` — which an earlier revision used,
+    described as "prevents collapse" — is a geometric *decay*: 60 → 6 → 2 → 2…
+    Two iterations in, the search window is 2 px, and no genuine link longer
+    than that survives. That silently reduced 3-D cumulative stretch/shear to a
+    0.3% tracking ratio.
 
     Parameters
     ----------
     disp_update : (N, D) displacement update from the global step
-    f_o_s_current : current field of search value
+    f_o_s_floor : the configured field of search — the result never goes below it
 
     Returns
     -------
     new_f_o_s : float
     """
     if len(disp_update) == 0:
-        return f_o_s_current
+        return f_o_s_floor
 
-    ndim = disp_update.shape[1]
-    vals = []
-    for d in range(ndim):
-        q25, q50, q75 = np.percentile(disp_update[:, d], [25, 50, 75])
-        vals.append(q50 + 0.5 * (q75 - q25))
-
-    # Floor: max(2 px, 10% of current f_o_s) — prevents collapse
-    floor = max(2.0, 0.1 * f_o_s_current)
-    return max(floor, *vals)
+    vals = [float(f_o_s_floor)]
+    for d in range(disp_update.shape[1]):
+        # MATLAB `quantile` uses the Hazen convention, not numpy's default.
+        q25, q50, q75 = np.quantile(disp_update[:, d], [0.25, 0.5, 0.75],
+                                    method="hazen")
+        vals.append(float(q50 + 0.5 * (q75 - q25)))
+    return max(vals)
 
 
 # ======================================================================
@@ -945,41 +974,53 @@ class TopologyMatcher:
     def _build_candidates(
         self, coords_a, tree_b, K, ndim
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Build padded candidate index array using ball query.
+        """Candidate B particles per A particle, in ascending distance order.
 
-        Falls back to KNN with distance filter when f_o_s is finite.
-        When f_o_s is inf, all B particles are candidates.
+        Ports ``f_track_neightopo_match3.m:122-128``::
+
+            neighborInd = knnsearch(part_B, part_A(parInd,:), 'K', n_neighbors);
+            dist = ...;
+            neighborInd = neighborInd(dist < sqrt(DIM)*f_o_s);
+
+        i.e. **the K nearest, then** a radius filter — not everything inside the
+        radius. The cap is load-bearing in both directions:
+
+        * *Correctness*: feature SSE is not monotone in distance, so an extra far
+          candidate can win the triple-argmin and then be thrown out by the
+          final ``< f_o_s`` gate at :func:`_match_features_3d` — losing a link
+          upstream would have made. By the late iterations ``K`` is 3, so the
+          two candidate sets are nothing alike.
+        * *Cost*: at ``f_o_s = 60`` in a 500×500×200 volume the ball holds ~470
+          candidates against upstream's 25, and the match kernel is
+          ``O(Na · n_cand · K)``.
+
+        ``f_o_s = inf`` means "search the whole field" (the ``else`` branch
+        upstream), which is the only case that is not K-capped.
         """
         Na = len(coords_a)
         Nb = tree_b.n
 
-        if self.f_o_s == np.inf or self.f_o_s <= 0:
-            # All B particles are candidates
-            max_c = Nb
-            cand_idx = np.empty((Na, max_c), dtype=np.int64)
-            cand_counts = np.full(Na, Nb, dtype=np.int64)
-            row = np.arange(Nb, dtype=np.int64)
-            for i in range(Na):
-                cand_idx[i, :] = row
-            return cand_idx, cand_counts
+        if not np.isfinite(self.f_o_s) or self.f_o_s <= 0:
+            # Whole field, every A row identical — build without a Python loop.
+            cand_idx = np.tile(np.arange(Nb, dtype=np.int64), (Na, 1))
+            return cand_idx, np.full(Na, Nb, dtype=np.int64)
 
-        # Use ball_point query for radius search
-        radius = np.sqrt(ndim) * self.f_o_s
-        ball_results = tree_b.query_ball_point(coords_a, r=radius)
+        k = int(min(max(K, 1), Nb))
+        dist, idx = tree_b.query(coords_a, k=k)
+        if k == 1:                      # cKDTree drops the trailing axis at k=1
+            dist = dist[:, None]
+            idx = idx[:, None]
 
-        # Determine max candidate count for padding
-        max_c = max(len(r) for r in ball_results) if len(ball_results) > 0 else 0
-        max_c = max(max_c, 1)  # at least 1 column
-        cand_idx = np.full((Na, max_c), -1, dtype=np.int64)
-        cand_counts = np.zeros(Na, dtype=np.int64)
+        keep = dist < np.sqrt(ndim) * self.f_o_s
+        cand_counts = keep.sum(axis=1).astype(np.int64)
 
-        for i, indices in enumerate(ball_results):
-            n = len(indices)
-            cand_counts[i] = n
-            for ci in range(n):
-                cand_idx[i, ci] = indices[ci]
-
-        return cand_idx, cand_counts
+        # Left-pack the survivors so the kernel can read [0:count) per row while
+        # preserving knnsearch's ascending-distance order (which is what breaks
+        # argmin ties toward the nearer particle, as upstream does).
+        order = np.argsort(~keep, axis=1, kind="stable")
+        cand_idx = np.take_along_axis(idx.astype(np.int64), order, axis=1)
+        cand_idx[~np.take_along_axis(keep, order, axis=1)] = -1
+        return np.ascontiguousarray(cand_idx), cand_counts
 
 
 class NearestNeighborMatcher:
@@ -997,20 +1038,28 @@ class NearestNeighborMatcher:
         coords_a: np.ndarray,
         coords_b: np.ndarray,
     ) -> np.ndarray:
-        """One-to-one nearest neighbor matching.
+        """Nearest-B-for-each-A matching (not mutually exclusive).
 
         Returns (M, 2) int64 array of (idx_a, idx_b) pairs.
+
+        ``f_o_s`` is accepted and **ignored**, matching upstream: the live body
+        of ``f_track_nearest_neighbour3.m:25-32`` is an ungated ``min(temp_dist)``
+        and the ``min(temp_dist) < f_o_s`` variant sits commented out below it
+        (``:43-61``). So this stage always returns exactly ``len(coords_a)``
+        pairs and can never come back empty — the outlier test and the
+        ghost-particle cull are what prune it.
+
+        Gating here instead lets the late ADMM iterations (where ``n_neighbors``
+        has decayed to ≤ 2 and this matcher takes over) return nothing, which
+        ``_ADMMFrameTracker.run`` reads as "no matches" and uses to break out of
+        the loop — a termination path upstream does not have.
         """
         if len(coords_a) == 0 or len(coords_b) == 0:
             return np.empty((0, 2), dtype=np.int64)
 
-        tree_b = cKDTree(coords_b)
-        dists, idx_b = tree_b.query(coords_a, k=1)
-
-        # Filter by f_o_s
-        mask = dists < self.f_o_s
-        idx_a = np.where(mask)[0]
-        return np.column_stack((idx_a, idx_b[mask]))
+        _, idx_b = cKDTree(coords_b).query(coords_a, k=1)
+        return np.column_stack((np.arange(len(coords_a), dtype=np.int64),
+                                np.asarray(idx_b, dtype=np.int64)))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1132,12 +1181,44 @@ from typing import Optional, Tuple, Union
 import numpy as np
 from pathlib import Path
 from typing import List
+import functools
 import logging
 from scipy import ndimage
 import numba as nb
 # ─────────────────────────────────────────────────────────────
 #  Numba-accelerated sub-pixel localization kernels
 # ─────────────────────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=16)
+def _fspecial_log(sigma: float, ndim: int) -> np.ndarray:
+    """MATLAB ``fspecial('log', ceil(sigma)*2+1, sigma)``, generalised to n-D.
+
+    ``f_detect_particles.m`` / ``f_detect_particles3.m`` build the
+    Laplacian-of-Gaussian at a *hard* half-width of ``ceil(sigma)``, i.e. only
+    7 taps for the σ=3 the examples use.  That truncation is not incidental:
+    it is what makes the filter respond at bead scale rather than at 4σ, and
+    reproducing it is worth ~1.8× in localisation accuracy and ~25% more
+    particles found versus ``scipy.ndimage.gaussian_laplace`` (which truncates
+    at 4σ).
+
+    Returned kernel sums to zero, as MATLAB's does.
+    """
+    half = int(np.ceil(sigma))
+    n = 2 * half + 1
+    ax = np.arange(-half, half + 1, dtype=np.float64)
+    grids = np.meshgrid(*([ax] * ndim), indexing="ij")
+    r2 = sum(g * g for g in grids)
+    std2 = float(sigma) ** 2
+
+    h = np.exp(-r2 / (2.0 * std2))
+    h[h < np.finfo(np.float64).eps * h.max()] = 0.0
+    s = h.sum()
+    if s != 0:
+        h = h / s
+    # ∇²G = (r² - d·σ²)/σ⁴ · G   (d = ndim; MATLAB's 2-D form uses 2·σ²)
+    h1 = h * (r2 - ndim * std2) / (std2 ** 2)
+    return h1 - h1.sum() / h1.size
+
 
 @nb.njit(cache=True)
 def _subpixel_poly_2d(log_img, xs, ys):
@@ -1219,60 +1300,95 @@ def _subpixel_poly_3d(log_img, xs, ys, zs):
 def _radial_symmetry_3d(patches, half_win, dccd, abc):
     """Radial-symmetry sub-voxel localization (Liu et al. 2013).
 
+    Port of ``radialcenter3dvec.m``.  Finds the point that minimises the
+    intensity-gradient-weighted sum of squared perpendicular distances to the
+    gradient lines::
+
+        [Σ qᵢ(I - nᵢnᵢᵀ)] c = Σ qᵢ(I - nᵢnᵢᵀ) pᵢ ,   qᵢ = |∇I|² / |pᵢ - p̄|
+
+    Two origins are in play and they are **not** the same one:
+
+    * ``pᵢ`` — the voxel position, measured from the **patch centre**.  This is
+      the origin the returned offset is expressed in, so the caller must add it
+      to the *integer* voxel the patch was cut around.
+    * ``p̄`` — the intensity-weighted centroid, which appears **only** inside the
+      weight denominator ``qᵢ`` (MATLAB ``d``, `radialcenter3dvec.m:78`).
+
+    Measuring ``pᵢ`` from the centroid instead of the patch centre — which an
+    earlier revision did — silently drops the centroid offset from the answer
+    and inflates the localisation error by ~5× (0.064 px → 0.34 px on the
+    SerialTrack3D synthetic beads).  See ``scripts/_serialtrack_validate.py``.
+
     Parameters
     ----------
-    patches : (N, wx, wy, wz)  float64 array of image patches
+    patches : (N, w0, w1, w2)  float64 array of image patches
     half_win : (3,) int array   half window sizes
-    dccd : (3,) float array     pixel spacings
-    abc  : (3,) float array     anisotropy factors
+    dccd : (3,) float array     voxel spacing along each patch axis
+    abc  : (3,) float array     anisotropy factor per patch axis
 
     Returns
     -------
-    dx, dy, dz : (N,) sub-pixel shifts
+    d0, d1, d2 : (N,) sub-voxel shifts along patch axes 0/1/2, relative to the
+        patch centre.
+
+    Notes
+    -----
+    ``dccd``/``abc`` are indexed *by patch axis* here.  MATLAB pairs its
+    ``dccd(1)``/``abc(1)`` with array dimension **2** (because ``meshgrid``
+    makes ``px`` vary along dim 2), so the two agree exactly for the isotropic
+    ``[1,1,1]`` values every shipped SerialTrack example uses, and differ only
+    for anisotropic settings — where MATLAB's own indexing is inconsistent.
     """
     N = patches.shape[0]
-    wx, wy, wz = patches.shape[1], patches.shape[2], patches.shape[3]
-    dx = np.zeros(N, dtype=np.float64)
-    dy = np.zeros(N, dtype=np.float64)
-    dz = np.zeros(N, dtype=np.float64)
+    w0, w1, w2 = patches.shape[1], patches.shape[2], patches.shape[3]
+    d0 = np.zeros(N, dtype=np.float64)
+    d1 = np.zeros(N, dtype=np.float64)
+    d2 = np.zeros(N, dtype=np.float64)
     a, b, c = abc[0], abc[1], abc[2]
-    dxc, dyc, dzc = dccd[0], dccd[1], dccd[2]
+    s0, s1, s2 = dccd[0], dccd[1], dccd[2]
 
     for pi in nb.prange(N):
-        # --- intensity-weighted centroid ---
-        sx_ = 0.0; sy_ = 0.0; sz_ = 0.0; tot = 0.0
-        for ix in range(wx):
-            for iy in range(wy):
-                for iz in range(wz):
-                    v = patches[pi, ix, iy, iz]
-                    sx_ += v * (ix - (wx-1)*0.5) * dxc
-                    sy_ += v * (iy - (wy-1)*0.5) * dyc
-                    sz_ += v * (iz - (wz-1)*0.5) * dzc
+        # --- intensity-weighted centroid (patch-centre origin, unscaled by abc,
+        #     exactly as MATLAB's xm/ym/zm) ---
+        m0 = 0.0; m1 = 0.0; m2 = 0.0; tot = 0.0
+        for i0 in range(w0):
+            p0 = (i0 - (w0 - 1) * 0.5) * s0
+            for i1 in range(w1):
+                p1 = (i1 - (w1 - 1) * 0.5) * s1
+                for i2 in range(w2):
+                    v = patches[pi, i0, i1, i2]
+                    m0 += v * p0
+                    m1 += v * p1
+                    m2 += v * (i2 - (w2 - 1) * 0.5) * s2
                     tot += v
         if tot < 1e-30:
             continue
-        xm = sx_ / tot;  ym = sy_ / tot;  zm = sz_ / tot
+        xm = m0 / tot;  ym = m1 / tot;  zm = m2 / tot
 
         # --- build 3×3 normal system from gradient votes ---
         A00=0.;A01=0.;A02=0.;A11=0.;A12=0.;A22=0.
         B0=0.;B1=0.;B2=0.
 
-        for ix in range(1, wx-1):
-            for iy in range(1, wy-1):
-                for iz in range(1, wz-1):
-                    gu = (patches[pi,ix+1,iy,iz] - patches[pi,ix-1,iy,iz])/(2*dxc)
-                    gv = (patches[pi,ix,iy+1,iz] - patches[pi,ix,iy-1,iz])/(2*dyc)
-                    gw = (patches[pi,ix,iy,iz+1] - patches[pi,ix,iy,iz-1])/(2*dzc)
+        for i0 in range(1, w0-1):
+            xp = (i0 - (w0 - 1) * 0.5) * s0 / a       # patch-centre-relative
+            for i1 in range(1, w1-1):
+                yp = (i1 - (w1 - 1) * 0.5) * s1 / b
+                for i2 in range(1, w2-1):
+                    zp = (i2 - (w2 - 1) * 0.5) * s2 / c
+                    # central differences over the abc-scaled spacing, matching
+                    # MATLAB's dx = dxccd/a
+                    gu = (patches[pi,i0+1,i1,i2] - patches[pi,i0-1,i1,i2])/(s0/a)
+                    gv = (patches[pi,i0,i1+1,i2] - patches[pi,i0,i1-1,i2])/(s1/b)
+                    gw = (patches[pi,i0,i1,i2+1] - patches[pi,i0,i1,i2-1])/(s2/c)
                     gm = np.sqrt(gu*gu + gv*gv + gw*gw)
-                    if gm < 1e-10:
+                    if gm < 1e-30:
                         continue
                     gu /= gm; gv /= gm; gw /= gm
 
-                    xp = (ix-(wx-1)*0.5)*dxc/a - xm/a
-                    yp = (iy-(wy-1)*0.5)*dyc/b - ym/b
-                    zp = (iz-(wz-1)*0.5)*dzc/c - zm/c
-                    dd = np.sqrt(xp*xp + yp*yp + zp*zp)
-                    if dd < 1e-10:
+                    # weight denominator: distance to the intensity centroid
+                    ex = xp - xm; ey = yp - ym; ez = zp - zm
+                    dd = np.sqrt(ex*ex + ey*ey + ez*ez)
+                    if dd < 1e-30:
                         continue
                     q = gm*gm / dd
 
@@ -1290,11 +1406,11 @@ def _radial_symmetry_3d(patches, half_win, dccd, abc):
         if abs(det) < 1e-30:
             continue
         inv = 1.0 / det
-        dx[pi] = ((A11*A22-A12*A12)*B0 + (A02*A12-A01*A22)*B1 + (A01*A12-A02*A11)*B2)*inv*a
-        dy[pi] = ((A02*A12-A01*A22)*B0 + (A00*A22-A02*A02)*B1 + (A01*A02-A00*A12)*B2)*inv*b
-        dz[pi] = ((A01*A12-A02*A11)*B0 + (A01*A02-A00*A12)*B1 + (A00*A11-A01*A01)*B2)*inv*c
+        d0[pi] = ((A11*A22-A12*A12)*B0 + (A02*A12-A01*A22)*B1 + (A01*A12-A02*A11)*B2)*inv*a
+        d1[pi] = ((A02*A12-A01*A22)*B0 + (A00*A22-A02*A02)*B1 + (A01*A02-A00*A12)*B2)*inv*b
+        d2[pi] = ((A01*A12-A02*A11)*B0 + (A01*A02-A00*A12)*B1 + (A00*A11-A01*A01)*B2)*inv*c
 
-    return dx, dy, dz
+    return d0, d1, d2
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1384,26 +1500,35 @@ class ParticleDetector:
     def _log_detect(self, img_m, img_n, ndim):
         sigma = self.cfg.bead_radius
 
-        # Laplacian of Gaussian
-        log_img = -ndimage.gaussian_laplace(img_m, sigma=sigma)
+        # Laplacian of Gaussian.  MATLAB's fspecial('log') is truncated to
+        # ceil(sigma)*2+1 taps; scipy's gaussian_laplace truncates at 4σ
+        # (25 taps for σ=3), which is a far coarser filter and both loses
+        # particles and degrades the sub-pixel fit.
+        log_img = ndimage.correlate(img_m, -_fspecial_log(sigma, ndim),
+                                    mode="nearest")
 
-        # Local-maximum filter
-        fp_size = int(2 * sigma * 2) + 1
-        fp = np.ones((fp_size,) * ndim)
+        # Local-maximum filter.  MATLAB uses strel('square', 2σ+1) in 2-D — a
+        # (2σ+1)-wide box, i.e. 7×7 for σ=3, roughly the bead spacing.  A box
+        # twice that wide suppresses every second particle in a dense field.
+        fp_size = int(2 * sigma) + 1
         rng = np.random.default_rng(42)
         noise = rng.random(log_img.shape) * 1e-5
-        dilated = ndimage.maximum_filter(log_img + noise, footprint=fp)
-        peaks = ((log_img + noise) == dilated) & (img_n > self.cfg.threshold)
+        dilated = ndimage.maximum_filter(log_img + noise, size=fp_size,
+                                         mode="nearest")
+        # MATLAB thresholds the *masked* image (`im = im.*BW3` above), so the
+        # size gate applies to the peaks too.
+        peaks = ((log_img + noise) == dilated) & (img_m > self.cfg.threshold)
 
         coords_int = np.asarray(np.nonzero(peaks), dtype=np.int64).T  # (N, ndim)
         if len(coords_int) == 0:
             return np.empty((0, ndim))
 
-        # Trim border
-        nb_ = max(int((sigma + 2) / 2), 1)
+        # Trim border: MATLAB keeps `y >= nb+1 & y < h-nb` in 1-based indexing.
+        nb_ = int((sigma + 2) // 2)
         mask = np.ones(len(coords_int), dtype=np.bool_)
         for d in range(ndim):
-            mask &= (coords_int[:, d] >= nb_) & (coords_int[:, d] < img_n.shape[d] - nb_)
+            mask &= ((coords_int[:, d] >= nb_)
+                     & (coords_int[:, d] <= img_n.shape[d] - nb_ - 2))
         coords_int = coords_int[mask]
         if len(coords_int) == 0:
             return np.empty((0, ndim))
@@ -1431,21 +1556,38 @@ class ParticleDetector:
     # ── TPT method ──────────────────────────────────────────
 
     def _detect_tpt(self, img_n: np.ndarray, img_raw: np.ndarray) -> np.ndarray:
-        """Blob centroid → radial-symmetry sub-voxel refinement."""
-        ndim = img_n.ndim
-        coords = self._centroid_detect(img_n, ndim)
-        if len(coords) == 0 or ndim != 3:
-            return coords  # radial symmetry only for 3-D
+        """Blob centroid → radial-symmetry sub-voxel refinement.
 
-        # Extract patches for radial-symmetry
+        Mirrors ``locateParticles.m`` → ``radialcenter3dvec.m``: the blob stage
+        produces an **integer voxel** seed (MATLAB rounds the *binary* blob
+        centroid), the patch is cut around that integer, and the radial-symmetry
+        offset — which is measured from the patch centre — is added to it.
+
+        Adding the offset to an *unrounded* sub-voxel centroid instead (as an
+        earlier revision did) double-counts the sub-voxel part.
+        """
+        ndim = img_n.ndim
+        seed = self._blob_seed(img_n, ndim)
+        if len(seed) == 0 or ndim != 3:
+            # 2-D upstream never reaches radialcenter: every shipped
+            # `fun_SerialTrack_2D_*` calls `f_detect_particles` (the LoG path)
+            # and leaves locateBeads/radial2center commented out.  Fall back to
+            # the intensity-weighted blob centroid, which is strictly better
+            # than the integer seed.
+            return self._centroid_detect(img_n, ndim) if ndim != 3 else seed
+
         ws = np.array(self.cfg.win_size[:3], dtype=np.int64)
         half = ws // 2
-        ci = np.round(coords).astype(np.int64)
+        ci = seed.astype(np.int64)
 
-        # Pad with reflected noise
+        # radialcenter3dvec works on the RAW (un-normalised) image plus a
+        # dither, and pads with near-zero noise (padNoise.m) — NOT by
+        # reflection, which would mirror real bead intensity into the border and
+        # bias particles within half a window of the edge.
         img_f = img_raw.astype(np.float64)
-        img_f += self.cfg.rand_noise * np.random.default_rng(0).random(img_f.shape)
-        img_p = np.pad(img_f, [(h, h) for h in half], mode="reflect")
+        img_f = img_f + self.cfg.rand_noise * np.random.default_rng(0).random(img_f.shape)
+        img_p = np.pad(img_f, [(h, h) for h in half], mode="constant",
+                       constant_values=0.0)
 
         patches = np.empty((len(ci), ws[0], ws[1], ws[2]), dtype=np.float64)
         for i, c in enumerate(ci):
@@ -1459,44 +1601,74 @@ class ParticleDetector:
         dccd = np.array(self.cfg.dccd[:3], dtype=np.float64)
         abc = np.array(self.cfg.abc[:3], dtype=np.float64)
 
-        dx, dy, dz = _radial_symmetry_3d(patches, half, dccd, abc)
+        off = np.column_stack(_radial_symmetry_3d(patches, half, dccd, abc))
 
-        # Apply only well-behaved shifts
-        ok = (np.abs(dx) < half[0]) & (np.abs(dy) < half[1]) & (np.abs(dz) < half[2])
-        out = coords.copy()
-        out[ok, 0] += dx[ok]
-        out[ok, 1] += dy[ok]
-        out[ok, 2] += dz[ok]
+        out = ci.astype(np.float64)
+        # A solve that lands outside the window is not a refinement — drop the
+        # offset for those (MATLAB drops the particle on NaN; keeping the seed
+        # preserves the detection, which the linker can still use).
+        ok = np.all(np.isfinite(off), axis=1) & np.all(np.abs(off) < half, axis=1)
+        out[ok] += off[ok]
         return out
 
     # ── shared helpers ──────────────────────────────────────
 
-    def _size_filtered_mask(self, img_n: np.ndarray) -> np.ndarray:
-        """Threshold → label → keep blobs within [min_size, max_size]."""
+    def _label_blobs(self, img_n: np.ndarray):
+        """Threshold → connected components → (labels, n, sizes)."""
         bw = img_n > self.cfg.threshold
         labeled, n = ndimage.label(bw)
         if n == 0:
-            return bw
-        sizes = ndimage.sum_labels(bw, labeled, range(1, n + 1))
-        keep = np.zeros(n + 1, dtype=bool)
-        for i, s in enumerate(sizes, 1):
-            if self.cfg.min_size <= s <= self.cfg.max_size:
-                keep[i] = True
-        return keep[labeled]
+            return labeled, 0, np.empty(0)
+        sizes = ndimage.sum_labels(bw, labeled, np.arange(1, n + 1))
+        return labeled, n, sizes
 
-    def _centroid_detect(self, img_n: np.ndarray, ndim: int) -> np.ndarray:
-        """Connected-component centroids, filtered by size."""
-        bw = img_n > self.cfg.threshold
-        labeled, n = ndimage.label(bw)
+    def _size_filtered_mask(self, img_n: np.ndarray) -> np.ndarray:
+        """Threshold → label → keep blobs of at least ``min_size`` voxels.
+
+        ``f_detect_particles.m`` computes ``BW3 = bwareaopen(BW,minSize) -
+        bwareaopen(BW,maxSize)`` and then unconditionally discards it::
+
+            if sum(mean(BW3(:))) < 1, BW3 = BW1; end
+
+        ``mean`` of a 0/1 array is the *fraction* of set voxels, so that test is
+        true unless the whole image is foreground — the LoG path therefore
+        applies the **minimum** size filter only.  Reinstating the maximum here
+        would silently delete merged bead pairs that upstream keeps.
+        """
+        labeled, n, sizes = self._label_blobs(img_n)
+        if n == 0:
+            return labeled.astype(bool)
+        return np.concatenate([[False], sizes >= self.cfg.min_size])[labeled]
+
+    def _blob_seed(self, img_n: np.ndarray, ndim: int) -> np.ndarray:
+        """Integer-voxel blob seeds, exactly as ``locateParticles.m``.
+
+        The centroid is taken over the **binary** mask (MATLAB's
+        ``regionprops(CC,'Centroid')`` is unweighted) and rounded, and the size
+        gate uses MATLAB's *strict* ``> minSize & < maxSize``.
+        """
+        labeled, n, sizes = self._label_blobs(img_n)
         if n == 0:
             return np.empty((0, ndim))
-        sizes = ndimage.sum_labels(bw, labeled, range(1, n + 1))
-        centroids = ndimage.center_of_mass(img_n, labeled, range(1, n + 1))
-        out = np.array([
-            c for c, s in zip(centroids, sizes)
-            if self.cfg.min_size <= s <= self.cfg.max_size
-        ])
-        return out if out.size else np.empty((0, ndim))
+        keep = (sizes > self.cfg.min_size) & (sizes < self.cfg.max_size)
+        if not keep.any():
+            return np.empty((0, ndim))
+        idx = np.flatnonzero(keep) + 1
+        cen = np.asarray(ndimage.center_of_mass(labeled > 0, labeled, idx),
+                         dtype=np.float64).reshape(-1, ndim)
+        return np.round(cen)
+
+    def _centroid_detect(self, img_n: np.ndarray, ndim: int) -> np.ndarray:
+        """Intensity-weighted connected-component centroids, filtered by size."""
+        labeled, n, sizes = self._label_blobs(img_n)
+        if n == 0:
+            return np.empty((0, ndim))
+        keep = (sizes >= self.cfg.min_size) & (sizes <= self.cfg.max_size)
+        if not keep.any():
+            return np.empty((0, ndim))
+        idx = np.flatnonzero(keep) + 1
+        return np.asarray(ndimage.center_of_mass(img_n, labeled, idx),
+                          dtype=np.float64).reshape(-1, ndim)
 
     @staticmethod
     def clip_to_bounds(coords: np.ndarray, shape: Tuple[int, ...]) -> np.ndarray:
@@ -1535,10 +1707,12 @@ from typing import Tuple, Optional, Dict, Any
 from enum import IntEnum
 import numpy as np
 from scipy.spatial import cKDTree, QhullError
-from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator, RBFInterpolator
+from scipy.interpolate import (LinearNDInterpolator, NearestNDInterpolator,
+                               RegularGridInterpolator)
 from scipy.ndimage import gaussian_filter
-from scipy.sparse import eye as speye, diags as spdiags, kron as spkron, csc_matrix
-from scipy.sparse.linalg import spsolve
+from scipy.sparse import (eye as speye, identity, diags as spdiags,
+                          kron as spkron, csc_matrix, vstack)
+from scipy.sparse.linalg import spsolve, splu, lsqr
 import logging
 
 
@@ -1546,9 +1720,209 @@ log = logging.getLogger("serialtrack.regularization")
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Scatter → Grid interpolation  (replaces funScatter2Grid3D.m
-#  + the 600-line regularizeNd.m)
+#  Scatter → Grid interpolation  (ports funScatter2Grid3D.m
+#  + regularizeNd.m)
 # ═══════════════════════════════════════════════════════════════
+
+#: Upper bound on regularisation-grid nodes.  The grid is only an intermediate
+#: smoothing lattice, and :func:`regularize_nd` solves an ``n_nodes × n_nodes``
+#: sparse normal system on it, so the cost is superlinear in the node count.
+#: 4·10⁵ nodes keeps that solve in the tens-of-milliseconds range.
+MAX_GRID_NODES = 400_000
+
+
+def _grid_axes(
+    coords: np.ndarray,
+    grid_step: np.ndarray,
+    grid_coords: Optional[Tuple[np.ndarray, ...]],
+) -> Tuple[Tuple[np.ndarray, ...], Tuple[np.ndarray, ...]]:
+    """Return ``(axes, grids)`` — 1-D node vectors and their ndgrid expansion.
+
+    Matches ``funScatter2Grid3D.m``: ``min(x) : step : max(x)+step`` per axis,
+    so the grid always strictly brackets the data (``regularizeNd`` requires it).
+
+    One deviation, for safety: the step is coarsened if the grid would exceed
+    :data:`MAX_GRID_NODES`.  Upstream derives ``sxyz = min(round(0.5*f_o_s), 20)``
+    and never revisits it, which is fine while ``f_o_s`` is the 15–60 px its own
+    examples use — but a caller that passes a small ``f_o_s`` (e.g. a few px,
+    which is what a micron-denominated "max displacement" becomes at coarse
+    pixel sizes) gets a 1 px lattice over the entire field of view.  On a
+    2048² frame that is 4·10⁶ nodes and a 4·10⁶-square sparse solve: not an
+    error, just an apparent hang.
+    """
+    ndim = coords.shape[1]
+    if grid_coords is not None:
+        axes = tuple(np.unique(g) for g in grid_coords)
+        return axes, tuple(grid_coords)
+
+    gs = np.asarray(grid_step, dtype=np.float64).copy()
+    lo = coords.min(axis=0).astype(np.float64)
+    hi = coords.max(axis=0).astype(np.float64)
+    gs[gs <= 0] = 1.0
+
+    n_nodes = np.prod(np.floor((hi - lo) / gs) + 2.0)
+    if n_nodes > MAX_GRID_NODES:
+        scale = (n_nodes / MAX_GRID_NODES) ** (1.0 / ndim)
+        log.warning("regularisation grid would be %.3g nodes at step %s; "
+                    "coarsening by %.2fx", n_nodes, np.round(gs, 3), scale)
+        gs = gs * scale
+
+    axes = []
+    for d in range(ndim):
+        step = float(gs[d])
+        ax = np.arange(lo[d], hi[d] + step, step)
+        if ax.size < 3:      # regularizeNd's 2nd-derivative stencil needs 3 nodes
+            ax = np.linspace(lo[d], hi[d] + step, 3)
+        axes.append(ax)
+    axes = tuple(axes)
+    return axes, tuple(np.meshgrid(*axes, indexing="ij"))
+
+
+def regularize_nd(
+    coords: np.ndarray,
+    values: np.ndarray,
+    axes: Tuple[np.ndarray, ...],
+    smoothness: float,
+) -> np.ndarray:
+    """Single-component :func:`regularize_nd_multi`. See there for the algorithm."""
+    return regularize_nd_multi(coords, values[:, None], axes, smoothness)[0]
+
+
+def regularize_nd_multi(
+    coords: np.ndarray,
+    values: np.ndarray,
+    axes: Tuple[np.ndarray, ...],
+    smoothness: float,
+) -> np.ndarray:
+    """Least-squares gridfit with a smoothness penalty — port of ``regularizeNd.m``.
+
+    Solves, in the least-squares sense,
+
+    * **fidelity**: for each scattered point, its multilinear interpolation from
+      the surrounding grid cell equals the observed value;
+    * **smoothness**: along each axis, the numerical second derivative is zero,
+      weighted by ``smoothness · √(N_scattered / N_eqn_axis) · (span_axis)²``.
+
+    The two scale factors are what make ``smoothness`` mean the same thing
+    regardless of grid resolution or axis units — which is why ``smoothness =
+    1e-1`` is a sane published default.  Substituting a thin-plate-spline RBF
+    with ``smoothing=smoothness`` (as an earlier revision did) is a *different
+    operator with a different parameterisation*: it is O(N³) in the scattered
+    point count, it extrapolates with a growing polynomial, and the same
+    numeric value means something unrelated.
+
+    All ``values`` columns share one system matrix, so it is assembled and
+    factorised once and back-substituted per component — the displacement
+    components of one ADMM global step differ only in their right-hand side.
+
+    Parameters
+    ----------
+    coords : (N, D) scattered positions.
+    values : (N, C) observed values, one column per field component.
+    axes : per-axis node vectors, strictly monotone, spanning ``coords``.
+    smoothness : ≥ 0 relative weight of smoothness against fidelity.
+
+    Returns
+    -------
+    (C, \\*grid_shape) array of fitted node values, in ndgrid order.
+    """
+    ndim = coords.shape[1]
+    values = np.atleast_2d(np.asarray(values, dtype=np.float64))
+    if values.shape[0] != len(coords):
+        values = values.T
+    ncomp = values.shape[1]
+    n_grid = np.array([len(a) for a in axes], dtype=np.int64)
+    n_total = int(np.prod(n_grid))
+    n_pts = len(coords)
+    # Column-major (ndgrid/MATLAB) strides, so the flat layout matches .ravel()
+    # of the meshgrid(indexing="ij") arrays used everywhere else... which is
+    # C-order.  Use C-order strides and keep everything consistent.
+    strides = np.ones(ndim, dtype=np.int64)
+    for d in range(ndim - 2, -1, -1):
+        strides[d] = strides[d + 1] * n_grid[d + 1]
+
+    # ── fidelity equations: multilinear weights of the containing cell ──
+    cell_idx = np.empty((n_pts, ndim), dtype=np.int64)
+    frac = np.empty((n_pts, ndim), dtype=np.float64)
+    for d in range(ndim):
+        ax = axes[d]
+        i = np.searchsorted(ax, coords[:, d], side="right") - 1
+        np.clip(i, 0, len(ax) - 2, out=i)
+        cell_idx[:, d] = i
+        h = ax[i + 1] - ax[i]
+        frac[:, d] = np.clip((coords[:, d] - ax[i]) / h, 0.0, 1.0)
+
+    n_corner = 1 << ndim
+    corners = ((np.arange(n_corner)[:, None] >> np.arange(ndim)[::-1]) & 1)  # (2^D, D)
+    w = np.ones((n_pts, n_corner), dtype=np.float64)
+    col = np.zeros((n_pts, n_corner), dtype=np.int64)
+    for d in range(ndim):
+        f = frac[:, d:d + 1]
+        bit = corners[:, d][None, :]
+        w *= np.where(bit == 1, f, 1.0 - f)
+        col += (cell_idx[:, d:d + 1] + bit) * strides[d]
+    row = np.repeat(np.arange(n_pts), n_corner)
+    A_fid = csc_matrix((w.ravel(), (row, col.ravel())), shape=(n_pts, n_total))
+
+    out_shape = (ncomp,) + tuple(n_grid)
+
+    if smoothness <= 0:
+        # Pure least-squares lookup-table fit, no smoothing (MATLAB allows it).
+        AtA = (A_fid.T @ A_fid).tocsc() + 1e-12 * identity(n_total, format="csc")
+        return _solve_factored(AtA, A_fid.T @ values, A_fid, values, out_shape)
+
+    # ── smoothness equations: zero 2nd derivative along each axis ──
+    blocks = [A_fid]
+    rhs_extra = 0
+    for d in range(ndim):
+        nd_ = n_grid[d]
+        if nd_ < 3:
+            continue
+        shape_eq = n_grid.copy()
+        shape_eq[d] -= 2
+        n_eq = int(np.prod(shape_eq))
+
+        ax = axes[d]
+        x1, x2, x3 = ax[:nd_ - 2], ax[1:nd_ - 1], ax[2:nd_]
+        # 2nd derivative of the parabolic Lagrange polynomial through 3 nodes
+        c1 = 2.0 / ((x1 - x3) * (x1 - x2))
+        c2 = 2.0 / ((x2 - x1) * (x2 - x3))
+        c3 = 2.0 / ((x3 - x1) * (x3 - x2))
+
+        scale = (smoothness
+                 * np.sqrt(n_pts / n_eq)
+                 * (float(ax[-1]) - float(ax[0])) ** 2)
+
+        # Flat indices of every (i_d, i_other...) stencil centre
+        sub = np.indices(tuple(shape_eq)).reshape(ndim, -1)
+        base = np.zeros(n_eq, dtype=np.int64)
+        for dd in range(ndim):
+            base += sub[dd] * strides[dd]
+        k = sub[d]                                  # 0 .. nd_-3
+        rows = np.tile(np.arange(n_eq), 3)
+        cols = np.concatenate([base, base + strides[d], base + 2 * strides[d]])
+        vals = scale * np.concatenate([c1[k], c2[k], c3[k]])
+        blocks.append(csc_matrix((vals, (rows, cols)), shape=(n_eq, n_total)))
+        rhs_extra += n_eq
+
+    A = vstack(blocks, format="csc")
+    b = np.vstack([values, np.zeros((rhs_extra, ncomp))])
+    return _solve_factored((A.T @ A).tocsc(), A.T @ b, A, b, out_shape)
+
+
+def _solve_factored(AtA, Atb, A, b, out_shape) -> np.ndarray:
+    """Solve the normal equations for every RHS column from one factorisation."""
+    Atb = np.asarray(Atb)
+    try:
+        lu = splu(AtA)
+        out = np.column_stack([lu.solve(Atb[:, c]) for c in range(Atb.shape[1])])
+        if not np.all(np.isfinite(out)):
+            raise ArithmeticError("non-finite solution")
+    except Exception as exc:                              # pragma: no cover
+        log.warning("regularize_nd direct solve failed (%s); using LSQR", exc)
+        out = np.column_stack([lsqr(A, b[:, c])[0] for c in range(b.shape[1])])
+    return out.T.reshape(out_shape)
+
 
 def scatter_to_grid(
     coords: np.ndarray,
@@ -1559,15 +1933,17 @@ def scatter_to_grid(
 ) -> Tuple[Tuple[np.ndarray, ...], np.ndarray]:
     """Interpolate scattered data onto a regular grid.
 
-    Replaces ``funScatter2Grid3D.m`` + ``regularizeNd.m`` (~650 lines).
+    Port of ``funScatter2Grid3D.m`` / ``funScatter2Grid2D.m``: with
+    ``smoothness == 0`` a plain linear scattered interpolation, otherwise
+    :func:`regularize_nd`.
 
     Parameters
     ----------
     coords : (N, D) — scattered point positions
     values : (N,)   — scalar field values at those points
     grid_step : (D,) — grid spacing per dimension
-    smoothness : float — RBF smoothing parameter (0 = pure interpolation)
-    grid_coords : optional pre-built meshgrid arrays
+    smoothness : float — regularisation weight (0 = pure interpolation)
+    grid_coords : optional pre-built ndgrid arrays
 
     Returns
     -------
@@ -1575,48 +1951,59 @@ def scatter_to_grid(
     f_grid : array with same shape — interpolated values
     """
     ndim = coords.shape[1]
-    gs = np.asarray(grid_step, dtype=np.float64)
+    axes, grids = _grid_axes(coords, grid_step, grid_coords)
 
-    # Build grid axes
-    if grid_coords is not None:
-        grids = grid_coords
-        axes = tuple(np.unique(g) for g in grids)
-    else:
-        axes = []
-        for d in range(ndim):
-            lo, hi = coords[:, d].min(), coords[:, d].max()
-            axes.append(np.arange(lo, hi + gs[d], gs[d]))
-        axes = tuple(axes)
-        grids = np.meshgrid(*axes, indexing="ij")
-        grids = tuple(grids)
-
-    query_pts = np.column_stack([g.ravel() for g in grids])
-
-    # Minimum point requirements:
-    #   LinearNDInterpolator needs ndim+1 for a simplex
-    #   RBFInterpolator(degree=1) needs ndim+1 points
     min_pts = ndim + 1
     if len(coords) < min_pts:
         log.warning("scatter_to_grid: only %d points (need %d) — returning zeros",
-                     len(coords), min_pts)
-        f_grid = np.zeros(grids[0].shape, dtype=np.float64)
-        return grids, f_grid
+                    len(coords), min_pts)
+        return grids, np.zeros(grids[0].shape, dtype=np.float64)
 
-    if smoothness <= 0:
-        # Pure linear interpolation (fast)
-        f_flat = _linear_or_nearest_interpolate(coords, values, query_pts)
-    else:
-        # RBF with smoothing — replaces the entire regularizeNd.m
-        interp = RBFInterpolator(
-            coords, values,
-            smoothing=smoothness,
-            kernel="thin_plate_spline",
-            degree=1,
-        )
-        f_flat = interp(query_pts)
+    if smoothness > 0:
+        try:
+            return grids, regularize_nd(coords, values, axes, smoothness)
+        except Exception as exc:
+            # MATLAB wraps the same call in try/catch and retries unsmoothed.
+            log.warning("regularize_nd failed (%s); falling back to smoothness=0", exc)
+    query_pts = np.column_stack([g.ravel() for g in grids])
+    return grids, _linear_extrap_interpolate(
+        coords, values, query_pts).reshape(grids[0].shape)
 
-    f_grid = f_flat.reshape(grids[0].shape)
-    return grids, f_grid
+
+def _linear_extrap_interpolate(
+    coords: np.ndarray,
+    values: np.ndarray,
+    query_pts: np.ndarray,
+) -> np.ndarray:
+    """Linear scattered interpolation that **extrapolates** outside the hull.
+
+    MATLAB's ``scatteredInterpolant(...,'linear','linear')`` — the second
+    ``'linear'`` is the extrapolation method — is what every SerialTrack global
+    step uses. ``scipy``'s ``LinearNDInterpolator`` cannot extrapolate, and
+    filling with ``0`` there is not a neutral choice: the regularisation grid is
+    deliberately built out to ``max(x) + step``, so its whole outer shell lies
+    outside the hull of the matched particles and would be pinned to zero,
+    dragging every edge particle's displacement toward nothing.
+
+    Implemented as detrend → interpolate residual → retrend: fit the global
+    least-squares affine trend, interpolate only the residual (zero-filled
+    outside, where there is no data to justify anything else), then add the trend
+    back. Inside the hull this is identical to plain linear interpolation up to
+    the trend; outside, the field continues along the fitted trend instead of
+    collapsing. For a genuinely affine field — which every homogeneous
+    deformation is — it is exact everywhere.
+    """
+    ndim = coords.shape[1]
+    if len(coords) < ndim + 2:
+        return _linear_or_nearest_interpolate(coords, values, query_pts)
+
+    A = np.column_stack([coords, np.ones(len(coords))])
+    beta, *_ = np.linalg.lstsq(A, values, rcond=None)
+    trend_c = A @ beta
+    trend_q = np.column_stack([query_pts, np.ones(len(query_pts))]) @ beta
+
+    resid = _linear_or_nearest_interpolate(coords, values - trend_c, query_pts)
+    return trend_q + np.nan_to_num(resid, nan=0.0)
 
 
 def _linear_or_nearest_interpolate(
@@ -1668,13 +2055,26 @@ def scatter_to_grid_multi(
     disp_grid : (D, *grid_shape) — gridded displacement components
     """
     ndim = coords.shape[1]
-    grids = grid_coords          # reuse grid if provided (critical for ADMM)
-    components = []
-    for d in range(ndim):
-        grids, fg = scatter_to_grid(
-            coords, disp[:, d], grid_step, smoothness, grids
-        )
-        components.append(fg)
+    axes, grids = _grid_axes(coords, grid_step, grid_coords)
+
+    if len(coords) < ndim + 1:
+        log.warning("scatter_to_grid_multi: only %d points (need %d) — returning zeros",
+                    len(coords), ndim + 1)
+        return grids, np.zeros((ndim,) + grids[0].shape, dtype=np.float64)
+
+    if smoothness > 0:
+        try:
+            # One assembly + one factorisation for all D components.
+            return grids, regularize_nd_multi(coords, disp, axes, smoothness)
+        except Exception as exc:
+            log.warning("regularize_nd failed (%s); falling back to smoothness=0", exc)
+
+    query_pts = np.column_stack([g.ravel() for g in grids])
+    components = [
+        _linear_extrap_interpolate(coords, disp[:, d], query_pts).reshape(
+            grids[0].shape)
+        for d in range(ndim)
+    ]
     return grids, np.array(components)  # shape (D, *grid_shape)
 
 
@@ -1880,15 +2280,28 @@ def _interp_grid_to_points(
 ) -> np.ndarray:
     """Interpolate a gridded D-component field to scattered points.
 
-    Uses LinearNDInterpolator for speed.
+    The source is a **regular** grid, so this is multilinear interpolation with
+    linear extrapolation outside — matching MATLAB's
+    ``scatteredInterpolant(...,'linear','linear')`` extrapolation behaviour.
+
+    An earlier revision instead fed the grid nodes to ``LinearNDInterpolator``,
+    i.e. it Delaunay-triangulated a regular lattice on every ADMM iteration for
+    every displacement component.  That was 76% of total tracking runtime, and
+    it was also *wrong* in two ways: the triangulation imposes an arbitrary
+    diagonal (so the interpolant is direction-biased rather than multilinear),
+    and ``fill_value=0.0`` zeroed the displacement update for every particle
+    outside the convex hull of the matched set instead of extrapolating —
+    silently pinning the field at the edges of the ROI.
     """
     ndim = points.shape[1]
-    grid_pts = np.column_stack([g.ravel() for g in grids])
+    axes = tuple(np.unique(g) for g in grids)
     result = np.zeros((len(points), ndim), dtype=np.float64)
     for d in range(ndim):
-        result[:, d] = _linear_or_nearest_interpolate(
-            grid_pts, field[d].ravel(), points
+        f = np.ascontiguousarray(field[d]).reshape(grids[0].shape)
+        interp = RegularGridInterpolator(
+            axes, f, method="linear", bounds_error=False, fill_value=None,
         )
+        result[:, d] = interp(points)
     return result
 
 
@@ -3417,7 +3830,20 @@ class _ADMMFrameTracker:
         match_ratio_eq1_count = 0
         match_ratio = 0.0
 
-        grid_step = np.full(ndim, min(round(0.5 * cfg.f_o_s), 20), dtype=np.float64)
+        # MATLAB: `sxyz = min([round(0.5*f_o_s), 20])`.  With the f_o_s = Inf that
+        # Table 3 prescribes for translation/rotation, MATLAB's `min` just picks
+        # 20; Python's `round(inf)` raises.
+        half_fos = 0.5 * cfg.f_o_s
+        grid_step = np.full(ndim, 20.0 if not np.isfinite(half_fos)
+                            else min(round(half_fos), 20), dtype=np.float64)
+
+        # Largest displacement update that could still be useful — see the clamp
+        # in the loop below.  When f_o_s is Inf the search is the whole field, so
+        # the field's own diagonal is the bound.
+        span = np.concatenate([coords_a, coords_b]) if Nb else coords_a
+        field_diag = float(np.linalg.norm(span.max(axis=0) - span.min(axis=0))) \
+            if len(span) else 0.0
+        update_cap = max(field_diag, 1.0)
 
         track_a2b = np.full(Na, -1, dtype=np.int64)
         track_b2a = np.full(Nb, -1, dtype=np.int64)
@@ -3449,9 +3875,16 @@ class _ADMMFrameTracker:
                 break
 
             track_a2b = local_track
-            match_ratio = np.sum(track_a2b >= 0) / max(len(not_missing_a), 1)
+            # MATLAB (ST3:150) takes the numerator from the RAW local match set:
+            # `matchRatio = size(matches_A2B,1) / length(parNotMissingIndA)`.
+            # `funCompDisp3` only zeroes entries of track_A2B, it never shrinks
+            # matches_A2B.  Counting post-outlier links instead caps the ratio
+            # below 1 whenever the Westerweel test rejects anything, so the
+            # `> 0.999` convergence counter never increments and the loop always
+            # runs to max_iter.
+            match_ratio = len(matches) / max(len(not_missing_a), 1)
             log.info("  Tracking ratio: %d/%d = %.4f",
-                     np.sum(track_a2b >= 0), len(not_missing_a), match_ratio)
+                     len(matches), len(not_missing_a), match_ratio)
 
             # ── GLOBAL STEP ──
             tracked_mask = track_a2b >= 0
@@ -3470,6 +3903,37 @@ class _ADMMFrameTracker:
                 is_first_iter=(iter_num == 0),
             )
 
+            # ── Bound the update to the search window ──
+            # The global step extrapolates (as MATLAB's
+            # `scatteredInterpolant(...,'linear','linear')` does), so when the
+            # local step matched only a handful of particles the fit is almost
+            # pure extrapolation over the whole ROI. Left unbounded that
+            # positively feeds back: a wild warp destroys the next local step,
+            # which yields an even wilder fit — observed reaching 1e81 px in
+            # four iterations on cold cumulative 1.5x stretch, then failing
+            # inside cKDTree with an opaque "data must be finite".
+            #
+            # An update larger than the current field of search cannot help: the
+            # next local step only accepts links shorter than `working_f_o_s`, so
+            # anything beyond that only moves particles somewhere no match can be
+            # found. Clamping there is inert whenever the solver is behaving
+            # (healthy updates are orders of magnitude smaller) and turns
+            # divergence into graceful degradation. Upstream has no such guard.
+            if not np.all(np.isfinite(temp_disp)):
+                log.warning("  Global step returned non-finite values at iter %d "
+                            "(%d/%d particles matched) — stopping",
+                            iter_num + 1, len(matches), len(not_missing_a))
+                break
+            cap = min(working_f_o_s, update_cap)
+            mag = np.linalg.norm(temp_disp, axis=1)
+            over = mag > cap
+            if np.any(over):
+                log.warning("  Clamping %d/%d global-step updates to %.2f px "
+                            "(max was %.3g)", int(over.sum()), len(mag),
+                            cap, float(mag.max()))
+                temp_disp = temp_disp.copy()
+                temp_disp[over] *= (cap / mag[over])[:, None]
+
             # ── Convergence check (BEFORE warping — matches MATLAB) ──
             update_norm = np.sqrt(np.sum(temp_disp**2) / max(len(temp_disp), 1))
             log.info("  Disp update norm: %.6f", update_norm)
@@ -3487,8 +3951,10 @@ class _ADMMFrameTracker:
             coords_b_curr = coords_b + disp_b2a
 
             # ── Update f_o_s for next iteration ──
+            # The floor is the CONFIGURED f_o_s (MATLAB's literal 60 / 30), not
+            # the current working value — see update_f_o_s.
             if len(temp_disp) > 0:
-                working_f_o_s = update_f_o_s(temp_disp, working_f_o_s)
+                working_f_o_s = update_f_o_s(temp_disp, cfg.f_o_s)
 
             # ── Cull missing particles (late iterations) ──
             if n_neighbors < 4:
@@ -3620,6 +4086,15 @@ class SerialTracker:
         cfg = self.trk_cfg
         coords_ref = all_coords[0]
         n_frames = len(all_coords)
+
+        # `TrackingConfig.ndim` / `.steps` are derived from roi_z, which only
+        # `init_roi_from_image` sets.  `track_coordinates` never calls it, so
+        # 3-column input would otherwise report ndim == 2 and hand a 2-element
+        # `steps` to the strain code.  Infer it from the coordinates instead.
+        if coords_ref.ndim == 2 and coords_ref.shape[1] >= 3 and cfg.roi_z is None:
+            lo = min(float(c[:, 2].min()) for c in all_coords if len(c))
+            hi = max(float(c[:, 2].max()) for c in all_coords if len(c))
+            cfg.roi_z = (int(np.floor(lo)), int(np.ceil(hi)) + 1)
 
         session = TrackingSession(
             detection_config=self.det_cfg,

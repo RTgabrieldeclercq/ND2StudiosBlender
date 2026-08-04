@@ -113,10 +113,22 @@ def leaf_recipe_hash(file_id: Any, byte_offset: int, mtime_ns: int, dtype: Any,
 
 def node_recipe_hash(op_key: str, params: Any,
                      upstream_recipe_hashes: Sequence[str],
-                     upstream_revisions: Sequence[int]) -> str:
+                     upstream_revisions: Sequence[int],
+                     code_fingerprint: str = "") -> str:
     """Structural lookup key: op + params (incl. the 2D/3D lever + modes, folded in
     by the engine) + upstream recipe hashes + upstream **revisions**. Declared reads
-    are validated separately on a hit (V2.02 §8), not baked into the lookup key."""
+    are validated separately on a hit (V2.02 §8), not baked into the lookup key.
+
+    ``code_fingerprint`` is the identity of the **code** behind ``op_key``
+    (:func:`nodegraph.revision.code_fingerprint`), which the engine supplies so a node
+    reloaded under a running session does not serve results its previous version computed —
+    params and upstream revisions are both unmoved in that case, so nothing else in this key
+    would notice. It is **omitted when empty** rather than hashed as ``""``: a session that
+    never reloads anything (headless, batch, the selftest) keeps byte-identical keys, and a
+    stamped op re-keys once, not on every subsequent reload that leaves its source alone."""
+    if code_fingerprint:
+        return digest("node", op_key, params, tuple(upstream_recipe_hashes),
+                      tuple(upstream_revisions), code_fingerprint)
     return digest("node", op_key, params,
                   tuple(upstream_recipe_hashes), tuple(upstream_revisions))
 
@@ -177,7 +189,13 @@ def payload_bytes(payload: Any) -> int:
             total += int(getattr(img, "nbytes", 0) or 0)
         for a in payload.attributes.values():
             v = getattr(a, "values", None)
-            if isinstance(v, np.ndarray):
+            # A memmapped layer (a docked checkpoint's Voxel raster — V2.18) counts as 0
+            # for the same reason a lazy image provider does: evicting the entry frees
+            # nothing, because the bytes live in the OS page cache against a file, not in
+            # this process's heap. Counting its full `nbytes` would have the GC evict
+            # real, freeable entries to "reclaim" memory it can't — the opposite of
+            # what a dock is for.
+            if isinstance(v, np.ndarray) and not isinstance(v, np.memmap):
                 total += int(v.nbytes)
         return total
     return 0
@@ -206,6 +224,10 @@ class Entry:
     reads: Tuple[Tuple[str, str], ...] = ()   # (calibration key, value digest)
     header: Optional[OutputHeader] = None
     changed: bool = True             # fingerprint differs from this node's previous
+    #: the graph node this entry was computed for. Recorded so entries can be dropped by
+    #: NODE rather than only by recipe hash — what :meth:`Memo.drop_nodes` needs to
+    #: release a docked-away upstream chain (V2.18) without flushing the whole table.
+    node_key: str = ""
 
 
 class Memo:
@@ -286,7 +308,7 @@ class Memo:
             recipe_hash=recipe_hash,
             full_hash=full_recipe_hash(recipe_hash, tuple(reads)),
             fingerprint=fp, revision=next_revision(), payload=blob,
-            reads=tuple(reads), header=header, changed=changed,
+            reads=tuple(reads), header=header, changed=changed, node_key=node_key,
         )
         self._entries[recipe_hash] = entry               # appended → most-recently-used
         self._evict_to_budget()
@@ -320,6 +342,27 @@ class Memo:
         ent = self._entries.pop(recipe_hash, None)
         if ent is not None:
             self._release_fp(ent.fingerprint)
+
+    def drop_nodes(self, node_keys: Sequence[str]) -> int:
+        """Evict every entry computed for one of ``node_keys``; returns the count.
+
+        The targeted counterpart to :meth:`clear`, added for docking (V2.18): once a
+        chain has been baked to disk, its intermediate payloads — the eager full-raster
+        Voxel layers above all — are dead weight that the byte-budget LRU would only
+        release *eventually*, after evicting live entries first. Dropping them by node
+        reclaims exactly the right memory and leaves everything still in play warm.
+
+        Safe by the same argument as any eviction: a drop can only cost a recompute, and
+        computes are deterministic. ``_last_fp`` is deliberately NOT cleared — it is one
+        string per node, and keeping it means an evict-then-recompute that yields
+        identical bytes still reports ``changed=False`` and cuts off downstream."""
+        keys = set(node_keys)
+        if not keys:
+            return 0
+        doomed = [rh for rh, e in self._entries.items() if e.node_key in keys]
+        for rh in doomed:
+            self.invalidate(rh)
+        return len(doomed)
 
     def clear(self) -> None:
         self._entries.clear()

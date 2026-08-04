@@ -51,6 +51,7 @@ import importlib.util
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
+import functools
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -97,6 +98,37 @@ class DetectionConfig:
 # ─────────────────────────────────────────────────────────────
 #  Numba-accelerated sub-pixel localization kernels
 # ─────────────────────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=16)
+def _fspecial_log(sigma: float, ndim: int) -> np.ndarray:
+    """MATLAB ``fspecial('log', ceil(sigma)*2+1, sigma)``, generalised to n-D.
+
+    ``f_detect_particles.m`` / ``f_detect_particles3.m`` build the
+    Laplacian-of-Gaussian at a *hard* half-width of ``ceil(sigma)``, i.e. only
+    7 taps for the σ=3 the examples use.  That truncation is not incidental:
+    it is what makes the filter respond at bead scale rather than at 4σ, and
+    reproducing it is worth ~1.8× in localisation accuracy and ~25% more
+    particles found versus ``scipy.ndimage.gaussian_laplace`` (which truncates
+    at 4σ).
+
+    Returned kernel sums to zero, as MATLAB's does.
+    """
+    half = int(np.ceil(sigma))
+    n = 2 * half + 1
+    ax = np.arange(-half, half + 1, dtype=np.float64)
+    grids = np.meshgrid(*([ax] * ndim), indexing="ij")
+    r2 = sum(g * g for g in grids)
+    std2 = float(sigma) ** 2
+
+    h = np.exp(-r2 / (2.0 * std2))
+    h[h < np.finfo(np.float64).eps * h.max()] = 0.0
+    s = h.sum()
+    if s != 0:
+        h = h / s
+    # ∇²G = (r² - d·σ²)/σ⁴ · G   (d = ndim; MATLAB's 2-D form uses 2·σ²)
+    h1 = h * (r2 - ndim * std2) / (std2 ** 2)
+    return h1 - h1.sum() / h1.size
+
 
 @nb.njit(cache=True)
 def _subpixel_poly_2d(log_img, xs, ys):
@@ -178,60 +210,95 @@ def _subpixel_poly_3d(log_img, xs, ys, zs):
 def _radial_symmetry_3d(patches, half_win, dccd, abc):
     """Radial-symmetry sub-voxel localization (Liu et al. 2013).
 
+    Port of ``radialcenter3dvec.m``.  Finds the point that minimises the
+    intensity-gradient-weighted sum of squared perpendicular distances to the
+    gradient lines::
+
+        [Σ qᵢ(I - nᵢnᵢᵀ)] c = Σ qᵢ(I - nᵢnᵢᵀ) pᵢ ,   qᵢ = |∇I|² / |pᵢ - p̄|
+
+    Two origins are in play and they are **not** the same one:
+
+    * ``pᵢ`` — the voxel position, measured from the **patch centre**.  This is
+      the origin the returned offset is expressed in, so the caller must add it
+      to the *integer* voxel the patch was cut around.
+    * ``p̄`` — the intensity-weighted centroid, which appears **only** inside the
+      weight denominator ``qᵢ`` (MATLAB ``d``, `radialcenter3dvec.m:78`).
+
+    Measuring ``pᵢ`` from the centroid instead of the patch centre — which an
+    earlier revision did — silently drops the centroid offset from the answer
+    and inflates the localisation error by ~5× (0.064 px → 0.34 px on the
+    SerialTrack3D synthetic beads).  See ``scripts/_serialtrack_validate.py``.
+
     Parameters
     ----------
-    patches : (N, wx, wy, wz)  float64 array of image patches
+    patches : (N, w0, w1, w2)  float64 array of image patches
     half_win : (3,) int array   half window sizes
-    dccd : (3,) float array     pixel spacings
-    abc  : (3,) float array     anisotropy factors
+    dccd : (3,) float array     voxel spacing along each patch axis
+    abc  : (3,) float array     anisotropy factor per patch axis
 
     Returns
     -------
-    dx, dy, dz : (N,) sub-pixel shifts
+    d0, d1, d2 : (N,) sub-voxel shifts along patch axes 0/1/2, relative to the
+        patch centre.
+
+    Notes
+    -----
+    ``dccd``/``abc`` are indexed *by patch axis* here.  MATLAB pairs its
+    ``dccd(1)``/``abc(1)`` with array dimension **2** (because ``meshgrid``
+    makes ``px`` vary along dim 2), so the two agree exactly for the isotropic
+    ``[1,1,1]`` values every shipped SerialTrack example uses, and differ only
+    for anisotropic settings — where MATLAB's own indexing is inconsistent.
     """
     N = patches.shape[0]
-    wx, wy, wz = patches.shape[1], patches.shape[2], patches.shape[3]
-    dx = np.zeros(N, dtype=np.float64)
-    dy = np.zeros(N, dtype=np.float64)
-    dz = np.zeros(N, dtype=np.float64)
+    w0, w1, w2 = patches.shape[1], patches.shape[2], patches.shape[3]
+    d0 = np.zeros(N, dtype=np.float64)
+    d1 = np.zeros(N, dtype=np.float64)
+    d2 = np.zeros(N, dtype=np.float64)
     a, b, c = abc[0], abc[1], abc[2]
-    dxc, dyc, dzc = dccd[0], dccd[1], dccd[2]
+    s0, s1, s2 = dccd[0], dccd[1], dccd[2]
 
     for pi in nb.prange(N):
-        # --- intensity-weighted centroid ---
-        sx_ = 0.0; sy_ = 0.0; sz_ = 0.0; tot = 0.0
-        for ix in range(wx):
-            for iy in range(wy):
-                for iz in range(wz):
-                    v = patches[pi, ix, iy, iz]
-                    sx_ += v * (ix - (wx-1)*0.5) * dxc
-                    sy_ += v * (iy - (wy-1)*0.5) * dyc
-                    sz_ += v * (iz - (wz-1)*0.5) * dzc
+        # --- intensity-weighted centroid (patch-centre origin, unscaled by abc,
+        #     exactly as MATLAB's xm/ym/zm) ---
+        m0 = 0.0; m1 = 0.0; m2 = 0.0; tot = 0.0
+        for i0 in range(w0):
+            p0 = (i0 - (w0 - 1) * 0.5) * s0
+            for i1 in range(w1):
+                p1 = (i1 - (w1 - 1) * 0.5) * s1
+                for i2 in range(w2):
+                    v = patches[pi, i0, i1, i2]
+                    m0 += v * p0
+                    m1 += v * p1
+                    m2 += v * (i2 - (w2 - 1) * 0.5) * s2
                     tot += v
         if tot < 1e-30:
             continue
-        xm = sx_ / tot;  ym = sy_ / tot;  zm = sz_ / tot
+        xm = m0 / tot;  ym = m1 / tot;  zm = m2 / tot
 
         # --- build 3×3 normal system from gradient votes ---
         A00=0.;A01=0.;A02=0.;A11=0.;A12=0.;A22=0.
         B0=0.;B1=0.;B2=0.
 
-        for ix in range(1, wx-1):
-            for iy in range(1, wy-1):
-                for iz in range(1, wz-1):
-                    gu = (patches[pi,ix+1,iy,iz] - patches[pi,ix-1,iy,iz])/(2*dxc)
-                    gv = (patches[pi,ix,iy+1,iz] - patches[pi,ix,iy-1,iz])/(2*dyc)
-                    gw = (patches[pi,ix,iy,iz+1] - patches[pi,ix,iy,iz-1])/(2*dzc)
+        for i0 in range(1, w0-1):
+            xp = (i0 - (w0 - 1) * 0.5) * s0 / a       # patch-centre-relative
+            for i1 in range(1, w1-1):
+                yp = (i1 - (w1 - 1) * 0.5) * s1 / b
+                for i2 in range(1, w2-1):
+                    zp = (i2 - (w2 - 1) * 0.5) * s2 / c
+                    # central differences over the abc-scaled spacing, matching
+                    # MATLAB's dx = dxccd/a
+                    gu = (patches[pi,i0+1,i1,i2] - patches[pi,i0-1,i1,i2])/(s0/a)
+                    gv = (patches[pi,i0,i1+1,i2] - patches[pi,i0,i1-1,i2])/(s1/b)
+                    gw = (patches[pi,i0,i1,i2+1] - patches[pi,i0,i1,i2-1])/(s2/c)
                     gm = np.sqrt(gu*gu + gv*gv + gw*gw)
-                    if gm < 1e-10:
+                    if gm < 1e-30:
                         continue
                     gu /= gm; gv /= gm; gw /= gm
 
-                    xp = (ix-(wx-1)*0.5)*dxc/a - xm/a
-                    yp = (iy-(wy-1)*0.5)*dyc/b - ym/b
-                    zp = (iz-(wz-1)*0.5)*dzc/c - zm/c
-                    dd = np.sqrt(xp*xp + yp*yp + zp*zp)
-                    if dd < 1e-10:
+                    # weight denominator: distance to the intensity centroid
+                    ex = xp - xm; ey = yp - ym; ez = zp - zm
+                    dd = np.sqrt(ex*ex + ey*ey + ez*ez)
+                    if dd < 1e-30:
                         continue
                     q = gm*gm / dd
 
@@ -249,11 +316,11 @@ def _radial_symmetry_3d(patches, half_win, dccd, abc):
         if abs(det) < 1e-30:
             continue
         inv = 1.0 / det
-        dx[pi] = ((A11*A22-A12*A12)*B0 + (A02*A12-A01*A22)*B1 + (A01*A12-A02*A11)*B2)*inv*a
-        dy[pi] = ((A02*A12-A01*A22)*B0 + (A00*A22-A02*A02)*B1 + (A01*A02-A00*A12)*B2)*inv*b
-        dz[pi] = ((A01*A12-A02*A11)*B0 + (A01*A02-A00*A12)*B1 + (A00*A11-A01*A01)*B2)*inv*c
+        d0[pi] = ((A11*A22-A12*A12)*B0 + (A02*A12-A01*A22)*B1 + (A01*A12-A02*A11)*B2)*inv*a
+        d1[pi] = ((A02*A12-A01*A22)*B0 + (A00*A22-A02*A02)*B1 + (A01*A02-A00*A12)*B2)*inv*b
+        d2[pi] = ((A01*A12-A02*A11)*B0 + (A01*A02-A00*A12)*B1 + (A00*A11-A01*A01)*B2)*inv*c
 
-    return dx, dy, dz
+    return d0, d1, d2
 
 
 # ─────────────────────────────────────────────────────────────
@@ -343,26 +410,35 @@ class ParticleDetector:
     def _log_detect(self, img_m, img_n, ndim):
         sigma = self.cfg.bead_radius
 
-        # Laplacian of Gaussian
-        log_img = -ndimage.gaussian_laplace(img_m, sigma=sigma)
+        # Laplacian of Gaussian.  MATLAB's fspecial('log') is truncated to
+        # ceil(sigma)*2+1 taps; scipy's gaussian_laplace truncates at 4σ
+        # (25 taps for σ=3), which is a far coarser filter and both loses
+        # particles and degrades the sub-pixel fit.
+        log_img = ndimage.correlate(img_m, -_fspecial_log(sigma, ndim),
+                                    mode="nearest")
 
-        # Local-maximum filter
-        fp_size = int(2 * sigma * 2) + 1
-        fp = np.ones((fp_size,) * ndim)
+        # Local-maximum filter.  MATLAB uses strel('square', 2σ+1) in 2-D — a
+        # (2σ+1)-wide box, i.e. 7×7 for σ=3, roughly the bead spacing.  A box
+        # twice that wide suppresses every second particle in a dense field.
+        fp_size = int(2 * sigma) + 1
         rng = np.random.default_rng(42)
         noise = rng.random(log_img.shape) * 1e-5
-        dilated = ndimage.maximum_filter(log_img + noise, footprint=fp)
-        peaks = ((log_img + noise) == dilated) & (img_n > self.cfg.threshold)
+        dilated = ndimage.maximum_filter(log_img + noise, size=fp_size,
+                                         mode="nearest")
+        # MATLAB thresholds the *masked* image (`im = im.*BW3` above), so the
+        # size gate applies to the peaks too.
+        peaks = ((log_img + noise) == dilated) & (img_m > self.cfg.threshold)
 
         coords_int = np.asarray(np.nonzero(peaks), dtype=np.int64).T  # (N, ndim)
         if len(coords_int) == 0:
             return np.empty((0, ndim))
 
-        # Trim border
-        nb_ = max(int((sigma + 2) / 2), 1)
+        # Trim border: MATLAB keeps `y >= nb+1 & y < h-nb` in 1-based indexing.
+        nb_ = int((sigma + 2) // 2)
         mask = np.ones(len(coords_int), dtype=np.bool_)
         for d in range(ndim):
-            mask &= (coords_int[:, d] >= nb_) & (coords_int[:, d] < img_n.shape[d] - nb_)
+            mask &= ((coords_int[:, d] >= nb_)
+                     & (coords_int[:, d] <= img_n.shape[d] - nb_ - 2))
         coords_int = coords_int[mask]
         if len(coords_int) == 0:
             return np.empty((0, ndim))
@@ -390,21 +466,38 @@ class ParticleDetector:
     # ── TPT method ──────────────────────────────────────────
 
     def _detect_tpt(self, img_n: np.ndarray, img_raw: np.ndarray) -> np.ndarray:
-        """Blob centroid → radial-symmetry sub-voxel refinement."""
-        ndim = img_n.ndim
-        coords = self._centroid_detect(img_n, ndim)
-        if len(coords) == 0 or ndim != 3:
-            return coords  # radial symmetry only for 3-D
+        """Blob centroid → radial-symmetry sub-voxel refinement.
 
-        # Extract patches for radial-symmetry
+        Mirrors ``locateParticles.m`` → ``radialcenter3dvec.m``: the blob stage
+        produces an **integer voxel** seed (MATLAB rounds the *binary* blob
+        centroid), the patch is cut around that integer, and the radial-symmetry
+        offset — which is measured from the patch centre — is added to it.
+
+        Adding the offset to an *unrounded* sub-voxel centroid instead (as an
+        earlier revision did) double-counts the sub-voxel part.
+        """
+        ndim = img_n.ndim
+        seed = self._blob_seed(img_n, ndim)
+        if len(seed) == 0 or ndim != 3:
+            # 2-D upstream never reaches radialcenter: every shipped
+            # `fun_SerialTrack_2D_*` calls `f_detect_particles` (the LoG path)
+            # and leaves locateBeads/radial2center commented out.  Fall back to
+            # the intensity-weighted blob centroid, which is strictly better
+            # than the integer seed.
+            return self._centroid_detect(img_n, ndim) if ndim != 3 else seed
+
         ws = np.array(self.cfg.win_size[:3], dtype=np.int64)
         half = ws // 2
-        ci = np.round(coords).astype(np.int64)
+        ci = seed.astype(np.int64)
 
-        # Pad with reflected noise
+        # radialcenter3dvec works on the RAW (un-normalised) image plus a
+        # dither, and pads with near-zero noise (padNoise.m) — NOT by
+        # reflection, which would mirror real bead intensity into the border and
+        # bias particles within half a window of the edge.
         img_f = img_raw.astype(np.float64)
-        img_f += self.cfg.rand_noise * np.random.default_rng(0).random(img_f.shape)
-        img_p = np.pad(img_f, [(h, h) for h in half], mode="reflect")
+        img_f = img_f + self.cfg.rand_noise * np.random.default_rng(0).random(img_f.shape)
+        img_p = np.pad(img_f, [(h, h) for h in half], mode="constant",
+                       constant_values=0.0)
 
         patches = np.empty((len(ci), ws[0], ws[1], ws[2]), dtype=np.float64)
         for i, c in enumerate(ci):
@@ -418,44 +511,74 @@ class ParticleDetector:
         dccd = np.array(self.cfg.dccd[:3], dtype=np.float64)
         abc = np.array(self.cfg.abc[:3], dtype=np.float64)
 
-        dx, dy, dz = _radial_symmetry_3d(patches, half, dccd, abc)
+        off = np.column_stack(_radial_symmetry_3d(patches, half, dccd, abc))
 
-        # Apply only well-behaved shifts
-        ok = (np.abs(dx) < half[0]) & (np.abs(dy) < half[1]) & (np.abs(dz) < half[2])
-        out = coords.copy()
-        out[ok, 0] += dx[ok]
-        out[ok, 1] += dy[ok]
-        out[ok, 2] += dz[ok]
+        out = ci.astype(np.float64)
+        # A solve that lands outside the window is not a refinement — drop the
+        # offset for those (MATLAB drops the particle on NaN; keeping the seed
+        # preserves the detection, which the linker can still use).
+        ok = np.all(np.isfinite(off), axis=1) & np.all(np.abs(off) < half, axis=1)
+        out[ok] += off[ok]
         return out
 
     # ── shared helpers ──────────────────────────────────────
 
-    def _size_filtered_mask(self, img_n: np.ndarray) -> np.ndarray:
-        """Threshold → label → keep blobs within [min_size, max_size]."""
+    def _label_blobs(self, img_n: np.ndarray):
+        """Threshold → connected components → (labels, n, sizes)."""
         bw = img_n > self.cfg.threshold
         labeled, n = ndimage.label(bw)
         if n == 0:
-            return bw
-        sizes = ndimage.sum_labels(bw, labeled, range(1, n + 1))
-        keep = np.zeros(n + 1, dtype=bool)
-        for i, s in enumerate(sizes, 1):
-            if self.cfg.min_size <= s <= self.cfg.max_size:
-                keep[i] = True
-        return keep[labeled]
+            return labeled, 0, np.empty(0)
+        sizes = ndimage.sum_labels(bw, labeled, np.arange(1, n + 1))
+        return labeled, n, sizes
 
-    def _centroid_detect(self, img_n: np.ndarray, ndim: int) -> np.ndarray:
-        """Connected-component centroids, filtered by size."""
-        bw = img_n > self.cfg.threshold
-        labeled, n = ndimage.label(bw)
+    def _size_filtered_mask(self, img_n: np.ndarray) -> np.ndarray:
+        """Threshold → label → keep blobs of at least ``min_size`` voxels.
+
+        ``f_detect_particles.m`` computes ``BW3 = bwareaopen(BW,minSize) -
+        bwareaopen(BW,maxSize)`` and then unconditionally discards it::
+
+            if sum(mean(BW3(:))) < 1, BW3 = BW1; end
+
+        ``mean`` of a 0/1 array is the *fraction* of set voxels, so that test is
+        true unless the whole image is foreground — the LoG path therefore
+        applies the **minimum** size filter only.  Reinstating the maximum here
+        would silently delete merged bead pairs that upstream keeps.
+        """
+        labeled, n, sizes = self._label_blobs(img_n)
+        if n == 0:
+            return labeled.astype(bool)
+        return np.concatenate([[False], sizes >= self.cfg.min_size])[labeled]
+
+    def _blob_seed(self, img_n: np.ndarray, ndim: int) -> np.ndarray:
+        """Integer-voxel blob seeds, exactly as ``locateParticles.m``.
+
+        The centroid is taken over the **binary** mask (MATLAB's
+        ``regionprops(CC,'Centroid')`` is unweighted) and rounded, and the size
+        gate uses MATLAB's *strict* ``> minSize & < maxSize``.
+        """
+        labeled, n, sizes = self._label_blobs(img_n)
         if n == 0:
             return np.empty((0, ndim))
-        sizes = ndimage.sum_labels(bw, labeled, range(1, n + 1))
-        centroids = ndimage.center_of_mass(img_n, labeled, range(1, n + 1))
-        out = np.array([
-            c for c, s in zip(centroids, sizes)
-            if self.cfg.min_size <= s <= self.cfg.max_size
-        ])
-        return out if out.size else np.empty((0, ndim))
+        keep = (sizes > self.cfg.min_size) & (sizes < self.cfg.max_size)
+        if not keep.any():
+            return np.empty((0, ndim))
+        idx = np.flatnonzero(keep) + 1
+        cen = np.asarray(ndimage.center_of_mass(labeled > 0, labeled, idx),
+                         dtype=np.float64).reshape(-1, ndim)
+        return np.round(cen)
+
+    def _centroid_detect(self, img_n: np.ndarray, ndim: int) -> np.ndarray:
+        """Intensity-weighted connected-component centroids, filtered by size."""
+        labeled, n, sizes = self._label_blobs(img_n)
+        if n == 0:
+            return np.empty((0, ndim))
+        keep = (sizes >= self.cfg.min_size) & (sizes <= self.cfg.max_size)
+        if not keep.any():
+            return np.empty((0, ndim))
+        idx = np.flatnonzero(keep) + 1
+        return np.asarray(ndimage.center_of_mass(img_n, labeled, idx),
+                          dtype=np.float64).reshape(-1, ndim)
 
     @staticmethod
     def clip_to_bounds(coords: np.ndarray, shape: Tuple[int, ...]) -> np.ndarray:

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional
 
 from nodegraph.registry import NODES, NodeSpec
 
@@ -39,15 +39,41 @@ class NodeInstance:
         return base
 
 
+#: Edge kinds that are **invisible to the DAG** — skipped by ``preds`` /
+#: ``dataset_preds`` / ``roots`` / ``topo_order`` so the graph stays acyclic for ordering
+#: and cycle rejection (V2.00 §7/§8). Each is consumed by a rewrite that runs *before* the
+#: engine ever sees the graph, and each one exists because the wire the user draws is a
+#: genuine cycle on the canvas while the computation it denotes is not:
+#:
+#: * ``"back"``   — a zone feedback wire (``Repeat/Sim Out`` → ``In``), consumed by
+#:   :mod:`nodegraph.zones` when it unrolls a zone into a per-iteration chain.
+#: * ``"driver"`` — a ``flow.iterate`` wire from a swept variable's output into the
+#:   PARAMETER of a node inside its cone, consumed by :mod:`nodegraph.iterate`. The
+#:   Iterate card drives a node whose result flows back into its own ``collect`` input,
+#:   so driver + collect close a loop on screen; the unrolled form is N independent
+#:   (or, in feedback mode, chained) copies with no loop at all.
+#:
+#: This is a **set**, not a literal comparison against ``"back"``, precisely so a second
+#: non-DAG kind cannot be added by declaring it and silently be treated as forward — the
+#: failure mode would be a cycle rejection at edit time and, if that were bypassed, an
+#: infinite recursion in ``Engine._entry``.
+NON_DAG_KINDS: FrozenSet[str] = frozenset({"back", "driver"})
+
+
+def is_dag_edge(edge: "Edge") -> bool:
+    """True for an edge the topological order and the engine walk actually follow."""
+    return edge.kind not in NON_DAG_KINDS
+
+
 @dataclass(frozen=True)
 class Edge:
     """A directed wire ``src.src_socket → dst.dst_socket``.
 
-    ``kind`` is ``"forward"`` (default) or ``"back"`` — a zone feedback edge
-    (``Repeat/Sim Out`` → ``In``). Back-edges are **invisible to the DAG** (skipped by
-    ``preds``/``dataset_preds``/``topo_order``) so a zoned graph stays acyclic for
-    ordering + cycle rejection (V2.00 §8); :mod:`nodegraph.zones` consumes them when it
-    unrolls a zone into a flat per-iteration chain.
+    ``kind`` is ``"forward"`` (default) or one of :data:`NON_DAG_KINDS` — ``"back"`` (a
+    zone feedback edge) or ``"driver"`` (a ``flow.iterate`` parameter wire). A non-DAG
+    edge is skipped by ``preds``/``dataset_preds``/``roots``/``topo_order``, so a zoned or
+    swept graph stays acyclic for ordering + cycle rejection; the corresponding rewrite
+    (:mod:`nodegraph.zones` / :mod:`nodegraph.iterate`) consumes it and emits a flat DAG.
     """
 
     src: str
@@ -78,10 +104,10 @@ class Graph:
 
     # ── query ────────────────────────────────────────────────────────────────
     def preds(self, node_id: str) -> List[Edge]:
-        """Forward edges INTO ``node_id`` (its incoming wires). Zone back-edges are
-        excluded — they are consumed by :mod:`nodegraph.zones` at unroll time, invisible
-        to the DAG (V2.00 §8)."""
-        return [e for e in self.edges if e.dst == node_id and e.kind != "back"]
+        """Forward edges INTO ``node_id`` (its incoming wires). :data:`NON_DAG_KINDS`
+        edges are excluded — a zone back-edge and an Iterate driver wire are both consumed
+        by their rewrite before the engine runs, and are invisible to the DAG (V2.00 §8)."""
+        return [e for e in self.edges if e.dst == node_id and is_dag_edge(e)]
 
     def dataset_preds(self, node_id: str) -> List[Edge]:
         """Incoming edges landing on a DATASET input socket of ``node_id`` — the
@@ -107,15 +133,15 @@ class Graph:
 
     def roots(self) -> List[str]:
         """Nodes with no forward incoming edge (sources — they need a seed envelope).
-        A zone back-edge does not make its target a non-root."""
-        has_in = {e.dst for e in self.edges if e.kind != "back"}
+        A :data:`NON_DAG_KINDS` edge does not make its target a non-root."""
+        has_in = {e.dst for e in self.edges if is_dag_edge(e)}
         return [nid for nid in self.nodes if nid not in has_in]
 
     def topo_order(self) -> List[str]:
         """Kahn topological order over the FORWARD edges; raises ``ValueError`` on a
-        cycle. Zone back-edges are excluded, so a well-formed zoned graph orders fine
-        and only a genuine (non-zone) cycle is rejected (V2.00 §7/§8)."""
-        fwd = [e for e in self.edges if e.kind != "back"]
+        cycle. :data:`NON_DAG_KINDS` edges are excluded, so a well-formed zoned or swept
+        graph orders fine and only a genuine cycle is rejected (V2.00 §7/§8)."""
+        fwd = [e for e in self.edges if is_dag_edge(e)]
         indeg: Dict[str, int] = {nid: 0 for nid in self.nodes}
         for e in fwd:
             if e.dst in indeg:
@@ -135,4 +161,4 @@ class Graph:
         return order
 
 
-__all__ = ["NodeInstance", "Edge", "Graph"]
+__all__ = ["NodeInstance", "Edge", "Graph", "NON_DAG_KINDS", "is_dag_edge"]

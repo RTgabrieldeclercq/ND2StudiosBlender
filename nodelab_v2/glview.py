@@ -5,7 +5,7 @@ a GPU texture **once** (cached by identity), and contrast (``lo/hi``), gamma, em
 colour and additive multi-channel compositing all happen in the **fragment shader** from
 uniforms. Consequences that fix the "viewer updates way slower than the load" problem:
 
-* Moving the T/Z slider only swaps which textures are bound (or uploads the new plane
+* Moving the T/Z cursor only swaps which textures are bound (or uploads the new plane
   once) — no per-frame ``np.percentile``, no numpy→QImage→QPixmap copies.
 * Dragging a contrast/colour/gamma control is a uniform change + ``update()`` — **zero**
   decode, zero re-upload.
@@ -19,6 +19,13 @@ Overlays (points / labels / tracks) stay on the CPU: :class:`GLImageView` calls 
 the panel with a :class:`QPainter` after the GL draw, and exposes :meth:`plane_to_widget`
 so the panel maps plane-space geometry onto the (pan/zoom) view.
 
+**Split-channel view** (:meth:`set_tiles`, NIS-Elements style): instead of one quad the
+widget lays out a near-square grid of *panes*, each drawing its own subset of channels
+(pane 0 is the composite, then one pane per channel) with the same shader and the same
+uniforms. Zoom/pan is shared — a pane is a window onto the same plane region, so the
+panes stay registered — and each pane is scissored so a zoomed image cannot bleed into
+its neighbour. Overlays keep mapping through pane 0.
+
 If the GL context or shader is unusable this widget never crashes — it emits
 :data:`gl_failed` once and the panel swaps in the CPU :class:`~nodelab_v2.viewer._ImageView`.
 
@@ -30,13 +37,15 @@ the image comes straight back instead of going black.
 """
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple
+import math
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
-    QImage, QMatrix4x4, QPainter, QSurfaceFormat, QVector2D, QVector3D)
+    QColor, QFont, QImage, QMatrix4x4, QPainter, QPen, QSurfaceFormat, QVector2D,
+    QVector3D)
 from PySide6.QtOpenGL import (
     QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture, QOpenGLVertexArrayObject)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -63,6 +72,13 @@ _GL_RGBA8 = 0x8058
 _GL_UNSIGNED_BYTE = 0x1401
 _GL_UNSIGNED_SHORT = 0x1403
 _GL_UNPACK_ALIGNMENT = 0x0CF5
+_GL_SCISSOR_TEST = 0x0C11
+
+#: gap between the panes of the split-channel view, in widget pixels
+_TILE_GAP = 2.0
+
+#: a split pane: (label, the channels it composites, the label's (r,g,b))
+Tile = Tuple[str, Tuple[int, ...], Tuple[int, int, int]]
 
 _MAX_CH = 8                      # sampler bank size (microscopy rarely exceeds this)
 
@@ -103,6 +119,17 @@ def _build_frag(n: int) -> str:
     # transfer function is t = pow(clamp((v-vlo)/(vhi-vlo)), gamma) — gamma < 1 brightens
     # midtones, > 1 darkens. Unpack + windowing inlined per channel with a constant index
     # (passing a sampler-array element to a helper returns a bad sampler on this driver).
+    # Per-channel BLEND (V2.19). `u_blend[i] = vec3(mode, opacity, checker_cells)` — a vec3
+    # for the same reason `u_win` is one: setUniformValue silently fails for a float ARRAY
+    # element in this PySide6 build, and the vector overloads are what work.
+    #
+    # Blending is per CHANNEL rather than global because that is exactly the granularity an
+    # overlay needs: `view.overlay` contributes its source as extra channel indices ABOVE
+    # the primary's own, so the primary's channels keep compositing additively among
+    # themselves (the microscopy convention) and only the overlay carries the chosen mode.
+    # The unroll runs in index order, so an overlay channel always blends against the
+    # already-accumulated primary — which is what makes the non-commutative modes (over,
+    # difference) mean what they say.
     lines = []
     for i in range(n):
         lines.append(
@@ -111,7 +138,8 @@ def _build_frag(n: int) -> str:
             f"        float v{i} = (c{i}.r * 65280.0 + c{i}.g * 255.0) / 65535.0;\n"
             f"        float t{i} = clamp((v{i} - u_win[{i}].x) / "
             f"max(u_win[{i}].y - u_win[{i}].x, 1e-6), 0.0, 1.0);\n"
-            f"        rgb += pow(t{i}, max(u_win[{i}].z, 1e-3)) * u_color[{i}];\n"
+            f"        t{i} = pow(t{i}, max(u_win[{i}].z, 1e-3));\n"
+            f"        rgb = blend_one(rgb, t{i} * u_color[{i}], t{i}, u_blend[{i}]);\n"
             f"    }}")
     body = "\n".join(lines)
     return f"""
@@ -122,6 +150,42 @@ uniform sampler2D u_tex[{n}];
 uniform int   u_nchan;
 uniform vec3  u_color[{n}];
 uniform vec3  u_win[{n}];
+uniform vec3  u_blend[{n}];
+
+// `src` is the channel's tinted colour, `t` its own windowed intensity, `spec` its
+// (mode, opacity, checker_cells). Kept as ONE function taking a sampler-free argument list
+// so the per-channel unroll above stays a single line — passing a sampler-array element to
+// a helper returns a bad sampler on this driver, but plain vectors are fine.
+vec3 blend_one(vec3 dst, vec3 src, float t, vec3 spec) {{
+    int mode = int(spec.x + 0.5);
+    float op = clamp(spec.y, 0.0, 1.0);
+    if (mode == 1) {{
+        // OVER — the channel's own brightness is its alpha, so a dark background does not
+        // occlude what is underneath it. That is the behaviour a fluorescence overlay
+        // wants: a flat alpha would grey out the primary everywhere the secondary is empty.
+        return mix(dst, src, clamp(t, 0.0, 1.0) * op);
+    }} else if (mode == 2) {{
+        // DIFFERENCE — the registration-QA look: aligned structure cancels toward black,
+        // misalignment lights up as edge-doubling.
+        return abs(dst - src * op);
+    }} else if (mode == 3) {{
+        // CHECKERBOARD — alternating squares of each source, in TEXTURE space so the
+        // squares stay locked to the image while you pan and zoom rather than crawling
+        // across it. spec.z is the number of cells on the long edge.
+        float cells = max(spec.z, 1.0);
+        float k = mod(floor(v_uv.x * cells) + floor(v_uv.y * cells), 2.0);
+        return mix(dst, src, k * op);
+    }} else if (mode == 4) {{
+        // WIPE — one vertical divider at spec.z (0..1 across the image), the overlay to
+        // its LEFT. Also in texture space, so dragging the divider moves it across the
+        // specimen rather than across the window: the boundary you are judging stays on
+        // the same feature while you pan.
+        float k = step(v_uv.x, clamp(spec.z, 0.0, 1.0));
+        return mix(dst, src, k * op);
+    }}
+    return dst + src * op;                       // 0 = ADD (the microscopy default)
+}}
+
 void main() {{
     vec3 rgb = vec3(0.0);
 {body}
@@ -153,9 +217,21 @@ void main() { float v = texture(u_tex[0], v_uv).r; frag = vec4(v, v, v, 1.0); }
 
 
 class GLImageView(QOpenGLWidget):
-    """OpenGL textured-quad image surface with shader contrast/colour/compositing."""
+    """OpenGL textured-quad image surface with shader contrast/colour/compositing.
+
+    Implements the same overlay/pick contract as the CPU
+    :class:`~nodelab_v2.viewer._ImageView` — ``plane_to_widget`` / ``widget_to_plane`` /
+    ``refresh`` / ``overlay_cb`` (:data:`nodelab_v2.viewer.SURFACE_CONTRACT`) — so one
+    renderer and one picker serve both backends.
+    """
 
     gl_failed = Signal()
+    #: the pan/zoom changed — the panel re-requests a viewport detail patch (debounced).
+    view_changed = Signal()
+
+    #: Declared at CLASS level (and re-bound per instance below) so the surface contract can
+    #: be checked without constructing a GL context.
+    overlay_cb = None
 
     def __init__(self) -> None:
         super().__init__()
@@ -171,7 +247,12 @@ class GLImageView(QOpenGLWidget):
         self._clim: Dict[int, Tuple[float, float]] = {}   # channel → LUT window (data units)
         self._color: Dict[int, Tuple[float, float, float]] = {}
         self._gamma: Dict[int, float] = {}
+        #: channel → (blend mode, opacity, checker cells). Absent means (0, 1, 8) — plain
+        #: additive at full strength, i.e. exactly what every channel did before overlays.
+        self._blend: Dict[int, Tuple[float, float, float]] = {}
         self._active: List[int] = []
+        #: split-channel panes; empty == one pane compositing every active channel
+        self._tiles: List[Tile] = []
         # planes waiting to be uploaded — ALL GL work is deferred to paintGL (the only
         # place the context is guaranteed current on the right thread); uploading from
         # set_planes via makeCurrent() before the first paint segfaults on some drivers.
@@ -181,6 +262,14 @@ class GLImageView(QOpenGLWidget):
         # the mini-map and back) can re-upload them instead of showing a black frame.
         self._last_planes: Dict[int, np.ndarray] = {}
         self._img_wh: Optional[Tuple[int, int]] = None   # (w, h) of the texture
+        # ── viewport detail patch (a second, finer texture over the visible rect) ──
+        self._dtex: Dict[int, QOpenGLTexture] = {}
+        self._dtex_key: Dict[int, int] = {}
+        self._drange: Dict[int, Tuple[float, float]] = {}
+        self._dpending: Dict[int, np.ndarray] = {}
+        self._dlast: Dict[int, np.ndarray] = {}
+        #: normalized image rect the detail textures cover, or ``None`` for "no patch"
+        self._drect: Optional[Tuple[float, float, float, float]] = None
         # view transform (plane-space → widget): fit-scale × user zoom, + pan (widget px)
         self._zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
@@ -204,6 +293,8 @@ class GLImageView(QOpenGLWidget):
         # dead by now, so start clean and re-queue the last planes for upload.
         self._tex.clear()
         self._tex_key.clear()
+        self._dtex.clear()
+        self._dtex_key.clear()
         self._prog = self._vbo = self._vao = None
         self._ok = False
         try:
@@ -240,6 +331,8 @@ class GLImageView(QOpenGLWidget):
             self.context().aboutToBeDestroyed.connect(self._release_gl)
             if self._last_planes:
                 self._pending.update(self._last_planes)
+            if self._dlast and self._drect is not None:
+                self._dpending.update(self._dlast)
             ver = self.context().format().version()
             print(f"[glview] GL ready — OpenGL {ver[0]}.{ver[1]}", file=sys.stderr, flush=True)
         except Exception as e:                   # noqa: BLE001 — degrade, never crash
@@ -256,6 +349,13 @@ class GLImageView(QOpenGLWidget):
         context, which :meth:`initializeGL` then rebuilds from ``_last_planes``."""
         try:
             self.makeCurrent()
+            for tex in list(self._dtex.values()):
+                try:
+                    tex.destroy()
+                except Exception:                # noqa: BLE001 — best-effort cleanup
+                    pass
+            self._dtex.clear()
+            self._dtex_key.clear()
             for tex in self._tex.values():
                 try:
                     tex.destroy()
@@ -303,13 +403,61 @@ class GLImageView(QOpenGLWidget):
             if self._tex_key.get(ch) != id(plane):
                 self._pending[ch] = plane     # (re)upload only when the plane changed
         if wh is not None and wh != self._img_wh:
+            self.clear_detail()          # the patch belonged to the previous image
             self._img_wh = wh
             if self._last_wh != wh:                # new image size → refit (keep zoom on scrub)
                 self._last_wh = wh
                 self.fit()
         self.update()
 
-    def _upload(self, ch: int, plane: np.ndarray) -> None:
+    def set_detail(self, planes: Dict[int, np.ndarray],
+                   rect01: Tuple[float, float, float, float]) -> None:
+        """Queue a finer texture covering ``rect01`` (normalized image coords) to be drawn
+        over the overview. Part of :data:`nodelab_v2.viewer.SURFACE_CONTRACT`.
+
+        The overview is never replaced, so there is always a complete picture on screen and
+        a patch that is late, partial or superseded can only ever make a sub-rect sharper.
+        ``planes`` empty (or :meth:`clear_detail`) drops back to the overview alone."""
+        if not planes:
+            self.clear_detail()
+            return
+        self._drect = tuple(float(v) for v in rect01)      # type: ignore[assignment]
+        self._dlast = dict(planes)
+        for ch, plane in planes.items():
+            if self._dtex_key.get(ch) != id(plane):
+                self._dpending[ch] = plane
+        self.update()
+
+    def clear_detail(self) -> None:
+        """Forget the detail patch (the frame/node/graph moved, or the view zoomed back
+        out). Cheap and idempotent; the textures themselves are reused on the next patch."""
+        if self._drect is None and not self._dpending:
+            return
+        self._drect = None
+        self._dpending.clear()
+        self._dlast.clear()
+        self.update()
+
+    def visible_rect01(self) -> Tuple[float, float, float, float]:
+        """The image rect currently visible in pane 0, in normalized image coords, clamped
+        to the image. ``(0,0,1,1)`` when the whole image is on screen — which is how the
+        panel knows a detail patch would buy nothing."""
+        w, h = self._img_wh or (1, 1)
+        ox, oy, dw, dh = self._disp_rect(0)
+        if dw <= 0 or dh <= 0:
+            return (0.0, 0.0, 1.0, 1.0)
+        rects = self._tile_rects()
+        vx, vy, vw, vh = rects[0] if rects else (0.0, 0.0, self.width(), self.height())
+        x0 = max(0.0, min(1.0, (vx - ox) / dw))
+        y0 = max(0.0, min(1.0, (vy - oy) / dh))
+        x1 = max(0.0, min(1.0, (vx + vw - ox) / dw))
+        y1 = max(0.0, min(1.0, (vy + vh - oy) / dh))
+        return (x0, y0, max(x1, x0), max(y1, y0))
+
+    def _upload(self, ch: int, plane: np.ndarray,
+                texmap: Optional[Dict[int, QOpenGLTexture]] = None,
+                keymap: Optional[Dict[int, int]] = None,
+                rangemap: Optional[Dict[int, Tuple[float, float]]] = None) -> None:
         # Upload the RAW plane ONCE as a normalized 16-bit single-channel texture (R16).
         # The LUT window is applied in the shader (u_vlo/u_vhi) so contrast changes are
         # free — no re-upload, no re-decode. We record the data range that maps texel
@@ -329,7 +477,10 @@ class GLImageView(QOpenGLWidget):
             u16 = ((af - dmin) / (dmax - dmin) * 65535.0).astype(np.uint16)
         u16 = np.ascontiguousarray(u16)
         h, w = u16.shape[:2]
-        self._range[ch] = (dmin, dmax)
+        texmap = self._tex if texmap is None else texmap
+        keymap = self._tex_key if keymap is None else keymap
+        rangemap = self._range if rangemap is None else rangemap
+        rangemap[ch] = (dmin, dmax)
         if self._debug:
             import sys
             print(f"[glview] upload ch{ch}: shape={u16.shape} src_dtype={a.dtype} "
@@ -342,11 +493,11 @@ class GLImageView(QOpenGLWidget):
         rgba[..., 3] = 255
         rgba = np.ascontiguousarray(rgba)
         f = self.context().functions()
-        tex = self._tex.get(ch)
+        tex = texmap.get(ch)
         if tex is None:
             tex = QOpenGLTexture(QOpenGLTexture.Target2D)
             tex.create()
-            self._tex[ch] = tex
+            texmap[ch] = tex
         f.glBindTexture(_GL_TEXTURE_2D, tex.textureId())
         f.glPixelStorei(_GL_UNPACK_ALIGNMENT, 1)
         # NEAREST: the packed high/low bytes must not be interpolated (that would corrupt
@@ -357,16 +508,34 @@ class GLImageView(QOpenGLWidget):
         f.glTexParameteri(_GL_TEXTURE_2D, _GL_TEXTURE_WRAP_T, _GL_CLAMP_TO_EDGE)
         f.glTexImage2D(_GL_TEXTURE_2D, 0, _GL_RGBA8, w, h, 0, _GL_RGBA,
                        _GL_UNSIGNED_BYTE, rgba.tobytes())
-        self._tex_key[ch] = id(plane)
+        keymap[ch] = id(plane)
 
     def set_channel(self, ch: int, lo: float, hi: float,
-                    color: Tuple[int, int, int], gamma: float = 1.0) -> None:
-        """Set a channel's LUT window (``lo``/``hi``, data units) + emission colour. Both
-        are free shader uniforms — no re-upload, no re-decode — so dragging a contrast
-        slider is instantaneous. Call :meth:`refresh` to repaint."""
+                    color: Tuple[int, int, int], gamma: float = 1.0,
+                    blend: int = 0, opacity: float = 1.0,
+                    checker: float = 8.0) -> None:
+        """Set a channel's LUT window (``lo``/``hi``, data units), emission colour, and how
+        it composites. Every one of them is a free shader uniform — no re-upload, no
+        re-decode — so dragging a contrast slider or an overlay's opacity is instantaneous.
+        Call :meth:`refresh` to repaint.
+
+        ``blend``: 0 add · 1 over · 2 difference · 3 checkerboard (see ``blend_one``).
+        ``checker`` is the number of cells on the long edge, read only by mode 3."""
         self._clim[ch] = (float(lo), float(hi))
         self._color[ch] = (color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
         self._gamma[ch] = float(gamma)
+        self._blend[ch] = (float(int(blend)), float(opacity), float(checker))
+
+    def set_tiles(self, tiles: Optional[Sequence[Tile]]) -> None:
+        """Set the split-channel panes — ``[(label, channels, label_rgb), …]`` — or pass an
+        empty sequence / ``None`` for the single composite pane. Pure layout state: no
+        upload, no decode, so toggling the split is a repaint."""
+        new = [(str(lb), tuple(int(c) for c in chans), tuple(int(v) for v in rgb))
+               for lb, chans, rgb in (tiles or [])]
+        if new == self._tiles:
+            return
+        self._tiles = new
+        self.update()
 
     def refresh(self) -> None:
         self.update()
@@ -375,55 +544,125 @@ class GLImageView(QOpenGLWidget):
         self._active = []
         self.update()
 
-    # ── view transform ──────────────────────────────────────────────────────────
-    def _fit_scale(self) -> float:
-        if not self._img_wh:
-            return 1.0
-        w, h = self._img_wh
-        if w <= 0 or h <= 0:
-            return 1.0
-        return min(self.width() / w, self.height() / h)
+    # ── view transform (pane-aware: every pane shares one zoom/pan) ──────────────
+    def _ntiles(self) -> int:
+        return max(1, len(self._tiles))
 
-    def _disp_rect(self) -> Tuple[float, float, float, float]:
-        """(origin_x, origin_y, disp_w, disp_h) of the image in widget pixels."""
+    def _tile_grid(self, W: float, H: float, n: int) -> Tuple[int, int]:
+        """Columns × rows for ``n`` panes — the split whose cells show the image LARGEST.
+        A square grid is the wrong default on the real shapes this panel takes: three
+        panes over a wide viewer fit far better 3×1 than 2×2 (which also leaves a hole)."""
         w, h = self._img_wh or (1, 1)
-        s = self._fit_scale() * self._zoom
+        best, best_cols = -1.0, 1
+        for cols in range(1, n + 1):
+            rows = int(math.ceil(n / cols))
+            tw = (W - _TILE_GAP * (cols - 1)) / cols
+            th = (H - _TILE_GAP * (rows - 1)) / rows
+            if tw <= 0 or th <= 0:
+                continue
+            s = min(tw / max(1, w), th / max(1, h))
+            if s > best:
+                best, best_cols = s, cols
+        return best_cols, int(math.ceil(n / best_cols))
+
+    def _tile_rects(self) -> List[Tuple[float, float, float, float]]:
+        """The pane rectangles ``(x, y, w, h)`` in widget pixels — one equal-sized cell per
+        pane (a single pane is the whole widget). Cells share their size, which is what
+        lets one shared pan offset keep the panes registered."""
+        W, H = float(max(1, self.width())), float(max(1, self.height()))
+        n = self._ntiles()
+        if n == 1:
+            return [(0.0, 0.0, W, H)]
+        cols, rows = self._tile_grid(W, H, n)
+        tw = max(1.0, (W - _TILE_GAP * (cols - 1)) / cols)
+        th = max(1.0, (H - _TILE_GAP * (rows - 1)) / rows)
+        out = []
+        for i in range(n):
+            r, c = divmod(i, cols)
+            out.append((c * (tw + _TILE_GAP), r * (th + _TILE_GAP), tw, th))
+        return out
+
+    def _disp_rect(self, tile: int = 0) -> Tuple[float, float, float, float]:
+        """(origin_x, origin_y, disp_w, disp_h) of the image inside pane ``tile``, in
+        widget pixels — fit-to-pane × user zoom, plus the shared pan."""
+        rects = self._tile_rects()
+        tx, ty, tw, th = rects[min(max(0, tile), len(rects) - 1)]
+        w, h = self._img_wh or (1, 1)
+        s = min(tw / max(1, w), th / max(1, h)) * self._zoom
         dw, dh = w * s, h * s
-        ox = (self.width() - dw) / 2.0 + self._pan.x()
-        oy = (self.height() - dh) / 2.0 + self._pan.y()
+        ox = tx + (tw - dw) / 2.0 + self._pan.x()
+        oy = ty + (th - dh) / 2.0 + self._pan.y()
         return ox, oy, dw, dh
 
-    def plane_to_widget(self, px: float, py: float) -> QPointF:
+    def plane_to_widget(self, px: float, py: float, tile: int = 0) -> QPointF:
         """Map a plane-space pixel (0..W, 0..H) to widget device-independent coords —
-        the panel uses this to place overlay geometry on the pan/zoomed image."""
+        the panel uses this to place overlay geometry on the pan/zoomed image. In the
+        split view this addresses pane 0 (the composite), so overlays live there."""
         w, h = self._img_wh or (1, 1)
-        ox, oy, dw, dh = self._disp_rect()
+        ox, oy, dw, dh = self._disp_rect(tile)
         return QPointF(ox + (px / max(1, w)) * dw, oy + (py / max(1, h)) * dh)
+
+    def widget_to_plane(self, pt: QPointF) -> Optional[Tuple[float, float]]:
+        """The inverse of :meth:`plane_to_widget` — a widget point → displayed-plane
+        ``(x, y)``, or ``None`` when there is no image or the point is outside it.
+
+        Half of the overlay/pick contract (:meth:`refresh`, :attr:`overlay_cb` and
+        :meth:`plane_to_widget` are the rest), which
+        :class:`~nodelab_v2.viewer._ImageView` implements too so the picker is
+        backend-agnostic. Omitting it here silently disabled every on-image gesture on the
+        GPU path — the DEFAULT surface in a windowed session — because the panel probes for
+        it with ``getattr`` and simply did nothing when it was absent. There is now a probe
+        gate (``nodelab_v2.viewer.SURFACE_CONTRACT``) that fails loudly instead.
+
+        Returns ``None`` outside the image rather than extrapolating: a click beside the
+        picture is not a coordinate, and letting it through produced ROI shapes with
+        negative vertices that rasterized to nothing."""
+        at = self._img_at(pt)
+        if at is None:
+            return None
+        _tile, px, py = at
+        w, h = self._img_wh or (0, 0)
+        if not (0 <= px <= w and 0 <= py <= h):
+            return None
+        return (px, py)
 
     def fit(self) -> None:
         self._zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
+        self.clear_detail()          # the whole image fits again — nothing to refine
         self.update()
+        self.view_changed.emit()
 
     def wheelEvent(self, e) -> None:
         f = 1.15 if e.angleDelta().y() > 0 else 1.0 / 1.15
         cursor = e.position()
-        # keep the point under the cursor fixed while zooming
+        # keep the point under the cursor fixed while zooming — measured in the pane the
+        # cursor is over, so zooming into a split pane holds that pane's point still.
         before = self._img_at(cursor)
         self._zoom = max(0.05, min(80.0, self._zoom * f))
-        after = self.plane_to_widget(*before) if before else None
-        if before and after:
-            self._pan += cursor - after
+        if before:
+            tile, px, py = before
+            self._pan += cursor - self.plane_to_widget(px, py, tile)
         self.update()
+        self.view_changed.emit()
+
+    def _tile_at(self, wpt: QPointF) -> int:
+        """Index of the pane under a widget point (the nearest one if it lands in a gap)."""
+        for i, (x, y, w, h) in enumerate(self._tile_rects()):
+            if x <= wpt.x() <= x + w and y <= wpt.y() <= y + h:
+                return i
+        return 0
 
     def _img_at(self, wpt: QPointF):
+        """``(tile, plane_x, plane_y)`` under a widget point, or ``None``."""
         w, h = self._img_wh or (0, 0)
         if not w or not h:
             return None
-        ox, oy, dw, dh = self._disp_rect()
+        tile = self._tile_at(wpt)
+        ox, oy, dw, dh = self._disp_rect(tile)
         if dw <= 0 or dh <= 0:
             return None
-        return ((wpt.x() - ox) / dw * w, (wpt.y() - oy) / dh * h)
+        return (tile, (wpt.x() - ox) / dw * w, (wpt.y() - oy) / dh * h)
 
     def mousePressEvent(self, e) -> None:
         if e.button() == Qt.LeftButton:
@@ -436,7 +675,12 @@ class GLImageView(QOpenGLWidget):
             self.update()
 
     def mouseReleaseEvent(self, e) -> None:
+        was_panning = self._panning is not None
         self._panning = None
+        if was_panning:
+            # on RELEASE, not per mouse-move: a drag is dozens of moves and each would
+            # supersede the previous request, so the patch could never land mid-drag
+            self.view_changed.emit()
 
     def mouseDoubleClickEvent(self, e) -> None:
         self.fit()
@@ -452,25 +696,95 @@ class GLImageView(QOpenGLWidget):
                     for ch, plane in list(self._pending.items()):
                         self._upload(ch, plane)
                     self._pending.clear()
+                if self._dpending:               # ...and the viewport detail patch
+                    for ch, plane in list(self._dpending.items()):
+                        self._upload(ch, plane, self._dtex, self._dtex_key, self._drange)
+                    self._dpending.clear()
                 if self._active and self._img_wh:
-                    self._draw_image(f)
+                    rects = self._tile_rects()
+                    if self._tiles:
+                        dpr = self.devicePixelRatioF()
+                        f.glEnable(_GL_SCISSOR_TEST)
+                        for i, (_lb, chans, _rgb) in enumerate(self._tiles):
+                            x, y, w, h = rects[i]
+                            # clip to the pane: a zoomed image must not bleed into its
+                            # neighbours (every pane draws the full quad, cropped here).
+                            f.glScissor(int(x * dpr), int((self.height() - y - h) * dpr),
+                                        max(1, int(w * dpr)), max(1, int(h * dpr)))
+                            self._draw_image(f, i, [c for c in chans if c in self._tex])
+                        f.glDisable(_GL_SCISSOR_TEST)
+                    else:
+                        self._draw_image(f, 0, self._active)
             except Exception as e:               # noqa: BLE001
                 import sys
                 print(f"[glview] paint/upload failed → CPU fallback: {e}",
                       file=sys.stderr, flush=True)
                 self._fail()
-        # overlays (CPU QPainter) on top, sharing the same pan/zoom transform
-        if self.overlay_cb is not None:
+        # pane frames + labels, then the overlays (CPU QPainter), sharing the pan/zoom
+        if self.overlay_cb is not None or self._tiles:
             try:
                 p = QPainter(self)
                 p.setRenderHint(QPainter.Antialiasing, True)
-                self.overlay_cb(p)
+                if self._tiles:
+                    self._draw_tile_chrome(p)
+                if self.overlay_cb is not None:
+                    self.overlay_cb(p)
                 p.end()
             except Exception:                    # noqa: BLE001 — overlays are non-fatal
                 pass
 
-    def _draw_image(self, f) -> None:
-        ox, oy, dw, dh = self._disp_rect()
+    def _draw_tile_chrome(self, p: QPainter) -> None:
+        """Name each split pane in its channel's colour, with a hairline frame — the pane
+        legend is the whole point of the split view (which channel am I looking at)."""
+        font = QFont(p.font())
+        font.setPointSizeF(max(8.0, min(11.0, font.pointSizeF())))
+        font.setBold(True)
+        p.setFont(font)
+        fm = p.fontMetrics()
+        for (label, _chans, rgb), (x, y, w, h) in zip(self._tiles, self._tile_rects()):
+            col = QColor(*rgb)
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 70), 1.0))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(x + 0.5, y + 0.5, w - 1.0, h - 1.0))
+            # a plate under the name rather than a text shadow: the label sits over live
+            # pixels, and a second offset draw of the glyphs reads as a smear.
+            tw = min(fm.horizontalAdvance(label) + 12.0, max(20.0, w - 8.0))
+            plate = QRectF(x + 4, y + 4, tw, fm.height() + 4.0)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(6, 9, 14, 170))
+            p.drawRoundedRect(plate, 4.0, 4.0)
+            p.setPen(col)
+            p.drawText(plate.adjusted(6, 0, -2, 0), Qt.AlignLeft | Qt.AlignVCenter, label)
+
+    def _draw_image(self, f, tile: int, chans: Sequence[int]) -> None:
+        """The overview quad, then — when one has arrived — the viewport DETAIL quad on
+        top of it.
+
+        Two quads rather than a bigger texture: the overview is the whole image at
+        ``MAX_DISPLAY_DIM``, and the detail patch is the visible rect at that same budget,
+        so together they are "always something to show, sharp where you are looking". The
+        detail draws second and opaquely (blending is off), so it simply replaces the
+        overview inside its own rect; nothing has to be blended or masked."""
+        if not chans:
+            return
+        self._draw_quad(f, tile, chans, (0.0, 0.0, 1.0, 1.0), self._tex, self._range)
+        if self._drect is not None:
+            fine = [c for c in chans if c in self._dtex]
+            if fine:
+                self._draw_quad(f, tile, fine, self._drect, self._dtex, self._drange)
+
+    def _draw_quad(self, f, tile: int, chans: Sequence[int],
+                   rect01: Tuple[float, float, float, float],
+                   texmap: Dict[int, QOpenGLTexture],
+                   rangemap: Dict[int, Tuple[float, float]]) -> None:
+        """Draw ``chans`` from ``texmap`` over the sub-rect ``rect01`` (normalized image
+        coords) of pane ``tile``. ``rect01 == (0,0,1,1)`` is the whole image."""
+        if not chans:
+            return
+        fx0, fy0, fx1, fy1 = rect01
+        ox, oy, dw, dh = self._disp_rect(tile)
+        ox, oy = ox + fx0 * dw, oy + fy0 * dh
+        dw, dh = (fx1 - fx0) * dw, (fy1 - fy0) * dh
         W, H = max(1, self.width()), max(1, self.height())
 
         def clip(wx, wy):
@@ -494,24 +808,31 @@ class GLImageView(QOpenGLWidget):
         prog.enableAttributeArray(1)
         prog.setAttributeBuffer(1, _GL_FLOAT, 8, 2, 16)
 
-        active = self._active[:_MAX_CH]
+        active = list(chans)[:_MAX_CH]
         # Uniforms MUST go through uniformLocation() + the (location:int, value) overload:
         # PySide6 has no setUniformValue(name:str, scalar) overload (only location-based
         # for a single int/float), so name-based scalar calls raise.
         prog.setUniformValue(prog.uniformLocation("u_nchan"), int(len(active)))
         for i, ch in enumerate(active):
             r, g, b = self._color.get(ch, (1.0, 1.0, 1.0))
-            dmin, dmax = self._range.get(ch, (0.0, 1.0))
+            # the LUT window is in DATA units, so it must be renormalized against THIS
+            # texture's own range — a detail patch of a float image has a different
+            # min/max from the overview, and reusing the overview's would shift its
+            # contrast against the picture underneath it
+            dmin, dmax = rangemap.get(ch, (0.0, 1.0))
             span = max(dmax - dmin, 1e-9)
             lo, hi = self._clim.get(ch, (dmin, dmax))
             vlo = (float(lo) - dmin) / span      # LUT window → texel-normalized [0,1]
             vhi = (float(hi) - dmin) / span
             gm = self._gamma.get(ch, 1.0)
+            bmode, bop, bchk = self._blend.get(ch, (0.0, 1.0, 8.0))
             prog.setUniformValue(prog.uniformLocation(f"u_color[{i}]"), QVector3D(r, g, b))
             prog.setUniformValue(prog.uniformLocation(f"u_win[{i}]"),
                                  QVector3D(float(vlo), float(vhi), float(gm)))
+            prog.setUniformValue(prog.uniformLocation(f"u_blend[{i}]"),
+                                 QVector3D(float(bmode), float(bop), float(bchk)))
             prog.setUniformValue(prog.uniformLocation(f"u_tex[{i}]"), int(i))
-            tex = self._tex.get(ch)
+            tex = texmap.get(ch)
             if tex is not None:
                 f.glActiveTexture(_GL_TEXTURE0 + i)
                 f.glBindTexture(_GL_TEXTURE_2D, tex.textureId())

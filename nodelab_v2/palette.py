@@ -6,10 +6,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Callable, Optional
 
-from PySide6.QtCore import QMimeData, Qt
+from PySide6.QtCore import QMimeData, Qt, Signal
 from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
-    QLineEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHBoxLayout, QLineEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from nodelab_v2 import theme as T
@@ -38,6 +39,11 @@ class _PaletteTree(QTreeWidget):
 class PalettePanel(QWidget):
     """The dockable palette. ``on_add(op_key)`` fires on double-click/Enter."""
 
+    #: the ⟳ button beside the search box was pressed — re-read the node catalog from disk.
+    #: The panel only asks; the window owns the reloader, the runner (which must be idle) and
+    #: the canvas that has to be relaid out afterwards.
+    refresh_requested = Signal()
+
     def __init__(self, on_add: Callable[[str], None]) -> None:
         super().__init__()
         self._on_add = on_add
@@ -47,12 +53,37 @@ class PalettePanel(QWidget):
         lay.setSpacing(6)
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search nodes…  (drag onto the canvas)")
+        self._refresh = QToolButton()
+        self._refresh.setText("⟳")
+        self._refresh.setCursor(Qt.PointingHandCursor)
+        self._refresh.setFixedSize(26, 26)
+        self._refresh.setToolTip(
+            "Re-read the node list from disk.\n\n"
+            "Picks up a node whose .py you ADDED while NodeLab was open, drops one whose "
+            "file you deleted, and reloads any that changed — so the list here matches the "
+            "files in nodegraph/catalog/.\n\n"
+            "Only nodes whose code actually changed recompute; everything else keeps its "
+            "cached results.")
+        self._refresh.clicked.connect(self.refresh_requested)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+        top.addWidget(self._search, 1)
+        top.addWidget(self._refresh)
         self._tree = _PaletteTree()
-        lay.addWidget(self._search)
+        lay.addLayout(top)
         lay.addWidget(self._tree)
         self._search.textChanged.connect(self.refill)
         self._tree.itemDoubleClicked.connect(self._add_current)
         self.refill("")
+
+    def reload_catalog(self) -> None:
+        """Rebuild the tree from the registry, keeping the user's search text.
+
+        The palette is built once from ``NODES``, so a live node reload
+        (:mod:`nodegraph.hotreload`) that added, removed, renamed or recategorized a node
+        type leaves it showing the catalog the window opened with."""
+        self.refill(self._search.text())
 
     def focus_search(self) -> None:
         """Select the search box (the welcome card's 'Browse nodes' lands here)."""
@@ -67,6 +98,9 @@ class PalettePanel(QWidget):
             QTreeWidget::item:selected {{ background:{T.ACCENT_DIM.name()};
                 color:{T.INK.name()}; }}
             QTreeWidget::item:hover {{ background:{T.PANEL_HI.name()}; }}
+            QToolButton {{ color:{T.MUTED.name()}; background:transparent;
+                border:1px solid {T.BORDER.name()}; border-radius:5px; font-size:14px; }}
+            QToolButton:hover {{ color:{T.INK.name()}; background:{T.PANEL_HI.name()}; }}
         """ + T.controls_qss())
 
     def refill(self, text: str = "") -> None:

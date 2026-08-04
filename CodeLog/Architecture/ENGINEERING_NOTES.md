@@ -81,7 +81,8 @@ run.py ─→ nodelab_v2.app.run
 Hard rules that keep this honest:
 
 * **`nodegraph/` never imports Qt, and never imports `nd2`.** ND2 coupling lives in
-  `nodelab_v2/ingest.py` + `nd2_meta.py`.
+  `nodelab_v2/ingest.py` + `nd2_meta.py`, and every one of their `nd2` imports goes through
+  `nodelab_v2/nd2_compat.py` (§19, *Ingest / the `nd2` seam*).
 * **`nodelab_v2/document.py` and `ops.py` are Qt-free**, so the editing model and the
   GUI-introduced ops are testable headless and a saved graph runs without PySide6.
 * **Heavy backends are lazily imported inside a compute** (scipy, skimage, sklearn, numba,
@@ -309,7 +310,9 @@ have. That is why the check is structural.
    (b) when the condition is not a rectangle of mode values.
 3. **`available_in` must name real modes and real values** — a typo hides the socket in every
    state.
-4. **A layer-name socket declares its direction and domain** (`layer_in` / `layer_out`).
+4. **A layer-name socket declares its direction and domain** (`layer_in` / `layer_out`), and
+   a **filesystem-path socket declares `path_kind`** so the GUI can offer a file/folder
+   dialog instead of a hand-typed path (V2.15).
 5. **A default is declared exactly once — in the `SocketSpec`.** Read layer params through
    **`ctx.layer("mask")`**, which resolves override → socket default via the one shared
    `registry.layer_value` — the same function `propagate_meta` calls. Never re-spell a default
@@ -353,6 +356,20 @@ InString("name", "Output layer", field=False, default="labels",
 per edge — and the inspector turns a `layer_in` socket into an editable combo over exactly
 those names (`document.layer_choices`, which follows the **primary** Dataset edge only, so a
 `reference`/`raw` second input never leaks in).
+
+### Path sockets (V2.15)
+
+A STRING socket holding a **filesystem path** declares
+`path_kind="open_file" | "save_file" | "directory"` (+ `path_filter`, `path_hint`), and the
+inspector puts a **Browse…** button on the row. Same shape of bug as an undeclared layer
+socket: the button used to key on the literal socket *name* `"path"`, so `analysis.segment`'s
+`sd_model_path` / `model_path` were reachable only by typing an absolute path from memory.
+`directory` gets `getExistingDirectory` — a local StarDist model is a folder, and no file
+dialog can return one. Enforced from both ends: `NodeRegistry.register` refuses an unknown
+kind or a non-STRING socket (a silently-ignored declaration would just look like a text
+field), and the socket-contract gate flags any name-shaped path socket (`path`/`dir`/`file`/
+`folder`) that declares none. All three fields are presentation-only and **never hashed**,
+like `description`.
 
 ---
 
@@ -422,6 +439,18 @@ Two guards make this enforceable:
 
 `_RecordingMetadata` additionally records reads made through `ctx.env.metadata` directly, so
 even that route stays fenced.
+
+**What gets recorded is the ENVELOPE's value, never the caller's default** (fixed
+2026-07-30). Re-validation compares each stored digest against `metadata.get(key)` with no
+default, so recording a *defaulted* value for an **absent** key stored a digest that could
+never match again — the entry re-validated false on every single pull and the node
+recomputed forever, silently. It bit every node that resolves a param through
+`envelope_symbols`, which reads `md.get("z_collapsed", False)`: i.e. most of the
+metadata-intelligent catalog, since real sources rarely carry that key. Measured after the
+fix: an unchanged re-pull of *Gaussian 3D → Segmentation → Measure* went from recomputing
+the two eager analysis nodes every time to a full `cached` chain. The fence is unweakened —
+the digest still moves whenever the envelope's value moves, absent → present included, and
+the caller's default is a code constant rather than data.
 
 ### 8.4 Per-channel derive — `ctx.channel(c)` (C8)
 
@@ -542,6 +571,46 @@ computes should call it — a compute returning a lazy provider must **not** fak
 staying silent is what tells the UI its cost is deferred. Observer exceptions are swallowed:
 a run must never depend on who is watching.
 
+**Two-level progress (V2.17).** The UI draws *two* stacked bars per node — frames finished
+out of total frames (orange, on top) and the work inside the frame in flight (accent,
+below) — so `progress` reports both levels. There are three ways in, and a node should use
+the cheapest one that is honest:
+
+| how | when | what happens |
+|---|---|---|
+| `ctx.progress(i+1, n, note, frames=ax.t)` | any eager per-unit loop | the flat count is *split* by arithmetic: `frames_done = floor(done·frames/total)`, sub = the remainder within one frame |
+| `…, sub=k, sub_total=K` | the work inside one unit reports its own percentage | the derived split is overridden, so the sub bar moves *through* a single unit |
+| `ctx.progress_frame(frame, frames, sub, sub_total, note)` | the compute's own structure is a frame loop with inner steps | the flat `done`/`total`/`fraction` are synthesized from the two |
+| `…, sub_unknown=True` | the frame is known but the work inside it is **one opaque call** | `sub_fraction` is an explicit `None` → the UI *sweeps* that bar |
+
+That last row is the one to reach for on a learned segmenter. `sub_unknown` is not a way to avoid
+counting something countable — it is the honest report for a single CNN inference with no upstream
+hook, and it exists because the alternatives are both lies: a determinate bar frozen for thirty
+seconds reads as a hang, and omitting the field reads as 0% ("nothing has started"). An explicit
+`None` is distinct from a missing key for exactly this reason, so a sink must test
+`"sub_fraction" in info and info["sub_fraction"] is None`, not truthiness.
+
+The helpers do this for you: `_each_plane_p` / `_each_volume_p` / `_parallel_progress` in
+`nodes.py` pass `frames=ax.t`, which is why every eager node gets both bars without its loop
+being touched. `_UnitBar` covers the third case — it measures the sub axis in *centi-units*
+(`sub_total = units_per_frame × 100`) and is what wires the ALDVC/DIC kernels' own
+`progress_cb` through, so a multi-second solve no longer freezes the bar.
+
+**Where the ticks come from matters as much as the arithmetic.** `fold_units` folds each result
+**as it lands** rather than materialising the batch (`_imap`, V2.17). Output and order are
+identical either way — but the eager catalog nodes tick from the fold, so a materialised batch
+collapsed every tick in a batch onto the instant its *slowest* unit finished. On a per-plane
+learned segmenter with N lanes that is a bar standing still for N planes and then jumping N.
+The two throttle exemptions in `nodelab_v2.runner` exist for the same class of reason: a **frame
+step** and a **flip between determinate and sweeping** are each the only event that carries a
+visible change, and the next one may be a whole unit of work away, so neither may be dropped.
+
+Invariants a sink may rely on (gated in `test_engine_observer`): `frames_done` is
+**monotone**, `sub_fraction` stays in `[0,1]` and restarts at each frame boundary, the final
+tick lands **both** at 1.0, and the frame fields are **absent entirely** when no frame count
+was reported — a node with no frame axis must not be given a fake one. `fraction` alone is
+always valid, so pre-V2.17 sinks keep working unchanged.
+
 `Engine(...)` knobs: `memo` (or `memo_bytes`), `seeds`, `providers`, `meta_seeds`,
 `strict_reads`, `cache_bytes` (tile cache, default 1 GiB), `observer`.
 `reseed_meta(meta_seeds)` re-runs the envelope pass while keeping the memo, so a subsequent
@@ -646,6 +715,26 @@ stays 1 and the Viewer stride-decimates full-res. Downsample-then-compute is wro
 non-linear ops, compute-then-downsample buys no savings, and the GPU viewer + prefetch path
 already covers viewer smoothness.
 
+> **Amended 2026-07-30.** That last clause was wrong, and the correction is in
+> `runner.py`, not here: the prefetch path *assumed* a plane read is a decompress. On a
+> `volume_unit` provider it is a whole-unit compute, so prefetching made things worse rather
+> than smoother, and the GUI thread's own inline decode of a cold plane froze the app for the
+> length of one unit. See the `runner.py` §18 bullets on the warm-inline/cold-async fast path
+> and `_prefetch_span`. The pyramid deferral itself stands.
+
+> **One scoped exception, 2026-07-31 — `MultiViewProvider` (`util.stitch`).** The deferral's
+> reasoning is a statement about *kernels*: downsample-then-compute is wrong for a non-linear
+> op, and compute-then-downsample saves nothing. A **paste** is neither — stitching
+> mean-downsampled tiles IS the mean-downsampled stitch (exactly, away from the seams), so
+> the coarse level is real work avoided rather than an approximation smuggled in. It is also
+> the case where "the Viewer stride-decimates full-res" stopped being affordable: the canvas
+> is far larger than any source plane, so displaying one frame of a 49×2048² mosaic stitched
+> 172 Mpx to show 3.5 Mpx — **measured 0.92 s/frame (overwrite) and 2.9 s/frame (feather)**,
+> paid again on every frame scrubbed to. Forwarding the base's pyramid took that to 89 ms and
+> 220 ms. So `StreamProvider.levels` stays 1 for every *computing* provider; only the fusion
+> provider overrides it, and only because its kernel commutes with the downsample. The
+> general deferral stands.
+
 ---
 
 ## 12. Providers & storage layout
@@ -667,11 +756,101 @@ load-bearing for the whole streaming design:
 
 Providers: `SyntheticProvider` (deterministic formula, numpy only), `B2ndProvider` (Blosc2
 b2nd store with planar blocks, in-memory or on disk; blosc2 lazily imported), `ArrayProvider`
-(a realized array, reports `nbytes` for the memo GC).
+(a realized array, reports `nbytes` for the memo GC), and `FrameSubsetProvider` /
+`FrameSliceProvider` — pure `(m,t,z)` index remaps that shrink a source to a chosen set of
+frames (or one) and, inside each, a chosen set of planes. They compute nothing, so they
+inherit `depth`; they are how the GUI scopes a *run* without editing the graph (§18).
 
 `TileProvider.version` (C5) defaults to `fingerprint()`; disk providers fold `mtime_ns`. That
 is what the engine's `__provider_version__` hook uses so a file changing on disk cannot serve
-a stale chain.
+a stale chain. For a b2nd store the mtime is **level 0's only** (V2.19) — every compute reads
+level 0 and the pyramid above it is a display convenience, so *completing a pyramid* must not
+re-key the source and discard every memoized result under it.
+
+### The pyramid: streamed, marked, repairable (V2.19)
+
+Levels above 0 are mean-pooled 2× per level, and three things about how they are written are
+load-bearing:
+
+* **Level *l* streams out of level *l-1*'s store**, one chunk-aligned z-slab at a time
+  (`_append_level`), with the per-plane reduction in one place (`_plane_mean_2x`), **on the
+  worker pool**. The old writer downsampled a whole level in RAM via `_mean_downsample_2x`
+  and handed the array to blosc2 — for the lab's 84.7 GB ND2 that is a 21 GB allocation made
+  *while* the 84.7 GB source is still live, and it is exactly why that file's store on disk
+  had a complete `level_0` and no pyramid at all. `_mean_downsample_2x` stays as the in-RAM
+  reference the selftest asserts the streamed levels against, bit for bit.
+
+  The pool part was a **V2.20 repair, and the omission was expensive**: V2.19's first cut
+  looped the slab's planes serially, silently giving up the fan-out `_mean_downsample_2x`
+  already had. Streaming never required that. Measured on a 1.64 GiB slice of the 640 series,
+  24 cores, `levels=3` — decode 2.0 s, level 0 compress 2.3 s, and **level 1 alone 6.0 s**:
+  a quarter of the data for nearly three times level 0's cost, one core mean-pooling 840
+  planes while 23 idled. On the pool level 1 is 1.8 s and level 2 is 0.2 s, taking the whole
+  ingest **11.9 s → 6.3 s (141 → 266 MB/s), a 1.9× speedup for bit-identical output**.
+* **Every level is marked twice** in its `vlmeta`: `complete: False` right after
+  `blosc2.empty` declares the geometry, `complete: True` once the last chunk lands. Marking
+  the *start* is the part that matters — a b2nd array declares its full shape up front and
+  unwritten blocks read as **zeros**, so stamping only on success would leave a half-written
+  level indistinguishable from a pre-V2.19 one. No marker at all means *legacy*, which the
+  marker check trusts — but see V2.20 below: that trust is no longer the last word.
+* **`open` takes the leading sound run.** A torn level above 0 is dropped (the store opens
+  short, and is repairable); a torn `level_0` is a hard error naming the fix, because nothing
+  but the source file can rebuild it. A *gap* (`level_0` + `level_2`) is refused outright —
+  `levels` is a count and every reader indexes by position, so accepting it would serve
+  level 2's pixels to a level-1 read.
+
+**`B2ndProvider.ensure_levels(urlpath, levels)`** is the repair: level *l* is a pure function
+of level *l-1*, so a store with an intact `level_0` regains its pyramid **without the source
+file being read, or even existing**. Idempotent, memo-neutral, and progress-reporting. The GUI
+runner calls it on every resolve where `prov.levels < PYRAMID_LEVELS` (§18), so a store torn
+by an earlier crash heals on the next pull instead of silently serving full-res planes to
+every zoom level forever. Measured on the lab's 640 series (12×16×210×1024²): **463 s** to
+build levels 1–2 from level 0, no ND2 touched, fingerprint unchanged — that figure predates
+the V2.20 parallel reduce above, which cut the same two levels by **3.8×** on a slice of that
+series, so expect ~2 minutes now.
+
+### "Legacy is trusted" was wrong, and the census replaces it (V2.20)
+
+V2.19 read the lab's 640 store as *a complete `level_0` with no pyramid* and repaired it on
+that basis. It was not complete. `level_0` held **7 899 of its 40 320 chunks** — the write had
+stopped at m=2, t=5, z=129 — so positions m≥2 loaded as solid black while the ND2 itself was
+perfect. The marker could not say so (the store predates it), the geometry looked right, and
+the 463 s repair then read those zeros and wrote two more levels of them, *marked complete*.
+The pyramid fix worked exactly as designed on a premise that was false.
+
+Two changes, one for each half of that:
+
+* **Detection — `B2ndProvider._blank_tail` (a chunk census, no marker required).** blosc2 files
+  a never-written chunk as a special run-length value rather than as data, so *which chunks
+  were written* is a fact on disk readable from 32-byte headers: 2.7 s for those 40 320, zero
+  decompression. The verdict is deliberately narrow — a **pure trailing run** of blanks with a
+  fully-written body. blosc2 files a genuinely-written constant chunk the same way, so a blank
+  chunk alone proves nothing (a mask is legitimately blank almost everywhere); only a write
+  that *stopped* leaves blanks exclusively at the end. Scattered blanks read as sparse and are
+  not flagged, which is the right way round for a verdict that costs a re-ingest.
+* **Policy lives at the ingest seam, not in `open`.** `nodelab_v2.ingest.verify_store` gates the
+  census on `level_state(0) == "legacy"` (so it self-sunsets — a marked store skips it) and
+  raises `ValueError`, which `_resolve_source` already catches and answers with a real
+  re-ingest. It is *not* in `B2ndProvider.open`, because density is a claim about ND2/TIFF data
+  specifically: `nodegraph.checkpoint` opens the same class over a raster that may be a mask,
+  and keeps its own manifest-written-last rule. `ensure_store_levels` verifies too — repairing
+  a torn level 0 is precisely how the zeros got propagated the first time.
+
+**And the cause, not just the symptom: ND2 ingest no longer materializes.** `ingest_image` fed
+`B2ndProvider.write` a realized 6-D numpy array — for this file an 84.7 GB `np.empty` filled
+before the first byte was compressed, then held live while blosc2 read out of it. Any death in
+those tens of minutes leaves a torn store. `_build_levels`' level-0 loop already reads exactly
+one z-slab per write, so it only ever needed a *lazy* source: `lazy_nd2()` hands it nd2's
+`ResourceBackedDaskArray` (valid after the file handle closes — it re-opens per block) and peak
+memory becomes one slab. Byte-identical output, verified against the eager reader on a 3-channel
+5300² plane and a 51×2 z-stack. TIFF and the in-memory path keep the two-phase read (`tifffile`
+has no lazy form), which is what `_READ_SHARE` still splits the bar for.
+
+**It costs nothing in wall time** — the concern to check, since the eager read got one big
+parallel dask compute per (m,t) and the streamed one gets a compute per z-slab. Benchmarked
+a-b-b-a on a 1.64 GiB slice of the 640 series so the cold page cache lands on one run of each,
+best-of-two: eager 6.7 s vs streamed 6.2 s, **0.94×**. The write dominates either way (decode
+is 2.0 s of it at 821 MB/s), so removing the materialize pass trades 84.7 GB of RAM for nothing.
 
 ---
 
@@ -914,6 +1093,19 @@ CPU work.
 * **A persistent `Memo` across runs** — engines are rebuilt when the document revision
   changes but the memo carries over, which is what makes "an unrelated edit recomputes only
   the invalidated chain" user-visible. Capped at 1 GiB (`MEMO_BUDGET_BYTES`).
+* **A persistent `TileCache` too, and it is not optional** (2026-07-30). The runner owns one
+  and passes it into every `Engine` it builds (`Engine(tiles=…)`). A `StreamProvider` holds
+  its cache by **weakref** so an orphaned engine's cache can be collected — but the memo
+  hands out lazy Datasets *built by an earlier engine*, so with a per-engine cache every
+  memo-hit lazy chain reads through `_NO_CACHE` from the first revision bump onwards: no
+  tile is ever stored again and **every plane re-runs the whole unit**. Measured on the
+  WellA3 640 series (12×16×210×1024², 3D Deconvolve, one unit = 210×1024² ⇒ ~130 s with the
+  V2.19 kernel, ~230 s when this was found):
+  z-scrubbing went from 0.00 s per step (cached per-z slabs) to a fresh whole-volume
+  Richardson–Lucy per step, permanently, after any edit — and the revision bumps by itself
+  on the first pull, via the `set_meta_seed` re-seed. Sharing is as sound as sharing the
+  memo: the tile key embeds the provider fingerprint (op + params + declared reads + field
+  hashes + base fp + grid), so it is content-addressed, not engine-scoped.
 * **Source resolution** — an `io.load` root resolves `path` through `ingest` (ingested once to
   an on-disk b2nd store next to the file, re-opened lazily); an empty path falls back to a
   deterministic `SyntheticProvider` with real calibration. The resolved envelope is delivered
@@ -921,6 +1113,26 @@ CPU work.
 * **Plane rendering** — a job may ask for a display plane at `(m,t,z,c)`, read in the worker
   through the tile cache and decimated to `max_dim`, so the GUI thread never blocks on a lazy
   chain.
+* **The scrub fast path is warm-inline / cold-async** (2026-07-30). A coords-only request
+  (`request_plane`) bypasses the graph snapshot and serves the `PlaneCache`. A **warm** frame
+  is emitted right there on the GUI thread — the pixels exist, so it costs a dict lookup and
+  scrubbing keeps zero-hop latency. A **cold** one goes to `_DecodeJob` on the pool, because
+  a `PlaneCache` miss on a *computing* provider does not decode a plane, it **runs the
+  node**: the same 3D Deconvolve read that costs 0.00 s warm costs ~130 s cold, and doing it
+  inline froze the whole application for that long with no repaint and no status. One decode
+  in flight with a single latest-wins pending slot (the `pull` shape) — a `volume_unit`
+  provider carries a whole unit's working set per concurrent job (8.5 GB for that volume), so
+  one job per pool thread is not an option. Staleness is judged on `_decode_gen` (cursor moved) and `_epoch` (edit or
+  real pull); a dropped result still populated the cache, so a cursor that comes back is
+  warm. The card + status bar say *reading planes* for the duration.
+* **The prefetcher is cost-gated** (`_prefetch_span`, 2026-07-30). ±8 T-neighbours is right
+  for a store-backed provider (a decompress each) and catastrophic for a computing one:
+  warming ±8 T across a `volume_unit` Deconvolve queued **sixteen whole-volume RL computes**
+  — over half an hour of CPU behind a cursor that had moved one frame, starving the Viewer's own
+  decode and pushing the volume being *looked at* down the cache LRU. Span is now 8 on real
+  bytes, 2 on a per-plane/per-tile compute, **0** across frames of a whole-unit compute
+  (there the useful neighbours are the other z of the unit, already cached by the read that
+  displayed it).
 * **Latest-wins queueing**, and stale results are dropped by epoch on arrival.
 
 ### `ops.py` — the two GUI-introduced ops, deliberately Qt-free
@@ -959,10 +1171,97 @@ CPU work.
   *role*, which is how "spread" copies a look by role). Settings persist in three merging JSON
   layers: defaults → the committed project file → this machine's file, or one explicit file via
   `NODELAB_OVERLAYS`.
+* **The identity palette.** Per-item colour keys off a **palette slot**, not a raw id, because
+  a segmentation re-issues label ids from 1 every frame — colouring by the id makes one cell
+  flash a new colour at every T step. `viewer._build_palette()` walks the dataset's structure
+  tables ONCE per dataset (not per frame) and produces, per layer, a dense `id → slot` LUT:
+  a row's object is its track when one links it, itself otherwise, and a track *prefers* the
+  slot of its first member so an untracked field keeps exactly the colours it already had.
+  `overlays.deconflict_slots()` then moves an object off its preference only when a neighbour
+  — from a per-frame k-NN over member centroids, deduplicated across frames — sits within
+  `MIN_HUE_SEP` (30°) of it; the golden angle spreads *consecutive* indices, so without this
+  slots 5 and 39 land 4.7° apart and two touching cells read as one. The LUT rides on
+  `OverlayFrame.label_keys` (dense, because the fill indexes it per pixel), on
+  `PointMark.key`, and on `TrackPath.color_key` — which is what makes a trajectory paint in
+  the same colour as the regions it threads. `None` anywhere means "colour by raw id", the
+  pre-palette behaviour, and is what the preview and every direct renderer call use.
+
+### The hover readout (`ViewerPanel._hover_text`)
+
+Pointer position → one line: pixel `(x, y)` in the viewed node's grid, that point in µm, the
+**absolute stage coordinate**, and each shown channel's value with the **raw** file value
+beside it. Three seams make it work, and each is a refusal boundary:
+
+* **Stage geometry is display metadata, not calibration.** `stage_xy_um[m]` (the ND2
+  XYPosLoop's per-position field CENTRE) rides on the seed `Dataset` via
+  `ingest.STAGE_KEYS`, alongside the channel names — *not* in `CALIBRATION_KEYS`. It is
+  per-M geometry, no `meta_transform` knows how to keep it true across a crop or a
+  resample, and putting it in the locked schema would imply the engine maintains it.
+* **Raw pixels come from the runner, through the window.** The Viewer holds no provider, so
+  `window` hands it `EngineRunner.raw_plane` as `raw_plane_cb` — the same division as
+  `arm_pick`'s calibration. `raw_source` gates on **exactly one** `io.load` in the pull's
+  ancestor closure AND the node's propagated axes **equalling** the source's on all six.
+  Enhancements pass; anything that re-addresses `(m,t,z,c,y,x)` does not, and the readout
+  then withholds both the raw value and the stage coordinate rather than naming the wrong
+  pixel. `raw_source` is memoized per `(node, document.revision)` — the caller is a
+  mouse-move handler and the uncached answer costs a run-graph build — but a **refusal is
+  never cached**, because the commonest refusal is "the source has not resolved yet" and
+  that resolves at an unchanged revision.
+* **The event filter is permanent.** `_install_surface_filter` installs the panel on the
+  surface (and its viewport) for good and forces mouse tracking; `_install_pick_filter` now
+  only swaps the cursor. Wiring the readout to the pick-time filter would have left it dead
+  in ordinary use — and a GL→CPU fallback replaces the filtered widget, so both
+  `_do_fallback_to_cpu` and construction re-install.
+
+Cost per move: two array index reads and a string build. The raw plane is cached in the same
+`PlaneCache` as the display planes, and when the viewed node *is* the load (no pin) it reuses
+the display key outright, so hovering a source costs no extra read.
 
 Five PySide6/GL landmines are documented in `glview.py` — VAO handling, float-array uniforms
 via `QVector2D`, the RGBA8 upload constraint, no sampler-in-function, deferred fallback. Read
 them before editing that file.
+
+### Frame strips and the run scope (F9)
+
+`framestrip.py` replaces the Viewer's M/T/Z sliders with **one box per frame** (fixed size,
+compressing to fit once the row runs out of width). It carries two independent pieces of
+state: the **cursor** — what is displayed, dragged like the slider it replaced (the pointer
+is grabbed on press, so a drag past either end keeps scrubbing against the clamp) — and a
+**selection**, entered with Ctrl / Shift / the context menu precisely so that plain dragging
+stays scrubbing. The widget is axis-agnostic; what an empty selection *means* is a scope
+policy the Viewer states per strip in `unpicked_note`.
+
+The selection is the **run scope** the troubleshooting mode evaluates, and the whole seam is
+three hops with nothing in between:
+
+* `ViewerPanel.frame_selection()` → `EngineRunner.set_frame_selection()`, as `(ms, ts, zs)`.
+  The axes pick independently, so what runs is their **cross product**. The two fallbacks
+  differ and the asymmetry is deliberate: an empty M or T means *the frame the cursor is on*
+  (so untouched strips reproduce the original one-frame scope exactly), an empty Z means
+  *the whole volume* — z is inside a frame, and cutting a 3D node to one plane because a
+  cursor happened to sit there would be a trap.
+* `_pin_frames` wraps every resolved **source seed** in a `FrameSubsetProvider` and shortens
+  its envelope to match. **No node participates**: the catalog keeps looping "every frame",
+  there are just few, each shorter in z. That is why this is a seed concern and not a graph
+  edit — the canvas, the run plan and the saved file are untouched.
+* The picks ride the provider `fingerprint` → `version` → `__seed_version__` → every
+  downstream `recipe_hash`, so one selection can never serve another and a revisit is a memo
+  hit. An unset `zs` is left out of the fingerprint entirely, so a frame-only scope keys the
+  memo exactly as it did before z became pickable.
+
+**Landmine 1 — addressing.** Under the scope a payload holds only the picked frames and
+planes and numbers them from 0, while every strip, label and request stays in *global*
+indices. `provider.subset_index` maps one to the other (an unpicked cursor resolves to its
+nearest picked neighbour; an unpicked axis passes through) and it must be applied **exactly
+once**, at the boundary where a global cursor first meets a payload —
+`ViewerPanel._payload_coords` on the display side, `EngineRunner._payload_coords` before any
+plane decode or prefetch. Re-applying it remaps an index that is already an index.
+
+**Landmine 2 — a z pick changes what 3D nodes compute.** Skipped planes are *absent*, not
+empty, so a Gaussian 3D over 5 picked planes is not the same filter as over all 60, and
+`z_step_um` still describes the source. That is the mode, not a bug — but it means a scoped
+result can only be compared against an unscoped one on a node with no z (or t) context. The
+GUI probe's T3 checks pixel identity on the **source** node for exactly this reason.
 
 ### Inspector
 
@@ -971,6 +1270,104 @@ be 1 — unknown ≠ 1), the resolved footprint, one row per **active** paramete
 label, and the **auto / pinned** toggle backed by the sticky `__locked__` list. Changing a mode
 rebuilds via a deferred `_rebuild`, and the card re-lays-out via `scene.sync → item.refresh` —
 **both halves must be verified** when you add mode gating.
+
+### Interactive parameters (V2.16) — `picker.py`
+
+Four presentation-only `SocketSpec` fields drive the whole feature, following the `path_kind`
+precedent exactly: **never hashed**, validated at registration (a typo in any of them would
+otherwise fail *silently*, by simply not drawing a control).
+
+| Field | Effect |
+|---|---|
+| `pick_kind` | the gesture this param offers (one of `PICK_KINDS`); draws the Inspector's **Pick** button and the card's `○` glyph |
+| `pick_peer` | another input on the same node that the same gesture also sets (a min/max interval, a grid's box + stride) — an interval, aimed in **two phases** |
+| `pick_bounds` | the complete ordered GROUP one gesture writes at once (`BOUND_PICK_KINDS`: `rect` → `("y0","y1","x0","x1")`, `zrange` → `("z0","z1")`) — a rectangle *is* four numbers, so there is no ordering and no second phase |
+| `choices` | a STRING param's closed value set → a dropdown |
+| `vocab` | a STRING param's multi-select set → a tick list, stored as the comma string the compute already parses |
+
+**`nodelab_v2/picker.py` is Qt-free and holds the state machine and the maths** — what a
+gesture means, how plane pixels become microns, what value gets committed. The viewer owns
+only mouse events, painting and *sampling*, feeding sampled numbers in as a `probe`. That
+split is why every conversion is checked headlessly by `selftest.test_picking` rather than
+only by eye.
+
+**The image-surface contract is `getattr`-probed, so an omission is silent.** A surface must
+provide `plane_to_widget` / `widget_to_plane` / `refresh` / `overlay_cb`
+(`viewer.SURFACE_CONTRACT`), and the panel reaches all four through `getattr` because the
+backend is swapped at runtime (a GL failure falls back mid-session). `widget_to_plane` was
+first added to the CPU `_ImageView` only — so on the **GPU path, the default in a windowed
+session**, `_pick_plane_pt` returned `None` for every click and *every* on-image gesture did
+nothing at all, with no error. The offscreen tests all force `NODELAB_GL=0` and passed
+throughout. `check_surface_contract()` now gates both classes in the GUI probe, and the probe
+additionally drives one gesture with **real `QMouseEvent`s through the widget** — driving
+`session.press()` directly, which every other check does, is exactly what let a dead event
+path look healthy.
+
+`widget_to_plane` returns `None` **outside** the image rather than extrapolating: the picture
+is letterboxed in the viewport, and accepting margin clicks produced ROI shapes with negative
+vertices that rasterized to nothing.
+
+Three surfaces, keyed off `PickRequest.surface`:
+
+* **canvas** — an event filter on the image widget *and* its viewport (the two backends
+  deliver mouse events to different objects; consuming the press is also what stops the CPU
+  view's `ScrollHandDrag` panning, with no mode to set and restore). Wheel is deliberately
+  **not** consumed — zooming is part of aiming.
+* **histogram** — reads the live LUT window/gamma on Apply.
+* **instant** — commits from the viewer's cursor with no bar at all.
+
+Landmines this cost:
+
+* **Two pixel spaces.** A payload can arrive decimated, so `_disp_scale()` converts between
+  *displayed* and *axes* pixels. Every committed value is in the node's own full-resolution
+  space; the same `sx/sy` the overlay renderer uses, for the same reason.
+* **Calibration is the target node's propagated envelope**, not the source file's — a Crop or
+  Resample upstream changes what a pixel is worth. Uncalibrated files report pixels and the
+  readout **says so**; silently relabelling px as µm is the one failure mode here that
+  produces a wrong number with nothing on screen to show it.
+* **A peer with no declared unit inherits its partner's** (`PickRequest.unit_for`). Defaulting
+  to px made phase 2 of a pair silently wrong by the pixel size.
+* **A peer must be gated identically to its partner.** `analysis.histogram_threshold`'s
+  low/high are gated apart under `direction=below|above`, so they are *not* peers — co-picking
+  there would write a param the user cannot see. `test_picking` enforces this across every
+  mode-state product, for `pick_peer` pairs **and** `pick_bounds` groups.
+* **A bound group must be homogeneous** (one SocketType, one unit), enforced at registration.
+  That is what lets `PickSession` convert the whole group using the armed socket's own
+  type/unit instead of threading a per-name table through every call — the invariant makes the
+  simple code *correct*, not merely lucky. It is also why crop's lateral rect and its axial Z
+  range are two groups, not one: they are gated apart on the 2D/3D lever, and a rectangle
+  drawn on a plane says nothing about z.
+* **A group draws its affordance once**, on `bounds[0]` (`PickRequest.leads_group`) — four
+  identical "Drag the crop rectangle" buttons down the panel is worse than one. Every member
+  still advertises the gesture in hover text.
+* **`rect`'s release position wins** over the last mouse-move. With a real mouse they
+  coincide, but relying on that makes the committed window depend on how Qt coalesced the
+  drag. The bounds are a slice with an **exclusive** end, so the pick floors the starts and
+  ceils the ends: `[start:end]` then covers exactly the pixels drawn. An off-by-one here still
+  looks plausible in the pills, which is why the probe compares **pulled pixels** against the
+  source window rather than checking the four numbers.
+* **A pick is an ordinary edit**: `window._on_pick_committed` writes value + sticky pin, the
+  same two lines as `inspector._set_param`. There is no second kind of parameter value.
+
+### On-canvas parameter editing (V2.16) — `node_item.py`
+
+Value pills are painted, hit-tested controls (drag-scrub / click-to-type / toggle / mode menu
+/ `ƒmd` pin / `○` pick), not embedded widgets — a `QGraphicsProxyWidget` per parameter would
+cost a real widget per row on a canvas that repaints at 60 fps while wires animate.
+
+* `NodeItem.controls()` is **the single source of both the hit rects and the painted ones**;
+  geometry must therefore be derivable outside `paint()`. Add a control in one place only.
+* `mousePressEvent` consumes the event when it hits a control, which is also what stops
+  `ItemIsMovable` dragging the card — there is no drag mode to suppress and nothing that can
+  disagree.
+* A live scrub writes `rec.params` and repaints but **does not** call `doc.touch()`; the
+  release does it once. `touch()` re-propagates metadata across the whole graph, which is not
+  a per-mouse-move operation.
+* Pills are width-capped and elide (`_PILL_MAX_W`); before that a long string value ran
+  underneath its own row label.
+* Glyph coverage: the shipped Windows UI fonts have no `◎`/`▭`/`⬠`/`✎` — they render as tofu.
+  `PICK_GLYPH` is a plain `○`, the tool buttons are words, and the card's ring is painted with
+  `QPainter` rather than drawn from a font.
 
 ---
 
@@ -1010,6 +1407,26 @@ Each of these cost real debugging time. They are listed in the order they tend t
 * Never read `ctx.inputs[i].metadata[<calibration key>]` — that bypasses the fence and is a
   hard error under `strict_reads`. (Non-calibration provenance keys are the deliberate
   exception, §8.5.)
+
+**Ingest / the `nd2` seam**
+
+* **Never `import nd2` directly — go through `nodelab_v2.nd2_compat.import_nd2()`.** The SDK
+  has bugs that make a *healthy* file unopenable, and they fire from `ND2File.sizes`, i.e. at
+  file-pick time in the File menu, before a pixel is read. Live example (2026-08-03): a
+  Z-stack configured in ND Acquisition but acquired at a **single plane** has
+  `dZLow == dZHigh` and `dZStep == 0`, and `nd2 <= 0.11.3` divides by that zero range in
+  `_calc_zstack_home_index` → `ZeroDivisionError` on a 6.08 GB file that is otherwise perfect.
+  0.11.3 is the newest release, so there was nothing to upgrade to.
+* **A shim wraps upstream and only acts on the raised exception** — it never reimplements the
+  calculation. That is what makes patching a third-party parser safe: a file that loads today
+  is bit-for-bit unaffected, and the shim self-sunsets when a fixed release stops raising.
+  `nodegraph.selftest.test_nd2_zstack_home_index_guard` pins both halves.
+* **The import stays lazy and in-function.** `ingest.py` must remain importable, and its TIFF
+  half usable, with no SDK installed.
+* **A garbage value that the FILE carries is not a shim's business.** The same file reports an
+  `acquisition_start` of 7/31/2609 with a matching Julian day — the microscope PC's clock, not
+  a parse error. It is passed through, so `frame_time_jd` stays honest and `view.overlay`
+  refuses to place it rather than placing it wrongly. Relative `dt_s` is unaffected.
 
 **Graph / sockets**
 
@@ -1115,6 +1532,29 @@ first. The node owns the m/t/c loop; the kernel acts on one frame/volume.
   does shared-file edits (`nodes.py` registration, `selftest.py` wiring) sequentially.
 * **Never `pip install` unprompted; re-verify a backend's signature in-env before writing
   against it.**
+* **Validate a vendored external solver against ITS OWN test suite, then distrust that
+  suite's tolerances** (V2.18, `dic_correlate`/pyALDIC). Cloning upstream and replicating its
+  synthetic cases as a repo-side bench (`scripts/dic_synthetic_bench.py`) is what turned
+  "the node runs" into a number — and it settled three questions no amount of reading could:
+  which of our defaults are inert (displacement smoothing below 1e-3), which are the real
+  trade-off (subset size: 3.4× noise vs 5.3× resolution, at flat wall-clock), and that our
+  adapter was already as accurate as a direct upstream call. Two traps that generalize:
+  * **Upstream tolerances can be looser than the signal they test.** pyALDIC's shear and
+    rotation strain cases assert against tolerances *exceeding twice* the quantity measured,
+    so a fully sign-inverted strain cross term passed its suite for both of us. We found it
+    only by checking an **antisymmetric** field (a rotation, where `∂u/∂y` and `∂v/∂x` must
+    have opposite signs) against analytic truth. Pick discriminating fixtures, not just
+    fixtures that pass.
+  * **Upstream benchmarks may seed the answer.** Every pyALDIC synthetic case passes `U0=`
+    the exact ground truth as the initial guess, so its quoted ~0.005 px is a
+    converged-from-truth floor, not a field number. Read what the harness *gives* the solver
+    before quoting what the solver achieves.
+  * And **an audit's severity ratings need the same verification as its findings**: of the
+    salvaged reports here, the "high severity, expose this param" item turned out to be
+    largely self-healing in the library (the FFT search radius auto-expands and is remembered
+    per reference), and the recommended `qfactor` fix was not implementable at all —
+    `cc_max` never reaches `PipelineResult`. Both were caught by opening the source, not by
+    re-reading the report.
 
 ---
 
@@ -1123,16 +1563,47 @@ first. The node owns the m/t/c loop; the kernel acts on one frame/volume.
 Nothing is blocking; these are the honest edges.
 
 * **No v1 importer.** `.nd2s_pipeline.json` files cannot be opened, by decision (2026-07-29).
-* **Computed-provider pyramids** deferred (`StreamProvider.levels == 1`); the Viewer
-  stride-decimates full-res.
+* **Computed-provider pyramids** deferred (`StreamProvider.levels == 1`) with **two
+  exceptions**, each allowed for its own reason and each keeping level 0 exact:
+  `MultiViewProvider`, because a paste of downsampled tiles *is* the downsampled paste
+  (§11 amendment), and `_AxisReduceProvider` (V2.20), because a z/t fold is *orthogonal* to
+  an xy mean-pool — `sum`/`mean` commute with it exactly, `max`/`min`/`median` deviate only
+  by the xy variation inside one `2**L` block and only in the smoother direction (measured
+  on bead fixtures: ~0–1% of the display range mean, ≤8% peak at level 3, at point-source
+  cores). Both are safe on the same invariant, verified repo-wide: the only callers that pass
+  `level > 0` are the three display reads in `nodelab_v2.runner`. Every node compute,
+  `realize`, the checkpoint writer and every export read level 0.
+  Either way, a computed intermediate *upstream* still has no pyramid, so a stitch or a
+  projection placed after an enhancement loses the coarse levels and its full-res display
+  cost returns.
+* **`plane_unit` is a cost contract, not an optimization** (V2.20). A level whose compute unit
+  is a whole plane must say so, and a level that decomposes its output into tiles must ask its
+  base for whole planes when the base says that. Getting this wrong is invisible in every
+  correctness test — the pixels stay right — and shows up only as a multiplier: `util.zproject`
+  over `util.stitch` cost `n_output_tiles × Z × n_positions` source-plane reads instead of
+  `Z × n_positions`, i.e. ~350× on a 26×26-tile mosaic, which is why "Max Z onto a stitch"
+  read as a hang. `test_zproject_over_stitch` asserts the read COUNT, not just the bytes.
+* **Viewport detail-on-demand** (2026-07-31) closes the other half: the Viewer's overview is
+  capped at `runner.MAX_DISPLAY_DIM` and zoom is a pure view transform over that texture, so
+  the cap used to be the only resolution a mosaic ever got. Zooming now re-reads the visible
+  rect off the GUI thread (`EngineRunner.request_detail` → `_DetailJob` → `detail_ready`) and
+  both surfaces draw it over the overview (`SURFACE_CONTRACT`: `set_detail`/`clear_detail`/
+  `visible_rect01`/`view_changed`). `MultiViewProvider` serves such a window by stitching
+  ONLY the tiles it touches, which is what makes a level-0 patch affordable. Display-only by
+  construction and asserted so (probe §V3). **Known gap:** the offscreen probe runs the CPU
+  surface, so the GL second-quad draw is structurally checked but not pixel-verified.
 * **`Engine._entry` is recursive**, papered over with `recursion_headroom` for deep unrolled
   chains; an iterative rewrite is a follow-up.
 * **Some bridge hops still raise**: Track↔Timepoint (member×t) and Frame→structure broadcast —
   call `bridges` directly.
 * **Structure-domain field transfer** is deferred (the field IR transfers lattice attributes
   only).
-* **Stitching / multi-view fusion**: the `stitch` meta_transform exists, but `MULTI_VIEW` has
-  no node and needs a real registration backend.
+* **Stitching / multi-view fusion**: closed — `util.stitch` is the first `MULTI_VIEW` node
+  (M→1 mosaic from the file's stage log, optional phase-correlation refinement, four blends;
+  streams one canvas plane at a time via `MultiViewProvider`). Still open beneath it:
+  *non-rigid* multi-view fusion (BigStitcher/multiview-stitcher-class deformable warping)
+  and re-addressing a structure table across a stitch — `util.stitch` refuses a Dataset
+  carrying one rather than leaving its objects at tile-grid coordinates.
 * **No conditional-branch node** (`if_else`); zones and groups exist, branching does not.
 * **Capability declared obsolete with v1** (`V2.05` §6): four enhancement extras (bleach,
   blob-subtract, spatial-flatness, temporal-fold), cell-tracker spatial maps, DIC mesh

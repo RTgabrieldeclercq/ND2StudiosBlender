@@ -47,7 +47,10 @@ looking up facts in the repo yourself). Walk this decision tree in dependency or
    invisible in the GUI), and every socket must be read by some path. If it names an
    attribute **layer**, decide its direction and domain now — `layer_in=<Domain>` to select
    an existing layer, `layer_out=(<Domain>,…)` to name one this node creates (a tuple: one
-   name can land in two domains). See `wire-node-v2` §4b/§4c — this is a hard gate below. Which have an optical basis (spot size, blur σ,
+   name can land in two domains). If it is a **filesystem path**, declare
+   `path_kind="open_file"|"save_file"|"directory"` (+ `path_filter`/`path_hint`) so the
+   inspector offers a **Browse…** dialog instead of demanding a hand-typed path —
+   `wire-node-v2` §4d. See `wire-node-v2` §4b/§4c — this is a hard gate below. Which have an optical basis (spot size, blur σ,
    min area) → a `derive`. Anisotropic ones get a 3D-only `_z` companion socket
    (`available_in={"dim": frozenset({"3D"})}`, `unit="um_axial"`). **If the node has a
    non-dim `Mode`, gate every param only one branch reads** — `available_in` keys on any
@@ -195,6 +198,52 @@ scipy/skimage-free.
       It runs inside `propagate_meta` on every keystroke, so it must be **total** (never
       raise). Without it the GUI's layer picker will not offer your node's output
       downstream.
+
+- [ ] **EVERY PARAM SOCKET HAS A `description`** (enforced by
+      `selftest::test_socket_docs`, which fails the build). This is the GUI's hover text —
+      the inspector row and the node-card port both render it via
+      `nodelab_v2.node_item.socket_hover_text`. A socket with no description is a control
+      the user can move but cannot interpret, which is the same defect as clause (2) of the
+      socket contract wearing a different hat.
+
+      **Write the EFFECT, not the type.** The reader can already see the name, the type and
+      the unit — the GUI prints those on the first line for free. What they cannot see is
+      which way to turn it and what happens to their numbers. Three rules:
+      * **Say which direction does what**, in the user's terms: "LOWER finds more cells and
+        more false positives", "shrinks every cell by ~1 px, which lowers reported areas".
+      * **Say if it moves a MEASUREMENT.** Anything that changes an area/volume/intensity a
+        downstream table reports must say so — that is the difference between a cosmetic
+        knob and one that silently rewrites the results.
+      * **Say when it is inert.** If the param is only read on some branch ("only read when
+        Tiled inference is on"), say that, or the user will tune a dead control.
+      Note the value where it is load-bearing (a library default, a paper's value) and flag
+      a disagreement between them. Do not restate the label ("the box threshold"), and do
+      not document a unit conversion the `unit=` field already shows.
+
+      **Exempt: params whose meaning lives in an external paper or repo.** A description
+      you cannot verify is worse than none — it reads as authoritative and is wrong. If the
+      param is a knob of a vendored external algorithm (an augmented-Lagrangian solver's
+      `mu`/`tol`, a published tracker's topology weights, another project's model
+      thresholds), add it to `selftest::_SOCKET_DOC_EXEMPT` **with the reason**, and only
+      describe it once you have read that algorithm's own documentation. Code vendored from
+      *this project's* history is NOT exempt — it is in the repo, so it is readable.
+
+- [ ] **EVERY DROPDOWN DOCUMENTS EVERY OPTION** (enforced by
+      `selftest::test_option_docs`, which fails the build). A `description` describes the
+      control; it cannot tell the user what separates `otsu` from `li`, which is the entire
+      question a menu asks. So each `Mode` carries a `description` **and** `choice_docs`
+      (`{choice: prose}`), and so does every `choices` / `vocab` socket.
+
+      **Write each option RELATIVE to its siblings:** what it assumes about the data, which
+      way the result moves, what it costs, and what it needs that the others do not (a
+      track column, a raster, a model download) — including when it is refused outright.
+      60 chars is the floor, not the target.
+
+      Do NOT re-write the canned vocabularies: `DimMode()` already carries the 2D/3D
+      lever's docs, and `domains.domain_docs(names)` / `reducers.reducer_docs(names)` serve
+      the domain and reducer menus. Registration refuses a `choice_docs` key matching no
+      option, a blank explanation, and a Mode `default` outside its own `choices`.
+      Memo-neutral, exactly like `description`. See wire-node-v2 §4e.
 
 If a spatial param would ship in raw pixels: STOP — give it `unit`/`derive` or justify
 scale-invariance in the docstring.

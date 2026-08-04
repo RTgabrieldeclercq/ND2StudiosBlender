@@ -142,6 +142,67 @@ def value_rescaled(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEn
     return env.with_metadata(bit_depth=None)
 
 
+def flatten_field(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``enhance.flatten_field``: only the ``ratio`` method leaves the count scale behind.
+
+    Three of the four methods return the image with a background removed or rebalanced —
+    still counts, still inside the declared range — so ``bit_depth`` survives. ``ratio``
+    divides the image BY its background, which is dimensionless and centred near 1: a raw-
+    count consumer downstream (a fixed threshold, a full-range γ) would be badly wrong to
+    read the sensor depth after it, so the key is dropped exactly as
+    :func:`value_rescaled` does for a percentile Normalize (§7c).
+
+    Axis-preserving either way — only the meaning of the numbers can change."""
+    return (env.with_metadata(bit_depth=None)
+            if (modes or {}).get("method") == "ratio" else env)
+
+
+# ── spatial provenance: WHERE the data is (origin_um) ──────────────────────────
+#
+# The companion rule to the intensity one above. `pixel_size_um` says how finely the data
+# is sampled; `origin_um` says where that sampling starts on the microscope. Only two
+# transforms move it — a crop (the cut corner becomes the new corner) and a stitch (the
+# mosaic's corner is the union's) — and the rest MUST leave it alone. In particular a
+# resample must not scale it: the field occupies the same patch of stage whether you
+# sample it at 0.29 or 1.72 µm/px, and scaling here would double-count the change the
+# transform already made to `pixel_size_um` (the V2.03 §2 A2 trap).
+
+def read_origin_um(env: MetaEnvelope) -> Optional[List[List[float]]]:
+    """``origin_um`` as a list of ``[z, y, x]`` triples, or ``None`` when unusable.
+
+    Validated rather than trusted: a list that does not cover every multipoint is dropped
+    whole, because `origin_um[m]` is addressed by INDEX and a short list silently reports
+    some other position's corner — the same rule (and the same reason) as the stage logs in
+    :func:`nodelab_v2.nd2_meta.read_nd2_metadata_extended`.
+    """
+    raw = env.metadata.get("origin_um")
+    if not isinstance(raw, (list, tuple)) or len(raw) < max(1, env.axes.m):
+        return None
+    out: List[List[float]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return None
+        try:
+            out.append([float(item[0]), float(item[1]), float(item[2])])
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
+                    dx: float = 0.0) -> Dict[str, Any]:
+    """``{"origin_um": moved}`` for a transform that cuts into the field, else ``{}``.
+
+    ``{}`` (not ``{"origin_um": None}``) when the key is absent, so a file that never had a
+    position log is left alone rather than gaining a key that says "unknown" where nothing
+    was ever claimed.
+    """
+    origins = read_origin_um(env)
+    if origins is None:
+        return {}
+    return {"origin_um": [[o[0] + dz, o[1] + dy, o[2] + dx] for o in origins]}
+
+
 def resample(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """Rescale: new size = old·scale; pixel size scales inversely (finer when
     upsampling). ``z`` scales only in 3D mode (stack-of-2D leaves z untouched)."""
@@ -164,7 +225,18 @@ def resample(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope
 def z_project(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """Collapse Z→1; drop ``z_step_um`` and mark ``z_collapsed`` provenance so a
     downstream lever defaults to 2D and no metric reads a meaningless z step. A ``sum``
-    projection also widens ``bit_depth`` (n_z summed samples), per :func:`bit_depth_after_sum`."""
+    projection also widens ``bit_depth`` (n_z summed samples), per :func:`bit_depth_after_sum`.
+
+    ``method == "none"`` is the RESET (V2.21): the node hands its input through untouched,
+    so the envelope is returned **verbatim** — Z survives at its full extent, ``z_step_um``
+    survives, and no ``z_collapsed`` is stamped, which is what lets a downstream lever go
+    back to defaulting 3D. It deliberately does not stamp ``z_collapsed=False``: absent and
+    False are not the same claim, and rewriting the key would erase a genuine upstream
+    collapse (a project → reset chain still happened). The literal is duplicated in
+    ``util.zproject``'s compute, whose payload must agree with this prediction for every
+    method — ``selftest::test_catalog_ported`` asserts the agreement per method."""
+    if modes.get("method") == "none":
+        return env
     widen = (bit_depth_after_sum(env, env.axes.z)
              if modes.get("method") == "sum" else {})
     return (env.with_axes(replace(env.axes, z=1))
@@ -215,22 +287,60 @@ def parse_channels(raw) -> Optional[List[int]]:
     return items or None
 
 
+#: EVERY metadata key that is a **list indexed by channel**. A node that narrows or
+#: reorders the channel axis must subset all of them together or the survivors stop
+#: describing the channels that are left — and because they are read POSITIONALLY
+#: (``names[c]``), a stale full-length list does not look stale, it looks like the wrong
+#: channel. That was the ch1-tap bug (2026-08-03): only ``channel_emission_nm`` was
+#: subset, so a tap on channel 1 kept ``channel_names == ["DAPI", "GFP"]`` with ``c == 1``
+#: and every positional reader — the Viewer's channel strip, the card's socket labels, the
+#: hover readout — reported it as "DAPI", the FIRST channel's name, on both branches.
+#:
+#: Only ``channel_emission_nm`` is calibration (:data:`~nodegraph.dataset.CALIBRATION_KEYS`);
+#: the rest are the Viewer's per-channel display lists, seeded onto the payload by
+#: :attr:`nodelab_v2.runner.EngineRunner._channel_display`. They travel together, so they
+#: are subset together.
+PER_CHANNEL_KEYS: Tuple[str, ...] = (
+    "channel_emission_nm", "channel_names",
+    "channel_excitation_nm", "channel_colors",
+)
+
+
+def channel_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
+    """The ``{key: subset}`` changes that reindex every :data:`PER_CHANNEL_KEYS` list in
+    ``metadata`` onto the channels ``keep`` (already validated indices, in output order).
+
+    SHARED by the ``channel_select`` meta_transform and ``channel.select``'s compute so the
+    predicted envelope and the produced payload cannot drift (build-node-v2 §2) — the same
+    contract :func:`parse_channels` has for the index list itself. A key that is absent, or
+    not a list, is left alone rather than invented."""
+    changes: Dict[str, Any] = {}
+    for key in PER_CHANNEL_KEYS:
+        vals = metadata.get(key)
+        if isinstance(vals, (list, tuple)):
+            changes[key] = [vals[i] for i in keep if i < len(vals)]
+    return changes
+
+
 def channel_select(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
-    """Subset/reindex channels; rewrite the per-channel emission list in lockstep.
+    """Subset/reindex channels; rewrite every per-channel list in lockstep.
 
     Out-of-range / negative indices are dropped FIRST, so the channel count and the
-    emission list always agree (review #13: len(keep) could otherwise claim more
+    per-channel metadata always agree (review #13: len(keep) could otherwise claim more
     channels than the source has)."""
     keep = parse_channels(params.get("channels"))
     if not keep:
         return env
     valid = [i for i in keep if 0 <= i < env.axes.c]     # lockstep count ↔ metadata
+    if not valid:
+        # A non-empty request that matches nothing is a user error the COMPUTE refuses
+        # (``_compute_select_channel``). This transform must stay total — it re-runs on
+        # every keystroke, so "0," and "1" are both seen while someone types "10" — hence
+        # the pre-edit envelope is held rather than predicting a c=0 Dataset. Same division
+        # of labour as ``crop``: the advisory transform degrades, the payload raises.
+        return env
     new_axes = replace(env.axes, c=len(valid))
-    changes: Dict[str, Any] = {}
-    emis = env.metadata.get("channel_emission_nm")
-    if isinstance(emis, (list, tuple)):
-        changes["channel_emission_nm"] = [emis[i] for i in valid if i < len(emis)]
-    return env.with_axes(new_axes).with_metadata(**changes)
+    return env.with_axes(new_axes).with_metadata(**channel_subset(env.metadata, valid))
 
 
 def crop(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
@@ -254,7 +364,22 @@ def crop(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
         x=span(params.get("x0"), params.get("x1"), ax.x),
         z=(span(params.get("z0"), params.get("z1"), ax.z)
            if modes.get("dim") == "3D" else ax.z))
-    return env.with_axes(new_axes)
+
+    # The origin MOVES by the cut — this is the transform the "origin deferred" note in
+    # this docstring was waiting for. `lo` mirrors `span`'s clamping exactly (same
+    # start-fill, same range clamp) so the predicted corner matches the payload's for
+    # one-sided and out-of-range crops alike, and the offset is in µm via the INPUT's
+    # sampling (a crop does not change pixel size, so no ordering subtlety arises).
+    def lo(a, n):
+        return max(0, min(int(a), n)) if a is not None else 0
+
+    px = env.metadata.get("pixel_size_um")
+    zs = env.metadata.get("z_step_um")
+    dy = lo(params.get("y0"), ax.y) * float(px) if px else 0.0
+    dx = lo(params.get("x0"), ax.x) * float(px) if px else 0.0
+    dz = (lo(params.get("z0"), ax.z) * float(zs)
+          if (zs and modes.get("dim") == "3D") else 0.0)
+    return env.with_axes(new_axes).with_metadata(**shift_origin_um(env, dz, dy, dx))
 
 
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
@@ -268,14 +393,55 @@ def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     if not nx:
         unknown.add("x")
     new_axes = replace(ax, m=1, y=int(ny) if ny else ax.y, x=int(nx) if nx else ax.x)
-    return env.with_axes(new_axes, unknown=frozenset(unknown))
+    # M→1, so the mosaic's single origin is the UNION corner: the minimum over the tiles
+    # that went into it, which is exactly what `_stitch_normalize` places at canvas (0, 0).
+    origins = read_origin_um(env)
+    changes: Dict[str, Any] = {}
+    if origins:
+        changes["origin_um"] = [[min(o[0] for o in origins),
+                                 min(o[1] for o in origins),
+                                 min(o[2] for o in origins)]]
+    return env.with_axes(new_axes, unknown=frozenset(unknown)).with_metadata(**changes)
+
+
+def overlay(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``view.overlay``: identity in ``display`` mode, **C+1** in ``resample`` mode.
+
+    Exactly ONE channel, and that is a design consequence rather than a simplification. A
+    ``meta_transform`` is handed only the PRIMARY edge's envelope (``propagate_meta`` reads
+    ``dataset_preds[0]``), so it cannot see how many channels the secondary has — and an
+    axis this pass cannot predict would have to be marked UNKNOWN, the way ``stitch`` marks
+    its extent. Baking one user-chosen channel instead keeps the prediction exact, which is
+    what the whole edit-time widget re-seed depends on, and it is also the useful shape: you
+    co-register the channel you are going to measure against, not the whole other file.
+
+    ``bit_depth`` is DROPPED. The output stacks two files' intensity scales, and this pass
+    cannot see the second one to check whether they agree, so asserting the primary's depth
+    over the pair would be a claim about data it never read. Absent is the honest signal
+    (§7c) and every consumer already handles it.
+
+    ``channel_names`` grows in lockstep so the Viewer's channel strip and any name-based
+    consumer stay correct; the real name is filled in by the compute, which CAN see the
+    secondary, and this pass supplies a placeholder of the right LENGTH — the count is what
+    downstream logic indexes by.
+    """
+    if (modes or {}).get("output") != "resample":
+        return env
+    ax = env.axes
+    names = list(env.metadata.get("channel_names") or [])
+    while len(names) < ax.c:
+        names.append(f"Ch{len(names) + 1}")
+    names.append("overlay")
+    return (env.with_axes(replace(ax, c=ax.c + 1))
+               .with_metadata(bit_depth=None, channel_names=names))
 
 
 META_TRANSFORMS: Dict[str, MetaTransform] = {
+    "overlay": overlay,
     "identity": identity, "resample": resample, "z_project": z_project,
     "stack_time": stack_time, "frame_slice": frame_slice,
     "channel_select": channel_select, "crop": crop, "stitch": stitch,
-    "value_rescaled": value_rescaled,
+    "value_rescaled": value_rescaled, "flatten_field": flatten_field,
 }
 
 
@@ -448,6 +614,7 @@ __all__ = [
     "MetaEnvelope", "MetaTransform", "META_TRANSFORMS", "named_meta_transform",
     "identity", "resample", "z_project", "stack_time", "frame_slice",
     "channel_select", "crop", "stitch", "value_rescaled", "bit_depth_after_sum",
-    "propagate_meta", "envelope_symbols",
+    "propagate_meta", "envelope_symbols", "parse_channels",
+    "PER_CHANNEL_KEYS", "channel_subset",
     "eval_derive", "resolve_dim_default",
 ]

@@ -16,6 +16,29 @@ Only the two functions v2 actually calls came across — the v1 ``ND2Metadata`` 
 the pixel loaders, the Z-projection helper, and the JSON sidecar cache stayed behind with
 v1 (v2 reads pixels via :func:`nodelab_v2.ingest.read_nd2` / ``nd2.to_dask()`` and caches
 through the engine memo instead).
+
+**Additions (2026-07-31) — the placement vocabulary.** Overlaying two FILES needs each
+one's absolute position on the microscope, and four fields the vendored parse left on the
+floor turned out to be present in the lab's real ND2s all along. Nothing existing was
+rewritten; these are extra reads beside it:
+
+* ``stage_z_um`` — per-multipoint focal Z. It was already read, but only inside the
+  ``frame_metadata`` FALLBACK branch, which never runs when ``f.experiment`` supplies the
+  XY loop — so it came back ``[]`` on every file whose positions were planned. The
+  ``XYPosLoop`` points carry ``z`` themselves, so it now costs nothing.
+* ``frame_time_jd`` — per-timepoint ``absoluteJulianDayNumber``. ``frame_timestamps_s`` is
+  ``relativeTimeMs``, whose ORIGIN is per-file: on the WellA3 pair the two relative clocks
+  start 1207.3 s apart, so comparing them across files is meaningless. The Julian day is
+  the only common clock, and it is what says GFP[k] was acquired 2415 s after 640[k].
+* ``z_home_index`` / ``z_bottom_to_top`` — the ``ZStackLoop`` anchoring. ``stagePositionUm.z``
+  is CONSTANT along a stack (it is the position's nominal focus, not the per-slice piezo
+  reading), so without knowing which slice that nominal Z names, a stack cannot be placed in
+  absolute Z at all. ``homeIndex=0, bottomToTop=True, stepUm=0.288`` puts slice *k* of the
+  WellA3 640 stack at ``5971.96 + k*0.288`` µm, which is what reveals that the GFP plane at
+  5999.74 µm falls INSIDE that stack, at slice ≈96 of 210.
+* ``bit_depth`` — the significant sensor depth (12 on these files, not 16).
+  :func:`nodelab_v2.ingest.read_calibration` already read it separately off
+  ``f.attributes``; reporting it here too keeps the two readers from disagreeing.
 """
 from __future__ import annotations
 
@@ -42,10 +65,24 @@ def read_nd2_metadata_extended(filepath):
         objective_name, objective_magnification, objective_na,
         objective_immersion, binning_x, binning_y,
         camera_name, microscope_name,
-        acquisition_start, frame_timestamps_s,
-        stage_xy_um, stage_z_um, loops
+        acquisition_start, frame_timestamps_s, frame_time_jd,
+        stage_xy_um, stage_z_um, stage_layout_source,
+        z_home_index, z_bottom_to_top, bit_depth, loops
+
+    ``stage_z_um`` / ``frame_time_jd`` / ``z_home_index`` / ``z_bottom_to_top`` /
+    ``bit_depth`` are the placement vocabulary described in the module docstring. Every one
+    of them is best-effort: a file that does not carry it gets an empty list or ``None``,
+    never a fabricated value, because absence is what the consumers test for before they
+    offer an absolute coordinate.
     """
-    import nd2
+    # The one edit to this vendored file: the bare `import nd2` goes through the shim door
+    # (:mod:`nodelab_v2.nd2_compat`) so a file the SDK's own parser cannot open — a
+    # zero-range ZStackLoop divides by zero in nd2 <= 0.11.3 — reaches this reader at all.
+    # It must be HERE and not only in the caller: `read_calibration` calls this function
+    # BEFORE its own nd2 import, so this is the first ND2File opened on a calibration read.
+    # Not a re-derivation of the parse below, which stays verbatim.
+    from nodelab_v2.nd2_compat import import_nd2
+    nd2 = import_nd2()
 
     out = {"filepath": filepath}
     with nd2.ND2File(filepath) as f:
@@ -130,9 +167,19 @@ def read_nd2_metadata_extended(filepath):
                 idx = idx * sizes.get(d, 1) + int(coords.get(d, 0))
             return idx
 
-        def _read_xy_from_experiment() -> List[Tuple[float, float]]:
-            """Read planned stage XY positions from f.experiment (XYPosLoop)."""
+        def _read_xy_from_experiment():
+            """Planned stage positions from ``f.experiment`` (XYPosLoop) →
+            ``(xy_pairs, z_values)``.
+
+            The Z rides on the very same ``Position.stagePositionUm`` the XY comes from, so
+            collecting it here is free — and it is the ONLY route on a file whose positions
+            were planned, because the per-frame fallback below never runs then. ``z`` is
+            gathered positionally: a point that has XY but no Z contributes ``None``, and
+            the completeness check after the call drops a partial list rather than letting
+            index *m* address the wrong position's focus.
+            """
             pts: List[Tuple[float, float]] = []
+            zs: List = []
             for loop in (_safe(lambda: f.experiment, default=[]) or []):
                 ltype = str(_safe(lambda lp=loop: lp.type) or "")
                 if "XYPos" not in ltype:
@@ -143,20 +190,19 @@ def read_nd2_metadata_extended(filepath):
                 for pt in points:
                     sx = _safe(lambda p=pt: float(p.stagePositionUm.x))
                     sy = _safe(lambda p=pt: float(p.stagePositionUm.y))
+                    sz = _safe(lambda p=pt: float(p.stagePositionUm.z))
                     if sx is not None and sy is not None:
                         pts.append((sx, sy))
+                        zs.append(sz)
                 if pts:
-                    return pts
-            return []
+                    return pts, zs
+            return [], []
 
         # 1) Per-M stage positions — try f.experiment XYPosLoop first, then
         #    fall back to frame_metadata() per-M (which requires correct flat-
         #    index arithmetic). The experiment loop is the authoritative planned
         #    positions; frame_metadata is the actual per-frame readback.
-        stage_xy: List[Tuple[float, float]] = []
-        stage_z: List[float] = []
-
-        stage_xy = _read_xy_from_experiment()
+        stage_xy, stage_z = _read_xy_from_experiment()
         xy_source_method = "experiment" if stage_xy else "frame_metadata"
 
         if not stage_xy and m_axis is not None:
@@ -176,8 +222,10 @@ def read_nd2_metadata_extended(filepath):
                 sy = _safe(lambda p=pos: float(p.stagePositionUm.y))
                 sz = _safe(lambda p=pos: float(p.stagePositionUm.z))
                 if sx is not None and sy is not None:
+                    # z appended INSIDE the xy guard (possibly None), so index m addresses
+                    # the same position in both lists — appending it separately let a
+                    # position with z but no xy slide every later focus by one.
                     stage_xy.append((sx, sy))
-                if sz is not None:
                     stage_z.append(sz)
         elif not stage_xy:
             # Single-M file — record one nominal position from frame 0.
@@ -190,13 +238,33 @@ def read_nd2_metadata_extended(filepath):
                 if pos is not None:
                     sx = _safe(lambda p=pos: float(p.stagePositionUm.x))
                     sy = _safe(lambda p=pos: float(p.stagePositionUm.y))
+                    sz = _safe(lambda p=pos: float(p.stagePositionUm.z))
                     if sx is not None and sy is not None:
                         stage_xy.append((sx, sy))
+                        stage_z.append(sz)
 
         n_xy_from_stage = len(stage_xy)
 
-        # 2) Per-T frame timestamps.
+        # A focus list that does not cover every multipoint, or that has a hole in it, is
+        # DROPPED rather than carried: `stage_z_um[m]` is addressed by index, so a short or
+        # gappy list silently reports some other position's focus. Same rule as
+        # `nodegraph.nodes._stitch_stage_xy` applies to the XY log, and for the same reason
+        # — a partial answer here looks exactly like a complete one.
+        if len(stage_z) != n_m or any(v is None for v in stage_z):
+            stage_z = []
+        else:
+            stage_z = [float(v) for v in stage_z]
+
+        # 2) Per-T frame times — the per-file RELATIVE clock and the absolute one.
+        #
+        # `relativeTimeMs` is measured from each file's own origin, so two files' values are
+        # NOT comparable: on the WellA3 pair the origins sit 1207.3 s apart, which makes a
+        # naive cross-file "nearest timestamp" match land a whole acquisition cycle off.
+        # `absoluteJulianDayNumber` is the shared wall clock and the only honest basis for
+        # matching T across files; both are carried so a within-file consumer (dt_s) keeps
+        # the cheap one.
         frame_ts: List[float] = []
+        frame_jd: List[float] = []
         for t in range(n_t):
             coords = {"T": t, "Z": 0, "C": 0}
             if m_axis is not None:
@@ -211,6 +279,14 @@ def read_nd2_metadata_extended(filepath):
             )
             if ts is not None:
                 frame_ts.append(ts / 1000.0)
+            jd = _safe(
+                lambda meta=fm: float(meta.channels[0].time.absoluteJulianDayNumber))
+            if jd is None:
+                jd = _safe(lambda meta=fm: float(meta.absoluteJulianDayNumber))
+            if jd is not None:
+                frame_jd.append(jd)
+        if len(frame_jd) != n_t:
+            frame_jd = []            # partial clock is no clock — same rule as stage_z
 
         if n_xy_from_stage == n_m and n_m > 0:
             stage_layout_source = f"stage_xy:{xy_source_method}"
@@ -220,10 +296,46 @@ def read_nd2_metadata_extended(filepath):
             stage_layout_source = "missing"
 
         out["frame_timestamps_s"] = frame_ts
+        out["frame_time_jd"] = frame_jd
         out["stage_xy_um"] = stage_xy
         out["stage_z_um"] = stage_z
         out["stage_layout_source"] = stage_layout_source
-        out["acquisition_start"] = ""
+
+        # 3) Z-stack anchoring. `stagePositionUm.z` is CONSTANT down a stack — it is the
+        # position's nominal focus, not a per-slice reading — so on its own it cannot say
+        # where slice k sits. The ZStackLoop supplies the missing half: `homeIndex` is the
+        # slice that nominal Z names, and `bottomToTop` its direction, giving
+        #     z_um(k) = stage_z_um[m] + (k - home) * z_step_um     (bottomToTop)
+        # Absent (a file with no Z loop, or an SDK that did not fill it in) both stay None
+        # and a consumer must decline to place the stack rather than assume slice 0.
+        z_home = None
+        z_b2t = None
+        for lp in (_safe(lambda: f.experiment, default=[]) or []):
+            if "ZStack" not in str(_safe(lambda q=lp: q.type) or ""):
+                continue
+            z_home = _safe(lambda q=lp: int(q.parameters.homeIndex))
+            z_b2t = _safe(lambda q=lp: bool(q.parameters.bottomToTop))
+            break
+        out["z_home_index"] = z_home
+        out["z_bottom_to_top"] = z_b2t
+
+        # 4) Significant sensor depth (12 on the lab's files, not the 16 bits it occupies).
+        # `nodelab_v2.ingest.read_calibration` reads this off `f.attributes` itself; it is
+        # reported here too so the two readers cannot disagree about the same file.
+        attrs = _safe(lambda: f.attributes)
+        bits = None
+        if attrs is not None:
+            for name in ("bitsPerComponentSignificant", "bitsPerComponentInMemory"):
+                bits = _safe(lambda n=name: int(getattr(attrs, n, None)))
+                if bits:
+                    break
+        out["bit_depth"] = bits or None
+
+        # The human-readable acquisition date, straight from the text block. Second
+        # resolution and free-form, so it labels a readout but never drives arithmetic —
+        # `frame_time_jd` is the field to compute with.
+        out["acquisition_start"] = str(
+            _safe(lambda: (f.text_info or {}).get("date")) or "")
         out["loops"] = [
             {
                 "type": str(_safe(lambda lp=lp: lp.type) or ""),

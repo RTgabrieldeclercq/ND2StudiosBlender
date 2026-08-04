@@ -93,6 +93,28 @@ CALIBRATION_KEYS: frozenset = frozenset({
     # (cropping or resampling does not change the sensor), so identity pass-through is
     # correct and no transform needs to touch it.
     "bit_depth",
+    # ``origin_um`` (2026-07-31) — WHERE the data is, as opposed to how finely it is
+    # sampled. A list of ``[z, y, x]`` µm triples, one per multipoint: the microscope-frame
+    # coordinate of the minimum corner of voxel ``(m, 0, 0, 0)``. Per-M and therefore a
+    # LIST, like ``channel_emission_nm``; ``_canon`` encodes containers injectively, so it
+    # fences through the memo exactly like a scalar.
+    #
+    # It is calibration rather than payload provenance precisely BECAUSE it must survive
+    # transforms: ``stage_xy_um`` describes where the camera was and stops describing the
+    # data the moment a node crops it, which is why the hover readout drops the stage line
+    # after a crop. ``origin_um`` is the maintained version — crop adds the cut offset,
+    # stitch takes the union corner, and every other transform preserves it (a resample
+    # changes the sampling, not where the field is; scaling it there would double-count the
+    # change the meta_transform already made — V2.03 §2 A2).
+    #
+    # Convention: +index runs along +µm. Camera handedness (``flip_x``/``flip_y``) is a
+    # SAMPLING property that no file records, so it stays where ``util.stitch`` already
+    # keeps it — at the point pixels are fetched — and never enters the envelope.
+    #
+    # ABSENT means "cannot be placed", and that is load-bearing: a node that moves content
+    # under a fixed index grid (drift/stabilize) drops the key rather than leave a claim it
+    # cannot honour, and the overlay reports that instead of drawing something plausible.
+    "origin_um",
 })
 
 
@@ -127,7 +149,19 @@ class AttributeLayer:
         # reflects writes through its base, review #5) OR if it is a writeable array we
         # were handed by reference (``a is self.values`` — freezing it would freeze the
         # caller's array). An owned, non-view array is safe to freeze in place.
-        a = np.asarray(self.values)
+        a = self.values
+        # A read-only ``np.memmap`` is the one array that must NOT be copied (V2.18): it
+        # is how a docked checkpoint serves a full-size Voxel layer for free
+        # (:func:`nodegraph.checkpoint.open_checkpoint` maps a ``.npy`` rather than
+        # loading it), so copying would materialize the very raster the dock exists to
+        # keep out of RAM — a 6-D mask, silently, on open. It also cannot alias anyone:
+        # the mapping is opened read-only by the checkpoint reader and handed straight
+        # here, and the OS page cache — not this process — owns the pages. Note
+        # ``np.asarray`` would strip the memmap subclass, so the check comes first.
+        if isinstance(a, np.memmap) and not a.flags.writeable:
+            object.__setattr__(self, "values", a)
+            return
+        a = np.asarray(a)
         if a.base is not None or (a.flags.writeable and a is self.values):
             a = a.copy()
         a.flags.writeable = False

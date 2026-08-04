@@ -105,18 +105,46 @@ def _patch_windows_symlink() -> None:
     os.symlink = _symlink_or_copy
 
 
-def get_stardist_model(model_name: str = "2D_versatile_fluo", disable_gpu: bool = False):
-    """Get or load the StarDist model (singleton)."""
+def get_stardist_model(model_name: str = "2D_versatile_fluo", disable_gpu: bool = False,
+                       *, dim: int = 2, model_path: str = ""):
+    """Get or load the StarDist model (singleton).
+
+    ``dim`` picks ``StarDist2D`` vs ``StarDist3D`` (V2.13 — the 3D lever). ``model_path``
+    loads a LOCALLY TRAINED model directory instead of a pretrained name, which is not a
+    nicety in 3D: ``3D_demo`` is the only 3D model StarDist registers and it is a demo, so
+    real volumetric work means training your own (Weigert et al., WACV 2020) and pointing
+    here at it. csbdeep's convention for that is ``StarDist3D(None, name=<dir>,
+    basedir=<parent>)``.
+
+    The singleton key includes ``dim`` and the path, so a 2D and a 3D StarDist node in one
+    graph do not silently hand each other the wrong network. They still THRASH — one global
+    slot, so alternating pulls reload — the same caveat this kernel and
+    ``cellsam_segment`` have always carried. Pass an explicit ``model`` to avoid it.
+    """
     global _stardist_model, _stardist_model_name
 
-    if _stardist_model is not None and _stardist_model_name == model_name:
+    key = (int(dim), str(model_path) or str(model_name))
+    if _stardist_model is not None and _stardist_model_name == key:
         return _stardist_model
 
     _patch_windows_symlink()
     _ensure_tf_threading(disable_gpu=disable_gpu)
-    from stardist.models import StarDist2D
-    _stardist_model = StarDist2D.from_pretrained(model_name)
-    _stardist_model_name = model_name
+    from stardist.models import StarDist2D, StarDist3D
+    cls = StarDist3D if int(dim) == 3 else StarDist2D
+    if model_path:
+        import os
+        path = os.path.abspath(os.path.expanduser(str(model_path).strip().strip('"')))
+        if not os.path.isdir(path):
+            raise ValueError(
+                f"StarDist model_path must be a trained-model DIRECTORY (the folder holding "
+                f"config.json + weights_best.h5), got {path!r}")
+        # csbdeep loads by (basedir, name); config=None reads the directory's own config.json,
+        # so a model trained at any anisotropy/ray count loads without restating it here.
+        _stardist_model = cls(None, name=os.path.basename(path.rstrip("/\\")),
+                              basedir=os.path.dirname(path.rstrip("/\\")))
+    else:
+        _stardist_model = cls.from_pretrained(model_name)
+    _stardist_model_name = key
     return _stardist_model
 
 
@@ -168,6 +196,87 @@ def segment_frame(
         n_tiles=n_tiles,
     )
 
+    return labels, details
+
+
+def segment_volume(
+    volume: np.ndarray,
+    model=None,
+    *,
+    prob_thresh: float = 0.5,
+    nms_thresh: float = 0.3,
+    scale: Optional[float] = None,
+    scale_z: Optional[float] = None,
+    model_name: str = "3D_demo",
+    model_path: str = "",
+    disable_gpu: bool = False,
+) -> Tuple[np.ndarray, dict]:
+    """Segment nuclei in a single prepared 3-D volume with StarDist3D (V2.13).
+
+    The 3-D counterpart of :func:`segment_frame`. StarDist3D predicts star-convex
+    POLYHEDRA (rays on a golden-spiral sphere) rather than 2-D polygons, so the objects it
+    returns are genuinely z-connected — this is not a stack of per-plane results, which is
+    exactly why the node's 3D lever can now route here instead of refusing.
+
+    Parameters
+    ----------
+    volume : 3-D array ``(Z, Y, X)``, any dtype
+        One prepared volume — one channel, one timepoint. ``axes="ZYX"`` is passed
+        explicitly rather than left to csbdeep's guesser, which would mis-read a volume
+        whose Z happens to be small as a channel axis.
+    scale, scale_z : float or None
+        Internal resize factor. ``scale`` applies laterally; ``scale_z`` applies along Z and
+        defaults to ``scale`` when omitted. Splitting them is what makes ANISOTROPIC data
+        usable: a pretrained network learned nuclei at one apparent aspect ratio, and
+        confocal voxels are typically several times taller than they are wide, so the same
+        nucleus is squashed along z relative to what the model expects. Pass
+        ``scale_z = z_step_um / pixel_size_um`` (times any lateral scale) to present the
+        model with near-isotropic objects. ``None`` for both = no resizing.
+    model_path : str
+        A locally trained model directory — see :func:`get_stardist_model`. Strongly
+        recommended in 3D: the only registered 3D model is a demo.
+
+    Returns
+    -------
+    labels : 3-D int array ``(Z, Y, X)``, one id per nucleus, z-connected.
+    details : dict from StarDist (probabilities, ray coordinates, …).
+    """
+    from csbdeep.utils import normalize
+
+    vol = np.asarray(volume)
+    if vol.ndim != 3:
+        raise ValueError(f"stardist segment_volume expects a 3-D (Z,Y,X) volume, got shape "
+                         f"{vol.shape} — the caller owns the (m,t,c) loop")
+    if model is None:
+        model = get_stardist_model(model_name, disable_gpu=disable_gpu, dim=3,
+                                   model_path=model_path)
+
+    img_norm = normalize(vol, 1, 99.8)
+
+    # Tiling heuristic, the 3-D form of segment_frame's. A volume is the product of three
+    # axes, so it hits memory limits far sooner than a frame does; tile whenever an axis
+    # exceeds 256, and never tile Z below 1 (a 12-plane stack must stay one tile).
+    nz, ny, nx = img_norm.shape
+    n_tiles = None
+    if max(nz, ny, nx) > 256:
+        n_tiles = (max(1, nz // 128), max(1, ny // 256), max(1, nx // 256))
+
+    # scale must be a per-AXIS triple when the two differ; a scalar would scale z with the
+    # lateral factor and defeat the anisotropy correction above.
+    sc = None
+    if scale is not None or scale_z is not None:
+        lat = float(scale) if scale is not None else 1.0
+        ax = float(scale_z) if scale_z is not None else lat
+        sc = (ax, lat, lat)
+
+    labels, details = model.predict_instances(
+        img_norm,
+        axes="ZYX",
+        prob_thresh=prob_thresh,
+        nms_thresh=nms_thresh,
+        scale=sc,
+        n_tiles=n_tiles,
+    )
     return labels, details
 
 

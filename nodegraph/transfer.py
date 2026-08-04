@@ -143,6 +143,22 @@ def _register_default_bridges() -> None:
 _register_default_bridges()
 
 
+#: The bridge hops whose executor in :func:`_bridge_hop` actually CONSUMES a reducer, so
+#: the caller's ``reducer`` must reach them (see :func:`plan_transfer`). Derived from the
+#: call sites, not from ``Bridge.kind`` — ``point→voxel`` is a "broadcast" that still
+#: reduces splat collisions, and ``track→timepoint`` is a "reduce" that ``_bridge_hop``
+#: refuses outright. Every entry here is a hop the chained executor can run.
+_REDUCING_HOPS: FrozenSet[Tuple[Domain, Domain]] = frozenset({
+    (Domain.VOXEL, Domain.LABEL),      # voxel_to_label(..., reducer)
+    (Domain.POINT, Domain.VOXEL),      # point_to_voxel(..., reducer) — collision rule
+    (Domain.POINT, Domain.LABEL),      # points_in_label(..., reducer)
+    (Domain.LABEL, Domain.TRACK),      # gather_by_track(..., reducer)
+    (Domain.POINT, Domain.TRACK),      # gather_by_track(..., reducer)
+    (Domain.LABEL, Domain.FRAME),      # reduce-in-frame → _reduce(..., reducer)
+    (Domain.POINT, Domain.FRAME),      # reduce-in-frame → _reduce(..., reducer)
+})
+
+
 # ── routing ──────────────────────────────────────────────────────────────────
 
 def _neighbours(d: Domain) -> List[Domain]:
@@ -204,7 +220,20 @@ def plan_transfer(src: Domain, dst: Domain,
             steps.extend(_lattice_steps(a, b, reducer))
         else:
             br = _BRIDGES[(a, b)]
-            steps.append(BridgeStep(a, b, br.name, br.kind, br.reducer))
+            # The CALLER's reducer wins on any hop whose executor actually consumes one
+            # (2026-07-30). This used to pass `br.reducer` unconditionally, and since no
+            # `register_bridge` call supplies a reducer, every registered bridge carries
+            # DEFAULT_REDUCER — so `plan_transfer(VOXEL, LABEL, reducer="max")` planned a
+            # step that then executed as MEAN. The `reducer` argument was the only knob on
+            # this API and it was inert for the entire structure half of the domain model:
+            # not just a wrong number, a dead control.
+            #
+            # Keyed on what the hop's function DOES with a reducer, not on `br.kind`: the
+            # Point→Voxel splat is `kind="broadcast"` yet `_bridge_hop` hands `red` to
+            # `point_to_voxel` as a real collision reducer, so a `kind == "reduce"` test
+            # would have left that one pinned to mean too.
+            red = reducer if (a, b) in _REDUCING_HOPS else br.reducer
+            steps.append(BridgeStep(a, b, br.name, br.kind, red))
     generated = all(isinstance(s, LatticeStep) for s in steps)
     return TransferPlan(src, dst, tuple(steps), generated)
 
@@ -365,6 +394,16 @@ def execute_bridge_plan(carrier: Carrier, plan: TransferPlan, *,
     *planned* but had no single executor. A structure hop lacking its input raises."""
     grid = axes or AxisSizes()
     if plan.generated:
+        if carrier.array is None:
+            # A STRUCTURE carrier keeps its payload in ``ids``/``values`` and leaves
+            # ``array`` None, and the four same-domain identity plans (label→label,
+            # point→point, track→track, mesh→mesh) are ``generated=True`` — truthfully so,
+            # since `execute_transfer` handles a non-lattice src. But this fast path
+            # hardcoded ``carrier.array``, so ``np.asarray(None)`` produced a 0-d OBJECT
+            # array, nothing validated it, and the call returned
+            # ``Carrier(dst, array=array(None, dtype=object))`` with the ids and values
+            # silently dropped and no exception. An identity plan must be the identity.
+            return Carrier(plan.dst, array=None, ids=carrier.ids, values=carrier.values)
         layer = AttributeLayer(plan.src, "carrier", np.asarray(carrier.array))
         return Carrier(plan.dst, array=np.asarray(execute_transfer(layer, plan, grid).values))
     cur = carrier

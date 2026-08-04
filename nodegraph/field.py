@@ -261,16 +261,32 @@ class FieldCache:
     With a ``store`` (the engine's byte-budget :class:`~nodegraph.streaming.TileCache`,
     C1 / V2.04 §6b) ndarray materializations live under the disjoint ``("f", key)``
     namespace and share the budget; :class:`VirtualArray` results are recreated (free)
-    rather than cached. Without a store it is the original unbounded dict (tests)."""
+    rather than cached. Without a store it is the original unbounded dict (tests).
+
+    **Thread-safe** (V2.14): with parallel unit loops (:mod:`nodegraph.parallel`) several
+    threads evaluate fields against one cache. The ``store`` path is already guarded by
+    :class:`~nodegraph.streaming.TileCache`'s own lock; the lock here covers the storeless
+    ``_by_key`` dict and the hit/miss counters (non-atomic ``+=``). Field evaluation
+    itself runs OUTSIDE the lock — it is pure, so two threads racing one key duplicate
+    work but cannot disagree on the answer."""
 
     def __init__(self, store: Any = None) -> None:
         self._by_key: Dict[str, Any] = {}
         # weak: a compute closure capturing this FieldCache must not pin an orphaned
         # engine's whole TileCache (V2.04 §3 weak/late-bound; review 2026-07-22)
+        import threading
         import weakref
         self._store_ref = weakref.ref(store) if store is not None else None
+        self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+
+    def _bump(self, hit: bool) -> None:
+        with self._lock:
+            if hit:
+                self.hits += 1
+            else:
+                self.misses += 1
 
     def evaluate(self, field: Field, ctx: FieldContext, *, token: Any = 0,
                  kernel_axes: Tuple[str, ...] = ()) -> Any:
@@ -279,23 +295,25 @@ class FieldCache:
         if self._store_ref is not None:
             store = self._store_ref()
             if store is None:                    # engine gone: evaluate uncached
-                self.misses += 1
+                self._bump(False)
                 return evaluate(field, ctx)
             hit = store.get(("f", key))
             if hit is not None:
-                self.hits += 1
+                self._bump(True)
                 return hit
-            self.misses += 1
+            self._bump(False)
             val = evaluate(field, ctx)
             if isinstance(val, np.ndarray):
                 return store.put(("f", key), val)
             return val
-        if key in self._by_key:
-            self.hits += 1
-            return self._by_key[key]
-        self.misses += 1
+        with self._lock:
+            if key in self._by_key:
+                self.hits += 1
+                return self._by_key[key]
+            self.misses += 1
         val = evaluate(field, ctx)
-        self._by_key[key] = val
+        with self._lock:
+            self._by_key[key] = val
         return val
 
 

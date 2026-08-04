@@ -113,9 +113,12 @@ survey (`node_backend_reference.md`) before adopting any backend.
 - **Multiscale enhancement:** wavelet / starlet à-trous (PySAP — **not installed**) / curvelet. *Deferred.*
 - **Registration · stacking · fusion (axis-changing!):** ~~drift align (`align.drift`, phase
   cross-correlation, stores the shift as Frame attrs)~~ ✓, ~~SNR stacking `util.stack` (T→1, robust
-  fusion reducers)~~ ✓; deformable align (ANTs/elastix — dep-gated), tile stitching / multi-view
-  fusion (M→1, `stitch` meta_transform exists — **still open**, needs `MULTI_VIEW` + a real
-  registration backend). ~~**Fusion reducers**~~ ✓ (`reducers.py`). Weighted-mean fusion (needs a
+  fusion reducers)~~ ✓; deformable align (ANTs/elastix — dep-gated), ~~tile stitching / multi-view
+  fusion (M→1)~~ ✓ (`util.stitch` — the first `MULTI_VIEW` node: stage-log layout + optional
+  pairwise phase-correlation refined by a globally-consistent weighted least-squares solve,
+  feather/max/mean/overwrite blending, streamed per canvas plane). Still open there:
+  *non-rigid* fusion, and re-addressing structure tables across a stitch (refused today).
+  ~~**Fusion reducers**~~ ✓ (`reducers.py`). Weighted-mean fusion (needs a
   weights input, doesn't fit the `(array,axis)` reducer signature) — *deferred*.
 - **Sparse reconstruction:** BART / ODL / SPORCO (GPU/CUDA — **BART not installed**). *Deferred.*
 - **DL restoration:** CSBDeep/CARE, StarDist (import OK but need trained model weights + TF);

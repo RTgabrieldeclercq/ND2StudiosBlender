@@ -192,3 +192,36 @@ Dropped as off-compute-path (see module header): `config.py` tracking enums/data
 `granule_types.py` `GranuleBoundary`/`GranuleTessellation`, `*_ATTR` constants,
 `points_from_rows`, `GRANULE_PALETTE`/`granule_color`. The single edit to compute code
 was removing nd2studios/relative imports (now defined in-file).
+
+---
+
+## 12. Localisation parity repairs (2026-07-31)
+
+> **This file shares its detector with `track_objects.py`.** `ParticleDetector`,
+> `_fspecial_log`, `_subpixel_poly_2d/3d` and `_radial_symmetry_3d` are the same
+> byte-copy of `serialtrack/detection.py` in both. **Any change to one must be
+> mirrored into the other** — the two are verified identical (same
+> `_fspecial_log` output, same `_radial_symmetry_3d` output to 0.0 on random
+> patches). The reasoning and the reproducible gate live in
+> `track_objects.md` §12 and `scripts/_serialtrack_validate.py`.
+
+Four localisation defects were fixed, validated against the upstream MATLAB
+(<https://github.com/FranckLab/SerialTrack>) and against FranckLab's own
+`results_3D_hardpar.mat` — the detections their MATLAB produced from the same
+synthetic bead volumes:
+
+| | defect | effect |
+|---|---|---|
+| 1 | `_radial_symmetry_3d` measured its gradient-vote positions from the intensity centroid; `radialcenter3dvec.m` uses the centroid **only** in the weight denominator and the positions from the **patch centre** | 3-D localisation error **0.340 px → 0.0637 px** (MATLAB: 0.0643 px) |
+| 2 | the TPT seed was an unrounded sub-voxel centroid, so the patch-relative offset was double-counted; also MATLAB's strict `> minSize & < maxSize` gate and `padNoise.m`'s near-zero padding (the port reflected, mirroring bead intensity into the border) | included above |
+| 3 | the LoG kernel was `scipy`'s 4σ-truncated `gaussian_laplace` (25 taps at σ=3) where `fspecial('log', ceil(σ)*2+1, σ)` is 7 | 2-D median error 0.26 → 0.147 px |
+| 4 | the local-maximum footprint was 13×13 where MATLAB's `strel('square', 2σ+1)` is 7×7, suppressing every second particle in a dense field; MATLAB also thresholds the *size-masked* image and applies the **minimum** size filter only | 2-D yield 1543 → 3075 of 3146 beads |
+
+The TPT path now reproduces the MATLAB detector **particle for particle**: same
+count on every frame checked, median pairing distance 0.0000 px.
+
+Note for the wrapper: `detect_beads` normalises and Otsu-thresholds before
+handing off, so `params["method"]` decides which of the two paths above runs.
+The TPT (radial-symmetry) path is the accurate one for compact, near-Gaussian
+beads; the LoG path is the one to use when beads vary in size, and is now worth
+roughly 1.8× less error and 25% more particles than before these repairs.

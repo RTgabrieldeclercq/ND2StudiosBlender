@@ -26,6 +26,7 @@ _DARK = {
     "INK": "#c9d2de", "INK_2": "#93a0b1", "MUTED": "#6f7c8d",
     "ACCENT": "#6fe3ff", "ACCENT_INK": "#06222b", "ACCENT_DIM": "#284a56",
     "DIM2D": "#e0a13a", "DIM2D_INK": "#2a1c03", "WIRE": "#5fd06a", "ERROR": "#e05a5a",
+    "PROG_FRAME": "#e0a13a", "PROG_TRACK": "#2b323c",
 }
 _LIGHT = {
     "BG": "#eef1f5", "GRID_DOT": "#d2d9e2", "PANEL": "#ffffff", "PANEL_HI": "#f4f7fa",
@@ -33,6 +34,7 @@ _LIGHT = {
     "INK": "#1b232e", "INK_2": "#48555f", "MUTED": "#7a8794",
     "ACCENT": "#0f8fb2", "ACCENT_INK": "#e6feff", "ACCENT_DIM": "#bce4ef",
     "DIM2D": "#b9770c", "DIM2D_INK": "#fff2d8", "WIRE": "#2c9a37", "ERROR": "#c23b3b",
+    "PROG_FRAME": "#d18a10", "PROG_TRACK": "#d2d9e2",
 }
 _PALETTES = {"dark": _DARK, "light": _LIGHT}
 
@@ -45,6 +47,7 @@ MODE = "dark"
 BG = GRID_DOT = PANEL = PANEL_HI = BODY = BORDER = BORDER_HI = None       # type: ignore
 INK = INK_2 = MUTED = ACCENT = ACCENT_INK = ACCENT_DIM = None             # type: ignore
 DIM2D = DIM2D_INK = WIRE = ERROR = None                                   # type: ignore
+PROG_FRAME = PROG_TRACK = None                                            # type: ignore
 
 
 def apply(mode: str) -> None:
@@ -86,6 +89,15 @@ CATEGORY = {
     "enhancement": c("#c98a5a"), "analysis": c("#5a8ac9"), "channel": c("#4bb8c0"),
     "io": c("#8a93a1"), "detection": c("#c264a0"), "general": c("#8a93a1"),
     "group": c("#9b7bd4"),
+    # `view` is the one category that does not touch the data — an Overlay changes how the
+    # Viewer DRAWS its input and hands the payload through untouched. Worth its own colour
+    # precisely so it does not read as another processing step in the chain.
+    "view": c("#d4a94b"),
+    # `flow` is control, not processing: an Iterate card decides HOW MANY TIMES the chain in
+    # front of it runs and which result survives. Distinct from `view` (which changes only
+    # the drawing) and from every processing colour, because reading a graph means seeing at
+    # a glance where the fan-out is.
+    "flow": c("#6fbf73"),
 }
 
 
@@ -232,7 +244,9 @@ GRAN_H = 28
 PAD_TOP = 8
 PAD_BOTTOM = 10
 RADIUS = 7
-PROG_H = 2            # the per-node progress rail riding the header's bottom edge
+PROG_H = 2            # one progress rail's thickness (two ride the header's bottom edge)
+PROG_GAP = 1          # the gap between the frame rail (orange) and the sub rail (blue).
+                      # 1 px keeps the 5 px stack clear of the title row's 15..31 band.
 DOT_R = 3.2           # the header status dot (running pulse / done / cached / error)
 CLOSE_BTN = 15        # the hover ✕ delete button in a card's header
 SANS = "Segoe UI"

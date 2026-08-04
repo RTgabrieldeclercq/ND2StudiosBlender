@@ -81,22 +81,25 @@ the orchestration; **they do NOT do Stage-0 prep** — see gotchas):
 
 | name | type | default | valid range / choices | semantics |
 |---|---|---|---|---|
-| `subset_size` | int | 16 | 4–128 (even) | Edge length (voxels) of each correlation subset window. Larger = smoother/more robust, less local. |
+| `subset_size` | int | 16 | 4–128 (even) | Edge length (voxels) of each correlation subset window. Larger = smoother/more robust, less local. Reduced **per axis** on an axis too short to hold it (shallow-Z stacks) — see `subset_shape_for`. |
 | `subset_spacing` | int | 10 | ≥1 | Spacing (voxels) between subset centers → sets grid density (measurement resolution). |
 | `search_radius` | int | 0 | ≥0 | Max residual seed displacement per axis for the FFT integer search. `0` → auto `max(4, subset_size)`. |
+| `border_margin` | int | auto | ≥0 | Extra inset (voxels) of the subset-center grid beyond `subset_size//2`, so the deformed **search window fits symmetrically** around every node. Auto = `min(search_radius, min(shape)//4 − subset_size//2)`. `0` reproduces the old flush-to-edge grid, where the outermost ring's seed cannot represent displacement of the clipped sign. ALDVC insets by `1 + round(winsize)` for the same reason. |
 | `seed_levels` | int | 3 | ≥1 | Coarse-to-fine multigrid pyramid levels for the integer seed. Higher brackets larger motion; `1` = single-scale. |
 | `correlation` | str | `"zncc"` | `"zncc"`, `"phase"` | Seed correlation metric. ZNCC = FFT normalized cross-correlation (robust to brightness/contrast); `phase` = phase cross-correlation. |
-| `mu` | float | 1e-3 | 1e-6–1.0 | ADMM `u`-coupling penalty (augmented-Lagrangian). |
+| `mu` | float | 1e-3 | 1e-6–1.0 | ADMM `u`-coupling penalty. Weighted against the **ZNSSD-normalized** image Hessian (`2·H/f_norm²`), so it is a scale-free ratio — the paper's "O(10⁻³)∼O(10⁻¹) times the diagonal terms of a′_ip" — and is invariant to intensity units and subset size. |
 | `admm_iterations` | int | 4 | ≥0 | Outer ADMM iterations. `0` ⇒ pass-0 only = conventional local DVC + one global solve. |
+| `repair_zncc` | float | 0.6 | [-1,1] | ZNCC floor below which a subset is retried from each converged neighbour's affine warp, first-order-extrapolated (reliability-guided propagation). Nodes still below it afterwards are rejected and interpolated. `≤ -1` disables. **This is what makes large rotation/stretch work** — the seed is translation-only, so a 20–25° rotation otherwise leaves several voxels of error. |
 | `strain_type` | str | `"infinitesimal"` | `infinitesimal`, `green-lagrange`, `almansi`, `hencky` | Strain measure derived from the displacement gradient. |
-| `strain_smooth` | float | 0.0 | ≥0 | Gaussian σ applied to `û` before `∂u/∂x` (0 = off). |
-| `use_gpu` | bool | False | — | Route the **seed FFT** through CuPy if importable (CPU fallback). IC-GN always runs on CPU. |
-| `n_workers` | int | 0 | ≥0 | IC-GN process-pool workers. `0` = auto (`min(cores-1, 8)`); `1` = serial (cached SD/Hessian). Forced to `1` when `grid.n_nodes < 64`. |
-| `icgn_tol` | float | 1e-2 | >0 | IC-GN convergence tol (radius-weighted parameter step). |
-| `icgn_max_iter` | int | 100 | ≥1 | Max IC-GN iterations per subset. |
-| `admm_tol` | float | 1e-2 | >0 | ADMM stop: `‖Δû‖₂/√N < admm_tol`. |
-| `cc_thresh` | float | 0.5 | [-1,1] | Drop subsets whose correlation confidence is below this (→ NaN → inpaint). |
-| `median_thresh` | float | 2.0 | >0 | Normalized-median-test threshold (Westerweel–Scarano) for outlier rejection. |
+| `strain_smooth` | float | 0.0 | ≥0 | Gaussian σ applied to `û` before `∂u/∂x`. `0` (default) means strain comes from the ADMM's own compatible gradient `F̂ = Dû` (what ALDVC reports); `>0` re-differentiates a smoothed `û` instead. |
+| `f_smooth_passes` | int | 3 | ≥0 | Passes of a 3³ median filter applied to the locally measured `F` before it enters the augmented-Lagrangian RHS (ALDVC's `funSmoothStrain3`, which is **not** a no-op at its default sizes). `0` = off. |
+| `use_gpu` | bool | False | — | Route the **seed FFT** through CuPy if importable (CPU fallback). IC-GN always runs on CPU. Mutually exclusive with the multi-process seed (the GPU path keeps the volumes device-resident). |
+| `n_workers` | int | 0 | ≥0 | Process-pool workers for **both** the seed and the IC-GN sweeps. `0` = auto (`min(cores-1, 32)`); `1` = serial. Forced to `1` when `grid.n_nodes < 64`. |
+| `icgn_tol` | float | 1e-2 | >0 | IC-GN convergence tol (radius-weighted parameter step). The paper's own benchmarks used `1e-4`. |
+| `icgn_max_iter` | int | 100 | ≥1 | Max IC-GN iterations per subset. Hitting it marks the subset unconverged → rejected → interpolated. |
+| `admm_tol` | float | 1e-2 | >0 | ADMM stop: `‖Δû‖₂/√(ndim·N) < admm_tol` (all displacement DOFs, matching MATLAB's `norm(dU)/sqrt(numel(U))`). |
+| `cc_thresh` | float | 0.0 | [-1,1] | Absolute ZNCC floor for the seed/local field. **Off by default**, matching the reference run (`qDICOrNot = 0`). Prefer `repair_zncc`, which only rejects what propagation could not rescue. |
+| `median_thresh` | float | 0.0 | ≥0 | Normalized-median-test threshold (Westerweel–Scarano). **Off by default**, matching `main_ALDVC.m`'s cumulative branch (`medianFilterThreshold = 0`); the incremental branch uses `2.0`. An always-on test at 2.0 rejected up to 40 % of nodes on a valid large-strain field. |
 
 > `DVCParams` also carries `tracking_mode` and `newFFTSearch`, but `run_aldvc`
 > itself does **not** read them — they are series-level knobs handled by the
@@ -122,7 +125,7 @@ the orchestration; **they do NOT do Stage-0 prep** — see gotchas):
 | `iterations` | int | — | — | — | — | ADMM iterations actually run. |
 | `mu`, `beta` | float | — | — | — | — | Penalty `mu` used and the L-curve-selected `beta`. |
 | `method`, `notes` | str | — | — | — | — | Human-readable provenance/summary. |
-| `diagnostics` | dict | — | — | — | — | `grid_shape`, `n_subsets`, `beta`, `admm_residuals`, `median_zncc`, `search_radius`, `n_workers`, `use_gpu`. |
+| `diagnostics` | dict | — | — | — | — | `grid_shape`, `n_subsets`, `beta`, `admm_residuals`, `median_zncc`, `search_radius`, `n_workers`, `use_gpu`, `border_margin`, `n_repaired` (subsets rescued by reliability-guided propagation — a nonzero count means the translation-only seed was struggling, i.e. large rotation/stretch or weak texture). |
 
 Convenience methods: `.magnitude` (voxels), `.displacement_um()` (per-axis
 `× voxel_size_um`), `.magnitude_um()`.
@@ -172,12 +175,121 @@ Convenience methods: `.magnitude` (voxels), `.displacement_um()` (per-axis
    `__main__` guard) must let a spawned process `import aldvc_field`. The
    `n_workers = 1` path is a plain in-process loop with no such requirement and is
    the safe default when embedding.
-10. **Failed/low-confidence subsets are NaN'd then inpainted** (nearest finite
-    value via EDT) before the global solve, so the returned field is dense/finite;
-    `qfactor` still marks the originally-failed subsets (NaN there).
-11. **Grid insetting & minimum size.** Centers are inset by `subset_size//2` from
-    every border; tiny axes fall back to a midpoint, and an axis that could hold
-    ≥2 centers is forced to ≥2 (the FD operator and `np.gradient` need ≥2 nodes).
+10. **Failed/low-confidence subsets are NaN'd then inpainted** by a discrete
+    **harmonic (Laplace) fill** — exact for a locally linear field, which is the
+    regime a displacement field is in over one grid step. (The earlier
+    nearest-finite-value EDT fill produced piecewise-constant blocks whose interior
+    gradient is zero and whose edge is a step, and those blocks fed straight into
+    `D` and the strain gradient.) `qfactor` still marks the originally-failed
+    subsets. A subset is rejected if it is non-finite, hit `icgn_max_iter`, or is
+    still below `repair_zncc` after the propagation pass.
+11. **Grid insetting & minimum size.** Centers are inset by
+    `subset_size//2 + border_margin`; the margin shrinks before the half-window
+    does. Tiny axes fall back to a midpoint, and an axis that could hold ≥2 centers
+    is forced to ≥2 (the FD operator and `np.gradient` need ≥2 nodes). An axis too
+    short for the isotropic window gets a **reduced window on that axis only**
+    (`subset_shape_for`) rather than centers whose window hangs off the end.
+12. **The global solve does not overwrite the grid's outer node shell.** ALDVC's
+    Neumann bookkeeping (`notNeumannBCInd_U`/`_F`) keeps boundary nodes at their
+    local IC-GN values for both `û` and `F̂`, because `D`'s one-sided border
+    stencil is a different operator from its central-difference interior. Pass
+    `restrict_boundary=False` to `AugLagGlobalStep.solve` to opt out.
+13. **Subpb1 inside the ADMM loop solves only the `ndim` translation DOFs**, with
+    the affine part frozen at the compatible `F̂ = Dû`, and then takes `F₁ := F̂`.
+    That is the paper's own simplification (p. 1209) and `funICGN_Subpb13`'s
+    behaviour; re-fitting all 12 DOF from `G = 0` each iteration threw away the
+    global step's regularized affine field and made the loop oscillate.
+14. **Out-of-volume subset voxels are masked out of the correlation**, not
+    edge-replicated into it: the means, norms, residual, Hessian and RHS are all
+    recomputed on the surviving voxels (`min_valid` = 0.5 of the window). The
+    reference rejects the whole subset on the first out-of-bounds voxel; accepting
+    up to 20 % fabricated voxels (the earlier behaviour) is worse than either.
+15. **The reference-subset cache is byte-budgeted.** A cached `_RefSubset` is
+    ~0.89 MB for a 21³ 3-D subset, so caching every node of a reference-sized grid
+    (39 k nodes) would want ~35 GB *per process*. `RefCache` caps it and simply
+    recomputes beyond the cap.
+
+---
+
+## 6b. Measured accuracy (what "works" means here)
+
+Run by `scripts/_aldvc_validate.py`. Three independent kinds of truth, because a
+port can be self-consistent and uniformly wrong:
+
+**A — exact truth.** The paper's own homogeneous benchmark (Fig. 2) on
+Appendix-D Gaussian-PSF bead volumes (96³, ws=20, st=10, 4 ADMM iterations),
+with the deformed volume built by re-placing every bead at its *analytically*
+deformed centre, so no interpolation enters the ground truth. RMS displacement
+error over the interior nodes, paper Eq. (13), in voxels:
+
+| case | range | RMS \|u\| | strain RMS | measured vs exact e_xx |
+|---|---|---|---|---|
+| x-translation | 0 → 1 vox | 0.0001 – 0.0020 | ≤1.3e-5 | 0 / 0 |
+| uniaxial stretch | λ = 1.00 → 1.30 | 0.0001 – 0.0025 | ≤1.2e-4 | +0.30014 / +0.30000 (λ=1.3) |
+| z-rotation | 0° → 25° | 0.0001 – 0.0016 | ≤1.7e-4 | −0.09368 / −0.09369 (25°) |
+
+Sub-voxel translations sit at ~2e-3 rather than ~1e-4 — that is the cubic
+interpolation bias (Bornert 2017, O(10⁻³) voxels), i.e. the floor, not the method.
+Re-running with `--warp` (the paper's own resample-based generation) gives
+0.0003 – 0.0012 across the same sweep.
+
+**B — MATLAB parity.** FranckLab's distributed SEM-Challenge Sample 14 volumes
+(`vol_Sample14_1001/1002`, 192×192×2048) at the reference's own ws=20/st=10,
+compared node-for-node against the `results_S14_ws20_st10.mat` that MATLAB
+produced from the same inputs (39 004 nodes, 150 s at 20 workers):
+
+- **β selected = 0.031623, MATLAB β = 0.031623** — the L-curve now picks the
+  reference's value exactly.
+- field agreement vs MATLAB ALDVC: **0.0115 vox** (x), 0.0089 (y), 0.0089 (z).
+  For scale, the paper's Table 1 quotes ALDVC's own x-displacement RMS error on
+  this case as 0.0128 vox — the two implementations agree to within the
+  reference's published error.
+
+**C — invariant.** The same deformation is imposed along x only, so u_y ≡ u_z ≡ 0
+is truth with no reference at all: **RMS 0.0050 vox** on Sample 14. On the
+distributed uniaxial-stretch volumes (`vol_stretch_1001/1002`, 192×512×512,
+ws=30/st=10, 20 339 nodes, 318 s), whose deformation an independent robust affine
+probe measures as `∂u_x/∂x = 0.05000` with every other gradient ≤1e-4: measured
+**e_xx = 0.049996 ± 0.00019** and u_y/u_z RMS 0.0030/0.0031 vox.
+
+(The `results_uniaxial_stretch_ws30_st10.mat` shipped alongside those volumes was
+produced from frames **1001 vs 1006**, not 1001 vs 1002, so its recorded
+β = 3.16e-4 is not a parity target for this pair — a different deformation
+magnitude legitimately selects a different β. Sample 14 is the β parity test, and
+there the match is exact.)
+
+**D — real experimental data.** ALDVC's own polyacrylamide indentation dataset
+(`hydrogel_indentation_20190504_cut_01/02`, 306×1024×1024 uint16 — `cut_01` is
+the stress-free reference, `cut_02` the indented state), on the paper's own VOI
+and DVC settings (MATLAB `[320,728]×[320,728]×[20,164]`, ws=32, st=8, voxel
+0.42/0.42/0.425 µm) — 15 876 nodes, 800 s at 20 workers. There is no ground
+truth, so what is checkable is sign, scale, shape and smoothness:
+
+| quantity | measured | paper (Fig. 7/8) |
+|---|---|---|
+| u_x range | −1.03 … +2.00 µm | −2 … +3 µm |
+| u_y range | −1.77 … +1.25 µm | −2 … +2 µm |
+| u_z range | −1.95 … +1.31 µm | −2 … 0 µm |
+| u_z sign under the indenter | median −0.267 µm, 98 % of nodes negative | compression |
+| e_zz median | −0.019 | −0.08 … 0 |
+| e_xz range | −0.105 … +0.113 | ±0.06 |
+| median ZNCC | 0.924 | — |
+| mean node-to-node jump | 0.051 µm (1.6 % of the field's range) | — |
+
+Swapping reference and deformed returns very nearly the negated field (u_z median
++0.280 vs −0.267 µm; e_zz +0.019 vs −0.019), i.e. the solve is self-inverse to
+~5 % — the residual is the genuine finite-strain asymmetry, and this is a useful
+consistency check on any real dataset where no truth exists.
+
+The ADMM did **not** reach `admm_tol` in 4 iterations on this dataset — which is
+consistent with the paper, whose own indentation run "converged after 6 ADMM
+iterations". Raise `admm_iterations` for experimental data; 4 is tuned to the
+synthetic cases.
+
+Regression to watch: the pre-fix kernel scored RMS 1.74 vox at λ=1.2 and 6.23 vox
+at 25° rotation, with e_xx reading 0.080 against 0.200 exact — while median ZNCC
+stayed at 0.99, i.e. **the correlation quality metric did not reveal the error.**
+Do not treat a healthy `qfactor` as evidence the field is right; run suite A.
 
 ---
 

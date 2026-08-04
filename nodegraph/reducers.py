@@ -131,6 +131,65 @@ REDUCERS: Dict[str, Reducer] = {
 
 DEFAULT_REDUCER = "mean"
 
+#: What each reducer DOES, as one hover line per option (V2.21). Beside :data:`REDUCERS`
+#: rather than in the nodes, because five dropdowns offer subsets of this one menu
+#: (``analysis.reduce_scalar``, both ``transform.transfer_*``, ``util.stack``,
+#: ``util.zproject``'s reducer half) and five copies of "median is robust to outliers" would
+#: only differ where one had rotted. Every entry says what the reducer assumes about the
+#: samples and what it does with a bad one, since that is the whole basis for choosing.
+#: Nodes select their subset with :func:`reducer_docs`.
+REDUCER_DOC: Dict[str, str] = {
+    "mean":
+        "Arithmetic average of the samples. Optimal when the spread is just Gaussian noise "
+        "— it improves signal-to-noise by about √n — and the wrong choice when it is not: "
+        "ONE cosmic ray, hot pixel or registration ghost shifts the result by its full value "
+        "divided by n. NaNs are skipped rather than poisoning the result.",
+    "sum":
+        "Total of the samples, so the result grows with how many there are. Use it when the "
+        "quantity is genuinely additive — total intensity, total volume, a count of events — "
+        "and never to compare groups of different sizes.",
+    "max":
+        "The largest sample. Keeps the brightest contribution wherever it occurred, which is "
+        "what you want for \"was this ever present\" and exactly what you do not want for a "
+        "level: it is the reducer most sensitive to a single outlier.",
+    "min":
+        "The smallest sample. Keeps only what is present across every sample, so it strips "
+        "sporadic contributions — useful for a background floor, and equally vulnerable to a "
+        "single dead pixel.",
+    "median":
+        "The middle sample. Rejects up to half the population as outliers at a small cost in "
+        "noise performance versus the mean, which makes it the default robust choice. It "
+        "needs every sample at once, so it cannot fold across tiles the way mean/sum can.",
+    "count":
+        "How many samples contributed — not their values. This is the reducer that answers "
+        "\"how many objects\": run it over any column of a Label or Point table and you get "
+        "the number of rows. NaNs are excluded from the count.",
+    "first":
+        "The sample at index 0 along each reduced axis — the first timepoint, the first "
+        "position, the first z. A SELECTION rather than a statistic: use it to broadcast one "
+        "reference sample, e.g. \"take frame 0's value for the whole series\".",
+    "sigma_clip":
+        "Sigma-clipped mean: iteratively drop samples more than 3 robust deviations from the "
+        "median (spread from the MAD, not the std, so one extreme outlier cannot inflate its "
+        "own test), then average the survivors. Nearly the mean's noise performance with the "
+        "median's outlier rejection — the best general choice for fusing many frames.",
+    "trimmed_mean":
+        "Sort the samples and drop the lowest and highest before averaging. Cheaper and more "
+        "predictable than sigma clipping — it always discards the same COUNT rather than "
+        "whatever fails a test — and the right choice for a small stack where you know each "
+        "end holds one bad sample. Needs at least three samples to trim anything.",
+}
+
+
+def reducer_docs(names: Iterable[str]) -> Dict[str, str]:
+    """``{reducer name: prose}`` for the reducer options a node actually offers.
+
+    Unknown names are skipped rather than raised, for the same reason as
+    :func:`nodegraph.domains.domain_docs`: registration already refuses a ``choice_docs`` key
+    that documents no option, and this helper must not turn a typo into an import-time crash
+    in another module."""
+    return {str(n): REDUCER_DOC[str(n)] for n in names if str(n) in REDUCER_DOC}
+
 
 def reduce(array: np.ndarray, axis: Tuple[int, ...], reducer: str = DEFAULT_REDUCER
            ) -> np.ndarray:
@@ -265,7 +324,7 @@ def tree_reduce(tiles: Iterable[np.ndarray], axis: Tuple[int, ...],
 
 
 __all__ = [
-    "Reducer", "REDUCERS", "DEFAULT_REDUCER", "reduce",
+    "Reducer", "REDUCERS", "DEFAULT_REDUCER", "REDUCER_DOC", "reduce", "reducer_docs",
     "PartialReducer", "TILEABLE_REDUCERS", "partial_reducer", "is_tileable",
     "tree_reduce",
 ]

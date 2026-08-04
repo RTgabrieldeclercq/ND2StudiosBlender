@@ -27,12 +27,18 @@ from nodegraph.groups import (
     GROUP_INPUT, GROUP_OUTPUT, Group, expand as _group_expand, group_name_of,
     inst_id as _inst_id,
 )
+from nodegraph.iterate import (
+    ITERATE_OP, MODE_TARGET_PREFIX, SWEEP_KEY as _SWEEP_KEY,
+    unroll as _iterate_unroll, var_out_names as _var_out_names,
+)
 from nodegraph.metadata import MetaEnvelope, propagate_meta
-from nodegraph.registry import InDataset, NODES, OutDataset
+from nodegraph.registry import InDataset, InString, NODES, OutDataset
 from nodegraph.serialize import from_dict as _ng_from_dict, to_dict as _ng_to_dict
 from nodegraph.sockets import Direction, SocketType, can_connect as _can_connect
 from nodegraph.zones import Zone, unroll as _unroll
-from nodelab_v2.ops import materialize_channel_taps
+from nodelab_v2.ops import (
+    BAKE_KEY, DOCK_DOCKED, DOCK_LIVE, DOCK_OP, dock_status as _dock_status,
+    dormant_nodes, is_docked, prepare_run_graph, upstream_signature)
 
 #: params key holding the sticky pinned-override list (serialized per V2.03; stripped
 #: from the params handed to the ENGINE — it is a UI annotation, not a compute input).
@@ -49,8 +55,28 @@ CHANNELS_KEY = "__channels__"
 #: channel — materialized into ``channel.select`` taps at graph-build (see nodelab_v2.ops).
 CHANNEL_TAP_OPS = ("io.load", "channel.split")
 
-#: params keys that are UI-only and must be stripped before the graph runs.
-_UI_PARAM_KEYS = (LOCKED_KEY, TITLE_KEY, CHANNELS_KEY)
+#: params keys that are UI-only and must be stripped before the graph runs. ``__sweep__``
+#: (an Iterate node's recorded results table) is here and NOT with ``io.dock``'s ``__bake__``
+#: for one decisive reason: a bake record is written by an explicit action and MUST re-key
+#: the memo, whereas a sweep record is written from the payload of every pull — leaving it
+#: in the run params would make each pull invalidate the entry it just created and re-run
+#: the sweep forever.
+_UI_PARAM_KEYS = (LOCKED_KEY, TITLE_KEY, CHANNELS_KEY, _SWEEP_KEY)
+
+#: Every ``flow.iterate`` variable OUTPUT socket name. A wire leaving one of these is a
+#: DRIVER wire (:data:`nodegraph.graph.NON_DAG_KINDS`), and that is decided *structurally*
+#: rather than stored: these sockets exist on no other node type, so the document keeps
+#: driver wires as ordinary 4-tuples in ``self.edges`` — the canvas draws them, undo and
+#: copy/paste move them and the file round-trips them with no new storage anywhere. Only
+#: :meth:`GraphDocument.to_graph` needs to know, and it re-derives the kind here.
+_DRIVER_SOCKETS: frozenset = frozenset(
+    n for k in range(4) for n in _var_out_names(k))
+
+
+def is_driver_edge(doc: "GraphDocument", edge: EdgeTuple) -> bool:
+    rec = doc.nodes.get(edge[0])
+    return (rec is not None and rec.op_key == ITERATE_OP
+            and edge[1] in _DRIVER_SOCKETS)
 
 
 class NodeRecord:
@@ -131,6 +157,11 @@ class GraphDocument:
         # GUI-only labelled frames (canvas organization; never enter the run graph —
         # they ride in the `ui` extras exactly like node positions).
         self.frames: Dict[str, FrameRecord] = {}
+        #: nodes a docked run no longer evaluates — the canvas greys these (V2.18).
+        #: Recomputed by :meth:`propagate`, so it is always current with the last edit.
+        self.dormant: frozenset = frozenset()
+        #: (node_id, revision) → dock status, for the per-repaint caller (see dock_status)
+        self._dock_status_cache: Dict[Tuple[str, int], Tuple[str, str]] = {}
         self._listeners: List[Callable[[], None]] = []
 
     # ── listeners ────────────────────────────────────────────────────────────
@@ -277,27 +308,92 @@ class GraphDocument:
         return base
 
     def input_specs(self, node_id: str) -> list:
-        """The live INPUT socket specs of one node instance (no per-channel expansion —
-        provided for symmetry with :meth:`output_specs`)."""
+        """The live INPUT socket specs of one node instance, plus — once the document
+        contains an Iterate node — one synthetic ``__mode__:<name>`` port per active Mode
+        (:meth:`mode_port_specs`)."""
         rec = self.nodes.get(node_id)
         if rec is not None and group_name_of(rec.op_key):
             return [InDataset()]                  # a group instance: one Dataset input
         spec = rec.spec() if rec else None
-        return list(spec.active_inputs(rec.state())) if spec else []
+        if spec is None:
+            return []
+        return list(spec.active_inputs(rec.state())) + self.mode_port_specs(node_id)
+
+    def mode_port_specs(self, node_id: str) -> list:
+        """Synthetic input ports for this node's Modes, so an Iterate variable can be wired
+        onto a dropdown.
+
+        A Mode is not a socket and has no port to land on, yet sweeping one (four segmenters,
+        five threshold methods) is the comparison most worth running. So the card grows a
+        port per Mode — but ONLY while the document holds at least one ``flow.iterate``
+        node, because otherwise every card in every graph would sprout ports nothing could
+        ever connect to. The name is reserved (``__mode__:method``) and never reaches the
+        engine: :func:`nodegraph.iterate.unroll` consumes every driver wire and bakes the
+        value into the clone's ``modes`` dict.
+
+        STRING because a mode value is a name, which also makes the type system carry the
+        rule for free — a numeric variable output cannot connect (there is no FLOAT→STRING
+        conversion), so sweeping a Mode requires setting that variable's Type to 'text'.
+        The 2D/3D lever is excluded: it is refused by the rewrite, so offering the port
+        would only let the user build something that cannot run."""
+        rec = self.nodes.get(node_id)
+        spec = rec.spec() if rec else None
+        if spec is None or rec.op_key == ITERATE_OP or not self.has_iterate:
+            return []
+        return [InString(MODE_TARGET_PREFIX + m.name, m.label or m.name, field=False,
+                         default="",
+                         description=f"Sweep the {m.label or m.name} dropdown from an "
+                                     f"Iterate node ({', '.join(m.choices)}).")
+                for m in spec.active_modes(rec.state()) if not m.is_dim_lever]
+
+    @property
+    def has_iterate(self) -> bool:
+        return any(r.op_key == ITERATE_OP for r in self.nodes.values())
 
     def channel_descriptors(self, node_id: str) -> list:
         """The per-channel descriptors ``[{name, emission_nm, color}, …]`` for a source /
         split node: the captured ``__channels__`` list (Load, richest — real names +
-        native colors) if present, else derived from the node's own propagated envelope
+        native colors) if present, else the same list INHERITED from upstream when the
+        channel count still matches, else derived from the node's own propagated envelope
         (Split passes its input env through unchanged, so its channel count/emission are
-        already correct)."""
+        already correct).
+
+        The inheritance step is what puts the file's real channel names on a Split's
+        per-channel sockets. ``channel_names`` is display metadata that rides the payload and
+        is deliberately kept OUT of the engine meta-seed (it is not in ``CALIBRATION_KEYS``),
+        so the envelope route can only ever fall back to ``Ch0``/``Ch1`` — which is how a
+        two-branch graph ended up with two sockets that both said "Ch0" and no way to tell
+        which physical channel each branch carried."""
         rec = self.nodes.get(node_id)
         if rec is None:
             return []
         chans = rec.params.get(CHANNELS_KEY)
         if isinstance(chans, list) and chans:
             return chans
-        return self._env_channel_descriptors(self.env(node_id))
+        env_descs = self._env_channel_descriptors(self.env(node_id))
+        inherited = self._inherited_channel_descriptors(node_id)
+        if inherited and len(inherited) == len(env_descs):
+            return inherited
+        return env_descs
+
+    def _inherited_channel_descriptors(self, node_id: str, _depth: int = 0) -> list:
+        """The captured ``__channels__`` descriptors of the nearest upstream node that has
+        them, following the first Dataset in-edge. ``[]`` if none does.
+
+        Depth-capped rather than cycle-tracked: the walk only ever runs a handful of hops
+        (Load → Split is the case it exists for) and a bounded walk cannot hang on the
+        zone back-edges the document legitimately holds."""
+        if _depth > 8:
+            return []
+        for src, ssock, dst, _dsock in self.edges:
+            if dst != node_id or (ssock.startswith("ch") and ssock[2:].isdigit()):
+                continue          # a chK tap is already ONE channel, not the source list
+            rec = self.nodes.get(src)
+            chans = rec.params.get(CHANNELS_KEY) if rec is not None else None
+            if isinstance(chans, list) and chans:
+                return chans
+            return self._inherited_channel_descriptors(src, _depth + 1)
+        return []
 
     @staticmethod
     def _env_channel_descriptors(env: MetaEnvelope) -> list:
@@ -316,6 +412,29 @@ class GraphDocument:
                 "color": None,
             })
         return out
+
+    def upstream_channel_descriptors(self, node_id: str) -> list:
+        """The channel descriptors of the Dataset flowing INTO ``node_id``.
+
+        Distinct from :meth:`channel_descriptors`, which reports a node's OWN channels: for
+        ``channel.select`` those are the ones it kept, and the picker needs the ones it can
+        still choose from. Wired from a synthetic ``chK`` tap the incoming stream is that one
+        channel, so the list narrows to it — otherwise the tick list would offer channels
+        that a single-channel tap already dropped."""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return []
+        for src, ssock, dst, _dsock in self.edges:
+            if dst != node_id:
+                continue
+            descs = self.channel_descriptors(src)
+            idx = None
+            if ssock.startswith("ch") and ssock[2:].isdigit():
+                idx = int(ssock[2:])
+            if idx is not None:
+                return [descs[idx]] if 0 <= idx < len(descs) else []
+            return descs
+        return []
 
     def source_channel_total(self, node_id: str) -> int:
         """The total channel count of the source file(s) feeding ``node_id`` — used by
@@ -340,6 +459,39 @@ class GraphDocument:
                               else self.env(nid).axes.c)
         return max(totals) if totals else self.env(node_id).axes.c
 
+    def source_scope_totals(self, node_id: str) -> Tuple[int, int, int]:
+        """``(M, T, Z)`` of the source data feeding ``node_id`` — how many frames and
+        planes there are to choose from, i.e. how far the Viewer's M/T/Z strips span and
+        therefore what can be picked on them under the GUI's troubleshooting scope
+        (:meth:`nodelab_v2.window.MainWindow.set_solo_frame`).
+
+        Read off the SOURCE roots, not off ``node_id``'s own envelope, and that is the
+        point: a chain that collapses time (Temporal Stack, a T reduction) publishes
+        ``t == 1`` downstream and one that projects z publishes ``z == 1``, but the user
+        still needs to choose *which* source frame and plane the run is scoped to — the
+        scope is applied at the source seed, upstream of both. Same root walk as
+        :meth:`source_channel_total`; the max over roots, so a graph fed by two files
+        offers the longer series.
+        """
+        seen: set = set()
+        stack = [node_id]
+        totals: List[Tuple[int, int, int]] = []
+        while stack:
+            nid = stack.pop()
+            if nid in seen or nid not in self.nodes:
+                continue
+            seen.add(nid)
+            preds = [e for e in self.edges if e[2] == nid]
+            if preds:
+                stack.extend(e[0] for e in preds)
+            else:
+                ax = self.env(nid).axes
+                totals.append((ax.m, ax.t, ax.z))
+        if not totals:
+            ax = self.env(node_id).axes
+            totals = [(ax.m, ax.t, ax.z)]
+        return tuple(max(1, max(t[i] for t in totals)) for i in range(3))
+
     # ── wiring (G1) ──────────────────────────────────────────────────────────
     def _socket_spec(self, node_id: str, io: str, name: str):
         rec = self.nodes.get(node_id)
@@ -363,13 +515,21 @@ class GraphDocument:
         if sa.direction is not Direction.OUT or sb.direction is not Direction.IN:
             return False, "direction"
         if not _can_connect(sa, sb):
-            return False, f"{sa.type.value} → {sb.type.value} is not connectable"
-        if self._creates_cycle(src, dst):
+            hint = ("" if not dst_socket.startswith(MODE_TARGET_PREFIX)
+                    else " — set this variable's Type to 'text' to sweep a dropdown")
+            return False, f"{sa.type.value} → {sb.type.value} is not connectable{hint}"
+        # A DRIVER wire is invisible to the DAG, so it cannot close a cycle — and refusing
+        # it here would make the node unusable, since driving a param downstream and
+        # collecting the result back is a loop on the canvas BY DESIGN.
+        if not is_driver_edge(self, (src, src_socket, dst, dst_socket)) \
+                and self._creates_cycle(src, dst):
             return False, "would create a cycle (rejected outside zones)"
         return True, ""
 
     def _creates_cycle(self, src: str, dst: str) -> bool:
-        """True if adding dst←src closes a cycle (src reachable FROM dst)."""
+        """True if adding dst←src closes a cycle (src reachable FROM dst). Driver wires are
+        skipped for the same reason ``Graph.topo_order`` skips them: the rewrite consumes
+        them, so they order nothing."""
         stack, seen = [dst], set()
         while stack:
             nid = stack.pop()
@@ -378,7 +538,8 @@ class GraphDocument:
             if nid in seen:
                 continue
             seen.add(nid)
-            stack.extend(e[2] for e in self.edges if e[0] == nid)
+            stack.extend(e[2] for e in self.edges
+                         if e[0] == nid and not is_driver_edge(self, e))
         return False
 
     def connect(self, src: str, src_socket: str, dst: str, dst_socket: str
@@ -410,7 +571,11 @@ class GraphDocument:
         return next((e for e in self.edges if e[2] == dst and e[3] == dst_socket), None)
 
     # ── graph / envelopes ────────────────────────────────────────────────────
-    def to_graph(self, *, for_run: bool = False, materialize: bool = False) -> Graph:
+    def to_graph(self, *, for_run: bool = False, materialize: bool = False,
+                 bypass_muted: Optional[bool] = None,
+                 live_docks: frozenset = frozenset(),
+                 unroll_iterate: bool = False,
+                 sweep_all: frozenset = frozenset()) -> Graph:
         """The headless :class:`Graph`. ``for_run`` strips the UI-only param annotations
         (``__locked__``/``__title__``/``__channels__`` — they must not re-key the memo)
         and resolves MUTED nodes by bypassing them (first Dataset input → their
@@ -418,26 +583,79 @@ class GraphDocument:
         (``chK``) into a real ``channel.select`` tap AND inlines every group instance
         (``group:<name>``) into its body via :func:`nodegraph.groups.expand` — used for
         the run graph and the edit-time envelope pass, but NOT for saving (the file keeps
-        the instance nodes + separate group definitions)."""
+        the instance nodes + separate group definitions).
+
+        ``bypass_muted`` splits the mute resolution out of ``for_run`` (2026-07-30), which
+        is what :meth:`propagate` needs: the edit-time envelope pass must describe the graph
+        that will actually RUN, and it was passing ``for_run=False``, so every muted node
+        still transformed the envelope. The visible consequence was a whole GUI describing a
+        pipeline nobody would execute — derived spinboxes, the layer picker, the domain rail
+        and the missing-domain chip all computed through nodes the run drops — and the
+        silent one was that pinning such a spinbox froze the mute-blind number into
+        ``params`` and carried it into the run. It defaults to ``for_run`` so every existing
+        caller is unchanged.
+
+        ``unroll_iterate`` additionally expands every ``flow.iterate`` cone into its
+        per-iteration clones (:func:`nodegraph.iterate.unroll`). It is a SEPARATE flag from
+        ``materialize`` on purpose: :meth:`propagate` also builds a materialized graph, and
+        unrolling there would delete the very node ids the inspector, the layer picker and
+        the domain rail look their envelopes up by. The un-unrolled graph is also the right
+        one to describe at edit time — the driver wires are non-DAG, so every node's
+        envelope is exactly what its own authored params say. Only the RUN graph unrolls.
+        ``sweep_all`` names the Iterate nodes that must mint every iteration regardless of
+        their preserve mode (the "Run sweep" action).
+
+        ``materialize`` also **cuts every docked dock's in-edge** (V2.18,
+        :func:`~nodelab_v2.ops.cut_docked_inputs`), which is what stops the engine walking
+        a docked chain. It rides on ``materialize`` rather than ``for_run`` for exactly the
+        reason mute rides on ``bypass_muted``: :meth:`propagate` must describe the graph
+        that will RUN, and a docked node's envelope comes from its checkpoint manifest (it
+        is a root there), not from an upstream it no longer reads. Saving still uses the
+        UNcut graph, so the file always keeps the chain that produced the bake."""
         g = Graph()
+        drop_muted = for_run if bypass_muted is None else bypass_muted
         for rec in self.nodes.values():
             params = dict(rec.params)
             if for_run:
                 for k in _UI_PARAM_KEYS:
                     params.pop(k, None)
-            g.add(NodeInstance(rec.id, rec.op_key, params=params,
-                               modes=dict(rec.modes)))
+                # A dock's folder is stored relative to the saved graph (portability);
+                # the worker thread and the engine have no idea where that file is, so
+                # the run graph carries the resolved ABSOLUTE path. Note the bake record
+                # (`__bake__`) deliberately survives here — unlike the UI annotations it
+                # must re-key the memo, so that a re-bake invalidates everything
+                # downstream of the dock.
+                if rec.op_key == DOCK_OP and params.get("store"):
+                    params["store"] = self.dock_store(rec.id)
+            modes = dict(rec.modes)
+            # `live_docks` forces a dock to pass through for THIS graph only — what a
+            # re-bake needs, since the node is currently docked and its in-edge would be
+            # cut, so the bake would read its own old checkpoint and write it back over
+            # itself. The forced state folds into the recipe hash like any mode, so the
+            # live pull and the docked pull memoize as the different computations they
+            # are, and neither can serve the other's result.
+            if rec.id in live_docks and rec.op_key == DOCK_OP:
+                modes["state"] = DOCK_LIVE
+            g.add(NodeInstance(rec.id, rec.op_key, params=params, modes=modes))
         edges = list(self.edges)
-        if for_run:
+        if drop_muted:
             edges = self._bypass_muted(edges)
         for (s, ss, d, ds) in edges:
-            g.connect(s, d, src_socket=ss, dst_socket=ds)
+            g.connect(s, d, src_socket=ss, dst_socket=ds,
+                      kind="driver" if is_driver_edge(self, (s, ss, d, ds)) else "forward")
         for e in self._back_edges:            # preserved zone-feedback edges verbatim
             g.connect(e.src, e.dst, src_socket=e.src_socket,
                       dst_socket=e.dst_socket, kind=e.kind)
         if materialize and self._groups:      # inline group instances into their bodies
             g = _group_expand(g, self._groups)
-        return materialize_channel_taps(g) if materialize else g
+        if not materialize:
+            return g
+        if unroll_iterate:
+            # Groups first (a group body may contain a driven node), Iterate second, dock
+            # cuts + channel taps last — one tap is then shared by every clone, which is
+            # right because a tap upstream of the cone is loop-invariant.
+            g = _iterate_unroll(g, envs=self.envs, sweep_all=sweep_all)
+        return prepare_run_graph(g)
 
     def _bypass_muted(self, edges: List[EdgeTuple]) -> List[EdgeTuple]:
         """Mute-with-passthrough (G3): rewire around each muted node via its first
@@ -448,7 +666,10 @@ class GraphDocument:
             ds_ins = [s.name for s in self.input_specs(rec.id)
                       if s.type is SocketType.DATASET]
             feed = next((e for e in edges if e[2] == rec.id and e[3] in ds_ins), None)
-            outs = [e for e in edges if e[0] == rec.id]
+            # A DRIVER wire is not a data route, so muting must drop it rather than
+            # re-attach it to the bypass source — rewiring one would point a parameter at
+            # the muted node's input, which is not a value at all.
+            outs = [e for e in edges if e[0] == rec.id and not is_driver_edge(self, e)]
             edges = [e for e in edges if e[0] != rec.id and e[2] != rec.id]
             if feed is not None:
                 for (_, _, d, ds) in outs:
@@ -647,12 +868,23 @@ class GraphDocument:
         """Re-run the edit-time MetaEnvelope pass (G8 live re-seed). Sources without
         a seed get an ALL-UNKNOWN envelope — unknown is not z==1, so the H11 lever
         guard never greys 3D just because a source hasn't resolved yet."""
+        self.dormant = self._dormant_nodes()
         try:
             # to_graph(materialize) inlines group instances; a malformed group (e.g. a
             # loaded file referencing a missing definition) raises here too — swallow it
             # like a mid-edit cycle so a single bad state never crashes the live re-seed.
-            g = self.to_graph(materialize=True)
+            # `bypass_muted` matches what the RUNNER builds (runner.py's for_run=True), so
+            # the envelopes the GUI shows describe the graph that will actually execute.
+            g = self.to_graph(materialize=True, bypass_muted=True)
             seeds = dict(self.meta_seeds)
+            # A DOCKED node is a root in this graph (its in-edge is cut), so its envelope
+            # must come from its checkpoint's manifest — axes, calibration, domain set and
+            # layer catalog, read without touching a pixel. Without this the whole
+            # downstream half of the graph would describe itself from an all-unknown
+            # source: no derived spinbox values, an empty layer picker, blank domain
+            # rails. Seeded per propagate rather than cached because the user can
+            # re-bake, repoint or delete a dock at any time; the read is one small JSON.
+            seeds.update(self._dock_seed_envs())
             unknown = MetaEnvelope(unknown_axes=frozenset(AXIS_ORDER))
             for nid in g.roots():
                 seeds.setdefault(nid, unknown)
@@ -674,6 +906,174 @@ class GraphDocument:
 
     def _group_by_name(self, name: str) -> Optional[Group]:
         return next((g for g in self._groups if g.name == name), None)
+
+    # ── docks (V2.18) ─────────────────────────────────────────────────────────
+    def dock_nodes(self) -> List[str]:
+        """Every ``io.dock`` node in the document, in insertion order."""
+        return [nid for nid, rec in self.nodes.items() if rec.op_key == DOCK_OP]
+
+    def _dock_seed_envs(self) -> Dict[str, MetaEnvelope]:
+        """The manifest envelope for each docked node that has a readable checkpoint."""
+        from nodegraph.checkpoint import checkpoint_envelope
+        out: Dict[str, MetaEnvelope] = {}
+        for nid in self.dock_nodes():
+            rec = self.nodes[nid]
+            if not is_docked(rec):
+                continue
+            try:
+                env = checkpoint_envelope(self.dock_store(nid))
+            except Exception:  # noqa: BLE001 — a bad/absent store just stays unknown
+                env = None
+            if env is not None:
+                out[nid] = env
+        return out
+
+    def _dormant_nodes(self) -> frozenset:
+        """The greyed-out set: nodes no docked run will evaluate. Read off the plain
+        (un-materialized, un-muted-bypassed) graph so the ids are the ones the canvas
+        draws — a group instance greys as a whole, which is what the user sees."""
+        if not any(is_docked(r) for r in self.nodes.values()):
+            return frozenset()
+        try:
+            return dormant_nodes(self.to_graph())
+        except Exception:  # noqa: BLE001 — mid-edit; nothing greys rather than crashing
+            return frozenset()
+
+    def dock_store(self, node_id: str) -> str:
+        """The dock's checkpoint directory as an **absolute** path.
+
+        Stored relative to the saved graph whenever it sits beside it (see
+        :meth:`to_dict`), so moving a project folder — or handing it to a colleague —
+        keeps every dock attached. Resolved against the graph's directory here, which is
+        the one place that knows it."""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return ""
+        import os
+        raw = str(rec.params.get("store", "") or "").strip().strip('"').strip("'").strip()
+        if not raw:
+            return ""
+        if os.path.isabs(raw):
+            return os.path.normpath(raw)
+        base = os.path.dirname(os.path.abspath(self.path)) if self.path else os.getcwd()
+        return os.path.normpath(os.path.join(base, raw))
+
+    def default_dock_store(self, node_id: str) -> str:
+        """Where a Bake of ``node_id`` should write when the user has not chosen a
+        folder: ``<graph-name>.docks/<node_id>`` beside the saved file.
+
+        Keyed by node id rather than by a name the user could duplicate, so two docks in
+        one graph can never bake into each other's folder. ``NODEGRAPH_STORE_DIR``
+        redirects it exactly as it redirects an ingest store — the reason is the same
+        (the data may live on slow media), and so is the uniqueness requirement, hence
+        the path digest when it is redirected."""
+        import hashlib
+        import os
+        from nodegraph.parallel import store_dir
+        if self.path:
+            # graphs are saved as `<name>.nd2graph.json`, so one splitext leaves
+            # `<name>.nd2graph` — strip that too, or every project grows a folder called
+            # `MyExperiment.nd2graph.docks`.
+            stem = os.path.splitext(os.path.abspath(self.path))[0]
+            if stem.endswith(".nd2graph"):
+                stem = stem[: -len(".nd2graph")]
+            base = stem + ".docks"
+        else:
+            base = os.path.join(os.getcwd(), "untitled.docks")
+        target = store_dir(os.path.dirname(base))
+        if os.path.abspath(target) == os.path.abspath(os.path.dirname(base)):
+            return os.path.join(base, node_id)
+        tag = hashlib.blake2b(base.lower().encode("utf-8"), digest_size=6).hexdigest()
+        return os.path.join(target,
+                            f"{os.path.basename(base)}.{tag}", node_id)
+
+    def dock_signature(self, node_id: str) -> str:
+        """The upstream signature of ``node_id`` right now — compared against the one
+        recorded at bake time to decide whether the dock has gone stale."""
+        try:
+            return upstream_signature(self.to_graph(bypass_muted=True), node_id)
+        except Exception:  # noqa: BLE001 — mid-edit: never claim staleness on a bad graph
+            return ""
+
+    def dock_status(self, node_id: str) -> Tuple[str, str]:
+        """``(status, detail)`` for a dock card — see
+        :func:`nodelab_v2.ops.dock_status`. Resolved against the document so the store
+        path is the absolute one and the signature matches what a run would see.
+
+        **Memoized per document revision**, because the caller is
+        :meth:`nodelab_v2.node_item.NodeItem.paint` — it runs on every repaint, and the
+        answer costs a graph build, an upstream-closure digest and a JSON read off disk.
+        Uncached, hovering the canvas re-read every dock's manifest tens of times a
+        second. Every edit that can change the answer bumps the revision, including a
+        finished bake (:meth:`set_dock_bake` notifies), so the cache cannot go stale
+        against anything the user did in the app."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key != DOCK_OP:
+            return ("", "")
+        key = (node_id, self.revision)
+        hit = self._dock_status_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            g = self.to_graph(bypass_muted=True)
+            got = (_dock_status(g, node_id, store=self.dock_store(node_id))
+                   if node_id in g.nodes else ("", ""))
+        except Exception:  # noqa: BLE001 — mid-edit: say nothing rather than crash a paint
+            return ("", "")
+        if len(self._dock_status_cache) > 64:         # revisions climb forever
+            self._dock_status_cache.clear()
+        self._dock_status_cache[key] = got
+        return got
+
+    def set_dock_bake(self, node_id: str, *, store: str, bake_id: str,
+                      precision: str, signature: str, nbytes: int = 0,
+                      when: str = "") -> None:
+        """Record a finished bake on ``node_id`` and switch it to ``docked``.
+
+        Writes the store path (relative to the saved graph when it sits beside it, so the
+        project stays portable) plus the machine-set bake record the memo and the
+        staleness check read, then flips the mode — one notify, so the canvas greys the
+        chain and the envelopes re-propagate from the manifest in a single step."""
+        import os
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return
+        rec.params["store"] = self._relative_store(store)
+        rec.params[BAKE_KEY] = {"id": str(bake_id), "sig": str(signature),
+                                "precision": str(precision), "bytes": int(nbytes),
+                                "at": str(when)}
+        rec.modes["state"] = DOCK_DOCKED
+        if precision:
+            rec.modes["precision"] = str(precision)
+        self._notify()
+
+    def _relative_store(self, store: str) -> str:
+        """``store`` relative to the saved graph's folder when it lives under it, else
+        absolute. Keeps a project directory movable without pinning a dock that the user
+        deliberately put on another drive."""
+        import os
+        if not store:
+            return ""
+        store = os.path.normpath(os.path.abspath(store))
+        if not self.path:
+            return store
+        base = os.path.dirname(os.path.abspath(self.path))
+        try:
+            rel = os.path.relpath(store, base)
+        except ValueError:                        # different drive on Windows
+            return store
+        return store if rel.startswith(os.pardir) else rel
+
+    def set_dock_state(self, node_id: str, docked: bool) -> None:
+        """Dock / un-dock without baking. Un-docking runs the chain again from the top;
+        the checkpoint is left on disk, so re-docking is instant."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key != DOCK_OP:
+            return
+        want = DOCK_DOCKED if docked else DOCK_LIVE
+        if rec.modes.get("state", DOCK_LIVE) != want:
+            rec.modes["state"] = want
+            self._notify()
 
     def env(self, node_id: str) -> MetaEnvelope:
         return self.envs.get(node_id, MetaEnvelope())
@@ -771,7 +1171,12 @@ class GraphDocument:
         self.meta_seeds.clear()
         self._zones = list(zones)                    # preserved verbatim (not yet edited)
         self._groups = list(groups)
-        self._back_edges = [e for e in graph.edges if e.kind != "forward"]
+        # A DRIVER edge is a first-class document edge (the canvas draws it, the user made
+        # it); only zone feedback rides in `_back_edges` as un-editable structure. Its kind
+        # is re-derived on save from the socket it leaves, so the round-trip is exact
+        # without the document ever storing a kind.
+        self._back_edges = [e for e in graph.edges
+                            if e.kind not in ("forward", "driver")]
         for nid, inst in graph.nodes.items():
             extra = ui_nodes.get(nid, {})
             self.nodes[nid] = NodeRecord(
@@ -780,7 +1185,7 @@ class GraphDocument:
                 muted=bool(extra.get("muted", False)),
                 collapsed=bool(extra.get("collapsed", False)))
         for e in graph.edges:
-            if e.kind == "forward":                  # back-edges ride in _back_edges
+            if e.kind in ("forward", "driver"):      # back-edges ride in _back_edges
                 self.edges.append((e.src, e.src_socket, e.dst, e.dst_socket))
         # GUI frames (only members that survived the load are kept; empty ⇒ dropped)
         self.frames = {}
@@ -804,15 +1209,29 @@ class GraphDocument:
 
     def save_file(self, path: str) -> None:
         import json
+        # Dock store paths are stored RELATIVE to the saved graph whenever they sit
+        # beside it, so a project folder stays movable. That makes them a function of
+        # `self.path` — so a Save As must re-anchor every one of them, or the docks would
+        # silently point at the old location's folders. Resolve to absolute against the
+        # OLD path first, then re-relativize against the new one.
+        absolute = {nid: self.dock_store(nid) for nid in self.dock_nodes()}
+        self.path = path
+        for nid, store in absolute.items():
+            if store:
+                self.nodes[nid].params["store"] = self._relative_store(store)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, sort_keys=True)
-        self.path = path
 
     def load_file(self, path: str) -> None:
         import json
         with open(path, "r", encoding="utf-8") as f:
-            self.load_dict(json.load(f))
+            d = json.load(f)
+        # `path` is set BEFORE the load: `load_dict` notifies, which re-propagates, which
+        # resolves every dock's relative store folder against the graph's directory. Set
+        # afterwards and that first propagation would look for the docks in the working
+        # directory and describe a whole loaded pipeline as unknown.
         self.path = path
+        self.load_dict(d)
 
 
 __all__ = ["GraphDocument", "NodeRecord", "FrameRecord", "LOCKED_KEY"]

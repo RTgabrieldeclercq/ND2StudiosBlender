@@ -21,18 +21,26 @@ and report ``axes``/``levels``/``tile``; the base derives every other read from 
   **lazily imported**, so the core and the synthetic provider need no blosc2). ND2
   ingest (ND2 → 6-D numpy) is an app/ingest-layer concern that feeds
   :meth:`B2ndProvider.from_array`; ``nodegraph`` itself stays nd2-free.
+* :class:`ArrayProvider` — an already-realized 6-D array (what a realizing node returns).
+* :class:`FrameSubsetProvider` — a lazy VIEW of another provider restricted to chosen
+  ``m``/``t``/``z`` indices (each axis picks independently, so the view is their cross
+  product). It scopes a whole run to those planes — the GUI's frame-selection
+  troubleshooting mode — without touching the graph. :class:`FrameSliceProvider` is the
+  one-frame case of it.
 
 Qt-free; numpy at the core, blosc2 optional.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from dataclasses import replace
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from nodegraph.dataset import AxisSizes
+from nodegraph.parallel import map_units
 
 
 class TileProvider(ABC):
@@ -146,15 +154,73 @@ class SyntheticProvider(TileProvider):
 
 # ── Blosc2 b2nd provider (planar blocks; blosc2 lazily imported) ──────────────
 
+#: Target bytes per b2nd **chunk** (the on-disk framing unit, not the read unit).
+#: Bigger chunks amortize blosc2's per-chunk framing, which is what capped the ingest
+#: write at 55 MB/s; the cap keeps the one contiguous slab the progress-reporting fill
+#: loop holds bounded, so a >50 GB ingest still never carries a second copy of the
+#: volume. 128 MiB sits on the flat part of the measured curve (67 MiB → 517 MB/s,
+#: 268 MiB → 630 MB/s).
+_CHUNK_TARGET_BYTES = 128 << 20
+
+
+#: ``vlmeta`` key each pyramid level is stamped with once it is **fully written**
+#: (V2.19). A b2nd array declares its full shape at ``blosc2.empty`` time, so an ingest
+#: killed partway (crash, cancel, OOM, full disk) leaves a file whose geometry looks right
+#: and whose unwritten chunks read as **zeros** — silently wrong pixels, and a torn pyramid
+#: that :meth:`B2ndProvider.open` used to accept as a complete store of fewer levels. The
+#: marker is what makes "complete" a fact on disk rather than an assumption.
+_LEVEL_META = "nodegraph_level"
+
+
+def _plane_mean_2x(plane: np.ndarray) -> np.ndarray:
+    """One 2-D plane mean-pooled 2× — **the** pyramid arithmetic, in one place.
+
+    Every pyramid path routes its per-plane reduction through this function so the
+    streamed build (:meth:`B2ndProvider._append_level`), the in-RAM reference
+    (:func:`_mean_downsample_2x`) and :mod:`nodegraph.checkpoint` cannot drift apart."""
+    y, x = plane.shape[-2], plane.shape[-1]
+    hy, hx = y // 2, x // 2
+    return plane[..., :hy * 2, :hx * 2].reshape(
+        *plane.shape[:-2], hy, 2, hx, 2).mean(axis=(-3, -1)).astype(plane.dtype)
+
+
 def _mean_downsample_2x(a: np.ndarray) -> np.ndarray:
     """Mean-pool the trailing (Y,X) by 2× (intensity pyramid). Returns ``a`` if a
-    spatial axis is < 2 (cannot halve further)."""
+    spatial axis is < 2 (cannot halve further).
+
+    **The in-RAM reference form.** The pyramid writer no longer calls this — it streams
+    level *l* out of level *l-1*'s store one z-slab at a time (:meth:`
+    B2ndProvider._append_level`), because materializing a whole downsampled level in RAM
+    is what killed the 84.7 GB ingest that motivated V2.19: this function's output for
+    level 1 of that series is 21 GB, allocated *while* the 84.7 GB source is still held.
+    It stays as the reference the selftest compares the streamed pyramid against, and for
+    bare plane/volume callers.
+
+    Computed **per plane on a worker pool** for a 6-D input (V2.14). Two reasons, and the
+    memory one matters more than the speed one: ``mean`` over a whole uint16 volume
+    promotes to float64, so the one-shot form allocated a float64 intermediate the size of
+    the *entire series* (4× the input's bytes for uint16) before casting back. Per-plane
+    keeps that intermediate at one plane. Once the b2nd write stopped being the
+    bottleneck this pass became ~58% of an ingest, so it is also now worth the fan-out.
+
+    The result is bit-identical to the one-shot form: each output plane is a reduction over
+    its own 2×2 neighbourhoods only, so splitting by plane changes no arithmetic."""
     y, x = a.shape[-2], a.shape[-1]
     if y < 2 or x < 2:
         return a
-    a = a[..., :y // 2 * 2, :x // 2 * 2]
-    r = a.reshape(*a.shape[:-2], y // 2, 2, x // 2, 2).mean(axis=(-3, -1))
-    return r.astype(a.dtype)
+    hy, hx = y // 2, x // 2
+    if a.ndim != 6:                       # keep the simple path for a bare plane/volume
+        return _plane_mean_2x(a)
+    m, t, z, c = a.shape[:4]
+    out = np.empty((m, t, z, c, hy, hx), dtype=a.dtype)
+
+    def one(unit):
+        im, it, iz, ic = unit
+        out[im, it, iz, ic] = _plane_mean_2x(a[im, it, iz, ic])
+
+    map_units(one, [(im, it, iz, ic) for im in range(m) for it in range(t)
+                    for iz in range(z) for ic in range(c)])
+    return out
 
 
 class B2ndProvider(TileProvider):
@@ -202,78 +268,548 @@ class B2ndProvider(TileProvider):
 
     # ── ingest / persistence (blosc2 lazily imported; nd2-free) ─────────────────
     @staticmethod
-    def _build_levels(vol6d: np.ndarray, *, tile: int, levels: int,
-                      cparams: Optional[dict], urlpath: Optional[str] = None) -> List:
+    def _pyramid_shapes(shape: Tuple[int, ...], levels: int) -> List[Tuple[int, ...]]:
+        """The 6-D shape of each pyramid level, stopping early when Y or X can no longer
+        be halved (mirrors :func:`_mean_downsample_2x`'s guard, so the writer, the byte
+        budget and :meth:`ensure_levels` all agree on how tall the pyramid can be)."""
+        m, t, z, c, y, x = shape
+        out = [(m, t, z, c, y, x)]
+        for _ in range(max(1, levels) - 1):
+            if y < 2 or x < 2:
+                break
+            y, x = y // 2, x // 2
+            out.append((m, t, z, c, y, x))
+        return out
+
+    @staticmethod
+    def _store_kwargs(shape: Tuple[int, ...], itemsize: int, *, tile: int,
+                      cparams: dict, urlpath: Optional[str], level: int) -> dict:
+        """The b2nd geometry for one level. **The two geometries do DIFFERENT jobs**
+        (V2.14):
+
+        ``blocks`` is the decompression granularity — the keystone verdict, one 2D tile per
+        z, and the whole reason a 512² ROI costs a few percent of a plane. It is the read
+        contract and does not move.
+
+        ``chunks`` is only the on-disk framing, and the shipped (2·tile)² was far too
+        small: measured on this pipeline, a 1 GiB uint16 series wrote at 55 MB/s with
+        ``(1,1,1,1,1024,1024)`` versus 630 MB/s at ``(1,1,32,1,2048,2048)`` — an 11.5×
+        ingest speedup for byte-identical compressed output (561.4 vs 561.5 MiB) and a 9%
+        tile-read cost. The write was never codec- or disk-bound: every codec landed at
+        53–58 MB/s, while the NVMe underneath absorbs 952 MB/s."""
+        import os
+        _m, _t, z, _c, y, x = shape
+        by, bx = min(tile, y), min(tile, x)              # READ granularity — unchanged
+        plane_bytes = max(1, y * x * itemsize)
+        cz = max(1, min(z, int(_CHUNK_TARGET_BYTES // plane_bytes)))
+        kw: dict = {"chunks": (1, 1, cz, 1, y, x), "blocks": (1, 1, 1, 1, by, bx),
+                    "cparams": cparams}
+        if urlpath is not None:
+            kw["urlpath"] = os.path.join(urlpath, f"level_{level}.b2nd")
+            kw["mode"] = "w"
+        return kw
+
+    @staticmethod
+    def _mark(arr: Any, level: int, complete: bool) -> None:
+        """Stamp a level's write state (see :data:`_LEVEL_META`).
+
+        Called **twice** per level: ``complete=False`` immediately after ``blosc2.empty``
+        declares the geometry, and ``complete=True`` once the last chunk is in. Marking the
+        start is what makes a tear detectable at all — stamping only on success would leave
+        a half-written level indistinguishable from a pre-V2.19 one, and those are trusted
+        (see :meth:`_level_state`), so a crashed ingest would go on serving zeros.
+
+        Best-effort: a blosc2 without writable ``vlmeta`` must not fail an otherwise good
+        ingest. There the store simply reads back as legacy, exactly as before V2.19."""
+        try:
+            arr.vlmeta[_LEVEL_META] = {"complete": bool(complete), "level": int(level),
+                                       "shape": [int(v) for v in arr.shape]}
+        except Exception:  # noqa: BLE001 — the marker is metadata, never the data
+            pass
+
+    @staticmethod
+    def _level_state(arr: Any) -> str:
+        """``"complete"`` / ``"torn"`` / ``"legacy"`` for one opened level array.
+
+        ``legacy`` — no marker at all — means *written before V2.19* and is **trusted**.
+        Those stores are overwhelmingly fine, and the alternative (distrusting them) would
+        force a multi-hour re-ingest of every file already on disk to fix a fault we have no
+        evidence of. The one case it cannot catch is a pre-V2.19 ingest torn mid-level, and
+        the honest reason that is acceptable: the only tell would be a tail of zero planes,
+        which a real fluorescence z-stack has too, so acting on it would corrupt good stores
+        to protect bad ones. Everything written from V2.19 on is marked before its first
+        byte, so a tear there is a fact, not an inference."""
+        try:
+            meta = arr.vlmeta.get(_LEVEL_META)
+        except Exception:  # noqa: BLE001 — no vlmeta support ⇒ indistinguishable from none
+            return "legacy"
+        if meta is None:
+            return "legacy"
+        if isinstance(meta, dict) and meta.get("complete") is True \
+                and list(meta.get("shape", arr.shape)) == [int(v) for v in arr.shape]:
+            return "complete"
+        return "torn"
+
+    @staticmethod
+    def _blank_tail(arr: Any) -> Optional[Tuple[int, int]]:
+        """``(chunks_written, chunks_total)`` when ``arr``'s never-written chunks form a
+        **pure trailing run**, else ``None``. This is the marker-free tear test — the one
+        that catches a store written *before* :data:`_LEVEL_META` existed (V2.20).
+
+        Why it is needed at all: :meth:`_level_state` trusts an unmarked level, and the
+        lab's 84.7 GB series turned out to have a *legacy* ``level_0`` holding only
+        7 899 of 40 320 chunks — positions m≥2 read back as solid zeros, and every layer
+        above (the pyramid repair included) faithfully reproduced them. "Legacy is fine"
+        was an assumption, and this is the evidence that replaced it.
+
+        Cheap: ``iterchunks_info`` reads each chunk's 32-byte header and decompresses
+        nothing (2.7 s for those 40 320 chunks). blosc2 stores a chunk that was never
+        written as a *special* run-length value rather than as data, so "written" is a
+        fact on disk, not an inference from the pixels.
+
+        **A pure tail, and nothing weaker.** blosc2 also files a chunk that was genuinely
+        written and happens to be constant as that same special value, so a blank chunk
+        alone proves nothing: a segmentation mask is legitimately blank almost everywhere.
+        A write that stops partway, though, leaves blanks *only* at the end — so a
+        trailing run with a fully-written body is the tear's signature and a scattered
+        pattern is real sparse data. The rule errs toward silence: a torn store whose
+        written part contains one constant chunk reads as sparse and is not flagged, which
+        is the right way round for a test whose verdict costs the user a re-ingest."""
+        try:
+            blank = [i.special.name != "NOT_SPECIAL"
+                     for i in arr.schunk.iterchunks_info()]
+        except Exception:  # noqa: BLE001 — no census available ⇒ no verdict, not a fault
+            return None
+        n = len(blank)
+        if not n or not blank[-1]:
+            return None                      # the last chunk holds data ⇒ nothing torn
+        first = n - 1
+        while first > 0 and blank[first - 1]:
+            first -= 1
+        if any(blank[:first]):
+            return None                      # blanks through the body ⇒ sparse, not torn
+        return (first, n)
+
+    def level_state(self, level: int = 0) -> str:
+        """:meth:`_level_state` for an already-open level — ``"complete"`` / ``"torn"`` /
+        ``"legacy"`` — so a caller can ask what a store's marker says without re-opening
+        it (the ingest layer gates its density check on ``"legacy"``)."""
+        return self._level_state(self._arrays[level])
+
+    def blank_tail(self, level: int = 0) -> Optional[Tuple[int, int]]:
+        """:meth:`_blank_tail` for an already-open level: ``(chunks_written,
+        chunks_total)`` when this level stops partway through, else ``None``."""
+        try:
+            return self._blank_tail(self._arrays[level])
+        except (IndexError, AttributeError):    # no such level / not a b2nd array
+            return None
+
+    @classmethod
+    def _append_level(cls, prev: Any, level: int, *, tile: int, cparams: dict,
+                      urlpath: Optional[str], bump: Optional[Callable[[int], None]] = None
+                      ) -> Optional[Any]:
+        """Build level ``level`` by **streaming out of ``prev``** (level ``level-1``'s
+        b2nd array) one z-slab at a time, and return it — or ``None`` when ``prev`` can no
+        longer be halved.
+
+        This is the V2.19 repair. The old writer downsampled the whole previous level in
+        RAM (``_mean_downsample_2x``) and handed the result to the store: for the lab's
+        84.7 GB ND2 that is a 21 GB allocation made *while* the 84.7 GB source array is
+        still live, and it is why that file's store on disk has a complete ``level_0`` and
+        no pyramid at all — the ingest died between levels, leaving no trace that it had.
+        Streaming holds one slab of each side instead (bounded by
+        :data:`_CHUNK_TARGET_BYTES`), so the pyramid's memory cost no longer scales with
+        the series at all, and level *l* can be rebuilt from level *l-1* long after the
+        ND2 is gone.
+
+        A slab is chunk-aligned on both sides and never crosses ``(M,T,C)``, so this writes
+        exactly the bytes the one-shot form did. The per-plane reduction is
+        :func:`_plane_mean_2x` — the same expression, so the result is bit-identical.
+
+        **The slab's planes reduce on the worker pool** (V2.20), exactly as the in-RAM
+        reference :func:`_mean_downsample_2x` already did. Streaming was never the reason
+        to give that up, but the first cut of this function looped the planes serially and
+        it cost more than everything else in an ingest put together: measured on a 1.64 GiB
+        slice of the lab's 640 series (24 cores), level 1 alone took **6.0 s** against 2.2 s
+        to compress level 0 and 2.1 s to decode the ND2 — a quarter of the data for three
+        times the time, because one core was mean-pooling 840 planes while 23 sat idle.
+        Order is irrelevant here (each plane writes its own row of ``out``), so this is the
+        cheapest possible use of the pool: pure per-plane compute, no fold."""
+        import blosc2
+        m, t, z, c, y, x = prev.shape
+        if y < 2 or x < 2:
+            return None
+        shape = (m, t, z, c, y // 2, x // 2)
+        dtype = prev.dtype
+        kw = cls._store_kwargs(shape, dtype.itemsize, tile=tile, cparams=cparams,
+                               urlpath=urlpath, level=level)
+        dst = blosc2.empty(shape, dtype=dtype, **kw)
+        cls._mark(dst, level, False)                 # declared, not yet written
+        cz = int(kw["chunks"][2])
+        for im, it, ic in np.ndindex(m, t, c):
+            for z0 in range(0, z, cz):
+                z1 = min(z0 + cz, z)
+                src = np.asarray(prev[im, it, z0:z1, ic, :, :])
+                out = np.empty((z1 - z0, shape[4], shape[5]), dtype=dtype)
+
+                def one(iz: int, _s=src, _o=out) -> None:
+                    _o[iz] = _plane_mean_2x(_s[iz])
+
+                map_units(one, range(z1 - z0))
+                dst[im:im + 1, it:it + 1, z0:z1, ic:ic + 1, :, :] = out[None, None, :, None]
+                if bump is not None:
+                    bump(z1 - z0)
+        cls._mark(dst, level, True)
+        return dst
+
+    @classmethod
+    def _build_levels(cls, vol6d: Any, *, tile: int, levels: int,
+                      cparams: Optional[dict], urlpath: Optional[str] = None,
+                      progress: Optional[Callable[[float], None]] = None) -> List:
         """Build ``levels`` planar-block b2nd pyramid arrays from a 6-D volume. If
         ``urlpath`` is a directory, each level persists to ``level_<l>.b2nd`` there;
-        otherwise the arrays are in-memory."""
+        otherwise the arrays are in-memory.
+
+        ``vol6d`` is any 6-D array-like that reports ``shape``/``dtype`` and supports
+        numpy-style slicing — a realized numpy array, or a **lazy** one (an nd2
+        ``to_dask()`` view). The level-0 loop below already reads exactly one z-slab per
+        write, so handing it a lazy source makes the whole ingest streaming: peak memory
+        is one slab rather than the entire series, and an 84.7 GB ND2 no longer needs an
+        84.7 GB ``np.empty`` to exist before its first byte is compressed (V2.20).
+
+        Level 0 is written from ``vol6d``; every level above it is streamed out of the
+        level below (:meth:`_append_level`) rather than downsampled in RAM, and each is
+        stamped complete only once fully written (:data:`_LEVEL_META`).
+
+        ``progress``, when given, is called with a monotonic ``0→1`` fraction of the
+        PLANES written so far across the WHOLE pyramid (level *l* carries ~1/4^l of level
+        0 by bytes, but one plane per source plane, which is what the loops step), so a
+        caller drives one determinate bar instead of one per level."""
         import blosc2
-        import os
         if vol6d.ndim != 6:
             raise ValueError(f"expected a 6-D (M,T,Z,C,Y,X) array, got {vol6d.shape}")
         cparams = cparams or {"codec": blosc2.Codec.ZSTD,
                               "filters": [blosc2.Filter.BITSHUFFLE]}
+        shapes = cls._pyramid_shapes(vol6d.shape, levels)
+        # The pyramid's plane budget up front (predicting the halvings is free) so the
+        # fraction stays monotonic across levels rather than restarting at 0 on each.
+        per_level = int(np.prod(vol6d.shape[:4]))
+        total = max(1, per_level * len(shapes))
+        done = 0
 
-        def store(vol: np.ndarray, level: int):
-            _, _, _, _, y, x = vol.shape
-            by, bx = min(tile, y), min(tile, x)
-            cy, cx = min(2 * tile, y), min(2 * tile, x)
-            kw: dict = {"chunks": (1, 1, 1, 1, cy, cx), "blocks": (1, 1, 1, 1, by, bx),
-                        "cparams": cparams}
-            if urlpath is not None:
-                kw["urlpath"] = os.path.join(urlpath, f"level_{level}.b2nd")
-                kw["mode"] = "w"
-            return blosc2.asarray(np.ascontiguousarray(vol), **kw)
+        def bump(n: int) -> None:
+            nonlocal done
+            done += int(n)
+            if progress is not None:
+                progress(min(1.0, done / total))
 
-        arrays, cur = [], vol6d
-        for lvl in range(max(1, levels)):
-            arrays.append(store(cur, lvl))
-            if lvl < levels - 1:
-                cur = _mean_downsample_2x(cur)
+        kw = cls._store_kwargs(shapes[0], np.dtype(vol6d.dtype).itemsize, tile=tile,
+                               cparams=cparams, urlpath=urlpath, level=0)
+        m, t, z, c = vol6d.shape[:4]
+        cz = int(kw["chunks"][2])
+        # A determinate bar needs sub-level granularity, and a chunk spans `cz` planes and
+        # never crosses (M,T,C) — so filling ONE z-slab at a time is exactly chunk-aligned
+        # (the same on-disk bytes as `blosc2.asarray`) and reports honestly. It also holds
+        # one slab contiguous at a time instead of a whole second copy of the volume, which
+        # is what made a >50 GB ingest thrash.
+        arr0 = blosc2.empty(vol6d.shape, dtype=vol6d.dtype, **kw)
+        cls._mark(arr0, 0, False)                    # declared, not yet written
+        for im, it, ic in np.ndindex(m, t, c):
+            for z0 in range(0, z, cz):
+                z1 = min(z0 + cz, z)
+                arr0[im:im + 1, it:it + 1, z0:z1, ic:ic + 1, :, :] = \
+                    np.ascontiguousarray(vol6d[im:im + 1, it:it + 1, z0:z1, ic:ic + 1])
+                bump(z1 - z0)
+        cls._mark(arr0, 0, True)
+
+        arrays = [arr0]
+        for lvl in range(1, len(shapes)):
+            nxt = cls._append_level(arrays[-1], lvl, tile=tile, cparams=cparams,
+                                    urlpath=urlpath, bump=bump)
+            if nxt is None:
+                break
+            arrays.append(nxt)
+        if progress is not None:
+            progress(1.0)
         return arrays
 
     @classmethod
     def from_array(cls, vol6d: np.ndarray, *, tile: int = 512, levels: int = 1,
-                   cparams: Optional[dict] = None) -> "B2ndProvider":
+                   cparams: Optional[dict] = None,
+                   progress: Optional[Callable[[float], None]] = None) -> "B2ndProvider":
         """Ingest a ``(M,T,Z,C,Y,X)`` numpy volume into an **in-memory** planar-block
         b2nd store with ``levels`` mean-downsampled pyramid levels. (An ND2 → 6-D numpy
         reader is an app/ingest-layer concern; ``nodegraph`` stays nd2-free.)"""
-        arrays = cls._build_levels(vol6d, tile=tile, levels=levels, cparams=cparams)
+        arrays = cls._build_levels(vol6d, tile=tile, levels=levels, cparams=cparams,
+                                   progress=progress)
         m, t, z, c, y, x = vol6d.shape
         return cls(arrays, AxisSizes(m=m, t=t, z=z, c=c, y=y, x=x), tile=tile)
 
     @classmethod
-    def write(cls, vol6d: np.ndarray, urlpath: str, *, tile: int = 512, levels: int = 1,
-              cparams: Optional[dict] = None) -> "B2ndProvider":
+    def write(cls, vol6d: Any, urlpath: str, *, tile: int = 512, levels: int = 1,
+              cparams: Optional[dict] = None,
+              progress: Optional[Callable[[float], None]] = None) -> "B2ndProvider":
         """Persist a 6-D volume to an **on-disk** b2nd store at directory ``urlpath``
         (one ``level_<l>.b2nd`` per pyramid level) and return a provider opened over it
-        (the C4 disk path — ingest once, then a lazy disk-backed provider)."""
+        (the C4 disk path — ingest once, then a lazy disk-backed provider). ``progress``
+        is forwarded to :meth:`_build_levels` (0→1 over the whole pyramid).
+
+        ``vol6d`` may be **lazy** (see :meth:`_build_levels`); it is deliberately NOT
+        coerced with ``np.asarray`` here, since that would realize the whole series in RAM
+        and defeat the streaming write."""
         import os
         os.makedirs(urlpath, exist_ok=True)
-        cls._build_levels(np.asarray(vol6d), tile=tile, levels=levels, cparams=cparams,
-                          urlpath=urlpath)
+        cls._build_levels(vol6d, tile=tile, levels=levels, cparams=cparams,
+                          urlpath=urlpath, progress=progress)
         return cls.open(urlpath)
+
+    @staticmethod
+    def _level_files(urlpath: str) -> List[str]:
+        """``level_0.b2nd`` … in index order, requiring a **contiguous run from 0**. A gap
+        (``level_0`` + ``level_2``) is a broken store, not a two-level one: ``levels`` is a
+        count and every reader indexes by position, so accepting the gap would serve
+        level 2's pixels to a request for level 1."""
+        import glob
+        import os
+        found = {}
+        for p in glob.glob(os.path.join(urlpath, "level_*.b2nd")):
+            stem = os.path.splitext(os.path.basename(p))[0]
+            try:
+                found[int(stem.split("_")[1])] = p
+            except (IndexError, ValueError):
+                continue
+        out: List[str] = []
+        while len(out) in found:
+            out.append(found[len(out)])
+        return out
 
     @classmethod
     def open(cls, urlpath: str) -> "B2ndProvider":
         """Open an on-disk b2nd store written by :meth:`write` — lazy (blocks decompress
-        on read). ``version``/``fingerprint`` fold in the store's ``mtime_ns`` so an
-        in-place file change invalidates the memo (C5)."""
+        on read). ``version``/``fingerprint`` fold in **level 0's** ``mtime_ns`` so an
+        in-place file change invalidates the memo (C5).
+
+        Levels are taken as the leading run that is complete-or-legacy
+        (:meth:`_level_state`); a **torn** level above 0 is dropped (the store opens
+        shorter and :meth:`ensure_levels` can rebuild it), and a torn level 0 is a hard
+        error — its pixels are partly zeros, so serving them would be silent corruption,
+        and the caller's answer is to re-ingest from the source file."""
         import blosc2
-        import glob
         import os
-        files = sorted(
-            glob.glob(os.path.join(urlpath, "level_*.b2nd")),
-            key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]))
+        files = cls._level_files(urlpath)
         if not files:
             raise FileNotFoundError(f"no level_*.b2nd store in {urlpath!r}")
-        arrays = [blosc2.open(f) for f in files]
+        arrays: List[Any] = []
+        for lvl, f in enumerate(files):
+            a = blosc2.open(f)
+            state = cls._level_state(a)
+            if state == "torn":
+                if lvl == 0:
+                    raise ValueError(
+                        f"torn b2nd store: {f!r} was never finished writing (its "
+                        f"unwritten blocks would read as zeros), so it must be re-ingested "
+                        f"from the source file — level 0 is the only level no other level "
+                        f"can be rebuilt from. Deleting {urlpath!r} forces that.")
+                break                      # a repairable pyramid: open what is sound
+            arrays.append(a)
         m, t, z, c, y, x = arrays[0].shape
         blocks = getattr(arrays[0], "blocks", None)
         tile = int(blocks[-1]) if blocks else 512
-        mtime_ns = max(os.stat(f).st_mtime_ns for f in files)
+        # LEVEL 0 ONLY (V2.19). Every compute reads level 0; levels above it are a display
+        # convenience. Folding the whole store's newest mtime in meant that *completing the
+        # pyramid* — which does not touch a single pixel a compute can see — re-keyed the
+        # source and threw away every memoized result downstream of it. On the lab's series
+        # that is a 4-minute Deconvolve recomputed to add a thumbnail level.
+        mtime_ns = os.stat(files[0]).st_mtime_ns
         return cls(arrays, AxisSizes(m=m, t=t, z=z, c=c, y=y, x=x), tile=tile,
                    urlpath=urlpath, mtime_ns=mtime_ns)
+
+    @classmethod
+    def ensure_levels(cls, urlpath: str, levels: int, *,
+                      cparams: Optional[dict] = None,
+                      progress: Optional[Callable[[float], None]] = None
+                      ) -> "B2ndProvider":
+        """Complete an existing store's pyramid **in place**, from the deepest sound level
+        it already has, and return a provider over the result (V2.19).
+
+        This is the repair half of the torn-pyramid fix. A store whose ``level_0`` is
+        intact needs no source file to regain its pyramid — level *l* is a pure function of
+        level *l-1* — so the 84.7 GB ND2 that produced it need not be read, re-decoded, or
+        even still exist. Idempotent: a store that already has ``levels`` sound levels is
+        opened and returned untouched.
+
+        Raises whatever :meth:`open` raises for a store that cannot be repaired (no
+        ``level_0``, or a torn one) — the caller's fallback there is a real re-ingest."""
+        import blosc2
+        prov = cls.open(urlpath)                     # raises on an unrepairable store
+        want = len(cls._pyramid_shapes(prov._arrays[0].shape, levels))
+        if prov.levels >= want:
+            return prov
+        cparams = cparams or {"codec": blosc2.Codec.ZSTD,
+                              "filters": [blosc2.Filter.BITSHUFFLE]}
+        per_level = int(np.prod(prov._arrays[0].shape[:4]))
+        total = max(1, per_level * (want - prov.levels))
+        done = 0
+
+        def bump(n: int) -> None:
+            nonlocal done
+            done += int(n)
+            if progress is not None:
+                progress(min(1.0, done / total))
+
+        last = prov._arrays[-1]
+        for lvl in range(prov.levels, want):
+            nxt = cls._append_level(last, lvl, tile=prov.tile, cparams=cparams,
+                                    urlpath=urlpath, bump=bump)
+            if nxt is None:
+                break
+            last = nxt
+        if progress is not None:
+            progress(1.0)
+        return cls.open(urlpath)
+
+
+def _picked(idx, n: int) -> tuple:
+    """``idx`` as a sorted, de-duplicated, in-range index tuple for an axis of length
+    ``n`` — never empty (an empty or fully out-of-range pick degrades to index 0).
+
+    Clamping rather than raising is deliberate: the picks come from a GUI cursor bounded
+    by whatever was last displayed, and a graph edit can shrink a source underneath it.
+    Showing the nearest real plane beats turning a stale cursor into a failed pull."""
+    hi = max(0, int(n) - 1)
+    out = sorted({min(max(0, int(i)), hi) for i in idx})
+    return tuple(out) if out else (0,)
+
+
+def subset_index(picks: Sequence[int], value: int) -> int:
+    """Where ``value`` — an index in the BASE provider's addressing — lands inside a
+    subset built from (sorted) ``picks``: the inverse of the remap
+    :meth:`FrameSubsetProvider.read_region` performs.
+
+    A value that was **not** picked resolves to the nearest one that was. That is what
+    lets a GUI cursor sit outside the run scope and still address a real plane of the
+    payload instead of reading past its end. ``picks`` of ``None``/empty means the axis
+    was not subset at all, so the value passes through unchanged."""
+    n = len(picks) if picks else 0
+    if n == 0:
+        return int(value)
+    j = bisect_left(picks, int(value))
+    if j >= n:
+        return n - 1
+    if j == 0 or picks[j] == value:
+        return j
+    return j if (picks[j] - value) < (value - picks[j - 1]) else j - 1
+
+
+class FrameSubsetProvider(TileProvider):
+    """A lazy **subset** view of another provider: ``m``/``t``/``z`` shrink to the picked
+    indices and every read resolves through them into the base's own addressing.
+
+    The three axes pick **independently**, so the view is their cross product: picking two
+    positions, three timepoints and five z-planes yields 2·3 frames of 5 planes each. That
+    is the honest generalisation of what the axes mean — a *frame* is the Frame domain's
+    own address ``(m, t)`` and z lives inside one — and it is what turns a per-frame node
+    loop into ``len(ms)·len(ts)`` units instead of M·T of them, each over a shorter volume.
+    ``c`` and the spatial extent (and the pyramid) still pass through untouched, so a
+    multi-channel node gets every channel of every picked plane; ``zs`` of ``None`` leaves
+    z alone, which is the right default because a 3D node needs a volume.
+
+    Picks are **sorted**, so t and z rise monotonically through the subset: a tracker (or
+    any other temporal node) walks the chosen frames in acquisition order, and a 3D kernel
+    walks the chosen planes bottom-to-top, just with the unpicked ones absent. Calibration
+    passes through untouched — ``dt_s`` and ``z_step_um`` still describe the *source's*
+    interval and spacing, exactly as :func:`nodegraph.metadata.frame_slice` reasons for
+    ``zone.frame``. That is exact for a contiguous pick and a deliberate approximation for
+    a strided one: a subset is a *sampling* of the acquisition, not a re-timed or
+    re-spaced one.
+
+    Its reason to exist is the GUI's **frame-selection troubleshooting scope**
+    (:meth:`nodelab_v2.runner.EngineRunner.set_solo_frame`): the runner seeds the graph
+    with a subset source and every node downstream — the eager per-unit computes included
+    — then sees a short series without a single node knowing about it. That is why it
+    lives here rather than in the node catalog: scoping a *run* is not an edit to the
+    user's graph, and a node the user cannot see in their own graph would be a lie about
+    what ran.
+
+    The picks fold into :meth:`fingerprint`, hence into ``version``, hence into the source
+    node's ``__seed_version__`` and so into every downstream ``recipe_hash`` (see
+    :meth:`nodegraph.engine.Engine._entry`). Two consequences, both required: a scoped
+    result can never be served for a different selection or for the un-scoped series, and
+    coming back to a selection already computed is a plain memo hit.
+    """
+
+    #: fingerprint discriminator — the single-frame subclass keeps its own, so the two
+    #: never alias in the memo and a one-frame scope keys exactly as it always has.
+    _TAG = "frame-subset"
+
+    def __init__(self, base: TileProvider, ms=(0,), ts=(0,), zs=None) -> None:
+        self._base = base
+        ax = base.axes
+        self._ms = _picked(ms, ax.m)
+        self._ts = _picked(ts, ax.t)
+        # None (not an empty tuple) is "z untouched": the whole volume, no remap, and
+        # nothing added to the fingerprint — so a scope that only picks frames keeps the
+        # identity it had before z became pickable.
+        self._zs = _picked(zs, ax.z) if zs else None
+        self.axes = replace(ax, m=len(self._ms), t=len(self._ts),
+                            z=ax.z if self._zs is None else len(self._zs))
+        self.tile = base.tile
+        self.levels = base.levels
+        # A pure index remap computes NOTHING, so it is not a level of the lazy chain:
+        # inheriting `depth` (rather than +1) keeps a consumer's tile fan-out heuristic
+        # (`StreamProvider._fanout_ok`) reading the same as it would without the pick.
+        self.depth = getattr(base, "depth", 0)
+        self.cum_halo = getattr(base, "cum_halo", 0)
+
+    @property
+    def frames(self) -> tuple:
+        """The picked ``(ms, ts)`` in the BASE provider's addressing (both sorted)."""
+        return (self._ms, self._ts)
+
+    @property
+    def planes(self) -> Optional[tuple]:
+        """The picked ``zs`` in the BASE provider's addressing, or ``None`` when the whole
+        z range passes through."""
+        return self._zs
+
+    def level_axes(self, level: int) -> AxisSizes:
+        lax = self._base.level_axes(level)
+        return replace(lax, m=len(self._ms), t=len(self._ts),
+                       z=lax.z if self._zs is None else len(self._zs))
+
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
+        # m/t/z are CLAMPED into the subset rather than trusted: this view has only the
+        # picked indices, a consumer's own clamping already sends an in-range one, and
+        # resolving through the pick means a hand-built read cannot escape the scope.
+        bm = self._ms[min(max(0, int(m)), len(self._ms) - 1)]
+        bt = self._ts[min(max(0, int(t)), len(self._ts) - 1)]
+        bz = z if self._zs is None else \
+            self._zs[min(max(0, int(z)), len(self._zs) - 1)]
+        return self._base.read_region(level, bm, bt, bz, c, y0, y1, x0, x1)
+
+    def fingerprint(self) -> tuple:
+        fp = (self._TAG, self._base.fingerprint(), self._ms, self._ts)
+        return fp if self._zs is None else fp + (self._zs,)
+
+
+class FrameSliceProvider(FrameSubsetProvider):
+    """The one-frame case of :class:`FrameSubsetProvider`: ``m``/``t`` collapse to 1 and
+    every read resolves to the pinned ``(m, t)``. ``zs`` picks planes within it, exactly
+    as on the general view, and defaults to the whole volume.
+
+    Kept as its own type — and its own fingerprint tag — because scoping to a single
+    frame is the common troubleshooting move: it reads better at the call site, and a
+    one-frame scope keeps keying the memo the way it did before subsets existed."""
+
+    _TAG = "frame-slice"
+
+    def __init__(self, base: TileProvider, m: int = 0, t: int = 0, zs=None) -> None:
+        super().__init__(base, (m,), (t,), zs)
+
+    @property
+    def frame(self) -> tuple:
+        """The pinned ``(m, t)`` in the BASE provider's addressing."""
+        return (self._ms[0], self._ts[0])
 
 
 class ArrayProvider(TileProvider):
@@ -320,4 +856,5 @@ class ArrayProvider(TileProvider):
         return self._fp
 
 
-__all__ = ["TileProvider", "SyntheticProvider", "B2ndProvider", "ArrayProvider"]
+__all__ = ["TileProvider", "SyntheticProvider", "B2ndProvider", "ArrayProvider",
+           "FrameSubsetProvider", "FrameSliceProvider", "subset_index"]

@@ -42,20 +42,83 @@ def _group_reduce(labels: np.ndarray, values: np.ndarray, reducer: str, *,
     """Reduce ``values`` grouped by ``labels``. With ``drop_nonpositive`` (default),
     non-positive keys are dropped as background (Label/Track ids are ≥1); pass False
     for keys where 0 is meaningful (e.g. timepoints). Returns ``(ids, reduced)`` with
-    ``ids`` the sorted keys."""
+    ``ids`` the sorted keys.
+
+    **The keys must be integers.** A label id IS an integer — the raster's value at a
+    voxel — and the returned ids used to be produced by ``np.unique(labels).astype(int64)``,
+    which TRUNCATES. A float key array therefore grouped correctly but reported collapsed
+    ids: 1.2 and 1.8 stayed two rows and both came back as id 1. That is reachable from the
+    GUI, because ``analysis.measure``'s layer picker offers every Voxel raster and
+    ``analysis.edt`` writes a float64 one. Refusing is the only honest option — rounding
+    would silently merge two regions and dropping the cast would break every ``int``
+    consumer downstream.
+
+    **max/min/median are segment reductions, not a loop.** They used to be
+    ``[fn(values[idx == k]) for k in range(ids.size)]``, which allocates TWO full-length
+    boolean masks per label (the ``np.any`` guard evaluated the comparison a second time,
+    and was dead code besides — every ``k`` comes from ``np.unique``, so the group is never
+    empty). That is O(n_labels · n_voxels), and it is the DEFAULT path:
+    ``analysis.measure``'s ``stats`` ships as ``"mean,max,min,count"``, so both slow
+    reducers run on every Measure. Sorting the values into contiguous per-label segments
+    once makes all three O(n log n) regardless of label count. Measured, ``max`` over 2^20
+    voxels:
+
+    ====================  =========  =========  ========
+    labels                loop       segments   speedup
+    ====================  =========  =========  ========
+    10                     27 ms      69 ms      0.4×
+    100                   129 ms      95 ms      1.4×
+    1 000                 621 ms     125 ms      5.0×
+    7 052 (real ND2)     3871 ms     176 ms     22.0×
+    ====================  =========  =========  ========
+
+    The small-label case is genuinely slower and is left that way on purpose: a fixed sort
+    beats a per-label scan from roughly 50 labels up, which is every real segmentation, and
+    the regression below that is a few tens of milliseconds on a case that was already
+    fast. A threshold to pick between the two would be a tuning constant and a second code
+    path to keep correct, bought with 40 ms nobody can perceive.
+    """
     if reducer not in _GROUP_REDUCERS:
         raise ValueError(f"unknown reducer {reducer!r}; choose {list(_GROUP_REDUCERS)}")
     labels = np.asarray(labels).ravel()
+    if labels.dtype.kind not in "iub":
+        raise ValueError(
+            f"group keys must be integer label ids, got dtype {labels.dtype} — a "
+            f"non-integer raster is not a label raster (its ids would be truncated, so "
+            f"two distinct regions could report the same id). If this is a distance "
+            f"field or another measured image, threshold and label it first; if it is "
+            f"already a label raster stored as float, cast it to an integer dtype.")
     values = np.asarray(values, dtype=float).ravel()
     if drop_nonpositive:
         fg = labels > 0
         labels, values = labels[fg], values[fg]
-    ids = np.unique(labels)
-    if ids.size == 0:
-        return ids.astype(np.int64), np.array([], dtype=float)
-    idx = np.searchsorted(ids, labels)                      # ids sorted → exact
+    ids_all = np.unique(labels)
+    if ids_all.size == 0:
+        return ids_all.astype(np.int64), np.array([], dtype=float)
+
+    # ── NaN is MISSING DATA, not a value (2026-07-30) ─────────────────────────
+    # Every reducer skips it, and a group with nothing left reduces to NaN. Plain numpy
+    # semantics (one NaN poisons the mean) are the wrong contract here, because in this
+    # engine NaN is exactly how a structure column says "no value for this element" —
+    # `analysis.measure` writes it for a region its shape walk never saw, and
+    # `analysis.object_metrics` writes it for a track's FIRST frame, where a velocity is
+    # undefined for want of a previous position. Poisoning made the most obvious workflow
+    # in the catalog useless: gathering per-object `speed` into its Track with `mean`
+    # returned NaN for EVERY track, because every track has a first frame.
+    #
+    # `count` counts the CONTRIBUTIONS, not the rows, so it stays the denominator of
+    # `mean` and doubles as "how many members actually had a value".
+    finite = np.isfinite(values)
+    keep_labels, keep_values = labels[finite], values[finite]
+    idx_all = np.searchsorted(ids_all, labels)              # ids sorted → exact
+    if keep_labels.size == 0:                               # every group is all-missing
+        return ids_all.astype(np.int64), np.full(ids_all.size, np.nan)
+    idx = np.searchsorted(ids_all, keep_labels)
+    labels, values = keep_labels, keep_values
+    counts = np.bincount(idx, minlength=ids_all.size)
+    empty = counts == 0                                     # groups with no finite member
+    ids = ids_all
     if reducer in ("sum", "mean", "count"):
-        counts = np.bincount(idx, minlength=ids.size)
         sums = np.bincount(idx, weights=values, minlength=ids.size)
         if reducer == "sum":
             out = sums
@@ -63,10 +126,42 @@ def _group_reduce(labels: np.ndarray, values: np.ndarray, reducer: str, *,
             out = counts.astype(float)
         else:
             out = sums / np.maximum(counts, 1)
+        if reducer != "count":
+            out = np.where(empty, np.nan, out)
+        return ids.astype(np.int64), out
+    if empty.any():
+        # a segment reduction cannot express an empty segment — compute over the groups
+        # that have data and fill the rest with NaN
+        live = ids[~empty]
+        sub_ids, sub_out = _group_reduce(
+            np.searchsorted(live, labels) + 1, values, reducer, drop_nonpositive=False)
+        out = np.full(ids.size, np.nan)
+        out[np.flatnonzero(~empty)[sub_ids - 1]] = sub_out
+        return ids.astype(np.int64), out
+    # ── segment reductions ────────────────────────────────────────────────────
+    # `median` needs each segment's values in ASCENDING order, so it lexsorts on
+    # (value, group); `max`/`min` only need the segments contiguous, and a stable sort of
+    # the small-integer group array is the cheaper way to get that.
+    if reducer == "median":
+        order = np.lexsort((values, idx))
     else:
-        fn = {"max": np.max, "min": np.min, "median": np.median}[reducer]
-        out = np.array([fn(values[idx == k]) if np.any(idx == k) else np.nan
-                        for k in range(ids.size)], dtype=float)
+        order = np.argsort(idx, kind="stable")
+    svals = values[order]
+    # every group here has at least one finite member (the all-missing ones were split off
+    # above), so the segment starts are just the running offsets — no searchsorted needed
+    # and no empty segment for `reduceat` to mis-handle
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    if reducer == "max":
+        out = np.maximum.reduceat(svals, starts)
+    elif reducer == "min":
+        out = np.minimum.reduceat(svals, starts)
+    else:
+        # the two middle elements of each ascending segment (they coincide when the
+        # segment is odd-length), averaged — exactly np.median's convention
+        half = counts // 2
+        hi = starts + half
+        lo = hi - (1 - counts % 2)
+        out = 0.5 * (svals[lo] + svals[hi])
     return ids.astype(np.int64), out
 
 

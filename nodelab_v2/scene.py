@@ -33,10 +33,10 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-from PySide6.QtCore import QPointF, Qt, QTimer, Signal
-from PySide6.QtGui import QPainter, QPen
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QPainter, QPen, QTransform
 from PySide6.QtWidgets import (
-    QGraphicsPathItem, QGraphicsScene, QGraphicsView, QLineEdit, QListWidget,
+    QGraphicsPathItem, QGraphicsScene, QGraphicsView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMenu, QVBoxLayout, QWidget,
 )
 
@@ -48,11 +48,15 @@ from nodelab_v2.edge_item import EdgeItem, wire_path
 from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.minimap import HudButton
 from nodelab_v2.node_item import NodeItem, SocketItem
+from nodelab_v2.ops import DOCK_OP, LOAD_OP, PRECISION_UNSET, bake_record
 
 #: op prefixes hidden from the palette / link search (boundary + fixture ops, plus the
 #: source loader ``io.load`` — it is created from File → Load ND2/TIFF file…, never dragged)
 HIDDEN_OP_PREFIXES = ("zone.", "group.", "test.", "io.seed", "io.stream_seed",
-                      "rr.", "eng.", "io.nd2", "io.load")
+                      "rr.", "eng.", "io.nd2", "io.load",
+                      # minted by nodegraph.iterate's feedback rewrite between two clones,
+                      # never placed by hand — it exists only inside an unrolled graph
+                      "flow.advance")
 
 
 def visible_specs():
@@ -152,6 +156,16 @@ class GraphScene(QGraphicsScene):
     pull_requested = Signal(str)      # context menu → pull/view this node
     #: a node was removed through the canvas (badge / key / menu) — the window reports it
     nodes_deleted = Signal(object)    # [node_id, …]
+    #: a card's ◎ glyph was clicked — a :class:`~nodelab_v2.picker.PickRequest`, forwarded
+    #: to the window (which owns the viewer) exactly like the inspector's Pick button.
+    pick_requested = Signal(object)
+    #: a Dock node's context-menu entry was chosen: ``(node_id, action)``. Same signal
+    #: shape (and same handler in the window) as the inspector's, so baking from the
+    #: canvas and baking from the panel are literally one code path.
+    dock_action = Signal(str, str)
+    #: a source card's context-menu *Ingest this file* — the same thing double-clicking a
+    #: not-yet-ingested source does, spelled out for discoverability.
+    ingest_requested = Signal(str)
 
     def __init__(self, document: GraphDocument) -> None:
         super().__init__()
@@ -167,6 +181,9 @@ class GraphScene(QGraphicsScene):
         #: run states survive a `sync()` (an edit mid-run must not blank the cards), so
         #: they live here keyed by node id, not only on the items.
         self._run: Dict[str, tuple] = {}      # node_id → (state, fraction, note, seconds)
+        #: source cards mid-ingest — exempt from a pull's canvas reset (see
+        #: :meth:`set_ingesting`).
+        self._ingesting: frozenset = frozenset()
         self._anim = QTimer(self)
         self._anim.setInterval(PROGRESS_TICK_MS)
         self._anim.timeout.connect(self._tick_progress)
@@ -189,6 +206,7 @@ class GraphScene(QGraphicsScene):
             if nid not in self.node_items:
                 item = NodeItem(rec, self.doc)
                 item.delete_requested.connect(self._on_delete_requested)
+                item.pick_requested.connect(self.pick_requested)
                 self.addItem(item)
                 self.node_items[nid] = item
         self._run = {k: v for k, v in self._run.items() if k in self.node_items}
@@ -197,7 +215,8 @@ class GraphScene(QGraphicsScene):
             item.set_viewed(item.node_id == self.viewed_id)   # survives a re-sync
             st = self._run.get(item.node_id)                  # …and so does the run state
             if st is not None:
-                item.set_run_state(st[0], fraction=st[1], note=st[2], seconds=st[3])
+                item.set_run_state(st[0], fraction=st[1], note=st[2], seconds=st[3],
+                                   levels=st[4])
         # frames (behind nodes) — reconcile by record identity like node items, then
         # reflow each to enclose its now-present members.
         for fid in list(self.frame_items):
@@ -242,13 +261,30 @@ class GraphScene(QGraphicsScene):
         for fitem in self.frame_items.values():   # frames follow their members' bounds
             fitem.reflow()
 
+    def resync_specs(self) -> List[str]:
+        """Re-resolve every card against the registry after a live node reload
+        (:mod:`nodegraph.hotreload`); returns the node ids whose op no longer exists.
+
+        Each card caches its :class:`NodeSpec` at construction, so a reload that changed a
+        node's sockets, modes or descriptions is invisible on the canvas until this runs.
+        Wires are re-pathed afterwards because a changed socket set moves the ports they
+        land on — a socket that grew a row taller would otherwise leave every wire into
+        this card pointing at where its port used to be."""
+        orphaned = [nid for nid, item in self.node_items.items() if not item.resync_spec()]
+        self.reroute()
+        return orphaned
+
     # ── per-node run progress ─────────────────────────────────────────────────
     def _set_state(self, node_id: str, state: str, *, fraction=None, note: str = "",
-                   seconds=None) -> None:
-        self._run[node_id] = (state, fraction, note, seconds)
+                   seconds=None, levels=None) -> None:
+        # `levels` rides in the cached tuple too, so a card rebuilt mid-run (a re-sync while
+        # the engine is still walking) comes back with BOTH rails rather than falling back
+        # to the flat one until the next progress event.
+        self._run[node_id] = (state, fraction, note, seconds, levels)
         item = self.node_items.get(node_id)
         if item is not None:
-            item.set_run_state(state, fraction=fraction, note=note, seconds=seconds)
+            item.set_run_state(state, fraction=fraction, note=note, seconds=seconds,
+                               levels=levels)
         self._sync_flows()
         self._sync_anim()
 
@@ -276,12 +312,28 @@ class GraphScene(QGraphicsScene):
         for e in self.edge_items:
             e.advance_phase()
 
+    def set_ingesting(self, node_ids: Iterable[str]) -> None:
+        """The source cards whose own ingest is running (V2.21).
+
+        They are exempt from the two places a pull resets the canvas — :meth:`set_run_plan`
+        and :meth:`finish_run` — because an ingest is not part of any pull: it starts on a
+        double-click, keeps running across edits and other people's pulls, and its card is
+        the only thing reporting it. Clearing it there would blank a bar that is still
+        moving, on a job that may have minutes left to run."""
+        self._ingesting = frozenset(node_ids)
+
     def set_run_plan(self, target: str, node_ids: Iterable[str]) -> None:
         """A pull was submitted: mark every participating node ``queued`` and clear the
-        cards that aren't in this run (their last result says nothing about this one)."""
+        cards that aren't in this run (their last result says nothing about this one) —
+        except any card mid-ingest, which is reporting work of its own."""
         planned = {n for n in node_ids}
-        self._run.clear()
+        busy = self._ingesting
+        for nid in list(self._run):
+            if nid not in busy:
+                self._run.pop(nid, None)
         for nid, item in self.node_items.items():
+            if nid in busy:
+                continue
             if nid in planned:
                 self._set_state(nid, "queued")
             else:
@@ -294,8 +346,11 @@ class GraphScene(QGraphicsScene):
         if event == "start":
             self._set_state(node_id, "running")
         elif event == "progress":
+            # `info` carries the two-level split when the compute knows its frame count;
+            # the card falls back to the single flat bar when it does not (see
+            # nodegraph.engine.Observer).
             self._set_state(node_id, "running", fraction=info.get("fraction"),
-                            note=str(info.get("note") or ""))
+                            note=str(info.get("note") or ""), levels=info)
         elif event == "cached":
             self._set_state(node_id, "cached")
         elif event == "done":
@@ -318,6 +373,8 @@ class GraphScene(QGraphicsScene):
         compute had returned)."""
         blamed = any(v[0] == "error" for v in self._run.values())
         for nid, item in self.node_items.items():
+            if nid in self._ingesting:
+                continue          # its own ingest is still running — not this pull's card
             if self._run.get(nid, ("",))[0] in ("queued", "running", "decoding"):
                 self._run.pop(nid, None)
                 item.set_run_state("")
@@ -635,6 +692,12 @@ class GraphScene(QGraphicsScene):
         menu.addSeparator()
         menu.addAction("View / pull this node\tF5").triggered.connect(
             lambda: self.pull_requested.emit(nid))
+        if node.op_key == LOAD_OP and str((rec.params.get("path") if rec else "") or ""):
+            act = menu.addAction("Ingest this file now")
+            act.setToolTip("Write this file's .b2nd store now, on its own worker. Other "
+                           "source cards can ingest at the same time and the app stays "
+                           "usable.")
+            act.triggered.connect(lambda: self.ingest_requested.emit(nid))
         mute = menu.addAction("Muted (pass through)\tM")
         mute.setCheckable(True)
         mute.setChecked(bool(rec.muted) if rec is not None else False)
@@ -647,6 +710,25 @@ class GraphScene(QGraphicsScene):
         coll.triggered.connect(
             lambda: [self.doc.set_collapsed(i, not self.doc.nodes[i].collapsed)
                      for i in sel if i in self.doc.nodes])
+        if node.op_key == DOCK_OP:
+            menu.addSeparator()
+            status, detail = self.doc.dock_status(nid)
+            head = menu.addAction(f"dock · {status}{(' — ' + detail) if detail else ''}")
+            head.setEnabled(False)
+            baked = bool(bake_record(rec)) if rec is not None else False
+            unset = node.state().get("precision", PRECISION_UNSET) == PRECISION_UNSET
+            bake = menu.addAction("Re-bake this dock" if baked else "Bake this dock…")
+            bake.setEnabled(not unset)
+            if unset:
+                bake.setToolTip("Choose a Precision in the inspector first — there is no "
+                                "default, because the right one depends on this chain.")
+            bake.triggered.connect(lambda: self.dock_action.emit(nid, "bake"))
+            if status in ("docked", "stale"):
+                menu.addAction("Un-dock (run the chain live)").triggered.connect(
+                    lambda: self.dock_action.emit(nid, "undock"))
+            elif baked:
+                menu.addAction("Re-dock (serve the existing bake)").triggered.connect(
+                    lambda: self.dock_action.emit(nid, "redock"))
         menu.addSeparator()
         many = len(sel) > 1
         menu.addAction(f"Delete {len(sel)} nodes\tDel" if many
@@ -736,11 +818,23 @@ class GraphView(QGraphicsView):
     Maximizing hands the whole centre to the graph and re-homes the Viewer into the
     :class:`~nodelab_v2.minimap.MiniMapOverlay`; the window owns that move and drives
     the button's state back through :meth:`set_maximized`.
+
+    It also carries the **troubleshooting HUD** (:meth:`set_troubleshooting`): an amber
+    frame around the whole canvas plus a top-left badge, up for as long as pulls are
+    scoped to picked frames instead of the series.
     """
 
     STEP = 26
     op_dropped = Signal(str, QPointF)
     maximize_toggled = Signal(bool)
+
+    #: troubleshooting frame: stroke width, and the inset its rounded rect sits at.
+    TS_BORDER = 3
+    TS_INSET = 12
+    #: pulse period of the badge's live dot (ms) — the canvas twin of the status-bar LED.
+    #: Only the dot's colour changes, so the tick repaints a 200 px label and never the
+    #: scene (a pulsing FRAME would repaint every node on the canvas twice a second).
+    TS_PULSE_MS = 620
 
     def __init__(self, scene: GraphScene) -> None:
         super().__init__(scene)
@@ -758,6 +852,21 @@ class GraphView(QGraphicsView):
         self._panning = False
         self._pan_moved = False
         self._pan_last = QPointF()
+        # troubleshooting HUD: an amber badge in the canvas's top-left corner, twinned
+        # with the frame drawn in `drawForeground`. A child of the VIEW (like the maximize
+        # button) so it never scrolls with the scene. Built FIRST: `childEvent` installs a
+        # geometry filter on every child, and that filter reads these attributes.
+        self._ts_on = False
+        self._ts_detail = ""
+        self._ts_dot = True
+        self._ts_badge = QLabel("", self)
+        self._ts_badge.setObjectName("tsBadge")
+        self._ts_badge.setTextFormat(Qt.RichText)
+        self._ts_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._ts_badge.hide()
+        self._ts_timer = QTimer(self)
+        self._ts_timer.setInterval(self.TS_PULSE_MS)
+        self._ts_timer.timeout.connect(self._ts_pulse)
         # corner chrome: the maximize toggle (a child of the VIEW, not the viewport, so
         # it never scrolls with the scene and always paints above it)
         self._max_btn = HudButton("maximize", self)
@@ -768,10 +877,120 @@ class GraphView(QGraphicsView):
         self._max_btn.toggled.connect(self._on_max_toggled)
         self._place_corner_chrome()
 
-    # ── corner chrome (maximize) ──────────────────────────────────────────────
+    # ── corner chrome (maximize + the troubleshooting badge) ──────────────────
     def _place_corner_chrome(self) -> None:
         self._max_btn.move(self.width() - self._max_btn.width() - 12, 12)
         self._max_btn.raise_()
+        self._place_ts_badge()
+
+    def _hud_siblings(self) -> List[QWidget]:
+        """The other *floating* HUD widgets over the canvas (mini-map, welcome card,
+        maximize button) — everything the badge has to share the surface with.
+
+        The viewport and the scroll bars are excluded by identity: they are the scroll
+        area's own furniture, and the viewport in particular covers the entire canvas, so
+        treating it as something to dodge would push the badge off the bottom edge."""
+        skip = {id(self.viewport()), id(self.horizontalScrollBar()),
+                id(self.verticalScrollBar()), id(self._ts_badge)}
+        return [w for w in self.children()
+                if isinstance(w, QWidget) and id(w) not in skip and w.isVisible()]
+
+    def _place_ts_badge(self) -> None:
+        """Pin the badge inside the canvas's top-left corner, stepping aside for any HUD
+        frame already there.
+
+        The mini-map (the re-homed Viewer in maximized mode) claims that same corner by
+        default. Preference order: the corner itself → immediately **right of** whatever
+        occupies it, staying on the top strip → **under** it, if there is no room to the
+        right. The rule is geometric rather than a special case for the mini-map, so a
+        future HUD gets the same treatment."""
+        if not self._ts_on:
+            return
+        self._ts_badge.adjustSize()
+        pad = self.TS_INSET + self.TS_BORDER + 3
+        w, h = self._ts_badge.width(), self._ts_badge.height()
+        rect = self._ts_badge.rect().translated(pad, pad)
+        blockers = [g for g in (s.geometry() for s in self._hud_siblings())
+                    if g.intersects(rect)]
+        x, y = pad, pad
+        if blockers:
+            right = max(g.right() for g in blockers) + 8
+            below = max(g.bottom() for g in blockers) + 8
+            if right + w <= self.width() - pad:
+                x = right                       # keep it on the top strip
+            elif below + h <= self.height() - pad:
+                y = below
+        self._ts_badge.move(x, y)
+        self._ts_badge.raise_()
+
+    # ── troubleshooting HUD ───────────────────────────────────────────────────
+    def set_troubleshooting(self, on: bool, detail: str = "") -> None:
+        """Show/hide the scoped-run HUD: the amber frame + the top-left badge.
+
+        The canvas is the honest place for it. Scoping a run to picked frames does not
+        change the graph, so the cards, wires and progress all look exactly as they do on
+        a full run — which is precisely why the mode needs to be impossible to miss from
+        the canvas itself, not only from a chip in the status bar. ``detail`` is the
+        compact scope (e.g. ``t7`` / ``3T[0,4,9]·2Z``) shown under the title."""
+        on, detail = bool(on), str(detail)
+        if (on, detail) == (self._ts_on, self._ts_detail):
+            return
+        self._ts_on, self._ts_detail = on, detail
+        self._ts_dot = True
+        self._style_ts_badge()
+        self._ts_badge.setVisible(on)
+        self._place_corner_chrome()
+        if on:
+            self._ts_timer.start()
+        else:
+            self._ts_timer.stop()                   # no idle cost when it is off
+        self.viewport().update()                    # repaint the frame
+
+    def is_troubleshooting(self) -> bool:
+        return self._ts_on
+
+    def _ts_pulse(self) -> None:
+        self._ts_dot = not self._ts_dot
+        self._refresh_ts_text()
+
+    # The badge shares its corner with whatever else is floating over the canvas, and
+    # those move on their own (the mini-map is draggable, and appears/vanishes with
+    # Ctrl+Space). Watching every child's geometry keeps the dodge in :meth:`_place_ts_badge`
+    # correct without this class having to know what the other HUD widgets ARE.
+    def childEvent(self, e) -> None:                    # noqa: N802 — Qt override
+        super().childEvent(e)
+        if e.type() == QEvent.ChildAdded and isinstance(e.child(), QWidget):
+            e.child().installEventFilter(self)
+
+    def eventFilter(self, obj, ev) -> bool:             # noqa: N802 — Qt override
+        # `getattr`, not `self._ts_on`: QGraphicsView's own constructor creates the
+        # viewport child, so ChildAdded (and the viewport's first Show/Resize) reach this
+        # filter BEFORE __init__'s body has bound any of the HUD attributes.
+        if (getattr(self, "_ts_on", False) and obj is not self._ts_badge
+                and ev.type() in (QEvent.Move, QEvent.Resize,
+                                  QEvent.Show, QEvent.Hide)):
+            self._place_ts_badge()
+        return False
+
+    def _refresh_ts_text(self) -> None:
+        """Re-render the badge's rich text. Split from :meth:`_style_ts_badge` because the
+        pulse runs through here twice a second — a stylesheet re-polish per tick is not
+        worth the blink."""
+        dot = (T.DIM2D_INK if self._ts_dot else T.mix(T.DIM2D_INK, T.DIM2D, 0.62)).name()
+        tail = (f"<br><span style='font-size:10px;font-weight:600;'>{self._ts_detail}"
+                f"  ·  F9 to exit</span>") if self._ts_detail else ""
+        self._ts_badge.setText(
+            f"<span style='font-size:12px;font-weight:800;'>"
+            f"<span style='color:{dot};'>&#9679;</span>&nbsp; TROUBLESHOOTING MODE"
+            f"</span>{tail}")
+
+    def _style_ts_badge(self) -> None:
+        self._refresh_ts_text()
+        self._ts_badge.setStyleSheet(
+            f"QLabel#tsBadge {{ background:{T.DIM2D.name()}; color:{T.DIM2D_INK.name()};"
+            f" border:1px solid {T.mix(T.DIM2D, T.DIM2D_INK, 0.25).name()};"
+            f" border-radius:8px; padding:6px 12px; }}")
+        self._ts_badge.adjustSize()
 
     def _on_max_toggled(self, on: bool) -> None:
         self._max_btn.set_kind("restore" if on else "maximize")
@@ -796,10 +1015,34 @@ class GraphView(QGraphicsView):
 
     def restyle(self) -> None:
         self._max_btn.update()
+        self._style_ts_badge()          # amber + ink come from the theme tokens
+        self._place_corner_chrome()
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self._place_corner_chrome()
+
+    def drawForeground(self, p: QPainter, rect: QRectF) -> None:
+        """Paint the troubleshooting frame over the graph, in VIEWPORT pixels.
+
+        Reset transform (the viewer's overlay idiom): the frame belongs to the canvas
+        widget, not to the scene, so it must not pan, zoom or scale with the nodes."""
+        super().drawForeground(p, rect)
+        if not self._ts_on:
+            return
+        p.save()
+        p.setTransform(QTransform())
+        vp = self.viewport().rect()
+        p.setBrush(Qt.NoBrush)
+        # a soft wide wash first, the crisp stroke over it — reads as a glow at a glance
+        # without costing an animation (the viewport repaints the whole scene).
+        p.setPen(QPen(T.alpha(T.DIM2D, 55), self.TS_BORDER * 3.5))
+        p.drawRoundedRect(QRectF(vp).adjusted(self.TS_INSET, self.TS_INSET,
+                                              -self.TS_INSET, -self.TS_INSET), 12, 12)
+        p.setPen(QPen(T.DIM2D, self.TS_BORDER))
+        p.drawRoundedRect(QRectF(vp).adjusted(self.TS_INSET, self.TS_INSET,
+                                              -self.TS_INSET, -self.TS_INSET), 12, 12)
+        p.restore()
 
     def keyPressEvent(self, e) -> None:
         # Esc leaves maximized mode — but never out from under a live wire drag, which

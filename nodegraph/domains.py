@@ -38,7 +38,7 @@ Qt-free; pure standard library.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Iterable, Optional, Tuple
 
 # Canonical ordering of the acquisition axes (V2.01 §H: ``c`` is a first-class
 # store/tile/memo axis). A lattice domain's attribute array is shaped by the axes
@@ -95,6 +95,70 @@ DOMAIN_ABBR: Dict[Domain, str] = {
     Domain.CHANNEL: "CHN", Domain.LABEL: "LBL", Domain.POINT: "PT",
     Domain.TRACK: "TRK", Domain.MESH: "MSH",
 }
+
+
+#: What each domain MEANS, as one hover line per option (V2.21). Lives here beside
+#: :data:`DOMAIN_COLOR` for the same reason that does: a domain's identity is a property of
+#: the data model, not of any node, and four nodes offer a domain dropdown
+#: (``analysis.reduce_scalar``, both ``transform.transfer_*``, and any future one). Written
+#: once here, they cannot drift into four descriptions of the same eleven things — and the
+#: honest phrasing is direction-neutral, so the same text serves a "from" and a "to" menu.
+#: Consumers pass the option names they actually offer through :func:`domain_docs`.
+DOMAIN_DOC: Dict[Domain, str] = {
+    Domain.VOXEL:
+        "Per voxel — one value for every (m,t,z,c,y,x) position, i.e. an image-shaped "
+        "layer. The finest domain there is: masks, intensity images and rasterized fields "
+        "all live here, and everything else is a coarsening of it.",
+    Domain.PLANE:
+        "Per (Y,X) plane — one value for each (m,t,z). The domain of per-plane summaries: "
+        "a focus score, a plane's background level, a per-slice mean.",
+    Domain.FRAME:
+        "Per frame — one value for each (m,t), i.e. one number per position per timepoint, "
+        "pooling z. The natural domain for \"how many cells in this frame\" and for a "
+        "per-frame drift or exposure correction.",
+    Domain.TIMEPOINT:
+        "Per timepoint — one value for each t, pooling every position. A time course: one "
+        "number per frame index shared across the whole plate or tile set.",
+    Domain.MULTIPOINT:
+        "Per position — one value for each m, pooling time. One number per well, tile or "
+        "stage point, which is what a per-position summary or calibration belongs on.",
+    Domain.GLOBAL:
+        "One single number for the entire dataset. The score an Iterate sweep compares, and "
+        "the coarsest possible domain — every axis has been reduced away.",
+    Domain.CHANNEL:
+        "Per channel — one value for each c. Orthogonal to the spatial/temporal chain, so "
+        "use it for anything that is a property of the STAIN (a per-channel gain, "
+        "background or bleed-through factor) rather than of a place or a time.",
+    Domain.LABEL:
+        "Per segmented region — one row per labelled object, from Segmentation or Connected "
+        "Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+    Domain.POINT:
+        "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions "
+        "are fractional, and a point has a location but no extent.",
+    Domain.TRACK:
+        "Per temporal identity — one row per tracked object, running over time rather than "
+        "at one instant. Where velocities, displacements and track lifetimes live.",
+    Domain.MESH:
+        "A boundary surface: vertices plus the faces joining them — the only domain that "
+        "carries topology. Read and written only through the mesh path, so it is not offered "
+        "as an ordinary value domain.",
+}
+
+
+def domain_docs(names: Iterable[str]) -> Dict[str, str]:
+    """``{domain value: prose}`` for the domain option names a node actually offers.
+
+    Keyed by the serialization VALUE (``"voxel"``, ``"label"``) because that is what a Mode's
+    ``choices`` carry; an unknown name is skipped rather than raised, since registration
+    already refuses a ``choice_docs`` key that documents no option and this helper must not
+    turn a typo into an import-time crash in a different file."""
+    out: Dict[str, str] = {}
+    for n in names:
+        try:
+            out[str(n)] = DOMAIN_DOC[Domain(str(n))]
+        except (ValueError, KeyError):
+            continue
+    return out
 
 
 def domain_color(domain: Domain) -> str:
@@ -221,7 +285,8 @@ def domain_from_value(value: str) -> Domain:
 
 __all__ = [
     "AXIS_ORDER", "Domain",
-    "DOMAIN_COLOR", "DOMAIN_ABBR", "domain_color", "domain_abbr",
+    "DOMAIN_COLOR", "DOMAIN_ABBR", "DOMAIN_DOC",
+    "domain_color", "domain_abbr", "domain_docs",
     "LATTICE_DOMAINS", "STRUCTURE_DOMAINS", "MULTI_INSTANCE_DOMAINS",
     "is_lattice", "is_structure", "is_multi_instance", "axes_of",
     "is_finer", "comparable", "join", "meet", "dropped_axes", "domain_from_value",

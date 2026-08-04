@@ -7,8 +7,21 @@ those into tables — one per ``(domain, layer)`` — and shows the selected one
 (elements, ordered by id) × columns (attributes, coordinate columns first per
 :data:`nodegraph.structure.COORD_COLUMNS`). The export path (Phase 6) reads from here.
 
-Lattice/Voxel attributes are per-voxel rasters (image-like) — shown in the Viewer, not
-tabulated here. Qt; reads only the numpy columns off the Dataset.
+**Coarse lattice attributes are tabulated here too** (V2.17). A Frame / Plane / Timepoint
+/ Multipoint / Channel / Global attribute is a small array indexed by acquisition axes —
+``align.drift``'s per-``(m,t)`` ``drift_y``/``drift_x``, anything
+``transform.transfer_domain`` produces — and it had **no output surface at all**: the
+Viewer draws only Voxel rasters and the structure overlays, and this panel's
+``is_structure`` gate dropped the rest, which the CSV/Parquet export inherits. So the
+entire non-Voxel half of the acquisition lattice was write-only: the engine computed it
+correctly and the user could neither see nor export a single number. :func:`lattice_tables`
+unrolls each one into rows keyed by its own axes.
+
+``Voxel`` stays out, and that is not the same omission: a Voxel layer is one row per voxel
+(12.6 M for a 3-position 4-frame 1024² series), it is image-shaped by definition, and the
+Viewer already renders it.
+
+Qt; reads only the numpy columns off the Dataset.
 """
 from __future__ import annotations
 
@@ -21,11 +34,15 @@ from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from nodegraph.domains import is_structure
+from nodegraph.domains import AXIS_ORDER, Domain, axes_of, is_lattice, is_structure
 from nodegraph.structure import COORD_COLUMNS
 from nodelab_v2 import theme as T
 
 _COORD_ORDER = {name: i for i, name in enumerate(COORD_COLUMNS)}
+
+#: domain VALUES whose rows are detected elements rather than axis indices
+#: (only affects the status line's wording).
+_STRUCTURE_NAMES = frozenset(d.value for d in Domain if is_structure(d))
 
 
 def structure_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]:
@@ -38,6 +55,58 @@ def structure_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.nd
         if not is_structure(domain):
             continue
         tables.setdefault((domain.value, layer), {})[name] = attr.values
+    return tables
+
+
+def lattice_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]:
+    """Group a Dataset's COARSE lattice attributes into the same ``{(domain, layer):
+    {col: values}}`` shape, with the domain's own axes unrolled as leading index columns.
+
+    A lattice attribute's array is shaped by ``axes_of(domain)`` in :data:`AXIS_ORDER`, so
+    a Frame layer is ``(M, T)`` and a Global layer is a scalar. Every layer on one domain
+    shares that index space, so they merge into one table: ``m, t, drift_y, drift_x``. The
+    index columns are named for the axes themselves, which is also what makes the CSV
+    self-describing without a separate header.
+
+    ``Voxel`` is excluded — see the module docstring. A layer whose stored shape does not
+    match the domain's expected shape is skipped rather than reshaped: that only happens
+    mid-edit while an axis change is propagating, and a wrong unrolling would be worse
+    than a briefly missing tab."""
+    tables: Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]] = {}
+    if dataset is None or not hasattr(dataset, "attributes"):
+        return tables
+    axes = getattr(dataset, "axes", None)
+    for (domain, layer, name), attr in dataset.attributes.items():
+        if not is_lattice(domain) or domain is Domain.VOXEL:
+            continue
+        dom_axes = tuple(a for a in AXIS_ORDER if a in (axes_of(domain) or frozenset()))
+        values = np.asarray(attr.values)
+        if axes is not None:
+            try:
+                if tuple(values.shape) != axes.shape_for(domain):
+                    continue                       # stale mid-edit shape — skip, never guess
+            except (ValueError, AttributeError):   # pragma: no cover - defensive
+                continue
+        key = (domain.value, layer)
+        cols = tables.setdefault(key, {})
+        if dom_axes and "__idx__" not in cols:
+            # one row per index tuple, in C order — the same order `ravel()` gives below
+            grid = np.indices(values.shape).reshape(len(dom_axes), -1)
+            for i, ax in enumerate(dom_axes):
+                cols[ax] = grid[i]
+            cols["__idx__"] = np.empty(0)          # marker: index columns already built
+        cols[name] = values.reshape(-1) if dom_axes else np.asarray([values.reshape(())])
+    for cols in tables.values():
+        cols.pop("__idx__", None)
+    return tables
+
+
+def all_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]:
+    """Every tabulatable table on a Dataset — the detected structures AND the coarse
+    lattice attributes. The one entry point for both the panel and the export, so a layer
+    visible in the spreadsheet is always a layer you can also write to CSV."""
+    tables = structure_tables(dataset)
+    tables.update(lattice_tables(dataset))
     return tables
 
 
@@ -93,7 +162,7 @@ class SpreadsheetPanel(QWidget):
     def show_dataset(self, node_id: str, dataset) -> None:
         self.dataset = dataset
         self.node_id = node_id
-        self._tables = structure_tables(dataset)
+        self._tables = all_tables(dataset)
         self._pick.blockSignals(True)
         self._pick.clear()
         for (dom, layer) in sorted(self._tables):
@@ -107,7 +176,8 @@ class SpreadsheetPanel(QWidget):
             self._table.clear()
             self._table.setRowCount(0)
             self._table.setColumnCount(0)
-            self._status.setText(f"{node_id}: no structure tables on this output")
+            self._status.setText(f"{node_id}: no tabulatable attributes on this "
+                                 f"output (image layers show in the Viewer)")
 
     def _show_current(self, *_a) -> None:
         key = self._pick.currentData()
@@ -135,8 +205,9 @@ class SpreadsheetPanel(QWidget):
                 self._table.setItem(r, c, it)
         self._table.resizeColumnsToContents()
         dom, layer = key
+        unit = "elements" if dom in _STRUCTURE_NAMES else "index rows"
         self._status.setText(f"{dom}" + (f" · {layer}" if layer else "")
-                             + f" — {n} elements × {len(names)} attributes")
+                             + f" — {n} {unit} × {len(names)} attributes")
 
 
-__all__ = ["SpreadsheetPanel", "structure_tables"]
+__all__ = ["SpreadsheetPanel", "structure_tables", "lattice_tables", "all_tables"]

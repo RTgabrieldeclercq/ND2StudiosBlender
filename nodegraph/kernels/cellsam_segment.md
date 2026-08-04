@@ -47,7 +47,9 @@ def segment_plane(
     image: np.ndarray,                 # (H, W)
     model=None,                        # loaded CellSAM; None -> the singleton
     *,
-    bbox_threshold: float = 0.4,
+    bbox_threshold: float = 0.4,       # threshold 1/3 — keyword
+    mask_threshold: float = 0.4,       # threshold 2/3 — assigned ONTO the model
+    mask_quality: float = 0.5,         # threshold 3/3 — assigned ONTO the model
     normalize: bool = True,
     postprocess: bool = False,
     remove_boundaries: bool = False,
@@ -57,7 +59,7 @@ def segment_plane(
     tile: bool = False,
     tile_size: int = 512,
     overlap: int = 56,
-    iou_threshold: float = 0.5,
+    tile_iou: float = 0.5,             # was `iou_threshold` (renamed 2026-07-29)
 ) -> np.ndarray: ...                   # (H, W) int32, ids 1..K, 0 = background
 
 def get_cellsam_model(model: str = "cellsam_general", *, model_path: str = "",
@@ -100,14 +102,17 @@ whether the **weights** have been downloaded, which is a separate failure mode.
 
 | name | type | default | valid range / choices | semantics (effect on output) |
 |------|------|---------|-----------------------|------------------------------|
-| bbox_threshold | `float` | `0.4` | `[0, 1]` | CellFinder box-confidence cut — **the** precision/recall knob. Lower it for out-of-distribution images, raise it for cleaner data. CellSAM then blends it with a per-image k-means split of the box confidences (`0.66·T + 0.33·T_cluster`), which is the paper's dynamic `T_box`; so the effective cut is data-adaptive around this value. |
-| normalize | `bool` | `True` | — | CellSAM's own preprocessing: 99.9-percentile clip, per-channel rescale to `[0,1]`, CLAHE with kernel 128 — the pipeline described in the paper's Methods. Leave on unless the caller already matched it. |
+| bbox_threshold | `float` | `0.4` | `[0, 1]` | CellFinder box-confidence cut — **the** precision/recall knob. Lower it for out-of-distribution images, raise it for cleaner data. CellSAM then blends it with a per-image k-means split of the box confidences (`0.66·T + 0.33·T_cluster`), which is the paper's dynamic `T_box`; so the effective cut is data-adaptive around this value. **Threshold 1 of 3** (§10b) and the only one upstream accepts as a keyword. |
+| mask_threshold | `float` | `0.4` | `(0, 1)` exclusive | **Threshold 2 of 3** — the per-pixel sigmoid cut on the decoder's logits, i.e. how far each mask extends. Lower ⇒ larger masks, so this moves every measured **area** without changing which cells are found. Assigned onto the model (no upstream keyword). Default is the SHIPPED 0.4; **the paper states 0.5** — see §10b. Out-of-range is refused rather than left to upstream's bare `assert`. |
+| mask_quality | `float` | `0.5` | `[0, 1]` | **Threshold 3 of 3** — the minimum predicted mask quality (the decoder's IoU-prediction-head score) for a detection to survive; upstream's `CellSAM.iou_threshold`. A recall knob **independent** of `bbox_threshold`: a box can clear the confidence cut and still be dropped here. Assigned onto the model (no upstream keyword). 0.5 in both code and paper. |
+| normalize | `bool` | `True` | — | CellSAM's own preprocessing: 99.9-percentile clip, per-channel rescale to `[0,1]`, CLAHE with kernel 128 — the pipeline described in the paper's Methods. **Effectively mandatory for anything outside `[0,1]`** (§6, quirk 6): with it off, the *box* branch destroys a 16-bit plane and the result is a silently empty segmentation. The real precondition is "already in `[0,1]`", not "already CLAHE'd". |
 | postprocess | `bool` | `False` | — | Upstream morphological cleanup (open/close with `disk(2)`, dilate/erode `disk(10)`, σ=3 Gaussian, re-threshold). Upstream calls it "recommended for noisy images". See the §8 crash. |
 | remove_boundaries | `bool` | `False` | — | Erode a one-pixel gap between touching cells (`subtract_boundaries`). |
 | tile | `bool` | `False` | — | Segment in overlapping blocks and stitch by IoU (`cellSAM.wsi.segment_wsi`) instead of one pass. Needed for large FOVs; upstream suggests tiling above roughly 3000 cells per image. |
 | tile_size | `int` | `512` | `>= 64`, practically `[256, 2048]` | Block edge, **pixels**. Smaller for dense images. |
 | overlap | `int` | `56` | `[1, tile_size-1]` | Block overlap, **pixels**; must be wide enough to contain a typical cell. Passed as upstream's `iou_depth` as well — upstream requires `iou_depth <= overlap`, so the same value is both legal and maximal. |
-| iou_threshold | `float` | `0.5` | `[0, 1]` | IoU above which two blocks' labels merge into one cell. Not exposed as a node socket; the upstream default. |
+| fast | `bool` | `False` | — | Batch the mask decoder (32 boxes/call) and upsample masks on the GPU instead of the CPU. **5.2–5.7× measured** on a 1024² block of 441 cells (RTX 3090, 11.6 s → 2.25 s); upstream calls the decoder once per detected cell, leaving the GPU idle on launch overhead. **Not bit-identical** — batched matmuls reduce in a different order, so a logit can cross the mask cut: 10 px in 1 M differ, 11/441 cells change area by exactly 1 px against a median cell of 558 px, none gained/lost/renumbered. Off by default for that reason; off, upstream's own function is called untouched. Re-verify with `scripts/_bench_cellsam_fast.py` after any `cellSAM`/`torch`/weights upgrade. |
+| tile_iou | `float` | `0.5` | `[0, 1]` | IoU above which two blocks' labels merge into one cell when stitching tiles. Renamed from `iou_threshold` on 2026-07-29: three distinct IoU quantities are now reachable (this, `mask_quality`'s predicted-mask IoU, and `track.objects`' own `iou_threshold` socket) and the bare name distinguished none of them. Only read when `tile=True`, and only matters where blocks meet. |
 
 Tiling parameters are in **pixels, deliberately**: CellSAM resizes every tile to 1024²
 internally, so tile geometry is a property of the model's input space and of memory, not a
@@ -162,13 +167,62 @@ would otherwise be carried through the memo.
   segmentation, which is what upstream's own dead branch was written to return.
   (b) That dead branch is itself mis-shaped: `np.zeros(img.shape[1:])` on the
   `(1, 3, H, W)` tensor gives `(3, H, W)`, not `(H, W)`. `segment_plane` collapses any 3-D
-  return too, so an upstream fix for (a) lands safely. **The tiled path is immune to both**:
-  `cellSAM.wsi.segment_chunk` wraps every block in `try/except Exception` and substitutes
-  zeros.
+  return too, so an upstream fix for (a) lands safely.
+  (c) **The tiled path never crashes from either — and that is the hazard, not the cure.**
+  `cellSAM.wsi.segment_chunk` wraps every block in `try/except Exception`, logs one
+  `ERROR:root:Error segmenting chunk: …` line and substitutes `np.zeros`. So a block that
+  failed for an *unrelated* reason (CUDA OOM, a killed worker, a torn read) is zeroed
+  identically to one that simply held no cells: a populated region is reported as
+  containing **no cells**, and the pull succeeds. Seen in the wild on a stitched 13106²
+  mosaic — 3 of 196 blocks logged it, with nothing to say which kind they were.
+  `_chunk_error_watch` reads the log record (the only evidence upstream's `except` leaves)
+  and classifies it, so the tiled path now holds the same line as the untiled one: the
+  no-cells signature is counted and its line suppressed — it was never an `ERROR` —
+  while anything else is re-raised naming the failed-block count, the distinct messages,
+  and the benign count it is *not* conflated with. Attached to the root logger **and** to
+  root's handlers/`lastResort`, so it keeps working if upstream ever moves to
+  `getLogger(__name__)`; a guard that can switch itself off silently would be the same
+  bug one level up.
+- **`normalize=False` silently corrupts the DETECTOR — the sharpest trap in this kernel.**
+  `CellSAM.predict` preprocesses twice and only one path is range-safe. The **embedding**
+  path (`prep_2(percentile=True)`) runs `PercentileThreshold`, which `rescale_intensity`s to
+  `[0,1]` and is range-agnostic. The **box** path
+  (`sam_bbox_preprocessing(…, percentile=False)`) skips it and calls
+  `torchvision.transforms.ToPILImage()`, whose `to_pil_image` does
+  `(npimg * 255).astype(np.uint8)` **with no clipping**. So `normalize_image` is the *only*
+  thing that puts the data in the range `ToPILImage` assumes: with `normalize=False`, a
+  uint16 plane (max ≈ 4000) becomes `4000·255` cast to `uint8` → wraparound noise →
+  CellFinder proposes no box → the quirk-2 no-cells path → an **empty plane and no error**.
+  The precondition is `[0,1]`, not "matched the paper's CLAHE". Deliberately NOT repaired
+  here (rescaling behind the caller's back would be inventing preprocessing); the mitigation
+  is the node socket's hover documentation.
+- **`fast=` is dead upstream.** `segment_cellular_image` declares it ("batched inference…
+  alpha feature") and never forwards it to `predict`. Not exposed, and there is no batched
+  path to advertise.
+- **`ToRGB` duplicates a mono plane, but only on the box path.** After
+  `format_image_shape` right-aligns the plane into slot 2, `sam_bbox_preprocessing` applies
+  `AnchorDETR.transforms.ToRGB`, which copies slot 2 into slot 1 when slot 1 is empty — so
+  CellFinder sees the plane in *both* the nuclear and whole-cell slots, while the embedding
+  path (`prep_2`, no `ToRGB`) sees it only in the whole-cell slot. Consistent with the
+  paper's "keep the blue channel always occupied"; recorded because the asymmetry is
+  invisible from the call site.
 - **`fill_holes_and_remove_small_masks` always runs inside upstream** with `min_size=25`
   **pixels**, and mutates its argument in place. So a hard 25-px floor is applied before any
   caller-side physical-unit filter ever sees the labels, and upstream's ids are already
   renumbered. Do not rely on the pre-filter numbering.
+- **`postprocess=True` spams deprecated-skimage warnings, and `segment_plane` filters
+  exactly those.** `postprocess_predictions` calls `binary_opening`, `binary_closing`,
+  `binary_dilation` and `binary_erosion` (`cellSAM/model.py` ~190-196), all deprecated in
+  scikit-image 0.26 — **once per cell per plane**, so a 200-cell time series emits thousands
+  of identical `FutureWarning`s. `segment_plane` wraps the upstream call in
+  `warnings.catch_warnings()` with one filter pinned to those four messages
+  (`_MORPHOLOGY_DEPRECATION_RE`); every other warning upstream raises still surfaces.
+  Suppression is the only lever — the calls are inside upstream and have no flag.
+  **The 0.28 removal cannot be filtered**: cellSAM imports those four names at **module
+  level**, so `scikit-image >= 0.28` breaks `import cellSAM` for *every* call, not just this
+  option. `_require_cellsam` catches that ImportError and names the pin
+  (`scikit-image<0.28`) instead of surfacing a bare "cannot import name". Nothing in this
+  repo calls the removed names.
 - **The model singleton is module-global and NOT thread-safe** — same caveat as
   `stardist_segment`. Two threads asking for different models race on the globals. Load a
   per-call model and pass it in if the caller multithreads.
@@ -194,6 +248,7 @@ would otherwise be carried through the memo.
 | `numpy` | arrays, bincount/LUT relabel | **import-time** (top level) |
 | `cellSAM` | `get_model` / `get_local_model` / `segment_cellular_image` | **lazy** — inside `_require_cellsam`, gated by `importlib.util.find_spec` |
 | `torch` | the ViT + SAM decoder; CUDA probe | **lazy** — inside `resolve_device` (skipped entirely for `device="cpu"`) and transitively by `cellSAM` |
+| `scikit-image` | a hard dep of `cellSAM` (`skimage.morphology`/`exposure`/`measure`), **not** of this kernel | with `cellSAM` — must be `<0.28` (§6) |
 | `segment_anything`, `torchvision`, `kornia`, `pyyaml`, `requests`, `tqdm`, `scikit-learn` | hard deps of `cellSAM` itself | with `cellSAM` |
 | `dask`, `dask-image`, `scikit-learn` | `cellSAM.wsi.segment_wsi` | **lazy** — only when `tile=True` |
 
@@ -252,6 +307,9 @@ dependency. Weights download to `$HOME/.deepcell/models/cellsam_v1.2/` on first
 - **Blank / featureless plane** → valid empty result, `labels.max() == 0`. Reached by
   absorbing the upstream `AttributeError` described in §6, NOT by upstream's own
   (unreachable) empty branch. Any OTHER `AttributeError` is re-raised.
+- **`scikit-image >= 0.28` with any `cellSAM`** → `ImportError` from `_require_cellsam`
+  naming the pin, because cellSAM imports the removed `skimage.morphology.binary_*` at
+  module level (§6). Not a `postprocess`-only failure — it kills the method outright.
 - **`postprocess=True` on a prediction with no non-zero label** → upstream
   `postprocess_predictions` ends in `np.max(new_masks, axis=0)` over a list built from
   `np.unique(...)[1:]`; that list is empty and numpy raises `ValueError: zero-size array`.
@@ -314,6 +372,79 @@ one plane at a time. Fusing 2-D slices into true 3-D objects is a separate algor
 
 ---
 
+## 10b. Paper ↔ shipped-code cross-check (2026-07-29)
+
+Checked against Marks, Israel *et al.*, *Nature Methods* 22:2585–2593 (2025), Methods →
+"Thresholding" / "CellSAM postprocessing" / "Inference time", against `cellSAM` at `master`
+(`0.0.dev1`, model `1.2`) as installed.
+
+**The process this kernel drives is the paper's.** The "draw boxes, then compute masks"
+sequence visible on <https://cellsam.deepcell.org> is not a prerequisite the caller must
+supply — it is CellSAM's two-stage architecture, and one `segment_cellular_image` call runs
+both stages: `predict` calls `generate_bounding_boxes` (CellFinder + the k-means dynamic
+threshold) whenever `boxes_per_heatmap is None`, then prompts SAM's mask decoder once per
+surviving box. Automatic prompting *is* the paper's headline claim. The website's editable
+boxes are the **human-in-the-loop labelling** use case — the paper positions ground-truth
+boxes as an *upper bound* on performance and as a fast way to generate labels ("drawing
+bounding boxes consumes considerably less time than drawing individual masks"), i.e. a
+different workflow, not a step this kernel skips.
+
+**The paper's three inference thresholds, vs what ships:**
+
+| paper | value | shipped | node socket | note |
+|-------|-------|---------|-------------|------|
+| CellFinder box confidence | 0.4, dynamically adjusted `T_box = (2/3)·T + (1/3)·T_μ` | `bbox_threshold=0.4`; blend written `0.66`/`0.33` | `bbox_threshold` ("Box threshold") | matches (the weights sum to 0.99 — upstream rounding). The only one upstream takes as a keyword |
+| mask-decoder IoU-head score | 0.5 | `CellSAM.iou_threshold = 0.5` | `mask_quality` ("Min mask quality") | matches. Drops a box outright, so it is a recall knob *independent* of `bbox_threshold` |
+| per-pixel sigmoid cut | **0.5** | `CellSAM.mask_threshold = **0.4**` | `mask_threshold` ("Mask cut") | **DISCREPANCY.** Sets each mask's extent, so it moves every reported `area`; the shipped default is more permissive (larger masks) than the published configuration. **The socket defaults to the shipped 0.4**, so exposing it changed no existing result — set 0.5 to reproduce the paper |
+
+`segment_cellular_image` assigns only `model.bbox_threshold`; the other two have no keyword at
+all and are read off `self` inside `CellSAM.predict`. `segment_plane` therefore assigns them
+onto the model object — **on every call**, because the model is a process singleton and
+setting them once would let plane 2 of a pull inherit plane 1's thresholds, making a memo hit
+depend on execution *order*. A model that does not carry both attributes is **refused** with a
+message, never silently accepted: assigning a name upstream had renamed would leave two
+live-looking sockets that change nothing.
+
+### Everything else that could have been a knob, and why it is not
+
+Audited 2026-07-29 against `cellSAM` at `master` when the node was asked to expose *all*
+user-impacting tunability. The twelve sockets it now has are the complete set that both
+changes results and can be driven honestly; these are the rejects, each for a stated reason
+rather than by omission.
+
+| candidate | where | why not a socket |
+|-----------|-------|------------------|
+| `device` (`cpu`/`cuda`/`auto`) | `resolve_device` | **Env knob `NODELAB_CELLSAM_DEVICE`, on purpose.** The model is a process singleton, so a per-graph socket would stop taking effect after the first load — a control that silently dies. It would also make the memo ambiguous: identical recipe hash, different device. Same reasoning as `NODELAB_STARDIST_CPU`. |
+| `bounding_boxes` | `segment_cellular_image` | Manual box prompts — the DeepCell site's editable-box UI. A per-plane list of `(x1,y1,x2,y2)` has no socket type and no meaning across a 400-plane batch; the paper frames it as a *labelling* workflow (and an upper bound on accuracy), not a pipeline one. |
+| `fast` | `segment_cellular_image` | **Dead upstream** — declared in the signature, never forwarded to `predict`. Exposing it would be a control that provably does nothing. |
+| `version` | `get_model(model, version)` | `_auth._model_versions` contains exactly one entry (`1.2`). A one-item dropdown is noise; revisit if upstream ships a second. |
+| `iou_depth` | `segment_wsi` | Upstream requires `iou_depth <= overlap`, and the kernel already passes `overlap` — the maximum legal value. A socket could only make stitching *worse*. |
+| `min_size=25` px floor | inside `segment_cellular_image`'s `fill_holes_and_remove_small_masks` call | Hardcoded at the call site inside upstream; unreachable without forking. The node's `min_area` (µm², physical) is the user-facing equivalent and composes with it — the stricter of the two wins (§6). |
+| k-means blend weights `0.66`/`0.33`; disabling dynamic thresholding | `generate_bounding_boxes` | Hardcoded inside upstream with no flag. `bbox_threshold` shifts the blended cut, which is the reachable half. |
+| `postprocess_predictions` radii (`disk(2)`, `disk(10)`, σ=3) | `cellSAM.model` | Hardcoded inside upstream; the `postprocess` switch is all-or-nothing. |
+| `ResizeLongestSide(1024)` / 1024² input | `CellSAM.__init__` | Structural — the ViT-B's input size, not a tunable. It is *why* `tile_size` is in pixels. |
+| multi-channel `(blank, nuclear, whole-cell)` fusion | `format_image_shape` | A real CellSAM capability, but a fused segmentation has no single `c` to file its Label rows under (§6). Needs a Label-domain channel-key decision first; select the marker channel upstream instead. |
+
+**Other paper facts this integration relies on:**
+
+- **Why `tile` exists.** CellFinder is built with `num_query_position = 3500`, sized at
+  "3.5 times the maximum number of cells" for images "generally no more than 1,000" cells.
+  That is a hard per-pass ceiling on detections: past roughly 3,000 cells in one field,
+  cells go undetected and tiling is the only fix.
+- **`postprocess` is not the paper's postprocessing.** The paper's "CellSAM postprocessing"
+  is Cellpose's *hole filling + island removal* — i.e. `fill_holes_and_remove_small_masks`,
+  which runs unconditionally. The `postprocess` flag is an extra morphological cleanup the
+  paper does not describe.
+- **Channel slots** are quoted correctly in §6: nuclear→green, whole-cell→blue, red always
+  blank, and green moved to blue for nuclear-only datasets.
+- **Runtime**: <1 s per image on GPU for both CellSAM and Cellpose; on CPU ~8 s (Cellpose)
+  vs ~12 s (CellSAM), scaling roughly linearly in cell count because the mask decoder runs
+  once per detection.
+- **512-px tiles upsampled to 1024²** is the paper's own image preparation, which is why
+  `tile_size=512` keeps inference near the training scale.
+
+---
+
 ## 11. Provenance
 
 **Not vendored from ND2Studios v1.45** — CellSAM postdates that branch and has no v1
@@ -329,6 +460,7 @@ the model cache.
 | `resolve_device`, `DEVICE_ENV` | new; the reasoning of the `NODELAB_STARDIST_CPU` env knob (`nodes.py`) |
 | `relabel_contiguous` | new; the bincount+LUT shape of `stardist_segment.filter_and_relabel`, minus the filtering (physical units live in the node) |
 | `segment_plane` | new adapter around `cellSAM.model.segment_cellular_image` / `cellSAM.wsi.segment_wsi` |
+| `mask_threshold` / `mask_quality` assignment onto the model | new (2026-07-29); upstream has no keyword for either, so this mirrors what `segment_cellular_image` does with `bbox_threshold` |
 
 **Upstream behaviour deliberately NOT reproduced:** `cellsam_pipeline` (reloads the model
 per call; §1), `enhance_low_contrast` (upstream `NameError`; §1), the returned image

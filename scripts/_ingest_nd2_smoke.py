@@ -22,7 +22,10 @@ def main() -> int:
     if not os.path.exists(SAMPLE):
         print(f"SKIP: sample not found at {SAMPLE}")
         return 0
-    import nd2
+    from nodelab_v2.nd2_compat import import_nd2
+    nd2 = import_nd2()        # shimmed, so this probe can be pointed at any real file;
+                              # the shims touch experiment parsing only, never pixels, so
+                              # the raw reference below is still a raw reference
 
     from nodegraph.dataset import Dataset
     from nodegraph.engine import Engine

@@ -116,7 +116,7 @@ widgets from `NodeSpec.inputs`. No functional test can see it — the node retur
 answer for the only value it can ever have. This is a *structural* defect, so the contract
 is checked structurally.
 
-**The five clauses:**
+**The six clauses:**
 
 1. **Every param the compute reads has a socket.** If you write `ctx.params.get("x")`,
    declare an `x` socket. The only exemptions are documented in `_PARAM_NO_SOCKET_OK`
@@ -134,6 +134,7 @@ is checked structurally.
    socket in every state.
 4. **A layer-name socket declares its direction and domain** (§4c).
 5. **A default is declared exactly ONCE — in the `SocketSpec`.**
+6. **Every param socket carries a `description`** — the GUI's hover text (§4d).
 
 **Clause 5 is the subtle one.** Because params are raw overrides, computes used to repeat
 their socket's default inline: `ctx.params.get("mask", "mask")`. That is a *second* copy —
@@ -172,6 +173,30 @@ InString("name",  "Output layer", field=False, default="labels",
 into an **editable combo** offering exactly those names (`document.layer_choices`, which
 follows the *primary* Dataset edge only, so a `reference`/`raw` second input never leaks in).
 
+### 4d. Filesystem-path sockets — `path_kind` (V2.15)
+
+A STRING socket whose value is a **path on the machine that runs the graph** is not free
+text either. Declare it and the inspector puts a **Browse…** button beside the field:
+
+```python
+InString("model_path", "Local weights", field=False, default="",
+         path_kind="open_file",                       # open_file | save_file | directory
+         path_filter="PyTorch checkpoint (*.pt *.pth);;All files (*)",
+         path_hint="empty = published · or Browse…")  # placeholder while empty
+```
+
+* `path_kind` is the **only** thing the GUI keys on. Before V2.15 the inspector matched the
+  literal socket *name* `"path"`, so `sd_model_path` / `model_path` were typing-only —
+  which is exactly the failure this declaration exists to prevent. A typo or a non-STRING
+  socket is **refused at registration** (`NodeRegistry.register`, `registry.PATH_KINDS`),
+  because a silently-ignored value would just look like a plain text field.
+* `directory` gets `getExistingDirectory`, not a file dialog — a StarDist local model is a
+  *folder* (`config.json` + `weights_best.h5`) and no file dialog can return one.
+* `path_hint` is the place to say what an **empty** value means; it differs per socket
+  (`io.load` → the synthetic demo; a model path → fall back to the pretrained name).
+* All three are **presentation-only, never hashed** (like `description`), so annotating an
+  existing socket cannot invalidate a memo entry or a saved graph.
+
 **Two traps if you touch the catalog itself:**
 
 * **Do not key anything on `LayerKey`.** It is `(domain, layer, name)`, but the user-facing
@@ -183,6 +208,94 @@ follows the *primary* Dataset edge only, so a `reference`/`raw` second input nev
   whose shape no longer matches, so an axis-changing node (crop/resample/zproject/stack/
   channel.select) *removes* layers. The drop is derived centrally from the axis delta — you
   do not declare it — but do not assume "layers only accumulate".
+
+### 4d. `description` — the hover text (clause 6, V2.13)
+
+Every param socket carries prose saying **what it does and how it moves the result**. It is
+`SocketSpec.description`, and the GUI renders it as the tooltip on both hover surfaces — the
+inspector's parameter row and the node card's port dot — through the one shared builder
+`nodelab_v2.node_item.socket_hover_text`, which prepends the `name — type · unit` identity
+line and hard-wraps the prose. Enforced by `selftest::test_socket_docs`.
+
+```python
+InFloat("mask_threshold", "Mask cut", unit="", field=False, default=0.4,
+        available_in={"method": frozenset({"cellsam"})},
+        description=
+        "The per-pixel sigmoid cut on the mask decoder's output — in effect, how far each "
+        "cell's mask extends. LOWER grows every mask, HIGHER shrinks it, so this is the "
+        "knob that moves reported µm² areas without changing WHICH cells are found. "
+        "Default 0.4 is what CellSAM ships; the paper states 0.5.")
+```
+
+**It is presentation-only and must stay that way.** `node_recipe_hash` keys on op_key +
+params + upstream, never on the `SocketSpec`, so editing a description cannot invalidate a
+memo entry or a saved graph — `test_socket_docs` asserts exactly this. That is what makes
+documentation a zero-risk edit; do not let anything start reading `description` at runtime.
+
+**What earns its space** (the reader already sees name/type/unit for free):
+* the DIRECTION — "lower finds more cells and more false positives";
+* whether it moves a **measurement** a downstream table reports (area/volume/intensity);
+* when it is **inert** — "only read when Tiled inference is on";
+* a load-bearing value: a library default, a paper's value, and any disagreement between
+  them.
+
+What does not: restating the label, restating the type, or explaining a unit conversion that
+`unit=` already displays.
+
+**The one exemption** is a param whose meaning lives in an external paper or repo — an
+augmented-Lagrangian solver's `mu`/`tol`, a published tracker's topology weights, another
+project's model thresholds. A confident wrong description is worse than none, so those are
+listed in `selftest::_SOCKET_DOC_EXEMPT` **with a reason**, and get documented only against
+the algorithm's own docs. Code vendored from *this project's* history is **not** exempt: it
+is in the repo, so it is readable.
+
+### 4e. `choice_docs` — one explanation per DROPDOWN OPTION (V2.21)
+
+A `description` can only describe the control. For a dropdown that is not enough: the menu
+then offers six bare tokens (`otsu`, `li`, `yen`, …) whose *differences* are the entire
+reason the user opened it, and naming a method is not explaining it. So **every dropdown
+documents every option**, on both spec types, and `Mode` additionally carries its own
+`description` (it had none before V2.21):
+
+* `ModeSpec.description` + `ModeSpec.choice_docs` — `{choice: prose}`.
+* `SocketSpec.choice_docs` — the same, for `choices` (pick one) and `vocab` (pick many).
+
+```python
+Mode("method", ["otsu", "li"], label="Level",
+     description="How the intensity cut is chosen — the methods differ in what they "
+                 "ASSUME the histogram looks like.",
+     choice_docs={
+         "otsu": "Maximizes between-class variance: the classic bimodal split. Biased LOW "
+                 "(mask too generous) when the foreground covers only a few percent.",
+         "li":   "Minimum cross-entropy. Handles a SMALL, sparse foreground far better than "
+                 "Otsu — the first thing to try when Otsu's masks come out too generous.",
+     })
+```
+
+**Write it RELATIVE to the siblings.** What this option assumes about the data, and which
+way the result moves if you pick it — that is what a menu is for. Say when an option is
+cheap/expensive, when it needs something the others do not (a track column, a raster, a
+download), and when it is refused in some state. Option prose is held to a lower length bar
+than a param description (`_OPTION_DOC_MIN`, 60 chars) because "assumes two intensity
+classes" is a complete answer.
+
+Three vocabularies are **canned centrally** — do not re-write them per node:
+`registry.DIM_CHOICE_DOCS` (the 2D/3D lever, carried by `DimMode()` for free),
+`domains.domain_docs(names)`, and `reducers.reducer_docs(names)`. Each lives beside the
+thing it describes, for the reason `DOMAIN_COLOR` does: it is a property of the data model,
+not of a node, and five hand-written copies would only differ where one had rotted.
+
+Same contract as `description`: **presentation-only and memo-neutral** — a Mode's docs
+cannot reach the recipe hash, because the engine folds the resolved mode STATE (`__modes__`)
+and never the `ModeSpec`. Registration refuses a `choice_docs` key that matches no option
+(it would render no tooltip, indistinguishable from never writing one), a blank explanation,
+and — new in V2.21, since Modes were previously unvalidated — a Mode `default` outside its
+own `choices`. Rendered by `mode_hover_text` / `option_hover_text` on four surfaces: the
+inspector row, each combo item, each vocab tick box, and the node card's popup menu (which
+needs `setToolTipsVisible(True)`, or QMenu swallows the prose). Enforced by
+`selftest::test_option_docs`, exemptions in `_OPTION_DOC_EXEMPT` on the same
+external-paper-only grounds.
+
 
 ---
 

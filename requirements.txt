@@ -31,3 +31,11 @@ pyarrow>=15.0      # Parquet / Arrow export + structure tables (lazily imported)
 #                                            #   trust store. setup_cellsam.py detects
 #                                            #   the case and tells you.
 #   pip install zarr                         # scripts/_bench_provider_granularity.py only
+#
+#   CuPy — optional CUDA path for the ndimage filters. Do NOT pin a wheel here: CuPy ships
+#   a separate build per CUDA major and the right one depends on the machine's DRIVER
+#   version AND its GPU architecture, neither of which a requirements file can know. Run
+#       python scripts/setup_cupy.py            # detects both, installs the match, verifies
+#   It always includes the [ctk] extra (CuPy JIT-compiles these kernels and rejects every
+#   one without the CUDA headers). The GPU stays OFF unless NODEGRAPH_GPU=auto; it is worth
+#   enabling for heavy 3D volumetric filtering (measured 9-31x) and about neutral otherwise.

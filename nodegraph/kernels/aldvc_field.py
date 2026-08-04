@@ -64,8 +64,60 @@ EDITS MADE DURING VENDORING (only the permitted kinds)
         class whose ``run`` still calls ``run_aldvc`` verbatim.
       * The ``ParamSpec`` import (only ``get_params`` needed it) — no ParamSpec
         stub was required because ``DVCResult``/``DVCParams`` do not use it.
-No compute-path code was altered. No private helper needed renaming (there were
-no cross-module name collisions).
+No private helper needed renaming (there were no cross-module name collisions).
+
+CORRECTNESS + PERFORMANCE PASS AGAINST THE MATLAB REFERENCE (2026-07-31)
+------------------------------------------------------------------------
+The vendored code was **no longer only re-plumbed** — it was audited stage by
+stage against FranckLab's MATLAB source and the paper, and the compute path was
+corrected. Validated by ``scripts/_aldvc_validate.py`` against three independent
+kinds of truth: the paper's own homogeneous benchmark on analytically-placed
+Appendix-D bead volumes (exact truth), FranckLab's distributed example datasets
+compared node-for-node against the ``results_*.mat`` MATLAB produced from them,
+and the u_y ≡ u_z ≡ 0 invariant of an x-only deformation.
+
+Corrected (each item is a measured behaviour change, not a refactor):
+
+* **Subpb1 was not the reference's Subpb1.** It re-fitted all 12 DOF from ``G=0``
+  every ADMM iteration; ``funICGN_Subpb13`` freezes the affine part at the
+  compatible ``F̂ = Dû`` and solves only the ``ndim`` translation DOFs, then
+  ``main_ALDVC.m:411`` sets ``FSubpb1 = FSubpb2``. → ``freeze_G``.
+* **The ADMM penalty was inert.** ``mu``/``beta`` were added to the raw
+  ``sdᵀsd``; the reference adds them to ``2·H/bottomf²``, making the port's
+  penalty ~f_norm²/2 (≈180×) too weak and unit-dependent. → normalized normal
+  equations.
+* **``tune_beta`` swept the wrong operator**, dropping ``β·DᵀF`` from the RHS, so
+  the L-curve always bottomed out on its smallest candidate. Fixed; the sweep now
+  reproduces MATLAB's selected ``β`` exactly on the reference dataset (0.031623).
+* **The seed's search window was truncated, not slid**, at volume borders, making
+  the reachable displacement one-sided; 18–40 % of nodes on a stretch field could
+  not reach their true displacement. → ``_slide_window`` + ``border_margin`` +
+  a reachability guard.
+* **Border subsets fabricated up to 20 % of their own data** by edge replication.
+  → masked ZNSSD.
+* **The normalized median test zeroed NaNs instead of filling them**, so one
+  failed subset dragged its 26 neighbours' median toward zero and got them
+  rejected too. Both outlier guards now default OFF, as in the reference run.
+* **Inpainting was nearest-neighbour**, giving piecewise-constant blocks that fed
+  the gradient operator. → harmonic (Laplace) fill.
+* Missing steps restored: the outlier mask is applied to ``F`` too; ``F`` is
+  median-denoised before the augmented-Lagrangian RHS (``funSmoothStrain3`` is not
+  a no-op at its defaults); the global solve leaves the Neumann boundary shell at
+  its local values; strain comes from ``F̂`` rather than a re-differentiation of
+  ``û``; the ADMM residual is normalized by ``√(ndim·N)``, not ``√N``; the
+  Tikhonov default is 0 (it shrank every displacement by 0.0999 %).
+* **Added beyond the reference:** ``reliability_guided_repair`` — a converged
+  neighbour's affine warp, first-order-extrapolated, retries any subset the
+  translation-only seed could not land. Without it a 20–25° in-plane rotation
+  carried several voxels of error (RMS 3.1 / 6.2); with it, 0.0012 / 0.0016.
+
+Performance (same answers, bit-identical across worker counts): one process pool
+and one shared-memory copy of the volumes for the whole solve instead of six; the
+seed fanned across processes (it was 73 % of wall clock in a serial Python loop);
+two of the seed's three FFTs per subset replaced by integral images; the
+finite-difference operator assembled with array arithmetic instead of a
+1.6 M-iteration Python loop; a byte-budgeted reference cache (the unbounded dict
+it replaced would have wanted ~35 GB on the paper's own reference grid).
 """
 from __future__ import annotations
 
@@ -357,23 +409,44 @@ class Grid:
         return self.coords.reshape(-1, self.ndim)
 
 
-def build_grid(shape: Tuple[int, ...], subset_size: int, subset_spacing: int) -> Grid:
+def build_grid(shape: Tuple[int, ...], subset_size: int, subset_spacing: int,
+               border_margin: int = 0) -> Grid:
     """Build a :class:`Grid` of subset centers for a volume of ``shape``.
 
-    Centers are ``subset_spacing`` apart, inset by ``subset_size // 2`` so every
-    subset window lies fully inside the volume. Tiny axes fall back to a single
-    center at the axis midpoint.
+    Centers are ``subset_spacing`` apart and inset by ``subset_size // 2 +
+    border_margin`` so every subset window lies fully inside the volume — and,
+    with ``border_margin > 0``, so the *deformed* search window has room too.
+
+    ``border_margin`` exists because ALDVC insets its mesh by substantially more
+    than half a subset: ``funIntegerSearch3Multigrid`` uses ``1 + round(winsize)``
+    and ``funIntegerSearch3`` trims by ``winsize/2 + 3 (+ searchRadius)``. With a
+    bare ``subset_size // 2`` inset, the outermost ring of centers sits exactly on
+    the edge of the legal region, so its FFT search window gets clipped on one
+    side and the seed there cannot represent displacement of the clipped sign
+    (measured: 18–40 % of nodes on a stretch field). :func:`run_aldvc` therefore
+    passes a margin derived from the search radius.
+
+    The inset is never allowed to collapse below the point where the subset
+    window still fits: an axis shorter than ``subset_size + 1`` gets a *reduced
+    window* on that axis (see :func:`subset_shape_for`) rather than centers whose
+    window would hang off the end, which used to yield a silently all-zero field
+    on thin-Z stacks.
     """
     shape = tuple(int(s) for s in shape)
     ndim = len(shape)
     half = max(1, int(subset_size) // 2)
+    margin = max(0, int(border_margin))
     step = max(1, int(subset_spacing))
     axes: List[np.ndarray] = []
     steps: List[float] = []
     for n in shape:
-        half_a = min(half, max(0, (n - 1) // 2))   # can't inset past the axis
-        start = half_a
-        stop = max(start + 1, n - half_a)          # exclusive upper bound
+        # Inset by half+margin where the axis allows it; shrink the margin first
+        # (it is only a search-window courtesy), then the half-window (which
+        # forces a reduced window on this axis via subset_shape_for).
+        half_a = min(half, max(0, (n - 1) // 2))
+        pad = min(margin, max(0, (n - 1) // 2 - half_a))
+        start = half_a + pad
+        stop = max(start + 1, n - half_a - pad)    # exclusive upper bound
         c = np.arange(start, stop, step, dtype=np.float64)
         if c.size == 0:
             c = np.asarray([n / 2.0], dtype=np.float64)
@@ -395,6 +468,49 @@ def build_grid(shape: Tuple[int, ...], subset_size: int, subset_spacing: int) ->
         step=np.asarray(steps, dtype=np.float64),
         ndim=ndim,
     )
+
+
+def subset_shape_for(shape: Tuple[int, ...], subset_size: int) -> Tuple[int, ...]:
+    """Per-axis odd subset window that actually fits inside a volume of ``shape``.
+
+    An isotropic ``subset_size`` window cannot fit on an axis shorter than
+    ``subset_size + 1`` (the common shallow-Z confocal stack). Rather than emit
+    centers whose window hangs off the end — which made every such subset fail
+    and the whole field collapse to the inpainted default — the window is reduced
+    on that axis only, keeping it odd and ≥3 so the 3-point gradient stencil and
+    the affine warp still have support.
+    """
+    half = max(1, int(subset_size) // 2)
+    out: List[int] = []
+    for n in shape:
+        h = min(half, max(1, (int(n) - 1) // 2))
+        out.append(int(2 * h + 1))
+    return tuple(out)
+
+
+def interior_node_mask(grid: Grid) -> np.ndarray:
+    """``(*grid,)`` bool — nodes NOT on the outer one-node shell of the grid.
+
+    ALDVC's finite-difference Subpb2 writes the global solution only into the
+    non-Neumann DOFs (``funFDNotNeumannBCInd3`` → ``main_ALDVC.m`` "``USubpb2 =
+    USubpb1; USubpb2(notNeumannBCInd_U) = USubpb2temp(notNeumannBCInd_U)``"), so
+    the boundary shell keeps its *local* IC-GN value and its duals stay zero. That
+    matters because ``D``'s one-sided stencil at the border is a different
+    operator from its central-difference interior, and letting the global solve
+    write there injects that inconsistency straight into the reported field.
+    Axes with fewer than 3 nodes have no interior, and are left entirely free
+    (marked interior) so a thin grid is not frozen to its local values.
+    """
+    mask = np.ones(grid.grid_shape, dtype=bool)
+    for ax, n in enumerate(grid.grid_shape):
+        if n < 3:
+            continue
+        sl: List[slice] = [slice(None)] * grid.ndim
+        sl[ax] = slice(0, 1)
+        mask[tuple(sl)] = False
+        sl[ax] = slice(n - 1, n)
+        mask[tuple(sl)] = False
+    return mask
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -467,7 +583,7 @@ Pure numpy/scipy — no PySide6.
 from typing import Tuple
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, median_filter
+from scipy.ndimage import distance_transform_edt, median_filter, uniform_filter
 
 
 def normalized_median_flags(
@@ -478,14 +594,20 @@ def normalized_median_flags(
 
     ``u_grid`` is ``(ndim, *grid)``. ``eps`` is the noise floor (voxels) that
     keeps the test from firing on uniform fields; ``threshold`` ~2 is typical.
+
+    NaNs are **filled before the test**, not zeroed. ALDVC's ``RemoveOutliers3``
+    runs ``inpaint_nans3`` first for exactly this reason: substituting 0.0 injects
+    a fake zero-displacement vector into all 26 neighbours' median, so a single
+    failed subset drags its whole neighbourhood's median toward zero and the test
+    then rejects the *good* neighbours. (The originally-NaN nodes are still
+    flagged, independently, by the finiteness test in :func:`remove_outliers`.)
     """
     ndim = u_grid.shape[0]
     flags = np.zeros(u_grid.shape[1:], dtype=bool)
     for c in range(ndim):
-        comp = np.asarray(u_grid[c], dtype=np.float64)
-        finite = np.nan_to_num(comp, nan=0.0)
-        med = median_filter(finite, size=size, mode="nearest")
-        res = np.abs(finite - med)
+        filled = inpaint_nans(np.asarray(u_grid[c], dtype=np.float64))
+        med = median_filter(filled, size=size, mode="nearest")
+        res = np.abs(filled - med)
         res_med = median_filter(res, size=size, mode="nearest")
         norm_res = res / (res_med + eps)
         flags |= norm_res > threshold
@@ -494,28 +616,48 @@ def normalized_median_flags(
 
 def remove_outliers(
     u_grid: np.ndarray, cc: np.ndarray, *,
-    cc_thresh: float = 0.5, median_thresh: float = 2.0,
+    cc_thresh: float = 0.0, median_thresh: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Set low-confidence / median-failing / non-finite nodes to NaN.
 
     Returns ``(u_clean, bad_mask)`` where ``u_clean`` is ``u_grid`` with flagged
     nodes NaN'd (a copy) and ``bad_mask`` is ``(*grid,)`` bool.
+
+    Both guards default to **off**, matching the reference run. ``main_ALDVC.m``'s
+    cumulative branch sets ``qDICOrNot = 0`` (no correlation-based rejection) and
+    ``medianFilterThreshold = 0`` (no median test); only the *incremental* branch
+    turns the median test on, at 2.0. The previous always-on defaults
+    (``cc_thresh=0.5``, ``median_thresh=2.0``) rejected up to 40 % of nodes on a
+    perfectly good large-strain field — every rejection is then replaced by an
+    interpolated value, so the guards were destroying more signal than noise.
+    Non-finite nodes are always rejected regardless.
     """
-    ndim = u_grid.shape[0]
     bad = ~np.all(np.isfinite(u_grid), axis=0)
-    if cc is not None:
+    if cc is not None and float(cc_thresh) > -1.0:
         bad |= np.asarray(cc) < float(cc_thresh)
-    bad |= normalized_median_flags(u_grid, threshold=median_thresh)
+    if float(median_thresh) > 0.0:
+        bad |= normalized_median_flags(u_grid, threshold=median_thresh)
     out = np.array(u_grid, dtype=np.float64, copy=True)
     out[:, bad] = np.nan
     return out, bad
 
 
-def inpaint_nans(field: np.ndarray) -> np.ndarray:
-    """Fill NaNs in a scalar ``(*grid,)`` array by nearest finite value.
+def inpaint_nans(field: np.ndarray, *, iterations: int = 60) -> np.ndarray:
+    """Fill NaNs in a scalar ``(*grid,)`` array by a discrete harmonic (Laplace) fill.
 
-    Uses the Euclidean distance transform to index the nearest valid sample —
-    guaranteed to fill every NaN provided at least one finite value exists.
+    ALDVC uses ``inpaint_nans3``, which solves the discrete Laplace equation over
+    the NaN set — the fill is therefore **exact for any locally linear field**,
+    which is precisely the regime a displacement field is in over one grid step.
+    The previous nearest-finite-value (EDT) fill is exact only for a *constant*
+    field: it produces piecewise-constant blocks whose internal gradient is zero
+    and whose boundary gradient is a step, and those blocks feed straight into the
+    finite-difference operator ``D`` and the strain gradient.
+
+    Implemented as a nearest-value seed followed by Jacobi smoothing restricted to
+    the NaN set (Dirichlet data = the finite nodes). That converges to the same
+    harmonic solution as a sparse solve but costs a handful of ``uniform_filter``
+    passes instead of factorizing a matrix per component per ADMM iteration; the
+    NaN regions here are small and the iteration count is capped accordingly.
     """
     arr = np.asarray(field, dtype=np.float64)
     nan_mask = ~np.isfinite(arr)
@@ -525,7 +667,16 @@ def inpaint_nans(field: np.ndarray) -> np.ndarray:
         return np.zeros_like(arr)
     idx = distance_transform_edt(nan_mask, return_distances=False,
                                  return_indices=True)
-    return arr[tuple(idx)]
+    out = arr[tuple(idx)]                     # nearest-value seed
+    n_iter = int(iterations)
+    if n_iter > 0:
+        # Jacobi sweeps toward the harmonic solution. `uniform_filter` averages a
+        # 3^ndim box; restricting the write to nan_mask pins the known values, so
+        # the iteration is a Dirichlet Laplace solve on the unknown set.
+        for _ in range(n_iter):
+            sm = uniform_filter(out, size=3, mode="nearest")
+            out[nan_mask] = sm[nan_mask]
+    return out
 
 
 def inpaint_vector(u_grid: np.ndarray) -> np.ndarray:
@@ -711,11 +862,40 @@ def _to_host(a) -> np.ndarray:
     return np.asarray(a)
 
 
+def _box_sums(a, win, xp):
+    """Sliding-window sums of ``a`` over every ``win``-shaped block, "valid"
+    positions — via a cumulative-sum integral image.
+
+    Equivalent to ``fftconvolve(a, ones(win), mode="valid")`` but O(N) instead of
+    an FFT pair, and exact rather than accumulating FFT round-off. This is how the
+    reference computes the NCC denominator (``funIntegerSearch3.m`` builds
+    ``intImgA``/``intImgA2`` with ``integralImage``), and it removes two of the
+    three FFT convolutions the port used to spend per subset.
+    """
+    c = a
+    for ax, w in enumerate(win):
+        c = xp.cumsum(c, axis=ax)
+        pad = [slice(None)] * c.ndim
+        pad[ax] = slice(w - 1, None)
+        head = c[tuple(pad)]
+        pad[ax] = slice(None, -w)
+        tail = c[tuple(pad)]
+        zshape = list(head.shape)
+        zshape[ax] = 1
+        z = xp.zeros(tuple(zshape), dtype=head.dtype)
+        c = head - xp.concatenate((z, tail), axis=ax)
+    return c
+
+
 def _ncc_fft(search, template, xp, signal):
     """FFT normalized cross-correlation of ``template`` within ``search`` (valid
     positions) — the Lewis (1995) NCC that ``skimage.feature.match_template``
     computes, written against a backend module (numpy or cupy) so it runs on CPU
     or GPU. Returns the NCC map (backend array) or ``None`` for a flat template.
+
+    Only the numerator needs an FFT; the denominator's ``Σ I`` and ``Σ I²`` are
+    box sums, computed by :func:`_box_sums` (integral images) exactly as the
+    reference does.
     """
     t0 = template - template.mean()
     tnorm = float(xp.sqrt(xp.sum(t0 * t0)))
@@ -723,10 +903,11 @@ def _ncc_fft(search, template, xp, signal):
         return None
     n = float(template.size)
     rev = tuple(slice(None, None, -1) for _ in range(template.ndim))
-    ones = xp.ones_like(template)
     num = signal.fftconvolve(search, t0[rev], mode="valid")           # Σ I·T0
-    sum_i = signal.fftconvolve(search, ones[rev], mode="valid")       # Σ I
-    sum_i2 = signal.fftconvolve(search * search, ones[rev], mode="valid")  # Σ I²
+    win = template.shape
+    s64 = search.astype(xp.float64, copy=False)
+    sum_i = _box_sums(s64, win, xp)                                   # Σ I
+    sum_i2 = _box_sums(s64 * s64, win, xp)                            # Σ I²
     var = xp.clip(sum_i2 - (sum_i * sum_i) / n, 0.0, None)
     denom = tnorm * xp.sqrt(var)
     return xp.where(denom > 1e-12, num / denom, 0.0)
@@ -760,10 +941,43 @@ def _parabolic_subpixel(corr: np.ndarray, peak: Tuple[int, ...]) -> np.ndarray:
 
 def _clamp_window(ctr: np.ndarray, half: np.ndarray, shape: Tuple[int, ...]):
     """Return ``(lo, hi)`` integer slice bounds for a window of half-width
-    ``half`` around integer center ``ctr``, clamped to ``[0, shape)``."""
+    ``half`` around integer center ``ctr``, clamped to ``[0, shape)``.
+
+    Truncating: the window shrinks at a border. Correct for the *reference*
+    template (whose extent defines what is being matched) — see
+    :func:`_slide_window` for the *search* window, which must not shrink.
+    """
     lo = np.maximum(ctr - half, 0)
     hi = np.minimum(ctr + half + 1, np.asarray(shape))
     return lo.astype(np.int64), hi.astype(np.int64)
+
+
+def _slide_window(ctr: np.ndarray, half: np.ndarray, shape: Tuple[int, ...]):
+    """Return ``(lo, hi)`` for a window of half-width ``half`` around ``ctr``,
+    **slid** inside ``[0, shape)`` rather than truncated.
+
+    Why this exists (this was a real, measured defect). The deformed search window
+    must span ``ctr ± (half + radius)`` so the seed can find displacement of
+    *either* sign up to ``radius``. Clamping it at a volume border keeps the
+    window inside but silently makes the reachable displacement interval
+    one-sided: a node near the low border could only ever report ``u ≥ 0``. On a
+    λ=1.2 uniaxial stretch, 18–40 % of grid nodes (depending on volume size) had a
+    true displacement *outside* the reachable interval, so the seed there latched
+    onto whatever spurious correlation peak existed on the reachable side — which
+    is why seed error used to grow with ``search_radius`` instead of shrinking.
+
+    Sliding preserves the full window width (hence the full ± range) whenever the
+    volume is wide enough to hold it, and only shrinks — symmetrically — when the
+    requested window is genuinely wider than the axis. Displacement is recovered
+    from absolute positions (``match_origin − rlo``), so re-centering the window
+    does not bias the result.
+    """
+    shp = np.asarray(shape, dtype=np.int64)
+    want = 2 * np.asarray(half, dtype=np.int64) + 1
+    width = np.minimum(want, shp)                    # can't exceed the axis
+    lo = np.asarray(ctr, dtype=np.int64) - (width // 2)
+    lo = np.clip(lo, 0, shp - width)                 # slide, don't truncate
+    return lo.astype(np.int64), (lo + width).astype(np.int64)
 
 
 def integer_search(
@@ -832,8 +1046,11 @@ def integer_search(
             continue                                        # flat/empty → no info
 
         if correlation == "phase":
-            # Compare equal-size windows (ref @ ctr vs deformed @ ctr+off).
-            dlo, dhi = _clamp_window(dctr, half, defm.shape)
+            # Compare equal-size windows (ref @ ctr vs deformed @ ctr+off). Slid
+            # so a border node still gets a full-size window; the actual window
+            # offset is then carried explicitly (dlo − rlo) rather than assumed
+            # to be `off`, which is what a truncated window would have broken.
+            dlo, dhi = _slide_window(dctr, half, defm.shape)
             dsl = tuple(slice(int(a), int(b)) for a, b in zip(dlo, dhi))
             moving = defm[dsl]
             if moving.shape != template.shape or float(moving.std()) < 1e-6:
@@ -841,8 +1058,9 @@ def integer_search(
             try:
                 shift, _err, _phase = phase_cross_correlation(
                     template, moving, upsample_factor=10, normalization=None)
-                # residual shift maps moving→ref; ref→deformed disp = off − shift.
-                u0[(slice(None), *idx)] = (off.astype(np.float64)
+                # `shift` maps moving→ref, so ref→deformed disp for these two
+                # windows is (window offset) − shift.
+                u0[(slice(None), *idx)] = ((dlo - rlo).astype(np.float64)
                                            - np.asarray(shift, dtype=np.float64))
                 cc[idx] = 1.0
             except Exception:                               # noqa: BLE001
@@ -853,7 +1071,9 @@ def integer_search(
         # ZNCC: FFT normalized cross-correlation of the template within an
         # expanded deformed search window (on the GPU when on_dev), centered at
         # ctr+off so the returned displacement includes the coarse-level offset.
-        slo, shi = _clamp_window(dctr, half + rad, defm.shape)
+        # SLID, not truncated — a clamped window would make the reachable
+        # displacement one-sided at borders (see _slide_window).
+        slo, shi = _slide_window(dctr, half + rad, defm.shape)
         ssl = tuple(slice(int(a), int(b)) for a, b in zip(slo, shi))
         if any((int(shi[d]) - int(slo[d])) < template.shape[d]
                for d in range(ndim)):
@@ -868,7 +1088,24 @@ def integer_search(
         # Best-match origin of the template inside defm = slo + peak (+subvoxel).
         sub = _parabolic_subpixel(corr, peak)
         match_origin = slo.astype(np.float64) + np.asarray(peak, np.float64) + sub
-        u0[(slice(None), *idx)] = match_origin - rlo.astype(np.float64)
+        disp = match_origin - rlo.astype(np.float64)
+        # Reachability guard. Even after sliding, a node whose template sits flush
+        # against a volume face has no room to search in the inward-negative
+        # direction — the data simply is not there. Trusting the best peak on the
+        # reachable side is worse than admitting ignorance: it returns a confident,
+        # sign-restricted, spurious displacement. Flag the node instead so the
+        # outlier/inpaint stage fills it from its neighbours. With the border
+        # margin run_aldvc applies, this should fire on no node at all; it is the
+        # backstop for callers that set border_margin=0.
+        reach_lo = disp - (off.astype(np.float64) - rad)
+        reach_hi = (off.astype(np.float64) + rad) - disp
+        if np.any(reach_lo < -0.5) or np.any(reach_hi < -0.5):
+            # The peak landed at (or outside) the edge of a truncated interval.
+            u0[(slice(None), *idx)] = np.nan
+            cc[idx] = np.nan
+            _emit(progress_cb, progress_lo, progress_hi, k, n)
+            continue
+        u0[(slice(None), *idx)] = disp
         cc[idx] = float(corr[peak])
         _emit(progress_cb, progress_lo, progress_hi, k, n)
 
@@ -878,6 +1115,98 @@ def integer_search(
 def _emit(cb: Optional[Callable[[int], None]], lo: int, hi: int, k: int, n: int) -> None:
     if cb is not None and n > 0 and (k & 63) == 0:
         cb(int(lo + (hi - lo) * k / n))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Parallel seed  — the stage that used to dominate the whole solve
+# ─────────────────────────────────────────────────────────────────────────
+
+def _seed_block(args):
+    """Worker: run :func:`integer_search` over a contiguous slab of grid nodes.
+
+    Attaches the shared reference/deformed volumes and rebuilds a sub-:class:`Grid`
+    from the slab's own centre coordinates, so the per-subset arithmetic (and hence
+    the result) is bit-identical to the serial sweep.
+    """
+    (ref_meta, def_meta, coords, subset_size, search_radius, correlation,
+     u0_center) = args
+    ref, ref_shm = attach_shared(*ref_meta)
+    defm, def_shm = attach_shared(*def_meta)
+    try:
+        ndim = coords.shape[-1]
+        sub = Grid(axes=[], coords=coords, grid_shape=coords.shape[:-1],
+                   step=np.ones(ndim), ndim=ndim)
+        return integer_search(ref, defm, sub, subset_size, search_radius,
+                              correlation=correlation, u0_center=u0_center)
+    finally:
+        ref_shm.close()
+        def_shm.close()
+
+
+def parallel_integer_search(
+    ref: np.ndarray, defm: np.ndarray, grid: Grid, subset_size: int,
+    search_radius: int, *, correlation: str = "zncc",
+    u0_center: Optional[np.ndarray] = None, n_workers: int = 1,
+    pool: Optional["_IcgnPool"] = None,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    cancelled_cb: Optional[Callable[[], bool]] = None,
+    progress_lo: int = 0, progress_hi: int = 100,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """:func:`integer_search` fanned across processes over the flattened node list.
+
+    The seed is one FFT normalized cross-correlation per subset in a Python loop —
+    measured at ~9 ms/subset, i.e. ~73 % of a whole solve's wall clock and ~340 s
+    on the paper's own 39 k-node reference grid, while the IC-GN sweeps around it
+    were already multi-process. Splitting the node grid is exactly equivalent (each
+    subset's correlation is independent) and makes the stage scale with cores.
+    """
+    gshape = grid.grid_shape
+    ndim = grid.ndim
+    n = int(np.prod(gshape)) if gshape else 0
+    nw = max(1, int(n_workers))
+    if nw <= 1 or n < 2 * nw:
+        return integer_search(
+            ref, defm, grid, subset_size, search_radius, correlation=correlation,
+            u0_center=u0_center, progress_cb=progress_cb,
+            cancelled_cb=cancelled_cb, progress_lo=progress_lo,
+            progress_hi=progress_hi)
+    # Split the FLATTENED node list, not a grid axis: the slowest axis of a real
+    # DVC grid is often the shortest (e.g. 14 for the paper's 2048x192x192 case at
+    # ws=20), which would cap the fan-out at 14 regardless of core count. Each
+    # subset's correlation is independent of every other, so any partition is exact.
+    flat_coords = grid.coords.reshape(-1, ndim)
+    flat_u0c = (np.moveaxis(u0_center, 0, -1).reshape(-1, ndim)
+                if u0_center is not None else None)
+    bounds = np.unique(np.linspace(0, n, min(nw * 4, n) + 1).astype(int))
+    chunks = [(int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+    u0_flat = np.zeros((ndim, n), dtype=np.float64)
+    cc_flat = np.zeros(n, dtype=np.float64)
+    own = pool is None
+    ctx = (_IcgnPool({"ref": ref, "def_raw": defm}, nw, key="seed")
+           if own else None)
+    p = ctx.__enter__() if own else pool
+    try:
+        tasks = [(p.meta["ref"], p.meta["def_raw"],
+                  np.ascontiguousarray(flat_coords[a:b]),
+                  int(subset_size), int(search_radius), str(correlation),
+                  (np.ascontiguousarray(flat_u0c[a:b].T)
+                   if flat_u0c is not None else None))
+                 for (a, b) in chunks]
+        done = 0
+        for (a, b), (u_s, cc_s) in zip(chunks, p.executor.map(_seed_block, tasks)):
+            u0_flat[:, a:b] = u_s
+            cc_flat[a:b] = cc_s
+            done += (b - a)
+            if progress_cb is not None:
+                progress_cb(int(progress_lo
+                                + (progress_hi - progress_lo) * done / n))
+            if cancelled_cb is not None and cancelled_cb():
+                raise InterruptedError("DVC cancelled")
+    finally:
+        if own:
+            ctx.__exit__(None, None, None)
+    return u0_flat.reshape(ndim, *gshape), cc_flat.reshape(gshape)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -924,7 +1253,8 @@ def _interp_u_to_grid(src_grid: Grid, u_src: np.ndarray, dst_grid: Grid,
 def integer_search_multigrid(
     ref: np.ndarray, defm: np.ndarray, grid: Grid, subset_size: int,
     search_radius: int, *, levels: int = 3, correlation: str = "zncc",
-    use_gpu: bool = False,
+    use_gpu: bool = False, n_workers: int = 1,
+    pool: Optional["_IcgnPool"] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancelled_cb: Optional[Callable[[], bool]] = None,
     progress_lo: int = 0, progress_hi: int = 100,
@@ -937,36 +1267,59 @@ def integer_search_multigrid(
     with a small residual radius. ``levels=1`` is the single-scale path.
     """
     levels = max(1, int(levels))
+    # The GPU path keeps both volumes resident on the device inside one process,
+    # so it must not be split across worker processes; CPU seeds fan out.
+    def _seed(r, d, g, ss, rad, u0c, plo, phi, use_shared_pool=False):
+        if use_gpu or int(n_workers) <= 1:
+            return integer_search(
+                r, d, g, ss, rad, correlation=correlation, use_gpu=use_gpu,
+                u0_center=u0c, progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+                progress_lo=plo, progress_hi=phi)
+        # Only the FULL-resolution pass can borrow the caller's pool: its shared
+        # "def_raw" block is the full-size volume, whereas a coarse level works on
+        # a downsampled copy and must ship its own.
+        return parallel_integer_search(
+            r, d, g, ss, rad, correlation=correlation, u0_center=u0c,
+            n_workers=int(n_workers), pool=(pool if use_shared_pool else None),
+            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+            progress_lo=plo, progress_hi=phi)
+
     if levels == 1:
-        return integer_search(
-            ref, defm, grid, subset_size, search_radius, correlation=correlation,
-            use_gpu=use_gpu, progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-            progress_lo=progress_lo, progress_hi=progress_hi)
+        return _seed(ref, defm, grid, subset_size, search_radius, None,
+                     progress_lo, progress_hi, use_shared_pool=True)
     f = 2 ** (levels - 1)
     facs = _downsample_facs(ref.shape, f, subset_size)
     if all(x == 1 for x in facs):
-        return integer_search(
-            ref, defm, grid, subset_size, search_radius, correlation=correlation,
-            use_gpu=use_gpu, progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-            progress_lo=progress_lo, progress_hi=progress_hi)
+        return _seed(ref, defm, grid, subset_size, search_radius, None,
+                     progress_lo, progress_hi, use_shared_pool=True)
     ref_c = _downsample(ref, facs)
     defm_c = _downsample(defm, facs)
     fmean = float(np.mean([x for x in facs if x > 1])) or 1.0
-    coarse_spacing = max(2, int(round(float(np.mean(grid.step)) / fmean)))
+    # The coarse pass exists to be CHEAP: it only has to bracket the motion well
+    # enough to re-center the fine search. Keeping the coarse grid at the same
+    # *physical* spacing as the fine grid (`mean(step)/fmean` in coarse voxels)
+    # made it evaluate as many subsets as the fine pass but with a much larger
+    # search window — i.e. the multigrid was slower than single-scale and bought
+    # nothing. Hold the spacing in *coarse voxels* instead, so the coarse grid has
+    # ~fmean^ndim fewer nodes.
+    coarse_spacing = max(2, int(round(float(np.mean(grid.step)))))
     coarse_grid = build_grid(ref_c.shape, subset_size, coarse_spacing)
-    coarse_rad = int(max(np.ceil(search_radius / fmean),
-                         0.3 * min(ref_c.shape)))
+    # Radius in coarse voxels: the residual motion the coarse pass must bracket is
+    # the full motion divided by the downsample factor. Cap by the coarse volume
+    # rather than forcing a floor of 0.3*extent (which used to inflate every
+    # coarse search window and invite spurious peaks).
+    coarse_rad = int(max(4, min(np.ceil(search_radius / fmean),
+                                0.5 * min(ref_c.shape))))
     mid = int(progress_lo + 0.4 * (progress_hi - progress_lo))
-    u0_c, _cc_c = integer_search(
-        ref_c, defm_c, coarse_grid, subset_size, coarse_rad,
-        correlation=correlation, use_gpu=use_gpu, progress_cb=progress_cb,
-        cancelled_cb=cancelled_cb, progress_lo=progress_lo, progress_hi=mid)
+    u0_c, _cc_c = _seed(ref_c, defm_c, coarse_grid, subset_size, coarse_rad,
+                        None, progress_lo, mid)
+    # The coarse seed is what re-centres the fine search window, so a coarse node
+    # the reachability guard rejected must not poison the fine pass — fill it.
+    u0_c = inpaint_vector(u0_c)
     u0_center = _interp_u_to_grid(coarse_grid, u0_c, grid, facs)
     fine_rad = max(4, int(subset_size) // 2)
-    return integer_search(
-        ref, defm, grid, subset_size, fine_rad, correlation=correlation,
-        use_gpu=use_gpu, u0_center=u0_center, progress_cb=progress_cb,
-        cancelled_cb=cancelled_cb, progress_lo=mid, progress_hi=progress_hi)
+    return _seed(ref, defm, grid, subset_size, fine_rad, u0_center,
+                 mid, progress_hi, use_shared_pool=True)
 
 
 # ==== vendored from nd2studios/backend/dvc/global_step.py ====
@@ -1035,35 +1388,50 @@ def _build_fd_operator(grid_shape, grid_step, ndim: int) -> csc_matrix:
             idx //= grid_shape[d]
         return mi
 
-    rows: List[int] = []
-    cols: List[int] = []
-    vals: List[float] = []
+    # Vectorized assembly. The previous triple Python loop ran ndim²·n_nodes
+    # iterations (≈1.6 M appends for a 59 k-node reference grid) to build the same
+    # three coordinate lists this does with array arithmetic — bit-identical
+    # output, ~20× faster, and it stops the operator build from dominating the
+    # setup cost on large grids.
+    p = np.arange(n, dtype=np.int64)
+    # Per-node index along each axis (C-order unravel).
+    along = [((p // strides[d]) % grid_shape[d]) if grid_shape[d] > 0 else p * 0
+             for d in range(ndim)]
+    rows_l: List[np.ndarray] = []
+    cols_l: List[np.ndarray] = []
+    vals_l: List[np.ndarray] = []
     for deriv in range(ndim):
         h = float(grid_step[deriv]) or 1.0
         stride = strides[deriv]
         sz = grid_shape[deriv]
+        if sz < 2:
+            continue                            # singleton axis → zero derivative
+        ia = along[deriv]
+        central = (ia > 0) & (ia < sz - 1)
+        forward = (ia == 0)
+        backward = (ia == sz - 1)
         for comp in range(ndim):
             f_off = deriv * ndim + comp
-            for p in range(n):
-                f_row = ndim * ndim * p + f_off
-                if sz < 2:
-                    continue                    # singleton axis → zero derivative
-                idx_along = _multi(p)[deriv]
-                if 0 < idx_along < sz - 1:       # central
-                    rows += [f_row, f_row]
-                    cols += [ndim * (p - stride) + comp, ndim * (p + stride) + comp]
-                    vals += [-1.0 / (2 * h), 1.0 / (2 * h)]
-                elif idx_along == 0:             # forward
-                    rows += [f_row, f_row]
-                    cols += [ndim * p + comp, ndim * (p + stride) + comp]
-                    vals += [-1.0 / h, 1.0 / h]
-                else:                            # backward
-                    rows += [f_row, f_row]
-                    cols += [ndim * (p - stride) + comp, ndim * p + comp]
-                    vals += [-1.0 / h, 1.0 / h]
+            f_row = ndim * ndim * p + f_off
+            for sel, (off_a, off_b), (va, vb) in (
+                (central, (-stride, +stride), (-1.0 / (2 * h), 1.0 / (2 * h))),
+                (forward, (0, +stride), (-1.0 / h, 1.0 / h)),
+                (backward, (-stride, 0), (-1.0 / h, 1.0 / h)),
+            ):
+                if not sel.any():
+                    continue
+                ps = p[sel]
+                fr = f_row[sel]
+                rows_l.append(np.concatenate((fr, fr)))
+                cols_l.append(np.concatenate((ndim * (ps + off_a) + comp,
+                                              ndim * (ps + off_b) + comp)))
+                vals_l.append(np.concatenate((np.full(ps.size, va),
+                                              np.full(ps.size, vb))))
+    if not rows_l:
+        return csc_matrix((n_f, n_u))
     return csc_matrix(
-        (np.asarray(vals, dtype=np.float64),
-         (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))),
+        (np.concatenate(vals_l),
+         (np.concatenate(rows_l), np.concatenate(cols_l))),
         shape=(n_f, n_u))
 
 
@@ -1074,10 +1442,15 @@ class AugLagGlobalStep:
     (only the RHS — i.e. the duals — changes).
     """
 
-    def __init__(self, grid: Grid, *, tikhonov: float = 1e-6):
+    def __init__(self, grid: Grid, *, tikhonov: float = 0.0):
         self.grid = grid
         self.ndim = grid.ndim
         self.n = grid.n_nodes
+        # Tikhonov defaults to OFF. `mu*I` already removes DᵀD's null space (the
+        # constant modes), so the system is non-singular for any mu > 0 and the
+        # extra term is pure bias: with the shipped mu=1e-3 a tikhonov of 1e-6
+        # shrank every reported displacement by exactly mu/(mu+tik) = 0.0999 %.
+        # Kept as a knob for the degenerate mu→0 case only.
         self.tikhonov = float(tikhonov)
         self.D: csc_matrix = _build_fd_operator(
             grid.grid_shape, grid.step, grid.ndim)
@@ -1086,6 +1459,9 @@ class AugLagGlobalStep:
         self._mu: Optional[float] = None
         self._beta: Optional[float] = None
         self._factor = None
+        # Boundary bookkeeping (ALDVC notNeumannBCInd_U / notNeumannBCInd_F): the
+        # global solve is written only into interior nodes.
+        self.interior: np.ndarray = interior_node_mask(grid)
 
     # ── matrix / factorization cache ────────────────────────────────────
     def _ensure_factor(self, mu: float, beta: float) -> None:
@@ -1104,12 +1480,20 @@ class AugLagGlobalStep:
     def solve(
         self, u_grid: np.ndarray, F_grid: np.ndarray,
         wu_grid: Optional[np.ndarray], wF_grid: Optional[np.ndarray],
-        mu: float, beta: float,
+        mu: float, beta: float, *, restrict_boundary: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return ``(u_hat_grid (ndim,*grid), F_hat_grid (ndim,ndim,*grid))``.
 
         ``F_hat = ∇û`` (the compatible gradient, ``unpack_F(D @ û)``). Duals may be
         ``None`` (treated as zero).
+
+        ``restrict_boundary`` reproduces ALDVC's Neumann bookkeeping: the global
+        solution is written only into interior nodes and the outer one-node shell
+        keeps its incoming local values, for both ``û`` and ``F̂``
+        (``main_ALDVC.m``: ``USubpb2 = USubpb1; USubpb2(notNeumannBCInd_U) =
+        USubpb2temp(notNeumannBCInd_U)`` and likewise for ``FSubpb2``). Writing the
+        global answer everywhere mixed ``D``'s one-sided border stencil into the
+        reported field on 14–31 % of nodes.
         """
         u_vec = pack_u(u_grid)
         F_vec = pack_F(F_grid)
@@ -1119,8 +1503,14 @@ class AugLagGlobalStep:
         rhs = self._rhs(u_vec, F_vec, wu_vec, wF_vec, mu, beta)
         uhat = self._factor(rhs)
         Fhat = self.D @ uhat
-        return (unpack_u(uhat, self.grid.grid_shape, self.ndim),
-                unpack_F(Fhat, self.grid.grid_shape, self.ndim))
+        u_out = unpack_u(uhat, self.grid.grid_shape, self.ndim)
+        F_out = unpack_F(Fhat, self.grid.grid_shape, self.ndim)
+        if restrict_boundary:
+            edge = ~self.interior
+            if edge.any():
+                u_out[:, edge] = np.asarray(u_grid, dtype=np.float64)[:, edge]
+                F_out[:, :, edge] = np.asarray(F_grid, dtype=np.float64)[:, :, edge]
+        return u_out, F_out
 
     # ── β selection (L-curve, MATLAB ErrSum criterion) ──────────────────
     def tune_beta(
@@ -1128,7 +1518,15 @@ class AugLagGlobalStep:
         beta_list: Optional[List[float]] = None,
     ) -> float:
         """Pick β by the FranckLab ``ErrSum = ‖u−û‖ + ‖F−∇û‖·mean(step)²`` L-curve,
-        with a guarded parabolic refine. Duals are zero at selection time."""
+        with a guarded parabolic refine. Duals are zero at selection time.
+
+        The sweep solves the **full** system ``(βDᵀD+μI)û = βDᵀF + μu`` at each
+        candidate β, exactly as ``main_ALDVC.m`` does. Omitting the ``βDᵀF`` half —
+        which the port used to do — degenerates the trade-off the L-curve is
+        supposed to measure: ``‖u−û‖`` then grows monotonically with β and the
+        argmin lands on the smallest candidate every time, so β was effectively a
+        constant ``√(1e-5)·mean(step)²·μ`` rather than a selected value.
+        """
         if beta_list is None:
             base = float(np.mean(self.grid.step) ** 2) * mu
             factors = np.array([np.sqrt(1e-5), 1e-2, np.sqrt(1e-3),
@@ -1136,11 +1534,13 @@ class AugLagGlobalStep:
             beta_list = list(np.maximum(factors * base, 1e-12))
         u_vec = pack_u(u_grid)
         F_vec = pack_F(F_grid)
+        DtF = self.D.T @ F_vec
         w2 = float(np.mean(self.grid.step) ** 2)
         errs = np.empty(len(beta_list))
         for i, b in enumerate(beta_list):
-            self._ensure_factor(mu, float(b))
-            uhat = self._factor(mu * u_vec)          # duals zero → rhs = μ·u
+            bb = float(b)
+            self._ensure_factor(mu, bb)
+            uhat = self._factor(bb * DtF + mu * u_vec)   # duals zero on this pass
             fid = float(np.linalg.norm(u_vec - uhat))
             smooth = float(np.linalg.norm(F_vec - (self.D @ uhat)))
             errs[i] = fid + smooth * w2
@@ -1214,11 +1614,74 @@ class _RefSubset:
     n_params: int
 
 
-def _subset_offsets(subset_size: int, ndim: int) -> np.ndarray:
-    """``(ndim, n_pix)`` integer local offsets spanning a centered subset."""
-    half = max(1, int(subset_size) // 2)
-    axis = np.arange(-half, half + 1, dtype=np.float64)
-    mesh = np.meshgrid(*([axis] * ndim), indexing="ij")
+class RefCache:
+    """Byte-budgeted cache of per-subset reference quantities (``_RefSubset``).
+
+    A ``_RefSubset`` is dominated by its steepest-descent matrix ``sd``, which is
+    ``n_pix × (ndim + ndim²)`` float64 — **0.89 MB for a 21³ 3-D subset**. Caching
+    it for every node of a reference-sized grid (39 k nodes for the paper's
+    2048×192×192 case at ws=20/st=10) would need ~35 GB *per process*, which is
+    why an unbounded dict here is a latent OOM rather than an optimization.
+
+    So the cache is capped in bytes and simply stops accepting new entries when
+    full: the subsets that land in it still skip their ``sd`` rebuild and their
+    12×12 ``sdᵀsd`` reduction (the single largest term, ~1.3 MFLOP/subset) on every
+    later ADMM sweep, and the rest recompute — correctness is identical either way.
+    """
+
+    __slots__ = ("_d", "_budget", "_used")
+
+    def __init__(self, budget_bytes: int = 512 << 20):
+        self._d: dict = {}
+        self._budget = int(budget_bytes)
+        self._used = 0
+
+    def get(self, key):
+        return self._d.get(key, _MISS)
+
+    def put(self, key, rs) -> None:
+        if key in self._d:
+            return
+        nb = 0 if rs is None else int(rs.sd.nbytes + rs.f0.nbytes + rs.H_img.nbytes)
+        if self._used + nb > self._budget and self._d:
+            return                                  # full — recompute instead
+        self._d[key] = rs
+        self._used += nb
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+
+_MISS = object()
+
+
+def _cache_get(cache, key):
+    """Read from either a :class:`RefCache` or a plain dict (back-compat)."""
+    if cache is None:
+        return _MISS
+    if isinstance(cache, RefCache):
+        return cache.get(key)
+    return cache.get(key, _MISS)
+
+
+def _cache_put(cache, key, rs) -> None:
+    if cache is None:
+        return
+    if isinstance(cache, RefCache):
+        cache.put(key, rs)
+    else:
+        cache[key] = rs
+
+
+def _subset_offsets_shape(subset_shape: Tuple[int, ...]) -> np.ndarray:
+    """``(ndim, n_pix)`` integer local offsets for a (possibly anisotropic) window.
+
+    Anisotropy matters for shallow-Z confocal stacks, where the isotropic
+    ``subset_size`` window does not fit along z (see :func:`subset_shape_for`).
+    """
+    axes = [np.arange(-(int(s) // 2), int(s) // 2 + 1, dtype=np.float64)
+            for s in subset_shape]
+    mesh = np.meshgrid(*axes, indexing="ij")
     return np.stack([m.ravel(order="C") for m in mesh], axis=0)
 
 
@@ -1229,6 +1692,15 @@ def _prepare_reference(ref: np.ndarray, c0: np.ndarray, dx: np.ndarray,
     Parameter order is ``[u_0..u_{d-1}, G_00, G_01, ..., G_{d-1,d-1}]`` (row-major
     ``G``). SD column for ``u_i`` is ``∂f/∂x_i``; for ``G_ij`` it is
     ``(∂f/∂x_i)·Δx_j``.
+
+    The gradient is taken on a window padded by one voxel and then trimmed, so
+    every subset voxel — including the outer shell — gets a true central
+    difference. Differentiating the bare window instead gave the shell a one-sided
+    difference computed only from data inside the window, which biases the
+    steepest-descent images (and hence the Hessian) on the ``(2·half+1)^ndim``
+    surface, i.e. ~27 % of a 21³ subset. ALDVC avoids this by computing gradients
+    on a 3-voxel-padded window (``funICGN3`` → ``funImgGradient3`` on
+    ``ImgEle.Imgf``, with the subset trimmed as ``Imgf(4:end-3, …)``).
     """
     ndim = c0.size
     half = np.asarray(subset_shape, dtype=np.int64) // 2
@@ -1240,10 +1712,18 @@ def _prepare_reference(ref: np.ndarray, c0: np.ndarray, dx: np.ndarray,
     f = np.asarray(ref[sl], dtype=np.float64)
     if f.std() < 1e-8:
         return None                                   # featureless subset
-    grads = np.gradient(f)                            # list[ndim] (ndim>1) or array
+    # Pad by 1 where the volume allows, differentiate, then trim back — so the
+    # subset's outer shell gets a central difference from real neighbouring data.
+    plo = np.maximum(lo - 1, 0)
+    phi = np.minimum(hi + 1, np.asarray(ref.shape))
+    psl = tuple(slice(int(a), int(b)) for a, b in zip(plo, phi))
+    fp = np.asarray(ref[psl], dtype=np.float64)
+    grads = np.gradient(fp)                           # list[ndim] (ndim>1) or array
     if ndim == 1:
         grads = [grads]
-    fg = [g.ravel(order="C") for g in grads]          # ∂f/∂x_k, each (n_pix,)
+    trim = tuple(slice(int(lo[d] - plo[d]), int(lo[d] - plo[d]) + int(hi[d] - lo[d]))
+                 for d in range(ndim))
+    fg = [np.ascontiguousarray(g[trim]).ravel(order="C") for g in grads]
     f_flat = f.ravel(order="C")
     f0 = f_flat - f_flat.mean()
     f_norm = float(np.sqrt(np.sum(f0 * f0)))
@@ -1286,78 +1766,145 @@ def _icgn_subset(
     beta: float = 0.0,
     u_target: Optional[np.ndarray] = None,
     F_target: Optional[np.ndarray] = None,
+    freeze_G: bool = False,
+    min_valid: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray, float, int]:
     """Run IC-GN for one subset. Returns ``(u, G, zncc, iters)``.
 
     ``u`` is the center displacement (voxels, mesh axis order); ``G`` the
     displacement gradient ``∂u_i/∂x_j``. ``zncc`` in ``[-1, 1]`` (NaN on failure).
+
+    Masked ZNSSD
+        Voxels whose warped position leaves the volume are **excluded** from the
+        correlation, the means, the norms, the residual, the Hessian and the RHS —
+        rather than being sampled by edge replication and folded in as if they were
+        data. The reference rejects the whole subset on the first out-of-bounds
+        voxel (``funICGN3.m``: ``if ~isempty([row1;…]) normOfWNew = nan; break``),
+        and the port previously did something worse than either: it accepted up to
+        20 % fabricated voxels. Masking keeps genuinely usable border subsets
+        (which the reference throws away and then has to inpaint) while never
+        correlating against invented intensities. ``min_valid`` is the fraction of
+        the window that must remain.
+
+    ADMM penalty (Subpb1)
+        ``mu``/``beta`` weight the augmented-Lagrangian pull toward
+        ``(u_target, F_target)``. They are added to the **ZNSSD-normalized** normal
+        equations — ``2·H_img/f_norm²`` and ``2·rhs/f_norm²`` — exactly as
+        ``funICGN_Subpb13.m`` does (``H2 = H(10:12,10:12)*2/(bottomf^2) + mu*I``;
+        ``tempb = b(10:12)*2/(bottomf^2) + mu*(P_u − UOld − vdual)``). Adding them
+        to the raw ``sdᵀsd`` instead — which is what the port used to do — made the
+        penalty ~f_norm²/2 (≈180×) too weak, i.e. the augmented-Lagrangian coupling
+        was numerically inert and ALDVC degenerated to repeated local DVC. The
+        normalization also makes ``mu`` invariant to intensity units and subset
+        size, which is what lets the paper quote it as a pure ratio
+        ("O(10⁻³)∼O(10⁻¹) times the diagonal terms of a′_ip").
+
+    ``freeze_G``
+        Solve only the ``ndim`` translation DOFs, holding the affine part at
+        ``G_init``. This is the reference's Subpb1: ``funICGN_Subpb13`` starts from
+        ``P0 = [FOld, UOld]`` with ``FOld = FSubpb2`` (the *compatible* gradient
+        ``Dû``) and only ever writes ``DP(10:12)``, and ``main_ALDVC.m:411`` then
+        sets ``FSubpb1 = FSubpb2``. It is the paper's own simplification (p. 1209:
+        "we update F^(k+1) to be exactly equal to Dû^k and only solve for u^(k+1)"),
+        and it is what carries the global step's regularized affine field back into
+        the local solve.
     """
     ndim = ref_sub.ndim
     dx = ref_sub.dx                                    # (ndim, n_pix)
     c0 = ref_sub.c0.astype(np.float64)
-    f0, f_norm, sd = ref_sub.f0, ref_sub.f_norm, ref_sub.sd
+    f0_full, sd_full = ref_sub.f0, ref_sub.sd
+    n_pix = f0_full.size
+    n_solve = ndim if freeze_G else ref_sub.n_params
 
-    # Penalty Hessian (diagonal): μ on the u params, β on the G params.
-    pen_diag = np.zeros(ref_sub.n_params)
-    if mu > 0.0:
-        pen_diag[:ndim] = mu
-    if beta > 0.0:
-        pen_diag[ndim:] = beta
     B_vec = None
-    if beta > 0.0 and F_target is not None:
+    if beta > 0.0 and F_target is not None and not freeze_G:
         B_vec = np.asarray(F_target, dtype=np.float64).reshape(-1)   # row-major G
 
     W = _warp_matrix(np.asarray(u_init, float), np.asarray(G_init, float))
     shape_arr = np.asarray(defm_pref.shape)
+    fail = (np.full(ndim, np.nan), np.full((ndim, ndim), np.nan), np.nan, 0)
     zncc = np.nan
     it = 0
+    prev_valid_mask: Optional[np.ndarray] = None
+    H_cache = None
     for it in range(1, int(max_iter) + 1):
         u = W[:ndim, ndim]
         G = W[:ndim, :ndim] - np.eye(ndim)
         # Warp reference-subset pixels into the deformed volume and sample.
         pos = c0[:, None] + dx + u[:, None] + G @ dx        # (ndim, n_pix)
-        in_lo = np.all(pos >= 0, axis=0)
-        in_hi = np.all(pos <= (shape_arr[:, None] - 1), axis=0)
-        valid = in_lo & in_hi
-        if valid.mean() < 0.8:
-            return (np.full(ndim, np.nan), np.full((ndim, ndim), np.nan),
-                    np.nan, it)
-        g = map_coordinates(defm_pref, pos, order=3, prefilter=False,
+        valid = (np.all(pos >= 0, axis=0)
+                 & np.all(pos <= (shape_arr[:, None] - 1), axis=0))
+        n_valid = int(valid.sum())
+        if n_valid < max(n_solve + 1, int(min_valid * n_pix)):
+            return fail[:3] + (it,)
+        if n_valid < n_pix:
+            # Re-derive the reference-side quantities on the surviving voxels: the
+            # mean, the norm and the Hessian all depend on WHICH voxels are in.
+            # The mask changes only while the warp is still moving, so cache the
+            # derived quantities against the mask itself (a cheap array compare)
+            # rather than rebuilding a 9k×12 selection every iteration.
+            if H_cache is None or not np.array_equal(valid, prev_valid_mask):
+                fsel = f0_full[valid]
+                f0 = fsel - fsel.mean()
+                f_norm = float(np.sqrt(np.sum(f0 * f0)))
+                sd = sd_full[valid]
+                H_cache = (sd.T @ sd, f0, f_norm, sd)
+                prev_valid_mask = valid.copy()
+            H_img, f0, f_norm, sd = H_cache
+            if f_norm < 1e-8:
+                return fail[:3] + (it,)
+            sample_pos = pos[:, valid]
+        else:
+            f0, f_norm, sd = f0_full, ref_sub.f_norm, sd_full
+            H_img = ref_sub.H_img
+            sample_pos = pos
+
+        g = map_coordinates(defm_pref, sample_pos, order=3, prefilter=False,
                             mode="nearest").astype(np.float64)
         g0 = g - g.mean()
         g_norm = float(np.sqrt(np.sum(g0 * g0)))
         if g_norm < 1e-8:
-            return (np.full(ndim, np.nan), np.full((ndim, ndim), np.nan),
-                    np.nan, it)
+            return fail[:3] + (it,)
         fn = f0 / f_norm
         gn = g0 / g_norm
         zncc = float(np.dot(fn, gn))
-        evec = gn - fn                                       # (n_pix,)
+        evec = gn - fn                                       # (n_valid,)
 
-        rhs = f_norm * (sd.T @ evec)
-        H = ref_sub.H_img
-        if pen_diag.any():
-            H = H + np.diag(pen_diag)
+        # ZNSSD-normalized normal equations (see the docstring): the shared
+        # 2/f_norm² cancels for the unpenalized solve, and is what gives mu/beta
+        # their reference-defined, scale-free meaning when a penalty is present.
+        inv = 2.0 / (f_norm * f_norm)
+        H = H_img * inv
+        rhs = (2.0 / f_norm) * (sd.T @ evec)
+        if mu > 0.0 or beta > 0.0:
+            pen_diag = np.zeros(ref_sub.n_params)
             g_pen = np.zeros(ref_sub.n_params)
-            if mu > 0.0 and u_target is not None:
-                g_pen[:ndim] = mu * (np.asarray(u_target, float) - u)
-            if beta > 0.0 and B_vec is not None:
-                g_pen[ndim:] = beta * (B_vec - G.reshape(-1))
+            if mu > 0.0:
+                pen_diag[:ndim] = mu
+                if u_target is not None:
+                    g_pen[:ndim] = mu * (np.asarray(u_target, float) - u)
+            if beta > 0.0 and not freeze_G:
+                pen_diag[ndim:] = beta
+                if B_vec is not None:
+                    g_pen[ndim:] = beta * (B_vec - G.reshape(-1))
+            H = H + np.diag(pen_diag)
             rhs = rhs + g_pen
+        if freeze_G:
+            H = H[:ndim, :ndim]
+            rhs = rhs[:ndim]
         try:
             dp = np.linalg.solve(H, rhs)
         except np.linalg.LinAlgError:
-            return (np.full(ndim, np.nan), np.full((ndim, ndim), np.nan),
-                    np.nan, it)
+            return fail[:3] + (it,)
 
         du = dp[:ndim]
-        dG = dp[ndim:].reshape(ndim, ndim)
+        dG = (np.zeros((ndim, ndim)) if freeze_G
+              else dp[ndim:].reshape(ndim, ndim))
         dW = _warp_matrix(du, dG)
         try:
             W = W @ np.linalg.inv(dW)
         except np.linalg.LinAlgError:
-            return (np.full(ndim, np.nan), np.full((ndim, ndim), np.nan),
-                    np.nan, it)
+            return fail[:3] + (it,)
 
         # Convergence: radius-weighted parameter step (Ncorr criterion).
         half = float(np.max(np.abs(dx))) or 1.0
@@ -1383,7 +1930,10 @@ def local_icgn(
     beta: float = 0.0,
     u_target: Optional[np.ndarray] = None,
     F_target: Optional[np.ndarray] = None,
+    G_init: Optional[np.ndarray] = None,
+    freeze_G: bool = False,
     ref_cache: Optional[dict] = None,
+    pool: Optional["_IcgnPool"] = None,
     n_workers: int = 1,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancelled_cb: Optional[Callable[[], bool]] = None,
@@ -1406,10 +1956,11 @@ def local_icgn(
 
     Returns ``(u_grid, F_grid, zncc_grid, iters_grid)``; failed subsets are NaN.
     """
-    if n_workers and int(n_workers) > 1:
+    if pool is not None or (n_workers and int(n_workers) > 1):
         return parallel_local_icgn(
             ref, defm_pref, grid, u0, subset_size, tol=tol, max_iter=max_iter,
             mu=mu, beta=beta, u_target=u_target, F_target=F_target,
+            G_init=G_init, freeze_G=freeze_G, pool=pool,
             n_workers=int(n_workers), progress_cb=progress_cb,
             cancelled_cb=cancelled_cb, progress_lo=progress_lo,
             progress_hi=progress_hi)
@@ -1419,10 +1970,13 @@ def local_icgn(
     F_out = np.full((ndim, ndim, *gshape), np.nan)
     zncc_out = np.full(gshape, np.nan)
     iters_out = np.zeros(gshape, dtype=np.int32)
-    dx = _subset_offsets(subset_size, ndim)
-    subset_shape = tuple([max(1, int(subset_size) // 2) * 2 + 1] * ndim)
+    # Per-axis window: an axis too short for the isotropic subset gets a reduced
+    # (still odd) window instead of a guaranteed-failing one.
+    subset_shape = subset_shape_for(ref.shape, subset_size)
+    dx = _subset_offsets_shape(subset_shape)
     if ref_cache is None:
         ref_cache = {}
+    zeroG = np.zeros((ndim, ndim))
 
     idx_list = list(np.ndindex(*gshape))
     n = len(idx_list)
@@ -1432,20 +1986,22 @@ def local_icgn(
         seed = u0[(slice(None), *idx)]
         if not np.all(np.isfinite(seed)):
             continue
-        rs = ref_cache.get(idx)
-        if rs is None:
+        rs = _cache_get(ref_cache, idx)
+        if rs is _MISS:
             c0 = np.rint(grid.coords[idx]).astype(np.int64)
             rs = _prepare_reference(ref, c0, dx, subset_shape)
-            ref_cache[idx] = rs
+            _cache_put(ref_cache, idx, rs)
         if rs is None:
             continue
         ut = u_target[(slice(None), *idx)] if u_target is not None else None
         Ft = (F_target[(slice(None), slice(None), *idx)]
               if F_target is not None else None)
+        g_in = (G_init[(slice(None), slice(None), *idx)]
+                if G_init is not None else zeroG)
         u, G, zncc, it = _icgn_subset(
-            rs, defm_pref, seed, np.zeros((ndim, ndim)),
+            rs, defm_pref, seed, g_in,
             tol=tol, max_iter=max_iter, mu=mu, beta=beta,
-            u_target=ut, F_target=Ft)
+            u_target=ut, F_target=Ft, freeze_G=freeze_G)
         u_out[(slice(None), *idx)] = u
         F_out[(slice(None), slice(None), *idx)] = G
         zncc_out[idx] = zncc
@@ -1485,23 +2041,58 @@ import numpy as np
 
 
 def default_workers() -> int:
-    """A sensible default worker count: physical cores minus one, capped at 8."""
-    return max(1, min((os.cpu_count() or 2) - 1, 8))
+    """A sensible default worker count: physical cores minus one.
+
+    The old cap of 8 left two thirds of a 24-core workstation idle on the stage
+    that dominates DVC runtime. Capped at 32 only to bound process-spawn cost and
+    the per-worker shared-memory attach on very large machines.
+    """
+    return max(1, min((os.cpu_count() or 2) - 1, 32))
+
+
+# Per-worker reference-subset cache. Workers are reused across ADMM iterations
+# (the pool is held open by _IcgnPool), so the steepest-descent images and image
+# Hessian — which depend only on the REFERENCE volume and the subset centre, i.e.
+# are constant for the whole solve — are computed once per subset per worker
+# instead of once per subset per ADMM iteration. This is the parallel-path
+# equivalent of the serial path's `ref_cache`, which the parallel path used to
+# bypass entirely, paying a full SD/Hessian rebuild on all 5 sweeps per frame.
+_WORKER_REF_CACHE: dict = {}
+
+
+def _worker_cache_budget() -> int:
+    """Bytes one worker may spend caching reference subsets.
+
+    Split a modest slice of *available* RAM across the workers so a 24-core box
+    running 23 workers cannot collectively page itself out. Falls back to a fixed
+    128 MB when the machine's free memory can't be read (no psutil).
+    """
+    try:
+        import psutil
+        avail = int(psutil.virtual_memory().available)
+    except Exception:  # noqa: BLE001
+        return 128 << 20
+    workers = max(1, min((os.cpu_count() or 2) - 1, 32))
+    return max(32 << 20, int(0.25 * avail / workers))
 
 
 def _icgn_block(args):
     """Worker: IC-GN over a block of subsets. Attaches the shared volumes,
     solves each subset, returns ``[(u, G, zncc, iters) | None, ...]``."""
-    # Import inside the worker so the spawned process resolves them fresh.
-    (ref_meta, def_meta, centers, seeds, u_targets, F_targets,
-     subset_size, tol, max_iter, mu, beta) = args
+    (ref_meta, def_meta, centers, seeds, u_targets, F_targets, G_inits,
+     subset_size, tol, max_iter, mu, beta, freeze_G, cache_key) = args
     ref, ref_shm = attach_shared(*ref_meta)
     defm, def_shm = attach_shared(*def_meta)
     try:
         ndim = len(ref_meta[1])
-        dx = _subset_offsets(subset_size, ndim)
-        half = max(1, int(subset_size) // 2)
-        subset_shape = tuple([half * 2 + 1] * ndim)
+        subset_shape = subset_shape_for(ref.shape, subset_size)
+        dx = _subset_offsets_shape(subset_shape)
+        cache = _WORKER_REF_CACHE.get(cache_key)
+        if cache is None:
+            # Budget per worker, not per machine: n_workers processes each hold one.
+            cache = RefCache(budget_bytes=_worker_cache_budget())
+            _WORKER_REF_CACHE[cache_key] = cache
+        zeroG = np.zeros((ndim, ndim))
         out = []
         for k in range(len(centers)):
             seed = seeds[k]
@@ -1509,15 +2100,20 @@ def _icgn_block(args):
                 out.append(None)
                 continue
             c0 = np.rint(centers[k]).astype(np.int64)
-            rs = _prepare_reference(ref, c0, dx, subset_shape)
+            ck = tuple(int(v) for v in c0)
+            rs = cache.get(ck)
+            if rs is _MISS:
+                rs = _prepare_reference(ref, c0, dx, subset_shape)
+                cache.put(ck, rs)
             if rs is None:
                 out.append(None)
                 continue
             ut = u_targets[k] if u_targets is not None else None
             Ft = F_targets[k] if F_targets is not None else None
-            res = _icgn_subset(rs, defm, seed, np.zeros((ndim, ndim)),
+            gi = G_inits[k] if G_inits is not None else zeroG
+            res = _icgn_subset(rs, defm, seed, gi,
                                tol=tol, max_iter=max_iter, mu=mu, beta=beta,
-                               u_target=ut, F_target=Ft)
+                               u_target=ut, F_target=Ft, freeze_G=freeze_G)
             out.append(res)
         return out
     finally:
@@ -1525,68 +2121,125 @@ def _icgn_block(args):
         def_shm.close()
 
 
+class _IcgnPool:
+    """Holds one process pool + the shared volumes open for a whole DVC solve.
+
+    Every stage that fans out (the integer seed, and each of the ``1 +
+    admm_iterations`` IC-GN sweeps) used to create its own
+    :class:`ProcessPoolExecutor` and its own shared-memory copies, then tear it all
+    down. On Windows (spawn) a pool costs seconds to start, and the reference-sized
+    volumes are ~200 MB each — so the setup was repeated 6× per frame and none of
+    it does arithmetic. One pool for the whole solve also keeps the workers'
+    reference-subset caches (:data:`_WORKER_REF_CACHE`) warm across sweeps.
+
+    ``arrays`` is a name → ndarray mapping; ``meta[name]`` is the
+    ``(shm_name, shape, dtype)`` triple a worker passes to :func:`attach_shared`.
+    The seed needs the *raw* normalized deformed volume while IC-GN needs the
+    *spline-prefiltered* one, so both live here alongside the shared reference.
+    """
+
+    def __init__(self, arrays: "dict[str, np.ndarray]", n_workers: int, key: str):
+        self._arrays = {k: np.ascontiguousarray(v, dtype=np.float32)
+                        for k, v in arrays.items()}
+        self.n_workers = max(1, int(n_workers))
+        self.key = key
+        self._stack = None
+        self.meta: dict = {}
+        self.executor: Optional[ProcessPoolExecutor] = None
+
+    def __enter__(self) -> "_IcgnPool":
+        from contextlib import ExitStack
+        self._stack = ExitStack()
+        for k, v in self._arrays.items():
+            self.meta[k] = self._stack.enter_context(shared_ndarray(v))
+        self.executor = self._stack.enter_context(
+            ProcessPoolExecutor(max_workers=self.n_workers))
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._stack is not None:
+            self._stack.close()
+        self._stack = None
+        self.executor = None
+        self.meta = {}
+
+
 def parallel_local_icgn(
     ref: np.ndarray, defm_pref: np.ndarray, grid: Grid, u0: np.ndarray,
     subset_size: int, *, tol: float, max_iter: int, mu: float, beta: float,
     u_target: Optional[np.ndarray], F_target: Optional[np.ndarray],
     n_workers: int,
+    G_init: Optional[np.ndarray] = None, freeze_G: bool = False,
+    pool: Optional["_IcgnPool"] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancelled_cb: Optional[Callable[[], bool]] = None,
     progress_lo: int = 0, progress_hi: int = 100,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """IC-GN over every subset, fanned across ``n_workers`` processes.
 
-    Same return contract as :func:`nd2studios.backend.dvc.icgn.local_icgn`
-    (``u_grid, F_grid, zncc_grid, iters_grid``, NaN for failed subsets).
+    Same return contract as :func:`local_icgn` (``u_grid, F_grid, zncc_grid,
+    iters_grid``, NaN for failed subsets). Pass a live :class:`_IcgnPool` to reuse
+    one pool + one shared-memory copy of the volumes across all the sweeps of a
+    solve; without it a private pool is created for this sweep alone.
     """
     ndim = grid.ndim
     gshape = grid.grid_shape
     idx_list = list(np.ndindex(*gshape))
     n = len(idx_list)
-    centers = [grid.coords[idx] for idx in idx_list]
-    seeds = [u0[(slice(None), *idx)] for idx in idx_list]
-    uts = ([u_target[(slice(None), *idx)] for idx in idx_list]
+    # Flatten once into contiguous (n, …) arrays and slice per block. Building
+    # per-subset Python lists of tiny arrays made every task's pickle a few tens
+    # of thousands of separate objects; contiguous slices pickle as single buffers.
+    centers = grid.coords.reshape(-1, ndim)
+    seeds = np.moveaxis(u0, 0, -1).reshape(-1, ndim)
+    uts = (np.moveaxis(u_target, 0, -1).reshape(-1, ndim)
            if u_target is not None else None)
-    fts = ([F_target[(slice(None), slice(None), *idx)] for idx in idx_list]
+    fts = (np.moveaxis(F_target, (0, 1), (-2, -1)).reshape(-1, ndim, ndim)
            if F_target is not None else None)
-
-    # Blocks: a few per worker for load balance.
-    nb = max(1, int(n_workers) * 4)
-    bounds = np.linspace(0, n, nb + 1).astype(int)
-    blocks = [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+    gis = (np.moveaxis(G_init, (0, 1), (-2, -1)).reshape(-1, ndim, ndim)
+           if G_init is not None else None)
 
     u_out = np.full((ndim, *gshape), np.nan)
     F_out = np.full((ndim, ndim, *gshape), np.nan)
     zncc_out = np.full(gshape, np.nan)
     iters_out = np.zeros(gshape, dtype=np.int32)
 
-    ref = np.ascontiguousarray(ref, dtype=np.float32)
-    defm_pref = np.ascontiguousarray(defm_pref, dtype=np.float32)
-    with shared_ndarray(ref) as ref_meta, shared_ndarray(defm_pref) as def_meta:
+    own_pool = pool is None
+    ctx = (_IcgnPool({"ref": ref, "def_pref": defm_pref}, int(n_workers),
+                     key="oneshot") if own_pool else None)
+    p = ctx.__enter__() if own_pool else pool
+    try:
+        # Blocks: a few per worker for load balance.
+        nb = max(1, p.n_workers * 4)
+        bounds = np.linspace(0, n, nb + 1).astype(int)
+        blocks = [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
         tasks = []
         for (a, b) in blocks:
             tasks.append((
-                ref_meta, def_meta, centers[a:b], seeds[a:b],
+                p.meta["ref"], p.meta["def_pref"], centers[a:b], seeds[a:b],
                 (uts[a:b] if uts is not None else None),
                 (fts[a:b] if fts is not None else None),
-                int(subset_size), float(tol), int(max_iter), float(mu), float(beta)))
+                (gis[a:b] if gis is not None else None),
+                int(subset_size), float(tol), int(max_iter), float(mu),
+                float(beta), bool(freeze_G), p.key))
         done = 0
-        with ProcessPoolExecutor(max_workers=int(n_workers)) as ex:
-            for (a, b), block_res in zip(blocks, ex.map(_icgn_block, tasks)):
-                for j, res in enumerate(block_res):
-                    if res is None:
-                        continue
-                    idx = idx_list[a + j]
-                    u, G, zncc, it = res
-                    u_out[(slice(None), *idx)] = u
-                    F_out[(slice(None), slice(None), *idx)] = G
-                    zncc_out[idx] = zncc
-                    iters_out[idx] = it
-                done += (b - a)
-                if progress_cb is not None and n > 0:
-                    progress_cb(int(progress_lo + (progress_hi - progress_lo) * done / n))
-                if cancelled_cb is not None and cancelled_cb():
-                    raise InterruptedError("DVC cancelled")
+        for (a, b), block_res in zip(blocks, p.executor.map(_icgn_block, tasks)):
+            for j, res in enumerate(block_res):
+                if res is None:
+                    continue
+                idx = idx_list[a + j]
+                u, G, zncc, it = res
+                u_out[(slice(None), *idx)] = u
+                F_out[(slice(None), slice(None), *idx)] = G
+                zncc_out[idx] = zncc
+                iters_out[idx] = it
+            done += (b - a)
+            if progress_cb is not None and n > 0:
+                progress_cb(int(progress_lo + (progress_hi - progress_lo) * done / n))
+            if cancelled_cb is not None and cancelled_cb():
+                raise InterruptedError("DVC cancelled")
+    finally:
+        if own_pool:
+            ctx.__exit__(None, None, None)
     return u_out, F_out, zncc_out, iters_out
 
 
@@ -1629,14 +2282,163 @@ class ADMMResult:
     iterations: int
     beta: float
     residuals: list         # per-iteration ‖Δû‖₂/√N
+    n_repaired: int = 0     # subsets rescued by reliability-guided propagation
 
 
-def _inpaint_tensor(F: np.ndarray) -> np.ndarray:
+def _inpaint_tensor(F: np.ndarray, bad: Optional[np.ndarray] = None) -> np.ndarray:
+    """Harmonic-fill NaNs in a ``(ndim,ndim,*grid)`` tensor field.
+
+    ``bad`` additionally NaNs (and therefore refills) the nodes an outlier test
+    rejected. ALDVC does exactly this — ``main_ALDVC.m`` NaNs all nine ``F``
+    components at every node in ``RemoveOutliersList`` and ``inpaint_nans3``-fills
+    them — whereas the port used to compute that mask, bind it to ``_bad`` and drop
+    it, leaving the diverged local gradient in place at rejected nodes to be fed
+    straight into ``β·Dᵀ(F+w_F)``.
+    """
     out = np.array(F, dtype=np.float64, copy=True)
     ndim = out.shape[0]
+    if bad is not None and np.any(bad):
+        out[:, :, bad] = np.nan
     for i in range(ndim):
         for j in range(ndim):
             out[i, j] = inpaint_nans(out[i, j])
+    return out
+
+
+def reliability_guided_repair(
+    ref: np.ndarray, defm_pref: np.ndarray, grid: Grid,
+    u: np.ndarray, F: np.ndarray, zncc: np.ndarray, subset_size: int,
+    *, tol: float, max_iter: int, zncc_floor: float = 0.6,
+    ref_cache=None, max_rounds: int = 64,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Re-solve poorly-correlated subsets from a converged neighbour's full warp.
+
+    WHY: the integer seed is a **translation-only** correlation. Under a large
+    rotation or stretch the reference subset is itself rotated/stretched relative
+    to its match, so a pure-translation NCC peak degrades — measured on the paper's
+    own rotation benchmark, a 20–25° in-plane rotation drove median ZNCC to 0.13
+    and displacement error to several voxels, while 0–15° stayed at ~3·10⁻⁴. This
+    is the same failure mode the paper reports for local FFT DVC (Fig. 2(f)); what
+    rescues IC-GN is being *started* near the right affine warp.
+
+    So: any node whose IC-GN did not reach ``zncc_floor`` is retried using each
+    already-converged neighbour's warp, first-order-extrapolated to this node,
+
+        u_init = u_nb + G_nb · (x − x_nb),   G_init = G_nb
+
+    and the best-correlating result is kept. Newly converged nodes become sources
+    in the next round, so reliability flows outward from wherever correlation was
+    good — the standard reliability-guided (flood-fill) DIC seeding of Pan (2009),
+    here applied only as a *repair* so well-behaved fields pay nothing.
+
+    Returns ``(u, F, zncc, n_repaired)``.
+    """
+    ndim = grid.ndim
+    gshape = grid.grid_shape
+    u = np.array(u, dtype=np.float64, copy=True)
+    F = np.array(F, dtype=np.float64, copy=True)
+    zncc = np.array(zncc, dtype=np.float64, copy=True)
+
+    good = (np.isfinite(zncc) & (zncc >= float(zncc_floor))
+            & np.all(np.isfinite(u), axis=0) & np.all(np.isfinite(F), axis=(0, 1)))
+    if good.all() or not good.any():
+        return u, F, zncc, 0
+
+    subset_shape = subset_shape_for(ref.shape, subset_size)
+    dx = _subset_offsets_shape(subset_shape)
+    coords = grid.coords
+    # Axis-neighbour offsets (6-connectivity in 3D, 4 in 2D): a face neighbour is
+    # the closest node, so its extrapolated warp is the most trustworthy.
+    offsets = []
+    for ax in range(ndim):
+        for s in (-1, 1):
+            o = [0] * ndim
+            o[ax] = s
+            offsets.append(tuple(o))
+
+    n_repaired = 0
+    for _round in range(int(max_rounds)):
+        bad_idx = [idx for idx in np.ndindex(*gshape) if not good[idx]]
+        if not bad_idx:
+            break
+        # Try the nodes with the best-correlating neighbour first.
+        cand = []
+        for idx in bad_idx:
+            best = -2.0
+            for o in offsets:
+                nb = tuple(idx[d] + o[d] for d in range(ndim))
+                if any(nb[d] < 0 or nb[d] >= gshape[d] for d in range(ndim)):
+                    continue
+                if good[nb] and zncc[nb] > best:
+                    best = float(zncc[nb])
+            if best > -2.0:
+                cand.append((best, idx))
+        if not cand:
+            break
+        cand.sort(key=lambda t: -t[0])
+        progressed = False
+        for _score, idx in cand:
+            rs = _cache_get(ref_cache, idx)
+            if rs is _MISS:
+                c0 = np.rint(coords[idx]).astype(np.int64)
+                rs = _prepare_reference(ref, c0, dx, subset_shape)
+                _cache_put(ref_cache, idx, rs)
+            if rs is None:
+                good[idx] = True          # unusable subset: stop retrying it
+                continue
+            best = (None, None, -2.0)
+            for o in offsets:
+                nb = tuple(idx[d] + o[d] for d in range(ndim))
+                if any(nb[d] < 0 or nb[d] >= gshape[d] for d in range(ndim)):
+                    continue
+                if not good[nb]:
+                    continue
+                G_nb = F[(slice(None), slice(None), *nb)]
+                u_nb = u[(slice(None), *nb)]
+                delta = coords[idx] - coords[nb]
+                u_try = u_nb + G_nb @ delta          # first-order extrapolation
+                uu, GG, zz, _it = _icgn_subset(
+                    rs, defm_pref, u_try, G_nb, tol=tol, max_iter=max_iter)
+                if np.isfinite(zz) and zz > best[2]:
+                    best = (uu, GG, float(zz))
+            if best[0] is None:
+                continue
+            if best[2] > (zncc[idx] if np.isfinite(zncc[idx]) else -2.0):
+                u[(slice(None), *idx)] = best[0]
+                F[(slice(None), slice(None), *idx)] = best[1]
+                zncc[idx] = best[2]
+                n_repaired += 1
+            if best[2] >= float(zncc_floor):
+                good[idx] = True
+                progressed = True
+        if not progressed:
+            break
+    return u, F, zncc, n_repaired
+
+
+def _median_smooth_tensor(F: np.ndarray, passes: int = 3,
+                          size: int = 3) -> np.ndarray:
+    """Apply ``passes`` × a ``size^ndim`` median filter to each component of ``F``.
+
+    ALDVC runs ``for tempi=1:3, FSubpb1 = funSmoothStrain3(FSubpb1, …)`` before the
+    first Subpb2, and with the reference's ``StrainFilterSize=StrainFilterStd=0``
+    that function does *not* degenerate to the identity: the zeros are re-read as
+    defaults and it applies ``medfilt3`` with a ``[3,3,3]`` kernel (twice per call).
+    So the locally measured deformation gradient is median-denoised before it ever
+    enters the augmented-Lagrangian right-hand side. The port fed it in raw.
+    """
+    if passes <= 0:
+        return F
+    out = np.array(F, dtype=np.float64, copy=True)
+    ndim = out.shape[0]
+    grid_shape = out.shape[2:]
+    if min(grid_shape) < 2:
+        return out
+    k = tuple(min(int(size), max(1, s)) for s in grid_shape)
+    for _ in range(int(passes)):
+        for i in range(ndim):
+            for j in range(ndim):
+                out[i, j] = median_filter(out[i, j], size=k, mode="nearest")
     return out
 
 
@@ -1652,9 +2454,12 @@ def run_admm(
     icgn_tol: float = 1e-2,
     icgn_max_iter: int = 100,
     admm_tol: float = 1e-2,
-    cc_thresh: float = 0.5,
-    median_thresh: float = 2.0,
+    cc_thresh: float = 0.0,
+    median_thresh: float = 0.0,
+    f_smooth_passes: int = 3,
+    repair_zncc: float = 0.6,
     n_workers: int = 1,
+    pool: Optional["_IcgnPool"] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancelled_cb: Optional[Callable[[], bool]] = None,
     progress_lo: int = 0,
@@ -1665,77 +2470,141 @@ def run_admm(
     ``ref`` is the (normalized) reference; ``defm_pref`` the (normalized) deformed
     volume **already spline-prefiltered**. ``u0`` is the ``(ndim,*grid)`` integer
     seed. Returns an :class:`ADMMResult` with the compatible field.
+
+    The loop follows ``main_ALDVC.m`` Sections 5–6 structurally, including the
+    paper's Subpb1 simplification: each iteration solves only the translation DOFs
+    with the affine part held at the *compatible* gradient ``F̂ = Dû``, and then
+    takes ``F₁ := F̂`` (``main_ALDVC.m:411``, ``FSubpb1 = FSubpb2``) rather than
+    feeding a freshly measured noisy local gradient back into the global RHS.
     """
     ndim = grid.ndim
-    ref_cache: dict = {}                       # per-subset reference SD/H reuse
+    # Byte-budgeted (an unbounded dict here is ~0.89 MB/subset — 35 GB on the
+    # paper's own reference grid). Only used by the serial path; the parallel path
+    # keeps an equivalent per-worker cache.
+    ref_cache = RefCache()
     n_iters = max(0, int(admm_iterations))
+    n_repaired = 0
 
     def _span(lo_frac: float, hi_frac: float):
         lo = progress_lo + (progress_hi - progress_lo) * lo_frac
         hi = progress_lo + (progress_hi - progress_lo) * hi_frac
         return int(lo), int(hi)
 
-    # ── Pass 0: conventional local IC-GN ───────────────────────────────
-    p_lo, p_hi = _span(0.0, 0.5 if n_iters else 0.9)
-    u_L, F_L, zncc, _iters = local_icgn(
-        ref, defm_pref, grid, u0, subset_size,
-        tol=icgn_tol, max_iter=icgn_max_iter, ref_cache=ref_cache,
-        n_workers=n_workers,
-        progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-        progress_lo=p_lo, progress_hi=p_hi)
-
-    # Clean the noisy local field before the compatibility solve.
-    u_L, _bad = remove_outliers(u_L, zncc, cc_thresh=cc_thresh,
-                                median_thresh=median_thresh)
-    u_L = inpaint_vector(u_L)
-    F_L = _inpaint_tensor(F_L)
-
-    # ── First global solve (β via L-curve) ─────────────────────────────
-    gstep = AugLagGlobalStep(grid)
-    beta = gstep.tune_beta(u_L, F_L, mu)
-    uhat, Fhat = gstep.solve(u_L, F_L, None, None, mu, beta)
-
-    residuals: list = []
-    converged = (n_iters == 0)
-    if n_iters == 0:
-        return ADMMResult(u=uhat, F=Fhat, zncc=zncc, converged=True,
-                          iterations=0, beta=beta, residuals=residuals)
-
-    # ── ADMM loop ──────────────────────────────────────────────────────
-    wu = np.zeros_like(uhat)                   # scaled dual for u constraint
-    wF = np.zeros_like(Fhat)                   # scaled dual for F constraint
-    n_nodes = float(grid.n_nodes)
-    it = 0
-    for it in range(1, n_iters + 1):
-        if cancelled_cb is not None and cancelled_cb():
-            raise InterruptedError("DVC cancelled")
-        a = uhat - wu                          # Subpb1 targets (z − dual)
-        B = Fhat - wF
-        li_lo, li_hi = _span(0.5 + 0.5 * (it - 1) / n_iters,
-                             0.5 + 0.5 * it / n_iters)
-        u1, F1, zncc, _it2 = local_icgn(
-            ref, defm_pref, grid, uhat, subset_size,
-            tol=icgn_tol, max_iter=icgn_max_iter,
-            mu=mu, beta=beta, u_target=a, F_target=B, ref_cache=ref_cache,
-            n_workers=n_workers,
+    use_pool = pool is None and bool(n_workers and int(n_workers) > 1)
+    pool_ctx = (_IcgnPool({"ref": ref, "def_pref": defm_pref}, int(n_workers),
+                          key="admm") if use_pool else None)
+    if use_pool:
+        pool = pool_ctx.__enter__()
+    try:
+        # ── Pass 0: conventional local IC-GN (all 12 DOF, no penalty) ──
+        p_lo, p_hi = _span(0.0, 0.5 if n_iters else 0.9)
+        u_L, F_L, zncc, iters0 = local_icgn(
+            ref, defm_pref, grid, u0, subset_size,
+            tol=icgn_tol, max_iter=icgn_max_iter, ref_cache=ref_cache,
+            pool=pool, n_workers=n_workers,
             progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-            progress_lo=li_lo, progress_hi=li_hi)
-        u1 = inpaint_vector(u1)
-        F1 = _inpaint_tensor(F1)
+            progress_lo=p_lo, progress_hi=p_hi)
 
-        prev = uhat
-        uhat, Fhat = gstep.solve(u1, F1, wu, wF, mu, beta)
-        wu = wu + (u1 - uhat)                   # dual update (x − z)
-        wF = wF + (F1 - Fhat)
+        # Rescue subsets the translation-only seed could not land (large rotation
+        # or stretch) by propagating a converged neighbour's affine warp. Costs
+        # nothing when pass 0 already correlated everywhere.
+        if repair_zncc > -1.0:
+            u_L, F_L, zncc, n_rep = reliability_guided_repair(
+                ref, defm_pref, grid, u_L, F_L, zncc, subset_size,
+                tol=icgn_tol, max_iter=icgn_max_iter,
+                zncc_floor=repair_zncc, ref_cache=ref_cache)
+            n_repaired = n_rep
 
-        change = float(np.linalg.norm((uhat - prev).ravel()) / np.sqrt(n_nodes))
-        residuals.append(change)
-        if change < admm_tol:
-            converged = True
-            break
+        # Clean the noisy local field before the compatibility solve. The reject
+        # mask is applied to F as well as u (ALDVC NaNs all nine components at a
+        # rejected node), and F is median-denoised the way funSmoothStrain3 does
+        # before it enters the augmented-Lagrangian RHS.
+        u_L, bad = remove_outliers(u_L, zncc, cc_thresh=cc_thresh,
+                                   median_thresh=median_thresh)
+        nonconv = (iters0 >= int(icgn_max_iter))
+        if nonconv.any():
+            bad = bad | nonconv
+        if repair_zncc > -1.0:
+            # A node the repair pass could not lift above the floor is genuinely
+            # unreliable — its own correlation says so, after being offered every
+            # converged neighbour's warp. Keeping its value would feed a known-bad
+            # displacement into the global solve; interpolating from the (now
+            # dense and reliable) neighbourhood is strictly better. This is an
+            # *earned* threshold, unlike a blanket absolute ZNCC floor applied to
+            # unrepaired data.
+            bad = bad | ~(np.isfinite(zncc) & (zncc >= float(repair_zncc)))
+        if bad.any():
+            u_L = np.where(bad[None, ...], np.nan, u_L)
+        u_L = inpaint_vector(u_L)
+        F_L = _median_smooth_tensor(_inpaint_tensor(F_L, bad), f_smooth_passes)
 
-    return ADMMResult(u=uhat, F=Fhat, zncc=zncc, converged=converged,
-                      iterations=it, beta=beta, residuals=residuals)
+        # ── First global solve (β via L-curve) ─────────────────────────
+        gstep = AugLagGlobalStep(grid)
+        beta = gstep.tune_beta(u_L, F_L, mu)
+        uhat, Fhat = gstep.solve(u_L, F_L, None, None, mu, beta)
+
+        residuals: list = []
+        converged = (n_iters == 0)
+        if n_iters == 0:
+            return ADMMResult(u=uhat, F=Fhat, zncc=zncc, converged=True,
+                              iterations=0, beta=beta, residuals=residuals,
+                              n_repaired=n_repaired)
+
+        # ── ADMM loop ──────────────────────────────────────────────────
+        wu = np.zeros_like(uhat)               # scaled dual for u constraint
+        wF = np.zeros_like(Fhat)               # scaled dual for F constraint
+        # Residual norm is over ALL ndim*n_nodes displacement DOFs — MATLAB's
+        # `norm(dU)/sqrt(size(U,1))` counts the full 3N-long vector. Dividing by
+        # sqrt(n_nodes) instead made the tolerance sqrt(ndim)≈1.73x tighter than
+        # the ADMMtol the user asked for.
+        denom = np.sqrt(float(grid.n_nodes) * ndim)
+        it = 0
+        for it in range(1, n_iters + 1):
+            if cancelled_cb is not None and cancelled_cb():
+                raise InterruptedError("DVC cancelled")
+            a = uhat - wu                      # Subpb1 target (ẑ − dual)
+            li_lo, li_hi = _span(0.5 + 0.5 * (it - 1) / n_iters,
+                                 0.5 + 0.5 * it / n_iters)
+            # Subpb1: translation-only, affine part frozen at the compatible F̂.
+            u1, _F_unused, zncc, iters_k = local_icgn(
+                ref, defm_pref, grid, uhat, subset_size,
+                tol=icgn_tol, max_iter=icgn_max_iter,
+                mu=mu, u_target=a, G_init=Fhat, freeze_G=True,
+                ref_cache=ref_cache, pool=pool, n_workers=n_workers,
+                progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+                progress_lo=li_lo, progress_hi=li_hi)
+            # Reject on the same three grounds as pass 0 — non-finite, hit the
+            # iteration cap, or failed to correlate. Omitting the correlation test
+            # here let a single subset that Subpb1 drove to a confident-looking but
+            # wrong warp survive into the global RHS and dominate the field's RMS
+            # error (measured: 1 node of 125 at ZNCC 0.12 carrying 6 voxels of
+            # error, while every other node was within 0.02).
+            bad_k = ~np.all(np.isfinite(u1), axis=0) | (iters_k >= int(icgn_max_iter))
+            if repair_zncc > -1.0:
+                bad_k = bad_k | ~(np.isfinite(zncc) & (zncc >= float(repair_zncc)))
+            if bad_k.any():
+                u1 = np.where(bad_k[None, ...], np.nan, u1)
+            u1 = inpaint_vector(u1)
+            # F₁ := F̂  (main_ALDVC.m:411). The local step did not re-measure F.
+            F1 = Fhat
+
+            prev = uhat
+            uhat, Fhat = gstep.solve(u1, F1, wu, wF, mu, beta)
+            wu = wu + (u1 - uhat)               # dual update (x − z)
+            wF = wF + (F1 - Fhat)
+
+            change = float(np.linalg.norm((uhat - prev).ravel()) / denom)
+            residuals.append(change)
+            if change < admm_tol:
+                converged = True
+                break
+
+        return ADMMResult(u=uhat, F=Fhat, zncc=zncc, converged=converged,
+                          iterations=it, beta=beta, residuals=residuals,
+                          n_repaired=n_repaired)
+    finally:
+        if use_pool:
+            pool_ctx.__exit__(None, None, None)
 
 
 # ==== vendored from nd2studios/backend/dvc/engine.py ====
@@ -1835,8 +2704,23 @@ def run_aldvc(
     icgn_tol = float(_get(raw, "icgn_tol", 1e-2))
     icgn_max_iter = int(_get(raw, "icgn_max_iter", 100))
     admm_tol = float(_get(raw, "admm_tol", 1e-2))
-    cc_thresh = float(_get(raw, "cc_thresh", 0.5))
-    median_thresh = float(_get(raw, "median_thresh", 2.0))
+    # Both outlier guards default OFF, matching main_ALDVC.m's cumulative branch
+    # (qDICOrNot=0, medianFilterThreshold=0). See remove_outliers.
+    cc_thresh = float(_get(raw, "cc_thresh", 0.0))
+    median_thresh = float(_get(raw, "median_thresh", 0.0))
+    f_smooth_passes = int(_get(raw, "f_smooth_passes", 3))
+    # ZNCC below which a subset is retried from a converged neighbour's affine
+    # warp (<= -1 disables the repair pass entirely).
+    repair_zncc = float(_get(raw, "repair_zncc", 0.6))
+    # Inset the grid so the deformed search window fits symmetrically around every
+    # node (ALDVC's borderGap). Without it the outermost ring's search is clipped
+    # on one side and its seed cannot represent displacement of that sign.
+    # Defaults to the search radius, capped so a small volume still yields a grid.
+    border_margin = _get(raw, "border_margin", None)
+    if border_margin is None:
+        border_margin = int(min(search_radius,
+                                max(0, min(ref.shape) // 4 - subset_size // 2)))
+    border_margin = max(0, int(border_margin))
 
     def _tick(v: int) -> None:
         if progress_cb is not None:
@@ -1854,7 +2738,8 @@ def run_aldvc(
     # cubic-B-spline evaluation (map_coordinates prefilter=False).
     defm_pref = spline_filter(def_n.astype(np.float32), order=3,
                               mode="nearest").astype(np.float32)
-    grid = build_grid(ref.shape, subset_size, subset_spacing)
+    grid = build_grid(ref.shape, subset_size, subset_spacing,
+                      border_margin=border_margin)
     # Fan the IC-GN sweep across cores by default; skip the process-pool overhead
     # on tiny grids. GPU (seed FFTs) and CPU multiprocessing (IC-GN) compose.
     if n_workers <= 0:
@@ -1863,42 +2748,71 @@ def run_aldvc(
         n_workers = 1
     _tick(8)
 
-    # Stage 1 — integer seed. Warm-start from a prior frame's field when given
-    # (ALDVC's cross-frame U0), else the multigrid FFT search; clean the FFT seed
-    # (the warm-start field is already smooth).
-    want_warm = (u0_seed is not None and not use_fft_seed
-                 and tuple(np.shape(u0_seed)) == (dim, *grid.grid_shape))
-    if want_warm:
-        u0 = inpaint_vector(np.asarray(u0_seed, dtype=np.float64).copy())
-        _tick(32)
-    else:
-        u0, cc = integer_search_multigrid(
-            ref_n, def_n, grid, subset_size, search_radius, levels=seed_levels,
-            correlation=correlation, use_gpu=use_gpu,
-            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-            progress_lo=8, progress_hi=32)
-        u0, _bad = remove_outliers(u0, cc, cc_thresh=cc_thresh,
-                                   median_thresh=median_thresh)
-        u0 = inpaint_vector(u0)
-    _tick(34)
+    # ONE process pool for the whole solve: the seed and all 1+admm_iterations
+    # IC-GN sweeps borrow it, so the (Windows-spawn) pool start-up and the
+    # shared-memory copy of the volumes are paid once instead of six times.
+    # `def_raw` feeds the seed's correlation, `def_pref` the IC-GN resampling.
+    want_pool = bool(n_workers and int(n_workers) > 1)
+    pool_ctx = (_IcgnPool({"ref": ref_n, "def_raw": def_n,
+                           "def_pref": defm_pref}, int(n_workers), key="solve")
+                if want_pool else None)
+    pool = pool_ctx.__enter__() if want_pool else None
+    try:
+        # Stage 1 — integer seed. Warm-start from a prior frame's field when given
+        # (ALDVC's cross-frame U0), else the multigrid FFT search; clean the FFT
+        # seed (the warm-start field is already smooth).
+        want_warm = (u0_seed is not None and not use_fft_seed
+                     and tuple(np.shape(u0_seed)) == (dim, *grid.grid_shape))
+        if want_warm:
+            u0 = inpaint_vector(np.asarray(u0_seed, dtype=np.float64).copy())
+            _tick(32)
+        else:
+            u0, cc = integer_search_multigrid(
+                ref_n, def_n, grid, subset_size, search_radius,
+                levels=seed_levels, correlation=correlation, use_gpu=use_gpu,
+                n_workers=n_workers, pool=pool,
+                progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+                progress_lo=8, progress_hi=32)
+            u0, _bad = remove_outliers(u0, cc, cc_thresh=cc_thresh,
+                                       median_thresh=median_thresh)
+            u0 = inpaint_vector(u0)
+        _tick(34)
 
-    # Stages 3–6 — local IC-GN + ADMM compatibility loop.
-    res = run_admm(
-        ref_n, defm_pref, grid, u0, subset_size,
-        mu=mu, admm_iterations=admm_iterations,
-        icgn_tol=icgn_tol, icgn_max_iter=icgn_max_iter, admm_tol=admm_tol,
-        cc_thresh=cc_thresh, median_thresh=median_thresh, n_workers=n_workers,
-        progress_cb=progress_cb, cancelled_cb=cancelled_cb,
-        progress_lo=34, progress_hi=90)
+        # Stages 3–6 — local IC-GN + ADMM compatibility loop.
+        res = run_admm(
+            ref_n, defm_pref, grid, u0, subset_size,
+            mu=mu, admm_iterations=admm_iterations,
+            icgn_tol=icgn_tol, icgn_max_iter=icgn_max_iter, admm_tol=admm_tol,
+            cc_thresh=cc_thresh, median_thresh=median_thresh,
+            f_smooth_passes=f_smooth_passes, repair_zncc=repair_zncc,
+            n_workers=n_workers, pool=pool,
+            progress_cb=progress_cb, cancelled_cb=cancelled_cb,
+            progress_lo=34, progress_hi=90)
+    finally:
+        if want_pool:
+            pool_ctx.__exit__(None, None, None)
     _tick(92)
 
-    # Stage 7 — strain.
+    # Stage 7 — strain, from the ADMM's OWN compatible gradient F̂ = Dû.
+    # ALDVC reports strain from FSubpb2, not from a fresh re-differentiation of
+    # û: F̂ already carries the Neumann-boundary treatment and is the quantity the
+    # augmented Lagrangian actually drove to compatibility. Re-differentiating û
+    # with np.gradient gave a different (edge_order=1, unrestricted) operator on
+    # the border shell. `strain_smooth` still routes through compute_strain, which
+    # needs a smoothed û rather than F̂.
     if not voxel_size_um or len(voxel_size_um) != dim:
         voxel_size_um = tuple([1.0] * dim)
     voxel = np.asarray(voxel_size_um, dtype=np.float64)
-    _F_def, strain = compute_strain(
-        res.u, grid.step, voxel_size=voxel,
-        strain_type=strain_type, smooth_sigma=strain_smooth)
+    if strain_smooth and strain_smooth > 0:
+        _F_def, strain = compute_strain(
+            res.u, grid.step, voxel_size=voxel,
+            strain_type=strain_type, smooth_sigma=strain_smooth)
+    else:
+        G = np.asarray(res.F, dtype=np.float64).copy()
+        for i in range(dim):                    # anisotropic-voxel rescaling
+            for j in range(dim):
+                G[i, j] *= voxel[i] / voxel[j]
+        strain = strain_from_gradient(G, strain_type)
     _tick(98)
 
     disp = np.moveaxis(res.u, 0, -1)                  # (*grid, ndim), voxels
@@ -1932,6 +2846,8 @@ def run_aldvc(
             "search_radius": int(search_radius),
             "n_workers": int(n_workers),
             "use_gpu": bool(use_gpu),
+            "border_margin": int(border_margin),
+            "n_repaired": int(res.n_repaired),
         },
     )
 

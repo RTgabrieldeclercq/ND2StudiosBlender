@@ -16,6 +16,11 @@ results/
 sample_data/
 *.nd2
 
+# Derived caches — both are rebuildable from the source file / the graph, and both are
+# the size of the data rather than the size of the code.
+*.b2nd_store/
+*.docks/
+
 # OS / editor
 .DS_Store
 Thumbs.db

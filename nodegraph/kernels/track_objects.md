@@ -366,4 +366,130 @@ at top; all `from .` relative imports and the two `from nd2studios.backend.*`
 lazy imports removed (every referenced symbol is defined in-file). Third-party
 import strategy kept verbatim: numba/scipy/pandas top-level, scikit-learn lazy.
 No name collisions required renaming; no UI/registry/compute-path members dropped.
+
+---
+
+## 12. SerialTrack parity repairs (2026-07-31)
+
+The vendored SerialTrack was validated against the **upstream MATLAB**
+(<https://github.com/FranckLab/SerialTrack>) and FranckLab's own distributed
+example data — `SerialTrack2D_data` / `SerialTrack3D_data`, whose
+`img_syn_hardpar/*/imposed_disp.mat` carry per-bead ground truth (`x0`, `x1{k}`,
+`u{k}`) and two of whose 3-D cases also ship `results_3D_hardpar.mat`, the
+detections/links/displacements MATLAB itself produced from those volumes.
+
+The reproducible gate is **`scripts/_serialtrack_validate.py`** (suites:
+`detect`, `link`, `pipeline`, `parity`, `invariant`). Read its module docstring
+before touching any of this: the MATLAB↔numpy conventions are subtle (the 2-D
+generator writes its TIFFs transposed and `funReadImage2.m` transposes them
+back), and every number below is meaningless if they are applied twice.
+
+Nine defects were found and fixed. Each is a *behaviour* change, so a graph
+saved before this date will produce different — better — numbers.
+
+### Detection (also mirrored into `bead_detect.py`, which carries a byte-copy)
+
+1. **`_radial_symmetry_3d` measured its gradient votes from the wrong origin.**
+   `radialcenter3dvec.m` uses the intensity centroid **only** in the weight
+   denominator `q = |∇I|²/d`; the voxel positions that enter the normal
+   equations are measured from the **patch centre**, because the returned offset
+   is added to the integer voxel the patch was cut around. The port subtracted
+   the centroid from both, dropping the centroid offset from the answer.
+   *Localisation error 0.340 px → 0.0637 px, against MATLAB's 0.0643 px; the
+   corrected kernel agrees with a literal transcription of the MATLAB to 3.3e-16.*
+2. **The TPT seed was sub-voxel, so the offset was double-counted.**
+   `locateParticles.m` rounds the *binary* blob centroid to an integer voxel and
+   `radialcenter3dvec` refines from there. The port added the patch-relative
+   offset to an *unrounded* intensity-weighted centroid. Also fixed: MATLAB's
+   strict `> minSize & < maxSize` size gate, and `padNoise.m`'s near-zero
+   padding (the port reflected, mirroring bead intensity into the border).
+3. **The LoG kernel was 25 taps where MATLAB's is 7.** `fspecial('log', ceil(σ)*2+1, σ)`
+   is hard-truncated at bead scale; `scipy.ndimage.gaussian_laplace` truncates at
+   4σ. Added `_fspecial_log`.
+4. **The local-maximum footprint was 13×13 where MATLAB's is 7×7**
+   (`strel('square', 2σ+1)`), suppressing every second particle in a dense field.
+   Also: MATLAB thresholds the *size-masked* image, and its LoG path applies the
+   **minimum** size filter only (`f_detect_particles.m`'s
+   `if sum(mean(BW3(:))) < 1, BW3 = BW1` is always true).
+   *Together, 3+4 take 2-D yield from 1543/3146 to 3075/3146 beads and median
+   error from 0.26 px to 0.147 px.*
+
+### Global step
+
+5. **`smoothness` was a thin-plate-spline RBF ridge, not `regularizeNd`.** These
+   are different operators with different parameterisations — the RBF is O(N³) in
+   the scattered-point count and extrapolates with a growing polynomial, and the
+   *same numeric value* means something unrelated. Replaced with a real
+   `regularizeNd` port (`regularize_nd` / `regularize_nd_multi`): a sparse
+   least-squares gridfit whose fidelity rows are the multilinear cell weights and
+   whose smoothness rows are the numerical 2nd derivative scaled by
+   `smoothness · √(N/N_eqn) · span²` — the scaling that makes the knob mean the
+   same thing at any grid resolution or axis unit. All components share one
+   factorisation.
+6. **Grid → particle interpolation Delaunay-triangulated a regular lattice**, on
+   every ADMM iteration, for every component — **76 % of total runtime** — and
+   was wrong twice over: the triangulation imposes an arbitrary diagonal (so the
+   interpolant is direction-biased rather than multilinear), and `fill_value=0`
+   zeroed the update for every particle outside the convex hull instead of
+   extrapolating, pinning the field at the ROI edges. Now
+   `RegularGridInterpolator` with linear extrapolation, matching MATLAB's
+   `scatteredInterpolant(...,'linear','linear')`. *Tracking ratio on 2-D
+   cumulative rotation 96.6 % → 100 %; the whole loop 12× faster.*
+   The same hull-zeroing was present in the *unsmoothed* scatter→grid path —
+   fixed via `_linear_extrap_interpolate` (detrend → interpolate → retrend).
+7. **`MAX_GRID_NODES` guard** (a deliberate deviation): upstream derives
+   `sxyz = min(round(0.5·f_o_s), 20)` and never revisits it, which is fine at the
+   15–60 px `f_o_s` its own examples use. A caller passing a few-px `f_o_s` — what
+   a micron-denominated "max displacement" becomes at coarse pixel sizes — got a
+   1 px lattice over the whole frame: 4·10⁶ nodes on a 2048² image, and a
+   4·10⁶-square sparse solve. Not an error; an apparent hang.
+
+### ADMM loop
+
+8. **`update_f_o_s` decayed the search window instead of flooring it.**
+   `f_track_serial_match3D.m:302` is `f_o_s = max([60; median+0.5·IQR; …])` where
+   the literal **is** the configured `MPTPara.f_o_s` — so the update can only ever
+   *raise* the window. The port used `max(2, 0.1·f_o_s_current)`, a geometric
+   decay: 60 → 6 → 2 → 2… Two iterations in, no link longer than 2 px survives.
+   *This alone reduced 3-D cumulative stretch/shear to a 0.3 % tracking ratio.*
+   Also switched the quantiles to MATLAB's Hazen convention.
+9. **Three smaller control-flow divergences**, all verified on both sides:
+   candidate selection was an *uncapped* ball query where
+   `f_track_neightopo_match3.m:122` takes the **K nearest** and *then* filters by
+   radius (≈470 candidates vs 25 at `f_o_s = 60` — a different answer *and*
+   O(n_cand·K) more work); the nearest-neighbour matcher applied an `f_o_s` gate
+   that upstream has commented out, letting the late iterations return no matches
+   and terminate the loop on a path upstream does not have; and `match_ratio`
+   counted *post*-outlier links where MATLAB counts raw ones, so the `> 0.999`
+   convergence counter could never increment.
+
+Plus two robustness repairs with no upstream counterpart: the global-step update
+is clamped to the current field of search (an update larger than that cannot
+help — the next local step will not accept a link that long — and unclamped it
+feeds back to 1e81 px in four iterations, then dies inside `cKDTree` with
+"data must be finite"); and `_run_tracking` now infers dimensionality from the
+coordinates, since `TrackingConfig.ndim` derives from `roi_z`, which only
+`track_images` ever set — so 3-column input silently reported 2-D.
+
+### Node-level
+
+`_compute_track_objects` passed only 2 of the 11 `st_*` knobs; the other 9 fell
+back to `link_objects`' signature defaults, which are SerialTrack's **3-D**
+constants — while the node's `z_kind` guard guarantees the data is 2-D. It now
+pins the 2-D set from `Example_main_2D_hardpar_inc_coords_only.m`, which is this
+node's exact use case (pre-detected coordinates, no image re-detection):
+`gbSolver 3 (ADMM)`, `smoothness 1e-2`, `outlrThres 2`, `distMissing 2`,
+`iterStopThres 1e-2`, `locSolver 1`, `n_neighborsMin 1`, `maxIterNum 20`. The
+`st_smoothness` socket default moved 0.1 → 0.01 for the same reason.
+
+### Where it stands
+
+With the paper's own Table 3 parameters, fed exact coordinates
+(`--suite link`), **every link the tracker makes is to the correct particle**
+(`correct` = 1.0000 in 7 of 8 cases, 0.9958 in the last). Rigid-body
+displacement recovery is at machine precision (1e-14 px for translation,
+1e-11 px for a 100° rotation). Tracking ratios follow the paper's Fig. 3 shape,
+including the rotation dip where reference/deformed frame overlap is smallest.
+Detection matches the golden MATLAB output to 4 decimal places on every frame a
+golden exists for.
 ```
