@@ -9,15 +9,24 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 [`nodelab_v2/`](nodelab_v2/). For how it works internally, see
 [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md).
 
-> **State as of 2026-07-30:** catalog **61 node types** (V2.12 folded Watershed +
+> **State as of 2026-08-03:** catalog **69 node types** — 72 registered ops, counting the
+> three the GUI layer adds (`io.load`, `io.dock`, `view.viewer`). V2.12 folded Watershed +
 > StarDist into the one **Segmentation** node and added CellSAM; V2.13 ported the last of
 > Cell-Tracker's processing — Flatten Illumination, Temporal Gain, Remove Blobs, Object
-> Metrics, Object Field; **Stitch (M→1)** put the first node behind the `MULTI_VIEW`
-> footprint); headless gate
-> `python -m nodegraph.selftest` → **69 `[ok]` lines green**; driven GUI gate
-> `scripts/_nodelab_v2_phase5_probe.py` → **ALL PASS**. There is exactly one editor — the
-> first-generation `nodelab`/`pipeline_kit` app was removed on 2026-07-29 and `--legacy`
-> no longer exists.
+> Metrics, Object Field — and **Stitch (M→1)** put the first node behind the `MULTI_VIEW`
+> footprint; V2.14–V2.21 added the machine-aware run and the optional CUDA path
+> ([§6](#tuning-the-run-to-your-machine-v214)), parameter picking
+> ([§8b](#8b-picking-parameters-off-the-image-v216)), docking
+> ([§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218)), parameter iteration
+> ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219)) and live node editing
+> ([§12d](#12d-editing-a-node-while-nodelab-is-running-v220)). Headless gate
+> `python -m nodegraph.selftest` → **85 `[ok]` lines green**; driven GUI gate
+> `scripts/_nodelab_v2_phase5_probe.py` → **ALL PASS** (23 `[ok]`); catalog gate
+> `python scripts/_catalog_snapshot.py check` → **CATALOG IDENTICAL**. On Windows, run all
+> three under `PYTHONUTF8=1` — they print `σ`/`→` and a cp1252 console raises
+> `UnicodeEncodeError` inside the reporting line itself, which reads like a failure but is
+> not one. There is exactly one editor — the first-generation `nodelab`/`pipeline_kit` app
+> was removed on 2026-07-29 and `--legacy` no longer exists.
 
 ---
 
