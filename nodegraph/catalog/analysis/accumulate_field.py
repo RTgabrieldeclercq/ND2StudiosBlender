@@ -14,6 +14,7 @@ from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dvc import _dvc_rows
+from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 
 def _layers_accumulate_field(params, modes):
     """Output name is DERIVED: empty `name` means `f"{source}_cumulative"`."""
@@ -83,7 +84,13 @@ def _compute_accumulate_field(ctx: EvalContext) -> Dataset:
     from types import SimpleNamespace
     from nodegraph.kernels.aldvc_field import accumulate_incremental, compute_strain
     ds = ctx.inputs[0]
-    source = ctx.layer("source")
+    # the one Point field on the wire, whatever it is called (`_resolve_layer`) — the literal
+    # default agreed only with `analysis.dvc_field`'s own default name
+    source, _note = _resolve_layer(
+        _point_layers(ds), ctx.layer("source"), node="accumulate field", socket="source",
+        what="Point table", where="the `data` input",
+        remedy="run analysis.dvc_field in previous_frame mode upstream — that is the "
+               "increment series this composes", ctx=ctx)
     out_layer = ctx.layer("name") or f"{source}_cumulative"
     md = ds.metadata
     ref_mode = md.get("dvc_reference_mode")

@@ -12,6 +12,7 @@ from nodegraph.reducers import reducer_docs
 from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import _lattice_layers, _resolve_layer
 
 # ── Transfer Domain (move a lattice attribute A→B: reduce / broadcast) ──────────
 #
@@ -82,7 +83,14 @@ def _compute_transfer_domain(ctx: EvalContext) -> Dataset:
             f"reducer back to 'mean'")
     layer = ds.get(src, name)
     if layer is None:
-        raise ValueError(f"transfer_domain: no {src.value} attribute {name!r}")
+        # the one attribute of the source domain on the wire, whatever it is called — the
+        # socket ships `mask`, which is right only for `analysis.threshold`'s own default
+        name, _note = _resolve_layer(
+            _lattice_layers(ds, src), name, node="transfer_domain", socket="attr",
+            what=f"{src.value} attribute", where="the `data` input",
+            remedy=f"this moves an existing {src.value} attribute to {dst.value}, so run the "
+                   f"node that produces one upstream", ctx=ctx)
+        layer = ds.get(src, name)
     return ds.with_attribute(lattice_transfer(layer, dst, ds.axes, reducer))
 register_node(
     _compute_transfer_domain, op_key="transform.transfer_domain",

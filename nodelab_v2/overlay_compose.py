@@ -11,7 +11,7 @@ same reason, with the same guarantee: nothing it produces reaches a downstream n
 overlay node's own output Dataset is untouched, which is what keeps "look at it" and
 "measure it" the same pipeline.
 
-Three properties worth stating, because each was a choice:
+Four properties worth stating, because each was a choice:
 
 * **Nearest-neighbour, and separable.** The row and column maps are independent, so the
   whole resample is two 1-D index arrays and one fancy-index — no interpolation pass over a
@@ -19,9 +19,18 @@ Three properties worth stating, because each was a choice:
   detail the GFP file does not have; blocky is the honest rendering of 171 real pixels
   stretched over 1024, and it also makes the sampling grid visible, which is a feature when
   you are checking an alignment.
+* **The secondary is read as a WINDOW, not as a plane** (V2.23). The compositor tells its
+  reader which fractional part of each tile it needs and the runner serves that at the finest
+  pyramid level it fits, so what is drawn is the source's own pixels at the resolution the
+  picture can show. Reading the whole plane decimated to ``MAX_DISPLAY_DIM`` instead served the
+  SOURCE's overview: for a stitched secondary the part covering one primary field is a few
+  hundred of those pixels magnified over the display, and no amount of zooming revealed more.
+  Note this is orthogonal to the blockiness above — that is a real magnification, this was a
+  read that threw the data away before the magnification happened.
 * **Several tiles, painted in coverage order.** A primary field can straddle up to four
   secondary tiles (WellA3 ``m10`` does). Each is mapped independently and written where it
-  lands; uncovered pixels keep the fill value, so a genuine gap reads as a gap.
+  lands; uncovered pixels keep the fill value, so a genuine gap reads as a gap. A tile that
+  does not reach the requested region is not read at all.
 * **Handedness applied HERE.** ``flip_x``/``flip_y`` describe how the camera is mounted and
   no file records them, so they never entered the envelope (see
   :data:`nodegraph.dataset.CALIBRATION_KEYS`). This is the sampling step, so this is where
@@ -35,13 +44,14 @@ import numpy as np
 
 from nodegraph.placement import (  # noqa: F401 — re-exported
     axis_map, compose_secondary_plane, field_box, paired_t,
-    secondary_z_index)
+    secondary_z_index, source_window, sub_field_box)
 
 #: Every name here is re-exported from `nodegraph.placement`. The compositing moved down to
 #: the engine layer when `view.overlay` gained its `resample` output mode: that mode bakes
 #: the SAME resample into a real Dataset channel, and a node cannot import the GUI package.
 #: This module is now the display path's alias for it, so the picture you look at and the
 #: pixels you measure are produced by one function rather than two that agree today.
-__all__ = ["axis_map", "compose_secondary_plane", "secondary_z_index", "paired_t"]
+__all__ = ["axis_map", "compose_secondary_plane", "secondary_z_index", "paired_t",
+           "source_window", "sub_field_box"]
 
 

@@ -19,6 +19,7 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import _resolve_layer, _structure_layers
 
 # ── Rasterize a MESH → a Voxel Label volume + geometry table (3D) ──────────────
 #
@@ -59,7 +60,16 @@ def _compute_rasterize_mesh(ctx: EvalContext) -> Dataset:
     ax = prov.axes
     if ax.z < 2:
         raise ValueError("rasterize mesh needs a 3D volume (z>1)")
-    layer = ctx.layer("mesh")
+    # The one mesh on the wire, whatever it is called (`_resolve_layer`). A mesh occupies
+    # THREE structure buckets — `<name>`, `<name>/vert`, `<name>/face` — so the candidates
+    # are the element tables only; the strata are not separately selectable meshes.
+    from nodegraph.mesh import MESH_SEP
+    layer, _note = _resolve_layer(
+        [n for n in _structure_layers(ds, Domain.MESH) if MESH_SEP not in n],
+        ctx.layer("mesh"), node="rasterize mesh", socket="mesh", what="mesh",
+        where="the `data` input",
+        remedy="run analysis.tessellate (which emits `mesh`) or analysis.voronoi with its "
+               "mesh output on (`voronoi_mesh`) upstream", ctx=ctx)
     name = ctx.layer("name")
     smooth = max(0.0, float(ctx.params.get("smooth_um", 0.0)))
     fill = bool(ctx.params.get("fill_holes", False))

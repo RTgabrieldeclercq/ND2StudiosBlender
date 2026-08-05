@@ -203,6 +203,73 @@ def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
     return {"origin_um": [[o[0] + dz, o[1] + dy, o[2] + dx] for o in origins]}
 
 
+#: EVERY metadata key that is a **list indexed by multipoint**. The per-M counterpart of
+#: :data:`PER_CHANNEL_KEYS`, and it exists for exactly the same reason: these are read
+#: POSITIONALLY (``xy[m]``), so a stale full-length list left behind by a node that
+#: narrowed M does not look stale — it looks like the wrong POSITION. That is a worse
+#: failure than the channel one it mirrors, because a tile placed at another field's stage
+#: coordinate reads as a handedness bug, so the user reaches for Stitch's ``flip_x`` /
+#: ``flip_y`` and makes it worse.
+#:
+#: The four of them, and why each is here:
+#:
+#: * ``origin_um`` — calibration (:data:`~nodegraph.dataset.CALIBRATION_KEYS`), the
+#:   transform-maintained corner of voxel ``(m,0,0,0)``. :func:`~nodegraph.placement.field_box`
+#:   prefers it over the stage log, so getting it wrong mis-places every placement consumer.
+#: * ``stage_xy_um`` / ``stage_z_um`` (:data:`nodelab_v2.ingest.STAGE_KEYS`) — display
+#:   provenance: where the camera was, which stops describing the data the moment a node
+#:   crops or stitches.
+#: * ``__align_um__`` (:data:`~nodegraph.placement.ALIGN_KEY`) and its companion
+#:   ``align_to_ncc`` — the per-field correction ``registration.align_to`` measured, one row
+#:   per M (``catalog/registration/align_to.py:137-141``), applied inside ``field_box``.
+#:
+#: ``frame_time_jd`` is deliberately ABSENT: it is indexed by T, not M.
+PER_POSITION_KEYS: Tuple[str, ...] = (
+    "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc",
+)
+
+
+def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
+    """The ``{key: subset}`` changes that reindex every :data:`PER_POSITION_KEYS` list in
+    ``metadata`` onto the multipoints ``keep`` (already validated indices, in output order).
+
+    The per-M twin of :func:`channel_subset`, and shared for the same reason: a node or a
+    run-scope that narrows M must subset all of these TOGETHER or the survivors stop
+    describing the positions that are left.
+
+    A key that is absent, or not a list, is left alone rather than invented. A list too
+    SHORT to cover an index in ``keep`` is dropped whole rather than silently shortened —
+    the same rule :func:`read_origin_um` applies, because a partial positional list reports
+    some other field's coordinate instead of admitting it does not know.
+    """
+    changes: Dict[str, Any] = {}
+    for key in PER_POSITION_KEYS:
+        vals = metadata.get(key)
+        if not isinstance(vals, (list, tuple)):
+            continue
+        changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
+                        else None)
+    return changes
+
+
+def drop_position_keys(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ``{key: None}`` changes that retire every per-M list **except** ``origin_um``.
+
+    For a node that collapses M to a single output whose positions no longer exist
+    separately — ``util.stitch``'s mosaic. Subsetting is wrong there: after a stitch there
+    is no per-position stage coordinate to keep, only one canvas, and fabricating a
+    single-entry ``stage_xy_um`` would state a field CENTRE for something no reader means
+    by that.
+
+    ``origin_um`` is excluded because it is the maintained key and the collapsing node
+    restamps it itself (``metadata.stitch`` takes the union corner) — which is precisely
+    why :func:`~nodegraph.placement.field_box` prefers it and keeps the stage log only as
+    a fallback for a Dataset that never crossed the calibration seam.
+    """
+    return {k: None for k in PER_POSITION_KEYS if k != "origin_um"
+            and metadata.get(k) is not None}
+
+
 def resample(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """Rescale: new size = old·scale; pixel size scales inversely (finer when
     upsampling). ``z`` scales only in 3D mode (stack-of-2D leaves z untouched)."""
@@ -401,6 +468,11 @@ def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
         changes["origin_um"] = [[min(o[0] for o in origins),
                                  min(o[1] for o in origins),
                                  min(o[2] for o in origins)]]
+    # The other per-M lists are RETIRED, in lockstep with the compute's own
+    # `drop_position_keys` call (build-node-v2 §2 — the predicted envelope and the produced
+    # payload may not drift). M→1 means those positions no longer exist separately, and a
+    # positional list that outlives its axis reports another field's coordinate.
+    changes.update(drop_position_keys(env.metadata))
     return env.with_axes(new_axes, unknown=frozenset(unknown)).with_metadata(**changes)
 
 
@@ -436,12 +508,95 @@ def overlay(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
                .with_metadata(bit_depth=None, channel_names=names))
 
 
+def merge_channels(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``channel.merge``: C and Z both grow, and both are UNKNOWN.
+
+    This pass is handed only the PRIMARY edge's envelope (``propagate_meta`` reads
+    ``dataset_preds[0]``), so it cannot see the second file at all — and both changed axes are
+    functions of it:
+
+    * ``c`` grows by however many channels the secondary has;
+    * ``z`` becomes the merged grid, whose plane count depends on the secondary's focus range
+      and step (:func:`nodegraph.placement.merge_z_grid`).
+
+    ``view.overlay``'s ``resample`` mode solves the same blindness by baking exactly ONE channel,
+    which keeps its prediction exact. That is the right trade for an overlay you are going to
+    *measure one channel of*, and the wrong one here: this node exists to put both files on one
+    axis, so the honest answer is ``stitch``'s — mark the axes unknown rather than guess
+    (V2.03 §2 A3). The GUI shows "?" for them until the first pull, which is true.
+
+    ``bit_depth`` is dropped for the same reason it is under ``resample``: the output stacks two
+    files' intensity scales and this pass has never seen the second one.
+
+    ``z_step_um`` is dropped too, and that one matters more than it looks. The merged grid's step
+    is the finer of the two files', which this pass cannot compute — and leaving the primary's
+    step standing would have every downstream µm→plane conversion silently using the wrong
+    spacing. Absent is the signal that it must be re-read from the payload.
+    """
+    ax = env.axes
+    names = list(env.metadata.get("channel_names") or [])
+    while len(names) < ax.c:
+        names.append(f"Ch{len(names) + 1}")
+    return (env.with_axes(replace(ax, c=ax.c + 1), unknown=frozenset({"c", "z"}))
+               .with_metadata(bit_depth=None, z_step_um=None,
+                              channel_names=names + ["merged"]))
+
+
+def zs_deconvnet(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``enhance.zs_deconvnet``: BOTH kinds of restamp at once, conditionally.
+
+    * **Intensity.** Always drops ``bit_depth``, for the reason :func:`value_rescaled`
+      exists: the network is fed percentile-normalized ``[0,1]`` input and its output is
+      percentile-normalized again, so the result is not integer counts on any scale — and
+      the ``relu`` output layer plus a deconvolution's flux concentration means it has no
+      predictable ceiling either, so there is no depth to widen to (the same call
+      ``enhance.deconvolve`` makes).
+
+    * **Geometry.** When ``upsample`` is on, the deconvolution head ends in an
+      ``UpSampling2D((2,2))`` / ``UpSampling3D((2,2,1))``, so Y and X double and
+      ``pixel_size_um`` halves. **Z is never scaled** — the 3D upsampling is deliberately
+      lateral-only, because an already-coarse axial axis gains nothing from interpolation —
+      so ``z_step_um`` is left exactly alone. That asymmetry is the whole reason this cannot
+      reuse :func:`resample`, whose ``scale_z`` would touch it.
+
+    The ``denoised`` output is NOT upsampled even when ``upsample`` is on: stage I is the
+    denoiser and runs at the input grid (its head is cropped, never upscaled). So the
+    geometry half is conditional on the OUTPUT mode as well as on ``upsample`` — pick
+    ``denoised`` and this is a pure intensity transform.
+
+    **``upsample`` may come from the CHECKPOINT** (V2.23). In ``pretrained`` mode an unset
+    socket takes the value recorded in the sidecar beside ``weights_path``, because a 2x head
+    that disagrees with the trained graph loads silently and predicts nonsense. That makes the
+    adopted value part of this prediction, not just of the compute: the axes here must equal
+    the axes the payload gets, and they would diverge the moment one of the two consulted the
+    sidecar and the other did not. Both call :func:`nodegraph.trained.zs_trained`, so there is
+    one answer rather than two that have to be kept in step by hand.
+    """
+    from nodegraph.trained import zs_trained as _zs_trained
+    out = env.with_metadata(bit_depth=None)
+    upsample = params.get("upsample")
+    if upsample in (None, ""):
+        upsample = _zs_trained(params, modes).get("upsample", True)
+    if upsample in (False, 0, "0", "false", "False"):
+        return out
+    if (modes or {}).get("output") == "denoised":
+        return out
+    ax = out.axes
+    changes: Dict[str, Any] = {}
+    px = out.metadata.get("pixel_size_um")
+    if px is not None:
+        changes["pixel_size_um"] = px / 2.0
+    return out.with_axes(replace(ax, y=max(1, ax.y * 2), x=max(1, ax.x * 2))) \
+              .with_metadata(**changes)
+
+
 META_TRANSFORMS: Dict[str, MetaTransform] = {
-    "overlay": overlay,
+    "overlay": overlay, "merge_channels": merge_channels,
     "identity": identity, "resample": resample, "z_project": z_project,
     "stack_time": stack_time, "frame_slice": frame_slice,
     "channel_select": channel_select, "crop": crop, "stitch": stitch,
     "value_rescaled": value_rescaled, "flatten_field": flatten_field,
+    "zs_deconvnet": zs_deconvnet,
 }
 
 
@@ -616,5 +771,6 @@ __all__ = [
     "channel_select", "crop", "stitch", "value_rescaled", "bit_depth_after_sum",
     "propagate_meta", "envelope_symbols", "parse_channels",
     "PER_CHANNEL_KEYS", "channel_subset",
+    "PER_POSITION_KEYS", "position_subset", "drop_position_keys",
     "eval_derive", "resolve_dim_default",
 ]

@@ -36,6 +36,13 @@ so a stateful advance would need a second output socket it cannot have. Replayin
 O(N²) edges for N ≤ :data:`MAX_ITERATIONS` iterations of pure arithmetic — free next to
 one segmentation.
 
+**Choosing the target.** :func:`candidate_targets` scrapes the chain feeding ``collect`` and
+returns every param and Mode this card could legally drive, so the GUI's "iterate on"
+dropdown is a view of the graph rather than a list anyone maintains. It filters through
+:func:`_check_target` — the same predicate the rewrite refuses on — which is the whole point:
+a menu built from a different rule than the refusals would become a way to construct exactly
+the configurations those refusals exist to prevent.
+
 **Honest cost note.** In *sweep* mode two iterations that resolve to the same value share a
 ``recipe_hash`` and the second is a memo hit. In *feedback* mode they do not: clone *i*'s
 value arrives from advance *i*, whose own predecessors differ, so a converged search still
@@ -54,7 +61,7 @@ from typing import (
 
 from nodegraph.graph import Edge, Graph, NodeInstance, is_dag_edge
 from nodegraph.registry import DIM_MODE, NODES, NodeSpec
-from nodegraph.sockets import SocketType
+from nodegraph.sockets import SocketType, can_convert
 
 #: The iterating node's frozen op_key.
 ITERATE_OP = "flow.iterate"
@@ -427,6 +434,24 @@ def _check_target(graph: Graph, plan_mode: str, target: Target) -> None:
         raise ValueError(
             f"{label}.{target.name} is a Dataset input, not a parameter — wire the image "
             f"there directly")
+    if getattr(sock, "layer_out", ()):
+        raise ValueError(
+            f"{label}.{target.name} NAMES the layer this node writes — sweeping it computes "
+            f"the identical result N times under N different names, and only one of them "
+            f"leaves the card anyway. Iterate a parameter that changes the pixels instead.")
+    wired = next((e for e in graph.preds(target.node_id)
+                  if e.dst_socket == target.name), None)
+    if wired is not None:
+        # The engine's wired-scalar rule is explicit that a wire BEATS a param
+        # (:func:`nodegraph.engine._with_driven_params`), and the sweep's value arrives as a
+        # param — baked in sweep mode, folded from the advance node in feedback. So every
+        # iteration would run at the wired number and the table would come out with N
+        # identical rows: the exact wrong-looking-right result every refusal here exists for.
+        raise ValueError(
+            f"{label}.{target.name} is already fed by a wire from {wired.src!r}, and a wired "
+            f"value beats a swept one — every iteration would run at that same number and "
+            f"the rows would come out identical. Unplug that wire, or iterate a different "
+            f"parameter.")
     if plan_mode == MODE_FEEDBACK and spec is not None and spec.meta_transform is not None:
         raise ValueError(
             f"{label}.{target.name} belongs to a node that changes the axes or calibration "
@@ -545,12 +570,145 @@ def _closure(adj: Mapping[str, List[str]], seeds: Iterable[str]) -> set:
     return seen
 
 
-def _is_docked(node: NodeInstance) -> bool:
-    """Duck-typed dock check. Deliberately NOT ``nodelab_v2.ops.is_docked``: that module is
-    Qt-free but sits *above* nodegraph, and importing it here would invert the dependency
-    for the sake of two string constants."""
+#: the dock states in which the upstream edge is cut — the duplicate of
+#: ``nodelab_v2.ops.DOCK_FROZEN`` this module deliberately keeps (see :func:`_is_frozen_dock`).
+#: ``held`` is here for the same reason ``docked`` is: it cuts the edge, so an iterated chain
+#: containing one would run N identical iterations.
+_FROZEN_DOCK_STATES = ("held", "docked")
+
+
+def _is_frozen_dock(node: NodeInstance) -> bool:
+    """Duck-typed check for a dock whose upstream edge is CUT (``held`` or ``docked``).
+
+    Deliberately NOT ``nodelab_v2.ops.is_frozen``: that module is Qt-free but sits *above*
+    nodegraph, and importing it here would invert the dependency for the sake of a few string
+    constants. The cost of the duplication is that a new frozen state has to be added in both
+    places — which is why :data:`_FROZEN_DOCK_STATES` is named rather than inlined, and why
+    ``nodelab_v2.ops.DOCK_FROZEN`` names its own copy."""
     return (node.op_key == "io.dock"
-            and str((node.modes or {}).get("state") or "live") == "docked")
+            and str((node.modes or {}).get("state") or "live") in _FROZEN_DOCK_STATES)
+
+
+# ── the target picker (V2.22) ────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class TargetOption:
+    """One thing a variable slot may be pointed AT — the offer behind the card's
+    "Iterate on" dropdown.
+
+    Scraped, never authored: the active sockets and Modes of the nodes upstream of
+    ``collect`` *are* the list, so a node type added to the catalog becomes sweepable the
+    day it is registered and a param gated away by a Mode disappears from the menu the
+    moment it stops existing. Every offer is put through :func:`_check_target` first, so the
+    menu and the refusals cannot drift apart: if it is in the list, wiring it is legal.
+
+    ``driver_id`` is set when something ALREADY drives this target — the slot that owns it
+    (so the dropdown can show its current selection) or another card. Reported rather than
+    filtered out, because "why is `threshold` not in the list" is a question the list itself
+    should answer.
+    """
+
+    target: Target
+    #: :data:`TYPE_NUMBER` or :data:`TYPE_TEXT` — which of the slot's two driver outputs
+    #: this target must be wired from, and therefore what its ``v{k}_type`` has to be set to.
+    kind: str
+    node_label: str
+    param_label: str
+    driver_id: str = ""
+    driver_slot: int = -1
+
+    @property
+    def key(self) -> Tuple[str, str]:
+        """``(node_id, socket)`` — the identity a GUI stores on its combo item."""
+        return (self.target.node_id, self.target.socket)
+
+    @property
+    def text(self) -> str:
+        return f"{self.node_label} · {self.param_label}"
+
+    @property
+    def detail(self) -> str:
+        return f"{self.target.node_id}.{self.target.name}"
+
+
+def _driver_owners(graph: Graph) -> Dict[Tuple[str, str], Tuple[str, int]]:
+    """``(node_id, socket) → (iterate_id, slot)`` for every driver wire in the graph."""
+    slot_of = {name: k for k in range(MAX_VARIABLES) for name in var_out_names(k)}
+    return {(e.dst, e.dst_socket): (e.src, slot_of.get(e.src_socket, -1))
+            for e in graph.edges if e.kind == "driver"}
+
+
+def candidate_targets(graph: Graph, node_id: str, *,
+                      mode: Optional[str] = None) -> Tuple[TargetOption, ...]:
+    """Every parameter and Mode this Iterate node could legally drive, in chain order.
+
+    The candidate SET is the nodes upstream of ``collect`` (including its sources) and
+    nothing else — that is exactly the set :func:`plan` requires a driven node to be in, so
+    the menu cannot offer a target whose own refusal ("not upstream of collect, so the sweep
+    would silently do nothing") is the next thing the user would see. With nothing wired
+    into ``collect`` yet there is no chain to scrape and the result is empty: collect first,
+    then choose.
+
+    Ordered by :meth:`~nodegraph.graph.Graph.topo_order`, so the menu reads down the chain
+    from the source to the collected end rather than in dictionary order.
+    """
+    node = graph.nodes.get(node_id)
+    if node is None or node.op_key != ITERATE_OP:
+        return ()
+    plan_mode = str(mode or node.state(node.spec()).get("mode") or MODE_SWEEP)
+    collect_src = [e.src for e in graph.preds(node_id) if e.dst_socket == "collect"]
+    if not collect_src:
+        return ()
+    _, pred = _forward_maps(graph)
+    reach = _closure(pred, collect_src)
+    reach.discard(node_id)
+    try:
+        order = [nid for nid in graph.topo_order() if nid in reach]
+    except ValueError:                       # a cyclic mid-edit graph still gets a menu
+        order = sorted(reach)
+    owners = _driver_owners(graph)
+
+    def spec_label(nid: str) -> str:
+        n = graph.nodes.get(nid)
+        s = n.spec() if n is not None else None
+        return (getattr(s, "label", "") or (n.op_key if n is not None else nid))
+
+    # Two nodes of the same type read as one entry twice ("Threshold · threshold" listed
+    # under two different cards), so the id disambiguates — but ONLY where it has to, or
+    # every line in the menu would carry an id nobody needs to see.
+    seen_labels: Dict[str, int] = {}
+    for nid in order:
+        seen_labels[spec_label(nid)] = seen_labels.get(spec_label(nid), 0) + 1
+
+    out: List[TargetOption] = []
+    for nid in order:
+        n2 = graph.nodes[nid]
+        s2 = n2.spec()
+        if s2 is None or n2.op_key in (ITERATE_OP, ADVANCE_OP):
+            continue
+        st = n2.state(s2)
+        label = spec_label(nid)
+        nlabel = f"{label} [{nid}]" if seen_labels.get(label, 0) > 1 else label
+        offers: List[Tuple[Target, str, str]] = []
+        for s in s2.active_inputs(st):
+            if can_convert(SocketType.FLOAT, s.type):
+                kind = TYPE_NUMBER
+            elif can_convert(SocketType.STRING, s.type):
+                kind = TYPE_TEXT
+            else:                            # DATASET, MENU — nothing a variable can carry
+                continue
+            offers.append((Target(nid, s.name), kind, s.label or s.name))
+        for m in s2.active_modes(st):
+            offers.append((Target(nid, m.name, is_mode=True), TYPE_TEXT,
+                           m.label or m.name))
+        for target, kind, plabel in offers:
+            try:
+                _check_target(graph, plan_mode, target)
+            except ValueError:               # the refusal IS the filter (see the docstring)
+                continue
+            owner, slot = owners.get((nid, target.socket), ("", -1))
+            out.append(TargetOption(target, kind, nlabel, plabel, owner, slot))
+    return tuple(out)
 
 
 def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None,
@@ -593,12 +751,12 @@ def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None
             f"so cloning them would change nothing and the sweep would silently do nothing. "
             f"Wire 'collect' to a node downstream of them.")
 
-    docked = sorted(n for n in cone if _is_docked(graph.nodes[n]))
+    docked = sorted(n for n in cone if _is_frozen_dock(graph.nodes[n]))
     if docked:
         raise ValueError(
-            f"{node_id}: the iterated chain contains docked Dock node(s) {docked}. A docked "
-            f"dock serves its checkpoint and its upstream is cut, so every iteration would "
-            f"read the same baked pixels and produce identical results. Set it to 'live', "
+            f"{node_id}: the iterated chain contains frozen Dock node(s) {docked}. A held or "
+            f"docked dock serves a frozen result and its upstream is cut, so every iteration "
+            f"would read the same pixels and produce identical results. Set it to 'live', "
             f"or move the Iterate node downstream of it.")
 
     nested = sorted(n for n in cone if graph.nodes[n].op_key == ITERATE_OP)
@@ -834,8 +992,8 @@ __all__ = [
     "PRESERVE_FIRST", "PRESERVE_LAST", "PRESERVE_BEST", "PRESERVE_PICKED",
     "COMBINE_ZIP", "COMBINE_GRID", "SRC_LIST", "SRC_LINEAR", "SRC_LOG", "SRC_AROUND",
     "TYPE_NUMBER", "TYPE_TEXT", "SEARCH_GOLDEN", "SEARCH_SECANT",
-    "Target", "Variable", "Iteration", "IteratePlan",
+    "Target", "TargetOption", "Variable", "Iteration", "IteratePlan",
     "var_mode_names", "var_out_names", "var_field_names",
     "iter_id", "advance_id", "iterate_nodes", "parse_list", "span", "around",
-    "advance_value", "plan", "unroll",
+    "advance_value", "candidate_targets", "plan", "unroll",
 ]

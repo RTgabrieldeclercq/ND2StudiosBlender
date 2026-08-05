@@ -12,6 +12,7 @@ from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
+from nodegraph.catalog._shared.labels import _resolve_layer, _voxel_layers
 
 def _layers_extract_boundary(params, modes):
     """Output name is DERIVED: empty `name` means `f"{labels}_boundary"`."""
@@ -49,10 +50,18 @@ def _compute_extract_boundary(ctx: EvalContext) -> Dataset:
     ds = ctx.inputs[0]
     ax = ds.axes
     is_3d = ctx.is_volume
-    layer = ctx.layer("labels")
+    # The one raster on the wire, whatever it is called (`_resolve_layer`). Candidates are
+    # every Voxel layer, not just whole Label INSTANCES: this path marches/contours the
+    # raster and never touches a Label table, so a plain `analysis.threshold` mask is a
+    # legal input (it outlines as one region) — the same rule as `voronoi (mask)`.
+    layer, _note = _resolve_layer(
+        _voxel_layers(ds), ctx.layer("labels"), node="extract boundary", socket="labels",
+        what="Voxel layer", where="the `data` input",
+        remedy="wire a label raster or a mask — run analysis.segment / analysis.label / "
+               "analysis.threshold upstream", ctx=ctx)
     out_layer = ctx.layer("name") or f"{layer}_boundary"
     raster_attr = ds.get(Domain.VOXEL, layer)
-    if raster_attr is None:
+    if raster_attr is None:                          # pragma: no cover - _resolve_layer
         raise ValueError(f"extract boundary needs a Label raster {layer!r}")
     raster6 = raster_attr.values
 

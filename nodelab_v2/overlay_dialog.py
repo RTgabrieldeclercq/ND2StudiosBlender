@@ -104,13 +104,18 @@ class OverlayDialog(QDialog):
 
     def __init__(self, settings: OV.OverlaySettings,
                  renderer: Optional[OV.OverlayRenderer] = None,
-                 parent: Optional[QWidget] = None) -> None:
+                 parent: Optional[QWidget] = None,
+                 layer_names: Optional[Callable[[str], List[str]]] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Overlays")
         self.setWindowFlag(Qt.Window)
         self.setMinimumWidth(400)
         self._settings = settings
         self._renderer = renderer or OV.OverlayRenderer()
+        #: supplies the LIVE label-raster names for a ``layer``-kind field. Injected rather
+        #: than reached for, so the dialog stays constructible (and testable) without a
+        #: Viewer — it just offers Auto alone.
+        self._layer_names = layer_names or (lambda _tab: [])
         self._widgets: Dict[Tuple[str, str], QWidget] = {}
         self._rows: Dict[Tuple[str, str], Tuple[QWidget, QWidget]] = {}
         self._previews: Dict[str, _PreviewStrip] = {}
@@ -265,6 +270,15 @@ class OverlayDialog(QDialog):
             editor.currentIndexChanged.connect(
                 lambda _i, t=tab, k=spec.key, w=editor:
                 self._set(t, k, w.currentData()))
+        elif spec.kind == "layer":
+            # A choice whose options are the LIVE payload's layers, not a static table — so
+            # it is repopulated on every `reload`, and it keeps "Auto" as an explicit first
+            # entry rather than pretending the guess is a name.
+            editor = QComboBox()
+            editor.addItem("Auto — this node's own output", "")
+            editor.currentIndexChanged.connect(
+                lambda _i, t=tab, k=spec.key, w=editor:
+                self._set(t, k, w.currentData() or ""))
         else:                                        # color
             editor = _ColorButton(getattr(self._settings.group(tab), spec.key))
             editor.picked.connect(
@@ -285,6 +299,22 @@ class OverlayDialog(QDialog):
                 for spec in OV.FIELDS[tab]:
                     w = self._widgets[(tab, spec.key)]
                     val = getattr(grp, spec.key)
+                    if spec.kind == "layer" and isinstance(w, QComboBox):
+                        # rebuild from the live payload every time the dialog syncs: the
+                        # answer changes as the user views a different node
+                        names = list(self._layer_names(tab))
+                        w.clear()
+                        w.addItem("Auto — this node's own output", "")
+                        for nm in names:
+                            w.addItem(nm, nm)
+                        cur = str(val or "")
+                        if cur and w.findData(cur) < 0:
+                            # a pick this payload does not carry: keep it visible and say so,
+                            # rather than silently snapping back to Auto and looking ignored
+                            w.addItem(f"{cur} — not on this payload", cur)
+                        idx = w.findData(cur)
+                        w.setCurrentIndex(idx if idx >= 0 else 0)
+                        continue
                     if isinstance(w, QCheckBox):
                         w.setChecked(bool(val))
                     elif isinstance(w, (QSpinBox, QDoubleSpinBox)):

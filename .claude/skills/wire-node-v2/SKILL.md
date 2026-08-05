@@ -160,9 +160,15 @@ InString("name",  "Output layer", field=False, default="labels",
 * `layer_in_mode="from_domain"` instead of `layer_in` when the domain is a **mode value**
   (only `transform.transfer_domain`).
 * **Domain consistency is enforced:** `layer_in` domain ⊆ `reads_domains`, and `layer_out`
-  domains ⊆ `adds_domains`. The `reads_domains` half is **exempt when the socket is
-  mode-gated** — a conditional requirement, and `reads_domains` has no per-mode form (why
-  `tessellate` / `track.link` legitimately declare it empty).
+  domains ⊆ `adds_domains`. The `reads_domains` half is checked in **every mode state the
+  socket is active in**, against `spec.resolve_reads_domains(state)` — so a conditional
+  requirement is stated with **`reads_domains_by_mode`** (§4f) rather than waived. The
+  exemption is an **empty default**: the socket then does not name a required layer *literally*
+  — either the layer is optional (`analysis.segment`'s watershed `mask`, `flow.iterate`'s
+  `metric`) or the node **infers** it (`analysis.voronoi`, §4g). An inferred layer is still
+  required, so declare its domain anyway; the structural check cannot tell the two cases apart
+  from the default alone, which is why `voronoi`'s declaration is pinned directly in
+  `selftest::test_conditional_reads_domains`.
 * Producers no socket can describe use **`NodeSpec.extra_layers(params, modes)`**: literal
   names with no socket (`align.drift`'s `drift_y`/`drift_x`), names derived from another
   param (`extract_boundary` → `f"{labels}_boundary"`), or writes into the layer a *read*
@@ -296,6 +302,75 @@ needs `setToolTipsVisible(True)`, or QMenu swallows the prose). Enforced by
 `selftest::test_option_docs`, exemptions in `_OPTION_DOC_EXEMPT` on the same
 external-paper-only grounds.
 
+
+### 4f. `reads_domains_by_mode` — the domain rail per BRANCH (V2.22)
+
+`NodeSpec.reads_domains` says which domains must be present on the incoming Dataset; it drives
+the card's input rail, the wire tint, and the red missing-domain chips. A node whose **branches
+read different structure** cannot state that once, and the catalog had drifted both ways:
+
+* **over-claiming** — `analysis.object_field` declared the static union `{LABEL, POINT}`, so a
+  pure-Label graph that was fine got a red PT chip;
+* **under-claiming** — `analysis.voronoi` declared `{POINT}` while `bound=per_region` also goes
+  through `_label_raster` and needs a whole Label instance. The node that combines dots with
+  labels advertised no labels requirement at all (reported 2026-08-03).
+
+Both are silent — nothing at pull time reads the rail, so it just tells the user the wrong thing.
+Declare the conditional half instead:
+
+```python
+reads_domains=frozenset({Domain.POINT}),          # unconditional (the seeds)
+reads_domains_by_mode={"bound": {
+    "per_region": frozenset({Domain.VOXEL, Domain.LABEL}),   # _label_raster wants the table
+    "mask":       frozenset({Domain.VOXEL}),                 # any non-zero raster
+    "frame":      frozenset(),                               # reads no layer at all
+}},
+```
+
+* It is a **UNION over every listed mode**, not the single-key `Mapping` `granularity` uses —
+  because the requirements are not keyed by one dropdown. `transform.transfer_structure` reads
+  what `from_domain` names AND what `to_domain` names; `flow.iterate` needs a Global under
+  `preserve=best` **OR** `mode=feedback`. An unlisted value contributes nothing.
+* Resolve it with **`spec.resolve_reads_domains(state)`** / **`missing_domains(incoming, state)`**
+  — never read the raw field. The GUI already does (`node_item.reads_domains`,
+  `document.missing_domains`).
+* Registration refuses a mode name that does not exist, a value that mode cannot take, and a
+  non-`Domain` entry — each would contribute nothing in every state, i.e. look exactly like
+  never having written it.
+* **Don't reach for it when the domain is the image.** `analysis.segment` keeps a static
+  `{VOXEL}`: that is the image domain every source supplies, not a per-method layer.
+
+### 4g. A layer name is DERIVABLE — infer it (`_resolve_layer`, 2026-08-04)
+
+A layer-name socket has to carry some default, and a **literal** default is right for exactly
+one upstream producer. `analysis.voronoi` shipped `points="particles"` — what `detect.particles`
+emits — so a graph seeded from `detect.spots` (`spots`) or `transform.label_to_points`
+(`<labels>_points`) was refused with *"no Point layer 'particles' on the input Dataset (it
+carries ['points'])"*: an error that prints the right answer one clause after declining to use
+it. There was nothing to decide; a single Point table was on the wire.
+
+Treat that the way you treat a spatial param: **derivable from the incoming data ⇒ the node
+derives it** (§7). Use `_resolve_layer(candidates, want, …)` (`_shared/labels.py`):
+
+| state | behaviour |
+|---|---|
+| socket set, name **present** | use it — an explicit name always wins |
+| socket **empty**, one candidate | use it, and report on the progress rail |
+| socket set but name **absent**, one candidate | use the candidate, saying the socket is stale |
+| **zero** candidates | raise, naming what to wire upstream |
+| **two or more** candidates | raise, listing them — never guess |
+
+* **Default `""`, not a literal.** Say in the `description` what empty means ("leave it empty and
+  the only Point table on `data` is used"), the same job `path_hint` does for a path socket.
+* **Candidates are per-purpose, not per-domain.** `per_region` needs a whole Label **instance**
+  (`_label_instances`: a raster *plus* the table that divides it into objects), so a plain `mask`
+  or a `distance` field beside a label raster is still unambiguous. `mask` takes any raster
+  (`_voxel_layers`) and so is ambiguous more often — correctly.
+* **Report the inference.** `ctx.progress(…, "using seeds: Point table 'points' (the only one on
+  the `data` input)")`. Inferring silently is how you get a node that quietly analyses the wrong
+  layer.
+* Never infer across a **domain** boundary or between candidates: two Point tables on one wire is
+  a real question, and picking one would tessellate the wrong cloud with no symptom.
 
 ---
 
@@ -544,18 +619,86 @@ Four rules make it safe, and they generalize to any "second Dataset input" node:
 - **Declare it AFTER `data`.** `graph.dataset_preds` sorts by declared socket position, so
   `data` stays `dpreds[0]` = the calibration/domain env source no matter which edge the
   user wired first. Never let an auxiliary input become the env.
-- **Refuse a geometry mismatch.** The two are read voxel-for-voxel, so a cropped /
-  resampled / z-projected / channel-tapped raw would report neighbouring objects'
-  intensities — silent corruption. Compare `provider.axes` and raise, naming both shapes
-  and the fix. (`AxisSizes` is a frozen dataclass: `==` works, but it is NOT iterable —
-  format it field by field.)
+- **Refuse a geometry mismatch** with **`_require_same_grid(main, other, socket=…,
+  consequence=…)`** (`_shared/sampling.py`) — do NOT hand-roll it. Two branches read
+  voxel-for-voxel must agree on BOTH halves: `AxisSizes` (catches a crop/resample/project)
+  *and* the sampling provenance `__sampling__` (catches everything shape-preserving that
+  moves the content — `align.drift` and `registration.stabilize` are exactly that, and a
+  shape-only guard waved them through while the node measured each object where it used to
+  be). `consequence` is the only per-node part: say what goes wrong *here*.
+- **A stamp may declare the AXES its effect is confined to**, as a `"<axes>:"` prefix —
+  `CHANNEL_STAMP` (`"c:"`) for a channel tap, `Z_STAMP` (`"z:"`) for a Z-collapse. The rule
+  `_sampling_of`/`_require_same_grid` apply is one sentence: **a stamp confined to axes that
+  are singleton on BOTH sides cannot misalign anything.** That is what lets "segment ch0,
+  measure ch1" and "dots from a Z-projection, areas from a single-plane Z-crop" through
+  while a lateral crop, a drift and a resample stay refused. If you write a node that
+  collapses or reindexes ONE axis and leaves every other address alone, mark its stamp;
+  `util.crop` decides **per call** (a pure z-crop is lateral identity, a windowed one moves
+  the corner), which is the discrimination the exemption rests on. An unmarked stamp is
+  never dropped — that is the safe default, so an unparsable prefix costs correctness
+  nothing. `m`/`t` are deliberately NOT exempt: collapsing them picks a position or
+  timepoint, and calling frame 3 and frame 7 one grid is a content decision the guard has no
+  basis to make.
 - **The memo needs nothing.** A new predecessor folds into `recipe_hash` automatically, so
-  wiring or unwiring `raw` re-keys the node on its own.
+  wiring or unwiring the second input re-keys the node on its own.
 
 Why not a Mode toggle: a lever cannot say *which* raw Dataset, and a hidden "read the
 source" path would break the "pure function of its inputs" law the memo depends on. An
 explicit socket is visible in the graph, diffable, and serializes for free. Same shape as
 `analysis.dvc_field`/`dic_correlate`'s optional `reference` input.
+
+#### 7e. A second input for a second DOMAIN — `layer_from` (V2.22)
+
+`raw`/`reference` bring in *pixels*. The other reason to take a second Dataset is that the
+node **combines two domains that different branches produce**: `analysis.voronoi` needs a
+Point table (the seed dots) *and* a Label raster (the areas to clip them to), and no single
+wire can carry a Point table plus someone else's labels. Reported as "I can only connect
+one data at a time" (2026-08-03).
+
+Same four rules as above, plus one:
+
+- **The layer socket must name the input it reads** — `layer_from="areas"` on the
+  `layer_in` socket. `document.layer_choices` follows the **primary** edge by design (a
+  `raw`/`reference` input's layers must never be offered as if they were on the payload
+  wire), so without this the picker lists names off a wire the compute never reads and the
+  user sees a valid-looking layer that "does not exist". Registration refuses a
+  `layer_from` naming a non-existent input, or the primary (already the default).
+- **The picker exists on BOTH surfaces.** `inspector._layer_box` (an editable combo) and
+  `node_item._open_layer_menu` (the card's pill popup). Until 2026-08-04 only the inspector
+  had one, so on the canvas a layer socket could only be typed — and a node left holding its
+  factory-default layer name while the wire carried another failed at pull time, several
+  nodes downstream, with a menu one click away that had the right answer in it. Both keep
+  free text reachable: the edit-time prediction is honest but incomplete.
+- **Falls back to the primary when unwired**, in the compute *and* the picker — that is
+  what keeps every single-wire graph that predates the socket working unchanged.
+- **Refuse the input in a mode that ignores it.** `analysis.voronoi` raises if `areas` is
+  wired under `bound=frame`, which reads no area layer at all — clause 2 of the socket
+  contract applied to a Dataset input.
+- **Do NOT `available_in`-gate a Dataset input.** No node in the catalog does: hiding a
+  socket that already has a wire leaves the edge dangling. Refuse instead.
+
+- **Put what it used on the OUTPUT.** The payload is built on `dataset_preds[0]`, so it inherits
+  the primary wire's layers and *nothing* from the auxiliary one. Viewing `analysis.voronoi`
+  therefore showed the seeds' branch labels and points with no trace of the areas the cells were
+  clipped to — and the inherited raster is usually *also* called `labels`, so the overlay looked
+  like the area layer while showing a different branch's. Copy it under a name of the node's own
+  choosing (`f"{name}_areas"`), declared via `extra_layers`; never under the source name, which
+  collides with what the primary branch already means by it.
+- **Declare it `view_source=True` if its IMAGE should be visible.** One payload has one image, so
+  the Viewer can only draw the primary's channel — "I can only see the UV channel" on a graph
+  whose areas came from the Red one. `InDataset("areas", view_source=True)` makes the runner
+  composite it (`overlay_chain` yields it; `_view_source_entry` synthesizes the placement, since
+  these nodes stamp no recipe — display config in a payload would ride the memo key).
+  **Opt-in per socket, and most sockets must NOT have it:** `raw` is the unenhanced version of
+  the *same* pixels and would draw the field twice, and a `reference` is another timepoint of
+  the same channel. The test is whether the wire carries genuinely different content, which is
+  the same condition as reading a *domain* off it rather than intensities. Placement is
+  field-for-field at scale 1 (`on_unplaceable="index"`), not by stage position: stage placement
+  refuses without a stage log, which a sibling branch does not need and a TIFF never has.
+
+The domain rail composes for free: `document.input_domains` unions **every** Dataset
+predecessor, so the LABEL arriving on the second wire satisfies the `reads_domains_by_mode`
+requirement declared for `bound=per_region` (§4f).
 
 ---
 

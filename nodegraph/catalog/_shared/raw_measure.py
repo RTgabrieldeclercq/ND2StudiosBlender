@@ -7,7 +7,7 @@ from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
 from nodegraph.registry import InDataset, SocketSpec
 
-from nodegraph.catalog._shared.sampling import _sampling_of
+from nodegraph.catalog._shared.sampling import _require_same_grid
 
 #: The optional **raw-intensity** Dataset socket (2026-07-28). Declared AFTER ``data`` so
 #: ``data`` stays the primary — ``graph.dataset_preds`` sorts by declared socket position,
@@ -55,31 +55,10 @@ def _intensity_provider(ctx: EvalContext, ds: Dataset):
         raise ValueError(
             "the `raw` input carries no image provider — wire an image Dataset (the "
             "unenhanced source) into it, or leave it unwired to measure the main input.")
-    if prov is not None and rprov.axes != prov.axes:
-        shape = lambda a: (a.m, a.t, a.z, a.c, a.y, a.x)   # AxisSizes is not iterable
-        raise ValueError(
-            f"the `raw` input's geometry {shape(rprov.axes)} does not match the measured "
-            f"input's {shape(prov.axes)} — they are read voxel-for-voxel, so a mismatch "
-            "would report the wrong regions' intensities. Apply the same crop / resample "
-            "/ z-project to BOTH branches, or branch `raw` off the point in the chain "
-            "where the geometry already matches. If only the channel COUNT differs, tap "
-            "`raw` down to one channel as well — it may be a DIFFERENT channel from the "
-            "measured one, which is the whole point of the socket.")
-    # both single-channel ⇒ the c axis is degenerate on each side, so a channel tap cannot
-    # misalign the voxel-for-voxel read and its stamp is dropped from the comparison.
-    per_channel = ds.axes.c > 1 or raw.axes.c > 1
-    mine = _sampling_of(ds, channel_axis=per_channel)
-    theirs = _sampling_of(raw, channel_axis=per_channel)
-    if mine != theirs:
-        only_mine = [s for s in mine if s not in theirs] or ["(none)"]
-        only_theirs = [s for s in theirs if s not in mine] or ["(none)"]
-        raise ValueError(
-            f"the `raw` input went through a DIFFERENT sampling geometry from the measured "
-            f"input, so the two do not address the same voxels even though their sizes "
-            f"agree. Only on the measured branch: {only_mine}. Only on `raw`: "
-            f"{only_theirs}. A shift is the dangerous case — a drift-corrected image and "
-            f"its uncorrected source have identical axes, so each object would be measured "
-            f"wherever it used to be. Branch `raw` off AFTER the geometry ops the measured "
-            f"branch has (enhancement steps in between are fine and are the whole point), "
-            f"or apply the same ones to both.")
+    # Both halves of the guard (shape, then sampling provenance) live in
+    # `_require_same_grid` — a second Dataset input arrived on `analysis.voronoi` and needed
+    # exactly this rule, and two copies of "do these branches address the same voxels?"
+    # would only differ where one of them had rotted.
+    _require_same_grid(ds, raw, socket="raw",
+                       consequence="report each object's intensity from the wrong place")
     return rprov, True

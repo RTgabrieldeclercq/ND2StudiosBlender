@@ -1,7 +1,14 @@
-"""EngineRunner — canvas → Engine off the UI thread (G7, LOCKED 2026-07-22: QThreadPool
-worker + **epoch registry**, no qasync — the engine is synchronous CPU work, so a Qt
-worker thread + queued-signal delivery is the whole bridge; stale results are dropped
-by epoch on arrival. One pull runs at a time (latest-wins queueing).
+"""EngineRunner — canvas → Engine off the UI thread (G7, LOCKED 2026-07-22: one worker
+thread + **epoch registry**, no qasync — the engine is synchronous CPU work, so a worker
+thread + queued-signal delivery is the whole bridge; stale results are dropped by epoch on
+arrival. One pull runs at a time (latest-wins queueing).
+
+The pull runs on ONE persistent, Python-created thread (:class:`_PullThread`), not on a
+``QThreadPool``. That is a correctness requirement, not a preference: a pool's recycled
+Qt-created thread is re-adopted by CPython as a new ``Dummy-N`` thread per pull, and torch's
+per-thread state does not survive that — it killed the process natively on the second
+CellSAM pull of a session. See :class:`_PullThread`. The read-only display jobs (decode,
+prefetch, viewport detail) stay on the shared pool.
 
 The runner owns the run-side model glue:
 
@@ -57,11 +64,11 @@ from nodegraph.dataset import AxisSizes, Dataset
 from nodegraph.engine import Engine
 from nodegraph.graph import Graph
 from nodegraph.memo import Memo
-from nodegraph.metadata import MetaEnvelope
+from nodegraph.metadata import MetaEnvelope, position_subset
 from nodegraph.parallel import (
-    cpu_budget, memo_bytes, plane_cache_bytes, store_dir, tile_cache_bytes)
+    cpu_budget, memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
 from nodegraph.provider import (
-    FrameSliceProvider, FrameSubsetProvider, SyntheticProvider, subset_index)
+    FrameSliceProvider, FrameSubsetProvider, SyntheticProvider, _picked, subset_index)
 from nodegraph.streaming import StreamProvider, TileCache
 from nodelab_v2.ops import LOAD_OP, dock_seeds, dock_store_of
 
@@ -146,6 +153,95 @@ def ensure_gui_ops() -> None:
 #: ``NODELAB_MAX_DISPLAY_DIM`` on a machine where that hurts more than the detail helps.
 MAX_DISPLAY_DIM = int(os.environ.get("NODELAB_MAX_DISPLAY_DIM", "") or 4096)
 
+#: Share of installed RAM the Viewer may hold in decoded display frames — the budget that
+#: decides whether a big frame is shown WHOLE at full resolution or progressively off the
+#: pyramid (V2.23). ``NODELAB_DISPLAY_RAM_PCT`` overrides the percentage,
+#: ``NODELAB_DISPLAY_RAM_BYTES`` the absolute number.
+#:
+#: 25% is Nikon's number: NIS-Elements sets ``MaxMemoryImageSize`` to a quarter of RAM at
+#: startup and opens an image in "normal mode" when it fits and "progressive mode" — thumbnail
+#: first, detail as you zoom, *and much of the processing menu disabled* — when it does not.
+#: Borrowing the threshold is deliberate: it is the number a decade of microscopy users have
+#: had their expectations set by, and the decision it drives here is the same one.
+#:
+#: Configurable because the right answer is a property of the MACHINE, and this codebase
+#: already runs on both a 256 GiB workstation (a quarter of which holds 160 full-resolution
+#: 7168² frames) and a laptop where a quarter is 4 GiB.
+DISPLAY_RAM_SHARE = max(0.01, min(0.9,
+                                  float(os.environ.get("NODELAB_DISPLAY_RAM_PCT", "")
+                                        or 25.0) / 100.0))
+
+
+def display_ram_bytes() -> int:
+    """How many bytes of decoded display frames the Viewer may hold at once."""
+    override = os.environ.get("NODELAB_DISPLAY_RAM_BYTES", "").strip()
+    if override:
+        try:
+            return max(64 * 1024 * 1024, int(override))
+        except ValueError:
+            pass
+    return ram_budget(DISPLAY_RAM_SHARE, floor=512 * 1024 * 1024,
+                      cap=192 * 1024 * 1024 * 1024)
+
+
+#: What one texture axis may be before the GPU refuses it. Replaced with the context's real
+#: ``GL_MAX_TEXTURE_SIZE`` by :meth:`EngineRunner.set_display_limits` as soon as a surface
+#: comes up — 8192 until then, which every GL 3.3 implementation this decade meets and which
+#: is the conservative direction to be wrong in: too small only costs sharpness, while too
+#: large is a black frame.
+DEFAULT_TEXTURE_LIMIT = 8192
+
+
+#: Bytes of GPU texture the shown channels may occupy at once. The uploader packs each plane
+#: into **RGBA8** (:meth:`nodelab_v2.glview.GLImageView._upload` — 16-bit split across R and G),
+#: so one frame costs ``4 * y * x`` of VRAM *and* two transient CPU copies of the same size:
+#: a 7168² plane is 205 MB three times over, per channel. ``NODELAB_TEXTURE_BYTES`` overrides.
+#:
+#: This exists because ``GL_MAX_TEXTURE_SIZE`` is the wrong ceiling to trust — this GPU reports
+#: 32768, which would permit a 4 GB texture. Uploads are not error-checked (there is no
+#: ``glGetError`` on that path), so exceeding VRAM does not raise: it leaves the previous
+#: texture's content bound, which is a frame with part of the picture missing.
+TEXTURE_BYTES = int(os.environ.get("NODELAB_TEXTURE_BYTES", "") or 512 * 1024 * 1024)
+
+
+def display_cap(axes: Any, *, texture_limit: int, bytes_per_px: int = 8,
+                planes: int = 1, streaming: bool = False) -> int:
+    """The display cap for a frame of ``axes``: its own long edge when the whole thing can be
+    shown at FULL resolution *affordably*, else :data:`MAX_DISPLAY_DIM`.
+
+    Four ceilings, and a frame has to clear all of them:
+
+    * the **texture limit** in px, because the overview is one texture per channel;
+    * the **texture BYTES** those channels cost (:data:`TEXTURE_BYTES`) — the limit that
+      actually bites, see its note;
+    * the **RAM budget** (:func:`display_ram_bytes`), because these frames land in the
+      :class:`PlaneCache` and playback wants a series of them resident, not one;
+    * **cost to produce**: ``streaming`` marks a provider that COMPUTES each plane (a stitch, a
+      filter chain) rather than reading bytes. Full resolution there is not a texture decision,
+      it is a 4x-per-frame decision — measured on the WellA3 mosaic, level 1 is 0.21 s a frame
+      and level 0 is 1.0 s — and it buys detail you can only see zoomed in, which the viewport
+      detail patch already serves at full resolution where you are actually looking. So a live
+      mosaic stays on the pyramid and a **baked** one (Flatten to Large Image → a store, which
+      is not streaming) gets the whole frame. That is the same normal-vs-progressive split
+      NIS-Elements makes, with cost added to the memory test.
+
+    ``bytes_per_px`` is deliberately pessimistic by default (8 — float64, what a stitch canvas
+    serves): budgeting may be conservative, and over-committing is the failure that matters.
+
+    Below the cap nothing changes: a camera frame was never decimated and is unaffected.
+    """
+    long_edge = max(1, int(getattr(axes, "y", 1)), int(getattr(axes, "x", 1)))
+    if long_edge <= MAX_DISPLAY_DIM:
+        return MAX_DISPLAY_DIM                # nothing to decide; it fits either way
+    if streaming:
+        return MAX_DISPLAY_DIM                # every frame is a compute: stay progressive
+    px = int(axes.y) * int(axes.x) * max(1, int(planes))
+    if (long_edge <= int(texture_limit)
+            and px * 4 <= TEXTURE_BYTES
+            and px * int(max(1, bytes_per_px)) <= display_ram_bytes()):
+        return long_edge
+    return MAX_DISPLAY_DIM
+
 #: How many channels ONE overlay source may contribute to the display.
 #:
 #: The ceiling is the GL sampler bank (``nodelab_v2.glview._MAX_CH`` = 8), shared with the
@@ -202,7 +298,114 @@ def _pick_level(provider: Any, max_dim: int):
     return level, ax
 
 
-def _fit_plane(plane: np.ndarray, max_dim: int) -> np.ndarray:
+def _pick_window_level(provider: Any, want: Tuple[float, float, float, float],
+                       budget: int) -> Tuple[int, Any]:
+    """The finest pyramid level at which the fractional window ``want`` fits ``budget`` px —
+    or the coarsest there is. Returns ``(level, level_axes)``.
+
+    The window, not the whole plane: that is the whole difference between
+    :func:`_pick_level` and this. A 13106² mosaic has no level whose *plane* is small, and
+    picking by plane size is what makes a zoomed-in read coarse — while the 1/20th of it that
+    is on screen fits level 0 comfortably.
+    """
+    fy0, fy1, fx0, fx1 = want
+    level, ax = 0, provider.level_axes(0)
+    for lv in range(max(1, int(getattr(provider, "levels", 1)))):
+        cand = provider.level_axes(lv)
+        level, ax = lv, cand
+        if max((fy1 - fy0) * cand.y, (fx1 - fx0) * cand.x) <= budget:
+            break
+    return level, ax
+
+
+def _snap_window(want: Tuple[float, float, float, float],
+                 lax: Any) -> Tuple[int, int, int, int]:
+    """A fractional window as whole pixel bounds ``(y0, y1, x0, x1)`` of ``lax``, snapped
+    OUTWARD and never empty — a rect that is narrower than what was asked for would leave a
+    hairline of the coarser picture showing along its edge."""
+    fy0, fy1, fx0, fx1 = want
+    ny, nx = max(1, int(lax.y)), max(1, int(lax.x))
+    y0, y1 = int(np.floor(fy0 * ny)), int(np.ceil(fy1 * ny))
+    x0, x1 = int(np.floor(fx0 * nx)), int(np.ceil(fx1 * nx))
+    y1, x1 = min(ny, max(y0 + 1, y1)), min(nx, max(x0 + 1, x1))
+    y0, x0 = max(0, min(y0, y1 - 1)), max(0, min(x0, x1 - 1))
+    return y0, y1, x0, x1
+
+
+def _window_read(provider: Any, m: int, t: int, z: int, c: int,
+                 want: Tuple[float, float, float, float], budget: int
+                 ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+    """``(pixels, covered)`` for a fractional window of one plane — the read behind both the
+    viewport detail patch and the overlay's secondary.
+
+    ``covered`` is the window the returned pixels REALLY span, in the same fractional units
+    as ``want``, because it was snapped out to whole pixels of whichever level was chosen.
+    Area-averaged down to ``budget`` afterwards for the same reason :func:`_fit_plane` exists:
+    point-sampling a window that overshoots the budget is noisier than the data it came from.
+    """
+    level, lax = _pick_window_level(provider, want, budget)
+    y0, y1, x0, x1 = _snap_window(want, lax)
+    plane = np.asarray(provider.get_region(level, int(m), int(t), int(z), int(c),
+                                           y0, y1, x0, x1))
+    covered = (y0 / float(max(1, lax.y)), y1 / float(max(1, lax.y)),
+               x0 / float(max(1, lax.x)), x1 / float(max(1, lax.x)))
+    return _fit_plane(plane, budget), covered
+
+
+def _display_dtype(ds: Any) -> Any:
+    """The dtype this Dataset's DISPLAY planes may be narrowed to, or ``None``.
+
+    ``bit_depth`` is the payload's own statement that its samples are integers of N bits —
+    maintained across the catalog and dropped to ``None`` by every node that makes the values
+    continuous (``enhance.normalize``, the overlay's ``resample``, any float field). So it is
+    exactly the right gate: an integer image narrows, a strain field or a probability does not,
+    and neither has to be scanned to find out.
+
+    ``uint16`` for anything up to 16 bits rather than ``uint8`` for the small ones: the GPU
+    uploader packs to 16-bit regardless, so a second narrowing would buy bytes in the cache and
+    lose a LUT range that a user can legitimately window into.
+    """
+    try:
+        bd = ds.metadata.get("bit_depth")
+    except Exception:  # noqa: BLE001 — a display hint, never a failure
+        return None
+    if isinstance(bd, bool) or not isinstance(bd, (int, float)):
+        return None
+    return np.uint16 if 0 < int(bd) <= 16 else None
+
+
+def _narrow(plane: np.ndarray, as_dtype: Any) -> Optional[np.ndarray]:
+    """``plane`` as ``as_dtype``, or ``None`` when that would not be lossless enough to do
+    silently.
+
+    The one caller is :func:`_fit_plane`, and the point is bytes: ``util.stitch`` fuses in
+    float64 (it has to — a feather blend is a weighted mean), so a 7168² mosaic frame reaches
+    the display as 392 MB of float64 carrying 12-bit data. At 98 MB instead, four times as
+    many frames stay resident, which is the difference between a series that plays from cache
+    and one that re-decodes.
+
+    **Display only.** Level 0 of a stitch is what every node compute reads, and rounding a
+    feather blend there would move a measured intensity — small, but a measurement change made
+    behind the user's back. That is what the Dock's explicit ``precision`` is for. This copy is
+    the one handed to the texture uploader and nothing else.
+
+    Refuses rather than wraps when the values do not fit. The min/max that decides costs one
+    pass (~8% of a full-resolution mosaic read); a wrapped intensity would look like data.
+    """
+    if as_dtype is None:
+        return None
+    dt = np.dtype(as_dtype)
+    if plane.dtype == dt or not np.issubdtype(dt, np.integer):
+        return None
+    info = np.iinfo(dt)
+    if plane.size:
+        lo, hi = float(np.nanmin(plane)), float(np.nanmax(plane))
+        if not (info.min <= lo and hi <= info.max):
+            return None
+    return np.ascontiguousarray(np.rint(plane).astype(dt))
+
+
+def _fit_plane(plane: np.ndarray, max_dim: int, *, as_dtype: Any = None) -> np.ndarray:
     """Decimate ``plane`` to ``max_dim`` on its long edge by **area-averaging**.
 
     This used to be ``plane[::stride, ::stride]``, and point-sampling was the wrong tool
@@ -218,11 +421,15 @@ def _fit_plane(plane: np.ndarray, max_dim: int) -> np.ndarray:
 
     Integer dtypes are rounded back to themselves, so the GPU uploader still picks the same
     texture format and the LUT still spans the same range. ``_sample`` maps a cursor to a
-    texel by RATIO, so nothing downstream depends on the output shape."""
+    texel by RATIO, so nothing downstream depends on the output shape.
+
+    ``as_dtype`` narrows the display copy (see :func:`_narrow`) — free, because both paths
+    below already materialize one."""
     h, w = plane.shape[:2]
     big = max(h, w)
     if big <= max_dim:
-        return np.ascontiguousarray(plane)
+        narrowed = _narrow(plane, as_dtype)
+        return np.ascontiguousarray(plane) if narrowed is None else narrowed
     nh = max(1, int(round(h * max_dim / big)))
     nw = max(1, int(round(w * max_dim / big)))
     ys = (np.arange(nh) * h) // nh
@@ -232,9 +439,28 @@ def _fit_plane(plane: np.ndarray, max_dim: int) -> np.ndarray:
     counts = (np.diff(np.append(ys, h))[:, None]
               * np.diff(np.append(xs, w))[None, :])
     out = acc / counts
-    if np.issubdtype(plane.dtype, np.integer):
-        out = np.rint(out).astype(plane.dtype)
+    keep = (plane.dtype if np.issubdtype(plane.dtype, np.integer)
+            else as_dtype if as_dtype is not None else None)
+    if keep is not None:
+        narrowed = _narrow(out, keep)
+        out = narrowed if narrowed is not None else out
     return np.ascontiguousarray(out)
+
+
+def _plane_key(node_id: str, pin: Optional[Any], m: int, t: int, z: int, ch: int,
+               cap: int) -> tuple:
+    """The one spelling of a :class:`PlaneCache` address.
+
+    It exists because there were two. `_plane_addrs` built a 7-tuple ending in the display
+    cap — for the reason its own comment gives, that several readers write these keys and a
+    disagreement must be a miss rather than a plane served at the wrong size — while
+    `_decode_planes`' two fallback branches built a 6-tuple without it. Those writes landed
+    in slots `_cached_planes` never probes, so the plane was re-decoded (or the overlay
+    re-composed) on every scrub. Worse, the fallback also omitted `max_dim=cap` on the read,
+    so with a cap above :data:`MAX_DISPLAY_DIM` — every docked mosaic that fits the texture
+    and RAM budgets — the shape-reference plane came back decimated to 4096 and the overlay
+    was composed onto a grid the primary channels do not share."""
+    return (node_id, pin, int(m), int(t), int(z), int(ch), int(cap))
 
 
 def render_plane(provider: Any, m: int, t: int, z: int, c: int,
@@ -250,15 +476,20 @@ def render_plane(provider: Any, m: int, t: int, z: int, c: int,
 
 
 def render_plane_native(provider: Any, m: int, t: int, z: int, c: int,
-                        *, max_dim: int = MAX_DISPLAY_DIM) -> Tuple[np.ndarray, int]:
+                        *, max_dim: int = MAX_DISPLAY_DIM,
+                        as_dtype: Any = None) -> Tuple[np.ndarray, int]:
     """A display plane at ``(m,t,z,c)`` in its **native dtype** (uint8/uint16/float) —
     the GPU uploader picks the texture internal format from the dtype, and the CPU
     fallback casts to float. Same level-selection + decimation as :func:`render_plane`,
     but without the ``dtype=float`` cast (which is the expensive per-frame work we push
-    onto the GPU / do once). Returns ``(plane2d, level)``."""
+    onto the GPU / do once). Returns ``(plane2d, level)``.
+
+    ``max_dim`` is the caller's display cap — :func:`display_cap` resolves it per provider, so
+    a frame that fits the texture limit and the RAM budget comes back at LEVEL 0 rather than
+    off the pyramid. ``as_dtype`` narrows the copy (see :func:`_narrow`)."""
     level, ax = _pick_level(provider, max_dim)
     plane = np.asarray(provider.get_region(level, m, t, z, c, 0, ax.y, 0, ax.x))
-    return _fit_plane(plane, max_dim), level
+    return _fit_plane(plane, max_dim, as_dtype=as_dtype), level
 
 
 #: the run scope: the ``(ms, ts, zs)`` picks every source seed is restricted to, or
@@ -288,15 +519,29 @@ def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEn
     it. Clamping shows the nearest real plane; raising would turn a stale cursor into a
     failed pull.
 
-    Calibration passes through untouched — ``dt_s`` and ``z_step_um`` still describe the
-    source's own interval and spacing, exactly as :func:`nodegraph.metadata.frame_slice`
-    reasons for ``zone.frame``.
+    Scalar calibration passes through untouched — ``dt_s`` and ``z_step_um`` still describe
+    the source's own interval and spacing, exactly as
+    :func:`nodegraph.metadata.frame_slice` reasons for ``zone.frame``.
+
+    **Per-M lists are not scalar and do NOT pass through**: they are indexed by multipoint
+    (:data:`nodegraph.metadata.PER_POSITION_KEYS`) and read positionally, so narrowing M
+    while leaving them full-length hands every consumer the wrong POSITION's coordinate.
+    Picking M = (10, 11, 12) and stitching put the tiles at positions 0-2's stage µm, which
+    reads as a handedness bug rather than as a stale list. `origin_um` is subset here for
+    the same reason and by the same call — the identical discipline
+    :func:`nodegraph.metadata.channel_subset` applies on the channel axis.
+
+    The picks are clamped by the provider, so they are re-derived from the VIEW's own axes
+    rather than from ``pin`` — a cursor past the end of a shrunken source names a real
+    position after clamping, and the subset must use the position actually served.
     """
     ms, ts, zs = pin
     view = (FrameSliceProvider(provider, ms[0], ts[0], zs) if len(ms) == len(ts) == 1
             else FrameSubsetProvider(provider, ms, ts, zs))
-    return view, env.with_axes(replace(env.axes, m=view.axes.m, t=view.axes.t,
-                                       z=view.axes.z))
+    out = env.with_axes(replace(env.axes, m=view.axes.m, t=view.axes.t, z=view.axes.z))
+    kept = _picked(ms, int(env.axes.m))
+    changes = position_subset(env.metadata, kept)
+    return view, (out.with_metadata(**changes) if changes else out)
 
 
 class PlaneCache:
@@ -308,15 +553,28 @@ class PlaneCache:
 
     The default budget is RAM-derived (V2.14, :func:`nodegraph.parallel.plane_cache_bytes`).
     At the old fixed 512 MiB it held only ~64 planes, so a 200-frame 2-channel series
-    evicted faster than a scrub could read it and every frame was re-decoded."""
+    evicted faster than a scrub could read it and every frame was re-decoded.
+
+    **One budget, not two** (V2.23). This cache holds decoded display frames, which is exactly
+    what :func:`display_ram_bytes` is the budget *for* — and the two disagreeing is not a
+    tuning question, it is a bug: a preload sized against one and stored in the other evicts
+    its own head and re-decodes every lap. So the default is the display budget (25% of RAM,
+    configurable), floored by the historical ``plane_cache_bytes`` so no machine gets less than
+    it used to. ``NODEGRAPH_PLANE_CACHE_BYTES`` still overrides both."""
 
     def __init__(self, budget_bytes: Optional[int] = None) -> None:
         if budget_bytes is None:
-            budget_bytes = plane_cache_bytes()
+            budget_bytes = max(plane_cache_bytes(), display_ram_bytes())
         self._budget = int(budget_bytes)
         self._d: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._bytes = 0
         self._lock = threading.Lock()
+
+    @property
+    def budget(self) -> int:
+        """The byte ceiling — what a preload must size itself against, since this is where the
+        frames it decodes actually live."""
+        return self._budget
 
     def get(self, key: tuple) -> Optional[np.ndarray]:
         with self._lock:
@@ -380,6 +638,61 @@ class _Job:
         self.bake = bake              # a Dock bake request: {store, precision, sig, …}
 
 
+class _PullThread:
+    """The ONE thread every node compute runs on, for the life of the process.
+
+    A pull used to be a :class:`QRunnable` on ``QThreadPool.globalInstance()``, and that is
+    what made the app die — natively, with no traceback — on the **second** CellSAM pull of a
+    session (2026-08-03). A pool recycles one OS thread but *Qt* created it, so CPython
+    re-adopts it as a fresh ``Dummy-N`` ``threading.Thread`` on every pull. Measured: three
+    pulls reported ``Dummy-1``/``Dummy-2``/``Dummy-3`` all with ``ident=9136`` — one OS
+    thread wearing three Python thread states. torch leaves per-thread native state attached
+    to that OS thread, so the second pull's inference ran against state belonging to a thread
+    identity that no longer existed: ``Windows fatal exception: code 0xc0000374``
+    (heap corruption) inside ``torch.from_numpy``, and when a model rebuild happened on that
+    thread CPython said it outright — ``_PyThreadState_Attach: non-NULL old thread state``.
+
+    A plain ``threading.Thread`` is the fix precisely because **Python** creates it: one real
+    ``Thread`` object, one thread state, created once and never re-adopted. That is the
+    configuration the isolating repros proved safe — the same 32 tiled CellSAM calls that
+    pass on the main thread crash on the second pull through a pool. A ``QThread`` would not
+    have done: it is Qt-created too, and only avoids the bug by accident of living long
+    enough. Nothing here needs a Qt event loop; results reach the GUI the way they always
+    did, through the runner's queued signals, which are safe to emit from any thread.
+
+    It costs nothing in concurrency: a pull was ALREADY single-slot latest-wins
+    (``_busy``/``_pending``, resolved on the GUI thread), so exactly one job ran at a time
+    anyway. The decode / prefetch / detail jobs stay on the shared pool — they read
+    providers rather than owning native per-thread state, and serializing them would undo
+    the display fast path.
+
+    Daemon, so a queued pull can never hold the app open at exit.
+    """
+
+    def __init__(self) -> None:
+        import queue
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, name="nodelab-pull",
+                                        daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            job = self._q.get()
+            try:
+                job.run()
+            except BaseException:  # noqa: BLE001 — the loop must outlive any single job
+                # `_Worker.run` already converts every exception into a delivered packet, so
+                # reaching here means the delivery itself failed. Swallow it: a dead pull
+                # thread would wedge every future pull with no way back short of a restart.
+                traceback.print_exc()
+
+    def start(self, job: Any) -> None:
+        """Queue a job (duck-typed ``.run()``) — the ``QThreadPool.start`` signature, so
+        the call sites read unchanged."""
+        self._q.put(job)
+
+
 class _Worker(QRunnable):
     def __init__(self, runner: "EngineRunner", job: _Job) -> None:
         super().__init__()
@@ -407,6 +720,10 @@ class _Worker(QRunnable):
             axes = None
             if isinstance(payload, Dataset) and payload.image is not None:
                 axes = payload.axes
+                # Set BEFORE the decode: `_plane_addrs` folds the display cap into every plane
+                # key and the cap's byte estimate depends on whether the planes narrow. Same
+                # write-on-the-worker discipline as `_overlay_ctx` above.
+                r._viewer_dtype = _display_dtype(payload)
                 if job.coords is not None:
                     # a lazy chain does its real work HERE, under the viewed node's name —
                     # report it as that node's state so the card isn't idle while the
@@ -415,7 +732,7 @@ class _Worker(QRunnable):
                                       {"epoch": job.epoch, "op_key": ""}))
                     plane = r._decode_planes(payload.image, job.node_id,
                                              job.coords, job.channels, axes,
-                                             pin=job.pin)
+                                             pin=job.pin, overlay_all=True)
             dt = time.perf_counter() - t0
             r._done.emit((job.epoch, job.node_id, payload, plane, axes, dt, None,
                           job.revision, job.coords, job.channels, job.pin))
@@ -546,10 +863,59 @@ class _PrefetchJob(QRunnable):
                 # the engine's TileCache was unsynchronized; the cache carries its own lock
                 # now, so holding one here only forced the prefetch pool to decode one frame
                 # at a time — the opposite of what a prefetcher is for.
-                arr, _lv = render_plane_native(prov, m, t, z, ch)
+                # The cap rides in the key (V2.23) — it must, because this writes planes the
+                # displayed-frame path then reads, and a prefetcher decimating to a different
+                # size would have it serve frames of the wrong shape.
+                arr, _lv = render_plane_native(prov, m, t, z, ch, max_dim=int(key[-1]),
+                                               as_dtype=r._viewer_dtype)
                 r._planes.put(key, arr)
             except Exception:                # noqa: BLE001 — prefetch is best-effort
                 return
+
+
+class _PreloadJob(QRunnable):
+    """Decode a share of the series into the :class:`PlaneCache` so playback can run off it.
+
+    Deliberately NOT a :class:`_PrefetchJob` with a longer list, for two reasons that are the
+    whole point of the class:
+
+    * **it has its own cancellation generation.** The prefetcher's is bumped by every cursor
+      move, and playback moves the cursor — so a preload sharing it died on the first frame
+      advance and playback went back to decoding each frame as it arrived. That is precisely
+      the "it loads every time" report (2026-08-05). A preload is cancelled by an edit, a node
+      change, a new preload, or stopping playback; never by the cursor it exists to serve.
+    * **several run at once.** Measured on the WellA3 mosaic with a cold tile cache, one
+      whole-canvas stitch is 1.03 s and four in parallel are 0.51 s each — ~2x, tailing off
+      past four (0.43 s at eight), because the source-tile reads parallelize but the paste
+      contends. So the fan-out is capped low, which also leaves pool threads for the frame
+      being *displayed*: starving that to prefetch the future would be exactly backwards.
+
+    Every plane decoded ticks the runner, so the window can show real progress and start
+    playback when the series is actually ready rather than hoping."""
+
+    def __init__(self, runner: "EngineRunner", gen: int,
+                 jobs: List[Tuple[tuple, int, int, int, int]]) -> None:
+        super().__init__()
+        self._r, self._gen, self._jobs = runner, gen, jobs
+
+    def run(self) -> None:  # worker thread
+        r = self._r
+        prov = r._viewer_provider
+        for (key, m, t, z, ch) in self._jobs:
+            if self._gen != r._preload_gen or prov is None:
+                return                       # cancelled: an edit, a stop, or a newer preload
+            if r._planes.get(key) is None:
+                try:
+                    arr, _lv = render_plane_native(prov, m, t, z, ch,
+                                                   max_dim=int(key[-1]),
+                                                   as_dtype=r._viewer_dtype)
+                    r._planes.put(key, arr)
+                except Exception:            # noqa: BLE001 — one unreadable frame must not
+                    pass                     # abandon the rest of the series
+            try:
+                r._preload_tick.emit((self._gen, 1))
+            except RuntimeError:
+                return    # the runner was destroyed under us (app teardown): stop, quietly
 
 
 class _DetailJob(QRunnable):
@@ -616,6 +982,13 @@ class EngineRunner(QObject):
     #: with the rect in NORMALIZED image coordinates, so it is independent of both the
     #: patch's own resolution and the overview's.
     detail_ready = Signal(str, object, object)
+    #: a playback preload advanced: ``(node_id, done, total)``. Emitted on the GUI thread so the
+    #: window can show progress and — the point — start the play timer only once the frames are
+    #: actually resident, which is what makes playback of a computed chain smooth instead of
+    #: stuttering at decode speed.
+    preload_progress = Signal(str, int, int)
+    #: the preload finished or was cancelled: ``(node_id, completed)``.
+    preload_finished = Signal(str, bool)
     #: a source card's own ingest started / ended (V2.21, :meth:`ingest_source`):
     #: ``(node_id)`` and ``(node_id, seconds, traceback-or-None)``. Separate from
     #: ``started``/``finished``, which belong to the single pull slot — several ingests run
@@ -625,6 +998,7 @@ class EngineRunner(QObject):
 
     _done = Signal(object)                       # internal cross-thread delivery
     _detail_done = Signal(object)                # internal: _DetailJob → GUI thread
+    _preload_tick = Signal(object)               # internal: _PreloadJob → GUI thread
     _progress = Signal(object)                   # internal cross-thread progress delivery
     _planes_done = Signal(object)                # internal: _DecodeJob → GUI thread
     _ingest_done = Signal(object)                # internal: _IngestJob → GUI thread
@@ -632,7 +1006,11 @@ class EngineRunner(QObject):
     def __init__(self, document) -> None:
         super().__init__()
         self.document = document
+        #: the shared pool, for the jobs that only READ providers (display decode, prefetch,
+        #: viewport detail). Deliberately NOT the pull: see :class:`_PullThread`.
         self._pool = QThreadPool.globalInstance()
+        #: the single Python-owned thread every node compute runs on (:class:`_PullThread`).
+        self._pull_thread = _PullThread()
         # Persists across engine rebuilds — so it's the memory hazard V2.04 flagged: an
         # eager full-raster node in a high-T zone would otherwise pin one raster per
         # iteration forever. Cap it with a byte-budget LRU (Memo GC); eviction only costs
@@ -688,7 +1066,18 @@ class EngineRunner(QObject):
         self._viewer_axes: Any = None
         self._viewer_rev: int = -1               # document.revision the provider belongs to
         self._viewer_pin: Optional[Pin] = None   # the scope it was pulled for
+        #: dtype the viewed node's display planes may be narrowed to, or ``None`` — set from
+        #: the payload's declared bit depth (see :func:`_display_dtype`).
+        self._viewer_dtype: Any = None
+        #: what one texture axis may be, from the live surface (:meth:`set_display_limits`).
+        self._texture_limit: int = DEFAULT_TEXTURE_LIMIT
         self._prefetch_gen = 0
+        # ── playback preload (see `preload_series`) — its OWN generation, because the
+        #    prefetcher's is bumped by the very cursor moves a preload exists to serve ──
+        self._preload_gen = 0
+        self._preload_node: Optional[str] = None
+        self._preload_total = 0
+        self._preload_done = 0
         # The displayed-plane decode is asynchronous when the plane is COLD (see
         # :class:`_DecodeJob`): one job in flight, one latest-wins pending request. A warm
         # plane never reaches this — it is served inline from the PlaneCache.
@@ -716,6 +1105,23 @@ class EngineRunner(QObject):
         # ── per-node progress bookkeeping ─────────────────────────────────────────
         #: epoch → the in-flight bake request (see :meth:`bake`), consumed by `_deliver`
         self._bakes: Dict[int, Dict[str, Any]] = {}
+        #: node_id → the Dataset a ``held`` dock is serving, and its envelope. Modelled on
+        #: :attr:`_providers` (keyed by source path): a payload cache that must OUTLIVE every
+        #: engine rebuild, because `_ensure_engine` builds a new Engine per document revision
+        #: and re-derives its seeds on every pull — so anything held on the engine would be
+        #: dropped by the next edit, which is exactly when a hold has to survive.
+        #:
+        #: A seed, not a memo entry, and that is load-bearing: `Memo._evict_to_budget` drops
+        #: entries on recency alone and is documented as "always correctness-safe" precisely
+        #: because dropping one only costs a recompute. For a held dock the upstream edge is
+        #: CUT, so an eviction would not cost a recompute — it would lose the data.
+        self._held: Dict[str, Dataset] = {}
+        self._held_envs: Dict[str, MetaEnvelope] = {}
+        #: set by :meth:`request_stop_bake`, polled by the writer at every block boundary.
+        #: A plain bool rather than an Event: it is written by the GUI thread and read by the
+        #: worker, and a torn read of a bool that only ever goes False→True cannot be wrong
+        #: in a way that matters — the worst case is one extra block written before it stops.
+        self._stop_bake: bool = False
         self._last_progress: Dict[str, float] = {}   # node_id → last delivery (perf time)
         self._last_frame: Dict[str, int] = {}        # node_id → last delivered frame step
         self._last_sweep: Dict[str, bool] = {}       # node_id → was the sub bar sweeping?
@@ -729,6 +1135,7 @@ class EngineRunner(QObject):
         self._progress.connect(self._deliver_progress)
         self._planes_done.connect(self._deliver_planes)
         self._detail_done.connect(self._deliver_detail)
+        self._preload_tick.connect(self._deliver_preload_tick)
         self._ingest_done.connect(self._deliver_ingest)
         document.on_change(self._prune)
 
@@ -800,6 +1207,16 @@ class EngineRunner(QObject):
         this stays False while a folder's worth of files is being written to disk."""
         return self._busy
 
+    @property
+    def baking(self) -> bool:
+        """Whether the job in flight is a **bake that writes** — so a Stop is offered only
+        when there is something to stop.
+
+        A ``hold`` is excluded on purpose: it writes nothing and finishes at the speed of the
+        pull it needs, so there is no long write for a Stop to interrupt, and offering one
+        would imply a partial artifact that cannot exist."""
+        return any(not spec.get("hold") for spec in self._bakes.values())
+
     def _deliver_ingest(self, packet) -> None:       # GUI thread (queued)
         node_id, key, seconds, err = packet
         # Every card naming this same file finishes with it — one job served them all.
@@ -826,6 +1243,47 @@ class EngineRunner(QObject):
                     self.document.set_meta_seed(nid, env)
         for nid in done:
             self.ingest_finished.emit(nid, float(seconds), err)
+
+    # ── display resolution policy (V2.23) ─────────────────────────────────────
+    #
+    # One question, asked in one place: is this frame shown WHOLE at full resolution, or off
+    # the pyramid with a detail patch filling in where you look? Nikon asks it once per image
+    # against `MaxMemoryImageSize`; the same decision, against the same 25%-of-RAM default,
+    # lives here — see `display_cap`.
+    #
+    # The answer MUST be a pure function of (axes, channel count) for a given machine, because
+    # it decides the SHAPE of a plane that goes into the PlaneCache under a key several other
+    # readers write to. Two writers disagreeing about the cap would serve each other's planes
+    # at the wrong size. The cap is in the cache key as well, so even a disagreement is a miss
+    # rather than a wrong picture.
+
+    def set_display_limits(self, texture_px: int) -> None:
+        """Tell the runner what the live surface can actually upload (its
+        ``GL_MAX_TEXTURE_SIZE``, or :data:`MAX_DISPLAY_DIM` for the CPU backend, which has no
+        texture but does have a QImage the size of the frame).
+
+        Called when a surface comes up, and on a backend switch. Bumps nothing and clears
+        nothing: the cap is part of every plane key, so planes decoded under the old limit are
+        simply never looked up again."""
+        px = max(int(MAX_DISPLAY_DIM), int(texture_px or 0))
+        if px != self._texture_limit:
+            self._texture_limit = px
+
+    def display_dim(self, axes: Any, *, planes: int = 1, provider: Any = None) -> int:
+        """The display cap for the viewed node's frames — full resolution when one frame of
+        every shown channel is affordable in texture, in RAM, and to PRODUCE.
+
+        ``provider`` decides the last of those and defaults to the held one; it is passed
+        explicitly by :meth:`_decode_planes`, which runs on the worker DURING the pull that
+        will later install it — reading the held one there would answer for the node being
+        replaced, and the answer is folded into every plane key."""
+        if axes is None:
+            return MAX_DISPLAY_DIM
+        prov = self._viewer_provider if provider is None else provider
+        return display_cap(axes, texture_limit=self._texture_limit,
+                           bytes_per_px=(2 if self._viewer_dtype is not None else 8),
+                           planes=planes,
+                           streaming=isinstance(prov, StreamProvider))
 
     # ── viewport detail-on-demand ─────────────────────────────────────────────
     def request_detail(self, node_id: str, coords, channels, rect01, budget: int) -> bool:
@@ -859,38 +1317,52 @@ class EngineRunner(QObject):
         The returned rect is the one actually read — snapped out to whole pixels of the
         chosen level — because the caller has to place the patch on screen and a rect that
         disagrees with the pixels by half a texel shows up as a seam against the overview
-        underneath it."""
+        underneath it.
+
+        The OVERLAY is composed onto the patch too, against the snapped rect. It has to be:
+        the detail quad is drawn opaquely over the overview inside its own rect, so a patch
+        that carried only the primary's channels *erased* the overlay wherever you zoomed in —
+        the "it disappears when I zoom" report (2026-08-04). Composing it here is also what
+        makes zooming show more of the secondary, since the composite is re-sampled from a
+        window of the secondary at the patch's own resolution."""
         pin = self._viewer_pin
         # the SAME re-addressing the display planes get, so a detail patch under the
         # solo-frame scope reads the frame the overview is showing, not the global one
         m, t, z, cur_c = self._clamp_coords(self._payload_coords(coords, pin), axes)
         x0, y0, x1, y1 = rect01
-        fy, fx = max(1, int(axes.y)), max(1, int(axes.x))
         # clamp + require a non-degenerate rect (a fully zoomed-out view asks for none)
         x0, x1 = max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))
         y0, y1 = max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))
         if x1 - x0 <= 0 or y1 - y0 <= 0:
             return {}, rect01
-        levels = max(1, int(getattr(prov, "levels", 1)))
-        level, lax = levels - 1, prov.level_axes(levels - 1)
-        for lv in range(levels):                 # finest level whose ROI fits the budget
-            cand = prov.level_axes(lv)
-            if max((x1 - x0) * cand.x, (y1 - y0) * cand.y) <= budget:
-                level, lax = lv, cand
-                break
-        ly0, ly1 = int(np.floor(y0 * lax.y)), int(np.ceil(y1 * lax.y))
-        lx0, lx1 = int(np.floor(x0 * lax.x)), int(np.ceil(x1 * lax.x))
-        ly1, lx1 = min(lax.y, max(ly0 + 1, ly1)), min(lax.x, max(lx0 + 1, lx1))
-        ly0, lx0 = max(0, min(ly0, ly1 - 1)), max(0, min(lx0, lx1 - 1))
+        want = (y0, y1, x0, x1)
+        level, lax = _pick_window_level(prov, want, budget)
+        ly0, ly1, lx0, lx1 = _snap_window(want, lax)
         out: Dict[int, np.ndarray] = {}
         for ch in (channels if channels else (cur_c,)):
-            ch = min(max(0, int(ch)), axes.c - 1)
+            ch = int(ch)
+            if ch >= int(axes.c):
+                continue          # a composed OVERLAY channel: it is not in this provider
+            ch = min(max(0, ch), axes.c - 1)
             if ch in out:
                 continue
             arr = np.asarray(prov.get_region(level, m, t, z, ch, ly0, ly1, lx0, lx1))
-            out[ch] = _fit_plane(arr, budget)
+            out[ch] = _fit_plane(arr, budget, as_dtype=self._viewer_dtype)
         # the rect the pixels REALLY cover, in normalized coords
         snapped = (lx0 / lax.x, ly0 / lax.y, lx1 / lax.x, ly1 / lax.y)
+        if out and self._overlay_ctx is not None:
+            ref = next(iter(out.values()))
+            composed = self._compose_overlay(
+                node_id, ref.shape[:2], m, t,
+                _z_um_of(self._overlay_ctx["pri_md"], self._overlay_ctx["pri_axes"], m, z),
+                # the SNAPPED rect, in the (fy0, fy1, fx0, fx1) order placement uses: the
+                # patch's pixels cover that box and not the one that was requested
+                region=(ly0 / lax.y, ly1 / lax.y, lx0 / lax.x, lx1 / lax.x))
+            # the caller asked for a channel set; an overlay channel whose toggle is off is
+            # not in it, and the patch must not put back what the overview leaves out
+            want = {int(ch) for ch in (channels or ()) if int(ch) >= int(axes.c)}
+            out.update({ch: pl for ch, pl in composed.items()
+                        if not channels or ch in want})
         return out, snapped
 
     def _deliver_detail(self, packet) -> None:            # GUI thread
@@ -952,6 +1424,8 @@ class EngineRunner(QObject):
         # …and the same for an in-flight viewport detail patch, which is reading through
         # the provider this call is about to drop
         self.invalidate_detail()
+        # A preload is reading that provider too, and its planes are about to be wrong.
+        self.cancel_preload()
         # the composed overlay belongs to the graph that produced it — an edit can change
         # the placement, the pairing or the secondary chain entirely
         self._overlay_ctx = None
@@ -1063,7 +1537,8 @@ class EngineRunner(QObject):
                      zip(coords, (axes.m, axes.t, axes.z, axes.c)))
 
     def _plane_addrs(self, node_id, coords, channels, axes,
-                     *, pin: Optional[Pin] = None) -> List[Tuple[tuple, int, int, int, int]]:
+                     *, pin: Optional[Pin] = None, provider: Any = None
+                     ) -> List[Tuple[tuple, int, int, int, int]]:
         """``(key, m, t, z, ch)`` per requested channel — the :class:`PlaneCache` addresses
         one display update needs, de-duplicated. Shared by the cache probe and the decode so
         the two can never disagree about a key.
@@ -1075,16 +1550,34 @@ class EngineRunner(QObject):
         the short payload (:meth:`_payload_coords`), and it IS part of the key: under the
         scope a payload addresses its first frame as ``t == 0``, so ten different scoped
         selections would otherwise all write ``(node, 0, 0, z, ch)`` and serve each
-        other's pixels."""
+        other's pixels.
+
+        A composed OVERLAY channel (an index at or above the payload's own channel count)
+        gets a cache slot of its own — the index cannot collide with a real one, and
+        :meth:`_decode_planes` fills it. It used to be *clamped* into the primary's range,
+        which meant a warm frame was served without the overlay at all: scrubbing then blinked
+        the secondary off on every frame that happened to be decoded already, and back on for
+        every frame that was not."""
         m, t, z, c = self._clamp_coords(self._payload_coords(coords, pin), axes)
+        ovl = self.overlay_channels(node_id)
+        wanted = [int(v) for v in (channels if channels else (c,))]
+        # The display CAP is part of the key (V2.23). It decides the plane's shape, several
+        # readers write these keys (the decode, the prefetcher, the raw probe), and the limit it
+        # comes from can arrive late — a surface coming up raises it. Keying on it turns any
+        # disagreement into a cache miss instead of a plane served at the wrong size.
+        cap = self.display_dim(axes, planes=max(1, len(set(wanted))), provider=provider)
         out: List[Tuple[tuple, int, int, int, int]] = []
         seen: set = set()
-        for ch in (channels if channels else (c,)):
-            ch = min(max(0, int(ch)), axes.c - 1)
+        for ch in wanted:
+            if ch >= int(axes.c):
+                if ch not in ovl:
+                    continue          # a stale index from a node that no longer overlays
+            else:
+                ch = min(max(0, ch), axes.c - 1)
             if ch in seen:
                 continue
             seen.add(ch)
-            out.append(((node_id, pin, m, t, z, ch), m, t, z, ch))
+            out.append((_plane_key(node_id, pin, m, t, z, ch, cap), m, t, z, ch))
         return out
 
     def _cached_planes(self, node_id, coords, channels, axes,
@@ -1126,12 +1619,34 @@ class EngineRunner(QObject):
         while cur and cur not in seen:
             seen.add(cur)
             node = graph.nodes.get(cur)
-            if node is None or node.op_key != "view.overlay":
+            if node is None:
                 break
-            sec = [e.src for e in graph.preds(cur) if e.dst_socket == "secondary"]
             pri = [e.src for e in graph.preds(cur) if e.dst_socket == "data"]
-            if sec:
-                out.append((cur, sec[0]))
+            if node.op_key == "view.overlay":
+                sec = [e.src for e in graph.preds(cur) if e.dst_socket == "secondary"]
+                if sec:
+                    out.append((cur, sec[0]))
+            else:
+                # ANY node may declare an auxiliary Dataset input a viewer SOURCE
+                # (`SocketSpec.view_source`, 2026-08-04). `analysis.voronoi`'s `areas` is the
+                # first: the payload carries only the primary's image, so a graph whose seeds
+                # and areas came from two channels could only ever show one of them. Same
+                # compositing path as an Overlay from here on — the placement entry is
+                # synthesized in `_resolve_overlay`, since these nodes stamp no recipe.
+                from nodegraph.registry import NODES as _NODES
+                _spec = _NODES.get(node.op_key)
+                _vs = {s.name for s in getattr(_spec, "inputs", ())
+                       if getattr(s, "view_source", False)} if _spec else set()
+                if _vs:
+                    for e in graph.preds(cur):
+                        if e.dst_socket in _vs:
+                            out.append((cur, e.src))
+                            break        # one source per node, like `secondary`
+            # Walk THROUGH a non-overlay node rather than stopping at it. The recipe rides
+            # on `Dataset.metadata`, so it survives every node downstream of the overlay —
+            # view an `Overlay -> Stitch` at the Stitch and the overlay is still logically
+            # present, and stopping here is why it drew nothing (reported 2026-08-03).
+            # The primary edge is the spine either way.
             cur = pri[0] if pri else None
         out.reverse()                      # base-first, the order they composite in
         return out
@@ -1152,28 +1667,59 @@ class EngineRunner(QObject):
         if not isinstance(payload, Dataset):
             return None
         recipe = payload.metadata.get(OVERLAY_KEY) or ()
-        if len(recipe) < 2:
+        chain = self.overlay_chain(graph, node_id)
+        if not chain:
             return None
+        # A `view.overlay` STAMPS its plan; a `view_source` socket's node does not (and must
+        # not — display config has no business in a payload the memo keys on). So the entry is
+        # synthesized for those, and the absence of a recipe is no longer a reason to bail.
         by_node = {str(e.get("node")): dict(e) for e in recipe[1:] if isinstance(e, dict)}
         base_c = int(payload.axes.c)
         budget = max(0, GL_MAX_CHANNELS - base_c)
         sources: List[Dict[str, Any]] = []
         dropped = 0
-        for ovl_id, sec_id in self.overlay_chain(graph, node_id):
+        for ovl_id, sec_id in chain:
             entry = by_node.get(ovl_id)
-            if entry is None:
-                continue                   # its node did not stamp — nothing to place with
+            synthetic = entry is None
+            if synthetic and not self._is_view_source_node(ovl_id):
+                continue                   # an Overlay that did not stamp: nothing to place
             try:
                 sec = engine.pull(sec_id)
             except Exception:  # noqa: BLE001 — a broken source must not kill the view
                 continue
             if not isinstance(sec, Dataset) or sec.image is None:
                 continue
+            if synthetic:
+                entry = self._view_source_entry(ovl_id, payload, sec)
+                if entry is None:
+                    continue
+            # RE-PLAN against the geometry actually being viewed. A stamped plan is a
+            # cache keyed on the primary's geometry AT THE OVERLAY NODE, and a Stitch /
+            # Crop / Resample after the overlay changes exactly that — the stamped tiles
+            # would place the secondary against fields that no longer exist (a stitch
+            # collapses twelve of them into one). Re-planning is pure metadata arithmetic
+            # and it is what makes the overlay follow its primary through anything that
+            # keeps `origin_um` true.
+            # ...but a SYNTHETIC entry was already planned against this very payload just
+            # above, and `_replan` would re-read blend params off a node that has none —
+            # picking up `overlay_entry`'s `flip_x=True` default, which is right for a
+            # secondary from another acquisition and wrong for a sibling branch of one file.
+            if not synthetic:
+                entry = self._replan(ovl_id, entry, payload, sec)
             n = min(int(sec.axes.c), MAX_OVERLAY_CHANNELS)
             if n <= 0 or n > budget:
                 dropped += 1
                 continue
             sources.append({"entry": entry, "ovl_id": ovl_id,
+                            # A `view_source` wire is not an OVERLAY, it is another CHANNEL of
+                            # the same acquisition — "I don't want an overlay, I want the
+                            # channel to be active" (2026-08-04). So it takes the socket's name
+                            # on the channel strip instead of `ovl1:`, and full opacity instead
+                            # of an Overlay node's 0.5: at half strength a second channel reads
+                            # as a wash over the first rather than as itself.
+                            "as_channel": synthetic,
+                            "prefix": (self._view_source_socket(graph, ovl_id)
+                                       if synthetic else ""),
                             "sec_md": dict(sec.metadata),
                             "sec_axes": sec.axes, "sec_provider": sec.image,
                             "base_c": base_c + (GL_MAX_CHANNELS - base_c - budget),
@@ -1184,9 +1730,22 @@ class EngineRunner(QObject):
         return {"node": node_id, "sources": sources, "dropped": dropped,
                 "pri_md": dict(payload.metadata), "pri_axes": payload.axes}
 
-    def _compose_overlay(self, node_id: str, out_shape, m: int, t: int,
-                         z_um) -> Dict[int, np.ndarray]:
+    def _compose_overlay(self, node_id: str, out_shape, m: int, t: int, z_um,
+                         *, region=None) -> Dict[int, np.ndarray]:
         """``{channel_index: composed plane}`` for the overlay on ``node_id``, or ``{}``.
+
+        ``region`` is a fractional ``(fy0, fy1, fx0, fx1)`` sub-rect of the primary's image
+        that ``out_shape`` covers — ``None`` for the whole field (the overview), the patch's
+        own rect when a zoomed viewport asked for detail. Both go through one function, so the
+        overlay cannot be present at one zoom level and absent at another.
+
+        **The secondary is read as a WINDOW, at the finest pyramid level that window fits in**
+        (:func:`_window_read`). It used to be read as a whole plane decimated to
+        ``MAX_DISPLAY_DIM`` — which is the source's own overview, and when the primary's field
+        is a small part of a stitched secondary that is a handful of source pixels magnified
+        over the whole display: "not the raw channel data" exactly. A window costs the same
+        read or less and scales with the zoom, so magnifying the picture now resolves more of
+        the secondary rather than more of the blur.
 
         Never raises: an overlay that cannot be drawn must cost the user their overlay, not
         their image."""
@@ -1195,6 +1754,9 @@ class EngineRunner(QObject):
         ctx = self._overlay_ctx
         if not ctx or ctx["node"] != node_id:
             return {}
+        # The composite is sampled onto `out_shape`, so reading the window any finer than that
+        # would be thrown away by the nearest-neighbour map — and any coarser is the blur.
+        budget = max(1, int(max(out_shape[0], out_shape[1])))
         out: Dict[int, np.ndarray] = {}
         for src in ctx.get("sources", ()):
             # Per SOURCE, so one source that cannot be placed at this frame (an unpaired
@@ -1215,15 +1777,15 @@ class EngineRunner(QObject):
                                           z_um, dz=dz)
                 prov = src["sec_provider"]
                 for k in range(int(src["n"])):
-                    def read_tile(j, _k=k, _p=prov, _t=t_sec, _z=z_sec):
+                    def read_tile(j, want, _k=k, _p=prov, _t=t_sec, _z=z_sec):
                         try:
-                            arr, _lv = render_plane_native(_p, int(j), int(_t), int(_z), _k)
-                            return arr
+                            return _window_read(_p, int(j), int(_t), int(_z), _k,
+                                                want, budget)
                         except Exception:  # noqa: BLE001 — one bad tile, not a crash
                             return None
                     composed = compose_secondary_plane(
                         entry, out_shape, ctx["pri_md"], ctx["pri_axes"], int(m),
-                        src["sec_md"], sec_ax, read_tile)
+                        src["sec_md"], sec_ax, read_tile, region=region)
                     if composed is not None:
                         out[int(src["base_c"]) + k] = composed
             except Exception:  # noqa: BLE001 — the image must survive a bad overlay
@@ -1275,8 +1837,11 @@ class EngineRunner(QObject):
             for k in range(int(src["n"])):
                 label = str(names[k]) if k < len(names) and names[k] else str(k)
                 # the source's ordinal is in the label, so three overlaid files are
-                # tellable apart on the channel strip without opening the graph
-                out[int(src["base_c"]) + k] = f"ovl{i + 1}:{label}"
+                # tellable apart on the channel strip without opening the graph. A
+                # `view_source` wire is named by its SOCKET instead — it is a channel of this
+                # graph, not the nth overlaid file, and `ovl1:` misdescribes it.
+                pre = str(src.get("prefix") or "")
+                out[int(src["base_c"]) + k] = f"{pre}:{label}" if pre else f"ovl{i + 1}:{label}"
         return out
 
     #: `blend` Mode value → the shader's mode number. Kept here, next to the only reader,
@@ -1290,6 +1855,119 @@ class EngineRunner(QObject):
     #: shader has no notion of time, which it should not.
     BLEND_MODES = {"add": 0, "over": 1, "difference": 2, "checkerboard": 3,
                    "wipe": 4, "flicker": 0}
+
+    @staticmethod
+    def _view_source_socket(graph, node_id: str) -> str:
+        """The name of the wired ``view_source`` socket on ``node_id`` (``""`` if none)."""
+        try:
+            from nodegraph.registry import NODES
+            node = graph.nodes.get(node_id)
+            spec = NODES.get(node.op_key) if node is not None else None
+            names = {s.name for s in getattr(spec, "inputs", ())
+                     if getattr(s, "view_source", False)}
+            for e in graph.preds(node_id):
+                if e.dst_socket in names:
+                    return str(e.dst_socket)
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def _is_view_source_node(self, node_id: str) -> bool:
+        """Whether ``node_id``'s op declares any ``view_source`` Dataset input."""
+        try:
+            from nodegraph.registry import NODES
+            node = self.document.nodes.get(node_id)
+            spec = NODES.get(node.op_key) if node is not None else None
+            return bool(spec) and any(getattr(s, "view_source", False)
+                                      for s in spec.inputs)
+        except Exception:  # noqa: BLE001 — a display question must never break a pull
+            return False
+
+    def _view_source_entry(self, ovl_id: str, payload, sec) -> Optional[Dict[str, Any]]:
+        """A placement entry for a ``view_source`` socket — synthesized, not stamped.
+
+        These nodes record nothing: display configuration in a payload would ride the memo
+        key, and `view.overlay` exists precisely so that "how it looks" is a graph decision
+        with its own node. So the plan is built here, through the SAME
+        :func:`~nodegraph.placement.plan_placement` + ``overlay_entry`` pair a real Overlay
+        uses — one builder, so a synthesized source and a real one cannot place differently.
+
+        The settings are identity on purpose (``blend="add"``, no flip, no shift): a
+        ``view_source`` wire is a sibling branch of the same acquisition, and the node has
+        already refused it unless it addresses the *same voxels* (``_require_same_grid``).
+        ``view.overlay``'s ``flip_x=True`` default is for a secondary from a different
+        acquisition and would be wrong here.
+
+        **Placement is BY INDEX, not by stage position** (``on_unplaceable="index"``). Stage
+        placement is the right default for an Overlay, whose two sources may be different
+        acquisitions — and it *refuses* without a stage log, which a sibling branch does not
+        need and a TIFF never has. Here field m pairs with field m at scale 1.0, which is not
+        a guess: the node already proved the two address the same voxels. The three
+        "alignment is NOT verified" warnings that path emits are therefore untrue of this
+        one and are replaced, or they would appear on the node card as a problem."""
+        try:
+            from dataclasses import replace as _dc_replace
+            from nodegraph.catalog.view.overlay import overlay_entry
+            from nodegraph.placement import plan_placement
+            from nodegraph.nodes import SAMPLING_KEY
+            if payload is None or sec is None:
+                return None
+            plan = plan_placement(
+                payload.metadata, payload.axes, sec.metadata, sec.axes,
+                t_shift=0, offset_um=(0.0, 0.0, 0.0),
+                dst_sampling=tuple(payload.metadata.get(SAMPLING_KEY, ())),
+                src_sampling=tuple(sec.metadata.get(SAMPLING_KEY, ())),
+                on_unplaceable="index")
+            if plan is None or not getattr(plan, "ok", True):
+                return None
+            if plan.placed_by == "index":
+                plan = _dc_replace(plan, warnings=(
+                    "placed field-for-field: this branch was verified to address the same "
+                    "voxels as the primary, so no stage alignment is needed",))
+            return overlay_entry(ovl_id, plan,
+                                 {"blend": "add", "flip_x": False, "flip_y": False,
+                                  "t_shift": 0})
+        except Exception:  # noqa: BLE001 — an unplaceable source costs its layer, not the view
+            return None
+
+    def _replan(self, ovl_id: str, stamped: Dict[str, Any], payload, sec) -> Dict[str, Any]:
+        """The recipe entry re-resolved against the VIEWED payload's geometry.
+
+        Settings come from the document (the same live-truth route the presentation params
+        take), placement from :func:`nodegraph.placement.plan_placement`, and the entry from
+        the node's own :func:`overlay_entry` — one builder, so the display and the stamped
+        record cannot drift. Falls back to the stamped entry if anything is missing, which
+        is the pre-existing behaviour and correct whenever nothing downstream moved."""
+        try:
+            from nodegraph.catalog.view.overlay import overlay_entry
+            from nodegraph.placement import plan_placement
+            from nodegraph.nodes import SAMPLING_KEY
+            node = self.document.nodes.get(ovl_id)
+            if node is None or payload is None or sec is None:
+                return stamped
+            prm, mds = dict(node.params or {}), dict(node.modes or {})
+            offset = (float(prm.get("offset_z", 0.0)), float(prm.get("offset_y", 0.0)),
+                      float(prm.get("offset_x", 0.0)))
+            plan = plan_placement(
+                payload.metadata, payload.axes, sec.metadata, sec.axes,
+                t_shift=int(prm.get("t_shift", 0)), offset_um=offset,
+                dst_sampling=tuple(payload.metadata.get(SAMPLING_KEY, ())),
+                src_sampling=tuple(sec.metadata.get(SAMPLING_KEY, ())),
+                min_coverage=float(prm.get("min_coverage", 0.0)),
+                on_unplaceable=mds.get("unplaceable", "refuse"))
+            if not plan.ok:
+                return stamped        # keep the record; the pull itself already refused
+            # The SAME handedness derivation the compute makes — an already-stitched secondary
+            # is in stage coordinates, and a display path that flipped it while the compute did
+            # not would draw the overlay 456 px from where a bake put it.
+            from nodegraph.catalog._shared.placement_entry import handedness_for
+            fx, fy, _w = handedness_for(sec, prm.get("flip_x", True),
+                                        prm.get("flip_y", False))
+            return overlay_entry(ovl_id, plan, {
+                "blend": mds.get("blend", "add"), "flip_x": fx, "flip_y": fy,
+                "t_shift": int(prm.get("t_shift", 0)), "offset_um": offset})
+        except Exception:      # noqa: BLE001 — a re-plan failure must not cost the image
+            return stamped
 
     def _look(self, ovl_id: str, name: str, default: float) -> float:
         """A PRESENTATION param, read live from the document rather than from the payload.
@@ -1321,36 +1999,83 @@ class EngineRunner(QObject):
             # mode: checker density for `checkerboard`, divider position for `wipe`
             param = (self._look(src["ovl_id"], "wipe_pos", 0.5) if name == "wipe"
                      else OVERLAY_CHECKER_CELLS)
-            style = (self.BLEND_MODES.get(name, 0),
-                     self._look(src["ovl_id"], "opacity", 0.5), param)
+            # A `view_source` channel composites at FULL strength: it has no opacity socket to
+            # read, and an Overlay's 0.5 default would make a second channel of the same
+            # acquisition read as a wash laid over the first instead of as a channel.
+            opacity = (1.0 if src.get("as_channel")
+                       else self._look(src["ovl_id"], "opacity", 0.5))
+            style = (self.BLEND_MODES.get(name, 0), opacity, param)
             for k in range(int(src["n"])):
                 out[int(src["base_c"]) + k] = style
         return out
 
     def _decode_planes(self, provider, node_id, coords, channels, axes,
-                       *, pin: Optional[Pin] = None) -> Dict[int, np.ndarray]:
+                       *, pin: Optional[Pin] = None, overlay_all: bool = False,
+                       as_dtype: Any = None) -> Dict[int, np.ndarray]:
         """Native per-channel planes at ``coords`` (a GLOBAL display cursor), cache-first
         (used by the pull worker and by :class:`_DecodeJob`). Misses decode and are cached.
+
+        Composed overlay planes are cached alongside the read ones, under the same keys
+        :meth:`_plane_addrs` hands out, so the warm fast path serves a frame's overlay instead
+        of quietly dropping it.
+
+        ``overlay_all`` includes every overlay channel the chain contributes, whether or not
+        it was asked for — right for a FULL PULL, which is the moment the Viewer first learns
+        those channels exist (it cannot request an index it has never been told about). On the
+        cursor fast path the request is authoritative instead, which is what makes an overlay
+        channel's toggle button work.
 
         **Never call this on the GUI thread.** On a lazy provider a miss runs the node — see
         :class:`_DecodeJob` for the minutes-long freeze that taught us so."""
         out: Dict[int, np.ndarray] = {}
-        addrs = self._plane_addrs(node_id, coords, channels, axes, pin=pin)
+        addrs = self._plane_addrs(node_id, coords, channels, axes, pin=pin,
+                                  provider=provider)
+        if not addrs:
+            return out
+        nc = int(axes.c)
+        cap = addrs[0][0][-1]          # the cap the keys were built with — never re-derived
+        dt = self._viewer_dtype if as_dtype is None else as_dtype
+        ovl_addrs = [a for a in addrs if a[4] >= nc]
+        ref: Optional[np.ndarray] = None
         for key, m, t, z, ch in addrs:
+            if ch >= nc:
+                continue                       # composed below, not read from the provider
             arr = self._planes.get(key)
             if arr is None:
-                arr, _lv = render_plane_native(provider, m, t, z, ch)
+                arr, _lv = render_plane_native(provider, m, t, z, ch, max_dim=cap,
+                                               as_dtype=dt)
                 self._planes.put(key, arr)
             out[ch] = arr
-        if addrs and self._overlay_ctx is not None:
-            _key, m, t, z, _ch = addrs[0]
-            ref = out[addrs[0][4]]
-            # The overlay is composed onto the shape of the plane actually being shown, and
-            # placed by µm, so the display decimation costs it nothing and no caller has to
-            # track a scale factor.
-            z_um = _z_um_of(self._overlay_ctx["pri_md"], self._overlay_ctx["pri_axes"],
-                            m, z)
-            out.update(self._compose_overlay(node_id, ref.shape[:2], m, t, z_um))
+            if ref is None:
+                ref = arr
+        if self._overlay_ctx is None or not (ovl_addrs or overlay_all):
+            return out
+        m, t, z, cur = self._clamp_coords(self._payload_coords(coords, pin), axes)
+        if ref is None:
+            # Every primary channel is toggled off and only the overlay is shown. The
+            # composite is still expressed on the primary's display grid, so one primary
+            # plane is read for its SHAPE — and deliberately not put in `out`, because the
+            # user turned it off.
+            key = _plane_key(node_id, pin, m, t, z, cur, cap)
+            ref = self._planes.get(key)
+            if ref is None:
+                ref, _lv = render_plane_native(provider, m, t, z, cur, max_dim=cap,
+                                               as_dtype=dt)
+                self._planes.put(key, ref)
+        # The overlay is composed onto the shape of the plane actually being shown, and
+        # placed by µm, so the display decimation costs it nothing and no caller has to
+        # track a scale factor.
+        z_um = _z_um_of(self._overlay_ctx["pri_md"], self._overlay_ctx["pri_axes"], m, z)
+        composed = self._compose_overlay(node_id, ref.shape[:2], m, t, z_um)
+        keys = {a[4]: a[0] for a in ovl_addrs}
+        for ch, plane in composed.items():
+            key = keys.get(ch)
+            if key is None:
+                if not overlay_all:
+                    continue                   # not asked for: its toggle is off
+                key = _plane_key(node_id, pin, m, t, z, int(ch), cap)
+            self._planes.put(key, plane)
+            out[int(ch)] = plane
         return out
 
     # ── raw (pre-enhancement) pixels, for the Viewer's hover readout ───────────
@@ -1522,19 +2247,126 @@ class EngineRunner(QObject):
             return
         m, t, z, _c = center
         nt = axes.t
-        chans = channels if channels else (min(max(0, center[3]), axes.c - 1),)
+        chans = tuple(min(max(0, int(ch)), axes.c - 1)
+                      for ch in (channels if channels else
+                                 (min(max(0, center[3]), axes.c - 1),)))
+        cap = self.display_dim(axes, planes=max(1, len(set(chans))))
         self._prefetch_gen += 1
         gen = self._prefetch_gen
         jobs: List[Tuple[tuple, int, int, int, int]] = []
         for d in range(1, span + 1):
             for tt in ((t + d) % nt, (t - d) % nt):
                 for ch in chans:
-                    ch = min(max(0, int(ch)), axes.c - 1)
-                    key = (node_id, pin, m, tt, z, ch)
+                    key = (node_id, pin, m, tt, z, ch, cap)
                     if self._planes.get(key) is None:
                         jobs.append((key, m, tt, z, ch))
         if jobs:
             self._pool.start(_PrefetchJob(self, gen, jobs))
+
+    #: How many preload jobs run at once. Four, measured: on the WellA3 mosaic with a cold tile
+    #: cache one whole-canvas stitch is 1.03 s, four in parallel are 0.51 s each and eight are
+    #: 0.43 s — the source-tile reads parallelize, the paste contends, and the curve is flat past
+    #: four. Kept low on purpose: these share the pool with the frame being DISPLAYED, and
+    #: starving that to fetch the future is exactly backwards.
+    PRELOAD_JOBS = 4
+
+    def _frame_bytes(self, axes: Any, chans: int) -> int:
+        """Bytes one displayed frame of ``chans`` channels occupies in the plane cache."""
+        cap = self.display_dim(axes, planes=max(1, chans))
+        return (min(cap, int(axes.y)) * min(cap, int(axes.x))
+                * (2 if self._viewer_dtype is not None else 8) * max(1, chans))
+
+    def preload_series(self, node_id: str, center, channels, *,
+                       pin: Optional[Pin] = None) -> int:
+        """Decode the whole T range of the viewed frame into the plane cache, in playback
+        order, on several pool threads. Returns how many planes were queued.
+
+        This is Nikon's "normal mode" made explicit: an image that fits the memory budget is
+        held whole, and then playback is a texture upload per frame rather than a read. The
+        ordinary :meth:`prefetch` cannot do this job — it is a *scrub* heuristic, cost-gated to
+        ±2 frames on a computing provider precisely so that nudging the cursor cannot queue
+        sixteen whole-volume deconvolutions. Pressing play is a different statement: every
+        frame is wanted, in order.
+
+        Three properties, each of which was a bug first:
+
+        * **its own cancellation generation.** Sharing ``_prefetch_gen`` meant the first frame
+          advance — which calls :meth:`prefetch` — cancelled the preload, so playback went
+          straight back to decoding every frame as it arrived (reported 2026-08-05, "it loads
+          every time"). Cancelled now only by :meth:`cancel_preload`, an edit, or a newer one.
+        * **from the CURSOR, wrapping.** Playback starts where you are, not at t=0, so reading
+          from 0 spent the first seconds decoding frames that would be shown last.
+        * **bounded by the cache that actually holds it.** The frames land in
+          :class:`PlaneCache`, so its budget is the ceiling — sizing against a *different*
+          number is how a preload evicts its own head and re-decodes every lap.
+        """
+        prov, axes = self._viewer_provider, self._viewer_axes
+        if prov is None or axes is None or node_id != self._viewer_node:
+            return 0
+        m, t0, z, _c = center
+        chans = tuple(sorted({min(max(0, int(ch)), axes.c - 1)
+                              for ch in (channels or (center[3],))}))
+        cap = self.display_dim(axes, planes=max(1, len(chans)))
+        nt = max(1, int(axes.t))
+        room = max(1, min(self._planes.budget, display_ram_bytes())
+                   // max(1, self._frame_bytes(axes, len(chans))))
+        start = min(max(0, int(t0)), nt - 1)
+        want: List[Tuple[tuple, int, int, int, int]] = []
+        for i in range(min(nt, int(room))):
+            tt = (start + i) % nt
+            for ch in chans:
+                key = (node_id, pin, m, tt, z, ch, cap)
+                if self._planes.get(key) is None:
+                    want.append((key, m, tt, z, ch))
+        self._preload_gen += 1
+        self._preload_node = node_id
+        self._preload_total = len(want)
+        self._preload_done = 0
+        if not want:
+            return 0
+        # Round-robin rather than contiguous blocks: every job then walks forward through the
+        # series roughly together, so the frames nearest the cursor land first whichever job
+        # gets a thread.
+        n = max(1, min(self.PRELOAD_JOBS, max(1, self._pool.maxThreadCount() - 1)))
+        for k in range(n):
+            share = want[k::n]
+            if share:
+                self._pool.start(_PreloadJob(self, self._preload_gen, share))
+        return len(want)
+
+    def cancel_preload(self) -> None:
+        """Retire any preload in flight (playback stopped, the node changed, an edit landed).
+        The planes already decoded stay cached — they are still the right pixels."""
+        if self._preload_total:
+            self._preload_gen += 1
+            node, self._preload_node = self._preload_node, None
+            self._preload_total = self._preload_done = 0
+            if node:
+                self.preload_finished.emit(node, False)
+
+    def _deliver_preload_tick(self, packet) -> None:            # GUI thread
+        gen, n = packet
+        if gen != self._preload_gen or not self._preload_total:
+            return
+        self._preload_done += int(n)
+        node = self._preload_node or ""
+        self.preload_progress.emit(node, self._preload_done, self._preload_total)
+        if self._preload_done >= self._preload_total:
+            self._preload_total = self._preload_done = 0
+            self._preload_node = None
+            self.preload_finished.emit(node, True)
+
+    def preloading(self) -> bool:
+        return bool(self._preload_total)
+
+    def series_fits(self, axes: Any = None, *, planes: int = 1) -> bool:
+        """Whether the whole T range of the viewed frame fits the budget — i.e. whether a
+        preload can make playback read-free rather than merely warmer."""
+        axes = self._viewer_axes if axes is None else axes
+        if axes is None:
+            return False
+        ceiling = min(self._planes.budget, display_ram_bytes())
+        return self._frame_bytes(axes, planes) * max(1, int(axes.t)) <= ceiling
 
     @staticmethod
     def _prefetch_span(prov: Any) -> int:
@@ -1636,8 +2468,19 @@ class EngineRunner(QObject):
         return sorted(seen)
 
     # ── bake (Dock) ───────────────────────────────────────────────────────────
+    def start_hold(self, node_id: str, *, signature: str) -> bool:
+        """Pull ``node_id``'s input and freeze it in memory. Returns False when a pull is
+        already in flight.
+
+        A thin wrapper over :meth:`bake` sharing its job, graph and worker — see
+        :meth:`_run_bake`. It passes no store and no precision because a hold writes nothing;
+        ``signature`` is still recorded so a held dock reports staleness on an upstream edit
+        exactly as a docked one does."""
+        return self.bake(node_id, store="", precision="", bake_id="",
+                         signature=signature, hold=True)
+
     def bake(self, node_id: str, *, store: str, precision: str, bake_id: str,
-             signature: str, scoped: bool = False,
+             signature: str, scoped: bool = False, hold: bool = False,
              coords: Optional[Tuple[int, int, int, int]] = None) -> bool:
         """Run a Dock node's bake: pull everything upstream of ``node_id`` and write it to
         the checkpoint at ``store``. Returns False when a pull is already in flight.
@@ -1653,6 +2496,7 @@ class EngineRunner(QObject):
         why the caller has to ask for it explicitly and the card stays marked."""
         if self._busy:
             return False
+        self._stop_bake = False          # a stop never leaks into the next bake
         self._epoch += 1
         self._last_progress.clear()
         self._last_frame.clear()
@@ -1664,27 +2508,42 @@ class EngineRunner(QObject):
         job = _Job(self._epoch, graph, self.document.revision, node_id, None, None,
                    sources, pin=self._pin_for(coords) if scoped else None,
                    bake={"store": store, "precision": precision, "bake_id": bake_id,
-                         "signature": signature, "scoped": bool(scoped)},
+                         "signature": signature, "scoped": bool(scoped),
+                         "hold": bool(hold)},
                    all_sources=every)
         self._busy = True
         self._bakes[job.epoch] = job.bake
         self.plan.emit(node_id, self.planned_nodes(node_id, graph))
         self.started.emit(node_id)
-        self._pool.start(_Worker(self, job))
+        self._pull_thread.start(_Worker(self, job))
         return True
 
     def _run_bake(self, engine: Engine, job: _Job) -> None:   # worker thread
-        """Pull the dock's input and write it to disk. Runs inside the worker, reporting
-        through the same observer a compute's ``ctx.progress`` uses — so the dock's card
-        shows the bake exactly like any other long node, throttle and stale-epoch guard
-        included."""
+        """Pull the dock's input and freeze it — to disk (``bake``) or in memory (``hold``).
+
+        Runs inside the worker, reporting through the same observer a compute's
+        ``ctx.progress`` uses — so the dock's card shows the bake exactly like any other long
+        node, throttle and stale-epoch guard included.
+
+        A **hold** shares this whole path deliberately, and takes the same graph: the dock is
+        forced live so the chain behind it is walked rather than cut, which is what makes
+        re-holding an already-held node work instead of freezing its own frozen output. All it
+        then skips is the write. Sharing the path is also what gives a hold the pull's epoch
+        guard, its refusals and its "a pull is already running" interlock for free."""
         from nodegraph.checkpoint import checkpoint_bytes, write_checkpoint
         spec = job.bake or {}
         payload = engine.pull(job.node_id)
+        verb = "hold" if spec.get("hold") else "bake"
         if not isinstance(payload, Dataset):
             raise TypeError(
-                f"a Dock can only bake a Dataset; this one's input produced "
+                f"a Dock can only {verb} a Dataset; this one's input produced "
                 f"{type(payload).__name__}. Wire the image/analysis chain into it.")
+        if spec.get("hold"):
+            # No write, no copy — the whole reason this tier is instant. The envelope is
+            # captured alongside because a held dock has no manifest to re-derive one from.
+            spec["payload"] = payload
+            spec["env"] = engine.env(job.node_id)
+            return
         observe = self._make_observer(job.epoch)
 
         def on_progress(fraction: float, note: str) -> None:
@@ -1701,9 +2560,66 @@ class EngineRunner(QObject):
             # payload: it is what `propagate_meta` computed for this edge, so a docked
             # node describes itself to the GUI exactly as the live one did.
             domains=(env.domains or None), layer_names=(env.layer_names or None),
-            progress=on_progress)
+            progress=on_progress,
+            # A bake polls this at every block boundary and returns None having written no
+            # manifest, so a stopped bake leaves the directory reading as *absent* — the
+            # state this module already treats as correct for an interrupted one.
+            should_cancel=lambda: self._stop_bake)
+        if man is None:
+            # Cancelled. Leave `spec["manifest"]` unset so `_deliver` records no bake and
+            # the dock does not start claiming a checkpoint that was never finished.
+            spec["cancelled"] = True
+            return
         spec["manifest"] = man
         spec["bytes"] = checkpoint_bytes(spec["store"])
+
+    # ── hold (the session tier) ───────────────────────────────────────────────
+    @property
+    def held(self) -> frozenset:
+        """The node ids currently holding a payload in memory — what
+        :func:`nodelab_v2.ops.dock_status` needs to tell ``held`` from ``released``."""
+        return frozenset(self._held)
+
+    def hold(self, node_id: str, payload: Any, env: Optional[MetaEnvelope] = None) -> None:
+        """Pin ``payload`` as ``node_id``'s frozen result. **No copy and no write** — this is
+        the whole reason the tier is instant.
+
+        The engine must be rebuilt so the next pull seeds from the registry rather than
+        walking the (now cut) chain; ``_engine_rev = -1`` is the narrow form of that, already
+        used by :meth:`set_sweep_all` — it drops no memo entry, so everything computed on the
+        way to this payload stays a hit.
+
+        Refuses a non-Dataset for the same reason :meth:`_run_bake` does: the alternative is a
+        seed the engine cannot use, surfacing later as a confusing type error inside a compute
+        rather than here where the user pressed the button."""
+        if not isinstance(payload, Dataset):
+            raise TypeError(
+                f"a Dock can only hold a Dataset; this one's input produced "
+                f"{type(payload).__name__}. Wire the image/analysis chain into it.")
+        self._held[node_id] = payload
+        if env is not None:
+            self._held_envs[node_id] = env
+        self._engine_rev = -1
+
+    def release(self, node_id: str) -> bool:
+        """Drop ``node_id``'s held payload (un-hold). True when something was released.
+
+        Rebuilds the engine for the mirror of :meth:`hold`'s reason: without it the cached
+        engine keeps the stale seed and would go on serving the released payload until the
+        next document edit happened to invalidate it."""
+        had = self._held.pop(node_id, None) is not None
+        self._held_envs.pop(node_id, None)
+        if had:
+            self._engine_rev = -1
+        return had
+
+    def request_stop_bake(self) -> None:
+        """Ask an in-flight bake to stop at its next block boundary.
+
+        Cleared by :meth:`bake` when the next one starts, so a stop can never leak into a
+        later request. The writer's own contract does the rest: no manifest is written, so
+        the half-written store reads as un-baked rather than as a shorter valid one."""
+        self._stop_bake = True
 
     # ── the sweep scope (flow.iterate) ────────────────────────────────────────
     @property
@@ -1791,7 +2707,7 @@ class EngineRunner(QObject):
         self._busy = True
         self.plan.emit(node_id, self.planned_nodes(node_id, graph))
         self.started.emit(node_id)
-        self._pool.start(_Worker(self, job))
+        self._pull_thread.start(_Worker(self, job))
 
     def _deliver(self, packet) -> None:          # GUI thread (queued)
         (epoch, node_id, payload, plane, axes, dt, err, revision, coords, channels,
@@ -1890,12 +2806,24 @@ class EngineRunner(QObject):
         meta_seeds: Dict[str, MetaEnvelope] = {}
         for nid, cfg in job.sources.items():
             prov, env = self._resolve_source(nid, cfg, epoch=job.epoch)
+            full_m = int(env.axes.m)
             if job.pin is not None:
                 prov, env = _pin_frames(prov, env, job.pin)
             # Display metadata (channel names/emission/colors) rides on the seed
             # Dataset only — NOT the engine meta-seed (kept to the calibration schema).
             disp = self._channel_display.get(self._node_source_key.get(nid), {})
             md = dict(env.metadata); md.update(disp)
+            # ...and the display dict carries the per-M STAGE keys too (`ingest.STAGE_KEYS`
+            # is documented as riding "alongside the channel display keys"), at FULL length.
+            # So this merge lands after `_pin_frames` and would put the un-subset list back
+            # — re-apply the subset to the merged result, or the pin's fix is undone one
+            # line later.
+            if job.pin is not None:
+                changes = position_subset(md, _picked(job.pin[0], full_m))
+                md.update({k: v for k, v in changes.items() if v is not None})
+                for k, v in changes.items():
+                    if v is None:
+                        md.pop(k, None)
             seeds[nid] = Dataset(axes=env.axes, metadata=md).with_image(prov)
             meta_seeds[nid] = env
         # Docked nodes are sources too (V2.18): the seed both satisfies the engine's
@@ -1904,9 +2832,14 @@ class EngineRunner(QObject):
         # downstream by itself. Deliberately NOT frame-pinned — a checkpoint is already
         # a finished result, and cutting one to the solo-frame scope would re-address
         # frames the bake did not have.
-        for nid, ds in dock_seeds(job.graph).items():
+        # A HELD dock is seeded from the in-memory registry instead of a store, by the same
+        # mechanism and for the same two reasons — it makes the node a source so its cut
+        # primary input is not refused, and its provider's `version` folds into the recipe
+        # hash so re-holding invalidates everything downstream on its own.
+        for nid, ds in dock_seeds(job.graph, held=self._held).items():
             seeds[nid] = ds
-            env = checkpoint_envelope(dock_store_of(job.graph.nodes[nid]))
+            env = self._held_envs.get(nid) if nid in self._held else \
+                checkpoint_envelope(dock_store_of(job.graph.nodes[nid]))
             if env is not None:
                 meta_seeds[nid] = env
         seed_axes = {nid: ds.axes for nid, ds in seeds.items()}

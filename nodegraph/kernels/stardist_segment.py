@@ -151,8 +151,8 @@ def get_stardist_model(model_name: str = "2D_versatile_fluo", disable_gpu: bool 
 def segment_frame(
     image: np.ndarray,
     model=None,
-    prob_thresh: float = 0.5,
-    nms_thresh: float = 0.3,
+    prob_thresh: Optional[float] = None,
+    nms_thresh: Optional[float] = None,
     scale: Optional[float] = None,
     model_name: str = "2D_versatile_fluo",
     disable_gpu: bool = False,
@@ -164,8 +164,15 @@ def segment_frame(
     ----------
     image : 2D array, any dtype
     model : StarDist2D instance, or None to use singleton
-    prob_thresh : float, object probability threshold
-    nms_thresh : float, non-maximum suppression threshold
+    prob_thresh : float or None, object probability threshold. **None means the
+        checkpoint's own tuned value** — StarDist substitutes ``model.thresholds.prob``,
+        which csbdeep loaded from the model directory's ``thresholds.json`` (written by
+        ``optimize_thresholds``) and validated to ``0 < x < 1``, falling back to its
+        built-in 0.5. This is the default here (it was 0.5) because a caller that does not
+        care should get the value the checkpoint's author measured, not one this kernel
+        invented — see ``StarDistBase._predict_sparse_generator``.
+    nms_thresh : float or None, non-maximum suppression threshold; None likewise defers to
+        ``model.thresholds.nms`` (StarDist's own fallback there is 0.4, not 0.3).
     scale : float or None, rescale factor
     model_name : str, pretrained model name
     disable_gpu : bool, clear CUDA_VISIBLE_DEVICES before the first TF import
@@ -203,8 +210,8 @@ def segment_volume(
     volume: np.ndarray,
     model=None,
     *,
-    prob_thresh: float = 0.5,
-    nms_thresh: float = 0.3,
+    prob_thresh: Optional[float] = None,
+    nms_thresh: Optional[float] = None,
     scale: Optional[float] = None,
     scale_z: Optional[float] = None,
     model_name: str = "3D_demo",
@@ -224,6 +231,11 @@ def segment_volume(
         One prepared volume — one channel, one timepoint. ``axes="ZYX"`` is passed
         explicitly rather than left to csbdeep's guesser, which would mis-read a volume
         whose Z happens to be small as a channel axis.
+    prob_thresh, nms_thresh : float or None
+        ``None`` (the default) defers to the checkpoint's own tuned thresholds — see
+        :func:`segment_frame`. It matters more in 3D than in 2D: the only registered 3D model
+        is ``3D_demo``, whose ``thresholds.json`` says ``prob=0.708``, so a hardcoded 0.5
+        here would run it far more sensitively than its author measured.
     scale, scale_z : float or None
         Internal resize factor. ``scale`` applies laterally; ``scale_z`` applies along Z and
         defaults to ``scale`` when omitted. Splitting them is what makes ANISOTROPIC data

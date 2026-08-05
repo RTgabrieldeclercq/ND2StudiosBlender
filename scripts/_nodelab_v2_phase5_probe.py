@@ -306,6 +306,200 @@ def main(argv) -> int:
     for _opt in ("otsu", "li"):
         assert f"<b>{_opt}</b>" in _entries[_opt], f"menu action {_opt!r} has no tooltip"
 
+    # THE CARD'S LAYER PICKER (2026-08-04). The inspector has offered one since V2.11, but
+    # clicking a `layer_in` pill on the CANVAS dropped straight into the inline text editor —
+    # so on the card the only way to change it was to already know the name. That is exactly
+    # the failure the picker exists to prevent: a node kept its factory-default layer name
+    # while the branch feeding it produced another, and the mismatch surfaced as a pull error
+    # several nodes downstream instead of as a menu with the right answer already in it.
+    _m_item = win.scene.node_items["n6"]                  # analysis.measure ← analysis.label
+    _lay_ctl = next(c for c in _m_item.controls()
+                    if c.kind == "value" and c.obj.name == "labels")
+    _offered = win.doc.layer_choices("n6", _lay_ctl.obj)
+    assert "labels" in _offered, f"the edit-time pass should predict `labels` here: {_offered}"
+    _menus.clear()
+    _NI.QMenu = _PeekMenu
+    try:
+        _m_item._open_layer_menu(_lay_ctl)
+    finally:
+        _NI.QMenu = _QMenu
+    assert _menus, "clicking a layer_in pill on the card opened no menu"
+    _lay_entries = dict(_menus[-1])
+    assert _lay_entries["__visible__"] == "True", "layer menu tooltips would be swallowed"
+    for _nm in _offered:
+        assert _nm in _lay_entries, f"{_nm!r} present on the wire but not offered: " \
+                                    f"{sorted(_lay_entries)}"
+    # free text stays reachable: the prediction is honest but INCOMPLETE (a few producers
+    # name layers it cannot foresee), so a closed menu would be a regression, not a fix
+    assert "Type a name…" in _lay_entries, sorted(_lay_entries)
+    assert "labels" == _m_item.rec.params.get("labels", _lay_ctl.obj.default), \
+        "dismissing the layer menu must not write a param"
+
+    # A TWO-INPUT NODE'S SOCKETS HOVER DIFFERENTLY (2026-08-04). The painted domain rail is a
+    # NODE-level answer repeated beside every Dataset input, so on `analysis.voronoi` the
+    # seeds wire and the areas wire showed identical chips and there was nowhere the card said
+    # which was which. Attributing the requirement per wire is not possible from the
+    # declarations (a Label instance's LABEL half is wanted by the areas wire while only its
+    # VOXEL half is named by a socket), so the per-socket fact that IS available — what that
+    # edge actually carries — goes in the hover, beside the node-level requirement rather than
+    # replacing it. Dataset sockets also carry `description` now; they could not before.
+    import re as _re
+    from nodelab_v2.document import GraphDocument as _GDv
+    from nodelab_v2.scene import GraphScene as _GSv
+    _vdoc = _GDv()
+    # the two branches must carry DIFFERENT domains, or "on this wire" cannot be SEEN to
+    # differ and the check would be passing on the two descriptions alone
+    for _nid, _op in (("vu", "io.load"), ("vd", "detect.spots"),
+                      ("vr", "io.load"), ("vt", "analysis.threshold"),
+                      ("vl", "analysis.label"), ("vv", "analysis.voronoi")):
+        _vdoc.add_node(_op, node_id=_nid)
+    _vdoc.connect("vu", "image", "vd", "data")        # seeds branch adds POINT
+    _vdoc.connect("vd", "out", "vv", "data")
+    _vdoc.connect("vr", "image", "vt", "data")        # areas branch adds VOXEL + LABEL
+    _vdoc.connect("vt", "out", "vl", "data")
+    _vdoc.connect("vl", "out", "vv", "areas")
+    _vsc = _GSv(_vdoc)
+    _vsc.sync()
+    _vit = _vsc.node_items["vv"]
+    _tips = {}
+    for _sk in ("data", "areas"):
+        _tips[_sk] = _re.sub(r"<[^>]+>", " ", _vit.socket("in", _sk).toolTip())
+        assert "on this wire:" in _tips[_sk], _tips[_sk][:200]
+        assert "the node requires:" in _tips[_sk], "the requirement must still be stated"
+    assert "SEEDS branch" in _tips["data"] and "AREAS branch" in _tips["areas"], \
+        "each Dataset socket must carry its OWN prose"
+    assert _tips["data"] != _tips["areas"], \
+        "two Dataset inputs that hover identically is the defect this closes"
+    _wire = lambda s: _tips[s].split("on this wire:")[1][:48]
+    assert "point" in _wire("data") and "point" not in _wire("areas"), \
+        (_wire("data"), _wire("areas"))
+    assert "label" in _wire("areas"), _wire("areas")
+    # an UNWIRED aux input says so rather than reporting the node's requirement as content
+    _vdoc.disconnect(*_vdoc.edge_into("vv", "areas"))
+    assert _vdoc.edge_into("vv", "areas") is None
+    _vsc.sync()
+    _bare = _re.sub(r"<[^>]+>", " ", _vsc.node_items["vv"].socket("in", "areas").toolTip())
+    assert "nothing wired" in _bare, _bare[:200]
+
+    # THE POINTS OVERLAY PICKS ITS LAYER TOO (2026-08-04). It drew EVERY Point table, which is
+    # right for one detection and wrong the moment a node publishes a filtered view of
+    # another's cloud: `analysis.voronoi` emits `<name>_seeds` holding only the dots that won a
+    # territory, so on Auto the display showed those AND the full input — the dropped dots
+    # included, which is exactly what was asked to stop showing.
+    import numpy as _np
+    from nodegraph.dataset import Dataset as _DS
+    from nodegraph.domains import Domain as _Dom
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodegraph.structure import StructureTable as _STp
+    _vp = win.viewer
+    _pax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    _mk = lambda ids, ys: _STp(_Dom.POINT, {
+        "id": _np.asarray(ids, dtype=_np.int64), "m": _np.zeros(len(ids), _np.int64),
+        "t": _np.zeros(len(ids), _np.int64), "c": _np.zeros(len(ids), _np.int64),
+        "z": _np.zeros(len(ids)), "y": _np.asarray(ys, float),
+        "x": _np.asarray(ys, float)}, layer=None, z_kind="plane_index")
+    _pds = (_DS(axes=_pax).with_image(_AP(_np.zeros((1, 1, 1, 1, 8, 8))))
+            .with_structure(_STp(_Dom.POINT, dict(_mk([1, 2, 3], [1., 3., 5.]).columns),
+                                 layer="all_dots", z_kind="plane_index"))
+            .with_structure(_STp(_Dom.POINT, dict(_mk([2], [3.]).columns),
+                                 layer="kept_dots", z_kind="plane_index")))
+    _pkeep = (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.points.layer,
+              _vp.overlays.points.z_project)
+    _had_pc2 = "_payload_coords" in _vp.__dict__
+    try:
+        _vp._dataset, _vp._axes = _pds, _pax
+        _vp._ref_plane = _np.zeros((8, 8))
+        _vp._payload_coords = lambda: (0, 0, 0, 0)
+        _vp.overlays.points.z_project = True
+        assert _vp.point_layer_names() == ["all_dots", "kept_dots"], _vp.point_layer_names()
+        _vp.overlays.points.layer = ""
+        assert len(_vp._point_marks()) == 4, "Auto still draws every table (3 + 1)"
+        _vp.overlays.points.layer = "kept_dots"
+        assert len(_vp._point_marks()) == 1, \
+            "an explicit pick must draw ONLY that table — the filtered view is the point"
+        _vp.overlays.points.layer = "renamed_away"
+        assert len(_vp._point_marks()) == 4, \
+            "a stale pick falls back to all, not to nothing (the Labels picker's rule)"
+        # the dialog's provider is PER TAB, or the Points tab would offer label rasters
+        assert _vp.overlay_layer_names("points") == ["all_dots", "kept_dots"]
+        assert _vp.overlay_layer_names("labels") == []      # this fixture has no raster
+        assert _vp.overlay_layer_names("tracks") == []
+    finally:
+        (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.points.layer,
+         _vp.overlays.points.z_project) = _pkeep
+        if not _had_pc2:
+            del _vp._payload_coords
+
+    # THE LABELS OVERLAY PICKS ITS LAYER (2026-08-04). It had no selector: `_label_plane`
+    # drew whichever integer Voxel raster had the most regions in the viewed plane. Several
+    # label rasters on one Dataset is the NORMAL case — `analysis.voronoi` alone emits its
+    # territories, inherits the seed branch's labels and copies the areas it clipped to, and
+    # two segmentations both default to the name `labels` — so the overlay drew whichever was
+    # most fragmented and no click could change it ("I select the segmentation from the Red
+    # channel but it still shows the UV labels": there was nothing to select).
+    _lax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    # `wanted` holds THREE regions with small ids; `noisy` holds ONE with a huge id. The two
+    # rankings disagree on purpose: by region COUNT `wanted` wins (3 > 1), by `plane.max()` —
+    # what the fallback used to compute — `noisy` wins on its single id 40. That is the shape
+    # of the real failure: a raster carrying another node's numbering outranked the answer.
+    _few = _np.zeros((1, 1, 1, 1, 8, 8), dtype=_np.int64)
+    _few[0, 0, 0, 0, 1:3, 1:3] = 1
+    _few[0, 0, 0, 0, 1:3, 4:6] = 2
+    _few[0, 0, 0, 0, 4:6, 1:3] = 3
+    _many = _np.zeros((1, 1, 1, 1, 8, 8), dtype=_np.int64)
+    _many[0, 0, 0, 0, 5:7, 5:7] = 40                      # one region, far bigger id
+    _lds = (_DS(axes=_lax).with_image(_AP(_np.zeros((1, 1, 1, 1, 8, 8))))
+            .with_layer(_Dom.VOXEL, "wanted", _few)
+            .with_layer(_Dom.VOXEL, "noisy", _many))
+    _keep = (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.labels.layer)
+    _had_pc = "_payload_coords" in _vp.__dict__      # restore the BOUND method, not a copy
+    try:
+        _vp._dataset, _vp._axes = _lds, _lax
+        _vp._ref_plane = _np.zeros((8, 8))
+        _vp._payload_coords = lambda: (0, 0, 0, 0)
+        assert _vp.label_layer_names() == ["noisy", "wanted"], _vp.label_layer_names()
+        # AUTO PREFERS THE VIEWED NODE'S OWN OUTPUT (2026-08-04). Ranking the payload's
+        # rasters by id drew whichever carried the biggest NUMBERING — on `analysis.voronoi`
+        # that was the copied areas raster, whose ids are the source segmentation's (in the
+        # hundreds) while only a handful of its regions survive. You view a node to see what
+        # it made, so its own declared output wins.
+        _vp.own_layers_cb = lambda _nid: ["wanted"]
+        _vp._node_id = "probe-node"
+        assert _np.array_equal(_vp._label_source(), _few), \
+            "Auto must draw the node's OWN output, not the raster with the biggest ids"
+        _vp.own_layers_cb = None
+        _vp.overlays.labels.layer = ""                     # no preference: count regions
+        assert _np.array_equal(_vp._label_source(), _few), \
+            "the fallback COUNTS regions (3 vs 1); `plane.max()` ranked the 1-region raster " \
+            "first because its single id is 40"
+        _vp.overlays.labels.layer = "wanted"               # ...and an explicit pick WINS
+        assert _np.array_equal(_vp._label_source(), _few), \
+            "an explicit layer pick must override the most-regions guess"
+        assert _np.array_equal(_vp._label_plane(), _few[0, 0, 0, 0]), \
+            "the PAINTED plane and the picked raster must be the same layer"
+        assert _np.array_equal(_vp._label_layer_values(), _few), \
+            "the size-probe must count off the layer that is on screen"
+        _vp.overlays.labels.layer = "renamed_away"         # a stale pick falls back, not blank
+        assert _vp._label_source() is not None, \
+            "a pick this payload lacks must fall back to Auto, not draw nothing"
+        # the dialog offers exactly those names, Auto first, and keeps a stale pick visible
+        from nodelab_v2.overlay_dialog import OverlayDialog as _OD
+        # the provider is PER TAB (two tabs now have a `layer` field and they mean different
+        # domains), so the dialog is handed the dispatcher, never one tab's list
+        _ld = _OD(_vp.overlays, None, None, layer_names=_vp.overlay_layer_names)
+        _ld.reload()
+        _lw = _ld._widgets[("labels", "layer")]
+        _items = [(_lw.itemText(i), _lw.itemData(i)) for i in range(_lw.count())]
+        assert _items[0][1] == "" and _items[0][0].startswith("Auto"), _items
+        assert [d for _t, d in _items[1:]] == ["noisy", "wanted", "renamed_away"], _items
+        assert _lw.currentData() == "renamed_away" and "not on this payload" in _lw.currentText()
+        _ld.deleteLater()
+    finally:
+        (_vp._dataset, _vp._axes, _vp._ref_plane,
+         _vp.overlays.labels.layer) = _keep
+        if not _had_pc:                  # the stub would otherwise pin every later check to
+            del _vp._payload_coords      # (0,0,0,0) — it broke `_points_here` 300 lines on
+
     # the 2D/3D lever hovers like the Mode it is — it used to say only the z==1 refusal
     _lever = win.scene.node_items["n3"]._switch          # enhance.gaussian bears one
     assert _lever is not None, "enhance.gaussian must carry the 2D/3D lever"
@@ -326,7 +520,22 @@ def main(argv) -> int:
     _ok("V2.21 option docs reach the widgets: the Mode row + its label carry the "
         "6-option block, every combo item carries its own Qt.ToolTipRole prose, the "
         "card's popup menu carries it with tooltips VISIBLE, the 2D/3D switch hovers "
-        "as a documented lever, and each vocab tick box explains its own token")
+        "as a documented lever, and each vocab tick box explains its own token; and a "
+        "`layer_in` pill on the CARD now opens the same picker the inspector has (every "
+        "layer the wire actually carries, each explained, plus a `Type a name…` escape "
+        "because the prediction is honest but incomplete) instead of dropping into a bare "
+        f"text box — it offered {sorted(_offered)} here. And the Labels OVERLAY finally has a "
+        "layer picker: it drew whichever integer Voxel raster had the most regions with no way "
+        "to override, so on a Dataset carrying several (the normal case) it showed the wrong "
+        "segmentation; an explicit pick now wins over the guess, the painted plane and the "
+        "size-probe read the SAME layer, a stale pick falls back rather than drawing nothing, "
+        "and the combo lists the live payload's rasters with Auto first. A node with TWO "
+        "Dataset inputs also hovers them apart at last: the painted rail is one node-level "
+        "answer repeated beside each, so each socket's tip now names what ITS OWN edge carries "
+        "(POINT on the seeds wire, LABEL on the areas one) beside the node's requirement, "
+        "carries its own prose (Dataset sockets could not before), says `nothing wired` when "
+        "unplugged — and re-reads on a wiring change, which `refresh` never did, so every tip "
+        "used to be frozen at the last relayout")
 
     # ── V2.15: a path socket is BROWSABLE — every socket declaring `path_kind` gets a
     # Browse… button that opens the right dialog and commits the pick. The inspector used
@@ -1791,7 +2000,7 @@ def main(argv) -> int:
     # covered headlessly by nodegraph.selftest.test_picking; what only a live window can
     # show is that the widgets, signals and document writes are actually connected.
     from PySide6.QtCore import QEvent
-    from PySide6.QtGui import QMouseEvent, QPainter, QPixmap
+    from PySide6.QtGui import QImage, QMouseEvent, QPainter, QPixmap
     from PySide6.QtWidgets import QCheckBox as _QCheck, QToolButton as _QTool
     from nodelab_v2.picker import Calibration as _Cal, PickRequest as _PickReq
 
@@ -1845,16 +2054,34 @@ def main(argv) -> int:
     _verts = _pv._pick.shapes[0]["vertices"]
     assert all(v >= 0 for pair in _verts for v in pair), \
         f"a drag near the image centre produced out-of-image vertices: {_verts}"
-    # and the gesture must actually paint something
+    # and the gesture must actually paint something.
+    #
+    # Measured over EVERY pixel, not a 1-in-9 grid thresholded at HSV value 40 (2026-08-05).
+    # That earlier form did not measure what it claimed: an ROI rect is a ~1.4 px antialiased
+    # stroke plus an alpha-30 fill, so on this 128²-in-246 px pane it put ~22 samples over the
+    # threshold against a required 21 — and the fill, at value ~18, counted for nothing. A
+    # two-sample margin over a sub-pixel stroke phase is not a test of whether the gesture
+    # painted; it is a test of whether the stroke happened to land on the sample lattice. A
+    # 51 px change in panel width (780 -> 729, from a legitimate layout change) re-centres the
+    # rect, moves the stroke off that lattice and takes the count to ZERO while the renderer
+    # is drawing 1645 pixels perfectly well. So: count every painted pixel, and separately
+    # require that a full-strength stroke is among them.
     _canvas = QPixmap(_surf.width(), _surf.height())
     _canvas.fill(Qt.black)
     _pp = QPainter(_canvas)
     _pv._paint_overlays(_pp)          # the same callback both surfaces invoke
     _pp.end()
-    _img = _canvas.toImage()
-    _lit = sum(1 for _yy in range(0, _img.height(), 3) for _xx in range(0, _img.width(), 3)
-               if _img.pixelColor(_xx, _yy).value() > 40)
-    assert _lit > 20, f"the armed gesture painted nothing ({_lit} lit samples)"
+    _img = _canvas.toImage().convertToFormat(QImage.Format_RGB32)
+    _rows = np.frombuffer(bytes(_img.constBits()), np.uint8).reshape(
+        _img.height(), _img.bytesPerLine() // 4, 4)[:, :_img.width(), :3]
+    _painted = int((_rows.max(axis=2) > 0).sum())
+    _peak = int(_rows.max())
+    # The rect is ~33x46 displayed px, so its fill alone is ~1500 painted pixels; a few
+    # hundred is a floor that cannot be met by stray antialiasing yet holds for any framing.
+    assert _painted > 300, \
+        f"the armed gesture painted nothing ({_painted} painted px, peak value {_peak})"
+    # ...and the stroke has to be a visible line, not only the translucent fill (~18).
+    assert _peak > 60, f"the gesture's stroke is invisible (peak value {_peak})"
     _pv.cancel_pick()
 
     pdoc2 = _PDoc()
@@ -2773,6 +3000,12 @@ def main(argv) -> int:
 
     frag = _GV._build_frag(_GV._MAX_CH)
     assert f"uniform vec3  u_blend[{_GV._MAX_CH}]" in frag, "u_blend not declared"
+    # V2.23: the two SPATIAL comparators are defined on the image, so the quad has to be told
+    # where in the image it is. The overview quad is (0,0,1,1) and a viewport detail patch is
+    # its own rect — off the quad's own uv a patch restarted the checkerboard and slid the
+    # wipe divider to the middle of the zoom.
+    assert "uniform vec4  u_rect" in frag and "u_rect.xy + v_uv * u_rect.zw" in frag, \
+        "the comparators are computed off the quad's own uv, not the image's"
     # THIS process cannot compile it: the probe runs under QT_QPA_PLATFORM=offscreen with
     # NODELAB_GL=0, so no GL context exists here by construction. A GLSL error would then
     # never be caught — the panel degrades to the CPU path on `gl_failed`, so a broken
@@ -2794,6 +3027,7 @@ def main(argv) -> int:
         "assert p.addShaderFromSourceCode(QOpenGLShader.Fragment,_build_frag(_MAX_CH)),p.log()\n"
         "assert p.link(),p.log()\n"
         "assert p.uniformLocation('u_blend[0]')>=0,'u_blend optimized away'\n"
+        "assert p.uniformLocation('u_rect')>=0,'u_rect optimized away'\n"
         "print('OK')\n" % os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     _env = {k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"}
     _env["NODELAB_GL"] = "1"
@@ -2869,6 +3103,22 @@ def main(argv) -> int:
                              {1: (0, _v, 8.0)}).constBits(), dtype=np.uint8).astype(float)
           for _v in (0.0, 0.5, 1.0)]
     assert _o[0].sum() < _o[1].sum() < _o[2].sum(), "opacity does not scale the overlay"
+    # ...and a PATCH of the image composites to the same pixels that part of the whole image
+    # did — which is only true if `region` (the CPU mirror of `u_rect`) reaches both spatial
+    # comparators. The detail quad is drawn OVER the overview, so any disagreement here is a
+    # visible seam that appears the moment you zoom.
+    for _mode, _param in ((3, 8.0), (4, 0.25)):
+        _tint = {0: (0, 255, 0), 1: (255, 255, 0)}
+        _lim = {0: (0.0, 4095.0), 1: (0.0, 4095.0)}
+        _all = np.frombuffer(_cwc({0: _base, 1: _ovl}, _tint, _lim, None,
+                                  {1: (_mode, _OP, _param)}).constBits(),
+                             dtype=np.uint8).reshape(16, -1, 3)[:, :16, :]
+        for _f0, _f1, _sl in ((0.0, 0.5, slice(0, 8)), (0.5, 1.0, slice(8, 16))):
+            _half = {0: _base[:, _sl], 1: _ovl[:, _sl]}
+            _pimg = _cwc(_half, _tint, _lim, None, {1: (_mode, _OP, _param)},
+                         region=(0.0, 1.0, _f0, _f1))
+            _pat = np.frombuffer(_pimg.constBits(), dtype=np.uint8).reshape(16, -1, 3)[:, :8, :]
+            assert np.array_equal(_pat, _all[:, _sl, :]), (_mode, _f0)
     # a channel with NO entry must composite exactly as it did before overlays existed
     _plain = _cwc({0: _base}, {0: (0, 255, 0)}, {0: (0.0, 4095.0)}, None, None)
     _same = _cwc({0: _base}, {0: (0, 255, 0)}, {0: (0.0, 4095.0)}, None, {1: (2, 0.3, 8.0)})
@@ -2881,7 +3131,11 @@ def main(argv) -> int:
         "quantization and are pairwise DISTINCT (so none silently fell through to add); "
         "opacity scales the overlay monotonically; and a channel with no blend entry "
         "composites byte-identically to how it did before overlays existed, which is what "
-        "keeps every non-overlay graph unchanged" % _compiled)
+        "keeps every non-overlay graph unchanged. V2.23: the two SPATIAL comparators are "
+        "computed in IMAGE coordinates (`u_rect`, which the driver confirms survives linking, "
+        "mirrored by `region=`), so a zoomed detail patch composites byte-identically to that "
+        "part of the whole image instead of restarting the checkerboard and sliding the wipe "
+        "divider into the middle of the zoom" % _compiled)
 
     # ── I1 flow.iterate: the GUI half of the parameter sweep (V2.19) ───────────
     #
@@ -2982,6 +3236,50 @@ def main(argv) -> int:
     # …and it is a UI annotation: the run graph must not carry it, or every pull would
     # re-key the memo entry that produced it
     assert _SW_KEY not in idoc.to_graph(for_run=True).nodes["ITT"].params
+    # the target picker (V2.22): the panel scrapes the chain and WIRES the choice, so the
+    # thing to prove is that the combo is not a parallel notion of what is being iterated —
+    # it must produce the same driver edge a drag makes, and it must never offer a target
+    # the rewrite would then refuse.
+    from PySide6.QtWidgets import QComboBox as _QCombo2
+
+    def _target_boxes():
+        iinsp.set_node(_NItem(idoc.nodes["ITT"], idoc))
+        app.processEvents()
+        return [c for c in iinsp.findChildren(_QCombo2)
+                if c.count() and c.itemData(0) == ""]
+
+    _boxes = _target_boxes()
+    assert len(_boxes) == 2, "V0 plus one spare row"          # variables == 1
+    assert "Threshold" in _boxes[0].currentText(), \
+        f"the slot's existing driver wire must show as its selection ({_boxes[0].currentText()!r})"
+    _spare_items = [_boxes[1].itemText(i) for i in range(_boxes[1].count())]
+    assert not any("Threshold · Threshold" in t for t in _spare_items), \
+        "a target another slot already drives must leave the other slots' menus"
+    assert not any("2D / 3D" in t or "dim" == t for t in _spare_items), _spare_items
+    # the spare row adds a SECOND variable: it raises `variables` rather than making the
+    # user find that Mode first, and picking a dropdown sets the slot's Type to text
+    _k = next(i for i in range(_boxes[1].count())
+              if "Connectivity" in _boxes[1].itemText(i))
+    _boxes[1].setCurrentIndex(_k)
+    app.processEvents()
+    assert ("ITT", "var1", "ILB", "connectivity") in idoc.edges, idoc.edges
+    assert idoc.nodes["ITT"].modes["variables"] == "2"
+    assert idoc.nodes["ITT"].modes["v1_type"] == "number"
+    _boxes = _target_boxes()
+    _k = next(i for i in range(_boxes[1].count()) if "method" in _boxes[1].itemText(i))
+    _boxes[1].setCurrentIndex(_k)
+    app.processEvents()
+    assert ("ITT", "var1_text", "ITH", "__mode__:method") in idoc.edges, idoc.edges
+    assert idoc.nodes["ITT"].modes["v1_type"] == "text", \
+        "a Mode is swept by NAME — the picker must move the slot onto its string output"
+    assert not any(e[1] == "var1" for e in idoc.edges), \
+        "re-pointing a slot must replace its wire, not leave the old one drawn"
+    # …and back, so the rest of the section sees the one-variable card it set up
+    idoc.set_iterate_target("ITT", 1)
+    idoc.nodes["ITT"].modes["variables"] = "1"
+    assert [e for e in idoc.edges if e[0] == "ITT"] == \
+        [("ITT", "var0", "ITH", "threshold")]
+
     iinsp.set_node(None)
     iinsp.setParent(None)
 
@@ -3014,8 +3312,12 @@ def main(argv) -> int:
         "'picked' and N for Run sweep with the value baked into each and no driver edge "
         "surviving; the inspector locks a driven editor, names what the sweep drives, "
         "counts its iterations, emits the sweep action and renders the recorded metric "
-        "table — which stays a UI annotation the run graph strips; the Viewer's iteration "
-        "strip shows, selects and hides; and the wire round-trips through save/load")
+        "table — which stays a UI annotation the run graph strips; the V2.22 target picker "
+        "shows the slot's existing wire as its selection, hides what another slot already "
+        "took, and BUILDS the same driver edge a drag would — its spare row raising "
+        "`variables` and a dropdown target moving the slot onto its string output; the "
+        "Viewer's iteration strip shows, selects and hides; and the wire round-trips "
+        "through save/load")
 
     # ── C1: TWO channel branches, told apart end to end (2026-08-03) ───────────
     #
@@ -3108,6 +3410,198 @@ def main(argv) -> int:
         "(a channel tap is no longer read as a spatial shift); and the Viewer's channel "
         "strip follows the branch — the two payloads have identical axes, so a size-keyed "
         "strip showed the first branch's name, tint and LUT for the second")
+
+    # ── C2: the Points overlay's Z gating + colour modes (2026-08-03 / 08-04) ──
+    #
+    # Two reports, one root cause. First "particle detection does not show points detected":
+    # a 3-D detection's z is a continuous DEPTH, so its particles sit on the planes they were
+    # found at (2–34 on the reported stack) and the plane a viewer opens on held none of them
+    # — while the status line SUPPRESSED the count when it was zero, so there was no way to
+    # tell "detected nothing" from "detected 41 000, none on this plane".
+    #
+    # The first fix for that was wrong, and this probe pins the corrected one. Making a
+    # subpixel layer project REGARDLESS of `z_project` broke two things at once, which became
+    # the second report ("Show points from every Z is not selected, it still shows up" and
+    # "all beads one colour"): the checkbox went inert, and drawing every plane's markers at
+    # once overlaps thousands of glyphs into a flat wash, so a per-point palette stops reading
+    # as a palette at all. So `z_project` is authoritative for BOTH z_kinds, and the
+    # discoverability problem is carried entirely by the status line — which costs the picture
+    # nothing.
+    from nodegraph.dataset import Dataset as _DS
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodegraph.structure import point_table as _pt
+
+    _zax = AxisSizes(m=1, t=1, z=8, c=1, y=32, x=32)
+    _zvol = np.zeros((1, 1, 8, 1, 32, 32), dtype=float)
+    _zds = _DS(axes=_zax, metadata={"pixel_size_um": 0.2}).with_image(_AP(_zvol))
+    # a 3-D cloud whose subpixel z rounds onto planes 3 / 4 / 5 / 5
+    _zds = _zds.with_structure(_pt(np.array([[3.2, 8.0, 8.0], [4.1, 12.0, 20.0],
+                                             [4.8, 20.0, 10.0], [5.3, 24.0, 24.0]]),
+                                   z_kind="subpixel", layer="particles"))
+    # …and a per-plane 2-D detection whose two rows belong to planes 1 and 6
+    _zds = _zds.with_structure(_pt(np.array([[6.0, 6.0], [26.0, 26.0]]),
+                                   z=np.array([1.0, 6.0]), z_kind="plane_index",
+                                   layer="perplane"))
+    win.viewer.show_result("zpts", {0: _zvol[0, 0, 0, 0]}, _zax, 0.01, dataset=_zds)
+    app.processEvents()
+    assert win.viewer.overlays.points.enabled
+    assert not win.viewer.overlays.points.z_project, "z_project must default OFF"
+
+    _ON = {0: 0, 1: 1, 2: 0, 3: 1, 4: 1, 5: 2, 6: 1, 7: 0}   # per plane, both layers summed
+    for _z, _want in _ON.items():
+        win.viewer._sliders["z"].setValue(_z)
+        app.processEvents()
+        _on, _frame = win.viewer._point_tally()
+        # `_point_tally` counts off the DATASET now, so it no longer refreshes the drawn
+        # geometry as a side effect — materialise it explicitly before reading _geo_points
+        win.viewer._ensure_geometry()
+        # (a) OFF draws the viewed plane's own detections and nothing else — the setting gates
+        #     a subpixel layer exactly as it gates a plane_index one
+        assert len(win.viewer._geo_points) == _want, (
+            f"z={_z}: z_project OFF drew {len(win.viewer._geo_points)}, expected {_want} — "
+            f"the setting must gate a 3-D layer too")
+        assert _on == _want, (_z, _on, _want)
+        # (b) the tally still knows the whole frame, which is what keeps an empty plane
+        #     distinguishable from an empty result while nothing is projected
+        assert _frame == 6, (_z, _frame)
+        # (c) ON draws every point, off-plane ones flagged so the renderer dims them
+        win.viewer.overlays.points.z_project = True
+        win.viewer._geo_key = None
+        win.viewer._ensure_geometry()
+        _all = win.viewer._geo_points
+        assert len(_all) == 6, (_z, len(_all))
+        assert sum(1 for mk in _all if mk.on_plane) == _want, (_z, _want)
+        win.viewer.overlays.points.z_project = False
+        win.viewer._geo_key = None
+
+    # the status line names the off-plane remainder on a plane holding NONE of them
+    win.viewer._sliders["z"].setValue(0)
+    app.processEvents()
+    win.viewer.show_result("zpts", {0: _zvol[0, 0, 0, 0]}, _zax, 0.01, dataset=_zds)
+    app.processEvents()
+    _txt = win.viewer._status.text()
+    assert "0 points" in _txt and "6 on other Z" in _txt, \
+        f"an empty plane inside a full volume must still say what was detected: {_txt!r}"
+
+    # each colour mode is what it claims. per_layer being ONE colour per layer is correct
+    # rather than broken — with a single Point layer it equals `single`, which is what was
+    # reported as "all beads one colour".
+    win.viewer._sliders["z"].setValue(4)
+    win.viewer.overlays.points.z_project = True          # all 6 marks across both layers
+    win.viewer._geo_key = None
+    win.viewer._ensure_geometry()
+    _mk = win.viewer._geo_points
+    _rend = win.viewer._renderer
+    _seen = {}
+    for _mode in ("single", "per_z", "per_point", "per_layer"):
+        win.viewer.overlays.points.color_mode = _mode
+        _seen[_mode] = len({_rend._point_color(win.viewer.overlays.points, k).name()
+                            for k in _mk})
+    assert len({mk.layer for mk in _mk}) == 2, "the fixture must carry TWO Point layers"
+    assert _seen["single"] == 1, _seen
+    assert _seen["per_point"] == 6, (
+        f"per_point must give one colour PER POINT, got {_seen} — 4 for 6 marks was the "
+        f"cross-layer id collision: every layer numbers ids from 0 and the neighbour graph "
+        f"is per layer, so two layers' objects preferred (and kept) the same palette slots")
+    assert _seen["per_layer"] == 2, f"per_layer must be one colour per layer, got {_seen}"
+    # per_z: one colour per PLANE, over the 5 planes these 6 marks occupy — the cloud rounds
+    # onto 3/4/5/5 and the per-plane layer sits on 1 and 6
+    assert sorted({mk.zplane for mk in _mk}) == [1, 3, 4, 5, 6],         sorted({m.zplane for m in _mk})
+    assert _seen["per_z"] == 5, f"per_z must give one colour per Z plane, got {_seen}"
+    # …and with projection OFF every drawn mark is on the viewed plane, so per_z is ONE
+    # colour. That is correct, not a repeat of the per_layer confusion — but it is a trap
+    # worth pinning, because "colour by Z" showing one colour reads exactly like a bug.
+    win.viewer.overlays.points.color_mode = "per_z"
+    win.viewer.overlays.points.z_project = False
+    win.viewer._geo_key = None
+    win.viewer._ensure_geometry()
+    _flat = win.viewer._geo_points
+    assert _flat and len({mk.zplane for mk in _flat}) == 1
+    assert len({_rend._point_color(win.viewer.overlays.points, k).name()
+                for k in _flat}) == 1, "per_z with projection off must be one colour"
+    win.viewer.overlays.points.color_mode = "single"
+    win.viewer.overlays.points.z_project = False
+    win.viewer._geo_key = None
+
+    _ok("C2 Points overlay Z gating + colour (2026-08-03/04): reported first as 'particle "
+        "detection does not show points detected', then as 'Show points from every Z is not "
+        "selected, it still shows up' + 'all beads one colour' — the same root cause twice. A "
+        "3-D detection's z is a continuous depth, so its particles sit on the planes they "
+        "were found at and the plane a viewer opens on can hold none; the first fix made a "
+        "subpixel layer project REGARDLESS of the setting, which left the checkbox inert and "
+        "overlapped every plane's glyphs into one flat wash that destroyed the per-point "
+        "palette too. Now z_project is authoritative for BOTH z_kinds (proved across 8 "
+        "planes, on and off, against a subpixel and a plane_index layer side by side), "
+        "discoverability rides on the status line alone — counted off the DATASET rather than "
+        "the drawn marks, so the off-plane remainder is still named when nothing is projected "
+        "— and all four colour modes are each what they claim: one colour, one per Z PLANE "
+        "(V2.23, the mode that makes a projected 3-D cloud read as depth — and legitimately "
+        "one colour when nothing is projected, since every drawn mark is then on the viewed "
+        "plane), a colour per POINT (6 for 6 marks; it was 4, because every layer numbers ids "
+        "from 0 and the neighbour graph is per layer, so two layers preferred and kept the "
+        "same palette slots), and one per LAYER (which with a single layer equals `single`)")
+
+    # ── V4 a computed node must LOOK like its raw source ────────────────────────
+    # Every streaming provider computes in float64, so Stitch/Gaussian/... reach the Viewer
+    # as floats even though their values are still the same integer counts. The LUT slider
+    # extent keyed on that dtype instead of on the payload's own `bit_depth` declaration,
+    # so a stitched mosaic got a slider spanning its DATA range while the raw source beside
+    # it got the SENSOR range — 135-1564 against 0-4095 on real dim 12-bit data.
+    from nodelab_v2.glview import pack_u16
+    _vp2 = win.viewer
+    _bd_save = _vp2._bit_depth
+
+    # (1) the LUT extent follows the DECLARATION, not the dtype
+    _u16 = np.full((8, 8), 700, np.uint16)
+    _f64 = _u16.astype(np.float64)
+    _vp2._bit_depth = 12
+    assert _vp2._display_range(_u16) == (0.0, 4095.0)
+    assert _vp2._display_range(_f64) == (0.0, 4095.0), \
+        "a float plane that still declares bit_depth must get the SENSOR range, like raw"
+    # ...and a node that genuinely rescaled (bit_depth dropped) still reads its own range
+    _vp2._bit_depth = None
+    _norm = np.linspace(0.0, 0.25, 64).reshape(8, 8)
+    assert _vp2._display_range(_norm) == (0.0, 0.25), \
+        "a rescaled [0,1] image must NOT be given a sensor range it no longer has"
+    assert _vp2._display_range(_u16) == (0.0, 65535.0)   # integer, no declaration
+    _vp2._bit_depth = _bd_save
+
+    # (2) the texture packing range CANCELS in the shader — pinned here because it looks
+    #     like it should be keyed to bit_depth, and pinning it there was tried and reverted.
+    #     `_upload` hands its (dmin, dmax) to the shader as u_win, which renormalizes the
+    #     LUT window against it, so the rendered value is (v - clim_lo)/(clim_hi - clim_lo)
+    #     whatever scale was used. Assert that equivalence directly, on two frames whose
+    #     EXTREMES differ — the case where a per-plane scale could have drifted.
+    def _rendered(plane, clim):
+        u16, dmin, dmax = pack_u16(plane)
+        span = max(dmax - dmin, 1e-9)
+        vlo, vhi = (clim[0] - dmin) / span, (clim[1] - dmin) / span
+        texel = u16.astype(np.float64) / 65535.0
+        return np.clip((texel - vlo) / max(vhi - vlo, 1e-6), 0.0, 1.0)
+
+    _clim = (169.0, 1526.0)
+    _fA = np.array([[128.0, 700.0, 1572.0]])          # two frames of the same series,
+    _fB = np.array([[210.0, 700.0, 1408.0]])          # differing only at the extremes
+    _a = _rendered(_fA, _clim)[0][1]                  # the 700-count pixel in each
+    _b = _rendered(_fB, _clim)[0][1]
+    _raw = _rendered(np.array([[128, 700, 1572]], np.uint16), _clim)[0][1]
+    assert abs(_a - _b) < 1e-4, f"one intensity must render alike across frames ({_a},{_b})"
+    assert abs(_a - _raw) < 1e-3, \
+        f"a computed node must render an intensity like its raw source ({_a} vs {_raw})"
+    # integer planes keep their exact, full-width scale
+    assert pack_u16(_u16)[1:] == (0.0, 65535.0)
+    assert pack_u16(np.full((4, 4), 3, np.uint8))[1:] == (0.0, 255.0)
+    # a flat float plane must not divide by zero
+    assert pack_u16(np.zeros((4, 4)))[1:] == (0.0, 1.0)
+
+    _ok("V4 computed-node display parity: the LUT slider extent now follows the payload's "
+        "`bit_depth` DECLARATION rather than the streaming dtype, so a Stitch/Gaussian gets "
+        "the same 0-4095 sensor slider as its raw source instead of a data-derived one "
+        "(measured 135-1564 before), while a node that really rescaled has dropped "
+        "bit_depth and still reads its own range; and the texture packing range is pinned "
+        "as CANCELLING in the shader — one intensity renders identically across frames with "
+        "different extremes, and identically to the raw uint16 path, which is why keying it "
+        "to bit_depth was tried and reverted as a no-op that only cost clipping headroom")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

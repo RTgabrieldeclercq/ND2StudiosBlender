@@ -164,15 +164,24 @@ def _guard_uint16_range(probe: np.ndarray, precision: str) -> None:
 
 
 def _downsample_2x(a: np.ndarray) -> np.ndarray:
-    """Mean-pool the trailing ``(Y, X)`` of a ``(Z, Y, X)`` slab by 2×. Mirrors
-    :func:`nodegraph.provider._mean_downsample_2x`'s arithmetic exactly (each output
-    pixel reduces its own 2×2 neighbourhood), so a checkpoint's pyramid matches an
-    ingest store's. Returns ``a`` unchanged when a spatial axis cannot halve."""
+    """Mean-pool the trailing ``(Y, X)`` of a ``(…, Y, X)`` slab by 2×, via
+    :func:`nodegraph.provider._plane_mean_2x` — **the** pyramid arithmetic, in one place.
+
+    It used to re-spell that expression here, which is precisely the drift
+    ``provider._plane_mean_2x``'s docstring claims cannot happen ("Every pyramid path routes
+    its per-plane reduction through this function so … :mod:`nodegraph.checkpoint` cannot
+    drift apart"). It could, because nothing enforced it and this module never called it.
+
+    Kept as a thin wrapper rather than deleted: it is the reference the selftest compares
+    the streamed pyramid against, and the checkpoint writer no longer calls it at all — the
+    coarse levels are streamed out of the finished ``level_0`` by
+    :meth:`nodegraph.provider.B2ndProvider._append_level`, which is pooled and bounded.
+    """
+    from nodegraph.provider import _plane_mean_2x
     y, x = a.shape[-2], a.shape[-1]
     if y < 2 or x < 2:
         return a
-    a = a[..., :y // 2 * 2, :x // 2 * 2]
-    return a.reshape(*a.shape[:-2], y // 2, 2, x // 2, 2).mean(axis=(-3, -1)).astype(a.dtype)
+    return _plane_mean_2x(a)
 
 
 # ── the layer index (what goes in the manifest) ───────────────────────────────
@@ -211,7 +220,9 @@ def write_checkpoint(ds: Dataset, dirpath: str, *, precision: str,
                      bake_id: str = "", levels: int = 3,
                      domains: Optional[frozenset] = None,
                      layer_names: Optional[Sequence[Tuple[Domain, str]]] = None,
-                     progress: Optional[ProgressFn] = None) -> Dict[str, Any]:
+                     progress: Optional[ProgressFn] = None,
+                     should_cancel: Optional[Callable[[], bool]] = None
+                     ) -> Optional[Dict[str, Any]]:
     """Write ``ds`` to the checkpoint directory ``dirpath`` and return its manifest.
 
     ``precision`` (one of :data:`PRECISIONS`) applies to **floating-point** data only —
@@ -223,6 +234,11 @@ def write_checkpoint(ds: Dataset, dirpath: str, *, precision: str,
     catalog (what ``propagate_meta`` computed for the edge being checkpointed), which is
     strictly better than re-deriving it from the payload; both fall back to a derivation
     when omitted.
+
+    ``should_cancel()`` is polled at every block/layer boundary; when it returns true this
+    returns **None** having written no manifest — which is the same state an interrupted bake
+    already leaves, i.e. one :func:`read_manifest` correctly reports as unusable. A caller
+    that gets ``None`` must not record a bake.
 
     Any pre-existing content at ``dirpath`` is overwritten. The manifest is written last,
     so an interrupted bake leaves a directory that reads as *absent*, never as valid."""
@@ -252,12 +268,19 @@ def write_checkpoint(ds: Dataset, dirpath: str, *, precision: str,
     if ds.image is not None:
         image_meta = _write_image(ds.image, ax, os.path.join(dirpath, IMAGE_DIR),
                                   precision=precision, levels=levels,
-                                  report=report, total_units=img_bytes)
+                                  report=report, total_units=img_bytes,
+                                  should_cancel=should_cancel)
+        if image_meta is None:
+            return None                  # cancelled: no manifest, so this reads as absent
 
     voxel_index = _write_voxel_layers(voxel, os.path.join(dirpath, VOXEL_DIR),
                                       precision=precision, report=report,
-                                      base=img_bytes)
+                                      base=img_bytes, should_cancel=should_cancel)
+    if voxel_index is None:
+        return None
     table_index = _write_tables(small, os.path.join(dirpath, TABLES_NAME))
+    if should_cancel is not None and should_cancel():
+        return None
 
     md = dict(ds.metadata)
     if image_meta is not None and image_meta["restamped_bit_depth"]:
@@ -286,71 +309,318 @@ def write_checkpoint(ds: Dataset, dirpath: str, *, precision: str,
     return manifest
 
 
+#: Set ``NODEGRAPH_DOCK_COPY=0`` to force every bake through the full re-encode, bypassing
+#: :func:`_copy_levels`. A kill-switch rather than an opt-in: the copy is guarded on exact
+#: equality of everything that could differ, so the honest default is to take it — but a
+#: comparison ("is the copy really producing the same store?") needs a way to turn it off, and
+#: so does a bug report.
+def _copy_enabled() -> bool:
+    return (os.environ.get("NODEGRAPH_DOCK_COPY", "1").strip().lower()
+            not in ("0", "false", "no", "off"))
+
+
+def _copy_levels(prov: Any, ax: AxisSizes, imgdir: str, *, dt: np.dtype, tile: int,
+                 report: Callable[[float, str], None], total_units: int,
+                 want_levels: int = 1,
+                 should_cancel: Optional[Callable[[], bool]] = None
+                 ) -> Optional[Tuple[Any, int]]:
+    """Copy the source store's pyramid files verbatim instead of decoding and re-encoding
+    them — returning ``(deepest copied array, how many levels were copied)``, or ``None`` when
+    any guard fails and the caller must do the real write.
+
+    **Why this exists.** The cheapest bake a user can ask for is "freeze the load so I stop
+    re-ingesting", and it was the one that paid full price: nothing tested what the input
+    provider *was*, so a dock straight after ``io.load`` decompressed a store off disk and
+    compressed it straight back, to produce bytes that were already there. Copying moves the
+    COMPRESSED bytes and skips both codec passes, so it is bounded by the disk rather than by
+    a core: on the 1.25 GiB fixture, 866 MiB of level 0 copies in well under a second against
+    ~3.3 s to re-encode it, and the saving grows with the file.
+
+    **Every guard is an exact-equality test, because "close enough" here means silently wrong
+    pixels.** The path is taken only when the destination bytes would be *identical*:
+
+    * the input is a **disk-backed** :class:`~nodegraph.provider.B2ndProvider` (an in-memory
+      one has no file to copy, and every other provider computes its pixels);
+    * its axes equal the payload's, so no node between the store and the dock reshaped,
+      subset or re-addressed anything (those all wrap the provider in another class, but a
+      metadata-only reshape would not, and the manifest's axes must describe the bytes);
+    * ``target_dtype`` is a **no-op** at this precision — i.e. the data is integer/bool, which
+      passes through untouched. A float source at ``float32``/``uint16`` is a real conversion
+      and must go the long way;
+    * ``tile`` matches, since it is the block geometry a reader decompresses by, and it is
+      part of the provider's fingerprint;
+    * the source's level 0 is **sound** — neither ``torn`` by its marker nor showing the
+      blank-chunk tail of a pre-marker interrupted write. This is the guard that matters most:
+      copying is the one path that would propagate a half-written source verbatim, and a tail
+      of zero planes is exactly what a killed ingest leaves.
+
+    **Every sound level is copied, not just level 0**, up to the depth this bake wants. The
+    first cut copied level 0 only and rebuilt the pyramid, which left the rebuild dominating
+    the whole operation — it decompresses all of level 0 again to produce coarse levels that
+    were already sitting on disk beside it, and measured only 1.3× faster than a full
+    re-encode. Copying them is sound for the same reason ``open`` can be trusted about them:
+    it takes only the leading run that is complete-or-legacy and DROPS a torn level, so
+    ``prov.levels`` already excludes anything it could not vouch for — and each one is put
+    through the blank-chunk census here as well. Levels the source does not have are still
+    built by :meth:`~nodegraph.provider.B2ndProvider._append_level` from the deepest one it
+    did have.
+
+    The copied coarse levels keep the SOURCE's chunk framing, which differs from what this
+    writer would choose (an ingest store does not batch thin Z). That is a framing difference,
+    not a pixel one — both sides derive from :func:`~nodegraph.provider._plane_mean_2x` — and
+    the manifest reports the framing that is actually on disk rather than the one that was
+    requested.
+    """
+    from nodegraph.provider import B2ndProvider
+    if not _copy_enabled() or not isinstance(prov, B2ndProvider):
+        return None
+    src_dir = getattr(prov, "_urlpath", None)
+    if not src_dir:
+        return None                      # an in-memory store: nothing on disk to copy
+    arrs = getattr(prov, "_arrays", None)
+    if not arrs:
+        return None
+    src0 = arrs[0]
+    if tuple(src0.shape) != (ax.m, ax.t, ax.z, ax.c, ax.y, ax.x):
+        return None                      # the payload is not this store's own geometry
+    if np.dtype(src0.dtype) != np.dtype(dt):
+        return None                      # a real precision conversion
+    if int(getattr(prov, "tile", -1)) != int(tile):
+        return None                      # different read granularity
+    # How many levels are BOTH sound at the source and wanted by this bake. `prov.levels`
+    # already excludes anything `open` would not vouch for; the census catches the pre-marker
+    # interrupted write that `open` trusts by age.
+    n = min(int(getattr(prov, "levels", 1)), max(1, int(want_levels)))
+    for lv in range(n):
+        a = arrs[lv]
+        if B2ndProvider._level_state(a) == "torn" or B2ndProvider._blank_tail(a) is not None:
+            n = lv                       # this level and everything under it get rebuilt
+            break
+    if n < 1:
+        return None                      # not even level 0 is trustworthy
+
+    srcs = [os.path.join(src_dir, f"level_{lv}.b2nd") for lv in range(n)]
+    dsts = [os.path.join(imgdir, f"level_{lv}.b2nd") for lv in range(n)]
+    if any(not os.path.isfile(s) for s in srcs):
+        return None
+    if any(os.path.abspath(s) == os.path.abspath(d) for s, d in zip(srcs, dsts)):
+        return None                      # baking a store onto itself
+    total_bytes = max(1, sum(os.path.getsize(s) for s in srcs))
+
+    # Copied in chunks rather than through `shutil.copyfile` so the bar moves and a stop is
+    # honoured: this is one operation on files that can total hundreds of GB, and a
+    # determinate bar that sits still for minutes reads as a hang.
+    step = 32 << 20
+    moved = 0
+    try:
+        for s, d in zip(srcs, dsts):
+            with open(s, "rb") as fin, open(d, "wb") as fout:
+                while True:
+                    if should_cancel is not None and should_cancel():
+                        raise InterruptedError
+                    buf = fin.read(step)
+                    if not buf:
+                        break
+                    fout.write(buf)
+                    moved += len(buf)
+                    report(int(total_units * (moved / total_bytes)),
+                           f"copying the source store · "
+                           f"{moved * 100 // total_bytes}%")
+    except (InterruptedError, OSError):
+        # A copy that cannot complete (cancelled, no space, a locked file) must not leave a
+        # truncated level behind for `open` to adopt. Remove every file this attempt made and
+        # fall through to the real write.
+        for d in dsts:
+            _unlink(d)
+        return None
+    import blosc2
+    out = None
+    for lv, d in enumerate(dsts):
+        try:
+            arr = blosc2.open(d, mode="a")
+        except Exception:  # noqa: BLE001 — an unopenable copy is not a checkpoint
+            for dd in dsts:
+                _unlink(dd)
+            return None
+        # The source may pre-date the marker (`legacy`), so stamp every copy: from here on
+        # these are levels THIS writer produced, and they must read as complete rather than
+        # as trusted-by-age.
+        B2ndProvider._mark(arr, lv, True)
+        out = arr
+    return (out, n)
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _write_image(prov: Any, ax: AxisSizes, imgdir: str, *, precision: str, levels: int,
-                 report: Callable[[float, str], None],
-                 total_units: int) -> Dict[str, Any]:
-    """Stream the raster into a planar-block ``.b2nd`` pyramid, plane by plane.
+                 report: Callable[[float, str], None], total_units: int,
+                 should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+    """Stream the raster into a planar-block ``.b2nd`` pyramid.
 
-    Never realizes the 6-D volume: one z-slab is read from the (possibly lazy, possibly
-    twenty-nodes-deep) provider, written to level 0, then repeatedly halved into the
-    higher levels. Peak memory is that slab plus its downsamples — bounded by the chunk
-    target — which is what lets a series larger than RAM be checkpointed at all.
+    Never realizes the 6-D volume: one ``(t-batch, z-slab)`` block is read from the
+    (possibly lazy, possibly twenty-nodes-deep) provider and written to level 0. Peak
+    memory is that block — bounded by :data:`~nodegraph.provider._CHUNK_TARGET_BYTES` —
+    which is what lets a series larger than RAM be checkpointed at all.
 
-    Every level is chunked on the SAME z-slab count as level 0, so every write is exactly
-    chunk-aligned at every level (a partial-chunk write to a compressed array costs a
-    decompress/recompress round-trip that the alignment avoids)."""
+    Four things changed here, and the first two are where the time was going on exactly the
+    data a Dock gets pointed at (a Z-projection, a stitch, a merge — all ``z == 1``):
+
+    1. **Geometry comes from** :meth:`~nodegraph.provider.B2ndProvider._store_kwargs`,
+       per level, with ``batch_thin_z=True``. This module used to compute ``cz`` **once**
+       from level-0 plane bytes and reuse it for every level, which both mis-framed the
+       coarse levels (4× and 16× smaller chunks than the store the ingest writes) and, on a
+       thin-Z series, pinned one 8 MiB plane per chunk. Measured: 143 → 552 MiB/s.
+    2. **The pyramid is streamed out of the finished level 0** by
+       :meth:`~nodegraph.provider.B2ndProvider._append_level` instead of being mean-pooled
+       here per slab. That call is already pooled across planes, already chunk-aligned,
+       already ``_mark``ed, and it routes through :func:`~nodegraph.provider._plane_mean_2x`
+       — so the pyramid is bit-identical to an ingest store's *by construction* rather than
+       by two copies of one expression agreeing. The old serial float64 mean-pool was ~22%
+       of a bake on its own.
+    3. **Every level is stamped** (:data:`~nodegraph.provider._LEVEL_META`) before its first
+       byte and again when complete. Manifest-last already made a torn *checkpoint* read as
+       absent, but it could not make a torn *level* read as torn — and
+       :meth:`~nodegraph.provider.B2ndProvider.open` globs the leading run of level files
+       rather than trusting the manifest's count, so a re-bake that produced fewer levels
+       left a stale higher level to be adopted as trusted-``legacy``.
+    4. **It is cancellable**, checked at the block boundary and always *before* the
+       manifest — so a cancelled bake lands in the state this module already documents as
+       correct for an interrupted one: readable as absent.
+
+    Returns the image manifest entry; ``None`` when the write was cancelled."""
     import blosc2
     os.makedirs(imgdir, exist_ok=True)
-    from nodegraph.provider import _CHUNK_TARGET_BYTES
+    from nodegraph.parallel import fold_units
+    from nodegraph.provider import B2ndProvider, pyramid_cparams
+
+    def cancelled() -> bool:
+        return bool(should_cancel is not None and should_cancel())
 
     tile = int(getattr(prov, "tile", 512) or 512)
     probe = np.asarray(prov.get_region(0, 0, 0, 0, 0, 0, min(ax.y, 64), 0, min(ax.x, 64)))
     _guard_uint16_range(probe, precision)
     dt = target_dtype(probe.dtype, precision)
     restamped = bool(probe.dtype.kind == "f" and dt.kind in "ui")
+    cparams = pyramid_cparams()
 
-    plane_bytes = max(1, ax.y * ax.x * dt.itemsize)
-    cz = max(1, min(int(ax.z), int(_CHUNK_TARGET_BYTES // plane_bytes)))
-    cparams = {"codec": blosc2.Codec.ZSTD, "filters": [blosc2.Filter.BITSHUFFLE]}
+    shape0 = (ax.m, ax.t, ax.z, ax.c, int(ax.y), int(ax.x))
 
-    arrays, geom = [], []
-    ly, lx = int(ax.y), int(ax.x)
-    for lv in range(max(1, int(levels))):
-        arrays.append(blosc2.empty(
-            (ax.m, ax.t, ax.z, ax.c, ly, lx), dtype=dt,
-            chunks=(1, 1, cz, 1, ly, lx),
-            blocks=(1, 1, 1, 1, min(tile, ly), min(tile, lx)),
-            cparams=cparams, urlpath=os.path.join(imgdir, f"level_{lv}.b2nd"), mode="w"))
-        geom.append((ly, lx))
-        if ly < 2 or lx < 2:
+    want = len(B2ndProvider._pyramid_shapes(shape0, max(1, int(levels))))
+
+    # ── the fast path: the input IS a store already, so copy it ────────────────
+    copied = _copy_levels(prov, ax, imgdir, dt=dt, tile=tile, report=report,
+                          total_units=total_units, want_levels=want,
+                          should_cancel=should_cancel)
+    if copied is not None:
+        last, n_levels = copied
+        # The framing actually ON DISK, which for a copy is the source's, not the one this
+        # writer would have chosen. Reporting the request instead would make the manifest
+        # describe bytes that are not there.
+        chunks = [int(v) for v in last.chunks] if n_levels == 1 else \
+            [int(v) for v in blosc2.open(os.path.join(imgdir, "level_0.b2nd")).chunks]
+        done = total_units
+    else:
+        if cancelled():
+            return None
+        kw0 = B2ndProvider._store_kwargs(shape0, dt.itemsize, tile=tile, cparams=cparams,
+                                         urlpath=imgdir, level=0, batch_thin_z=True)
+        chunks = [int(v) for v in kw0["chunks"]]
+        last = _write_level0(prov, ax, imgdir, dt=dt, kw0=kw0, report=report,
+                             total_units=total_units, cancelled=cancelled,
+                             fold_units=fold_units, B2ndProvider=B2ndProvider,
+                             blosc2=blosc2)
+        if last is None:
+            return None
+        n_levels, done = 1, total_units
+
+    # ── whatever the copy did not supply, built from the deepest level we have ──
+    for lv in range(n_levels, want):
+        if cancelled():
+            return None
+        report(done, f"baking pyramid · level {lv}")
+        nxt = B2ndProvider._append_level(last, lv, tile=tile, cparams=cparams,
+                                         urlpath=imgdir, batch_thin_z=True)
+        if nxt is None:
             break                       # cannot halve further — stop adding levels
-        ly, lx = ly // 2, lx // 2
+        last = nxt
+        n_levels += 1
+    return {"levels": n_levels, "dtype": str(dt), "tile": tile,
+            "restamped_bit_depth": restamped, "chunks": chunks,
+            # How many levels came from the source verbatim: 0 for a real write, and the
+            # difference between this and `levels` is what was rebuilt. Recorded because it is
+            # the one thing about a bake that a reader cannot infer from the bytes, and it is
+            # what a "why is this store framed oddly?" question resolves to.
+            "copied_levels": (copied[1] if copied is not None else 0),
+            "copied_level0": copied is not None}
 
+
+def _write_level0(prov: Any, ax: AxisSizes, imgdir: str, *, dt: np.dtype, kw0: dict,
+                  report: Callable[[float, str], None], total_units: int,
+                  cancelled: Callable[[], bool], fold_units: Any, B2ndProvider: Any,
+                  blosc2: Any) -> Optional[Any]:
+    """Stream level 0 out of ``prov``, block by block. ``None`` when cancelled.
+
+    Split out of :func:`_write_image` when the copy fast path arrived, so the two ways to
+    produce level 0 read as the alternatives they are instead of one of them being buried in
+    an ``else``."""
+    ct, cz = int(kw0["chunks"][1]), int(kw0["chunks"][2])
+    shape0 = (ax.m, ax.t, ax.z, ax.c, int(ax.y), int(ax.x))
+    arr0 = blosc2.empty(shape0, dtype=dt, **kw0)
+    B2ndProvider._mark(arr0, 0, False)
+
+    # One reusable destination buffer per block, allocated once rather than per iteration.
+    # `fold_units` reads the planes on the pool and this thread writes them into the block
+    # in submission order, so the buffer is only ever touched by one thread at a time — the
+    # canonical eager shape (`parallel.fold_units`), with a small `batch` because a unit
+    # here is a whole plane and in-flight results are what bound peak memory.
     done = 0
     for im in range(ax.m):
-        for it in range(ax.t):
-            for ic in range(ax.c):
+        for ic in range(ax.c):
+            for t0 in range(0, ax.t, ct):
+                t1 = min(t0 + ct, ax.t)
                 for z0 in range(0, ax.z, cz):
+                    if cancelled():
+                        return None
                     z1 = min(z0 + cz, ax.z)
-                    slab = np.empty((z1 - z0, ax.y, ax.x), dtype=dt)
-                    for k, iz in enumerate(range(z0, z1)):
-                        slab[k] = _cast(
-                            prov.get_region(0, im, it, iz, ic, 0, ax.y, 0, ax.x), dt)
-                    cur = slab
-                    for lv, (gy, gx) in enumerate(geom):
-                        if lv:
-                            cur = _downsample_2x(cur)
-                        arrays[lv][im:im + 1, it:it + 1, z0:z1, ic:ic + 1, :, :] = \
-                            cur[:, :gy, :gx].reshape(1, 1, z1 - z0, 1, gy, gx)
-                    done += (z1 - z0) * ax.y * ax.x
+                    block = np.empty((t1 - t0, z1 - z0, int(ax.y), int(ax.x)), dtype=dt)
+                    units = [(j, k) for j in range(t1 - t0) for k in range(z1 - z0)]
+
+                    def read(unit, _im=im, _ic=ic, _t0=t0, _z0=z0):
+                        j, k = unit
+                        return np.asarray(prov.get_region(
+                            0, _im, _t0 + j, _z0 + k, _ic,
+                            0, int(ax.y), 0, int(ax.x)))
+
+                    def place(_i, unit, plane, _b=block):
+                        j, k = unit
+                        # `casting="unsafe"` into a typed destination replaces `_cast`'s
+                        # allocate-and-return for the pass-through case, but a float→integer
+                        # narrowing still has to round and clip rather than truncate — so
+                        # that one keeps going through `_cast`.
+                        if plane.dtype == dt:
+                            np.copyto(_b[j, k], plane)
+                        else:
+                            np.copyto(_b[j, k], _cast(plane, dt), casting="unsafe")
+
+                    fold_units(read, units, place, batch=max(1, min(len(units), 8)))
+                    arr0[im:im + 1, t0:t1, z0:z1, ic:ic + 1, :, :] = \
+                        block.reshape(1, t1 - t0, z1 - z0, 1, int(ax.y), int(ax.x))
+                    done += (t1 - t0) * (z1 - z0) * ax.y * ax.x
                     report(done, f"baking image · {done * 100 // max(1, total_units)}%")
-    return {"levels": len(arrays), "dtype": str(dt), "tile": tile,
-            "restamped_bit_depth": restamped}
+    B2ndProvider._mark(arr0, 0, True)
+    return arr0
 
 
 def _write_voxel_layers(layers: Sequence[AttributeLayer], voxdir: str, *,
                         precision: str, report: Callable[[float, str], None],
-                        base: int) -> List[Dict[str, Any]]:
+                        base: int,
+                        should_cancel: Optional[Callable[[], bool]] = None
+                        ) -> Optional[List[Dict[str, Any]]]:
     """Write each Voxel attribute layer to its own ``.npy``, copied **per timepoint** so
     a dtype conversion never allocates a second copy of the whole layer.
 
@@ -374,6 +644,8 @@ def _write_voxel_layers(layers: Sequence[AttributeLayer], voxdir: str, *,
             if src.ndim >= 2 and src.shape[0] and src.shape[1]:
                 for im in range(src.shape[0]):
                     for it in range(src.shape[1]):
+                        if should_cancel is not None and should_cancel():
+                            return None
                         out[im, it] = _cast(src[im, it], dt)
                         done += int(src[im, it].size)
                         report(done, f"baking layer {attr.name!r}")

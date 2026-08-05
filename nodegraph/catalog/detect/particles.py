@@ -65,7 +65,10 @@ def _compute_particles(ctx: EvalContext) -> Dataset:
         "threshold": float(ctx.params.get("threshold", 0.0)),
         "min_intensity": float(ctx.params.get("min_intensity", 0.0)),
         "subpixel": bool(ctx.params.get("subpixel", True)),
-        "min_size": max(1, int(ctx.params.get("min_size", 1))),
+        # the fallback MUST equal the SocketSpec default: the engine does not default-fill
+        # params, so a headless caller passing `params={}` lands here, and a drifted pair
+        # means a batch run and the GUI disagree about what the node does.
+        "min_size": max(1, int(ctx.params.get("min_size", 4))),
     }
     layer = ctx.layer("name")
     is_3d = ctx.is_volume
@@ -138,14 +141,23 @@ register_node(
                 "counts\" — an absolute, calibration-independent criterion that survives "
                 "changes in the brightest object present, which the relative Threshold does "
                 "not. Applied after detection, so it only ever REMOVES particles."),
-        InInt("min_size", "Min size", unit="", field=False, default=1,
+        InInt("min_size", "Min size", unit="", field=False, default=4,
               description=
-              "Smallest blob to accept, in VOXELS — area in 2D, volume in 3D. Raise it to "
-              "reject single-voxel noise spikes and shot noise that survived thresholding; "
-              "each step up also discards genuinely small particles, and in 3D the count grows "
-              "as the cube of radius so a threshold that seems small removes a lot. 1 accepts "
-              "everything. Applied before centroids are computed, so a rejected blob "
-              "contributes nothing to any position."),
+              "Smallest blob to accept, in VOXELS — AREA in 2D, VOLUME in 3D, so the same "
+              "number is a much stricter test in 3D. This is the main defence against shot "
+              "noise, because a noise spike is one voxel and a particle is many: measured on "
+              "a real 51-plane 10x/0.45 bead stack whose 11 particles are verifiable by eye, "
+              "raising it from 1 to 4 cut the detections from 73 403 to 41 212 and 20 cut "
+              "them to 14 960. So RAISE it whenever the result is dominated by specks — and "
+              "note from those numbers that on a genuinely noisy stack this control alone "
+              "will NOT get you to a sane count; it has to be combined with an explicit "
+              "Threshold (0.25 with min_size 20 gave 136 on that file, against Otsu's "
+              "73 403). LOWER it toward 1 if genuinely small particles are being missed — a "
+              "diffraction-limited spot can be only a few pixels of AREA in 2D, which is the "
+              "case where this default is too strict. Applied before centroids are computed, "
+              "so a rejected blob contributes nothing to any position, and it changes how "
+              "many particles are reported — every downstream count and density moves with "
+              "it."),
         InBool("subpixel", "Subpixel", field=False, default=True,
                description=
                "Refine each detection to a position BETWEEN voxels instead of snapping it to "

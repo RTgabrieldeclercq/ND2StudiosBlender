@@ -10,6 +10,11 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InFloat, InString, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import (
+    _point_layers,
+    _resolve_layer,
+    _voxel_layers,
+)
 
 # ── Track Linking (frame-to-frame tracking → a Track membership, C3) ──────────
 
@@ -41,9 +46,16 @@ def _compute_track_link(ctx: EvalContext) -> Dataset:
             offset += int(mem.track_id.max())         # keep (m,c) runs' track ids unique
 
     if target == "label":
-        src = ctx.layer("labels")
+        # the one raster on the wire, whatever it is called (`_resolve_layer`); this branch
+        # groups the raster by id and needs no Label table, so any Voxel layer qualifies
+        src, _note = _resolve_layer(
+            _voxel_layers(ds), ctx.layer("labels"), node="track.link (label)",
+            socket="labels", what="Voxel layer", where="the `data` input",
+            remedy="label mode links regions frame to frame by IoU overlap, so run "
+                   "analysis.segment / analysis.label upstream — or set Target to `point` "
+                   "to link a detection's dots instead", ctx=ctx)
         attr = ds.get(Domain.VOXEL, src)
-        if attr is None:
+        if attr is None:                             # pragma: no cover - _resolve_layer
             raise ValueError(f"track.link: no label raster {src!r} on the input Dataset")
         raster6 = attr.values                         # (m,t,z,c,y,x)
         iou = float(ctx.params.get("iou_threshold", 0.0))
@@ -53,10 +65,15 @@ def _compute_track_link(ctx: EvalContext) -> Dataset:
                 _accumulate(link_labels(rasters_by_t, iou_threshold=iou))
         member_domain = Domain.LABEL
     else:
-        src = ctx.layer("points")
+        src, _note = _resolve_layer(
+            _point_layers(ds), ctx.layer("points"), node="track.link (point)",
+            socket="points", what="Point table", where="the `data` input",
+            remedy="point mode links dots frame to frame, so wire a detection "
+                   "(detect.spots / detect.particles) or transform.label_to_points upstream",
+            ctx=ctx)
         cols = {k: ds.get(Domain.POINT, k, layer=src)
                 for k in ("id", "m", "t", "c", "z", "y", "x")}
-        if cols["id"] is None:
+        if cols["id"] is None:                       # a Point layer with no `id` column
             raise ValueError(f"track.link: no Point structure {src!r} on the input Dataset")
         cid, cm, ct, cc, cz, cy, cx = (cols[k].values
                                        for k in ("id", "m", "t", "c", "z", "y", "x"))
@@ -88,7 +105,15 @@ def _compute_track_link(ctx: EvalContext) -> Dataset:
 register_node(
     _compute_track_link,
     op_key="track.link", label="Track Linking", category="analysis",
-    adds_domains=frozenset({Domain.TRACK}),   # reads Label OR Point (per 'target' mode)
+    adds_domains=frozenset({Domain.TRACK}),
+    # reads Label OR Point, per the 'target' mode — stated per branch since V2.22. Unlike
+    # track.objects the label branch reads the RASTER and nothing else (`attr.values` fed
+    # to `link_labels`, which groups by id), so it does not require a Label table and a
+    # graph whose raster outlived its table still links.
+    reads_domains_by_mode={"target": {
+        "label": frozenset({Domain.VOXEL}),
+        "point": frozenset({Domain.POINT}),
+    }},
     inputs=[
         InDataset(),
         InFloat("max_distance", "Max distance", unit="um", field=True, default=2.0,

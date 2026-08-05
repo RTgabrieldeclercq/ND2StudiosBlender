@@ -1,11 +1,14 @@
 """Structure-table export (Phase 6 / V2.00 §10 — "the export path reads from here").
 
-Takes the per-``(domain, layer)`` tables that :func:`nodelab_v2.spreadsheet.all_tables`
+Takes the per-``(domain, layer)`` tables that :func:`nodelab_v2.tables.all_tables`
 produces off a pulled Dataset and writes them to disk — the detected structures AND (since
 V2.17) the coarse lattice attributes, so anything the spreadsheet can show is also
-exportable. Reading through the same one function is what keeps those two in step. Qt-free (a caller supplies the
-path); numpy + stdlib for CSV, pyarrow **lazily imported** for Arrow/Parquet so the
-core has no hard pyarrow dependency.
+exportable. Reading through the same one function is what keeps those two in step.
+Genuinely Qt-free (a caller supplies the path): the tabulation is imported from
+:mod:`nodelab_v2.tables`, not from the Qt spreadsheet panel that used to host it — which
+is what lets the headless LabLink worker write a session's CSV without a display. numpy +
+stdlib for CSV, pyarrow **lazily imported** for Arrow/Parquet so the core has no hard
+pyarrow dependency.
 
 * ``.csv`` — one file; when a Dataset has several structure tables the domain/layer is
   written as leading ``domain``/``layer`` columns so everything lands in one sheet.
@@ -20,9 +23,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from nodelab_v2.spreadsheet import _ordered_columns, all_tables, structure_tables
-
-Tables = Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]
+from nodelab_v2.tables import (
+    Tables, _ordered_columns, all_tables, structure_tables,
+)
 
 
 def _long_rows(tables: Tables) -> Tuple[List[str], List[list]]:

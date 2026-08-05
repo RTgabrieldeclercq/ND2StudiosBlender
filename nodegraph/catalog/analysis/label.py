@@ -12,9 +12,11 @@ from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.parallel import fold_units
 from nodegraph.registry import DimMode, Granularity, InDataset, InInt, InString, OutDataset
+from nodegraph.spill import dense_output
 from nodegraph.structure import StructureTable, label_components
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import _resolve_layer, _voxel_layers
 from nodegraph.catalog._shared.progress import _parallel_progress
 
 def _compute_label(ctx: EvalContext) -> Dataset:
@@ -25,11 +27,25 @@ def _compute_label(ctx: EvalContext) -> Dataset:
     ax = ds.axes
     is_3d = ctx.granularity is Granularity.WHOLE_VOLUME
     conn = int(ctx.params.get("connectivity", 26 if is_3d else 8))
-    mask_attr = ds.get(Domain.VOXEL, ctx.layer("mask"))
-    if mask_attr is None:
-        raise ValueError(f"no mask attribute {ctx.params.get('mask', 'mask')!r}")
+    # the one raster on the wire, whatever it is called (`_resolve_layer`)
+    mask_layer, _note = _resolve_layer(
+        _voxel_layers(ds), ctx.layer("mask"), node="connected components", socket="mask",
+        what="Voxel layer", where="the `data` input",
+        remedy="this divides a mask's foreground into regions, so run Threshold "
+               "(analysis.threshold / analysis.histogram_threshold) upstream", ctx=ctx)
+    mask_attr = ds.get(Domain.VOXEL, mask_layer)
+    if mask_attr is None:                            # pragma: no cover - _resolve_layer
+        raise ValueError(f"no mask attribute {mask_layer!r}")
     mask6 = mask_attr.values
-    raster = np.zeros_like(mask6, dtype=np.int64)
+    # Same dense-output ceiling as `analysis.segment`, and reached through the same door:
+    # this is Threshold's immediate consumer, so a mask big enough to have been spilled
+    # (nodegraph.spill) hands `zeros_like(..., int64)` a request 8× the size of the mask —
+    # 315 GiB against the 39.4 GiB uint8 mask on the lab's 42.3-Gvoxel 640 series. Fixing
+    # Threshold without this one just moves the _ArrayMemoryError one node to the right.
+    # Globally-unique ids are folded in order, so the raster cannot be lazy; above the
+    # budget it is a memmapped .npy the layer keeps uncopied (2026-08-04).
+    raster_out = dense_output(tuple(mask6.shape), np.int64, tag=f"labels_{ctx.node_id}")
+    raster = raster_out.array
     cols: Dict[str, list] = defaultdict(list)
     offset = 0
 
@@ -67,7 +83,7 @@ def _compute_label(ctx: EvalContext) -> Dataset:
 
     fold_units(_label_one, units, _fold)
     layer = ctx.layer("name")
-    out = ds.with_layer(Domain.VOXEL, layer, raster)
+    out = ds.with_layer(Domain.VOXEL, layer, raster_out.seal())
     if cols.get("id"):
         merged = StructureTable(
             Domain.LABEL, {k: np.array(v) for k, v in cols.items()},

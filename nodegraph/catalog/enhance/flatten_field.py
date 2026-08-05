@@ -90,7 +90,11 @@ def _compute_flatten_field(ctx: EvalContext) -> Dataset:
     background, >1 on an object. Cell-Tracker's Local Contrast additionally squeezed the
     ratio through a fixed ``(x-0.5)/1.5`` display window and clipped it to the dtype
     range; that is a *display* transform, so it is not reproduced here — chain
-    ``enhance.normalize`` if you want it.
+    ``enhance.normalize`` with ``bounds="absolute"``, ``low_value=0.5``,
+    ``high_value=2.0`` to get that window exactly. It has to be the **absolute** bounds
+    mode: 0.5 and 2.0 are positions on the ratio scale, and a percentile names a position
+    in the *distribution*, so no ``low_pct``/``high_pct`` pair reproduces them (that mode
+    was added in V2.23 for this; before it, this pointer named a route that did not exist).
 
     ``reference``
         * ``per_plane`` — the background is estimated from the plane being corrected.
@@ -250,7 +254,8 @@ register_node(
                         "above 1 on an object, so values read directly as \"times the local "
                         "background\". Comparable across frames and fields, but no longer in "
                         "counts, so the declared bit depth is dropped. Cell-Tracker's Local "
-                        "Contrast (without its display window).",
+                        "Contrast — for that plugin's display window too, follow it with "
+                        "Normalize in `absolute` bounds over 0.5 … 2.0.",
                 }),
            Mode("reference", ["per_plane", "time_averaged"], default="per_plane",
                 label="Reference",

@@ -18,6 +18,7 @@ from nodegraph.registry import (
 )
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 
 # ── Cluster a point cloud → a per-point cluster-id label column ────────────────
 #
@@ -44,7 +45,12 @@ def _compute_cluster_points(ctx: EvalContext) -> Dataset:
     :func:`nodegraph.kernels.granule_cluster.cluster_granules` (scikit-learn)."""
     from nodegraph.kernels.granule_cluster import cluster_granules
     ds = ctx.inputs[0]
-    source = ctx.layer("source")
+    # the one Point cloud on the wire, whatever it is called (`_resolve_layer`)
+    source, _note = _resolve_layer(
+        _point_layers(ds), ctx.layer("source"), node="cluster points", socket="source",
+        what="Point table", where="the `data` input",
+        remedy="these are the points to group, so wire a detection (detect.particles / "
+               "detect.spots) or transform.label_to_points upstream", ctx=ctx)
     name = ctx.params.get("name", "cluster")
     method = ctx.params.get("__modes__", {}).get("method", "gmm")
     px = ctx.calib("pixel_size_um") or 0.1
@@ -55,7 +61,7 @@ def _compute_cluster_points(ctx: EvalContext) -> Dataset:
           "method": method,
           "n_init": max(1, int(ctx.params.get("n_init", 1)))}
     pts = [a for a in ds.layers_on(Domain.POINT) if a.layer == source]
-    if not pts:
+    if not pts:                                      # pragma: no cover - _resolve_layer
         raise ValueError(f"cluster points needs a Point layer {source!r} "
                          "(run detect.particles first)")
     col = {a.name: np.asarray(a.values) for a in pts}

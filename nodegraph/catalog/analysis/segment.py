@@ -22,7 +22,9 @@ from nodegraph.registry import (
     Mode,
     OutDataset,
 )
+from nodegraph.spill import dense_output
 from nodegraph.structure import StructureTable, label_components, seeded_watershed
+from nodegraph.trained import stardist_config, stardist_model_dir, stardist_trained
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_GRAN_GLOBAL, _DIM_KAX
@@ -224,6 +226,115 @@ def _segment_watershed_split(fg: np.ndarray, sampling, footprint: np.ndarray) ->
     if markers.max() == 0:                           # no separable peak → one basin
         markers[np.unravel_index(int(np.argmax(edt)), edt.shape)] = 1
     return np.asarray(seeded_watershed(fg, markers, sampling=sampling), dtype=np.int64)
+# ── what the loaded StarDist checkpoint says about itself (V2.23) ──────────────
+
+def _as_num(value) -> "float | None":
+    """``value`` as a finite float, or ``None`` for anything that is not one.
+
+    Used on ``model.thresholds`` fields, which are namedtuple entries built from a JSON
+    file — so a field can legitimately be absent on an unexpected StarDist build, and the
+    reporting path must degrade to "say nothing" rather than raise while formatting a
+    progress note."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and abs(f) != float("inf") else None
+
+
+def _stardist_trained(params, modes) -> dict:
+    """``NodeSpec.trained_params`` for this node: the values the LOADED StarDist checkpoint
+    was trained with, for the sockets that have one.
+
+    A thin delegate to :func:`nodegraph.trained.stardist_trained` — the resolver lives in
+    ``nodegraph/`` rather than here because ``metadata.py`` and the GUI both reach it, and
+    because keeping it out of the catalog module means reading a model's JSON never pulls
+    scipy/skimage in behind it.
+
+    **Only for the ``stardist`` method.** The other three speak for nothing here: the two
+    classical methods have no model at all, and CellSAM's checkpoint is a bare torch state
+    dict whose configuration lives in the ``cellSAM`` package rather than beside the
+    weights. Returning values for a method that is not selected would put a
+    checkpoint-derived number under a socket the run will never consult.
+    """
+    if str((modes or {}).get("method") or "threshold") != "stardist":
+        return {}
+    return stardist_trained(params, modes)
+
+
+def _sd_check(ctx: EvalContext, *, is_3d: bool, px: float, zs: float) -> None:
+    """Refuse — or warn about — a StarDist checkpoint whose own ``config.json`` disagrees
+    with how this node is set up.
+
+    Called BEFORE the model loads, because every failure it catches is otherwise expensive
+    or silent:
+
+    * **``n_dim``.** A 2D checkpoint handed to ``StarDist3D`` (or the reverse) fails deep
+      inside csbdeep with a shape or axes error that names neither the model nor the lever.
+      The mismatch is stated in one line of the model's own record, so read it.
+    * **``n_channel_in``.** This node feeds single-channel planes (each channel is segmented
+      independently, by design). A checkpoint trained on RGB — ``2D_versatile_he`` is one —
+      cannot consume that, and the failure again arrives as a shape error.
+    * **``anisotropy``.** NOT an error and NOT auto-applied. A StarDist3D model's rays are
+      built on a sphere scaled by the training anisotropy (``Rays_GoldenSpiral(n,
+      anisotropy=…)``, and ``edt_prob`` uses it too), so the network learned distances on a
+      grid of that aspect — but rescaling the volume at inference to match is a correction
+      StarDist's own documentation does not prescribe (upstream's advice is to TRAIN at your
+      data's anisotropy). So this reports the disagreement and names the ``scale_z`` that
+      would close it, and leaves the decision with the user rather than silently changing
+      what a 3D segmentation returns.
+
+    Reads nothing if there is no model directory on disk yet — a pretrained checkpoint that
+    has not been downloaded states nothing until the loader below fetches it.
+    """
+    cfg = stardist_config(ctx.params, {"dim": "3D" if is_3d else "2D"})
+    if not cfg:
+        return
+    where = stardist_model_dir(ctx.params, {"dim": "3D" if is_3d else "2D"})
+    name = os.path.basename(where.rstrip("/\\")) or where
+    want_dim = 3 if is_3d else 2
+    got_dim = _as_num(cfg.get("n_dim"))
+    if got_dim is not None and int(got_dim) != want_dim:
+        raise ValueError(
+            f"segmentation (stardist): {name!r} is a {int(got_dim)}-D checkpoint but the "
+            f"2D/3D lever is set to {'3D' if is_3d else '2D'}, which loads "
+            f"StarDist{want_dim}D. Its own config.json says n_dim={int(got_dim)}. A "
+            f"{int(got_dim)}-D checkpoint cannot load into StarDist{want_dim}D — set the "
+            f"lever to {int(got_dim)}D, or point at a {want_dim}-D model.")
+    n_ch = _as_num(cfg.get("n_channel_in"))
+    if n_ch is not None and int(n_ch) != 1:
+        raise ValueError(
+            f"segmentation (stardist): {name!r} was trained on {int(n_ch)}-channel input "
+            f"(config.json n_channel_in={int(n_ch)}) but this node segments ONE channel at a "
+            f"time — each channel independently, so a fused multi-channel segmentation has "
+            f"no single `c` to file its Label rows under. Use a single-channel checkpoint "
+            f"(`2D_versatile_fluo` for fluorescence); `2D_versatile_he` is the RGB one.")
+    # anisotropy: report, never apply.
+    aniso = cfg.get("anisotropy")
+    if not (is_3d and isinstance(aniso, (list, tuple)) and len(aniso) == 3 and px > 0):
+        return
+    az, ay = _as_num(aniso[0]), _as_num(aniso[1])
+    if not az or not ay or az <= 0 or ay <= 0:
+        return
+    trained_aspect = az / ay
+    data_aspect = (zs / px) if px > 0 else 0.0
+    if data_aspect <= 0:
+        return
+    # 15%: below that the ray geometry difference is far smaller than the segmentation's own
+    # run-to-run spread, and a warning that fires on every ordinary volume trains the user to
+    # ignore the rail.
+    if abs(data_aspect - trained_aspect) <= 0.15 * trained_aspect:
+        return
+    ctx.progress(0, 1,
+                 f"segmentation (stardist): {name!r} was trained at z:xy anisotropy "
+                 f"{trained_aspect:.3g} but this volume's is {data_aspect:.3g} "
+                 f"(z_step {zs:.4g} / pixel {px:.4g} um). Its star-convex rays were built "
+                 f"for the trained aspect, so objects here are a different shape than it "
+                 f"learned. Set `scale_z` to {data_aspect / trained_aspect:.3g} to present "
+                 f"it the trained aspect, or retrain at this anisotropy (which is what "
+                 f"StarDist recommends).")
+
+
 # ── process-pool workers for the learned segmenters (V2.14) ────────────────────
 #
 # StarDist / CellSAM are the textbook case for PROCESS parallelism, and the reason is in
@@ -477,9 +588,26 @@ def _compute_segment(ctx: EvalContext) -> Dataset:
         model_id = str((ctx.params.get("model_name_3d") if is_3d
                         else ctx.params.get("model_name"))
                        or ("3D_demo" if is_3d else "2D_versatile_fluo"))
+        # UNSET means "use what this checkpoint was trained with" (V2.23), which is why the
+        # sentinel is `None` and not a number. Every StarDist model directory ships a
+        # `thresholds.json` that `optimize_thresholds` wrote after measuring THAT network
+        # against its own validation set, and `predict_instances(prob_thresh=None)` reads it
+        # (`StarDistBase._predict_sparse_generator`: `if prob_thresh is None: prob_thresh =
+        # self.thresholds.prob`). Passing a number unconditionally — which this node did
+        # until V2.23 — overrode that tuning with a value nobody measured: on the registered
+        # `3D_demo` the trained prob is 0.708 against the 0.5 that was being forced, and
+        # StarDist's own nms fallback is 0.4 against the forced 0.3. The socket's `description`
+        # had said so in as many words while the code did the opposite.
+        #
+        # `ctx.params.get` with NO fallback is the load-bearing part: params are raw
+        # overrides (never default-filled), so absence is exactly "the user did not pin
+        # this" — the same signal the inspector's auto/pin box draws from, resolved through
+        # the shared `trained.stardist_trained` so the number shown and the number used
+        # cannot drift.
         prob = ctx.params.get("prob_thresh")
-        prob = float(prob) if prob not in (None, "") else 0.5
-        nms = float(ctx.params.get("nms_thresh", 0.3))
+        prob = float(prob) if prob not in (None, "") else None
+        nms = ctx.params.get("nms_thresh")
+        nms = float(nms) if nms not in (None, "") else None
         scale = ctx.params.get("scale")
         scale = float(scale) if scale not in (None, "") else 0.0
         scale = scale if scale > 0 else None          # a 0 spin-box means "no rescale"
@@ -493,6 +621,10 @@ def _compute_segment(ctx: EvalContext) -> Dataset:
         # (identical recipe hash, different device). Same argument as NODELAB_CELLSAM_DEVICE.
         import os as _os
         _cpu = _os.environ.get("NODELAB_STARDIST_CPU", "") in ("1", "true", "yes")
+        # Read the checkpoint's OWN record before touching TensorFlow, so a dim or channel
+        # mismatch is one sentence naming the fix instead of a shape error thrown from
+        # somewhere inside csbdeep's resizer several seconds into a load (V2.23).
+        _sd_check(ctx, is_3d=is_3d, px=px, zs=(zs if is_3d else 0.0))
         try:
             model = get_stardist_model(model_id, disable_gpu=_cpu,
                                        dim=(3 if is_3d else 2), model_path=sd_path)
@@ -502,6 +634,21 @@ def _compute_segment(ctx: EvalContext) -> Dataset:
                               f"(tensorflow/stardist/csbdeep + weights): {exc}") from exc
         if sd_path:
             model_id = sd_path        # provenance must name the checkpoint that RAN
+        # The EFFECTIVE thresholds, read off the loaded model rather than re-derived from the
+        # JSON. `model.thresholds` is the authority — csbdeep parsed the file, applied its own
+        # `0 < x < 1` validity test and substituted its built-in 0.5/0.4 for anything that
+        # failed — so this is the only value that is guaranteed to be what the network uses.
+        # Reported on the rail and stamped into provenance below, because "which threshold
+        # actually ran" is otherwise unanswerable from the graph once the socket is on auto.
+        _th = getattr(model, "thresholds", None)
+        eff_prob = float(prob) if prob is not None else _as_num(getattr(_th, "prob", None))
+        eff_nms = float(nms) if nms is not None else _as_num(getattr(_th, "nms", None))
+        if prob is None or nms is None:
+            ctx.progress(0, 1, "segmentation (stardist): "
+                               f"{'prob %.4g' % eff_prob if eff_prob is not None else ''}"
+                               f"{' / ' if eff_prob is not None and eff_nms is not None else ''}"
+                               f"{'nms %.4g' % eff_nms if eff_nms is not None else ''}"
+                               " from the checkpoint's own thresholds.json")
     if method == "cellsam":
         from nodegraph.kernels.cellsam_segment import get_cellsam_model, segment_plane
         model_id = str(ctx.params.get("cellsam_model") or "cellsam_general")
@@ -573,7 +720,18 @@ def _compute_segment(ctx: EvalContext) -> Dataset:
             return _segment_watershed_split(fg, sampling, footprint)
         return np.asarray(label_components(fg, conn)[0], dtype=np.int64)
 
-    raster = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=np.int64)
+    # The label raster is the one output that cannot be made lazy even in principle: ids are
+    # GLOBALLY unique, assigned by folding the units in order, so plane n's labels depend on
+    # how many objects the previous n-1 units found. It is therefore always a dense array
+    # over the whole grid — 42.3 Gvoxel on the lab's 640 series, which is 315 GiB at int64
+    # and an unconditional `_ArrayMemoryError` (2026-08-04, the failure that read as an
+    # upstream Z-Project's `none` being broken). Above `spill_budget` it is written through a
+    # memmapped .npy instead, which the layer keeps without copying and the Memo GC counts
+    # as zero (nodegraph.spill). `fold` assigns into it exactly as before either way, and the
+    # fold stays serial and ordered, so ids and rows are byte-identical.
+    raster_out = dense_output((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), np.int64,
+                              tag=f"labels_{ctx.node_id}")
+    raster = raster_out.array
     cols: Dict[str, list] = defaultdict(list)
     offset = 0
 
@@ -680,7 +838,7 @@ def _compute_segment(ctx: EvalContext) -> Dataset:
     fold_units(worker, units, fold, prepare=prepare,
                proc=(backend == "process"), workers=lanes, batch=lanes)
 
-    out = ds.with_layer(Domain.VOXEL, layer, raster)
+    out = ds.with_layer(Domain.VOXEL, layer, raster_out.seal())
     if cols.get("id"):
         out = out.with_structure(StructureTable(
             Domain.LABEL, {k: np.array(v) for k, v in cols.items()},
@@ -691,6 +849,17 @@ def _compute_segment(ctx: EvalContext) -> Dataset:
     prov_md = {"segment_method": method}
     if model_id:
         prov_md["segment_model"] = model_id
+    if method == "stardist":
+        # The thresholds that ACTUALLY ran, whether they came from a pinned socket or the
+        # checkpoint's own thresholds.json (V2.23). Stamped because the socket alone no
+        # longer answers the question: on auto it holds nothing, and the value in force is a
+        # property of the model file. A reader comparing two runs — or a future self asking
+        # why one graph found 30% more nuclei — needs the number, not the provenance of the
+        # number. Namespaced non-calibration keys, the `track.objects` shape (wire-node-v2 §7b).
+        if eff_prob is not None:
+            prov_md["segment_prob_thresh"] = eff_prob
+        if eff_nms is not None:
+            prov_md["segment_nms_thresh"] = eff_nms
     return out.with_metadata(**prov_md)
 #: The pretrained checkpoint names each learned backend REGISTERS — closed, published sets,
 #: which is why the three sockets below declare them as ``choices`` (a dropdown) rather than
@@ -706,6 +875,11 @@ _CELLSAM_MODELS: Tuple[str, ...] = ("cellsam_general", "cellsam_extra")
 register_node(
     _compute_segment, op_key="analysis.segment", label="Segmentation",
     category="analysis",
+    # STATIC on purpose, and left alone by the V2.22 per-mode sweep: this is the image
+    # domain every source already supplies (`io.load` adds VOXEL), not a layer requirement
+    # that varies by method. The only method-specific Voxel layer is watershed's `mask`,
+    # and its default is `""` — "cut the foreground out of the image with the level
+    # controls" — so no branch demands anything the others do not.
     reads_domains=frozenset({Domain.VOXEL}),
     adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),   # a label RASTER and a table
     inputs=[
@@ -828,11 +1002,13 @@ register_node(
                 "Only pixels whose predicted object probability exceeds this become candidate "
                 "nuclei — the detection sensitivity knob. LOWER finds more objects, including "
                 "faint and spurious ones; HIGHER keeps only confident detections and misses dim "
-                "nuclei. Note StarDist itself defaults to the threshold OPTIMIZED for each "
-                "pretrained checkpoint and shipped alongside it; passing a value here overrides "
-                "that per-model tuning, so 0.5 is a neutral starting point rather than the "
-                "model's own best guess. Lower it first if a well-focused image returns too few "
-                "nuclei."),
+                "nuclei. Lower it first if a well-focused image returns too few nuclei. "
+                "ON AUTO it takes the value the loaded checkpoint was TRAINED with — every "
+                "StarDist model directory ships a thresholds.json that its author tuned against "
+                "their own validation set, and that is the number the network is meant to run "
+                "at (the registered `3D_demo` says 0.708, not 0.5). Pin it only to deviate from "
+                "that deliberately; the value in force is recorded on the output as "
+                "segment_prob_thresh either way."),
         InFloat("nms_thresh", "NMS threshold", unit="", field=False, default=0.3,
                 available_in={"method": frozenset({"stardist"})},
                 description=
@@ -842,8 +1018,9 @@ register_node(
                 "delete a genuinely touching or partly-overlapping nucleus, HIGHER keeps more "
                 "and risks reporting one nucleus twice. Raise it for densely packed samples — "
                 "separating crowded nuclei is what StarDist's star-convex shapes are for. Like "
-                "Prob threshold, this overrides the value optimized for the pretrained "
-                "checkpoint."),
+                "Prob threshold it comes from the checkpoint's own thresholds.json ON AUTO, and "
+                "StarDist's fallback when a model states none is 0.4 rather than the 0.3 shown "
+                "here as the pinned starting point."),
         InFloat("scale", "Scale", unit="", field=False, default=0.0,
                 available_in={"method": frozenset({"stardist"})},
                 description=
@@ -1207,6 +1384,9 @@ register_node(
                         "everywhere.",
                 })],
     granularity=_DIM_GRAN_GLOBAL, kernel_axes=_DIM_KAX,
+    # The StarDist thresholds default to what the LOADED CHECKPOINT was trained with rather
+    # than to a number this catalog invented (V2.23). See `_stardist_trained`.
+    trained_params=_stardist_trained,
     description="THE segmentation node: image → a Voxel label raster + a Label table, "
                 "with the algorithm as a `method` Mode — threshold+CCL, "
                 "distance-transform watershed, StarDist (CNN), or CellSAM (SAM + "

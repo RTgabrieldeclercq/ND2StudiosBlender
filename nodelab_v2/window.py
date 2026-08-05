@@ -18,7 +18,7 @@ button, or a header double-click puts the Viewer back in the splitter at its old
 from __future__ import annotations
 
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 import nodegraph.nodes  # noqa: F401 — registers the node catalog into NODES
 from nodegraph import hotreload
@@ -35,6 +35,7 @@ from nodelab_v2 import theme as T
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
+from nodelab_v2.lablink.panel import LabLinkPanel
 from nodelab_v2.minimap import MiniMapOverlay
 from nodelab_v2.node_item import NodeItem
 from nodelab_v2.ops import DOCK_OP, LOAD_OP, PRECISION_UNSET
@@ -199,6 +200,19 @@ class MainWindow(QMainWindow):
         sdock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
         self.addDockWidget(Qt.RightDockWidgetArea, sdock)
         self.tabifyDockWidget(idock, sdock)
+
+        # LabLink: whether this machine is serving the lab, and how to send work out to
+        # another hub. Tabbed with the other two rather than given its own edge — it is
+        # consulted occasionally, not watched while editing — and it starts BEHIND
+        # Properties (the `idock.raise_()` below), so the dock exists without competing for
+        # attention on every launch.
+        self.lablink = LabLinkPanel()
+        ldock = QDockWidget("LabLink", self)
+        ldock.setWidget(self.lablink)
+        ldock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        self.addDockWidget(Qt.RightDockWidgetArea, ldock)
+        self.tabifyDockWidget(idock, ldock)
+        self._lablink_dock = ldock
         idock.raise_()
 
         # Console removed — the reclaimed bottom-dock space goes to the central splitter
@@ -297,6 +311,13 @@ class MainWindow(QMainWindow):
         self.viewer.request_changed.connect(self._on_view_request)
         self.viewer.selection_changed.connect(self._on_frame_selection)
         self.viewer.iteration_changed.connect(self._on_iteration_changed)
+        # What the live surface can hold decides whether a big frame is shown WHOLE at full
+        # resolution or off the pyramid (V2.23). The surface knows the number, the runner makes
+        # the decision, and neither should know about the other.
+        self.viewer.display_limits.connect(self.runner.set_display_limits)
+        self.viewer.playing.connect(self._on_playing)
+        self.runner.preload_progress.connect(self._on_preload_progress)
+        self.runner.preload_finished.connect(self._on_preload_finished)
         # Interactive parameter picking (V2.16). Both surfaces that can ARM a pick — the
         # inspector's Pick button and a card's ◎ glyph — route here rather than talking to
         # the viewer directly, because arming needs the node's calibration and committing
@@ -321,6 +342,7 @@ class MainWindow(QMainWindow):
         # viewport detail-on-demand: the panel asks (debounced, on pan/zoom), the runner
         # reads the rect off the GUI thread and answers on `detail_ready`.
         self.viewer.detail_cb = self._request_detail
+        self.viewer.own_layers_cb = self.doc.own_label_layers
         self.runner.detail_ready.connect(self.viewer.on_detail_ready)
         self.view.maximize_toggled.connect(self.set_maximized)
         self.minimap.restore_requested.connect(lambda: self.set_maximized(False))
@@ -411,6 +433,38 @@ class MainWindow(QMainWindow):
             "large file.")
         self._bake_act.triggered.connect(self._bake_selected)
         m_run.addAction(self._bake_act)
+        self._hold_act = QAction("&Hold selected dock", self)
+        self._hold_act.setShortcut("Ctrl+F6")
+        self._hold_act.setToolTip(
+            "Freeze everything above the selected Dock node IN MEMORY and stop evaluating it. "
+            "Effectively instant and writes nothing — the troubleshooting counterpart of "
+            "Bake.\n\n"
+            "It does NOT free memory (the result is still held, it just stops being "
+            "recomputed) and does NOT survive reopening the file. Bake does both.")
+        self._hold_act.triggered.connect(self._hold_selected)
+        m_run.addAction(self._hold_act)
+        self._stop_bake_act = QAction("S&top bake", self)
+        self._stop_bake_act.setToolTip(
+            "Stop the bake that is running. Nothing is recorded, so the dock still reads as "
+            "un-baked and the half-written folder is safe to bake over — the same state an "
+            "interrupted bake leaves.")
+        self._stop_bake_act.triggered.connect(self.runner.request_stop_bake)
+        m_run.addAction(self._stop_bake_act)
+        self._flatten_act = QAction("&Flatten to Large Image…", self)
+        self._flatten_act.setShortcut("Shift+F6")
+        self._flatten_act.setToolTip(
+            "Write the viewed result to a chunked, pyramidal store and serve it from there — "
+            "the same trade a microscope's own software makes for a stitched mosaic.\n\n"
+            "A stitched canvas is recomputed for every frame you display: measured on the "
+            "49-position WellA3 montage (7168²), 0.78 s per full-resolution frame live against "
+            "0.06 s from a store, and the read-ahead goes from 2 frames to 8 because a store is "
+            "bytes rather than a compute. One-time cost on that series: 29 s and about 1 GiB.\n\n"
+            "This adds a Dock below the node and bakes it, so it is undoable (Un-dock) and the "
+            "chain that produced it stays on the canvas. An overlay must be set to "
+            "Output = resample first, since `display` mode stores no pixels by design — you "
+            "will be offered the switch.")
+        self._flatten_act.triggered.connect(lambda: self.flatten_to_large_image())
+        m_run.addAction(self._flatten_act)
         m_run.aboutToShow.connect(self._sync_run_actions)
         m_run.addSeparator()
         self._solo_act = QAction("&Troubleshoot: picked frames only", self)
@@ -625,7 +679,7 @@ class MainWindow(QMainWindow):
         T.apply(mode)
         self.setStyleSheet(_window_qss())
         for panel in (self.palette, self.inspector, self.viewer, self.sheet,
-                      self.minimap, self.welcome, self.view):
+                      self.minimap, self.welcome, self.view, self.lablink):
             panel.restyle()
         self._paint_led()          # the LED colors come from the tokens, not from QSS
         self._sync_solo_chip()     # ditto for the solo chip's amber
@@ -1016,6 +1070,18 @@ class MainWindow(QMainWindow):
         nid = self._selected_dock()
         self._bake_act.setEnabled(nid is not None)
         self._bake_act.setText(f"&Bake dock “{nid}”…" if nid else "&Bake selected dock…")
+        self._hold_act.setEnabled(nid is not None)
+        self._hold_act.setText(f"&Hold dock “{nid}”" if nid else "&Hold selected dock")
+        # Stop is offered only while a bake is actually in flight — an always-live Stop that
+        # does nothing is the same defect as a socket the kernel ignores.
+        baking = bool(self.runner.busy and self.runner.baking)
+        self._stop_bake_act.setEnabled(baking)
+        # Flatten names the node it would act on, because the answer to "what does this apply
+        # to" is the viewed node and that is not where the mouse is.
+        view = self._viewed
+        self._flatten_act.setEnabled(view is not None and view in self.doc.nodes)
+        self._flatten_act.setText(f"&Flatten “{view}” to a Large Image…" if view
+                                  else "&Flatten to Large Image…")
 
     # ── live node reload (nodegraph.hotreload) ────────────────────────────────
     def _set_autoreload(self, on: bool) -> None:
@@ -1055,6 +1121,21 @@ class MainWindow(QMainWindow):
         missing = [p for p in hotreload.watch_paths() if p and p not in watched]
         if missing:
             self._watcher.addPaths(missing)
+
+    def closeEvent(self, event) -> None:                     # noqa: N802 — Qt override
+        """Join the LabLink panel's threads before Qt tears its widgets down.
+
+        The panel polls a local hub on a timer and runs every hub call on a one-shot
+        ``QThread``. A thread still running when the interpreter destroys the Qt object that
+        parents it is a crash on exit — and it would land at the worst possible moment, when
+        the user has already asked to quit and has no way to read the traceback.
+        Best-effort: a failure here must not prevent the window from closing.
+        """
+        try:
+            self.lablink.shutdown()
+        except Exception:                                    # noqa: BLE001 — see above
+            pass
+        super().closeEvent(event)
 
     def _autoreload_tick(self) -> None:
         """The debounced watcher wake-up: reload if anything really changed.
@@ -1223,6 +1304,148 @@ class MainWindow(QMainWindow):
             return
         self._start_bake(nid)
 
+    def _hold_selected(self) -> None:
+        nid = self._selected_dock()
+        if nid is None:
+            QMessageBox.information(
+                self, "No dock selected",
+                "Select a Dock Data node first (or add one from the Nodes palette, under "
+                "io).\n\nHolding one freezes what the chain above it last produced in "
+                "memory and stops evaluating that chain — instant, and it writes nothing. "
+                "Bake the same node instead when you need the memory back or need the "
+                "result to survive reopening the file.")
+            return
+        self._hold_dock(nid)
+
+    # ── flatten to a Large Image (V2.23) ──────────────────────────────────────
+    #
+    # The Nikon-shaped half of "I want the stitched and overlay to be full resolution and
+    # instantly loaded/playable". The live path answers the full-resolution part directly (see
+    # `EngineRunner.display_dim`), but a stitched canvas still costs a stitch per frame — 0.78 s
+    # on the WellA3 montage against 0.06 s from a store. NIS-Elements does not keep a mosaic
+    # live either: it produces a Large Image with the pyramid IN the file and browses that.
+    # A Dock already writes exactly that artifact; what was missing was one gesture that sets
+    # it up, and the refusal below.
+
+    def _display_overlays_above(self, node_id: str) -> List[str]:
+        """Overlay nodes feeding ``node_id`` that are recording a placement for the VIEWER
+        rather than writing pixels — the ones a bake would silently drop.
+
+        Walks the document's own edges rather than the run graph, so it sees the chain the way
+        the canvas draws it."""
+        seen, stack, out = set(), [node_id], []
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            rec = self.doc.nodes.get(cur)
+            if rec is None:
+                continue
+            if rec.op_key == "view.overlay" and \
+                    (rec.modes or {}).get("output", "display") == "display":
+                out.append(cur)
+            stack.extend(src for src, _ss, dst, _ds in self.doc.edges if dst == cur)
+        return sorted(out)
+
+    def _settle_display_overlays(self, node_id: str, what: str) -> bool:
+        """Make sure a bake of ``node_id`` cannot quietly lose an overlay. Returns whether to
+        proceed.
+
+        An overlay in ``display`` mode stores NOTHING — that is its contract, and the reason
+        dragging its opacity is a repaint rather than a re-run. So a bake of a chain containing
+        one writes a store with no secondary in it, and viewing that store shows the primary
+        alone: the overlay does not degrade, it vanishes, and the graph still says it is there.
+        ``resample`` is the mode that writes the placed secondary as a real channel, which is
+        also what makes it measurable — the same flatten-then-it-is-just-an-image step
+        NIS-Elements takes.
+
+        Offered rather than done: switching the mode changes what the node OUTPUTS, so it is
+        the user's call. Declining cancels, because the alternative is a silent loss."""
+        ovl = self._display_overlays_above(node_id)
+        if not ovl:
+            return True
+        names = ", ".join(ovl)
+        ans = QMessageBox.question(
+            self, "Overlay would not be baked",
+            f"{'This overlay is' if len(ovl) == 1 else 'These overlays are'} set to "
+            f"Output = display: {names}.\n\n"
+            f"That mode records WHERE the secondary goes and deliberately stores no pixels — "
+            f"the Viewer composites it at draw time. A {what} therefore writes the primary "
+            f"only, and opening the result would show no overlay at all.\n\n"
+            f"Switch {'it' if len(ovl) == 1 else 'them'} to Output = resample, so the placed "
+            f"secondary is written as a real extra channel? That is also what makes the "
+            f"overlaid pixels measurable.\n\n"
+            f"Choosing No cancels — a {what} that silently drops the overlay is worse than "
+            f"no {what}.",
+            QMessageBox.Yes | QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return False
+        for nid in ovl:
+            self.doc.nodes[nid].modes["output"] = "resample"
+        self.doc.touch()
+        self.runner.invalidate()
+        self.statusBar().showMessage(
+            f"{names}: Output → resample — the secondary is now written as a real channel")
+        return True
+
+    def flatten_to_large_image(self, node_id: Optional[str] = None) -> None:
+        """Dock the chain at ``node_id`` (default: the viewed node) so it is served from a
+        chunked, pyramidal store instead of recomputed per frame.
+
+        Measured on the WellA3 GFP montage (49 positions → 7168², 16 T): 0.78 s per
+        full-resolution frame live against 0.06 s from the store, 0.21 s against 0.02 s for the
+        overview, and the prefetcher's lookahead goes from 2 frames to 8 because the store is
+        bytes rather than a compute. One-time cost 29 s and 0.97 GiB.
+
+        Reuses a Dock already wired below the node rather than adding a second one — the point
+        is one artifact per result, not a Dock per press."""
+        node_id = node_id or self._viewed
+        if node_id is None or node_id not in self.doc.nodes:
+            self.statusBar().showMessage("Select the node whose result you want flattened")
+            return
+        existing = [dst for src, _ss, dst, ds in self.doc.edges
+                    if src == node_id and ds == "data"
+                    and self.doc.nodes.get(dst) is not None
+                    and self.doc.nodes[dst].op_key == DOCK_OP]
+        if existing:
+            self._start_bake(existing[0])
+            return
+        rec = self.doc.nodes[node_id]
+        # uint16 when the payload still says it is camera counts, float32 otherwise: the
+        # precision Mode has no default on purpose (see `_start_bake`), and this is the one
+        # place that can answer it from the data instead of asking.
+        precision = "uint16" if self._integer_payload(node_id) else "float32"
+        dock = self.doc.add_node(DOCK_OP, x=rec.x + 240.0, y=rec.y,
+                                 modes={"precision": precision})
+        try:
+            self.doc.connect(node_id, "out", dock.id, "data")
+        except Exception as exc:                  # noqa: BLE001 — leave no orphan behind
+            self.doc.remove_node(dock.id)
+            QMessageBox.information(self, "Cannot flatten",
+                                    f"{node_id}'s output cannot feed a Dock: {exc}")
+            return
+        self.scene.sync()
+        self.statusBar().showMessage(
+            f"added {dock.id} below {node_id} (precision {precision}) — baking it now")
+        self._start_bake(dock.id)
+
+    def _integer_payload(self, node_id: str) -> bool:
+        """Whether ``node_id``'s result is still an integer image, read off its PROPAGATED
+        envelope — the same ``doc.env`` a pick reads its calibration from, so the question is
+        answered without pulling anything.
+
+        ``bit_depth`` is the payload's own claim to be camera counts, and every node that makes
+        its values continuous drops it. That is exactly the distinction ``uint16`` needs: the
+        bake refuses uint16 on normalized data, so guessing wrong here would be a dialog rather
+        than a wrong store — but guessing right means the user is not asked at all."""
+        try:
+            bd = dict(self.doc.env(node_id).metadata or {}).get("bit_depth")
+        except Exception:  # noqa: BLE001 — an un-propagated node: fall back to float32
+            return False
+        return (isinstance(bd, (int, float)) and not isinstance(bd, bool)
+                and 0 < int(bd) <= 16)
+
     def _on_dock_action(self, node_id: str, action: str) -> None:
         """Everything a Dock node's buttons and menu can ask for."""
         rec = self.doc.nodes.get(node_id)
@@ -1230,6 +1453,17 @@ class MainWindow(QMainWindow):
             return
         if action in ("bake", "bake_scoped"):
             self._start_bake(node_id, scoped=(action == "bake_scoped"))
+        elif action == "hold":
+            self._hold_dock(node_id)
+        elif action == "release":
+            self.runner.release(node_id)
+            self.doc.set_dock_hold(node_id, False)
+            self.doc.set_held_nodes(self.runner.held)
+            self.runner.invalidate()
+            self.statusBar().showMessage(
+                f"{node_id} released — the chain above runs live again")
+            if self._viewed is not None:
+                self.pull_node(self._viewed)
         elif action == "undock":
             self.doc.set_dock_state(node_id, False)
             self.runner.invalidate()
@@ -1369,6 +1603,8 @@ class MainWindow(QMainWindow):
                 f"{node_id} has nothing wired into its 'data' input, so there is no "
                 f"chain to freeze. Connect the pipeline you want to bake into it first.")
             return
+        if not self._settle_display_overlays(node_id, "bake"):
+            return
         store = self.doc.dock_store(node_id) or self.doc.default_dock_store(node_id)
         existing = os.path.isdir(store)
         scope = ("ONLY the frames picked in the Viewer" if scoped
@@ -1400,8 +1636,42 @@ class MainWindow(QMainWindow):
         self._baked_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         self.statusBar().showMessage(f"baking {node_id} → {store} …")
 
+    def _hold_dock(self, node_id: str) -> None:
+        """Freeze the chain above ``node_id`` in memory (the session tier).
+
+        No confirmation dialog, unlike Bake: this writes nothing, deletes nothing and is
+        reversible with one click, so a modal would be pure friction on the action whose
+        entire value is that it is instant. The status line says what it did and names the
+        limit that matters."""
+        if not self.runner.start_hold(node_id, signature=self.doc.dock_signature(node_id)):
+            self.statusBar().showMessage(
+                "a pull is already running — wait for it to finish, then hold")
+            return
+        self.statusBar().showMessage(f"holding {node_id} …")
+
+    def _on_held(self, node_id: str, spec: dict) -> None:
+        """Record a finished hold: pin the payload, flip the mode, grey the chain."""
+        self.runner.hold(node_id, spec["payload"], spec.get("env"))
+        self.doc.set_dock_hold(node_id, True)
+        self.doc.set_held_nodes(self.runner.held)
+        self.runner.invalidate()
+        self.statusBar().showMessage(
+            f"{node_id} held in memory — the chain above is frozen and greyed out. "
+            f"Nothing was written, so this does NOT free memory and does NOT survive "
+            f"reopening the file; Bake it if you need either.")
+        if self._viewed is not None:
+            self.pull_node(self._viewed)
+
     def _on_baked(self, node_id: str, spec: dict) -> None:
         """Record a finished bake, dock the node, and release what it made redundant."""
+        if spec.get("hold"):
+            self._on_held(node_id, spec)
+            return
+        if spec.get("cancelled"):
+            self.statusBar().showMessage(
+                f"{node_id} bake stopped — nothing was recorded, so the dock still reads "
+                f"as un-baked and the half-written folder is safe to re-bake over")
+            return
         man = spec.get("manifest") or {}
         self.doc.set_dock_bake(
             node_id, store=spec["store"], bake_id=str(man.get("bake_id", "")),
@@ -1562,6 +1832,63 @@ class MainWindow(QMainWindow):
             self._sync_solo_chip()
             self.runner.request_plane(self._viewed, self.viewer.coords(),
                                       self.viewer.channels())
+
+    def _on_playing(self, on: bool, axis: str) -> None:
+        """Play pressed: decode the series first, then let it run (V2.23).
+
+        Pressing play says every frame is wanted, in order — the one statement that licenses
+        reading them all, which the scrub prefetcher deliberately will not infer from a cursor
+        nudge (it is cost-gated to ±2 frames on a computing provider so that nudging cannot
+        queue sixteen whole-volume deconvolutions). Only T is preloaded: it is the axis whose
+        frames are separate reads, while Z of one volume comes back with the read that displayed
+        its neighbour.
+
+        **Playback is HELD while that happens**, which is the difference between "smooth" and
+        "loads every time" (reported 2026-08-05). A computed chain cannot be played at 1 s a
+        frame; letting the timer run against cold frames just means every tick waits on a
+        decode. So the gate goes up, the progress bar says what is happening, and the timer
+        starts when the frames are resident — the same "load it, then play it" an ingested file
+        gets for free because its frames were already cheap.
+
+        A series too big for the budget preloads what fits and plays anyway: a partly-warm
+        playback is what was happening before, so it is a floor rather than a regression."""
+        if axis != "t":
+            return
+        if not on:
+            self.runner.cancel_preload()
+            self.viewer.set_play_gate(False)
+            self._set_progress(None)
+            return
+        if self._viewed is None:
+            return
+        n = self.runner.preload_series(self._viewed, self.viewer.coords(),
+                                      self.viewer.channels())
+        if not n:
+            return                       # already resident: play immediately, as before
+        fits = self.runner.series_fits(planes=len(self.viewer.channels()))
+        self.viewer.set_play_gate(
+            True, f"preparing {n} frame{'s' if n != 1 else ''} for smooth playback…"
+                  + ("" if fits else "  (larger than the display memory budget — the tail "
+                                     "will re-read)"))
+        self._set_progress(0.0)
+
+    def _on_preload_progress(self, node_id: str, done: int, total: int) -> None:
+        if node_id == self._viewed and total:
+            self._set_progress(done / float(total))
+            self.statusBar().showMessage(
+                f"preparing frames for playback — {done}/{total}")
+
+    def _on_preload_finished(self, node_id: str, completed: bool) -> None:
+        """Frames are in: drop the gate and let the timer run.
+
+        Also on a CANCELLED preload — an edit, or the node changing under it. Leaving the gate
+        up there would strand playback in a paused state whose button says it is playing, which
+        is worse than playing a frame cold."""
+        self._set_progress(None)
+        if self.viewer.play_gated():
+            self.viewer.set_play_gate(False)
+            if completed and node_id == self._viewed:
+                self.statusBar().showMessage("playing from memory", 2500)
 
     def _on_run_finished(self, node_id, payload, plane, axes, seconds) -> None:
         if plane:

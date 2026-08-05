@@ -127,6 +127,14 @@ def snapshot() -> dict:
             "supports_true_3d": spec.supports_true_3d,
             "three_d_fallback": spec.three_d_fallback,
             "reads_domains": sorted(d.value for d in spec.reads_domains),
+            # the CONDITIONAL half (V2.22) — recorded separately rather than flattened
+            # into the line above, because a flattened union is exactly the over-claiming
+            # declaration the field replaced and the snapshot would then be unable to tell
+            # "requires both" from "requires one or the other".
+            "reads_domains_by_mode": {
+                mode: {value: sorted(d.value for d in domains)
+                       for value, domains in sorted(per_value.items())}
+                for mode, per_value in sorted(spec.reads_domains_by_mode.items())},
             "adds_domains": sorted(d.value for d in spec.adds_domains),
             "has_compute": spec.op_key in NN.COMPUTES,
             "compute": _fn(NN.COMPUTES.get(spec.op_key)),

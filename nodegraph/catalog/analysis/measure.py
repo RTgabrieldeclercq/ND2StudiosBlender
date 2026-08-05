@@ -1,4 +1,4 @@
-"""Measure (``analysis.measure``) — Per-label statistics of the image (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops."""
+"""Measure (``analysis.measure``) — Per-label statistics of the image (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops; or, on Point members, each detection's µm position and the intensity of the voxel it sits on."""
 
 from __future__ import annotations
 
@@ -11,11 +11,16 @@ from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.parallel import map_units
-from nodegraph.registry import Granularity, InDataset, InString, OutDataset
-from nodegraph.structure import StructureTable
+from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDataset
+from nodegraph.structure import COORD_COLUMNS, StructureTable
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.labels import _label_raster
+from nodegraph.catalog._shared.labels import (
+    _label_raster,
+    _point_layers,
+    _resolve_label_instance,
+    _resolve_layer,
+)
 from nodegraph.catalog._shared.planes import _each_plane
 from nodegraph.catalog._shared.progress import _parallel_progress
 from nodegraph.catalog._shared.raw_measure import _InRaw, _intensity_provider
@@ -28,7 +33,16 @@ _MEASURE_COLUMNS = {
 def _layers_measure(params, modes):
     """`analysis.measure` has no output-name socket: it attaches its statistic columns to
     the Label table named by its READ socket, creating that (LABEL, name) pair when the
-    upstream produced only a Voxel raster."""
+    upstream produced only a Voxel raster.
+
+    The **point** branch announces nothing, and that is not an omission: it writes into a
+    Point table whose invariant coordinate columns it just read, so the ``(POINT, name)``
+    pair is already in the catalog from whichever detector produced it. (Its `points` socket
+    also ships EMPTY — the layer is inferred, §4g — so there would be no name to predict on
+    a fresh node anyway, and inventing one here would offer a layer downstream that no node
+    writes.)"""
+    if (modes or {}).get("target") == "point":
+        return ()
     return ((Domain.LABEL, params.get("labels") or "labels"),)
 def _measure_stats(raw) -> list:
     """The ``stats`` selector → an ordered, de-duplicated list of reducer names.
@@ -112,15 +126,170 @@ def _measure_shape_columns(raster6: np.ndarray, names: Sequence[str], *,
                             out[p][int(lid)] = float(val)
     return out
 def _compute_measure(ctx: EvalContext) -> Dataset:
-    """Measure per-region statistics of the image over a label raster → Label-domain
-    attributes (Voxel→Label bridge, V2.00 §6). Emits one column per requested stat
-    (``mean_intensity``/``max_intensity``/``min_intensity``/``total_intensity``/
+    """Measure the image over the members of a structure table → columns on that table.
+
+    Two branches, selected by the **``target``** Mode, because the two member kinds are
+    measurable in genuinely different ways rather than by the same code with a switch:
+
+    * **``label``** (:func:`_measure_labels`) — a region has extent, so it has statistics:
+      per-label ``mean``/``max``/``min``/``sum``/``median`` intensity and a voxel ``count``
+      via the Voxel→Label bridge, plus optional µm-aware ``regionprops`` geometry.
+    * **``point``** (:func:`_measure_points`) — a detection is dimensionless, so it has a
+      *position* and one *sample*: ``x_um``/``y_um``/``z_um`` and the intensity of the voxel
+      it sits on, via the Voxel→Point bridge's nearest-voxel rule.
+
+    The optional **``raw``** Dataset input serves both: it redirects *which pixels are
+    measured* while the structure keeps coming from the main input — the "segment on
+    enhanced, measure on raw" workflow (:func:`_intensity_provider`). Unwired, each branch
+    measures its own image.
+
+    The image provider is resolved (and refused) HERE, before the branch, because neither
+    branch has anything to measure without one and the `raw` guard is the same question for
+    both."""
+    ds = ctx.inputs[0]
+    prov, on_raw = _intensity_provider(ctx, ds)
+    if prov is None:
+        raise ValueError("measure needs an image provider (on its input, or via `raw`)")
+    if ctx.params.get("__modes__", {}).get("target", "label") == "point":
+        return _measure_points(ctx, ds, prov, on_raw=on_raw)
+    return _measure_labels(ctx, ds, prov, on_raw=on_raw)
+def _measure_points(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dataset:
+    """``target=point`` — each detection's **physical position** and the intensity of the
+    **voxel it sits on**, as columns on its own Point table.
+
+    A Point row is dimensionless: there is no region to reduce over, so `stats` and `shape`
+    are `available_in`-gated away and this branch writes a fixed set of four columns:
+
+    ==================  ==========================================================
+    ``x_um``/``y_um``   the row's own ``x``/``y`` scaled by ``pixel_size_um``
+    ``z_um``            ``z`` scaled by ``z_step_um`` (0 on a single-plane Dataset)
+    ``mean_intensity``  the value of the nearest voxel to ``(z, y, x)``
+    ==================  ==========================================================
+
+    **Why µm columns rather than just re-emitting z/y/x.** The invariant schema already
+    carries ``z``,``y``,``x`` — in **voxel index** units — so those are not something this
+    node can add. The physical position is, and it is the form a result actually gets
+    reported in. They are *new* columns, not a rewrite: every downstream consumer
+    (``transform.rasterize_field``, ``analysis.tessellate``, ``track.link``) reads ``y``/``x``
+    as pixel indices, so those stay exactly as the detector wrote them.
+
+    **``mean_intensity``, though one voxel is not a mean.** It is the stable downstream key
+    — the label branch guarantees it (``mean`` is force-added there for this reason) and
+    ``analysis.object_field``'s `intensity` socket defaults to it, so a Point table measured
+    here can feed the same graph a Label table can. Naming it ``intensity`` instead would
+    make Point members the one member kind that node cannot grid.
+
+    **Nearest voxel, not interpolated**, matching ``bridges.voxel_to_point``'s ``nearest``:
+    "the pixel it is on" is the question, and a LoG-fitted sub-pixel peak still sits on
+    exactly one voxel. That also makes the two ``z_kind`` provenances one code path — a
+    ``plane_index`` table's ``z`` IS the plane, and a ``subpixel`` table's rounds to it.
+
+    **What is clipped and what is refused.** ``z``/``y``/``x`` are continuous coordinates, so
+    a centroid at 511.6 on a 512-wide image legitimately lands on the last voxel and is
+    clipped. ``m``/``t``/``c`` are discrete addresses naming which position, frame and
+    channel, so a row outside them is not an edge case — the table came from a different
+    chain, and clipping would report a neighbouring frame's intensity. Those rows get **NaN**
+    (never 0, which is a legal intensity), and a table with no addressable row at all is
+    refused rather than returning an all-NaN column.
+
+    Footprint: only the planes that actually hold a detection are read, so a sparse cloud on
+    a 49-position file does not pay for the whole volume. The reads are independent and each
+    writes a disjoint set of rows, so they fan out (V2.14) exactly as the label branch's
+    gather does."""
+    ax = ds.axes
+    # the ONE Point table on the wire, whatever it is called (§4g) — no literal default
+    # could be right for detect.spots (`spots`), detect.particles (`particles`) AND
+    # transform.label_to_points (`<labels>_points`) at once.
+    layer, note = _resolve_layer(
+        _point_layers(ds), ctx.layer("points"), node="measure", socket="points",
+        what="Point table", where="the `data` input",
+        remedy="this measures one row per DETECTION, so it needs a point cloud — run "
+               "detect.spots / detect.particles / transform.label_to_points upstream (or "
+               "switch `target` to Label to measure regions)")
+    cols = {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.POINT)
+            if a.layer == layer}
+    missing = sorted(k for k in COORD_COLUMNS if k not in cols)
+    if missing:
+        raise ValueError(
+            f"measure: the Point layer {layer!r} is missing the invariant column(s) "
+            f"{missing}, so its detections have no position to report or to sample at.")
+    n = int(len(cols["id"]))
+    ragged = sorted(k for k, v in cols.items() if len(v) != n)
+    if ragged:
+        raise ValueError(
+            f"measure: column(s) {ragged} on Point layer {layer!r} disagree in length with "
+            f"'id' ({n}) — every sample would be taken from a misaligned row.")
+    mm = np.asarray(cols["m"], dtype=np.int64)
+    tt = np.asarray(cols["t"], dtype=np.int64)
+    cc = np.asarray(cols["c"], dtype=np.int64)
+    zf = np.asarray(cols["z"], dtype=float)
+    yf = np.asarray(cols["y"], dtype=float)
+    xf = np.asarray(cols["x"], dtype=float)
+    # a non-finite coordinate has no voxel; substitute 0 for the cast (np.rint(nan) cast to
+    # int64 is undefined, not an error) and drop the row via `inside` below.
+    finite = np.isfinite(zf) & np.isfinite(yf) & np.isfinite(xf)
+
+    def _voxel(v: np.ndarray, hi: int) -> np.ndarray:
+        return np.clip(np.rint(np.where(finite, v, 0.0)), 0, hi - 1).astype(np.int64)
+
+    zi, yi, xi = _voxel(zf, ax.z), _voxel(yf, ax.y), _voxel(xf, ax.x)
+    inside = (finite & (mm >= 0) & (mm < ax.m) & (tt >= 0) & (tt < ax.t)
+              & (cc >= 0) & (cc < ax.c))
+    vals = np.full(n, np.nan, dtype=float)
+    live = np.flatnonzero(inside)
+    if live.size == 0:
+        raise ValueError(
+            f"measure: not one of the {n} rows on Point layer {layer!r} addresses a "
+            f"(position, frame, channel) this Dataset has — its axes are m={ax.m}, "
+            f"t={ax.t}, c={ax.c}. The points and the image are not from the same chain: a "
+            f"frame slice, a channel tap or a temporal stack between the detector and here "
+            f"would do it. Measure where the geometry still matches, or wire the detector's "
+            f"own branch into `raw`.")
+    # group the rows by the plane they sample from, so each plane is read ONCE — one
+    # np.unique instead of a Python pass over what can be 10^6 detections.
+    key = ((mm * ax.t + tt) * ax.z + zi) * ax.c + cc
+    uk, inv = np.unique(key[live], return_inverse=True)
+    counts = np.bincount(inv, minlength=uk.size)
+    order = np.argsort(inv, kind="stable")
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    if note:                       # say which layer was inferred, before the reads
+        ctx.progress(0, int(uk.size), "using " + note, frames=ax.t)
+    tick = _parallel_progress(ctx, int(uk.size),
+                              "sampling raw pixels" if on_raw else "sampling pixels",
+                              frames=ax.t)
+
+    def _sample(j: int) -> None:
+        k = int(uk[j])
+        c, k = k % ax.c, k // ax.c
+        z, k = k % ax.z, k // ax.z
+        t, m = k % ax.t, k // ax.t
+        rows = live[order[starts[j]:starts[j] + counts[j]]]
+        plane = np.asarray(prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x), dtype=float)
+        vals[rows] = plane[yi[rows], xi[rows]]
+        tick()
+
+    map_units(_sample, list(range(int(uk.size))))
+    px = ctx.calib("pixel_size_um") or 0.1
+    # A single-plane Dataset puts every detection on plane 0, so the axial step cannot move
+    # z_um — and reading a calibration key the node could not have used would fence the memo
+    # on it (the R1 rule `_frame_interval_s` follows for dt_s).
+    zs = (ctx.calib("z_step_um") or 0.5) if ax.z > 1 else 0.0
+    out = {
+        "id": np.asarray(cols["id"]),                # unchanged: the row-alignment anchor
+        "z_um": zf * zs, "y_um": yf * px, "x_um": xf * px,
+        "mean_intensity": vals,
+    }
+    # Re-emits the SAME Point layer with the new columns, so its z_kind provenance (§7b)
+    # must be carried forward rather than clobbered with the StructureTable default
+    # ("subpixel"), which would tell every downstream node this 2D cloud was volumetric.
+    zk = ds.structure_zkind(Domain.POINT, layer) or "plane_index"
+    return ds.with_structure(StructureTable(Domain.POINT, out, layer=layer, z_kind=zk))
+def _measure_labels(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dataset:
+    """``target=label`` — per-region statistics of the image over a label raster →
+    Label-domain attributes (Voxel→Label bridge, V2.00 §6). Emits one column per requested
+    stat (``mean_intensity``/``max_intensity``/``min_intensity``/``total_intensity``/
     ``area`` = voxel count); ``mean`` is always present so ``mean_intensity`` stays a
     stable downstream key. Every stat shares the sorted-id order of the same raster.
-
-    The optional **``raw``** Dataset input redirects *which pixels are measured* while the
-    label raster keeps coming from the main input — the "segment on enhanced, measure on
-    raw" workflow (:func:`_intensity_provider`). Unwired, it measures its own image.
 
     ``shape`` (V2.13) adds per-region **geometry** columns from ``regionprops`` —
     Cell-Tracker's ``eccentricity`` and its companions. They are a different kind of
@@ -128,13 +297,14 @@ def _compute_measure(ctx: EvalContext) -> Dataset:
     image, so ``raw`` does not affect them, and lengths are reported in **µm** via the
     voxel ``spacing``. Off by default (they cost a second walk), and the 2D-only ones are
     refused on a 3D Label table rather than failing inside skimage."""
-    ds = ctx.inputs[0]
-    prov, on_raw = _intensity_provider(ctx, ds)
     ax = ds.axes
-    layer = ctx.layer("labels")
+    # the ONE Label instance on the wire, whatever it is called (`_resolve_layer`) — the
+    # literal default agreed only with `analysis.segment`'s own default name.
+    layer, _lnote = _resolve_label_instance(
+        ds, ctx.layer("labels"), node="measure", socket="labels",
+        remedy="this measures one row per REGION, so it needs a label raster AND its table "
+               "— run analysis.segment / analysis.label upstream")
     raster6, _zk_declared = _label_raster(ds, layer, node="measure")
-    if prov is None:
-        raise ValueError("measure needs an image provider (on its input, or via `raw`)")
     img = np.zeros_like(raster6, dtype=float)
     # this gather REALIZES the whole lazy chain plane by plane — for a deep enhancement
     # chain it is the run's real cost, so it is worth a determinate bar. And because it IS
@@ -142,6 +312,8 @@ def _compute_measure(ctx: EvalContext) -> Dataset:
     # independent, each writes a disjoint slice, and the upstream tile computes they trigger
     # are pure. Purely a map — no ordering constraint, no fold state.
     _note = "reading raw planes" if on_raw else "reading planes"
+    if _lnote:                     # say which layer was inferred, before the long gather
+        ctx.progress(0, ax.m * ax.t * ax.z * ax.c, "using " + _lnote, frames=ax.t)
     tick = _parallel_progress(ctx, ax.m * ax.t * ax.z * ax.c, _note, frames=ax.t)
 
     def _gather(unit):
@@ -198,22 +370,72 @@ def _compute_measure(ctx: EvalContext) -> Dataset:
 register_node(
     _compute_measure, op_key="analysis.measure", label="Measure", category="analysis",
     extra_layers=_layers_measure,
-    reads_domains=frozenset({Domain.VOXEL, Domain.LABEL}),
-    adds_domains=frozenset({Domain.LABEL}),
+    # VOXEL is unconditional because it is the IMAGE domain — both branches measure pixels,
+    # and §4f is explicit that the image is not a per-branch layer requirement. What DOES
+    # vary is the structure: the label branch needs a Label table (its raster's ids must
+    # divide the foreground into objects), the point branch a Point table. Declaring the
+    # static union `{VOXEL, LABEL, POINT}` would paint a red PT chip on every Label graph
+    # that works — the exact over-claim `analysis.object_field` was fixed for in V2.22.
+    reads_domains=frozenset({Domain.VOXEL}),
+    reads_domains_by_mode={"target": {
+        "label": frozenset({Domain.VOXEL, Domain.LABEL}),
+        "point": frozenset({Domain.POINT}),
+    }},
+    adds_domains=frozenset({Domain.LABEL, Domain.POINT}),
+    modes=[Mode("target", ["label", "point"], default="label", label="Members",
+                description=
+                "Which members are measured — the REGIONS of a Label table or the "
+                "DETECTIONS of a Point table. It selects the live source socket and, because "
+                "the two member kinds are measurable in different ways, which columns come "
+                "out: a region has extent, so it has statistics and geometry; a point is "
+                "dimensionless, so it has a position and one sample. Both write onto the "
+                "table they read, and both honour the `raw` input.",
+                choice_docs={
+                    "label":
+                        "Measure the regions of a Label table (Segmentation / Connected "
+                        "Components): per-region intensity statistics over every voxel the "
+                        "region owns, plus optional µm regionprops geometry. This is the "
+                        "branch `stats` and `shape` belong to; it needs a raster whose ids "
+                        "divide the foreground into objects, not a bare mask.",
+                    "point":
+                        "Measure the detections of a Point table (Spot / Particle Detection, "
+                        "Label to Points): writes `x_um`/`y_um`/`z_um` — the physical "
+                        "position, which the invariant pixel `x`/`y`/`z` columns are not — "
+                        "and `mean_intensity`, the value of the single voxel each detection "
+                        "sits on. `stats` and `shape` are hidden here: there is no region to "
+                        "reduce over or fit an ellipse to.",
+                })],
     inputs=[InDataset(), _InRaw(),
             InString("labels", "Label layer", field=False, default="labels",
                      layer_in=Domain.VOXEL,
+                     available_in={"target": frozenset({"label"})},
                      description=
                      "Which label raster defines the regions to measure — the output of "
                      "Connected Components or Segmentation. One row is produced per label "
                      "id, so this choice fixes both WHAT gets measured and how many rows "
                      "come out. It always comes from the MAIN input, even when a `raw` "
                      "Dataset is wired: `raw` redirects only the pixels being measured."),
+            # Ships EMPTY, unlike `labels` above: no literal default can be right for
+            # detect.spots (`spots`), detect.particles (`particles`) and
+            # transform.label_to_points (`<labels>_points`) at once, so the layer is
+            # inferred from the wire when there is only one candidate (§4g).
+            InString("points", "Point layer", field=False, default="",
+                     layer_in=Domain.POINT,
+                     available_in={"target": frozenset({"point"})},
+                     description=
+                     "Which point cloud is measured — the output of Spot Detection, Particle "
+                     "Detection or Label to Points. One row comes out per DETECTION, and the "
+                     "new columns are written back onto this same table. Leave it EMPTY and "
+                     "the only Point table on `data` is used, which is what you want on a "
+                     "single-branch graph; name one explicitly when the wire carries two. "
+                     "Like `labels`, it always comes from the MAIN input even when `raw` is "
+                     "wired — `raw` redirects only the pixels being sampled."),
             # comma-separated: SocketType has no LIST member. `mean` is force-added by
             # the compute, so `mean_intensity` stays a stable downstream key.
             InString("stats", "Statistics", field=False,
                      vocab=tuple(_MEASURE_COLUMNS),
                      default="mean,max,min,count",
+                     available_in={"target": frozenset({"label"})},
                      description=
                      "Which statistics to compute, comma-separated, one Label column each: "
                      "`mean`→mean_intensity, `max`→max_intensity, `min`→min_intensity, "
@@ -256,6 +478,7 @@ register_node(
                      }),
             InString("shape", "Shape metrics", field=False, default="",
                      vocab=tuple(_MEASURE_SHAPE),
+                     available_in={"target": frozenset({"label"})},
                      description=
                      "Per-region GEOMETRY columns, comma-separated — empty (the default) "
                      "computes none. `eccentricity` (0 = circle, →1 = elongated; this is the "
@@ -305,9 +528,12 @@ register_node(
                      })],
     outputs=[OutDataset()],
     granularity=Granularity.WHOLE_VOLUME,
-    description="Per-label statistics of the image (mean/max/min/area) via the "
-                "Voxel→Label bridge, plus optional µm-aware `shape` geometry columns "
-                "(eccentricity, perimeter, solidity, …) from regionprops. Optional `raw` "
-                "input measures THOSE pixels instead (segment on enhanced, measure on raw); "
-                "labels and shape always come from the main input.",
+    description="Measures the image over a structure table's members. On LABEL members: "
+                "per-region statistics (mean/max/min/area) via the Voxel→Label bridge, plus "
+                "optional µm-aware `shape` geometry columns (eccentricity, perimeter, "
+                "solidity, …) from regionprops. On POINT members: each detection's physical "
+                "position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the "
+                "voxel it sits on. Optional `raw` input measures THOSE pixels instead "
+                "(segment on enhanced, measure on raw); the structure, the labels and the "
+                "shape metrics always come from the main input.",
 )

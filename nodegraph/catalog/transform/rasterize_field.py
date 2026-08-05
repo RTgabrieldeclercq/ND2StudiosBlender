@@ -10,6 +10,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 
 # ── Rasterize a Point vector field → Voxel layers (interpolate the coarse grid) ─
 #
@@ -43,7 +44,12 @@ def _compute_rasterize_field(ctx: EvalContext) -> Dataset:
     if prov is None:
         raise ValueError("rasterize field needs an image provider to define the voxel grid")
     ax = prov.axes
-    source = ctx.layer("source")
+    # the one Point field on the wire, whatever it is called (`_resolve_layer`)
+    source, _note = _resolve_layer(
+        _point_layers(ds), ctx.layer("source"), node="rasterize field", socket="source",
+        what="Point table", where="the `data` input",
+        remedy="this interpolates a point field's attribute columns onto the voxel grid, so "
+               "run a DVC / DIC / point-field node upstream", ctx=ctx)
     prefix = ctx.layer("prefix") or source
     method = ctx.params.get("__modes__", {}).get("method", "linear")
     # Inherit the field's dimensionality from its stamped z_kind (§7b); fall back to the
@@ -51,7 +57,7 @@ def _compute_rasterize_field(ctx: EvalContext) -> Dataset:
     zk = ds.structure_zkind(Domain.POINT, source)
     is_3d = (zk == "subpixel") if zk is not None else (ax.z > 1)
     pts = [a for a in ds.layers_on(Domain.POINT) if a.layer == source]
-    if not pts:
+    if not pts:                                      # pragma: no cover - _resolve_layer
         raise ValueError(f"rasterize field needs a Point layer {source!r} "
                          "(run a DVC / point-field node first)")
     col = {a.name: np.asarray(a.values) for a in pts}

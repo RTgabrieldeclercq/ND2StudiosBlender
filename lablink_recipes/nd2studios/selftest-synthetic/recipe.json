@@ -1,0 +1,70 @@
+{
+  "format": "lablink.recipe/1",
+  "name": "selftest-synthetic",
+  "title": "ND2 Studios self-test (synthetic source)",
+  "description": "Proves the whole loop against the real engine -- handshake, open, tier-2 validation, set, ingest, run, per-node progress, artifacts, thumbnails, return -- with no data files at all. An empty io.load path yields the deterministic synthetic source, so the result is reproducible and can be pinned by hash. Send an ND2 or TIFF and the same five nodes run on it instead.",
+  "workflow": "nd2studios",
+  "graph": "graph.nd2graph.json",
+  "allow_zones": false,
+  "targets": {"primary": "measure"},
+  "inputs": [
+    {"role": "image", "node": "load", "required": false,
+     "match": ["*.nd2", "*.tif", "*.tiff"]}
+  ],
+  "knobs": [
+    {"name": "channel", "node": "pick", "param": "channels", "kind": "param",
+     "type": "channel_list", "max_items": 4,
+     "label": "Channel",
+     "help": "Which channels to keep, as 0-based indices. Left unset every channel goes through."},
+
+    {"name": "background_um", "node": "tophat", "param": "radius", "kind": "param",
+     "type": "float", "unit": "um", "min": 0.1, "max": 50.0, "default": 5.0,
+     "label": "Background scale",
+     "help": "Top-hat radius in microns. Larger keeps more large-scale structure."},
+
+    {"name": "background_polarity", "node": "tophat", "param": "variant", "kind": "mode",
+     "type": "enum", "enum": ["white", "black"], "default": "white",
+     "label": "Feature polarity",
+     "help": "white = bright objects on a dark background (fluorescence); black = the inverse (brightfield)."},
+
+    {"name": "method", "node": "segment", "param": "method", "kind": "mode",
+     "type": "enum", "enum": ["threshold", "watershed"], "default": "watershed",
+     "label": "Segmentation method",
+     "help": "Only the two methods that need no model weights are offered here. stardist and cellsam are real choices of this node but pull large downloads, so a recipe that wants them should declare them in requires.capabilities and be reviewed by the operator."},
+
+    {"name": "level", "node": "segment", "param": "level", "kind": "mode",
+     "type": "enum", "enum": ["otsu", "li", "yen", "triangle", "mean"], "default": "otsu",
+     "label": "Threshold method",
+     "help": "How the intensity cut is chosen. 'fixed' is deliberately not offered: it would need the companion threshold number, which this recipe does not expose."},
+
+    {"name": "min_area_um2", "node": "segment", "param": "min_area", "kind": "param",
+     "type": "float", "unit": "um2", "min": 0.0, "max": 1000000.0,
+     "unset_means": "derive",
+     "label": "Minimum object area",
+     "help": "Left unset it is derived from the file's own calibration. Pinning it overrides the microscope, so leave it out unless you mean to."},
+
+    {"name": "fill_holes", "node": "segment", "param": "fill_holes", "kind": "param",
+     "type": "bool", "default": false,
+     "label": "Fill holes",
+     "help": "Close interior gaps in each detected region before measuring."},
+
+    {"name": "stats", "node": "measure", "param": "stats", "kind": "param",
+     "type": "string", "pattern": "^[a-z_]+(,[a-z_]+)*$", "max_len": 64,
+     "default": "mean,max,min,count",
+     "label": "Statistics",
+     "help": "Comma-separated intensity statistics to measure per object."}
+  ],
+  "outputs": [
+    {"name": "measurements", "kind": "table", "format": "csv", "from": "measure",
+     "policy": "auto", "filename": "{stem}_measurements.csv"},
+    {"name": "overlay", "kind": "quicklook", "from": "segment",
+     "policy": "auto", "filename": "{stem}_overlay.png"},
+    {"name": "metrics", "kind": "metrics",
+     "policy": "auto", "filename": "{stem}_metrics.json"},
+    {"name": "labels", "kind": "image_stack", "from": "segment",
+     "policy": "pull", "filename": "{stem}_labels.tif"}
+  ],
+  "requires": {"capabilities": [], "min_worker_protocol": 1},
+  "limits": {"silence_timeout_s": 300, "hard_timeout_s": 0},
+  "expected_runtime_s": {"typical": 8, "worst": 60}
+}

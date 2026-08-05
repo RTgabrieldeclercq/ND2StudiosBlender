@@ -1,0 +1,21 @@
+{
+  "format_version": "2.0",
+  "graph": {
+    "nodes": [
+      {"id": "load",    "op_key": "io.load",           "params": {},                                "modes": {}},
+      {"id": "pick",    "op_key": "channel.select",    "params": {},                                "modes": {}},
+      {"id": "tophat",  "op_key": "enhance.tophat",    "params": {"radius": 5.0},                   "modes": {"dim": "2D", "variant": "white"}},
+      {"id": "segment", "op_key": "analysis.segment",  "params": {"name": "labels"},                "modes": {"dim": "2D", "method": "watershed", "level": "otsu"}},
+      {"id": "measure", "op_key": "analysis.measure",  "params": {"stats": "mean,max,min,count", "labels": "labels"}, "modes": {"target": "label"}}
+    ],
+    "edges": [
+      {"src": "load",    "dst": "pick",    "src_socket": "image", "dst_socket": "data", "kind": "forward"},
+      {"src": "pick",    "dst": "tophat",  "src_socket": "out",   "dst_socket": "data", "kind": "forward"},
+      {"src": "tophat",  "dst": "segment", "src_socket": "out",   "dst_socket": "data", "kind": "forward"},
+      {"src": "segment", "dst": "measure", "src_socket": "out",   "dst_socket": "data", "kind": "forward"},
+      {"src": "pick",    "dst": "measure", "src_socket": "out",   "dst_socket": "raw",  "kind": "forward"}
+    ]
+  },
+  "zones": [],
+  "groups": []
+}

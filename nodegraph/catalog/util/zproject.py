@@ -16,7 +16,7 @@ from nodegraph.registry import Granularity, InDataset, Mode, OutDataset
 from nodegraph.streaming import ZReduceProvider, stream_fp
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.sampling import _sampled
+from nodegraph.catalog._shared.sampling import Z_STAMP, _sampled
 
 # ── Z-Project (axis-changing: z→1 — the meta_transform showcase) ────────────────
 
@@ -78,7 +78,7 @@ def _compute_zproject(ctx: EvalContext) -> Dataset:
                     vol = prov.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x)
                     out[m, t, 0, c] = _reduce(vol.astype(float), (0,), method)
         projected = _sampled(ds.with_image(ArrayProvider(out)).reshaped_axes(new_axes),
-                             f"zproject[{method}]")
+                             f"{Z_STAMP}zproject[{method}]")
         return projected.with_metadata(z_step_um=None, z_collapsed=True,
                                       bit_depth=bd_out)
     # C1: the engine-driven tree-reduce — output tile (iy,ix) folds the base's
@@ -88,7 +88,7 @@ def _compute_zproject(ctx: EvalContext) -> Dataset:
                    (), prov)
     projected = ds.with_image(
         ZReduceProvider(prov, method, fp=fp, cache=cache)).reshaped_axes(new_axes)
-    projected = _sampled(projected, f"zproject[{method}]")
+    projected = _sampled(projected, f"{Z_STAMP}zproject[{method}]")
     return projected.with_metadata(z_step_um=None, z_collapsed=True,
                                    bit_depth=bd_out)
 register_node(

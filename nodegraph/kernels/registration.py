@@ -787,6 +787,43 @@ def estimate_series(
             "warps": warps, "confidence": confidence, "gated": gated}
 
 
+def apply_frame(
+    plane: np.ndarray,
+    transforms: Dict[str, Any],
+    t: int,
+    interp_order: int = 1,
+) -> np.ndarray:
+    """Apply frame ``t``'s effective transform (from :func:`estimate_series`) to ONE
+    ``(H, W)`` plane, preserving dtype.
+
+    The per-frame unit of :func:`apply_series`, factored out because the apply half of
+    register-once is **separable per plane**: frame ``t``'s output depends only on frame
+    ``t``'s pixels and frame ``t``'s transform, never on its neighbours. That is what lets
+    ``registration.stabilize`` hand the engine a lazy per-plane provider instead of
+    materializing the whole ``(M,T,Z,C,Y,X)`` volume, so a z-stack costs only the planes
+    actually looked at.
+
+    :func:`apply_series` delegates here rather than keeping its own copy of the
+    shift-vs-warp branch: two implementations of the same arithmetic is exactly how a
+    lazy path and an eager path come to disagree in the last bits, and the node asserts
+    they do not.
+
+    An all-zero shift (or an identity warp) returns the plane untouched instead of
+    resampling by nothing — a no-op interpolation still costs a pass and, at order 1,
+    still perturbs the values.
+    """
+    arr = np.asarray(plane)
+    shifts = transforms.get("shifts")
+    warps = transforms.get("warps")
+    if warps is None:
+        sh = np.asarray(shifts[t], dtype=np.float64)
+        return arr if not np.any(sh) else apply_shift(arr, sh, order=interp_order)
+    W = np.asarray(warps[t], dtype=np.float32)
+    if np.allclose(W, np.eye(2, 3)):
+        return arr
+    return apply_warp(arr, W, output_shape=arr.shape[:2], interp_order=interp_order)
+
+
 def apply_series(
     series: np.ndarray,
     transforms: Dict[str, Any],
@@ -795,25 +832,16 @@ def apply_series(
 ) -> np.ndarray:
     """Apply per-frame effective ``transforms`` (from :func:`estimate_series`) to a
     ``(T, H, W)`` series — any channel — returning the aligned series (dtype
-    preserved). This is the "apply to all channels" half of register-once."""
+    preserved). This is the "apply to all channels" half of register-once.
+
+    Per-frame work lives in :func:`apply_frame`; this is the loop over ``t``."""
     vol = np.asarray(series)
     if vol.ndim != 3:
         raise ValueError(f"apply_series expects (T,H,W), got {vol.shape}")
     T = int(vol.shape[0])
-    shifts = transforms.get("shifts")
-    warps = transforms.get("warps")
     out = np.empty_like(vol)
     for t in range(T):
-        if warps is None:
-            sh = np.asarray(shifts[t], dtype=np.float64)
-            out[t] = vol[t] if not np.any(sh) else apply_shift(vol[t], sh, order=interp_order)
-        else:
-            W = np.asarray(warps[t], dtype=np.float32)
-            if np.allclose(W, np.eye(2, 3)):
-                out[t] = vol[t]
-            else:
-                out[t] = apply_warp(vol[t], W, output_shape=vol.shape[1:],
-                                    interp_order=interp_order)
+        out[t] = apply_frame(vol[t], transforms, t, interp_order=interp_order)
         if progress_cb is not None:
             progress_cb(int(100 * (t + 1) / max(T, 1)))
     return out

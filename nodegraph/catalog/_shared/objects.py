@@ -11,6 +11,12 @@ from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.registry import InFloat, SocketSpec
 
+from nodegraph.catalog._shared.labels import (
+    _label_tables,
+    _point_layers,
+    _resolve_layer,
+)
+
 def _object_velocity(track: np.ndarray, tt: np.ndarray, y_um: np.ndarray,
                      x_um: np.ndarray, dt_s: float):
     """Per-object velocity ``(vy, vx)`` in µm/s from consecutive detections of the same
@@ -111,7 +117,15 @@ def _object_table(ctx: EvalContext, ds: Dataset, *, node: str):
     in a geometry the maths does not describe."""
     target = ctx.params.get("__modes__", {}).get("target", "label")
     domain = Domain.LABEL if target == "label" else Domain.POINT
-    layer = ctx.layer("labels") if target == "label" else ctx.layer("points")
+    # the one member table on the wire, whatever it is called (`_resolve_layer`) — both of
+    # these nodes read the TABLE only, so the candidates are the structure instances
+    layer, _note = _resolve_layer(
+        _label_tables(ds) if target == "label" else _point_layers(ds),
+        ctx.layer("labels") if target == "label" else ctx.layer("points"),
+        node=node, socket="labels" if target == "label" else "points",
+        what=f"{domain.value} table", where="the `data` input",
+        remedy="run analysis.segment / analysis.label (Label members) or detect.spots / "
+               "detect.particles (Point members) upstream", ctx=ctx)
     cols = {a.name: np.asarray(a.values) for a in ds.layers_on(domain)
             if a.layer == layer}
     if "id" not in cols:

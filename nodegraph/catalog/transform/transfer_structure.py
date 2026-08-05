@@ -14,7 +14,12 @@ from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDatase
 from nodegraph.structure import COORD_COLUMNS, TrackMembership
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.labels import _label_raster
+from nodegraph.catalog._shared.labels import (
+    _label_raster,
+    _resolve_label_instance,
+    _resolve_layer,
+    _structure_layers,
+)
 
 # ── Transfer Structure (the geometric spine: Voxel↔Label↔Point↔Track, +→Frame) ──
 #
@@ -157,8 +162,25 @@ def _compute_transfer_structure(ctx: EvalContext) -> Dataset:
             f"statistic.")
 
     # ── endpoints ──────────────────────────────────────────────────────────────
-    src_layer = ctx.layer("source_layer") if is_structure(src) else None
-    dst_layer = ctx.layer("target_layer") if is_structure(dst) else None
+    #
+    # Both endpoint sockets ship the literal default `labels`, which is right for a Label
+    # endpoint and wrong for the other three — a point→label transfer had to be told the
+    # Point table's name even when exactly one was on the wire. `_resolve_layer` fills that
+    # in; an explicit name that exists still wins, and two candidates still raise.
+    src_layer = (_resolve_layer(
+        _structure_layers(ds, src), ctx.layer("source_layer"),
+        node="transfer structure", socket="source_layer",
+        what=f"{src.value} table", where="the `data` input",
+        remedy=f"the values come FROM this table — run the node that produces a "
+               f"{src.value} structure upstream", ctx=ctx)[0]
+        if is_structure(src) else None)
+    dst_layer = (_resolve_layer(
+        _structure_layers(ds, dst), ctx.layer("target_layer"),
+        node="transfer structure", socket="target_layer",
+        what=f"{dst.value} table", where="the `data` input",
+        remedy=f"the transferred column is written ONTO this table — run the node that "
+               f"produces a {dst.value} structure upstream", ctx=ctx)[0]
+        if is_structure(dst) else None)
     attr_name = ctx.layer("attr")
     out_name = str(ctx.params.get("name") or "").strip() or attr_name
     if out_name in COORD_COLUMNS:
@@ -188,15 +210,19 @@ def _compute_transfer_structure(ctx: EvalContext) -> Dataset:
     # ── the label raster, when the route touches Label ─────────────────────────
     raster_layer = None
     if (src_name, dst_name) in _XS_VIA_LABEL:
-        raster_layer = str(ctx.layer("via_label") or "").strip()
-        if not raster_layer:
-            raise ValueError(
-                f"transfer structure: {src_name}→{dst_name} has no direct bridge — it "
-                f"routes through Label ({'voxel→label→track' if src_name == 'voxel' else 'track→label→voxel'}), "
-                f"so it needs to know WHICH Label instance to pass through. Set the "
-                f"`via_label` socket, or do it as two nodes "
-                f"({'voxel→label then label→track' if src_name == 'voxel' else 'track→label then label→voxel'}), "
-                f"which also lets you pick a different reducer for each step.")
+        # An UNSET `via_label` used to be a hard refusal ("it needs to know WHICH Label
+        # instance to pass through"). It still is when the answer is genuinely open, but
+        # with one Label instance on the wire there is nothing to decide — `_resolve_layer`
+        # raises the same question, listing the candidates, only when there are several.
+        route = ('voxel→label→track' if src_name == 'voxel' else 'track→label→voxel')
+        two = ('voxel→label then label→track' if src_name == 'voxel'
+               else 'track→label then label→voxel')
+        raster_layer, _note = _resolve_label_instance(
+            ds, ctx.layer("via_label"), node="transfer structure", socket="via_label",
+            remedy=f"{src_name}→{dst_name} has no direct bridge — it routes through Label "
+                   f"({route}), so it needs a label raster and its table to pass through. "
+                   f"Run analysis.segment / analysis.label, or do it as two nodes ({two}), "
+                   f"which also lets you pick a different reducer for each step", ctx=ctx)
     elif (src_name, dst_name) in _XS_NEEDS_RASTER:
         raster_layer = src_layer if src is Domain.LABEL else dst_layer
     raster6 = None
@@ -428,9 +454,31 @@ def _layers_transfer_structure(params: Mapping, modes: Mapping):
 register_node(
     _compute_transfer_structure, op_key="transform.transfer_structure",
     label="Transfer Structure", category="transform",
-    # reads/adds stay EMPTY on purpose: both are per-INSTANCE here (whatever From/To say)
-    # while NodeSpec's declarations are per-TYPE — the same reason transform.transfer_domain
-    # and track.link leave theirs empty. The output layer is announced via extra_layers.
+    # adds stays EMPTY on purpose: it is per-INSTANCE here (whatever To says) while
+    # NodeSpec's declaration is per-TYPE. The output layer is announced via extra_layers.
+    #
+    # reads is now stated (V2.22): this node touches BOTH endpoints, so the requirement is
+    # the union of what From names and what To names — the case a single-mode Mapping (the
+    # `granularity` form) could not have expressed, and the reason the per-mode field is a
+    # union rather than a lookup. `frame` contributes nothing: it is a lattice destination
+    # with no table to find.
+    #
+    # A label endpoint asks only for LABEL, not for the raster, even though four of the
+    # pairs do read one (`_XS_NEEDS_RASTER`). That is deliberate and matches that set's own
+    # note: label→track / track→label / label→frame are pure table joins, and demanding
+    # VOXEL for them would refuse a valid graph whose Label table outlived its raster. The
+    # pairs that DO read a raster always have a voxel or point endpoint supplying it.
+    reads_domains_by_mode={
+        "from_domain": {"voxel": frozenset({Domain.VOXEL}),
+                        "label": frozenset({Domain.LABEL}),
+                        "point": frozenset({Domain.POINT}),
+                        "track": frozenset({Domain.TRACK})},
+        "to_domain": {"voxel": frozenset({Domain.VOXEL}),
+                      "label": frozenset({Domain.LABEL}),
+                      "point": frozenset({Domain.POINT}),
+                      "track": frozenset({Domain.TRACK}),
+                      "frame": frozenset()},
+    },
     extra_layers=_layers_transfer_structure,
     inputs=[
         InDataset(),

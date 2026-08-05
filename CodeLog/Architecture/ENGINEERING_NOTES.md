@@ -258,8 +258,9 @@ registration.
 | `granularity` / `kernel_axes` | engine read routing, streaming unit | the data-access footprint, per dim |
 | `supports_true_3d` / `three_d_fallback` | GUI honesty | a stack-of-2D backend says so and keeps 3D at `WHOLE_PLANE` |
 | `meta_transform` | edit-time envelope pass | axes/calibration prediction, pixel-free |
-| `reads_domains` / `adds_domains` | domain rail, wire tint, validation | required vs produced domains |
+| `reads_domains` / `reads_domains_by_mode` / `adds_domains` | domain rail, wire tint, validation | required vs produced domains; the `_by_mode` half states the requirement **per branch** |
 | `layer_in` / `layer_out` / `extra_layers` | layer catalog + GUI picker | which named layers a node reads / writes |
+| `layer_from` | GUI picker | which **Dataset input** a layer socket picks from (default: the primary) |
 
 ### The footprint
 
@@ -345,12 +346,243 @@ InString("name", "Output layer", field=False, default="labels",
 * `layer_in_mode="from_domain"` when the domain is itself a mode value (only
   `transform.transfer_domain`).
 * Domain consistency is enforced: `layer_in` ⊆ `reads_domains`, `layer_out` ⊆ `adds_domains`.
-  The `reads_domains` half is **exempt for a mode-gated socket** — a conditional requirement,
-  and `reads_domains` has no per-mode form.
+  The `reads_domains` half is checked in **every mode state the socket is active in**, against
+  `spec.resolve_reads_domains(state)` — see **`reads_domains_by_mode`** below. The only
+  exemption left is an **empty default**, which means the layer is optional (`analysis.segment`'s
+  watershed `mask` falls back to cutting the image; `flow.iterate`'s `metric` to not scoring).
 * Producers no socket can describe use **`NodeSpec.extra_layers(params, modes)`** — literal
   names (`drift_y`/`drift_x`), names derived from another param
   (`f"{labels}_boundary"`), or writes into the layer a *read* socket names (`measure`). It
   runs on **every keystroke**: it must never raise.
+
+#### `reads_domains_by_mode` — the rail resolved per branch (V2.22)
+
+`{mode: {value: frozenset(Domain)}}`, **unioned** onto the static `reads_domains` and resolved
+by `spec.resolve_reads_domains(state)` / `missing_domains(incoming, state)`.
+
+A node whose branches read different structure could previously state only one static answer,
+so the catalog split into nodes that over-claimed (`analysis.object_field` declared
+`{LABEL, POINT}` and demanded Points of a pure-Label graph) and nodes that declared
+`frozenset()` and warned about nothing (`analysis.voronoi` needs a whole Label instance under
+`bound=per_region`, and its rail said POINT — reported 2026-08-03). Both were silent: the rail
+is advisory, so nothing failed, it just told you the wrong thing.
+
+A **union over modes**, not the single-key `Mapping` that `granularity` uses, because the real
+requirements are not keyed by one dropdown: `transform.transfer_structure` reads what
+`from_domain` names AND what `to_domain` names, and `flow.iterate` needs a Global under
+`preserve=best` **or** under `mode=feedback` — a disjunction (and the same limit that makes that
+socket's own `available_in` approximate). An unlisted value contributes nothing, which is how a
+branch says it requires no structure at all.
+
+Registration refuses all three ways it can silently do nothing: a mode name that does not exist,
+a value that mode cannot take, and a non-`Domain` entry. Eight nodes carry it; `analysis.segment`
+deliberately stays static (its VOXEL is the image domain every source supplies, not a
+per-method layer). Covered by `selftest::test_conditional_reads_domains`.
+
+#### `layer_from` — a second Dataset input for a second DOMAIN (V2.22)
+
+Declaring the requirement is not the same as being able to satisfy it. `analysis.voronoi`
+needs a Point table AND a Label raster, and those come from different branches — dots detected
+on one channel, areas segmented on another — which one wire cannot carry. Every other
+multi-Dataset node uses its second input for *pixels* (`raw`, `reference`) or *display*
+(`secondary`); none of them brings in a domain, and there is no merge/join node.
+
+So `analysis.voronoi` grew an optional **`areas`** input (declared after `data`, so `data` stays
+`dataset_preds[0]` = the calibration/domain env source), and the `region` layer socket declares
+**`layer_from="areas"`** — because `document.layer_choices` follows the *primary* edge on
+purpose, and without the declaration the picker would list names off a wire the compute never
+reads. Unwired, both the compute and the picker fall back to the primary, so every pre-existing
+single-wire graph is unaffected.
+
+The geometry guard is now shared: **`_require_same_grid`** (`_shared/sampling.py`), lifted out
+of `_intensity_provider` when the second consumer arrived — `AxisSizes` *plus* the `__sampling__`
+provenance. An `areas` wire under `bound=frame` is refused rather than ignored (a Dataset input
+is not `available_in`-gated: hiding a socket that has a wire would dangle the edge). The rail
+composes for free, since `input_domains` unions every Dataset predecessor. Covered in
+`selftest::test_label_to_points_voronoi`.
+
+#### Axis-confined sampling stamps (2026-08-04)
+
+A `__sampling__` stamp may declare the axes its effect is **confined** to, as a `"<axes>:"`
+prefix — `CHANNEL_STAMP` (`"c:"`), `Z_STAMP` (`"z:"`). One rule follows: *a stamp confined to
+axes that are singleton on both sides being compared cannot misalign anything.* The channel tap
+was the first instance; the second came from a real graph and was a **false refusal** of correct
+work — Voronoi seeds from a `zproject[max]` of one channel, areas from a single-plane
+`crop[z5:6,y0:2048,x0:2048]` of another. Both end at `z == 1` and neither moves a `(y,x)`
+address, so they address identical voxels, but strict stamp equality rejected them.
+
+`util.zproject` always marks; `util.crop` marks **per call** (a pure z-crop is lateral identity;
+a windowed one moves the corner) — that conditional is what the exemption rests on and is tested
+against the real compute. An unmarked stamp is never dropped, so the parse fails safe.
+`m`/`t` are deliberately not exempt: collapsing them picks a position or timepoint, and calling
+frame 3 and frame 7 one grid is a content decision this guard cannot make for the user.
+
+#### The card's layer picker (2026-08-04)
+
+`inspector._layer_box` has offered a layer combo since V2.11, but the node CARD had none: a
+`layer_in` pill fell through to the inline text editor, so on the canvas the only way to change
+it was to know the name. A node holding its factory-default layer name against a wire that
+carried another therefore failed at **pull** time, several nodes downstream, with the right
+answer one click away. `node_item._open_layer_menu` closes it — the layers the wire actually
+carries (via `layer_choices`, so `layer_from` is honoured), each with hover prose, plus a
+`Type a name…` entry because the edit-time prediction is honest but incomplete. Driven in the
+phase-5 probe via the `_PeekMenu` pattern.
+
+#### A second input needs an OUTPUT trace (2026-08-04)
+
+A node's payload is built on `dataset_preds[0]`, so it inherits the **primary** wire's layers and
+nothing from the auxiliary one. For `raw`/`reference` that is right — those bring in pixels to
+measure, not data to keep. For a second input that brings in a **domain** it is a hole: viewing
+`analysis.voronoi` showed the *seeds'* branch labels and points and no trace of the areas the
+cells were clipped to, so a territory could not be seen against the region that bounded it — and
+the inherited raster is usually *also* named `labels`, so the overlay looked like the area layer
+while showing a different branch's.
+
+So the compute copies the area raster onto its output as **`f"{name}_areas"`**, declared through
+`NodeSpec.extra_layers` (`_layers_voronoi`) — no socket can describe it, since the name derives
+from another param and the layer is a copy of one a *read* socket named. Deliberately not under
+its original name, which usually collides with what the seeds' branch already means by it. Empty
+under `bound=frame`, which reads no area layer. **Rule for any future second-domain input: if the
+node reads structure off an auxiliary wire, put what it used on the output, under a name of the
+node's own choosing.**
+
+#### A layer socket's DEFAULT is a guess about the graph (2026-08-04)
+
+A `layer_in` socket must ship some default, and a literal one is a bet on which upstream node
+you wired. Every such bet in the catalog was wrong for every producer but one, and it failed at
+**pull** time with an error that printed the right answer one clause after refusing to use it:
+
+```
+ValueError: label to points: no Voxel layer 'labels' on the input Dataset (it carries
+['CELLS']) — run analysis.segment / analysis.label upstream, or point the layer socket at
+the right name.
+```
+
+Two nodes, one Label instance on the wire, nothing to decide. And renaming was not even needed
+to reach it: the shipped defaults of sockets that are *routinely wired to each other* disagree —
+`detect.particles` emits `particles` while `track.link`/`track.objects` ask for `spots`,
+`analysis.tessellate` emits `mesh` while `analysis.voronoi`'s mesh is `voronoi_mesh`,
+`analysis.dvc_field` emits `dvc` and nothing else does.
+
+`catalog/_shared/labels._resolve_layer` had already fixed this for `analysis.voronoi`; it is now
+the route for **every required input-layer socket** (17 nodes). Three-way rule, unchanged from
+voronoi's: a name that IS on the wire wins literally; zero-or-stale with exactly ONE candidate
+resolves to it and says so on the progress rail; **several candidates raise**, listing them —
+it never chooses between them. So this can only widen what runs, and it replaces an error with
+either an answer or a better error.
+
+The candidate SET is per-node and is the interesting part, because it encodes what each node
+actually needs:
+
+| set | who | why |
+|---|---|---|
+| `_label_instances` (raster **and** table) | measure, label_to_points, transfer_structure's `via_label` | one row/dot per REGION — a bare mask would collapse the foreground to one |
+| `_voxel_layers` (any raster) | edt, label, extract_boundary, boundary_band, tessellate's `label_surface`, track.link's label branch | groups by id, never reads a Label table, so a plain threshold mask is legal |
+| `_label_tables` / `_point_layers` | track.objects, object_metrics, object_field | read the TABLE only; a raster dropped by an axis change is no obstacle |
+| element tables only | rasterize_mesh | a mesh occupies three buckets (`m`, `m/vert`, `m/face`) and the strata are not separately selectable |
+
+Two refinements the first cut got wrong:
+
+* **`_resolve_label_instance`** hands back a name that is a Voxel layer but not a whole Label
+  instance, unchanged, so `_label_raster` can give its own specific refusal ("carries no Label
+  table, so its non-zero voxels are one undivided region"). Inferring past a name the user
+  pointed at something real with would answer a question they did not ask and lose the one
+  message that names the problem.
+* **Optional sockets are excluded**, and a non-empty default is not proof of required. Kept out
+  with their reasons in `selftest._LAYER_RESOLVE_EXEMPT`: `dic_correlate.roi` (unresolvable ⇒
+  `roi6 = None` ⇒ correlate the whole frame — inference would silently MASK it) and
+  `reduce_scalar.source` (names an attribute COLUMN, where on a structure domain every
+  invariant coordinate is a "candidate", and an empty domain must stay a RESULT, not an error).
+
+Gated structurally as **clause (g) of `test_param_socket_contract`**: any required `layer_in` /
+`layer_in_mode` socket whose compute does not call a resolver fails the build. Three selftest
+assertions that encoded the OLD contract were inverted with their reasoning recorded in place —
+"a missing source layer must raise" was the defect, not the rule. Catalog declarations are
+byte-identical (`_catalog_snapshot check` green): this is a compute-level change, so no saved
+graph is affected and no memo key moves.
+
+One known seam: `NodeSpec.extra_layers` sees params only, not the incoming layer catalog, so
+`label_to_points`/`extract_boundary`/`accumulate_field` announce `<socket>_points` at edit time
+while the run writes `<resolved>_points`. Harmless in practice — a downstream socket pointed at
+the announced name resolves by the same only-candidate rule — and fixable only by widening the
+`extra_layers` contract.
+
+#### The Labels overlay had no layer selector (2026-08-04)
+
+`viewer._label_plane` chose its raster by a heuristic — *the integer Voxel layer with the most
+regions in the viewed plane* — and there was no control anywhere to override it. Several label
+rasters on one Dataset is the normal case (Voronoi alone contributes three, and two segmentation
+nodes both default their output name to `labels`), so the overlay drew whichever happened to be
+the most fragmented. Reported as *"it pulls the wrong label — I select the segmentation from the
+Red channel but it still shows the UV labels"*: there was nothing to select.
+
+Now `LabelsOverlay.layer` (`""` = the old guess, kept as the fallback), resolved once in
+**`viewer._label_source`** and shared by `_label_plane` (what is painted) and
+`_label_layer_values` (what the size-probe counts) — they could otherwise disagree about which
+layer is on screen. Exposed as a new `FieldSpec` kind `"layer"`: a combo the dialog repopulates
+from the **live payload** on every `reload` (via an injected `layer_names` callable, so the
+dialog stays constructible without a Viewer), Auto first, and a pick the current payload lacks is
+kept visible as *"… — not on this payload"* rather than snapping silently back to Auto. A stale
+pick falls back to the guess instead of drawing nothing. Driven in the phase-5 probe.
+
+#### `view_source` — an auxiliary input's IMAGE reaches the Viewer (2026-08-04)
+
+One payload, one image. So a node reading structure off a second branch could only ever display
+the primary's channel — reported as *"I can only see the UV channel"* on a graph whose seeds came
+from one channel and its areas from another. The compositing machinery already existed (it is what
+`view.overlay` drives); nothing could tell it a socket other than `secondary` was a source.
+
+`SocketSpec.view_source` says so. `EngineRunner.overlay_chain` now yields those edges alongside
+`view.overlay`'s, and `_resolve_overlay` no longer bails when the payload carries no
+`OVERLAY_KEY` recipe — because these nodes stamp none, and must not: display config in a payload
+would ride the memo key, and `view.overlay` exists so that "how it looks" is a graph decision.
+`_view_source_entry` synthesizes the placement through the same `plan_placement` +
+`overlay_entry` pair a real Overlay uses, with **`on_unplaceable="index"`**: field-for-field at
+scale 1, no stage log required (a sibling branch needs none and a TIFF never has one), and no
+`flip_x=True` — that default is for a secondary from a different acquisition. The degrade path's
+"alignment is NOT verified" warnings are replaced, since `_require_same_grid` already verified it.
+
+**Opt-in per socket, deliberately.** `analysis.voronoi`'s `areas` qualifies; `measure`/`
+label_to_points`' `raw` and DVC/DIC/`align_to`'s `reference` do not — those are a second version
+of the *same* pixels or another timepoint of the same channel, and compositing them by default
+would draw the field twice and read as a bug. The test that separates them is whether the node
+reads a *domain* off the wire rather than intensities.
+
+#### Two Dataset inputs, told apart (2026-08-04)
+
+The painted domain rail is a **node-level** answer repeated beside every Dataset input, so
+`analysis.voronoi`'s seeds wire and areas wire showed identical chips. Attributing the
+requirement per wire is **not derivable**: `reads_domains_by_mode` says a `per_region` transfer
+needs `{POINT, VOXEL, LABEL}`, and while `layer_from` maps the `region` socket's VOXEL onto the
+areas wire, nothing maps LABEL there — a Label instance's table half is wanted by that branch but
+no socket names it. Splitting the declaration per socket would give the node total and the
+per-socket sets two sources of truth, which is the defect `reads_domains_by_mode` was written to
+end. **So the chips stay node-level and the per-socket fact goes in the hover**, where it is
+honest: each Dataset socket's tip names what *its own* edge carries, beside (not instead of) the
+node's requirement, and says `nothing wired` when unplugged. `InDataset` also takes a
+`description` now — a value socket has carried prose since V2.13, a Dataset socket could not, so
+`areas`/`raw`/`secondary`/`reference` all hovered as bare names.
+
+Found while testing it: `NodeItem.refresh()` only re-applied domain tips through `_layout`, which
+it skips when the socket set is unchanged — so **every tip was frozen at the last relayout** and a
+wiring change never updated it. That was invisible while the tips were node-level and constant.
+
+**Still open:** `transform.transfer_structure` is the other node that combines two domains (its
+`From` and `To` endpoints) and still has one input. It is NOT the same shape as
+`analysis.voronoi`'s `areas` and should not be copied from it — see below.
+
+#### Why `transfer_structure` did not get a second input
+
+Its compute reads both endpoints off one `ds` across ~250 lines and fifteen pair-specific paths,
+and the blocker is the **output contract**, not the plumbing: this node writes the transferred
+column *onto the target table*. If the target lives on a second wire, the output — built on the
+primary — has no such table to write to, so the target structure would have to be copied onto the
+output wholesale. At which point the honest reading is that the **target** is what the result is
+about and should be the primary input, with the *source* arriving auxiliary — the opposite of
+`voronoi`, where the primary is unambiguously the seeds.
+
+That is a design decision about the node's identity, not a mechanical extension, so it wants its
+own grill rather than an analogy to `areas`.
 
 `propagate_meta` turns these into `MetaEnvelope.layer_names` — the `(domain, name)` catalog
 per edge — and the inspector turns a `layer_in` socket into an editable combo over exactly
@@ -852,6 +1084,112 @@ a-b-b-a on a 1.64 GiB slice of the 640 series so the cold page cache lands on on
 best-of-two: eager 6.7 s vs streamed 6.2 s, **0.94×**. The write dominates either way (decode
 is 2.0 s of it at 821 MB/s), so removing the materialize pass trades 84.7 GB of RAM for nothing.
 
+### The checkpoint writer, and why it drifted (V2.26)
+
+`nodegraph/checkpoint.py` is the Dock's persistence layer and it writes the **same** layout the
+ingest does — manifest-last, `image/level_*.b2nd` planar-block pyramid, `voxel/*.npy` memmapped,
+one `tables.npz`. It had its own copy of the geometry and the pyramid arithmetic, and both copies
+had drifted. This section exists because there was no section: §12 documented the provider and
+the ingest and never mentioned the second writer, which is plausibly *how* it drifted.
+
+Three faults, in order of what they cost:
+
+1. **The chunk was framed off Z alone.** `cz = min(ax.z, target // plane_bytes)` — right for a
+   z-stack, and on a `z == 1` series it pins **one plane per chunk** however small the plane is.
+   That is not an edge case for a Dock: a timelapse, a Z-projection, a stitched mosaic and a
+   channel merge are all `z == 1`, which is to say everything the feature exists to freeze. A
+   2048² uint16 plane is an 8 MiB chunk and writes at 143 MiB/s against 552 at cz=16.
+   `_store_kwargs(..., batch_thin_z=True)` now batches over **T** until the chunk clears
+   `_CHUNK_FLOOR_BYTES` (32 MiB — a floor to escape per-chunk overhead, not a target, since
+   every byte past it costs full-plane read latency for nothing). Opt-in, so the ingest store's
+   read profile — load-bearing for every live chain, and benchmarked at its current framing —
+   is unchanged until someone measures it.
+2. **The pyramid was a private copy of the mean-pool**, run serially on the calling thread
+   through a `float64` intermediate, while `B2ndProvider._append_level` did the identical
+   reduction pooled and chunk-aligned. `provider._plane_mean_2x`'s own docstring claims "every
+   pyramid path routes its per-plane reduction through this function so … `nodegraph.checkpoint`
+   cannot drift apart" — it could, because nothing enforced it and this module never called it.
+   The coarse levels are now streamed out of the finished `level_0` by `_append_level`, so the
+   bake's pyramid is bit-identical to an ingest store's *by construction*. `_append_level` had
+   the mirror-image of fault 1: with `z == 1` it looped once per `(m,t,c)` over a single plane,
+   paying a pool dispatch with a fan-out of **one** and writing a small chunk, 160 times for a
+   160-plane series — 17.4 s against 3.3 s for all of level 0.
+3. **`clevel` was never set**, so all three call sites inherited blosc2's dataclass default of
+   **5** while its own docstring says 1. ~1.5× the write time for ~1% of the ratio.
+   `pyramid_cparams()` is now the single definition and names `clevel=1` explicitly.
+
+Measured end-to-end on a 1.25 GiB uint16 fixture, 160 planes, 3 levels: **thin-Z 23.0 s → 6.6 s
+(3.5×), deep-Z 9.4 s → 5.7 s (1.7×)**. The same bytes took 2.4× longer as thin-Z than as deep-Z
+before, which is the shape of fault 1.
+
+**The fourth fault was not in the writer at all — it was that nothing asked what the input
+WAS.** `_write_image` touched `prov` through `get_region` only, so a dock straight after
+`io.load` decompressed a b2nd store and compressed it straight back, to produce bytes already
+on disk. `_copy_level0` now copies the store's pyramid files when the destination bytes would
+be identical: **12.4 s → 2.6 s** on a 1.25 GiB store.
+
+Two things about it are worth keeping straight. First, **every guard is exact equality**,
+because "close enough" here means silently wrong pixels — disk-backed `B2ndProvider`, axes
+equal to the payload's, `target_dtype` a no-op at this precision (so integer data copies and a
+real float conversion does not), `tile` equal, and the source level sound by both its marker
+and the blank-chunk census. That last one is the guard that matters: copying is the only path
+that would propagate a half-written source verbatim, and a marker-free interrupted write is
+exactly what `open` trusts by age.
+
+Second, **all sound levels are copied, not just level 0.** The first cut copied level 0 and
+rebuilt the pyramid, which left the rebuild dominating — it decompresses all of level 0 again
+to make coarse levels that were already beside it, and measured just 1.3× against a full
+re-encode. Copying them is sound on `open`'s own terms (it takes the leading complete-or-legacy
+run and drops a torn level, so `prov.levels` already excludes what it could not vouch for),
+and each is put through the census here too. The copied levels keep the SOURCE's framing, which
+differs from this writer's because an ingest store does not batch thin Z — a framing
+difference, not a pixel one, and the manifest reports what is on disk (`chunks`) plus how many
+levels came over verbatim (`copied_levels`) rather than what was requested.
+
+Two correctness additions alongside: every level is `_mark`ed (`_LEVEL_META`) before its first
+byte and again when complete — manifest-last made a torn *checkpoint* read as absent but could
+not make a torn *level* read as torn, and `B2ndProvider.open` globs the leading run of level
+files rather than trusting the manifest's count, so a re-bake producing fewer levels left a
+stale higher level to be adopted as trusted-`legacy`. And the writer takes a `should_cancel`
+token polled at each block boundary, returning `None` with no manifest — the state this module
+already documents as correct for an interrupted bake.
+
+### The `held` tier — a frozen dock that wrote nothing (V2.26)
+
+`io.dock`'s `state` is `[live, held, docked]`. `held` cuts the upstream edge exactly as `docked`
+does and serves the already-computed payload from memory. It is Cell-Tracker's *Set as raw data*
+with the copy removed — and worth noting that Cell-Tracker's version is instant only because its
+data model has **no M and no Z axis** (`nd2_loader` indexes position 0), so on the lab's
+49-position file it keeps 1/49 of the acquisition and never says so. The latency was the target;
+the technique was not available.
+
+Everything it needs already existed, which is why it is small:
+
+* **`Engine.seeds` is the right slot**, not the memo. `Memo._evict_to_budget` drops entries on
+  recency alone and is documented as "always correctness-safe" precisely because dropping one
+  only costs a recompute — but a held dock's upstream edge is **cut**, so an eviction would not
+  cost a recompute, it would lose the data. Nothing evicts a seed.
+* **`EvalContext.seed` was the one gap.** The engine's compute branch wins over its seed branch
+  (`if fn is not None: payload = fn(ctx)`), so a node with both never saw its own seed. That was
+  invisible while the only such node was `io.dock`, whose `docked` state re-opens a store from a
+  path in its params and needs nothing from the engine.
+* **`is_docked` had to split into two predicates.** It meant both "frozen" and "has a disk
+  store". Every graph rewrite wants the first (`cut_docked_inputs`, `dormant_nodes`,
+  `upstream_signature`'s walk stop) and every disk path wants the second. Conflating them is how
+  a new frozen state ends up cut-but-still-evaluated, or evaluated-but-not-cut — which is worse,
+  because the seed is then ignored and the chain the user froze runs anyway.
+  `nodegraph/iterate.py` keeps its own duplicate of the state list on purpose (importing
+  `nodelab_v2.ops` would invert the dependency); `selftest::test_iterate` asserts both states
+  refuse, which is the only thing forcing the two copies to keep pace.
+
+**The three honest limits, all stated on the card and in `choice_docs`:** it does not free
+memory, it is uncounted by every budget, and it does not survive a reload. On reload the node
+reports **`released`** in red and names the fix — never auto-re-held (that would re-run the
+frozen chain on file open with no progress bar anyone asked for) and never silently downgraded
+to `live` (which looks like it worked). Cell-Tracker ships the silent version of exactly this:
+its baseline is never serialized, so after a reload the page renders empty with no message while
+downstream pages still look loaded.
+
 ---
 
 ## 13. Structure, transfer, bridges
@@ -1271,6 +1609,19 @@ label, and the **auto / pinned** toggle backed by the sticky `__locked__` list. 
 rebuilds via a deferred `_rebuild`, and the card re-lays-out via `scene.sync → item.refresh` —
 **both halves must be verified** when you add mode gating.
 
+**The Iterate target picker (V2.22).** `flow.iterate`'s panel grows one "iterate on" dropdown
+per variable slot, filled by `nodegraph.iterate.candidate_targets` — the active params and
+Modes of every node upstream of `collect`, in `topo_order`. Two properties are the whole
+design. (1) The menu is filtered by `_check_target`, the *same* predicate the rewrite refuses
+on, so it can never offer a target the run would then reject; if you add a refusal there, the
+menu narrows for free. (2) Choosing writes a **driver edge** through
+`GraphDocument.set_iterate_target` and nothing else — the wire stays the single storage, so
+the canvas, save/load, the "driven by" note on the target's own editor and `unroll` need to
+know nothing about the control. The slot's `v{k}_type` follows the target (a Mode or a string
+param is swept from the slot's STRING output) and the spare `+` row raises `variables`,
+because both are settings the user would otherwise have to discover before the wire would
+connect at all.
+
 ### Interactive parameters (V2.16) — `picker.py`
 
 Four presentation-only `SocketSpec` fields drive the whole feature, following the `path_kind`
@@ -1592,6 +1943,142 @@ Nothing is blocking; these are the honest edges.
   ONLY the tiles it touches, which is what makes a level-0 patch affordable. Display-only by
   construction and asserted so (probe §V3). **Known gap:** the offscreen probe runs the CPU
   surface, so the GL second-quad draw is structurally checked but not pixel-verified.
+* **A detail patch has to carry EVERY channel the composite draws** (V2.23, reported
+  2026-08-04 as "the overlay disappears if you zoom in"). The patch is drawn opaquely over the
+  overview inside its rect, so a channel missing from it is not dimmed there, it is *erased* —
+  and `view.overlay`'s composed channels live at indices above the payload's own, which
+  `_plane_addrs` was **clamping** into the primary's range. Clamping is the shape of bug worth
+  naming: it makes a request for something that does not exist look satisfied, so nothing
+  anywhere reports a problem. The same clamp was dropping the overlay from every *warm* frame
+  (composed planes now have cache slots of their own, so a re-visited frame keeps its
+  secondary instead of blinking it off). Three consequences to hold onto:
+  - the compositor takes the output's `region` of the primary field
+    (`placement.sub_field_box`), so the overview and the patch go through **one** function.
+    Two would drift, and the way they would drift is by placing the same overlay differently
+    at two zoom levels — which reads as a registration error, not a rendering one;
+  - its reader is offered the fractional **window** of the tile the picture needs
+    (`placement.source_window`, the inverse of `axis_map`) and may return `(plane, window)`
+    instead of a whole plane. Reading the whole plane decimated to `MAX_DISPLAY_DIM` was
+    reading the *source's own overview*: with a stitched secondary the part covering one
+    primary field is a few hundred of those pixels stretched over the display, which is
+    exactly what "not the raw channel data" meant. Measured on the WellA3 pair with the
+    7168² mosaic as the secondary: 1085 distinct values against 681 at the overview and
+    120 against 47 at a 10 % zoom, and 0.02 s against 0.26 s — more data for less work,
+    because the old read decoded 12.8 Mpx to sample 30 k of them;
+  - the spatial comparators (`checkerboard`, `wipe`) are defined on the **image**, so the
+    quad has to know where it sits: `u_rect` in the shader, `region=` in
+    `composite_with_clim`. Off the quad's own uv a patch grew a fresh checkerboard and slid
+    the divider to the middle of the zoom — a registration check that moves when you look
+    closer is worse than none.
+* **The display cap was a constant where it should have been a decision** (V2.23, asked
+  2026-08-04: "I want the stitched and overlay to be full resolution and instantly
+  loaded/playable"). `MAX_DISPLAY_DIM = 4096` pinned a 7168² stitched canvas to pyramid level 1 —
+  half resolution everywhere outside a zoom patch — and the reason was nothing but the number.
+  Measured before changing anything: the whole-canvas read is 0.78 s live and 0.06 s from a baked
+  store, one frame narrows to 98 MiB, the whole 16-frame series is 1.53 GiB against a 64 GiB
+  budget, and this GPU reports `GL_MAX_TEXTURE_SIZE` 32768. Nothing was ever protecting anything.
+  It is now `display_cap(axes, texture_limit, bytes_per_px, planes)` — the decision NIS-Elements
+  makes once per image against `MaxMemoryImageSize`, against the same 25%-of-RAM default
+  (`DISPLAY_RAM_SHARE`, configurable because the answer is a property of the machine). Four
+  things this taught, in descending order of how much they will bite again:
+  - **a shape-deciding parameter must ride in the cache key.** The cap decides a plane's shape,
+    and *three* writers put planes under that key (the displayed-frame decode, the prefetcher,
+    the warm probe). Two of them disagreeing would serve a plane at the wrong size — so the cap
+    is in the key, which turns any disagreement into a miss instead of a picture. The limit that
+    feeds it also arrives *late* (a surface has to come up first), so this is not hypothetical.
+  - **narrowing a display copy is free; converting for its own sake is not.** `util.stitch` fuses
+    in float64 because a feather blend is a weighted mean, so a mosaic frame reached the display
+    as 392 MiB carrying 12-bit data. The fix belongs inside `_fit_plane`, which *already*
+    materializes a copy on both paths — riding that costs nothing, whereas a standalone
+    `astype` pass would have cost as much as the read it was saving RAM for. Gated on the
+    payload's own `bit_depth` (every node that makes values continuous drops it) and it
+    **refuses** rather than wraps out-of-range values.
+  - **level 0 is not display-only, so it must not be narrowed at the source.** Casting the fuse
+    result would have been simpler and is wrong: every compute reads `get_region(0, …)`, and
+    rounding a blend there moves a measured intensity behind the user's back. That is what the
+    Dock's explicit `precision` is for.
+  - **play is a licence the cursor does not grant.** `preload_series` reads the whole T range;
+    `prefetch` deliberately will not (±2 frames on a computing provider — warming ±8 T of the
+    WellA3 640 series once queued sixteen whole-volume deconvolutions). Pressing play is the user
+    saying every frame is wanted in order. It stops at the budget rather than evicting its own
+    head, because a preload that wraps the LRU re-decodes every lap.
+* **A live mosaic has a floor no display trick reaches** (V2.23). Full resolution was a display
+  decision; *cheap* is not — a stitched canvas is recomputed per displayed frame. NIS-Elements
+  does not keep one live either (its Large Image mode carries the pyramid in the file and
+  disables much of the processing menu), and the repo already had the artifact: a Dock's
+  `write_checkpoint` writes a chunked 3-level pyramid. `Run → Flatten to Large Image…` is that
+  path with the setup done — insert the Dock, pick `precision` off the propagated envelope's
+  `bit_depth`, bake. 0.78 s → 0.06 s per full-resolution frame, read-ahead 2 → 8 (a store is not
+  a `StreamProvider`), for 29 s and 0.97 GiB once.
+  **The refusal is the interesting part.** Baking a chain containing a `display`-mode overlay
+  wrote the primary alone: docking cuts in-edges in the run graph, so the chain walk finds no
+  `secondary`, and `display` mode stores no pixels *by contract*. The overlay did not degrade, it
+  vanished, while the graph still showed it — so the bake now offers to switch the node to
+  `resample` and cancels if declined. Two ceilings remain, both documented in the manual rather
+  than hidden: `resample` builds its output eagerly (6.1 GiB for 16 frames of this mosaic, ~77
+  GiB for 200), and it reports no `bit_depth`, so its frames stay float32 and half as many fit.
+* **`channel.merge`: two files on one channel axis, lazily** (V2.23, asked 2026-08-05 — "no need
+  of an overlay, but instead a true metadata/image overlay … each channel can go through their
+  individual Z frames since they are overlaid based on registration of metadata"). `view.overlay`
+  could not be it: `display` mode changes nothing a node reads, and `resample` bakes ONE channel
+  EAGERLY. The new node returns a real merged Dataset behind `ChannelMergeProvider` — the first
+  provider that reads from two sources — at 0.025 s and +0 MiB against `resample`'s 25 s and
+  +12.4 GiB for the same pair. Four things worth keeping:
+  - **the meta_transform is shown only the PRIMARY's envelope**, and here BOTH grown axes depend
+    on the secondary (`c` by its channel count, `z` by its focus range and step). So both are
+    marked unknown, `stitch`-style, rather than guessed — and `z_step_um` is dropped with them,
+    because leaving the primary's step standing would put every downstream µm→plane conversion
+    on the wrong spacing. Overlay solves the same blindness by baking exactly one channel, which
+    is right for something you measure one channel of and wrong for a merge.
+  - **"union of both Z grids" is not literally representable.** The calibration vocabulary
+    describes Z as origin + step + count, so an irregular list of focus positions has nowhere to
+    live. The union is therefore the finest-step *uniform* grid spanning both — every acquired
+    focus addressable to within half a step, collapsing to the finer stack's own grid when one
+    range nests inside the other. Claiming a non-uniform grid in metadata that says uniform
+    would be a lie about where the pixels are. On the real pair it is 297 planes rather than the
+    640's own 210, because that file's twelve fields were each focused at a different height —
+    correct, and worth reading the note for before assuming it is a bug.
+  - **`primary` mode has to keep the primary's STEP, not just its range.** The first cut used the
+    finer step for both modes, which silently multiplied the primary's plane count — the one
+    thing that mode promises not to do. Caught by asserting the plane count, not the extent.
+  - **the fixture step is 3 µm, not 2, on purpose.** At 2 µm the union's integer planes land
+    exactly halfway between primary planes, where "nearest" is decided by round-half-to-even —
+    a dead-band fixture tests the tie-break instead of the placement.
+  Also: the recipe-entry builder moved to `catalog/_shared/placement_entry.py`, because the
+  catalog forbids one node module importing another (importing executes it, registering that node
+  early and welding the two fingerprints together) and two copies of a placement record is exactly
+  the drift the single-builder rule exists to prevent.
+* **Three co-registration defects found by reading the LIVE graph** (V2.23, 2026-08-05: "the 640
+  channel still has no Z and looks like a lower quality"). Worth recording as a method as much as
+  a fix: the saved workflow (`TFM_test_fullZ`) named the actual wiring, and one of its params —
+  a hand-set `flip_x: False` — was the clue that cracked the third.
+  - **"No Z" was not a bug.** `view.overlay`'s output axes ARE the primary's, and the primary was
+    the stitched GFP mosaic at `z=1`. The 640 secondary carried 210 planes, none of them
+    reachable, and the Z slider had one position. `channel.merge` is the fix; nothing in the
+    overlay could have been.
+  - **A MINIFIED secondary was point-sampled.** At 0.287 µm/px into the mosaic's 1.718, the 640
+    lands 36 source pixels per output pixel and `axis_map` kept exactly one — the defect
+    `_fit_plane` documents at length, and for once the *same* one: it discards `1 - 1/36` of the
+    data while keeping the noise at full amplitude, so the output is noisier than the source. Now
+    area-averaged when the source outnumbers the output samples by >1.5x, measured at 71% of the
+    point-sampled noise at an unchanged mean. Magnification is deliberately left
+    nearest-neighbour — "blocky is the honest rendering of real pixels stretched" depends on it.
+  - **An already-stitched secondary must not be flipped again.** `flip_x`/`flip_y` describe how
+    the camera is mounted, which no file records — but `util.stitch` had to answer that to place
+    its tiles, so its canvas is already in stage coordinates. Applying the flip again mirrored the
+    mosaic inside its own footprint: **784 µm, 456 px** out in x on the WellA3 pair. Derived from
+    the sampling provenance (`stitch[stage…]`, and deliberately not `stitch[grid…]`, which makes
+    no stage claim) in `_shared/placement_entry.handedness_for`, applied by the overlay, the merge
+    AND the runner's display re-plan — a display path that flipped while the compute did not would
+    draw the overlay 456 px from where a bake put it. The general lesson: a param that answers a
+    question an upstream node has already answered is not a preference, it is inapplicable, and
+    the honest form is to derive it and say so rather than ship a default the user finds by eye.
+* **Per-channel display state now survives** (V2.23, same report). Contrast is keyed
+  `(node_id, channel)` and was *also* being cleared on every node switch — redundant, since the
+  key already namespaces it, and it threw away the one thing that cannot be recomputed: a window
+  set by hand. And a composed overlay/merged channel is auto-enabled the first time it appears
+  rather than on every pull, so one the user switched off stays off instead of its toggle button
+  looking broken.
 * **`Engine._entry` is recursive**, papered over with `recursion_headroom` for deep unrolled
   chains; an iterative rewrite is a follow-up.
 * **Some bridge hops still raise**: Track↔Timepoint (member×t) and Frame→structure broadcast —

@@ -20,6 +20,11 @@ from nodegraph.registry import (
 )
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import (
+    _point_layers,
+    _resolve_layer,
+    _voxel_layers,
+)
 
 # ── Tessellate points / labels → a MESH (3D) ───────────────────────────────────
 #
@@ -35,16 +40,19 @@ from nodegraph.catalog._base import register_node
 
 
 def _tess_points(ctx: EvalContext, ds: Dataset, ax: AxisSizes, mode: str,
-                 vox: Tuple[float, float, float]) -> list:
+                 vox: Tuple[float, float, float], source: str) -> list:
     """POINTS path — one mesh element per label of a Point layer's cluster-id column.
 
     The vendored kernel takes VOXEL ``(z,y,x)`` points and returns world ``(x,y,z)`` µm
-    vertices, so the only conversion here is on the way out."""
+    vertices, so the only conversion here is on the way out.
+
+    ``source`` is passed IN rather than read here: the caller resolves it once (a single
+    Point table on the wire is used whatever it is called) and stamps the same resolved
+    name as mesh provenance, so the two cannot name different layers."""
     from nodegraph.kernels.granule_tessellate import tessellate_granules
     from nodegraph.kernels.mesh_raster import verts_um_to_zyx
     from nodegraph.mesh import MeshElement, surface_area_um2
 
-    source = ctx.layer("points")
     labels_col = ctx.params.get("cluster", "cluster")
     if mode == "voronoi":
         tp: Dict[str, Any] = {"tess_mode": "voronoi"}
@@ -98,18 +106,19 @@ def _tess_points(ctx: EvalContext, ds: Dataset, ax: AxisSizes, mode: str,
                         density=float(bnd.density), n_points=int(bnd.n_points)))
     return elements
 def _tess_label_surface(ctx: EvalContext, ds: Dataset, ax: AxisSizes,
-                        vox: Tuple[float, float, float]) -> list:
+                        vox: Tuple[float, float, float], src: str) -> list:
     """LABELS path — one mesh element per region of a Voxel label raster, via marching
     cubes. ``marching_cubes`` already returns voxel ``(z,y,x)`` vertices, so this path
-    needs no coordinate conversion at all."""
+    needs no coordinate conversion at all.
+
+    ``src`` is resolved by the caller — see :func:`_tess_points` on why it is a parameter."""
     from skimage.measure import marching_cubes
     from nodegraph.mesh import MeshElement, enclosed_volume_um3, surface_area_um2
 
-    src = ctx.layer("labels")
     level = float(ctx.params.get("iso_level", 0.5))
     step = max(1, int(ctx.params.get("decimate", 1)))
     lay = ds.get(Domain.VOXEL, src)
-    if lay is None:
+    if lay is None:                                  # pragma: no cover - _resolve_layer
         raise ValueError(f"tessellate (label_surface) needs a Voxel layer {src!r} "
                          "(run analysis.label / analysis.threshold first)")
     raster = np.asarray(lay.values)
@@ -174,12 +183,27 @@ def _compute_tessellate(ctx: EvalContext) -> Dataset:
     zs = ctx.calib("z_step_um") or 0.5
     vox = (zs, px, px)
 
+    # Resolve the source layer ONCE, here: both the tessellation and the mesh provenance
+    # stamp use it, and `transform.rasterize_mesh` derives its interior test from that
+    # stamp — so a helper re-reading the socket could stamp a layer this node did not read.
+    # The single candidate on the wire wins whatever it is called (`_resolve_layer`); the
+    # shipped defaults were `labels` / `particles` against producers that emit neither.
     if mode == "label_surface":
-        elements = _tess_label_surface(ctx, ds, ax, vox)
-        src_kind, src_layer = "labels", ctx.layer("labels")
+        src_kind = "labels"
+        src_layer, _note = _resolve_layer(
+            _voxel_layers(ds), ctx.layer("labels"), node="tessellate (label_surface)",
+            socket="labels", what="Voxel layer", where="the `data` input",
+            remedy="marching cubes needs a raster to walk — run analysis.segment / "
+                   "analysis.label / analysis.threshold upstream", ctx=ctx)
+        elements = _tess_label_surface(ctx, ds, ax, vox, src_layer)
     else:
-        elements = _tess_points(ctx, ds, ax, mode, vox)
-        src_kind, src_layer = "points", ctx.layer("points")
+        src_kind = "points"
+        src_layer, _note = _resolve_layer(
+            _point_layers(ds), ctx.layer("points"), node=f"tessellate ({mode})",
+            socket="points", what="Point table", where="the `data` input",
+            remedy="these are the points to wrap a surface around — run detect.particles / "
+                   "detect.spots → analysis.cluster_points upstream", ctx=ctx)
+        elements = _tess_points(ctx, ds, ax, mode, vox, src_layer)
 
     tables = build_mesh_tables(elements, layer=name, z_kind="subpixel")
     return with_mesh(ds, tables, provenance={
@@ -188,9 +212,18 @@ def _compute_tessellate(ctx: EvalContext) -> Dataset:
 register_node(
     _compute_tessellate, op_key="analysis.tessellate", label="Tessellate",
     category="analysis",
-    # deliberately empty — see the compute docstring (POINT in three modes, VOXEL in the
-    # fourth, and reads_domains has no per-mode form)
+    # POINT in three modes, VOXEL in the fourth — the split that used to be inexpressible
+    # and shipped as `frozenset()` (V2.22). `label_surface` wants only the RASTER, not a
+    # Label table: `_tess_label_surface` reads `ds.get(Domain.VOXEL, src)` and marches it
+    # directly, so a plain `analysis.threshold` mask is a legal input and demanding LABEL
+    # here would refuse it.
     reads_domains=frozenset(),
+    reads_domains_by_mode={"boundary": {
+        "convex_hull": frozenset({Domain.POINT}),
+        "alpha_shape": frozenset({Domain.POINT}),
+        "voronoi": frozenset({Domain.POINT}),
+        "label_surface": frozenset({Domain.VOXEL}),
+    }},
     adds_domains=frozenset({Domain.MESH}),
     inputs=[InDataset(),
             InString("points", "Point layer", field=False, default="particles",

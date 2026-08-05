@@ -187,8 +187,10 @@ scipy/skimage-free.
       charter-forbidden);
       **(3)** `available_in` names real modes AND real values;
       **(4)** a layer-name socket declares `layer_in`/`layer_out` with a domain that is
-      consistent with `reads_domains`/`adds_domains` (the `reads` half is exempt when the
-      socket is mode-gated);
+      consistent with `reads_domains`/`adds_domains` — the `reads` half in **every mode
+      state the socket is active in**, so a requirement that varies by branch is stated
+      with `reads_domains_by_mode` (`wire-node-v2` §4f) rather than waived; only an
+      **empty default** (= the layer is optional) is exempt;
       **(5)** the default is declared **once**, in the `SocketSpec` — read layer params
       with **`ctx.layer("name")`**, never `ctx.params.get("name", "name")`, so the compute
       and `propagate_meta`'s edit-time prediction cannot drift.

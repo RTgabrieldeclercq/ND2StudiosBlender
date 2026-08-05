@@ -717,16 +717,28 @@ class GraphScene(QGraphicsScene):
             head.setEnabled(False)
             baked = bool(bake_record(rec)) if rec is not None else False
             unset = node.state().get("precision", PRECISION_UNSET) == PRECISION_UNSET
+            # Hold FIRST, and always enabled: it is the cheap, reversible, precision-free
+            # action, so it belongs where the cursor already is. Bake follows as the durable
+            # (slower, disk-costing) alternative.
+            hold = menu.addAction("Re-hold this dock" if status in ("held", "released")
+                                  else "Hold this dock (in memory, instant)")
+            hold.setToolTip("Freeze what the chain above last produced in memory and stop "
+                            "evaluating it. Writes nothing. Does not free memory and does "
+                            "not survive reopening the file — Bake does both.")
+            hold.triggered.connect(lambda: self.dock_action.emit(nid, "hold"))
             bake = menu.addAction("Re-bake this dock" if baked else "Bake this dock…")
             bake.setEnabled(not unset)
             if unset:
                 bake.setToolTip("Choose a Precision in the inspector first — there is no "
                                 "default, because the right one depends on this chain.")
             bake.triggered.connect(lambda: self.dock_action.emit(nid, "bake"))
+            if status == "held":
+                menu.addAction("Release (run the chain live)").triggered.connect(
+                    lambda: self.dock_action.emit(nid, "release"))
             if status in ("docked", "stale"):
                 menu.addAction("Un-dock (run the chain live)").triggered.connect(
                     lambda: self.dock_action.emit(nid, "undock"))
-            elif baked:
+            elif baked and status == "live":
                 menu.addAction("Re-dock (serve the existing bake)").triggered.connect(
                     lambda: self.dock_action.emit(nid, "redock"))
         menu.addSeparator()

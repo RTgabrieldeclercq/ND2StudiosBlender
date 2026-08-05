@@ -96,6 +96,90 @@ _SCRUB_STEP = {
 #: Step for a unitless FLOAT — thresholds, weights, fractions, almost all 0–1.
 _SCRUB_STEP_UNITLESS = 0.005
 
+#: Decimals a FLOAT editor shows unless its magnitude demands more, and the widest step it
+#: will ever take. Floors, not fixed values — see :func:`value_step`.
+_FLOAT_DECIMALS = 3
+_FLOAT_STEP = 0.05
+
+#: Editor bounds. Deliberately far past anything the catalog means, because the WIDGET must
+#: never be the thing that limits a value — the compute validates, and a silent clamp is the
+#: worst way to be told no. The old caps (1e6 float / 1e5 int) were reachable in practice:
+#: an `iterations` of 200000 and a `max_area` on a millimetre-scale colony both hit them and
+#: were quietly truncated to the ceiling.
+NUM_MAX_FLOAT = 1e12
+NUM_MAX_INT = 2_000_000_000             # just under Qt's INT_MAX for QSpinBox
+
+
+def _magnitude(v) -> Optional[float]:
+    """``abs(float(v))`` when that is a usable positive magnitude, else ``None``."""
+    try:
+        f = abs(float(v))
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0.0 else None
+
+
+def value_step(spec, current=None, *, integer: bool = False) -> float:
+    """One increment for a numeric socket, from its UNIT **and** its MAGNITUDE.
+
+    The unit table stays authoritative — it encodes the granularity the quantity is measured
+    in (0.01 µm, 1 px, 0.01 s), and that is a property of the physics, not of the current
+    number. Magnitude only **bounds** it, which is what fixes the two symmetric pathologies
+    a fixed step has at the extremes:
+
+    * **too coarse for a small value** — a 0.005 step on a 5e-5 learning rate overshoots it
+      100× on the first pixel of drag, and the inspector's 0.05 could not express it at all
+      (it rounded to ``0.000``, so the widget displayed zero for a non-zero default). Already
+      true before this node of ``dic_correlate``'s ``strain_smoothness`` (1e-5) and
+      ``disp_smoothness`` (5e-4) and both solvers' ``mu``;
+    * **too fine for a large one** — 0.05 on a 2047.5 threshold, or 1 on a 33 000-iteration
+      training budget, is tens of thousands of clicks to cross, so the control is decorative.
+
+    The bound is one order of magnitude either side of the value: never coarser than the
+    value itself, never finer than a tenth of its leading order. So ``sigma`` at 0.5 µm keeps
+    its 0.01 table step exactly, while ``iterations`` at 2000 steps by 100 and a 5e-5 rate
+    steps by 1e-5.
+
+    Presentation-only: nothing here reaches ``node_recipe_hash``, so retuning an editor
+    cannot invalidate a memo entry or a saved graph.
+    """
+    base = 1.0 if integer else _SCRUB_STEP.get(getattr(spec, "unit", "") or "",
+                                               _SCRUB_STEP_UNITLESS)
+    mag = _magnitude(current)
+    if mag is None:
+        mag = _magnitude(getattr(spec, "default", None))
+    if mag is None:
+        return base
+    import math
+    order = 10.0 ** math.floor(math.log10(mag))
+    step = min(max(base, order / 10.0), order)
+    return max(1.0, float(int(step))) if integer else step
+
+
+def value_decimals(spec, current=None) -> int:
+    """Decimals a FLOAT editor needs: enough for the FINEST value in play, floored at 3.
+
+    Driven by the smallest magnitude of (current, default) rather than by the current value
+    alone, so a socket whose default is 5e-5 stays typable after the user has entered 0.5 and
+    wants to go back. Floored at the historic 3 rather than reduced for large values: showing
+    ``2047.500`` is only cosmetic noise, whereas dropping below 3 decimals would make ``0.001``
+    unreachable on a socket that had merely been left at a big number.
+    """
+    mags = [m for m in (_magnitude(current),
+                        _magnitude(getattr(spec, "default", None))) if m is not None]
+    if not mags:
+        return _FLOAT_DECIMALS
+    import math
+    step = value_step(spec, min(mags))
+    return max(_FLOAT_DECIMALS, min(9, int(math.ceil(-math.log10(step)))))
+
+
+def float_editor_precision(spec, current=None) -> Tuple[int, float]:
+    """``(decimals, step)`` for a FLOAT spin box — :func:`value_decimals` +
+    :func:`value_step`. Decimals follow the finest value in play; the step follows where the
+    value is NOW, so stepping feels right without anything becoming untypable."""
+    return value_decimals(spec, current), value_step(spec, current)
+
 
 class Ctl(NamedTuple):
     """One hit-testable control on a card: where it is, what it does, what it edits.
@@ -306,13 +390,23 @@ class SocketItem(QGraphicsItem):
         self._head = socket_identity(spec)
         self.setToolTip(socket_hover_text(spec, head=self._head))
 
-    def set_domain_tip(self, domains, missing=()) -> None:
+    def set_domain_tip(self, domains, missing=(), *, on_wire=()) -> None:
         """Append the domain-set this Dataset socket carries/requires (the rail's
-        hover detail). No-op tail for value sockets (``domains`` empty)."""
+        hover detail). No-op tail for value sockets (``domains`` empty).
+
+        ``on_wire`` is what THIS socket's edge actually brings — the only per-socket fact
+        available on a node with several Dataset inputs, whose painted rail is one node-level
+        answer repeated beside each of them (2026-08-04). Listed separately from ``requires``
+        rather than replacing it: "what this wire carries" and "what the node needs" are
+        different questions, and collapsing them is how the rail came to look like it was
+        answering the first while answering the second."""
         extra = []
         if domains:
             names = ", ".join(d.value for d in domains)
-            extra.append(("carries: " if self.io == "out" else "requires: ") + names)
+            extra.append(("carries: " if self.io == "out" else "the node requires: ") + names)
+        if self.io == "in":
+            extra.append("on this wire: " + (", ".join(d.value for d in on_wire)
+                                             if on_wire else "nothing wired"))
         if missing:
             extra.append("⚠ missing upstream: " + ", ".join(d.value for d in missing))
         self.setToolTip(socket_hover_text(self.spec, extra, head=self._head))
@@ -680,8 +774,14 @@ class NodeItem(QGraphicsObject):
         return tuple(sorted(domains, key=lambda d: d.value))
 
     def reads_domains(self) -> tuple:
-        """Domains this node requires on its Dataset input (the input rail)."""
-        return self._dsorted(self.spec.reads_domains) if self.spec else ()
+        """Domains this node requires on its Dataset input (the input rail).
+
+        Resolved against the live mode state (V2.22): a node whose branches read different
+        structure — Voronoi Cells clipping to a Label instance under ``per_region`` and to
+        nothing under ``frame`` — shows the rail for the branch that is actually selected,
+        not a static worst case that is wrong in every state."""
+        return (self._dsorted(self.spec.resolve_reads_domains(self.state()))
+                if self.spec else ())
 
     def out_domains(self) -> tuple:
         """The accumulated domain-set flowing out of this node (the output rail +
@@ -692,11 +792,36 @@ class NodeItem(QGraphicsObject):
         """Required domains absent upstream — the red validation chips (H-domains)."""
         return self.doc.missing_domains(self.rec.id)
 
+    def trained(self) -> dict:
+        """What the MODEL this node has loaded was trained with, keyed by socket name
+        (V2.23) — ``{}`` for the great majority of nodes, which load no model.
+
+        Read from the JSON beside the weights, through ``NodeSpec.trained`` (which swallows
+        everything, so an unreadable or absent file simply reports nothing). Called on every
+        relayout and every inspector rebuild; ``nodegraph.trained`` caches the parse on
+        ``(path, mtime, size)``, so the repeated calls cost a ``stat`` rather than a read —
+        and keying on mtime means retraining to the same filename shows up immediately.
+        """
+        return self.spec.trained(self.rec.params, self.state()) if self.spec else {}
+
     def resolved(self, s) -> object:
-        """The pill value: an explicit param, else the LIVE metadata-derived value
-        from this node's propagated envelope (G8), else the static default."""
+        """The pill value: an explicit param, else what the loaded MODEL was trained with,
+        else the LIVE metadata-derived value from this node's propagated envelope (G8), else
+        the static default.
+
+        The model sits ABOVE ``derive`` in that order deliberately. A ``derive`` is this
+        app's inference from the image's metadata; the checkpoint's own record is a
+        measured fact about the network that is going to run. Where both speak — the only
+        current case is ZS-DeconvNet's ``background``, whose ``derive`` is the constant
+        ``0.0`` — the file wins, because a value that disagrees with the trained graph is
+        not a different opinion but a wrong answer.
+        """
         if s.name in self.rec.params:
             return self.rec.params[s.name]
+        tr = self.trained()
+        if s.name in tr:
+            v = tr[s.name]
+            return round(v, 4) if isinstance(v, float) else v
         if s.derive:
             try:
                 v = eval_derive(s.derive, envelope_symbols(self.env()))
@@ -708,14 +833,33 @@ class NodeItem(QGraphicsObject):
         return s.default
 
     def is_derived(self, s) -> bool:
-        return bool(s.derive) and s.name not in self.locked and s.name not in self.rec.params
+        """Whether this socket is currently on AUTO — i.e. it has a live source other than
+        its static default, and the user has not pinned it.
+
+        A model-sourced socket counts, which is what gives it the greyed box and the pin
+        button: the two sources differ in where the value comes from, not in how the control
+        behaves once it has one.
+        """
+        if s.name in self.locked or s.name in self.rec.params:
+            return False
+        return bool(s.derive) or s.name in self.trained()
 
     # ── layout ──────────────────────────────────────────────────────────────────
     def _apply_domain_tip(self, sock: "SocketItem", s, io: str) -> None:
         if s.type is not SocketType.DATASET:
             return
         if io == "in":
-            sock.set_domain_tip(self.reads_domains(), self.missing_domains())
+            # `on_wire` is per SOCKET; the requirement is per NODE. Keeping them separate is
+            # what lets a two-input node's sockets hover differently without the rail having
+            # to attribute a node-level requirement to one wire or the other — an attribution
+            # the declarations cannot support (a Label instance's LABEL half is required by
+            # the areas wire, but only its VOXEL half is named by a socket).
+            try:
+                on_wire = self._dsorted(self.doc.socket_domains(self.rec.id, s.name))
+            except Exception:  # noqa: BLE001 — a hover must never break a relayout
+                on_wire = ()
+            sock.set_domain_tip(self.reads_domains(), self.missing_domains(),
+                                on_wire=on_wire)
         else:
             sock.set_domain_tip(self.out_domains())
 
@@ -824,11 +968,21 @@ class NodeItem(QGraphicsObject):
         if want != have or collapse_changed:
             self._shown_collapsed = self.rec.collapsed
             self._layout()
-        elif self._switch is not None:
-            self._switch.set_allow_3d(not self.z_is_one())
-            if self._switch.dim != self.dim:
-                self._switch.dim = self.dim
-                self._switch.update()
+        else:
+            if self._switch is not None:
+                self._switch.set_allow_3d(not self.z_is_one())
+                if self._switch.dim != self.dim:
+                    self._switch.dim = self.dim
+                    self._switch.update()
+            # Domain tips are per-WIRE (2026-08-04) and only `_layout` used to set them, so a
+            # wiring change that leaves the socket set alone — connecting or unplugging an
+            # auxiliary input, or an edit upstream that changes what a branch carries — left
+            # every socket hovering the state it had when the card was last laid out.
+            for (io, name), sock in self._sockets.items():
+                spec = (self.spec.input(name) if io == "in"
+                        else self.spec.output(name)) if self.spec else None
+                if spec is not None:
+                    self._apply_domain_tip(sock, spec, io)
         self.update()
 
     def resync_spec(self) -> bool:
@@ -1522,9 +1676,11 @@ class NodeItem(QGraphicsObject):
     # there is no drag mode to suppress and no way for the two to disagree.
 
     def _scrub_step(self, s) -> float:
-        if s.type is SocketType.INT:
-            return 1.0
-        return _SCRUB_STEP.get(s.unit, _SCRUB_STEP_UNITLESS)
+        # INT included, and for the same reason: a step of 1 on a 33 000-iteration budget is
+        # 100 000 pixels of drag. `value_step` keeps the unit table's granularity wherever it
+        # is usable and only bounds it at the two extremes (see its docstring).
+        return value_step(s, self._current_number(s),
+                          integer=s.type is SocketType.INT)
 
     def _current_number(self, s) -> float:
         try:
@@ -1579,6 +1735,8 @@ class NodeItem(QGraphicsObject):
                 self._write_param(s.name, not bool(self.resolved(s)))
             elif s.type is SocketType.STRING and getattr(s, "choices", ()):
                 self._open_menu(ctl, list(s.choices), str(self.resolved(s) or ""))
+            elif s.type is SocketType.STRING and (s.layer_in or s.layer_in_mode):
+                self._open_layer_menu(ctl)
             elif s.type in (SocketType.INT, SocketType.FLOAT):
                 # Defer: this is a scrub only if the pointer actually travels. A press that
                 # doesn't move is a click, and opens the editor on release.
@@ -1683,6 +1841,60 @@ class NodeItem(QGraphicsObject):
                 self.changed.emit(self)
         elif text != current:
             self._write_param(ctl.obj.name, text)
+
+    def _open_layer_menu(self, ctl: Ctl) -> None:
+        """A popup of the layers actually present on this socket's wire (2026-08-04).
+
+        The inspector has offered a layer picker since V2.11 (``inspector._layer_box``), but
+        the CARD did not: clicking a ``layer_in`` pill on the canvas dropped straight into
+        :meth:`_open_inline_edit`, so the only way to change it was to know the name and type
+        it. That is the failure mode the picker exists to prevent — a Voronoi node kept its
+        factory default ``particles`` while the branch feeding it produced ``points``, and
+        the mismatch surfaced as a pull error four nodes deep instead of as a menu with one
+        obvious entry in it.
+
+        The list is honest but INCOMPLETE — a couple of producers name layers the edit-time
+        pass cannot predict — so free text must stay reachable, exactly as the inspector's
+        combo is editable. Hence the trailing "Type a name…" entry rather than a closed
+        menu, and hence a menu is still opened when the list comes back empty (with the
+        current value as its one entry) instead of silently doing nothing."""
+        s = ctl.obj
+        try:
+            choices = list(self.doc.layer_choices(self.rec.id, s))
+        except Exception:                     # never let a picker eat a click
+            choices = []
+        current = str(self.resolved(s) or "")
+        if not choices:
+            self._open_inline_edit(ctl)       # nothing to offer — go straight to typing
+            return
+        view, r = self._view_and_rect(ctl)
+        if view is None:
+            return
+        menu = QMenu()
+        menu.setStyleSheet(T.menu_qss())
+        menu.setToolTipsVisible(True)
+        dom = s.layer_in.value if s.layer_in else (s.layer_in_mode or "layer")
+        src = s.layer_from or "the input"
+        for c in choices:
+            act = menu.addAction(c)
+            act.setCheckable(True)
+            act.setChecked(c == current)
+            act.setToolTip(option_hover_text(
+                c, f"A {dom} layer present on `{src}`."))
+        menu.addSeparator()
+        typed = menu.addAction("Type a name…")
+        typed.setToolTip(option_hover_text(
+            "Type a name…",
+            "The list above is what the edit-time pass can predict for this wire; a few "
+            "producers name layers it cannot. Type the name if yours is missing."))
+        chosen = menu.exec(view.viewport().mapToGlobal(
+            QPoint(int(r.left()), int(r.bottom() + 2))))
+        if chosen is None:
+            return
+        if chosen is typed:
+            self._open_inline_edit(ctl)
+        elif chosen.text() != current:
+            self._write_param(s.name, chosen.text())
 
     def _open_inline_edit(self, ctl: Ctl) -> None:
         """Type a value straight into the pill."""

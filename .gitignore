@@ -21,6 +21,21 @@ sample_data/
 *.b2nd_store/
 *.docks/
 
+# Trained weights. A ZS-DeconvNet checkpoint is ~50 MB of .h5 per channel, it is the size
+# of the data rather than the size of the code, and it is reproducible by re-running the
+# node on the file it was trained on. The sidecar JSON `nodegraph.trained` reads is only
+# meaningful next to its weights, so the whole directory goes.
+models/
+
+# Working graphs saved at the repo root. These carry absolute paths into the operator's own
+# Desktop/Downloads, so they are personal scratch, not shippable examples — the pipelines
+# that ARE shipped live under `lablink_recipes/` and are matched by the anchored pattern.
+/*.nd2graph.json
+
+# Ad-hoc analysis dumps written by hand while auditing the catalog. Nothing reads them.
+/shared_detail.json
+nodelab_v2/scratch_none
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -5142,6 +5142,7 @@ def link_objects(
     st_iter_stop_threshold: float = 1e-2,
     st_dist_missing: float = 5.0,
     st_use_prev_results: bool = False,
+    st_ndim: int = 2,
     ct_n_neighbors: int = 5,
     ct_topo_weight: float = 0.3,
     ct_area_weight: float = 0.3,
@@ -5219,6 +5220,13 @@ def link_objects(
     st_use_prev_results:
         Enable the data-driven initial-guess predictor (warm start) for frames
         ≥3.  The POD-GPR stage (frames ≥7) needs scikit-learn.  SerialTrack only.
+    st_ndim:
+        2 (default) or 3 — how many coordinate columns the SerialTrack linker gets.
+        At 3 each row's ``centroid_z_px`` becomes a real third coordinate, which is
+        what SerialTrack3D does; the descriptor, the ADMM loop and the outlier
+        constants all follow ``coords.shape[1]``.  ``centroid_z_px`` must already be
+        in the same length unit as y/x — see :func:`_cz`.  Every OTHER linker here is
+        two-column by construction, so this is SerialTrack only.
     ct_n_neighbors:
         CellTracker topology-Hungarian neighbor count for the rotation-invariant
         descriptor.  Used only by ``METHOD_CT_TOPOLOGY``.
@@ -5316,7 +5324,7 @@ def link_objects(
                 outlier_threshold=st_outlier_threshold, max_iter=st_max_iter,
                 iter_stop_threshold=st_iter_stop_threshold,
                 dist_missing=st_dist_missing, use_prev_results=st_use_prev_results,
-                progress_cb=_group_cb,
+                st_ndim=st_ndim, progress_cb=_group_cb,
             )
         elif method in (METHOD_CT_TOPOLOGY, METHOD_CT_FINGERPRINT):
             _link_group_celltracker(
@@ -5377,7 +5385,7 @@ def link_objects_with_params(
     * SerialTrack only — ``st_mode``, ``st_n_neighbors``, ``st_solver``,
       ``st_loc_solver``, ``st_n_neighbors_min``, ``st_smoothness``,
       ``st_outlier_threshold``, ``st_max_iter``, ``st_iter_stop_threshold``,
-      ``st_dist_missing``, ``st_use_prev_results``.
+      ``st_dist_missing``, ``st_use_prev_results``, ``st_ndim``.
     * Cell-Tracker topology only — ``ct_n_neighbors``, ``ct_topo_weight``.
     * Cell-Tracker fingerprint only — ``ct_area_weight``, ``ct_max_gap``.
 
@@ -5407,6 +5415,7 @@ def link_objects_with_params(
         st_iter_stop_threshold=float(params.get("st_iter_stop_threshold", 1e-2)),
         st_dist_missing=float(params.get("st_dist_missing", 5.0)),
         st_use_prev_results=bool(params.get("st_use_prev_results", False)),
+        st_ndim=int(params.get("st_ndim", 2)),
         ct_n_neighbors=int(params.get("ct_n_neighbors", 5)),
         ct_topo_weight=float(params.get("ct_topo_weight", 0.3)),
         ct_area_weight=float(params.get("ct_area_weight", 0.3)),
@@ -5531,6 +5540,7 @@ def _link_group_serialtrack(
     iter_stop_threshold: float = 1e-2,
     dist_missing: float = 5.0,
     use_prev_results: bool = False,
+    st_ndim: int = 2,
     progress_cb: Optional[ProgressCB] = None,
 ) -> None:
     """Link objects within one (channel, m_position) group via SerialTrack.
@@ -5557,13 +5567,20 @@ def _link_group_serialtrack(
         return  # nothing to link (mirrors _link_group's early-out)
 
     # coords_list[i] aligns row-for-row with row_refs[i] (same object order).
+    # 3-D adds `centroid_z_px` as a third coordinate; SerialTrack is dimension-agnostic
+    # from here down (`_build_features_3d`/`_match_features_3d`, the 3-D ADMM loop and the
+    # per-dimension outlier constants in `remove_outliers` all key off `coords.shape[1]`).
+    # z must already be in the lateral length unit — see `_cz`.
+    ndim = 3 if int(st_ndim) == 3 else 2
     coords_list: List[np.ndarray] = []
     row_refs: List[List[Dict[str, Any]]] = []
     for fr in sorted_frames:
         rows_f = frames[fr]
-        coords_list.append(
-            np.array([[_cy(r), _cx(r)] for r in rows_f], dtype=np.float64)
-        )
+        if ndim == 3:
+            arr = np.array([[_cz(r), _cy(r), _cx(r)] for r in rows_f], dtype=np.float64)
+        else:
+            arr = np.array([[_cy(r), _cx(r)] for r in rows_f], dtype=np.float64)
+        coords_list.append(arr)
         row_refs.append(rows_f)
 
     mode = (TrackingMode.CUMULATIVE if mode_str == "Cumulative"
@@ -5797,6 +5814,22 @@ def _cy(row: Dict[str, Any]) -> float:
 
 def _cx(row: Dict[str, Any]) -> float:
     return float(row.get("centroid_x_px") or 0.0)
+
+
+def _cz(row: Dict[str, Any]) -> float:
+    """Object depth, in the SAME length unit as ``centroid_y_px``/``centroid_x_px``.
+
+    Only the SerialTrack linker reads this, and only when it is running in 3-D
+    (``st_ndim=3``); every other linker in this file is two-column by construction.
+
+    **The caller owns the isotropy.** SerialTrack's descriptor is built from Euclidean
+    neighbour distances (``_build_features_3d``), so a raw z *index* mixed with lateral
+    *pixels* would distort every angle and radius the match depends on. Upstream never
+    hits this — its 3-D examples are isotropic synthetic volumes with ``xstep = 1`` — so
+    there is no MATLAB behaviour to copy: pre-scale z into the lateral unit
+    (``z_index * z_step_um / pixel_size_um``) before building the rows.
+    """
+    return float(row.get("centroid_z_px") or 0.0)
 
 
 def _area(row: Dict[str, Any]) -> float:

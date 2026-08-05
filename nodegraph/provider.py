@@ -163,6 +163,38 @@ class SyntheticProvider(TileProvider):
 _CHUNK_TARGET_BYTES = 128 << 20
 
 
+#: The compression settings **every** pyramid store in this project is written with — the
+#: ingest (:meth:`B2ndProvider._build_levels`), the pyramid repair
+#: (:meth:`B2ndProvider.ensure_levels`) and the Dock's checkpoint
+#: (:func:`nodegraph.checkpoint._write_image`). One definition because it was three
+#: identical literals, and the third had already drifted in effect: none of them named
+#: ``clevel``, so all three inherited blosc2's dataclass default.
+#:
+#: **``clevel=1`` is explicit, and the explicitness is the point.** blosc2 4.9.1's
+#: ``CParams.clevel`` defaults to **5** (``blosc2/storage.py``) while its own docstring a few
+#: lines above claims "Default is 1" — so omitting the key does not get you the cheap setting
+#: it looks like it gets you. Measured at this project's write geometry, ZSTD+BITSHUFFLE on
+#: 12-bit-in-uint16 image data: clevel 1 ≈ 780 MB/s at ratio 2.07, clevel 5 ≈ 530 MB/s at
+#: ratio 2.10, clevel 9 ≈ 91 MB/s at ratio 2.14. So level 5 was costing ~1.5× the write time
+#: for ~1% of the ratio, and 9 is a 5.8× regression that must never be offered as a choice.
+#:
+#: BITSHUFFLE stays: this repo's own granularity sweep
+#: (``scripts/_bench_provider_granularity.py``) measured it against SHUFFLE on a real 6554²
+#: plane and took the ratio, and the ROI-latency argument for changing it was checked and
+#: does not hold at the Viewer's actual read sizes.
+PYRAMID_CPARAMS: dict = {"codec": None, "clevel": 1, "filters": None}
+
+
+def pyramid_cparams() -> dict:
+    """A fresh copy of :data:`PYRAMID_CPARAMS` with the blosc2 enums resolved (they need
+    the module imported, which the core does lazily). Returned as a NEW dict every call —
+    blosc2 stores what it is handed, and a shared mutable would let one store's tweak
+    follow every later one."""
+    import blosc2
+    return {"codec": blosc2.Codec.ZSTD, "clevel": 1,
+            "filters": [blosc2.Filter.BITSHUFFLE]}
+
+
 #: ``vlmeta`` key each pyramid level is stamped with once it is **fully written**
 #: (V2.19). A b2nd array declares its full shape at ``blosc2.empty`` time, so an ingest
 #: killed partway (crash, cancel, OOM, full disk) leaves a file whose geometry looks right
@@ -281,9 +313,20 @@ class B2ndProvider(TileProvider):
             out.append((m, t, z, c, y, x))
         return out
 
+    #: Smallest chunk a write should aim for, when the axis it normally batches over (Z)
+    #: cannot supply one. Deliberately far below :data:`_CHUNK_TARGET_BYTES`: this is a
+    #: FLOOR that exists to escape per-chunk overhead, not a target, and every byte of chunk
+    #: past it costs full-plane read latency for nothing. 32 MiB is where the measured write
+    #: curve flattens on this pipeline — a 2048² uint16 plane (8 MiB) batches 4 timepoints
+    #: into one chunk and the write goes from 143 to 552 MiB/s, while a full-plane read
+    #: slows ~17%; a 7168² plane is already 98 MiB, clears the floor on its own, and is
+    #: therefore left framed one plane per chunk exactly as before.
+    _CHUNK_FLOOR_BYTES = 32 << 20
+
     @staticmethod
     def _store_kwargs(shape: Tuple[int, ...], itemsize: int, *, tile: int,
-                      cparams: dict, urlpath: Optional[str], level: int) -> dict:
+                      cparams: dict, urlpath: Optional[str], level: int,
+                      batch_thin_z: bool = False) -> dict:
         """The b2nd geometry for one level. **The two geometries do DIFFERENT jobs**
         (V2.14):
 
@@ -296,13 +339,31 @@ class B2ndProvider(TileProvider):
         ``(1,1,1,1,1024,1024)`` versus 630 MB/s at ``(1,1,32,1,2048,2048)`` — an 11.5×
         ingest speedup for byte-identical compressed output (561.4 vs 561.5 MiB) and a 9%
         tile-read cost. The write was never codec- or disk-bound: every codec landed at
-        53–58 MB/s, while the NVMe underneath absorbs 952 MB/s."""
+        53–58 MB/s, while the NVMe underneath absorbs 952 MB/s.
+
+        ``batch_thin_z`` extends that verdict to the case it cannot reach. ``cz`` is capped
+        by **Z**, so a 2D or thin-Z series pins one plane per chunk no matter how small that
+        plane is — and thin Z is not an edge case here: a timelapse, a Z-projection, a
+        stitched mosaic and a channel merge are all ``z == 1``, i.e. exactly the transformed
+        data a Dock gets pointed at. With the flag on, a chunk still under
+        :data:`_CHUNK_FLOOR_BYTES` batches over **T** until it clears the floor.
+
+        Opt-in rather than always-on because the two callers want different things. A Dock
+        checkpoint is written once and read whole-plane, so it takes the 3.9× write for a
+        ~17% full-plane read. The ingest store's read profile is load-bearing for every live
+        chain and has never been measured under T-batching, so it keeps the framing it was
+        benchmarked with."""
         import os
-        _m, _t, z, _c, y, x = shape
+        _m, t, z, _c, y, x = shape
         by, bx = min(tile, y), min(tile, x)              # READ granularity — unchanged
         plane_bytes = max(1, y * x * itemsize)
         cz = max(1, min(z, int(_CHUNK_TARGET_BYTES // plane_bytes)))
-        kw: dict = {"chunks": (1, 1, cz, 1, y, x), "blocks": (1, 1, 1, 1, by, bx),
+        ct = 1
+        if batch_thin_z:
+            slab = max(1, cz * plane_bytes)
+            if slab < B2ndProvider._CHUNK_FLOOR_BYTES:
+                ct = max(1, min(int(t), int(B2ndProvider._CHUNK_FLOOR_BYTES // slab)))
+        kw: dict = {"chunks": (1, ct, cz, 1, y, x), "blocks": (1, 1, 1, 1, by, bx),
                     "cparams": cparams}
         if urlpath is not None:
             kw["urlpath"] = os.path.join(urlpath, f"level_{level}.b2nd")
@@ -406,8 +467,8 @@ class B2ndProvider(TileProvider):
 
     @classmethod
     def _append_level(cls, prev: Any, level: int, *, tile: int, cparams: dict,
-                      urlpath: Optional[str], bump: Optional[Callable[[int], None]] = None
-                      ) -> Optional[Any]:
+                      urlpath: Optional[str], bump: Optional[Callable[[int], None]] = None,
+                      batch_thin_z: bool = False) -> Optional[Any]:
         """Build level ``level`` by **streaming out of ``prev``** (level ``level-1``'s
         b2nd array) one z-slab at a time, and return it — or ``None`` when ``prev`` can no
         longer be halved.
@@ -434,7 +495,17 @@ class B2ndProvider(TileProvider):
         to compress level 0 and 2.1 s to decode the ND2 — a quarter of the data for three
         times the time, because one core was mean-pooling 840 planes while 23 sat idle.
         Order is irrelevant here (each plane writes its own row of ``out``), so this is the
-        cheapest possible use of the pool: pure per-plane compute, no fold."""
+        cheapest possible use of the pool: pure per-plane compute, no fold.
+
+        **The block is ``(t-batch, z-slab)``, not one ``(m,t,c)`` frame's z-slab**, and on a
+        thin-Z series that distinction is most of the runtime. With ``z == 1`` the loop used to
+        degenerate to one iteration per ``(m,t,c)`` handling a SINGLE plane — so it paid a
+        worker-pool dispatch over ``range(1)``, a fan-out of one, and wrote one small chunk,
+        160 times over for a 160-plane series. Measured on a 1.25 GiB 2D series, the two coarse
+        levels together cost 17.4 s against 3.3 s for all of level 0. Batching over T (via
+        ``batch_thin_z``, the same floor :meth:`_store_kwargs` applies) gives the pool a real
+        unit count and the store a real chunk. ``ct == 1`` reproduces the old loop exactly,
+        which is what keeps the ingest path byte-identical."""
         import blosc2
         m, t, z, c, y, x = prev.shape
         if y < 2 or x < 2:
@@ -442,23 +513,28 @@ class B2ndProvider(TileProvider):
         shape = (m, t, z, c, y // 2, x // 2)
         dtype = prev.dtype
         kw = cls._store_kwargs(shape, dtype.itemsize, tile=tile, cparams=cparams,
-                               urlpath=urlpath, level=level)
+                               urlpath=urlpath, level=level, batch_thin_z=batch_thin_z)
         dst = blosc2.empty(shape, dtype=dtype, **kw)
         cls._mark(dst, level, False)                 # declared, not yet written
-        cz = int(kw["chunks"][2])
-        for im, it, ic in np.ndindex(m, t, c):
-            for z0 in range(0, z, cz):
-                z1 = min(z0 + cz, z)
-                src = np.asarray(prev[im, it, z0:z1, ic, :, :])
-                out = np.empty((z1 - z0, shape[4], shape[5]), dtype=dtype)
+        ct, cz = int(kw["chunks"][1]), int(kw["chunks"][2])
+        for im, ic in np.ndindex(m, c):
+            for t0 in range(0, t, ct):
+                t1 = min(t0 + ct, t)
+                for z0 in range(0, z, cz):
+                    z1 = min(z0 + cz, z)
+                    src = np.asarray(prev[im, t0:t1, z0:z1, ic, :, :])
+                    out = np.empty((t1 - t0, z1 - z0, shape[4], shape[5]), dtype=dtype)
 
-                def one(iz: int, _s=src, _o=out) -> None:
-                    _o[iz] = _plane_mean_2x(_s[iz])
+                    def one(unit, _s=src, _o=out) -> None:
+                        j, k = unit
+                        _o[j, k] = _plane_mean_2x(_s[j, k])
 
-                map_units(one, range(z1 - z0))
-                dst[im:im + 1, it:it + 1, z0:z1, ic:ic + 1, :, :] = out[None, None, :, None]
-                if bump is not None:
-                    bump(z1 - z0)
+                    map_units(one, [(j, k) for j in range(t1 - t0)
+                                    for k in range(z1 - z0)])
+                    dst[im:im + 1, t0:t1, z0:z1, ic:ic + 1, :, :] = \
+                        out.reshape(1, t1 - t0, z1 - z0, 1, shape[4], shape[5])
+                    if bump is not None:
+                        bump((t1 - t0) * (z1 - z0))
         cls._mark(dst, level, True)
         return dst
 
@@ -488,8 +564,7 @@ class B2ndProvider(TileProvider):
         import blosc2
         if vol6d.ndim != 6:
             raise ValueError(f"expected a 6-D (M,T,Z,C,Y,X) array, got {vol6d.shape}")
-        cparams = cparams or {"codec": blosc2.Codec.ZSTD,
-                              "filters": [blosc2.Filter.BITSHUFFLE]}
+        cparams = cparams or pyramid_cparams()
         shapes = cls._pyramid_shapes(vol6d.shape, levels)
         # The pyramid's plane budget up front (predicting the halvings is free) so the
         # fraction stays monotonic across levels rather than restarting at 0 on each.
@@ -645,8 +720,7 @@ class B2ndProvider(TileProvider):
         want = len(cls._pyramid_shapes(prov._arrays[0].shape, levels))
         if prov.levels >= want:
             return prov
-        cparams = cparams or {"codec": blosc2.Codec.ZSTD,
-                              "filters": [blosc2.Filter.BITSHUFFLE]}
+        cparams = cparams or pyramid_cparams()
         per_level = int(np.prod(prov._arrays[0].shape[:4]))
         total = max(1, per_level * (want - prov.levels))
         done = 0
@@ -699,6 +773,135 @@ def subset_index(picks: Sequence[int], value: int) -> int:
     if j == 0 or picks[j] == value:
         return j
     return j if (picks[j] - value) < (value - picks[j - 1]) else j - 1
+
+
+class ChannelMergeProvider(TileProvider):
+    """Two acquisitions on one channel axis, placed by absolute stage position and focus —
+    ``channel.merge``'s image, and the only provider that reads from two sources.
+
+    A channel index below ``pri_c`` is served from the PRIMARY and one at or above it from the
+    SECONDARY. Both are addressed the same way: the output plane has an absolute µm focus (the
+    node's :class:`~nodegraph.placement.ZGrid`), and each side answers with **its own plane
+    nearest that focus**. Nothing is interpolated in Z — a channel shows a plane its microscope
+    actually acquired, or the nearest one it has, which is what makes "walk the merged stack"
+    mean something for two files with different Z sampling.
+
+    Laterally the secondary IS re-addressed, because the two files rarely share a pixel size
+    (the WellA3 pair are 0.287 and 1.718 µm/px). That resampling is nearest-neighbour through
+    :func:`~nodegraph.placement.compose_secondary_plane`, so every value written is a real
+    sample of the source file rather than a blend of several — and only the WINDOW being read is
+    fetched, at whichever pyramid level suits it.
+
+    **Lazy, which is the whole reason it exists.** ``view.overlay``'s ``resample`` mode does the
+    same co-registration eagerly: it allocates the entire ``(M,T,Z,C,Y,X)`` result up front,
+    which is 6.1 GiB for sixteen frames of a 7168² mosaic and ~77 GiB for two hundred. Here a
+    plane costs a plane.
+
+    Uncovered pixels read ``0``: the secondary genuinely has nothing there, and a gap that reads
+    as a gap is the honest rendering (the node reports the coverage fraction per field).
+    """
+
+    def __init__(self, primary: TileProvider, secondary: TileProvider, *,
+                 axes: AxisSizes, entry: Dict[str, Any], grid: Any,
+                 pri_md: Dict[str, Any], pri_axes: AxisSizes,
+                 sec_md: Dict[str, Any], sec_axes: AxisSizes) -> None:
+        self._p, self._s = primary, secondary
+        self.axes = axes
+        self._entry = dict(entry)
+        self._grid = grid
+        self._pri_md, self._pri_axes = dict(pri_md), pri_axes
+        self._sec_md, self._sec_axes = dict(sec_md), sec_axes
+        self._pri_c = int(pri_axes.c)
+        # The pyramid is the PRIMARY's: it defines the lateral grid, so its levels are the ones
+        # whose geometry the output shares. The secondary picks its own level per read.
+        self.levels = max(1, int(getattr(primary, "levels", 1)))
+        self.tile = int(getattr(primary, "tile", 512))
+        self._dz = float((self._entry.get("offset_um") or (0.0, 0.0, 0.0))[0])
+        # A window is no cheaper than the plane it is in if EITHER source says so, and a stitch
+        # says so emphatically: its windowed path re-reads every overlapping tile, uncached, so
+        # a consumer walking a 26x26 output grid pays for the whole mosaic 676 times. This flag
+        # is the fence that stops that, and not forwarding it would put the cliff back one
+        # provider further along.
+        self.plane_unit = bool(getattr(primary, "plane_unit", False)
+                               or getattr(secondary, "plane_unit", False))
+        self.volume_unit = bool(getattr(primary, "volume_unit", False))
+
+    def level_axes(self, level: int) -> AxisSizes:
+        base = self._p.level_axes(level)
+        return replace(self.axes, y=base.y, x=base.x)
+
+    def fingerprint(self) -> tuple:
+        # Content identity of BOTH sources plus the placement — two merges of the same pair with
+        # different nudges are different images and must not share a memo entry.
+        return ("merge", self._p.fingerprint(), self._s.fingerprint(),
+                (self.axes.m, self.axes.t, self.axes.z, self.axes.c),
+                self._grid.step_um, self._grid.n, tuple(self._grid.z0_um),
+                repr(sorted(self._entry.items(), key=lambda kv: kv[0])))
+
+    def _z_of(self, md: Dict[str, Any], axes: AxisSizes, m: int,
+              z_um: Optional[float], *, dz: float = 0.0) -> int:
+        from nodegraph.placement import secondary_z_index
+        return secondary_z_index(md, axes, int(m), z_um, dz=dz)
+
+    def read_region(self, level: int, m: int, t: int, z: int, c: int,
+                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        from nodegraph.placement import compose_secondary_plane, paired_t
+        lax = self.level_axes(level)
+        z_um = self._grid.plane_um(m, z)
+        if int(c) < self._pri_c:
+            # The primary's own plane nearest this focus. With no focus log (`z_um is None`)
+            # `secondary_z_index` answers 0 for a single plane and the grid is the primary's own
+            # index space anyway, so pass the index straight through.
+            pz = int(z) if z_um is None else self._z_of(self._pri_md, self._pri_axes, m, z_um)
+            pz = min(max(0, pz), int(self._pri_axes.z) - 1)
+            return np.asarray(self._p.get_region(level, m, t, pz, int(c), y0, y1, x0, x1))
+
+        k = int(c) - self._pri_c
+        h, w = max(0, y1 - y0), max(0, x1 - x0)
+        out = np.zeros((h, w), dtype=np.float32)
+        if h == 0 or w == 0:
+            return out
+        t_sec = paired_t(self._entry, int(t))
+        tiles = dict((int(a), b) for a, b in (self._entry.get("tiles") or ()))
+        hits = tiles.get(int(m)) or ()
+        if t_sec is None or not hits:
+            return out                     # unpaired frame / no covering tile: honestly empty
+        def read_tile(j, want):
+            """The window of secondary tile ``j`` this output window needs, at the finest of ITS
+            levels that window fits — so a coarse read stays coarse and a full-resolution one
+            gets full resolution, without either being decided here."""
+            budget = max(h, w)
+            fy0, fy1, fx0, fx1 = want
+            lv, sax = 0, self._s.level_axes(0)
+            for cand_lv in range(max(1, int(getattr(self._s, "levels", 1)))):
+                cand = self._s.level_axes(cand_lv)
+                lv, sax = cand_lv, cand
+                if max((fy1 - fy0) * cand.y, (fx1 - fx0) * cand.x) <= budget:
+                    break
+            ny, nx = max(1, int(sax.y)), max(1, int(sax.x))
+            wy0, wy1 = int(np.floor(fy0 * ny)), int(np.ceil(fy1 * ny))
+            wx0, wx1 = int(np.floor(fx0 * nx)), int(np.ceil(fx1 * nx))
+            wy1, wx1 = min(ny, max(wy0 + 1, wy1)), min(nx, max(wx0 + 1, wx1))
+            wy0, wx0 = max(0, min(wy0, wy1 - 1)), max(0, min(wx0, wx1 - 1))
+            # THIS tile's own nearest plane, not the first hit's. The secondary's fields are
+            # each focused at their own height — that is why a union Z grid over twelve WellA3
+            # 640 fields is 297 planes and not 210 — so one plane index shared across every
+            # covering tile is the wrong plane for all but one of them.
+            z_j = (0 if z_um is None
+                   else self._z_of(self._sec_md, self._sec_axes, int(j), z_um, dz=self._dz))
+            plane = np.asarray(self._s.get_region(lv, int(j), int(t_sec), int(z_j),
+                                                  min(k, int(self._sec_axes.c) - 1),
+                                                  wy0, wy1, wx0, wx1))
+            return plane, (wy0 / ny, wy1 / ny, wx0 / nx, wx1 / nx)
+
+        # The window as a fraction of the primary's plane at THIS level — which is what makes a
+        # tile read and a whole-plane read place the secondary identically.
+        region = (y0 / max(1, lax.y), y1 / max(1, lax.y),
+                  x0 / max(1, lax.x), x1 / max(1, lax.x))
+        got = compose_secondary_plane(
+            self._entry, (h, w), self._pri_md, self._pri_axes, int(m),
+            self._sec_md, self._sec_axes, read_tile, region=region)
+        return out if got is None else got
 
 
 class FrameSubsetProvider(TileProvider):
@@ -857,4 +1060,5 @@ class ArrayProvider(TileProvider):
 
 
 __all__ = ["TileProvider", "SyntheticProvider", "B2ndProvider", "ArrayProvider",
-           "FrameSubsetProvider", "FrameSliceProvider", "subset_index"]
+           "ChannelMergeProvider", "FrameSubsetProvider", "FrameSliceProvider",
+           "subset_index"]
