@@ -63,6 +63,12 @@ from nodegraph.catalog.enhance.deconvolve import (  # noqa: E402,F401
     _gauss_blur_zero,
     _rl,
     _rl_gaussian,
+)
+# The PSF derivation is re-exported from where it now LIVES rather than through
+# `enhance.deconvolve`, which merely re-imports it: two nodes derive a PSF from optics
+# metadata (`enhance.deconvolve` and `enhance.zs_deconvnet`) and catalog rule 5 forbids one
+# node module importing another, so it moved to `_shared/psf.py`. Public names unchanged.
+from nodegraph.catalog._shared.psf import (  # noqa: E402,F401
     diffraction_sigmas,
     gaussian_psf,
 )

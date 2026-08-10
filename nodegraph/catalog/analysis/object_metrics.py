@@ -303,7 +303,14 @@ register_node(
     _compute_object_metrics, op_key="analysis.object_metrics", label="Object Metrics",
     category="analysis",
     extra_layers=_layers_object_metrics,
-    reads_domains=frozenset({Domain.LABEL, Domain.POINT}),
+    # ONE of the two, never both — the `analysis.object_field` note applies verbatim:
+    # `_object_table` is shared, so the two nodes' requirements are the same function of
+    # `target` and the static union over-claimed on both branches (V2.22).
+    reads_domains=frozenset(),
+    reads_domains_by_mode={"target": {
+        "label": frozenset({Domain.LABEL, Domain.VOXEL}),
+        "point": frozenset({Domain.POINT}),
+    }},
     adds_domains=frozenset({Domain.LABEL, Domain.POINT}),
     inputs=[
         InDataset(),

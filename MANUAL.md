@@ -9,7 +9,7 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 [`nodelab_v2/`](nodelab_v2/). For how it works internally, see
 [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md).
 
-> **State as of 2026-08-03:** catalog **69 node types** — 72 registered ops, counting the
+> **State as of 2026-08-05:** catalog **74 node types** — 77 registered ops, counting the
 > three the GUI layer adds (`io.load`, `io.dock`, `view.viewer`). V2.12 folded Watershed +
 > StarDist into the one **Segmentation** node and added CellSAM; V2.13 ported the last of
 > Cell-Tracker's processing — Flatten Illumination, Temporal Gain, Remove Blobs, Object
@@ -20,9 +20,12 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 > ([§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218)), parameter iteration
 > ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219)) and live node editing
 > ([§12d](#12d-editing-a-node-while-nodelab-is-running-v220)). Headless gate
-> `python -m nodegraph.selftest` → **85 `[ok]` lines green**; driven GUI gate
-> `scripts/_nodelab_v2_phase5_probe.py` → **ALL PASS** (23 `[ok]`); catalog gate
-> `python scripts/_catalog_snapshot.py check` → **CATALOG IDENTICAL**. On Windows, run all
+> `python -m nodegraph.selftest` → **105 `[ok]` lines green**; driven GUI gate
+> `scripts/_nodelab_v2_phase5_probe.py` → **ALL PASS** (67 `[ok]`); catalog gate
+> `python scripts/_catalog_snapshot.py check` → its committed baseline **predates V2.22**
+> (the `layer_from`/`view_source` socket fields and the last five nodes), so it currently
+> reports differences that are all *intended* catalog changes; re-bless it with
+> `_catalog_snapshot.py save` when you want it to guard a refactor again. On Windows, run all
 > three under `PYTHONUTF8=1` — they print `σ`/`→` and a cp1252 console raises
 > `UnicodeEncodeError` inside the reporting line itself, which reads like a failure but is
 > not one. There is exactly one editor — the first-generation `nodelab`/`pipeline_kit` app
@@ -54,6 +57,7 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 15. [Node reference](#15-node-reference)
 16. [Worked workflows](#16-worked-workflows)
 17. [Headless / scripted use](#17-headless--scripted-use)
+    - [LabLink mode — serve the lab, or send work out](#17b-lablink-mode--serve-the-lab-or-send-work-out)
 18. [Troubleshooting](#18-troubleshooting)
 19. [Verifying a build](#19-verifying-a-build)
 
@@ -322,8 +326,78 @@ derive pills work out of the box. The welcome card's *Example graph* button buil
 Dataset sockets carry a **domain rail** — small chips (`VOX`, `LBL`, `PT`, `TRK`, `MSH`, …)
 naming the attribute domains present on that wire. Wires are tinted by domain, and a node
 whose required domain is **missing upstream** paints a red validation chip. That is your
-at-a-glance answer to "why does Measure complain?" — it needs `LABEL`, and nothing upstream
-produced labels.
+at-a-glance answer to "why does Measure complain?" — on `Members = label` it needs `LABEL`,
+and nothing upstream produced labels.
+
+The rail follows the node's **current mode**, not its node type. Measure itself is an example:
+`Members = label` asks for `LBL`, `Members = point` for `PT`, and only the image domain is
+required in both. Voronoi Cells requires a
+Label instance under `Bound = per_region`, a bare Voxel raster under `mask`, and nothing but
+the seed points under `frame`, so its chips change as you move that dropdown. Same for Track
+Objects / Object Metrics / Object Field (Label vs Point per `Target`), Tessellate (per
+`Boundary`) and Transfer Structure (the union of its From and To domains).
+
+### Converging two branches
+
+Most nodes take one Dataset wire, and everything a node reads normally rides on it — segment,
+then detect, then measure, all in a chain. Two nodes take a second wire for **pixels**
+(`Raw` on Measure and Histogram Threshold: find objects on the enhanced image, report the
+intensities the camera actually recorded) and DVC/DIC take a `Reference`.
+
+**Voronoi Cells takes a second wire for a second domain.** Its dots are a Point table and its
+areas are a label raster, and those usually come from different branches — nuclei detected on
+one channel, cell bodies segmented on another — which one wire cannot carry. So:
+
+* **`data`** — the seed dots. This is the primary: calibration and metadata come from here.
+* **`areas`** — the branch carrying the layer to clip the cells to. Optional; leave it
+  unwired and the area layer is read off the main wire exactly as before.
+
+The `Area layer` picker follows whichever wire is supplying the areas, so it offers the names
+that are actually there — click the pill on the card (or the field in the inspector) and pick
+from the list rather than typing.
+
+The two branches must address the **same voxels**. A lateral crop, a resample or a drift
+correction on one side and not the other is refused rather than silently clipping every cell to
+the wrong place. What is *allowed* is anything that collapses an axis both sides have reduced to
+one: **a Z-projection on one branch and a single-plane Z-crop on the other is fine** (neither
+moves a Y/X address), as is taking the two branches from different channels. Enhancement steps
+in between are fine too — that is the point of a second wire.
+
+Wiring `areas` while `Bound` is `frame` is refused, since `frame` reads no area layer at all.
+
+**What you see when you view the node.** A node's payload is built on its **primary** wire, so
+Voronoi Cells shows the *seeds'* branch — its image, and any layers that branch carried, which
+for a segmented seed chain includes a raster usually called `labels`. That is **not** the area
+layer, even though the name matches. To see a territory against the region that bounded it,
+overlay **`voronoi_areas`**: the node copies the area raster it actually used onto its output
+under that name (`<Output layer>_areas`, absent under `Bound = frame`).
+
+**Both channels are drawn.** The `areas` wire is a viewer *source*: its image composites under the
+seeds' one, so viewing Voronoi Cells shows the Red field and the UV field together, placed
+field-for-field (the node has already verified the two branches address the same voxels). For
+finer control over blend mode, opacity or a wipe, insert a `view.overlay` node — that is still
+the explicit way to say how two images combine.
+
+This is opt-in per socket, so the second inputs that are *not* a different channel stay invisible
+by design: Measure's `Raw` is the unenhanced version of the same pixels, and DVC/DIC's `Reference`
+is another timepoint of the same channel — compositing either would just draw the field twice.
+
+Pick the label raster in **Overlays → Labels → Which layer**. On **Auto** the viewed node's own
+output is drawn — you opened it to see what it made — so viewing Voronoi Cells draws the
+territories. Switch to `<Output layer>_areas` to see the regions they were clipped to, or to the
+seed branch's own labels. Only when a node declares no output of its own does Auto fall back to
+whichever raster holds the most regions. That control matters whenever a payload carries
+more than one label raster, which here is always: `labels` (the seeds' branch), `voronoi` (the
+territories) and `voronoi_areas` (the regions). Left on **Auto** the overlay draws the raster
+with the most regions — a guess, not a preference, and on a graph like this it will usually be
+the wrong one. Two segmentation nodes both default their output to the name `labels`, so giving
+them distinct names (`nuclei`, `actin`) makes every picker in the app unambiguous.
+
+If the cell count looks short, check the progress rail — the node reports every seed that got no
+territory and why. The usual cause is that the two branches disagree spatially: centroids taken
+from a Z-projection sit wherever their object is in *any* plane, so an area layer cut from a
+single Z-plane leaves most of them on background, where they belong to no region and are
+dropped. `Bound = mask` is the fix when the area layer marks extent rather than compartments.
 
 ### Editing the graph
 
@@ -735,7 +809,7 @@ The **◈ Overlays** button (also `Ctrl+Shift+O`, **View → Overlays…**) open
 tab per domain: **Points**, **Labels**, **Tracks**, **Mesh** (and a reserved Voxels tab).
 Quick on/off checkboxes for Points / Labels / Tracks sit in the channel strip.
 
-* **Points** — golden-star glyphs, per-point palette, configurable arm spread.
+* **Points** — golden-star glyphs, configurable arm spread, and four **Colour by** modes: one colour, **one per Z plane** (what makes a projected 3-D cloud read as depth), one per point (which follows the *track* once a tracker has linked them, so a particle keeps its colour across T), or one per layer.
 * **Labels** — outlines and/or fills, per-object palette (fill hue matches outline hue).
 * **Tracks** — one hued polyline per track through its members' `(y,x)` ordered by t, with
   the vertex at the **currently viewed T enlarged** — so scrubbing T walks each track's
@@ -747,6 +821,37 @@ Every overlay size is a **screen** size, so an outline keeps its thickness as yo
 a label instead of being magnified with the image. Region *fills* scale, because a fill is
 the region. A tab's look can be **spread** to the other tabs by role (opacity travels;
 "arm spread" does not).
+
+#### Which Z a point belongs to
+
+A detection's `z` means one of two things, and it is worth knowing which you are looking at:
+
+* a **3-D** detection (`detect.particles` / `detect.spots` on the 3D lever, a DVC field)
+  carries a *sub-voxel depth*, so its particles sit at the depths they were found at;
+* a **2-D, per-plane** detection carries the *plane index* it was made on.
+
+Either way, **Show points from every Z** decides what is drawn: off (the default) only the
+detections whose `z` lands on the viewed plane; on, all of them, with the off-plane ones
+dimmed to **Off-plane opacity**. That is the control to reach for on a 3-D result — and
+pair it with **Colour by → One colour per Z plane**, which is what turns a projected cloud
+from a pile of markers into something with legible depth.
+
+The status line always reports the tally — `· 128 points (16856 on other Z)` — whether or
+not anything is projected, so a plane that happens to hold none of the detections can never
+be mistaken for an empty result. A 3-D run over a deep stack routinely puts nothing on plane
+0, which is where the Viewer opens.
+
+Two things that look like bugs and are not:
+
+* **Colour by → per Z plane with projection off gives one colour.** Every marker drawn is on
+  the viewed plane, so they share it. Turn projection on for this mode to say anything.
+* **Colour by → per layer gives one colour** when there is one Point layer, which is the
+  normal case for a single detection node. It differs only *between* layers. Use per point or
+  per Z plane to tell markers apart within a layer.
+
+Neither colour mode can rescue a crowded cloud: a few thousand markers overlap into a wash
+however they are coloured. Thin the detection first (see
+[§15.1](#151-particle-detection-on-a-noisy-stack)).
 
 #### One colour per object, not per id
 
@@ -893,7 +998,7 @@ Viewer.
 | **Drag the radius** | press at the centre of a feature, drag to its edge | every µm radius/σ — Gaussian, Median, Morphology, Top-Hat, Unsharp, DoG, Bilateral, Local Threshold's block, Boundary Band, Tessellate's alpha, Flatten Illumination, … |
 | **Two rings** | drag the inner, then the outer, over one real spot | Spot Detection & Remove Blobs `min_radius`/`max_radius`, DoG's two σ |
 | **Click or draw the size** | click a segmented object to take its measured area, **or** drag to draw a blob and use that | Segmentation & Histogram Threshold `min_area`/`max_area`, `min_volume`/`max_volume`, `min_hole_size` |
-| **Eyedropper** | click a pixel; its intensity becomes the level | Threshold, Segmentation's fixed level, Histogram Threshold's low/high, Spot/Particle Detection, Remove Blobs |
+| **Eyedropper** | click a pixel; its intensity becomes the level | Threshold, Segmentation's fixed level, Histogram Threshold's low/high, Spot/Particle Detection, Remove Blobs, Normalize's `low_value`/`high_value` under bounds `absolute` |
 | **Measure on the image** | click two points; the value is the distance between them | Track Linking / Track Objects `max_distance`, Particle Detection & watershed seed `min_distance`, Voronoi Cells' max reach |
 | **Drag the crop rectangle** | drag one box; **all four bounds** are set at once and everything outside it dims | Crop `y0`/`y1`/`x0`/`x1` |
 | **Use the picked Z planes** | tick planes on the Z strip; their span becomes the Z window | Crop `z0`/`z1` (3D only) |
@@ -948,10 +1053,33 @@ on release, not on every mouse move, so dragging a value on a large graph stays 
 
 ## 8c. Zooming into a big image — detail on demand
 
-The Viewer draws a whole plane as one texture capped at **`MAX_DISPLAY_DIM`** (4096 px;
-override with `NODELAB_MAX_DISPLAY_DIM`). For a camera frame that cap is never reached, so
-what you see is every pixel. For a **stitched mosaic** it is: a 13106² canvas overviews at
-3276², a quarter of the linear resolution.
+**Full resolution when it fits (V2.23).** The Viewer asks one question per frame, the same one
+NIS-Elements asks against `MaxMemoryImageSize`: can this be shown *whole*? A frame is drawn at
+full resolution when it clears both ceilings —
+
+* the surface's real `GL_MAX_TEXTURE_SIZE` (this machine reports 32768, so a 7168² mosaic is
+  comfortable; the CPU fallback declines, because its QImage is the size of the frame);
+* the **display memory budget**, 25% of RAM by default and counted over every channel you have
+  switched on. `NODELAB_DISPLAY_RAM_PCT` changes the share, `NODELAB_DISPLAY_RAM_BYTES` sets it
+  outright — the right answer is a property of the machine, and this runs on both a 256 GiB
+  workstation (a quarter of which holds 160 full-resolution 7168² frames) and a laptop.
+
+Frames that clear neither fall back to the behaviour below: the pyramid, plus a detail patch
+where you are looking. A frame the surface could not upload is *declined* rather than attempted
+— being wrong that way costs sharpness, the other way shows black.
+
+The stitched mosaic is the case this changes. It used to be pinned to whatever pyramid level
+fitted a fixed 4096 px — half resolution for a 7168² canvas, everywhere outside a zoom patch —
+for no reason other than the constant.
+
+Two things make that affordable rather than merely possible: the display copy is narrowed to the
+payload's own bit depth (a mosaic frame is 98 MiB of uint16, not the 392 MiB of float64 a feather
+blend has to be *computed* in), and pressing **play** preloads the whole T range into the plane
+cache, so playback after the first pass is a texture upload per frame — 0.1 ms. If the series is
+larger than the budget the status line says so, and the tail re-reads.
+
+For a fixed cap regardless of any of this, set `NODELAB_MAX_DISPLAY_DIM`. For a camera frame
+none of it applies — the cap was never reached and you were always seeing every pixel.
 
 **Zoom in and it re-reads.** About 0.1 s after the wheel or the drag settles, the visible
 rectangle is read again at the finest pyramid level that fits the same 4096 px budget and
@@ -959,16 +1087,76 @@ drawn over the overview. On a 49-tile mosaic that means **true 1:1 — every sou
 in 0.2–0.45 s**, because a stitched provider serves a window by stitching only the tiles
 that window touches rather than rebuilding the whole 172 Mpx canvas.
 
-Three things worth knowing:
+**An Overlay zooms with it (V2.23).** The patch carries the secondary's channels too, and
+composes them from the **window of the secondary the picture needs**, at the finest pyramid
+level that window fits — so zooming into an overlay resolves more of the second file rather
+than magnifying the first read. On the WellA3 pair with a stitched whole-well secondary that
+is 1085 distinct source values across the primary's field where a whole-plane read gave 681,
+in a fifteenth of the time; zoomed to 10 % of the field it is 120 against 47. Before this the
+patch carried the primary alone — and it draws *over* the overview, so zooming in did not fade
+the overlay, it erased it.
+
+Four things worth knowing:
 
 * the overview stays underneath, so there is always a complete picture: a patch that is
   late or superseded can only ever make a sub-rect sharper, never blank it;
+* `checkerboard` and `wipe` are computed in **image** coordinates inside a patch, so the
+  divider and the squares stay on the specimen you were judging instead of restarting
+  across the zoom;
 * the read happens **off the GUI thread**, and a patch for a rect (or a frame) you have
   already left is discarded rather than painted somewhere wrong;
 * **it is a display artefact and nothing else.** A node always reads its input at full
   extent and full resolution — zoom state cannot reach a measurement, an export or a
   memo. The GUI gate asserts exactly that (probe §V3: after a detail patch, the node's
   payload still has its full extent and byte-identical pixels).
+
+### Flatten to a Large Image — when a mosaic should stop being live
+
+Full resolution is one thing; **cheap** is another. A stitched canvas is *recomputed for every
+frame you display*, and no display trick changes that. Measured on the 49-position WellA3
+montage (7168², 16 T):
+
+| | live `util.stitch` | flattened to a store |
+|---|---|---|
+| full-resolution frame | 0.78 s — 1.3 fps | **0.06 s — 16 fps** |
+| overview frame | 0.21 s — 4.8 fps | 0.02 s — 55 fps |
+| read-ahead while scrubbing | 2 frames | 8 frames |
+| after one pass (cached) | 0.1 ms | 0.1 ms |
+
+**Run → Flatten to Large Image…** (`Shift+F6`) does what a microscope's own software does with a
+mosaic: it adds a **Dock** below the viewed node, bakes the result to a chunked pyramidal store,
+and serves it from there. The chain that produced it stays on the canvas (greyed, editable) and
+**Un-dock** puts it back — this is the existing Dock workflow with the setup done for you, not a
+new kind of object. Precision is chosen from the payload: `uint16` while the values are still
+camera counts, `float32` once a node has made them continuous.
+
+One-time cost on that series: **29 s and 0.97 GiB before V2.26, and the writer rework cut the
+write itself by ~3.5× on exactly this shape** (a mosaic is `z == 1`, which is the case the old
+chunk geometry handled worst — see [§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218)).
+What is left is mostly the stitch itself, which is real work. That is the trade — disk and a
+wait, once, for a mosaic that browses and plays like an ordinary file.
+
+If you only want to *look* downstream rather than keep the result, **Hold** the dock instead:
+no write at all, and the mosaic stops being recomputed per frame the same way. It costs no disk
+and does not survive a reload.
+
+**An overlay has to be flattened INTO the image first.** `view.overlay`'s default `display` mode
+stores nothing by design — that is why dragging its opacity is a repaint rather than a re-run —
+so baking a chain that contains one would write the primary alone and the overlay would simply be
+gone. Flatten (and any bake) therefore offers to switch it to `output = resample`, which writes
+the placed secondary as a real extra channel; declining cancels, because a silent loss is worse
+than no bake. Verified on the real pair: stitch + resampled overlay bakes to a 2-channel 7168²
+store whose overlay channel covers 0.69 % of the mosaic — exactly the coverage the placement plan
+reported.
+
+Two limits worth knowing before you reach for it on a long series:
+
+* `output = resample` builds its result **eagerly** — the whole `(M,T,Z,C,Y,X)` array at once.
+  For the 16-frame mosaic that is 6.1 GiB (12.4 GiB peak); a 200-frame series would want ~77 GiB.
+  Flatten a scoped range, or stay in `display` mode and look rather than bake.
+* a resampled overlay has no single integer scale, so it reports no `bit_depth` and its frames
+  stay `float32` — 411 MB per two-channel frame instead of 205. Still inside the default budget
+  here, but it halves how many frames stay resident.
 
 ---
 
@@ -1024,6 +1212,13 @@ That is what the domain chips on Dataset sockets mean. Practical consequences:
   `analysis.voronoi` writes one too (in 3D), alongside its territory raster.
 * `transform.label_to_points` goes the other way across the structure spine: it **creates**
   Point rows from `Label` regions, which is what the attribute-moving bridges cannot do.
+  `transform.grow_points` (**Grow**) is its inverse under `grow=points` — it creates `Label`
+  regions (and their raster) from `Point` rows by growing each dot to a physical radius, which
+  is how a detection-only graph gets objects it can measure, track and export. Its other three
+  branches stay inside the `Label` domain: they grow an existing segmentation from its **own**
+  shape (outward from each region's border by a µm distance, by resampling that outline about
+  its centroid, or by replacing it with an ellipsoid), which is the Label→Label constructive
+  hop — not a bridge, since no rows cross domains.
 * `transform.transfer_domain` moves a **lattice** attribute between lattice domains
   (coarsening reduces over the dropped axes; refining broadcasts). Structure hops use the
   built-in bridges inside the relevant nodes.
@@ -1035,8 +1230,18 @@ Nodes that consume a named layer (`mask`, `labels`, `points`, `source`, `mesh`, 
 instead of retyping. Free text is still accepted for hand-authored graphs. A node is never
 offered its own output.
 
-Two behaviours worth knowing:
+Three behaviours worth knowing:
 
+* **A layer socket resolves itself.** If the name it holds is not on the wire and there is
+  exactly **one** candidate of the right kind, that one is used, and the run says which on the
+  progress line (`using Label instance 'CELLS' — …`). So renaming a segmentation does not
+  break the nodes below it, and two nodes whose defaults happen to disagree still connect. It
+  never picks *between* candidates: two label rasters on one wire is a real question, and the
+  node stops and lists them for you to choose from the dropdown. A name that **is** present is
+  always taken literally.
+  Optional layer sockets are excluded on purpose — Correlate DIC's `roi` and Segmentation's
+  seed `mask` mean "no ROI / no seed mask" when they name nothing, and inferring one would
+  quietly restrict the run.
 * The catalog is **not monotone**. An axis-changing node (crop, resample, z-project, stack,
   channel select) **drops** lattice layers whose shape no longer matches. If a mask
   disappears after a crop, that is the rule working — re-derive it after the crop.
@@ -1117,15 +1322,83 @@ not a lazy provider — and every time one is evicted, getting a plane back mean
 the whole chain above it**. Past a certain point, adding one more node means waiting for
 twenty again.
 
-A **Dock Data** node (Nodes palette → `io`) cuts that. Drop it mid-chain, press **Bake**, and:
+A **Dock Data** node (Nodes palette → `io`) cuts that. Drop it mid-chain, freeze it, and the
+nodes above it **grey out** and are dropped from the run graph entirely. You keep building
+downstream at the cost of a fresh load, not the cost of the whole pipeline.
 
-* everything above it is computed **once** and written to a checkpoint folder on disk;
-* the dock then behaves like a freshly loaded file — downstream nodes read decompressed
-  pixels off disk instead of recomputing;
-* the nodes it replaced **grey out**, are dropped from the run graph entirely, and their
-  cached results are released from memory.
+### Hold or Bake — two ways to freeze (V2.26)
 
-You keep building downstream at the cost of a fresh load, not the cost of the whole pipeline.
+The node has **three** states, and the middle one is new. Both frozen states cut the upstream
+edge and grey out the chain; what differs is where the frozen bytes live.
+
+| | **Hold** | **Bake** (dock) |
+|---|---|---|
+| Cost to enter | **effectively instant** — nothing is written, nothing is copied | one pass over the series |
+| Disk | none | the checkpoint |
+| Frees memory | **no** — the payload is still held, it just stops being recomputed | **yes** — full-size rasters come back memory-mapped |
+| Survives reopening the file | **no** | yes |
+| Counted against a cache budget | no | it is a file; the size is shown |
+| Precision choice | n/a (nothing is stored) | required |
+
+**Hold is the troubleshooting action.** Freeze a stitch, a merge or a projection once, then
+tune everything downstream against it without paying for it again. It is the same idea as
+Cell-Tracker's *Set as raw data*, and cheaper: the payload is pinned exactly as it is, with no
+copy at all.
+
+**Bake is the durable one.** It is what you want when the chain is settled, when you need the
+memory back, or when the result has to still be there tomorrow.
+
+Press **Hold** and the card reads **HELD**. Press **Release** to run the chain live again.
+Reopen the graph and a held dock reads **RELEASED** in red and says so — a hold lives in
+memory, and memory does not survive a reload. It is never quietly re-run for you and never
+quietly downgraded to live: either would put a multi-minute chain back into every pull while
+looking like it had worked. One click on **Hold** freezes it again, or **Bake** it so next time
+it survives.
+
+### How fast a bake is (V2.26)
+
+Measured on a 1.25 GiB uint16 fixture, 160 planes, three pyramid levels:
+
+| | before | after |
+|---|---|---|
+| **2D data** — a timelapse, a Z-projection, a **stitched** mosaic, a **merge** | 23.0 s (55 MB/s) | **6.6 s (193 MB/s)** |
+| a real Z-stack | 9.4 s (136 MB/s) | **5.7 s (226 MB/s)** |
+
+The 2D case was the slow one and it is the common one, because everything the Dock exists to
+freeze — projected, stitched, merged — has `z == 1`. Three things were wrong, all now fixed:
+the on-disk chunk was computed from the Z axis alone, so a 2D series wrote one small chunk per
+plane; the pyramid was mean-pooled on a single core through a `float64` intermediate instead of
+using the pooled, chunk-aligned builder the ingest already had; and the compression level was
+inheriting blosc2's default of 5 rather than the 1 it reads as. The pyramid a bake writes is
+**bit-identical** to the one an ingest writes, and every level is now marked complete on disk,
+so a re-bake can no longer leave a stale higher level to be trusted.
+
+A bake can also be **stopped**. Nothing is recorded, so the folder reads as un-baked rather
+than as a shorter valid series.
+
+### Freezing the source costs a file copy, not a re-encode (V2.26)
+
+The cheapest thing you can ask a dock to do is *"freeze the load so I stop re-ingesting"* — a
+Dock right after **Load**, or after nodes that only pass pixels through. That used to be the
+one case that paid full price: the bake decompressed the store off disk and compressed it
+straight back, to produce bytes that were already sitting there.
+
+It now **copies the store's files** instead, which moves the compressed bytes and skips both
+codec passes. On a 1.25 GiB store: **12.4 s → 2.6 s.**
+
+The copy is taken only when the result would be byte-for-byte what a full write produced, so
+it is silently skipped — with no loss but the time — whenever anything could differ:
+
+* the input is not a store on disk (any computed chain, a stitch, a merge, a filter);
+* the **Precision** you chose is a real conversion. Integer data passes through untouched at
+  every precision, so a raw uint16 file copies; a float chain baked to `float32` does not;
+* a node between the store and the dock changed the geometry;
+* the source store is not sound — a half-written one is the case this matters for, and a copy
+  is the one path that would carry it over verbatim. Both the completeness marker and the
+  chunk census are checked, and a refusal leaves nothing behind.
+
+`NODEGRAPH_DOCK_COPY=0` forces every bake through the full re-encode, for when you want to
+compare the two.
 
 ### What gets baked
 
@@ -1178,9 +1451,12 @@ precision marks it stale the same way. **Un-dock** runs the chain live again and
 checkpoint on disk, so re-docking is instant.
 
 Docks chain: bake one, add ten nodes, bake a second. Editing above the first dock does not
-stale the second — the first one's frozen bake stands between them.
+stale the second — the first one's frozen bake stands between them. A **held** dock stands
+between them the same way, for the same reason.
 
 ### It survives save/load
+
+(A **hold** does not — see the table above. Everything in this section is about a bake.)
 
 The folder is stored **relative** to the graph whenever it sits beside it, so a project
 directory can be moved or handed to someone else and the docks stay attached. A loaded graph
@@ -1202,15 +1478,27 @@ iterates *parameters*: it runs the chain in front of it once per value and keeps
 ### Wiring one up
 
 1. Drop an **Iterate** card after the chain you want to tune.
-2. Drag from its **V0** output onto the parameter you want to sweep — any spin box, text
-   field or **dropdown** on any node downstream of it. (Mode dropdowns grow a port as soon as
-   an Iterate node exists in the graph; the 2D/3D lever deliberately does not, because
-   sweeping it would produce errors rather than comparisons.)
-3. Wire the **end** of that chain back into the Iterate node's **Collect** input.
+2. Wire the **end** of that chain into the Iterate node's **Collect** input.
+3. In the Iterate panel, pick what to iterate from the **V0** dropdown. It lists every
+   parameter and every mode dropdown of every node in the chain feeding Collect — read down
+   the chain, node by node — and choosing one wires it. Use the **+** row below it to add a
+   second parameter; that raises **Variables** for you.
 
-Those two wires close a loop on the canvas, which is intended — the driver wire is not a data
-route, so it never makes the graph cyclic. Everything between the driven node and Collect is
-the **iterated chain**, and it is what gets run once per value.
+The list is *scraped from your graph*, not a fixed menu: a param that this card could not
+legally drive is never in it (see [what it refuses](#what-it-refuses-and-why)), and a param
+another slot already drives is dropped from the others' lists. Picking a mode dropdown or a
+text field also sets that variable's **Type** to `text` for you, because a number and a name
+leave the card on different outputs.
+
+You can still do it by hand: drag from the card's **V0** output onto the parameter itself.
+The dropdown builds exactly that wire, so the two are the same edit — the menu is just the
+way that does not require hunting for the control. (Mode dropdowns grow a port as soon as an
+Iterate node exists in the graph; the 2D/3D lever deliberately does not, because sweeping it
+would produce errors rather than comparisons.)
+
+The driver wire and Collect close a loop on the canvas, which is intended — the driver wire
+is not a data route, so it never makes the graph cyclic. Everything between the driven node
+and Collect is the **iterated chain**, and it is what gets run once per value.
 
 ### Choosing the values
 
@@ -1271,11 +1559,18 @@ or a parameter that changes the image's axes — those values have to be known b
 Each of these would otherwise produce a plausible, wrong answer rather than an error:
 
 * a driven node that is not upstream of Collect (the sweep would change nothing);
-* a **docked** Dock inside the chain (every iteration would read the same baked pixels);
+* a **frozen** Dock inside the chain — held or docked (every iteration would read the same
+  frozen pixels);
 * another Iterate node inside, or overlapping, this one's chain;
 * one parameter driven by two Iterate cards;
 * a branch leaving the chain to somewhere outside it (which iteration would it read?);
+* a parameter that is already fed by a **wire** (a wired value beats a swept one, so every
+  row would come out identical);
+* a field that only **names** the layer a node writes (same pixels, N different names);
 * the 2D/3D lever, and more than 64 iterations.
+
+Those refusals are also what the V0 dropdown is filtered by, so the menu cannot offer you a
+target the run would then reject.
 
 ---
 
@@ -1485,12 +1780,13 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Load (GUI source) | `io.load` | The pipeline source. Resolves `path` to a lazy provider (ND2/TIFF → planar-block `.b2nd`), or a synthetic fallback when empty. Grows per-channel output sockets. |
 | Select Channel | `channel.select` | Subset/reorder the channel axis; the per-channel emission list follows in lockstep. |
 | Split Channels | `channel.split` | Fan a multi-channel Dataset into per-channel outputs; `out` still carries the full bundle. |
+| **Merge Channels** | `channel.merge` | Put **two acquisitions on one channel axis**, placed by absolute stage position and focus — two files become a single multi-channel image every downstream node can measure across. Where **Overlay** records a placement for the Viewer and changes nothing a node reads, this returns real merged data, and it is **lazy**: a plane costs a plane (measured on the WellA3 pair — pull 0.025 s, +0 MiB, against `view.overlay`'s `resample` at 25 s and +12.4 GiB for the same co-registration). **Each channel shows its OWN plane nearest the viewed focus**, so scrolling Z walks acquired planes on both sides instead of interpolating one to fit the other. `Z grid` = `union` (default: span both focus ranges at the finer step, so which file you wired as primary cannot decide whether the other's stack is reachable) or `primary` (keep this input's grid exactly, naming the secondary planes it cannot address). Lateral placement is nearest-neighbour, so every value is a real sample of its source. `If unplaceable` = `refuse`/`align_by_index` as Overlay, and it matters more here because this output is measured. C and Z both show **?** until the first pull — the edit-time pass is shown only the primary's envelope, so both are honestly unknown. **Which input you make the primary decides the output grid**: wire the FINE-pixel file as the primary or its detail is minified away (a 0.287 µm/px stack into a 1.718 µm/px mosaic loses 6× linear — the node warns, and a minified secondary is area-averaged rather than point-sampled so at least the noise is not amplified). `Flip X`/`Flip Y` go **inert** when the secondary is an already-stitched canvas: the stitch answered that question to place its tiles, so flipping again would mirror the mosaic 456 px out of place. |
 | Dock Data | `io.dock` | Bake everything upstream to a disk checkpoint, then serve it as a new source — the chain behind it greys out and is released from memory. See [§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218). |
 | Reroute | `rr.reroute` | Identity pass-through for wire tidiness (created by double-clicking a wire; hidden from the palette). |
 | Viewer tap | `view.viewer` | Pure pass-through inspection tap. |
 | **Overlay** | `view.overlay` | Draw a **second Dataset inside this one's field**, placed by absolute stage position, pixel size and focus — so two files that ran through different graphs line up on the microscope's own coordinates. Controls: blend `add/over/difference/checkerboard/wipe/flicker`, `opacity`, a µm `offset_y`/`offset_x`/`offset_z` nudge, `t_shift`, `flip_x`/`flip_y` handedness, `min_coverage`, `secondary_channel`. Output `display` (default) records **where** the secondary goes and changes nothing a downstream node reads — the payload passes straight through, and `opacity`/`wipe_pos`/`flicker_hz` are outside the recipe hash, so dragging one repaints rather than re-runs; `resample` bakes the secondary onto the primary's grid as real pixels. Overlays **chain**: wiring one into another's primary appends a third source, so N-way needs no N-ary socket. `If unplaceable` = `refuse` (default) declines when the files cannot prove they line up; `align_by_index` overrides and stays loud about it — every refusal reappears as a warning. The pairing, the nudge and the time shift are decisions about the experiment, not the window, which is why this is a node and not a Viewer setting. See [§7](#7-the-viewer). |
 
-### Enhancement (18)
+### Enhancement (19)
 
 | Node | `op_key` | Key controls | Notes |
 |---|---|---|---|
@@ -1507,13 +1803,14 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Bilateral Denoise | `enhance.bilateral` | `sigma_spatial` µm, `sigma_color` | lever; **stack-of-2D** (declared) |
 | CLAHE | `enhance.clahe` | `clip_limit`, `tile_grid` | lever; rescales back into the input range. `tile_grid` = contextual regions per axis (8 = Cell-Tracker's OpenCV default; was pinned to 4 before V2.13) |
 | Gamma | `enhance.gamma` | `gamma`, scale `full_range/plane_max` | no lever (pointwise). `full_range` (default) takes the power law over `2**bit_depth-1` — one fixed transfer curve for the series, Cell-Tracker's behaviour; `plane_max` is the adaptive pre-V2.13 per-plane normalisation |
-| Normalize | `enhance.normalize` | `low_pct`, `high_pct`, scope `plane/volume/series` | **drops `bit_depth`** — output is no longer integer counts |
+| Normalize | `enhance.normalize` | bounds `percentile/absolute`; then either `low_pct`, `high_pct` + scope `plane/volume/series`, or `low_value`, `high_value` | **drops `bit_depth`** either way — output is no longer integer counts. `percentile` (default) measures the two endpoints from the data over the chosen scope; `absolute` (V2.23) takes them verbatim in the image's own units, so one setting is one fixed transfer curve for the whole series. Scope and the percentile pair show only under `percentile`, the value pair only under `absolute`; the footprint follows (`absolute` is TILEABLE, `percentile` WHOLE_SERIES) |
 | Deconvolve | `enhance.deconvolve` | `na`, `emission_nm` nm, `z_step_um`, `iterations` | lever; Richardson–Lucy with a PSF derived **per channel** from optics |
+| **ZS-DeconvNet** | `enhance.zs_deconvnet` | model **zero_shot** (`iterations`, `train_units`, `seed`, `batch_size`, `patch`/`patch_3d` px, `patch_z`, `learning_rate`(`_3d`), `hess_weight`(`_3d`), `denoise_weight` 2D, `alpha`/`beta1`/`beta2` 2D, `psf_path`+`psf_pixel_um`/`psf_z_um`, `na`, `emission_nm`, `cache_path`) · **pretrained** (`weights_path`); shared: output `deconvolved`/`denoised`, `upsample`, `tile`/`tile_z` px, `overlap`/`overlap_z`, `insert_xy`(`_3d`), `norm_low`, `background`, 3D `damping_length`/`damping_width`; 3D backbone `rcan3d`/`unet3d` | lever, **true 3D**. Zero-shot deconvolution network (Qiao et al., *Nat Commun* 15:4180, 2024): a dual-stage CNN trained **self-supervised on the incoming data itself** — no ground truth, no reference dataset — by manufacturing training pairs from the measurement (2D re-corruption, paper Eq. 9-12; 3D axial-parity splitting, parameter-free). Denoises *and* sharpens ~1.5× past the diffraction limit; `upsample` doubles Y/X and halves `pixel_size_um`, and **drops `bit_depth`** either way (output is percentile-normalized). The PSF is a **training-time term only** — inference needs none — and defaults to the same optics-derived Gaussian `Deconvolve` uses (validated within 1 % of the authors' measured PSF). `pretrained` runs a published `.h5` in seconds; `zero_shot` trains one model **per channel** (~1.4 s/iteration on this CPU-only build, so set `cache_path` and pay it once). Golden-output parity against the authors' own published results: 2D **max 1 count in 10 000**, 3D **r = 0.99997** — see `scripts/_bench_zsdeconvnet.py` |
 | **Flatten Illumination** | `enhance.flatten_field` | method `subtract/subtract_mean/divide_mean/ratio`, reference `per_plane/time_averaged`, `sigma` µm, `bg_floor` | no lever (lateral background). Ports Cell-Tracker's Background Subtract + Spatial Flatness + Local Contrast; `ratio` **drops `bit_depth`** |
 | **Temporal Gain** | `enhance.temporal_gain` | reference `series_mean/rolling_mean/exponential_fit`, extent `global/tile/gaussian`, `window`, `threshold`, `tile_size` µm, `local_sigma` µm | no lever; per (m,z,c) T-series. Ports Bleach Correction + Temporal Fold Correction (+ the exponential decay model CT's UI promised but never ran). Refuses T=1 |
 | **Remove Blobs** | `enhance.remove_blobs` | detector `log/dog`, action `zero/interpolate/median`, `min_radius`/`max_radius` µm (per channel), `threshold`, `expand`, `fill_radius` µm | per-plane, no lever (sensor/glass artifacts are per-plane). Ports Blob Subtract |
 
-### Segmentation & analysis (24)
+### Segmentation & analysis (26)
 
 | Node | `op_key` | Key controls | Produces |
 |---|---|---|---|
@@ -1523,10 +1820,12 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Connected Components | `analysis.label` | `mask`, `connectivity` (8 / 26 default), `name` | Voxel raster **+ Label table** |
 | **Segmentation** | `analysis.segment` | method **threshold** (`level` otsu/li/yen/triangle/mean/fixed, `connectivity`) · **watershed** (optional `mask` layer, `min_distance` µm) · **stardist** (`prob_thresh`, `nms_thresh`, `scale`, `model_name`) · **cellsam** (`bbox_threshold`, `cellsam_model`, `model_path`, `normalize`, `postprocess`, `remove_boundaries`, `tile`+`tile_size`/`tile_overlap` px, `fast`); shared: `name`, `fill_holes`, min/max **area µm²** (2D) or **volume µm³** (3D) | Voxel label raster **+ Label table**; lever: 2D = per-plane instances, 3D = z-connected *(the two learned methods refuse 3D)*. CellSAM `fast` = **~5× on a GPU** (batched mask decoder); not bit-identical, so it is off by default — see below |
 | Distance Transform | `analysis.edt` | `mask`, `name` | µm distance field (anisotropic in 3D) |
-| Measure | `analysis.measure` | `labels`, `stats`, `shape`, optional **`raw`** Dataset | per-label stats on the Label table. `shape` adds µm-aware regionprops geometry (`eccentricity`, `perimeter`, `solidity`, `extent`, `axis_major`, `axis_minor`, `orientation`); the 2-D-only three are refused on a 3D Label table |
+| Measure | `analysis.measure` | **Members** `label` (`labels`, `stats`, `shape`) · `point` (`points`); optional **`raw`** Dataset in both | `label`: per-region stats on the Label table, and `shape` adds µm-aware regionprops geometry (`eccentricity`, `perimeter`, `solidity`, `extent`, `axis_major`, `axis_minor`, `orientation`) — the 2-D-only three are refused on a 3D Label table. `point`: each detection's physical position `x_um`/`y_um`/`z_um` **and** `mean_intensity`, the value of the voxel it sits on. `stats`/`shape` are hidden there — a point has no region to reduce over. The pixel `x`/`y`/`z` columns are left alone, so everything reading them as indices keeps working; leave `points` **empty** and the only Point table on the wire is used |
 | Histogram Threshold | `analysis.histogram_threshold` | method `single/hysteresis/percentile/relative` × direction `below/above/between/outside`, morphology cleanup, area filters µm², optional `raw` | mask + Label raster + region table (2D) |
+| **Threshold Per Label** | `analysis.threshold_per_label` | method `otsu/li/yen/triangle/mean/percentile/relative` × direction `above/below`, `labels`, `min_pixels`, `sub_labels`+`connectivity`, `label_channel`/`signal_channel`, `name`/`sub_name`, optional `raw` | **Thresholds INSIDE each label separately** — every parent region derives its own level from its own pixel histogram, so a bright cell and a dim one are cut at different absolute levels and no single global cut can reproduce the result. Writes a 0/1 sub-mask, re-CCL'd **sub-objects with a `parent_id` join** (labelled one parent at a time, so two touching cells can never merge their sub-objects), and per-parent `level`/`n_above`/`frac_above`/`n_sub`. 2D vs 3D is **inherited** from the Label instance's own provenance, not levered. A region under `min_pixels` or with no spread is skipped and reported as **NaN**, never handed the frame's global level; `label_channel`+`signal_channel` express "cells segmented on ch0, signal in ch1", which `raw` cannot (it redirects the chain, not the channel) |
+| **Filter Labels** | `analysis.filter_labels` | method `otsu/li/yen/triangle/mean/fixed/percentile` × keep `above/below` × scope `plane/volume/series/dataset`, `labels`, `column`, `level`/`percentile`, `name` | **Keeps or drops whole labels** by cutting one per-label *column* — `mean_intensity`, `area`, `eccentricity`, `n_sub`, anything the table carries — with the cut derived from the population of label values (or given as a fixed level / percentile). Reads the table, never the pixels, so it filters whatever was measured upstream. Surviving **ids are preserved** with gaps, so a measurement or track made upstream still joins; the input layer stays on the wire. Every original column reaches the output plus `cut`. A non-finite value can neither set the cut nor survive it |
 | Spot Detection | `detect.spots` | `min/max_radius` µm (+ `_z`), method `log/dog`, polarity `bright/dark` | Point table; lever |
-| Particle Detection | `detect.particles` | `min_distance` µm, `threshold`, `min_intensity`, `min_size`, `subpixel`, mode `log/components` | Point table; lever |
+| Particle Detection | `detect.particles` | `min_distance` µm, `threshold`, `min_intensity`, `min_size`, `subpixel`, mode `log/components` | Point table; lever. `min_size` (voxels — area in 2D, volume in 3D) defaults to 4 and is the main defence against single-voxel shot noise; lower it toward 1 if small spots are being missed. See [§15.1](#151-particle-detection-on-a-noisy-stack). |
 | Extract Boundary | `analysis.extract_boundary` | `labels`, `name` | boundary Points (2D contours / 3D surface verts) |
 | Boundary Band | `analysis.boundary_band` | method `dilation/edt`, `band_voxels`, `band_um` µm, `include_neighbors` | outward band Label raster; **3D only** |
 | Cluster Points | `analysis.cluster_points` | method `gmm/kmeans`, `n_clusters`, `relax_pct`, `n_init` | per-point cluster-id column *(dep: scikit-learn)* |
@@ -1563,6 +1862,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Transfer Domain | `transform.transfer_domain` | `from_domain`, `to_domain`, `reducer`, `attr` | lattice ↔ lattice only |
 | **Transfer Structure** | `transform.transfer_structure` | From `voxel/label/point/track` → To `voxel/label/point/track/frame`, `attr`, `source_layer`, `target_layer`, `via_label` (voxel↔track only), reducer `mean/sum/count/max/min/median`, `name` | The structure counterpart to Transfer Domain: moves an attribute across the **detected-structure spine** — the four-domain spine fully connected (12 ordered pairs) plus the three structure→Frame reductions, **15 pairs**. This is the surface for transfers the engine's bridges could always run but no node exposed, so a graph that segmented, detected or tracked could not move a value between those domains at all. Only what can actually run is offered, so no menu entry raises: `voxel→frame` is redirected to Transfer Domain (it is a lattice reduce, and it carries the fusion reducers this node's group vocabulary lacks) and From == To is refused. A pair whose route reads the Label **raster** needs one; the pure table joins (label↔track, label→frame) do not, so a Label table that outlived its raster still transfers |
 | **Label → Points** | `transform.label_to_points` | `labels`, position `centroid/inside/weighted`, `name` (empty ⇒ `<labels>_points`), optional **`raw`** Dataset | every region → **one dot** at its centre, keeping a `label` column back to the region. `inside` snaps to the nearest region voxel so a C-shaped or annular object still gets a point *inside* it; `weighted` is the intensity-weighted centre of mass. **No lever** — 2D vs 3D is inherited from the Label instance's own provenance |
+| **Grow** | `transform.grow_points` | Grow `points/surface/scale/stamp`; Overlap `union/nearest/merge`; lever. Per branch: `points`, `radius` µm (+ `radius_z`), `radius_column` — or `labels`, `distance` µm (+ `distance_z`) / `scale`, `protect`; `name` | Grows seeds into measurable objects — a Voxel label raster **and** its Label table. **`points`** (the default, and the **inverse** of Label → Points) turns every dot into a disc (2D) or ellipsoid (3D) of a physical radius, so a point cloud becomes objects. The other three grow an **existing Label segmentation from its own shape**: **`surface`** dilates outward from each region's border by a µm distance, conserving the outline (concavities, holes and elongation all survive — every object grows the *same* distance); **`scale`** resamples that outline about its centroid by a factor, so growth is *proportional* to size and the population's size ordering is preserved exactly; **`stamp`** replaces the region with an ellipsoid at its centroid, discarding the outline. Overlap decides contested voxels: `union` (fixed-size stamps, lower source id keeps the overlap), `nearest` (a tessellation capped at the growth — nearest centre under `points`/`stamp`, nearest region *surface* under `surface`/`scale`) or `merge` (touching regions fuse into ONE, so the object count drops). `protect` (label branches) keeps growth out of a neighbour's interior, so every source region survives; off, a nearer or lower-id region can consume a smaller neighbour outright. Under `points` raster ids are **`point_id + 1`** — point tables are 0-based and 0 is the raster background — and the table joins back through `point_id`; the label branches mint ids globally unique and join through **`source_id`** (necessary, not cosmetic: under the 2D lever a z-connected region spans several planes, and passing its id through would put several rows under one `id`). Under `merge` there is no such column and `n_points`/`n_regions` is reported instead. `radius_column` gives each detection its own µm size (Measure can write one); a missing value falls back to the socket and is reported. A `radius`/`distance` the pixel size rounds below one voxel is refused, as is a non-positive `scale`, a raster carrying no Label table, and an all-background raster. **Why not Voronoi Cells:** `nearest` on points is voxel-for-voxel identical to `Bound = frame` + `Max reach`, but bounded by the stamps rather than the whole frame — measured **139×** faster (2071 ms → 15 ms, 2000 points at r=5 px on 2048²), and the gap widens as detections get sparser. Growth confined to a mask or one region per arena is *not* duplicated here: that is Voronoi Cells. **Why not Morphology or Boundary Band:** grey `dilate` moves every boundary in an *image* and knows nothing about objects (neighbours merge into one blob, no table comes out); Boundary Band grows a band and then *excludes* the interior, i.e. a shell around each object — the opposite output |
 | Rasterize Mesh | `transform.rasterize_mesh` | `mesh`, `smooth_um` µm, `min_voxels`, `fill_holes`, `name` | Mesh → filled Voxel Label + per-element table (concavity survives) |
 | Rasterize Field | `transform.rasterize_field` | method `linear/nearest`, `source`, `prefix` | Point field → full-res Voxel layers; **no lever** (dim inherited from the field) |
 
@@ -1579,6 +1879,45 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 `group.input` / `group.output` — the group interface markers. `flow.advance` — one step of an
 Iterate node's feedback search, minted by the rewrite between two iterations (never placed by
 hand, hidden from the palette).
+
+### 15.1 Particle detection on a noisy stack
+
+If Particle Detection returns thousands of hits, it is finding **shot noise**, not particles.
+On a real 51-plane 10x/0.45 bead stack (0.86 µm pixels, a 15 µm z-step) whose **11**
+particles are verifiable by eye, the node's automatic settings return **73 403** detections —
+which the overlay then draws as a solid wash. Two controls, and you generally need both:
+
+1. **`threshold`** — set it explicitly rather than leaving it at 0. `0` means auto-Otsu, and
+   Otsu assumes foreground and background are comparable fractions of the image, which a
+   sparse particle field is not: on that stack it put the cut at the 98.9th percentile and
+   admitted **1.2 % of every voxel** as foreground. Scattered over the volume that is 2.3
+   million voxels in 296 195 blobs, and 4 306 of them reach 50 voxels *by coincidence alone*
+   — chance clusters that no later size or intensity filter can tell from real particles.
+2. **`min_size`** (voxels — area in 2D, volume in 3D) — a noise spike is one voxel and a
+   particle is many. Default 4. Lower it toward 1 only if genuinely small spots are missed.
+
+Measured on that file, so you can calibrate: `min_size` 1 → 4 gives 41 212; 20 gives 14 960;
+**`threshold` 0.25 with `min_size` 20 gives 136**. Neither control alone is enough — the
+threshold is the one that matters most.
+
+Two structural limits worth knowing, because no setting works around them:
+
+* **`min_distance` sets two things at once** — the size of feature the filter looks for *and*
+  the suppression radius — so you cannot widen the filter without also merging neighbours.
+  Its automatic value is the diffraction limit, which on a low-magnification stack is
+  *smaller than one pixel*; the filter is then tuned to roughly single-pixel features, which
+  is precisely why it responds to shot noise.
+* **On the 3D lever the filter is isotropic in array indices, not in microns.** With a 15 µm
+  z-step against 0.86 µm pixels, the axial filter is ~17x wider physically than the lateral
+  one, and the suppression radius likewise treats one plane apart as "adjacent" when it is
+  15 µm. On a strongly anisotropic stack, prefer the **2D** lever and treat the planes
+  independently.
+
+Finally, a **3-D** run reports particles at the depth they sit at, so the Points overlay
+draws them on every plane (dimmed off-plane) and the status line always names the tally —
+see [§7 Which Z a point belongs to](#which-z-a-point-belongs-to). A 2-D run reports each
+particle once per plane it appears on, which is why the same stack gives more rows in 2-D
+than in 3-D.
 
 ---
 
@@ -1746,7 +2085,7 @@ Second_pass: enhance.clahe ─→ enhance.unsharp ─→ enhance.flatten_field (
 | Morphological Gradient | `enhance.morphological_gradient` | `rescale` on, `blend` 0.5 |
 | Background Subtract | `enhance.flatten_field` | method `subtract` |
 | Spatial Flatness | `enhance.flatten_field` | method `divide_mean` / `subtract_mean`, reference `per_plane` / `time_averaged` |
-| Local Contrast | `enhance.flatten_field` | method `ratio` |
+| Local Contrast | `enhance.flatten_field` | method `ratio` — then, for that plugin's fixed display window `clip((f/bg − 0.5)/1.5, 0, 1)`, follow it with `enhance.normalize` bounds `absolute`, `low_value` 0.5, `high_value` 2.0. It has to be `absolute`: 0.5 and 2.0 are positions on the ratio scale, and a percentile names a position in the distribution |
 | Bleach Correction | `enhance.temporal_gain` | reference `series_mean`, extent `global` |
 | Temporal Fold Correction | `enhance.temporal_gain` | reference `rolling_mean`, extent `global` / `tile` / `gaussian` |
 | Blob Subtract | `enhance.remove_blobs` | — |
@@ -1822,12 +2161,206 @@ Notes:
 
 ---
 
+## 17b. LabLink mode — serve the lab, or send work out
+
+[LabLink](https://github.com/McGheeLab/lablink) moves files between lab machines and runs
+workflows on them. Its **hub** holds heavy analysis software *warm*: a microscope PC opens a
+session, streams a file and a few knobs, and the second run after a knob change costs
+milliseconds instead of the whole pipeline. NodeLab plugs into both ends of that.
+
+Everything lives in `nodelab_v2/lablink/`. The **LabLink** dock (tabbed beside Properties
+and Spreadsheet) is the front end for both halves.
+
+### What a remote machine is allowed to ask for
+
+This is the whole security model, and it is worth reading before the setup:
+
+* A node names a **recipe** — a hub-owned pair of files, curated by the operator who owns
+  the machine — and sets only the **knobs** that recipe whitelists, inside the ranges it
+  declares. It can never supply a command, a path, an argument or a graph.
+* **The token is anti-misdirection, not security.** LabLink traffic is plain HTTP. The token
+  stops you sending into the wrong machine on a shared subnet and does nothing else. Do not
+  put sensitive data through the link; if it must be private, put it on Tailscale or a
+  private hotspot — a transport decision, not something this mode can make for you.
+
+### Half 1: serving — this machine as the lab's analysis engine
+
+The worker is a headless, Qt-free process the hub spawns, one per session, speaking LWP/1
+(newline-delimited JSON on stdin/stdout). Check this machine can serve at all:
+
+```powershell
+python nd2studios_worker.py --print-hello
+```
+
+You should get one JSON line naming the worker, the software version, the graph format it
+reads, and a census of the optional dependencies (`stardist`, `cellsam`, `numba`, …) that a
+recipe may require. The **Serving** tab's *Run readiness check* button does exactly this and
+formats the answer.
+
+Then, on the machine that will be the hub (LabLink's own checkout, standard library only):
+
+```powershell
+python -m lablink hub --make-config hub.json
+```
+
+The starter config already contains an `nd2studios` workflow stub. Point its `command` at
+this checkout and enable it:
+
+```json
+{
+  "name": "nd2studios",
+  "title": "ND2 Studios V2",
+  "command": ["C:/path/to/python.exe",
+              "C:/path/to/ND2StudiosBlender/nd2studios_worker.py",
+              "--session", "{session}"],
+  "recipes_dir": "C:/path/to/ND2StudiosBlender/lablink_recipes/nd2studios",
+  "workdir": "C:/path/to/ND2StudiosBlender",
+  "max_sessions": 1,
+  "limits": {"memo_bytes": "2GiB", "cache_bytes": "2GiB", "silence_timeout_s": 300}
+}
+```
+
+Name an **absolute interpreter path**: the hub runs the command with no shell and will not
+find a virtualenv for you. Then prove it end to end — this spawns the worker, reads its
+handshake, and runs one real session with artifacts and teardown:
+
+```powershell
+python -m lablink hub doctor --config hub.json --root lablink_data
+python -m lablink hub serve  --config hub.json --root lablink_data
+```
+
+If `doctor` is green, a node's first call will work. With a hub running on this machine, the
+**Serving** tab shows its uptime, session count, free disk and every live and recent
+session, read from LabLink's own read-only console API. It cannot see *inside* a
+hub-spawned worker — those are the hub's processes, not the editor's — so it reads the one
+authoritative source instead of guessing.
+
+**Two memory limits are required per workflow, on purpose**: `memo_bytes` and
+`cache_bytes`. A warm instance with no ceiling is a leak. They map straight onto
+`Engine(memo_bytes=…, cache_bytes=…)`, and both survive across commands in a session —
+which is the entire point of a hub. Measured on the shipped self-test recipe: 0.31 s cold,
+**0.03 s** for an identical re-run (every node a memo hit), and 0.25 s after one knob
+change (three of five nodes recomputed, the loader and channel select still cached).
+
+### Recipes
+
+A recipe is two hub-owned files in one directory:
+
+```
+<recipes_dir>/<name>/recipe.json          the manifest — knobs, inputs, outputs
+<recipes_dir>/<name>/graph.nd2graph.json  the pipeline — exactly what NodeLab saves
+```
+
+The graph is a plain `*.nd2graph.json`, read by the same `nodegraph.serialize` the editor
+writes, so **authoring a recipe starts by building the graph in NodeLab and saving it.**
+`lablink_recipes/nd2studios/selftest-synthetic/` is a worked example: five nodes, eight
+knobs, four outputs, and an empty `io.load` path so it runs against the synthetic demo
+source with no data files at all.
+
+Validation happens in two tiers, and the split matters when you are debugging a refusal:
+
+* **Tier 1, on the hub** (`--check-config`) — everything checkable from the manifest and
+  the graph JSON alone. No third-party imports, so it runs on an instrument PC.
+* **Tier 2, in this worker, at `open`** — the four things that need the node catalogue, and
+  therefore numpy: each knob's socket exists on its node and its **unit matches the
+  socket's own**; each mode knob's values are real choices of that node; **every node with
+  a 2D/3D lever sets it explicitly** (a graph that does not would run 2D on a z-stack,
+  silently); and each output kind is one the worker can produce. A failure is a
+  `bad_recipe` naming the node and the fix.
+
+Writing a knob, three rules that are easy to get wrong:
+
+| In `recipe.json` | Means |
+|---|---|
+| `"kind": "param"` | writes the node's **params** (a socket) |
+| `"kind": "mode"` | writes the node's **modes** (a dropdown) — the wrong one is a silent no-op |
+| `"unit": "um"` | must equal the socket's declared unit, or the number silently means something else |
+| `"unset_means": "derive"` | leave it out and the value is derived from **the file's own calibration**. Do not also pin it in the graph — the hub refuses that combination, because as written the recipe would ignore the microscope and nothing would report it |
+
+`path`, `model_path`, `__locked__`, `__title__` and `__channels__` may never be knobs.
+The first two would let a remote machine choose which file the hub opens; the dunders are
+editor bookkeeping that would change the cache key without changing the result.
+
+### Half 2: sending work out — this machine as a node
+
+The **Send work** tab: enter a hub URL and token, press *Connect*, and it lists the recipes
+that hub's operator offers (plus, deliberately, any that **failed** validation on the hub —
+"the recipe I was told to use is not in the list" is otherwise unanswerable from this side).
+Pick one and its knobs appear with their real bounds, units and defaults. Every dropdown's
+first row is `— recipe default: … —` or `— derived from the file —`: leaving it there sends
+nothing for that knob, which is what you want unless you mean to override the operator's
+choice or the microscope's own calibration.
+
+The same thing in a script:
+
+```python
+from nodelab_v2.lablink.client import HubClient
+
+hub = HubClient("http://10.0.0.5:8765", token="…")     # node_id="scope-a" once enrolled
+with hub.open_session("nd2studios", "selftest-synthetic",
+                      knobs={"background_um": 6.0}) as s:
+    ref = s.send_data(r"D:\scans\2026-08-03 A1 (well 3) 60x.nd2")
+    for level in ("otsu", "li", "yen"):
+        r = s.run(inputs=[ref], knobs={"level": level}, cmd_id=f"a1-{level}",
+                  on_progress=lambda p: print(p.text), check=False)
+        print(r.state, r.duration_s, r.cached_steps, "step(s) cached")
+    s.pull()                                  # anything the recipe held back
+    for path in s.fetch_all("inbox"):
+        print("got", path)
+# the session is closed here, including if the block raised
+```
+
+Notes on the client, each of which is a rule the protocol enforces:
+
+* **Closing is not optional**, hence the context manager. A session holds a running program
+  and often one of very few slots; to the next machine that asks, a hub with no free slots
+  is indistinguishable from a broken one.
+* Uploads **stream** from the file handle and downloads **resume** with `Range` into a
+  `.partial`, checksum-verified before being moved into place — this link carries
+  multi-gigabyte stacks.
+* Filenames are repaired for the exchange's name rules (`A1 (well 3).nd2` →
+  `A1 _well 3_.nd2`) with the original recorded, and results are fetched by `returned_as`.
+* Knob bounds are checked **locally first**, so a bad value is instant instead of a wasted
+  run.
+* **A failed command does not end the session.** "The threshold found no objects" is a
+  scientific result; the warm software is still there, so change a knob and run again. Only
+  `SessionLost` means the instance — and its cache — is gone.
+* `503` (hub full) is retried with backoff; `409 busy` is not; a `410` id is never retried.
+
+### Cancelling, and what it actually guarantees
+
+Cancellation is **cooperative at node boundaries**, and the worker advertises exactly that
+rather than claiming more. The engine has no cancellation point *inside* a compute — one
+CNN inference or one upstream solver simply runs to completion — so a cancel takes effect at
+the next node that has not started. A single long node will therefore be terminated by the
+hub's escalation ladder (cancel → grace → SIGTERM → SIGKILL), and losing the warm cache is
+the correct outcome there.
+
+Long runs stay alive through the hub's **silence timeout** because the worker emits a `beat`
+every few seconds and a `progress` line during the one-time ingest. That timeout is what
+kills a wedged worker without killing a legitimately 40-minute segmentation, which is why
+per-node progress is load-bearing rather than cosmetic.
+
+### Verifying the whole thing
+
+```powershell
+python -m nodegraph.selftest              # includes test_lablink (offline, no hub needed)
+python -m lablink hub doctor --config hub.json --root lablink_data
+python tools_stress.py --url http://<hub>:8765 --token <token>    # LabLink's own suite
+```
+
+`test_lablink` is the one that catches drift over time: it re-validates the shipped recipe
+against the live node catalog, so a rename or a unit change in a node breaks the test rather
+than a session six weeks later.
+
+---
+
 ## 18. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | "install scikit-learn / al-dic / stardist / numba" | that node is dependency-gated; install the extra from [§1](#1-install--launch) |
-| A node shows a **red domain chip** | it requires a domain nothing upstream produced (e.g. Measure needs `LABEL` — add Connected Components) |
+| A node shows a **red domain chip** | it requires a domain nothing upstream produced (e.g. Measure on `Members = label` needs `LABEL` — add Connected Components; on `Members = point` it needs `PT`, from Spot / Particle Detection or Label to Points) |
 | The **3D switch is greyed out** | the incoming `z` is known to be 1. Z-project or a `z==1` file will do that. If a Z-Project upstream is the cause, set its method to **`none`** — the stack (and the 3D switch) come back without deleting the node or rewiring |
 | Red validation badge on a card | the graph is locked to 3D but `z == 1` |
 | A **mask vanished** after Crop/Resample/Z-Project | the layer catalog is not monotone: an axis change drops lattice layers whose shape no longer matches. Re-derive the mask after the geometry change |
@@ -1835,6 +2368,7 @@ Notes:
 | Raw-input geometry error on Measure | the optional `raw` Dataset must match voxel-for-voxel; both shapes are named in the message |
 | A node finishes instantly with a full bar | it returned a lazy provider; the real cost lands on whichever node reads planes |
 | **CellSAM is very slow** (tens of minutes on a big/stitched image) | upstream calls the SAM mask decoder **once per detected cell**, so a 24 GB GPU sits idle on launch overhead. Turn on the CellSAM **`fast`** socket: batched decoder + GPU mask upsample, measured **5.2×** (a 1024² block of 441 cells goes 11.6 s → 2.25 s; a 26-minute stitched mosaic → ~5 min). It is **not bit-identical** — 11 of 441 cells shifted by exactly 1 px, none gained or lost — so leave it off to reproduce a published number. Also check `analysis.segment` is on CUDA (`NODELAB_CELLSAM_DEVICE`), and put a **Dock** after it so tuning downstream nodes does not re-run it |
+| **A computed node's contrast slider spans a different range from the raw source** | fixed 2026-08-04. Every streaming provider computes in float64, so a Stitch or a Gaussian reaches the Viewer as floats although its values are still the same integer counts; the LUT extent used to key on that dtype and gave the node its DATA range (e.g. 135-1564) where the raw source got the SENSOR range (0-4095). It now follows the payload's `bit_depth` declaration, which this project already drops when a node genuinely leaves the count scale — so Normalize/CLAHE still get their own `[0,1]` range. The rendered image was never affected, only the slider/histogram extent |
 | **A stitched mosaic looks lower-resolution than the tiles when zoomed OUT** | expected, and only on screen — the pulled data, every measurement and every export are full-resolution. The whole-image overview is decimated once to `MAX_DISPLAY_DIM` (4096 px, `NODELAB_MAX_DISPLAY_DIM`), so a 13106² mosaic previews at 3276². **Zoom in and it sharpens**: the visible rect is re-read at full detail ~0.1 s after the wheel/drag settles (§8c). If it stays soft after zooming, the detail read is failing — check the status line |
 | **Stitch scrubs slowly**, as if each frame loads on the spot | a stitched canvas is far bigger than a source plane, so the Viewer serves it from the source's pyramid. Put **Stitch early** — directly after the load, before any enhancement. Most computed intermediates have no pyramid, so a stitch downstream of one must build the full-resolution canvas for every frame (measured 0.9 s/frame `overwrite`, 2.9 s `feather` at 49×2048², versus 0.09/0.22 s straight off the load). `overwrite` is also ~2.5× cheaper than `feather` if you are only previewing. **Z-Project and Stack are the exceptions** (V2.20): an axis reduce forwards the pyramid, so `load → Z-Project → Stitch` keeps its coarse levels and scrubs |
 | **Which order — Stitch→Z-Project, or Z-Project→Stitch?** | Both stream at the ideal cost (every source voxel read once) and both keep the pyramid, so this is a question about the *numbers*, not speed. With blend `overwrite` or `max` the two are **bit-identical**, always. With `feather`/`mean` they agree exactly as long as overlapping tiles differ only by a **z-independent** factor — vignetting, exposure, gain all cancel — and diverge when they disagree *as a function of z*: measured on a ±0.45-z-step per-tile focus offset, 8% of overlap pixels differ (peak 3% of range); on 5% independent per-tile noise, 41% differ (peak 1.6%). The direction is fixed by convexity — `Z-Project(Stitch) ≤ Stitch(Z-Project)` — so projecting **last** averages the tiles before taking the max and suppresses independent noise in the seams, while projecting **first** takes each tile's best focus and then averages, which is brighter there. Outside the overlaps they are identical either way. Prefer **Stitch → Z-Project** unless you specifically want per-tile best-focus |
@@ -1853,6 +2387,14 @@ Notes:
 | Numbers shifted in the last ~7 digits after a config change | `NODEGRAPH_FLOAT32=1` is set; it is a genuinely different (single-precision) computation, not just a faster one |
 | `serialtrack` seems hung | it is 1–2 orders of magnitude slower than the other linkers (≈8–18 s on 1k–15k detections) |
 | An old `.nd2s_pipeline.json` will not open | that is the retired first-generation format; it is not supported and no importer exists |
+| **LabLink**: a session fails to open with `open_timeout` / `worker_exited` | the hub could not start the worker. Its `detail` carries our stderr — usually a missing dependency or the wrong interpreter. Check the workflow's `command` names an **absolute** python path (the hub runs it with no shell and will not find a virtualenv), then `python nd2studios_worker.py --print-hello` on that machine |
+| **LabLink**: `bad_recipe` naming a node and a socket | tier-2 validation refused it. The message says which of the four it is: a knob's socket does not exist, its `unit` disagrees with the socket's, a mode value is not a real choice, or an output kind we cannot produce. Fix the manifest — the hub's `--check-config` cannot catch these, which is why it says so |
+| **LabLink**: `bad_recipe` about a 2D/3D lever | a node with a `dim` lever does not set it. Left unset it runs the default on whatever arrives, so a z-stack would be processed plane by plane and look plausible. Set `modes.dim` in the graph |
+| **LabLink**: a knob appears to do nothing | almost always `kind` — `"param"` writes the node's params and `"mode"` writes its modes, they are read from different places, and the wrong one is a silent no-op |
+| **LabLink**: a session dies mid-run with `silence_timeout` | the worker emitted nothing for the recipe's `silence_timeout_s`. Ours beats every few seconds, so this means a single node genuinely blocked longer than the limit — raise `limits.silence_timeout_s` for that workflow rather than lowering it, and consider a Dock before the expensive node |
+| **LabLink**: a cancel did not stop anything | cancellation is cooperative **at node boundaries** — the engine has no cancellation point inside a compute. A long single node runs to completion or is killed by the hub's ladder; there is no third option, and the worker advertises exactly that |
+| **LabLink**: every long poll looks like a dead hub | a client socket timeout at or below the hub's `longpoll_max_s` (25 s) trips on its own successful waits. `HubClient` clamps above it; a hand-rolled client must too |
+| **LabLink**: a result never arrives although the run said `done` | it was declared `policy: "pull"` and is held on the hub on purpose (a 3 GB label volume should not cross the network by default). Call `pull()`, then fetch by `returned_as` |
 
 ---
 
@@ -1863,7 +2405,14 @@ PYTHONUTF8=1 python -m nodegraph.selftest                        # headless core
 PYTHONUTF8=1 python scripts/_nodelab_v2_phase5_probe.py out.png  # driven GUI probe
 PYTHONUTF8=1 python scripts/_hotreload_probe.py                  # live per-node reload (§12d)
 PYTHONUTF8=1 python scripts/_catalog_snapshot.py check           # the catalog is unchanged
+python nd2studios_worker.py --print-hello                        # LabLink mode is servable
 ```
+
+The `--print-hello` line is the cheapest check that this machine could serve LabLink at all:
+one JSON handshake naming the worker, the graph format and every optional dependency. The
+protocol's own gate is `test_lablink` inside the self-test above (offline, no hub needed);
+proving it against a real hub is `python -m lablink hub doctor`, which spawns the worker and
+runs one whole session — see [§17b](#17b-lablink-mode--serve-the-lab-or-send-work-out).
 
 The first three must end in `ALL NODEGRAPH SELF-TESTS PASSED` / `ALL PHASE-5 GUI PROBES
 PASSED` / `All live per-node reload probes passed.`; the fourth in `CATALOG IDENTICAL`.

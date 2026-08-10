@@ -14,36 +14,16 @@ from nodegraph.registry import DimMode, Granularity, InDataset, InFloat, InInt, 
 from nodegraph.streaming import MapComputeProvider, VolumeComputeProvider, stream_fp
 
 from nodegraph.catalog._base import register_node
-
 # ── metadata-intelligent PSF (the directive A showcase) ───────────────────────
+#
+# `diffraction_sigmas` and `gaussian_psf` MOVED to `_shared/psf.py` when
+# `enhance.zs_deconvnet` became a second consumer of the same derivation: catalog rule 5
+# forbids one node module from importing another, so a helper two nodes need cannot stay in
+# either of them. Re-imported here (not re-implemented) so this node's compute and its
+# `_rl_gaussian` docstrings still refer to exactly one definition, and so
+# `nodegraph.nodes`' public re-export keeps working.
+from nodegraph.catalog._shared.psf import diffraction_sigmas, gaussian_psf
 
-def diffraction_sigmas(emission_nm: Optional[float], na: Optional[float],
-                       pixel_size_um: Optional[float], z_step_um: Optional[float],
-                       is_3d: bool) -> Tuple[float, ...]:
-    """Gaussian-approximation PSF sigmas **derived from optics metadata**: lateral
-    ``σ_xy ≈ 0.21·λ/NA`` and axial ``σ_z ≈ 0.66·λ·n/NA²`` (n≈1.5 immersion), converted
-    to pixels via ``pixel_size_um`` / ``z_step_um``. Returns ``(σ_y,σ_x)`` in 2D or
-    ``(σ_z,σ_y,σ_x)`` in 3D. (A Gaussian PSF is the portable default; a Gibson–Lanni /
-    measured PSF is a backend swap behind the same derived sampling.)"""
-    lam_um = (emission_nm or 520.0) / 1000.0
-    na = na or 1.4
-    sxy_um = 0.21 * lam_um / na
-    sxy = sxy_um / (pixel_size_um or 0.1)
-    if not is_3d:
-        return (sxy, sxy)
-    sz_um = 0.66 * lam_um * 1.5 / (na * na)
-    sz = sz_um / (z_step_um or 0.5)
-    return (sz, sxy, sxy)
-def gaussian_psf(sigmas: Sequence[float], *, radius_factor: float = 3.0) -> np.ndarray:
-    """A normalized n-D Gaussian kernel with the given per-axis ``sigmas`` (pixels)."""
-    sig = tuple(max(0.5, float(s)) for s in sigmas)
-    radii = [max(1, int(round(radius_factor * s))) for s in sig]
-    grids = np.meshgrid(*[np.arange(-r, r + 1) for r in radii], indexing="ij")
-    g = np.ones_like(grids[0], dtype=float)
-    for coord, s in zip(grids, sig):
-        g = g * np.exp(-(coord.astype(float) ** 2) / (2.0 * s * s))
-    total = g.sum()
-    return g / total if total else g
 # ── Deconvolve (the two-mode metadata-intelligent PSF flagship) ───────────────
 
 def _rl(image: np.ndarray, psf: np.ndarray, iters: int) -> np.ndarray:

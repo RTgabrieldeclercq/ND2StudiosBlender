@@ -92,6 +92,25 @@ MODULES: Tuple[str, ...] = (
     "registration.align_to",
     "view.overlay",
     "transform.rigid",
+    # Appended, not slotted in beside `transform.label_to_points` whose inverse it is: this
+    # list's order is what the link-drag search menu enumerates, so inserting mid-list would
+    # shift every node after it and re-key nothing usefully. Last is also where
+    # `module_order()` would put it on its own.
+    "transform.grow_points",
+    # Appended for the same reason (see above), not slotted beside `channel.split`/`select`.
+    "channel.merge",
+    # Appended for the same reason, not slotted beside `enhance.deconvolve` whose learned
+    # counterpart it is: the two share the PSF derivation but nothing else, and moving
+    # `enhance.deconvolve` off position 4 would shift every node after it in the link-drag
+    # search menu for no gain.
+    "enhance.zs_deconvnet",
+    # Appended for the same reason, not slotted beside the other `analysis.threshold*` nodes:
+    # this list's order is the link-drag search menu's order, so inserting mid-list shifts
+    # every node after it and re-keys nothing useful. The two are each other's natural
+    # companions — one thresholds inside each label, the other cuts on a per-label column —
+    # so they go in together, in that order.
+    "analysis.threshold_per_label",
+    "analysis.filter_labels",
 )
 
 

@@ -257,7 +257,17 @@ def _compute_object_field(ctx: EvalContext) -> Dataset:
 register_node(
     _compute_object_field, op_key="analysis.object_field", label="Object Field",
     category="analysis",
-    reads_domains=frozenset({Domain.LABEL, Domain.POINT}),
+    # ONE of the two, never both — `_object_table` reads the Label table under
+    # `target=label` and the Point table under `target=point`. The shipped static union
+    # was the opposite failure to the empty declaration elsewhere: it demanded Points of a
+    # pure-Label graph and painted a red chip on a pipeline that was fine (V2.22). VOXEL
+    # rides along on the label branch because the `labels` socket is `layer_in=VOXEL` —
+    # what it names is a Label INSTANCE, and the picker has no names to offer without it.
+    reads_domains=frozenset(),
+    reads_domains_by_mode={"target": {
+        "label": frozenset({Domain.LABEL, Domain.VOXEL}),
+        "point": frozenset({Domain.POINT}),
+    }},
     adds_domains=frozenset({Domain.POINT}),
     inputs=[
         InDataset(),

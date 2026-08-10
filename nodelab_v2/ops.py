@@ -61,9 +61,19 @@ BAKE_KEY = "__bake__"
 #: ends up spelled differently.
 LOAD_OP = "io.load"
 
-#: the two dock states. ``live`` = an identity pass-through (the chain runs normally);
-#: ``docked`` = the upstream in-edge is cut and the node serves its checkpoint instead.
-DOCK_LIVE, DOCK_DOCKED = "live", "docked"
+#: the three dock states. ``live`` = an identity pass-through (the chain runs normally);
+#: ``held`` = the computed payload is pinned in memory as an engine seed and the in-edge is
+#: cut; ``docked`` = the in-edge is cut and the node serves its on-disk checkpoint instead.
+#:
+#: ``live`` stays FIRST because :func:`dock_state_of` falls back to the spec's first choice
+#: for an unset mode, and every saved graph written before ``held`` existed relies on that.
+DOCK_LIVE, DOCK_HELD, DOCK_DOCKED = "live", "held", "docked"
+
+#: the states in which the upstream edge is CUT — the predicate every graph rewrite wants.
+#: Deliberately not the same question as :func:`is_docked` ("does this serve a disk store"):
+#: conflating the two is how a new frozen state silently keeps evaluating the chain it was
+#: supposed to freeze.
+DOCK_FROZEN = (DOCK_HELD, DOCK_DOCKED)
 
 #: the ``precision`` mode's "not chosen yet" value. There is deliberately no default
 #: precision: the right answer depends on what the chain upstream produced (a filter
@@ -123,26 +133,44 @@ def ensure_ops() -> None:
             ],
             outputs=[OutDataset("out")],
             modes=[
-                Mode("state", [DOCK_LIVE, DOCK_DOCKED], label="State",
+                Mode("state", [DOCK_LIVE, DOCK_HELD, DOCK_DOCKED], label="State",
                      description=
-                     "Whether the chain upstream is being EVALUATED or replaced by the "
-                     "checkpoint on disk. Flipping it does not bake anything and does not "
-                     "delete anything — the bake is a separate action, and this switch only "
-                     "chooses which of the two sources the graph reads.",
+                     "Whether the chain upstream is being EVALUATED, or replaced by a frozen "
+                     "copy of what it last produced. Flipping it does not bake anything and "
+                     "does not delete anything — the bake is a separate action, and this "
+                     "switch only chooses which source the graph reads.",
                      choice_docs={
                          DOCK_LIVE:
                              "Pass through: the upstream chain runs normally on every pull, so "
                              "edits above take effect immediately. The state to be in while you "
                              "are still tuning, and the only one in which the nodes behind this "
                              "one are live.",
+                         DOCK_HELD:
+                             "Freeze what the chain last produced IN MEMORY and cut the edge — "
+                             "no disk write, so it is effectively instant and costs no disk. "
+                             "The state for quick troubleshooting: freeze a stitch or a merge "
+                             "once, then tune everything downstream against it without paying "
+                             "for it again. Three honest limits, all of which `docked` fixes: "
+                             "it does NOT free memory (the payload is still held, it just stops "
+                             "being recomputed), it is NOT counted against any cache budget, "
+                             "and it does NOT survive closing the file — reopen and the node "
+                             "reports 'released' and asks you to hold it again.",
                          DOCK_DOCKED:
-                             "Cut the upstream edge and serve the baked checkpoint instead. The "
-                             "nodes behind grey out and stop costing memory and runtime, and "
-                             "full-size rasters are memory-mapped rather than loaded. If "
-                             "something upstream changed since the bake, the dock says so "
-                             "instead of quietly serving stale data.",
+                             "Cut the upstream edge and serve the baked checkpoint on disk "
+                             "instead. Slower to enter than `held` because it writes the whole "
+                             "series out once, and the only state that actually FREES memory "
+                             "(full-size rasters come back memory-mapped) and that survives "
+                             "saving and reopening the graph. If something upstream changed "
+                             "since the bake, the dock says so instead of quietly serving "
+                             "stale data.",
                      }),
                 Mode("precision", [PRECISION_UNSET, *PRECISIONS], label="Precision",
+                     # Gated to `docked`: a held dock writes nothing, so there is no stored
+                     # dtype for this to choose. Leaving it live in `held` would be a control
+                     # the kernel ignores — clause 2 of the socket contract, one level up.
+                     # Gating is EDIT-TIME only, so the Bake action's own PRECISION_UNSET
+                     # refusal still stands and must (the compute still resolves the value).
+                     available_in={"state": frozenset({DOCK_DOCKED})},
                      description=
                      "What dtype FLOATING-POINT data is stored at in the bake. Integer rasters, "
                      "label ids and masks always store as themselves, so this only affects "
@@ -206,7 +234,21 @@ def dock_state_of(rec: Any) -> str:
 
 
 def is_docked(rec: Any) -> bool:
+    """True for a dock serving its ON-DISK checkpoint. The disk-specific question: it gates
+    the store path, the manifest read, the precision check and the bake record."""
     return dock_state_of(rec) == DOCK_DOCKED
+
+
+def is_frozen(rec: Any) -> bool:
+    """True for a dock whose upstream edge is CUT — ``held`` or ``docked``.
+
+    The graph question, and the one every rewrite wants: :func:`cut_docked_inputs`,
+    :func:`dormant_nodes` and :func:`upstream_signature` care only that the chain behind
+    this node is out of play, not about where the frozen bytes live. Keeping it separate
+    from :func:`is_docked` is what stops a `held` dock from being cut-but-still-evaluated
+    (or evaluated-but-not-cut, which is worse: the seed would be ignored and the chain the
+    user froze would run anyway)."""
+    return dock_state_of(rec) in DOCK_FROZEN
 
 
 def dock_store_of(rec: Any) -> str:
@@ -256,8 +298,30 @@ def _compute_dock(ctx: EvalContext):
     the fix. They matter because the alternative — quietly falling back to the live input —
     would recompute the entire chain the user docked precisely to avoid, and look like a
     mysterious hang rather than a missing file."""
-    if dock_state_of(_Rec(ctx.op_key, ctx.params)) != DOCK_DOCKED:
+    state = dock_state_of(_Rec(ctx.op_key, ctx.params))
+    if state == DOCK_LIVE:
         return ctx.inputs[0]
+    if state == DOCK_HELD:
+        # The held payload arrives as this node's SEED (`ctx.seed`) — the engine's compute
+        # branch wins over its seed branch, so a node with both has to read it explicitly.
+        # Returned as-is, no copy: entering the tier costing nothing is the entire point,
+        # and a memoized payload is immutable by the same convention every other one is.
+        seed = ctx.seed
+        if (getattr(seed, "image", None) is not None
+                or getattr(seed, "attributes", None)):
+            return seed
+        # An empty seed means the hold was RELEASED (a reload, a restart, a crash). Refuse
+        # with the fix rather than falling through to `ctx.inputs[0]`: that would put the
+        # whole frozen chain back into every pull — a multi-minute stall wearing the costume
+        # of a cache hit.
+        held_in = ctx.inputs[0] if ctx.inputs else None
+        raise ValueError(
+            "this Dock node is set to 'held' but nothing is being held any more.\n"
+            "A hold lives in memory, so it does not survive reopening the file (or a "
+            "restart, or a crash). Press Hold to freeze the chain again — or switch State "
+            "to 'docked' and Bake, which writes it to disk and does survive."
+            + ("" if held_in is None else
+               "\nThe chain above is still wired, so holding it again is one click."))
     store = str(ctx.params.get("store", "") or "").strip().strip('"').strip("'").strip()
     if not store:
         raise ValueError(
@@ -281,8 +345,20 @@ def _compute_dock(ctx: EvalContext):
 
 
 def docked_nodes(graph: Graph) -> Tuple[str, ...]:
-    """Every docked ``io.dock`` node id in ``graph``, sorted."""
-    return tuple(sorted(nid for nid, n in graph.nodes.items() if is_docked(n)))
+    """Every FROZEN ``io.dock`` node id in ``graph``, sorted — ``held`` and ``docked`` alike.
+
+    Named for the disk state for compatibility (it is the seed/rewrite roster every caller
+    already passes around), but the predicate is :func:`is_frozen`: a held dock is a graph
+    root exactly as a docked one is, and must appear in the seed map, the cut and the
+    dormancy walk for the same reasons."""
+    return tuple(sorted(nid for nid, n in graph.nodes.items() if is_frozen(n)))
+
+
+def held_nodes(graph: Graph) -> Tuple[str, ...]:
+    """Every ``held`` dock node id, sorted — the ones whose payload must come from the
+    runner's in-memory registry rather than from a store on disk."""
+    return tuple(sorted(nid for nid, n in graph.nodes.items()
+                        if dock_state_of(n) == DOCK_HELD))
 
 
 def cut_docked_inputs(graph: Graph) -> Graph:
@@ -320,7 +396,7 @@ def prepare_run_graph(graph: Graph) -> Graph:
     return materialize_channel_taps(cut_docked_inputs(graph))
 
 
-def dock_seeds(graph: Graph) -> Dict[str, Any]:
+def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """A seed :class:`~nodegraph.dataset.Dataset` per docked node, for ``Engine(seeds=…)``.
 
     Two jobs, both required. It makes the engine treat a docked node as a **source**, so
@@ -333,10 +409,24 @@ def dock_seeds(graph: Graph) -> Dict[str, Any]:
 
     A dock whose checkpoint cannot be opened still gets a seed — an empty Dataset — so the
     engine reaches the compute, which raises the specific "your bake is missing" message
-    instead of the engine's generic "this input is not wired"."""
+    instead of the engine's generic "this input is not wired".
+
+    ``held`` maps node id → an already-computed Dataset the caller is pinning in memory (the
+    runner's hold registry). A ``held`` dock is seeded straight from it, with **no copy**:
+    the whole point of the tier is that entering it costs nothing, and the payload is
+    immutable by the same convention every memoized payload relies on. That is also why a
+    seed is the right slot for it rather than the memo — ``Memo._evict_to_budget`` drops
+    entries on recency alone, and evicting a payload whose upstream edge has been cut would
+    not cost a recompute, it would lose the data."""
     from nodegraph.dataset import Dataset
+    held = dict(held or {})
     out: Dict[str, Any] = {}
     for nid in docked_nodes(graph):
+        if dock_state_of(graph.nodes[nid]) == DOCK_HELD:
+            # A released hold (nothing in the registry) falls through to an empty Dataset,
+            # exactly as a missing checkpoint does, so the compute owns the message.
+            out[nid] = held.get(nid) if isinstance(held.get(nid), Dataset) else Dataset()
+            continue
         store = dock_store_of(graph.nodes[nid])
         try:
             out[nid] = open_checkpoint(store)
@@ -372,8 +462,12 @@ def upstream_signature(graph: Graph, node_id: str) -> str:
         if nid in seen or nid not in graph.nodes:
             continue
         seen.add(nid)
-        if is_docked(graph.nodes[nid]):
-            continue                      # its own bake id stands in for its whole chain
+        if is_frozen(graph.nodes[nid]):
+            # Its own frozen payload stands in for its whole chain. FROZEN, not just
+            # docked: the walk must stop wherever the run graph stops, and a held dock
+            # cuts its edge too — otherwise an edit above a held dock would mark this one
+            # stale over a change nobody downstream can see.
+            continue
         stack.extend(e.src for e in graph.preds(nid))
     parts = []
     for nid in sorted(seen):
@@ -387,20 +481,39 @@ def upstream_signature(graph: Graph, node_id: str) -> str:
 
 
 def dock_status(graph: Graph, node_id: str, *,
-                store: Optional[str] = None) -> Tuple[str, str]:
+                store: Optional[str] = None,
+                held: Any = ()) -> Tuple[str, str]:
     """``(status, detail)`` for a dock, for the card badge and the inspector.
 
-    ``status`` is one of ``"live"`` (pass-through), ``"unbaked"`` (docked but there is no
-    checkpoint to serve — an error state), ``"stale"`` (serving a good bake that no longer
-    matches the graph) or ``"docked"`` (serving, and current). ``detail`` is the
-    user-facing reason, empty when there is nothing to say.
+    ``status`` is one of ``"live"`` (pass-through), ``"held"`` (serving a payload pinned in
+    memory), ``"released"`` (set to ``held`` but the pinned payload is gone — the reload
+    case), ``"unbaked"`` (docked but there is no checkpoint to serve), ``"stale"`` (serving
+    a good bake that no longer matches the graph) or ``"docked"`` (serving, and current).
+    ``detail`` is the user-facing reason, empty when there is nothing to say.
 
     ``store`` overrides the node's own (possibly graph-relative) folder param — the
-    document passes the path resolved against the saved file, which only it knows."""
+    document passes the path resolved against the saved file, which only it knows.
+    ``held`` is the set of node ids the runner currently has a pinned payload for; a ``held``
+    dock outside it reports ``released``.
+
+    **A released hold is reported, never repaired.** Not auto-re-held (that would silently
+    re-run the chain the user froze precisely to avoid, on file open, with no progress bar
+    they asked for) and never silently downgraded to ``live`` (which would look like it
+    worked and quietly put a multi-minute chain back in every pull). Cell-Tracker ships the
+    silent version of exactly this — its baseline is never serialized, so after a reload the
+    page renders empty with no message while downstream pages still look loaded — and an
+    undiagnosable dead panel is worse than a red badge that names the fix."""
     node = graph.nodes.get(node_id)
     if node is None or getattr(node, "op_key", "") != DOCK_OP:
         return ("", "")
-    if not is_docked(node):
+    state = dock_state_of(node)
+    if state == DOCK_HELD:
+        if node_id in set(held or ()):
+            return (DOCK_HELD, "")
+        return ("released", "this node was holding its result in memory, and memory does "
+                            "not survive reopening the file — press Hold to freeze it "
+                            "again, or Bake to write it to disk so it survives next time")
+    if state != DOCK_DOCKED:
         return (DOCK_LIVE, "")
     store = dock_store_of(node) if store is None else store
     try:
@@ -558,6 +671,6 @@ def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
 __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",
-           "dock_store_of", "bake_record", "is_docked",
-           "CH_SOCKET_RE", "DOCK_OP", "BAKE_KEY", "DOCK_LIVE", "DOCK_DOCKED",
-           "PRECISION_UNSET"]
+           "dock_store_of", "bake_record", "is_docked", "is_frozen", "held_nodes",
+           "CH_SOCKET_RE", "DOCK_OP", "BAKE_KEY", "DOCK_LIVE", "DOCK_HELD",
+           "DOCK_DOCKED", "DOCK_FROZEN", "PRECISION_UNSET"]

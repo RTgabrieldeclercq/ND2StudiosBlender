@@ -78,6 +78,14 @@ try:
 except Exception:  # noqa: BLE001
     _HAVE_WATERSHED = False
 
+try:
+    # Only the ZS-DeconvNet group needs it, and only for its end-to-end pull; every other
+    # assertion in that group is pure numpy/scipy so the maths stays covered without it.
+    import tensorflow as _tf     # noqa: F401
+    _HAVE_TF, _TF_VER = True, _tf.__version__
+except Exception:  # noqa: BLE001
+    _HAVE_TF, _TF_VER = False, ""
+
 D = Domain
 AX = AxisSizes(m=2, t=3, z=4, c=2, y=5, x=6)
 
@@ -1855,6 +1863,14 @@ def test_catalog_ported() -> None:
     # geometry provenance untouched — a downstream `raw` intensity wire must still match
     assert not znone.metadata.get(SAMPLING_KEY), "reset must not stamp __sampling__"
     assert zout.metadata.get(SAMPLING_KEY), "a real projection DOES stamp it"
+    # ...and stamps it Z-CONFINED (2026-08-04): a projection reduces along z and leaves every
+    # (y,x) address where it was, so a consumer comparing two z==1 branches drops it. Without
+    # the marker, reading a projected branch against a single-plane z-cropped one was refused
+    # as a geometry mismatch even though the two address identical voxels.
+    from nodegraph.catalog._shared.sampling import Z_STAMP as _ZS, _stamp_axes as _sax
+    assert all(_sax(s) == frozenset({"z"})
+               for s in zout.metadata[SAMPLING_KEY]), zout.metadata[SAMPLING_KEY]
+    assert str(zout.metadata[SAMPLING_KEY][-1]).startswith(_ZS)
     # the reset memoizes apart from every reducer, and declares the honest cheap footprint
     zspec = NODES.get("util.zproject")
     assert zspec.footprint_mode == "method", "zproject's footprint follows its method"
@@ -2129,13 +2145,32 @@ def test_catalog_ported2() -> None:
                     chain=(("analysis.threshold", None,
                             {"threshold": 20.0, "name": "m2"}),)).pull("N")
     assert wat_named.get(D.VOXEL, "ws2") is not None, "segment `mask`+`name` sockets"
-    # pointing a node at a layer that does not exist must RAISE, not silently no-op
+    # ...and pointing a node at a layer that does NOT exist resolves to the only candidate
+    # on the wire (2026-08-04, the `_resolve_layer` sweep — same rule as analysis.voronoi's
+    # own sockets). This assertion used to be "a missing source layer must raise", which is
+    # what shipped `analysis.segment` writing `CELLS` into `transform.label_to_points`
+    # demanding `labels` as a hard error on a two-node graph. It is a no-op that had to be
+    # refused, not a name that is merely absent, and inference is not a no-op: it runs on the
+    # single candidate and names it on the progress rail.
+    recov = eng("analysis.label", modes={"dim": "2D"}, params={"mask": "nope"},
+                chain=(thr,)).pull("N")
+    assert recov.get(D.VOXEL, "labels") is not None, \
+        "a stale mask name with exactly one Voxel candidate must be recovered"
+    # ZERO candidates still raises — there is nothing to infer from
     try:
-        eng("analysis.label", modes={"dim": "2D"}, params={"mask": "nope"},
-            chain=(thr,)).pull("N")
-        raise AssertionError("a missing source layer must raise")
+        eng("analysis.label", modes={"dim": "2D"}, params={"mask": "nope"}).pull("N")
+        raise AssertionError("no Voxel layer at all must raise")
     except (ValueError, KeyError):
         pass
+    # ...and so does an AMBIGUOUS wire: two masks is a real question, and labelling the
+    # wrong one would silently measure a different population
+    try:
+        eng("analysis.label", modes={"dim": "2D"}, params={"mask": "nope"},
+            chain=(thr, ("analysis.threshold", None,
+                         {"threshold": 40.0, "name": "m3"}))).pull("N")
+        raise AssertionError("two Voxel candidates must raise rather than pick one")
+    except ValueError as _exl:
+        assert "has to say which" in str(_exl), str(_exl)
     # `stats` selects the measured columns (it too had no socket, so the set was fixed)
     md2 = eng("analysis.measure", params={"stats": "mean,median"},
               chain=(thr, ("analysis.label", {"dim": "2D"}, {}))).pull("N")
@@ -2205,6 +2240,179 @@ def test_catalog_ported2() -> None:
     _ok("catalog (batch 2): morph-gradient/bilateral/nlm, LoG+DoG × bright/dark, EDT, "
         "watershed, resample+stack+drift meta, multi-stat measure, extract-boundary "
         "(2D contours + 3D surface verts; labels/name sockets redirect + re-key; rail)")
+
+
+# ── Normalize's ABSOLUTE bounds mode (V2.23) — Cell-Tracker Local Contrast parity ──
+
+def test_normalize_absolute_window() -> None:
+    """``enhance.normalize`` ``bounds="absolute"``: a window typed in the image's own
+    intensity units rather than measured from the data.
+
+    It exists because Cell-Tracker's **Local Contrast** plugin closes with a FIXED display
+    window — ``clip((f/bg - 0.5) / 1.5, 0, 1)`` — and the rest of that plugin is
+    ``enhance.flatten_field`` ``method="ratio"``. 0.5 and 2.0 are positions on the ratio
+    SCALE, so no ``low_pct``/``high_pct`` pair reproduces them: a percentile names a
+    position in the distribution, which moves with the content. Before V2.23
+    ``flatten_field``'s docstring pointed at ``enhance.normalize`` for this window anyway,
+    naming a route that did not exist.
+
+    The parity assertion below therefore chains the two real nodes and compares against the
+    Cell-Tracker line computed directly on the same fixture."""
+    if not _HAVE_SKIMAGE:
+        _ok("normalize absolute window: SKIPPED (scipy/skimage absent)")
+        return
+    from scipy.ndimage import gaussian_filter
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+
+    nspec = NODES.get("enhance.normalize")
+
+    # ── 1. spec: the two bounds settings hide each other's sockets, and `scope` (a
+    #    statistical population) is gated away where there is no population to pick.
+    vis = lambda st: {s.name for s in nspec.active_inputs(st)}
+    amodes = lambda st: {m.name for m in nspec.active_modes(st)}
+    st_pct = dict(nspec.default_state())
+    assert st_pct["bounds"] == "percentile", "the pre-V2.23 behaviour stays the default"
+    st_abs = {**st_pct, "bounds": "absolute"}
+    assert {"low_pct", "high_pct"} <= vis(st_pct)
+    assert not ({"low_value", "high_value"} & vis(st_pct))
+    assert {"low_value", "high_value"} <= vis(st_abs)
+    assert not ({"low_pct", "high_pct"} & vis(st_abs)), \
+        "an absolute window measures nothing — a live percentile field would be a lie"
+    # socket names stay DISJOINT across the two branches: the node card relayouts on the
+    # name list, so one socket meaning two things would not redraw (analysis.segment §)
+    assert not ({"low_pct", "high_pct"} & {"low_value", "high_value"})
+    assert amodes(st_pct) == {"bounds", "scope"}
+    assert amodes(st_abs) == {"bounds"}, "no population to pick under an absolute window"
+    # the absolute endpoints resolve to SCALARS — the compute never evaluates a wired
+    # Field on them, so field=True would be the lie this suite forbids elsewhere
+    # (track.link, analysis.segment). A per-voxel window is also not the operation: the
+    # point of `absolute` is ONE fixed curve, and a spatially varying one is neither.
+    assert all(not nspec.input(n).is_field for n in ("low_value", "high_value")), \
+        "no path in this node evaluates a wired Field on the absolute window"
+    # ...but a hidden Mode keeps its value, so the compute and the memo are unaffected
+    assert nspec.default_state()["scope"] == "plane"
+
+    # ── 2. footprint per `bounds` (footprint_mode="bounds"), not per a dim lever it lacks
+    assert not nspec.has_dim_lever() and nspec.dim_lever() is None
+    assert nspec.footprint_mode == "bounds"
+    assert nspec.resolve_granularity(st_pct) is Granularity.WHOLE_SERIES
+    assert nspec.resolve_granularity(st_abs) is Granularity.TILEABLE, \
+        "a pointwise clip-and-scale reads only the voxel it writes"
+    assert nspec.resolve_kernel_axes(st_abs) == frozenset()
+
+    # ── 3. `high_value`'s derive follows the DECLARED intensity scale, and degrades to 1.0
+    #    when there is none — i.e. after a percentile Normalize, or after flatten_field
+    #    method=ratio (both drop bit_depth), which is exactly the ratio case below.
+    _axd = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    hspec = nspec.input("high_value")
+    for _md, _want in (({"bit_depth": 12}, 4095), ({"bit_depth": 16}, 65535), ({}, 1.0)):
+        got = eval_derive(hspec.derive,
+                          envelope_symbols(MetaEnvelope(axes=_axd, metadata=_md)))
+        assert got == _want, f"high_value derive on {_md}: {got} != {_want}"
+    assert nspec.input("low_value").derive == "", "0 is 0 on every intensity scale"
+
+    # ── 4. fixture: a dark field with two bright blobs and a lateral shading gradient, so
+    #    the ratio genuinely varies and a wrong window would not go unnoticed.
+    Y = X = 24
+    yy, xx = np.mgrid[0:Y, 0:X]
+    plane = np.zeros((Y, X), dtype=float)
+    for cy, cx in ((7, 7), (16, 17)):
+        plane += 800.0 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 2.5 ** 2))
+    plane += 40.0 * np.exp(-((xx - 4) ** 2) / (2 * 14.0 ** 2))       # uneven illumination
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=Y, x=X)
+    img = np.zeros((1, 1, 1, 1, Y, X), dtype=float)
+    img[0, 0, 0, 0] = plane
+    optics = {"pixel_size_um": 0.5, "bit_depth": 12}
+    ds = Dataset(axes=ax, metadata=dict(optics)).with_image(ArrayProvider(img))
+    seedenv = MetaEnvelope(axes=ax, metadata=dict(optics))
+    define_node("io.normseed", "Seed", outputs=[OutDataset()])
+
+    def eng(nodes, edges):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for s, d in edges:
+            g.connect(s, d)
+        return Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": seedenv})
+
+    def plane_of(dset):
+        p = dset.image
+        return p.get_region(0, 0, 0, 0, 0, 0, p.axes.y, 0, p.axes.x)
+
+    # ── 5. THE PARITY CHECK: flatten_field(ratio) → normalize(absolute, 0.5 … 2.0) is
+    #    Cell-Tracker's Local Contrast, display window included.
+    SIGMA_UM = 5.0
+    sigma_px = SIGMA_UM / optics["pixel_size_um"]
+    ech = eng([("S", "io.normseed", {}),
+               ("F", "enhance.flatten_field", {"modes": {"method": "ratio",
+                                                         "reference": "per_plane"},
+                                               "params": {"sigma": SIGMA_UM}}),
+               ("N", "enhance.normalize", {"modes": {"bounds": "absolute"},
+                                           "params": {"low_value": 0.5,
+                                                      "high_value": 2.0}})],
+              [("S", "F"), ("F", "N")])
+    got = plane_of(ech.pull("N"))
+    # the Cell-Tracker line, on the same fixture (LocalContrastPlugin.execute). Its floor
+    # is on the DENOMINATOR only, which is what flatten_field's bg_floor reproduces; the
+    # `f+1` offset it also carries is a separate regularizer that this node deliberately
+    # does not, and on data with any signal the two agree to ~1e-2 on the ratio.
+    ratio = plane / np.maximum(gaussian_filter(plane, sigma_px), 1.0)
+    want = np.clip((ratio - 0.5) / 1.5, 0.0, 1.0)
+    assert got.shape == want.shape and np.all(np.isfinite(got))
+    assert np.allclose(got, want, atol=1e-9), \
+        f"Local Contrast parity: max |Δ| = {np.abs(got - want).max():.3g}"
+    assert got.max() > 0.5 and got.min() == 0.0, "the window must actually bite"
+
+    # ── 6. absolute bounds still land in [0,1] and still drop bit_depth (both branches
+    #    return [0,1], so the flat `value_rescaled` meta_transform covers them)
+    ea = eng([("S", "io.normseed", {}),
+              ("N", "enhance.normalize", {"modes": {"bounds": "absolute"},
+                                          "params": {"low_value": 100.0,
+                                                     "high_value": 500.0}})],
+             [("S", "N")])
+    arr = plane_of(ea.pull("N"))
+    assert arr.min() >= 0.0 and arr.max() <= 1.0 + 1e-9
+    assert np.allclose(arr, np.clip((plane - 100.0) / 400.0, 0.0, 1.0))
+    assert ea.pull("N").metadata.get("bit_depth") is None, "no longer raw integer counts"
+    assert ea.env("N").metadata.get("bit_depth") is None, "edit-time half in lockstep"
+
+    # ── 7. the bounds Mode folds into the recipe hash, so the two never share a memo entry
+    h_abs = ea.entry("N").recipe_hash
+    h_pct = eng([("S", "io.normseed", {}),
+                 ("N", "enhance.normalize", {"modes": {"bounds": "percentile"}})],
+                [("S", "N")]).entry("N").recipe_hash
+    assert h_abs != h_pct, "bounds must re-key the memo"
+
+    # ── 8. an empty window is REFUSED, not silently returned as a black image: absolute
+    #    bounds are wrong before a pixel is read (the flatten_field σ≤0 precedent).
+    try:
+        eng([("S", "io.normseed", {}),
+             ("N", "enhance.normalize", {"modes": {"bounds": "absolute"},
+                                         "params": {"low_value": 2.0,
+                                                    "high_value": 2.0}})],
+            [("S", "N")]).pull("N")
+        raise SystemExit("normalize: an empty absolute window should be refused")
+    except ValueError as ex:
+        assert "empty" in str(ex) and "high_value" in str(ex), f"unhelpful message: {ex}"
+
+    # ── 9. the percentile branch is untouched by all of the above
+    for scope in ("plane", "volume", "series"):
+        pr = plane_of(eng([("S", "io.normseed", {}),
+                           ("N", "enhance.normalize", {"modes": {"scope": scope}})],
+                          [("S", "N")]).pull("N"))
+        assert pr.min() >= 0.0 and pr.max() <= 1.0 + 1e-9, f"percentile/{scope} range"
+    lo, hi = np.percentile(plane, 1.0), np.percentile(plane, 99.0)
+    assert np.allclose(
+        plane_of(eng([("S", "io.normseed", {}),
+                      ("N", "enhance.normalize", {"modes": {"scope": "plane"}})],
+                     [("S", "N")]).pull("N")),
+        np.clip((plane - lo) / (hi - lo), 0.0, 1.0)), "percentile maths must not drift"
+
+    _ok("normalize absolute window: bounds Mode gates scope + both socket pairs; footprint "
+        "TILEABLE vs WHOLE_SERIES per bounds; high_value derive follows bit_depth; "
+        "flatten_field(ratio)→normalize(absolute 0.5…2.0) == Cell-Tracker Local Contrast; "
+        "empty window refused; percentile branch unchanged")
 
 
 # ── ported catalog batch 3: threshold methods, multi-otsu, transfer-domain ────
@@ -2333,9 +2541,78 @@ def test_two_channel_branches() -> None:
     except ValueError as exc:
         assert "sampling geometry" in str(exc), exc
 
+    # (5) the same exemption, generalized to any axis that is SINGLETON on both sides
+    #     (2026-08-04). A channel tap was the first instance; a Z-collapse is the second,
+    #     and it arrived from a real graph: Voronoi seeds from a Z-PROJECTION of one channel,
+    #     areas from a single-plane Z-CROP of another. Both branches end at z==1 and neither
+    #     moved a (y,x) address, so they DO address the same voxels — but the strict stamp
+    #     comparison refused it, which is the channel bug wearing a different axis.
+    from nodegraph.catalog._shared.sampling import (
+        Z_STAMP, _require_same_grid, _sampling_of, _stamp_axes)
+
+    # `util.crop` earns the marker CONDITIONALLY — a pure z-crop is lateral identity, a
+    # windowed one moves the corner — which is the discrimination the whole exemption rests
+    # on, so it is checked against the real compute rather than a hand-written string.
+    _cax = AxisSizes(m=1, t=1, z=8, c=1, y=32, x=32)
+    _cds = Dataset(axes=_cax).with_image(ArrayProvider(np.zeros((1, 1, 8, 1, 32, 32))))
+    define_node("io.cseed", "S", outputs=[OutDataset()])
+    for _params, _want_axes, _why in (
+            ({"z0": 5, "z1": 6}, frozenset({"z"}), "pure z-crop: full y/x extent"),
+            ({"z0": 5, "z1": 6, "y0": 4}, frozenset(), "y windowed: the corner MOVED"),
+            ({"x1": 20}, frozenset(), "x windowed: the corner MOVED")):
+        _g = Graph()
+        _g.add(NodeInstance("S", "io.cseed"))
+        _g.add(NodeInstance("K", "util.crop", params=_params, modes={"dim": "3D"}))
+        _g.connect("S", "K")
+        _st = tuple(Engine(_g, computes=COMPUTES, seeds={"S": _cds},
+                           meta_seeds={"S": MetaEnvelope(axes=_cax)})
+                    .pull("K").metadata.get(SAMPLING_KEY, ()))
+        assert len(_st) == 1, _st
+        assert _stamp_axes(_st[0]) == _want_axes, (_why, _st[0], _stamp_axes(_st[0]))
+
+    for _s, _want in ((f"{Z_STAMP}zproject[max]", {"z"}),
+                      (f"{Z_STAMP}crop[z5:6,y0:2048,x0:2048]", {"z"}),
+                      ("crop[z0:1,y10:20,x10:20]", set()),   # a LATERAL crop: corner moved
+                      (f"{CHANNEL_STAMP}channel.select(1,)", {"c"}),
+                      ("align.drift", set()), ("resample[xy=2,z=2]", set()),
+                      ("zone.frame[t=0]", set())):
+        assert set(_stamp_axes(_s)) == _want, (_s, _stamp_axes(_s))
+    # an UNMARKED stamp is never dropped, whatever is ignored — `frozenset() <= anything`
+    assert _sampling_of(Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4),
+                                metadata={SAMPLING_KEY: ("align.drift",)}),
+                        ignore_axes=frozenset("mtzcyx")) == ("align.drift",)
+
+    def _grid(z, c, *stamps):
+        return Dataset(axes=AxisSizes(m=1, t=1, z=z, c=c, y=64, x=64),
+                       metadata={SAMPLING_KEY: tuple(stamps)})
+
+    _require_same_grid(_grid(1, 1, f"{Z_STAMP}zproject[max]"),
+                       _grid(1, 1, f"{Z_STAMP}crop[z5:6,y0:2048,x0:2048]"),
+                       socket="areas", consequence="clip each cell to the wrong region")
+    for _other, _why in (
+            (_grid(1, 1, "crop[z0:1,y10:74,x10:74]"), "a LATERAL crop moves the corner"),
+            (_grid(1, 1, "align.drift"), "a drift correction shifts content"),
+            (_grid(1, 1, f"{Z_STAMP}zproject[max]", "resample[xy=2,z=1]"),
+             "a resample changes the scale")):
+        try:
+            _require_same_grid(_grid(1, 1, f"{Z_STAMP}zproject[max]"), _other,
+                               socket="areas", consequence="x")
+            raise AssertionError(f"the z exemption swallowed a real mismatch: {_why}")
+        except ValueError:
+            pass
+    # and at z>1 a z-crop is NOT exempt: there the index really does name a different plane
+    try:
+        _require_same_grid(_grid(4, 1), _grid(4, 1, f"{Z_STAMP}crop[z2:6,y0:64,x0:64]"),
+                           socket="areas", consequence="x")
+        raise AssertionError("a z-crop was exempted while z>1 on both sides")
+    except ValueError:
+        pass
     _ok("two channel branches: per-channel metadata narrows per tap (names/colors/"
         "excitation, not just emission); ch0-labels + ch1-intensity runs and reports ch1; "
-        "a c>1 permutation still refused")
+        "a c>1 permutation still refused; and the exemption is now per-AXIS — a stamp "
+        "confined to axes that are SINGLETON on both sides is dropped, so a Z-projection "
+        "reads against a single-plane pure Z-crop while a lateral crop, a drift and a "
+        "resample are all still refused, and a z-crop at z>1 stays compared")
 
 
 def test_reroute() -> None:
@@ -3376,7 +3653,7 @@ def test_track_objects() -> None:
     assert all(not i.is_field for i in s.inputs if i.type is not SocketType.DATASET), \
         "no compute in this class evaluates a wired Field — field=True would be a lie"
     mode_of = {mm.name: mm for mm in s.modes}
-    assert set(mode_of) == {"target", "method"} and mode_of["method"].default == "centroid"
+    assert mode_of["method"].default == "centroid"      # mode SET asserted below with st_dim
     assert set(mode_of["method"].choices) == {"centroid", "serialtrack", "topology",
                                               "fingerprint", "overlap"}
     # method-gated variant sockets resolve per mode state (registry available_in)
@@ -3385,7 +3662,13 @@ def test_track_objects() -> None:
     assert "ct_min_iou" not in vis({"method": "centroid"})
     assert "st_n_neighbors" in vis({"method": "serialtrack"})
     assert "max_frame_gap" in vis({"method": "centroid"})
-    assert "labels" in vis({"target": "label"}) and "labels" not in vis({"target": "point"})
+    # `labels` gates on target AND method (serialtrack is Point-only), so probe it with a
+    # COMPLETE mode state — `available_in` reads an unlisted mode as absent, not as its
+    # default, and every production caller resolves through `NodeInstance.state(spec)`,
+    # which starts from `default_state()`. Same reason `max_size_diff_frac` is probed with
+    # both keys below.
+    assert "labels" in vis({"target": "label", "method": "centroid"})
+    assert "labels" not in vis({"target": "point", "method": "centroid"})
     # review: a socket the chosen linker never receives must be HIDDEN, not accepted and
     # discarded. `overlap` matches by mask IoU and takes no distance bound; the centroid
     # size gate is inert on arealess (Point) members.
@@ -3393,6 +3676,24 @@ def test_track_objects() -> None:
     assert "max_distance" not in vis({"method": "overlap"})
     assert "max_size_diff_frac" in vis({"method": "centroid", "target": "label"})
     assert "max_size_diff_frac" not in vis({"method": "centroid", "target": "point"})
+    # `serialtrack` is Point-only, so the Label-raster picker must not be offered with it —
+    # the combination refuses at compute time, and a picker that leads only to a refusal is
+    # the same dead control the charter forbids.
+    assert "labels" in vis({"target": "label", "method": "centroid"})
+    assert "labels" not in vis({"target": "label", "method": "serialtrack"})
+    assert "points" in vis({"target": "point", "method": "serialtrack"})
+    # ── serialtrack's own 2D/3D lever (V2.24) ─────────────────────────────────
+    # NOT the canonical DimMode: `spec.dim_lever()` is what the GUI header renders and it
+    # does not consult `available_in`, so a gated dim_lever would still draw for all five
+    # methods — dead for the four that are two-column by construction.
+    assert not s.has_dim_lever() and s.dim_lever() is None, \
+        "a role='dim_lever' Mode would render in the header for every method"
+    assert set(mode_of) == {"target", "method", "st_dim"}
+    assert mode_of["st_dim"].choices == ("2D", "3D") and mode_of["st_dim"].default == "2D"
+    amodes = lambda st: {m.name for m in s.active_modes(st)}
+    assert "st_dim" in amodes({"target": "point", "method": "serialtrack"})
+    for other in ("centroid", "topology", "fingerprint", "overlap"):
+        assert "st_dim" not in amodes({"target": "label", "method": other}), other
 
     if _u.find_spec("numba") is None or _u.find_spec("pandas") is None:
         _ok("track.objects: spec OK; RUN SKIPPED (kernel needs numba+pandas)")
@@ -3448,9 +3749,11 @@ def test_track_objects() -> None:
         get = lambda n: out.get(D.TRACK, n, layer=layer).values.tolist()
         return set(zip(get("track_id"), get("t"), get("member_id")))
 
-    # ── all five methods, Label members: 3 objects → 3 tracks spanning all 4 frames ──
+    # ── the four Label-capable methods: 3 objects → 3 tracks spanning all 4 frames ──
+    # `serialtrack` is absent by design — it is Point-only (see the refusals below), the
+    # mirror image of `overlap` being Label-only.
     hashes = {}
-    for meth in ("centroid", "topology", "fingerprint", "overlap", "serialtrack"):
+    for meth in ("centroid", "topology", "fingerprint", "overlap"):
         out, e = pull(*build("label"), method=meth)
         rows = trows(out)
         assert len(rows) == 12, (meth, len(rows))
@@ -3464,9 +3767,11 @@ def test_track_objects() -> None:
 
     # ── Point members (no area column ⇒ area_px 0.0; overlap unavailable) ──────
     for meth in ("centroid", "topology", "fingerprint", "serialtrack"):
-        out, _ = pull(*build("point"), target="point", method=meth)
+        out, e_ptm = pull(*build("point"), target="point", method=meth)
         assert sorted({r[0] for r in trows(out)}) == [1, 2, 3], meth
         assert int((out.get(D.POINT, "track_id", layer="spots").values > 0).sum()) == 12
+        if meth == "serialtrack":                    # its only runnable target
+            hashes["serialtrack"] = e_ptm.entry("K").recipe_hash
 
     # ── plane independence: a 2D kernel on a z-stack must NOT link across planes ──
     out, _ = pull(*build("label", nz=2))
@@ -3516,6 +3821,11 @@ def test_track_objects() -> None:
     refuses(lambda: pull(*build("label"), method="bogus"), "unknown method")
     refuses(lambda: pull(*build("point"), target="point", method="overlap"),
             "unavailable for Point members")
+    # `serialtrack` is Point-only. A Label table DOES carry the (y,x) centroids it reads,
+    # so this combination would run — and that is why it must refuse: under target='label'
+    # the node declares reads={LABEL,VOXEL} and offers a raster picker, for a linker that
+    # opens no raster and consumes no shape or size.
+    refuses(lambda: pull(*build("label"), method="serialtrack"), "particle tracker")
     refuses(lambda: pull(*build("point"), target="point", max_size_diff_frac=0.1),
             "silently inert")                       # arealess members ⇒ gate does nothing
     refuses(lambda: pull(*build("label"), method="overlap", ct_max_gap=0),
@@ -3564,11 +3874,105 @@ def test_track_objects() -> None:
         StructureTable(D.LABEL, {"y": np.zeros(3)}, layer="labels", z_kind="plane_index"))
     refuses(lambda: pull(ds_rg, ax_rg), "disagree in length")
 
+    # ── SerialTrack 3D (V2.24) ────────────────────────────────────────────────
+    # SerialTrack is a 2D *and* 3D method and the vendored kernel implements both, so
+    # `st_dim=3D` makes z a coordinate instead of a grouping key. The fixture is the case
+    # that separates the two: particles drifting THROUGH DEPTH as well as laterally. In 2D
+    # the plane is part of the group key, so crossing a plane boundary breaks the track and
+    # each per-plane group is too small to match at all; in 3D the motion is continuous.
+    NZ3, N3 = 24, 60
+    _rng3 = np.random.default_rng(11)
+    _base3 = np.column_stack([_rng3.uniform(4, 18, N3), _rng3.uniform(6, 42, N3),
+                              _rng3.uniform(6, 42, N3)])
+    _vel3 = np.array([1.1, 0.35, 0.35])
+    ax3 = AxisSizes(m=1, t=T, z=NZ3, c=1, y=Y, x=X)
+    meta3 = {"pixel_size_um": 0.2, "z_step_um": 0.6}       # anisotropic on purpose (3x)
+
+    def build3(z_kind="subpixel"):
+        col = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x")}
+        nid3 = 1
+        for t3 in range(T):
+            pos = _base3 + _vel3 * t3
+            for j3 in range(N3):
+                col["id"].append(nid3); nid3 += 1
+                col["m"].append(0); col["t"].append(t3); col["c"].append(0)
+                col["z"].append(pos[j3, 0])
+                col["y"].append(pos[j3, 1]); col["x"].append(pos[j3, 2])
+        arr3 = {k: np.asarray(v) for k, v in col.items()}
+        return Dataset(axes=ax3).with_structure(
+            StructureTable(D.POINT, arr3, layer="spots", z_kind=z_kind))
+
+    def pull3(st_dim, z_kind="subpixel", md=None):
+        g3 = Graph(); g3.add(NodeInstance("S", "io.trkobj"))
+        g3.add(NodeInstance("K", "track.objects", params={"max_distance": 8.0},
+                            modes={"target": "point", "method": "serialtrack",
+                                   "st_dim": st_dim}))
+        g3.connect("S", "K")
+        e3 = Engine(g3, computes=COMPUTES, seeds={"S": build3(z_kind)},
+                    meta_seeds={"S": MetaEnvelope(axes=ax3,
+                                                  metadata=meta3 if md is None else md)})
+        return e3.pull("K"), e3
+
+    def held3(out3):
+        """How many of the N3 physical particles kept ONE track id across all T frames."""
+        ids3 = out3.get(D.POINT, "id", layer="spots").values.tolist()
+        back3 = out3.get(D.POINT, "track_id", layer="spots").values.tolist()
+        tid3 = dict(zip(ids3, back3))
+        order3 = sorted(ids3)                       # ids are assigned in (t, particle) order
+        return sum(1 for j3 in range(N3)
+                   if all(tid3[order3[t3 * N3 + j3]] for t3 in range(T))
+                   and len({tid3[order3[t3 * N3 + j3]] for t3 in range(T)}) == 1)
+
+    o3, e3d = pull3("3D")
+    assert held3(o3) == N3, f"3D lost tracks through depth: {held3(o3)}/{N3}"
+    assert o3.metadata["track_dim"] == "3D"
+    # the Track table's provenance follows the space it linked in, not the members'
+    assert o3.structure_zkind(D.TRACK, "tracks") == "subpixel"
+    assert o3.structure_zkind(D.POINT, "spots") == "subpixel"    # §7b not clobbered
+    # z is rescaled by z_step/pixel_size into the lateral unit, so BOTH calibrations are
+    # read — and the memo must fence on the axial one or an anisotropy change would be a hit
+    reads3 = dict(e3d.entry("K").reads)
+    assert "z_step_um" in reads3 and "pixel_size_um" in reads3, sorted(reads3)
+
+    o2, e2d = pull3("2D")                            # same data, tracked plane by plane
+    assert held3(o2) == 0, \
+        f"2D must fragment depth-crossing tracks (got {held3(o2)}/{N3} intact) — if this " \
+        f"passes, z is no longer in the 2D grouping key and planes are being linked"
+    assert o2.metadata["track_dim"] == "2D"
+    assert o2.structure_zkind(D.TRACK, "tracks") == "plane_index"
+    assert "z_step_um" not in dict(e2d.entry("K").reads), \
+        "2D does not rescale z, so fencing the memo on z_step_um would invalidate for nothing"
+    hashes["st3d"] = e3d.entry("K").recipe_hash
+    hashes["st2d"] = e2d.entry("K").recipe_hash
+    assert len(set(hashes.values())) == len(hashes), hashes   # st_dim reached the recipe
+
+    # the lever is checked against the layer's own z provenance, in BOTH directions
+    refuses(lambda: pull3("3D", z_kind="plane_index"), "needs a depth to track in")
+    refuses(lambda: pull3("3D", md={"pixel_size_um": 0.2}), "z_step_um")   # no axial step
+    # ... and a 2D-only method may not silently ignore a measured depth
+    def _pull_2donly():
+        g4 = Graph(); g4.add(NodeInstance("S", "io.trkobj"))
+        g4.add(NodeInstance("K", "track.objects", params={"max_distance": 8.0},
+                            modes={"target": "point", "method": "centroid"}))
+        g4.connect("S", "K")
+        return Engine(g4, computes=COMPUTES, seeds={"S": build3("subpixel")},
+                      meta_seeds={"S": MetaEnvelope(axes=ax3, metadata=meta3)}).pull("K")
+    refuses(_pull_2donly, "2D-only")
+    # 2D on a subpixel layer IS allowed for serialtrack (coarse/noisy z), just lossy
+    pull3("2D", z_kind="subpixel")
+
     _ok("track.objects: 5 linkers (centroid/serialtrack/CT topology+fingerprint+overlap) "
-        "track Label AND Point members end-to-end; per-(m,c,z) plane independence; "
-        "track_id write-back aligned under a row permutation; track.link membership "
-        "conventions; distinct per-mode recipes; unconsumed sockets hidden per method; "
-        "<2-frame groups survive min_track_length=1; 8 silent-degradation refusals")
+        "track Label AND Point members end-to-end; the two single-target linkers are "
+        "exclusive BOTH ways (overlap Label-only, serialtrack Point-only) and neither "
+        "offers the other target's layer picker; SerialTrack tracks in TRUE 3D behind its "
+        "own gated st_dim Mode (never a header dim_lever) — 60/60 particles drifting "
+        "through depth keep one id where 2D per-plane grouping holds 0, z rescaled by "
+        "z_step/pixel_size with both calibrations memo-fenced, Track z_kind + track_dim "
+        "provenance follow, and the lever is checked against the layer's z_kind both ways; "
+        "per-(m,c,z) plane independence; track_id write-back aligned under a row "
+        "permutation; track.link membership conventions; distinct per-mode recipes; "
+        "unconsumed sockets hidden per method; <2-frame groups survive "
+        "min_track_length=1; 12 silent-degradation refusals")
 
 
 # ── save / load *.nd2graph.json (graph + zones + groups round-trip) ───────────
@@ -3794,6 +4198,58 @@ def test_iterate() -> None:
     assert e_dup.compute_count < e_uni.compute_count, \
         "repeated values must collapse onto one recipe_hash"
 
+    # ── the target picker: the menu IS the refusals (V2.22) ───────────────────
+    #
+    # The card scrapes the chain feeding `collect` and offers what it may drive. The
+    # property worth pinning is that the OFFER and the REFUSAL are the same predicate:
+    # anything the menu lists must wire, and anything the rewrite rejects must never be
+    # listed — otherwise the dropdown becomes a way to build the exact configurations
+    # every refusal below exists to prevent.
+    g = build({"v0_list": "0.3,0.5"}, LIST)
+    opts = IT.candidate_targets(g, "IT")
+    by_key = {o.key: o for o in opts}
+    assert ("TH", "threshold") in by_key and ("LB", "connectivity") in by_key, sorted(by_key)
+    assert by_key[("TH", "threshold")].kind == IT.TYPE_NUMBER
+    assert (by_key[("TH", "threshold")].driver_id,
+            by_key[("TH", "threshold")].driver_slot) == ("IT", 0), \
+        "an already-driven target must report WHICH slot holds it, not vanish"
+    assert by_key[("TH", "__mode__:method")].kind == IT.TYPE_TEXT, \
+        "a Mode is swept by name, so it needs the slot's TEXT output"
+    assert ("LB", "__mode__:dim") not in by_key, "the 2D/3D lever is never offered"
+    assert ("LB", "name") not in by_key, \
+        "naming the output layer changes no pixels — N identical iterations"
+    assert not any(k[0] in ("S", "IT") for k in by_key), \
+        "the seed has no params and the card cannot drive itself"
+    ids = [o.target.node_id for o in opts]
+    assert ids.index("TH") < ids.index("LB") < ids.index("RS"), \
+        "the menu must read down the chain, not in dictionary order"
+    # every offer really connects: no listed target may raise on the way to a plan
+    for o in opts:
+        probe = build({"v0_list": "0.3,0.5"},
+                      {**LIST, "v0_type": o.kind, "variables": "1"})
+        probe.edges = [e for e in probe.edges if e.kind != "driver"]
+        src = IT.var_out_names(0)[0 if o.kind == IT.TYPE_NUMBER else 1]
+        probe.connect("IT", o.target.node_id, src_socket=src,
+                      dst_socket=o.target.socket, kind="driver")
+        IT.plan(probe, "IT")                      # raises if the menu offered a lie
+
+    g2 = build({"v0_list": "0.3,0.5"}, LIST)
+    g2.add(NodeInstance("X", "enhance.gamma", params={"gamma": 2.0}))
+    g2.connect("LB", "X")
+    assert not any(o.target.node_id == "X" for o in IT.candidate_targets(g2, "IT")), \
+        "a node that is not upstream of collect would be a stranded target"
+
+    g3 = build({"v0_start": 0.2, "v0_stop": 1.0, "v0_steps": 3, "metric": "n_cells"},
+               {"mode": "feedback", "variables": "1", "v0_source": "linear"})
+    assert not any(o.target.is_mode for o in IT.candidate_targets(g3, "IT")), \
+        "feedback cannot drive a Mode — its value must be literal before the run"
+    assert any(o.key == ("TH", "threshold") for o in IT.candidate_targets(g3, "IT"))
+
+    g4 = build({"v0_list": "0.3,0.5"}, LIST)
+    g4.edges = [e for e in g4.edges if e.dst_socket != "collect"]
+    assert IT.candidate_targets(g4, "IT") == (), \
+        "with nothing collected there is no chain to scrape — collect first, then choose"
+
     # ── the refusals (each would otherwise return a believable wrong answer) ───
     def refuses(g, needle):
         try:
@@ -3819,6 +4275,10 @@ def test_iterate() -> None:
     refuses(rewired("TH", "__mode__:method", modes={"mode": "feedback"}),
             "only be swept")                                    # a Mode driven by payload
     refuses(rewired("TH", "data"), "Dataset input")             # a value onto the main wire
+    refuses(rewired("TH", "name"), "NAMES the layer")           # renames, computes nothing
+    g = build({"v0_list": "0.3,0.5"}, LIST)
+    g.connect("S", "TH", dst_socket="threshold")   # a wire beats a param, so every row ties
+    refuses(g, "already fed by a wire")
 
     # truly NESTED: IT2 collects inside IT's chain AND feeds the rest of it, so IT2 itself
     # lands in IT's cone and would have to be cloned along with everything else.
@@ -3848,11 +4308,23 @@ def test_iterate() -> None:
     g.connect("IT2", "TH", src_socket="var0", dst_socket="threshold", kind="driver")
     refuses(g, "driven by two Iterate nodes")
 
+    # BOTH frozen dock states, because both cut the upstream edge and so both would make
+    # every iteration read the same pixels. `held` is the one that would have slipped
+    # through: it was added after this refusal existed, and nothing but this assertion
+    # forces `iterate._is_frozen_dock` to keep pace with `ops.DOCK_FROZEN` (the two are
+    # deliberately separate copies, to keep nodegraph from importing nodelab_v2).
+    for _state in ("docked", "held"):
+        g = build({"v0_list": "0.3,0.5"}, LIST)
+        g.add(NodeInstance("D", "io.dock", modes={"state": _state}))
+        g.edges = [e for e in g.edges if not (e.src == "TH" and e.dst == "LB")]
+        g.connect("TH", "D"); g.connect("D", "LB")
+        refuses(g, "frozen Dock")
+    # ...and a LIVE dock in the cone is fine: it passes through, so each iteration differs.
     g = build({"v0_list": "0.3,0.5"}, LIST)
-    g.add(NodeInstance("D", "io.dock", modes={"state": "docked"}))
+    g.add(NodeInstance("D", "io.dock", modes={"state": "live"}))
     g.edges = [e for e in g.edges if not (e.src == "TH" and e.dst == "LB")]
     g.connect("TH", "D"); g.connect("D", "LB")
-    refuses(g, "docked Dock")
+    IT.unroll(g, envs=None)               # must NOT raise
 
     g = build({"v0_start": 0.1, "v0_stop": 1.0, "v0_steps": 9,
                "v1_list": "1,2,3,4,5,6,7,8,9"},
@@ -3898,8 +4370,10 @@ def test_iterate() -> None:
         "the target's own value; feedback secant converges to a target and golden "
         "maximizes, with probe 0 baked and later probes arriving on a wire; an empty "
         "iteration reports 0; the memo caches an unchanged sweep and collapses repeated "
-        "values; 15 refusals; an un-rewritten graph passes through without inventing a "
-        "sweep, and refuses outright when one was really described")
+        "values; the target picker scrapes the chain feeding collect in chain order, marks "
+        "what already drives each one and offers ONLY what plan() accepts (every offer "
+        "wired and planned here); 17 refusals; an un-rewritten graph passes through without "
+        "inventing a sweep, and refuses outright when one was really described")
 
 
 # ── engine hardening: C5 provider identity + C7 un-contexted-read guard ───────
@@ -4509,13 +4983,256 @@ def test_streaming() -> None:
         "crop z-guard, weak cache, non-multi edge guard, unwired-primary guard)")
 
 
+def test_spill_and_streaming_stats() -> None:
+    """Dense outputs too large for RAM, and threshold levels derived without staging.
+
+    The failure this closes (2026-08-04): the lab's 640 series is
+    12 × 16 × 210 × 1 × 1024 × 1024 = 42.3 **Gvoxel**, so any node allocating one array over
+    the whole grid wants 39.4 GiB at ``uint8`` and 315 GiB at ``int64``/``float64``.
+    ``analysis.threshold`` and ``analysis.segment`` both did, and both died with
+    ``_ArrayMemoryError`` — but only once an upstream Z-Project was reset from ``max`` to
+    ``none`` and Z came back at full extent. With the projection ON the same graph needs
+    1/210th of it and runs, which is what made a hard ceiling in these nodes read as
+    Z-Project's ``none`` being broken.
+
+    Three things are asserted, because three separate things had to be true:
+
+    1. the spill mechanism itself — a memmapped output reaches the layer WITHOUT being
+       copied, and the Memo counts it as zero retained bytes (both properties already
+       existed for a docked checkpoint; ``Dataset.with_layer`` was silently defeating them
+       by routing through ``np.asarray``, which strips the subclass and yields a view that
+       ``AttributeLayer`` then copies);
+    2. spilled output ≡ in-RAM output, byte for byte, including the Label rows;
+    3. a streaming threshold level ≡ the staged one — exactly for otsu/yen/mean, and inside
+       a stated bound for li/triangle, which consume raw values and so can only be fed a
+       histogram surrogate.
+    """
+    if not _HAVE_SKIMAGE:
+        _ok("spill + streaming stats: SKIPPED (scipy/skimage absent)")
+        return
+    import os
+    import skimage.filters as skf
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.memo import payload_bytes
+    from nodegraph.spill import dense_output, spill_budget, spilling
+    from nodegraph.spill import _FLUSH_EVERY as _spill_flush_const
+
+    def _spill_flush_every():
+        return _spill_flush_const
+    from nodegraph.catalog.analysis.threshold import _bins_for, _level_from_hist
+
+    def _budget(v):
+        os.environ["NODEGRAPH_SPILL_BYTES"] = str(v)
+
+    prior = os.environ.get("NODEGRAPH_SPILL_BYTES")
+    try:
+        # ── 1. the mechanism ──────────────────────────────────────────────────
+        _budget(1 << 40)
+        assert not spilling((64, 64), np.uint8), "under budget must stay in RAM"
+        d = dense_output((4, 4), np.uint8, tag="t")
+        assert not d.spilled
+        d.array[1, 1] = 7
+        assert d.seal()[1, 1] == 7
+        _budget(1)
+        assert spilling((64, 64), np.uint8) and spill_budget() == 1
+        d = dense_output((2, 3, 4), np.int64, tag="t")
+        assert d.spilled and d.path and os.path.isfile(d.path)
+        # a fresh mapping reads as ZERO — relied on for a mask's background and a label
+        # raster's unlabelled voxels, neither of which is ever assigned explicitly
+        assert int(np.asarray(d.array).sum()) == 0, "spilled output must be zero-filled"
+        d.array[1, 2, 3] = 99
+        sealed = d.seal()
+        assert isinstance(sealed, np.memmap) and not sealed.flags.writeable
+        # ── the writable face FLUSHES as it fills, which is the load-bearing half ──
+        # Spilling alone bounds nothing: pages written through a mapping enter the working
+        # set and stay MODIFIED until flushed, and the OS cannot reclaim a modified page. On
+        # the real 640 series that took the process to 208 GiB RSS with 5.3 GiB of 256 GiB
+        # available, and `analysis.label`'s next per-volume allocation died with
+        # "MemoryError: Unable to allocate 1.64 GiB" — the same exhaustion the spill was
+        # meant to remove, wearing a different message. Flushed, the pages go clean and are
+        # reclaimable: measured, writing 211 GiB then allocating 1.64 GiB and 4 GiB both
+        # succeeded at 23.5 GiB available (2026-08-04).
+        from nodegraph.spill import _SpillView
+        d = dense_output((8, 1024), np.int64, tag="flushy")
+        assert isinstance(d.array, _SpillView), "a spilled output must flush as it writes"
+        flushes = []
+        d.array._a.flush = lambda *_a, **_k: flushes.append(1)   # count, don't msync
+        row = np.ones(1024, dtype=np.int64)                      # 8 KiB per assignment
+        for i in range(8):
+            d.array[i] = row
+        assert not flushes, "8 KiB of writes must not trigger a 1 GiB-cadence flush"
+        d.array._pending = _spill_flush_every() - 1              # one byte short
+        d.array[0] = row
+        assert len(flushes) == 1, f"crossing the cadence must flush once, got {len(flushes)}"
+        # the forwarded protocol: nodes and the selftest both read through it
+        assert d.array.shape == (8, 1024) and d.array.dtype == np.int64
+        assert d.array.ndim == 2 and len(d.array) == 8
+        assert int(np.asarray(d.array).sum()) == 8 * 1024        # __array__ forwards
+        assert int(d.array[3][7]) == 1                           # __getitem__ forwards
+        # ...and it survives `with_layer` as a memmap. This is the clause that was broken:
+        # `np.asarray` on a memmap returns a VIEW (base is not None), which AttributeLayer
+        # copies — so a 315 GiB spilled raster came straight back into the heap.
+        ax1 = AxisSizes(m=2, t=3, z=4, c=1, y=1, x=1)
+        dss = Dataset(axes=ax1).with_layer(D.VOXEL, "v",
+                                          sealed.reshape(2, 3, 4, 1, 1, 1))
+        got = dss.get(D.VOXEL, "v").values
+        assert isinstance(got, np.memmap), "with_layer must not strip the memmap subclass"
+        assert payload_bytes(dss) == 0, "a memmapped layer must cost the Memo nothing"
+        assert int(got[1, 2, 3, 0, 0, 0]) == 99
+
+        # ── 2. spilled ≡ in-RAM, for both nodes ───────────────────────────────
+        M, T, Z, C, Y, X = 2, 2, 3, 1, 32, 32
+        rng = np.random.default_rng(9)
+        vol = rng.integers(50, 200, (M, T, Z, C, Y, X)).astype(np.uint16)
+        vol[:, :, :, :, 6:12, 6:12] = 3000
+        vol[:, :, :, :, 20:26, 18:24] = 3500
+        axs = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+        mds = {"pixel_size_um": 0.5, "z_step_um": 1.0, "bit_depth": 12}
+        envs = MetaEnvelope(axes=axs, metadata=mds)
+        define_node("io.spillseed", "Seed", outputs=[OutDataset()])
+
+        def run(chain, budget):
+            _budget(budget)
+            g = Graph()
+            g.add(NodeInstance("S", "io.spillseed"))
+            prev = "S"
+            for nid, op, modes, params in chain:
+                g.add(NodeInstance(nid, op, modes=modes, params=params))
+                g.connect(prev, nid)
+                prev = nid
+            ds_ = Dataset(axes=axs, metadata=mds).with_image(ArrayProvider(vol))
+            return Engine(g, computes=COMPUTES, seeds={"S": ds_},
+                          meta_seeds={"S": envs}).pull(prev)
+
+        _THR = ("H", "analysis.threshold", {"method": "otsu", "scope": "plane"}, {})
+        for chain, lname in (
+                ([_THR], "mask"),
+                ([("H", "analysis.threshold", {"method": "fixed"},
+                   {"threshold": 1000.0})], "mask"),
+                ([("G", "analysis.segment",
+                   {"method": "threshold", "dim": "2D"}, {})], "labels"),
+                ([("G", "analysis.segment",
+                   {"method": "threshold", "dim": "3D"}, {})], "labels"),
+                ([("G", "analysis.segment",
+                   {"method": "watershed", "dim": "2D"}, {})], "labels"),
+                # ...and Threshold's own consumer. `analysis.label` sizes its raster off the
+                # MASK (`zeros_like(mask6, int64)`), so a spilled 39.4 GiB uint8 mask asks it
+                # for 315 GiB — fixing Threshold alone just moves the MemoryError right.
+                ([_THR, ("L", "analysis.label", {"dim": "2D"}, {})], "labels"),
+                ([_THR, ("L", "analysis.label", {"dim": "3D"}, {})], "labels")):
+            ram = run(chain, 1 << 40)
+            spl = run(chain, 1)
+            tag = "->".join(c[1] for c in chain) + f"/{chain[-1][2]}"
+            rv = np.asarray(ram.get(D.VOXEL, lname).values)
+            sv = spl.get(D.VOXEL, lname).values
+            assert isinstance(sv, np.memmap), f"{tag}: output was not spilled"
+            assert np.array_equal(rv, np.asarray(sv)), f"{tag}: spilled != in-RAM"
+            # the Label rows are folded in the same order, so they must match too — a
+            # reordered fold would give different global ids for identical pixels
+            for key in ("id", "y", "x"):
+                ra = ram.get(D.LABEL, key, layer=lname)
+                sa = spl.get(D.LABEL, key, layer=lname)
+                assert (ra is None) == (sa is None), f"{tag}: {key} presence"
+                if ra is not None:
+                    assert np.array_equal(ra.values, sa.values), f"{tag}: {key} rows"
+
+        # ── 3. streaming levels vs the staged (exact) ones ─────────────────────
+        # Whole-mask equality per method × scope: the streaming path takes over below,
+        # and for otsu/yen/mean the mask must come out bit-identical.
+        for integral in (True, False):
+            if integral:
+                v = rng.integers(0, 4096, (M, T, Z, 2, Y, X)).astype(np.uint16)
+            else:
+                v = rng.normal(0.5, 0.2, (M, T, Z, 2, Y, X))
+            v[:, :, :, :, 6:14, 6:14] = v.max()
+            ax2 = AxisSizes(m=M, t=T, z=Z, c=2, y=Y, x=X)
+            env2 = MetaEnvelope(axes=ax2, metadata=mds)
+
+            def run2(method, scope, budget):
+                _budget(budget)
+                g = Graph()
+                g.add(NodeInstance("S", "io.spillseed"))
+                g.add(NodeInstance("N", "analysis.threshold",
+                                   modes={"method": method, "scope": scope}))
+                g.connect("S", "N")
+                ds_ = Dataset(axes=ax2, metadata=mds).with_image(ArrayProvider(v))
+                return np.asarray(Engine(g, computes=COMPUTES, seeds={"S": ds_},
+                                         meta_seeds={"S": env2}
+                                         ).pull("N").get(D.VOXEL, "mask").values)
+
+            for method in ("otsu", "yen", "mean", "li", "triangle"):
+                for scope in ("plane", "volume", "series", "dataset"):
+                    staged = run2(method, scope, 1 << 40)
+                    stream = run2(method, scope, 0)
+                    exact = method in ("otsu", "yen", "mean") or scope == "plane"
+                    if exact:
+                        # `plane` is the DEFAULT scope and its groups are single planes, so
+                        # the streaming path calls skimage on the plane itself — every
+                        # method is exact there, which is what keeps the default honest.
+                        assert np.array_equal(staged, stream), \
+                            f"{method}/{scope} must be bit-identical, is not"
+                    else:
+                        moved = float((staged != stream).mean())
+                        assert moved < 0.02, f"{method}/{scope} moved {moved:.4%} of voxels"
+
+        # ...and the level-space bound the docstring states, method by method, against
+        # skimage called on the raw values. Asserted here rather than trusted, because the
+        # whole argument for the streaming path is that these numbers stay put.
+        FN = {"otsu": skf.threshold_otsu, "li": skf.threshold_li,
+              "yen": skf.threshold_yen, "triangle": skf.threshold_triangle,
+              "mean": skf.threshold_mean}
+        BOUND = {"otsu": 0.0, "yen": 0.0, "mean": 0.0, "li": 1e-4, "triangle": 3e-3}
+        r2 = np.random.default_rng(3)
+        for trial in range(8):
+            if trial % 2:
+                a = r2.integers(0, 4096, 60_000).astype(np.uint16).astype(float)
+            else:
+                a = np.concatenate([r2.normal(0.2, 0.05, 45_000),
+                                    r2.normal(0.8, 0.08, 15_000)])
+            integral = bool(np.all(a == np.floor(a)))
+            lo, hi = float(a.min()), float(a.max())
+            span = (hi - lo) or 1.0
+            for method, fn in FN.items():
+                edges, centers = _bins_for(method, lo, hi, integral)
+                counts, _ = np.histogram(a, bins=edges)
+                got = _level_from_hist(fn, method, counts.astype(np.int64), centers,
+                                       float(a.size), float(a.sum()))
+                rel = abs(got - float(fn(a))) / span
+                assert rel <= BOUND[method], \
+                    f"{method}: streaming level off by {rel:.2e} of range (bound " \
+                    f"{BOUND[method]:.0e}); one 256-bin width is {1/256:.2e}"
+    finally:
+        if prior is None:
+            os.environ.pop("NODEGRAPH_SPILL_BYTES", None)
+        else:
+            os.environ["NODEGRAPH_SPILL_BYTES"] = prior
+
+    _ok("spill + streaming stats (V2.24, reported 2026-08-04): a 42.3-Gvoxel series "
+        "(12x16x210 planes of 1024²) made analysis.threshold and analysis.segment die with "
+        "_ArrayMemoryError — 315 GiB of float64 staging and 315 GiB of int64 label raster — "
+        "but ONLY once an upstream Z-Project was reset to `none`, so a hard ceiling in these "
+        "two nodes read as the Z reset being broken. Now: a dense output above spill_budget "
+        "is a memmapped .npy that reaches the layer UNCOPIED and costs the Memo 0 bytes "
+        "(Dataset.with_layer was defeating both by routing through np.asarray, which strips "
+        "the subclass into a view AttributeLayer then copies); spilled output is byte-"
+        "identical to in-RAM for threshold and segment incl. the globally-numbered Label "
+        "rows; and the threshold level is derived from a streamed histogram instead of the "
+        "staged dataset — EXACT for otsu/yen/mean and for every method under the default "
+        "`plane` scope (whose groups are single planes), and within 4.3e-5 / 1.8e-3 of the "
+        "data range for pooled li / triangle, which consume raw values and so can only be "
+        "handed a surrogate — under half of one 256-bin width, asserted both ways")
+
+
 def test_streaming_slivers() -> None:
     """C1 follow-up slivers (V2.04 §6b): ``util.stack`` T→1 tree-reduce; lazy units for
-    normalize / resample / drift (eager-stat, lazy-apply); the kernel-param field gate."""
+    normalize / resample / drift / stabilize (eager-stat, lazy-apply); the kernel-param
+    field gate."""
     if not _HAVE_SKIMAGE:
         _ok("streaming slivers: SKIPPED (scipy/skimage absent)")
         return
     import itertools
+    from nodegraph.engine import EvalContext, ReadContext
     from nodegraph.provider import ArrayProvider
     from nodegraph.nodes import COMPUTES, register_node as _reg, _map_image, _DIM_KAX
     from nodegraph.streaming import (
@@ -4614,6 +5331,75 @@ def test_streaming_slivers() -> None:
                                              mode="constant")
     assert np.allclose(gather(dft), ref_d, rtol=_stream_rtol(1e-7), atol=1e-7)
 
+    # 3b) registration.stabilize: the SAME eager-estimate / lazy-per-plane-apply split as
+    #     align.drift above (2026-08-04). It used to allocate (M,T,Z,C,Y,X) float64 and warp
+    #     every plane inside the pull, so its cost scaled with Z for a viewer showing ONE
+    #     plane — 20.0 GiB and 640 plane-warps on a 16-position 10-plane 4-channel 2048²
+    #     stack, against 2.0 GiB and 64 for the same stack z-projected. Resetting an upstream
+    #     Z-Project to `none` therefore turned a working pull into a ~10x slower one and the
+    #     Viewer kept showing the stale z==1 frame, which read as Z-Project's `none` being
+    #     broken when Z-Project had done its job exactly right.
+    #
+    #     Both models are checked because they take DIFFERENT kernel branches — translation
+    #     resamples through apply_shift, euclidean through cv2's apply_warp — and the lazy
+    #     path has to reproduce the eager one through both.
+    for _model in ("translation", "euclidean"):
+        _st = eng([("S", "test.slv_seed", {}),
+                   ("R", "registration.stabilize", {"modes": {"model": _model}})],
+                  [("S", "R")]).pull("R")
+        assert isinstance(_st.image, MapComputeProvider), type(_st.image)
+        # whole planes, never tiles: a shift/warp fills the vacated edge with zeros, so a
+        # tiled unit would invent that border in the middle of the image
+        assert _st.image.plane_unit, f"{_model}: a warp must fold whole planes"
+        _sa = _st.image.axes
+        assert (_sa.m, _sa.t, _sa.z, _sa.c) == (1, 3, 2, 1), "axis-preserving"
+        assert (_st.get(D.FRAME, "drift_y") is not None
+                and _st.get(D.FRAME, "drift_x") is not None)
+        # the eager (bare-ctx) fallback is the reference: same estimate, same per-frame
+        # kernel call (registration.apply_frame), so the two paths must agree in every BIT.
+        # Two implementations of one piece of arithmetic is how a lazy and an eager path
+        # come to disagree in the last digits, which is why apply_series was refactored to
+        # delegate to apply_frame rather than keep its own copy of the branch.
+        _eager = COMPUTES["registration.stabilize"](EvalContext(
+            node_id="R", op_key="registration.stabilize",
+            params={"__modes__": {"model": _model}}, env=env,
+            granularity=Granularity.WHOLE_SERIES,
+            kernel_axes=frozenset({"t", "y", "x"}), inputs=(ds,),
+            reads=ReadContext(env.metadata),
+            spec=NODES.get("registration.stabilize")))
+        assert isinstance(_eager.image, ArrayProvider)
+        assert np.array_equal(gather(_st), gather(_eager)), \
+            f"{_model}: the lazy per-plane apply disagrees with the eager reference"
+        for _k in ("drift_y", "drift_x"):
+            assert np.array_equal(_st.get(D.FRAME, _k).values,
+                                  _eager.get(D.FRAME, _k).values), f"{_model}/{_k}"
+
+    # ...and the cost fence, which is the whole point of the change: ONE output plane must
+    # read ONE source plane, not the whole stack. Stated as the IDEAL rather than "fewer
+    # than before", because anything above it is a multiplier that grows with Z and C.
+    class _CountingStab(ArrayProvider):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.reads = 0
+
+        def read_region(self, level, m, t, z, c, y0, y1, x0, x1):
+            self.reads += 1
+            return super().read_region(level, m, t, z, c, y0, y1, x0, x1)
+
+    _cprov = _CountingStab(raw, tile=32)
+    _cds = Dataset(axes=axt, metadata=optics).with_image(_cprov)
+    _cst = eng([("S", "test.slv_seed", {}), ("R", "registration.stabilize", {})],
+               [("S", "R")], seed_ds=_cds).pull("R")
+    _cprov.reads = 0                       # discount the eager estimate's own reads
+    _ = np.asarray(_cst.image.get_region(0, 0, 0, 0, 0, 0, axt.y, 0, axt.x))
+    assert _cprov.reads == 1, \
+        f"one output plane cost {_cprov.reads} source reads, ideal 1 (the eager " \
+        f"(M,T,Z,C,Y,X) apply is back — cost scales with Z again)"
+    _cprov.reads = 0                       # and a z-column costs exactly its own planes
+    for _z in range(axt.z):
+        _ = np.asarray(_cst.image.get_region(0, 0, 0, _z, 0, 0, axt.y, 0, axt.x))
+    assert _cprov.reads == axt.z, _cprov.reads
+
     # 4) resample lazy per-UNIT realize (geometry-changing → PlaneRealizeProvider): only
     #    touched planes resize; ≡ a direct skimage reference; output axes scaled.
     from skimage.transform import resize as _rsz
@@ -4657,8 +5443,14 @@ def test_streaming_slivers() -> None:
 
     _ok("streaming slivers (V2.04 §6b): util.stack T→1 tree-reduce (monoid+gather≡ref, "
         "dt_s dropped); normalize plane/volume/series lazy units; drift eager-estimate + "
-        "lazy per-plane apply; resample lazy per-unit realize (geometry change); "
-        "kernel-param field gate (non-Const σ field → plane unit; Const/none → tiled)")
+        "lazy per-plane apply; registration.stabilize the same split (2026-08-04) — "
+        "BYTE-identical to the eager reference through both kernel branches (apply_shift "
+        "and cv2 apply_warp, which is why apply_series now delegates to a shared "
+        "apply_frame), whole-plane unit, axis-preserving, drift attrs intact, and ONE "
+        "output plane costs ONE source read instead of the whole (M,T,Z,C) stack, so its "
+        "cost no longer scales with Z for a viewer showing one plane; resample lazy "
+        "per-unit realize (geometry change); kernel-param field gate (non-Const σ field → "
+        "plane unit; Const/none → tiled)")
 
 
 def test_catalog_kernels() -> None:
@@ -4704,9 +5496,50 @@ def test_catalog_kernels() -> None:
                              ("B", "detect.particles", {"modes": {"dim": "2D"},
                                                         "params": {"min_distance": 0.6}})],
                  [("S", "B")])
+        # The 2D branch was asserted only on its HASH, never on its OUTPUT — which is how a
+        # per-plane detection could have returned nothing without anyone noticing. It is 18:
+        # each planted bead is a 3-plane-deep block and 2D detects PER PLANE (3 beads x 3
+        # planes = 9 blobs), and each 5x5 plateau yields **two** detections rather than one.
+        # That doubling is real shipped behaviour, not a fixture artefact, and it is the
+        # cheapest available demonstration of why `min_distance` doing two jobs is awkward:
+        # it is both the LoG sigma and the suppression radius, so at min_distance=0.6 um /
+        # 0.2 um-px it gives sigma=1.5 -> a 4x4 maximum-filter footprint, NARROWER than the
+        # 5x5 blob, so two corners of the plateau both survive as local maxima — and then the
+        # 3.0 px suppression radius is just under their ~3.1 px separation, so neither is
+        # merged away. Widening it to merge them would also widen the filter, and vice versa.
+        p2 = e2.pull("B").get(D.POINT, "z", layer="particles")
+        assert p2 is not None and len(p2.values) == 18, \
+            f"particles 2D found {0 if p2 is None else len(p2.values)} (expected 18 = " \
+            f"3 beads x 3 planes each x the 2 plateau corners that survive)"
+        assert sorted(np.unique(p2.values).tolist()) == [1.0, 2.0, 3.0, 4.0, 5.0], \
+            f"2D rows must carry the true plane index, got {np.unique(p2.values)}"
+        assert len(p2.values) > len(pts.values), \
+            "2D must yield MORE rows than 3D — it reports a bead once per plane it spans"
+        assert e2.pull("B").structure_zkind(D.POINT, "particles") == "plane_index"
+        assert e3.pull("B").structure_zkind(D.POINT, "particles") == "subpixel"
         assert e3.entry("B").recipe_hash != e2.entry("B").recipe_hash
         assert any(k == "pixel_size_um" for k, _ in e3.entry("B").reads)
-        beads_note = "particles 2D/3D (3 detected, distinct hash, fenced)"
+        # `min_size` is the node's main defence against single-voxel shot noise, so it has to
+        # be a LIVE control rather than one the kernel ignores: raising it past a planted
+        # bead's own voxel count must lose the beads. Each block is 5x5x3 = 75 voxels.
+        tiny = eng(bds, benv, [("S", "io.kseed", {}),
+                               ("B", "detect.particles",
+                                {"modes": {"dim": "3D"},
+                                 "params": {"min_distance": 0.6, "min_size": 200}})],
+                   [("S", "B")])
+        ptiny = tiny.pull("B").get(D.POINT, "z", layer="particles")
+        assert ptiny is not None and len(ptiny.values) == 0, \
+            f"min_size must actually gate — 200 voxels is past the 75-voxel blocks, got " \
+            f"{0 if ptiny is None else len(ptiny.values)}"
+        assert tiny.entry("B").recipe_hash != e3.entry("B").recipe_hash, \
+            "min_size must fold into the recipe hash"
+        beads_note = ("particles 2D/3D (3 beads = 3 volumetric points in 3D, and in 2D 18 "
+                      "per-plane rows carrying their true plane index — 3 beads x 3 planes "
+                      "x the 2 plateau corners that survive, because min_distance is both "
+                      "the LoG sigma and the suppression radius and cannot merge them "
+                      "without also widening the filter; the 2D branch was only ever "
+                      "hash-checked, never on its output; z_kind per dim, distinct hash, "
+                      "px fenced, min_size live and re-keying)")
     else:
         beads_note = "beads SKIPPED (numba absent)"
 
@@ -4968,7 +5801,10 @@ def test_catalog_kernels() -> None:
                        raw_env=MetaEnvelope(axes=axbad, metadata=rmeta))[1].pull("M")
         raise SystemExit("a mis-shaped `raw` input should be refused")
     except ValueError as ex:
-        assert "does not match the measured input" in str(ex), str(ex)
+        # V2.22: the check moved into the shared `_require_same_grid`, so the wording is
+        # now socket-parameterized ("the `raw` input's geometry … the main input's") —
+        # `analysis.voronoi`'s second input needed the identical rule.
+        assert "`raw` input's geometry" in str(ex) and "does not match" in str(ex), str(ex)
     # histogram_threshold: mask from the main pixels, intensities re-measured on raw
     _g = Graph()
     for nid, op in (("S", "io.kseed"), ("R", "io.kseed2")):
@@ -5396,7 +6232,8 @@ def test_catalog_dvc() -> None:
              ("R", "transform.rasterize_field", {})], [("S", "R")]).pull("R")
         raise SystemExit("rasterize without a Point layer should raise")
     except ValueError as ex2:
-        assert "Point layer" in str(ex2)
+        # ZERO candidates: `_resolve_layer` has nothing to infer from (2026-08-04 sweep)
+        assert "no Point table" in str(ex2), str(ex2)
 
     _ok("catalog (DVC + field rasterize): 2D/3D recover known shift (µm), Point schema "
         "+ disp/strain/qfactor; 2D≠3D hash; pixel/z-step fenced; external-ref socket + "
@@ -6102,14 +6939,15 @@ def test_label_to_points_voronoi() -> None:
     define_node("io.vseed", "S", outputs=[OutDataset()])
     META = {"pixel_size_um": 0.2, "z_step_um": 0.5}
 
-    def run(nodes, edges, sink, seed, ax):
+    def run(nodes, edges, sink, seed, ax, observer=None):
         g = Graph()
         for nid, op, kw in nodes:
             g.add(NodeInstance(nid, op, **kw))
         for e in edges:
             g.connect(e[0], e[1], dst_socket=(e[2] if len(e) > 2 else "data"))
         eng = Engine(g, computes=COMPUTES, seeds={"S": seed},
-                     meta_seeds={"S": MetaEnvelope(axes=ax, metadata=META)})
+                     meta_seeds={"S": MetaEnvelope(axes=ax, metadata=META)},
+                     observer=observer)
         return eng, eng.pull(sink)
 
     def col(ds, dom, name, layer):
@@ -6180,7 +7018,61 @@ def test_label_to_points_voronoi() -> None:
             [("S", "P")], "P", ds2, ax2)
         raise SystemExit("a bare mask is not a label raster")
     except ValueError as exm:
-        assert "not a LABEL raster" in str(exm), str(exm)
+        # TWO refusals guard this one mistake and either is correct, so the assertion accepts
+        # both rather than pinning whichever currently fires first (2026-08-04). Since the
+        # `_resolve_layer` sweep a plain `mask` is not a *candidate* — `_label_instances`
+        # counts only names carrying a Label table — so the resolver can refuse it before
+        # `_label_raster` is reached, and which one speaks depends on how the node orders the
+        # two calls. What must never change is that a bare mask is refused and the message
+        # says a Label TABLE is what is missing; pinning one wording made this test fail on a
+        # pure refactor that improved the error.
+        _m = str(exm)
+        assert ("not a LABEL raster" in _m) or ("no Label instance" in _m), _m
+        assert "Label table" in _m or "the table" in _m, _m
+
+    # ── the reported bug: a RENAMED segmentation feeds every consumer (2026-08-04) ──
+    #
+    # The fixture's Label instance is called `areas`, and every socket above names it by
+    # hand. Left at their SHIPPED defaults (`labels`) they used to fail with "no Voxel layer
+    # 'labels' (it carries ['areas'])" — which is what a user hit on a two-node
+    # segment→label_to_points graph after renaming the segmentation `CELLS`. One candidate is
+    # on the wire, so there is nothing to decide: the consumers resolve it themselves and
+    # NAME what they inferred on the progress rail.
+    _bare = ("P", "transform.label_to_points", {})               # no params at all
+    _rails: List[str] = []
+    _, o_bare = run([("S", "io.vseed", {}), CC2, _bare], [("S", "C"), ("C", "P")], "P",
+                    ds2, ax2,
+                    observer=lambda k, nid, i: _rails.append(str(i.get("note", "")))
+                    if k == "progress" else None)
+    assert col(o_bare, D.POINT, "label", "areas_points").tolist() == [1, 2], \
+        "an untouched `labels` socket must resolve to the only Label instance on the wire"
+    _said = [r for r in _rails if r.startswith("using ")]
+    assert _said and "'areas'" in _said[0], _rails[:4]
+    # ...and the auto-derived OUTPUT name follows the RESOLVED layer, not the socket's
+    # literal default — `labels_points` would name a layer built from `areas`.
+    assert o_bare.get(D.POINT, "y", layer="labels_points") is None
+    # the same for the measurement half: an untouched `labels` measures `areas`
+    _, o_meas = run([("S", "io.vseed", {}), CC2, ("M", "analysis.measure", {})],
+                    [("S", "C"), ("C", "M")], "M", ds2, ax2)
+    assert col(o_meas, D.LABEL, "mean_intensity", "areas").tolist() != [], "measure resolved"
+    assert np.allclose(col(o_meas, D.LABEL, "area", "areas"), [512.0, 384.0]), \
+        "measure must resolve `areas` and keep its own region order"
+    # ...and for the tracker — whose two targets have DIFFERENT candidate sets, which is what
+    # makes this wire show both halves of the rule at once. The label branch groups a raster
+    # by id and needs no Label table, so the seed's own `mask` counts beside `areas`: two
+    # candidates, a real question, refused with both named rather than guessed.
+    try:
+        run([("S", "io.vseed", {}), CC2, ("K", "track.link", {})],
+            [("S", "C"), ("C", "K")], "K", ds2, ax2)
+        raise SystemExit("two Voxel candidates should raise rather than pick one")
+    except ValueError as exk:
+        assert "has to say which" in str(exk) and "'mask'" in str(exk), str(exk)
+    # the POINT branch of the same node has exactly one candidate, so it resolves
+    _, o_tkp = run([("S", "io.vseed", {}), CC2, _bare,
+                    ("K", "track.link", {"modes": {"target": "point"}})],
+                   [("S", "C"), ("C", "P"), ("P", "K")], "K", ds2, ax2)
+    assert o_tkp.get(D.TRACK, "member_id", layer="tracks") is not None, \
+        "track.link (point) must resolve the only Point table on the wire"
 
     # ── voronoi 2D: four dots, per-region arenas ──────────────────────────────────
     dots = _ST(D.POINT, {
@@ -6212,20 +7104,144 @@ def test_label_to_points_voronoi() -> None:
     assert np.allclose(dens, 1.0 / (area * 0.04)), (dens.tolist(), area.tolist())
     assert {"pixel_size_um"} <= {k for k, _ in ev.entry("V").reads}
 
+    # ── TWO BRANCHES converging: seeds on `data`, areas on `areas` (V2.22) ────────
+    #
+    # The reported limitation (2026-08-03): "I can only connect one data at a time when I
+    # need the Point domain and label domain from two different nodes." Which is the normal
+    # shape — dots detected on one channel, areas segmented on another — and no single wire
+    # can carry a Point table and someone else's Label raster. Asserted here against the
+    # SAME fixture as the single-wire run above, so the two must agree voxel for voxel:
+    # routing the areas through a second input may not change the answer, only where it
+    # comes from.
+    define_node("io.vareas", "B", outputs=[OutDataset()])
+    areas_only = (Dataset(axes=ax2, metadata=META)
+                  .with_image(ArrayProvider(np.zeros_like(img)))
+                  .with_layer(D.VOXEL, "mask", mask))
+    seeds_only = (Dataset(axes=ax2, metadata=META).with_image(ArrayProvider(img))
+                  .with_structure(dots))
+
+    def two_branch(**vkw):
+        """Seeds into `data`, a SEPARATE labelled branch into `areas`."""
+        g = Graph()
+        g.add(NodeInstance("S", "io.vseed"))
+        g.add(NodeInstance("B", "io.vareas"))
+        g.add(NodeInstance("C", "analysis.label",
+                           params={"mask": "mask", "name": "areas"}, modes={"dim": "2D"}))
+        g.add(NodeInstance("V", "analysis.voronoi",
+                           params={"points": "dots", "region": "areas"},
+                           modes={"dim": "2D", "bound": "per_region"}, **vkw))
+        g.connect("S", "V")                              # seeds — the PRIMARY
+        g.connect("B", "C"); g.connect("C", "V", dst_socket="areas")
+        eng = Engine(g, computes=COMPUTES,
+                     seeds={"S": seeds_only, "B": areas_only},
+                     meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=META)})
+        return eng, eng.pull("V")
+
+    e2b, o2b = two_branch()
+    assert np.array_equal(np.asarray(o2b.get(D.VOXEL, "voronoi").values), rast), \
+        "the same dots and the same areas must tessellate identically whichever wire the " \
+        "areas arrived on"
+    assert col(o2b, D.LABEL, "region", "voronoi").tolist() == [1, 1, 2, 2]
+    # `data` stays the calibration/env source even though `areas` is the labelled branch —
+    # dataset_preds sorts by DECLARED socket position, not by which edge was wired first
+    assert {"pixel_size_um"} <= {k for k, _ in e2b.entry("V").reads}
+    assert e2b.env("V").metadata.get("pixel_size_um") == 0.2
+    # wiring the second input re-keys the node on its own (a new predecessor folds into
+    # recipe_hash), so the single-wire memo entry cannot be served for it
+    assert e2b.entry("V").recipe_hash != ev.entry("V").recipe_hash
+
+    # the guard: the two branches are read voxel-for-voxel, so a DIFFERENT grid is refused
+    # rather than clipping every cell to the wrong part of the image
+    gx = Graph()
+    gx.add(NodeInstance("S", "io.vseed")); gx.add(NodeInstance("B", "io.vareas"))
+    gx.add(NodeInstance("C", "analysis.label",
+                        params={"mask": "mask", "name": "areas"}, modes={"dim": "2D"}))
+    gx.add(NodeInstance("K", "util.crop", params={"y1": 20, "x1": 20}))
+    gx.add(NodeInstance("V", "analysis.voronoi",
+                        params={"points": "dots", "region": "areas"},
+                        modes={"dim": "2D", "bound": "per_region"}))
+    gx.connect("S", "V"); gx.connect("B", "C"); gx.connect("C", "K")
+    gx.connect("K", "V", dst_socket="areas")
+    try:
+        Engine(gx, computes=COMPUTES, seeds={"S": seeds_only, "B": areas_only},
+               meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=META)}).pull("V")
+        raise AssertionError("a cropped `areas` branch was accepted — every cell would be "
+                             "clipped to the wrong region")
+    except ValueError as exg:
+        assert "`areas`" in str(exg) and "voxel-for-voxel" in str(exg), str(exg)
+
+    # and an `areas` wire under `frame` is REFUSED, not silently ignored: `frame` reads no
+    # area layer at all, so accepting the edge would be a dead input (contract clause 2)
+    gf = Graph()
+    gf.add(NodeInstance("S", "io.vseed")); gf.add(NodeInstance("B", "io.vareas"))
+    gf.add(NodeInstance("V", "analysis.voronoi", params={"points": "dots"},
+                        modes={"dim": "2D", "bound": "frame"}))
+    gf.connect("S", "V"); gf.connect("B", "V", dst_socket="areas")
+    try:
+        Engine(gf, computes=COMPUTES, seeds={"S": seeds_only, "B": areas_only},
+               meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=META)}).pull("V")
+        raise AssertionError("`areas` wired under bound=frame was silently ignored")
+    except ValueError as exf:
+        assert "frame" in str(exf) and "silently ignored" in str(exf), str(exf)
+
+    # THE AREAS MUST REACH THE OUTPUT (2026-08-04). The payload is built on `data`, so with
+    # the seeds on one wire and the areas on another the result inherited the SEEDS' layers
+    # and the areas branch left no trace — viewing the node showed the seeds' own labels and
+    # points, under the name `labels`, which is what the areas raster is usually called too.
+    # So a territory could not be seen against the region that bounded it: the one picture
+    # this node exists to draw.
+    _avox = {k[2] for k in o2b.attributes if k[0] is D.VOXEL}
+    assert "voronoi_areas" in _avox, sorted(_avox)
+    _av = np.asarray(o2b.get(D.VOXEL, "voronoi_areas").values)
+    _src = np.asarray(e2b.pull("C").get(D.VOXEL, "areas").values)
+    _used = set(int(v) for v in col(o2b, D.LABEL, "region", "voronoi"))
+    assert _used == {1, 2}, _used
+    assert np.array_equal(_av, np.where(np.isin(_src, list(_used)), _src, 0)), \
+        "`voronoi_areas` must be the raster the cells were clipped to, restricted to the " \
+        "arenas that actually produced one"
+    # a region NO dot landed in contributed nothing, so drawing it beside the territories
+    # invites the misreading this layer exists to prevent (2026-08-04). On this fixture both
+    # arenas are used; the dot-less case is checked below via `mask` reaching into an empty one.
+    assert set(int(v) for v in np.unique(_av) if v) == _used
+    # the edit-time catalog has to predict it too, or no picker and no overlay list offers it
+    from nodegraph.catalog.analysis.voronoi import _layers_voronoi as _lv
+    assert _lv({}, {"bound": "per_region"}) == ((D.POINT, "voronoi_seeds"),
+                                                (D.VOXEL, "voronoi_areas"))
+    assert _lv({"name": "terr"}, {"bound": "mask"}) == ((D.POINT, "terr_seeds"),
+                                                       (D.VOXEL, "terr_areas"))
+    # `frame` reads no area layer so copies none — but it still publishes the surviving seeds,
+    # because the reach cap can drop a dot there too
+    assert _lv({}, {"bound": "frame"}) == ((D.POINT, "voronoi_seeds"),)
+    assert _lv(None, None) == ((D.POINT, "voronoi_seeds"),
+                               (D.VOXEL, "voronoi_areas")), "must never raise (keystroke)"
+
+    # the socket declares WHERE its picker looks, or the GUI would offer the primary wire's
+    # names for a layer the compute reads off the second one
+    _vspec = NODES.get("analysis.voronoi")
+    assert [i.name for i in _vspec.inputs][:2] == ["data", "areas"], \
+        "`areas` must be declared AFTER `data` or it could become dataset_preds[0]"
+    assert _vspec.input("region").layer_from == "areas"
+    assert _vspec.input("points").layer_from == "", "seeds come from the primary"
+
     # ── the other two bounds, and the reach cap ───────────────────────────────────
-    def voronoi(bound, extra=None, seed=None, ax=None, dim="2D", chain=True):
+    def voronoi(bound, extra=None, seed=None, ax=None, dim="2D", chain=True,
+                observer=None):
         params = {"points": "dots", "region": "areas"}
         params.update(extra or {})
         node = ("V", "analysis.voronoi", {"params": params,
                                           "modes": {"dim": dim, "bound": bound}})
         nodes = [("S", "io.vseed", {})] + ([CC2] if chain else []) + [node]
         edges = [("S", "C"), ("C", "V")] if chain else [("S", "V")]
-        return run(nodes, edges, "V", seed if seed is not None else ds2d, ax or ax2)
+        return run(nodes, edges, "V", seed if seed is not None else ds2d, ax or ax2,
+                   observer=observer)
     _, omask = voronoi("mask", {"region": "mask"}, chain=False)
     rm = np.asarray(omask.get(D.VOXEL, "voronoi").values)
     assert int((rm != 0).sum()) == int((mask != 0).sum())     # one arena, same coverage
     _, ofr = voronoi("frame", chain=False)
     assert int((np.asarray(ofr.get(D.VOXEL, "voronoi").values) != 0).sum()) == 40 * 40
+    assert not [k for k in ofr.attributes
+                if k[0] is D.VOXEL and str(k[2]).endswith("_areas")], \
+        "`frame` reads no area layer, so it copies none onto the output"
     _, ocap = voronoi("per_region", {"max_distance_um": 1.0})
     n_cap = int((np.asarray(ocap.get(D.VOXEL, "voronoi").values) != 0).sum())
     assert 0 < n_cap < int((mask != 0).sum()), n_cap
@@ -6338,6 +7354,34 @@ def test_label_to_points_voronoi() -> None:
     assert not [a for a in onone.layers_on(D.LABEL) if a.layer == "voronoi"]
     assert MSH.read_mesh(onone, "voronoi_mesh").validate().element.n == 0, \
         "an empty mesh must still be a VALID mesh, not a raise"
+    # ...but it must not be SILENT (2026-08-04). A real graph reported 25 cells for 141
+    # nuclei — the seeds were centroids of a Z-PROJECTION while the areas came from a single
+    # Z-PLANE, so 116 of them sat on background and were dropped with nothing said. The node
+    # succeeded and the only symptom was a short table, which is why this is accounted for on
+    # the output rather than left to whoever thinks to count rows.
+    assert (onone.metadata["voronoi_seeds"], onone.metadata["voronoi_cells"],
+            onone.metadata["voronoi_seeds_outside"]) == (1, 0, 1), \
+        {k: v for k, v in onone.metadata.items() if k.startswith("voronoi_")}
+    # and the count reaches the progress rail — the one user-visible channel a compute has
+    _notes: list = []
+    run([("S", "io.vseed", {}), CC3,
+         ("V", "analysis.voronoi", {"params": {"points": "dots", "region": "areas"},
+                                    "modes": {"dim": "3D", "bound": "per_region"}})],
+        [("S", "C"), ("C", "V")], "V",
+        (Dataset(axes=ax3, metadata=META).with_image(ArrayProvider(blank3))
+         .with_layer(D.VOXEL, "mask", box).with_structure(far)), ax3,
+        observer=lambda kind, nid, info: _notes.append(info.get("note", ""))
+        if kind == "progress" else None)
+    _drop = [n for n in _notes if "seeds got a cell" in str(n)]
+    assert _drop, f"a dropped seed was never reported: {_notes}"
+    assert "0/1" in _drop[-1] and "BACKGROUND" in _drop[-1], _drop[-1]
+    # a run that keeps every seed says NOTHING — the note is a signal, not noise
+    _quiet: list = []
+    run([("S", "io.vseed", {}), CC2, VOR], [("S", "C"), ("C", "V")], "V", ds2d, ax2,
+        observer=lambda kind, nid, info: _quiet.append(info.get("note", ""))
+        if kind == "progress" else None)
+    assert not [n for n in _quiet if "dropped" in str(n)], \
+        f"a fully-successful tessellation must not report drops: {_quiet}"
 
     # ── a stray NEGATIVE value in a raster is junk, not label id 1 ────────────────
     # `searchsorted` would file it under the first id, dragging that region's centroid to
@@ -6366,17 +7410,66 @@ def test_label_to_points_voronoi() -> None:
     keys = {n: ek.entry(n).recipe_hash for n in ("V", "W", "X")}
     assert len(set(keys.values())) == 3, keys      # bound AND the dim lever both re-key
 
-    # ── guards + per-mode socket / Mode gating ────────────────────────────────────
+    # ── the layer sockets RESOLVE THEMSELVES (2026-08-04) ─────────────────────────
+    #
+    # These two used to assert the opposite — that a name which is not on the wire raises —
+    # and that was the defect, not the contract. The node shipped `points="particles"`, the
+    # literal name ONE upstream producer emits, so seeding it from `detect.spots` or
+    # `transform.label_to_points` failed with "no Point layer 'particles' (it carries
+    # ['points'])": an error that printed the right answer one clause after refusing to use
+    # it, with nothing to decide because a single Point table was on the wire. A layer name
+    # derivable from the incoming data is derived, exactly as a spatial param gets a `derive`
+    # instead of a pixel constant.
+    #
+    # It never chooses BETWEEN candidates, and it never overrides a name that IS present.
+    _, oauto = voronoi("per_region", {"points": "", "region": ""})     # nothing typed at all
+    assert col(oauto, D.LABEL, "region", "voronoi").tolist() == [1, 1, 2, 2], \
+        "an unset socket must resolve to the only candidate and give the same answer"
+    _, ostale = voronoi("per_region", {"points": "nope"})              # a name that is gone
+    assert col(ostale, D.LABEL, "region", "voronoi").tolist() == [1, 1, 2, 2], \
+        "a stale name with exactly one candidate is recovered, not refused"
+    # ...and it SAYS which layers it inferred, on the one channel a compute has
+    _inote: list = []
+    voronoi("per_region", {"points": "", "region": ""},
+            observer=lambda k, nid, i: _inote.append(i.get("note", ""))
+            if k == "progress" else None)
+    _using = [n for n in _inote if str(n).startswith("using ")]
+    assert _using and "'dots'" in _using[0] and "'areas'" in _using[0], _inote[:4]
+
+    # ZERO candidates still raises — there is nothing to infer
     try:
-        voronoi("per_region", {"points": "nope"})
-        raise SystemExit("a missing Point layer should raise")
+        voronoi("per_region", {"points": ""}, seed=ds2)     # ds2 carries no Point table
+        raise SystemExit("no Point table at all should raise")
     except ValueError as exp:
-        assert "no Point layer" in str(exp), str(exp)
+        assert "no Point table" in str(exp), str(exp)
+    # ...and so does an AMBIGUOUS wire: two Point tables is a real question, and guessing
+    # would silently tessellate the wrong cloud
+    _more = _ST(D.POINT, {
+        "id": np.arange(2, dtype=np.int64) + 90, "m": np.zeros(2, np.int64),
+        "t": np.zeros(2, np.int64), "c": np.zeros(2, np.int64), "z": np.zeros(2),
+        "y": np.array([12., 32.]), "x": np.array([12., 32.])},
+        layer="other_dots", z_kind="plane_index")
     try:
-        voronoi("mask", {"region": "nothere"}, chain=False)
-        raise SystemExit("a missing mask should raise")
-    except ValueError as exq:
-        assert "to bound the cells" in str(exq), str(exq)
+        voronoi("per_region", {"points": ""}, seed=ds2d.with_structure(_more))
+        raise SystemExit("two Point tables should raise rather than pick one")
+    except ValueError as exa:
+        assert "has to say which" in str(exa) and "other_dots" in str(exa), str(exa)
+    # the same three-way rule on the AREA socket: `mask` takes any Voxel layer, so an
+    # unchained seed has one candidate (recovered) and the chained one has two (refused)
+    _, omr = voronoi("mask", {"region": "nothere"}, chain=False)
+    assert np.asarray(omr.get(D.VOXEL, "voronoi").values).any(), \
+        "one Voxel candidate must be recovered under `mask`"
+    try:
+        voronoi("mask", {"region": ""})                    # chained: `mask` AND `areas`
+        raise SystemExit("two Voxel layers should raise under `mask`")
+    except ValueError as exv:
+        assert "has to say which" in str(exv), str(exv)
+    # under `per_region` a plain mask is NOT a candidate — only a whole Label instance is,
+    # so the same chained wire is unambiguous there even though it has two Voxel layers
+    _, opr = voronoi("per_region", {"region": ""})
+    assert col(opr, D.LABEL, "region", "voronoi").tolist() == [1, 1, 2, 2]
+
+    # ── per-mode socket / Mode gating ─────────────────────────────────────────────
     SPEC = NODES.get("analysis.voronoi")
     vis = lambda st: {i.name for i in SPEC.active_inputs(st)}
     mvis = lambda st: {m.name for m in SPEC.active_modes(st)}
@@ -6400,7 +7493,28 @@ def test_label_to_points_voronoi() -> None:
         "3D cell surfaces watertight and "
         "rasterize back at IoU>0.9, mesh=skip skips, dim+bound both re-key; a dot outside "
         "every region yields an empty-but-VALID mesh and a stray negative raster value is "
-        "junk rather than id 1; guards and per-mode socket/Mode gating")
+        "junk rather than id 1; guards and per-mode socket/Mode gating; and the V2.22 "
+        "SECOND input — dots on `data`, a separately-segmented branch on `areas` tessellate "
+        "byte-identically to the single-wire run while `data` stays the calibration source "
+        "and the extra predecessor re-keys the memo, with a cropped areas branch and an "
+        "areas wire under bound=frame both refused instead of silently misclipped/ignored; "
+        "and every seed is ACCOUNTED FOR — a dot that gets no territory is counted on the "
+        "output and named on the progress rail (background of the area layer / no unit / "
+        "out-competed), because a real graph reported 25 cells for 141 nuclei and the only "
+        "symptom was a short table; a run that keeps every seed stays quiet. And both layer "
+        "and the 2026-08-04 sweep: with EVERY layer socket left at its shipped default, a "
+        "segmentation renamed `areas` still reaches label_to_points, measure and track.link's "
+        "point branch (the reported \"no Voxel layer 'labels' (it carries ['CELLS'])\" on a "
+        "two-node graph), each naming what it inferred on the rail, with the auto-derived "
+        "output name following the RESOLVED layer — while track.link's LABEL branch, whose "
+        "candidates include a plain mask, refuses the two-candidate wire by name. And both "
+        "voronoi sockets RESOLVE THEMSELVES — empty or stale, the only candidate on their wire is "
+        "used and named on the rail, where `per_region` counts only whole Label INSTANCES so a "
+        "plain mask beside a label raster is still unambiguous; zero candidates and two "
+        "candidates both raise rather than guess. And the AREA raster reaches the output as "
+        "`<name>_areas` (declared via extra_layers, absent under `frame`) — the payload is "
+        "built on `data`, so the areas branch used to leave no trace and a territory could "
+        "not be viewed against the region that bounded it")
 
 
 def test_engine_observer() -> None:
@@ -6735,7 +7849,14 @@ def _test_segment_body() -> None:
     # ── structural spec (no image deps needed) ─────────────────────────────────
     s = NODES.get("analysis.segment")
     assert s.category == "analysis" and s.label == "Segmentation"
-    assert s.reads_domains == frozenset({D.VOXEL})
+    # STATIC, and deliberately untouched by the V2.22 per-mode sweep: VOXEL here is the
+    # image domain every source supplies, not a per-method layer requirement. The one
+    # method-specific Voxel layer is watershed's `mask`, whose default is "" ("cut the
+    # foreground out of the image with the level controls"), so no branch needs more than
+    # another — which is what makes a static declaration the honest one.
+    assert s.reads_domains == frozenset({D.VOXEL}) and not s.reads_domains_by_mode
+    assert all(s.resolve_reads_domains({"method": me}) == frozenset({D.VOXEL})
+               for me in ("threshold", "watershed", "stardist", "cellsam"))
     assert s.adds_domains == frozenset({D.VOXEL, D.LABEL})   # a raster AND a table
     assert s.meta_transform is None                          # never changes axes/calib
     assert s.resolve_granularity({"dim": "2D"}) is Granularity.WHOLE_PLANE
@@ -7907,6 +9028,1240 @@ def test_celltracker_parity() -> None:
         "morph-gradient blend) and 5 refusals")
 
 
+def test_measure_points() -> None:
+    """``analysis.measure`` on POINT members (2026-08-04) — position + one sample.
+
+    Measure could only read Label members, so a point cloud had no way to acquire either a
+    physical position or an intensity: ``detect.spots`` writes ``z``/``y``/``x`` in **voxel
+    index** units and nothing else, and ``analysis.object_field``'s `intensity` socket
+    (default ``mean_intensity``) therefore had no Point column to grid — the one member kind
+    that node could not serve.
+
+    The branch is a ``target`` Mode, following ``analysis.object_field`` /
+    ``analysis.object_metrics``, and it writes four columns: ``x_um``/``y_um``/``z_um`` and
+    ``mean_intensity``.
+
+    What is asserted, and why each one is a thing that could silently be wrong:
+
+    1. **The sample is the right voxel.** The fixture's intensity is a bijection of
+       ``(t,z,y,x)``, so a value sampled off by one plane, one frame or one pixel is a
+       different number rather than a similar one.
+    2. **µm is the calibration, not a guess** — and the *unrounded* coordinate is what gets
+       scaled, so a sub-pixel peak's reported position keeps its precision.
+    3. **The pixel columns are untouched.** Every downstream consumer reads ``y``/``x`` as
+       indices; rewriting them in µm would break tessellate / rasterize_field / track.link
+       with no error anywhere.
+    4. **``z_kind`` survives.** Re-emitting the layer with the ``StructureTable`` default
+       would tell everything downstream a 2-D cloud was volumetric (§7b).
+    5. **The two targets memoize apart**, and each hides the other's sockets.
+    6. **The layer is inferred** from an empty socket when there is one candidate, and two
+       candidates raise rather than pick (§4g).
+    7. **A row that addresses a frame this Dataset does not have gets NaN, not a
+       neighbour's intensity** — the failure mode of clipping a discrete address — and a
+       table with no addressable row at all is refused rather than returning all-NaN.
+    8. **``raw`` redirects the sampled pixels here too**, so "detect on enhanced, measure on
+       raw" works for points exactly as it does for regions.
+    9. **``z_step_um`` is read only when it can matter** (the R1 rule): on a single-plane
+       Dataset every detection is on plane 0, so the axial step cannot move ``z_um`` and
+       fencing the memo on it would invalidate the node for nothing."""
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+    define_node("io.ptseed", "S", outputs=[OutDataset()])
+    T, Z, Y, X = 2, 3, 32, 40
+    ax = AxisSizes(m=1, t=T, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 2.0, "bit_depth": 16}
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    # a BIJECTION of (t,z,y,x): every wrong voxel is a visibly different number, so an
+    # off-by-one in any axis cannot pass by landing on a neighbouring similar value.
+    img = np.zeros((1, T, Z, 1, Y, X), dtype=float)
+    for t in range(T):
+        for z in range(Z):
+            img[0, t, z, 0] = (100000.0 * t + 10000.0 * z
+                               + 100.0 * np.arange(Y)[:, None] + np.arange(X)[None, :])
+
+    def _pixel(t, z, y, x):
+        return 100000.0 * t + 10000.0 * z + 100.0 * y + x
+
+    # sub-pixel y/x on purpose (rows 1 and 3), so the nearest-voxel rounding is exercised
+    # rather than assumed, and one row lands hard on the far edge (row 4) to check the clip.
+    rows = [(0, 0, 0.0, 4.0, 6.0), (0, 1, 1.0, 10.4, 20.6),
+            (1, 2, 2.0, 25.0, 30.0), (1, 0, 0.0, 31.4, 39.4)]
+    n = len(rows)
+    tt = np.array([r[0] for r in rows], np.int64)
+    zz = np.array([r[2] for r in rows], float)
+    yy = np.array([r[3] for r in rows], float)
+    xx = np.array([r[4] for r in rows], float)
+    ptab = _ST(D.POINT, {"id": np.arange(1, n + 1, dtype=np.int64),
+                         "m": np.zeros(n, np.int64), "t": tt,
+                         "c": np.zeros(n, np.int64), "z": zz, "y": yy, "x": xx},
+               layer="blobs", z_kind="plane_index")
+    base = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+            .with_structure(ptab))
+
+    def run(nodes, edges, sink, seed=None, seed_env=None):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b in edges:
+            g.connect(a, b)
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed if seed is not None else base},
+                   meta_seeds={"S": seed_env or env})
+        return e, e.pull(sink)
+
+    def col(out, name, layer="blobs"):
+        a = out.get(D.POINT, name, layer=layer)
+        assert a is not None, f"missing Point column {name!r} on layer {layer!r}"
+        return np.asarray(a.values, dtype=float)
+
+    PT = {"modes": {"target": "point"}}
+    e, out = run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)], [("S", "Q")], "Q")
+
+    # ── 1. the sample is the voxel the detection sits on ─────────────────────────
+    want = np.array([_pixel(rows[i][0], int(round(rows[i][2])),
+                            int(round(min(yy[i], Y - 1))), int(round(min(xx[i], X - 1))))
+                     for i in range(n)])
+    got = col(out, "mean_intensity")
+    assert np.allclose(got, want), f"sampled {got.tolist()} want {want.tolist()}"
+
+    # ── 2. µm from the calibration, scaled from the UNROUNDED coordinate ─────────
+    assert np.allclose(col(out, "y_um"), yy * 0.5), col(out, "y_um")
+    assert np.allclose(col(out, "x_um"), xx * 0.5), col(out, "x_um")
+    assert np.allclose(col(out, "z_um"), zz * 2.0), col(out, "z_um")
+    assert not np.allclose(col(out, "y_um"), np.rint(yy) * 0.5), \
+        "y_um was scaled from the ROUNDED index — a sub-pixel peak lost its precision"
+    for key in ("pixel_size_um", "z_step_um"):
+        assert key in dict(e.entry("Q").reads), f"{key} must be memo-fenced"
+
+    # ── 3. the invariant pixel columns are NOT rewritten ────────────────────────
+    for name, ref in (("z", zz), ("y", yy), ("x", xx)):
+        assert np.allclose(col(out, name), ref), \
+            f"measure rewrote the pixel column {name!r} — every index consumer downstream " \
+            f"(rasterize_field, tessellate, track.link) reads it as a voxel index"
+
+    # ── 4. z_kind provenance carried forward, not clobbered with the default ────
+    assert out.structure_zkind(D.POINT, "blobs") == "plane_index", \
+        "measure stamped 'subpixel' over a 2-D cloud's own provenance"
+
+    # ── 5. the two targets memoize apart and gate each other's sockets ──────────
+    h_pt = node_recipe_hash("analysis.measure", {"__modes__": {"target": "point"}}, (), ())
+    h_lab = node_recipe_hash("analysis.measure", {"__modes__": {"target": "label"}}, (), ())
+    assert h_pt != h_lab, "the target Mode did not reach the recipe hash"
+    spec = NODES.get("analysis.measure")
+    live_pt = {s.name for s in spec.active_inputs({"target": "point"})}
+    live_lab = {s.name for s in spec.active_inputs({"target": "label"})}
+    assert {"points", "data", "raw"} <= live_pt and "labels" not in live_pt, live_pt
+    assert not ({"stats", "shape"} & live_pt), \
+        "stats/shape must be HIDDEN on points — a dimensionless row has no region to " \
+        "reduce over, and a live control the compute ignores is charter-forbidden"
+    assert {"labels", "stats", "shape"} <= live_lab and "points" not in live_lab, live_lab
+
+    # ── 6. the layer is inferred from an empty socket; two candidates raise ─────
+    assert not str(spec.input("points").default or "").strip(), \
+        "`points` must ship EMPTY — no literal is right for spots/particles/<labels>_points"
+    two = base.with_structure(_ST(D.POINT, dict(ptab.columns), layer="other",
+                                 z_kind="plane_index"))
+    try:
+        run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)], [("S", "Q")], "Q",
+            seed=two)
+        raise AssertionError("measure picked between two Point tables instead of asking")
+    except ValueError as exc:
+        assert "blobs" in str(exc) and "other" in str(exc), exc
+    _, named = run([("S", "io.ptseed", {}),
+                    ("Q", "analysis.measure",
+                     {"modes": {"target": "point"}, "params": {"points": "other"}})],
+                   [("S", "Q")], "Q", seed=two)
+    assert np.allclose(np.asarray(named.get(D.POINT, "mean_intensity",
+                                            layer="other").values, dtype=float), want), \
+        "an explicit layer name must select that table"
+
+    # ── 7. an unaddressable row is NaN; a wholly unaddressable table is refused ──
+    off = dict(ptab.columns)
+    off["t"] = np.array([0, 99, 1, 1], np.int64)          # row 1 names a frame beyond t=2
+    ds_off = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+              .with_structure(_ST(D.POINT, off, layer="blobs", z_kind="plane_index")))
+    _, o_off = run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)],
+                   [("S", "Q")], "Q", seed=ds_off)
+    v_off = col(o_off, "mean_intensity")
+    assert np.isnan(v_off[1]), \
+        "a row addressing a frame this Dataset has not must be NaN — clipping t would " \
+        "report a NEIGHBOURING frame's intensity, and 0 is a legal intensity"
+    assert np.isfinite(v_off[[0, 2, 3]]).all(), "the addressable rows must still measure"
+    all_off = dict(ptab.columns)
+    all_off["t"] = np.full(n, 99, np.int64)
+    ds_none = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+               .with_structure(_ST(D.POINT, all_off, layer="blobs", z_kind="plane_index")))
+    try:
+        run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)], [("S", "Q")], "Q",
+            seed=ds_none)
+        raise AssertionError("an all-unaddressable table returned an all-NaN column")
+    except ValueError as exc:
+        assert "not one of the" in str(exc), exc
+
+    # ── 8. `raw` redirects the sampled pixels for points as well ────────────────
+    define_node("io.ptraw", "R", outputs=[OutDataset()])
+    raw_img = img + 7.0                                   # same grid, different pixels
+    raw_ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(raw_img))
+    g = Graph()
+    g.add(NodeInstance("S", "io.ptseed"))
+    g.add(NodeInstance("R", "io.ptraw"))
+    g.add(NodeInstance("Q", "analysis.measure", modes={"target": "point"}))
+    g.connect("S", "Q")
+    g.connect("R", "Q", dst_socket="raw")
+    e_raw = Engine(g, computes=COMPUTES, seeds={"S": base, "R": raw_ds},
+                   meta_seeds={"S": env, "R": env})
+    o_raw = e_raw.pull("Q")
+    assert np.allclose(np.asarray(o_raw.get(D.POINT, "mean_intensity",
+                                            layer="blobs").values, dtype=float), want + 7.0), \
+        "`raw` must redirect the sampled pixels while the point table stays on the main input"
+
+    # ── 9. a single-plane Dataset must NOT fence the memo on z_step_um (R1) ─────
+    from dataclasses import replace as _replace
+    ax1 = _replace(ax, z=1)
+    flat = (Dataset(axes=ax1, metadata=meta).with_image(ArrayProvider(img[:, :, :1]))
+            .with_structure(_ST(D.POINT, {**dict(ptab.columns), "z": np.zeros(n)},
+                                layer="blobs", z_kind="plane_index")))
+    e_flat, o_flat = run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)],
+                         [("S", "Q")], "Q", seed=flat,
+                         seed_env=MetaEnvelope(axes=ax1, metadata=meta))
+    assert "z_step_um" not in dict(e_flat.entry("Q").reads), \
+        "every detection is on plane 0, so the axial step cannot move z_um — reading it " \
+        "would invalidate this node whenever an unrelated z calibration changed"
+    assert np.allclose(col(o_flat, "z_um"), 0.0), col(o_flat, "z_um")
+    assert np.isfinite(col(o_flat, "mean_intensity")).all()
+
+    # ── 10. a non-finite coordinate is NaN, not a garbage int64 cast ────────────
+    nanc = dict(ptab.columns)
+    nanc["y"] = np.array([4.0, np.nan, 25.0, 31.4])
+    ds_nan = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+              .with_structure(_ST(D.POINT, nanc, layer="blobs", z_kind="plane_index")))
+    _, o_nan = run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)],
+                   [("S", "Q")], "Q", seed=ds_nan)
+    v_nan = col(o_nan, "mean_intensity")
+    assert np.isnan(v_nan[1]) and np.isfinite(v_nan[[0, 2, 3]]).all(), v_nan
+
+    # ── 11. no Point table at all → an error that names what to wire ────────────
+    bare = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+    try:
+        run([("S", "io.ptseed", {}), ("Q", "analysis.measure", PT)], [("S", "Q")], "Q",
+            seed=bare)
+        raise AssertionError("measure measured points with no point cloud on the wire")
+    except ValueError as exc:
+        assert "detect.spots" in str(exc), exc
+
+    _ok("measure on POINT members (2026-08-04): x_um/y_um/z_um from the calibration (scaled "
+        "from the UNROUNDED coordinate, memo-fenced) + mean_intensity sampled at the exact "
+        "voxel of a (t,z,y,x)-bijective fixture, sub-pixel rounding and the far-edge clip "
+        "included; the invariant pixel z/y/x and the layer's z_kind both survive; the two "
+        "targets hash apart and each hides the other's sockets (stats/shape gone on points); "
+        "the layer is inferred from an empty socket and two candidates raise; an "
+        "unaddressable frame is NaN rather than a neighbour's pixel while an all-"
+        "unaddressable table is refused; `raw` redirects the sampled pixels; z_step_um is "
+        "NOT read at z==1 (R1); a NaN coordinate and a missing table both handled")
+
+
+def test_grow_points() -> None:
+    """``transform.grow_points`` (2026-08-04) — Points → grown Label regions.
+
+    The inverse of ``transform.label_to_points``: each detection becomes a disc (2D) or
+    ellipsoid (3D) of a physical µm radius, emitted as a Voxel label raster **and** its Label
+    table, so a point cloud becomes measurable objects.
+
+    **The node's whole justification is that it is not ``analysis.voronoi``**, which with
+    ``bound=frame`` + ``max_distance_um`` already grows dots into discs. So the first thing
+    asserted is the one claim that could quietly be false — that ``overlap=nearest``
+    reproduces voronoi's partition EXACTLY — and the rest covers what voronoi cannot do:
+
+    1. **Geometry** — an isolated point's region is the discretized disc, and its extent is
+       symmetric about the point.
+    2. **Anisotropy** — a µm radius on an anisotropic stack grows a real ELLIPSOID: the
+       lateral extent comes from ``pixel_size_um`` and the axial from ``z_step_um``, so the
+       two differ in voxels while agreeing in µm. A shared voxel radius would make it a cube.
+    3. **Parity with voronoi**, voxel-for-voxel, after mapping voronoi's own cell ids through
+       its ``point_id`` column. If this ever diverges, the catalog has grown two subtly
+       different tessellations, which is worse than having one slow one.
+    4. **The three overlaps genuinely differ** on a deliberately overlapping pair, and
+       ``union`` gives the contested voxels to the LOWER id (its documented tie-break).
+    5. **``merge`` fuses and changes the object count**, drops ``point_id`` and reports
+       ``n_points`` — the contract difference, pinned so it cannot regress into silently
+       emitting a ``point_id`` that means nothing.
+    6. **``point_id`` is the join, and it is off-by-one from the raster on purpose.** Point
+       tables are 0-based and 0 is a raster's background, so ids are ``point_id + 1``; using
+       them directly would delete the first detection of every cloud. Checked end-to-end by
+       joining a column ``analysis.measure`` wrote on the Point table back onto the regions.
+    7. Distinct recipe hashes for all 6 (dim × overlap) states.
+    8. ``radius_column`` sizes each point individually, and a NaN row falls back to the
+       socket rather than vanishing.
+    9. ``pixel_size_um`` is fenced; ``z_step_um`` **only in 3D** (R1).
+    10. ``z_kind`` follows the lever, and the ``layer_out`` prediction reaches
+        ``layer_names`` so a downstream picker offers the new layer.
+    11. Six refusals.
+    12. **A fixture guard, not a comment.** The disc edge is a ``<=`` on floats, so the test
+        asserts its own radius keeps every voxel clear of ``d² == R²`` before trusting any
+        voxel count. A fixture sitting on that boundary turns the count into a coin flip."""
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST, point_table
+    from dataclasses import replace as _replace
+    define_node("io.gseed", "S", outputs=[OutDataset()])
+
+    def graph(nodes, edges, sink, seed, seed_env):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b in edges:
+            g.connect(a, b)
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": seed_env})
+        return e, e.pull(sink)
+
+    def cloud(pts, ax, meta, *, layer="pts", zk="plane_index", ids=None, z=0.0, extra=None):
+        tb = point_table(np.asarray(pts, dtype=float), z=z, layer=layer, z_kind=zk, ids=ids)
+        cols = dict(tb.columns)
+        if extra:
+            cols.update(extra)
+        ds = (Dataset(axes=ax, metadata=meta)
+              .with_image(ArrayProvider(np.zeros(ax.shape_for(D.VOXEL))))
+              .with_structure(_ST(D.POINT, cols, layer=layer, z_kind=zk)))
+        return ds, MetaEnvelope(axes=ax, metadata=meta)
+
+    def grow(seed, env, sink="G", **kw):
+        return graph([("S", "io.gseed", {}), (sink, "transform.grow_points", kw)],
+                     [("S", sink)], sink, seed, env)
+
+    def raster(out, name="grown"):
+        return np.asarray(out.get(D.VOXEL, name).values)
+
+    def table(out, name="grown"):
+        return {a.name: np.asarray(a.values) for a in out.layers_on(D.LABEL)
+                if a.layer == name}
+
+    # ── 12 (first, because everything numeric below leans on it): the tie guard ──
+    #
+    # r = 2.35 µm at 0.5 µm/px is 4.7 px. Assert directly that no integer offset lands on the
+    # circle, so `d2 <= R2` is never decided by the last bit of a float.
+    R_UM, PX = 2.35, 0.5
+    r_px = R_UM / PX
+    off = np.arange(-8, 9)
+    d2 = (off[:, None] ** 2 + off[None, :] ** 2).astype(float)
+    assert np.min(np.abs(d2 - r_px ** 2)) > 1e-9, \
+        "the fixture radius puts a voxel on the disc boundary — every area assertion below " \
+        "would be a float coin flip (guard it at 1e-12, not 'comfortably far')"
+
+    Y = X = 64
+    ax2 = AxisSizes(m=1, t=1, z=1, c=1, y=Y, x=X)
+    meta2 = {"pixel_size_um": PX}
+
+    # ── 1. an isolated point grows the discretized disc, symmetric about itself ──
+    one, env2 = cloud([[32.0, 32.0]], ax2, meta2)
+    e1, o1 = grow(one, env2, params={"radius": R_UM}, modes={"dim": "2D"})
+    r1 = raster(o1)[0, 0, 0, 0]
+    ideal = int(((off[:, None] ** 2 + off[None, :] ** 2) <= r_px ** 2).sum())
+    assert int((r1 > 0).sum()) == ideal, (int((r1 > 0).sum()), ideal)
+    ys, xs = np.nonzero(r1)
+    assert ys.min() == 32 - int(r_px) and ys.max() == 32 + int(r_px), (ys.min(), ys.max())
+    assert xs.min() == 32 - int(r_px) and xs.max() == 32 + int(r_px), (xs.min(), xs.max())
+    t1 = table(o1)
+    assert t1["id"].tolist() == [1] and t1["point_id"].tolist() == [0], t1
+    assert int(t1["area"][0]) == ideal and int(t1["n_points"][0]) == 1
+    assert np.isclose(float(t1["radius_um"][0]), R_UM)
+    # the region's reported position is the POINT's own, not a discretized centroid
+    assert np.allclose([t1["y"][0], t1["x"][0]], [32.0, 32.0])
+    assert "pixel_size_um" in dict(e1.entry("G").reads), "µm→px conversion must be fenced"
+    assert "z_step_um" not in dict(e1.entry("G").reads), \
+        "2D grows within each plane — reading the axial step would fence a key it cannot use"
+    assert o1.structure_zkind(D.LABEL, "grown") == "plane_index", "2D ⇒ plane_index"
+
+    # ── 2. anisotropy: one µm radius, two different voxel extents ───────────────
+    ax3 = AxisSizes(m=1, t=1, z=8, c=1, y=Y, x=X)
+    meta3 = {"pixel_size_um": 0.2, "z_step_um": 1.0}     # 5 px per µm laterally, 1 plane per µm
+    vol, env3 = cloud([[4.0, 32.0, 32.0]], ax3, meta3, zk="subpixel")
+    e3, o3 = grow(vol, env3, modes={"dim": "3D"},
+                  params={"radius": 2.0, "radius_z": 2.0})
+    r3 = raster(o3)[0, 0, :, 0]
+    zs_, ys_, xs_ = np.nonzero(r3)
+    assert (ys_.max() - ys_.min(), xs_.max() - xs_.min()) == (20, 20), \
+        f"lateral extent {(ys_.max()-ys_.min(), xs_.max()-xs_.min())} != 20 px (2 µm / 0.2)"
+    assert (zs_.max() - zs_.min()) == 4, \
+        f"axial extent {zs_.max()-zs_.min()} != 4 planes (2 µm / 1.0) — a shared VOXEL " \
+        f"radius would have made this 20 too, i.e. a cube, not an ellipsoid"
+    assert "z_step_um" in dict(e3.entry("G").reads), "3D must fence on the axial step"
+    assert o3.structure_zkind(D.LABEL, "grown") == "subpixel", "3D ⇒ subpixel"
+
+    # ── 3. PARITY: nearest == voronoi(bound=frame, max_distance_um=R), voxel-for-voxel ──
+    rng = np.random.default_rng(7)
+    many = np.column_stack([rng.uniform(10, Y - 10, 25), rng.uniform(10, X - 10, 25)])
+    pds, penv = cloud(many, ax2, meta2)
+    _, o_near = grow(pds, penv, modes={"dim": "2D", "overlap": "nearest"},
+                     params={"radius": 3.7})
+    _, o_vor = graph([("S", "io.gseed", {}),
+                      ("V", "analysis.voronoi",
+                       {"modes": {"bound": "frame", "dim": "2D", "mesh": "skip"},
+                        "params": {"max_distance_um": 3.7}})],
+                     [("S", "V")], "V", pds, penv)
+    a = raster(o_near)[0, 0, 0, 0]
+    b = np.asarray(o_vor.get(D.VOXEL, "voronoi").values)[0, 0, 0, 0]
+    vc = table(o_vor, "voronoi")
+    lut = np.zeros(int(b.max()) + 1, np.int64)
+    lut[vc["id"].astype(int)] = vc["point_id"].astype(np.int64) + 1   # our raster convention
+    assert int((a > 0).sum()) > 0 and np.array_equal(a, lut[b]), \
+        "overlap=nearest diverged from analysis.voronoi(frame, max reach) — the catalog now " \
+        "has two different tessellations, which is worse than having one slow one"
+
+    # ── 4/5. the three overlaps on a deliberately overlapping pair ──────────────
+    # 6 px apart with r = 4.7 px ⇒ the discs overlap; the third point is isolated.
+    pair, penv2 = cloud([[20.0, 20.0], [20.0, 26.0], [48.0, 48.0]], ax2, meta2)
+    got = {}
+    for ov in ("union", "nearest", "merge"):
+        _, o = grow(pair, penv2, modes={"dim": "2D", "overlap": ov},
+                    params={"radius": R_UM})
+        rr = raster(o)[0, 0, 0, 0]
+        ids = np.unique(rr)[1:]
+        got[ov] = (rr, {int(i): int((rr == i).sum()) for i in ids}, table(o))
+    (ru, au, tu), (rn, an, tn), (rm, am, tm) = got["union"], got["nearest"], got["merge"]
+    assert list(au) == [1, 2, 3] and list(an) == [1, 2, 3], (au, an)
+    assert au[1] == ideal, "union: the LOWER id keeps its full disc"
+    assert au[2] < ideal, "union: the higher id yields the contested voxels"
+    assert an[1] < au[1] and an[2] > au[2], \
+        "nearest must split the overlap between the pair, unlike union"
+    assert au[1] + au[2] == an[1] + an[2], \
+        "both cover the same union of voxels; they only disagree on who owns the overlap"
+    assert au[3] == an[3] == ideal, "the isolated point is untouched by the overlap rule"
+    # merge fuses the pair into ONE region and keeps the isolated one separate
+    assert sorted(am) == [1, 2] and am[1] == au[1] + au[2], (am, au)
+    assert "point_id" not in tm, \
+        "merge must NOT emit a point_id — a fused region comes from several points, so any " \
+        "value there would be a join key that silently means one of them"
+    assert tm["n_points"].tolist() == [2, 1], tm["n_points"]
+    assert "point_id" in tu and "point_id" in tn
+
+    # ── 6. point_id joins a measured column back onto the grown regions ─────────
+    img = np.zeros((1, 1, 1, 1, Y, X))
+    yy, xx = np.mgrid[0:Y, 0:X]
+    for cy, cx, amp in ((16, 16, 900.0), (40, 44, 500.0)):
+        img[0, 0, 0, 0] += amp * np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / 8.0))
+    sds = (Dataset(axes=ax2, metadata={**meta2, "channel_emission_nm": [520.0],
+                                       "objective_na": 1.4, "bit_depth": 12})
+           .with_image(ArrayProvider(img)))
+    senv = MetaEnvelope(axes=ax2, metadata=dict(sds.metadata))
+    _, o_join = graph([("S", "io.gseed", {}), ("P", "detect.spots", {}),
+                       ("Q", "analysis.measure", {"modes": {"target": "point"}}),
+                       ("G", "transform.grow_points",
+                        {"modes": {"dim": "2D"}, "params": {"radius": R_UM}})],
+                      [("S", "P"), ("P", "Q"), ("Q", "G")], "G", sds, senv)
+    gt = table(o_join)
+    pt = {a.name: np.asarray(a.values) for a in o_join.layers_on(D.POINT)
+          if a.layer == "spots"}
+    assert gt["id"].size and np.array_equal(gt["id"], gt["point_id"] + 1), \
+        "raster ids must be point_id+1 — point tables are 0-based and 0 is the background, " \
+        "so using the ids directly deletes the first detection of every cloud"
+    order = np.argsort(pt["id"])
+    joined = np.asarray(pt["mean_intensity"], dtype=float)[
+        np.searchsorted(pt["id"][order], gt["point_id"])]
+    assert np.isfinite(joined).all() and joined.max() > 100.0, joined
+    assert set(np.round(joined).tolist()) <= {900.0, 500.0}, \
+        f"joining Measure's mean_intensity through point_id landed on the wrong rows: {joined}"
+
+    # ── 7. all six (dim x overlap) states memoize apart ─────────────────────────
+    hashes = {node_recipe_hash("transform.grow_points",
+                               {"__modes__": {"dim": d, "overlap": o}}, (), ())
+              for d in ("2D", "3D") for o in ("union", "nearest", "merge")}
+    assert len(hashes) == 6, f"only {len(hashes)} distinct hashes for 6 mode states"
+
+    # ── 8. radius_column sizes each point; a NaN falls back to the socket ───────
+    two, tenv = cloud([[20.0, 20.0], [48.0, 48.0]], ax2, meta2,
+                      extra={"r": np.array([R_UM, 2.0 * R_UM])})
+    _, o_rc = grow(two, tenv, modes={"dim": "2D"},
+                   params={"radius": R_UM, "radius_column": "r"})
+    trc = table(o_rc)
+    assert int(trc["area"][0]) == ideal, "the row matching the socket must be unchanged"
+    assert int(trc["area"][1]) > 3 * ideal, \
+        f"a doubled radius must roughly quadruple the area, got {trc['area'].tolist()}"
+    assert np.allclose(trc["radius_um"], [R_UM, 2.0 * R_UM]), trc["radius_um"]
+    nan_ds, nenv = cloud([[20.0, 20.0], [48.0, 48.0]], ax2, meta2,
+                         extra={"r": np.array([np.nan, 2.0 * R_UM])})
+    _, o_nan = grow(nan_ds, nenv, modes={"dim": "2D"},
+                    params={"radius": R_UM, "radius_column": "r"})
+    tnan = table(o_nan)
+    assert int(tnan["area"][0]) == ideal, \
+        "a NaN radius must fall back to the SOCKET, not drop the detection — the socket " \
+        "value is declared and visible, a vanished object is not"
+
+    # ── 10. the output layer is predicted at edit time, so a picker offers it ───
+    g_pred = Graph()
+    g_pred.add(NodeInstance("S", "io.gseed"))
+    g_pred.add(NodeInstance("P", "detect.spots"))
+    g_pred.add(NodeInstance("G", "transform.grow_points"))
+    g_pred.connect("S", "P")
+    g_pred.connect("P", "G")
+    g_pred.add(NodeInstance("M", "analysis.measure"))
+    g_pred.connect("G", "M")
+    pred = propagate_meta(g_pred, {"S": senv})["M"].layer_names
+    assert (D.VOXEL, "grown") in pred and (D.LABEL, "grown") in pred, \
+        f"the grown layer must reach the downstream layer catalog, got {pred}"
+
+    # ── 11. the six refusals ────────────────────────────────────────────────────
+    bare = (Dataset(axes=ax2, metadata=meta2)
+            .with_image(ArrayProvider(np.zeros(ax2.shape_for(D.VOXEL)))))
+    cases = [
+        (bare, env2, {}, "detect.spots", "no point cloud"),
+        (cloud([[20.0, 20.0]], ax2, meta2)[0].with_structure(
+            _ST(D.POINT, dict(point_table(np.array([[8.0, 8.0]]), z=0, layer="other").columns),
+                layer="other", z_kind="plane_index")), env2, {}, "pts", "two clouds"),
+        (one, MetaEnvelope(axes=ax2, metadata={"pixel_size_um": 1.7183}),
+         {"params": {"radius": 1.0}}, "below one voxel", "sub-voxel radius"),
+        (one, env2, {"params": {"radius_column": "nope"}}, "radius_column", "bad column"),
+        (cloud([[20.0, 20.0], [40.0, 40.0]], ax2, meta2,
+               ids=np.array([-1, 0], np.int64))[0], env2, {}, "negative id", "negative id"),
+        (cloud([[20.0, 20.0]], ax2, meta2,
+               extra={"t": np.array([99], np.int64)})[0], env2, {}, "not one of the",
+         "all rows unaddressable"),
+    ]
+    # NOTE the coarse-plate case reads its 1.7183 µm/px from the ENVELOPE, not the seed
+    # Dataset: the compute goes through `ctx.calib`, which resolves the incoming edge's
+    # envelope. That is the whole point of the memo fence, and it is why patching the seed's
+    # own metadata here would prove nothing.
+    for seed, senv_i, kw, needle, why in cases:
+        try:
+            grow(seed, senv_i, **kw)
+            raise AssertionError(f"grow points accepted {why}")
+        except ValueError as exc:
+            assert needle in str(exc), f"{why}: wrong message — {exc}"
+
+    _ok("transform.grow_points (2026-08-04): each detection grown into a µm disc/ellipsoid → "
+        "a Voxel label raster + its Label table; `nearest` is voxel-for-voxel IDENTICAL to "
+        "analysis.voronoi(bound=frame, max reach) on 25 random seeds (so the catalog has one "
+        "tessellation, not two) while costing O(stamps) not O(image); the three overlaps "
+        "differ on an overlapping pair with union's lower-id tie-break and the same total "
+        "coverage as nearest, and merge fuses to one region, drops point_id and reports "
+        "n_points; a µm radius grows a real ELLIPSOID (20 px lateral vs 4 planes axial from "
+        "one 2 µm value); ids are point_id+1 so a 0-based cloud's first detection survives, "
+        "checked by joining Measure's mean_intensity back through point_id; radius_column "
+        "sizes each point and a NaN falls back to the socket; 6 mode states hash apart; "
+        "pixel_size_um fenced and z_step_um only in 3D; z_kind follows the lever; the layer "
+        "reaches the downstream catalog; 6 refusals; and the fixture asserts its own radius "
+        "is off the disc-boundary tie")
+
+
+def test_grow_labels() -> None:
+    """``transform.grow_points`` on LABEL regions (2026-08-04) — the ``grow`` Mode's three
+    label branches, which grow an existing segmentation from **its own shape** instead of
+    inventing one around a dot.
+
+    The node's original branch (``grow=points``) is pinned by :func:`test_grow_points`; this
+    covers what the label branches claim that the point branch cannot:
+
+    1. **``surface`` conserves the outline.** A concave L is grown by a µm distance and stays
+       concave — asserted against the *exact* Minkowski set (every voxel within the reach of
+       the source, computed independently here from a brute-force distance), not against a
+       voxel count that a wrong-but-plausible dilation would also hit.
+    2. **``surface`` is a µm ELLIPSOID, not a voxel box.** On an anisotropic stack one
+       distance grows 4 px laterally and 1 plane axially, which is the whole reason the reach
+       is normalized per axis before the transform.
+    3. **``scale`` is PROPORTIONAL where ``surface`` is absolute** — the property that
+       distinguishes the two branches. A factor of 2 quadruples a 2D area exactly, and the
+       big/small area RATIO is preserved by ``scale`` and compressed by ``surface``.
+    4. **``stamp`` discards the outline** — the L becomes a disc whose area depends only on
+       the radius, not on the source shape.
+    5. **The three overlaps mean the same thing here as on points**: ``union`` gives contested
+       voxels to the lower SOURCE id, ``nearest`` splits them on the midline, both cover the
+       same union, and ``merge`` fuses and reports ``n_regions``.
+    6. **``protect``.** ON, a neighbour's interior is untouchable and every source region
+       survives; OFF, the overlap rule eats it — asserted as an exact voxel handover, so a
+       flag that silently did nothing would fail.
+    7. **Ids are minted, and ``source_id`` is the join.** Pinned on the case that forces it: a
+       z-connected source region under the 2D lever spans several planes, and passing its id
+       through would put several rows with the same ``id`` in one Label table.
+    8. Every (dim × grow × overlap) state hashes apart, and the label sockets are gated so
+       that no branch shows a control it does not read.
+    9. ``pixel_size_um`` fenced; ``z_step_um`` **only in 3D** (R1).
+    10. Five refusals."""
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import NODES
+    from nodegraph.structure import StructureTable as _ST
+    define_node("io.glseed", "S", outputs=[OutDataset()])
+
+    PX = 0.5
+
+    def seeded(lab, ax, meta, ids, zk="plane_index"):
+        r6 = np.zeros(ax.shape_for(D.VOXEL), dtype=np.int64)
+        if lab.ndim == 2:
+            r6[0, 0, 0, 0] = lab
+        else:
+            r6[0, 0, :, 0] = lab
+        n = len(ids)
+        tb = {"id": np.asarray(ids, np.int64), "m": np.zeros(n, np.int64),
+              "t": np.zeros(n, np.int64), "c": np.zeros(n, np.int64),
+              "z": np.zeros(n, float), "y": np.zeros(n, float), "x": np.zeros(n, float),
+              "area": np.ones(n, np.int64)}
+        ds = (Dataset(axes=ax, metadata=meta)
+              .with_image(ArrayProvider(np.zeros(ax.shape_for(D.VOXEL))))
+              .with_layer(D.VOXEL, "labels", r6)
+              .with_structure(_ST(D.LABEL, tb, layer="labels", z_kind=zk)))
+        return ds, MetaEnvelope(axes=ax, metadata=dict(meta))
+
+    def grow(seed, env, **kw):
+        g = Graph()
+        g.add(NodeInstance("S", "io.glseed"))
+        g.add(NodeInstance("G", "transform.grow_points", **kw))
+        g.connect("S", "G")
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": env})
+        out = e.pull("G")
+        return (e, np.asarray(out.get(D.VOXEL, "grown").values),
+                {a.name: np.asarray(a.values) for a in out.layers_on(D.LABEL)
+                 if a.layer == "grown"})
+
+    Y = X = 44
+    ax2 = AxisSizes(m=1, t=1, z=1, c=1, y=Y, x=X)
+    meta2 = {"pixel_size_um": PX}
+
+    # ── 1. surface conserves the outline — against the exact Minkowski set ──────
+    #
+    # An L: concave, so a dilation that quietly went through a bounding box, a centroid or a
+    # convex hull would fill the notch and be caught here rather than by an area that happens
+    # to land close.
+    ell = np.zeros((Y, X), np.int64)
+    ell[8:24, 8:14] = 1                      # the upright
+    ell[18:24, 8:28] = 1                     # the foot
+    dsL, envL = seeded(ell, ax2, meta2, [1])
+    D_UM = 1.5                               # 3 px at 0.5 µm/px
+    eL, rL, tL = grow(dsL, envL, modes={"dim": "2D", "grow": "surface"},
+                      params={"distance": D_UM})
+    got = rL[0, 0, 0, 0] > 0
+    src = np.argwhere(ell == 1).astype(float)
+    yy, xx = np.mgrid[0:Y, 0:X]
+    want = np.zeros((Y, X), bool)
+    for sy, sx in src:                       # brute-force Minkowski sum with a µm disc
+        want |= (((yy - sy) * PX) ** 2 + ((xx - sx) * PX) ** 2) <= D_UM ** 2 + 1e-12
+    assert np.array_equal(got, want), \
+        f"surface must be the exact set of voxels within {D_UM} µm of the source — " \
+        f"{int((got ^ want).sum())} voxels disagree"
+    # the notch, minus the 3 px the upright reaches rightward and the foot reaches upward
+    assert not got[8:15, 17:28].any(), \
+        "the L's notch must stay empty — a concavity that fills is a dilation through a box " \
+        "or a hull, not shape-conserving growth"
+    assert tL["id"].tolist() == [1] and tL["source_id"].tolist() == [1]
+    assert int(tL["area"][0]) == int(got.sum())
+    assert np.isclose(float(tL["distance_um"][0]), D_UM)
+    assert "pixel_size_um" in dict(eL.entry("G").reads), "µm→voxel must be fenced"
+    assert "z_step_um" not in dict(eL.entry("G").reads), \
+        "2D grows within each plane — reading the axial step would fence a key it cannot use"
+
+    # ── 2. one µm distance, two voxel extents (a real ellipsoid, not a box) ─────
+    ax3 = AxisSizes(m=1, t=1, z=9, c=1, y=32, x=32)
+    meta3 = {"pixel_size_um": 0.25, "z_step_um": 1.0}    # 4 px per µm laterally, 1 plane per µm
+    cube = np.zeros((9, 32, 32), np.int64)
+    cube[4, 14:18, 14:18] = 1
+    ds3, env3 = seeded(cube, ax3, meta3, [1], zk="subpixel")
+    e3, r3, _t3 = grow(ds3, env3, modes={"dim": "3D", "grow": "surface"},
+                       params={"distance": 1.0, "distance_z": 1.0})
+    zs_, ys_, xs_ = np.nonzero(r3[0, 0, :, 0])
+    assert (zs_.min(), zs_.max()) == (3, 5), \
+        f"axial extent {(zs_.min(), zs_.max())} != 1 plane each way (1 µm / 1.0 µm step)"
+    assert (ys_.min(), ys_.max()) == (10, 21), \
+        f"lateral extent {(ys_.min(), ys_.max())} != 4 px each way (1 µm / 0.25) — a shared " \
+        f"VOXEL reach would have grown 4 planes too, i.e. a box, not an ellipsoid"
+    assert "z_step_um" in dict(e3.entry("G").reads), "3D must fence on the axial step"
+
+    # ── 3/4. scale is proportional; surface is absolute; stamp discards the shape ──
+    two = np.zeros((Y, X), np.int64)
+    two[6:18, 6:18] = 1                      # 12x12 = 144
+    two[30:34, 30:34] = 2                    # 4x4 = 16
+    ds2, env2 = seeded(two, ax2, meta2, [1, 2])
+    _, r_sc, t_sc = grow(ds2, env2, modes={"dim": "2D", "grow": "scale"},
+                         params={"scale": 2.0})
+    assert t_sc["area"].tolist() == [4 * 144, 4 * 16], \
+        f"a x2 outline resample must scale a 2D area by exactly 4, got {t_sc['area'].tolist()}"
+    assert np.allclose(t_sc["scale"], 2.0) and "distance_um" not in t_sc, \
+        "each branch writes ITS OWN geometry column — a shared one whose unit depends on a " \
+        "dropdown is a join waiting to be read wrong"
+    _, _r_su, t_su = grow(ds2, env2, modes={"dim": "2D", "grow": "surface"},
+                          params={"distance": 1.0})     # +2 px each way
+    # a 2 px DISC, so each of the four corners loses the 3 voxels beyond the circle
+    assert t_su["area"].tolist() == [16 * 16 - 12, 8 * 8 - 12], \
+        f"surface must add the SAME 2 px to both objects, got {t_su['area'].tolist()}"
+    big_small_src = 144 / 16
+    assert np.isclose(t_sc["area"][0] / t_sc["area"][1], big_small_src), \
+        "scale preserves the size ORDERING exactly — that is what distinguishes it"
+    assert (t_su["area"][0] / t_su["area"][1]) < big_small_src, \
+        "surface compresses the size ratio (a fixed distance is proportionally more of a " \
+        "small object) — if this ever matched scale the two branches would be one branch"
+    _, _r_st, t_st = grow(dsL, envL, modes={"dim": "2D", "grow": "stamp"},
+                          params={"radius": 2.0})       # 4 px
+    assert abs(int(t_st["area"][0]) - int(np.pi * 16)) <= 6, \
+        f"stamp must replace the L with a disc of the RADIUS only, got {t_st['area'][0]}"
+    assert int(t_st["area"][0]) < int(tL["area"][0]), \
+        "the L is longer than a 4 px disc — stamp discarding its outline must shrink it"
+
+    # ── 5. the three overlaps, and the same total coverage ─────────────────────
+    pair = np.zeros((Y, X), np.int64)
+    pair[16:24, 6:12] = 1
+    pair[16:24, 18:24] = 2                   # a 6 px gap ⇒ 3 µm shells collide
+    dsP, envP = seeded(pair, ax2, meta2, [1, 2])
+    ov: Dict[str, tuple] = {}
+    for k in ("union", "nearest", "merge"):
+        _, rr, tt = grow(dsP, envP, modes={"dim": "2D", "grow": "surface", "overlap": k},
+                         params={"distance": 3.0})
+        p = rr[0, 0, 0, 0]
+        ov[k] = (p, {int(i): int((p == i).sum()) for i in np.unique(p)[1:]}, tt)
+    (_pu, au, tu), (_pn, an, tn), (_pm, am, tm) = ov["union"], ov["nearest"], ov["merge"]
+    assert list(au) == [1, 2] and list(an) == [1, 2], (au, an)
+    assert au[1] > au[2], "union: the LOWER source id keeps the contested voxels"
+    assert an[1] == an[2], "nearest: two identical regions must split the gap evenly"
+    assert sum(au.values()) == sum(an.values()), \
+        "union and nearest cover the same union of voxels; they only disagree on who owns " \
+        "the overlap"
+    assert list(am) == [1] and am[1] == sum(au.values()), "merge fuses the pair into one"
+    assert "source_id" not in tm, \
+        "merge must NOT emit a source_id — a fused region comes from several regions, so " \
+        "any value there would be a join key that silently means one of them"
+    assert tm["n_regions"].tolist() == [2]
+    assert "source_id" in tu and "source_id" in tn
+
+    # ── 6. protect, as an exact voxel handover ─────────────────────────────────
+    nb = np.zeros((Y, X), np.int64)
+    nb[8:32, 6:14] = 1                       # big
+    nb[18:22, 17:21] = 2                     # small, 3 px away, 16 voxels
+    dsN, envN = seeded(nb, ax2, meta2, [1, 2])
+    keep: Dict[bool, tuple] = {}
+    for pr in (True, False):
+        _, rr, tt = grow(dsN, envN, modes={"dim": "2D", "grow": "surface",
+                                           "overlap": "union"},
+                         params={"distance": 5.0, "protect": pr})
+        p = rr[0, 0, 0, 0]
+        keep[pr] = ({int(i): int((p == i).sum()) for i in np.unique(p)[1:]}, tt)
+    (aon, _ton), (aoff, _toff) = keep[True], keep[False]
+    assert sorted(aon) == [1, 2] and aon[2] > 16, \
+        "protect ON: every source region survives with at least its own voxels"
+    assert aoff[1] - aon[1] == 16 and aon[2] - aoff[2] == 16, \
+        f"protect OFF must hand region 2's 16 interior voxels to region 1 — got " \
+        f"{aoff[1] - aon[1]} / {aon[2] - aoff[2]}. An exact count, so a flag that silently " \
+        f"did nothing cannot pass"
+
+    # ── 7. minted ids + source_id, on the case that forces them ───────────────
+    #
+    # A z-connected source region under the 2D lever: three planes, ONE source id. Passing it
+    # through would put three rows with id 7 in one Label table, i.e. an id that no longer
+    # identifies a row.
+    axz = AxisSizes(m=1, t=1, z=4, c=1, y=Y, x=X)
+    span = np.zeros((4, Y, X), np.int64)
+    span[1:4, 16:20, 16:20] = 7
+    dsZ, envZ = seeded(span, axz, meta2, [7], zk="subpixel")
+    _, rZ, tZ = grow(dsZ, envZ, modes={"dim": "2D", "grow": "surface"},
+                     params={"distance": 1.0})
+    assert tZ["id"].size == 3 and len(set(tZ["id"].tolist())) == 3, \
+        f"one region per PLANE, each with its own id — got {tZ['id'].tolist()}"
+    assert tZ["source_id"].tolist() == [7, 7, 7], \
+        "…all joining back to the one source region through source_id"
+    per_plane = [np.unique(rZ[0, 0, z, 0])[1:].tolist() for z in range(4)]
+    assert per_plane[0] == [] and [len(p) for p in per_plane[1:]] == [1, 1, 1], per_plane
+
+    # ── 8. every mode state hashes apart, and the sockets are gated ────────────
+    hashes = {node_recipe_hash("transform.grow_points",
+                               {"__modes__": {"dim": d, "grow": g, "overlap": o}}, (), ())
+              for d in ("2D", "3D") for g in ("points", "surface", "scale", "stamp")
+              for o in ("union", "nearest", "merge")}
+    assert len(hashes) == 24, f"only {len(hashes)} distinct hashes for 24 mode states"
+    spec = NODES.get("transform.grow_points")
+    shown = {g: {s.name for s in spec.active_inputs(
+        {"dim": "3D", "grow": g, "overlap": "union"})}
+        for g in ("points", "surface", "scale", "stamp")}
+    assert "points" in shown["points"] and "labels" not in shown["points"]
+    assert "radius_column" in shown["points"] and "protect" not in shown["points"]
+    for g in ("surface", "scale", "stamp"):
+        assert "labels" in shown[g] and "points" not in shown[g], (g, shown[g])
+        assert "radius_column" not in shown[g] and "protect" in shown[g], (g, shown[g])
+    assert {"radius", "radius_z"} <= shown["stamp"] and "distance" not in shown["stamp"]
+    assert {"distance", "distance_z"} <= shown["surface"] and "radius" not in shown["surface"]
+    assert "scale" in shown["scale"] and "distance" not in shown["scale"]
+    assert "scale" not in shown["surface"], \
+        "a control the selected geometry never reads must be hidden, not accepted and " \
+        "discarded (socket contract clause 2)"
+
+    # ── 10. the five refusals ─────────────────────────────────────────────────
+    plain = (Dataset(axes=ax2, metadata=meta2)
+             .with_image(ArrayProvider(np.zeros(ax2.shape_for(D.VOXEL))))
+             .with_layer(D.VOXEL, "mask",
+                         np.ones(ax2.shape_for(D.VOXEL), dtype=np.int64)))
+    empty, _ = seeded(np.zeros((Y, X), np.int64), ax2, meta2, [])
+    cases = [
+        (plain, envL, {"modes": {"grow": "surface"}}, "no Label instance", "no labels"),
+        (plain, envL, {"modes": {"grow": "surface"}, "params": {"labels": "mask"}},
+         "is not a LABEL raster", "a plain mask"),
+        (empty, envL, {"modes": {"grow": "surface"}}, "entirely background", "empty raster"),
+        (dsL, MetaEnvelope(axes=ax2, metadata={"pixel_size_um": 1.7183}),
+         {"modes": {"grow": "surface"}, "params": {"distance": 1.0}},
+         "below one voxel", "sub-voxel distance"),
+        (dsL, envL, {"modes": {"grow": "scale"}, "params": {"scale": 0.0}},
+         "POSITIVE factor", "a zero scale"),
+    ]
+    for seed, env_i, kw, needle, why in cases:
+        try:
+            grow(seed, env_i, **kw)
+            raise AssertionError(f"grow labels accepted {why}")
+        except ValueError as exc:
+            assert needle in str(exc), f"{why}: wrong message — {exc}"
+
+    _ok("transform.grow_points on LABELS (2026-08-04): the `grow` Mode's three label "
+        "branches grow a segmentation from its OWN shape — `surface` is the EXACT Minkowski "
+        "set within a µm distance of the source (checked voxel-for-voxel against a "
+        "brute-force disc, and the L's notch stays empty, so a box/hull dilation cannot "
+        "pass) and a real ellipsoid in 3D (1 plane axially vs 4 px laterally from one 1 µm "
+        "value); `scale` quadruples a 2D area at x2 and PRESERVES the big/small ratio where "
+        "`surface` compresses it; `stamp` discards the outline for a radius-only disc; the "
+        "three overlaps carry over from points (union's lower-source-id tie-break, nearest "
+        "splitting evenly, the same total coverage, merge fusing and reporting n_regions "
+        "without a source_id); `protect` hands over exactly 16 voxels when turned off; ids "
+        "are minted and joined through source_id, pinned on a z-connected region split "
+        "across 3 planes by the 2D lever; 24 mode states hash apart and every branch hides "
+        "the controls it does not read; pixel_size_um fenced and z_step_um only in 3D; 5 "
+        "refusals")
+
+
+def _pl_seed(img: np.ndarray, lab: np.ndarray, ax, *, zk: str, cols: dict,
+             meta: Optional[dict] = None):
+    """``(Dataset, MetaEnvelope)`` carrying ``img`` as the image and ``lab`` as a full Label
+    INSTANCE (raster + table) named ``labels`` — the fixture both per-label nodes need.
+
+    ``img``/``lab`` are already 6-D. ``cols`` is the table, ``zk`` its ``z_kind`` provenance,
+    which is what decides 2D-vs-3D for :func:`test_threshold_per_label` (there is no lever)."""
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+    meta = dict(meta or {"pixel_size_um": 0.5})
+    ds = (Dataset(axes=ax, metadata=meta)
+          .with_image(ArrayProvider(img))
+          .with_layer(D.VOXEL, "labels", lab)
+          .with_structure(_ST(D.LABEL, cols, layer="labels", z_kind=zk)))
+    return ds, MetaEnvelope(axes=ax, metadata=dict(meta))
+
+
+def _pl_table(ids, *, m=0, t=0, c=0, z=0.0, y=0.0, x=0.0, **extra) -> dict:
+    """The invariant ``id,m,t,c,z,y,x`` Label schema for ``ids``, plus any extra columns.
+    Scalars broadcast; a sequence is taken per row."""
+    ids = np.asarray(ids, dtype=np.int64)
+    n = ids.size
+
+    def col(v, dt):
+        return (np.full(n, v, dtype=dt) if np.isscalar(v)
+                else np.asarray(v, dtype=dt))
+
+    out = {"id": ids, "m": col(m, np.int64), "t": col(t, np.int64), "c": col(c, np.int64),
+           "z": col(z, float), "y": col(y, float), "x": col(x, float)}
+    out.update({k: col(v, float) for k, v in extra.items()})
+    return out
+
+
+def _pl_run(op: str, seed, env, **kw):
+    """Pull ``op`` on a one-edge graph over a ``_pl_seed`` fixture → ``(engine, payload)``."""
+    from nodegraph.nodes import COMPUTES
+    g = Graph()
+    g.add(NodeInstance("S", "io.plseed"))
+    g.add(NodeInstance("N", op, **kw))
+    g.connect("S", "N")
+    e = Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": env})
+    return e, e.pull("N")
+
+
+def _pl_cols(payload, layer: str) -> dict:
+    """The Label-domain columns of ``layer`` on ``payload``, as ``{name: array}``."""
+    return {a.name: np.asarray(a.values) for a in payload.layers_on(D.LABEL)
+            if a.layer == layer}
+
+
+def test_threshold_per_label() -> None:
+    """``analysis.threshold_per_label`` — one level per REGION, derived from that region's
+    own pixels.
+
+    The node exists because no other threshold in the catalog can choose its population:
+    ``analysis.threshold``'s scope is plane/volume/series/dataset, ``threshold_local``'s is a
+    µm block, ``histogram_threshold``'s is a plane. So the first assertion is the one that
+    justifies the node at all — a fixture on which NO global cut can reproduce the answer:
+
+    1. **A bright cell and a dim cell, each with a punctum.** Per-label Otsu selects both
+       puncta exactly; the best global Otsu over the same voxels is *proved* here to select
+       something different (it takes all of the bright cell and none of the dim one), so the
+       result is not reachable by tuning a single cut.
+    2. **A skipped region is NaN, never a fabricated level.** A FLAT region (no spread) and a
+       region under ``min_pixels`` both yield no sub-object and ``level = NaN``; the parent's
+       pre-existing columns survive the merge. All-skipped RAISES with the sizes measured.
+    3. **Touching parents cannot merge their sub-objects** — the claim that makes the CCL run
+       per parent rather than once per unit. Two adjacent cells whose bright blocks are
+       contiguous ACROSS the shared border yield one sub-object each, each wholly inside its
+       own parent; a unit-wide labelling would have returned a single object spanning both.
+    4. **2D vs 3D is INHERITED from the Label instance's ``z_kind``** (`wire-node-v2` §7b),
+       not levered: the SAME voxels give one volumetric sub-object under ``subpixel``
+       provenance and one per plane under ``plane_index``.
+    5. **The channel pairing.** ``label_channel``/``signal_channel`` express "cells segmented
+       on ch0, signal in ch1", which the matched-channel default cannot; the combination that
+       would write one parent id twice is refused.
+    6. ``direction=below`` selects the dark interior; ``sub_labels=False`` writes no raster.
+    7. Every method/direction state hashes apart, and the node fences on NO calibration key.
+    8. Six refusals."""
+    if not _HAVE_SKIMAGE:
+        _ok("threshold per label: skipped (no skimage in this environment)")
+        return
+    from skimage.filters import threshold_otsu
+    define_node("io.plseed", "S", outputs=[OutDataset()])
+
+    # ── 1. per-label beats every global cut ────────────────────────────────────
+    Y = X = 24
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=Y, x=X)
+    img, lab = np.zeros((Y, X)), np.zeros((Y, X), np.int64)
+    lab[2:10, 2:10] = 1                       # BRIGHT cell: body 100, punctum 200
+    img[2:10, 2:10], img[4:6, 4:6] = 100.0, 200.0
+    lab[14:22, 14:22] = 2                     # DIM cell: body 20, punctum 40
+    img[14:22, 14:22], img[16:18, 16:18] = 20.0, 40.0
+    lab[2:5, 14:17] = 3                       # FLAT cell: 9 voxels, all 55
+    img[2:5, 14:17] = 55.0
+    img6 = np.zeros(ax.shape_for(D.VOXEL)); img6[0, 0, 0, 0] = img
+    lab6 = np.zeros(ax.shape_for(D.VOXEL), np.int64); lab6[0, 0, 0, 0] = lab
+    tbl = _pl_table([1, 2, 3], y=[5.5, 17.5, 3.0], x=[5.5, 17.5, 15.0],
+                    mean_intensity=[106.25, 21.25, 55.0])
+    seed, env = _pl_seed(img6, lab6, ax, zk="plane_index", cols=tbl)
+
+    e1, o1 = _pl_run("analysis.threshold_per_label", seed, env,
+                     modes={"method": "otsu", "direction": "above"},
+                     params={"min_pixels": 4})
+    got = np.asarray(o1.get(D.VOXEL, "submask").values)[0, 0, 0, 0] > 0
+    want = np.zeros((Y, X), bool)
+    want[4:6, 4:6] = True
+    want[16:18, 16:18] = True
+    assert np.array_equal(got, want), \
+        f"per-label otsu must select exactly the two puncta — " \
+        f"{int((got ^ want).sum())} voxel(s) disagree"
+    # ...and no single global cut can produce that set. Proved, not asserted by assumption.
+    gcut = float(threshold_otsu(img[lab > 0]))
+    gsel = (img >= gcut) & (lab > 0)
+    assert not np.array_equal(gsel, want), \
+        "the fixture is not discriminating: a global otsu reproduces the per-label answer"
+    assert gsel[2:10, 2:10].all() and not gsel[16:18, 16:18].any(), \
+        f"global otsu at {gcut:g} should take ALL of the bright cell and NONE of the dim " \
+        f"cell's punctum — that asymmetry is what only a per-region level can fix"
+    sub = _pl_cols(o1, "subobjects")
+    assert sub["parent_id"].tolist() == [1, 2] and sub["area"].tolist() == [4, 4], \
+        "one sub-object per real punctum, joined to its parent; the FLAT region gives none"
+    assert sub["id"].tolist() == [1, 2], "sub ids are minted 1..K, global-unique"
+    assert np.allclose(sub["z"], 0.0) and np.allclose(sub["y"], [4.5, 16.5])
+    par = _pl_cols(o1, "labels")
+    assert par["id"].tolist() == [1, 2, 3]
+    assert par["n_above"].tolist() == [4, 4, 0] and par["n_sub"].tolist() == [1, 1, 0]
+    assert np.allclose(par["frac_above"], [4 / 64, 4 / 64, 0.0])
+    assert par["mean_intensity"].tolist() == [106.25, 21.25, 55.0], \
+        "the parent's own columns must SURVIVE — this writes onto the existing table"
+
+    # ── 2. skipped regions: flat, then too small; all-skipped raises ────────────
+    assert np.isnan(par["level"][2]) and np.isfinite(par["level"][:2]).all(), \
+        "a FLAT region has no cut — NaN, never the frame's level, which would put two " \
+        "incomparable numbers in one column"
+    _e, o2 = _pl_run("analysis.threshold_per_label", seed, env, params={"min_pixels": 10})
+    p2 = _pl_cols(o2, "labels")
+    assert np.isnan(p2["level"][2]) and int(p2["n_sub"][2]) == 0, \
+        "the 9-voxel region is under min_pixels=10 and must be skipped"
+    assert np.isfinite(p2["level"][:2]).all(), "the 64-voxel regions still get their level"
+
+    # ── 3. touching parents: the per-parent CCL claim ───────────────────────────
+    imgT, labT = np.zeros((Y, X)), np.zeros((Y, X), np.int64)
+    labT[4:12, 2:10], labT[4:12, 10:18] = 1, 2          # share the border at x=10
+    imgT[4:12, 2:18] = 50.0
+    imgT[6:9, 8:12] = 200.0                             # ONE bright block, both parents
+    i6 = np.zeros(ax.shape_for(D.VOXEL)); i6[0, 0, 0, 0] = imgT
+    l6 = np.zeros(ax.shape_for(D.VOXEL), np.int64); l6[0, 0, 0, 0] = labT
+    sT, eT = _pl_seed(i6, l6, ax, zk="plane_index", cols=_pl_table([1, 2]))
+    _e, oT = _pl_run("analysis.threshold_per_label", sT, eT, params={"min_pixels": 4})
+    subT, parT = _pl_cols(oT, "subobjects"), _pl_cols(oT, "labels")
+    rT = np.asarray(oT.get(D.VOXEL, "subobjects").values)[0, 0, 0, 0]
+    assert parT["n_sub"].tolist() == [1, 1] and subT["id"].size == 2, \
+        f"the contiguous bright block must become TWO sub-objects, one per parent — got " \
+        f"{subT['id'].size}. A unit-wide CCL merges them and the parent_id join then picks " \
+        f"whichever parent won"
+    for sid, pid in zip(subT["id"].tolist(), subT["parent_id"].tolist()):
+        assert set(labT[rT == sid].tolist()) == {pid}, \
+            f"sub-object {sid} must lie ENTIRELY inside parent {pid}"
+    assert subT["area"].tolist() == [6, 6], "3x2 voxels each side of the border"
+
+    # ── 4. dimensionality is inherited from z_kind, not levered ────────────────
+    ax3 = AxisSizes(m=1, t=1, z=5, c=1, y=16, x=16)
+    v_img = np.zeros((5, 16, 16)); v_lab = np.zeros((5, 16, 16), np.int64)
+    v_lab[1:4, 4:12, 4:12] = 1
+    v_img[1:4, 4:12, 4:12] = 30.0
+    v_img[1:4, 6:9, 6:9] = 180.0                        # a core spanning all three planes
+    vi6 = np.zeros(ax3.shape_for(D.VOXEL)); vi6[0, 0, :, 0] = v_img
+    vl6 = np.zeros(ax3.shape_for(D.VOXEL), np.int64); vl6[0, 0, :, 0] = v_lab
+    meta3 = {"pixel_size_um": 0.5, "z_step_um": 1.0}
+    s3d, e3d = _pl_seed(vi6, vl6, ax3, zk="subpixel",
+                        cols=_pl_table([1], z=2.0), meta=meta3)
+    _e, o3d = _pl_run("analysis.threshold_per_label", s3d, e3d, params={"min_pixels": 4})
+    s3 = _pl_cols(o3d, "subobjects")
+    assert s3["id"].size == 1 and int(s3["area"][0]) == 27, \
+        f"volumetric provenance must give ONE 3x3x3 sub-object, got {s3['id'].size} of " \
+        f"area {s3['area'].tolist()}"
+    assert np.isclose(float(s3["z"][0]), 2.0), "3D: z is the component's own centroid"
+    # the SAME voxels, declared 2D-per-plane → three per-plane sub-objects instead
+    s2d, e2d = _pl_seed(vi6, vl6, ax3, zk="plane_index",
+                        cols=_pl_table([1], z=1.0), meta=meta3)
+    _e, o2d = _pl_run("analysis.threshold_per_label", s2d, e2d, params={"min_pixels": 4})
+    s2 = _pl_cols(o2d, "subobjects")
+    assert s2["id"].size == 3 and s2["area"].tolist() == [9, 9, 9], \
+        f"plane_index provenance must label each plane separately — got {s2['id'].size} " \
+        f"object(s). This is the §7b inheritance: no lever decides it"
+    assert s2["z"].tolist() == [1.0, 2.0, 3.0], "2D: z IS the plane index"
+    assert s2["parent_id"].tolist() == [1, 1, 1], "all three came from the one parent"
+
+    # ── 5. the channel pairing ─────────────────────────────────────────────────
+    axc = AxisSizes(m=1, t=1, z=1, c=2, y=Y, x=X)
+    ci = np.zeros(axc.shape_for(D.VOXEL)); cl = np.zeros(axc.shape_for(D.VOXEL), np.int64)
+    cl[0, 0, 0, 0][2:10, 2:10] = 1                      # labels live on ch0 ONLY
+    ci[0, 0, 0, 0][2:10, 2:10] = 100.0
+    ci[0, 0, 0, 0][3:5, 3:5] = 130.0                    # ch0 has some structure of its own
+    ci[0, 0, 0, 1][2:10, 2:10] = 20.0                   # ch1: the signal to be cut
+    ci[0, 0, 0, 1][6:8, 6:8] = 90.0
+    sc_, ec_ = _pl_seed(ci, cl, axc, zk="plane_index", cols=_pl_table([1]))
+    _e, oM = _pl_run("analysis.threshold_per_label", sc_, ec_, params={"min_pixels": 4})
+    mM = np.asarray(oM.get(D.VOXEL, "submask").values)
+    assert not mM[0, 0, 0, 1].any(), \
+        "matched channel: ch1 carries no labels, so nothing in it can be thresholded"
+    assert mM[0, 0, 0, 0].any(), "ch0 has both labels and pixels, so it does run"
+    _e, oC = _pl_run("analysis.threshold_per_label", sc_, ec_,
+                     params={"min_pixels": 4, "label_channel": 0, "signal_channel": 1})
+    mC = np.asarray(oC.get(D.VOXEL, "submask").values)
+    wantC = np.zeros((Y, X), bool); wantC[6:8, 6:8] = True
+    assert np.array_equal(mC[0, 0, 0, 1] > 0, wantC), \
+        "cells on ch0, signal in ch1: the ch1 punctum and nothing else"
+    assert not mC[0, 0, 0, 0].any(), "signal_channel=1 must not write ch0"
+    assert _pl_cols(oC, "labels")["id"].tolist() == [1], \
+        "exactly ONE row per parent — the pairing exists so a parent is visited once"
+
+    # ── 6. direction=below, and sub_labels off ─────────────────────────────────
+    _e, oB = _pl_run("analysis.threshold_per_label", seed, env,
+                     modes={"method": "otsu", "direction": "below"},
+                     params={"min_pixels": 4, "sub_labels": False})
+    mB = np.asarray(oB.get(D.VOXEL, "submask").values)[0, 0, 0, 0]
+    assert int(mB.sum()) == 120, \
+        f"below selects each cell's dark BODY (2 x 60 voxels), got {int(mB.sum())}"
+    assert oB.get(D.VOXEL, "subobjects") is None, \
+        "sub_labels=False must write no sub-label raster at all"
+    assert "n_sub" not in _pl_cols(oB, "labels"), \
+        "...and no n_sub column, which would read as 'zero sub-objects found'"
+
+    # ── 7. mode states hash apart; no calibration key fenced ───────────────────
+    hashes = {}
+    for meth in ("otsu", "li", "yen", "triangle", "mean", "percentile", "relative"):
+        for dirn in ("above", "below"):
+            eh, _ = _pl_run("analysis.threshold_per_label", seed, env,
+                            modes={"method": meth, "direction": dirn},
+                            params={"min_pixels": 4})
+            hashes[(meth, dirn)] = eh.entry("N").recipe_hash
+    assert len(set(hashes.values())) == len(hashes), \
+        "every (method, direction) state must key its own memo entry"
+    reads = dict(e1.entry("N").reads)
+    assert "pixel_size_um" not in reads and "z_step_um" not in reads, \
+        f"this node converts no physical extent — fencing on a calibration key it cannot " \
+        f"use would re-key the memo on an irrelevant edit (reads {sorted(reads)})"
+
+    # ── 8. refusals ────────────────────────────────────────────────────────────
+    bare = (seed.with_layer(D.VOXEL, "justamask",
+                            (lab6 > 0).astype(np.int64)))
+    for kw, seedx, why in (
+            (dict(params={"labels": "justamask"}), bare, "a raster with no Label table"),
+            (dict(params={"name": "labels"}), seed, "sub-mask name == parent layer"),
+            (dict(params={"name": "x", "sub_name": "x"}), seed, "two outputs, one name"),
+            (dict(params={"min_pixels": 10_000}), seed, "every region skipped"),
+            (dict(modes={"method": "percentile"}, params={"percentile": 140.0}), seed,
+             "percentile outside 0-100"),
+            (dict(params={"label_channel": 7}), seed, "channel index out of range"),
+    ):
+        try:
+            _pl_run("analysis.threshold_per_label", seedx, env, **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"threshold per label accepted {why}")
+    # ...and the one refusal that needs a MULTI-channel fixture to exist at all: pinning the
+    # geometry to one channel while thresholding every channel would visit each parent id
+    # once per channel and write that many rows under one id.
+    try:
+        _pl_run("analysis.threshold_per_label", sc_, ec_,
+                params={"min_pixels": 4, "label_channel": 0, "signal_channel": -1})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "threshold per label accepted label_channel with signal_channel=-1 on a "
+            "2-channel Dataset — each parent would get two rows under one id")
+
+    _ok("threshold per label: one level per REGION from that region's own pixels — a bright "
+        "and a dim cell each yield their punctum, and the best GLOBAL otsu over the same "
+        "voxels is proved to take all of one and none of the other, so the result is not "
+        "reachable by tuning a single cut; a flat region and one under min_pixels report "
+        "level=NaN with the parent's own columns intact, and all-skipped raises with the "
+        "sizes measured; two touching cells whose bright blocks are contiguous across the "
+        "border give one sub-object EACH, wholly inside its own parent (the per-parent CCL); "
+        "2D/3D is inherited from z_kind, so the same voxels give one 27-voxel object under "
+        "subpixel provenance and three 9-voxel ones under plane_index; label_channel + "
+        "signal_channel express 'cells on ch0, signal in ch1' with one row per parent; "
+        "direction=below takes the dark bodies; 14 mode states hash apart; no calibration "
+        "key fenced; 7 refusals")
+
+
+def test_filter_labels() -> None:
+    """``analysis.filter_labels`` — keep or drop WHOLE labels on one per-label column, with
+    the cut derived from the population of label values.
+
+    1. **The cut is on a COLUMN, so it filters anything upstream measured** — including a
+       column no node in this catalog produces, which is why this reads the table instead of
+       re-implementing the Voxel→Label bridge.
+    2. **Ids are PRESERVED.** Label 5 stays label 5 in both the raster and the table, with
+       gaps; renumbering to 1..K would break every join against a table or track measured
+       upstream while looking perfectly healthy. The input layer stays on the wire.
+    3. **``scope`` really groups.** Two positions with disjoint value ranges: under ``series``
+       each position derives its own cut and both contribute survivors; under ``dataset`` one
+       cut is derived over all of them and the dim position is wiped out. Same column, same
+       method — only the population differs.
+    4. **NaN is not a value**: an unmeasured row is excluded from the population AND from the
+       survivors, so it can neither set the cut nor sneak through it.
+    5. Every column is carried over to the output table, plus ``cut``; ``keep=below`` inverts;
+       ``fixed``/``percentile`` bypass the population.
+    6. Mode states hash apart; no calibration key fenced. Five refusals."""
+    if not _HAVE_SKIMAGE:
+        _ok("filter labels: skipped (no skimage in this environment)")
+        return
+    define_node("io.plseed", "S", outputs=[OutDataset()])
+
+    # two positions, four 3x3 labels each, disjoint brightness ranges
+    ax = AxisSizes(m=2, t=1, z=1, c=1, y=16, x=16)
+    lab6 = np.zeros(ax.shape_for(D.VOXEL), np.int64)
+    img6 = np.zeros(ax.shape_for(D.VOXEL))
+    means = {1: 10.0, 2: 20.0, 3: 30.0, 4: 40.0,
+             5: 110.0, 6: 120.0, 7: 130.0, 8: 140.0}
+    for k in range(4):
+        y0 = 2 + 3 * k
+        lab6[0, 0, 0, 0][y0:y0 + 3, 2:5] = k + 1
+        lab6[1, 0, 0, 0][y0:y0 + 3, 2:5] = k + 5
+    for pid, mv in means.items():
+        img6[lab6 == pid] = mv
+    ids = sorted(means)
+    cols = _pl_table(ids, m=[0, 0, 0, 0, 1, 1, 1, 1],
+                     mean_intensity=[means[i] for i in ids],
+                     area=[9.0] * 8,
+                     wobble=[0.9, 0.1, 0.8, 0.2, 0.7, 0.3, 0.6, 0.4])
+    seed, env = _pl_seed(img6, lab6, ax, zk="plane_index", cols=cols)
+
+    def kept(payload):
+        return _pl_cols(payload, "labels_kept")["id"].tolist()
+
+    # ── 1/2. a fixed cut; ids preserved; the input layer untouched ─────────────
+    e1, o1 = _pl_run("analysis.filter_labels", seed, env,
+                     modes={"method": "fixed", "keep": "above", "scope": "dataset"},
+                     params={"column": "mean_intensity", "level": 50.0})
+    assert kept(o1) == [5, 6, 7, 8], f"above 50 keeps position 1's labels, got {kept(o1)}"
+    r1 = np.asarray(o1.get(D.VOXEL, "labels_kept").values)
+    assert sorted(set(r1.ravel().tolist())) == [0, 5, 6, 7, 8], \
+        "the raster must keep the ORIGINAL ids (with gaps), not renumber to 1..K — " \
+        "renumbering silently breaks every join made upstream"
+    assert np.array_equal(r1 > 0, np.isin(lab6, [5, 6, 7, 8]))
+    assert o1.get(D.VOXEL, "labels") is not None, \
+        "the unfiltered instance must stay on the wire so the drop is visible"
+    t1 = _pl_cols(o1, "labels_kept")
+    assert sorted(t1) == sorted(list(cols) + ["cut"]), \
+        f"every original column plus `cut` must reach the output, got {sorted(t1)}"
+    assert t1["wobble"].tolist() == [0.7, 0.3, 0.6, 0.4], \
+        "an arbitrary column no catalog node produces is carried through untouched"
+    assert np.allclose(t1["cut"], 50.0), "`cut` records what each row was judged against"
+    assert min(abs(v - 50.0) for v in means.values()) > 1e-9, \
+        "fixture guard: no label value may sit ON the cut (a float coin flip otherwise)"
+
+    # a column this node knows nothing about is a first-class cut
+    _e, oW = _pl_run("analysis.filter_labels", seed, env,
+                     modes={"method": "fixed", "keep": "above", "scope": "dataset"},
+                     params={"column": "wobble", "level": 0.5})
+    assert kept(oW) == [1, 3, 5, 7], f"cut on `wobble` should keep the >0.5 rows, got {kept(oW)}"
+
+    # ── 3. scope groups the population ─────────────────────────────────────────
+    _e, oD = _pl_run("analysis.filter_labels", seed, env,
+                     modes={"method": "otsu", "keep": "above", "scope": "dataset"},
+                     params={"column": "mean_intensity"})
+    _e, oS = _pl_run("analysis.filter_labels", seed, env,
+                     modes={"method": "otsu", "keep": "above", "scope": "series"},
+                     params={"column": "mean_intensity"})
+    kD, kS = kept(oD), kept(oS)
+    assert all(i >= 5 for i in kD), \
+        f"scope=dataset pools both positions, so one cut wipes out the dim one — got {kD}"
+    assert any(i <= 4 for i in kS) and any(i >= 5 for i in kS), \
+        f"scope=series derives a cut PER POSITION, so both must contribute — got {kS}"
+    assert kD != kS, "the two scopes must not agree on this fixture, or it proves nothing"
+    cS = _pl_cols(oS, "labels_kept")["cut"]
+    assert float(np.ptp(cS)) > 0.0, "series: two positions, two different cuts"
+    cD = _pl_cols(oD, "labels_kept")["cut"]
+    assert float(np.ptp(cD)) == 0.0, "dataset: one cut for every row"
+
+    # ── 4. NaN is neither a survivor nor a vote ────────────────────────────────
+    nan_cols = dict(cols)
+    nan_cols["mean_intensity"] = np.array([10.0, 20.0, 30.0, 40.0,
+                                           np.nan, 120.0, 130.0, 140.0])
+    sN, eN = _pl_seed(img6, lab6, ax, zk="plane_index", cols=nan_cols)
+    _e, oN = _pl_run("analysis.filter_labels", sN, eN,
+                     modes={"method": "fixed", "keep": "above", "scope": "dataset"},
+                     params={"column": "mean_intensity", "level": 50.0})
+    assert kept(oN) == [6, 7, 8], \
+        f"a row whose column is NaN was never measured, so it cannot survive — got {kept(oN)}"
+    rN = np.asarray(oN.get(D.VOXEL, "labels_kept").values)
+    assert 5 not in set(rN.ravel().tolist()), "...and its voxels must be dropped too"
+
+    # ── 5. keep=below, and percentile ─────────────────────────────────────────
+    _e, oB = _pl_run("analysis.filter_labels", seed, env,
+                     modes={"method": "fixed", "keep": "below", "scope": "dataset"},
+                     params={"column": "mean_intensity", "level": 50.0})
+    assert kept(oB) == [1, 2, 3, 4], f"keep=below inverts the survivors, got {kept(oB)}"
+    _e, oP = _pl_run("analysis.filter_labels", seed, env,
+                     modes={"method": "percentile", "keep": "above", "scope": "dataset"},
+                     params={"column": "mean_intensity", "percentile": 75.0})
+    assert len(kept(oP)) == 2, \
+        f"the 75th percentile of 8 labels keeps the top quarter, got {kept(oP)}"
+
+    # ── 6. hashes, reads, refusals ────────────────────────────────────────────
+    hs = {}
+    for meth in ("otsu", "li", "yen", "triangle", "mean", "fixed", "percentile"):
+        for sc in ("plane", "volume", "series", "dataset"):
+            for kp in ("above", "below"):
+                eh, _ = _pl_run("analysis.filter_labels", seed, env,
+                                modes={"method": meth, "keep": kp, "scope": sc},
+                                params={"column": "mean_intensity", "level": 50.0})
+                hs[(meth, sc, kp)] = eh.entry("N").recipe_hash
+    assert len(set(hs.values())) == len(hs), \
+        "every (method, scope, keep) state must key its own memo entry"
+    assert not ({"pixel_size_um", "z_step_um"} & set(dict(e1.entry("N").reads))), \
+        "the column is already in whatever unit it was measured in; this node converts " \
+        "nothing and must fence on no calibration key"
+
+    v3d, e3v = _pl_seed(img6, lab6, ax, zk="subpixel", cols=cols)
+    # A stale/absent layer NAME is deliberately NOT in this list: `_resolve_label_instance`
+    # infers the only Label instance on the wire (§4g), which is a feature — the refusal that
+    # belongs here is a raster that exists but carries no Label table, i.e. no objects to keep.
+    bare = seed.with_layer(D.VOXEL, "justamask", (lab6 > 0).astype(np.int64))
+    for kw, seedx, why in (
+            (dict(params={"column": "nope"}), seed, "a column the table lacks"),
+            (dict(params={"name": "labels"}), seed, "output overwrites the input layer"),
+            (dict(modes={"method": "fixed"}, params={"level": 1e9}), seed,
+             "a cut nothing survives"),
+            (dict(modes={"scope": "plane"}), v3d, "scope=plane on a 3D Label table"),
+            (dict(params={"labels": "justamask", "column": "mean_intensity"}), bare,
+             "a Voxel raster with no Label table (one undivided region, not objects)"),
+    ):
+        try:
+            _pl_run("analysis.filter_labels", seedx, e3v if seedx is v3d else env, **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"filter labels accepted {why}")
+
+    _ok("filter labels: whole labels kept/dropped on ONE per-label column, cut derived over "
+        "the population — surviving ids are PRESERVED with gaps (5 stays 5, so upstream "
+        "joins hold) and the unfiltered instance stays on the wire; every original column "
+        "reaches the output plus `cut`, including one no catalog node produces; two "
+        "positions with disjoint ranges prove `scope` groups (series gives each its own cut "
+        "and both contribute, dataset pools and wipes the dim one out); a NaN row can "
+        "neither set the cut nor survive it; keep=below inverts; 56 mode states hash apart; "
+        "no calibration key fenced; 5 refusals")
+
+
 #: Param sockets exempt from the description requirement (socket-contract clause 6), keyed
 #: ``op_key`` → {param: reason}. THE ONLY GROUND FOR EXEMPTION is that the param's meaning
 #: lives in an external paper or repository, so a description written from this repo alone
@@ -8310,23 +10665,84 @@ _PARAM_NO_SOCKET_OK = {
 #: kernel ignores is the "live-looking GUI control" the node charter forbids.
 _SOCKET_UNREAD_OK: set = set()
 
+#: The functions that resolve an input layer name against what is actually on the wire
+#: (`catalog/_shared/labels.py`). Clause (g) below looks for a call to one of these in the
+#: compute's own source; `_object_table` is a shared *wrapper* that resolves on its callers'
+#: behalf, which is why it counts.
+_LAYER_RESOLVERS = ("_resolve_layer(", "_resolve_label_instance(", "_object_table(")
+#: REQUIRED-looking layer_in sockets that must NOT self-resolve. A non-empty default is the
+#: proxy clause (g) uses for "the compute cannot proceed without this", and these are the
+#: cases where that proxy is wrong: the socket ships a name but the compute treats an
+#: unresolvable one as *absent*, and inferring the only candidate on the wire would turn a
+#: deliberate "no ROI" into a silent restriction. Every entry needs that kind of reason.
+_LAYER_RESOLVE_EXEMPT = {
+    # OPTIONAL despite the non-empty default: `roi_name` that names no layer leaves
+    # `roi6 = None` and correlates the whole frame. Inferring the only Voxel layer on the
+    # wire (a segmentation, an EDT field) would silently mask the correlation instead.
+    ("analysis.dic_correlate", "roi"),
+    # Not a layer name at all on 3 of its 5 domains: `source` names an attribute COLUMN, and
+    # on a structure domain every invariant coordinate (id/m/t/c/z/y/x) is a "candidate", so
+    # "the only one on the wire" is never the question being asked. It also must keep
+    # treating an EMPTY domain as a RESULT (0 objects) rather than an error, which is the
+    # opposite of what a zero-candidate refusal does — and it already owns a purpose-built
+    # message plus a `table` socket for the genuinely ambiguous case.
+    ("analysis.reduce_scalar", "source"),
+}
+
 
 def _compute_source(module, fn) -> str:
-    """The source text of one compute (for the declared-once check); ``""`` if unavailable.
+    """The source text of one compute **plus the helpers it calls**; ``""`` if unavailable.
 
-    The gate the source feeds is clause (f): a layer name's default must be declared ONCE, on
-    the socket, not repeated inside the compute. That check is only as good as this function.
+    The gates this source feeds are clauses (f) and (g) of the layer-socket contract: a layer
+    name's default must be declared ONCE on the socket (never re-spelled as
+    ``params.get("mask", "mask")``), and a REQUIRED layer socket must resolve itself against
+    the wire through ``_resolve_layer``. Both are text searches, so they are only as good as
+    this function — and a check that inspects the wrong text does not fail, it silently
+    reports nothing wrong.
 
-    It used to accept a compute only when ``fn.__module__ == "nodegraph.nodes"``. Under the
-    per-node split every compute reports its own module, so that test excluded ALL of them and
-    clause (f) went quietly dark — a check that inspects nothing and reports nothing wrong.
-    Now the source is taken from wherever the function actually lives, and the caller's
-    ``module`` argument is only the fallback for a function with no resolvable source."""
+    It has now gone dark twice, the same way each time: the text it searched excluded the
+    code that mattered.
+
+    1. It used to accept a compute only when ``fn.__module__ == "nodegraph.nodes"``. Under the
+       per-node split every compute reports its own module, so that test excluded ALL of them.
+       Fixed by taking the source from wherever the function actually lives (the caller's
+       ``module`` argument is now only the fallback for a function with no resolvable source).
+    2. ``inspect.getsource(fn)`` is the REGISTERED compute alone, so a compute that delegates
+       its work to helpers hands both clauses an empty shell. ``analysis.measure`` became the
+       first such node when its Label and Point branches moved into ``_measure_labels`` /
+       ``_measure_points``: its ``_resolve_label_instance`` call was still right there in the
+       module, one function down, and clause (g) reported it as unresolved.
+
+    So the scan follows the module-level functions the compute NAMES, one level deep, within
+    its own module. One level is what the delegation pattern needs (a compute dispatching to
+    per-branch helpers), and staying inside the defining module keeps the shared
+    ``_shared/*`` helpers out — those are checked as the resolvers themselves, and pulling
+    their bodies in would let one node's inline fallback exonerate every other node that
+    imports it."""
     import inspect
+    import sys
+    import ast as _ast
     try:
-        return inspect.getsource(fn)
+        src = inspect.getsource(fn)
     except (OSError, TypeError):        # pragma: no cover - defensive
         return ""
+    home_name = getattr(fn, "__module__", "") or ""
+    home = sys.modules.get(home_name) or module
+    if home is None:                    # pragma: no cover - defensive
+        return src
+    try:
+        named = {n.id for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.Name)}
+    except SyntaxError:                 # pragma: no cover - defensive
+        return src
+    for nm in sorted(named):
+        helper = getattr(home, nm, None)
+        if (inspect.isfunction(helper) and helper is not fn
+                and getattr(helper, "__module__", None) == home_name):
+            try:
+                src += "\n" + inspect.getsource(helper)
+            except (OSError, TypeError):    # pragma: no cover - defensive
+                pass
+    return src
 
 
 def test_catalog_import_hygiene() -> None:
@@ -8631,6 +11047,180 @@ def _param_key_index(modules):
     return keys
 
 
+def _gated_states(spec, restrict):
+    """Mode states to check a per-state rule against: the cartesian product over
+    ``restrict`` (``{mode_name: {values}}``), every other mode pinned at its default.
+
+    Distinct from :func:`_mode_states`, which enumerates the FULL product. That is fine for
+    the reachability sweep it serves but not here: ``flow.iterate`` has fourteen modes, so
+    its full product is in the millions. It is not needed either — a rule about one socket
+    depends only on the modes that GATE it and the modes its node's ``reads_domains_by_mode``
+    is keyed by. Everything else is held at the default it would have had anyway."""
+    import itertools
+    base = spec.default_state()
+    names = sorted(k for k, v in restrict.items() if v)
+    if not names:
+        return [base]
+    out = []
+    for combo in itertools.product(*(sorted(restrict[n]) for n in names)):
+        st = dict(base)
+        st.update(dict(zip(names, combo)))
+        out.append(st)
+    return out
+
+
+def test_conditional_reads_domains() -> None:
+    """``reads_domains_by_mode`` — the domain rail resolved per BRANCH (V2.22).
+
+    The rail is advisory (nothing at pull time reads it), so every defect in this area was
+    silent, and the catalog had drifted into two opposite ones. The reported case is
+    ``analysis.voronoi``: its rail said POINT, while under the default ``bound=per_region``
+    it also goes through ``_label_raster`` and needs a whole Label INSTANCE — so the node
+    that combines dots with labels advertised no labels input requirement at all. The
+    mirror-image case is ``analysis.object_field``, which declared the static UNION
+    ``{LABEL, POINT}`` and therefore demanded Points of a pure-Label graph that was fine.
+
+    A static frozenset cannot state either one, which is why eight nodes carried a
+    documented "no per-mode form" waiver — and why the contract check waived them right
+    back. What is asserted here is the resolution itself (per branch, and the UNION over
+    two modes that ``transfer_structure`` and ``iterate`` need), the GUI's consumption of
+    it, and that the registration validator refuses each of the three ways the declaration
+    can silently do nothing."""
+    from dataclasses import replace as _replace
+    from nodegraph.registry import NodeRegistry
+
+    # ── the reported node: one rail per bound, none of them the shipped one ────
+    v = NODES.get("analysis.voronoi")
+    assert v.reads_domains == frozenset({D.POINT}), "seeds are unconditional"
+    per_bound = {b: v.resolve_reads_domains({"bound": b})
+                 for b in ("per_region", "mask", "frame")}
+    assert per_bound["per_region"] == frozenset({D.POINT, D.VOXEL, D.LABEL}), \
+        "per_region goes through _label_raster — it needs the table, not just a raster"
+    assert per_bound["mask"] == frozenset({D.POINT, D.VOXEL}), \
+        "mask reads any non-zero Voxel layer and never looks for a Label table"
+    assert per_bound["frame"] == frozenset({D.POINT}), \
+        "frame tessellates the whole image and reads no layer at all"
+    # ...and the default state is the one the user actually meets first
+    assert v.resolve_reads_domains() == per_bound["per_region"]
+    # the missing-domain chips follow, which is the whole user-visible point
+    pts_only = frozenset({D.POINT})
+    assert v.missing_domains(pts_only, {"bound": "per_region"}) == frozenset({D.VOXEL,
+                                                                             D.LABEL})
+    assert v.missing_domains(pts_only, {"bound": "frame"}) == frozenset(), \
+        "frame needs nothing but seeds — flagging it would be the over-claim in reverse"
+
+    # ── UNION over two modes: the case a single-key Mapping cannot express ─────
+    xs = NODES.get("transform.transfer_structure")
+    assert xs.resolve_reads_domains({"from_domain": "point", "to_domain": "track"}) == \
+        frozenset({D.POINT, D.TRACK}), "both endpoints, not one"
+    assert xs.resolve_reads_domains({"from_domain": "label", "to_domain": "frame"}) == \
+        frozenset({D.LABEL}), "frame is a lattice destination with no table to find"
+    it = NODES.get("flow.iterate")
+    assert it.resolve_reads_domains({"mode": "sweep", "preserve": "picked"}) == frozenset()
+    for st in ({"mode": "sweep", "preserve": "best"},        # scored by the metric
+               {"mode": "feedback", "preserve": "picked"}):  # forced to best in the compute
+        assert it.resolve_reads_domains(st) == frozenset({D.GLOBAL}), \
+            f"iterate needs a Global under {st} — a disjunction, hence the union form"
+
+    # ── the branch-exclusive nodes: never both halves at once ─────────────────
+    for op, lab, pt in (("track.objects", {D.LABEL, D.VOXEL}, {D.POINT}),
+                        ("track.link", {D.VOXEL}, {D.POINT}),
+                        ("analysis.object_field", {D.LABEL, D.VOXEL}, {D.POINT}),
+                        ("analysis.object_metrics", {D.LABEL, D.VOXEL}, {D.POINT}),
+                        ("analysis.tessellate", None, None)):
+        sp = NODES.get(op)
+        if op == "analysis.tessellate":
+            assert sp.resolve_reads_domains({"boundary": "voronoi"}) == frozenset({D.POINT})
+            assert sp.resolve_reads_domains({"boundary": "label_surface"}) == \
+                frozenset({D.VOXEL}), "marches the raster directly; a mask is legal input"
+            continue
+        assert sp.resolve_reads_domains({"target": "label"}) == frozenset(lab)
+        assert sp.resolve_reads_domains({"target": "point"}) == frozenset(pt)
+        assert not (sp.resolve_reads_domains({"target": "label"}) &
+                    sp.resolve_reads_domains({"target": "point"})), \
+            f"{op}: the two targets share no requirement — a union would over-claim both"
+
+    # ── OVERLAPPING branches: `analysis.measure`, where the shared half is the IMAGE ──
+    #
+    # The counter-example to the loop above, and the reason that rule is a property of those
+    # nodes rather than a law. Measure's two targets read different STRUCTURE (a Label table
+    # of regions vs a Point table of detections) but both measure PIXELS, and §4f is explicit
+    # that the image domain is not a per-branch layer requirement — so VOXEL is declared
+    # unconditionally and is legitimately in both resolutions. What must NOT happen is the
+    # static union: `{VOXEL, LABEL, POINT}` would put a red PT chip on every working Label
+    # graph, which is the over-claim object_field was fixed for.
+    m = NODES.get("analysis.measure")
+    assert m.resolve_reads_domains({"target": "label"}) == frozenset({D.VOXEL, D.LABEL})
+    assert m.resolve_reads_domains({"target": "point"}) == frozenset({D.VOXEL, D.POINT})
+    assert m.resolve_reads_domains({"target": "label"}) & \
+        m.resolve_reads_domains({"target": "point"}) == frozenset({D.VOXEL}), \
+        "the image is shared; the structure is not"
+    assert D.POINT not in m.resolve_reads_domains({"target": "label"}), \
+        "a pure-Label graph must not be told it is missing Points"
+    assert D.LABEL not in m.resolve_reads_domains({"target": "point"}), \
+        "a pure-Point graph must not be told it is missing Labels"
+    assert m.missing_domains(frozenset({D.VOXEL, D.POINT}), {"target": "point"}) == frozenset()
+
+    # ── a plain static node keeps the identity behaviour (no state, no mapping) ─
+    st = NODES.get("analysis.label")
+    assert not st.reads_domains_by_mode
+    assert st.resolve_reads_domains() is st.reads_domains, \
+        "the unconditional path must not allocate or diverge from the declaration"
+    assert st.missing_domains(frozenset()) == st.reads_domains, \
+        "missing_domains keeps its one-argument form for every existing caller"
+
+    # ── layer_from: which INPUT a layer picker follows (V2.22) ────────────────
+    #
+    # The other half of "two branches converge here". A layer socket picks from the primary
+    # edge by design (a `raw`/`reference` input's layers must never be offered as if they
+    # were on the payload wire), so a socket that genuinely reads the SECOND input has to
+    # say so — otherwise the picker lists names off a wire the compute never looks at, and
+    # the user sees a valid-looking layer that "does not exist".
+    for op in sorted(NODES.keys()):
+        sp = NODES.get(op)
+        ds_ins = [i.name for i in sp.inputs if i.type is SocketType.DATASET]
+        for so in sp.inputs:
+            if not so.layer_from:
+                continue
+            assert so.layer_in or so.layer_in_mode, f"{op}.{so.name}: layer_from, no picker"
+            assert so.layer_from in ds_ins[1:], \
+                f"{op}.{so.name}: layer_from={so.layer_from!r} must be a NON-primary " \
+                f"Dataset input (has {ds_ins})"
+    for bad, why in (
+            ({"layer_from": "nope"}, "a Dataset input that does not exist"),
+            ({"layer_from": "data"}, "the primary input, which is already the default")):
+        try:
+            NodeRegistry._check_layer_from(v, _replace(v.input("region"), **bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"registration accepted layer_from naming {why} — the picker "
+                             f"would silently follow the primary edge either way")
+
+    # ── registration refuses each way the declaration can silently do nothing ──
+    for bad, why in (
+            ({"bnd": {"mask": frozenset()}}, "a mode name that does not exist"),
+            ({"bound": {"masc": frozenset()}}, "a value the mode cannot take"),
+            ({"bound": {"mask": frozenset({"voxel"})}}, "a string where a Domain goes")):
+        try:
+            NodeRegistry._check_reads_domains(_replace(v, reads_domains_by_mode=bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"registration accepted {why} — it would contribute no "
+                             f"domains in every state, i.e. look exactly like never "
+                             f"having written the declaration")
+
+    _ok("conditional domain rail (V2.22): reads_domains_by_mode resolves per BRANCH — "
+        "voronoi needs a Label instance under per_region, a bare raster under mask and "
+        "nothing under frame (its shipped rail said POINT in all three); the missing-domain "
+        "chips follow; a UNION over two modes covers transfer_structure's two endpoints and "
+        "iterate's 'best OR feedback'; 4 target-gated nodes require disjoint halves instead "
+        "of the static union that over-claimed both; static nodes keep the identity path; "
+        "3 silent-failure declarations refused at registration. And `layer_from`, the other "
+        "half of two-branch convergence: every layer socket that reads a SECOND Dataset "
+        "input names it (so its picker follows that edge, not the primary), with a "
+        "non-existent input and a redundant primary both refused")
+
+
 def test_param_socket_contract() -> None:
     """Every param a compute reads has a socket, and every socket a compute reads.
 
@@ -8781,16 +11371,43 @@ def test_param_socket_contract() -> None:
             if so.layer_in_mode and so.layer_in_mode not in mode_names:
                 bad_layer.append("%s: layer_in_mode=%r names no such mode"
                                  % (tag, so.layer_in_mode))
-            # (d) reading a layer in domain D means the node READS D. Exempt when the
-            #     socket is mode-gated: the requirement is then conditional and
-            #     `reads_domains` has no per-mode form (the tessellate / track.link
-            #     case, whose empty declaration is deliberate and documented).
-            if so.layer_in is not None:
-                if so.layer_in not in spec.reads_domains and not so.available_in:
-                    bad_layer.append(
-                        "%s: reads a %s layer but reads_domains=%s"
-                        % (tag, so.layer_in.value,
-                           sorted(d.value for d in spec.reads_domains)))
+            # (d) reading a layer in domain D means the node READS D — checked in every
+            #     mode state the socket is ACTIVE in, against the state-resolved
+            #     declaration (V2.22). This used to be waived outright for any mode-gated
+            #     socket, on the grounds that `reads_domains` had no per-mode form. That
+            #     waiver covered exactly the nodes whose declaration was wrong: eight of
+            #     them, splitting into ones that over-claimed (`object_field` demanding
+            #     Points of a pure-Label graph) and ones that declared `frozenset()` and
+            #     warned about nothing (`analysis.voronoi`, which needs a whole Label
+            #     instance under `bound=per_region` while its rail said POINT — reported
+            #     2026-08-03). `reads_domains_by_mode` states it per branch, so the
+            #     conditional case is now checkable rather than exempt.
+            #
+            #     An EMPTY default is the exemption that remains, and it is a real
+            #     distinction rather than a loophole: an empty layer name means *unset*,
+            #     and every compute that has one treats the layer as optional
+            #     (`analysis.segment`'s watershed `mask` falls back to cutting the
+            #     foreground out of the image; `flow.iterate`'s `metric` to not scoring).
+            #     Requiring their domains would paint a red chip on the ordinary graph
+            #     that leaves the field blank.
+            if so.layer_in is not None and str(so.default or "").strip():
+                restrict = {m: (set(vs) & mode_names.get(m, set()))
+                            for m, vs in (so.available_in or {}).items()
+                            if m in mode_names}
+                for m in spec.reads_domains_by_mode:
+                    restrict.setdefault(m, set(mode_names.get(m, set())))
+                for st in _gated_states(spec, restrict):
+                    if not so.active_in(st):
+                        continue
+                    have = spec.resolve_reads_domains(st)
+                    if so.layer_in not in have:
+                        bad_layer.append(
+                            "%s: reads a %s layer, but with %s the node's reads_domains "
+                            "resolves to %s"
+                            % (tag, so.layer_in.value,
+                               {k: st[k] for k in sorted(restrict)} or "its defaults",
+                               sorted(d.value for d in have)))
+                        break
             # (e) writing a layer in domain D means the node ADDS D — unconditionally,
             #     since the write happens whenever the socket is active.
             if so.layer_out:
@@ -8810,6 +11427,28 @@ def test_param_socket_contract() -> None:
                 bad_layer.append(
                     "%s: compute reads params.get(%r) directly — use ctx.layer(%r) so "
                     "the default is declared once" % (tag, so.name, so.name))
+            # (g) a REQUIRED input-layer socket must RESOLVE ITSELF against the wire
+            #     (2026-08-04). `ctx.layer` gives the DECLARED name, and a declared name is
+            #     right for exactly one upstream producer — so a literal default is the same
+            #     defect class as a spatial param shipping a pixel constant instead of a
+            #     `derive`. It shipped catalog-wide and was reported as
+            #     "label to points: no Voxel layer 'labels' (it carries ['CELLS'])" on a
+            #     TWO-NODE graph: `analysis.segment` had been renamed and every consumer
+            #     refused, each printing the answer one clause after declining to use it.
+            #     Sockets that ship defaults for each other and disagree made it reachable
+            #     with no renaming at all (`particles` vs `spots`, `mesh` vs `voronoi_mesh`).
+            #     `_resolve_layer` never chooses BETWEEN candidates, so this cannot make a
+            #     node guess — it fills in the single answer and refuses an open question
+            #     with the candidates listed.
+            if ((so.layer_in is not None or so.layer_in_mode)
+                    and str(so.default or "").strip()
+                    and (spec.op_key, so.name) not in _LAYER_RESOLVE_EXEMPT
+                    and not any(tok in (src or "") for tok in _LAYER_RESOLVERS)):
+                bad_layer.append(
+                    "%s: a required layer socket read straight from ctx.layer() — resolve "
+                    "it with catalog._shared.labels._resolve_layer so the only candidate "
+                    "on the wire is used whatever it is called (or exempt it in "
+                    "_LAYER_RESOLVE_EXEMPT with the reason it is optional)" % tag)
 
     assert not bad_layer, "layer-socket contract violations:\n  " + "\n  ".join(bad_layer)
     # V2.12: `analysis.watershed` + `detect.stardist_nuclei` folded into
@@ -8836,15 +11475,67 @@ def test_param_socket_contract() -> None:
     # catalog grew past 70, i.e. slack by ~16 — a floor that far below actual cannot
     # catch a lost node, which is the only thing it exists to do.
     assert audited >= 70, f"only {audited} catalog computes audited — index broke"
+
+    # ── clause 5b: a `derive` must actually DERIVE something (2026-08-05) ───────
+    #
+    # A `derive` that folds to a constant with no metadata symbols in it is always a defect,
+    # because it is what the inspector keys the greyed "ƒ auto" box on: the socket claims to
+    # track the incoming file while showing a number nothing computed, and — the way this was
+    # found — a number that need not even match what the compute uses. `enhance.zs_deconvnet`'s
+    # `background` carried `derive="0.0"` against a compute fallback of 100.0, so the panel
+    # displayed 0 for a run that subtracted 100. A constant belongs in `default`, which is
+    # already the one place a default may be declared (clause 5) and which renders as a plain
+    # editable field instead of promising metadata intelligence the socket cannot have.
+    #
+    # Folding against EMPTY symbols is the discriminator: a genuine derive names at least one
+    # envelope symbol (`bit_depth`, `emission_nm`, `n_z`, …) and so raises here, while
+    # `"0.0"` / `"16"` / `"'2D'"` evaluate. Modes are covered too — `DimMode`'s lever derive is
+    # the reason the mechanism exists, and a constant one there would pin the lever while
+    # looking adaptive.
+    const_derive = []
+    for spec in sorted(NODES.all(), key=lambda s: s.op_key):
+        if not _is_catalog_op(spec.op_key):
+            continue
+        for sock in spec.inputs:
+            if not getattr(sock, "derive", ""):
+                continue
+            try:
+                folded = eval_derive(sock.derive, {})
+            except Exception:  # noqa: BLE001 — names a real symbol: a genuine derive
+                continue
+            const_derive.append(
+                f"{spec.op_key}.{sock.name}: derive={sock.derive!r} folds to {folded!r} "
+                f"(default={sock.default!r}) — move it to `default` and drop the derive")
+        for m in spec.modes:
+            if not getattr(m, "derive", ""):
+                continue
+            try:
+                folded = eval_derive(m.derive, {})
+            except Exception:  # noqa: BLE001
+                continue
+            const_derive.append(
+                f"{spec.op_key} mode {m.name}: derive={m.derive!r} folds to {folded!r} — a "
+                f"constant lever derive pins the mode while looking metadata-adaptive")
+    assert not const_derive, (
+        "a `derive` that needs no metadata is a constant wearing the 'ƒ auto' badge — the "
+        "inspector greys the box and shows this value while the compute uses its own "
+        "fallback, so the panel can disagree with the run:\n  " + "\n  ".join(const_derive))
     _ok("socket contract: all %d catalog node types — (1) every param a compute reads "
         "has a socket, (2) every socket is read (helper-forwarded, suffixed `_z`, "
         "transitive, per-channel and ctx.layer keys resolved), (3) %d layer_in + %d "
-        "layer_out sockets are STRING, domain-consistent with reads/adds_domains "
-        "(mode-gated exempt), mode-resolvable, available_in-valid, and declare their "
+        "layer_out sockets are STRING, domain-consistent with reads/adds_domains in "
+        "EVERY mode state they are active in (empty-default = optional, exempt), "
+        "mode-resolvable, available_in-valid, and declare their "
         "default ONCE, (4) %d path sockets declare path_kind + hint (+ filter for file "
-        "kinds) and no path-shaped socket is left un-browsable; %d documented alias "
-        "exemption"
-        % (audited, n_in, n_out, n_path, len(_PARAM_NO_SOCKET_OK)))
+        "kinds) and no path-shaped socket is left un-browsable, (5) every REQUIRED input-"
+        "layer socket RESOLVES ITSELF against the wire (2026-08-04) instead of trusting a "
+        "literal default that is right for one producer — the defect behind "
+        "\"label to points: no Voxel layer 'labels' (it carries ['CELLS'])\" on a two-node "
+        "graph, and behind sockets that ship each other's names and disagree "
+        "(`particles`/`spots`, `mesh`/`voronoi_mesh`); %d optional-socket exemptions, each "
+        "with the reason absent must stay absent; %d documented alias exemption"
+        % (audited, n_in, n_out, n_path, len(_LAYER_RESOLVE_EXEMPT),
+           len(_PARAM_NO_SOCKET_OK)))
 
 
 
@@ -9862,8 +12553,24 @@ def test_transfer_structure() -> None:
     refuses("label", "point", "does not reduce", attr="score", reducer="sum")
     refuses("point", "voxel", "reduces only the COLLISIONS", attr="pv", reducer="median")
     refuses("label", "track", "invariant coordinate columns", attr="score", name="y")
-    refuses("voxel", "track", "routes through Label", attr="signal")   # via_label unset
-    refuses("label", "track", "no label instance", attr="score", source_layer="nope")
+    # `via_label` UNSET no longer refuses when the wire carries exactly one Label instance —
+    # the `_resolve_layer` sweep (2026-08-04) fills it in and names it on the progress rail,
+    # because "which Label do I route through?" has one answer here and demanding it typed was
+    # the same defect as `analysis.voronoi`'s `points="particles"`. It still refuses when the
+    # answer is genuinely unknown, which is what this pair's guard is really about.
+    _, _via = xfer("voxel", "track", attr="signal")
+    assert _via is not None, "voxel→track must resolve the only Label instance on the wire"
+    _two = base.with_structure(_ST(D.LABEL, dict(ltab.columns), layer="labels_b",
+                                  z_kind="plane_index")) \
+               .with_layer(D.VOXEL, "labels_b",
+                           np.asarray(base.get(D.VOXEL, "labels").values))
+    refuses("voxel", "track", "has to say which", attr="signal", seed=_two)
+    # ...and the same for a stale `source_layer`: one candidate on the wire is used, several
+    # is a real question. (Was: a name that is merely absent must raise.)
+    _, _sl = xfer("label", "track", attr="score", source_layer="nope")
+    assert _sl is not None, "a stale source_layer with one candidate must be recovered"
+    refuses("label", "track", "has to say which", attr="score", source_layer="nope",
+            seed=_two)
     refuses("label", "track", "has no column", attr="not_a_column")
     # a z_kind disagreement between the two structure endpoints
     mixed = base.with_structure(_ST(D.POINT, dict(ptab.columns), layer="spots",
@@ -10837,19 +13544,218 @@ def test_checkpoint_dock() -> None:
                 raise AssertionError("expected an OSError deleting a mapped checkpoint")
             except OSError as exc:
                 assert "still open" in str(exc), str(exc)
+
+        # ── 11. the WRITER's contract (V2.26) ─────────────────────────────────
+        #
+        # The pyramid used to be re-derived by a private copy of the mean-pool expression
+        # in `checkpoint.py`, which is exactly the drift `provider._plane_mean_2x`'s
+        # docstring claims cannot happen. It now streams out of the finished level 0 via
+        # `B2ndProvider._append_level`. These four assertions are what hold that.
+        from nodegraph.provider import B2ndProvider, _mean_downsample_2x
+        for tag, (mm, tt, zz, cc) in (("thin-z", (1, 4, 1, 1)),
+                                      ("deep-z", (1, 1, 6, 1))):
+            vol = (np.arange(mm * tt * zz * cc * 16 * 16, dtype=np.uint16)
+                   .reshape(mm, tt, zz, cc, 16, 16) % 4093)
+            wds = Dataset(axes=AxisSizes(m=mm, t=tt, z=zz, c=cc, y=16, x=16),
+                          metadata={"pixel_size_um": 1.0}).with_image(ArrayProvider(vol))
+            wdir = os.path.join(root, f"w-{tag}")
+            man = CP.write_checkpoint(wds, wdir, precision="float32", bake_id=f"bk-{tag}")
+            prov = B2ndProvider.open(os.path.join(wdir, "image"))
+            # (a) every level is MARKED complete — not "legacy", which is trusted blindly.
+            for lv in range(prov.levels):
+                assert prov.level_state(lv) == "complete", (tag, lv, prov.level_state(lv))
+            # (b) the pyramid is bit-identical to the in-RAM reference, per plane.
+            ref = _mean_downsample_2x(vol)
+            for im, it, iz, ic in np.ndindex(mm, tt, zz, cc):
+                got = np.asarray(prov.get_region(1, im, it, iz, ic, 0, 8, 0, 8))
+                assert np.array_equal(got, ref[im, it, iz, ic]), (tag, im, it, iz, ic)
+            # (c) level 0 is exact, and the chunk framing came from `_store_kwargs` — the
+            #     THIN-Z case is the one that regressed: `cz` is capped by Z, so without the
+            #     batch floor a 2D series writes one small chunk per plane.
+            assert np.array_equal(
+                np.asarray(prov.get_region(0, 0, 0, 0, 0, 0, 16, 0, 16)), vol[0, 0, 0, 0])
+            chunks = man["image"]["chunks"]
+            want = B2ndProvider._store_kwargs(
+                (mm, tt, zz, cc, 16, 16), 2, tile=512,
+                cparams={}, urlpath=None, level=0, batch_thin_z=True)["chunks"]
+            assert tuple(chunks) == tuple(want), (tag, chunks, want)
+            if zz == 1:
+                assert chunks[1] > 1 or tt == 1, \
+                    f"{tag}: a thin-Z series must batch its chunk over T, got {chunks}"
+
+        # (e) the FREEZE-SOURCE fast path: when the dock's input is already a sound disk
+        #     b2nd store, the bake copies its pyramid files instead of decoding and
+        #     re-encoding bytes that are already there. The whole risk of the path is that a
+        #     copy is only correct if the destination bytes would have been IDENTICAL, so
+        #     that is what is asserted — against a full re-encode of the same input, level by
+        #     level and plane by plane.
+        vol = (np.arange(2 * 3 * 32 * 32, dtype=np.uint16).reshape(1, 2, 3, 1, 32, 32)
+               % 4093)
+        sdir = os.path.join(root, "src-store")
+        B2ndProvider.write(vol, sdir, tile=512, levels=3)
+        sds = Dataset(axes=AxisSizes(m=1, t=2, z=3, c=1, y=32, x=32),
+                      metadata={"pixel_size_um": 1.0}).with_image(B2ndProvider.open(sdir))
+        d_cp = os.path.join(root, "bake-copy")
+        m_cp = CP.write_checkpoint(sds, d_cp, precision="float32", bake_id="cp")
+        assert m_cp["image"]["copied_levels"] >= 1, \
+            "a bake of a disk b2nd store must take the copy path"
+        os.environ["NODEGRAPH_DOCK_COPY"] = "0"
+        try:
+            d_re = os.path.join(root, "bake-reencode")
+            m_re = CP.write_checkpoint(sds, d_re, precision="float32", bake_id="re")
+        finally:
+            os.environ.pop("NODEGRAPH_DOCK_COPY", None)
+        assert m_re["image"]["copied_levels"] == 0, "the kill-switch must force a real write"
+        p_cp = B2ndProvider.open(os.path.join(d_cp, "image"))
+        p_re = B2ndProvider.open(os.path.join(d_re, "image"))
+        assert p_cp.levels == p_re.levels >= 2, (p_cp.levels, p_re.levels)
+        for lv in range(p_cp.levels):
+            la = p_cp.level_axes(lv)
+            assert p_re.level_axes(lv) == la, (lv, la)
+            assert p_cp.level_state(lv) == "complete", (lv, p_cp.level_state(lv))
+            for im, it, iz, ic in np.ndindex(la.m, la.t, la.z, la.c):
+                a = np.asarray(p_cp.get_region(lv, im, it, iz, ic, 0, la.y, 0, la.x))
+                b = np.asarray(p_re.get_region(lv, im, it, iz, ic, 0, la.y, 0, la.x))
+                assert np.array_equal(a, b), \
+                    f"the copy path differs from a re-encode at level {lv} {(im,it,iz,ic)}"
+        # ...and every guard falls back to the real write rather than copying something it
+        # cannot vouch for. A real precision conversion is the one a user hits by accident.
+        f64 = (vol.astype(np.float64) / 7.0)
+        fdir = os.path.join(root, "src-f64")
+        B2ndProvider.write(f64, fdir, tile=512, levels=1)
+        fds = Dataset(axes=AxisSizes(m=1, t=2, z=3, c=1, y=32, x=32),
+                      metadata={"pixel_size_um": 1.0}).with_image(B2ndProvider.open(fdir))
+        m_f = CP.write_checkpoint(fds, os.path.join(root, "bake-f32"),
+                                  precision="float32", bake_id="f")
+        assert m_f["image"]["copied_levels"] == 0, \
+            "float64 -> float32 is a real conversion and must never be copied"
+        # a torn source cannot even be opened, so the copy is unreachable for it; the
+        # reachable unsoundness is the marker-free blank tail, which the census must catch
+        import blosc2
+        bdir = os.path.join(root, "src-blank")
+        os.makedirs(bdir, exist_ok=True)
+        ba = blosc2.empty((1, 4, 1, 1, 32, 32), dtype=np.uint16, chunks=(1, 1, 1, 1, 32, 32),
+                          blocks=(1, 1, 1, 1, 32, 32), mode="w",
+                          urlpath=os.path.join(bdir, "level_0.b2nd"))
+        ba[0:1, 0:1] = vol[0:1, 0:1, 0:1]        # ...then die, leaving the rest unwritten
+        assert B2ndProvider._blank_tail(ba) is not None, "the fixture is not actually torn"
+        del ba
+        out_b = os.path.join(root, "blank-out")
+        os.makedirs(out_b, exist_ok=True)
+        assert CP._copy_levels(
+            B2ndProvider.open(bdir), AxisSizes(m=1, t=4, z=1, c=1, y=32, x=32), out_b,
+            dt=np.dtype(np.uint16), tile=512, report=lambda *_a: None,
+            total_units=1, want_levels=3) is None, \
+            "a store with a blank trailing run must not be copied verbatim"
+        assert not os.path.exists(os.path.join(out_b, "level_0.b2nd")), \
+            "a refused copy must leave nothing behind for `open` to adopt"
+
+        # (d) a CANCELLED bake writes no manifest, so it reads as ABSENT rather than as a
+        #     shorter valid checkpoint — the same contract an interrupted bake already has.
+        cdir = os.path.join(root, "cancelled")
+        calls = {"n": 0}
+
+        def stop_after_first() -> bool:
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        vol = np.arange(2 * 16 * 16, dtype=np.uint16).reshape(1, 2, 1, 1, 16, 16)
+        cds = Dataset(axes=AxisSizes(m=1, t=2, z=1, c=1, y=16, x=16),
+                      metadata={"pixel_size_um": 1.0}).with_image(ArrayProvider(vol))
+        assert CP.write_checkpoint(cds, cdir, precision="float32", bake_id="x",
+                                   should_cancel=stop_after_first) is None, \
+            "a cancelled bake must return None, not a manifest"
+        assert CP.read_manifest(cdir) is None, \
+            "a cancelled bake left a manifest — it would read as a valid short series"
+        assert not CP.is_checkpoint(cdir)
+
+        # ── 12. the HELD tier (V2.26) — a frozen dock that wrote nothing ───────
+        #
+        # Same proof as the docked case, and for the same reason it is the load-bearing one:
+        # the tier's whole value is that the chain behind it stops running, and that is a
+        # property of the graph REWRITE, not of what the compute returns.
+        from nodelab_v2.ops import DOCK_FROZEN, is_docked, is_frozen
+        held_payload = e_live.pull("dock")
+        runs["n"] = 0
+        g_held = build({"state": "held"}, {})
+        assert is_frozen(g_held.nodes["dock"]), "a held dock is frozen"
+        assert not is_docked(g_held.nodes["dock"]), \
+            "a held dock is NOT docked — it has no store, and the disk paths must skip it"
+        assert set(DOCK_FROZEN) == {"held", "docked"}
+        g_run_h = prepare_run_graph(g_held)
+        assert not g_run_h.preds("dock"), "a held node must be a ROOT in the run graph"
+        assert len(g_held.preds("dock")) == 1, "the DOCUMENT keeps the chain"
+        seeds_h = dock_seeds(g_run_h, held={"dock": held_payload})
+        seeds_h["src"] = seed
+        e_held = Engine(g_run_h, computes=computes, seeds=seeds_h,
+                        meta_seeds=m_seed)
+        assert e_held.pull("dock") is held_payload, \
+            "a held dock must serve the SAME object — a copy would defeat the whole tier"
+        held_mask = np.asarray(e_held.pull("thr").get(Domain.VOXEL, "mask").values)
+        assert runs["n"] == 0, \
+            f"the chain behind a HELD node must never run — ran {runs['n']} time(s)"
+        assert np.array_equal(held_mask, live_mask), \
+            "a held run must produce the same answer as the live one"
+        assert dormant_nodes(g_held) == dormant_nodes(build({"state": "docked"}, {})), \
+            "held and docked grey out exactly the same nodes"
+        # all three states key the memo distinctly, so flipping between them cannot serve
+        # another state's cached result
+        hashes = set()
+        for st, prm in (("live", {}), ("held", {}), ("docked", dparams)):
+            gg = prepare_run_graph(build({"state": st, "precision": "float32"}, prm))
+            sd = dock_seeds(gg, held={"dock": held_payload}); sd["src"] = seed
+            ee = Engine(gg, computes=computes, seeds=sd, meta_seeds=m_seed)
+            ee.pull("dock")
+            hashes.add(ee.entry("dock").recipe_hash)
+        assert len(hashes) == 3, f"the three dock states must key distinctly, got {hashes}"
+        # status: held while the registry has it, RELEASED when it does not — and a released
+        # hold REFUSES rather than falling through to the live input, which would silently
+        # put the whole frozen chain back into every pull.
+        assert dock_status(g_held, "dock", held={"dock"})[0] == "held"
+        st_rel, why_rel = dock_status(g_held, "dock", held=set())
+        assert st_rel == "released" and "Hold" in why_rel, (st_rel, why_rel)
+        e_rel = Engine(prepare_run_graph(g_held), computes=computes,
+                       seeds={"src": seed, "dock": Dataset()}, meta_seeds=m_seed)
+        try:
+            e_rel.pull("dock")
+            raise AssertionError("a released hold must refuse, not recompute silently")
+        except ValueError as exc:
+            assert "nothing is being held" in str(exc), str(exc)
+        # the signature walk stops at a HELD node too, so an edit above one does not stale
+        # a dock further downstream
+        g_h_edit = build({"state": "held"}, {})
+        g_h_edit.nodes["blur"].params["radius"] = 9.5
+        assert (upstream_signature(g_h_edit, "thr")
+                == upstream_signature(g_held, "thr")), \
+            "the signature walk must stop at a held node, exactly as at a docked one"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-    _ok("checkpoint + Dock (V2.18): a bake round-trips a whole Dataset (raster pyramid, "
-        "Voxel mask, coarse lattice, structure columns + z_kind, calibration) and re-opens "
-        "LAZY — the Voxel layer comes back as a read-only memmap the AttributeLayer does "
-        "not copy and the Memo GC counts as 0 bytes; integer data survives every precision "
-        "and [0,1] float is REFUSED at uint16 instead of collapsing to 0/1; a torn bake "
-        "reads as absent and a future format is a hard error; and the node itself proves "
+    _ok("checkpoint + Dock (V2.18/V2.26): a bake round-trips a whole Dataset (raster "
+        "pyramid, Voxel mask, coarse lattice, structure columns + z_kind, calibration) and "
+        "re-opens LAZY — the Voxel layer comes back as a read-only memmap the AttributeLayer "
+        "does not copy and the Memo GC counts as 0 bytes; integer data survives every "
+        "precision and [0,1] float is REFUSED at uint16 instead of collapsing to 0/1; a torn "
+        "bake reads as absent and a future format is a hard error; and the node itself proves "
         "the point — a docked pull runs its upstream chain ZERO times and still returns "
         "byte-identical results, greys only nodes with no live consumer, reports staleness "
         "without ever acting on it, stops the signature walk at an upstream dock, names the "
-        "fix in all 3 refusals, and drop_nodes releases exactly the docked-away entries")
+        "fix in all 3 refusals, and drop_nodes releases exactly the docked-away entries. "
+        "V2.26 — the WRITER: every level is marked complete (never trusted-legacy), the "
+        "streamed pyramid is bit-identical to the in-RAM reference plane by plane on both "
+        "thin-Z and deep-Z, the chunk framing comes from `_store_kwargs` and a thin-Z series "
+        "really does batch over T, and a CANCELLED bake writes no manifest so it reads as "
+        "absent rather than as a short valid series. The FREEZE-SOURCE fast path: a bake whose "
+        "input is already a sound disk store COPIES its pyramid files, and every level of the "
+        "copy is plane-for-plane identical to a full re-encode of the same input; a real "
+        "precision conversion is never copied, a store with a blank trailing run is refused "
+        "and leaves nothing behind for `open` to adopt, and the kill-switch forces the long "
+        "way. The HELD tier: a held dock is frozen but "
+        "not docked, is a root in the run graph while the document keeps its chain, serves "
+        "the SAME object (no copy), runs its upstream ZERO times for a byte-identical answer, "
+        "greys exactly what docked greys, keys the memo distinctly from live and docked, "
+        "stops the signature walk like a docked one, and a RELEASED hold refuses with the fix "
+        "instead of silently recomputing the chain it was freezing")
 
 
 #: The lab's real WellA3 pair, as numbers. Both files' geometry is reproduced here exactly
@@ -11043,7 +13949,9 @@ def test_overlay_placement() -> None:
         "tiles": [[m, [[j, f] for j, f in plan.tiles[m]]] for m in sorted(plan.tiles)],
         "offset_um": [0.0, 0.0, 0.0], "flip_x": True, "flip_y": False,
         "t_pairs": [[t, t, 2414.6] for t in range(16)]}
-    tile_of = lambda j: np.full((64, 64), float(j), dtype=np.float32)
+    # a reader that ignores the window it is offered: the whole tile, which is what every
+    # in-memory reader hands back and the contract compose_secondary_plane keeps supporting
+    tile_of = lambda j, _want=None: np.full((64, 64), float(j), dtype=np.float32)
     for m in (10, 0, 2):
         comp = compose_secondary_plane(entry, (256, 256), pri_md, pri_ax, m,
                                        sec_md, sec_ax, tile_of)
@@ -11097,6 +14005,64 @@ def test_overlay_placement() -> None:
     assert EngineRunner.overlay_chain(gcy, "X") == [("X", "S")]
     assert GL_MAX_CHANNELS == 8, "the channel ceiling must track the shader's sampler bank"
 
+    # ── ANY node may declare an auxiliary input a viewer SOURCE (V2.22) ───────────
+    #
+    # The engine is one-payload-per-node and a payload has ONE image, so a node reading
+    # structure off a second branch showed only the primary's channel — "I can only see the
+    # UV channel" on a graph whose seeds came from one channel and its areas from another
+    # (2026-08-04). The compositing machinery already existed; nothing could tell it that a
+    # socket other than `view.overlay`'s `secondary` was a source.
+    from nodegraph.registry import NODES as _RN
+    _vspec = _RN.get("analysis.voronoi")
+    assert [i.name for i in _vspec.inputs if getattr(i, "view_source", False)] == ["areas"]
+    gvs = Graph()
+    gvs.add(NodeInstance("U", "io.load")); gvs.add(NodeInstance("R", "io.load"))
+    gvs.add(NodeInstance("V", "analysis.voronoi"))
+    gvs.connect("U", "V"); gvs.connect("R", "V", dst_socket="areas")
+    assert EngineRunner.overlay_chain(gvs, "V") == [("V", "R")], \
+        "the areas branch must be offered to the viewer as a second source"
+    # ...and it is OPT-IN: the sockets that must not composite still do not. `raw` is the
+    # unenhanced version of the SAME pixels (it would draw the field twice) and a `reference`
+    # is another timepoint of the same channel.
+    for _op, _sock in (("analysis.measure", "raw"), ("analysis.dvc_field", "reference"),
+                       ("registration.align_to", "reference"),
+                       ("transform.label_to_points", "raw")):
+        assert not any(getattr(s, "view_source", False) for s in _RN.get(_op).inputs), _op
+        gno = Graph()
+        gno.add(NodeInstance("P", "io.load")); gno.add(NodeInstance("Q", "io.load"))
+        gno.add(NodeInstance("N", _op))
+        gno.connect("P", "N"); gno.connect("Q", "N", dst_socket=_sock)
+        assert EngineRunner.overlay_chain(gno, "N") == [], f"{_op}.{_sock} must not composite"
+    # the placement entry is SYNTHESIZED (these nodes stamp no recipe — display config in a
+    # payload would ride the memo key) and it must be identity: a view_source wire is a
+    # sibling branch of one acquisition, already refused unless it addresses the same voxels,
+    # so `view.overlay`'s flip_x=True default would be wrong here.
+    _vsax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    _vsmd = {"pixel_size_um": 1.0}
+    _vsa = Dataset(axes=_vsax, metadata=_vsmd).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8))))
+    _vsb = Dataset(axes=_vsax, metadata=dict(_vsmd)).with_image(
+        ArrayProvider(np.ones((1, 1, 1, 1, 8, 8))))
+
+    class _FakeRunner:
+        document = type("D", (), {"nodes": {"V": NodeInstance("V", "analysis.voronoi")}})()
+    _ent = EngineRunner._view_source_entry(_FakeRunner(), "V", _vsa, _vsb)
+    assert _ent is not None, \
+        "a sibling branch must be placeable with NO stage log — it needs none, and a TIFF " \
+        "never has one; stage placement is the right default for an Overlay, not for this"
+    assert _ent["node"] == "V" and _ent["blend"] == "add"
+    assert _ent["flip_x"] is False and _ent["flip_y"] is False, \
+        "an implicit source must not inherit the Overlay node's mirror default"
+    assert int(_ent["t_shift"]) == 0
+    assert _ent["placed_by"] == "index" and _ent["scale"] == 1.0
+    assert _ent["tiles"] and _ent["coverage"], "field m must pair with field m"
+    # the degrade path's "alignment is NOT verified" warnings are untrue of this source —
+    # the node proved the grids identical — and would read as a problem on the node card
+    assert len(_ent["warnings"]) == 1 and "same voxels" in _ent["warnings"][0], \
+        _ent["warnings"]
+    assert EngineRunner._is_view_source_node(_FakeRunner(), "V") is True
+    assert EngineRunner._is_view_source_node(_FakeRunner(), "absent") is False
+
     _ok("overlay placement (V2.19): the real WellA3 pair placed by stage µm — 12 primary "
         "fields resolve to 1/2/4 GFP tiles (m10 draws four), 5.985x pixel ratio reported, "
         "the 0.18 µm montage seam NOT called a hole, index t-pairing carries the absolute "
@@ -11111,7 +14077,14 @@ def test_overlay_placement() -> None:
         "plan chose, each one's share of the picture equal to its coverage fraction to "
         "within 1%, at any display shape, with off-field samples left unpainted rather "
         "than clamped to the border row; and the chain walk collects EVERY source down the "
-        "primary spine, base-first, terminating on a self-referential primary")
+        "primary spine, base-first, terminating on a self-referential primary. V2.22: ANY "
+        "node may declare an auxiliary input a viewer SOURCE (`view_source`) — "
+        "`analysis.voronoi`'s `areas` does, so a graph whose seeds and areas come from two "
+        "channels finally shows both instead of the primary's alone; it stays opt-in, so `raw` "
+        "and the two `reference` sockets (a second version of the SAME pixels) composite "
+        "nothing; and the entry is SYNTHESIZED — placed field-for-field at scale 1 with no "
+        "stage log and no mirror default, because the node already proved the two branches "
+        "address the same voxels")
 
 
 def test_overlay_renderers() -> None:
@@ -11374,12 +14347,12 @@ def test_overlay_override_and_presentation() -> None:
              "placed_by": "index", "t_pairs": [[0, 0, None]]}
     src = np.arange(64, dtype=float).reshape(8, 8)
     drawn = compose_secondary_plane(entry, (16, 16), stageless, ax, 0,
-                                    stageless, ax, lambda j: src)
+                                    stageless, ax, lambda j, _w=None: src)
     assert drawn is not None and drawn.shape == (16, 16)
     assert drawn.min() == 0 and drawn.max() == 63          # the whole plane, resized
     # a STAGE placement with no boxes still declines — the override is the only way in
     assert compose_secondary_plane({**entry, "placed_by": "stage"}, (16, 16), stageless,
-                                   ax, 0, stageless, ax, lambda j: src) is None
+                                   ax, 0, stageless, ax, lambda j, _w=None: src) is None
 
     # ── presentation params: memo-neutral, and absent from the payload ───────────
     md = {"pixel_size_um": 1.0, "stage_xy_um": [(4.0, 4.0)]}
@@ -11503,6 +14476,56 @@ def test_overlay_after_geometry_change() -> None:
     # a source with no origin but a CLEAN history is still fine — the log is current
     assert plan_placement(have, one, lost, one).ok
 
+    # ── viewing DOWNSTREAM of the overlay (reported 2026-08-03) ─────────────────
+    #
+    # `Overlay -> Stitch`, viewed at the Stitch, drew no secondary. Two faults, and the
+    # second is the one that would have made a "fix" wrong: the chain walk stopped at any
+    # node that was not itself an Overlay, AND the stamped plan is a cache keyed on the
+    # primary's geometry AT THE OVERLAY NODE — a stitch collapses twelve fields into one,
+    # so replaying those tiles would have placed the secondary against fields that no
+    # longer exist. The display therefore RE-PLANS against whatever is being viewed.
+    from types import SimpleNamespace
+    from nodelab_v2.runner import EngineRunner
+    from nodegraph.placement import compose_secondary_plane
+
+    g2 = Graph()
+    g2.add(NodeInstance("A", "io.load")); g2.add(NodeInstance("B", "io.load"))
+    g2.add(NodeInstance("O", "view.overlay"))
+    g2.add(NodeInstance("S", "util.stitch", params={"out_y": 8, "out_x": 16}))
+    g2.connect("A", "O"); g2.connect("B", "O", dst_socket="secondary")
+    g2.connect("O", "S")
+    # the walk must pass THROUGH the stitch (and anything else) to find the overlay
+    assert EngineRunner.overlay_chain(g2, "S") == [("O", "B")]
+    g2.add(NodeInstance("C2", "util.crop")); g2.connect("S", "C2")
+    assert EngineRunner.overlay_chain(g2, "C2") == [("O", "B")]
+
+    flat_md = {"pixel_size_um": 1.0, "stage_xy_um": [(4.0, 4.0), (12.0, 4.0)],
+               "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 8.0]]}
+    flat_ax = AxisSizes(m=2, t=1, z=1, c=1, y=8, x=8)
+    flat = Dataset(axes=flat_ax, metadata=flat_md).with_image(
+        ArrayProvider(np.zeros((2, 1, 1, 1, 8, 8), np.uint16)))
+    eng2 = Engine(g2, computes=COMPUTES, seeds={"A": flat, "B": sec},
+                  meta_seeds={"A": MetaEnvelope(axes=flat_ax, metadata=dict(flat_md))})
+    stitched = eng2.pull("S")
+    stamped = stitched.metadata[OVERLAY_KEY][-1]
+    assert stitched.axes.m == 1 and stitched.axes.x == 16
+    # the STAMPED plan still describes the two pre-stitch fields — it is a record, not a
+    # claim about the stitched canvas
+    assert sorted(dict((m, v) for m, v in stamped["tiles"])) == [0, 1]
+    fake = SimpleNamespace(document=SimpleNamespace(nodes=dict(g2.nodes)))
+    fresh = EngineRunner._replan(fake, "O", stamped, stitched, sec)
+    assert sorted(dict((m, v) for m, v in fresh["tiles"])) == [0], fresh["tiles"]
+    # ...and it draws across the WHOLE stitched canvas, spanning what both fields covered
+    drawn = compose_secondary_plane(fresh, (8, 16), stitched.metadata, stitched.axes, 0,
+                                    sec_md, sec_ax,
+                                    lambda j, _w=None: np.arange(64.0).reshape(8, 8))
+    assert drawn is not None and drawn.shape == (8, 16)
+    assert {int(v) for v in np.unique(drawn)} == {26, 27, 28, 29, 34, 35, 36, 37}, \
+        sorted({int(v) for v in np.unique(drawn)})
+    # a re-plan that cannot resolve keeps the stamped record rather than losing the overlay
+    assert EngineRunner._replan(fake, "O", stamped, None, sec) is stamped
+    assert EngineRunner._replan(fake, "nope", stamped, stitched, sec) is stamped
+
     _ok("overlay after a geometry change (V2.19, reported 2026-08-03): an overlay placed "
         "after stitch / z-project / crop now WORKS — it places by maintained µm origins, "
         "which is what origin_um is for, instead of refusing whenever the two chains "
@@ -11511,7 +14534,717 @@ def test_overlay_after_geometry_change() -> None:
         "such pull; a Z projection costs Z and NOT X/Y — lateral coverage is unchanged while "
         "the depth relation is retired rather than reported against a plane the data is not "
         "on; and the real guard is untouched: an input with no maintained origin whose "
-        "geometry moved (drift) still REFUSES, while one with a clean history still passes")
+        "geometry moved (drift) still REFUSES, while one with a clean history still passes; "
+        "and viewing DOWNSTREAM of an overlay works — the chain walk passes through Stitch "
+        "and Crop to find it, and the display RE-PLANS against the geometry actually being "
+        "viewed rather than replaying a plan keyed on fields a stitch has already collapsed, "
+        "so the secondary is drawn across the whole stitched canvas covering what both "
+        "original fields covered; an unresolvable re-plan keeps the stamped record")
+
+
+def test_channel_merge() -> None:
+    """``channel.merge`` must put two files on ONE channel axis by metadata — lazily, with each
+    channel keeping its own Z planes.
+
+    Asked for 2026-08-05: "no need of an overlay, but instead a true metadata/image overlay …
+    each channel can go through their individual Z frames since they are overlaid based on
+    registration of metadata". ``view.overlay`` cannot be that: its ``display`` mode changes
+    nothing a downstream node reads, and its ``resample`` mode bakes ONE channel EAGERLY (the
+    whole ``(M,T,Z,C,Y,X)`` array up front — 6.1 GiB for sixteen frames of a 7168² mosaic).
+
+    The fixture is two 8×8 single-field files, the primary a 3-plane stack at 3 µm steps from
+    100 µm and the secondary a 5-plane stack at 1 µm from 104, so the union grid is decided by
+    the FINER step and spans BOTH ranges. Every assertion is an exact pixel identity rather than
+    a shape check, because a placement error and a working merge produce arrays of the same
+    shape.
+
+    **3 µm and not 2**: at a 2 µm primary step the union's integer planes land exactly halfway
+    between primary planes (101, 103), where "nearest" is a coin flip decided by Python's
+    round-half-to-even — a fixture sitting on a dead-band boundary tests the tie-break rather
+    than the placement. 3 µm puts every output plane strictly nearer one plane than another.
+    """
+    from types import SimpleNamespace
+    from nodegraph.nodes import COMPUTES, SAMPLING_KEY
+    from nodegraph.provider import ArrayProvider, ChannelMergeProvider
+    from nodegraph.placement import merge_z_grid
+
+    # primary: 3 planes at 3 µm, home 0, nominal focus 100 → 100, 103, 106
+    p_md = {"pixel_size_um": 1.0, "z_step_um": 3.0, "z_home_index": 0, "bit_depth": 12,
+            "stage_xy_um": [(4.0, 4.0)], "stage_z_um": [100.0],
+            "origin_um": [[100.0, 0.0, 0.0]], "channel_names": ["DAPI"],
+            "frame_time_jd": [2461249.0]}
+    p_ax = AxisSizes(m=1, t=1, z=3, c=1, y=8, x=8)
+    # every primary voxel carries its own z, so a wrong plane is visible in the VALUES
+    p_vox = np.zeros((1, 1, 3, 1, 8, 8), np.uint16)
+    for k in range(3):
+        p_vox[0, 0, k, 0] = 100 + k
+    # secondary: 5 planes at 1 µm from 104 → 104..108, same 8×8 field at the same stage XY
+    s_md = {"pixel_size_um": 1.0, "z_step_um": 1.0, "z_home_index": 0, "bit_depth": 12,
+            "stage_xy_um": [(4.0, 4.0)], "stage_z_um": [104.0],
+            "origin_um": [[104.0, 0.0, 0.0]], "channel_names": ["GFP", "RFP"],
+            "frame_time_jd": [2461249.0]}
+    s_ax = AxisSizes(m=1, t=1, z=5, c=2, y=8, x=8)
+    s_vox = np.zeros((1, 1, 5, 2, 8, 8), np.uint16)
+    for k in range(5):
+        for c in range(2):
+            s_vox[0, 0, k, c] = 200 + 10 * c + k
+
+    pri = Dataset(axes=p_ax, metadata=dict(p_md)).with_image(ArrayProvider(p_vox))
+    sec = Dataset(axes=s_ax, metadata=dict(s_md)).with_image(ArrayProvider(s_vox))
+
+    g = Graph()
+    g.add(NodeInstance("A", "io.load")); g.add(NodeInstance("B", "io.load"))
+    g.add(NodeInstance("M", "channel.merge"))
+    g.connect("A", "M"); g.connect("B", "M", dst_socket="secondary")
+    eng = Engine(g, computes=COMPUTES, seeds={"A": pri, "B": sec},
+                 meta_seeds={"A": MetaEnvelope(axes=p_ax, metadata=dict(p_md))})
+    out = eng.pull("M")
+
+    # ── the UNION grid: finest step, spanning both ranges ────────────────────────
+    # primary 100..106, secondary 104..108 → 100..108 at the finer 1 µm step = 9 planes
+    assert out.axes.c == 3 and out.axes.z == 9, out.axes
+    assert out.axes.m == 1 and out.axes.y == 8 and out.axes.x == 8, out.axes
+    assert abs(float(out.metadata["z_step_um"]) - 1.0) < 1e-9, out.metadata["z_step_um"]
+    assert out.metadata["channel_names"] == ["DAPI", "GFP", "RFP"], \
+        out.metadata["channel_names"]
+    # the axial origin follows the union's first plane; the LATERAL corner is untouched,
+    # because the primary defines the lateral grid
+    assert out.metadata["origin_um"][0] == [100.0, 0.0, 0.0], out.metadata["origin_um"]
+    # `bit_depth` SURVIVES when both files declare the same one (V2.26). The edit-time pass
+    # still drops it — `metadata.merge_channels` is handed only the primary envelope and
+    # cannot see the second file to check — but the COMPUTE has both, so it checks instead of
+    # claiming. Both fixtures here are 12-bit, so the pair really is on one integer scale.
+    #
+    # It is load-bearing for the Viewer, not cosmetic. Absent, `_display_range` sends an
+    # integer plane to the dtype's full range and a float plane to its observed range — and a
+    # merged payload is BOTH, since `ChannelMergeProvider` passes the primary through in its
+    # own dtype and composes the secondary in float32. So a 12-bit pair rendered with channel
+    # 0 on a 0-65535 slider (nearly black) beside channel 1 auto-stretched.
+    assert out.metadata.get("bit_depth") == 12, out.metadata.get("bit_depth")
+    # ...and it is DROPPED the moment that claim would be unsupported: a disagreement, or
+    # either side silent. Absent is the honest signal (§7c), never a guess at the primary's.
+    for pd, sd, why in ((12, 16, "the two files disagree"),
+                        (12, None, "the secondary never declared one"),
+                        (None, 12, "the primary never declared one")):
+        p2 = Dataset(axes=p_ax, metadata={**p_md, "bit_depth": pd}).with_image(
+            ArrayProvider(p_vox))
+        s2 = Dataset(axes=s_ax, metadata={**s_md, "bit_depth": sd}).with_image(
+            ArrayProvider(s_vox))
+        e2 = Engine(g, computes=COMPUTES, seeds={"A": p2, "B": s2},
+                    meta_seeds={"A": MetaEnvelope(axes=p_ax,
+                                                  metadata={**p_md, "bit_depth": pd})})
+        assert e2.pull("M").metadata.get("bit_depth") is None, why
+
+    # ── LAZY: a plane costs a plane, not the series ──────────────────────────────
+    assert isinstance(out.image, ChannelMergeProvider), type(out.image).__name__
+    assert not isinstance(out.image, ArrayProvider), \
+        "the merge must not materialize — that is the cliff `view.overlay`'s resample has"
+
+    # ── each channel shows ITS OWN nearest plane, in absolute µm ─────────────────
+    #
+    # This is the whole point. Output plane k sits at 100+k µm. The primary has planes at
+    # 100/103/106 and the secondary at 104..108, so walking k must walk each file's own planes
+    # independently — never one file's planes with the other interpolated to fit. Beyond a file's
+    # own range its nearest plane is its edge one, which is why both tables flatten at the ends.
+    want_pri = {0: 100, 1: 100, 2: 101, 3: 101, 4: 101, 5: 102, 6: 102, 7: 102, 8: 102}
+    want_sec = {0: 200, 1: 200, 2: 200, 3: 200, 4: 200, 5: 201, 6: 202, 7: 203, 8: 204}
+    for k in range(9):
+        got_p = np.asarray(out.image.get_region(0, 0, 0, k, 0, 0, 8, 0, 8))
+        got_g = np.asarray(out.image.get_region(0, 0, 0, k, 1, 0, 8, 0, 8))
+        got_r = np.asarray(out.image.get_region(0, 0, 0, k, 2, 0, 8, 0, 8))
+        assert np.all(got_p == want_pri[k]), (k, "primary", got_p[0, 0], want_pri[k])
+        assert np.all(got_g == want_sec[k]), (k, "GFP", got_g[0, 0], want_sec[k])
+        assert np.all(got_r == want_sec[k] + 10), (k, "RFP", got_r[0, 0])
+    # a WINDOW read places identically to the whole plane — the tiled path is the one the
+    # display and every tiled consumer take
+    win = np.asarray(out.image.get_region(0, 0, 0, 6, 1, 2, 5, 3, 7))
+    assert win.shape == (3, 4) and np.all(win == want_sec[6]), win
+
+    # ── Z grid = primary keeps this input's own planes, and says what it drops ───
+    g2 = Graph()
+    g2.add(NodeInstance("A", "io.load")); g2.add(NodeInstance("B", "io.load"))
+    g2.add(NodeInstance("M", "channel.merge", modes={"z_grid": "primary"}))
+    g2.connect("A", "M"); g2.connect("B", "M", dst_socket="secondary")
+    eng2 = Engine(g2, computes=COMPUTES, seeds={"A": pri, "B": sec},
+                  meta_seeds={"A": MetaEnvelope(axes=p_ax, metadata=dict(p_md))})
+    kept = eng2.pull("M")
+    assert kept.axes.z == 3, kept.axes            # exactly the primary's own plane count
+    assert abs(float(kept.metadata["z_step_um"]) - 3.0) < 1e-9, kept.metadata["z_step_um"]
+    note = kept.metadata["__merge__"]
+    assert any("not addressable" in w for w in note["warnings"]), note["warnings"]
+    # ...and the two Z-grid modes are DIFFERENT results, so they must memoize apart
+    assert eng.entry("M").recipe_hash != eng2.entry("M").recipe_hash
+
+    # ── a MINIFIED secondary is area-averaged, not point-sampled ─────────────────
+    #
+    # Reported 2026-08-05 as "the 640 channel looks like a lower quality". The 640 mosaic is
+    # 0.287 µm/px and the GFP mosaic it was being placed into is 1.718, so its 36093x11520
+    # canvas lands on 6031x1925 output pixels — 36 source pixels per output pixel, of which
+    # `axis_map` kept exactly ONE. That is the defect `_fit_plane` documents: it discards
+    # 1 - 1/36 of the data and keeps the noise at full amplitude, so the result is noisier than
+    # the image it came from. Asserted on noise, because that is the symptom: averaging a block
+    # must cut the standard deviation, and point-sampling cannot.
+    from nodegraph.placement import _area_shrink, compose_secondary_plane as _compose
+    rng = np.random.default_rng(20260805)
+    fine = (1000.0 + rng.normal(0.0, 100.0, size=(240, 240))).astype(np.float32)
+    coarse_md = {"pixel_size_um": 6.0, "stage_xy_um": [(120.0, 120.0)],
+                 "stage_z_um": [0.0], "origin_um": [[0.0, 0.0, 0.0]]}
+    coarse_ax = AxisSizes(m=1, t=1, z=1, c=1, y=40, x=40)          # 240 µm field, 6 µm/px
+    fine_md = {"pixel_size_um": 1.0, "stage_xy_um": [(120.0, 120.0)],
+               "stage_z_um": [0.0], "origin_um": [[0.0, 0.0, 0.0]]}
+    fine_ax = AxisSizes(m=1, t=1, z=1, c=1, y=240, x=240)          # same field, 1 µm/px
+    ent = {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 0.0], "flip_x": False,
+           "flip_y": False, "placed_by": "stage", "t_pairs": [[0, 0, 0.0]]}
+    got = _compose(ent, (40, 40), coarse_md, coarse_ax, 0, fine_md, fine_ax,
+                   lambda j, w=None: fine)
+    assert got is not None and got.shape == (40, 40)
+    point = fine[::6, ::6][:40, :40]                    # what it used to do
+    assert got.std() < 0.55 * point.std(), (got.std(), point.std())
+    # …and the MEAN is preserved, so it is a resample and not a filter that moved the level
+    assert abs(float(got.mean()) - float(fine.mean())) < 2.0, (got.mean(), fine.mean())
+    # a MAGNIFIED secondary must be untouched by this — nearest-neighbour is right there, and
+    # "blocky is the honest rendering of real pixels stretched" depends on it
+    up = _compose(ent, (240, 240), fine_md, fine_ax, 0, coarse_md, coarse_ax,
+                  lambda j, w=None: np.arange(1600, dtype=np.float32).reshape(40, 40))
+    assert up is not None and len(np.unique(up)) == 1600, len(np.unique(up))
+    # the shrink helper itself: exact block means, and a no-op at the same size
+    blk = np.arange(16, dtype=np.float64).reshape(4, 4)
+    assert np.allclose(_area_shrink(blk, 2, 2), [[2.5, 4.5], [10.5, 12.5]])
+    assert _area_shrink(blk, 4, 4) is blk
+
+    # ── an already-STITCHED secondary must not be flipped again ──────────────────
+    #
+    # Reported 2026-08-05 via the live graph, which had `flip_x` set to False by hand — the clue.
+    # Flip X/Y say whether image +x runs along stage −x, which no file records; but `util.stitch`
+    # had to answer that to place its tiles, so its canvas is ALREADY in stage coordinates.
+    # Applying the flip again mirrors the mosaic inside its own footprint: measured on the WellA3
+    # pair, the stitched 640 secondary landed 784 µm — 456 px at the primary's 1.718 µm/px — out
+    # in x. Derived from the data, because a default the user has to find by eye is not a default.
+    from nodegraph.catalog._shared.placement_entry import already_stage_placed, handedness_for
+    raw = SimpleNamespace(metadata={})
+    assert already_stage_placed(raw) is False
+    assert handedness_for(raw, True, False) == (True, False, ())
+    stitched_sec = SimpleNamespace(metadata={SAMPLING_KEY: ("stitch[stage[49 tiles]]",)})
+    assert already_stage_placed(stitched_sec) is True
+    fx, fy, why = handedness_for(stitched_sec, True, False)
+    assert (fx, fy) == (False, False) and why and "mirror" in why[0], (fx, fy, why)
+    # …and it says nothing when there was no flip to ignore, so the card stays quiet
+    assert handedness_for(stitched_sec, False, False) == (False, False, ())
+    # a GRID-layout stitch is NOT stage-placed and must keep the camera handedness
+    grid_sec = SimpleNamespace(metadata={SAMPLING_KEY: ("stitch[grid[4x3]]",)})
+    assert already_stage_placed(grid_sec) is False, \
+        "a contact-sheet montage makes no stage claim, so the camera flip still applies"
+
+    # ── the merged note reports what it did ─────────────────────────────────────
+    n = out.metadata["__merge__"]
+    assert n["placed_by"] == "stage" and n["added_channels"] == 2 and n["z_planes"] == 9
+    assert n["coverage"][0][1] > 0.99, n["coverage"]
+    assert "+2 channel(s)" in n["note"] and "9 z" in n["note"], n["note"]
+
+    # ── the edit-time envelope: BOTH grown axes are UNKNOWN, and honest about it ─
+    env = eng.env("M")
+    assert env.metadata.get("bit_depth") is None
+    assert env.metadata.get("z_step_um") is None, \
+        "leaving the primary's Z step standing would have every downstream µm→plane " \
+        "conversion use the wrong spacing"
+    assert "c" in env.unknown_axes and "z" in env.unknown_axes, env.unknown_axes
+
+    # ── refusals ────────────────────────────────────────────────────────────────
+    g3 = Graph()
+    g3.add(NodeInstance("A", "io.load")); g3.add(NodeInstance("M", "channel.merge"))
+    g3.connect("A", "M")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"A": pri}).pull("M")
+        raise AssertionError("a merge with no secondary must refuse")
+    except ValueError as exc:
+        assert "secondary" in str(exc)
+    # two specimens focused 5 mm apart: the union would be thousands of planes of which almost
+    # none carry both files, and every one of them would still READ
+    far = dict(s_md); far["stage_z_um"] = [5000.0]; far["origin_um"] = [[5000.0, 0.0, 0.0]]
+    grid, _w, refuse = merge_z_grid(p_md, p_ax, far, s_ax, {0: [(0, 1.0)]})
+    assert refuse and "too far apart" in refuse[0], refuse
+    # no stage log at all → refuse by default, and the override still places by index
+    bare = {"pixel_size_um": 1.0}
+    _grid, warn, _r = merge_z_grid(bare, p_ax, bare, s_ax, {0: [(0, 1.0)]})
+    assert any("paired by INDEX" in w for w in warn), warn
+
+    _ok("channel.merge (V2.23, asked 2026-08-05): two acquisitions on ONE channel axis, placed "
+        "by absolute stage position and focus — a real merged Dataset every downstream node can "
+        "measure across, where `view.overlay` records a placement the Viewer composites and "
+        "nothing else ever sees. LAZY through a two-source ChannelMergeProvider (a plane costs a "
+        "plane) against `resample`'s eager whole-array bake; C and Z both grow and the "
+        "meta_transform marks BOTH unknown rather than guess, because propagate_meta is shown "
+        "only the primary's envelope — dropping z_step_um with them, since leaving the primary's "
+        "step standing would put every downstream µm→plane conversion on the wrong spacing. Each "
+        "channel shows its OWN plane nearest the viewed focus (asserted pixel-exact across all 9 "
+        "planes of a union grid built from a 3-plane 3 µm stack and a 5-plane 1 µm one, and "
+        "window reads place identically to whole planes), the union takes the FINER step and "
+        "spans both ranges so which file you wired as primary cannot decide whether the other's "
+        "stack is reachable, `primary` keeps this input's grid and names the planes it cannot "
+        "address, the two modes memoize apart, and two specimens focused 5 mm apart are REFUSED "
+        "rather than merged into thousands of planes that all still read; and a secondary FINER "
+        "than the primary is area-averaged into its grid instead of point-sampled (reported as "
+        "\"the 640 channel looks like a lower quality\": at 0.287 µm/px into 1.718 the 640 lands "
+        "36 source pixels per output pixel and axis_map kept one, discarding 1-1/36 of the data "
+        "while keeping the noise at full amplitude — measured std now under 55% of the "
+        "point-sampled one at an unchanged mean), while a MAGNIFIED secondary is left "
+        "nearest-neighbour, since \"blocky is the honest rendering of real pixels stretched\" "
+        "depends on exactly that; each covering tile is also read at ITS OWN nearest plane rather "
+        "than the first hit's, because the secondary's fields are each focused at their own "
+        "height; and Flip X/Y are DERIVED inert for an already-stitched secondary — the stitch "
+        "answered the handedness question to place its tiles, so its canvas is in stage "
+        "coordinates and flipping it again mirrored the mosaic inside its own footprint, "
+        "measured 784 µm (456 px) out in x on the WellA3 pair, which is what had the live graph "
+        "carrying a hand-set flip_x=False; a GRID-layout stitch makes no stage claim and keeps "
+        "the camera flip")
+
+
+def test_display_resolution_policy() -> None:
+    """The display cap must be a DECISION about this machine, not a constant.
+
+    Asked for 2026-08-04: "I want the stitched and overlay to be full resolution and instantly
+    loaded/playable." A stitched mosaic was pinned to whatever pyramid level fitted a fixed
+    4096 px — half resolution for a 7168 canvas, everywhere except inside a zoom patch — for no
+    reason other than the constant. Measured on the WellA3 GFP montage (49 positions → 7168²,
+    16 T): the whole-canvas read is 0.78 s live and 0.06 s from a baked store, one frame is 98
+    MiB narrowed, and the entire series is 1.53 GiB against a 64 GiB budget on this box. There
+    was never anything to be afraid of; there was only a number.
+
+    So the cap is now the decision NIS-Elements makes once per image against
+    ``MaxMemoryImageSize``: show it WHOLE when it fits the surface's texture limit and the RAM
+    budget, else go progressive (pyramid + a detail patch where you look). Their default share
+    is 25% of RAM and so is this one — see :data:`nodelab_v2.runner.DISPLAY_RAM_SHARE`.
+    """
+    from types import SimpleNamespace
+    from typing import Any, List
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.runner import (DEFAULT_TEXTURE_LIMIT, DISPLAY_RAM_SHARE, MAX_DISPLAY_DIM,
+                                   TEXTURE_BYTES, EngineRunner, _display_dtype, _fit_plane,
+                                   display_cap, display_ram_bytes)
+
+    big = AxisSizes(m=1, t=16, z=1, c=1, y=7168, x=7168)
+    small = AxisSizes(m=1, t=1, z=1, c=1, y=2048, x=2048)
+    assert 0.0 < DISPLAY_RAM_SHARE <= 0.9 and display_ram_bytes() > 0
+    assert display_cap(small, texture_limit=32768, bytes_per_px=2) == MAX_DISPLAY_DIM, \
+        "a frame already under the cap must be untouched by any of this"
+    assert display_cap(big, texture_limit=32768, bytes_per_px=2) == 7168
+    assert display_cap(big, texture_limit=DEFAULT_TEXTURE_LIMIT, bytes_per_px=2) == 7168, \
+        "the conservative default must still clear a 7168 mosaic — 8192 is the floor every " \
+        "GL 3.3 implementation of the last decade meets"
+    assert display_cap(big, texture_limit=4096, bytes_per_px=2) == MAX_DISPLAY_DIM, \
+        "a frame the surface cannot upload must fall back, not be attempted (the CPU " \
+        "backend takes this branch: its QImage is the size of the frame)"
+    huge = AxisSizes(m=1, t=1, z=1, c=1, y=300000, x=300000)
+    assert display_cap(huge, texture_limit=32768, bytes_per_px=2) == MAX_DISPLAY_DIM
+
+    # ── COST is a ceiling too (V2.23b, reported 2026-08-05) ──────────────────────
+    #
+    # The first cut asked only "does it fit", and fitting is not affording. Two ways that bit,
+    # both on the live mosaic and both reported as "it needs to update immediately … part of
+    # the stitch does not appear on some frames":
+    #
+    #  * a STREAMING provider computes every plane. Level 0 of the WellA3 mosaic is 1.0 s a
+    #    frame against level 1's 0.21 s, for detail only visible zoomed in — which the detail
+    #    patch already serves at full resolution, where you are actually looking.
+    #  * the uploader packs planes into RGBA8, so a frame costs 4 bytes/px of VRAM plus two
+    #    transient CPU copies of the same size. `GL_MAX_TEXTURE_SIZE` (32768 here) would permit
+    #    a 4 GB texture, and the upload path has no `glGetError` — so overrunning VRAM does not
+    #    raise, it leaves the previous texture bound. That IS a frame with part of the picture
+    #    missing.
+    assert display_cap(big, texture_limit=32768, bytes_per_px=2, streaming=True) \
+        == MAX_DISPLAY_DIM, "a plane that must be COMPUTED stays on the pyramid"
+    assert display_cap(big, texture_limit=32768, bytes_per_px=2, streaming=False) == 7168, \
+        "…and the same frame from a store (a Flatten bake) is shown whole"
+    # the texture-BYTES ceiling counts every shown channel: 7168² is 205 MB of RGBA8 each
+    per_mb = 7168 * 7168 * 4
+    n_tex = max(1, TEXTURE_BYTES // per_mb)
+    assert display_cap(big, texture_limit=32768, bytes_per_px=2, planes=int(n_tex)) == 7168
+    assert display_cap(big, texture_limit=32768, bytes_per_px=2,
+                       planes=int(n_tex) + 1) == MAX_DISPLAY_DIM, \
+        "one channel too many must drop the whole frame to the pyramid rather than attempt " \
+        "an upload that fails silently"
+    # the RAM budget is the third ceiling and is checked against the narrowed size
+    assert display_cap(big, texture_limit=32768, bytes_per_px=10 ** 6) == MAX_DISPLAY_DIM
+
+    # ── the display copy NARROWS, which is a quarter of the reason a series fits ───
+    #
+    # `util.stitch` fuses in float64 (a feather blend is a weighted mean), so a mosaic frame
+    # reached the display as 8 bytes/px carrying 12-bit data — 392 MiB where 98 would do. The
+    # narrowing rides on a copy `_fit_plane` was making anyway, so it is free, and it is gated
+    # on the payload's own `bit_depth`: an integer image narrows, a continuous field does not,
+    # and neither has to be scanned to find out which it is.
+    assert _display_dtype(SimpleNamespace(metadata={"bit_depth": 12})) is np.uint16
+    assert _display_dtype(SimpleNamespace(metadata={"bit_depth": None})) is None, \
+        "every node that makes its values continuous drops bit_depth — normalize, the " \
+        "overlay's resample, any float field — and none of them may be narrowed"
+    assert _display_dtype(SimpleNamespace(metadata={})) is None
+    assert _display_dtype(SimpleNamespace(metadata={"bit_depth": 32})) is None
+    assert _display_dtype(SimpleNamespace(metadata={"bit_depth": True})) is None
+    f64 = np.array([[0.0, 1.4, 4094.6], [12.0, 40.0, 4095.0]], dtype=np.float64)
+    got = _fit_plane(f64, 64, as_dtype=np.uint16)
+    assert got.dtype == np.uint16 and np.array_equal(got, np.rint(f64).astype(np.uint16))
+    # out of range REFUSES rather than wrapping — a wrapped intensity would look like data
+    assert _fit_plane(np.array([[-1.0, 5.0]]), 64, as_dtype=np.uint16).dtype == np.float64
+    assert _fit_plane(np.array([[0.0, 7e4]]), 64, as_dtype=np.uint16).dtype == np.float64
+    # …and the pre-existing rules are intact: an integer plane keeps its own dtype through a
+    # decimation, and the decimation still lands on the cap exactly
+    u16 = np.arange(256, dtype=np.uint16).reshape(16, 16)
+    assert _fit_plane(u16, 8, as_dtype=np.uint16).shape == (8, 8)
+    assert _fit_plane(u16, 8).dtype == np.uint16
+    assert _fit_plane(f64, 1).shape == (1, 1)
+
+    # ── the PRELOAD: what makes a series playable rather than merely warm ─────────
+    #
+    # Pressing play says every frame is wanted, in order. That is the one statement licensing a
+    # whole-series read — the scrub prefetcher must not infer it from a cursor nudge, which is
+    # why it is cost-gated to ±2 frames on a computing provider (warming ±8 T of the WellA3 640
+    # series once queued sixteen whole-volume deconvolutions). Bounded by the same budget, and
+    # it stops rather than evicting its own head: a preload that wraps the LRU would re-decode
+    # every lap, which is slower than not preloading at all.
+    from nodelab_v2.runner import PlaneCache
+    prov = ArrayProvider(np.zeros((1, 6, 1, 1, 64, 64), np.uint16))
+    queued: List[Any] = []
+
+    def _fake_runner(axes, provider=prov, cache=None):
+        r = SimpleNamespace(
+            _viewer_pin=None, _viewer_dtype=np.uint16, _texture_limit=32768,
+            _viewer_node="N", _viewer_axes=axes, _viewer_provider=provider,
+            _planes=cache if cache is not None else PlaneCache(),
+            _prefetch_gen=0, _preload_gen=0, _preload_node=None,
+            _preload_total=0, _preload_done=0,
+            PRELOAD_JOBS=EngineRunner.PRELOAD_JOBS,
+            _pool=SimpleNamespace(start=queued.append, maxThreadCount=lambda: 8))
+        r.display_dim = lambda a, planes=1: EngineRunner.display_dim(r, a, planes=planes)
+        r._frame_bytes = lambda a, ch: EngineRunner._frame_bytes(r, a, ch)
+        r._prefetch_span = EngineRunner._prefetch_span
+        r.preload_finished = SimpleNamespace(emit=lambda *a: None)
+        r.preload_progress = SimpleNamespace(emit=lambda *a: None)
+        return r
+
+    r = _fake_runner(prov.axes)
+    n = EngineRunner.preload_series(r, "N", (0, 2, 0, 0), (0,))
+    assert n == 6, n                                # the whole T range
+    assert 1 < len(queued) <= EngineRunner.PRELOAD_JOBS, len(queued)
+    # ...ordered from the CURSOR and wrapping, so the frames about to be shown land first.
+    # Round-robin over the jobs, so interleaving them recovers playback order.
+    order = [j._jobs for j in queued]
+    flat = [order[k % len(order)][k // len(order)]
+            for k in range(sum(len(s) for s in order))]
+    assert [t for _k, _m, t, _z, _c in flat] == [2, 3, 4, 5, 0, 1], \
+        [t for _k, _m, t, _z, _c in flat]
+    assert EngineRunner.series_fits(r, planes=1) is True
+
+    # ── THE regression: a cursor move must not cancel it (reported 2026-08-05) ────
+    #
+    # `preload_series` used to share `_prefetch_gen` with the scrub prefetcher, and playback
+    # moves the cursor — so the first frame advance bumped the generation and every preload job
+    # aborted on its next iteration. Playback went straight back to decoding each frame as it
+    # arrived, which is exactly "it loads every time".
+    gen_before = r._preload_gen
+    EngineRunner.prefetch(r, "N", (0, 3, 0, 0), (0,), pin=None)
+    assert r._preload_gen == gen_before, \
+        "a cursor move cancelled the preload — the whole bug"
+    assert r._prefetch_gen != 0, "…while the scrub prefetcher's own generation still moves"
+    # a stop DOES retire it, and says so
+    EngineRunner.cancel_preload(r)
+    assert r._preload_gen != gen_before and r._preload_total == 0
+
+    # a series far past the budget preloads only what fits, and says so by returning fewer
+    big_ax = AxisSizes(m=1, t=100000, z=1, c=1, y=7168, x=7168)
+    r2 = _fake_runner(big_ax)
+    n2 = EngineRunner.preload_series(r2, "N", (0, 0, 0, 0), (0,))
+    ceiling = min(r2._planes.budget, display_ram_bytes())
+    assert 0 < n2 < 100000, n2
+    assert n2 <= ceiling // (7168 * 7168 * 2) + 1, n2
+    assert EngineRunner.series_fits(r2, planes=1) is False, \
+        "a series past the budget must say so, so the status line can be honest about it"
+    # the ceiling is the cache the frames actually LAND in — sizing against a different number
+    # is how a preload evicts its own head and re-decodes every lap
+    small = _fake_runner(prov.axes, cache=PlaneCache(budget_bytes=3 * 64 * 64 * 2))
+    assert EngineRunner.preload_series(small, "N", (0, 0, 0, 0), (0,)) == 3
+    assert EngineRunner.series_fits(small, planes=1) is False
+    # a node that is not the viewed one preloads nothing — the held provider is not its data
+    assert EngineRunner.preload_series(r, "somebody-else", (0, 0, 0, 0), (0,)) == 0
+
+    _ok("display resolution policy (V2.23, asked 2026-08-04): the display cap is no longer a "
+        "fixed 4096 that pinned a 7168² stitched mosaic to half resolution everywhere outside "
+        "a zoom patch — it is now the decision NIS-Elements makes once per image against "
+        "MaxMemoryImageSize, and against the same 25%-of-RAM default (configurable, since the "
+        "right answer is a property of the machine): a frame is shown WHOLE at full resolution "
+        "when it fits both the surface's real GL_MAX_TEXTURE_SIZE and the memory budget counted "
+        "over every shown channel, and falls back to pyramid-plus-patch when it does not — a "
+        "frame the surface could not upload is refused rather than attempted, which is the "
+        "direction that costs sharpness instead of showing black; and the display copy is "
+        "narrowed to the payload's own declared bit depth, so a mosaic frame is 98 MiB of "
+        "uint16 rather than 392 MiB of the float64 a feather blend has to be computed in — free, "
+        "because it rides a copy that was already being made, gated on `bit_depth` so no "
+        "continuous field is touched, and REFUSED rather than wrapped when a value would not "
+        "fit; and pressing PLAY preloads the whole T range into the plane cache — the one "
+        "gesture that licenses reading every frame, which the ±2-frame scrub prefetcher must "
+        "never infer from a cursor nudge — bounded by the same budget, stopping rather than "
+        "evicting its own head, and reporting how far it got so a series too big to hold says "
+        "so instead of quietly re-decoding every lap. V2.23b (reported 2026-08-05, \"it loads "
+        "every time\"): the preload had been sharing the scrub prefetcher's cancellation "
+        "generation, and playback MOVES THE CURSOR — so the first frame advance retired every "
+        "preload job and playback went straight back to decoding each frame as it arrived. It "
+        "now has its own generation (retired by a stop, an edit or a newer preload, never by the "
+        "cursor it exists to serve), reads from the cursor outward with wraparound instead of "
+        "from t=0, fans out over 4 pool threads (measured cold: 1.03 s/frame serial, 0.51 at "
+        "four, 0.43 at eight — capped low so the frame being DISPLAYED still gets a thread), and "
+        "sizes itself against the plane cache the frames actually land in rather than a second "
+        "budget that would let it evict its own head. V2.23c (reported 2026-08-05, \"it needs "
+        "to update immediately … part of the stitch does not appear on some frames\"): fitting "
+        "is not affording, and the first cut asked only whether it fit. Full resolution is now "
+        "also gated on COST — a STREAMING provider computes every plane (level 0 of the WellA3 "
+        "mosaic is 1.0 s a frame against level 1's 0.21 s, for detail the zoom patch already "
+        "serves where you are looking), and on TEXTURE BYTES, because the uploader packs to "
+        "RGBA8 at 4 bytes/px plus two transient copies and has no glGetError — so exceeding VRAM "
+        "does not raise, it leaves the previous texture bound, which is exactly a frame with "
+        "part of the picture missing. A live mosaic is back on the pyramid at 24 MiB planes and "
+        "49 MiB textures; the same frame from a Flatten bake is still shown whole")
+
+
+def test_overlay_zoom_detail() -> None:
+    """The overlay must survive a ZOOM, and it must draw the secondary's RAW pixels.
+
+    Reported 2026-08-04: "it is currently bugged and disappears if the user zooms in on it,
+    the files overlaid are stitched". Two faults behind that one sentence, and they compound:
+
+    * the viewport DETAIL patch — the finer read of the visible rect that a zoom triggers —
+      carried only the primary's channels. It is drawn opaquely over the overview inside its
+      own rect, so zooming in did not fade the overlay, it *erased* it. Worse, the patch
+      request asked for the composed channel by index and :meth:`_plane_addrs` clamped that
+      index into the primary's range, so the request looked satisfied.
+    * the secondary was read as a WHOLE plane decimated to the display cap. That cap is the
+      source's own overview: with a stitched secondary, the part of it covering one primary
+      field is a few hundred of those pixels, magnified over the whole display. "Not the raw
+      channel data" is exactly right, and it is why zooming used to reveal nothing.
+
+    Both are now one path: :func:`~nodegraph.placement.compose_secondary_plane` takes the
+    output's ``region`` of the primary, and its reader is offered the fractional window of the
+    tile it needs (:func:`~nodegraph.placement.source_window`) so a pyramid-backed source can
+    serve that window at full resolution.
+    """
+    from types import SimpleNamespace
+    from nodegraph.placement import (FieldBox, compose_secondary_plane, field_box,
+                                     plan_placement, source_window, sub_field_box)
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.runner import EngineRunner, _pick_window_level, _window_read
+
+    # ── the geometry helpers, on their own ───────────────────────────────────────
+    box = FieldBox(0.0, 10.0, 0.0, 20.0)
+    sub = sub_field_box(box, (0.5, 1.0, 0.0, 0.25))
+    assert (sub.y0, sub.y1, sub.x0, sub.x1) == (5.0, 10.0, 0.0, 5.0), sub
+    # a tile that exactly covers the output is needed WHOLE, whichever way it is mirrored
+    assert source_window(box, box, flip_y=False, flip_x=False) == (0.0, 1.0, 0.0, 1.0)
+    assert source_window(box, box, flip_y=True, flip_x=True) == (0.0, 1.0, 0.0, 1.0)
+    # the right half of the output comes from the right half of an aligned tile — and from
+    # the LEFT half of its pixel grid when the camera is mounted mirrored, which is the one
+    # thing a caller must not be left to re-derive
+    right = sub_field_box(box, (0.0, 1.0, 0.5, 1.0))
+    assert source_window(right, box, flip_x=False)[2:] == (0.5, 1.0)
+    assert source_window(right, box, flip_x=True)[2:] == (0.0, 0.5)
+    # a tile that does not reach the output is not read at all
+    assert source_window(sub_field_box(box, (0.0, 1.0, 0.0, 0.25)),
+                         FieldBox(0.0, 10.0, 15.0, 20.0)) is None
+
+    # ── a windowed reader must draw the SAME picture as a whole-tile one ──────────
+    #
+    # This is the invariant that lets the display path read a window instead of a plane: the
+    # two must be indistinguishable in the picture, or "read less" would silently mean "draw
+    # something else". Unique per-pixel values, so a one-pixel slip anywhere fails.
+    pri_md = {"pixel_size_um": 1.0, "origin_um": [[0.0, 0.0, 0.0]]}
+    pri_ax = AxisSizes(m=1, t=1, z=1, c=1, y=48, x=48)
+    sec_md = {"pixel_size_um": 1.5, "origin_um": [[0.0, -12.0, -12.0]]}
+    sec_ax = AxisSizes(m=1, t=1, z=1, c=1, y=48, x=48)
+    plan = plan_placement(pri_md, pri_ax, sec_md, sec_ax)
+    assert plan.ok, plan.refusals
+    src = np.arange(48 * 48, dtype=np.float32).reshape(48, 48)
+
+    def whole(j, want=None):
+        return src
+
+    def windowed(j, want):
+        fy0, fy1, fx0, fx1 = want
+        y0, y1 = int(np.floor(fy0 * 48)), max(int(np.ceil(fy1 * 48)), 1)
+        x0, x1 = int(np.floor(fx0 * 48)), max(int(np.ceil(fx1 * 48)), 1)
+        return src[y0:y1, x0:x1], (y0 / 48.0, y1 / 48.0, x0 / 48.0, x1 / 48.0)
+
+    for fy in (False, True):
+        for fx in (False, True):
+            entry = {"tiles": [[m, [[j, f] for j, f in plan.tiles[m]]]
+                               for m in sorted(plan.tiles)],
+                     "offset_um": [0.0, 3.0, -2.0], "flip_x": fx, "flip_y": fy,
+                     "placed_by": "stage", "t_pairs": [[0, 0, 0.0]]}
+            a = compose_secondary_plane(entry, (48, 48), pri_md, pri_ax, 0,
+                                        sec_md, sec_ax, whole)
+            b = compose_secondary_plane(entry, (48, 48), pri_md, pri_ax, 0,
+                                        sec_md, sec_ax, windowed)
+            assert a is not None and b is not None, (fy, fx)
+            assert np.array_equal(a, b), (fy, fx, int(np.abs(a - b).max()))
+            # ...and a REGION is exactly the corresponding part of the whole-field picture.
+            # Output sample centres land on the same µm either way, so this is equality, not
+            # approximation — anything looser would hide a half-pixel drift, which is the
+            # error a zoom exists to make visible.
+            quad = compose_secondary_plane(entry, (24, 24), pri_md, pri_ax, 0,
+                                           sec_md, sec_ax, windowed,
+                                           region=(0.0, 0.5, 0.5, 1.0))
+            assert quad is not None and np.array_equal(quad, a[:24, 24:]), (fy, fx)
+
+    # ── the windowed read picks a level by the WINDOW, not by the plane ───────────
+    #
+    # `_pick_level` asks "does the whole plane fit the display cap"; a stitched mosaic answers
+    # no at every level, which is how a zoomed read stayed coarse while the sliver of it on
+    # screen would have fitted level 0 with room to spare.
+    class _Pyramid:
+        levels = 3
+
+        def level_axes(self, lv):
+            return AxisSizes(m=1, t=1, z=1, c=1, y=64 >> lv, x=64 >> lv)
+
+        def get_region(self, lv, m, t, z, c, y0, y1, x0, x1):
+            n = 64 >> lv
+            full = np.arange(n * n, dtype=np.float32).reshape(n, n)
+            return full[y0:y1, x0:x1]
+
+    prov = _Pyramid()
+    assert _pick_window_level(prov, (0.0, 1.0, 0.0, 1.0), 16)[0] == 2   # whole plane: coarse
+    assert _pick_window_level(prov, (0.0, 0.25, 0.0, 0.25), 16)[0] == 0, \
+        "a quarter of level 0 is 16 px and fits — reading it from a coarser level is the blur"
+    got, cover = _window_read(prov, 0, 0, 0, 0, (0.25, 0.5, 0.25, 0.5), 16)
+    assert got.shape == (16, 16) and cover == (0.25, 0.5, 0.25, 0.5), (got.shape, cover)
+    assert np.array_equal(got, np.arange(64 * 64, dtype=np.float32)
+                          .reshape(64, 64)[16:32, 16:32]), "level-0 pixels, not a decimation"
+    # a window that overshoots the budget is area-averaged down to it rather than point-
+    # sampled — the same rule the overview plane follows, for the same noise reason
+    big, _cov = _window_read(prov, 0, 0, 0, 0, (0.0, 1.0, 0.0, 1.0), 32)
+    assert big.shape == (32, 32)
+
+    # ── and the DETAIL PATCH carries the overlay: the reported bug ────────────────
+    pri = np.zeros((1, 1, 1, 1, 48, 48), dtype=np.float32)
+    pri[0, 0, 0, 0] = 7.0
+    ctx = {"node": "O", "sources": [
+        {"entry": {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 0.0],
+                   "flip_x": False, "flip_y": False, "placed_by": "stage",
+                   "t_pairs": [[0, 0, 0.0]]},
+         "ovl_id": "O", "as_channel": False, "prefix": "",
+         "sec_md": dict(sec_md), "sec_axes": sec_ax,
+         "sec_provider": ArrayProvider(src.reshape(1, 1, 1, 1, 48, 48)),
+         "base_c": 1, "n": 1}],
+        "dropped": 0, "pri_md": dict(pri_md), "pri_axes": pri_ax}
+    # `_viewer_dtype` / `_texture_limit` are the V2.23 display-resolution policy's inputs
+    # (see `EngineRunner.display_dim`); a 48² fixture is far under every cap either way.
+    prim = ArrayProvider(pri)
+    fake = SimpleNamespace(_viewer_pin=None, _overlay_ctx=ctx, _viewer_dtype=None,
+                           _texture_limit=8192, _viewer_provider=prim)
+    fake._payload_coords = lambda coords, pin: coords
+    fake._clamp_coords = lambda coords, axes: EngineRunner._clamp_coords(fake, coords, axes)
+    fake._compose_overlay = lambda *a, **k: EngineRunner._compose_overlay(fake, *a, **k)
+    fake.display_dim = lambda axes, planes=1, provider=None: EngineRunner.display_dim(
+        fake, axes, planes=planes, provider=provider)
+
+    # zoomed onto the top-left quarter, exactly one channel of primary shown plus the overlay
+    planes, snapped = EngineRunner.detail_planes(
+        fake, prim, "O", (0, 0, 0, 0), (0, 1), pri_ax, (0.0, 0.0, 0.5, 0.5), 24)
+    assert snapped == (0.0, 0.0, 0.5, 0.5), snapped
+    assert sorted(planes) == [0, 1], \
+        f"the detail patch must carry the composed overlay channel too, got {sorted(planes)}"
+    assert planes[0].shape == (24, 24) and planes[1].shape == (24, 24)
+    # the primary's field is 48 µm and the secondary's 72 µm from -12: the quarter patch
+    # covers primary µm [0,24), which is secondary pixels [8,24) — read at LEVEL 0 and
+    # nearest-sampled onto 24 output samples, so every value is a real source pixel
+    assert set(np.unique(planes[1])).issubset(set(src.ravel().tolist())), \
+        "the overlay in a patch must be source pixels, not an interpolation of an overview"
+    assert float(planes[1][0, 0]) == float(src[8, 8]), \
+        (planes[1][0, 0], src[8, 8])
+    # zooming REVEALS more of the secondary rather than magnifying the same samples: the
+    # patch resolves more distinct source pixels over its area than the overview did there
+    over, _snap = EngineRunner.detail_planes(
+        fake, prim, "O", (0, 0, 0, 0), (0, 1), pri_ax, (0.0, 0.0, 1.0, 1.0), 24)
+    assert len(np.unique(planes[1])) > len(np.unique(over[1][:12, :12])), \
+        (len(np.unique(planes[1])), len(np.unique(over[1][:12, :12])))
+    # a channel set that leaves the overlay's index out (its toggle is off) must not have it
+    # put back by the patch — the patch replaces the overview, so it decides what is shown
+    only_pri, _s = EngineRunner.detail_planes(
+        fake, prim, "O", (0, 0, 0, 0), (0,), pri_ax, (0.0, 0.0, 0.5, 0.5), 24)
+    assert sorted(only_pri) == [0], sorted(only_pri)
+
+    # ── and a WARM frame keeps it too (the other way it vanished) ─────────────────
+    #
+    # The cursor fast path serves a frame whose planes are all decoded already. Composed
+    # overlay planes had no cache slot — their index was clamped into the primary's range —
+    # so a warm frame was served without the overlay and a cold one with it: scrubbing blinked
+    # the secondary on and off depending on what happened to be decoded.
+    from nodelab_v2.runner import PlaneCache
+    fake._planes = PlaneCache()
+    fake.overlay_channels = lambda nid: EngineRunner.overlay_channels(fake, nid)
+    fake._plane_addrs = lambda *a, **k: EngineRunner._plane_addrs(fake, *a, **k)
+    assert sorted(fake.overlay_channels("O")) == [1]
+    assert EngineRunner._cached_planes(fake, "O", (0, 0, 0, 0), (0, 1), pri_ax) is None
+    decoded = EngineRunner._decode_planes(fake, prim, "O", (0, 0, 0, 0), (0, 1), pri_ax)
+    assert sorted(decoded) == [0, 1], sorted(decoded)
+    warm = EngineRunner._cached_planes(fake, "O", (0, 0, 0, 0), (0, 1), pri_ax)
+    assert warm is not None and sorted(warm) == [0, 1], \
+        "a re-visited frame must serve the overlay from the cache, not drop it"
+    assert np.array_equal(warm[1], decoded[1])
+    # the toggle is honoured on this path as well — and a full pull ignores it, because that
+    # is the moment the Viewer is first TOLD the channel exists and cannot yet ask for it
+    assert sorted(EngineRunner._decode_planes(
+        fake, prim, "O", (0, 0, 0, 0), (0,), pri_ax)) == [0]
+    assert sorted(EngineRunner._decode_planes(
+        fake, prim, "O", (0, 0, 0, 0), (0,), pri_ax, overlay_all=True)) == [0, 1]
+    # every primary channel off, only the overlay shown: the composite is still expressed on
+    # the primary's display grid, so a plane is read for its SHAPE and NOT displayed
+    only_ovl = EngineRunner._decode_planes(fake, prim, "O", (0, 0, 0, 0), (1,), pri_ax)
+    assert sorted(only_ovl) == [1], sorted(only_ovl)
+    assert only_ovl[1].shape == (48, 48)
+
+    # ── the two spatial comparators stay locked to the IMAGE inside a patch ───────
+    #
+    # `wipe` and `checkerboard` are defined on the specimen, so a patch has to be told where
+    # it sits or the divider slides to the middle of wherever you zoomed and the checkerboard
+    # restarts — a registration check that moves when you look closer is worse than none. The
+    # CPU mirror is asserted here; the GL path carries the same rect as `u_rect`.
+    from nodelab_v2.viewer import composite_with_clim
+
+    def _blue(img):
+        """The blue plane of a composited QImage — COPIED, because the numpy view aliases
+        Qt's buffer and the QImage dies with this call."""
+        w, h = img.width(), img.height()
+        raw = np.frombuffer(img.constBits(), np.uint8)
+        return np.array(raw.reshape(h, img.bytesPerLine())[:, :w * 3]
+                        .reshape(h, w, 3)[..., 2])
+
+    flat_p, flat_s = np.full((32, 32), 100.0), np.full((32, 32), 200.0)
+    cols = {0: (255, 255, 255), 1: (255, 0, 255)}          # overlay tinted magenta
+    lims = {0: (0.0, 255.0), 1: (0.0, 255.0)}
+    wipe = {1: (4, 1.0, 0.5)}                               # divider at the image midline
+    whole_img = _blue(composite_with_clim({0: flat_p, 1: flat_s}, cols, lims, None, wipe))
+    assert whole_img[0, 0] == 200 and whole_img[0, -1] == 100, "the overlay draws LEFT"
+    half = {0: flat_p[:, :16], 1: flat_s[:, :16]}
+    lhs = _blue(composite_with_clim(half, cols, lims, None, wipe, region=(0., 1., 0., .5)))
+    rhs = _blue(composite_with_clim(half, cols, lims, None, wipe, region=(0., 1., .5, 1.)))
+    assert lhs.min() == 200 and rhs.max() == 100, \
+        "a patch's wipe must sit where the IMAGE's does, not across the patch"
+
+    _ok("overlay under ZOOM (V2.23, reported 2026-08-04): the viewport detail patch now "
+        "carries the composed overlay channel, so zooming no longer erases the secondary — "
+        "the patch is drawn opaquely over the overview inside its rect, and it was being "
+        "read with the overlay's channel index CLAMPED into the primary's range, which made "
+        "the request look satisfied; the secondary is now read as the WINDOW the picture "
+        "needs at the finest pyramid level that window fits, instead of as a whole plane "
+        "decimated to the display cap (the source's own overview — a few hundred pixels of a "
+        "stitched file magnified over the display, which is what 'not the raw channel data' "
+        "meant), so a zoom resolves more of the secondary rather than more of the blur; a "
+        "windowed reader and a whole-tile one are proven to draw the identical picture under "
+        "every mirror combination and a nudge, a region is exactly the corresponding part of "
+        "the whole-field composite, and an overlay channel whose toggle is off is not put "
+        "back by the patch; a WARM frame keeps its overlay as well — composed planes now have "
+        "a cache slot of their own, where before a re-visited frame served the primary alone "
+        "and scrubbing blinked the secondary on and off; and the `wipe`/`checkerboard` "
+        "comparators are computed in IMAGE "
+        "space in a patch (CPU here, `u_rect` in the shader), so the divider stays on the "
+        "feature you were judging instead of jumping to the middle of the zoom")
 
 
 def test_align_to() -> None:
@@ -12167,6 +15900,761 @@ def test_transform() -> None:
         "fences its pixel_size_um read, and re-keys on both the lever and the interp Mode")
 
 
+def test_lablink() -> None:
+    """The LabLink mode's contract with a hub — the parts that can drift silently.
+
+    Everything here is Qt-free, offline and fast. What it is guarding against, in order:
+    a wire constant drifting from the LabLink repo's copy; the shipped recipe going stale
+    against the node catalog; the tier-2 checks the hub delegates to us quietly passing
+    something they should refuse; and the three encoders whose failure is invisible until a
+    session tries to return a result.
+    """
+    import io as _io
+    import json as _json
+    import os as _os
+    import struct as _struct
+    from contextlib import redirect_stdout
+
+    from nodegraph.serialize import FORMAT_VERSION
+    from nodelab_v2.lablink import artifacts as LA
+    from nodelab_v2.lablink import protocol as LP
+    from nodelab_v2.lablink import client as LC
+    from nodelab_v2.lablink.worker import Worker, WorkerFault, emit, sanitize
+
+    # ── 1. wire constants ────────────────────────────────────────────────────────
+    # The hub compares LWP versions at the handshake and refuses on a mismatch, so THAT
+    # one cannot drift silently. These can.
+    assert LP.WORKER_PROTOCOL_VERSION == 1
+    assert LP.GRAPH_FORMAT == FORMAT_VERSION, (
+        f"the worker advertises graph format {LP.GRAPH_FORMAT!r} in its handshake but "
+        f"nodegraph.serialize writes {FORMAT_VERSION!r}. A hub whose recipes were saved by "
+        f"this build would be told we cannot read them (or worse, that we can).")
+    # The five node states ARE the engine's observer events — that identity is what makes
+    # the adapter a dict merge, and it is asserted rather than assumed.
+    assert set(LP.NODE_STATES) == {"start", "cached", "progress", "done", "error"}
+    # We must never synthesise a link failure for a compute problem.
+    assert LP.HUB_ONLY_ERROR_CODES <= LP.WORKER_ERROR_CODES
+    assert not (LP.EMITTABLE_ERROR_CODES & LP.HUB_ONLY_ERROR_CODES)
+    for code in LP.HUB_ONLY_ERROR_CODES:
+        try:
+            WorkerFault(code, "should be impossible")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"WorkerFault let us emit the hub-only code {code!r}")
+    # A client socket timeout at or below the long-poll ceiling turns every SUCCESSFUL long
+    # poll into an apparent dead server.
+    assert LC.HubClient("http://x", "t").timeout > LP.LONGPOLL_MAX_S
+    # Every artifact kind we advertise must have something that can write it.
+    for kind in LP.ARTIFACT_KINDS:
+        assert kind in LA.WRITERS or kind == "metrics", \
+            f"hello advertises artifact kind {kind!r} with no writer for it"
+    _ok("LabLink wire constants: graph format tracks nodegraph.serialize, node states are "
+        "the engine's observer events, hub-only error codes are unemittable by "
+        "construction, the client timeout clears the long-poll ceiling, and every "
+        "advertised artifact kind has a writer")
+
+    # ── 2. the shipped recipe still matches the catalog ──────────────────────────
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    rdir = _os.path.join(repo, "lablink_recipes", "nd2studios", "selftest-synthetic")
+    with open(_os.path.join(rdir, "recipe.json"), encoding="utf-8") as fh:
+        manifest = _json.load(fh)
+    with open(_os.path.join(rdir, "graph.nd2graph.json"), encoding="utf-8") as fh:
+        graph_doc = _json.load(fh)
+    from nodegraph.serialize import from_dict as _from_dict
+    from nodelab_v2.ops import ensure_ops as _ensure_ops
+    _ensure_ops()
+    recipe_graph, _z, _g = _from_dict(graph_doc)
+    payload = {"name": manifest["name"], "target": manifest["targets"]["primary"],
+               "allow_zones": manifest.get("allow_zones", False),
+               "inputs": manifest.get("inputs") or [],
+               "knobs": manifest.get("knobs") or [],
+               "outputs": manifest.get("outputs") or []}
+    worker = Worker(repo)
+    problems = worker.validate_recipe(payload, recipe_graph)
+    assert not problems, (
+        "the shipped LabLink recipe no longer validates against this node catalog:\n  "
+        + "\n  ".join(problems))
+
+    # ── 3. tier 2 must actually REFUSE each of its four cases ────────────────────
+    def _mutate(**changes):
+        out = {k: (list(v) if isinstance(v, list) else v) for k, v in payload.items()}
+        out.update(changes)
+        return out
+
+    # (a) a param knob naming a socket the node does not have
+    bad = _mutate(knobs=[{**payload["knobs"][1], "param": "no_such_socket"}])
+    assert any("no param socket" in p for p in worker.validate_recipe(bad, recipe_graph))
+    # (b) a unit that disagrees with the socket's own — the silent-wrong-number case
+    bad = _mutate(knobs=[{**payload["knobs"][1], "unit": "s"}])
+    hits = worker.validate_recipe(bad, recipe_graph)
+    assert any("is in 'um'" in p for p in hits), hits
+    # (c) a mode knob offering a value the node does not have
+    level = next(k for k in payload["knobs"] if k["name"] == "level")
+    bad = _mutate(knobs=[{**level, "enum": ["otsu", "kittens"]}])
+    assert any("kittens" in p for p in worker.validate_recipe(bad, recipe_graph))
+    # (d) an output kind this worker cannot produce
+    bad = _mutate(outputs=[{"name": "x", "kind": "hologram"}])
+    assert any("cannot produce" in p for p in worker.validate_recipe(bad, recipe_graph))
+    # (e) the 2D/3D lever left unset — a z-stack would run plane-by-plane, silently
+    stripped, _z2, _g2 = _from_dict(graph_doc)
+    stripped.nodes["segment"].modes.pop("dim")
+    hits = worker.validate_recipe(payload, stripped)
+    assert any("2D/3D lever" in p for p in hits), hits
+    _ok("LabLink tier 2: the shipped recipe validates against the live catalog, and each "
+        "of the four checks the hub delegates (socket exists, unit agrees, mode value is "
+        "real, output kind is producible) plus the unset 2D/3D lever is refused with a "
+        "message naming the node")
+
+    # ── 4. NaN handling and the line cap ─────────────────────────────────────────
+    clean, found = sanitize({"mean": float("nan"), "sd": float("inf"),
+                             "rows": [1.0, float("-inf")], "n": 3})
+    assert clean["mean"] is None and clean["sd"] is None and clean["rows"][1] is None
+    assert clean["n"] == 3 and set(found) == {"mean", "sd", "rows[1]"}, found
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        emit(id=1, ev="result", note="x" * (2 * LP.MAX_WORKER_LINE_BYTES))
+    line = buf.getvalue().strip()
+    assert len(line.encode()) <= LP.MAX_WORKER_LINE_BYTES, \
+        "emit let a line past the protocol cap; the hub would kill the session"
+    msg = _json.loads(line)
+    assert msg["ev"] == "result" and msg["id"] == 1, \
+        "the oversize replacement must keep the id and ev, or the command looks unanswered"
+    _ok("LabLink wire hygiene: non-finite numbers become null with their paths reported, "
+        "and an oversize line is replaced by a small one that keeps its id/ev rather than "
+        "being truncated into unparseable JSON")
+
+    # ── 5. the encoders ──────────────────────────────────────────────────────────
+    rgb = np.zeros((7, 11, 3), dtype=np.uint8)
+    rgb[..., 0] = 200
+    blob = LA.png_bytes(rgb)
+    assert blob[:8] == b"\x89PNG\r\n\x1a\n"
+    w, h = _struct.unpack(">II", blob[16:24])          # IHDR width/height
+    assert (w, h) == (11, 7), (w, h)
+    # A label quicklook is STRIDED, never interpolated: averaging ids invents regions.
+    ids = np.zeros((16, 16), dtype=np.int32)
+    ids[4:8, 4:8] = 4
+    ids[9:13, 9:13] = 6
+    small = LA._stride_to(ids, 4)
+    assert max(small.shape) <= 4
+    assert set(np.unique(small)) <= set(np.unique(ids)), (
+        "downsampling a label raster produced an id that was never segmented — the "
+        "quicklook is interpolating where it must stride")
+    # A robust window, so one hot pixel cannot black out the whole picture.
+    plane = np.full((32, 32), 100.0)
+    plane[0, 0] = 1e6
+    grey = LA._to_gray_u8(plane)
+    assert int(grey[16, 16]) > 0, "one hot pixel collapsed the quicklook to black"
+    _ok("LabLink artifacts: png_bytes writes a real PNG with correct IHDR dims from zlib "
+        "alone, label downsampling strides (never inventing an id), and the grey window is "
+        "robust to a single hot pixel")
+
+    # ── 6. the client's own guards ───────────────────────────────────────────────
+    assert LC.repair_name("2026-08-03 A1 (well 3) 60x.nd2") == \
+        "2026-08-03 A1 _well 3_ 60x.nd2"
+    assert LC.repair_name("...") == "upload.bin"       # must never be empty
+    assert LC.repair_name("(x).nd2")[0].isalnum()      # must start alphanumeric
+    meta = {"name": "r", "knobs": [
+        {"name": "background_um", "type": "float", "unit": "um", "min": 0.1, "max": 50.0,
+         "default": 5.0},
+        {"name": "level", "type": "enum", "enum": ["otsu", "li"], "default": "otsu"},
+        {"name": "min_area_um2", "type": "float", "unset_means": "derive"},
+        {"name": "fill_holes", "type": "bool", "default": False}]}
+    for bad_knobs, needle in (({"background_um": 999.0}, "above the maximum"),
+                              ({"background_um": "six"}, "must be a number"),
+                              ({"level": "kittens"}, "is not one of"),
+                              ({"fill_holes": 1}, "true or false"),
+                              ({"nope": 1}, "no knob named")):
+        try:
+            LC.HubClient.check_knobs(meta, bad_knobs)
+        except LC.LabLinkError as exc:
+            assert needle in str(exc), (bad_knobs, str(exc))
+        else:
+            raise AssertionError(f"check_knobs accepted {bad_knobs!r}")
+    # A knob left out stays out — absent means "derive from the file", and substituting the
+    # declared default here would silently override the microscope's own calibration.
+    assert LC.HubClient.check_knobs(meta, {"level": "li"}) == {"level": "li"}
+    # …while an explicit None is the documented way to put one BACK to derived.
+    assert LC.HubClient.check_knobs(meta, {"min_area_um2": None}) == {"min_area_um2": None}
+    # No total means no percentage: a bar with no denominator is the UI lying.
+    assert "%" not in LC.Progress(done=2, total=0, determinate=False).text
+    assert "%" in LC.Progress(done=2, total=4, fraction=0.5, determinate=True).text
+    _ok("LabLink client: a real microscopy filename is repaired to something the exchange "
+        "accepts (never empty, always alphanumeric-initial), every knob bound is enforced "
+        "locally before a round trip, an omitted knob is NOT defaulted while an explicit "
+        "null is passed through, and an indeterminate progress line shows no percentage")
+
+    # ── 7. the beat, which is what keeps a long run alive ────────────────────────
+    # The hub's silence timeout is reset only by a PARSED protocol line, and a single opaque
+    # compute (one CNN inference, one solver with no callback) emits nothing for as long as
+    # it takes. The beat is the whole reason such a node is not killed — and it is a
+    # background thread, so "it works" is not something reading the code establishes.
+    import time as _time
+    from nodelab_v2.lablink import worker as _W
+    saved_interval = _W.P.BEAT_INTERVAL_S
+    try:
+        _W.P.BEAT_INTERVAL_S = 0.05        # 15 s of real beats would be a silly test
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            worker._start_beats(7)
+            _time.sleep(0.4)
+            worker._stop_beats()
+        beats = [_json.loads(ln) for ln in buf.getvalue().splitlines() if ln.strip()]
+        assert beats, ("no beat was emitted while a command was in flight — a long opaque "
+                       "compute would trip the hub's silence timeout and be killed")
+        assert all(b["ev"] == "beat" and b["id"] == 7 for b in beats), beats[:2]
+        # …and it must STOP, or a warm session sitting idle emits forever.
+        after = _io.StringIO()
+        with redirect_stdout(after):
+            _time.sleep(0.3)
+        assert not after.getvalue().strip(), \
+            "the beat thread outlived the command it was reporting on"
+    finally:
+        _W.P.BEAT_INTERVAL_S = saved_interval
+    _ok("LabLink beat: a command in flight emits periodic beats carrying rss/memo/cache "
+        "bytes (so the hub's silence timeout kills wedged workers and not working ones), "
+        "and the beat thread stops with the command rather than running for the session")
+
+    # ── 8. one terminal message per command id ───────────────────────────────────
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        assert worker._answer(42, "result", status="ok") is True
+        assert worker._answer(42, "error", code="internal", message="second") is False
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 1 and _json.loads(lines[0])["ev"] == "result", lines
+    _ok("LabLink terminal discipline: a second terminal message for one command id is "
+        "refused rather than sent, so the hub can never attribute it to whatever command "
+        "reuses that id")
+
+
+def test_zs_deconvnet() -> None:
+    """``enhance.zs_deconvnet`` — the ZS-DeconvNet port (Qiao et al., Nat Commun 15:4180).
+
+    Three layers, cheapest first. (A) the kernel's pure-numeric core against the equations
+    and the reference's own arithmetic; (B) the node's SPEC — mode gating, per-dim sockets,
+    footprint, and the ``meta_transform``, all pixel-free; (C) one end-to-end pull per dim
+    through the Engine, guarded on TensorFlow.
+
+    Deliberately does NOT train: the shipped 2 000 iterations is ~45 minutes on CPU, so
+    training is exercised by ``scripts/_bench_zsdeconvnet.py`` (which also holds the
+    golden-output parity check against the authors' published inference results) rather than
+    by a gate that has to stay fast. Same call the catalog already makes for StarDist and
+    CellSAM, whose selftest coverage is structural for the same reason.
+    """
+    if not _HAVE_SKIMAGE:
+        _ok("zs-deconvnet: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from nodegraph.kernels import zsdeconvnet as zsk
+    from nodegraph.catalog._shared.psf import gaussian_psf as _gpsf
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+
+    # ── (A1) prctile_norm: the exact reference expression ────────────────────
+    a = np.linspace(0.0, 10.0, 101).astype(np.float32)
+    n = zsk.prctile_norm(a)
+    assert abs(float(n.min())) < 1e-6 and abs(float(n.max()) - 1.0) < 1e-3, "prctile 0-100"
+    lo, hi = np.percentile(a, 3.0), np.percentile(a, 100.0)
+    want = np.clip((a - lo) / (hi - lo + 1e-7), 0.0, 1.0)
+    assert np.allclose(zsk.prctile_norm(a, 3.0, 100.0), want, atol=1e-6), "prctile 3-100"
+    # the low percentile is a genuine CUT (clipped), not a shift — this is what makes the
+    # node's `norm_low` destroy dim signal, so it must be asserted rather than assumed
+    assert float((zsk.prctile_norm(a, 3.0, 100.0) == 0.0).sum()) >= 3, "prctile 3% clipped"
+    # a single NaN must not poison the whole array (np.percentile would return NaN)
+    b = a.copy(); b[7] = np.nan
+    nb = zsk.prctile_norm(b)
+    assert np.all(np.isfinite(nb)) and nb[7] == 0.0, "prctile NaN handling"
+    # flat input: the 1e-7 guard, not a divide-by-zero
+    assert np.all(np.isfinite(zsk.prctile_norm(np.full((4, 4), 3.0)))), "prctile flat"
+
+    # ── (A2) re-corruption: paper Eq. 9-12, and its noise-splitting invariant ─
+    rng = np.random.default_rng(7)
+    flat = np.full((96, 96), 500.0, dtype=np.float32)
+    bg, beta1, beta2, alpha = 100.0, 1.0, 25.0, 1.0
+    inp, gt = zsk.recorrupt(flat, bg, beta1, beta2, alpha, rng)
+    # alpha=1 => inp + gt = 2y exactly (Eq. 9 + Eq. 10 cancel), so after the ONE shared
+    # affine normalization their sum must be constant on a constant image
+    s = inp + gt
+    assert float(s.std()) < 1e-4, f"recorrupt alpha=1 sum not constant ({s.std():.3g})"
+    # and the two copies must be ANTI-correlated — that IS the point of Eq. 9/10, and it is
+    # what makes one usable as the other's training target
+    r = float(np.corrcoef((inp - inp.mean()).ravel(), (gt - gt.mean()).ravel())[0, 1])
+    assert r < -0.9, f"recorrupt copies not anti-correlated (r={r:.3f})"
+    # alpha's ASYMMETRY, checkable through the shared normalization because it is a ratio:
+    # inp-y = alpha*sigma*g and gt-y = -sigma*g/alpha, so std(inp)/std(gt) == alpha^2
+    ia, ga = zsk.recorrupt(flat, bg, beta1, beta2, 2.0, rng)
+    ratio = float(ia.std()) / max(float(ga.std()), 1e-12)
+    assert abs(ratio - 4.0) < 0.4, f"recorrupt alpha^2 scaling: {ratio:.3f} vs 4.0"
+    # beta2=0 on a below-background image leaves NO noise (both clamps in Eq. 12 active)
+    dark = np.full((32, 32), 50.0, dtype=np.float32)
+    di, dg = zsk.recorrupt(dark, bg, 1.0, 0.0, 1.0, rng)
+    assert float(np.abs(di - dg).max()) < 1e-6, "recorrupt clamps below background"
+
+    # ── (A3) beta2 estimation from background pixels ─────────────────────────
+    var = 36.0
+    field = rng.normal(100.0, np.sqrt(var), size=(160, 160)).astype(np.float32)
+    field[60:100, 60:100] += 3000.0                       # a bright object to be excluded
+    est_b2 = zsk.estimate_beta2([field, field.copy()], bg=100.0)
+    assert 0.4 * var < est_b2 < 3.0 * var, f"estimate_beta2 {est_b2:.1f} vs {var}"
+
+    # ── (A4) axial parity split (3D augmentation) ────────────────────────────
+    vol = np.arange(10 * 5 * 4, dtype=np.float32).reshape(10, 5, 4)
+    ev, od = zsk.axial_split(vol)
+    assert ev.shape == od.shape == (5, 5, 4), "axial_split shape"
+    assert np.array_equal(ev, vol[0:10:2]) and np.array_equal(od, vol[1:10:2]), "parities"
+    try:
+        zsk.axial_split(np.zeros((1, 4, 4), dtype=np.float32)); raise AssertionError()
+    except ValueError:
+        pass                                              # z<2 is refused, not silently 0
+    ev9, od9 = zsk.axial_split(np.zeros((9, 2, 2), dtype=np.float32))
+    assert ev9.shape[0] == od9.shape[0] == 4, "odd z drops the unpaired plane"
+
+    # ── (A5) tile geometry: divisibility, and a GAPLESS seam partition ───────
+    for ext in (17, 32, 63, 64, 100, 251, 512):
+        for lv in (0, 4):
+            win = zsk.net_window(ext, 128, lv)
+            ins = zsk.net_padding(win, 16, lv)
+            assert ins >= 16, f"padding {ins} < insert (ext={ext}, levels={lv})"
+            if lv:
+                assert win % 2 == 0, f"pooling window {win} odd (ext={ext})"
+                assert (win + 2 * ins) % (2 ** lv) == 0, \
+                    f"padded {win + 2 * ins} not a multiple of {2 ** lv} (ext={ext})"
+            # the seams must COVER [0, ext) with no gap, for every overlap including ones
+            # larger than the window (which used to leave an unwritten band of zeros)
+            for req_ov in (0, 4, 20, 64):
+                starts, w2, ov2 = zsk.tile_plan(ext, win, req_ov)
+                covered = np.zeros(ext, dtype=np.int32)
+                for s in starts:
+                    d0, d1, s0, s1 = zsk._seam(s, w2, ext, ov2)
+                    assert (d1 - d0) == (s1 - s0), "seam dst/src length mismatch"
+                    assert 0 <= s0 <= s1 <= w2, f"seam src out of tile: {s0}:{s1}/{w2}"
+                    covered[d0:d1] += 1
+                assert covered.min() >= 1, \
+                    f"seam GAP ext={ext} win={w2} ov={ov2} (asked {req_ov}): {starts}"
+    # an odd extent is still fully covered once the window is evened down
+    assert zsk.net_window(251, 128, 4) % 2 == 0
+
+    # ── (A6) PSF helpers, incl. the single-source claim vs enhance.deconvolve ─
+    sig = (2.0, 2.0)
+    psf = zsk.gaussian_psf_from_sigmas(sig)
+    assert abs(float(psf.sum()) - 1.0) < 1e-6, "psf not normalized"
+    # SAME kernel as enhance.deconvolve's, to float32 precision — this node stores it as a
+    # float32 TF conv kernel while that one keeps float64 numpy, and the two deconvolution
+    # nodes must model the same optics identically or a user comparing them is comparing
+    # PSFs, not algorithms.
+    ref = np.asarray(_gpsf(sig), dtype=np.float64)
+    assert psf.shape == ref.shape and np.allclose(psf.astype(np.float64), ref,
+                                                 rtol=1e-6, atol=1e-9), \
+        "gaussian_psf_from_sigmas has DRIFTED from _shared.psf.gaussian_psf"
+    got = zsk.psf_sigma(psf)
+    assert all(abs(g - 2.0) < 0.25 for g in got), f"psf_sigma {got} vs 2.0"
+    cropped = zsk.crop_psf(zsk.gaussian_psf_from_sigmas((1.0, 1.0)))
+    assert abs(float(cropped.sum()) - 1.0) < 1e-6 and cropped.shape[0] % 2 == 1, "crop_psf"
+    rs = zsk.resample_psf(psf, 0.05, 0.1)                 # PSF finer than data => shrinks
+    assert abs(float(rs.sum()) - 1.0) < 1e-6, "resample_psf renormalized"
+    assert rs.shape[0] % 2 == 1 and rs.shape[0] < psf.shape[0], "resample_psf odd + smaller"
+    assert zsk.resample_psf(psf, 0.1, 0.1).shape == psf.shape, "resample_psf identity"
+    psf3 = zsk.gaussian_psf_from_sigmas((1.0, 2.0, 2.0))
+    assert abs(float(zsk.crop_psf(psf3, max_z=1).sum()) - 1.0) < 1e-6, "crop_psf 3D max_z"
+
+    # ── (A7) Fourier damping ────────────────────────────────────────────────
+    v = rng.normal(0.0, 1.0, size=(3, 32, 32)).astype(np.float32)
+    assert np.array_equal(zsk.fourier_damp(v, 0, 1), v), "damping off is identity"
+    damped = zsk.fourier_damp(v, 8, 1)
+    assert damped.shape == v.shape and np.all(np.isfinite(damped)), "damped finite"
+    f = np.fft.fftshift(np.fft.fft2(damped, axes=(-2, -1)), axes=(-2, -1))
+    hx = f.shape[-1] // 2
+    assert float(np.abs(f[..., :8, hx - 1:hx + 2]).max()) < 1e-3, "damping band not zeroed"
+
+    # ── (B) the node SPEC: gating, per-dim sockets, footprint, meta ──────────
+    spec = NODES.get("enhance.zs_deconvnet")
+    assert spec is not None, "enhance.zs_deconvnet not registered"
+    assert spec.supports_2d and spec.supports_true_3d and not spec.three_d_fallback, \
+        "zs-deconvnet must claim genuine 3D (Conv3D throughout, z-connected)"
+    assert spec.resolve_granularity({"dim": "2D"}) is Granularity.WHOLE_PLANE
+    assert spec.resolve_granularity({"dim": "3D"}) is Granularity.WHOLE_VOLUME
+    assert spec.resolve_kernel_axes({"dim": "3D"}) == frozenset({"z", "y", "x"})
+
+    def vis(**over):
+        st = dict(spec.default_state()); st.update(over)
+        return {s.name for s in spec.active_inputs(st)}
+
+    z2, p2 = vis(dim="2D", mode="zero_shot"), vis(dim="2D", mode="pretrained")
+    z3, p3 = vis(dim="3D", mode="zero_shot"), vis(dim="3D", mode="pretrained")
+    assert "weights_path" in p2 and "weights_path" not in z2, "weights_path gating"
+    assert "cache_path" in z2 and "cache_path" not in p2, "cache_path gating"
+    # the PSF is a TRAINING-time term only — showing it in pretrained mode would be a live
+    # control the kernel never reads
+    for s in ("psf_path", "psf_pixel_um", "na", "emission_nm", "iterations", "seed"):
+        assert s in z2 and s not in p2, f"{s} must be zero_shot-only"
+    # the four per-dim pairs: exactly one of each is ever visible
+    for two_d, three_d in (("insert_xy", "insert_xy_3d"), ("patch", "patch_3d"),
+                           ("learning_rate", "learning_rate_3d"),
+                           ("hess_weight", "hess_weight_3d")):
+        assert two_d in z2 and two_d not in z3, f"{two_d} must be 2D-only"
+        assert three_d in z3 and three_d not in z2, f"{three_d} must be 3D-only"
+    # 2D-only noise model (3D augmentation is parameter-free) and 3D-only controls
+    for s in ("alpha", "beta1", "beta2", "denoise_weight"):
+        assert s in z2 and s not in z3, f"{s} must be 2D-only"
+    for s in ("patch_z", "tile_z", "overlap_z", "insert_z", "damping_length", "psf_z_um"):
+        assert s in z3 and s not in z2, f"{s} must be 3D-only"
+    assert {m.name for m in spec.active_modes({"dim": "3D"})} >= {"arch_3d"}
+    assert "arch_3d" not in {m.name for m in spec.active_modes({"dim": "2D"})}, \
+        "the 3D backbone picker must be hidden in 2D"
+
+    # the meta_transform, pixel-free: geometry only moves for an UPSAMPLED DECONVOLUTION
+    env_in = MetaEnvelope(axes=AxisSizes(m=1, t=1, z=2, c=1, y=16, x=24),
+                          metadata={"pixel_size_um": 0.1, "z_step_um": 0.5,
+                                    "bit_depth": 12})
+    mt = spec.meta_transform
+    for (upl, outp, ey, ex, epx) in ((True, "deconvolved", 32, 48, 0.05),
+                                     (False, "deconvolved", 16, 24, 0.1),
+                                     (True, "denoised", 16, 24, 0.1),
+                                     (False, "denoised", 16, 24, 0.1)):
+        e = mt(env_in, {"upsample": upl}, {"dim": "3D", "output": outp})
+        assert (e.axes.y, e.axes.x) == (ey, ex), f"meta axes {upl}/{outp}: {e.axes}"
+        assert abs(float(e.metadata["pixel_size_um"]) - epx) < 1e-12, \
+            f"meta pixel size {upl}/{outp}"
+        # z is NEVER scaled — the 3D upsampling is UpSampling3D((2,2,1)), lateral only
+        assert e.axes.z == 2 and e.metadata.get("z_step_um") == 0.5, "z must not move"
+        # the intensity half is unconditional
+        assert e.metadata.get("bit_depth") is None, "bit_depth must be dropped"
+
+    # ── (C) end-to-end pulls through the Engine ─────────────────────────────
+    if not _HAVE_TF:
+        _ok("zs-deconvnet: kernel maths + spec + meta_transform verified; "
+            "end-to-end pull SKIPPED (tensorflow absent)")
+        return
+
+    tmp = _tempfile.mkdtemp(prefix="zsdeconv_selftest_")
+    try:
+        zsk.clear_model_cache()
+        optics = {"pixel_size_um": 0.1, "z_step_um": 0.3, "objective_na": 1.0,
+                  "channel_emission_nm": [520], "bit_depth": 12}
+
+        def run(op_modes, params, ax, img):
+            ds = Dataset(axes=ax, metadata=optics).with_image(ArrayProvider(img))
+            g = Graph()
+            g.add(NodeInstance("S", "io.seed_zs"))
+            g.add(NodeInstance("N", "enhance.zs_deconvnet",
+                               modes=op_modes, params=params))
+            g.connect("S", "N")
+            eng = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                         meta_seeds={"S": MetaEnvelope(axes=ax, metadata=optics)})
+            return eng, eng.pull("N")
+
+        define_node("io.seed_zs", "Seed", outputs=[OutDataset()])
+
+        # --- 3D: the cheap model (RCAN3D is ~2 M params vs the 2D U-Net's 13 M) ---
+        ax3 = AxisSizes(m=1, t=1, z=4, c=1, y=32, x=32)
+        img3 = np.zeros((1, 1, 4, 1, 32, 32), dtype=float)
+        img3[0, 0, :, 0, 12:20, 12:20] = 900.0
+        img3[0, 0, :, 0, 15:17, 15:17] = 3000.0
+        # UpSampling3D carries NO weights, so ONE checkpoint serves upsample on and off
+        m3 = zsk.get_model("rcan3d", (32 + 16, 32 + 16, 4 + 4, 1), upsample=False,
+                           insert_xy=8, insert_z=2)
+        w3 = _os.path.join(tmp, "r3.weights.h5")
+        zsk.save_weights(m3, w3)
+        for upl in (False, True):
+            eng, out = run({"dim": "3D", "mode": "pretrained", "arch_3d": "rcan3d"},
+                           {"weights_path": w3, "tile": 32, "tile_z": 0,
+                            "insert_xy_3d": 8, "insert_z": 2, "upsample": upl,
+                            "background": 0.0, "norm_low": 0.0}, ax3, img3)
+            p = out.image
+            got = p.get_region_volume(0, 0, 0, 0, 0, p.axes.z, 0, p.axes.y, 0, p.axes.x)
+            side = 64 if upl else 32
+            assert got.shape == (4, side, side), f"3D/up={upl} geometry {got.shape}"
+            assert np.all(np.isfinite(got)), f"3D/up={upl} non-finite"
+            # THE §8 CHECK: the pulled payload must equal the meta_transform's prediction,
+            # in axes AND calibration — a header/payload disagreement is invisible until
+            # something downstream reads the wrong pixel size.
+            env = eng.env("N")
+            assert (env.axes.y, env.axes.x) == (side, side), f"env axes {env.axes}"
+            assert p.axes.y == env.axes.y and p.axes.x == env.axes.x, "payload != header"
+            assert env.axes.z == 4 and out.metadata.get("z_step_um") == 0.3, "z moved"
+            assert abs(float(out.metadata["pixel_size_um"])
+                       - float(env.metadata["pixel_size_um"])) < 1e-12, \
+                "payload pixel size disagrees with the meta_transform (double-counted?)"
+            assert out.metadata.get("bit_depth") is None, "bit_depth survived"
+            # the calibration read is FENCED, so a pixel-size change re-keys this node
+            assert "pixel_size_um" in dict(eng.entry("N").reads), "pixel_size_um not fenced"
+
+        # --- 2D: one pull, the WHOLE_PLANE path ---
+        ax2 = AxisSizes(m=1, t=1, z=1, c=1, y=32, x=32)
+        img2 = np.zeros((1, 1, 1, 1, 32, 32), dtype=float)
+        img2[0, 0, 0, 0, 12:20, 12:20] = 900.0
+        m2 = zsk.get_model("unet2d", (32 + 32, 32 + 32, 1), upsample=False, insert_xy=16)
+        w2 = _os.path.join(tmp, "u2.weights.h5")
+        zsk.save_weights(m2, w2)
+        eng2, out2 = run({"dim": "2D", "mode": "pretrained", "output": "denoised"},
+                         {"weights_path": w2, "tile": 32, "insert_xy": 16,
+                          "upsample": False, "norm_low": 0.0}, ax2, img2)
+        p2v = out2.image
+        got2 = p2v.get_region(0, 0, 0, 0, 0, 0, p2v.axes.y, 0, p2v.axes.x)
+        assert got2.shape == (32, 32) and np.all(np.isfinite(got2)), \
+            f"2D geometry/finite {got2.shape}"
+        assert eng2.env("N").axes.y == 32, "2D denoised must not upsample"
+
+        # every mode axis re-keys the memo distinctly (they all fold in as __modes__)
+        def rh(modes, params):
+            return run(modes, params, ax2, img2)[0].entry("N").recipe_hash
+
+        base = {"weights_path": w2, "tile": 32, "insert_xy": 16, "upsample": False,
+                "norm_low": 0.0}
+        h_den = rh({"dim": "2D", "mode": "pretrained", "output": "denoised"}, base)
+        h_dec = rh({"dim": "2D", "mode": "pretrained", "output": "deconvolved"}, base)
+        h_up = rh({"dim": "2D", "mode": "pretrained", "output": "denoised"},
+                  {**base, "upsample": True})
+        assert len({h_den, h_dec, h_up}) == 3, "output/upsample must re-key the memo"
+        zsk.clear_model_cache()
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+    _ok(f"zs-deconvnet (Qiao et al. 2024): re-corruption Eq. 9-12 (sigma, anti-correlated "
+        f"pair, both clamps), beta2 estimation, axial parity split, GAPLESS tile/seam "
+        f"partition + 16-divisibility on odd extents, PSF helpers single-sourced with "
+        f"_shared/psf.py, Fourier damping; spec gating (8 sockets pretrained/2D -> 26 "
+        f"zero_shot/3D, 4 per-dim pairs, PSF hidden in pretrained); meta_transform geometry "
+        f"only for an upsampled deconvolution and z never scaled; end-to-end 2D+3D pulls "
+        f"agree with the header in axes AND pixel size, fence pixel_size_um, drop bit_depth "
+        f"(TF {_TF_VER})")
+
+
+def test_trained_params() -> None:
+    """``NodeSpec.trained_params`` — a loaded MODEL fills in the parameters it was trained
+    with, from the JSON beside its weights (V2.23, ``nodegraph.trained``).
+
+    Structural and filesystem-only: every assertion here is about reading a small JSON and
+    resolving a socket, so none of it needs TensorFlow, torch or a real checkpoint. That is
+    deliberate — the defect this feature fixes was itself structural (the node passed a
+    hardcoded ``prob_thresh=0.5`` over the value the checkpoint's author had measured, and no
+    functional test could see it because 0.5 was the only value the node could ever produce).
+
+    Five things are pinned:
+
+    (A) the reader is **total** — every way a model file can be unusable degrades to "states
+        nothing", because this runs on the edit-time path on every keystroke;
+    (B) StarDist reports the thresholds its own ``thresholds.json`` carries, applies
+        StarDist's own ``0 < x < 1`` validity rule, and refuses a checkpoint whose
+        ``config.json`` contradicts the lever;
+    (C) ZS-DeconvNet adopts an unset socket and REFUSES a pinned one that contradicts the
+        sidecar, while its two Modes are refused either way (they cannot be adopted — the
+        engine hands a compute the resolved mode state, so "unset" is unobservable);
+    (D) the sidecar's inference block is **additive** — a sidecar written before it existed
+        still satisfies the cache-reuse comparison, so no already-trained model is
+        invalidated (retraining is tens of minutes to hours per channel);
+    (E) the ``meta_transform`` and the compute agree about an ADOPTED ``upsample``, which is
+        the §8 payload-equals-prediction law applied to a value that comes from a file.
+    """
+    import json as _json
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from dataclasses import replace
+
+    from nodegraph import trained as T
+    from nodegraph.catalog.analysis.segment import _sd_check, _stardist_trained
+    from nodegraph.catalog.enhance.zs_deconvnet import _check_checkpoint, _zs_trained
+    from nodegraph.metadata import zs_deconvnet as _meta_zs
+
+    root = _tempfile.mkdtemp(prefix="nd2s_trained_")
+    try:
+        # ── (A) the reader is total ───────────────────────────────────────────
+        assert T.read_json("") is None, "empty path"
+        assert T.read_json(_os.path.join(root, "nope.json")) is None, "absent file"
+        assert T.read_json(root) is None, "a DIRECTORY must read as None, not raise"
+        bad = _os.path.join(root, "bad.json")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        assert T.read_json(bad) is None, "unparsable JSON"
+        arr = _os.path.join(root, "arr.json")
+        with open(arr, "w", encoding="utf-8") as fh:
+            fh.write("[1, 2, 3]")
+        assert T.read_json(arr) is None, "a JSON array is not a model record"
+
+        # ── (B) StarDist ─────────────────────────────────────────────────────
+        mdir = _os.path.join(root, "my_model")
+        _os.makedirs(mdir)
+
+        def _write_sd(cfg, th):
+            with open(_os.path.join(mdir, "config.json"), "w", encoding="utf-8") as fh:
+                _json.dump(cfg, fh)
+            with open(_os.path.join(mdir, "thresholds.json"), "w", encoding="utf-8") as fh:
+                _json.dump(th, fh)
+            T.clear_cache()      # same mtime tick: the (path, mtime, size) key would collide
+
+        _write_sd({"n_dim": 2, "n_channel_in": 1}, {"prob": 0.7079, "nms": 0.42})
+        p2 = {"sd_model_path": mdir}
+        assert T.stardist_model_dir(p2, {"dim": "2D"}) == _os.path.abspath(mdir)
+        got = T.stardist_trained(p2, {"dim": "2D"})
+        assert got == {"prob_thresh": 0.7079, "nms_thresh": 0.42}, got
+        # A local path WINS over the pretrained name, exactly as `get_stardist_model` does —
+        # otherwise the panel could show a published model's thresholds while the pull ran a
+        # locally trained one.
+        assert T.stardist_trained({**p2, "model_name": "2D_versatile_fluo"},
+                                  {"dim": "2D"}) == got, "sd_model_path must win"
+        # StarDist's OWN validity rule (StarDistBase.__init__ rejects out-of-range and
+        # substitutes its built-in), replicated so the number shown equals the number used.
+        _write_sd({"n_dim": 2, "n_channel_in": 1}, {"prob": 3.0, "nms": 0.0})
+        assert T.stardist_trained(p2, {"dim": "2D"}) == {}, "out-of-range must be ignored"
+        _write_sd({"n_dim": 2, "n_channel_in": 1}, {"prob": "x", "nms": None})
+        assert T.stardist_trained(p2, {"dim": "2D"}) == {}, "non-numeric must be ignored"
+        # a directory with no config.json is not a model directory
+        assert T.stardist_model_dir({"sd_model_path": root}, {"dim": "2D"}) == ""
+        # gated to the stardist METHOD: the other three load no model with a JSON beside it
+        _write_sd({"n_dim": 2, "n_channel_in": 1}, {"prob": 0.6, "nms": 0.4})
+        assert _stardist_trained(p2, {"method": "stardist", "dim": "2D"}), "stardist gate"
+        for m in ("threshold", "watershed", "cellsam"):
+            assert _stardist_trained(p2, {"method": m, "dim": "2D"}) == {}, m
+
+        # config.json validation. A fake ctx is enough: `_sd_check` only reads params and
+        # reports through `ctx.progress`.
+        class _FakeCtx:
+            def __init__(self, params):
+                self.params = params
+                self.notes = []
+
+            def progress(self, done, total, note="", **kw):
+                self.notes.append(note)
+
+        _write_sd({"n_dim": 2, "n_channel_in": 1}, {"prob": 0.6, "nms": 0.4})
+        c = _FakeCtx(p2)
+        _sd_check(c, is_3d=False, px=0.1, zs=0.0)        # matching: silent
+        assert not c.notes, c.notes
+        try:
+            _sd_check(_FakeCtx(p2), is_3d=True, px=0.1, zs=0.5)
+            raise AssertionError("a 2-D checkpoint under the 3D lever must be refused")
+        except ValueError as exc:
+            assert "n_dim" in str(exc) and "lever" in str(exc), str(exc)
+        _write_sd({"n_dim": 2, "n_channel_in": 3}, {"prob": 0.6, "nms": 0.4})
+        try:
+            _sd_check(_FakeCtx(p2), is_3d=False, px=0.1, zs=0.0)
+            raise AssertionError("an RGB checkpoint must be refused")
+        except ValueError as exc:
+            assert "n_channel_in" in str(exc), str(exc)
+        # anisotropy WARNS and never raises, and never silently sets scale_z — the decision
+        # stays with the user because rescaling at inference is not what StarDist prescribes.
+        _write_sd({"n_dim": 3, "n_channel_in": 1, "anisotropy": [2.0, 1.0, 1.0]},
+                  {"prob": 0.7, "nms": 0.3})
+        c = _FakeCtx(p2)
+        _sd_check(c, is_3d=True, px=0.1, zs=0.6)          # data aspect 6 vs trained 2
+        assert len(c.notes) == 1 and "anisotropy" in c.notes[0], c.notes
+        assert "scale_z" in c.notes[0] and "3" in c.notes[0], c.notes[0]
+        c = _FakeCtx(p2)
+        _sd_check(c, is_3d=True, px=0.1, zs=0.2)          # data aspect 2 == trained 2
+        assert not c.notes, "a matching anisotropy must not warn"
+
+        # ── (C)+(D) ZS-DeconvNet ─────────────────────────────────────────────
+        wpath = _os.path.join(root, "m_c0.weights.h5")
+        with open(wpath, "wb") as fh:
+            fh.write(b"\x00")                            # never loaded; only its name matters
+        side = T.zs_sidecar_path(wpath)
+        assert side == _os.path.join(root, "m_c0.json"), side
+        sig = {"arch": "unet2d", "dim": "2D", "upsample": False, "iterations": 2000.0}
+
+        def _write_side(doc):
+            with open(side, "w", encoding="utf-8") as fh:
+                _json.dump(doc, fh)
+            T.clear_cache()
+
+        _write_side({**sig, T.INFERENCE_KEY: {"arch": "unet2d", "dim": "2D",
+                                              "upsample": False, "insert_xy": 24}})
+        pre = {"weights_path": wpath}
+        adopted = _zs_trained(pre, {"mode": "pretrained"})
+        assert adopted == {"upsample": False, "insert_xy": 24}, adopted
+        # zero_shot is TRAINING a model now — its sockets are inputs to that, not facts about
+        # an existing checkpoint, so nothing is adopted there.
+        assert _zs_trained(pre, {"mode": "zero_shot"}) == {}, "zero_shot must adopt nothing"
+        # (D) the inference block is additive: a legacy sidecar still satisfies the cache
+        # comparison, and one carrying the block reduces to exactly the same signature.
+        assert T.zs_signature_of(_json.loads(_json.dumps(sig))) == sig, "legacy sidecar"
+        assert T.zs_signature_of({**sig, T.INFERENCE_KEY: {"whatever": 1}}) == sig, "strip"
+        # a legacy sidecar (no block) still speaks for `upsample`, which it carries top-level
+        _write_side(dict(sig))
+        assert _zs_trained(pre, {"mode": "pretrained"}) == {"upsample": False}, "legacy"
+
+        # `_check_checkpoint`: Modes refuse, unset sockets adopt, pinned sockets refuse.
+        _write_side({**sig, T.INFERENCE_KEY: {"arch": "unet2d", "dim": "2D",
+                                              "upsample": False, "insert_xy": 24}})
+        note = _check_checkpoint(wpath, arch="unet2d", is_3d=False, params=pre)
+        assert "verified" in note, note
+        try:
+            _check_checkpoint(wpath, arch="rcan3d", is_3d=False, params=pre)
+            raise AssertionError("an arch mismatch must be refused (a Mode cannot adopt)")
+        except ValueError as exc:
+            assert "arch" in str(exc), str(exc)
+        try:
+            _check_checkpoint(wpath, arch="unet2d", is_3d=True, params=pre)
+            raise AssertionError("a dim mismatch must be refused")
+        except ValueError as exc:
+            assert "dim" in str(exc), str(exc)
+        # an UNSET socket is not a conflict — it has already been made to agree
+        assert _check_checkpoint(wpath, arch="unet2d", is_3d=False,
+                                 params={**pre, "tile": 128})
+        # a PINNED contradicting socket IS a conflict, and the message says how to yield
+        try:
+            _check_checkpoint(wpath, arch="unet2d", is_3d=False,
+                              params={**pre, "upsample": True})
+            raise AssertionError("a pinned contradicting `upsample` must be refused")
+        except ValueError as exc:
+            assert "upsample" in str(exc) and "unpin" in str(exc), str(exc)
+        try:
+            _check_checkpoint(wpath, arch="unet2d", is_3d=False,
+                              params={**pre, "insert_xy": 16})
+            raise AssertionError("a pinned contradicting margin must be refused")
+        except ValueError as exc:
+            assert "insert_xy" in str(exc), str(exc)
+        # ...but a pinned value that AGREES is fine, across the int/float/str round trip a
+        # param takes through JSON and a Qt spin box
+        for same in (24, 24.0, "24"):
+            assert _check_checkpoint(wpath, arch="unet2d", is_3d=False,
+                                     params={**pre, "insert_xy": same}), repr(same)
+        # no sidecar at all (the authors' published checkpoints) — nothing stated, no refusal
+        _os.remove(side)
+        T.clear_cache()
+        assert _check_checkpoint(wpath, arch="rcan3d", is_3d=True, params=pre) == ""
+        assert _zs_trained(pre, {"mode": "pretrained"}) == {}
+
+        # ── (E) meta_transform and compute agree about an ADOPTED upsample ────
+        # The sidecar says the 2x head was NOT trained, so the predicted axes must NOT double
+        # even though the socket's own default is True. Get this wrong and the memo's
+        # OutputHeader disagrees with the payload (§8) — the node would predict 2y/2x and
+        # produce y/x.
+        _write_side({**sig, T.INFERENCE_KEY: {"arch": "unet2d", "dim": "2D",
+                                              "upsample": False, "insert_xy": 24}})
+        ax0 = AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16)
+        env0 = MetaEnvelope(axes=ax0, metadata={"pixel_size_um": 0.2, "bit_depth": 12})
+        got_env = _meta_zs(env0, pre, {"mode": "pretrained", "output": "deconvolved"})
+        assert (got_env.axes.y, got_env.axes.x) == (16, 16), got_env.axes
+        assert got_env.metadata.get("pixel_size_um") == 0.2, "no adopted upsample => no halve"
+        assert got_env.metadata.get("bit_depth") is None, "bit_depth is always dropped"
+        # and a PINNED upsample still wins over the sidecar in the prediction, so the pinned
+        # path (which `_check_checkpoint` refuses at pull time) is at least self-consistent
+        up_env = _meta_zs(env0, {**pre, "upsample": True},
+                          {"mode": "pretrained", "output": "deconvolved"})
+        assert (up_env.axes.y, up_env.axes.x) == (32, 32), up_env.axes
+        # with no sidecar the socket default (True) applies — the pre-V2.23 behaviour
+        _os.remove(side)
+        T.clear_cache()
+        d_env = _meta_zs(env0, pre, {"mode": "pretrained", "output": "deconvolved"})
+        assert (d_env.axes.y, d_env.axes.x) == (32, 32), d_env.axes
+
+        # ── the seam is total even when a resolver is not ─────────────────────
+        spec = NODES.get("analysis.segment")
+        assert spec.trained_params is not None, "segment must declare a resolver"
+        broken = replace(spec, trained_params=lambda p, m: 1 / 0)
+        assert broken.trained({}, {}) == {}, "a raising resolver must degrade to {}"
+        assert replace(spec, trained_params=lambda p, m: "nonsense").trained({}, {}) == {}
+        assert replace(spec, trained_params=None).trained({}, {}) == {}
+    finally:
+        _shutil.rmtree(root, ignore_errors=True)
+        T.clear_cache()
+    _ok("trained params: model JSON fills sockets (stardist thresholds/config, "
+        "zs sidecar adopt-or-refuse, additive cache signature, meta lockstep)")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -12201,6 +16689,7 @@ def main() -> int:
     test_catalog()
     test_catalog_ported()
     test_catalog_ported2()
+    test_normalize_absolute_window()
     test_channel_split()
     test_two_channel_branches()
     test_reroute()
@@ -12220,6 +16709,7 @@ def main() -> int:
     test_review_regressions()
     test_streaming()
     test_streaming_slivers()
+    test_spill_and_streaming_stats()
     test_parallel()
     test_gpu_platform()
     test_catalog_kernels()
@@ -12232,8 +16722,14 @@ def main() -> int:
     test_label_to_points_voronoi()
     test_segment()
     test_celltracker_parity()
+    test_measure_points()
+    test_grow_points()
+    test_grow_labels()
+    test_threshold_per_label()
+    test_filter_labels()
     test_socket_docs()
     test_option_docs()
+    test_conditional_reads_domains()
     test_param_socket_contract()
     test_layer_catalog()
     test_picking()
@@ -12250,12 +16746,18 @@ def main() -> int:
     test_overlay_resample()
     test_overlay_override_and_presentation()
     test_overlay_after_geometry_change()
+    test_channel_merge()
+    test_display_resolution_policy()
+    test_overlay_zoom_detail()
     test_align_to()
     test_origin_um_maintenance()
     test_transform()
     test_shape_synth()
     test_fit_shape()
     test_background_probability()
+    test_lablink()
+    test_zs_deconvnet()
+    test_trained_params()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

@@ -51,8 +51,8 @@ __all__ = [
     "FieldBox", "SECONDS_PER_DAY", "field_box", "z_um_of_slice", "lateral_extent_um",
     "overlap_fraction", "axis_map", "translate", "ALIGN_KEY", "tiles_covering", "pair_timepoints",
     "PlacementPlan", "plan_placement", "compose_secondary_plane", "paired_t",
-    "context_extent",
-    "secondary_z_index",
+    "context_extent", "sub_field_box", "source_window",
+    "secondary_z_index", "ZGrid", "merge_z_grid", "Z_GRID_BLOWUP",
 ]
 
 #: Julian day → seconds. ``frame_time_jd`` is the only clock two files share, and it is in
@@ -279,6 +279,107 @@ def axis_map(n_out: int, out_lo: float, out_hi: float,
     return np.where(inside, idx, -1)
 
 
+def sub_field_box(box: FieldBox, region: Tuple[float, float, float, float]) -> FieldBox:
+    """The µm box of a fractional sub-rect ``(fy0, fy1, fx0, fx1)`` of ``box``'s IMAGE grid.
+
+    The viewport shows a *rect* of the primary, not the whole field, and a detail patch read
+    for that rect has to be composited against the µm extent the rect covers rather than the
+    field's. Row fraction 0 is image row 0 — the same direction :func:`axis_map` walks the
+    output in — so this is a straight linear interpolation and needs no handedness: a flip
+    mirrors which SOURCE sample an output sample takes, never where the output sample is.
+    Z is carried through untouched; a lateral zoom does not change focus.
+    """
+    fy0, fy1, fx0, fx1 = (float(v) for v in region)
+    hy, hx = box.y1 - box.y0, box.x1 - box.x0
+    return FieldBox(y0=box.y0 + fy0 * hy, y1=box.y0 + fy1 * hy,
+                    x0=box.x0 + fx0 * hx, x1=box.x0 + fx1 * hx,
+                    z0=box.z0, z1=box.z1)
+
+
+def source_window(out_box: FieldBox, src_box: FieldBox, *, flip_y: bool = False,
+                  flip_x: bool = True) -> Optional[Tuple[float, float, float, float]]:
+    """Which fractional part of a source tile's PIXEL grid ``out_box`` needs, or ``None``.
+
+    Returns ``(fy0, fy1, fx0, fx1)`` in ``[0, 1]`` of the tile's rows/columns — deliberately
+    in *pixel* fractions rather than µm, because the caller's job is to read pixels and it
+    should not have to re-derive the handedness rule to do it. ``None`` means the tile does
+    not reach the box at all, which saves the read entirely.
+
+    This is the inverse of :func:`axis_map`, and it exists so that an overlay can fetch **the
+    pixels it is about to draw** instead of the whole tile: a stitched secondary is tens of
+    thousands of pixels wide, of which a zoomed viewport wants a few hundred. Reading the
+    whole plane and decimating it to a display cap is what made a magnified overlay a blur of
+    the source's own overview rather than the source's data.
+    """
+    def part(o_lo: float, o_hi: float, s_lo: float, s_hi: float,
+             flip: bool) -> Optional[Tuple[float, float]]:
+        span = s_hi - s_lo
+        if not (span > 0):
+            return None
+        lo, hi = max(o_lo, s_lo), min(o_hi, s_hi)
+        if not (hi > lo):
+            return None
+        f0, f1 = (lo - s_lo) / span, (hi - s_lo) / span
+        if flip:
+            f0, f1 = 1.0 - f1, 1.0 - f0
+        return max(0.0, min(1.0, f0)), max(0.0, min(1.0, f1))
+
+    ry = part(out_box.y0, out_box.y1, src_box.y0, src_box.y1, bool(flip_y))
+    rx = part(out_box.x0, out_box.x1, src_box.x0, src_box.x1, bool(flip_x))
+    if ry is None or rx is None:
+        return None
+    return (ry[0], ry[1], rx[0], rx[1])
+
+
+#: Minify by area-averaging once the source is more than this many samples per output sample.
+#: Below it, point-sampling is what you want — it keeps the source's own values, and the
+#: "blocky is honest" argument for a MAGNIFIED secondary depends on exactly that.
+_SHRINK_AT = 1.5
+
+
+def _area_shrink(plane: np.ndarray, ny: int, nx: int) -> np.ndarray:
+    """``plane`` block-averaged down to ``(ny, nx)`` — the minification :func:`axis_map` must
+    not do by point-sampling.
+
+    A secondary coarser than the primary is magnified, and nearest-neighbour is right there: it
+    keeps real source values and makes the sampling grid visible. A secondary FINER than the
+    primary is the opposite case and the same code was doing the same thing — on the WellA3 pair
+    the 640 mosaic lands on 6031x1925 output pixels from 36093x11520, so 36 source pixels fall in
+    each output pixel and ``axis_map`` kept exactly one of them. That is the defect
+    :func:`nodelab_v2.runner._fit_plane` documents at length: it throws away ``1 - 1/36`` of the
+    data while keeping the noise at full amplitude, so the result is *noisier* than the image it
+    came from. Averaging the block instead is both quieter and more honest — every output pixel
+    then reports what the sensor saw over that area.
+    """
+    h, w = plane.shape[:2]
+    ny, nx = max(1, min(int(ny), h)), max(1, min(int(nx), w))
+    if ny == h and nx == w:
+        return plane
+    ys = (np.arange(ny) * h) // ny
+    xs = (np.arange(nx) * w) // nx
+    acc = np.add.reduceat(np.add.reduceat(np.asarray(plane, dtype=np.float64), ys, axis=0),
+                          xs, axis=1)
+    counts = (np.diff(np.append(ys, h))[:, None] * np.diff(np.append(xs, w))[None, :])
+    return acc / counts
+
+
+def _window_extent(lo: float, hi: float, covered: Tuple[float, float],
+                   flip: bool) -> Tuple[float, float]:
+    """The µm span a *windowed* read covers, given the pixel fractions it spans.
+
+    ``covered`` is the ``(f0, f1)`` slice of the tile's pixel grid the reader actually
+    returned (snapped out to whole pixels of whatever level it chose). Under a flip the
+    pixel grid runs against µm, so the window's µm bounds mirror — getting this backwards
+    draws the right pixels in the wrong place, which looks like a placement error rather
+    than a sampling one.
+    """
+    f0, f1 = float(covered[0]), float(covered[1])
+    span = hi - lo
+    if flip:
+        return lo + (1.0 - f1) * span, lo + (1.0 - f0) * span
+    return lo + f0 * span, lo + f1 * span
+
+
 def paired_t(entry: Dict[str, Any], t: int) -> Optional[int]:
     """The secondary timepoint paired with primary ``t``, or ``None`` if unpaired.
 
@@ -311,19 +412,180 @@ def secondary_z_index(sec_md: Dict[str, Any], sec_axes: Any, sec_m: int,
     return int(min(max(0, round(frac)), nz - 1))
 
 
+@dataclass(frozen=True)
+class ZGrid:
+    """The Z axis a merged Dataset is expressed on: a uniform grid, per multipoint.
+
+    ``z0_um[m]`` is field *m*'s first plane in absolute µm and ``step_um`` the spacing, so
+    plane *k* of field *m* sits at ``z0_um[m] + k * step_um``. ``z0_um[m] is None`` means that
+    field could not be placed axially at all (no focus log) — the grid then degenerates to the
+    primary's own index space, which :meth:`plane_um` reports by returning ``None``.
+
+    **Uniform on purpose, and that is a schema constraint rather than a simplification.** The
+    calibration vocabulary describes Z as an origin plus a step plus a count
+    (``origin_um``/``z_step_um``, read back by :func:`z_um_of_slice`); there is nowhere to put
+    an irregular list of focus positions. So a "union" of two stacks is the finest-step uniform
+    grid that SPANS both — which contains every acquired focus to within half a step, and which
+    collapses to the finer stack's own grid whenever one range nests inside the other (the
+    WellA3 pair: a single GFP plane at 5999.7 µm sits inside the 640 stack's 5972–6032 µm, so
+    the union grid IS the 640's 210 planes). Claiming a non-uniform grid in metadata that says
+    uniform would be a lie about where the pixels are.
+    """
+
+    z0_um: Tuple[Optional[float], ...]
+    step_um: float
+    n: int
+
+    def plane_um(self, m: int, k: int) -> Optional[float]:
+        """Absolute µm focus of plane ``k`` of field ``m`` (``None`` when unplaceable)."""
+        z0 = self.z0_um[int(m)] if 0 <= int(m) < len(self.z0_um) else None
+        return None if z0 is None else z0 + int(k) * self.step_um
+
+
+def _z_span(md: Mapping[str, Any], axes: Any, m: int) -> Optional[Tuple[float, float]]:
+    """Field ``m``'s axial span in absolute µm (``lo, hi``), or ``None`` without a focus log."""
+    nz = int(getattr(axes, "z", 1) or 1)
+    lo = z_um_of_slice(md, axes, int(m), 0)
+    hi = z_um_of_slice(md, axes, int(m), nz - 1) if nz > 1 else lo
+    if lo is None or hi is None:
+        return None
+    return (min(lo, hi), max(lo, hi))
+
+
+def _z_step(md: Mapping[str, Any], axes: Any) -> Optional[float]:
+    """A file's own Z spacing in µm, or ``None`` for a single plane / no step recorded."""
+    if int(getattr(axes, "z", 1) or 1) <= 1:
+        return None
+    try:
+        step = abs(float(md.get("z_step_um")))
+    except (TypeError, ValueError):
+        return None
+    return step if step > 0 else None
+
+
+#: Refuse a merged Z grid more than this many times either input's own plane count. Two stacks
+#: focused far apart (one at 100 µm, one at 500) have a *union* spanning the gap, and at a fine
+#: step that is thousands of planes of which almost none carry data from both files. That is not
+#: a merge, it is an accident — and a silent one, since every plane still reads.
+Z_GRID_BLOWUP = 4
+
+
+def merge_z_grid(dst_md: Mapping[str, Any], dst_axes: Any,
+                 src_md: Mapping[str, Any], src_axes: Any,
+                 tiles: Mapping[int, Sequence[Tuple[int, float]]],
+                 *, mode: str = "union", dz: float = 0.0
+                 ) -> Tuple[ZGrid, List[str], List[str]]:
+    """The Z grid a channel merge is expressed on → ``(grid, warnings, refusals)``.
+
+    ``mode="union"`` spans both files' focus ranges at the finer of their two steps, so every
+    acquired plane of either is addressable — the point being that which file you happened to
+    wire as the primary must not decide whether you can see the other's stack.
+    ``mode="primary"`` keeps the primary's own grid exactly, for when downstream measurements
+    have to be expressed on it; the secondary's out-of-range planes are then unreachable, and
+    that is reported rather than left to be discovered.
+
+    Without a focus log on either side the grid falls back to the primary's index space and
+    says so: a Z placement that cannot be computed must not be invented.
+    """
+    warnings: List[str] = []
+    refusals: List[str] = []
+    nm = int(getattr(dst_axes, "m", 1) or 1)
+    p_step = _z_step(dst_md, dst_axes)
+    s_step = _z_step(src_md, src_axes)
+    if mode == "primary":
+        # The primary's grid EXACTLY — its own step, not the finer of the two. Keeping the
+        # primary's range at the secondary's finer step would silently multiply its plane count,
+        # which is the one thing this mode promises not to do.
+        step = p_step or 1.0
+    else:
+        steps = [s for s in (p_step, s_step) if s]
+        step = min(steps) if steps else 1.0
+
+    spans: List[Optional[Tuple[float, float]]] = []
+    for m in range(nm):
+        p = _z_span(dst_md, dst_axes, m)
+        if p is None:
+            spans.append(None)
+            continue
+        lo, hi = p
+        if mode != "primary":
+            for j, _frac in (tiles.get(m) or ()):
+                s = _z_span(src_md, src_axes, int(j))
+                if s is not None:
+                    lo, hi = min(lo, s[0] + dz), max(hi, s[1] + dz)
+        spans.append((lo, hi))
+
+    if not any(s is not None for s in spans):
+        # No axial placement anywhere: keep the primary's own axis and be explicit that each
+        # channel is then paired BY INDEX in z, which is the one thing this node otherwise
+        # never does.
+        warnings.append(
+            "no focus log on either input: Z is paired by INDEX, not by absolute µm — the "
+            "channels are laterally placed but their planes are only assumed to correspond")
+        return (ZGrid(tuple([None] * nm), step, max(1, int(getattr(dst_axes, "z", 1) or 1))),
+                warnings, refusals)
+
+    n = 1
+    for s in spans:
+        if s is not None:
+            n = max(n, int(round((s[1] - s[0]) / step)) + 1)
+    z0 = tuple(None if s is None else s[0] for s in spans)
+    own = max(int(getattr(dst_axes, "z", 1) or 1), int(getattr(src_axes, "z", 1) or 1))
+    if n > max(2, Z_GRID_BLOWUP * own):
+        refusals.append(
+            f"the two inputs' focus ranges are too far apart to merge in Z: a union grid at "
+            f"{step:g} µm would be {n} planes, against {own} in the deeper input. They were "
+            f"probably not focused on the same specimen — check the Nudge Z, or set the Z grid "
+            f"Mode to 'primary' to keep this input's own planes.")
+    if mode == "primary":
+        missing = [m for m in range(nm)
+                   for j, _f in (tiles.get(m) or ())
+                   if (_z_span(src_md, src_axes, int(j)) or (0.0, 0.0))[1]
+                   > (spans[m] or (0.0, 0.0))[1] + 0.5 * step]
+        if missing:
+            warnings.append(
+                f"Z grid = primary: the secondary reaches deeper than this input does, so its "
+                f"planes past {n} are not addressable (fields {sorted(set(missing))[:4]}…). "
+                f"Use Z grid = union to walk the whole stack.")
+    elif p_step and s_step and abs(p_step - s_step) > 1e-9:
+        warnings.append(
+            f"Z grid = union at the finer step ({step:g} µm of {max(p_step, s_step):g}), so the "
+            f"coarser input repeats a plane across neighbouring steps — it has none of its own "
+            f"to show there")
+    return ZGrid(z0, step, n), warnings, refusals
+
+
 def compose_secondary_plane(entry: Dict[str, Any],
                             out_shape: Tuple[int, int],
                             pri_md: Dict[str, Any], pri_axes: Any, pri_m: int,
                             sec_md: Dict[str, Any], sec_axes: Any,
                             read_tile: Any,
-                            *, fill: float = 0.0) -> Optional[np.ndarray]:
+                            *, fill: float = 0.0,
+                            region: Optional[Tuple[float, float, float, float]] = None
+                            ) -> Optional[np.ndarray]:
     """The secondary's pixels for primary field ``pri_m``, on the primary's display grid.
 
-    ``read_tile(sec_m)`` returns that secondary multipoint's native plane (already at the
-    right t/z/c), or ``None`` if it cannot be read. ``out_shape`` is the DISPLAY plane's
-    ``(H, W)`` — which is generally not the primary's native size, because the display path
-    decimates to ``MAX_DISPLAY_DIM``; the mapping is done in µm, so that difference costs
-    nothing and no caller has to track the decimation factor.
+    ``out_shape`` is the output plane's ``(H, W)`` — generally not the primary's native size,
+    because the display path decimates to ``MAX_DISPLAY_DIM``; the mapping is done in µm, so
+    that difference costs nothing and no caller has to track the decimation factor.
+
+    ``region`` is a fractional ``(fy0, fy1, fx0, fx1)`` sub-rect of the primary's image grid
+    that ``out_shape`` covers, or ``None`` for the whole field. It is what lets the Viewer
+    compose onto a zoomed-in **detail patch**: the patch is a rect of the primary read at a
+    finer pyramid level, and an overlay that was only ever composed for the whole field would
+    have to be dropped there — which is exactly how a zoom made the overlay disappear.
+
+    ``read_tile(sec_m, want)`` returns that secondary multipoint's pixels at the already-
+    resolved t/z/c, or ``None`` if it cannot be read. ``want`` is the fractional window of
+    the tile's pixel grid the composite actually needs (:func:`source_window`), and the
+    reader may honour it or ignore it:
+
+    * a 2-D array is taken to be **the whole tile**, whatever ``want`` asked for — what every
+      in-memory reader does, and the cheapest correct answer;
+    * ``(plane, (fy0, fy1, fx0, fx1))`` says "these pixels are that fractional part of the
+      tile", so a reader backed by a pyramid can serve the window at full resolution instead
+      of handing back a decimated whole plane. The window it returns need not be the one
+      asked for — it will have been snapped out to whole pixels of whichever level it chose.
 
     ``None`` when the field cannot be placed or no tile covers it, which the caller shows as
     "no overlay here" rather than as a black plane.
@@ -344,6 +606,8 @@ def compose_secondary_plane(entry: Dict[str, Any],
                else field_box(pri_md, pri_axes, pri_m))
     if pri_box is None:
         return None
+    # The µm box the OUTPUT covers — the whole field, or the zoomed rect of it.
+    out_box = pri_box if region is None else sub_field_box(pri_box, region)
 
     dz, dy, dx = (float(v) for v in (entry.get("offset_um") or (0.0, 0.0, 0.0)))
     flip_x = bool(entry.get("flip_x", True))
@@ -360,18 +624,45 @@ def compose_secondary_plane(entry: Dict[str, Any],
                    else field_box(sec_md, sec_axes, int(sec_m)))
         if sec_box is None:
             continue
-        plane = read_tile(int(sec_m))
-        if plane is None or plane.ndim != 2:
+        # The nudge moves the SECONDARY, so it is added to the tile's box once, here, and
+        # every µm comparison below is against the nudged box.
+        s_y0, s_y1 = sec_box.y0 + dy, sec_box.y1 + dy
+        s_x0, s_x1 = sec_box.x0 + dx, sec_box.x1 + dx
+        want = source_window(out_box, FieldBox(s_y0, s_y1, s_x0, s_x1),
+                             flip_y=flip_y, flip_x=flip_x)
+        if want is None:
+            continue                  # this tile does not reach the output — no read at all
+        got = read_tile(int(sec_m), want)
+        if got is None:
+            continue
+        plane, cover = (got, None) if isinstance(got, np.ndarray) else got
+        plane = np.asarray(plane)
+        if plane.ndim != 2 or plane.size == 0:
             continue
         n_sy, n_sx = plane.shape
-        rows = axis_map(h, pri_box.y0, pri_box.y1, n_sy,
-                        sec_box.y0 + dy, sec_box.y1 + dy, flip=flip_y)
-        cols = axis_map(w, pri_box.x0, pri_box.x1, n_sx,
-                        sec_box.x0 + dx, sec_box.x1 + dx, flip=flip_x)
+        if cover is None:                      # whole tile: its extent IS the tile's box
+            r_lo, r_hi, c_lo, c_hi = s_y0, s_y1, s_x0, s_x1
+        else:
+            r_lo, r_hi = _window_extent(s_y0, s_y1, (cover[0], cover[1]), flip_y)
+            c_lo, c_hi = _window_extent(s_x0, s_x1, (cover[2], cover[3]), flip_x)
+        rows = axis_map(h, out_box.y0, out_box.y1, n_sy, r_lo, r_hi, flip=flip_y)
+        cols = axis_map(w, out_box.x0, out_box.x1, n_sx, c_lo, c_hi, flip=flip_x)
         r_ok = np.flatnonzero(rows >= 0)
         c_ok = np.flatnonzero(cols >= 0)
         if r_ok.size == 0 or c_ok.size == 0:
             continue
+        # MINIFICATION: this tile's pixels outnumber the output samples they land in, so
+        # point-sampling would keep one in N and discard the rest (see `_area_shrink`). Average
+        # the blocks down to the output's own sampling first, then the map is ~1:1.
+        if (n_sy > _SHRINK_AT * r_ok.size) or (n_sx > _SHRINK_AT * c_ok.size):
+            plane = _area_shrink(plane, r_ok.size, c_ok.size)
+            n_sy, n_sx = plane.shape
+            rows = axis_map(h, out_box.y0, out_box.y1, n_sy, r_lo, r_hi, flip=flip_y)
+            cols = axis_map(w, out_box.x0, out_box.x1, n_sx, c_lo, c_hi, flip=flip_x)
+            r_ok = np.flatnonzero(rows >= 0)
+            c_ok = np.flatnonzero(cols >= 0)
+            if r_ok.size == 0 or c_ok.size == 0:
+                continue
         patch = plane[np.ix_(rows[r_ok], cols[c_ok])]
         out[np.ix_(r_ok, c_ok)] = patch.astype(np.float32, copy=False)
         painted = True

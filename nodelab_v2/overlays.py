@@ -58,6 +58,18 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QImage, QPainter, QPain
 
 SCHEMA = 1
 
+#: How many channels the GL composite shader can sample in one pass — its sampler-bank
+#: size, and a hard limit on what the composite can show.
+#:
+#: It lives in this module, which neither backend can avoid importing, because it is needed
+#: by BOTH: :mod:`nodelab_v2.glview` builds its fragment shader from it, and
+#: :mod:`nodelab_v2.viewer` has to know the number to warn about — while deliberately not
+#: importing ``glview`` at module level, since the viewer must keep working with no GL at all
+#: (``NODELAB_GL=0``, a headless probe, or a driver failure that falls back to the CPU
+#: renderer). Two copies of this number would mean the warning could quote a limit the
+#: shader does not enforce, which is worse than no warning.
+GL_MAX_CHANNELS = 8
+
 #: Golden-angle hue step — successive integer indices land far apart on the colour wheel,
 #: so "each label / point / track a different colour" stays legible for hundreds of items.
 GOLDEN_ANGLE = 137.507764
@@ -307,8 +319,22 @@ def slot_of(keys: Optional[np.ndarray], value: int) -> int:
 class PointsOverlay:
     """Point-domain detections. The default look is the requested **golden star**: a
     bright centre pixel exactly on the detection, with arms stepping ``spread`` pixels
-    out in each direction and dimming as they go."""
+    out in each direction and dimming as they go.
+
+    ``z_project`` governs **every** layer, 2-D and 3-D alike: off, only the detections whose
+    ``z`` lands on the viewed plane are drawn. Leaving a 3-D layer projected regardless (a
+    2026-08-03 revision did) makes the control inert AND flattens a per-point palette into
+    one wash, because every plane's glyphs overlap — see
+    :meth:`~nodelab_v2.viewer.ViewerPanel._point_marks`."""
     enabled: bool = True
+    #: WHICH Point table to draw (``""`` = all of them, the historical behaviour).
+    #:
+    #: Drawing every layer is right for one detection but wrong the moment a node emits a
+    #: FILTERED view of another's cloud: `analysis.voronoi` publishes the seeds that actually
+    #: won a territory as `<name>_seeds`, and with no selector the display showed those *and*
+    #: the full input — including the dots the node dropped, which is what the caller asked to
+    #: stop seeing (2026-08-04).
+    layer: str = ""
     shape: str = "star"
     spread: int = 3
     unit_px: float = 3.0
@@ -334,6 +360,16 @@ class LabelsOverlay:
     identity-palette section above). Untracked regions fall back to their own id.
     """
     enabled: bool = True
+    #: WHICH integer Voxel raster to draw (``""`` = the one with the most regions).
+    #:
+    #: There was no such control until 2026-08-04, and the automatic choice is not a
+    #: preference — it is a guess. A Dataset routinely carries several label rasters at once
+    #: (``analysis.voronoi`` alone emits its territories, inherits the seeds' branch labels
+    #: and copies the areas it clipped to), and "most regions" then draws whichever happens
+    #: to be the most fragmented. Reported as "it pulls the wrong label — I select the
+    #: segmentation from the Red channel but it still shows the UV labels": there was
+    #: nothing to select, and the heuristic was choosing.
+    layer: str = ""
     style: str = "both"             # outline | fill | both
     width: float = 2.0
     color_mode: str = "per_label"
@@ -598,6 +634,14 @@ _GRADIENT_SHAPES = ("star", "cross", "diag")
 
 FIELDS: Dict[str, Tuple[FieldSpec, ...]] = {
     "points": (
+        FieldSpec("layer", "layer", "Which layer",
+                  tip="WHICH Point table to draw. Leave it on Auto and EVERY table on the "
+                      "payload is drawn, each in its own colour — right for a single "
+                      "detection, wrong once a node publishes a filtered view of another's "
+                      "cloud: Voronoi Cells emits `<Output layer>_seeds` holding only the dots "
+                      "that actually won a territory, and on Auto you see those AND the full "
+                      "input, dropped dots included. The list is the Point tables on the "
+                      "viewed payload"),
         FieldSpec("shape", "choice", "Marker", choices=_POINT_SHAPES,
                   tip="The glyph stamped on each detection. The gradient shapes put a "
                       "bright pixel on the exact position and step outward."),
@@ -619,21 +663,45 @@ FIELDS: Dict[str, Tuple[FieldSpec, ...]] = {
                   tip="Brighten the single pixel sitting on the actual position"),
         FieldSpec("color_mode", "choice", "Colour by", role="color_mode",
                   choices=(("single", "One colour"),
+                           ("per_z", "One colour per Z plane"),
                            ("per_point", "Every point a different colour"),
-                           ("per_layer", "One colour per Point layer")),
-                  tip="A single colour, a distinct colour per point, or one per layer"),
+                           ("per_layer", "One colour for each whole layer")),
+                  tip="`One colour per Z plane` colours each marker by the plane it sits on, "
+                      "so a 3-D cloud reads as depth instead of a pile — neighbouring planes "
+                      "are pushed far apart on the wheel. It only says anything with `Show "
+                      "points from every Z` ON: with it off, every marker drawn IS on the "
+                      "viewed plane, so they legitimately all share one colour. And note it "
+                      "cannot rescue a crowded cloud — a few thousand markers overlap into a "
+                      "wash however they are coloured; thin the detection instead. `Every "
+                      "point a different colour` tells individual detections apart, and "
+                      "follows the TRACK once a tracker has linked them, so a particle keeps "
+                      "its colour across T. `One colour for each whole layer` gives every "
+                      "point in a layer the SAME colour and differs only between layers — so "
+                      "with a single Point layer (one detection node) it looks identical to "
+                      "`One colour`, which is correct rather than broken"),
         FieldSpec("color", "color", "Colour", role="color",
                   enable_if=("color_mode", ("single",)),
                   tip="The marker colour (default: gold)"),
         _SAT, _VAL, _OPACITY,
         FieldSpec("z_project", "bool", "Show points from every Z",
-                  tip="Also draw detections that sit on other Z planes, dimmed — "
-                      "useful for a sparse 3-D point cloud"),
+                  tip="Also draw detections that sit on other Z planes, dimmed. Useful for a "
+                      "SPARSE 3-D cloud; on a dense one every plane's markers overlap into a "
+                      "wash that hides both the image and the per-point colours, so leave it "
+                      "off and step through Z instead — the status line always reports how "
+                      "many detections are on other planes"),
         FieldSpec("off_opacity", "int", "Off-plane opacity", lo=5, hi=100, unit="%",
                   enable_if=("z_project", (True,)),
                   tip="Opacity of the points that are NOT on the viewed plane"),
     ),
     "labels": (
+        FieldSpec("layer", "layer", "Which layer",
+                  tip="WHICH label raster to draw. A Dataset often carries several at once — "
+                      "Voronoi Cells alone emits its territories, inherits the seed branch's "
+                      "labels and copies the areas it clipped to, and two segmentations both "
+                      "default to the name `labels`. On Auto the VIEWED NODE's own output is "
+                      "drawn (you opened it to see what it made), falling back to whichever "
+                      "raster holds the most regions when the node declares none. The list is "
+                      "the label rasters actually on the viewed payload"),
         FieldSpec("style", "choice", "Style",
                   choices=(("outline", "Outline only"), ("fill", "Fill only"),
                            ("both", "Outline + fill")),
@@ -962,12 +1030,20 @@ def load_defaults() -> Tuple[OverlaySettings, List[str]]:
 @dataclass
 class PointMark:
     """One point ready to draw: position in **displayed-plane** pixels, the id used for
-    per-point colouring, its layer index, and whether it sits on the viewed Z."""
+    per-point colouring, its layer index, and whether it sits on the viewed Z.
+
+    ``zplane`` is the point's ``z`` rounded to a plane index — the same rounding
+    :attr:`on_plane` is decided by, so a mark that *is* on the viewed plane always carries
+    that plane's number. It exists for the ``per_z`` colour mode, which is the useful one for
+    a projected 3-D cloud: with every plane's markers drawn at once, colouring by depth is
+    what turns an unreadable pile into something you can read the structure of.
+    """
     y: float
     x: float
     key: int
     layer: int
     on_plane: bool = True
+    zplane: int = 0
 
 
 @dataclass
@@ -1779,6 +1855,11 @@ class OverlayRenderer:
         opacity = s.opacity if mark.on_plane else min(s.opacity, s.off_opacity)
         if s.color_mode == "per_point":
             return distinct_color(mark.key, s.sat, s.val, opacity)
+        if s.color_mode == "per_z":
+            # golden-angle on the PLANE INDEX, so consecutive planes land far apart on the
+            # wheel — the question this mode answers is "which plane is this marker on",
+            # and neighbouring planes are exactly the ones that must not look alike
+            return distinct_color(mark.zplane, s.sat, s.val, opacity)
         if s.color_mode == "per_layer":
             return distinct_color(mark.layer, s.sat, s.val, opacity)
         return qcolor(s.color, opacity)

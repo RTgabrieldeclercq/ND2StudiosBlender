@@ -14,7 +14,11 @@ from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDatase
 from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.labels import _label_centroids, _label_raster
+from nodegraph.catalog._shared.labels import (
+    _label_centroids,
+    _label_raster,
+    _resolve_label_instance,
+)
 from nodegraph.catalog._shared.raw_measure import _InRaw, _intensity_provider
 
 def _snap_inside(vol: np.ndarray, ids: np.ndarray, centroids: np.ndarray,
@@ -87,10 +91,23 @@ def _compute_label_to_points(ctx: EvalContext) -> Dataset:
     nearest that centroid (``inside`` — guaranteed to lie in a concave/annular region); or
     the intensity-weighted centre of mass (``weighted``, which reads pixels, from the
     optional ``raw`` input when one is wired). ``raw`` is refused on the two geometric modes
-    rather than silently ignored."""
+    rather than silently ignored.
+
+    The ``labels`` socket resolves through :func:`_resolve_layer` (2026-08-04): the ONE Label
+    instance on the wire is used whatever it is called, because the socket's literal default
+    matched only ``analysis.segment``'s own default and a user who renamed the segmentation
+    ``CELLS`` got "no Voxel layer 'labels'" on a two-node graph. The auto-derived output name
+    follows the RESOLVED layer (``CELLS_points``), which ``extra_layers`` cannot predict at
+    edit time since it sees params only, not the incoming layer catalog — it announces
+    ``<socket>_points``. Harmless in practice: a downstream Point socket pointed at the
+    predicted name resolves the same way, by the only-candidate rule."""
     ds = ctx.inputs[0]
     ax = ds.axes
-    layer = ctx.layer("labels")
+    layer, _note = _resolve_label_instance(
+        ds, ctx.layer("labels"), node="label to points", socket="labels",
+        remedy="one point comes out per REGION, so it needs a label raster AND the table "
+               "that divides it into objects — run analysis.segment / analysis.label "
+               "upstream (a plain binary mask would collapse to a single dot)")
     out_layer = ctx.layer("name") or f"{layer}_points"
     mode = ctx.params.get("__modes__", {}).get("position", "centroid")
     raster6, zk = _label_raster(ds, layer, node="label to points")
@@ -117,6 +134,8 @@ def _compute_label_to_points(ctx: EvalContext) -> Dataset:
              [(m, t, z, c) for m in range(ax.m) for t in range(ax.t)
               for z in range(ax.z) for c in range(ax.c)])
     parts: List[Dict[str, np.ndarray]] = []
+    if _note:                       # say which layer was inferred, before the long loop
+        ctx.progress(0, len(units), "using " + _note, frames=ax.t)
     ctx.progress(0, len(units), "locating regions", frames=ax.t)
     for i, (m, t, z, c) in enumerate(units):
         vol = np.asarray(raster6[m, t, :, c] if z is None else raster6[m, t, z, c])

@@ -19,6 +19,7 @@ from nodegraph.registry import (
 )
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.labels import _resolve_layer, _voxel_layers
 
 # ── Boundary bands (Voxel label raster → outward band raster, 3D) ──────────────
 
@@ -36,9 +37,15 @@ def _compute_boundary_band(ctx: EvalContext) -> Dataset:
     from nodegraph.kernels.granule_boundary import extract_boundary_bands
     ds = ctx.inputs[0]
     ax = ds.axes
-    src = ctx.layer("labels")
+    # the one raster on the wire, whatever it is called (`_resolve_layer`); any Voxel layer
+    # qualifies because this groups by id and never reads a Label table
+    src, _note = _resolve_layer(
+        _voxel_layers(ds), ctx.layer("labels"), node="boundary band", socket="labels",
+        what="Voxel layer", where="the `data` input",
+        remedy="the bands are grown around labelled regions, so run a label / watershed / "
+               "mask-volume node first", ctx=ctx)
     lab_attr = ds.get(Domain.VOXEL, src)
-    if lab_attr is None:
+    if lab_attr is None:                             # pragma: no cover - _resolve_layer
         raise ValueError(f"boundary band needs a Voxel label layer {src!r} "
                          f"(run a label / watershed / mask-volume node first)")
     labels6 = np.asarray(lab_attr.values)

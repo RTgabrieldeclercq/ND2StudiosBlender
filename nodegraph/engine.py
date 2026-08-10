@@ -336,6 +336,16 @@ class EvalContext:
     fields: Any = None                      # the engine's FieldCache (C1)
     spec: Any = None                        # the node's NodeSpec (C8 per-channel derive)
     observer: Optional[Observer] = None     # run-progress sink (per-node progress)
+    #: this node's entry in ``Engine.seeds``, when it has one.
+    #:
+    #: A seed is normally the payload *itself* — the branch below at ``_entry`` returns it
+    #: for a node with no compute, which is how ``io.load`` works. But a node that has BOTH
+    #: a compute and a seed never saw its own seed: the compute wins, unconditionally. That
+    #: was invisible while the only such node was ``io.dock``, whose ``docked`` state
+    #: re-opens the store from a path in its params and so needs nothing from the engine.
+    #: A node serving something the engine holds IN MEMORY (a held dock) has no path to
+    #: re-open, and this is how it reaches it.
+    seed: Any = None
 
     def progress(self, done: int, total: int, note: str = "", *,
                  frames: Optional[int] = None,
@@ -745,7 +755,7 @@ class Engine:
             inputs=inputs, reads=rc,
             provider=self.providers.get(node_id),
             by_name=by_name, tiles=self.tiles, fields=self.fields, spec=spec,
-            observer=self.observer,
+            observer=self.observer, seed=self.seeds.get(node_id),
         )
         fn = self.computes.get(node.op_key)
         # per-node progress: the window between "start" and "done" is exactly the time

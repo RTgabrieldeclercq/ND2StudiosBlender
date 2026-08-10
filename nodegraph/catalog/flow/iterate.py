@@ -355,6 +355,19 @@ for _k in range(MAX_VARS):
 register_node(
     _compute_iterate, op_key="flow.iterate", label="Iterate", category="flow",
     adds_domains=frozenset({Domain.GLOBAL}),
+    # The metric is a Global scalar, and it is needed under `preserve=best` OR under
+    # `mode=feedback` — feedback IS an optimization, so the compute forces preserve to
+    # `best` there whatever the dropdown says. That disjunction is exactly why the field is
+    # a UNION over modes: two entries, either one sufficient. It is also why the `metric`
+    # socket's own `available_in` is approximate (a conjunction cannot say "best OR
+    # feedback"), so the rail is stricter than the gate here on purpose.
+    #
+    # Read off the COLLECT wire, not off a primary input — this node has no other Dataset
+    # input, so `input_domains` unions exactly the right edge.
+    reads_domains_by_mode={
+        "mode": {"feedback": frozenset({Domain.GLOBAL}), "sweep": frozenset()},
+        "preserve": {"best": frozenset({Domain.GLOBAL})},
+    },
     inputs=[
         InDataset("collect", multi=True, label="Collect"),
         InString("metric", "Metric", field=False, default="",
@@ -515,7 +528,8 @@ register_node(
     ],
     granularity=Granularity.TILEABLE, kernel_axes=frozenset(),
     description="Run the chain in front of it once per parameter value and keep one "
-                "result. Drag a variable output onto any parameter to iterate it, wire the "
-                "end of the chain back into Collect, and flip through the results on the "
-                "Viewer's iteration strip. 'best' picks by a Global scalar; 'feedback' "
+                "result. Wire the end of the chain into Collect, then pick what to iterate "
+                "from the panel's dropdown (it lists every parameter in that chain) or drag "
+                "a variable output onto the control itself, and flip through the results on "
+                "the Viewer's iteration strip. 'best' picks by a Global scalar; 'feedback' "
                 "searches for the value that maximizes it or hits a target.")

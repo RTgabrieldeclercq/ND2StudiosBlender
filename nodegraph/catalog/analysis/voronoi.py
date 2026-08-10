@@ -23,7 +23,15 @@ from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
-from nodegraph.catalog._shared.labels import _label_centroids, _label_raster
+from nodegraph.catalog._shared.labels import (
+    _label_centroids,
+    _label_instances,
+    _label_raster,
+    _point_layers,
+    _resolve_layer,
+    _voxel_layers,
+)
+from nodegraph.catalog._shared.sampling import _require_same_grid
 
 # ── Voronoi cells: dots + areas → territory raster (+ a MESH in 3D) ────────────
 #
@@ -40,6 +48,33 @@ from nodegraph.catalog._shared.labels import _label_centroids, _label_raster
 # and comes out already registered to the image grid every downstream node reads.
 
 
+def _layers_voronoi(params, modes):
+    """The AREAS raster is carried onto the output as ``f"{name}_areas"`` (2026-08-04).
+
+    No socket can describe it — its name is derived from the output name, and it is a *copy*
+    of a layer a READ socket named — so it needs declaring here or the layer catalog, the
+    downstream pickers and the Viewer's overlay list would never know it exists.
+
+    **Why copy it at all.** The output Dataset is built on the ``data`` input, so it inherits
+    that branch's layers: with the seeds coming from one chain and the areas from another,
+    viewing this node showed the SEEDS' labels and points and no trace of the areas the cells
+    were actually clipped to (reported 2026-08-04) — and, worse, the inherited raster is
+    usually *also* called ``labels``, so the overlay looked like it was showing the area layer
+    while showing a different branch's. There was no way to see a territory against the region
+    that bounded it, which is the one picture this node exists to produce.
+
+    Must never raise (it runs on every keystroke), and it is skipped under ``frame``, which
+    reads no area layer at all."""
+    nm = (params or {}).get("name") or "voronoi"
+    # `<name>_seeds` — the dots that actually WON a territory (2026-08-04). The Points overlay
+    # draws every Point table on the payload, so the seed cloud it shows includes the ones this
+    # node dropped; a caller who wants "only what participated" needs them as their own layer
+    # to pick. Emitted in every bound, since a dot can be dropped by the reach cap under
+    # `frame` too.
+    out = ((Domain.POINT, "%s_seeds" % nm),)
+    if (modes or {}).get("bound", "per_region") == "frame":
+        return out
+    return out + ((Domain.VOXEL, "%s_areas" % nm),)
 #: Arena voxels per KD-tree query. Bounds the peak coordinate array (this many rows × ndim
 #: float64) independently of arena size, so a full-frame 3-D Voronoi cannot try to
 #: materialize a (26M, 3) point array.
@@ -143,12 +178,25 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
     """**Voronoi cells from dots, clipped to areas** — one territory per Point, bounded by a
     Voxel area layer, as a Label raster + table (+ a MESH in 3D).
 
-    Resolved spec: category analysis; op ``analysis.voronoi``; reads POINT (and VOXEL, in the
-    two bounded modes), adds VOXEL + LABEL + MESH. 2D/3D lever: ``{"2D": WHOLE_PLANE,
-    "3D": WHOLE_VOLUME}`` — 2D partitions each plane among the dots on that plane, 3D
-    partitions the volume among all of its dots.
+    Resolved spec: category analysis; op ``analysis.voronoi``; reads POINT (and VOXEL +
+    LABEL, in the two bounded modes), adds VOXEL + LABEL + MESH. 2D/3D lever:
+    ``{"2D": WHOLE_PLANE, "3D": WHOLE_VOLUME}`` — 2D partitions each plane among the dots on
+    that plane, 3D partitions the volume among all of its dots.
 
-    The ``bound`` Mode is what links the two inputs:
+    **Two Dataset inputs.** The dots are a Point table and the areas are a raster, and they
+    are routinely produced by different branches — nuclei detected on one channel, cell
+    bodies segmented on another — which one wire cannot carry. So ``areas`` is an optional
+    second input; the area layer is read from it when wired and from the main input when
+    not, and the two must address the same voxels (``_require_same_grid``) because the
+    partition is computed on one shared grid. ``data`` stays the primary: it is the
+    calibration and domain source, and the seeds always come from it.
+
+    Which is also why the area raster is COPIED onto the output as ``f"{name}_areas"``: the
+    payload is built on ``data``, so the areas branch would otherwise leave no trace and the
+    result could not be viewed against the regions that produced it (see
+    :func:`_layers_voronoi`).
+
+    The ``bound`` Mode is what links the two:
 
     * ``per_region`` — the area layer is a **Label** raster and each region is its own arena:
       a cell may only claim voxels of the region its seed sits in, so territories never cross
@@ -197,31 +245,70 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
     max_um = max(0.0, float(ctx.params.get("max_distance_um", 0.0)))
     upper = max_um if max_um > 0.0 else np.inf
 
+    # The seeds are whichever Point table is on `data`; the socket only has to speak up when
+    # there is more than one. See `_resolve_layer` for why this is inferred rather than typed.
+    notes: List[str] = []
+    pts_layer, _note = _resolve_layer(
+        _point_layers(ds), pts_layer, node="voronoi", socket="points",
+        what="Point table", where="the `data` input",
+        remedy="these are the seed dots, so wire a detection (detect.spots / "
+               "detect.particles) or transform.label_to_points into `data`")
+    if _note:
+        notes.append("seeds: " + _note)
+
     seeds = {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.POINT)
              if a.layer == pts_layer}
-    if not seeds:
-        have = sorted({k[1] for k in ds.attributes if k[0] is Domain.POINT and k[1]})
-        raise ValueError(
-            f"voronoi: no Point layer {pts_layer!r} on the input Dataset"
-            + (f" (it carries {have})" if have else " (it carries no Point layers)")
-            + " — these are the seed dots, so wire a detection (detect.spots / "
-              "detect.particles) or transform.label_to_points upstream.")
     for req in ("id", "m", "t", "c", "z", "y", "x"):
         if req not in seeds:
             raise ValueError(f"voronoi: Point layer {pts_layer!r} is missing the "
                              f"coordinate column {req!r}")
 
+    # ── where the AREAS come from: the optional second Dataset, else this one ──
+    #
+    # The dots and the areas are routinely produced by two DIFFERENT branches — nuclei
+    # detected on one channel, cell bodies segmented on another — and a Point table and
+    # someone else's Label raster cannot be put on one wire. Unwired, `areas` falls back to
+    # the main input, which is exactly the single-wire behaviour every existing graph has.
+    areas = ctx.input("areas")
+    if areas is None:
+        areas = ds
+    elif bound == "frame":
+        raise ValueError(
+            "voronoi: an `areas` Dataset is wired but Bound is `frame`, which tessellates "
+            "the whole image and reads no area layer at all — so those areas would be "
+            "silently ignored. Set Bound to `per_region` (Label regions as separate arenas) "
+            "or `mask` (one shared arena), or unwire `areas`.")
+    else:
+        # read voxel-for-voxel against this node's grid: a cropped/shifted areas branch
+        # would clip every cell to the wrong part of the image
+        _require_same_grid(ds, areas, socket="areas",
+                           consequence="clip each cell to the wrong region")
+
+    # ...and the areas are whichever candidate is on the AREAS wire. `per_region` needs a
+    # whole Label instance (a raster plus the table that divides it into objects); `mask`
+    # takes any non-zero raster, so there its candidate set is wider and more often ambiguous.
+    region_layer = ctx.layer("region")
+    wire = "the `areas` input" if areas is not ds else "the `data` input"
     region6 = None
     if bound == "per_region":
-        region6, _zk = _label_raster(ds, ctx.layer("region"), node="voronoi (per_region)")
+        region_layer, _note = _resolve_layer(
+            _label_instances(areas), region_layer, node="voronoi (per_region)",
+            socket="region", what="Label instance", where=wire,
+            remedy="`per_region` clips each cell to the region its own dot sits in, so it "
+                   "needs a label raster AND its table — run analysis.segment / "
+                   "analysis.label, or set Bound to `mask` to use a plain mask instead")
+        if _note:
+            notes.append("areas: " + _note)
+        region6, _zk = _label_raster(areas, region_layer, node="voronoi (per_region)")
     elif bound == "mask":
-        attr = ds.get(Domain.VOXEL, ctx.layer("region"))
-        if attr is None:
-            raise ValueError(
-                f"voronoi (mask): no Voxel layer {ctx.layer('region')!r} to bound the cells "
-                "— wire a threshold/ROI mask, or set Bound to `frame` to tessellate the "
-                "whole image.")
-        region6 = np.asarray(attr.values)
+        region_layer, _note = _resolve_layer(
+            _voxel_layers(areas), region_layer, node="voronoi (mask)",
+            socket="region", what="Voxel layer", where=wire,
+            remedy="wire a threshold/ROI mask, or set Bound to `frame` to tessellate the "
+                   "whole image")
+        if _note:
+            notes.append("areas: " + _note)
+        region6 = np.asarray(areas.get(Domain.VOXEL, region_layer).values)
 
     s_m = seeds["m"].astype(np.int64)
     s_t = seeds["t"].astype(np.int64)
@@ -239,11 +326,27 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
               for z in range(ax.z) for c in range(ax.c)])
     # voxel volume/area, for the local-density column (µm³ in 3D, µm² in 2D)
     unit_um = float(np.prod(np.asarray(scale, dtype=float)))
+    if notes:                       # say which layers were inferred, before the long loop
+        ctx.progress(0, len(units), "using " + "; ".join(notes), frames=ax.t)
+    # Seed accounting. A dot that gets no territory is DROPPED, and until 2026-08-04 it was
+    # dropped in silence — which is how a real graph came to report 25 cells for 141 nuclei
+    # and read as "the area layer isn't being used". Two independent causes, both counted so
+    # the message can name the actionable one:
+    #   * `outside` — under `per_region` the seed's own voxel is BACKGROUND, so it belongs to
+    #     no arena and never competes. This is the one that bites when the two branches do
+    #     not spatially agree (nuclei from a Z-PROJECTION against an area layer from a single
+    #     Z-PLANE: the projected centroid sits wherever the nucleus is in any plane, while
+    #     the areas only cover that one plane).
+    #   * `n_sel` vs the table length — a seed whose (m,t,c[,z]) addresses no unit at all.
+    n_seeds = int(len(s_id))
+    n_sel = 0
+    outside = 0
     ctx.progress(0, len(units), "tessellating", frames=ax.t)
     for i, (m, t, z, c) in enumerate(units):
         sel = (s_m == m) & (s_t == t) & (s_c == c)
         if not volumetric:
             sel = sel & (np.rint(s_z).astype(np.int64) == z)
+        n_sel += int(sel.sum())
         if sel.any():
             if region6 is None:
                 arena = np.ones(shape, dtype=np.int64)
@@ -258,6 +361,7 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
                                     seeds["x"][sel].astype(float)]))
             seed_arena = (_vox_lookup(arena, pos) if bound == "per_region"
                           else np.ones(len(pos), dtype=np.int64))
+            outside += int((seed_arena == 0).sum())
             assign = _voronoi_assign(pos, arena, seed_arena, scale, upper)
             present = np.unique(assign)
             present = present[present > 0]
@@ -292,7 +396,83 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
                     })
         ctx.progress(i + 1, len(units), "tessellating", frames=ax.t)
 
-    out = ds.with_layer(Domain.VOXEL, name, raster)
+    # ── account for every seed, out loud (2026-08-04) ──────────────────────────
+    #
+    # `len(rows)` is the number of dots that actually got a territory. Anything missing was
+    # dropped, and a silently shorter table is the worst possible way to say so: the node
+    # succeeds, the raster looks plausible, and the only symptom is a cell count nobody
+    # cross-checks. Reported on the progress rail (the one user-visible channel a compute
+    # has) and stamped on the output so it survives the run and a downstream node can read
+    # it — the §7b namespaced non-calibration pattern.
+    kept = len(rows)
+    dropped = max(0, n_seeds - kept)
+    if dropped:
+        why = []
+        if outside:
+            why.append(f"{outside} sat on BACKGROUND of {region_layer!r} "
+                       f"(no arena, so they never compete)")
+        if n_sel < n_seeds:
+            why.append(f"{n_seeds - n_sel} addressed no (m,t,c"
+                       f"{'' if volumetric else ',z'}) unit of this image")
+        residual = dropped - outside - (n_seeds - n_sel)
+        if residual > 0:
+            why.append(f"{residual} won no voxel at all (another dot was nearer to every "
+                       f"voxel they could claim — coincident or near-coincident dots, or "
+                       f"`Max reach` set below the spacing)")
+        ctx.progress(len(units), len(units),
+                     f"{kept}/{n_seeds} seeds got a cell — {dropped} dropped"
+                     + (f" ({'; '.join(why)})" if why else ""), frames=ax.t)
+    # Deliberately NOT a raise, even when EVERY seed is dropped. An empty result has to stay
+    # a structurally valid one (`build_mesh_tables` with zero elements is a pinned contract),
+    # and a refusal would in any case have been silent about the case that actually bit: a
+    # PARTIAL loss, where the node succeeds and only the row count is short.
+    out = ds.with_layer(Domain.VOXEL, name, raster).with_metadata(
+        voronoi_seeds=n_seeds, voronoi_cells=kept, voronoi_seeds_outside=outside)
+
+    # ── the seeds that WON a territory, as their own Point table ──────────────
+    #
+    # The Points overlay draws every Point table on the payload, so the dots on screen are the
+    # input cloud — including the ones dropped here. Filtering has to be a LAYER the caller can
+    # select, not a flag on the original table, because the original belongs to the upstream
+    # node and this node has no business editing what it means. `cell_id` closes the loop back
+    # to the Label row each surviving dot produced.
+    _kept_ids = {int(r["point_id"]) for r in rows}
+    _sel = np.isin(s_id, np.fromiter(_kept_ids, dtype=np.int64, count=len(_kept_ids))) \
+        if _kept_ids else np.zeros(len(s_id), dtype=bool)
+    _cell_of = {int(r["point_id"]): int(r["id"]) for r in rows}
+    seed_cols = {k: np.asarray(seeds[k])[_sel] for k in ("id", "m", "t", "c", "z", "y", "x")}
+    seed_cols["cell_id"] = np.array([_cell_of[int(i)] for i in seed_cols["id"]],
+                                    dtype=np.int64)
+    out = out.with_structure(StructureTable(
+        Domain.POINT, seed_cols, layer="%s_seeds" % name,
+        z_kind=(ds.structure_zkind(Domain.POINT, pts_layer)
+                or ("subpixel" if volumetric else "plane_index"))))
+    if region6 is not None:
+        # Carry the arenas through under a name of our own (`_layers_voronoi`). The payload is
+        # built on `data`, so without this the areas branch leaves NO trace on the output and
+        # a territory cannot be viewed against the region that bounded it. Deliberately not
+        # under its original name: that is usually `labels`, which the seeds' branch has
+        # already put on this Dataset meaning something else entirely.
+        #
+        # Only the arenas that PRODUCED a cell survive (2026-08-04). A region no dot landed in
+        # contributed nothing to the result, so drawing it alongside the territories invites
+        # exactly the misreading this layer exists to prevent — that the empty region is a
+        # territory, or that a territory is missing from it. `region` on the Label table is the
+        # arena id each cell came from, which is the authoritative "was this one used" set.
+        used = np.zeros(int(np.asarray(region6).max()) + 2, dtype=bool)
+        for r in rows:
+            rid = int(r["region"])
+            if 0 <= rid < used.size:
+                used[rid] = True
+        keep = np.asarray(region6, dtype=np.int64).copy()
+        if bound == "mask":
+            # every non-zero voxel is ONE arena here, so "used" is all-or-nothing and the
+            # per-id mask above would zero a raster whose ids are not arena ids at all
+            if not rows:
+                keep[:] = 0
+        else:
+            keep[~used[np.clip(keep, 0, used.size - 1)]] = 0
+        out = out.with_layer(Domain.VOXEL, "%s_areas" % name, keep)
     if rows:
         merged = {k: np.array([r[k] for r in rows],
                               dtype=(np.int64 if k in ("id", "m", "t", "c", "area",
@@ -311,26 +491,75 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
 register_node(
     _compute_voronoi, op_key="analysis.voronoi", label="Voronoi Cells",
     category="analysis",
-    # POINT is required in every mode; the VOXEL area layer is mode-gated, which is what
-    # exempts it from the reads_domains consistency check (`frame` reads no Voxel layer, and
-    # reads_domains has no per-mode form — the tessellate / track.link precedent).
+    extra_layers=_layers_voronoi,
+    # POINT is required in every mode — they are the seeds. The AREA is conditional, and
+    # what it demands differs per bound: `per_region` goes through `_label_raster`, which
+    # refuses a raster carrying no Label table, so it needs a whole Label INSTANCE (the
+    # VOXEL raster and the LABEL table under one name); `mask` reads any non-zero Voxel
+    # layer and never looks for the table; `frame` reads no layer at all. Declared
+    # statically this had to be wrong in two states out of three, and the shipped
+    # `frozenset({POINT})` was the one that warned about nothing — the node told you it
+    # reads Points while silently also needing your labels (reported 2026-08-03).
     reads_domains=frozenset({Domain.POINT}),
-    adds_domains=frozenset({Domain.VOXEL, Domain.LABEL, Domain.MESH}),
-    inputs=[InDataset(),
-            InString("points", "Seed points", field=False, default="particles",
+    reads_domains_by_mode={"bound": {
+        "per_region": frozenset({Domain.VOXEL, Domain.LABEL}),
+        "mask": frozenset({Domain.VOXEL}),
+        "frame": frozenset(),
+    }},
+    # POINT because of `<name>_seeds` — the surviving dots, so an overlay can show what
+    # participated rather than the whole input cloud
+    adds_domains=frozenset({Domain.VOXEL, Domain.LABEL, Domain.MESH, Domain.POINT}),
+    inputs=[InDataset(description=
+                      "The SEEDS branch, and the primary: calibration, axes and the domain "
+                      "envelope all come from here, and so do the dots — one Voronoi cell per "
+                      "point of its Point table. The output image is this branch's, which is "
+                      "why the areas wire is composited on top rather than replacing it."),
+            # The AREAS branch. Declared AFTER `data` so `data` stays the primary —
+            # `graph.dataset_preds` sorts by declared socket position, so calibration and
+            # domain propagation keep flowing from the seeds' chain no matter which edge the
+            # user wired first (`wire-node-v2` §7d).
+            #
+            # It exists because this node is the one that genuinely COMBINES two domains:
+            # the dots are a Point table and the areas are a Label/Voxel raster, and those
+            # are routinely produced by different branches (nuclei on one channel, cell
+            # bodies on another). With one input there was no way to converge them.
+            # Optional — unwired, the area layer is read off the main input exactly as
+            # before, so every graph that predates this socket is unaffected.
+            # `view_source`: its image is composited into the Viewer under the seeds' one, so
+            # viewing this node shows BOTH channels. Without it the payload carries only the
+            # primary's image and the areas branch is invisible — "I can only see the UV
+            # channel" (2026-08-04). It qualifies on the rule in `SocketSpec.view_source`:
+            # this wire carries genuinely different content (another channel, segmented on
+            # its own), not a second version of the primary's pixels.
+            InDataset("areas", label="Areas", view_source=True, description=
+                      "The AREAS branch — the layer the cells are clipped to, which is "
+                      "routinely segmented from a DIFFERENT channel than the seeds. Optional: "
+                      "leave it unwired and the area layer is read off the main wire instead. "
+                      "Its image is composited into the Viewer so both channels are visible, "
+                      "and its raster reaches the output as `<Output layer>_areas`. It must "
+                      "address the same voxels as the main wire (same crop / resample / drift), "
+                      "or the cells would be clipped to the wrong part of the image."),
+            InString("points", "Seed points", field=False, default="",
                      layer_in=Domain.POINT,
                      description=
                      "The DOTS — one Voronoi cell per point of this table. A detection output, "
-                     "or Label → Points if the seeds are segmented nuclei. Points are compared "
-                     "in MICRONS, so an anisotropic z step cannot stretch the cells along z. "
-                     "In 2D each dot only seeds the plane its z rounds to; in 3D every dot in "
-                     "the volume competes."),
-            InString("region", "Area layer", field=False, default="labels",
-                     layer_in=Domain.VOXEL,
+                     "or Label → Points if the seeds are segmented nuclei. LEAVE IT EMPTY and "
+                     "the only Point table on the `data` wire is used, which is the usual case; "
+                     "it only has to be set when two are present. Points are compared in "
+                     "MICRONS, so an anisotropic z step cannot stretch the cells along z. In 2D "
+                     "each dot only seeds the plane its z rounds to; in 3D every dot in the "
+                     "volume competes."),
+            InString("region", "Area layer", field=False, default="",
+                     layer_in=Domain.VOXEL, layer_from="areas",
                      available_in={"bound": frozenset({"per_region", "mask"})},
                      description=
-                     "The AREAS the cells are clipped to. Under `per_region` this must be a "
-                     "LABEL raster and each region becomes its own arena — a cell can only "
+                     "Which layer on the AREAS wire the cells are clipped to — or on the main "
+                     "wire when nothing is plugged into Areas. LEAVE IT EMPTY and the only "
+                     "candidate on that wire is used (under `per_region` that means the only "
+                     "Label INSTANCE, ignoring plain masks and distance fields; under `mask`, "
+                     "the only Voxel layer); set it when several are present. Under "
+                     "`per_region` this must be a LABEL raster and each region becomes its own "
+                     "arena: a cell can only "
                      "claim voxels of the region its own dot sits in, so territories never "
                      "cross a compartment boundary and a region with no dot stays empty. Under "
                      "`mask` any non-zero voxel layer works and every dot competes for all of "
@@ -353,7 +582,10 @@ register_node(
                      "`density` (1 / area in µm² or µm³ — the Voronoi local number density), "
                      "and `point_id` / `region` recording which dot and which area each cell "
                      "came from. Ids are globally unique across every (m,t,c), so Measure can "
-                     "join on id."),
+                     "join on id. A SECOND Voxel layer `<name>_areas` carries the area raster "
+                     "the cells were clipped to — overlay that to see a territory against the "
+                     "region that bounded it, since the output otherwise inherits only the "
+                     "SEEDS' branch layers (whose raster is usually also called `labels`)."),
             InString("mesh_name", "Output mesh", field=False, default="voronoi_mesh",
                      layer_out=(Domain.MESH,),
                      available_in={"dim": frozenset({"3D"}),

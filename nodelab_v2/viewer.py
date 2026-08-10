@@ -61,6 +61,22 @@ from nodegraph.mesh import mesh_part as MESH_PART
 from nodegraph.provider import subset_index
 from nodelab_v2 import overlays as OV
 from nodelab_v2 import theme as T
+#: How many channels the GL composite can sample at once. Defined in
+#: :mod:`nodelab_v2.overlays` rather than imported from :mod:`nodelab_v2.glview` because
+#: this module must keep working with **no GL at all** (``NODELAB_GL=0``, a headless probe,
+#: or after a driver failure falls the surface back to the CPU renderer) — a module-level
+#: import of the GL view would make the shader's sampler-bank size a hard dependency of the
+#: path that exists for when there is no shader. ``glview`` reads the same constant, so the
+#: number the status line quotes is the number the shader actually enforces.
+_GL_MAX_CH = OV.GL_MAX_CHANNELS
+
+#: Longest edge the CPU split-view MOSAIC may reach, before its panes are decimated to fit.
+#: Matches :data:`nodelab_v2.runner.MAX_DISPLAY_DIM`'s intent — that is the cap on a single
+#: display plane, and the mosaic is several of them side by side, so without a cap of its own
+#: the assembled image is `sqrt(n)` times over budget. Not imported from ``runner`` to keep
+#: this module's import graph free of the engine; the number is a display constant, and the
+#: consequence of the two differing is sharpness, never correctness.
+_MAX_MOSAIC_DIM = 4096
 from nodelab_v2.framestrip import FrameStrip, compact_list
 from nodelab_v2.minimap import ElidedLabel
 from nodelab_v2.picker import (
@@ -208,11 +224,19 @@ def composite_to_qimage(planes: Dict[int, np.ndarray], colors: Dict[int, Tuple[i
     return QImage(u8.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
 
+def _img_axis(n: int, f0: float, f1: float) -> np.ndarray:
+    """``(n,)`` of normalized IMAGE positions for the samples of a plane covering the
+    fractional span ``[f0, f1]`` — sample centres, matching the shader's interpolated uv."""
+    n = max(1, int(n))
+    return float(f0) + (np.arange(n, dtype=float) + 0.5) / n * (float(f1) - float(f0))
+
+
 def composite_with_clim(planes: Dict[int, np.ndarray],
                         colors: Dict[int, Tuple[int, int, int]],
                         clims: Dict[int, Tuple[float, float]],
                         gammas: Optional[Dict[int, float]] = None,
-                        blends: Optional[Dict[int, Tuple[int, float, float]]] = None
+                        blends: Optional[Dict[int, Tuple[int, float, float]]] = None,
+                        region: Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
                         ) -> QImage:
     """Like :func:`composite_to_qimage` but uses **precomputed** ``(lo, hi)`` intensity
     bounds per channel (contrast computed once per volume and cached, the biggest
@@ -227,6 +251,12 @@ def composite_with_clim(planes: Dict[int, np.ndarray],
     picture. Channels are composited in **index order** here for the same reason the shader
     unrolls in index order — `over` and `difference` are not commutative, and an overlay
     (which lives at an index above the primary's own channels) has to land on top.
+
+    ``region`` is the fractional ``(fy0, fy1, fx0, fx1)`` part of the whole image these planes
+    cover — anything but the default when compositing a zoomed **detail patch**. The two
+    spatial comparators are defined on the IMAGE, so a patch has to be told where it sits or
+    its checkerboard restarts and its wipe divider slides to the middle of the patch (the CPU
+    mirror of the shader's ``u_rect``).
     """
     if not planes:
         return QImage(1, 1, QImage.Format_RGB888)
@@ -263,16 +293,16 @@ def composite_with_clim(planes: Dict[int, np.ndarray],
         elif mode == 3:                                  # checkerboard, in image space
             if checker_cache is None or checker_cache.shape != shape:
                 n = max(float(cells), 1.0)
-                ys = np.floor(np.arange(shape[0]) / shape[0] * n)
-                xs = np.floor(np.arange(shape[1]) / shape[1] * n)
+                ys = np.floor(_img_axis(shape[0], region[0], region[1]) * n)
+                xs = np.floor(_img_axis(shape[1], region[2], region[3]) * n)
                 checker_cache = np.mod(ys[:, None] + xs[None, :], 2.0)
             k = (checker_cache * op)[..., None]
             rgb = rgb * (1.0 - k) + src * k
         elif mode == 4:                                  # wipe, in image space
-            cut = int(round(min(max(cells, 0.0), 1.0) * shape[1]))
-            k = np.zeros(shape, dtype=float)
-            k[:, :cut] = op
-            rgb = rgb * (1.0 - k[..., None]) + src * k[..., None]
+            k = np.where(_img_axis(shape[1], region[2], region[3])
+                         <= min(max(cells, 0.0), 1.0), op, 0.0)
+            k = np.broadcast_to(k[None, :], shape)[..., None]
+            rgb = rgb * (1.0 - k) + src * k
         else:                                            # add
             rgb = rgb + src * op
     u8 = np.ascontiguousarray((np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8))
@@ -302,6 +332,19 @@ def mosaic_with_clim(planes: Dict[int, np.ndarray],
     n = len(tiles)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
+    # The MOSAIC is what the budget applies to, not the pane. Each plane already arrived
+    # capped at `runner.MAX_DISPLAY_DIM`, but the split view lays out `1 + len(channels)` of
+    # them — so 3 channels of a mosaic at the 4096 cap builds an 8192² RGB888 QImage, ~201 MB,
+    # allocated and composited from scratch on every LUT change and every repaint. Decimating
+    # the panes so the ASSEMBLED mosaic honours the same cap keeps the split view usable on
+    # the CPU backend (headless, NODELAB_GL=0, or after a driver fall-back) instead of
+    # stalling the GUI thread on a 200 MB allocation per drag of a contrast slider.
+    span = max(cols * w + gap * (cols - 1), rows * h + gap * (rows - 1))
+    if span > _MAX_MOSAIC_DIM:
+        step = int(np.ceil(span / float(_MAX_MOSAIC_DIM)))
+        planes = {ch: pl[::step, ::step] for ch, pl in planes.items()}
+        shape = next(iter(planes.values())).shape
+        h, w = int(shape[0]), int(shape[1])
     out = QImage(cols * w + gap * (cols - 1), rows * h + gap * (rows - 1),
                  QImage.Format_RGB888)
     out.fill(QColor(5, 8, 13))
@@ -909,6 +952,13 @@ class ViewerPanel(QWidget):
     #: a pick was armed (True) / disarmed (False) — keeps the inspector's Pick buttons in
     #: the right state and lets the status bar say what is going on.
     pick_armed = Signal(bool)
+    #: the live surface reported what it can hold, in px of one texture axis. Forwarded to the
+    #: runner, which decides full-resolution-whole vs pyramid-plus-patch from it.
+    display_limits = Signal(int)
+    #: playback started (True) / stopped (False), on the axis named. Playing is a statement
+    #: that EVERY frame is wanted in order, which is what licenses a whole-series preload —
+    #: the scrub prefetcher deliberately will not do that from a cursor nudge.
+    playing = Signal(bool, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1103,6 +1153,9 @@ class ViewerPanel(QWidget):
         # NAME so the choice follows the channel across nodes/pulls rather than being
         # pinned to a position, and survives every _rebuild_channels.
         self._chan_color_user: Dict[str, Tuple[int, int, int]] = {}
+        #: colour keys of composed (overlay / merged) channels that have appeared before, so
+        #: each is auto-enabled ONCE rather than on every pull — see `_apply_axes`.
+        self._chan_seen: set = set()
         self._active_channels: List[int] = [0]
         self._auto_on = False
         self._split = False
@@ -1125,6 +1178,10 @@ class ViewerPanel(QWidget):
         self._status = ElidedLabel("")
         self._status.setProperty("role", "muted")
         v.addWidget(self._status)
+        #: is the status line currently reporting a FAILED pull? The label paints itself, so
+        #: :meth:`restyle` re-applies its colour from the theme and would quietly drop the
+        #: error tint on any theme change; this is what it reads to keep it.
+        self._status_error = False
 
         # state
         self._axes = None
@@ -1174,6 +1231,12 @@ class ViewerPanel(QWidget):
         # ``cb(node_id, (m,t,z,c), channels, rect01)``; results arrive at
         # :meth:`on_detail_ready`.
         self.detail_cb: Optional[Callable[..., None]] = None
+        #: node_id -> the Voxel layers that node ITSELF produces, in declaration
+        #: order. What the Labels overlay draws on Auto: you view a node to see what
+        #: it made, and ranking every raster on the payload by id drew whichever
+        #: carried the biggest numbering (2026-08-04). Injected by the window, which
+        #: owns the document; absent, Auto falls back to the region count.
+        self.own_layers_cb: Optional[Callable[[str], list]] = None
         self._detail_rect: Optional[Tuple[float, float, float, float]] = None
         #: debounce for pan/zoom → detail request (ms). Long enough that a wheel spin or a
         #: drag settles first, short enough to feel immediate once the hand stops.
@@ -1185,6 +1248,9 @@ class ViewerPanel(QWidget):
         # playback — a wall-clock QTimer that draws whatever frame is ready and drops
         # frames to hold the target fps (decoupled from decode; napari's frame budget).
         self._playing_axis: Optional[str] = None
+        #: playback is held while the series is being decoded (:meth:`set_play_gate`) — the
+        #: user asked to play and the answer is "in a moment", not "no".
+        self._gated = False
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._tick_play)
         self._last_frame_t: Optional[float] = None
@@ -1211,12 +1277,18 @@ class ViewerPanel(QWidget):
                 if probe_gl_available():
                     view = GLImageView()
                     view.gl_failed.connect(self._fallback_to_cpu)
+                    view.limits_ready.connect(self.display_limits)
                     self._gl = view
             except Exception:                    # noqa: BLE001 — any import/ctor issue → CPU
                 self._gl = None
                 view = None
         if view is None:
             view = _ImageView()
+            # The CPU surface has no texture, but it does build a QImage and a QPixmap the
+            # size of the frame — so it gets the ordinary cap rather than a full-resolution
+            # escalation. A 7168² RGB888 QImage is 154 MB per repaint, which is not a
+            # trade the fallback path should be making silently.
+            QTimer.singleShot(0, self._cpu_display_limits)
         view.overlay_cb = self._paint_overlays
         # both surfaces announce pan/zoom the same way, so detail-on-demand needs no
         # branch on which backend came up
@@ -1225,6 +1297,12 @@ class ViewerPanel(QWidget):
         except Exception:                        # noqa: BLE001 — a surface without the
             pass                                 # signal simply never asks for detail
         return view
+
+    def _cpu_display_limits(self) -> None:
+        """Announce the CPU surface's ceiling (lazy import: viewer ← runner is circular at
+        module scope)."""
+        from nodelab_v2.runner import MAX_DISPLAY_DIM
+        self.display_limits.emit(int(MAX_DISPLAY_DIM))
 
     def _fallback_to_cpu(self) -> None:
         """Runtime GL failure → replace the GL surface with the CPU view. Deferred to the
@@ -1430,9 +1508,12 @@ class ViewerPanel(QWidget):
         self._overlay_style = dict(overlay_style or {})
         self._overlay_note = str(overlay_note or "")
         self._dataset = dataset
-        if node_id != self._clim_node:
-            self._clim.clear()                    # a new node/volume → recompute contrast
-            self._clim_node = node_id
+        # Contrast is keyed ``(node_id, channel)`` and is now KEPT across a node switch
+        # (2026-08-05: "each channel should be its state from before"). Clearing it was
+        # redundant belt-and-braces — the key already namespaces per node, so a different node
+        # simply misses and auto-contrasts — and it threw away the one thing that cannot be
+        # recomputed: a window the user set by hand. Going A → B → A now returns to A's look.
+        self._clim_node = node_id
         self._node_id = node_id
         key = ((axes.m, axes.t, axes.z, axes.c) + self._channel_key(axes, dataset)
                if axes is not None else None)
@@ -1440,6 +1521,27 @@ class ViewerPanel(QWidget):
             self._apply_axes(axes, dataset)
             self._axes_key = key
         self._axes = axes if axes is not None else self._axes
+        # `bit_depth` is refreshed UNCONDITIONALLY, not only inside `_rebuild_channels`.
+        # That rebuild is gated on the key above — axis sizes plus channel names/emissions —
+        # and the declared intensity scale is in neither, so two payloads that differ ONLY in
+        # scale left `self._bit_depth` at the previous one's value and `_display_range`
+        # therefore produced the wrong histogram extent for whichever was viewed second.
+        # It is bidirectional (a normalize child then its raw 12-bit parent reintroduces the
+        # exact "135-1564 against 0-4095" regression the bit_depth branch was written to
+        # fix), and a BAKE triggers it on its own: `write_checkpoint` restamps
+        # `bit_depth = 16` whenever float data was rounded into 16-bit counts.
+        #
+        # A declared-scale change also retires the cached per-channel LUT extent for this
+        # node — `_drange` is what the slider clamp and the committed percentile pick read,
+        # and it was captured under the old scale. The user's own `_clim` window is left
+        # alone: it is the one thing here that cannot be recomputed.
+        if dataset is not None:
+            bd = (getattr(dataset, "metadata", {}) or {}).get("bit_depth")
+            bd = int(bd) if bd else None
+            if bd != self._bit_depth:
+                self._bit_depth = bd
+                for ck in [k for k in self._drange if k[0] == node_id]:
+                    self._drange.pop(ck, None)
 
         if not planes:
             self._planes = {}
@@ -1448,18 +1550,34 @@ class ViewerPanel(QWidget):
                 self._gl.clear()
             else:
                 self._view.set_pixmap(QPixmap())
-            self._status.setText(f"{node_id} · no image on this output · "
-                                 f"pulled in {seconds:.2f}s")
+            self._set_status(f"{node_id} · no image on this output · "
+                             f"pulled in {seconds:.2f}s")
             return
-        npts = self._display(node_id, planes, self._axes)
+        self._display(node_id, planes, self._axes)
         h, w = self._ref_plane.shape[:2]
-        extra = f" · {npts} points" if npts else ""
+        npts, nframe = self._point_tally()
+        # Report the count whenever the frame carries ANY point, not only when some land on
+        # the viewed plane — an empty plane inside a full volume must not look like an empty
+        # detection. The parenthetical names the rest so the Z strip is the obvious next move.
+        extra = f" · {npts} points" if nframe else ""
+        if nframe > npts:
+            extra += f" ({nframe - npts} on other Z)"
+        shown = list(self.channels())
         chans = "+".join(self._chan_names[c] if c < len(self._chan_names) else f"Ch{c}"
-                         for c in self.channels())
+                         for c in shown)
         note = getattr(self, "_overlay_note", "")
-        self._status.setText(
+        # The GL composite has a fixed sampler bank (`glview._MAX_CH`) and simply TRUNCATES
+        # past it — `active = list(chans)[:_MAX_CH]`, with no error check on the path. A
+        # 4+5 channel merge is enough to reach it (`channel.merge` puts no ceiling on the
+        # channel axis), and the failure is invisible: the extra channel keeps its button,
+        # its LUT and its own split-view pane, and is missing only from the composite. So
+        # say it here rather than leaving the user to notice a colour that never appears.
+        over = len(shown) - _GL_MAX_CH
+        self._set_status(
             f"{node_id} · {w}×{h} px · {chans}{extra}{self._solo_note()} · "
             f"pulled in {seconds:.2f}s"
+            + (f"  ·  COMPOSITE SHOWS THE FIRST {_GL_MAX_CH} CHANNELS ONLY "
+               f"({over} more switched on; split view shows each one)" if over > 0 else "")
             # the placement readout rides HERE, beside the picture it describes: a wrong
             # tile, time or focus offset should be visible without opening the inspector
             + (f"  ·  overlay {note}" if note else ""))
@@ -1498,14 +1616,29 @@ class ViewerPanel(QWidget):
         return lohi
 
     def _display_range(self, plane: np.ndarray) -> Tuple[float, float]:
-        """The LUT histogram extent. Prefer the file's **significant bit depth** from
-        metadata (``bit_depth`` → ``0 .. 2**bits-1``) — the pixel values alone can't
-        reveal it (a dim 12-bit frame maxes out below 1024, which is why inferring from
-        the data under-capped the slider at 1023). Without metadata, an integer image
-        falls back to its dtype's full range (never under-caps); a float (computed) image
-        uses its observed range."""
+        """The LUT histogram extent. Prefer the **significant bit depth** carried on the
+        payload (``bit_depth`` → ``0 .. 2**bits-1``) — the pixel values alone can't reveal
+        it (a dim 12-bit frame maxes out below 1024, which is why inferring from the data
+        under-capped the slider at 1023). Without it, an integer image falls back to its
+        dtype's full range (never under-caps) and a genuinely rescaled image to its
+        observed range.
+
+        **``bit_depth`` is honoured whatever the dtype**, and that is the whole point:
+        every streaming provider computes in ``float64`` (:data:`nodegraph.streaming._F`),
+        so a Stitch or a Gaussian arrives as float even though its values are still the
+        same integer counts. Gating on ``dtype`` therefore ignored the payload's own
+        declaration and gave a computed node a data-derived slider while the raw source
+        beside it got the sensor range — 135‑1564 against 0‑4095 on a real dim 12‑bit
+        mosaic, i.e. the same picture with visibly different contrast depending on which
+        node you clicked.
+
+        Reading the declaration rather than the dtype is safe precisely because this
+        project already maintains it: a node that leaves the count scale DROPS
+        ``bit_depth`` (``metadata.value_rescaled`` — percentile Normalize, CLAHE, the
+        ``ratio`` flatten), so an image that really is ``[0,1]`` floats still lands on the
+        observed-range branch below."""
         a = np.asarray(plane)
-        if self._bit_depth and np.issubdtype(a.dtype, np.integer):
+        if self._bit_depth:
             return 0.0, float((1 << int(self._bit_depth)) - 1)
         if np.issubdtype(a.dtype, np.integer):
             return 0.0, float(np.iinfo(a.dtype).max)
@@ -1629,12 +1762,15 @@ class ViewerPanel(QWidget):
         if self._gl is not None:
             surf.set_detail(planes, rect01)
             return
-        # CPU path: composite the patch with the SAME clim/gamma the overview uses, or it
-        # would sit on the image as a differently-contrasted rectangle
+        # CPU path: composite the patch with the SAME clim/gamma/blend the overview uses, or
+        # it would sit on the image as a differently-contrasted rectangle — and, once the
+        # patch carries the overlay's channels too, as a differently-BLENDED one.
         clims = {ch: self._clim.get((node_id, ch)) or self._clim_for(node_id, ch, pl)
                  for ch, pl in planes.items()}
         gammas = {ch: self._gammas.get((node_id, ch), 1.0) for ch in planes}
-        img = composite_with_clim(planes, self._chan_colors, clims, gammas)
+        x0, y0, x1, y1 = (float(v) for v in rect01)
+        img = composite_with_clim(planes, self._chan_colors, clims, gammas,
+                                  self._blend_map(planes), region=(y0, y1, x0, x1))
         surf.set_detail((QPixmap.fromImage(img), rect01))
 
     def _refresh_hover(self) -> None:
@@ -1688,15 +1824,19 @@ class ViewerPanel(QWidget):
             return
         self._blink_timer.start(max(16, int(500.0 / hz)))   # half-period per toggle
 
-    def _blend_map(self) -> Dict[int, Tuple[int, float, float]]:
+    def _blend_map(self, planes=None) -> Dict[int, Tuple[int, float, float]]:
         """``{channel: (mode, opacity, checker cells)}`` for the shown channels.
 
         Only an OVERLAY channel carries a non-default entry: the primary's own channels
         composite additively at full strength, which is both the microscopy convention and
         exactly what they did before overlays existed. Read live from the recipe the node
-        stamped, so changing the blend or the opacity is a repaint and never a re-pull."""
+        stamped, so changing the blend or the opacity is a repaint and never a re-pull.
+
+        ``planes`` names the channel set to answer for — the displayed frame by default, the
+        detail patch's own (smaller) set when one is being composited."""
+        have = self._planes if planes is None else planes
         out = {ch: style for ch, style in (self._overlay_style or {}).items()
-               if ch in self._planes}
+               if ch in have}
         if not self._overlay_blink:
             # the hidden half of the blink: opacity 0, mode untouched, so flipping back
             # restores exactly the look the recipe asked for
@@ -1869,13 +2009,35 @@ class ViewerPanel(QWidget):
             self._repaint()
 
     def show_error(self, node_id: str, trace: str) -> None:
+        """Report a failed pull. The image, the M/T/Z ranges and the channel strip are all
+        left exactly as they were — a failure produces nothing to put there, and blanking
+        the last good frame would throw away the only thing the user still has to look at.
+
+        That makes the panel *lie*: the previous graph's picture sits under the current
+        graph's controls. So the status line has to say so, in the error colour, naming the
+        strips as well as the image. Without it a stale frame is indistinguishable from a
+        fresh one, and the failure mode is nastier than a missed error message: resetting
+        Z-Project's method to ``none`` on a chain whose downstream pull then fails looks
+        exactly like the reset not working — the stale z==1 frame stays on screen with the Z
+        strip still spanning a single plane, so the node that *did* do its job takes the
+        blame (2026-08-04)."""
         self._stop_play()
         last = [ln for ln in trace.strip().splitlines() if ln.strip()][-1]
-        self._status.setText(f"{node_id} FAILED — {last}")
+        stale = (" · SHOWING THE PREVIOUS RESULT — the image and the M/T/Z ranges below "
+                 "are the last successful pull's, not this graph's" if self._planes else "")
+        self._set_status(f"{node_id} FAILED — {last}{stale}", error=True)
         self._view.setToolTip(trace)
 
     def show_running(self, node_id: str) -> None:
-        self._status.setText(f"pulling {node_id}…")
+        self._set_status(f"pulling {node_id}…")
+
+    def _set_status(self, text: str, *, error: bool = False) -> None:
+        """Write the status line, tinting it :data:`~nodelab_v2.theme.ERROR` for a failed
+        pull and clearing that tint for every ordinary message — so the warning cannot
+        outlive the stale frame it is about."""
+        self._status_error = bool(error)
+        self._status.setText(text)
+        self._status.set_color(T.ERROR if error else T.MUTED)
 
     # ── axes / channels rebuild ────────────────────────────────────────────────
     @staticmethod
@@ -1972,13 +2134,37 @@ class ViewerPanel(QWidget):
         n_total = nc + len(ovl_idx)
 
         # keep only still-valid active channels; default to channel 0 if none. An overlay
-        # channel is switched ON the moment it appears — an overlay you have to go and
-        # enable is an overlay that looks broken.
+        # channel is switched ON the moment it FIRST appears — an overlay you have to go and
+        # enable is an overlay that looks broken — but only the first time: one the user
+        # switched off stays off, where before every pull switched it back on and its toggle
+        # button looked broken instead (2026-08-05, "each channel should be its state from
+        # before"). `_chan_seen` is keyed the same way the colour override is, so it survives a
+        # node switch and a re-pull for the same reason.
+        # The first-appearance rule applies to the payload's OWN channels too, not just to
+        # overlay ones. It used to run over `ovl_idx` alone — indices >= nc — and
+        # `channel.merge` grows the real channel axis (`merge.py`: `replace(ax, c=ax.c +
+        # sax.c, …)`), so its new channels are INSIDE nc and were only ever filtered by the
+        # line above, never appended. The result was the merge's own headline symptom: the
+        # buttons appear with the right names and the picture does not change, because the
+        # channels the node was added to combine arrive switched off.
+        #
+        # `_chan_seen` is keyed by channel NAME (`_color_key`), so "first appearance" means
+        # first time that named channel is seen in this session — a channel the user switched
+        # off stays off through a node switch and a re-pull, which is the property the
+        # overlay version was written for and the reason this can be widened safely.
         self._active_channels = [c for c in self._active_channels
                                  if c < nc or c in ovl] or [0]
-        for i in ovl_idx:
-            if i not in self._active_channels:
-                self._active_channels.append(i)
+        # Auto-enable stops at the sampler bank, so the DEFAULT state is always one the
+        # composite can actually render. Past that the user can still switch more on and the
+        # status line says what the composite dropped — but arriving in a state that silently
+        # hides a channel would be the same defect this loop is here to fix.
+        for i in list(range(nc)) + ovl_idx:
+            key = self._color_key(i)
+            if key not in self._chan_seen:
+                self._chan_seen.add(key)
+                if (i not in self._active_channels
+                        and len(self._active_channels) < _GL_MAX_CH):
+                    self._active_channels.append(i)
 
         # rebuild the per-channel LUT columns: [channel toggle] over [its histogram]
         for col in self._lut_cols:
@@ -2201,15 +2387,45 @@ class ViewerPanel(QWidget):
             self._play_btns[ax].setText("⏸")
             self._last_frame_t = None
             self._fps_ema = None
-            self._play_timer.start(self._interval_ms(ax))
+            self._gated = False
+            # The gate may be raised by the handler this emit reaches (the window asks the
+            # runner to preload the series first), so it goes out BEFORE the timer starts —
+            # otherwise the first tick lands on a cold frame and playback begins by stuttering,
+            # which is the thing the preload exists to prevent.
+            self.playing.emit(True, ax)
+            if not self._gated:
+                self._play_timer.start(self._interval_ms(ax))
         else:
             if self._playing_axis == ax:
                 self._stop_play()
             self._play_btns[ax].setText("▶")
+            self.playing.emit(False, ax)
+
+    def set_play_gate(self, on: bool, note: str = "") -> None:
+        """Hold playback without stopping it — the frames are still being decoded.
+
+        The button stays in its playing state and ``_playing_axis`` is untouched, so this is
+        *not* :meth:`_stop_play`: the user asked to play, and the answer is "in a moment",
+        which is what makes a computed series play smoothly instead of at decode speed. Lower
+        the gate and the timer starts from wherever the cursor now is."""
+        on = bool(on)
+        self._gated = on
+        if on:
+            self._play_timer.stop()
+            if note:
+                self._set_status(note)
+        elif self._playing_axis is not None and self._play_btns[self._playing_axis].isChecked():
+            self._last_frame_t = None            # do not charge the wait to the frame rate
+            self._fps_ema = None
+            self._play_timer.start(self._interval_ms(self._playing_axis))
+
+    def play_gated(self) -> bool:
+        return bool(getattr(self, "_gated", False))
 
     def _stop_play(self) -> None:
         ax = self._playing_axis
         self._playing_axis = None
+        self._gated = False
         self._play_timer.stop()
         if ax is not None:
             btn = self._play_btns[ax]
@@ -2261,7 +2477,8 @@ class ViewerPanel(QWidget):
         configuration. Non-modal, so edits are seen against the live image."""
         from nodelab_v2.overlay_dialog import OverlayDialog
         if self._ovl_dialog is None:
-            dlg = OverlayDialog(self.overlays, self._renderer, self)
+            dlg = OverlayDialog(self.overlays, self._renderer, self,
+                                layer_names=self.overlay_layer_names)
             dlg.changed.connect(self._overlays_changed)
             self._ovl_dialog = dlg
             if self._ovl_sources:
@@ -2757,31 +2974,112 @@ class ViewerPanel(QWidget):
             return None
         return float(plane[py, px])
 
-    def _label_layer_values(self) -> Optional[np.ndarray]:
-        """The full-resolution 6-D integer Voxel layer the label overlay is drawing — the
-        one with the most regions, the same choice :meth:`_label_plane` makes. Full
-        resolution on purpose: :meth:`_label_plane` decimates for painting, and counting an
-        object's pixels off a decimated raster would under-report its area by the square of
-        the decimation."""
+    def point_layer_names(self) -> list:
+        """The Point tables on the viewed payload — what the Points tab's picker offers."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return []
+        return sorted({str(k[1]) for k in ds.attributes
+                       if k[0] is Domain.POINT and k[1]})
+
+    def overlay_layer_names(self, tab: str) -> list:
+        """The live layer names for a ``layer``-kind field on ``tab``.
+
+        One entry point rather than a callable per tab: the dialog is generic over
+        :data:`nodelab_v2.overlays.FIELDS` and should not learn which domain each tab means."""
+        if tab == "labels":
+            return self.label_layer_names()
+        if tab == "points":
+            return self.point_layer_names()
+        return []
+
+    def label_layer_names(self) -> list:
+        """The label rasters on the viewed payload — every integer 6-D Voxel layer, by name.
+
+        What the Labels tab's **Which layer** picker offers. Read off the payload rather than
+        the edit-time catalogue so it lists what is genuinely drawable right now."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return []
+        out = []
+        for (dom, _layer, name), attr in ds.attributes.items():
+            if dom is not Domain.VOXEL or not name:
+                continue
+            vals = attr.values
+            if np.issubdtype(vals.dtype, np.integer) and vals.ndim == 6:
+                out.append(str(name))
+        return sorted(set(out))
+
+    def _label_source(self) -> Optional[np.ndarray]:
+        """The full-resolution 6-D integer Voxel layer the Labels overlay draws.
+
+        Honours ``overlays.labels.layer`` when it names a raster that is present; otherwise
+        falls back to the historical guess — the one with the most regions in the viewed
+        plane. The fallback is what made this unpredictable: several label rasters on one
+        Dataset is the normal case, so "most regions" silently drew whichever was most
+        fragmented and no click could change it (2026-08-04).
+
+        Shared with :meth:`_label_plane` so the picked raster, the painted outline and the
+        object-size probe can never disagree about WHICH layer is on screen."""
         ds = self._dataset
         if ds is None or not hasattr(ds, "attributes"):
             return None
+        want = str(getattr(self.overlays.labels, "layer", "") or "").strip()
         m, t, z, c = self._payload_coords()
-        best, best_regions = None, 1
-        for (dom, _layer, _name), attr in ds.attributes.items():
-            if dom is not Domain.VOXEL:
+        # Auto prefers the layers the VIEWED NODE itself produced, in declaration order — you
+        # view a node to see what it made (2026-08-04). Ranking every raster on the payload by
+        # id instead drew the seeds branch's labels, or the copied areas raster whose ids are
+        # the SOURCE's (in the hundreds while a handful of its regions survive).
+        rasters = {}
+        for (dom, _layer, name), attr in ds.attributes.items():
+            if dom is not Domain.VOXEL or not name:
                 continue
             vals = attr.values
-            if not np.issubdtype(vals.dtype, np.integer) or vals.ndim != 6:
-                continue
+            if np.issubdtype(vals.dtype, np.integer) and vals.ndim == 6:
+                rasters[str(name)] = vals
+        if want:
+            if want in rasters:
+                return rasters[want]       # an explicit pick wins, empty plane or not
+            # named a layer this payload does not carry (a stale pick, or a graph edit that
+            # renamed it) — fall through to the guess rather than draw nothing
+            return self._label_source_auto()
+        if self.own_layers_cb is not None and self._node_id:
+            try:
+                for nm in self.own_layers_cb(self._node_id):
+                    if nm in rasters:
+                        return rasters[nm]
+            except Exception:  # noqa: BLE001 — a preference must never break the view
+                pass
+        best, best_regions = None, 0
+        for vals in rasters.values():
             try:
                 plane = vals[m, t, z, c]
             except IndexError:
                 continue
-            regions = int(plane.max())
+            # COUNT the regions; `plane.max()` is the largest id, which a raster carrying
+            # another node's numbering wins on while showing almost nothing
+            regions = int(np.count_nonzero(np.unique(plane)))
             if regions >= 1 and regions >= best_regions:
                 best, best_regions = vals, regions
         return best
+
+    def _label_source_auto(self) -> Optional[np.ndarray]:
+        """:meth:`_label_source` with the explicit pick ignored — what a STALE pick falls back
+        to, so a layer that has been renamed away draws the node's own output instead of
+        nothing."""
+        keep = getattr(self.overlays.labels, "layer", "")
+        try:
+            self.overlays.labels.layer = ""
+            return self._label_source()
+        finally:
+            self.overlays.labels.layer = keep
+
+    def _label_layer_values(self) -> Optional[np.ndarray]:
+        """The full-resolution raster the label overlay is drawing. Full resolution on
+        purpose: :meth:`_label_plane` decimates for painting, and counting an object's pixels
+        off a decimated raster would under-report its area by the square of the
+        decimation."""
+        return self._label_source()
 
     def _probe_object_size(self, pt: Tuple[float, float], *,
                            volume: bool) -> Optional[float]:
@@ -3025,6 +3323,49 @@ class ViewerPanel(QWidget):
             return 0
         return len(self._points_here())
 
+    def _point_tally(self) -> Tuple[int, int]:
+        """``(on the viewed plane, on the viewed frame)`` — the status line's two counts.
+
+        The pair exists because the two numbers genuinely differ, and reporting only the
+        first is what let a real result read as an empty one: a 3-D detection's ``z`` is a
+        continuous depth, so its particles spread across the planes they were found at and
+        the plane the cursor happens to sit on may hold none of them. The status line then
+        said *nothing at all* (the count was suppressed when it was zero), so there was no
+        way to tell "detected nothing" from "detected 41 000, none on this plane".
+
+        Counted straight off the dataset rather than off :attr:`_geo_points`, and that is the
+        whole point: the drawn marks depend on ``z_project``, so with projection OFF — the
+        default — every mark is on-plane, the two numbers would always agree and the
+        off-plane note could never appear. The tally has to answer "what did this frame
+        detect", which is not a question about what is currently being drawn.
+        """
+        if not (self.overlays.points.enabled and self._axes is not None):
+            return (0, 0)
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return (0, 0)
+        m, t, z, _c = self._payload_coords()
+        by_layer: Dict[Any, Dict[str, np.ndarray]] = {}
+        for (dom, layer, name), attr in ds.attributes.items():
+            if dom is Domain.POINT:
+                by_layer.setdefault(layer, {})[name] = attr.values
+        on = frame = 0
+        for cols in by_layer.values():
+            if "y" not in cols or "x" not in cols:
+                continue
+            keep = np.ones(len(cols["y"]), dtype=bool)
+            for key, want in (("m", m), ("t", t)):
+                if key in cols:
+                    keep &= np.asarray(cols[key]) == want
+            frame += int(keep.sum())
+            zs = cols.get("z")
+            if zs is None:
+                on += int(keep.sum())
+            else:
+                # np.rint matches the paint path's round() — both round half to even
+                on += int((keep & (np.rint(np.asarray(zs, dtype=float)) == z)).sum())
+        return (on, frame)
+
     def _point_marks(self) -> List[OV.PointMark]:
         """Every Point-domain row that belongs on the viewed frame, as draw-ready marks.
 
@@ -3034,6 +3375,17 @@ class ViewerPanel(QWidget):
         — so a detection keeps one colour across frames; the layer index is the per-layer
         key. With ``z_project`` on, off-plane detections come along flagged
         ``on_plane=False`` and the renderer dims them.
+
+        **``z_project`` is authoritative for every layer, including a 3-D one.** A previous
+        revision made a ``z_kind="subpixel"`` layer project regardless of the setting, on the
+        reasoning that a continuous depth belongs to the volume rather than to one plane. It
+        was the wrong call twice over: the checkbox became inert, and on a real 3-D detection
+        it drew *every* plane's particles at once — thousands of overlapping glyphs at the
+        off-plane opacity blend into one flat wash, so a per-point palette also stopped
+        looking like a palette. The problem it was trying to solve (a plane that holds none
+        of the detections reading as "nothing was detected") is solved by
+        :meth:`_point_tally` reporting the off-plane count in the status line, which costs
+        the picture nothing.
         """
         ds = self._dataset
         if ds is None or not hasattr(ds, "attributes"):
@@ -3045,6 +3397,12 @@ class ViewerPanel(QWidget):
         for (dom, layer, name), attr in ds.attributes.items():
             if dom is Domain.POINT:
                 by_layer.setdefault(layer, {})[name] = attr.values
+        # one table when the picker names a present one; every table otherwise (2026-08-04).
+        # A pick this payload lacks falls through to all, rather than drawing nothing — the
+        # same rule the Labels picker uses for a stale name.
+        _want = str(getattr(self.overlays.points, "layer", "") or "").strip()
+        if _want and _want in {str(k) for k in by_layer}:
+            by_layer = {k: v for k, v in by_layer.items() if str(k) == _want}
         out: List[OV.PointMark] = []
         # sorted: the per-layer colour must not depend on dict insertion order
         for li, layer in enumerate(sorted(by_layer, key=lambda v: str(v))):
@@ -3060,11 +3418,13 @@ class ViewerPanel(QWidget):
                     continue
                 if ts is not None and int(ts[i]) != t:
                     continue
-                on_plane = zs is None or round(float(zs[i])) == z
+                zpl = z if zs is None else int(round(float(zs[i])))
+                on_plane = zpl == z
                 if not on_plane and not project:
                     continue
                 key = OV.slot_of(slots, int(ids[i])) if ids is not None else i + 1
-                out.append(OV.PointMark(float(ys[i]), float(xs[i]), key, li, on_plane))
+                out.append(OV.PointMark(float(ys[i]), float(xs[i]), key, li, on_plane,
+                                        zpl))
         return out
 
     def _points_here(self):
@@ -3077,26 +3437,19 @@ class ViewerPanel(QWidget):
         return [(mk.y, mk.x) for mk in marks if mk.on_plane]
 
     def _label_plane(self) -> Optional[np.ndarray]:
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes") or self._ref_plane is None:
+        """The viewed plane of the chosen label raster, decimated to the reference plane.
+
+        Selection lives in :meth:`_label_source` — one place, so the outline that is painted
+        and the raster the size-probe counts are always the same layer."""
+        if self._ref_plane is None:
+            return None
+        vals = self._label_source()
+        if vals is None:
             return None
         m, t, z, c = self._payload_coords()
-        best = None
-        best_regions = 1
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is not Domain.VOXEL:
-                continue
-            vals = attr.values
-            if not np.issubdtype(vals.dtype, np.integer) or vals.ndim != 6:
-                continue
-            try:
-                plane = vals[m, t, z, c]
-            except IndexError:
-                continue
-            regions = int(plane.max())
-            if regions >= 1 and regions >= best_regions:
-                best, best_regions = plane, regions
-        if best is None:
+        try:
+            best = vals[m, t, z, c]
+        except IndexError:
             return None
         ay, ax_ = best.shape
         ty = max(1, int(np.ceil(ay / self._ref_plane.shape[0])))
@@ -3396,6 +3749,21 @@ class ViewerPanel(QWidget):
             ids_of[key] = ids
             obj_row[key] = np.full(len(ids), -1, dtype=np.int64)
         prefer: Dict[int, int] = {}
+        # Every layer numbers its ids from 0, so objects in two different layers would PREFER
+        # the same slots — and keep them, because the neighbour graph below is built per layer
+        # (two marks in different layers are never neighbours, so de-confliction never looks
+        # at the pair). The result was a point in one layer painted the same colour as a point
+        # in another under `per_point`: a 4-row and a 2-row Point layer gave 4 colours for 6
+        # marks. Each layer therefore gets its own disjoint band of preferences. The first
+        # band starts at 0, so a single-layer dataset — which is nearly every dataset — keeps
+        # exactly the colours it had, and a track still prefers its first member's slot
+        # because both halves are offset by the same layer's base.
+        layer_base: Dict[Any, int] = {}
+        _base = 0
+        for key in sorted(ids_of, key=str):
+            layer_base[key] = _base
+            ids = ids_of[key]
+            _base += int(max(0, int(ids.max()) + 1)) if ids.size else 0
         track_slots: Dict[Any, Tuple[np.ndarray, np.ndarray]] = {}   # layer → (tids, objs)
         next_obj = 0
         for tlayer in sorted(tracks, key=str):
@@ -3425,7 +3793,8 @@ class ViewerPanel(QWidget):
             # already wears the frame it appears in
             first = np.full(len(uniq), np.iinfo(np.int64).max, dtype=np.int64)
             np.minimum.at(first, inv, ids[rows])
-            prefer.update({int(o): int(f) for o, f in zip(objs.tolist(), first.tolist())})
+            prefer.update({int(o): int(f) + layer_base.get(mkey, 0)
+                           for o, f in zip(objs.tolist(), first.tolist())})
             track_slots[tlayer] = (uniq, objs)
         for key, ids in ids_of.items():             # untracked rows: each is its own object
             loose = np.nonzero(obj_row[key] < 0)[0]
@@ -3433,7 +3802,7 @@ class ViewerPanel(QWidget):
                 objs = np.arange(next_obj, next_obj + loose.size, dtype=np.int64)
                 next_obj += loose.size
                 obj_row[key][loose] = objs
-                prefer.update({int(o): int(v)
+                prefer.update({int(o): int(v) + layer_base.get(key, 0)
                                for o, v in zip(objs.tolist(), ids[loose].tolist())})
 
         # ── 2. neighbour graph, per sampled frame, deduplicated across frames ──
@@ -3649,7 +4018,9 @@ class ViewerPanel(QWidget):
                 background:{T.ACCENT_DIM.name()}; border-color:{T.ACCENT.name()};
                 color:{T.ACCENT.name()}; }}
         """)
-        self._status.set_color(T.MUTED)      # self-painted (elided) → QSS can't reach it
+        # self-painted (elided) → QSS can't reach it. A live "showing the previous result"
+        # warning keeps its tint: a theme change must not turn it back into a routine line.
+        self._status.set_color(T.ERROR if self._status_error else T.MUTED)
         for strip in self._sliders.values():
             strip.update()                   # self-painted from the live theme tokens
         for idx, b in self._chan_btns.items():

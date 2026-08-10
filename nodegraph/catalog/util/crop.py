@@ -14,7 +14,7 @@ from nodegraph.streaming import WindowView
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_GRAN
-from nodegraph.catalog._shared.sampling import _sampled
+from nodegraph.catalog._shared.sampling import Z_STAMP, _sampled
 
 # ── Crop (axis-changing: shrink Y,X and, in 3D, Z) ──────────────────────────────
 
@@ -47,7 +47,16 @@ def _compute_crop(ctx: EvalContext) -> Dataset:
     # source dtype is preserved, and a kernel op downstream clips its halo at THIS
     # view's extents (= the eager reflect-at-crop-edge behavior, V2.04 §6b).
     view = WindowView(prov, z0=z0, y0=y0, x0=x0, axes=new_axes)
+    # A crop that keeps the FULL lateral extent only cuts along z, so every (y,x) address
+    # still points at the same physical location — the `z:` marker says so, and a consumer
+    # comparing two z==1 branches then drops it (`_sampling_of`). This is what lets a
+    # single-plane z-crop of one channel be read against a Z-PROJECTION of another: both
+    # collapse z, neither moves anything laterally. The moment y or x is windowed the corner
+    # MOVES, and the stamp must stay comparable or a voxel-for-voxel consumer would read
+    # every object at an offset.
+    lateral_identity = (y0 == 0 and y1 == ax.y and x0 == 0 and x1 == ax.x)
     out = _sampled(ds.with_image(view).reshaped_axes(new_axes),
+                   f"{Z_STAMP if lateral_identity else ''}"
                    f"crop[z{z0}:{z1},y{y0}:{y1},x{x0}:{x1}]")
     # A crop MOVES the field's corner, so the payload must carry the moved origin or it
     # would disagree with the header the meta_transform already predicted (§8). SYNCED

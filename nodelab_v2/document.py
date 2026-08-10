@@ -28,17 +28,21 @@ from nodegraph.groups import (
     inst_id as _inst_id,
 )
 from nodegraph.iterate import (
-    ITERATE_OP, MODE_TARGET_PREFIX, SWEEP_KEY as _SWEEP_KEY,
-    unroll as _iterate_unroll, var_out_names as _var_out_names,
+    ITERATE_OP, MAX_VARIABLES as _MAX_VARIABLES, MODE_TARGET_PREFIX,
+    SWEEP_KEY as _SWEEP_KEY, TYPE_NUMBER as _TYPE_NUMBER, TYPE_TEXT as _TYPE_TEXT,
+    unroll as _iterate_unroll, var_mode_names as _var_mode_names,
+    var_out_names as _var_out_names,
 )
 from nodegraph.metadata import MetaEnvelope, propagate_meta
 from nodegraph.registry import InDataset, InString, NODES, OutDataset
 from nodegraph.serialize import from_dict as _ng_from_dict, to_dict as _ng_to_dict
-from nodegraph.sockets import Direction, SocketType, can_connect as _can_connect
+from nodegraph.sockets import (
+    Direction, SocketType, can_connect as _can_connect, can_convert as _can_convert)
 from nodegraph.zones import Zone, unroll as _unroll
 from nodelab_v2.ops import (
-    BAKE_KEY, DOCK_DOCKED, DOCK_LIVE, DOCK_OP, dock_status as _dock_status,
-    dormant_nodes, is_docked, prepare_run_graph, upstream_signature)
+    BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP,
+    dock_status as _dock_status,
+    dormant_nodes, is_docked, is_frozen, prepare_run_graph, upstream_signature)
 
 #: params key holding the sticky pinned-override list (serialized per V2.03; stripped
 #: from the params handed to the ENGINE — it is a UI annotation, not a compute input).
@@ -160,8 +164,14 @@ class GraphDocument:
         #: nodes a docked run no longer evaluates — the canvas greys these (V2.18).
         #: Recomputed by :meth:`propagate`, so it is always current with the last edit.
         self.dormant: frozenset = frozenset()
-        #: (node_id, revision) → dock status, for the per-repaint caller (see dock_status)
-        self._dock_status_cache: Dict[Tuple[str, int], Tuple[str, str]] = {}
+        #: (node_id, revision, held) → dock status, for the per-repaint caller (dock_status)
+        self._dock_status_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
+        #: the node ids the RUNNER currently holds a payload for, mirrored here because the
+        #: document is what the canvas asks for a dock's badge. Set by
+        #: :meth:`set_held_nodes`; never persisted — a hold does not survive a reload, and
+        #: writing it to the file would be the durability lie the `released` badge exists to
+        #: avoid.
+        self._held_nodes: frozenset = frozenset()
         self._listeners: List[Callable[[], None]] = []
 
     # ── listeners ────────────────────────────────────────────────────────────
@@ -570,6 +580,63 @@ class GraphDocument:
     def edge_into(self, dst: str, dst_socket: str) -> Optional[EdgeTuple]:
         return next((e for e in self.edges if e[2] == dst and e[3] == dst_socket), None)
 
+    # ── iterate targets (V2.22) ──────────────────────────────────────────────
+    def iterate_targets(self, iterate_id: str, slot: int) -> List[EdgeTuple]:
+        """The driver wires leaving variable slot ``slot`` of ``iterate_id``."""
+        outs = set(_var_out_names(slot))
+        return [e for e in self.edges if e[0] == iterate_id and e[1] in outs]
+
+    def set_iterate_target(self, iterate_id: str, slot: int, target_node: str = "",
+                           target_socket: str = "") -> None:
+        """Point one Iterate variable slot at a parameter — the dropdown's whole edit.
+
+        The wire stays the storage. Choosing from the menu builds exactly the driver edge a
+        drag would have built, so save/load, the canvas, the rewrite and the "driven by"
+        note in the inspector all keep working with nothing new to know about; the picker is
+        a second way to make the same statement, not a second place it lives. An empty
+        ``target_node`` clears the slot.
+
+        Two things are set for the user rather than left as a trap. The slot's ``v{k}_type``
+        follows the TARGET (text for a Mode or a string param, number otherwise) because
+        those are two different output sockets and picking the wrong one is a wire that
+        simply refuses to connect; and ``variables`` is raised to cover the slot, since a
+        slot the count hides is a wire the rewrite would silently pass over."""
+        rec = self.nodes.get(iterate_id)
+        if rec is None or rec.op_key != ITERATE_OP:
+            raise ValueError(f"{iterate_id!r} is not an Iterate node")
+        if not 0 <= int(slot) < _MAX_VARIABLES:
+            raise ValueError(f"variable slot {slot} is outside 0…{_MAX_VARIABLES - 1}")
+        slot = int(slot)
+        for e in self.iterate_targets(iterate_id, slot):
+            self.edges.remove(e)
+        if not target_node:
+            self._notify()
+            return
+        kind = self._iterate_target_kind(target_node, target_socket)
+        rec.modes[_var_mode_names(slot)[0]] = kind
+        try:
+            live = int(rec.modes.get("variables", "1") or 1)
+        except (TypeError, ValueError):
+            live = 1
+        if live < slot + 1:
+            rec.modes["variables"] = str(slot + 1)
+        num_out, txt_out = _var_out_names(slot)
+        self.connect(iterate_id, num_out if kind == _TYPE_NUMBER else txt_out,
+                     target_node, target_socket)
+
+    def _iterate_target_kind(self, target_node: str, target_socket: str) -> str:
+        """Which of a slot's two driver outputs can reach this target. A Mode port is a
+        name, and so is anything a STRING can convert to; everything a FLOAT reaches is
+        numeric. Same test :func:`nodegraph.sockets.can_connect` applies to the drag, so the
+        menu and the wire agree by construction."""
+        if target_socket.startswith(MODE_TARGET_PREFIX):
+            return _TYPE_TEXT
+        sock = self._socket_spec(target_node, "in", target_socket)
+        if sock is None:
+            raise ValueError(f"{target_node}.{target_socket} is not an active parameter")
+        return (_TYPE_NUMBER if _can_convert(SocketType.FLOAT, sock.type)
+                else _TYPE_TEXT)
+
     # ── graph / envelopes ────────────────────────────────────────────────────
     def to_graph(self, *, for_run: bool = False, materialize: bool = False,
                  bypass_muted: Optional[bool] = None,
@@ -913,7 +980,14 @@ class GraphDocument:
         return [nid for nid, rec in self.nodes.items() if rec.op_key == DOCK_OP]
 
     def _dock_seed_envs(self) -> Dict[str, MetaEnvelope]:
-        """The manifest envelope for each docked node that has a readable checkpoint."""
+        """The manifest envelope for each docked node that has a readable checkpoint.
+
+        ``docked`` only, deliberately. A ``held`` dock's envelope cannot come from here —
+        there is no manifest to read — so the runner supplies it from the held payload
+        through :meth:`set_meta_seed`, the same hook an envelope the document is *handed*
+        rather than reads already uses. Falling back to a derived one here would describe
+        the held node by whatever the chain looks like NOW, which is exactly the thing a
+        frozen node is not."""
         from nodegraph.checkpoint import checkpoint_envelope
         out: Dict[str, MetaEnvelope] = {}
         for nid in self.dock_nodes():
@@ -932,8 +1006,8 @@ class GraphDocument:
         """The greyed-out set: nodes no docked run will evaluate. Read off the plain
         (un-materialized, un-muted-bypassed) graph so the ids are the ones the canvas
         draws — a group instance greys as a whole, which is what the user sees."""
-        if not any(is_docked(r) for r in self.nodes.values()):
-            return frozenset()
+        if not any(is_frozen(r) for r in self.nodes.values()):
+            return frozenset()          # FROZEN: a held dock greys its chain out too
         try:
             return dormant_nodes(self.to_graph())
         except Exception:  # noqa: BLE001 — mid-edit; nothing greys rather than crashing
@@ -1010,13 +1084,18 @@ class GraphDocument:
         rec = self.nodes.get(node_id)
         if rec is None or rec.op_key != DOCK_OP:
             return ("", "")
-        key = (node_id, self.revision)
+        # The held set is part of the key: holding or releasing changes the answer for a
+        # `held` node ("held" vs "released") without editing the graph, so it cannot bump the
+        # revision — bumping it would invalidate every memo entry, which is the opposite of
+        # what a hold is for.
+        key = (node_id, self.revision, self._held_nodes)
         hit = self._dock_status_cache.get(key)
         if hit is not None:
             return hit
         try:
             g = self.to_graph(bypass_muted=True)
-            got = (_dock_status(g, node_id, store=self.dock_store(node_id))
+            got = (_dock_status(g, node_id, store=self.dock_store(node_id),
+                                held=self._held_nodes)
                    if node_id in g.nodes else ("", ""))
         except Exception:  # noqa: BLE001 — mid-edit: say nothing rather than crash a paint
             return ("", "")
@@ -1045,6 +1124,36 @@ class GraphDocument:
         rec.modes["state"] = DOCK_DOCKED
         if precision:
             rec.modes["precision"] = str(precision)
+        self._notify()
+
+    def set_held_nodes(self, node_ids: Any) -> None:
+        """Mirror the runner's hold registry so the canvas can tell ``held`` from
+        ``released``.
+
+        Clears the status cache and pings the listeners so the cards repaint, but deliberately
+        does **not** go through :meth:`_notify`, because that bumps ``revision`` — and the
+        revision is what keys the memo and the runner's cached Engine. Bumping it here would
+        invalidate every memo entry, dropping exactly the computed payloads a hold exists to
+        keep, which is the opposite of the feature. Holding is not an edit to the user's graph.
+        """
+        ids = frozenset(node_ids)
+        if ids == self._held_nodes:
+            return
+        self._held_nodes = ids
+        self._dock_status_cache.clear()
+        for fn in list(self._listeners):        # repaint only — no revision, no re-propagate
+            fn()
+
+    def set_dock_hold(self, node_id: str, held: bool) -> None:
+        """Switch ``node_id`` between ``held`` and ``live``.
+
+        The counterpart of :meth:`set_dock_bake` for the session tier, and deliberately much
+        thinner: there is no store to record, no bake id to claim and no precision to stamp,
+        because nothing was written. The mode is the whole state."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key != DOCK_OP:
+            return
+        rec.modes["state"] = DOCK_HELD if held else DOCK_LIVE
         self._notify()
 
     def _relative_store(self, store: str) -> str:
@@ -1088,7 +1197,14 @@ class GraphDocument:
         offered here (``analysis.measure``'s ``raw``, and the ``reference`` of
         ``dvc_field``/``dic_correlate``): the payload flows from the PRIMARY input, and
         ``propagate_meta`` agrees — it builds the envelope from ``dataset_preds[0]``
-        alone. So follow the primary edge only.
+        alone. So follow the primary edge by default.
+
+        The exception is a socket declaring **``layer_from``** (V2.22), which reads its
+        layer off a NAMED second input because its node combines structure produced by two
+        different branches — ``analysis.voronoi`` takes its seed dots from one chain and
+        the areas it clips them to from another, and no single wire can carry both. Such a
+        socket follows that edge, and falls back to the primary when it is unwired, which
+        is what keeps a pre-existing single-wire graph offering the right names.
 
         Never falls back to this node's OWN envelope: that already contains the layers
         this node writes, so a source picker would offer the node its own output."""
@@ -1113,7 +1229,13 @@ class GraphDocument:
                         if s.type is SocketType.DATASET), None)
         if primary is None:
             return []
-        edge = self.edge_into(node_id, primary)
+        # a `layer_from` socket reads the named second input; unwired, it falls back to
+        # the primary exactly as the compute does
+        edge = None
+        if sock.layer_from:
+            edge = self.edge_into(node_id, sock.layer_from)
+        if edge is None:
+            edge = self.edge_into(node_id, primary)
         if edge is None:
             return []
         return list(self.env(edge[0]).layers_in(domain))
@@ -1134,6 +1256,51 @@ class GraphDocument:
                 doms = doms | self.env(src).domains
         return doms
 
+    def own_label_layers(self, node_id: str) -> list:
+        """The Voxel layer names this node ITSELF produces, in declaration order.
+
+        What the Labels overlay should draw when it has not been told otherwise: you view a
+        node to see what it made. Before this, "Auto" ranked every raster on the payload by
+        the largest id in the plane — so viewing `analysis.voronoi` could draw the seeds
+        branch's labels, or the copied areas raster (whose ids are the *source's*, up in the
+        hundreds, while only a handful of its regions survive), and neither is the node's
+        answer (2026-08-04).
+
+        Declaration order is the priority: a `layer_out` socket names the node's real output
+        (`voronoi`) and `extra_layers` the auxiliary copies (`voronoi_areas`), which is exactly
+        the order to prefer them in."""
+        rec = self.nodes.get(node_id)
+        spec = rec.spec() if rec else None
+        if spec is None:
+            return []
+        from nodegraph.registry import layer_value
+        out: list = []
+        for s in spec.inputs:
+            if Domain.VOXEL in (s.layer_out or ()):
+                nm = str(layer_value(s, rec.params) or "").strip()
+                if nm and nm not in out:
+                    out.append(nm)
+        extra = getattr(spec, "extra_layers", None)
+        if extra is not None:
+            try:
+                for dom, nm in extra(dict(rec.params), dict(rec.state())) or ():
+                    if dom is Domain.VOXEL and nm and str(nm) not in out:
+                        out.append(str(nm))
+            except Exception:  # noqa: BLE001 — extra_layers must never break the view
+                pass
+        return out
+
+    def socket_domains(self, node_id: str, socket: str) -> frozenset:
+        """The domains arriving on ONE Dataset input socket (empty if it is unwired).
+
+        :meth:`input_domains` unions every Dataset predecessor, which is right for deciding
+        whether a requirement is met but useless for saying *which wire brought what*. On a
+        node with two Dataset inputs the card paints the same node-level rail beside each one,
+        so hovering was the only place left that could distinguish them — and it could not,
+        until this (2026-08-04)."""
+        edge = self.edge_into(node_id, socket)
+        return self.env(edge[0]).domains if edge is not None else frozenset()
+
     def missing_domains(self, node_id: str) -> frozenset:
         """Required domains (``reads_domains``) absent from the upstream set — the
         GUI's red validation chips (e.g. a Measure node with no Label upstream)."""
@@ -1141,7 +1308,10 @@ class GraphDocument:
         spec = rec.spec() if rec else None
         if spec is None:
             return frozenset()
-        return spec.missing_domains(self.input_domains(node_id))
+        # resolved against this instance's mode state (V2.22) — a conditional read
+        # (`analysis.voronoi` under `bound=per_region`) is required here and absent two
+        # dropdown values away, and a static answer had to be wrong in one of them.
+        return spec.missing_domains(self.input_domains(node_id), rec.state())
 
     def set_meta_seed(self, node_id: str, env: MetaEnvelope) -> None:
         self.meta_seeds[node_id] = env

@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from nodegraph.dataset import AxisSizes, Dataset
 from nodegraph.domains import is_structure
 from nodegraph.engine import EvalContext
-from nodegraph.metadata import stitch as _meta_stitch
+from nodegraph.metadata import drop_position_keys, stitch as _meta_stitch
 from nodegraph.provider import ArrayProvider
 from nodegraph.registry import Granularity, InBool, InDataset, InFloat, InInt, Mode, OutDataset
 from nodegraph.streaming import MultiViewProvider, stream_fp
@@ -400,6 +400,16 @@ def _compute_stitch(ctx: EvalContext) -> Dataset:
             f"object at the wrong place on the canvas, and objects seen twice across a "
             f"seam would stay duplicated. Stitch BEFORE detection/labelling, then run the "
             f"analysis on the mosaic.")
+    if int(ax.m) < 2:
+        raise ValueError(
+            "this input has only ONE multipoint, so there is no tile grid to stitch — the "
+            "output would be a copy of the single field on a canvas its own size.\n"
+            "The usual cause is the solo-frame troubleshooting scope (F9), which narrows M "
+            "to the position the cursor is on: it makes a per-frame node cheap, but this "
+            "node's unit of work IS every M at one (t, z, c), so scoping M does not make it "
+            "faster — it changes what it produces. Pick every position on the M strip, or "
+            "turn the scope off, then stitch.\n"
+            "If the file really has one position, this node has nothing to do — delete it.")
     blend = ctx.params.get("__modes__", {}).get("blend", "feather")
     offsets, canvas_h, canvas_w, note = _stitch_layout(ctx, ds, prov, ax)
     new_axes = replace(ax, m=1, y=canvas_h, x=canvas_w)
@@ -443,7 +453,23 @@ def _compute_stitch(ctx: EvalContext) -> Dataset:
     # M→1 collapses twelve origins into the mosaic's union corner; sync it from the env
     # (post-`_meta_stitch`) so payload and header agree.
     origin = ctx.calib("origin_um")
-    return out.with_metadata(origin_um=origin) if origin is not None else out
+    if origin is not None:
+        out = out.with_metadata(origin_um=origin)
+    # ...and retire the OTHER per-M lists in the same breath. They are read positionally
+    # (`stage_xy_um[m]`), so leaving a 49-entry log on a 1-position canvas does not read as
+    # stale — the Viewer's hover readout computes an absolute stage coordinate from
+    # position 0's centre and the CANVAS width, i.e. a confident wrong answer that looks
+    # like a handedness bug. Dropping rather than subsetting is the honest move: after a
+    # stitch there is no per-position stage coordinate left to keep, only one canvas, and
+    # `origin_um` above already carries its corner — which is exactly why
+    # `placement.field_box` prefers `origin_um` and keeps the stage log as a fallback only
+    # for a Dataset that never crossed the calibration seam.
+    #
+    # This matters most under a BAKE: `write_checkpoint` copies `ds.metadata` into the
+    # manifest, so without this the transient wrong list becomes a permanent one that
+    # `checkpoint_envelope` then feeds to every downstream node.
+    retire = drop_position_keys(out.metadata)
+    return out.with_metadata(**retire) if retire else out
 _STITCH_FLIP_DOC = (
     "Mirror the {axis} axis when turning stage microns into canvas pixels. The ND2 does "
     "NOT record which way the camera is mounted relative to the stage, so this cannot be "

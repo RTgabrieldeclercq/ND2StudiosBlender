@@ -211,7 +211,21 @@ class Dataset:
 
     def with_layer(self, domain: Domain, name: str, values: np.ndarray,
                    layer: Optional[str] = None) -> "Dataset":
-        return self.with_attribute(AttributeLayer(domain, name, np.asarray(values), layer))
+        """Add/replace a layer. ``values`` may be anything array-like.
+
+        A read-only ``np.memmap`` is passed through **untouched** rather than through
+        ``np.asarray``, which is what makes the no-copy rule in
+        :meth:`AttributeLayer.__post_init__` reachable from here at all: ``np.asarray``
+        strips the ``memmap`` subclass and returns a *view*, so the layer failed the
+        ``isinstance`` check and then matched ``a.base is not None`` — i.e. it was COPIED
+        into RAM, which is precisely the materialization the mapping exists to avoid.
+        Only :func:`~nodegraph.checkpoint.open_checkpoint` was unaffected, because it
+        builds its :class:`AttributeLayer` directly; every ``with_layer`` caller silently
+        did not get the guarantee (found 2026-08-04 wiring up :mod:`nodegraph.spill`,
+        where a 315 GiB spilled raster came straight back into the heap)."""
+        vals = values if (isinstance(values, np.memmap)
+                          and not values.flags.writeable) else np.asarray(values)
+        return self.with_attribute(AttributeLayer(domain, name, vals, layer))
 
     def without(self, domain: Domain, name: str,
                 layer: Optional[str] = None) -> "Dataset":

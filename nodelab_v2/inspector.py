@@ -43,15 +43,32 @@ from PySide6.QtWidgets import (
 from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
 from nodelab_v2.node_item import (
-    NodeItem, mode_hover_text, option_hover_text, socket_hover_text,
+    NUM_MAX_FLOAT, NUM_MAX_INT, NodeItem, float_editor_precision, mode_hover_text,
+    option_hover_text, socket_hover_text, value_step,
 )
-from nodegraph.iterate import ITERATE_OP, SWEEP_KEY, plan as iterate_plan
+from nodegraph.iterate import (
+    ITERATE_OP, MAX_VARIABLES as ITERATE_MAX_VARIABLES, SWEEP_KEY, TYPE_TEXT,
+    candidate_targets, plan as iterate_plan,
+)
 from nodelab_v2.document import is_driver_edge as _is_driver
 from nodelab_v2.ops import DOCK_OP, PRECISION_UNSET, bake_record
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 
 _UNIT = {"um": "µm", "um_axial": "µm↕", "um2": "µm²", "um3": "µm³",
          "nm": "nm", "s": "s", "px": "px"}
+
+
+#: How an Iterate target combo carries ``(node_id, socket)`` on one item. A STRING rather
+#: than the tuple itself, because the item data is round-tripped through a QVariant and a
+#: string is the one form whose equality ``QComboBox.findData`` is guaranteed to reproduce.
+#: The separator is a control character no socket or node id can contain.
+_TOKEN_SEP = "\x1f"
+#: the sentinel meaning "leave the hand-wired targets alone" (see ``_MANY_TARGETS``)
+_KEEP_TARGET = "keep"
+
+
+def _target_token(node_id: str, socket: str) -> str:
+    return f"{node_id}{_TOKEN_SEP}{socket}"
 
 
 def _clean_path(s: str) -> str:
@@ -99,13 +116,49 @@ class _NoWheelCombo(QComboBox):
 
 
 def _derived_value(node: NodeItem, s) -> float:
-    """The LIVE metadata-derived value from the node's propagated envelope (G8 —
-    replaces the old hard-coded preview table)."""
+    """The LIVE auto value for a numeric socket — the metadata-derived value from the node's
+    propagated envelope (G8), or what the loaded model was trained with (V2.23). Both arrive
+    through ``NodeItem.resolved``, which fixes the precedence in one place."""
     v = node.resolved(s)
     try:
         return float(v)
     except (TypeError, ValueError):
         return float(s.default) if s.default is not None else 0.0
+
+
+def _pin_value(node: NodeItem, s):
+    """The value to write into ``params`` when the user pins an auto socket — the value that
+    was on display, in the socket's OWN type.
+
+    Type matters here, unlike in ``_derived_value`` (whose only consumer is ``setValue`` on a
+    spin box). Pinning is a document edit that serializes and then reaches a compute, and a
+    BOOL socket pinned as ``1.0`` would arrive at ``bool(ctx.params.get("upsample"))`` as a
+    float that happens to be truthy — correct by accident, and wrong in the saved graph, which
+    is meant to record a flag. BOOL gained an auto state in V2.23 (ZS-DeconvNet's ``upsample``
+    is adopted from the checkpoint), so this is newly reachable.
+    """
+    v = node.resolved(s)
+    if s.type is SocketType.BOOL:
+        return bool(v)
+    if s.type is SocketType.INT:
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return int(s.default or 0)
+    if s.type is SocketType.STRING:
+        return "" if v is None else str(v)
+    return _derived_value(node, s)
+
+
+def _auto_source(node: NodeItem, s) -> str:
+    """Which source an auto socket is currently taking its value from — for the pin button's
+    tooltip, so "ƒ auto" says *auto from what*.
+
+    Worth distinguishing: a metadata-derived value moves when the incoming file changes,
+    while a checkpoint-derived one moves when the user points at a different model. A user
+    deciding whether to pin needs to know which of those they are looking at.
+    """
+    return "model" if s.name in node.trained() else "metadata"
 
 
 def _h(col) -> str:
@@ -234,6 +287,9 @@ class InspectorPanel(QScrollArea):
         self._node: Optional[NodeItem] = None
         self._auto_boxes = []              # (node, socket, box) — live ƒmd refresh (G8)
         self._last_dir = ""                # last browsed folder (seeds the next dialog)
+        # carries a refused target choice across the rebuild the choice triggers, so the
+        # reason is shown in the panel instead of being swallowed by the combo's signal
+        self._iterate_error = ""
         self._host = QWidget(); self._host.setObjectName("inspRoot")
         self.setWidget(self._host)
         self._v = QVBoxLayout(self._host)
@@ -492,7 +548,21 @@ class InspectorPanel(QScrollArea):
             lay.addWidget(lbl)
 
         try:
-            plan = iterate_plan(doc.to_graph(), node.node_id, envs=doc.envs)
+            graph = doc.to_graph()
+        except Exception:                     # noqa: BLE001 — a mid-edit graph, not a bug
+            blurb("Wire the end of the chain you are tuning back into Collect.",
+                  italic=True)
+            return sec
+
+        # The target picker comes FIRST and outside the plan, because the state it exists
+        # for is the one the plan cannot describe: a card that drives nothing yet.
+        lay.addWidget(self._iterate_targets(node, graph))
+        if self._iterate_error:
+            blurb(self._iterate_error, T.ERROR)
+            self._iterate_error = ""
+
+        try:
+            plan = iterate_plan(graph, node.node_id, envs=doc.envs)
         except (ValueError, KeyError) as exc:
             # Every refusal nodegraph.iterate raises already names its fix, so showing it
             # verbatim here is better than paraphrasing — and it arrives while the user is
@@ -500,8 +570,8 @@ class InspectorPanel(QScrollArea):
             blurb(str(exc), T.ERROR)
             return sec
         except Exception:                     # noqa: BLE001 — a mid-edit graph, not a bug
-            blurb("Wire a variable output onto a parameter, and the end of that chain "
-                  "back into Collect.", italic=True)
+            blurb("Pick a parameter above (or drag a variable output onto one), and wire "
+                  "the end of that chain back into Collect.", italic=True)
             return sec
 
         n = plan.n
@@ -541,6 +611,146 @@ class InspectorPanel(QScrollArea):
 
         lay.addWidget(self._sweep_table(plan, node.params.get(SWEEP_KEY)))
         return sec
+
+    # ── the target picker (V2.22) ───────────────────────────────────────────
+    #: what the first entry of a slot's target menu says when the slot drives nothing.
+    _NO_TARGET = "— nothing —"
+    #: the entry a slot shows when it was WIRED to several params by hand. Selecting
+    #: anything else collapses the slot onto that one target, so the menu says so before
+    #: it happens rather than quietly dropping wires the user drew.
+    _MANY_TARGETS = "several targets (wired by hand)"
+
+    def _iterate_targets(self, node: NodeItem, graph) -> QWidget:
+        """One "iterate on" dropdown per variable slot, scraped from the chain (V2.22).
+
+        The menu is :func:`nodegraph.iterate.candidate_targets` — every param and dropdown
+        of every node upstream of Collect that this card could legally drive, in chain
+        order, each one already put through the rewrite's own ``_check_target``. So the
+        offer and the refusal cannot disagree: anything listed here connects, and anything
+        the rewrite would reject never appears.
+
+        It does not replace the wire, it BUILDS one. Choosing an entry writes exactly the
+        driver edge a drag from the variable output would have written
+        (:meth:`~nodelab_v2.document.GraphDocument.set_iterate_target`), which is why the
+        canvas, the "driven by" note on the target's own editor, save/load and the rewrite
+        need to know nothing about this control."""
+        doc = node.doc
+        nid = node.node_id
+        host = QWidget()
+        v = QVBoxLayout(host)
+        v.setContentsMargins(0, 0, 0, 4)
+        v.setSpacing(3)
+
+        def note(text: str) -> None:
+            lbl = QLabel(text); lbl.setWordWrap(True); lbl.setProperty("role", "muted")
+            f = lbl.font(); f.setPointSize(9); f.setItalic(True); lbl.setFont(f)
+            v.addWidget(lbl)
+
+        if doc.edge_into(nid, "collect") is None:
+            note("Wire the END of the chain you want to tune into Collect. This menu then "
+                 "lists every parameter in that chain.")
+            return host
+        options = candidate_targets(graph, nid)
+        if not options:
+            note("Nothing upstream of Collect has a parameter this card can drive.")
+            return host
+
+        state = node.state()
+        try:
+            n_vars = int(state.get("variables", "1") or 1)
+        except (TypeError, ValueError):
+            n_vars = 1
+        n_vars = max(1, min(ITERATE_MAX_VARIABLES, n_vars))
+        for k in range(n_vars):
+            v.addWidget(self._iterate_target_row(node, k, options))
+        # One SPARE row past the live slots, so "iterate a second parameter as well" is one
+        # click rather than "first find Variables, raise it, then come back up here".
+        # Choosing in it raises `variables` (set_iterate_target does), and the rebuild turns
+        # it into an ordinary slot. Not offered under feedback, which searches exactly one.
+        if (n_vars < ITERATE_MAX_VARIABLES
+                and str(state.get("mode") or "sweep") != "feedback"):
+            v.addWidget(self._iterate_target_row(node, n_vars, options, spare=True))
+        return host
+
+    def _iterate_target_row(self, node: NodeItem, slot: int, options,
+                            *, spare: bool = False) -> QWidget:
+        doc = node.doc
+        nid = node.node_id
+        wires = doc.iterate_targets(nid, slot)
+        current = (wires[0][2], wires[0][3]) if len(wires) == 1 else None
+
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lab = QLabel("+" if spare else f"V{slot}")
+        lab.setFixedWidth(24)
+        lf = lab.font(); lf.setPointSize(9); lf.setBold(True); lab.setFont(lf)
+        if spare:
+            lab.setProperty("role", "muted")
+        lay.addWidget(lab)
+
+        combo = _NoWheelCombo()
+        combo.setToolTip(
+            ("Iterate a SECOND parameter as well — picking one here raises Variables to "
+             "%d and gives it its own value fields. Under 'grid' the run count multiplies."
+             % (slot + 1)) if spare else
+            ("Which parameter this variable iterates. The list is every parameter and "
+             "dropdown in the chain feeding Collect that this card can legally drive — "
+             "choosing one wires it, exactly as dragging the V%d output onto it would."
+             % slot))
+        combo.addItem("— add another parameter —" if spare else self._NO_TARGET, "")
+        if len(wires) > 1:
+            combo.addItem(self._MANY_TARGETS, _KEEP_TARGET)
+        last_node = ""
+        for opt in options:
+            if opt.driver_id and (opt.driver_id, opt.driver_slot) != (nid, slot):
+                continue                    # taken by another slot or another card
+            if opt.target.node_id != last_node and combo.count() > 1:
+                combo.insertSeparator(combo.count())
+            last_node = opt.target.node_id
+            text = opt.text + (" (dropdown)" if opt.target.is_mode else "")
+            combo.addItem(text, _target_token(*opt.key))
+            combo.setItemData(combo.count() - 1, self._target_tip(opt), Qt.ToolTipRole)
+        # A hand-wired target the scrape no longer offers (its node's Mode gated the socket
+        # away, something else was wired into it) must still show as the current selection —
+        # a menu that silently reads "nothing" while a driver wire exists on the canvas is
+        # the one thing this control must never do.
+        token = _target_token(*current) if current is not None else ""
+        if token and combo.findData(token) < 0:
+            combo.insertItem(1, f"{current[0]}.{current[1]}", token)
+        if len(wires) > 1:
+            combo.setCurrentIndex(combo.findData(_KEEP_TARGET))
+        elif token:
+            combo.setCurrentIndex(max(0, combo.findData(token)))
+        combo.currentIndexChanged.connect(
+            lambda _i, c=combo, k=slot: self._commit_iterate_target(node, k, c))
+        lay.addWidget(combo, 1)
+        return row
+
+    @staticmethod
+    def _target_tip(opt) -> str:
+        """One menu entry's hover: which node and socket it really is, and what picking it
+        does to the slot's Type — that Mode is set for the user, so it is worth saying where
+        the choice is made rather than leaving the change to be noticed later."""
+        kind = ("a dropdown — picking it sets this variable's Type to text and sweeps the "
+                "option names" if opt.target.is_mode else
+                "a text parameter — picking it sets this variable's Type to text"
+                if opt.kind == TYPE_TEXT else "a numeric parameter")
+        return f"{opt.detail}\n{kind}"
+
+    def _commit_iterate_target(self, node: NodeItem, slot: int, combo) -> None:
+        """Apply a target choice, then rebuild — the slot's Type may have changed, which
+        reconfigures the card's own sockets exactly as :meth:`_set_mode` does."""
+        data = str(combo.currentData() or "")
+        if data == _KEEP_TARGET:
+            return
+        target_node, _, target_socket = data.partition(_TOKEN_SEP)
+        try:
+            node.doc.set_iterate_target(node.node_id, slot, target_node, target_socket)
+        except ValueError as exc:
+            self._iterate_error = str(exc)
+        QTimer.singleShot(0, self._rebuild)
 
     def _sweep_table(self, plan, recorded) -> QWidget:
         """The results table: one row per iteration, its values, and its metric once a
@@ -594,11 +804,16 @@ class InspectorPanel(QScrollArea):
     # ── dock section ────────────────────────────────────────────────────────
     #: what each dock status means, in the user's terms — the sentence under the buttons.
     _DOCK_BLURB = {
-        "live": "Running the chain above normally. Bake it to freeze the result to disk "
-                "and stop recomputing it.",
+        "live": "Running the chain above normally. Hold it to freeze the result in memory "
+                "instantly, or Bake it to write the result to disk.",
+        "held": "Serving a frozen copy held IN MEMORY. Everything above is greyed out and "
+                "is not being evaluated. Nothing was written, so this does not free memory "
+                "and will be gone when you reopen the file — Bake it for either of those.",
+        "released": "Set to held, but the held copy is gone (memory does not survive "
+                    "reopening the file). Hold it again, or Bake it so it survives.",
         "docked": "Serving the baked checkpoint. Everything above is greyed out and is "
                   "not being evaluated or held in memory.",
-        "stale": "Still serving the OLD bake — nothing has changed behind your back. "
+        "stale": "Still serving the OLD result — nothing has changed behind your back. "
                  "Re-bake to pick up the edit, or un-dock to run the chain live.",
         "unbaked": "Set to docked, but there is nothing on disk to serve. Bake it, or "
                    "switch State back to live.",
@@ -624,7 +839,10 @@ class InspectorPanel(QScrollArea):
         # red for unbaked (docked with nothing to serve, which IS a broken run).
         if status == "stale":
             blurb.setStyleSheet(f"color:{_h(T.DIM2D)};")
-        elif status == "unbaked":
+        elif status in ("unbaked", "released"):
+            # `released` is red for the same reason `unbaked` is: the node is set to serve
+            # something it cannot, so the run is broken until the user acts. Amber would
+            # read as "older than the graph", which is a different and milder thing.
             blurb.setStyleSheet(f"color:{_h(T.ERROR)};")
         lay.addWidget(blurb)
 
@@ -644,7 +862,10 @@ class InspectorPanel(QScrollArea):
         # The precision gate is deliberate: there is no default, because the honest
         # choice depends on what the chain produced. Say so where the button is, rather
         # than letting the press fail with a dialog.
-        if precision == PRECISION_UNSET:
+        # Not shown while `held`: Precision is gated to `docked` (it chooses a STORED dtype
+        # and a hold stores nothing), so the control this sentence says is "above" would not
+        # be on screen to pick.
+        if precision == PRECISION_UNSET and status not in ("held", "released"):
             warn = QLabel("Pick a Precision above before baking — float32 is the usual "
                           "answer for a filter chain; float64 keeps every last digit at "
                           "4× the size; uint16 only suits data still in camera counts.")
@@ -653,12 +874,29 @@ class InspectorPanel(QScrollArea):
             lay.addWidget(warn)
 
         row = QHBoxLayout(); row.setSpacing(6)
+        # Hold comes FIRST and is always enabled: it is the cheap, reversible, no-precision
+        # action, so it should be the one under the cursor. Bake sits beside it as the
+        # durable (and slower, and disk-costing) alternative.
+        held_now = status == "held"
+        hold = QPushButton("Re-hold" if status in ("held", "released") else "Hold")
+        hold.setToolTip(
+            "Freeze what the chain above last produced IN MEMORY and stop evaluating it. "
+            "Effectively instant and writes nothing — the troubleshooting action. It does "
+            "not free memory and does not survive reopening the file; Bake does both.")
+        hold.clicked.connect(lambda: self.dock_action.emit(nid, "hold"))
+        row.addWidget(hold)
         bake = QPushButton("Re-bake" if rec else "Bake")
         bake.setEnabled(precision != PRECISION_UNSET)
         bake.setToolTip("Compute everything above once and write it to the dock folder, "
-                        "then serve it from there.")
+                        "then serve it from there. Slower to enter than Hold, but it frees "
+                        "memory and survives saving and reopening the graph.")
         bake.clicked.connect(lambda: self.dock_action.emit(nid, "bake"))
         row.addWidget(bake)
+        if held_now:
+            rel = QPushButton("Release")
+            rel.setToolTip("Drop the held copy and run the chain above live again.")
+            rel.clicked.connect(lambda: self.dock_action.emit(nid, "release"))
+            row.addWidget(rel)
         if status in ("docked", "stale"):
             und = QPushButton("Un-dock")
             und.setToolTip("Run the chain above live again. The bake stays on disk, so "
@@ -877,8 +1115,12 @@ class InspectorPanel(QScrollArea):
         tip = socket_hover_text(s)
         row.setToolTip(tip); lab.setToolTip(tip)
         lay.addStretch(1)
-        derived = bool(s.derive)
         pinned = s.name in node.params or s.name in node.locked
+        # A socket has an auto value when SOMETHING other than its static default speaks for
+        # it: a metadata `derive`, or the record of the model this node has loaded (V2.23).
+        # `node.trained()` is the same call the card's pill makes, so both surfaces agree.
+        trained_here = s.name in node.trained()
+        derived = bool(s.derive) or trained_here
         auto = derived and not pinned
 
         if s.type is SocketType.BOOL:
@@ -888,13 +1130,29 @@ class InspectorPanel(QScrollArea):
             # `bool` because the computes read it through `bool(ctx.params.get(...))` and
             # the param is serialized as-is.
             chk = QCheckBox()
-            chk.setChecked(bool(node.params.get(s.name, s.default)))
+            # `resolved` rather than `params.get(..., default)` so an AUTO flag shows the
+            # value actually in force — ZS-DeconvNet's `upsample` on a checkpoint trained
+            # without the 2x head must read as unticked, not as the socket's `True`. That
+            # mismatch was the whole failure this adoption exists to prevent, and a panel
+            # that displayed the wrong state would just relocate it.
+            chk.setChecked(bool(node.resolved(s)) if auto
+                           else bool(node.params.get(s.name, s.default)))
+            chk.setEnabled(not auto)
             chk.toggled.connect(lambda v, nm=s.name: self._set_param(node, nm, bool(v)))
             lay.addWidget(chk)
+            if derived:
+                lay.addWidget(self._pin_button(node, s, auto=auto, pinned=pinned))
             return row
         if s.type is SocketType.INT:
-            box = QSpinBox(); box.setRange(0, 100000)
-            box.setValue(int(node.params.get(s.name, s.default if s.default is not None else 0)))
+            ival = int(node.params.get(
+                s.name, _derived_value(node, s) if derived
+                else (s.default if s.default is not None else 0)))
+            # Range and step both widened: 100000 was reachable (an `iterations` above it was
+            # silently truncated to the ceiling), and a step of 1 makes a 33000-iteration
+            # budget 33000 clicks. Shared with the card's scrub so the two agree.
+            box = QSpinBox(); box.setRange(0, NUM_MAX_INT)
+            box.setSingleStep(int(value_step(s, ival, integer=True)))
+            box.setValue(ival)
         elif s.type is SocketType.STRING and getattr(s, "choices", ()):
             lay.addWidget(self._choice_box(node, s))
             return row
@@ -927,16 +1185,28 @@ class InspectorPanel(QScrollArea):
                 lay.addWidget(browse)
             return row
         else:
-            box = QDoubleSpinBox(); box.setRange(0.0, 1e6); box.setDecimals(3); box.setSingleStep(0.05)
             base = node.params.get(s.name, _derived_value(node, s) if derived
                                    else (s.default if s.default is not None else 0.0))
+            # Decimals/step come from the socket's MAGNITUDE, not a fixed 3/0.05: at 3
+            # decimals a 5e-5 learning rate rounded to 0.000, so the box displayed zero for a
+            # non-zero default and the smallest value reachable was 0.001. Shared with the
+            # card's scrub step so the two surfaces cannot disagree about what is typable.
+            decimals, step = float_editor_precision(s, base)
+            box = QDoubleSpinBox(); box.setRange(0.0, NUM_MAX_FLOAT)
+            box.setDecimals(decimals); box.setSingleStep(step)
             try:
                 box.setValue(float(base))
             except (TypeError, ValueError):
                 box.setValue(0.0)
         box.setEnabled(not auto)
         box.valueChanged.connect(lambda v, nm=s.name: self._set_param(node, nm, v))
-        if auto and isinstance(box, QDoubleSpinBox):
+        if auto and isinstance(box, (QDoubleSpinBox, QSpinBox)):
+            # QSpinBox joined QDoubleSpinBox here in V2.23. `refresh_derived` only calls
+            # `setValue`, which both have, so the INT case worked all along — it was simply
+            # never registered, so an auto INT box showed its build-time value and then never
+            # moved again. Latent while no INT socket had a `derive`; ZS-DeconvNet's padding
+            # margins are auto from the checkpoint, so a box that ignored a model change
+            # would show a stale margin for the wrong graph.
             self._auto_boxes.append((node, s, box))
         lay.addWidget(box)
 
@@ -946,14 +1216,34 @@ class InspectorPanel(QScrollArea):
             uf = u.font(); uf.setPointSize(9); u.setFont(uf); lay.addWidget(u)
 
         if derived:
-            btn = QToolButton(); btn.setCheckable(True); btn.setChecked(not auto)
-            btn.setText("pinned" if pinned else "ƒ auto")
-            btn.setProperty("state", "pinned" if pinned else "auto")
-            btn.setToolTip("Metadata-derived (auto). Pin to fix the value; unpin to revert."
-                           if auto else "Pinned. Click to revert to the metadata-derived value.")
-            btn.clicked.connect(lambda _c, nm=s.name: self._toggle_pin(node, nm))
-            lay.addWidget(btn)
+            lay.addWidget(self._pin_button(node, s, auto=auto, pinned=pinned))
         return row
+
+    def _pin_button(self, node: NodeItem, s, *, auto: bool, pinned: bool):
+        """The ƒ auto / pinned toggle. Shared by the BOOL branch and the numeric ones since
+        V2.23, when BOOL gained an auto state (ZS-DeconvNet's ``upsample`` is adopted from the
+        checkpoint) — two copies of this would have drifted the first time the wording changed.
+        """
+        btn = QToolButton(); btn.setCheckable(True); btn.setChecked(not auto)
+        btn.setText("pinned" if pinned else "ƒ auto")
+        btn.setProperty("state", "pinned" if pinned else "auto")
+        # The tooltip names the SOURCE, because "auto" answers the wrong question once there
+        # are two of them: a metadata-derived value tracks the incoming file, a
+        # checkpoint-derived one tracks which model is loaded, and pinning means something
+        # different against each.
+        src = _auto_source(node, s)
+        if auto and src == "model":
+            btn.setToolTip("Auto — from the loaded model's own training record. Pin to "
+                           "override it deliberately; unpin to follow the checkpoint again.")
+        elif auto:
+            btn.setToolTip("Metadata-derived (auto). Pin to fix the value; unpin to revert.")
+        elif src == "model":
+            btn.setToolTip("Pinned. Click to revert to what the loaded model was trained "
+                           "with.")
+        else:
+            btn.setToolTip("Pinned. Click to revert to the metadata-derived value.")
+        btn.clicked.connect(lambda _c, nm=s.name: self._toggle_pin(node, nm))
+        return btn
 
     def _choice_box(self, node: NodeItem, s):
         """A CLOSED dropdown for a socket declaring ``SocketSpec.choices``.
@@ -981,8 +1271,13 @@ class InspectorPanel(QScrollArea):
             box.setCurrentIndex(0)
             box.setToolTip(f"“{current}” is not one of the registered checkpoints — kept "
                            f"as saved. Pick another to replace it.")
+        # `_after_model_edit` too: this dropdown is how a PRETRAINED checkpoint is chosen
+        # (`model_name` / `model_name_3d` / `cellsam_model`), so picking another entry points
+        # the node at a different model directory — and therefore at different trained
+        # thresholds — exactly as editing a local model path does.
         box.activated.connect(
-            lambda _i, nm=s.name, b=box: self._set_param(node, nm, b.currentText()))
+            lambda _i, nm=s.name, b=box: (self._set_param(node, nm, b.currentText()),
+                                          self._after_model_edit(node)))
         return box
 
     def _layer_box(self, node: NodeItem, s):
@@ -1081,6 +1376,7 @@ class InspectorPanel(QScrollArea):
         if is_path and text != box.text():
             box.blockSignals(True); box.setText(text); box.blockSignals(False)
         self._set_param(node, name, text)
+        self._after_model_edit(node)
 
     def _browse_path(self, node: NodeItem, s, box) -> None:
         """Open the file/folder chooser this socket declares (``SocketSpec.path_kind``)
@@ -1111,6 +1407,26 @@ class InspectorPanel(QScrollArea):
         self._last_dir = path if kind == "directory" else os.path.dirname(path)
         box.setText(path)
         self._set_param(node, s.name, path)
+        self._after_model_edit(node)
+
+    def _after_model_edit(self, node: NodeItem) -> None:
+        """Rebuild the form when an edit may have changed which MODEL is loaded (V2.23).
+
+        A full rebuild rather than the cheaper ``refresh_derived``, because pointing at a
+        different checkpoint can change the form's STRUCTURE and not merely its numbers: a
+        socket with no ``derive`` — ZS-DeconvNet's padding margins, StarDist's thresholds —
+        has no auto state and therefore no pin button until a model that speaks for it is
+        loaded, and it loses both again when the path is cleared. ``refresh_derived`` only
+        calls ``setValue`` on boxes that already exist, so it cannot add or remove the
+        button, and the checkbox branch has no box registered at all.
+
+        Deferred to the next event-loop turn for the same reason ``_set_mode`` defers: this
+        runs from a widget's own signal handler, and tearing down that widget mid-emit
+        crashes. A no-op for the overwhelming majority of nodes, which declare no
+        ``trained_params`` and so can never change what a model says.
+        """
+        if node.spec is not None and node.spec.trained_params is not None:
+            QTimer.singleShot(0, self._rebuild)
 
     # ── edits (all through the document — G8 re-propagates envelopes) ────────
     def _set_param(self, node: NodeItem, name: str, value) -> None:
@@ -1137,7 +1453,7 @@ class InspectorPanel(QScrollArea):
             rec.set_locked(rec.locked - {name})                 # revert to auto
         else:
             spec_sock = node.spec.input(name) if node.spec else None
-            rec.params[name] = (_derived_value(node, spec_sock)
+            rec.params[name] = (_pin_value(node, spec_sock)
                                 if spec_sock is not None else 0.0)
             rec.set_locked(rec.locked | {name})                 # pin the derived value
         node.doc.touch()

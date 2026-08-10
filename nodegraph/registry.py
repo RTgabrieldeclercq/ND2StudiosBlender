@@ -158,6 +158,38 @@ class SocketSpec:
     layer_in: Optional[Domain] = None
     layer_in_mode: str = ""
     layer_out: Tuple[Domain, ...] = ()
+    #: WHICH Dataset input a ``layer_in`` socket picks from (V2.22). Empty = the primary,
+    #: which is what every layer socket meant until a node needed to combine structure
+    #: produced by two DIFFERENT branches — Voronoi Cells takes its seed dots from one
+    #: chain and the areas it clips them to from another, and a graph cannot put a Point
+    #: table and someone else's Label raster on one wire.
+    #:
+    #: The GUI picker follows the primary edge on purpose (``document.layer_choices``):
+    #: the payload flows from ``dataset_preds[0]`` and a ``raw``/``reference`` input's
+    #: layers must never be offered as if they were on it. So a socket that genuinely
+    #: reads the SECOND input has to say so, or the picker would offer names from a wire
+    #: its compute never looks at — which reads as "the layer picker is broken" and is
+    #: indistinguishable from a typo'd layer name.
+    #:
+    #: Falls back to the primary when the named input is UNWIRED, which is what keeps the
+    #: single-wire graphs that predate the second input working unchanged.
+    layer_from: str = ""
+    #: On an AUXILIARY Dataset input: its image is a viewer SOURCE, composited under the
+    #: primary's when this node is viewed (V2.22, reported 2026-08-04).
+    #:
+    #: The engine is one-payload-per-node and a payload has one image, so a node that reads
+    #: structure off a second branch shows only the primary's channel — "I can only see the
+    #: UV channel" on a graph whose areas came from the Red one. The display machinery to
+    #: composite two sources already exists (it is what ``view.overlay`` drives); what was
+    #: missing is any way for a socket to say it *is* one.
+    #:
+    #: Declared per socket rather than inferred for every second input, because most of them
+    #: must NOT composite: ``analysis.measure``'s ``raw`` is the unenhanced version of the
+    #: same pixels and would draw the field twice, and a ``reference`` is another timepoint
+    #: of the same channel. The ones that qualify carry genuinely different content — a
+    #: different channel, segmented independently — which is exactly the case where the node
+    #: reads a DOMAIN off the wire rather than intensities.
+    view_source: bool = False
     #: ── filesystem-path sockets (V2.15) ──────────────────────────────────────
     #: A STRING socket whose value is a PATH on the machine that runs the graph, not free
     #: text. ``path_kind`` says what the user is choosing — ``"open_file"`` (must exist),
@@ -354,6 +386,26 @@ class NodeSpec:
     # (unioned into the accumulated set that flows downstream). Both default empty —
     # an un-annotated node is domain-transparent (passes the upstream set through).
     reads_domains: FrozenSet[Domain] = frozenset()
+    #: CONDITIONAL reads, unioned onto ``reads_domains`` per mode state (V2.22):
+    #: ``{mode_name: {mode_value: frozenset(Domain)}}``. A node whose branches read
+    #: DIFFERENT domains — Voronoi Cells needs a Label instance under ``per_region`` and
+    #: nothing at all under ``frame``; Track Objects needs Label under ``target=label``
+    #: and Point under ``target=point`` — could previously express only the single static
+    #: worst case, so the catalog split into nodes that over-claimed (a false red chip on
+    #: a graph that is fine) and nodes that declared ``frozenset()`` and warned about
+    #: nothing. Both halves were silent: the rail is advisory, so nobody noticed that the
+    #: node telling you it reads Points is the one that also needs your labels.
+    #:
+    #: It is a UNION over every listed mode rather than the single-mode ``Mapping`` form
+    #: ``granularity`` uses, because the real requirements are not keyed by one dropdown:
+    #: ``transform.transfer_structure`` reads the domain named by ``from_domain`` AND the
+    #: one named by ``to_domain``, and ``flow.iterate`` needs a Global under
+    #: ``preserve=best`` OR under ``mode=feedback`` — a disjunction a single key cannot
+    #: state (the same limit that makes the socket's own ``available_in`` approximate
+    #: there). An unlisted value contributes nothing, which is how "this branch requires
+    #: no structure at all" is said.
+    reads_domains_by_mode: Mapping[str, Mapping[str, FrozenSet[Domain]]] = field(
+        default_factory=dict)
     adds_domains: FrozenSet[Domain] = frozenset()
     #: Layers this node creates that no ``layer_out`` socket can describe (V2.11):
     #: ``(params, modes) -> ((Domain, name), ...)``. Needed by the handful of producers
@@ -363,6 +415,53 @@ class NodeSpec:
     #: their READ socket names (``analysis.measure`` adds Label columns to the raster it
     #: measures). MUST be total — see ``propagate_meta``, which runs on every keystroke.
     extra_layers: Optional[Callable[..., Any]] = None
+    #: Socket values this node's LOADED MODEL was trained with (V2.23):
+    #: ``(params, modes) -> {socket_name: value}``, read from the JSON beside the weights
+    #: (``nodegraph.trained``). Same shape and the same total-function obligation as
+    #: ``extra_layers`` — it runs inside ``propagate_meta`` and the inspector rebuild, i.e.
+    #: on every keystroke, so it must never raise and never be slow.
+    #:
+    #: It declares a THIRD source for a param's value, between the two that already
+    #: existed: an explicit param still wins, and the ``SocketSpec`` default still applies
+    #: when nothing else speaks, but in between, a socket named here shows (and resolves to)
+    #: what the checkpoint on the wire was trained with. That is why it lives on the spec
+    #: rather than purely inside the compute — the inspector needs it to draw the auto/pin
+    #: box, and a value the GUI derived independently could disagree with the pull.
+    #:
+    #: It is NOT a substitute for ``SocketSpec.derive``, and the two are deliberately
+    #: separate: ``derive`` is a pure-arithmetic expression over the metadata envelope
+    #: (``eval_derive``, empty builtins, no I/O), while this reads a file whose path comes
+    #: from another param. Keeping them apart is what stops every ``derive`` read in the
+    #: app from becoming a possible disk touch.
+    #:
+    #: A **Mode** can never be sourced this way. The engine hands a compute the *resolved*
+    #: mode state, so "unset" and "explicitly the default" are indistinguishable there and
+    #: adopting would silently overwrite a deliberate choice — a checkpoint/mode
+    #: disagreement is refused instead (``enhance.zs_deconvnet``'s ``arch_3d`` and the dim
+    #: lever).
+    trained_params: Optional[Callable[..., Any]] = None
+
+    def trained(self, params: Mapping[str, Any],
+                modes: Mapping[str, Any]) -> Dict[str, Any]:
+        """Resolve :attr:`trained_params`, swallowing everything. ``{}`` for a node that
+        declares none.
+
+        The blanket ``except`` is the same call the GUI already makes around
+        ``extra_layers``, for the same reason: this runs on every keystroke on the edit-time
+        path, and a model file that turns out to be a directory (or a resolver bug) must
+        degrade to "the model states nothing" — i.e. static socket defaults — rather than
+        take down the inspector or the propagation pass. Every function in
+        ``nodegraph.trained`` is already total; this is the backstop that makes that a
+        property of the SEAM instead of a promise each resolver has to keep.
+        """
+        fn = self.trained_params
+        if fn is None:
+            return {}
+        try:
+            got = fn(dict(params or {}), dict(modes or {}))
+        except Exception:  # noqa: BLE001 — a resolver must never break edit-time propagation
+            return {}
+        return dict(got) if isinstance(got, Mapping) else {}
 
     def input(self, name: str) -> Optional[SocketSpec]:
         return next((s for s in self.inputs if s.name == name), None)
@@ -418,17 +517,43 @@ class NodeSpec:
         node adds (domain-transparent by default)."""
         return incoming | self.adds_domains
 
-    def missing_domains(self, incoming: FrozenSet[Domain]) -> FrozenSet[Domain]:
+    def resolve_reads_domains(self,
+                              state: Optional[Mapping[str, str]] = None
+                              ) -> FrozenSet[Domain]:
+        """The domains this node requires in mode ``state`` — the unconditional
+        :attr:`reads_domains` unioned with every :attr:`reads_domains_by_mode` entry the
+        state selects (V2.22). ``state=None`` resolves against :meth:`default_state`.
+
+        Mirrors :meth:`resolve_granularity`: the declaration is the honest per-branch one
+        and every consumer resolves it, so no caller has to know whether a given node
+        happens to be conditional."""
+        if not self.reads_domains_by_mode:
+            return self.reads_domains
+        st = self.default_state() if state is None else state
+        out = set(self.reads_domains)
+        for mode, table in self.reads_domains_by_mode.items():
+            out |= set(table.get(st.get(mode, ""), ()))
+        return frozenset(out)
+
+    def missing_domains(self, incoming: FrozenSet[Domain],
+                        state: Optional[Mapping[str, str]] = None) -> FrozenSet[Domain]:
         """Required domains not present upstream — the GUI's red validation chips."""
-        return self.reads_domains - incoming
+        return self.resolve_reads_domains(state) - incoming
 
 
 # ── socket / mode factories (the §11 sketch) ─────────────────────────────────
 
 def InDataset(name: str = "data", *, multi: bool = False, label: str = "",
+              view_source: bool = False, description: str = "",
               available_in: Optional[Mapping[str, FrozenSet[str]]] = None) -> SocketSpec:
+    """A Dataset input. ``description`` is the hover text, and it earns its place on a node
+    with SEVERAL Dataset inputs: the domain rail is a node-level answer painted identically
+    beside each one, so the card cannot say which wire wants what. A value socket has carried
+    prose since V2.13; a Dataset socket could not, which is why `areas`, `raw`, `secondary`
+    and `reference` all hovered as bare names."""
     return SocketSpec(name, SocketType.DATASET, Direction.IN, label=label,
-                      multi=multi, available_in=available_in)
+                      multi=multi, view_source=view_source, description=description,
+                      available_in=available_in)
 
 
 def OutDataset(name: str = "out", *, label: str = "",
@@ -464,7 +589,7 @@ def _in_value(t: SocketType):
              multi: bool = False, dims: int = 3,
              available_in: Optional[Mapping[str, FrozenSet[str]]] = None,
              layer_in: Optional[Domain] = None, layer_in_mode: str = "",
-             layer_out: Tuple[Domain, ...] = (),
+             layer_out: Tuple[Domain, ...] = (), layer_from: str = "",
              kernel_param: bool = False, description: str = "",
              path_kind: str = "", path_filter: str = "",
              path_hint: str = "", pick_kind: str = "", pick_peer: str = "",
@@ -476,7 +601,8 @@ def _in_value(t: SocketType):
                           unit=unit, derive=derive, default=default, domain=domain,
                           multi=multi, dims=dims, available_in=available_in,
                           layer_in=layer_in, layer_in_mode=layer_in_mode,
-                          layer_out=tuple(layer_out), kernel_param=kernel_param,
+                          layer_out=tuple(layer_out), layer_from=layer_from,
+                          kernel_param=kernel_param,
                           description=description, path_kind=path_kind,
                           path_filter=path_filter, path_hint=path_hint,
                           pick_kind=pick_kind, pick_peer=pick_peer,
@@ -652,9 +778,11 @@ class NodeRegistry:
                     raise ValueError(
                         f"{spec.op_key}.{s.name}: path_kind is only meaningful on a STRING "
                         f"socket, got {s.type.name}")
+            self._check_layer_from(spec, s)
             self._check_interaction(spec, s, in_names)
         for m in spec.modes:
             self._check_mode(spec, m)
+        self._check_reads_domains(spec)
         self._by_key[spec.op_key] = spec
         self._owner[spec.op_key] = _defining_module()
         self._counter += 1
@@ -803,6 +931,73 @@ class NodeRegistry:
                            "choices/vocab")
 
     @staticmethod
+    def _check_layer_from(spec: NodeSpec, s: SocketSpec) -> None:
+        """Validate :attr:`SocketSpec.layer_from` (V2.22) — which Dataset input a layer
+        socket picks from.
+
+        Silent both ways if wrong, and in the most confusing possible manner: a name that
+        matches no socket falls straight back to the primary edge, so the picker offers a
+        plausible list of names from the wrong wire while the compute reads the other one.
+        The user sees a valid-looking layer name that "doesn't exist"."""
+        if s.view_source:
+            where = f"{spec.op_key}.{s.name}"
+            ds_ins = [i.name for i in spec.inputs if i.type is SocketType.DATASET]
+            if s.type is not SocketType.DATASET:
+                raise ValueError(f"{where}: view_source is only meaningful on a Dataset "
+                                 f"input, got {s.type.name}")
+            if ds_ins and s.name == ds_ins[0]:
+                raise ValueError(f"{where}: view_source on the PRIMARY input — the primary's "
+                                 f"image is what the viewer already shows; this marks an "
+                                 f"AUXILIARY one as a second source")
+        if not s.layer_from:
+            return
+        where = f"{spec.op_key}.{s.name}"
+        if not (s.layer_in or s.layer_in_mode):
+            raise ValueError(f"{where}: layer_from={s.layer_from!r} without layer_in — "
+                             f"there is no picker for it to redirect")
+        ds_ins = [i.name for i in spec.inputs if i.type is SocketType.DATASET]
+        if s.layer_from not in ds_ins:
+            raise ValueError(f"{where}: layer_from={s.layer_from!r} is not a Dataset input "
+                             f"on this node (it has {ds_ins}) — it would silently fall back "
+                             f"to the primary edge")
+        if ds_ins and s.layer_from == ds_ins[0]:
+            raise ValueError(f"{where}: layer_from={s.layer_from!r} IS the primary input — "
+                             f"that is already the default; spelling it out suggests a "
+                             f"different input was meant")
+
+    @staticmethod
+    def _check_reads_domains(spec: NodeSpec) -> None:
+        """Validate :attr:`NodeSpec.reads_domains_by_mode` (V2.22).
+
+        Every failure here is silent at runtime — the domain rail is advisory, so a mode
+        name or value that matches nothing simply contributes no domains and the node goes
+        on under-claiming exactly as it did before the declaration was written. That is
+        indistinguishable from not having written it, which is the whole class of defect
+        this field exists to end."""
+        table = spec.reads_domains_by_mode
+        if not table:
+            return
+        by_name = {m.name: m for m in spec.modes}
+        for mode_name, per_value in table.items():
+            where = f"{spec.op_key}[{mode_name}]"
+            mode = by_name.get(mode_name)
+            if mode is None:
+                raise ValueError(
+                    f"{where}: reads_domains_by_mode names no such mode (this node has "
+                    f"{sorted(by_name)}) — it would contribute no domains in every state")
+            unknown = sorted(set(per_value) - set(mode.choices))
+            if unknown:
+                raise ValueError(
+                    f"{where}: reads_domains_by_mode keys {unknown} are not choices of "
+                    f"this mode {list(mode.choices)} — they can never be selected")
+            for value, domains in per_value.items():
+                bad = [d for d in domains if not isinstance(d, Domain)]
+                if bad:
+                    raise ValueError(
+                        f"{where}={value!r}: reads_domains_by_mode holds {bad!r}, which "
+                        f"is not a Domain")
+
+    @staticmethod
     def _check_mode(spec: NodeSpec, m: ModeSpec) -> None:
         """Validate one :class:`ModeSpec` (V2.21). Modes went unvalidated until per-option
         docs arrived, and both checks here are for failures with NO symptom: a
@@ -845,8 +1040,11 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                 supports_2d: bool = True, supports_true_3d: bool = True,
                 three_d_fallback: str = "",
                 reads_domains: FrozenSet[Domain] = frozenset(),
+                reads_domains_by_mode: Optional[
+                    Mapping[str, Mapping[str, FrozenSet[Domain]]]] = None,
                 adds_domains: FrozenSet[Domain] = frozenset(),
-                extra_layers: Optional[Callable[..., Any]] = None) -> NodeSpec:
+                extra_layers: Optional[Callable[..., Any]] = None,
+                trained_params: Optional[Callable[..., Any]] = None) -> NodeSpec:
     """Build and register a :class:`NodeSpec`."""
     return NODES.register(NodeSpec(
         op_key=op_key, label=label, category=category,
@@ -855,8 +1053,12 @@ def define_node(op_key: str, label: str, *, category: str = "general",
         footprint_mode=footprint_mode,
         meta_transform=meta_transform, supports_2d=supports_2d,
         supports_true_3d=supports_true_3d, three_d_fallback=three_d_fallback,
-        reads_domains=frozenset(reads_domains), adds_domains=frozenset(adds_domains),
+        reads_domains=frozenset(reads_domains),
+        reads_domains_by_mode={m: {v: frozenset(d) for v, d in per.items()}
+                               for m, per in (reads_domains_by_mode or {}).items()},
+        adds_domains=frozenset(adds_domains),
         extra_layers=extra_layers,
+        trained_params=trained_params,
     ))
 
 

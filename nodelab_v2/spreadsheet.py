@@ -21,6 +21,12 @@ unrolls each one into rows keyed by its own axes.
 (12.6 M for a 3-position 4-frame 1024² series), it is image-shaped by definition, and the
 Viewer already renders it.
 
+**Where the tabulation itself lives.** The four grouping functions moved to the Qt-free
+:mod:`nodelab_v2.tables` when the LabLink worker landed — a headless process needs them
+and must not import PySide6 to get them. They are re-exported here unchanged, so every
+existing ``from nodelab_v2.spreadsheet import all_tables`` keeps working and there is
+still exactly one implementation.
+
 Qt; reads only the numpy columns off the Dataset.
 """
 from __future__ import annotations
@@ -37,82 +43,10 @@ from PySide6.QtWidgets import (
 from nodegraph.domains import AXIS_ORDER, Domain, axes_of, is_lattice, is_structure
 from nodegraph.structure import COORD_COLUMNS
 from nodelab_v2 import theme as T
-
-_COORD_ORDER = {name: i for i, name in enumerate(COORD_COLUMNS)}
-
-#: domain VALUES whose rows are detected elements rather than axis indices
-#: (only affects the status line's wording).
-_STRUCTURE_NAMES = frozenset(d.value for d in Domain if is_structure(d))
-
-
-def structure_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]:
-    """Group a Dataset's structure-domain attributes into ``{(domain, layer):
-    {col_name: values}}`` — one entry per detected Label/Point/Track instance."""
-    tables: Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]] = {}
-    if dataset is None or not hasattr(dataset, "attributes"):
-        return tables
-    for (domain, layer, name), attr in dataset.attributes.items():
-        if not is_structure(domain):
-            continue
-        tables.setdefault((domain.value, layer), {})[name] = attr.values
-    return tables
-
-
-def lattice_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]:
-    """Group a Dataset's COARSE lattice attributes into the same ``{(domain, layer):
-    {col: values}}`` shape, with the domain's own axes unrolled as leading index columns.
-
-    A lattice attribute's array is shaped by ``axes_of(domain)`` in :data:`AXIS_ORDER`, so
-    a Frame layer is ``(M, T)`` and a Global layer is a scalar. Every layer on one domain
-    shares that index space, so they merge into one table: ``m, t, drift_y, drift_x``. The
-    index columns are named for the axes themselves, which is also what makes the CSV
-    self-describing without a separate header.
-
-    ``Voxel`` is excluded — see the module docstring. A layer whose stored shape does not
-    match the domain's expected shape is skipped rather than reshaped: that only happens
-    mid-edit while an axis change is propagating, and a wrong unrolling would be worse
-    than a briefly missing tab."""
-    tables: Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]] = {}
-    if dataset is None or not hasattr(dataset, "attributes"):
-        return tables
-    axes = getattr(dataset, "axes", None)
-    for (domain, layer, name), attr in dataset.attributes.items():
-        if not is_lattice(domain) or domain is Domain.VOXEL:
-            continue
-        dom_axes = tuple(a for a in AXIS_ORDER if a in (axes_of(domain) or frozenset()))
-        values = np.asarray(attr.values)
-        if axes is not None:
-            try:
-                if tuple(values.shape) != axes.shape_for(domain):
-                    continue                       # stale mid-edit shape — skip, never guess
-            except (ValueError, AttributeError):   # pragma: no cover - defensive
-                continue
-        key = (domain.value, layer)
-        cols = tables.setdefault(key, {})
-        if dom_axes and "__idx__" not in cols:
-            # one row per index tuple, in C order — the same order `ravel()` gives below
-            grid = np.indices(values.shape).reshape(len(dom_axes), -1)
-            for i, ax in enumerate(dom_axes):
-                cols[ax] = grid[i]
-            cols["__idx__"] = np.empty(0)          # marker: index columns already built
-        cols[name] = values.reshape(-1) if dom_axes else np.asarray([values.reshape(())])
-    for cols in tables.values():
-        cols.pop("__idx__", None)
-    return tables
-
-
-def all_tables(dataset) -> Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]]:
-    """Every tabulatable table on a Dataset — the detected structures AND the coarse
-    lattice attributes. The one entry point for both the panel and the export, so a layer
-    visible in the spreadsheet is always a layer you can also write to CSV."""
-    tables = structure_tables(dataset)
-    tables.update(lattice_tables(dataset))
-    return tables
-
-
-def _ordered_columns(cols: Dict[str, np.ndarray]) -> List[str]:
-    """Coordinate columns first (canonical order), then the rest alphabetically."""
-    return sorted(cols, key=lambda n: (_COORD_ORDER.get(n, len(_COORD_ORDER)), n))
+from nodelab_v2.tables import (
+    _COORD_ORDER, _STRUCTURE_NAMES, _ordered_columns, all_tables, lattice_tables,
+    structure_tables,
+)
 
 
 class SpreadsheetPanel(QWidget):

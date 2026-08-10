@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from typing import Any, Dict
+
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.provider import ArrayProvider
 from nodegraph.registry import Granularity, InDataset, InFloat, InInt, Mode, OutDataset
+from nodegraph.streaming import MapComputeProvider, stream_fp
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.drift_layers import _layers_drift
@@ -27,8 +30,31 @@ def _compute_stabilize(ctx: EvalContext) -> Dataset:
     (phase-corr) / euclidean·affine (ECC) / feature (ORB+RANSAC), and ``reference`` ∈
     first / previous (cumulative) / mean / template. WHOLE_SERIES; pixel-space (no
     calibration — pure geometric registration, like ``align.drift``). Kernel:
-    :mod:`nodegraph.kernels.registration` (numpy/scipy/skimage/cv2)."""
-    from nodegraph.kernels.registration import apply_series, estimate_series
+    :mod:`nodegraph.kernels.registration` (numpy/scipy/skimage/cv2).
+
+    **The estimate is eager, the apply is LAZY** — the same split ``align.drift`` uses,
+    and for the same reason. Estimating is inherently whole-series (a global correlation
+    per frame) but reads only ONE plane per (m, t): the reference channel at mid-z, so it
+    costs m·t plane reads no matter how deep or how many-channelled the stack is. Applying
+    is separable per plane (:func:`~nodegraph.kernels.registration.apply_frame` — frame t's
+    output depends only on frame t's pixels and frame t's transform), so it is deferred to
+    a per-plane :class:`~nodegraph.streaming.MapComputeProvider` and only the planes
+    actually pulled are ever computed.
+
+    This used to allocate ``(M,T,Z,C,Y,X)`` float64 up front and apply to every plane
+    eagerly, which made the node scale linearly in Z for a viewer showing ONE plane. On a
+    16-position 10-plane 4-channel 2048² stack that is 20.0 GiB and 640 plane-warps
+    against 2.0 GiB and 64 for the same stack z-projected — so resetting an upstream
+    Z-Project to ``none`` turned a working pull into a ~10× slower, 20 GiB one, and the
+    Viewer sat on the previous z==1 frame while it ran. The node that looked broken was
+    Z-Project; the node that could not absorb the result was this one (2026-08-04).
+
+    The footprint declaration is UNCHANGED (``WHOLE_SERIES`` + ``kernel_axes={t,y,x}``, the
+    same pair ``align.drift`` declares) and that is correct, not an oversight: laziness
+    changes when the work happens, never what the node reads. The estimate still needs
+    every timepoint of a whole plane, so a scheduler that tiled this node or fed it one
+    frame at a time would still be wrong."""
+    from nodegraph.kernels.registration import apply_frame, estimate_series
     ds = ctx.inputs[0]
     prov = ds.image
     if prov is None:
@@ -42,7 +68,6 @@ def _compute_stabilize(ctx: EvalContext) -> Dataset:
     min_conf = float(ctx.params.get("min_confidence", 0.0))
     ref_c = min(max(0, int(ctx.params.get("ref_channel", 0))), ax.c - 1)
     ref_z = ax.z // 2
-    out = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=float)
     dy = np.zeros((ax.m, ax.t), dtype=float)
     dx = np.zeros((ax.m, ax.t), dtype=float)
 
@@ -50,16 +75,42 @@ def _compute_stabilize(ctx: EvalContext) -> Dataset:
         return np.stack([prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x).astype(float)
                          for t in range(ax.t)])
 
+    # ── the estimate: eager, one transform bundle per M, off the reference plane ──
+    # Held for the lazy closure below: t shifts (or t 2×3 warps) per M — kilobytes, and
+    # the whole reason the apply needs nothing else from the estimate pass.
+    tfs: Dict[int, Dict[str, Any]] = {}
     for m in range(ax.m):
         tf = estimate_series(series_of(m, ref_z, ref_c), model=model,
                              reference=reference, upsample=upsample,
                              highpass_sigma=highpass, min_confidence=min_conf)
+        tfs[m] = tf
         shifts = np.asarray(tf["shifts"], dtype=float)
         dy[m, :], dx[m, :] = shifts[:, 0], shifts[:, 1]
-        for c in range(ax.c):
-            for z in range(ax.z):
-                out[m, :, z, c] = apply_series(series_of(m, z, c), tf)
-    res = _sampled(ds.with_image(ArrayProvider(out)), f"registration.stabilize[{model}]")
+
+    cache = ctx.tiles
+    if cache is None:                             # pre-C1 eager fallback (bare ctx)
+        # SAME per-frame kernel call as the lazy path below (apply_frame), so the two
+        # paths cannot drift in the last bits — the selftest asserts they are identical.
+        out = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=float)
+        for m in range(ax.m):
+            for t in range(ax.t):
+                for c in range(ax.c):
+                    for z in range(ax.z):
+                        plane = prov.get_region(0, m, t, z, c,
+                                                0, ax.y, 0, ax.x).astype(float)
+                        out[m, t, z, c] = apply_frame(plane, tfs[m], t)
+        res = ds.with_image(ArrayProvider(out))
+    else:
+        # WHOLE_PLANE unit: a shift/warp needs the whole plane (the vacated edge is filled
+        # with zeros, so a tile would invent a border mid-image). The transforms are baked
+        # from the eager estimate and fold into the provider fp via the BASE fingerprint —
+        # a base change re-estimates and re-keys, exactly as in align.drift.
+        fp = stream_fp("stabilize", ctx.op_key, ctx.params,
+                       ctx.reads.declared_reads(), (), prov)
+        res = ds.with_image(MapComputeProvider(
+            prov, lambda a, m, t, z, c, *_: apply_frame(a, tfs[m], t),
+            unit="plane", fp=fp, cache=cache))
+    res = _sampled(res, f"registration.stabilize[{model}]")
     # Same reason as align.drift: the content has been moved (and for the non-rigid models
     # WARPED) under an unchanged index grid, so the per-M corner no longer describes it.
     # Dropped rather than carried forward as a claim that cannot be honoured.

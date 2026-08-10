@@ -53,6 +53,7 @@ def link_objects(
     st_iter_stop_threshold: float = 1e-2,
     st_dist_missing: float = 5.0,
     st_use_prev_results: bool = False,
+    st_ndim: int = 2,
     # --- Cell-Tracker only ---
     ct_n_neighbors: int = 5,
     ct_topo_weight: float = 0.3,
@@ -117,6 +118,7 @@ track_overlap(df, masks: (T,H,W) int, min_iou=0.1, max_gap=1,
 | `frame` | int | required | 0-based time index; coerced via `int(...)`, default `0` |
 | `centroid_y_px` | float | required | object centroid **row (y)**, pixels; `None`→`0.0` |
 | `centroid_x_px` | float | required | object centroid **col (x)**, pixels; `None`→`0.0` |
+| `centroid_z_px` | float | optional | object depth, **in the same length unit as y/x** — read ONLY by SerialTrack at `st_ndim=3`; `None`→`0.0`. The caller owns the isotropy (see §12) |
 | `area_px` | float | required | object area in pixels; `None`→`0.0` (size gate) |
 | `m_position` | int | optional | multipoint index; groups detections; default `0` |
 | `label_id` | int | optional | per-frame integer mask id; **required** for CT_TOPOLOGY / CT_FINGERPRINT / CT_OVERLAP; default `0` |
@@ -167,6 +169,7 @@ sole value is used). When a group's masks are missing, CT_OVERLAP silently
 | `st_iter_stop_threshold` | float | 1e-2 | ≥ 0 | ADMM convergence threshold on the disp-update norm |
 | `st_dist_missing` | float | 5.0 | ≥ 0 | ghost-particle cull distance `ε_d` (px), late iterations |
 | `st_use_prev_results` | bool | False | — | warm-start predictor; POD-GPR stage (7+ frames) **needs scikit-learn** |
+| `st_ndim` | int | 2 | 2 \| 3 | SerialTrack coordinate columns. 3 ⇒ `centroid_z_px` becomes a real third coordinate (SerialTrack3D); the descriptor, ADMM loop and outlier constants all follow it. Every other linker is two-column by construction |
 | `ct_n_neighbors` | int | 5 | ≥ 1 | **CT_TOPOLOGY**: rotation-invariant descriptor neighbors |
 | `ct_topo_weight` | float | 0.3 | 0–1 | **CT_TOPOLOGY**: topology cost weight vs raw distance |
 | `ct_area_weight` | float | 0.3 | 0–1 | **CT_FINGERPRINT**: area-similarity weight vs distance |
@@ -481,6 +484,67 @@ node's exact use case (pre-detected coordinates, no image re-detection):
 `gbSolver 3 (ADMM)`, `smoothness 1e-2`, `outlrThres 2`, `distMissing 2`,
 `iterStopThres 1e-2`, `locSolver 1`, `n_neighborsMin 1`, `maxIterNum 20`. The
 `st_smoothness` socket default moved 0.1 → 0.01 for the same reason.
+
+**`serialtrack` is Point-only at the node (2026-08-03).** `METHOD_SERIALTRACK`
+reaches `_link_group_serialtrack`, which builds its coordinate array from
+`_cy(r)` / `_cx(r)` and touches neither `area_px` nor any raster — the method
+*is* the topology of neighbouring positions. A Label table does carry those
+centroids, so `track.objects` with `target='label'` used to run; it now refuses.
+Under that target the node declares `reads_domains = {LABEL, VOXEL}` and offers a
+raster picker — `reads_domains_by_mode` unions each mode's branch independently,
+so it cannot say "VOXEL for the other four methods only" — meaning the node
+demanded a raster this linker never opens and presented the Label-only area gate
+to the one linker that cannot consume it. The refusal is the mirror image of
+`overlap`, which is Label-only because it needs rasters to intersect, and the
+`labels` layer picker is gated off when `serialtrack` is selected so no dead
+control is offered.
+
+Kernel-side **nothing changed**: `link_objects(method=METHOD_SERIALTRACK, …)`
+still accepts any row-dicts carrying `centroid_y_px`/`centroid_x_px`, so a direct
+caller (or the validation suite, which drives `SerialTracker` itself) is
+unaffected. This is a node policy, not a kernel restriction.
+
+**SerialTrack tracks in true 3D (2026-08-04).** SerialTrack is a 2-D *and* 3-D
+method (paper Table 1) and the solver half of this kernel always implemented both
+— `_build_features_3d` / `_match_features_3d`, the 3-D ADMM loop, and (since the
+parity pass) `remove_outliers`' per-dimension constants all key off
+`coords.shape[1]`. Only the **adapter** was two-column:
+`_link_group_serialtrack` built `[[_cy(r), _cx(r)]]` unconditionally, so the one
+node that reaches it could never ask for 3-D.
+
+New: `link_objects(st_ndim=3)` → `_link_group_serialtrack(st_ndim=3)` builds
+`[[_cz(r), _cy(r), _cx(r)]]` from a new optional `centroid_z_px` row key.
+`st_ndim` is SerialTrack-only, because every other linker here is two-column by
+construction (the Hungarian and Cell-Tracker linkers correlate `(_cy, _cx)`;
+`overlap` needs `(T,H,W)` masks).
+
+**`centroid_z_px` must already be in the lateral length unit** — the caller owns
+the isotropy. The descriptor is built from Euclidean neighbour distances, so a
+raw plane index mixed with lateral pixels distorts every radius and angle the
+match depends on, by the anisotropy ratio (5–10× on a typical stack). There is no
+MATLAB behaviour to copy: upstream's 3-D examples are isotropic synthetic volumes
+with `xstep = 1`, so it never faces this. `track.objects` scales by
+`z_step_um / pixel_size_um` and refuses when either calibration is unknown.
+
+At the node this is the `st_dim` Mode (2D | 3D, default 2D, gated to
+`serialtrack`) — deliberately **not** the canonical `DimMode()`, because the GUI
+renders a `role="dim_lever"` Mode from `spec.dim_lever()`, which does not consult
+`available_in`; a gated header lever would still draw for all five methods. The
+lever is checked against the member layer's own `z_kind` in both directions: `3D`
+requires `subpixel` (a measured depth), and a 2-D-only method refuses a
+`subpixel` layer rather than ignoring the depth it carries. `serialtrack` +
+`st_dim=2D` on a `subpixel` layer is permitted and lossy — z is rounded into the
+grouping key, so planes are tracked in isolation — which is right when `z_step`
+is coarse or z is noisy, and is recorded as `track_dim` in the output metadata.
+
+3-D also switches to upstream's **3-D** constant set
+(`Example_main_3D_hardpar_inc_coords_only.m`): `gbSolver 2` (Regularization, not
+ADMM), `outlrThres 5`, `distMissing 5`, `iterStopThres 1e-3` — the 2-D values are
+2.5× tighter and the two sets are not interchangeable.
+
+The discriminating gate (`selftest::test_track_objects`) is particles drifting
+**through depth**: 60/60 keep one track id in 3-D where 2-D per-plane grouping
+holds **0**, because crossing a plane boundary changes the group key.
 
 ### Where it stands
 

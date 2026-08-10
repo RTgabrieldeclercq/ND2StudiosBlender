@@ -45,10 +45,12 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor, QFont, QImage, QMatrix4x4, QPainter, QPen, QSurfaceFormat, QVector2D,
-    QVector3D)
+    QVector3D, QVector4D)
 from PySide6.QtOpenGL import (
     QOpenGLBuffer, QOpenGLShaderProgram, QOpenGLTexture, QOpenGLVertexArrayObject)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
+
+from nodelab_v2.overlays import GL_MAX_CHANNELS as OV_GL_MAX_CHANNELS
 
 #: raw GL enums we need (QOpenGLWidget hands us a GL-ES-style functions object)
 _GL_COLOR_BUFFER_BIT = 0x4000
@@ -80,7 +82,10 @@ _TILE_GAP = 2.0
 #: a split pane: (label, the channels it composites, the label's (r,g,b))
 Tile = Tuple[str, Tuple[int, ...], Tuple[int, int, int]]
 
-_MAX_CH = 8                      # sampler bank size (microscopy rarely exceeds this)
+#: sampler bank size (microscopy rarely exceeds this). Shared with the Viewer via
+#: :data:`nodelab_v2.overlays.GL_MAX_CHANNELS` so the limit the status line reports and the
+#: limit the shader enforces cannot drift.
+_MAX_CH = OV_GL_MAX_CHANNELS
 
 #: PixelUnpackBuffer enum (PySide6 exposes it on the class or the nested Type enum)
 _PIXEL_UNPACK = getattr(QOpenGLBuffer, "PixelUnpackBuffer", None)
@@ -139,7 +144,7 @@ def _build_frag(n: int) -> str:
             f"        float t{i} = clamp((v{i} - u_win[{i}].x) / "
             f"max(u_win[{i}].y - u_win[{i}].x, 1e-6), 0.0, 1.0);\n"
             f"        t{i} = pow(t{i}, max(u_win[{i}].z, 1e-3));\n"
-            f"        rgb = blend_one(rgb, t{i} * u_color[{i}], t{i}, u_blend[{i}]);\n"
+            f"        rgb = blend_one(rgb, t{i} * u_color[{i}], t{i}, u_blend[{i}], g_uv);\n"
             f"    }}")
     body = "\n".join(lines)
     return f"""
@@ -151,12 +156,19 @@ uniform int   u_nchan;
 uniform vec3  u_color[{n}];
 uniform vec3  u_win[{n}];
 uniform vec3  u_blend[{n}];
+// (u0, v0, du, dv): where this quad sits in the WHOLE image, in normalized image coords.
+// (0,0,1,1) for the overview quad; the patch's own rect for a viewport detail quad. The
+// spatial comparators (checkerboard, wipe) are defined on the image, so they must be
+// computed from image uv — off the quad's own uv, a detail patch grew a full checkerboard
+// inside its rect and the wipe divider jumped to the middle of wherever you had zoomed.
+uniform vec4  u_rect;
 
 // `src` is the channel's tinted colour, `t` its own windowed intensity, `spec` its
-// (mode, opacity, checker_cells). Kept as ONE function taking a sampler-free argument list
-// so the per-channel unroll above stays a single line — passing a sampler-array element to
-// a helper returns a bad sampler on this driver, but plain vectors are fine.
-vec3 blend_one(vec3 dst, vec3 src, float t, vec3 spec) {{
+// (mode, opacity, checker_cells), `g_uv` its position in the whole image. Kept as ONE
+// function taking a sampler-free argument list so the per-channel unroll above stays a
+// single line — passing a sampler-array element to a helper returns a bad sampler on this
+// driver, but plain vectors are fine.
+vec3 blend_one(vec3 dst, vec3 src, float t, vec3 spec, vec2 g_uv) {{
     int mode = int(spec.x + 0.5);
     float op = clamp(spec.y, 0.0, 1.0);
     if (mode == 1) {{
@@ -173,14 +185,14 @@ vec3 blend_one(vec3 dst, vec3 src, float t, vec3 spec) {{
         // squares stay locked to the image while you pan and zoom rather than crawling
         // across it. spec.z is the number of cells on the long edge.
         float cells = max(spec.z, 1.0);
-        float k = mod(floor(v_uv.x * cells) + floor(v_uv.y * cells), 2.0);
+        float k = mod(floor(g_uv.x * cells) + floor(g_uv.y * cells), 2.0);
         return mix(dst, src, k * op);
     }} else if (mode == 4) {{
         // WIPE — one vertical divider at spec.z (0..1 across the image), the overlay to
         // its LEFT. Also in texture space, so dragging the divider moves it across the
         // specimen rather than across the window: the boundary you are judging stays on
         // the same feature while you pan.
-        float k = step(v_uv.x, clamp(spec.z, 0.0, 1.0));
+        float k = step(g_uv.x, clamp(spec.z, 0.0, 1.0));
         return mix(dst, src, k * op);
     }}
     return dst + src * op;                       // 0 = ADD (the microscopy default)
@@ -188,6 +200,7 @@ vec3 blend_one(vec3 dst, vec3 src, float t, vec3 spec) {{
 
 void main() {{
     vec3 rgb = vec3(0.0);
+    vec2 g_uv = u_rect.xy + v_uv * u_rect.zw;
 {body}
     frag = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }}
@@ -216,6 +229,41 @@ void main() { float v = texture(u_tex[0], v_uv).r; frag = vec4(v, v, v, 1.0); }
 """ % {"N": _MAX_CH}
 
 
+def pack_u16(plane: np.ndarray):
+    """``(u16_plane, dmin, dmax)`` — a display plane packed into 16 bits plus the data
+    range those texels map back to. Pure; module level so the gate can check it without a
+    GL context (the offscreen probe runs the CPU surface, so nothing else here is
+    reachable headlessly).
+
+    A float plane is normalized by its OWN extremes, and that is deliberately NOT keyed to
+    the payload's declared ``bit_depth``, though it looks like it should be. Every
+    streaming provider computes in float64, so a Stitch or a Gaussian lands here while its
+    values are still integer counts — but the range chosen here is handed to the shader as
+    ``u_win`` and the LUT window is renormalized against it
+    (``vlo = (lo - dmin) / span``), so ``dmin``/``dmax`` **cancel**: the rendered value is
+    ``(v - clim_lo) / (clim_hi - clim_lo)`` whatever scale is used. Measured: a pixel of
+    intensity 700 renders to 0.3913 on two frames with different extremes, per-plane and
+    fixed-scale alike.
+
+    Pinning it to ``0 .. 2**bit_depth-1`` was tried and reverted: it changes nothing
+    on screen, quantizes more coarsely (a 4095-wide window into 16 bits instead of the
+    plane's own ~1400-wide one), and CLIPS a node that legitimately overshoots full scale
+    (a blur ringing, a feather sum) where the per-plane rule shows it. The contrast parity
+    that DID need fixing was the LUT slider extent, which is
+    ``ViewerPanel._display_range`` and reads the declaration properly."""
+    a = np.asarray(plane)
+    if a.dtype == np.uint16:
+        return a, 0.0, 65535.0
+    if a.dtype == np.uint8:
+        return a.astype(np.uint16) * 257, 0.0, 255.0
+    af = np.nan_to_num(a.astype(np.float32))
+    dmin, dmax = float(af.min()), float(af.max())
+    if dmax <= dmin:
+        dmax = dmin + 1.0
+    u16 = ((af - dmin) / (dmax - dmin) * 65535.0).astype(np.uint16)
+    return u16, dmin, dmax
+
+
 class GLImageView(QOpenGLWidget):
     """OpenGL textured-quad image surface with shader contrast/colour/compositing.
 
@@ -226,6 +274,9 @@ class GLImageView(QOpenGLWidget):
     """
 
     gl_failed = Signal()
+    #: the context came up and reported what it can hold: ``GL_MAX_TEXTURE_SIZE`` in px. The
+    #: Viewer forwards it to the runner, which uses it to decide full-resolution vs pyramid.
+    limits_ready = Signal(int)
     #: the pan/zoom changed — the panel re-requests a viewport detail patch (debounced).
     view_changed = Signal()
 
@@ -334,13 +385,45 @@ class GLImageView(QOpenGLWidget):
             if self._dlast and self._drect is not None:
                 self._dpending.update(self._dlast)
             ver = self.context().format().version()
-            print(f"[glview] GL ready — OpenGL {ver[0]}.{ver[1]}", file=sys.stderr, flush=True)
+            # What this GPU will actually accept as one texture axis. It decides whether the
+            # Viewer may show a big frame WHOLE at full resolution or has to work off the
+            # pyramid — so it is published rather than assumed (the runner's conservative
+            # default is 8192; this machine's driver reports 32768).
+            self._max_tex = self._query_max_texture(f)
+            self.limits_ready.emit(int(self._max_tex))
+            print(f"[glview] GL ready — OpenGL {ver[0]}.{ver[1]}, "
+                  f"max texture {self._max_tex} px", file=sys.stderr, flush=True)
         except Exception as e:                   # noqa: BLE001 — degrade, never crash
             print(f"[glview] GL init failed → CPU fallback: {e}", file=sys.stderr, flush=True)
             self._ok = False
             if not self._failed:
                 self._failed = True
                 self.gl_failed.emit()
+
+    #: ``GL_MAX_TEXTURE_SIZE``. Not imported from PyOpenGL — this module deliberately depends
+    #: only on Qt's own GL wrapper, so the enum is spelled out.
+    _GL_MAX_TEXTURE_SIZE = 0x0D33
+
+    @classmethod
+    def _query_max_texture(cls, f: Any) -> int:
+        """The context's ``GL_MAX_TEXTURE_SIZE``, or a conservative 8192.
+
+        The return shape of ``glGetIntegerv`` differs across PySide6 builds (a scalar on some,
+        a sequence on others), so both are handled and anything unrecognized falls back — the
+        conservative direction to be wrong in, since too small only costs sharpness while too
+        large is a driver-rejected upload and a black frame."""
+        try:
+            got = f.glGetIntegerv(cls._GL_MAX_TEXTURE_SIZE)
+            if isinstance(got, (list, tuple)) and got:
+                got = got[0]
+            px = int(got)
+            return px if px >= 1024 else 8192
+        except Exception:  # noqa: BLE001 — a display hint, never a failure
+            return 8192
+
+    def max_texture_px(self) -> int:
+        """What one texture axis may be on the live context (8192 until it comes up)."""
+        return int(getattr(self, "_max_tex", 0) or 8192)
 
     def _release_gl(self) -> None:
         """Destroy this context's GL objects while it is still usable — Qt emits
@@ -462,19 +545,7 @@ class GLImageView(QOpenGLWidget):
         # The LUT window is applied in the shader (u_vlo/u_vhi) so contrast changes are
         # free — no re-upload, no re-decode. We record the data range that maps texel
         # [0,1] back to data units, so the viewer's clim (data units) → normalized window.
-        a = np.asarray(plane)
-        if a.dtype == np.uint16:
-            u16 = a
-            dmin, dmax = 0.0, 65535.0
-        elif a.dtype == np.uint8:
-            u16 = a.astype(np.uint16) * 257
-            dmin, dmax = 0.0, 255.0
-        else:
-            af = np.nan_to_num(a.astype(np.float32))
-            dmin, dmax = float(af.min()), float(af.max())
-            if dmax <= dmin:
-                dmax = dmin + 1.0
-            u16 = ((af - dmin) / (dmax - dmin) * 65535.0).astype(np.uint16)
+        u16, dmin, dmax = pack_u16(plane)
         u16 = np.ascontiguousarray(u16)
         h, w = u16.shape[:2]
         texmap = self._tex if texmap is None else texmap
@@ -483,7 +554,12 @@ class GLImageView(QOpenGLWidget):
         rangemap[ch] = (dmin, dmax)
         if self._debug:
             import sys
-            print(f"[glview] upload ch{ch}: shape={u16.shape} src_dtype={a.dtype} "
+            # `plane`, not the `a` that only exists inside `pack_u16` — this line raised
+            # NameError, and `paintGL`'s blanket except turned that into `_fail()`, a
+            # one-way fall back to the CPU surface. So the one switch you reach for when
+            # the GL path renders wrong was disabling the GL path.
+            print(f"[glview] upload ch{ch}: shape={u16.shape} "
+                  f"src_dtype={np.asarray(plane).dtype} "
                   f"range=({dmin:.4g},{dmax:.4g}) clim={self._clim.get(ch)}",
                   file=sys.stderr, flush=True)
         # Pack the 16-bit value into R (high byte) + G (low byte) of an RGBA8 texture.
@@ -769,7 +845,12 @@ class GLImageView(QOpenGLWidget):
             return
         self._draw_quad(f, tile, chans, (0.0, 0.0, 1.0, 1.0), self._tex, self._range)
         if self._drect is not None:
-            fine = [c for c in chans if c in self._dtex]
+            # `_dlast`, not `_dtex`: the texture map is kept across patches (uploads are
+            # reused), so a channel the CURRENT patch does not carry would otherwise be drawn
+            # from the previous patch's pixels at the new patch's rect. An overlay legitimately
+            # drops out of a patch — the secondary covers only part of the field — and that is
+            # a channel this quad must simply not draw.
+            fine = [c for c in chans if c in self._dtex and c in self._dlast]
             if fine:
                 self._draw_quad(f, tile, fine, self._drect, self._dtex, self._drange)
 
@@ -813,6 +894,11 @@ class GLImageView(QOpenGLWidget):
         # PySide6 has no setUniformValue(name:str, scalar) overload (only location-based
         # for a single int/float), so name-based scalar calls raise.
         prog.setUniformValue(prog.uniformLocation("u_nchan"), int(len(active)))
+        # where this quad sits in the whole image — what makes the checkerboard and the wipe
+        # land on the same specimen coordinates in a detail patch as in the overview
+        prog.setUniformValue(prog.uniformLocation("u_rect"),
+                             QVector4D(float(fx0), float(fy0),
+                                       float(fx1 - fx0), float(fy1 - fy0)))
         for i, ch in enumerate(active):
             r, g, b = self._color.get(ch, (1.0, 1.0, 1.0))
             # the LUT window is in DATA units, so it must be renormalized against THIS

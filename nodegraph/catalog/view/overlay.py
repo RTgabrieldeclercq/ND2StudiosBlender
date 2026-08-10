@@ -14,6 +14,8 @@ from nodegraph.provider import ArrayProvider
 from nodegraph.registry import Granularity, InBool, InDataset, InFloat, InInt, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.placement_entry import handedness_for as _handedness_for
+from nodegraph.catalog._shared.placement_entry import overlay_entry as _overlay_entry
 from nodegraph.catalog._shared.sampling import _sampling_of
 
 # ── Overlay (view — physical co-display of two Datasets) ───────────────────────
@@ -33,6 +35,14 @@ from nodegraph.catalog._shared.sampling import _sampling_of
 #: Overlay's output into another Overlay's primary appends a third source, so N-way
 #: overlay needs no N-ary socket and no bespoke layer-stack UI.
 OVERLAY_KEY = "__overlay__"
+
+#: The recipe-entry builder moved to ``_shared`` when ``channel.merge`` became a second caller
+#: (2026-08-05): the catalog forbids a node module importing another, and two copies of a
+#: placement record is precisely the drift the single-builder rule exists to prevent. Re-exported
+#: here because the Viewer's runner and the selftest both reach for it by this name.
+overlay_entry = _overlay_entry
+
+
 def _overlay_of(ds: Any) -> tuple:
     """A Dataset's overlay recipe as a tuple (``()`` = not an overlay)."""
     return tuple(getattr(ds, "metadata", {}).get(OVERLAY_KEY, ()))
@@ -102,40 +112,18 @@ def _compute_overlay(ctx: EvalContext) -> Dataset:
     # The recipe entry for THIS pairing. Plain JSON-shaped values only: the recipe rides in
     # `metadata`, which folds into `output_fingerprint`, so anything exotic in here would
     # make the fingerprint depend on object identity.
-    entry = {
-        "node": ctx.node_id,
-        "blend": str(blend),
-        # `opacity` / `wipe_pos` / `flicker_hz` are PRESENTATION sockets and deliberately
-        # do NOT appear here. They are excluded from the recipe hash so dragging one is a
-        # repaint rather than a re-run, and a value that is not in the key must not be in
-        # the payload either — a memo hit would otherwise hand back a recipe stamped with
-        # the value the slider used to have. The GUI reads them live from the document.
-        "flip_x": bool(ctx.params.get("flip_x", True)),
-        "flip_y": bool(ctx.params.get("flip_y", False)),
-        "scale": plan.scale,
-        "t_shift": t_shift,
-        "offset_um": list(offset),
-        # int keys would not survive a JSON round-trip through a saved checkpoint, so the
-        # per-field maps are emitted as sorted lists of pairs.
-        "tiles": [[m, [[j, round(f, 6)] for j, f in plan.tiles[m]]]
-                  for m in sorted(plan.tiles)],
-        "coverage": [[m, round(plan.coverage[m], 6)] for m in sorted(plan.coverage)],
-        "z_offset_um": [[m, plan.z_offset_um[m]] for m in sorted(plan.z_offset_um)],
-        "t_pairs": [[t, j, e] for t, j, e in plan.t_pairs],
-        "placed_by": plan.placed_by,
-        # The CONTEXT extent, recorded per field so the Viewer can widen to it without
-        # recomputing the placement. Display-only by construction: `canvas` never changes
-        # the Dataset's axes (see the Mode's own note), so nothing downstream can be
-        # affected by it and `resample` refuses to combine with it.
-        "context": _context_boxes(ctx, ds, sec, plan, offset),
-        "warnings": list(plan.warnings),
-        # An override's warnings ride IN the note, not merely beside it: the note is what
-        # reaches the status line under the picture, and "placed by index" is the one thing
-        # a person looking at that picture must not have to go and look up.
-        "note": plan.describe(0) + (
-            "  ·  " + plan.warnings[0] if (plan.placed_by != "stage" and plan.warnings)
-            else ""),
-    }
+    # Handedness is DERIVED for an already-stitched secondary: its canvas is in stage
+    # coordinates, so flipping it again mirrors the mosaic (`handedness_for`).
+    flip_x, flip_y, hand_warn = _handedness_for(
+        sec, ctx.params.get("flip_x", True), ctx.params.get("flip_y", False))
+    entry = overlay_entry(
+        ctx.node_id, plan,
+        {"blend": blend, "flip_x": flip_x, "flip_y": flip_y, "t_shift": t_shift,
+         "offset_um": offset},
+        context=_context_boxes(ctx, ds, sec, plan, offset))
+    if hand_warn:
+        entry["warnings"] = list(entry.get("warnings") or ()) + list(hand_warn)
+        entry["note"] = str(entry.get("note") or "") + "  ·  Flip inert (stitched secondary)"
     recipe = _overlay_of(ds) or ({"node": "primary", "role": "base"},)
     out = ds.with_metadata(**{OVERLAY_KEY: list(recipe) + [entry]})
     if modes.get("output") == "resample":
@@ -213,7 +201,10 @@ def _bake_resample(ctx: EvalContext, ds: Dataset, sec: Dataset, entry: dict) -> 
                     z_sec = secondary_z_index(sec.metadata, sax, int(hits[0][0]),
                                               z_um, dz=dz)
 
-                    def read_tile(j, _t=t_sec, _z=z_sec):
+                    # `_want` (the fractional window the compositor needs) is ignored: this
+                    # already reads level 0, so the whole tile IS the raw data and there is
+                    # nothing a window would buy except a second code path to keep in step.
+                    def read_tile(j, _want=None, _t=t_sec, _z=z_sec):
                         return sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
                                                 0, sax.y, 0, sax.x)
 

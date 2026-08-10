@@ -12,6 +12,7 @@ from nodegraph.registry import DimMode, Granularity, InDataset, InString, OutDat
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
+from nodegraph.catalog._shared.labels import _resolve_layer, _voxel_layers
 from nodegraph.catalog._shared.progress import _parallel_progress
 
 # ── EDT (distance transform of a mask → a physical-µm Voxel field) ──────────────
@@ -22,10 +23,15 @@ def _compute_edt(ctx: EvalContext) -> Dataset:
     whole volume."""
     ds = ctx.inputs[0]                    # the transform itself goes through `_ndi`
     ax = ds.axes
-    mask_attr = ds.get(Domain.VOXEL, ctx.layer("mask"))
-    if mask_attr is None:
-        raise ValueError(f"EDT needs a Voxel mask {ctx.params.get('mask', 'mask')!r} "
-                         f"(run Threshold first)")
+    # the one raster on the wire, whatever it is called (`_resolve_layer`)
+    mask_layer, _note = _resolve_layer(
+        _voxel_layers(ds), ctx.layer("mask"), node="EDT", socket="mask",
+        what="Voxel layer", where="the `data` input",
+        remedy="distance is measured from a mask's foreground, so run Threshold "
+               "(analysis.threshold / analysis.histogram_threshold) upstream", ctx=ctx)
+    mask_attr = ds.get(Domain.VOXEL, mask_layer)
+    if mask_attr is None:                            # pragma: no cover - _resolve_layer
+        raise ValueError(f"EDT needs a Voxel mask {mask_layer!r} (run Threshold first)")
     mask6 = mask_attr.values
     px = ctx.calib("pixel_size_um") or 0.1
     out = np.zeros_like(mask6, dtype=float)
