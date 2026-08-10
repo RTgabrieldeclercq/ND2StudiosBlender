@@ -3260,14 +3260,22 @@ def main(argv) -> int:
     finally:
         win.viewer._play_btns["t"].setChecked(False)
         app.processEvents()
-    # the ETA half of the cap, pinned as arithmetic: two ticks in, a preparation whose
-    # measured rate projects past PLAY_PREPARE_MAX_S releases the hold — without cancelling
-    # the preload, which keeps warming behind the now-running playback
+    # the ETA half of the cap, pinned as arithmetic — CAPPED holds only, i.e. a series too
+    # big to ever be fully resident: two ticks in, a preparation whose measured rate
+    # projects past PLAY_PREPARE_MAX_S releases the hold, without cancelling the preload,
+    # which keeps warming behind the now-running playback
     win.viewer.set_play_gate(True)
     win._preload_hold_t0 = time.monotonic() - (_PREP_CAP + 1.0)
+    win._preload_hold_capped = False                 # fits the budget: waits to completion
+    win._on_preload_progress("n3", 2, 1000)
+    assert win.viewer.play_gated(), \
+        "a series that FITS the budget holds to completion — the cap must not touch it " \
+        "(user decision 2026-08-10: pressing play on a series that CAN be made smooth " \
+        "means 'make it smooth')"
+    win._preload_hold_capped = True                  # larger than the budget: capped
     win._on_preload_progress("n3", 2, 1000)
     assert not win.viewer.play_gated(), \
-        "a hold whose ETA projects past PLAY_PREPARE_MAX_S must release playback"
+        "a capped hold whose ETA projects past PLAY_PREPARE_MAX_S must release playback"
     win._drop_play_gate("n3")                        # already down: must be a quiet no-op
     win.runner._views.pop("n3", None)
 
@@ -3354,7 +3362,7 @@ def main(argv) -> int:
     import nodelab_v2.runner as _RR
     _detail_seen: list = []
     win.runner.detail_ready.connect(
-        lambda nid, planes, rect: _detail_seen.append((nid, planes, rect)))
+        lambda nid, planes, rect, coords: _detail_seen.append((nid, planes, rect, coords)))
     _vp = win.viewer
     _surf = _vp._surface()
     _node = "n3"
@@ -3391,8 +3399,11 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.005)
     assert _detail_seen, "no detail patch arrived"
-    _nid, _dplanes, _drect = _detail_seen[-1]
+    _nid, _dplanes, _drect, _dcoords = _detail_seen[-1]
     assert _nid == _node and _dplanes, (_nid, list(_dplanes))
+    assert tuple(_dcoords)[:3] == tuple(_vp.coords())[:3], \
+        "the patch must carry the (m,t,z) it was read at — the panel's staleness check " \
+        "hangs off it"
     # the rect the pixels really cover is the requested one snapped OUT to whole pixels of
     # the level actually read — never a rect that disagrees with the pixels (that shows up
     # on screen as a seam against the overview underneath)
@@ -3433,6 +3444,36 @@ def main(argv) -> int:
     # a patch for another node is refused rather than painted over this one's image
     _vp.on_detail_ready("some-other-node", _dplanes, _drect)
     assert _vp._detail_rect is None
+
+    # a patch that OUTLIVED ITS FRAME is refused too (2026-08-10, "the frames are going
+    # back to previously loaded frames"): the generation only advances on a new request,
+    # so during playback / a fast scrub a windowed read that took longer than the frame
+    # cadence lands generation-current — the (m,t,z) stamp is the guard that catches it
+    _m0, _t0c, _z0, _c0 = _vp.coords()
+    _vp.on_detail_ready(_node, _dplanes, _drect, (_m0, _t0c + 1, _z0, _c0))
+    assert _vp._detail_rect is None, \
+        "a detail patch from a previous frame must not be painted over the current one"
+    _vp.on_detail_ready(_node, _dplanes, _drect, (_m0, _t0c, _z0, _c0))
+    assert _vp._detail_rect is not None, "…while the current frame's patch still lands"
+    _surf.fit()
+    app.processEvents()
+    _vp._request_detail()
+    app.processEvents()
+    assert _vp._detail_rect is None
+
+    # …and PLAYBACK requests none at all: a full-detail windowed read per frame lands
+    # after the frame it described and starves the pool the preload and the frame decodes
+    # share. The parked frame sharpens on pause instead (ViewerPanel._stop_play).
+    _calls: list = []
+    _saved_cb = _vp.detail_cb
+    _vp.detail_cb = lambda *a: _calls.append(a)
+    try:
+        _vp._playing_axis = "t"
+        _vp._request_detail()
+        assert not _calls, "playback must not issue detail reads"
+    finally:
+        _vp._playing_axis = None
+        _vp.detail_cb = _saved_cb
 
     # a graph EDIT retires an in-flight patch: it is being read through the provider the
     # edit is about to drop, so delivering it would paint pre-edit pixels on a post-edit

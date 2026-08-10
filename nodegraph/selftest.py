@@ -16053,24 +16053,28 @@ def test_display_resolution_policy() -> None:
     huge = AxisSizes(m=1, t=1, z=1, c=1, y=300000, x=300000)
     assert display_cap(huge, texture_limit=32768, bytes_per_px=2) == MAX_DISPLAY_DIM
 
-    # ── COST is a ceiling too (V2.23b, reported 2026-08-05) ──────────────────────
+    # ── the BYTE ceilings survived V2.23b's cost ceiling (dropped 2026-08-10) ─────
     #
-    # The first cut asked only "does it fit", and fitting is not affording. Two ways that bit,
-    # both on the live mosaic and both reported as "it needs to update immediately … part of
-    # the stitch does not appear on some frames":
+    # V2.23b (reported 2026-08-05, "part of the stitch does not appear on some frames") added
+    # two ceilings on top of "does it fit". One is gone and one is load-bearing:
     #
-    #  * a STREAMING provider computes every plane. Level 0 of the WellA3 mosaic is 1.0 s a
-    #    frame against level 1's 0.21 s, for detail only visible zoomed in — which the detail
-    #    patch already serves at full resolution, where you are actually looking.
+    #  * COST: a STREAMING provider computes every plane (level 0 of the WellA3 mosaic is
+    #    1.0 s a frame against level 1's 0.21 s), so a live mosaic was pinned to the pyramid
+    #    outright. Dropped 2026-08-10 ("I want the image to appear at its native resolution
+    #    at all times"): ▶ now materializes the series to RAM behind a held, cancellable
+    #    prepare, so the per-frame cost is paid once — a computed frame is capped by
+    #    AFFORDABILITY alone, exactly like a store's. The parameter is gone with the branch,
+    #    so a revert cannot happen silently:
     #  * the uploader packs planes into RGBA8, so a frame costs 4 bytes/px of VRAM plus two
     #    transient CPU copies of the same size. `GL_MAX_TEXTURE_SIZE` (32768 here) would permit
     #    a 4 GB texture, and the upload path has no `glGetError` — so overrunning VRAM does not
     #    raise, it leaves the previous texture bound. That IS a frame with part of the picture
-    #    missing.
-    assert display_cap(big, texture_limit=32768, bytes_per_px=2, streaming=True) \
-        == MAX_DISPLAY_DIM, "a plane that must be COMPUTED stays on the pyramid"
-    assert display_cap(big, texture_limit=32768, bytes_per_px=2, streaming=False) == 7168, \
-        "…and the same frame from a store (a Flatten bake) is shown whole"
+    #    missing. This ceiling stays, and it is what still (correctly) declines a 13106²
+    #    canvas at the default TEXTURE_BYTES.
+    import inspect as _inspect
+    assert "streaming" not in _inspect.signature(display_cap).parameters, \
+        "cost-to-produce is no longer a display ceiling — a computed frame is shown at " \
+        "native resolution whenever it is affordable, same as a baked one"
     # the texture-BYTES ceiling counts every shown channel: 7168² is 205 MB of RGBA8 each
     per_mb = 7168 * 7168 * 4
     n_tex = max(1, TEXTURE_BYTES // per_mb)
@@ -16263,14 +16267,17 @@ def test_display_resolution_policy() -> None:
         "sizes itself against the plane cache the frames actually land in rather than a second "
         "budget that would let it evict its own head. V2.23c (reported 2026-08-05, \"it needs "
         "to update immediately … part of the stitch does not appear on some frames\"): fitting "
-        "is not affording, and the first cut asked only whether it fit. Full resolution is now "
-        "also gated on COST — a STREAMING provider computes every plane (level 0 of the WellA3 "
-        "mosaic is 1.0 s a frame against level 1's 0.21 s, for detail the zoom patch already "
-        "serves where you are looking), and on TEXTURE BYTES, because the uploader packs to "
+        "is not affording, and the first cut asked only whether it fit. Full resolution is "
+        "gated on TEXTURE BYTES, because the uploader packs to "
         "RGBA8 at 4 bytes/px plus two transient copies and has no glGetError — so exceeding VRAM "
         "does not raise, it leaves the previous texture bound, which is exactly a frame with "
-        "part of the picture missing. A live mosaic is back on the pyramid at 24 MiB planes and "
-        "49 MiB textures; the same frame from a Flatten bake is still shown whole")
+        "part of the picture missing. V2.23b's second gate — COST, which pinned every live "
+        "(computed) mosaic to the pyramid because level 0 is 1.0 s a frame against level 1's "
+        "0.21 s — was dropped 2026-08-10 ('I want the image to appear at its native "
+        "resolution at all times'): pressing play now materializes the series to RAM behind a "
+        "held, cancellable prepare, so the level-0 cost is paid once and a live mosaic is "
+        "shown whole whenever it is AFFORDABLE, exactly like a Flatten bake; the byte "
+        "ceilings above still decline what the surface or the budget cannot hold")
 
 
 def test_held_views() -> None:

@@ -74,16 +74,20 @@ PROGRESS_BAR_H = 5     # one of the two stacked bars (frame above, within-frame 
 SOURCE_STACK_GAP = 34
 PROGRESS_BAR_GAP = 2
 
-#: The longest a pressed ▶ may hold playback while its frames prepare (seconds). The hold
-#: is a bet that preparation is short — true for a byte-backed series (decompresses, over
-#: in a second or two) and for a cheap per-plane compute like a stitched mosaic (~0.5 s a
-#: frame at the preload's width). A series whose preparation PROJECTS past this cap loses
-#: the bet and starts playing immediately off whatever is warm, frames landing as they
-#: compute, while the preload keeps warming behind it — so the cap is never a cliff, only
-#: the moment honesty beats smoothness. Enforced twice: by the ETA check in
+#: The longest a pressed ▶ may hold playback while its frames prepare (seconds) — applied
+#: ONLY to a series larger than the display budget, which can never be fully resident, so
+#: holding longer buys warmth the first lap immediately evicts. Such a series plays after
+#: at most this wait, off whatever is warm, frames landing as they compute while the
+#: preload keeps warming behind it. Enforced twice: by the ETA check in
 #: :meth:`MainWindow._on_preload_progress` (drops the hold as soon as the measured rate
 #: says the wait would run long) and by a wall-clock watchdog armed at ▶ (drops it even if
 #: no tick ever arrives, so a wedged preload cannot strand a lit play button).
+#:
+#: A series that FITS the budget is held to completion instead — minutes if that is what
+#: the frames cost — with the progress bar counting and ⏸ as the way out (it cancels the
+#: preload, which drops the gate). That is the user's stated preference (2026-08-10):
+#: pressing ▶ on a series that CAN be made smooth means "make it smooth", and watching
+#: frames trickle in at decode cadence is worse than an honest, cancellable wait.
 PLAY_PREPARE_MAX_S = 8.0
 
 
@@ -2141,16 +2145,23 @@ class MainWindow(QMainWindow):
         frames are separate reads, while Z of one volume comes back with the read that displayed
         its neighbour.
 
-        **Any series the preload will read is HELD while it prepares — but never past**
-        :data:`PLAY_PREPARE_MAX_S`. The hold is the difference between "smooth" and "loads
-        every time" (reported 2026-08-05), and it is as right for a cheap per-plane compute
-        as for a byte read: a stitched mosaic or a Z-projection warms in seconds, and playing
-        it cold means every frame lands at its own decode latency — the ~9 fps, 33–267 ms
-        jitter recorded on the stitched series (2026-08-10). What the hold must never become
-        is a wait with nothing on screen, so it is capped by measured cost, not by provider
-        type: the moment the preload's own tick rate projects past the cap (or the watchdog
-        fires without a tick), the gate drops and playback runs off whatever is warm, frames
-        landing as they compute, while the preload keeps warming behind it.
+        **Any series the preload will read is HELD while it prepares.** The hold is the
+        difference between "smooth" and "loads every time" (reported 2026-08-05), and it is
+        as right for a cheap per-plane compute as for a byte read: a stitched mosaic or a
+        Z-projection warms in seconds, and playing it cold means every frame lands at its
+        own decode latency — the ~9 fps, 33–267 ms jitter recorded on the stitched series
+        (2026-08-10). How long the hold may run is decided by whether waiting can ever pay
+        off (the user's stated preference, 2026-08-10):
+
+        * a series that **fits the display budget** is held to completion — minutes if that
+          is what its frames cost — with the progress bar counting and ⏸ as the cancellable
+          way out. It ends resident, and playback is a texture upload per frame from the
+          first tick.
+        * a series **larger than the budget** can never be fully resident, so its hold is
+          capped at :data:`PLAY_PREPARE_MAX_S`: the moment the preload's own tick rate
+          projects past the cap (or the watchdog fires without a tick), the gate drops and
+          playback runs off whatever is warm, frames landing as they compute, while the
+          preload keeps warming behind it.
 
         **A whole-volume chain is never held and never preloaded** — there "every frame" is
         the node running once per frame, ~130 s and ~30 GB of working set each, so the gate
@@ -2184,18 +2195,25 @@ class MainWindow(QMainWindow):
         fits = self.runner.series_fits(planes=len(self.viewer.channels()),
                                        node_id=self._viewed)
         self._preload_hold_t0 = time.monotonic()
+        #: whether this hold is subject to the PLAY_PREPARE_MAX_S cap — only a series too
+        #: big to ever be fully resident is; one that fits holds to completion (see the
+        #: constant's note). ⏸ remains the way out either way (it cancels the preload,
+        #: whose `preload_finished` drops the gate).
+        self._preload_hold_capped = not fits
         self.viewer.set_play_gate(
             True, f"preparing {n} frame{'s' if n != 1 else ''} for smooth playback…"
                   + ("" if fits else "  (larger than the display memory budget — the tail "
                                      "will re-read)"))
         self._set_progress(0.0)
-        # the wall-clock half of the cap: a preload whose first frame never finishes emits
-        # no tick for the ETA check to judge, and a lit play button showing nothing is the
-        # exact state the 2026-08-06 report describes. Checked against `play_gated`, so a
-        # gate that already dropped (finished, cancelled, ETA) makes this a no-op.
-        node = self._viewed
-        QTimer.singleShot(int(PLAY_PREPARE_MAX_S * 1000),
-                          lambda: self._drop_play_gate(node))
+        if not fits:
+            # the wall-clock half of the cap: a preload whose first frame never finishes
+            # emits no tick for the ETA check to judge, and a lit play button showing
+            # nothing is the exact state the 2026-08-06 report describes. Checked against
+            # `play_gated`, so a gate that already dropped (finished, cancelled, ETA)
+            # makes this a no-op.
+            node = self._viewed
+            QTimer.singleShot(int(PLAY_PREPARE_MAX_S * 1000),
+                              lambda: self._drop_play_gate(node))
 
     def _on_preload_progress(self, node_id: str, done: int, total: int) -> None:
         if node_id != self._viewed or not total:
@@ -2203,12 +2221,12 @@ class MainWindow(QMainWindow):
         self._set_progress(done / float(total))
         self.statusBar().showMessage(
             f"preparing frames for playback — {done}/{total}")
-        # The ETA half of the PLAY_PREPARE_MAX_S cap: judged on the preload's own measured
-        # rate, so a stitched mosaic that warms in three seconds keeps its hold (and plays
-        # smoothly from memory) while a chain that computes for minutes releases playback
-        # after the first couple of frames rather than at the watchdog. Two ticks before
-        # judging — one frame's wall time divided by one is not a rate.
-        if self.viewer.play_gated() and done >= 2:
+        # The ETA half of the PLAY_PREPARE_MAX_S cap — CAPPED holds only (a series larger
+        # than the budget; one that fits waits to completion, see the constant's note).
+        # Judged on the preload's own measured rate, and two ticks before judging — one
+        # frame's wall time divided by one is not a rate.
+        if (getattr(self, "_preload_hold_capped", True)
+                and self.viewer.play_gated() and done >= 2):
             elapsed = time.monotonic() - getattr(self, "_preload_hold_t0", 0.0)
             if elapsed * total / done > PLAY_PREPARE_MAX_S:
                 self._drop_play_gate(node_id)

@@ -644,8 +644,9 @@ iterations, real optics — NA 0.8, 663 nm, 0.287/0.288 µm sampling):
 
 **Pressing play here is honest, not instant.** On a stored file — and on a per-plane computed
 series like a stitch or a Z-projection — play preloads the series and starts when it is warm
-(capped at ~8 s; a longer prepare releases playback early). On a **whole-volume** chain that
-preload would be a wait of hours with nothing on screen, so it is not done at all: play starts
+(held to completion when the series fits the display budget, ⏸ cancels; capped at ~8 s only
+when it is larger than the budget). On a **whole-volume** chain that preload would be a wait of
+hours with nothing on screen, so it is not done at all: play starts
 immediately, off whatever is already cached, and
 the cursor then **advances as each frame lands** rather than on the fps clock — nothing here can
 answer at 8 fps, and a wall clock would race the cursor through the series while one stale volume
@@ -1132,37 +1133,50 @@ on release, not on every mouse move, so dragging a value on a large graph stays 
 
 ## 8c. Zooming into a big image — detail on demand
 
-**Full resolution when it fits (V2.23).** The Viewer asks one question per frame, the same one
-NIS-Elements asks against `MaxMemoryImageSize`: can this be shown *whole*? A frame is drawn at
-full resolution when it clears both ceilings —
+**Full resolution when it fits (V2.23; extended to live mosaics 2026-08-10).** The Viewer asks
+one question per frame, the same one NIS-Elements asks against `MaxMemoryImageSize`: can this
+be shown *whole*? A frame is drawn at full resolution when it clears three ceilings —
 
 * the surface's real `GL_MAX_TEXTURE_SIZE` (this machine reports 32768, so a 7168² mosaic is
   comfortable; the CPU fallback declines, because its QImage is the size of the frame);
+* the **texture byte budget** (512 MiB by default; `NODELAB_TEXTURE_BYTES` overrides): the
+  uploader packs each shown channel to RGBA8 at 4 bytes/px, so a 7168² frame is 205 MiB of
+  VRAM and a 13106² whole-well canvas is 687 MiB — past the default, so a canvas that big
+  stays progressive unless you raise the budget on a GPU with room for it;
 * the **display memory budget**, 25% of RAM by default and counted over every channel you have
   switched on. `NODELAB_DISPLAY_RAM_PCT` changes the share, `NODELAB_DISPLAY_RAM_BYTES` sets it
   outright — the right answer is a property of the machine, and this runs on both a 256 GiB
   workstation (a quarter of which holds 160 full-resolution 7168² frames) and a laptop.
 
-Frames that clear neither fall back to the behaviour below: the pyramid, plus a detail patch
-where you are looking. A frame the surface could not upload is *declined* rather than attempted
-— being wrong that way costs sharpness, the other way shows black.
+**Whether the frame is stored bytes or computed live no longer matters.** A live **Stitch** or
+**Z-Project** used to be pinned to the pyramid outright because its full-resolution frame is a
+compute (~1 s against 0.21 s on the WellA3 mosaic); now that ▶ materializes the whole series
+into RAM behind the held prepare, that cost is paid once, and an affordable computed frame is
+shown whole — native resolution at all times, playing included. The price is honest: preparing
+takes longer at full resolution than it did at the old 4096 cap, and *scrubbing a cold frame*
+pays its full read on the worker (the card shows *reading planes*).
 
-The stitched mosaic is the case this changes. It used to be pinned to whatever pyramid level
-fitted a fixed 4096 px — half resolution for a 7168² canvas, everywhere outside a zoom patch —
-for no reason other than the constant.
+Frames that clear the ceilings are shown whole; the rest fall back to the behaviour below: the
+pyramid, plus a detail patch where you are looking. A frame the surface could not upload is
+*declined* rather than attempted — being wrong that way costs sharpness, the other way shows
+black.
+
+The stitched mosaic is the case all of this changed for. It was originally pinned to whatever
+pyramid level fitted a fixed 4096 px — half resolution for a 7168² canvas, everywhere outside a
+zoom patch — for no reason other than the constant.
 
 Two things make that affordable rather than merely possible: the display copy is narrowed to the
 payload's own bit depth (a mosaic frame is 98 MiB of uint16, not the 392 MiB of float64 a feather
 blend has to be *computed* in), and pressing **play** preloads the whole T range into the plane
-cache, so playback after that is a texture upload per frame — 0.1 ms. Playback waits for the
-preload — the difference between smooth and reloading every lap — but never past ~8 s: the hold
-is judged on the preload's own measured rate, and a series that projects past the cap starts
-playing immediately off whatever is warm while the rest keeps preparing behind it. This covers
-*stored bytes* (warm in a second or two) **and per-plane computed series alike** — a live
-**Stitch**, a **Z-Project**, or the projection of a stitch each cost a fraction of a second per
-frame, so holding briefly and then playing from memory is what makes them smooth instead of
-stuttering at decode cadence for the whole first lap. If the series is larger than the budget
-the status line says so, and the tail re-reads.
+cache, so playback after that is a texture upload per frame — 0.1 ms. Playback **waits for the
+preload** — the difference between smooth and reloading every lap. A series that fits the
+display budget is held until it is fully resident, minutes if that is what its frames cost,
+with the progress bar counting and **⏸ as the cancellable way out**; playback then starts
+smooth and stays smooth. This covers *stored bytes* (warm in a second or two) **and per-plane
+computed series alike** — a live **Stitch**, a **Z-Project**, or the projection of a stitch.
+Only a series *larger than the budget* is treated differently: it can never be fully resident,
+so it is held at most ~8 s and then plays off whatever is warm while the preload keeps working
+behind it — the status line says so, and the tail re-reads.
 
 A series whose frames are **whole-volume computes** (3D Deconvolve and kin) is never preloaded
 and never waits — see

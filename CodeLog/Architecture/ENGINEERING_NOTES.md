@@ -2090,10 +2090,32 @@ Nothing is blocking; these are the honest edges.
     ~9 fps with 33–267 ms jitter — for its entire first lap instead of going smooth after a
     short prepare. The line that matters is per-plane vs whole-volume: `_preload_jobs` now
     gives every per-plane series (bytes or kernel) the full measured width and only
-    `volume_unit` chains zero, and the window holds any series the preload accepts — capped
-    at `PLAY_PREPARE_MAX_S` (8 s) by the preload's own tick rate plus a wall-clock watchdog,
-    so a chain that computes for minutes releases playback early instead of holding a blank
-    stare, and the 2026-08-06 whole-volume case still raises no hold at all.
+    `volume_unit` chains zero, and the window holds any series the preload accepts. How long
+    is the user's call, made explicitly (2026-08-10): a series that FITS the display budget
+    holds to completion — minutes if needed, progress bar counting, ⏸ the cancellable out —
+    because it ends resident and playback is then smooth from the first tick; only a series
+    larger than the budget (which can never be fully resident) is capped at
+    `PLAY_PREPARE_MAX_S` (8 s) by the preload's own tick rate plus a wall-clock watchdog.
+    The 2026-08-06 whole-volume case still raises no hold at all. Two same-day companion
+    fixes in the zoomed path: the viewport detail patch stamps its `(m,t,z)` and the panel
+    refuses one that outlived its frame (the generation only advances on a new REQUEST, so
+    during playback a windowed read landing late was painted over the NEXT frame — "the
+    frames are going back to previously loaded frames"), and playback issues no detail
+    reads at all (a full-detail windowed stitch per frame starved the pool the preload and
+    the frame decodes share; the parked frame sharpens on pause instead).
+  - **…and materializing to RAM retired the cost ceiling on display resolution** (same day,
+    "I want the image to appear at its native resolution at all times"). V2.23b pinned every
+    live (computed) mosaic to the pyramid because a full-resolution frame is a ~1 s compute
+    against level 1's 0.21 s — a per-DISPLAY cost when frames were decoded on demand. With ▶
+    holding until the series is resident, that cost is per-SERIES, paid once behind the
+    progress bar, so `display_cap` now caps computed frames by affordability alone (texture
+    px, texture bytes, RAM — same three ceilings as a Flatten bake; the `streaming`
+    parameter is deleted so a revert cannot happen silently). What did NOT come back is the
+    V2.23b bug the byte ceilings fixed: a 13106² canvas at 687 MiB of RGBA8 still exceeds
+    the default `TEXTURE_BYTES` and stays progressive — `NODELAB_TEXTURE_BYTES` is the
+    knob, VRAM permitting. Cold scrubs on a native-res mosaic pay ~1 s a frame where the
+    pyramid paid 0.2 — the user chose that trade with eyes open, and Flatten remains the
+    answer when it stings.
 * **A live mosaic has a floor no display trick reaches** (V2.23). Full resolution was a display
   decision; *cheap* is not — a stitched canvas is recomputed per displayed frame. NIS-Elements
   does not keep one live either (its Large Image mode carries the pyramid in the file and
