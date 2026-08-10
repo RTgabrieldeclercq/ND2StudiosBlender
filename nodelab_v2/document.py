@@ -1429,7 +1429,15 @@ class GraphDocument:
         in-flight work. Once a QUEUE existed, that same loop-back also emptied it — so
         asking for two branches ran the first, silently discarded the second, and left its
         card sitting on ``queued`` forever. Caught on the real 16-position file; no synthetic
-        fixture reaches it, because it needs a source whose envelope is resolved late."""
+        fixture reaches it, because it needs a source whose envelope is resolved late.
+
+        An UNCHANGED envelope is a no-op (2026-08-10): the runner re-announces whenever a
+        source's resolved key changes, and a delivery arriving after the seed is already
+        current must not re-notify — even an empty-set notification bumps the document
+        revision, and anything keyed on it (the runner's held-view revision tie, the
+        finished-results map) pays for a bump that announced nothing."""
+        if self.meta_seeds.get(node_id) == env:
+            return
         self.meta_seeds[node_id] = env
         self._notify(())
 

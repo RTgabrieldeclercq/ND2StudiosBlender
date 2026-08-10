@@ -215,25 +215,30 @@ TEXTURE_BYTES = int(os.environ.get("NODELAB_TEXTURE_BYTES", "") or 512 * 1024 * 
 
 
 def display_cap(axes: Any, *, texture_limit: int, bytes_per_px: int = 8,
-                planes: int = 1, streaming: bool = False) -> int:
+                planes: int = 1) -> int:
     """The display cap for a frame of ``axes``: its own long edge when the whole thing can be
     shown at FULL resolution *affordably*, else :data:`MAX_DISPLAY_DIM`.
 
-    Four ceilings, and a frame has to clear all of them:
+    Three ceilings, and a frame has to clear all of them:
 
     * the **texture limit** in px, because the overview is one texture per channel;
     * the **texture BYTES** those channels cost (:data:`TEXTURE_BYTES`) — the limit that
       actually bites, see its note;
     * the **RAM budget** (:func:`display_ram_bytes`), because these frames land in the
-      :class:`PlaneCache` and playback wants a series of them resident, not one;
-    * **cost to produce**: ``streaming`` marks a provider that COMPUTES each plane (a stitch, a
-      filter chain) rather than reading bytes. Full resolution there is not a texture decision,
-      it is a 4x-per-frame decision — measured on the WellA3 mosaic, level 1 is 0.21 s a frame
-      and level 0 is 1.0 s — and it buys detail you can only see zoomed in, which the viewport
-      detail patch already serves at full resolution where you are actually looking. So a live
-      mosaic stays on the pyramid and a **baked** one (Flatten to Large Image → a store, which
-      is not streaming) gets the whole frame. That is the same normal-vs-progressive split
-      NIS-Elements makes, with cost added to the memory test.
+      :class:`PlaneCache` and playback wants a series of them resident, not one.
+
+    Cost to produce is deliberately NOT a ceiling any more (it was V2.23b's fourth, dropped
+    2026-08-10 — "I want the image to appear at its native resolution at all times"). A
+    ``StreamProvider`` frame is a compute — level 0 of the WellA3 mosaic is 1.0 s against
+    level 1's 0.21 s — and that once justified pinning every live mosaic to the pyramid.
+    Two things changed underneath it: pressing ▶ now materializes the whole series to RAM
+    behind a held, cancellable prepare (so the per-frame cost is paid once, visibly, and
+    playback re-uses the resident planes), and playback no longer runs the detail patch
+    that was the pyramid's zoomed-in alibi. A cold scrub does pay the level-0 read, on the
+    worker, with the card showing "reading planes" — slower and honest, like every other
+    lazy read in this app. The affordability ceilings above still refuse what the surface
+    or the budget genuinely cannot hold (a 13106² canvas is 687 MB of RGBA8 — past the
+    default :data:`TEXTURE_BYTES`; raise ``NODELAB_TEXTURE_BYTES`` if the GPU has room).
 
     ``bytes_per_px`` is deliberately pessimistic by default (8 — float64, what a stitch canvas
     serves): budgeting may be conservative, and over-committing is the failure that matters.
@@ -243,8 +248,6 @@ def display_cap(axes: Any, *, texture_limit: int, bytes_per_px: int = 8,
     long_edge = max(1, int(getattr(axes, "y", 1)), int(getattr(axes, "x", 1)))
     if long_edge <= MAX_DISPLAY_DIM:
         return MAX_DISPLAY_DIM                # nothing to decide; it fits either way
-    if streaming:
-        return MAX_DISPLAY_DIM                # every frame is a compute: stay progressive
     px = int(axes.y) * int(axes.x) * max(1, int(planes))
     if (long_edge <= int(texture_limit)
             and px * 4 <= TEXTURE_BYTES
@@ -1066,7 +1069,14 @@ class _DetailJob(QRunnable):
         except Exception:                    # noqa: BLE001 — detail is best-effort; the
             return                           # overview is already on screen and correct
         if self._gen == r._detail_gen and planes:
-            r._detail_done.emit((self._gen, self._node_id, planes, rect01))
+            # coords ride in the packet so the panel can refuse a patch that outlived its
+            # frame — the generation only advances on a NEW request, and during playback
+            # (or a fast scrub) the frame moves on without one, so a windowed read that
+            # took longer than the frame cadence would land with a CURRENT generation and
+            # paint the previous timepoint's pixels over the new frame (2026-08-10,
+            # "the frames are going back to previously loaded frames").
+            r._detail_done.emit((self._gen, self._node_id, planes, rect01,
+                                 tuple(self._coords)))
 
 
 class EngineRunner(QObject):
@@ -1093,7 +1103,7 @@ class EngineRunner(QObject):
     #: a viewport detail patch is ready: ``(node_id, {channel: plane}, (x0,y0,x1,y1))``
     #: with the rect in NORMALIZED image coordinates, so it is independent of both the
     #: patch's own resolution and the overview's.
-    detail_ready = Signal(str, object, object)
+    detail_ready = Signal(str, object, object, object)   # node, planes, rect01, coords
     #: a playback preload advanced: ``(node_id, done, total)``. Emitted on the GUI thread so the
     #: window can show progress and — the point — start the play timer only once the frames are
     #: actually resident, which is what makes playback of a computed chain smooth instead of
@@ -1436,20 +1446,23 @@ class EngineRunner(QObject):
     def display_dim(self, axes: Any, *, planes: int = 1, provider: Any = None,
                     dtype: Any = None) -> int:
         """The display cap for a node's frames — full resolution when one frame of
-        every shown channel is affordable in texture, in RAM, and to PRODUCE.
+        every shown channel is affordable in texture and in RAM.
 
-        ``provider`` decides the last of those and ``dtype`` whether the display copy
-        narrows (half the bytes per pixel). Both are passed EXPLICITLY — from the node's
-        :class:`_HeldView`, or by :meth:`_decode_planes`, which runs on the worker DURING
-        the pull that will later install that view — because the answer is folded into
-        every plane key and reading another node's held state here would have two panes
-        disagree about a key's shape."""
+        ``dtype`` decides whether the display copy narrows (half the bytes per pixel);
+        it is passed EXPLICITLY — from the node's :class:`_HeldView`, or by
+        :meth:`_decode_planes`, which runs on the worker DURING the pull that will later
+        install that view — because the answer is folded into every plane key and reading
+        another node's held state here would have two panes disagree about a key's shape.
+
+        ``provider`` no longer moves the answer (2026-08-10 — cost-to-produce was dropped
+        as a ceiling, see :func:`display_cap`); it stays in the signature because every
+        call site and test harness passes it, and it is the hook any future
+        provider-shaped cap decision would hang off."""
         if axes is None:
             return MAX_DISPLAY_DIM
         return display_cap(axes, texture_limit=self._texture_limit,
                            bytes_per_px=(2 if dtype is not None else 8),
-                           planes=planes,
-                           streaming=isinstance(provider, StreamProvider))
+                           planes=planes)
 
     # ── viewport detail-on-demand ─────────────────────────────────────────────
     def request_detail(self, node_id: str, coords, channels, rect01, budget: int) -> bool:
@@ -1534,9 +1547,9 @@ class EngineRunner(QObject):
         return out, snapped
 
     def _deliver_detail(self, packet) -> None:            # GUI thread
-        gen, node_id, planes, rect01 = packet
+        gen, node_id, planes, rect01, coords = packet
         if gen == self._detail_gen:
-            self.detail_ready.emit(node_id, planes, rect01)
+            self.detail_ready.emit(node_id, planes, rect01, coords)
 
     # ── public API (GUI thread) ────────────────────────────────────────────────
     def pull(self, node_id: str,
@@ -1706,6 +1719,18 @@ class EngineRunner(QObject):
         whose node has left the document are dropped here too (deleting a queued card must
         not leave a phantom entry holding a place in line).
         """
+        if nodes is not None and not nodes:
+            # An EMPTY set is a positive statement — "this edit changed nothing a run can
+            # see" — sent by ``set_meta_seed`` (the G8 source re-seed and the ingest's late
+            # envelope), both fired from INSIDE a delivery. The run/queue half of that
+            # contract has held since 2026-08-06; this return makes the display half hold
+            # too. Falling through wiped the held views, the decoded-plane cache and any
+            # preload in flight for an edit that by its own definition moved no pixels —
+            # measured on a 146-frame stitched export (2026-08-10): the source envelope
+            # resolving a few seconds into playback killed the preload at 46/129 and every
+            # later frame re-pulled through the engine at ~3.4 s instead of serving the
+            # planes it had already decoded.
+            return
         self._views.clear()
         self.invalidate_detail()
         dropped: List[str] = []          # queued requests this call retires
@@ -1716,13 +1741,6 @@ class EngineRunner(QObject):
             # never resolve.
             dropped = list(self._queue)
             self._queue.clear()
-        elif not nodes:
-            # An EMPTY set is a positive statement — "this edit changed nothing a run can
-            # see" — and is what the G8 source re-seed sends. It must cancel nothing and,
-            # above all, must not empty the queue: that notification fires from inside the
-            # delivery of a finished pull, so treating it as a structural edit silently threw
-            # away every branch waiting behind it.
-            dead = []
         else:
             touched = frozenset(nodes)
             dead = [rid for rid, cone in self._run_cones.items() if cone & touched]

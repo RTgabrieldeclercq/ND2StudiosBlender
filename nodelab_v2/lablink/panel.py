@@ -309,6 +309,13 @@ class ServePanel(_TaskHost):
     def _poll(self) -> None:
         if not self._polling:
             return
+        if not self.isVisible():
+            # The dock is closed or hidden: nobody can read the answer, and the probe is
+            # not free — against a hub that is not answering, the socket connect was
+            # measured at 0.9–1.9 s per attempt, every POLL_MS, in every session that
+            # never opened this panel (2026-08-10). The timer keeps ticking, so opening
+            # the dock resumes watching within one interval, with nothing to re-arm.
+            return
         port = int(self._port.value())
         self.spawn(lambda: _console_state(port), self._show_state, self._show_state_error)
 

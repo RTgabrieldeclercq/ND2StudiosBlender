@@ -1722,7 +1722,12 @@ class ViewerPanel(QWidget):
         else:
             clims = {ch: self._clim_for(node_id, ch, pl) for ch, pl in self._planes.items()}
         gammas = {ch: self._gammas.get((node_id, ch), 1.0) for ch in self._planes}
-        self._sync_luts()
+        # Not while playing: the histograms re-sample the plane and repaint their strip on
+        # every call — measured 51 ms of a 125 ms frame budget at 8 fps, for a readout
+        # nobody can follow frame-by-frame. They freeze for the run and `_stop_play` syncs
+        # them once on the frame playback parks on, exactly like the detail patch.
+        if self._playing_axis is None:
+            self._sync_luts()
         if self._gl is not None:
             blends = self._blend_map()
             for ch, pl in self._planes.items():
@@ -1775,6 +1780,11 @@ class ViewerPanel(QWidget):
         if (self.detail_cb is None or self._node_id is None or self._axes is None
                 or self._ref_plane is None):
             return
+        if self._playing_axis is not None:
+            return   # playback: a patch is a windowed full-detail read PER FRAME — it
+            # lands after the frame it described (painting the previous timepoint over
+            # the current one) and its reads starve the pool the preload and the frame
+            # decodes are running on. The parked frame sharpens on pause (:meth:`_stop_play`).
         try:
             rect = surf.visible_rect01()
         except Exception:                      # noqa: BLE001 — never break a repaint
@@ -1796,11 +1806,18 @@ class ViewerPanel(QWidget):
         except Exception:                      # noqa: BLE001 — detail is best-effort
             pass
 
-    def on_detail_ready(self, node_id: str, planes, rect01) -> None:
+    def on_detail_ready(self, node_id: str, planes, rect01, coords=None) -> None:
         """A patch arrived (GUI thread). Dropped unless it still describes what is shown —
-        the runner drops stale generations too, but the node can change between the two."""
+        the runner drops stale generations too, but the node can change between the two,
+        and so can the FRAME: the generation only advances on a new request, so a windowed
+        read that outlived its frame (playback advanced, or a fast scrub) would arrive
+        generation-current and paint the previous timepoint's pixels over the new frame.
+        ``coords`` is the ``(m, t, z, …)`` the patch was read at; ``None`` (a synthetic or
+        legacy delivery) skips the check rather than refusing."""
         if node_id != self._node_id or not planes or self._axes is None:
             return
+        if coords is not None and tuple(coords)[:3] != tuple(self.coords())[:3]:
+            return                     # a patch for a frame no longer on screen
         surf = self._surface()
         self._detail_rect = tuple(rect01)
         if self._gl is not None:
@@ -2502,6 +2519,13 @@ class ViewerPanel(QWidget):
             btn.setText("▶")
             btn.blockSignals(False)
             self._sync_axis_label(ax)
+            # detail was held off for the whole run (:meth:`_request_detail`) — sharpen
+            # the frame playback parked on, exactly as a settled scrub would
+            if self._detail_timer is not None:
+                self._detail_timer.start()
+            # the LUT histograms were frozen for the run (:meth:`_display`) — catch them
+            # up to the parked frame
+            self._sync_luts()
 
     def _retarget_fps(self, ax: str) -> None:
         if self._playing_axis == ax and self._play_timer.isActive():

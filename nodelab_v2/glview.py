@@ -122,7 +122,7 @@ def _build_frag(n: int) -> str:
     # QVector3D), NOT float array uniforms: setUniformValue(loc, python_float) silently
     # fails for a float ARRAY element in this PySide6 build (vector overloads work). The
     # transfer function is t = pow(clamp((v-vlo)/(vhi-vlo)), gamma) — gamma < 1 brightens
-    # midtones, > 1 darkens. Unpack + windowing inlined per channel with a constant index
+    # midtones, > 1 darkens. Windowing inlined per channel with a constant index
     # (passing a sampler-array element to a helper returns a bad sampler on this driver).
     # Per-channel BLEND (V2.19). `u_blend[i] = vec3(mode, opacity, checker_cells)` — a vec3
     # for the same reason `u_win` is one: setUniformValue silently fails for a float ARRAY
@@ -140,7 +140,9 @@ def _build_frag(n: int) -> str:
         lines.append(
             f"    if (u_nchan > {i}) {{\n"
             f"        vec4 c{i} = texture(u_tex[{i}], v_uv);\n"
-            f"        float v{i} = (c{i}.r * 65280.0 + c{i}.g * 255.0) / 65535.0;\n"
+            # GL_R16 (`_upload`): the sampler already normalizes to u16/65535, so `.r`
+            # IS the value the RGBA8 byte-packing used to reconstruct here.
+            f"        float v{i} = c{i}.r;\n"
             f"        float t{i} = clamp((v{i} - u_win[{i}].x) / "
             f"max(u_win[{i}].y - u_win[{i}].x, 1e-6), 0.0, 1.0);\n"
             f"        t{i} = pow(t{i}, max(u_win[{i}].z, 1e-3));\n"
@@ -562,12 +564,15 @@ class GLImageView(QOpenGLWidget):
                   f"src_dtype={np.asarray(plane).dtype} "
                   f"range=({dmin:.4g},{dmax:.4g}) clim={self._clim.get(ch)}",
                   file=sys.stderr, flush=True)
-        # Pack the 16-bit value into R (high byte) + G (low byte) of an RGBA8 texture.
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[..., 0] = (u16 >> 8).astype(np.uint8)
-        rgba[..., 1] = (u16 & 0xFF).astype(np.uint8)
-        rgba[..., 3] = 255
-        rgba = np.ascontiguousarray(rgba)
+        # A native GL_R16 texture: the sampler hands the shader ``u16/65535`` as ``.r``,
+        # which is exactly the value the old code reconstructed. It used to pack the high
+        # and low bytes into R and G of an RGBA8 texture (an ES2-era trick; this widget
+        # requires a 3.3 core context, where R16 has been core since 3.0), and at
+        # native-resolution frames that packing WAS the playback cost: building the 4-byte
+        # copy of a 9217×6145 plane moved ~700 MB of CPU traffic per frame — measured
+        # 0.36 s/frame, i.e. 3 fps with a fully warm plane cache (2026-08-10). R16 uploads
+        # the plane's own bytes: same picture, same window math, a quarter of the traffic,
+        # none of the repacking.
         f = self.context().functions()
         tex = texmap.get(ch)
         if tex is None:
@@ -575,15 +580,17 @@ class GLImageView(QOpenGLWidget):
             tex.create()
             texmap[ch] = tex
         f.glBindTexture(_GL_TEXTURE_2D, tex.textureId())
+        # rows of odd width are 2-byte texels at arbitrary byte offsets; the default
+        # 4-byte unpack alignment would shear them
         f.glPixelStorei(_GL_UNPACK_ALIGNMENT, 1)
-        # NEAREST: the packed high/low bytes must not be interpolated (that would corrupt
-        # the reconstructed value). Display planes are pre-decimated, so this is fine.
+        # NEAREST keeps this change invisible: it is what the packed texture required, so
+        # sampling must not start interpolating the moment the format stops forbidding it.
         f.glTexParameteri(_GL_TEXTURE_2D, _GL_TEXTURE_MIN_FILTER, _GL_NEAREST)
         f.glTexParameteri(_GL_TEXTURE_2D, _GL_TEXTURE_MAG_FILTER, _GL_NEAREST)
         f.glTexParameteri(_GL_TEXTURE_2D, _GL_TEXTURE_WRAP_S, _GL_CLAMP_TO_EDGE)
         f.glTexParameteri(_GL_TEXTURE_2D, _GL_TEXTURE_WRAP_T, _GL_CLAMP_TO_EDGE)
-        f.glTexImage2D(_GL_TEXTURE_2D, 0, _GL_RGBA8, w, h, 0, _GL_RGBA,
-                       _GL_UNSIGNED_BYTE, rgba.tobytes())
+        f.glTexImage2D(_GL_TEXTURE_2D, 0, _GL_R16, w, h, 0, _GL_RED,
+                       _GL_UNSIGNED_SHORT, u16.tobytes())
         keymap[ch] = id(plane)
 
     def set_channel(self, ch: int, lo: float, hi: float,
