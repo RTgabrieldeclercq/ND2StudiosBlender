@@ -342,7 +342,7 @@ class MainWindow(QMainWindow):
             m_file.addAction(act)
 
         m_file.addSeparator()
-        load = QAction("&Load ND2/TIFF file…", self)
+        load = QAction("&Load ND2/ND3/TIFF file…", self)
         load.setShortcut("Ctrl+L")
         load.triggered.connect(self.file_load_source)
         m_file.addAction(load)
@@ -917,7 +917,7 @@ class MainWindow(QMainWindow):
         bad = [n for n, s in states.items() if s == "missing"]
         if not states:
             self.statusBar().showMessage(
-                "no source nodes — File → Load ND2/TIFF file… first")
+                "no source nodes — File → Load ND2/ND3/TIFF file… first")
             return
         if started:
             self._set_led("busy")
@@ -1784,9 +1784,9 @@ class MainWindow(QMainWindow):
         import os
 
         paths, _f = QFileDialog.getOpenFileNames(
-            self, "Load ND2 / TIFF file(s)", "",
-            "Microscopy images (*.nd2 *.tif *.tiff);;ND2 (*.nd2);;"
-            "TIFF (*.tif *.tiff);;All files (*)")
+            self, "Load ND2 / ND3 / TIFF file(s)", "",
+            "Microscopy images (*.nd2 *.nd3 *.tif *.tiff);;ND2 (*.nd2);;"
+            "ND3 (*.nd3);;TIFF (*.tif *.tiff);;All files (*)")
         if not paths:
             return
 

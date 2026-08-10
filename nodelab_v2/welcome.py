@@ -56,7 +56,7 @@ class WelcomeCard(QWidget):
         self._hints = []
         for text in (
                 "Double-click a node in the <b>Nodes</b> palette — or drag it onto the canvas",
-                "<b>Ctrl+L</b> loads an ND2/TIFF and drops a source node with its channels",
+                "<b>Ctrl+L</b> loads an ND2/ND3/TIFF and drops a source node with its channels",
                 "Double-click any node to preview it · <b>Ctrl+Space</b> maximizes the canvas"):
             lab = QLabel(text)
             lab.setAlignment(Qt.AlignCenter)
@@ -69,7 +69,7 @@ class WelcomeCard(QWidget):
         row.setSpacing(8)
         self._btn_load = QPushButton("Load image…")
         self._btn_load.setProperty("role", "primary")
-        self._btn_load.setToolTip("File → Load ND2/TIFF file… (Ctrl+L)")
+        self._btn_load.setToolTip("File → Load ND2/ND3/TIFF file… (Ctrl+L)")
         self._btn_browse = QPushButton("Browse nodes")
         self._btn_browse.setToolTip("Jump to the Nodes palette search")
         self._btn_example = QPushButton("Example graph")

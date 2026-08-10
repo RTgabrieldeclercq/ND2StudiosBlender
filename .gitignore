@@ -26,3 +26,12 @@ sample_data/
 Thumbs.db
 .idea/
 .vscode/
+
+# evidence-log: the record is log.jsonl + img/ + evidence_log.md and IS committed.
+# These are regenerable in one command each, and are the size of the data.
+CodeLog/live/evidence_archive.html
+CodeLog/live/label/img/
+# Ground truth: the hand-drawn ANSWER (gt/*.json) is irreplaceable and is committed. The
+# tiles and the annotator page are rebuilt by `python scripts/_gt_tiles.py` and are ~23 MB.
+CodeLog/live/gt/img/
+CodeLog/live/gt/index.html

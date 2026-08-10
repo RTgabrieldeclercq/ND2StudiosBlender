@@ -1,0 +1,695 @@
+<meta charset="utf-8">
+<title>The packed-bed analysis, redone in shipped nodes</title>
+<style>
+  :root{--bg:#14161a;--panel:#1b1e24;--ink:#e8e8ea;--mute:#9aa0a8;--line:#2c3138;
+        --cy:#4dd2ff;--gn:#5ad19a;--rd:#ff6b6b;--am:#ffd166;--vi:#c39bff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.62 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:34px 26px 90px}
+  h1{font-size:31px;line-height:1.2;margin:0 0 6px;letter-spacing:-.4px}
+  h2{font-size:22px;margin:52px 0 4px;padding-top:20px;border-top:1px solid var(--line)}
+  h3{font-size:17px;margin:30px 0 6px;color:var(--cy)}
+  h4{font-size:14.5px;margin:20px 0 4px;color:var(--ink)}
+  .sub{color:var(--mute);font-size:15px;margin:0 0 26px}
+  .lede{font-size:16.5px;color:#d4d6da}
+  p{margin:10px 0}
+  code,kbd{font:12.6px/1.5 ui-monospace,Consolas,"Courier New",monospace;
+       background:#0f1115;border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+  pre{background:#0f1115;border:1px solid var(--line);border-radius:8px;padding:13px 15px;
+      overflow-x:auto;font:12.4px/1.6 ui-monospace,Consolas,monospace;color:#cfd3d8}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13px;display:block;
+        overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;white-space:nowrap}
+  th{background:#20242b;font-weight:600}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  tr:nth-child(even) td{background:#181b20}
+  img{max-width:100%;height:auto;border-radius:8px;border:1px solid var(--line);
+      display:block;margin:14px 0 4px}
+  figcaption{color:var(--mute);font-size:12.6px;margin:0 0 20px}
+  .box{border-radius:9px;padding:13px 17px;margin:18px 0;border:1px solid}
+  .good{background:#12291f;border-color:#2c6b4d}
+  .bad{background:#2b1618;border-color:#7a3038}
+  .warn{background:#2a2416;border-color:#7a6330}
+  .info{background:#151f2b;border-color:#2f5875}
+  .box b{color:#fff}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:16px}
+  .cards img{margin:0}
+  .node{display:grid;grid-template-columns:250px 1fr;gap:22px;align-items:start;
+        border:1px solid var(--line);border-radius:10px;padding:16px;margin:20px 0;
+        background:var(--panel)}
+  .node img{margin:0}
+  .node h4{margin-top:0;font-size:16px}
+  .node .op{font:12.4px ui-monospace,Consolas,monospace;color:var(--cy)}
+  .kv{color:var(--mute);font-size:12.7px;margin-top:8px}
+  .pill{display:inline-block;border:1px solid var(--line);border-radius:20px;
+        padding:1px 9px;font-size:11.6px;color:var(--mute);margin:0 4px 4px 0}
+  .tocs{columns:2;column-gap:34px;font-size:14px;color:var(--mute)}
+  .tocs a{color:#bfe8ff;text-decoration:none;display:block;padding:2px 0}
+  .big{font-size:27px;font-weight:600;font-variant-numeric:tabular-nums}
+  .yes{color:var(--gn)} .no{color:var(--rd)} .part{color:var(--am)}
+  @media (max-width:760px){.node{grid-template-columns:1fr}.tocs{columns:1}}
+</style>
+<div class="wrap">
+
+<h1>The packed-bed analysis, redone in shipped nodes</h1>
+<p class="sub">Every number below was produced by the <code>nodegraph</code> engine running
+real node graphs on <code>ChannelGFP,R-B,Nile&nbsp;Blue,TD_Seq0001.nd2</code>, and scored
+against 582 hand-labelled granule blobs. Zero new ops were added.</p>
+
+<div class="box info">
+<p style="margin-top:0"><b>Why this document exists.</b> Until now every quantitative result
+in this project came from hand-rolled <code>skimage</code> scripts that never touched the
+engine — <code>scripts/_bed_analyze.py</code> imports only <code>numpy</code> and
+<code>skimage</code>, and exactly one script in the whole repository had ever driven
+<code>Engine</code> on a real ND2 (<code>_ingest_nd2_smoke.py</code>, a 92-line smoke test).
+So there was a prototype, not a workflow, and a standing proposal to add eight new nodes.</p>
+<p style="margin-bottom:0">This pass inverts the question: <b>express the analysis in nodes
+that already exist, and let the training data decide whether anything needs adding.</b> The
+labels overturned three of my own hypotheses along the way, and a fourth — that the partition
+was accurate, full stop — survived until someone asked the one question the labels cannot
+answer. All four corrections are in here, in §6, §7 and §9.</p>
+</div>
+
+<h3 style="margin-top:34px">Contents</h3>
+<div class="tocs">
+  <a href="#budget">1 · The node budget</a>
+  <a href="#wiring">2 · How the nodes wire together</a>
+  <a href="#nodes">3 · The nodes, one at a time</a>
+  <a href="#chain">4 · The chain on real data</a>
+  <a href="#valid">5 · Scored against the labels</a>
+  <a href="#diag">6 · Whose fault is the gap?</a>
+  <a href="#surface">7 · Surface energy: is the boundary checked?</a>
+  <a href="#results">8 · The results, redone</a>
+  <a href="#ledger">9 · The honest ledger</a>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="budget">1 · The node budget</h2>
+
+<p class="lede">Fifteen shipped ops do the whole analysis. <b>None were added, none were
+modified.</b> <code>scripts/_catalog_snapshot.py check</code> reports
+<code>CATALOG IDENTICAL</code> for this entire pass.</p>
+
+<table>
+<tr><th>Analysis step</th><th>Shipped op</th><th>What it contributed</th></tr>
+<tr><td>Load + pick a channel</td><td><code>io.load</code> → <code>channel.select</code></td><td>the F, I and GFP branches</td></tr>
+<tr><td>Foreground</td><td><code>analysis.threshold</code></td><td>uint8 0/1 mask, per channel, Otsu or fixed</td></tr>
+<tr><td>Foreground + size filter + components</td><td><code>analysis.segment</code></td><td>one node; <code>min_area</code> is in µm²</td></tr>
+<tr><td>Smooth for seeding</td><td><code>enhance.gaussian</code></td><td>σ in µm</td></tr>
+<tr><td>Neck-breaking (tested, rejected)</td><td><code>enhance.morphology</code></td><td>greyscale opening — made it <span class="no">worse</span></td></tr>
+<tr><td>Intensity-maximum seeds</td><td><code>detect.spots</code></td><td>radius band in µm; <b>the accuracy ceiling</b></td></tr>
+<tr><td>Alternative seeder (tested, rejected)</td><td><code>detect.particles</code></td><td>one coupled knob; <span class="no">54.1%</span></td></tr>
+<tr><td>Split each blob by its own seeds</td><td><code>analysis.voronoi</code></td><td><code>bound=per_region</code> — one arena per component</td></tr>
+<tr><td>Per-object shape + intensity</td><td><code>analysis.measure</code></td><td>solidity, and cross-channel via <code>raw</code></td></tr>
+<tr><td>Regions → points</td><td><code>transform.label_to_points</code></td><td>cell centroids for tracking</td></tr>
+<tr><td>Per-plane phase fraction</td><td><code>transform.transfer_domain</code></td><td><code>voxel→plane reducer=mean</code> on a 0/1 mask</td></tr>
+<tr><td>Paint a column; bridge a track</td><td><code>transform.transfer_structure</code></td><td><code>label→voxel</code>, <code>track→point</code></td></tr>
+<tr><td>Linking</td><td><code>track.link</code></td><td>max-IoU on labels, nearest on points</td></tr>
+<tr><td>Velocity</td><td><code>analysis.object_metrics</code></td><td>needs <code>frame_interval</code></td></tr>
+</table>
+
+<div class="box good">
+<p style="margin:0"><b>Three proposals died on contact with the catalog.</b>
+<code>analysis.classify_objects</code> is unnecessary here — F and I are separate channels,
+so the class <i>is</i> the channel. <code>analysis.refine_labels</code> is unnecessary —
+<code>analysis.voronoi bound=per_region</code> already subdivides a component by its own
+seeds. And the granule-linking defect I had blamed on the repository was mine:
+<code>track.link target=label</code> has always linked by maximum IoU
+(<code>track/link.py:43-53</code>); my batch script used centroid distance.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="wiring">2 · How the nodes wire together</h2>
+
+<p>These are screenshots of ND2 Studios, rendered offscreen from the
+<b>same <code>*.nd2graph.json</code> files that produced every number in this document</b>
+(<code>CodeLog/graphs/</code>). Nothing here is a redraw: the engine loaded these files, and
+so did the GUI.</p>
+
+<p>One tell you can check yourself. Node cards render metadata-derived values by evaluating
+each socket's <code>derive</code> expression against the propagated envelope; with no
+metadata seed they fall back to the literal string <code>"auto"</code>
+(<code>node_item.py:707</code>). Every card below shows real resolved numbers —
+<code>1079.73 um2</code>, <code>6.9 µm</code>, <code>23.693… µm</code> — which is only
+possible for a graph carrying this acquisition's real calibration. A decorative graph would
+be full of <code>auto</code> and red missing-domain chips.</p>
+
+<img src="img/nodes/canvas_r2.png" alt="The seven-node pipeline in ND2 Studios">
+<figcaption><b>The main pipeline (route R2), laid out in dependency order.</b>
+<code>Load ND2</code> → <code>Select Channel [1]</code> → <code>Segmentation</code>
+(Otsu + <code>min_area</code>) → <code>Gaussian Blur</code> → <code>Spot Detection</code>
+→ <code>Voronoi Cells</code> → <code>Measure</code>. The second green edge from
+<code>Select Channel</code> down to <code>Measure</code>'s <code>raw</code> socket is the
+cross-channel tap. Amber <span class="pill">2D</span> levers, granularity chips
+(<span class="pill">WHOLE PLANE</span>, <span class="pill">WHOLE VOLUME</span>) and domain
+chips (<span class="pill">VOX</span> <span class="pill">LBL</span>
+<span class="pill">PT</span> <span class="pill">MSH</span>) are all live state, not
+decoration.</figcaption>
+
+<p>Two orderings in that picture are load-bearing rather than stylistic, and both would be
+easy to get wrong:</p>
+<ul>
+<li><b><code>Gaussian Blur</code> sits <i>after</i> the threshold.</b> Smoothing first would
+move the Otsu cut, and the cut is the one thing verified bit-identical to the prototype.
+Smoothing after it changes only what the seeder sees.</li>
+<li><b><code>Measure</code>'s <code>raw</code> taps the pre-smoothing branch.</b> Intensities
+are then read off the unsmoothed image. <code>_shared/raw_measure.py</code> explicitly permits
+enhancement between the two branches and refuses a <i>geometry</i> op — a crop or a shift
+would mean the two branches no longer address the same voxels.</li>
+</ul>
+
+<img src="img/nodes/canvas_r0.png" alt="The three-node baseline">
+<figcaption><b>The baseline (R0), three nodes.</b> This is the whole of connected-component
+segmentation, and it is the 73.4% floor everything else is measured against.</figcaption>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="nodes">3 · The nodes, one at a time</h2>
+
+<p>Each card below is the real thing, rendered at 3× supersample straight out of the scene
+graph. The prose is what the node contributed here and what it cost.</p>
+
+<div class="node">
+  <img src="img/nodes/card_io_load.png" alt="io.load card">
+  <div>
+    <h4>Load ND2/TIFF file <span class="op">io.load</span></h4>
+    <p>Emits a lazy <code>DATASET</code> plus per-channel taps <code>Ch0…Ch3</code> in the
+    file's own display colours. Headless, the engine takes the source payload from
+    <code>seeds[]</code>, so the run scopes itself to whichever planes it needs — the 18.5 GB
+    file never materialises and was never transcoded for this work.</p>
+    <p class="kv"><b>It also told me something wrong.</b> Its calibration reports
+    <code>dt_s = 11351.1 s</code>. The true interval is <b>2837.2 s</b> — a factor of
+    <b>4.0009</b>. <code>_dt_from_timestamps</code> takes the median of consecutive
+    differences of <code>frame_timestamps_s</code>, and on this file the reader recovers only
+    4 of 15 stamps, at t = 0, 4, 8, 12. The median defends against <i>one</i> dropped frame;
+    against a uniformly strided subset every gap is wrong by the same integer factor, so the
+    median is exactly as wrong as the mean and nothing looks anomalous. Since
+    <code>analysis.object_metrics</code> divides by this, every velocity would have come out
+    4× too slow.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_channel_select.png" alt="channel.select card">
+  <div>
+    <h4>Select Channel <span class="op">channel.select</span></h4>
+    <p>A <code>meta_transform</code>, so axes and calibration stay consistent downstream.
+    Doing the analysis per channel is what retires the whole object-classification problem:
+    the functional and inert populations are two channels, so "which class is this object"
+    is answered by which branch it came from.</p>
+    <p class="kv">It is also what makes <code>analysis.measure</code>'s cross-channel read
+    legal — the provenance comparison drops the channel stamp precisely when both branches
+    are single-channel, which two taps off one source guarantee.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_analysis_segment.png" alt="analysis.segment card">
+  <div>
+    <h4>Segmentation <span class="op">analysis.segment</span></h4>
+    <p>The workhorse. Threshold, size filter and connected components in one node, with
+    <code>min_area</code>/<code>max_area</code> in <b>µm²</b> and four methods including two
+    foundation models.</p>
+    <div class="box good" style="margin:12px 0">
+    <p style="margin:0"><b>Verified bit-identical to the prototype.</b> With
+    <code>min_area=0</code>, <code>method=threshold level=otsu fill_holes=True</code> produces
+    an array <b>exactly equal</b> to the hand-rolled
+    <code>binary_fill_holes(img &gt; threshold_otsu(img))</code> at all three label
+    conditions — not similar, equal. With the filter on, the foreground is a strict
+    <i>subset</i>, and the IoU deficit (0.9372 measured vs 0.9374 predicted from the area
+    ratio at M01) is entirely the filter.</p>
+    </div>
+    <p class="kv">It reduces 2337 / 1906 / 2125 raw components to 303 / 171 / 210
+    granule-sized ones. The rest is sub-granule haze — the debris population that had been
+    quietly contaminating every per-object statistic in this project.</p>
+    <p class="kv"><b>Its limits, measured.</b> The watershed branch floods its <i>own</i>
+    internal EDT with peaks spaced by <code>min_distance</code>; it cannot be handed a
+    different landscape or different seeds. That constraint is what routes R1 and R2 exist to
+    compare — see §6, where it turns out not to be the bottleneck.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/panel_analysis_segment.png" alt="analysis.segment inspector panel">
+  <div>
+    <h4>…and the same node in the properties panel</h4>
+    <p>The card shows resolved state; the inspector shows the editable form — spin boxes with
+    real ranges, the ƒ-auto toggles that switch a socket between a pinned value and its
+    metadata-derived default, and the mode dropdowns.</p>
+    <p class="kv">Note what is <i>absent</i>: rows gated by <code>available_in</code> on an
+    inactive mode do not render at all. The <code>min_volume</code>/<code>max_volume</code>
+    pair only appears on the 3D lever, and <code>mask</code>/<code>min_distance</code> only
+    under <code>method=watershed</code>. The card is a picture of the node's <i>current</i>
+    configuration, not its full socket list.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_enhance_gaussian.png" alt="enhance.gaussian card">
+  <div>
+    <h4>Gaussian Blur <span class="op">enhance.gaussian</span></h4>
+    <p>σ in µm, converted through <code>pixel_size_um</code>. Swept from 0 to 20 µm: the
+    optimum is <b>10.0 µm</b> and it is worth <b>8.4 points</b> of accuracy over no smoothing
+    at all (75.4% → 83.8%). Below it the seeder fires on texture; above it neighbouring
+    granules merge into one maximum.</p>
+    <p class="kv">One caveat the card cannot show: <code>enhance.*</code> nodes operate on the
+    <i>image</i>, never on a named layer. There is no way to blur a mask, which is why the
+    neck-breaking experiment had to go through greyscale morphology instead.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_detect_spots.png" alt="detect.spots card">
+  <div>
+    <h4>Spot Detection <span class="op">detect.spots</span></h4>
+    <p>A two-ended radius band in µm, with σ = r ⁄ pixel_size ⁄ √ndim and a 1-voxel floor.
+    The band here is <b>0.7–1.3 × r_eq</b>, and <code>r_eq</code> comes from the
+    <i>labels</i> — the median area of a user-confirmed single granule, per condition. That is
+    why the card reads <code>23.693… µm</code> rather than a round number: the parameter is
+    measured, not chosen.</p>
+    <p class="kv"><b>This node is the accuracy ceiling</b>, and §6 shows why. Both of its
+    settings were exhausted: <code>method=log</code> beats <code>method=dog</code> at every
+    band tried (83.8% vs 82.0%), and its <code>threshold</code> is a flat plateau — 81.3% for
+    every value from 0 to 0.005, because the response is already saturated.</p>
+    <p class="kv">Its <code>threshold</code> acts on a <b>per-plane min-max normalised</b>
+    image, which is a real design decision rather than an accident: it makes one value
+    transferable across planes of differing brightness. Here it also made it insensitive.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_analysis_voronoi.png" alt="analysis.voronoi card">
+  <div>
+    <h4>Voronoi Cells <span class="op">analysis.voronoi</span></h4>
+    <p>The splitter, and the node I had most underrated. <code>bound=per_region</code> treats
+    every connected component of the <code>region</code> raster as its own <b>arena</b>: a
+    voxel competes only among the seeds sharing its arena value, so a seed cannot claim
+    territory in a different blob. That makes it subdivide each blob by its own seeds — the
+    closest shipped analogue of flooding a landscape.</p>
+    <div class="box good" style="margin:12px 0">
+    <p style="margin:0"><b>It is essentially exact.</b> Given the right number of seeds, the
+    nearest-seed partition returns the right number of pieces <b>99.6%</b> of the time — 2
+    errors in 484 blobs. I predicted this node would be the weak link. It is the strongest.</p>
+    </div>
+    <p class="kv">I also predicted the arena choice was doing the work. It is not:
+    <code>bound=mask</code> (one arena for everything) scores 81.6% against
+    <code>per_region</code>'s 81.3% at default parameters — a tie. <b>Retracted.</b></p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_analysis_measure.png" alt="analysis.measure card">
+  <div>
+    <h4>Measure <span class="op">analysis.measure</span></h4>
+    <p>Per-object intensity statistics and shape, including <b>solidity</b> — which was the
+    single best merge discriminator this project ever measured, and which has been a shipped
+    column all along. Its second <code>raw</code> input reads a <i>different</i> channel at
+    the same voxels, and that is the whole cross-channel measurement used in §7.</p>
+    <p class="kv"><b>A friction worth naming:</b> it has no output-name socket, so its columns
+    land on the Label table named by <code>labels</code>. Two <code>measure</code> nodes on one
+    table collide on <code>mean_intensity</code>. Reading two channels therefore means two
+    <i>pulls</i>, not two nodes — which is how the cell numbers in §7 were taken.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_analysis_threshold.png" alt="analysis.threshold card">
+  <div>
+    <h4>Threshold <span class="op">analysis.threshold</span></h4>
+    <p>Writes a uint8 0/1 mask — the form <code>transfer_domain</code> needs to turn a phase
+    into a per-plane area fraction. Six methods; the one that mattered was <b><code>fixed</code></b>,
+    for the reason in §7: Otsu is a <i>relative</i> rule, and on a channel with no signal in it
+    a relative rule dutifully splits the noise floor and reports the brighter half as
+    material.</p>
+  </div>
+</div>
+
+<div class="node">
+  <img src="img/nodes/card_detect_particles.png" alt="detect.particles card">
+  <div>
+    <h4>Particle Detection <span class="op">detect.particles</span> — tried, rejected</h4>
+    <p>Its only scale knob is <code>min_distance</code>, which sets the LoG σ <i>and</i> the
+    NMS radius <i>and</i> the border trim at once. Coupled that way it cannot both resolve a
+    granule and permit two touching ones: scored <b>54.1%</b>, with <b>22.2% of granules lost
+    outright</b> (33.0% at M15). Included here because a rejected route with a number attached
+    is evidence, and the coupling is the reason.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="chain">4 · The chain on real data</h2>
+
+<p>What each node does to the image, on one real plane. Colours use a stable id→colour hash,
+so a granule keeps its colour from panel to panel and you can follow one object through the
+chain.</p>
+
+<img src="img/nodes/fig_stages.png" alt="Stage-by-stage transformation of a real plane">
+<figcaption><b>M08 (pure medium functional), z=1, t=0.</b> Panels ①–⑥ are a 430 µm crop of the
+1.76 mm field. Watch the large blob at the top of panel ②: connected components make it
+<i>one</i> object, and by panel ⑤ the seeds inside it have split it into three. That single
+transition is what the 10-point improvement over the baseline consists of. Panel ⑥ is a
+measured column painted back onto the raster by
+<code>transform.transfer_structure label→voxel</code> — a node producing its own figure.</figcaption>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="valid">5 · Scored against the labels</h2>
+
+<p>582 blobs across three conditions, hand-labelled "how many granules are in this blob"
+(1 · 427, 2 · 109, 3+ · 46). The metric is vendored unchanged from the prototype so the
+numbers are comparable: for each labelled blob, count the pieces of the candidate labelling
+inside it with area ≥ 0.30 × the median <i>label-confirmed single</i> for that condition, cap
+at 3, compare.</p>
+
+<div class="box info">
+<p style="margin:0"><b>The reference partition stays frozen.</b> The labels key on
+<code>oid</code>, the id of a connected component of the <i>original</i> Otsu foreground.
+Re-deriving those blobs from the graph would renumber them and silently unjoin every label,
+so the harness rebuilds the reference labelling with <code>skimage</code> and scores the node
+raster <i>inside</i> each reference blob. The node route supplies the candidate subdivision,
+never the frame it is judged in.</p>
+</div>
+
+<div class="box good">
+<p style="margin:0"><b>Harness control passed before anything else was believed.</b> Route R0
+— plain connected components through the graph — scores <b>73.4%</b> pooled against the
+prototype's independently-derived <b>73.3%</b>, and its per-condition under-split rates
+(34.5% / 26.3% / 19.3% for S/M/L) reproduce the prototype's merge rates exactly. The scoring
+is measuring the graph, not itself.</p>
+</div>
+
+<img src="img/nodes/fig_bench.png" alt="Held-out accuracy of each route">
+<figcaption>Parameters chosen on two conditions and scored on the third, three ways round.
+Error bars are the half-range across the three splits.</figcaption>
+
+<table>
+<tr><th>Route</th><th>Nodes</th><th class="n">M01</th><th class="n">M08</th><th class="n">M15</th><th class="n">held-out mean</th><th class="n">under</th><th class="n">over</th><th class="n">lost</th></tr>
+<tr><td><b>R2</b> spots + voronoi</td><td>6</td><td class="n">85.7%</td><td class="n">84.4%</td><td class="n">81.6%</td><td class="n"><b>83.8%</b></td><td class="n">9.1%</td><td class="n">7.0%</td><td class="n">1.5%</td></tr>
+<tr><td><b>R1</b> EDT watershed</td><td>4</td><td class="n">84.2%</td><td class="n">82.0%</td><td class="n">82.1%</td><td class="n">82.8%</td><td class="n">9.1%</td><td class="n">8.1%</td><td class="n">1.2%</td></tr>
+<tr><td><b>R4</b> greyscale open + watershed</td><td>5</td><td class="n">83.3%</td><td class="n">79.0%</td><td class="n">82.1%</td><td class="n">81.6%</td><td class="n">11.3%</td><td class="n">7.0%</td><td class="n">2.2%</td></tr>
+<tr><td><b>R2p</b> particles + voronoi</td><td>6</td><td class="n">66.5%</td><td class="n">50.9%</td><td class="n">44.8%</td><td class="n">54.1%</td><td class="n">31.3%</td><td class="n">14.6%</td><td class="n">22.2%</td></tr>
+<tr><td><b>R0</b> connected components</td><td>3</td><td class="n">65.5%</td><td class="n">73.7%</td><td class="n">80.7%</td><td class="n">73.4%</td><td class="n">26.6%</td><td class="n">0.0%</td><td class="n">0.0%</td></tr>
+<tr><td colspan="5" style="text-align:right"><i>prototype — hand-rolled intensity h-maxima flooded on intensity</i></td><td class="n"><b>88.9%</b></td><td class="n">8.4%</td><td class="n">2.8%</td><td class="n">0.4%</td></tr>
+</table>
+
+<p><b>All three leave-one-condition-out splits independently picked the same parameters</b> —
+σ = 10.0 µm, band 0.7–1.3 × r_eq, threshold 0.01. That agreement is a result in itself: the
+optimum is a property of the material, not of which two conditions were used to find it.</p>
+
+<img src="img/nodes/fig_sweep.png" alt="Parameter sweeps and the diagnosis">
+<figcaption>Every sweep was required to <b>bracket</b> its optimum. Two flagged as sitting on
+a boundary and both were chased down rather than left ambiguous: <code>detect.spots
+threshold</code> is a <b>flat plateau</b> (81.3% for every value from 0 to 0.005 — saturated,
+not unexplored), and R4's two flags are one-sided by construction, where 0 means "do not apply
+the operation" and the honest reading is that <b>both extra operations make it worse</b>
+— pre-smoothing before the Otsu cut costs 4.1 points, a greyscale opening costs 6.0.</figcaption>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="diag">6 · Whose fault is the gap?</h2>
+
+<p>83.8% against the prototype's 88.9% is a 5-point deficit, and the error decomposition says
+exactly where it is <i>not</i>. Under-split is <b>9.1%</b> against the prototype's 8.4% —
+the same. The entire gap is <b>over-splitting</b>: 7.0% against 2.8%.</p>
+
+<p>Two very different bills could produce that, so I counted the seeds inside each labelled
+blob and compared against both the label and the number of pieces produced:</p>
+
+<table>
+<tr><th>Question</th><th class="n">measured</th><th>reading</th></tr>
+<tr><td>Seed count matches the label</td><td class="n">83.2%</td><td>of 582 blobs</td></tr>
+<tr><td>Too many seeds</td><td class="n">7.7%</td><td>≈ the 7.0% over-split rate</td></tr>
+<tr><td>Too few seeds</td><td class="n">9.1%</td><td>= the 9.1% under-split rate</td></tr>
+<tr><td><b>P(over-split | seed count was right)</b></td><td class="n"><b class="yes">0.4%</b></td><td>2 errors in 484 blobs — the partition</td></tr>
+<tr><td><b>P(over-split | seed count was too high)</b></td><td class="n"><b class="no">86.7%</b></td><td>45 blobs — the seeder</td></tr>
+</table>
+
+<div class="box bad">
+<p style="margin-top:0"><b>Retraction — the COUNT is the seeder's, not the partition's.</b> I
+went in expecting the partition to be the weak link and pre-authorised two new sockets on
+<code>analysis.segment</code> to fix it. For counting, that was wrong: the partition
+contributes 2 errors out of 582, and <b>the score simply <i>is</i> the seeder's accuracy</b> —
+83.2% seed agreement against 83.8% held-out score, with both error directions matching their
+seed-count causes to within a point.</p>
+<p style="margin-bottom:0"><b>But read the scope of that claim carefully</b>, because I
+initially over-stated it. The labels say <i>how many</i> granules are in a blob and never
+where the boundary lies, so this metric is blind to boundary placement. "The partition is
+essentially exact" is true of <i>counting</i> and, as §7 shows by measurement, false of
+<i>placing</i>. Both gaps are real and they are different gaps.</p>
+</div>
+
+<p><b>Where the gap actually lives.</b> Both shipped seeders were exhausted:
+<code>detect.spots</code> <code>method=log</code> at its swept optimum, <code>method=dog</code>
+worse at every band, its threshold on a plateau, and <code>detect.particles</code> structurally
+unable to do the job because its one knob sets the filter scale and the suppression radius
+together. So <b>83.8% is the shipped catalog's ceiling for this task</b>, and the missing
+capability is a <i>seeding algorithm</i> — h-maxima on smoothed intensity, which suppresses a
+shallow maximum by its <b>depth</b> rather than by scale or absolute response.</p>
+
+<p>Which makes the minimal change a <b>new <code>method</code> option on
+<code>detect.spots</code></b> — one Mode choice on one existing node — rather than two sockets
+on <code>analysis.segment</code>. Smaller than what I proposed, and pointed at a different
+node. <b>Nothing has been built; this is a measurement, not a change.</b></p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="surface">7 · Is anything checking the granules against the energy at their surface?</h2>
+
+<p class="lede">No. And the cost is about <b>a third of a granule radius</b>.</p>
+
+<p><code>analysis.voronoi</code> assigns each voxel to the nearest seed <i>in µm</i>. It never
+reads the image. So its divide between two granules is the perpendicular bisector of their two
+seeds — a geometric midpoint — where the physical boundary is the dim seam where the two
+bodies meet. Nothing in the shipped chain compares the two.</p>
+
+<div class="box warn">
+<p style="margin:0"><b>The labels cannot detect this, which is why §5 and §6 missed it.</b> A
+label says "this blob holds two granules". It says nothing about where the surface between
+them lies. Every score in §5 is a <i>count</i> metric and is structurally blind to a boundary
+that is in the wrong place but on the right side of every seed. So this needed a separate,
+label-free measurement.</p>
+</div>
+
+<p><b>The experiment.</b> Take the pipeline's seeds and hold them <i>identical</i>. Partition
+once with <code>analysis.voronoi</code> (geometric) and once by flooding the smoothed intensity
+from the same markers. No shipped node can do the second — that is the point — but as a
+measuring instrument it isolates the partition rule with nothing else moving.</p>
+
+<img src="img/nodes/fig_surface.png" alt="Boundary placement against surface intensity">
+<figcaption><b>Left panel is the whole argument.</b> Red is the geometric divide, blue the
+intensity saddle, same seeds. The red boundaries are long straight bisectors that visibly cut
+<i>through</i> bright granule bodies; the blue ones are short segments sitting in the narrow
+dark necks — which is where a boundary between two touching solids belongs.</figcaption>
+
+<table>
+<tr><th>Check (no ground truth needed)</th><th class="n">M01</th><th class="n">M08</th><th class="n">M15</th><th>reading</th></tr>
+<tr><td>intensity ON the voronoi divide ÷ interior</td><td class="n no">0.982</td><td class="n no">0.937</td><td class="n no">1.024</td><td>at body brightness — at M15 <i>brighter</i> than the interior median</td></tr>
+<tr><td>…on the intensity-flood divide</td><td class="n yes">0.948</td><td class="n yes">0.870</td><td class="n yes">0.991</td><td>consistently dimmer: a real seam</td></tr>
+<tr><td>median solidity, voronoi objects</td><td class="n no">0.801</td><td class="n no">0.834</td><td class="n no">0.853</td><td>granules are convex polygons, so higher is right</td></tr>
+<tr><td>median solidity, flood objects</td><td class="n yes">0.832</td><td class="n yes">0.856</td><td class="n yes">0.865</td><td>more convex at every condition</td></tr>
+<tr><td>foreground assigned differently</td><td class="n">5.5%</td><td class="n">7.4%</td><td class="n">7.5%</td><td>6.6% pooled</td></tr>
+<tr><td><b>mean boundary shift</b></td><td class="n">6.6 µm</td><td class="n">10.9 µm</td><td class="n">16.1 µm</td><td><b>31.9% of a granule radius</b>, pooled</td></tr>
+</table>
+
+<p>Three independent checks, all pointing the same way, and the first one is the most damning:
+<b>a divide sitting at 0.98–1.02 of interior brightness is not in a seam at all</b> — it is in
+the granule body. The user's own read of these images was that a merge betrays itself through
+"very high energy areas that form peninsulas" and thin bright connections. That tell is about
+the <i>surface</i>, and the current pipeline uses intensity only to locate <i>centres</i>.</p>
+
+<h3>What this changes</h3>
+
+<ul>
+<li><b>Counts are sound; per-object geometry is not.</b> Anything derived from the partition's
+boundaries — per-granule area, solidity, axis lengths, and therefore any size distribution or
+per-granule packing figure — carries a ~32%-of-radius boundary error. This is why no
+per-granule size number appears in §7 below.</li>
+<li><b>Void fractions are unaffected.</b> They come from the phase <i>mask</i> and the
+size-filtered component areas, never from the instance partition. The numbers in §7 do not
+depend on where the divide between two touching granules falls.</li>
+<li><b>Solidity is a usable in-graph diagnostic.</b> <code>analysis.measure shape=solidity</code>
+is shipped, so a user can see 0.80 where a convex polygon should give ~0.95 and know the
+boundaries are wrong, with no labels at all. That is worth writing into the preset.</li>
+<li><b>The <code>height</code> socket is back on the table</b> — for boundary accuracy, not
+for counting. My retraction of it in §6 was made on a count-only metric and was premature;
+this is the measurement that would have justified it, and it is a different justification from
+the one I originally gave. Still nothing built.</li>
+</ul>
+
+<p class="kv">Not measured, and worth being explicit about: the plan's <i>other</i> surface-energy
+idea — a boundary-area penalty <code>γ̃|∂L|</code> that forbids protrusions thinner than
+<code>w_min</code>, so a thin jut can never be admitted — is not implemented or tested anywhere
+here. It lives in <code>analysis.relax_shapes</code>, which this pass never exercised. The
+solidity numbers above are the closest thing to evidence that such a term would have something
+to do: at 0.80–0.87, both partitions are producing objects less convex than the material is.</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="results">8 · The results, redone</h2>
+
+<img src="img/nodes/fig_results.png" alt="Void, phantom phase, the fix, and dye leaching">
+
+<h3>The phantom phase — and a second retraction</h3>
+
+<p>At a pure-functional control the well contains <b>no inert material at all</b>, so every
+voxel Otsu calls "inert" in the Nile-Blue channel is an artefact. My plan asserted that
+<code>analysis.segment</code>'s <code>min_area</code> "<i>is</i> the phantom-inert fix". It
+is not. A uniform µm² filter removed only 45–64% of it and stalled.</p>
+
+<p>The reason is measurable. The residual phantom mask sits <b>83.7% / 94.7% / 95.7%</b>
+inside the F mask, against random expectations of 24.4% / 37.2% / 40.2%. It is the functional
+granules' own autofluorescence pedestal bleeding into the Nile-Blue channel — so it is
+granule-<i>shaped</i>, therefore granule-<i>sized</i>, and <b>no area threshold can reach
+it</b>.</p>
+
+<div class="box good">
+<p style="margin-top:0"><b>An existing node does fix it — a different parameter of the same
+node.</b> <code>analysis.segment level=fixed</code> takes an absolute raw-DN threshold, and
+the design supplies its own calibration set: at the three pure-F controls every Nile-Blue
+count is known to be artefact. At <b>200 DN</b> the phantom phase is <b>exactly 0.0000</b> at
+all three, while <b>109–137%</b> of what Otsu found survives at the three mixed conditions —
+Otsu was <i>under</i>-detecting real inert, because bright granules pull its cut upward.</p>
+<p style="margin-bottom:0">The threshold is interior to a well-behaved range: below it the mask
+balloons (277% at 100 DN), above it real inert dies (73% at 300, 0% at 700). Zero new nodes;
+the experiment's own zero control choosing a parameter.</p>
+</div>
+
+<div class="box warn">
+<p style="margin:0"><b>And the trade-off that buys.</b> A fixed cut is immune to being handed
+a channel with no signal, but unlike Otsu it does <b>not</b> self-correct for bleaching over a
+15-frame series. The mixed conditions come out flat-to-falling in inert fraction, so bleaching
+is not visibly biting here — but on a longer series or a dimmer dye this is the failure mode to
+watch, and it is the price of the fix rather than a free win.</p>
+</div>
+
+<h3>Void fraction per phase</h3>
+
+<table>
+<tr><th>Condition</th><th>design</th><th class="n">F solid</th><th class="n">I solid</th><th class="n">void = 1−F−I</th><th class="n">F∩I Jaccard</th></tr>
+<tr><td>M01</td><td>pure F, small</td><td class="n">0.218</td><td class="n">0.000</td><td class="n">0.782</td><td class="n">—</td></tr>
+<tr><td>M08</td><td>pure F, medium</td><td class="n">0.308</td><td class="n">0.000</td><td class="n">0.692</td><td class="n">—</td></tr>
+<tr><td>M15</td><td>pure F, large</td><td class="n">0.382</td><td class="n">0.000</td><td class="n">0.618</td><td class="n">—</td></tr>
+<tr><td>M04</td><td>0.50 F, S+M inert</td><td class="n">0.061</td><td class="n">0.480</td><td class="n">0.459</td><td class="n">0.0024</td></tr>
+<tr><td>M11</td><td>0.50 F, M+M inert</td><td class="n">0.080</td><td class="n">0.426</td><td class="n">0.494</td><td class="n">0.0006</td></tr>
+<tr><td>M19</td><td>0.75 F, L+L inert</td><td class="n">0.242</td><td class="n">0.175</td><td class="n">0.583</td><td class="n">0.0003</td></tr>
+</table>
+
+<p><b>The subtraction is licensed, and measured rather than assumed.</b> There is no shipped
+boolean op to intersect two masks, so the F∩I overlap is computed in the reporting layer from
+two node outputs — and at every mixed condition it is ≤ 0.24%, which bounds the error in
+<code>1 − F − I</code>.</p>
+
+<p><b>Void now behaves like packing.</b> It falls monotonically as inert is added (pure-F
+0.782 / 0.692 / 0.618 → mixed 0.459 / 0.494 / 0.583), and within the pure-F series it falls
+with granule size. The prototype's uniform ~0.60 across all six conditions was hiding that
+trend <i>behind the phantom solid it was counting as material</i> — this is a case where the
+node route is not merely comparable but more coherent.</p>
+
+<h3>Cells: dye leaching, measured cross-channel</h3>
+
+<table>
+<tr><th>Condition</th><th class="n">cells</th><th class="n">d_eq µm</th><th class="n">GFP</th><th class="n">F channel</th><th class="n">NB above void</th></tr>
+<tr><td>M01 <span class="pill">pure F</span></td><td class="n">302</td><td class="n">13.1</td><td class="n">2559</td><td class="n">1277</td><td class="n yes">+22</td></tr>
+<tr><td>M08 <span class="pill">pure F</span></td><td class="n">101</td><td class="n">12.9</td><td class="n">2709</td><td class="n">1654</td><td class="n yes">+25</td></tr>
+<tr><td>M15 <span class="pill">pure F</span></td><td class="n">72</td><td class="n">11.9</td><td class="n">2789</td><td class="n">1582</td><td class="n yes">+22</td></tr>
+<tr><td>M04</td><td class="n">67</td><td class="n">12.7</td><td class="n">2331</td><td class="n">1034</td><td class="n no">+784</td></tr>
+<tr><td>M11</td><td class="n">18</td><td class="n">12.4</td><td class="n">2266</td><td class="n">1134</td><td class="n no">+1260</td></tr>
+<tr><td>M19</td><td class="n">30</td><td class="n">10.2</td><td class="n">2543</td><td class="n">1628</td><td class="n no">+519</td></tr>
+</table>
+
+<p>A <b>24–57× split</b> on nothing but dye availability, with GFP roughly equal across both
+groups as the detection control and cell diameter consistent at 10–13 µm. The cells are
+GFP-labelled; where Nile-Blue granules exist the dye leaches into them. The three pure-F
+controls are the experiment's own zero — no inert material, nothing to take up — and this is
+the whole measurement, delivered by <code>analysis.measure</code>'s <code>raw</code> socket
+with no unmixing anywhere.</p>
+
+<h3>Tracking — and what it does not support</h3>
+
+<p><code>track.link target=label</code> links by maximum IoU, and it runs. But the number that
+matters is how long an identity survives: <b>only 2.4–30.7% of granule tracks span 90% of the
+series</b>. Granule identity does not persist, so per-granule motion is <b>not measurable</b>
+from this linking — the same blocker the prototype hit, now reproduced through the node route
+rather than blamed on a script.</p>
+
+<div class="box warn">
+<p style="margin:0"><b>A metric I had to disqualify.</b> I first reported "match/frame = 100.0%"
+at every condition. It is vacuous: every object appears in exactly one membership row, so
+rows ÷ objects is 1.0 whatever the linking did. It is left in the script output labelled as
+vacuous rather than deleted, because a metric that reads 100% at every condition is exactly the
+kind of thing that gets quoted.</p>
+</div>
+
+<p>Cell speed comes out at <b>0.144–0.318 µm/min</b> against the prototype's 0.39 µm/min
+drift-corrected — same order, both inside the textbook mammalian crawling range. The node route
+reads <i>lower</i>, not higher, so my prediction that a missing drift model would inflate it was
+wrong. The difference is unattributed and stays that way until measured.</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 id="ledger">9 · The honest ledger</h2>
+
+<h3>What the shipped catalog does as well as, or better than, the prototype</h3>
+<table>
+<tr><th>Capability</th><th>Verdict</th><th>Evidence</th></tr>
+<tr><td>Otsu foreground</td><td class="yes">identical</td><td>bit-for-bit equal arrays at all three conditions</td></tr>
+<tr><td>Debris rejection</td><td class="yes">better</td><td>µm²-calibrated, one node; 2337 → 303 components</td></tr>
+<tr><td>Splitting touching granules</td><td class="part">10 points up, 5 short</td><td>73.4% → 83.8% vs 88.9%</td></tr>
+<tr><td>EDT watershed</td><td class="yes">better</td><td>82.8% vs the prototype's EDT h-maxima at 81.7%</td></tr>
+<tr><td>Nearest-seed partition — counting</td><td class="yes">essentially exact</td><td>99.6% correct given correct seeds</td></tr>
+<tr><td>Nearest-seed partition — boundary placement</td><td class="no">worse</td><td>cuts through bright bodies; 0.98-1.02 of interior brightness on the divide</td></tr>
+<tr><td>Phantom-phase suppression</td><td class="yes">better</td><td>exactly 0.0000, and it <i>gains</i> real inert</td></tr>
+<tr><td>Void fraction</td><td class="yes">more coherent</td><td>monotone in inert content; prototype's was flat</td></tr>
+<tr><td>Cross-channel intensity</td><td class="yes">reproduced</td><td>24–57× leaching split, no unmixing</td></tr>
+<tr><td>IoU linking</td><td class="yes">was always there</td><td>my centroid linker was the defect</td></tr>
+<tr><td>Per-granule motion</td><td class="no">not supported</td><td>2.4–30.7% track span</td></tr>
+</table>
+
+<h3>Gaps found, and what each actually costs</h3>
+<table>
+<tr><th>Gap</th><th>Cost here</th><th>Smallest honest fix</th></tr>
+<tr><td>No h-maxima seeder</td><td class="no"><b>5.1 points</b> of accuracy — the only gap that cost real precision</td><td>a <code>method</code> option on <code>detect.spots</code></td></tr>
+<tr><td>No mask boolean algebra</td><td class="part">none — the overlap is two numbers, and it is ≤0.24%</td><td>nothing; reporting layer</td></tr>
+<tr><td>No per-object column filter</td><td class="part">none <i>here</i> — both uses were area windows the producers already have</td><td>nothing yet</td></tr>
+<tr><td>No object classification by feature</td><td class="yes">none — F and I are channels</td><td>nothing; proposal withdrawn</td></tr>
+<tr><td>No external flood landscape — <i>counting</i></td><td class="yes">none — measured at 0.4%</td><td>nothing needed for count accuracy</td></tr>
+<tr><td>No external flood landscape — <i>boundary placement</i></td><td class="no"><b>31.9% of a granule radius</b>; the divide sits at body brightness, not in a seam</td><td>a <code>height</code> socket on <code>analysis.segment</code>'s watershed branch — justified by §7, not by §5</td></tr>
+<tr><td><code>track.link</code> writes no <code>track_id</code> back</td><td class="part">it does not compose with <code>object_metrics</code></td><td>bridged with a third shipped node, <code>transfer_structure track→point</code></td></tr>
+<tr><td>Cross-channel object→object binding</td><td class="part">cell <i>parent identity</i> unavailable; cell/phase preference is not</td><td>a channel-scope Mode on <code>transfer_structure</code> — not needed for any result here</td></tr>
+<tr><td><code>measure</code> has no output name</td><td class="part">two channels need two pulls</td><td>nothing; a documented shape</td></tr>
+<tr><td><code>dt_s</code> 4× wrong on strided timestamps</td><td class="no">would have made every velocity 4× too slow</td><td>compare stamp count to the T axis and refuse, per the module's own "absent is the honest signal" rule</td></tr>
+<tr><td>Empty result emits <i>no</i> structure table</td><td class="part">a correct "found nothing" looks like a missing layer</td><td>nothing; worth documenting</td></tr>
+</table>
+
+<h3>Things I got wrong, and what caught them</h3>
+<ol>
+<li><b>"<code>min_area</code> is the phantom-inert fix."</b> It removes 45–64% and stalls,
+because the phantom is granule-sized by construction. The fix was <code>level=fixed</code>.</li>
+<li><b>"The nearest-seed partition will lose to intensity flooding."</b> For <i>counting</i>, wrong — the partition is 99.6% correct. But I then over-stated the result as the partition being exact full stop, on a metric that cannot see boundaries at all. §7 measures the boundary and the partition loses there by 31.9% of a radius, so the socket I withdrew is justified after all — for a different reason than I first gave.</li>
+<li><b>"<code>bound=per_region</code>'s arena constraint is what does the work."</b>
+<code>bound=mask</code> ties it. The arenas are not the mechanism.</li>
+<li><b>"The partition is essentially exact."</b> Said on a count-only metric and repeated without its scope. It is exact at counting and measurably wrong at placing, and the labels could never have told me — that needed a separate, label-free measurement, which only got run because the question was asked.</li>
+</ol>
+
+<h3>Reproducing this</h3>
+<pre>PYTHONUTF8=1 python scripts/_bed_nodegraph.py parity     # foreground vs the prototype
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py bench      # the five routes, per condition
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py sweep      # bracketed sweeps + leave-one-out
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py diagnose    # seeder vs partition
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py plateau     # resolve the boundary flags
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py phases      # void per phase over time
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py phantom     # the containment test + the fix
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py cells       # leaching, cross-channel
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py track       # IoU linking + cell speed
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py surface     # boundary vs the intensity saddle
+PYTHONUTF8=1 python scripts/_bed_nodegraph.py graphs      # write CodeLog/graphs/*.nd2graph.json
+
+PYTHONUTF8=1 QT_QPA_PLATFORM=offscreen python scripts/_bed_nodegraph_shots.py   # the GUI shots
+PYTHONUTF8=1 python scripts/_bed_nodegraph_report.py                           # the figures</pre>
+
+<p class="kv">Qt lives only in <code>_bed_nodegraph_shots.py</code>; the engine work never
+imports PySide6. The two meet through the <code>*.nd2graph.json</code> files, which is what
+keeps the screenshots and the numbers describing the same graph. Figures and every number are
+script-generated into <code>CodeLog/img/nodes/</code> and
+<code>results/nodegraph/*.json</code>; the prose around them is written by hand.</p>
+
+<p class="kv" style="margin-top:26px">Validation set: 582 of 589 hand-labelled blobs across
+M01 / M08 / M15. Results: 6 conditions × 15 timepoints at z=1. The 18.5 GB source was read
+lazily throughout and never transcoded.</p>
+
+</div>

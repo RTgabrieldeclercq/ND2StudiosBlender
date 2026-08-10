@@ -1,0 +1,140 @@
+{
+  "format_version": "2.0",
+  "graph": {
+    "edges": [
+      {
+        "dst": "G",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "A",
+        "src_socket": "out"
+      },
+      {
+        "dst": "A",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "C",
+        "src_socket": "out"
+      },
+      {
+        "dst": "M",
+        "dst_socket": "raw",
+        "kind": "forward",
+        "src": "C",
+        "src_socket": "out"
+      },
+      {
+        "dst": "V",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "D",
+        "src_socket": "out"
+      },
+      {
+        "dst": "D",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "G",
+        "src_socket": "out"
+      },
+      {
+        "dst": "C",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "S",
+        "src_socket": "out"
+      },
+      {
+        "dst": "M",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "V",
+        "src_socket": "out"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "A",
+        "modes": {
+          "dim": "2D",
+          "level": "otsu",
+          "method": "threshold"
+        },
+        "op_key": "analysis.segment",
+        "params": {
+          "fill_holes": true,
+          "min_area": 1079.73,
+          "name": "blobs"
+        }
+      },
+      {
+        "id": "C",
+        "modes": {},
+        "op_key": "channel.select",
+        "params": {
+          "channels": [
+            1
+          ]
+        }
+      },
+      {
+        "id": "D",
+        "modes": {
+          "dim": "2D",
+          "method": "log",
+          "polarity": "bright"
+        },
+        "op_key": "detect.spots",
+        "params": {
+          "max_radius": 44.00128632443939,
+          "min_radius": 23.693000328544287,
+          "name": "seeds",
+          "threshold": 0.02
+        }
+      },
+      {
+        "id": "G",
+        "modes": {
+          "dim": "2D"
+        },
+        "op_key": "enhance.gaussian",
+        "params": {
+          "sigma": 6.9
+        }
+      },
+      {
+        "id": "M",
+        "modes": {},
+        "op_key": "analysis.measure",
+        "params": {
+          "labels": "grains",
+          "shape": "solidity,eccentricity,perimeter,axis_major,axis_minor",
+          "stats": "mean,max,median,count"
+        }
+      },
+      {
+        "id": "S",
+        "modes": {},
+        "op_key": "io.bedseed",
+        "params": {}
+      },
+      {
+        "id": "V",
+        "modes": {
+          "bound": "per_region",
+          "dim": "2D",
+          "mesh": "skip"
+        },
+        "op_key": "analysis.voronoi",
+        "params": {
+          "max_distance_um": 0.0,
+          "name": "grains",
+          "points": "seeds",
+          "region": "blobs"
+        }
+      }
+    ]
+  },
+  "groups": [],
+  "zones": []
+}

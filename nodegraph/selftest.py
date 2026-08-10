@@ -7693,17 +7693,46 @@ def test_celltracker_parity() -> None:
     lay = ras.get(D.VOXEL, "object_field_density")
     assert lay is not None and lay.values.shape == (1, T, 1, 1, Y, X), lay
 
-    # refusals: a 3D table, and a missing track_id
+    # a 2D table must NOT carry a vz column: an all-NaN axial column on every 2D
+    # workflow is noise, so vz appears only where it is actually measured
+    assert out.get(D.LABEL, "vz", layer="labels") is None, \
+        "vz must not be written for a plane_index table"
+
+    # ── 3D (subpixel) member table: per-METRIC refusal, not a blanket one ──────
+    # object_field stays 2D-only (its whole output is a grid of in-plane estimators);
+    # object_metrics now measures a volume and refuses only `divergence`/`curl`.
     ds_3d = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
              .with_layer(D.VOXEL, "labels", raster)
              .with_structure(_ST(D.LABEL, dict(tbl.columns), layer="labels",
                                  z_kind="subpixel")))
-    for op in ("analysis.object_metrics", "analysis.object_field"):
+    try:
+        run([("S", "io.ctseed", {}), ("N", "analysis.object_field", {})],
+            [("S", "N")], "N", seed=ds_3d)
+        raise AssertionError("analysis.object_field accepted a 3D (subpixel) table")
+    except ValueError as exc:
+        assert "2D-only" in str(exc), exc
+    for planar in ("divergence", "curl"):
         try:
-            run([("S", "io.ctseed", {}), ("N", op, {})], [("S", "N")], "N", seed=ds_3d)
-            raise AssertionError(f"{op} accepted a 3D (subpixel) table")
+            run([("S", "io.ctseed", {}),
+                 ("N", "analysis.object_metrics", {"params": {"metrics": planar}})],
+                [("S", "N")], "N", seed=ds_3d)
+            raise AssertionError(f"object_metrics accepted {planar!r} on a 3D table")
         except ValueError as exc:
-            assert "2D-only" in str(exc), exc
+            assert planar in str(exc) and "volumetric" in str(exc), exc
+    # …and the volume-safe metrics run, adding a real vz. This fixture's objects stay in
+    # one plane, so the axial velocity is exactly 0 wherever a predecessor exists (NOT
+    # NaN — that would mean "unmeasured") and the 3-norm speed matches the 2D answer.
+    _e3, o3 = run([("S", "io.ctseed", {}),
+                   ("M", "analysis.object_metrics",
+                    {"params": {"metrics": "velocity,speed,neighbors"}})],
+                  [("S", "M")], "M", seed=ds_3d)
+    c3 = {c: o3.get(D.LABEL, c, layer="labels").values
+          for c in ("vz", "vy", "vx", "speed")}
+    assert np.isnan(c3["vz"][0]) and np.isnan(c3["vz"][1]), \
+        "a track's first detection has no axial predecessor either"
+    assert np.allclose(c3["vz"][2:], 0.0), c3["vz"]
+    assert np.allclose(c3["speed"][2:], v_expect), c3["speed"]
+    assert o3.structure_zkind(D.LABEL, "labels") == "subpixel", "z_kind clobbered"
     ds_nt = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
              .with_layer(D.VOXEL, "labels", raster)
              .with_structure(_ST(D.LABEL,
@@ -7965,7 +7994,7 @@ def test_socket_docs() -> None:
     # stayed green. `is_catalog_op` asks the registry who registered the op, which is exact
     # and stays exact however the catalog is laid out.
     shipped = [s for s in NODES.all() if _is_catalog_op(s.op_key)]
-    assert len(shipped) >= 54, \
+    assert len(shipped) >= 70, \
         f"the catalog sweep found only {len(shipped)} shipped nodes — did the discriminator " \
         f"stop matching? (registry has {len(NODES.all())})"
 
@@ -8125,7 +8154,7 @@ def test_option_docs() -> None:
         gui_ops = frozenset()
     shipped = [s for s in NODES.all()
                if _is_catalog_op(s.op_key) or s.op_key in gui_ops]
-    assert len(shipped) >= 54, \
+    assert len(shipped) >= 70, \
         f"the catalog sweep found only {len(shipped)} shipped nodes — did the discriminator " \
         f"stop matching? (registry has {len(NODES.all())})"
     assert not gui_ops or NODES.get("io.dock") in shipped, \
@@ -8375,10 +8404,27 @@ def test_catalog_import_hygiene() -> None:
                             f"registers that node early and scrambles catalog order; it also "
                             f"welds the two nodes' fingerprints together. Move the shared "
                             f"code to `_shared/`.")
+                    # rule 6 (V2.22): `nodegraph.synth` is a TEST FIXTURE — it generates
+                    # synthetic beds with known per-voxel ownership so the shape nodes can be
+                    # graded against ground truth. It must never enter a shipped compute path.
+                    # A machine-checked clause is strictly stronger than the accidental
+                    # guarantee that living under `scripts/` would give, and it is the reason
+                    # the fixture is allowed to sit inside the package at all.
+                    if mod == "nodegraph.synth" or mod.startswith("nodegraph.synth."):
+                        bad.append(f"{rel}:{node.lineno}: `from nodegraph.synth import …` "
+                                   f"(rule 6) — that module is a test fixture and must not "
+                                   f"reach a shipped compute path")
+                    elif mod == "nodegraph" and any(a.name == "synth" for a in node.names):
+                        bad.append(f"{rel}:{node.lineno}: imports the `synth` test fixture "
+                                   f"(rule 6)")
                 elif isinstance(node, _ast.Import):
                     for a in node.names:
                         if a.name == "nodegraph.nodes":
                             bad.append(f"{rel}: `import nodegraph.nodes` (rule 1)")
+                        elif (a.name == "nodegraph.synth"
+                              or a.name.startswith("nodegraph.synth.")):
+                            bad.append(f"{rel}:{node.lineno}: `import nodegraph.synth` "
+                                       f"(rule 6) — test fixture, not a compute path")
 
     # rule 4: an __init__ may hold only docstrings, imports, assignments, and function defs
     # that are not CALLED at import time (catalog/__init__'s `load()` is defined there but
@@ -8409,10 +8455,11 @@ def test_catalog_import_hygiene() -> None:
             ("_shared/__init__.py must not import (and so must not re-export) its "
              "submodules: one re-export puts all 15 concern modules into every node's "
              "closure, which is the monolith with extra files")
-    _ok(f"catalog import hygiene: {n_mod} catalog modules obey the five import rules "
+    _ok(f"catalog import hygiene: {n_mod} catalog modules obey the six import rules "
         f"(no facade import, no bare `from nodegraph import`, no `_shared` package import, "
-        f"logic-free initialisers, no node->node imports) — the rules that keep per-node memo "
-        f"granularity and registration order from silently collapsing")
+        f"logic-free initialisers, no node->node imports, no `nodegraph.synth`) — the rules "
+        f"that keep per-node memo granularity and registration order from silently collapsing, "
+        f"and the test fixture out of every shipped compute path")
 
 
 def _is_catalog_op(op_key: str) -> bool:
@@ -8785,8 +8832,10 @@ def test_param_socket_contract() -> None:
     assert "min_radius_z" in keys_of("_compute_spots"), \
         "ctx.params[\"X\"] subscript read not resolved"
 
-    # 54 after V2.12 folded two segmentation nodes into `analysis.segment` (was 55)
-    assert audited >= 54, f"only {audited} catalog computes audited — index broke"
+    # Raised from 54 to the real count in V2.22. It had sat at 54 since V2.12 while the
+    # catalog grew past 70, i.e. slack by ~16 — a floor that far below actual cannot
+    # catch a lost node, which is the only thing it exists to do.
+    assert audited >= 70, f"only {audited} catalog computes audited — index broke"
     _ok("socket contract: all %d catalog node types — (1) every param a compute reads "
         "has a socket, (2) every socket is read (helper-forwarded, suffixed `_z`, "
         "transitive, per-channel and ctx.layer keys resolved), (3) %d layer_in + %d "
@@ -9311,6 +9360,297 @@ def test_nd2_zstack_home_index_guard() -> None:
         "step 0) no longer raises ZeroDivisionError out of ND2File.sizes — home index 0, "
         "installed by import_nd2, idempotent, and provably inert on a healthy 210-slice "
         "stack and on upstream's other branches")
+
+
+def test_nd3_calibration_mapping() -> None:
+    """The ND3 seam's honesty rules, on plain dicts — no file, no h5py.
+
+    Every rule here is the difference between a correct measurement and a
+    plausible-looking wrong one on a real MEBP export:
+
+    * **the mosaic pitfall** (ND3 spec §8.5): a plate-mosaic canvas is
+      downscaled from camera resolution, so reading ``captured_um_per_px``
+      instead of the image's own pitch mis-scales every µm figure ~75×;
+    * **sensor vs container depth**: the array dtype is the CONTAINER's depth
+      — a uint16 canvas of a 12-bit sensor — so ``bit_depth`` comes from the
+      acquisition record or stays absent, never from the dtype;
+    * **placement comes from the stored matrix only** (§8.2/§8.4): the matrix
+      is the one field guaranteed registration-shift-subtracted, and it is
+      trusted only when the file says the shift is known;
+    * **alphabetical ids are not channel order**: ``ND3Reader.image_ids()``
+      sorts alphabetically, so ``Bright_Field`` (filter channel 4) precedes
+      ``DAPI`` (channel 1) — ingesting in id order puts DAPI pixels under a
+      Bright_Field label while looking entirely normal.
+    """
+    from nodelab_v2.nd3_ingest import (calibration_from_metas, split_fragment,
+                                       stack_order)
+
+    mat = {"transforms": {"pixel_to_stage_um": [[50.0, 0, 100.0],
+                                                [0, 50.0, 200.0], [0, 0, 1]]}}
+
+    # scale: the matrix diagonal is authoritative; um_per_px is the fallback;
+    # captured_um_per_px (the CAMERA pitch) is never read even when present
+    c = calibration_from_metas([{**mat, "scale": {
+        "um_per_px": 49.0, "captured_um_per_px": 0.65}}],
+        stacked=False, c_count=1)
+    assert c["pixel_size_um"] == 50.0, c
+    c = calibration_from_metas([{"scale": {
+        "um_per_px": 50.0, "captured_um_per_px": 0.65,
+        "mosaic_scale_px_per_um": 0.02}}], stacked=False, c_count=1)
+    assert c["pixel_size_um"] == 50.0 and "origin_um" not in c, c
+
+    # bit depth: leading integer of the SENSOR record; absent stays absent
+    c = calibration_from_metas([{"acquisition": {"bit_depth": "12-bit"}}],
+                               stacked=False, c_count=1)
+    assert c["bit_depth"] == 12 and "pixel_size_um" not in c, c
+    assert "bit_depth" not in calibration_from_metas(
+        [{}], stacked=False, c_count=1)
+
+    # optics: "10x Plan Fluor" parses, junk stays absent, NA passes through
+    c = calibration_from_metas([{"acquisition": {
+        "magnification": "10x Plan Fluor", "numerical_aperture": 0.45}}],
+        stacked=False, c_count=1)
+    assert c["objective_magnification"] == 10.0 and c["objective_na"] == 0.45
+    assert "objective_magnification" not in calibration_from_metas(
+        [{"acquisition": {"objective": "Plan Fluor"}}],
+        stacked=False, c_count=1)
+
+    # origin: matrix + shift known → [[focus, oy, ox]]; shift_known false or
+    # no matrix → ABSENT (fine for translation-invariant work, never placed)
+    honest = {**mat, "planes": [{"t": 0, "c": 0, "z": 0, "focus_um": 12.5}]}
+    c = calibration_from_metas([honest], stacked=False, c_count=1)
+    assert c["origin_um"] == [[12.5, 200.0, 100.0]], c
+    legacy = {**honest, "stage_frame": {"shift_known": False}}
+    assert "origin_um" not in calibration_from_metas(
+        [legacy], stacked=False, c_count=1), \
+        "shift_known:false means the shift is UNKNOWN (up to ~half a field) " \
+        "— an origin from it is a guess wearing coordinates"
+    assert "origin_um" not in calibration_from_metas(
+        [{"planes": honest["planes"]}], stacked=False, c_count=1)
+
+    # stacking order: by channel_number when all unique (Bright_Field is
+    # filter 4 — AFTER DAPI despite sorting first alphabetically); id order
+    # the moment one is missing — never a mixed sort
+    bf = {"channels": [{"name": "Bright Field", "channel_number": 4}]}
+    dapi = {"channels": [{"name": "DAPI", "channel_number": 1,
+                          "emission_nm": 461}]}
+    assert stack_order([("Bright_Field", bf), ("DAPI", dapi)]) == \
+        ["DAPI", "Bright_Field"]
+    assert stack_order([("Bright_Field", {"channels": [{"name": "BF"}]}),
+                        ("DAPI", dapi)]) == ["Bright_Field", "DAPI"]
+
+    # stacked origins: half-a-pixel lateral tolerance. Agreeing → the first
+    # sorted channel's; one unknown → ABSENT (never "the channels that know");
+    # apart → ValueError, because those are different fields and stacking
+    # them would misregister the C axis
+    def well(ox, oy, *, known=True, ps=0.65):
+        m = {"scale": {"um_per_px": ps},
+             "transforms": {"pixel_to_stage_um": [[ps, 0, ox], [0, ps, oy],
+                                                  [0, 0, 1]]},
+             "channels": [{"name": "x"}]}
+        if not known:
+            m["stage_frame"] = {"shift_known": False}
+        return m
+
+    c = calibration_from_metas([well(100.0, 200.0), well(100.1, 200.2)],
+                               stacked=True, c_count=2)
+    assert c["origin_um"] == [[0.0, 200.0, 100.0]], c
+    c = calibration_from_metas([well(100.0, 200.0),
+                                well(100.0, 200.0, known=False)],
+                               stacked=True, c_count=2)
+    assert "origin_um" not in c, c
+    try:
+        calibration_from_metas([well(100.0, 200.0), well(150.0, 200.0)],
+                               stacked=True, c_count=2)
+        raise AssertionError("origins 50 µm apart (77 px) stacked silently")
+    except ValueError:
+        pass
+
+    # per-channel emission: holes stay None; all-absent stays absent (never
+    # fabricated from a fluorophore table — LabLink's missing_metadata refusal
+    # is the designed remediation loop)
+    c = calibration_from_metas([dapi, bf], stacked=True, c_count=2)
+    assert c["channel_emission_nm"] == [461, None], c
+    assert "channel_emission_nm" not in calibration_from_metas(
+        [bf, bf], stacked=True, c_count=2)
+
+    # dt_s: median of t_iso diffs per distinct T; absent for a single stamp
+    # or stamps that cannot be compared (mixed naive/aware)
+    lapse = {"planes": [
+        {"t": 0, "t_iso": "2026-08-08T10:00:00"},
+        {"t": 1, "t_iso": "2026-08-08T10:01:00"},
+        {"t": 2, "t_iso": "2026-08-08T10:02:00"},
+        {"t": 3, "t_iso": "2026-08-08T10:08:00"}]}   # one long gap
+    c = calibration_from_metas([lapse], stacked=False, c_count=1, t_count=4)
+    assert c["dt_s"] == 60.0, c
+    assert "dt_s" not in calibration_from_metas(
+        [{"planes": lapse["planes"][:1]}], stacked=False, c_count=1,
+        t_count=4)
+    mixed = {"planes": [{"t": 0, "t_iso": "2026-08-08T10:00:00"},
+                        {"t": 1, "t_iso": "2026-08-08T10:01:00+00:00"}]}
+    assert "dt_s" not in calibration_from_metas(
+        [mixed], stacked=False, c_count=1, t_count=2)
+    # and z_step_um is NEVER emitted (v1: no MEBP profile writes Z stacks;
+    # a fabricated spacing feeds every µm³ figure downstream)
+    assert "z_step_um" not in c
+
+    # the #image_id fragment: honored only when it can be meant as one
+    assert split_fragment("Q:\\nowhere\\well.nd3#DAPI") == \
+        ("Q:\\nowhere\\well.nd3", "DAPI")
+    assert split_fragment("Q:\\nowhere\\photo.png#frag") == \
+        ("Q:\\nowhere\\photo.png#frag", None)
+
+    _ok("nd3 calibration mapping: pitch from the stored matrix (never the "
+        "camera's captured_um_per_px — the §8.5 mosaic pitfall), bit depth "
+        "from the sensor record (never the container dtype), origin only "
+        "when the shift is known, channel_number ordering over alphabetical "
+        "ids, stacked origins honest to half a pixel, and absent — never "
+        "fabricated — everywhere the file does not say")
+
+
+def test_nd3_ingest_roundtrip() -> None:
+    """End-to-end .nd3 ingest against fixtures written with RAW h5py.
+
+    Raw h5py, not the vendored ND3 writer, deliberately: writer→reader through
+    one module only proves self-consistency; these fixtures are built straight
+    from the spec (ND3_SPEC.md §2/§3), so the test is a conformance check on
+    the reading side. Skips when h5py is absent — the rest of the ingest seam
+    (ND2/TIFF) does not need it."""
+    try:
+        import h5py
+    except ImportError:
+        _ok("nd3 ingest roundtrip: SKIPPED (h5py absent)")
+        return
+    import json
+    import os
+    import tempfile
+
+    from nodelab_v2 import nd3 as nd3mod
+    from nodelab_v2.ingest import _is_nd3, ingest_image, read_meta_only
+    from nodelab_v2.nd3_ingest import nd3_meta_only, read_nd3
+
+    # the vendor-drift canary: a re-vendored ND3.py with a new MAJOR must not
+    # land silently (readers refuse newer majors, so this repo would start
+    # refusing files the lab's MEBP still writes — or vice versa)
+    assert nd3mod.SCHEMA_VERSION == "1.0", nd3mod.SCHEMA_VERSION
+
+    tmp = tempfile.mkdtemp(prefix="nd3_selftest_")
+
+    def write(name, images, dataset_json=None, fmt="nd3", schema="1.0"):
+        path = os.path.join(tmp, name)
+        with h5py.File(path, "w") as f:
+            f.attrs["format"] = fmt
+            f.attrs["schema_version"] = schema
+            f.attrs["created_iso"] = "2026-08-08T10:00:00"
+            if dataset_json is not None:
+                f.create_dataset("dataset_json", data=np.frombuffer(
+                    json.dumps(dataset_json).encode("utf-8"), dtype=np.uint8))
+            g = f.create_group("images")
+            for image_id, (arr, axes, pixel_format, meta) in images.items():
+                gi = g.create_group(image_id)
+                ds = gi.create_dataset("data", data=arr)
+                ds.attrs["axes"] = axes
+                ds.attrs["pixel_format"] = pixel_format
+                gi.create_dataset("meta_json", data=np.frombuffer(
+                    json.dumps(meta).encode("utf-8"), dtype=np.uint8))
+        return path
+
+    def chan_meta(name, num, ps=0.65, ox=100.0, oy=200.0):
+        return {"scale": {"um_per_px": ps},
+                "transforms": {"pixel_to_stage_um": [[ps, 0, ox], [0, ps, oy],
+                                                     [0, 0, 1]]},
+                "channels": [{"name": name, "channel_number": num}],
+                "planes": [{"t": 0, "c": 0, "z": 0, "focus_um": 12.5}],
+                "acquisition": {"bit_depth": 12}}
+
+    # 1. a fluor_well twin whose ALPHABETICAL id order (Bright_Field, DAPI)
+    #    differs from its channel_number order (DAPI=1, Bright_Field=4)
+    dapi_px = np.arange(48, dtype=np.uint16).reshape(6, 8)
+    bf_px = dapi_px + 1000
+    well = write("well.nd3",
+                 {"Bright_Field": (bf_px, "YX", "gray16",
+                                   chan_meta("Bright Field", 4)),
+                  "DAPI": (dapi_px, "YX", "gray16", chan_meta("DAPI", 1))},
+                 dataset_json={"profile": "mebp.fluor_well/1",
+                               "plate_id": "plate-24", "well": "B3"})
+    axes, calib, disp = read_meta_only(well)     # through the DISPATCH seam
+    assert (axes.m, axes.t, axes.z, axes.c, axes.y, axes.x) == (1, 1, 1, 2, 6, 8)
+    assert disp["channel_names"] == ["DAPI", "Bright Field"], disp
+    assert disp["plate_id"] == "plate-24" and \
+        disp["nd3_profile"] == "mebp.fluor_well/1"
+    assert calib["origin_um"] == [[12.5, 200.0, 100.0]] and \
+        calib["bit_depth"] == 12
+    prov, env = ingest_image(well)               # in-memory provider
+    r = np.asarray(prov.read_region(0, 0, 0, 0, 0, 0, 6, 0, 8)).reshape(6, 8)
+    assert np.array_equal(r, dapi_px), "channel 0 must be DAPI (channel 1), " \
+        "not Bright_Field (alphabetically first, filter channel 4)"
+    r = np.asarray(prov.read_region(0, 0, 0, 0, 1, 0, 6, 0, 8)).reshape(6, 8)
+    assert np.array_equal(r, bf_px)
+    assert env.metadata["pixel_size_um"] == 0.65
+
+    # 2. shape mismatch refuses naming the remediation; #id loads one image
+    bad = write("bad.nd3",
+                {"A": (np.zeros((6, 8), np.uint16), "YX", "gray16",
+                       chan_meta("A", 1)),
+                 "B": (np.zeros((5, 8), np.uint16), "YX", "gray16",
+                       chan_meta("B", 2))})
+    try:
+        read_meta_only(bad)
+        raise AssertionError("a shape-mismatched pair stacked silently")
+    except ValueError as exc:
+        assert "#<image_id>" in str(exc) and "'A'" in str(exc), exc
+    ax1, _c1, d1 = read_meta_only(bad + "#A")
+    assert _is_nd3(bad + "#A") and ax1.c == 1 and \
+        d1["channel_names"] == ["A"]
+
+    # 3. YXS/BGR reorders samples to R,G,B; an unknown S format is refused
+    #    (spec §5.3: never guess an unknown format's sample order)
+    bgr = np.zeros((4, 5, 3), np.uint8)
+    bgr[..., 0] = 10                             # the stored B plane
+    bgr[..., 2] = 30                             # the stored R plane
+    cam = {"scale": {"um_per_px": 1.0}, "channels": [{"name": "Cam"}]}
+    f = write("bgr.nd3", {"capture": (bgr, "YXS", "BGR", cam)})
+    vol, _ = read_nd3(f)
+    assert vol.shape == (1, 1, 1, 3, 4, 5)
+    assert vol[0, 0, 0, 0].max() == 30 and vol[0, 0, 0, 2].max() == 10, \
+        "BGR samples not reordered — channel 0 would be blue wearing red"
+    f = write("weird.nd3", {"capture": (bgr, "YXS", "Weird3", cam)})
+    try:
+        nd3_meta_only(f)
+        raise AssertionError("unknown pixel_format with an S axis loaded")
+    except ValueError:
+        pass
+
+    # 4. a TYX time-lapse gets dt_s from its t_iso stamps (median)
+    lapse_meta = {"scale": {"um_per_px": 0.65},
+                  "channels": [{"name": "lapse"}],
+                  "planes": [{"t": t, "c": 0, "z": 0,
+                              "t_iso": f"2026-08-08T10:{t:02d}:00"}
+                             for t in range(4)]}
+    f = write("lapse.nd3", {"lapse": (np.zeros((4, 6, 8), np.uint16), "TYX",
+                                      "gray16", lapse_meta)})
+    axes, calib, _d = nd3_meta_only(f)
+    assert axes.t == 4 and calib["dt_s"] == 60.0, calib
+
+    # 5. not-nd3 and newer-major files are refused, naming the reason
+    f = write("not.nd3", {}, fmt="zarr")
+    try:
+        nd3_meta_only(f)
+        raise AssertionError("a non-nd3 HDF5 file was read as nd3")
+    except nd3mod.ND3FormatError:
+        pass
+    f = write("future.nd3", {}, schema="2.0")
+    try:
+        nd3_meta_only(f)
+        raise AssertionError("a schema-2.0 file was read by a 1.x reader")
+    except nd3mod.ND3FormatError:                # ND3VersionError subclasses it
+        pass
+
+    _ok("nd3 ingest roundtrip: raw-h5py spec fixtures load through the "
+        "dispatch seam — fluor_well twin stacked in channel_number order "
+        "(pixels verified per channel), shape mismatch refused with the "
+        "#image_id remediation, BGR reordered to RGB, dt_s from t_iso, and "
+        "non-nd3 / newer-major files refused")
 
 
 def test_transfer_structure() -> None:
@@ -11363,6 +11703,313 @@ def test_origin_um_maintenance() -> None:
         "refuses instead of falling back to the stage log that still rides the payload")
 
 
+
+def test_shape_synth() -> None:
+    """The synthetic fixture, checked BEFORE anything is graded against it (V2.22).
+
+    Runs first among the shape tests on purpose. The 585 hand labels count granules and are
+    structurally blind to where a boundary lies, so ground truth is the only instrument that
+    can say *correct* rather than *better than the last thing* — and a fixture nobody
+    validated is worse than no fixture, because every absolute number downstream inherits its
+    errors.
+
+    The two planted contacts are the load-bearing part: a THIN neck a split move must take
+    apart, and a BROAD contact it must leave alone. A split validated only on necks would
+    bisect every large granule and a count metric would barely notice.
+    """
+    try:
+        from nodegraph.synth import bed_to_dataset, make_bed
+    except Exception as exc:                                     # pragma: no cover
+        _ok(f"shape synth: SKIPPED ({type(exc).__name__}: {exc})")
+        return
+    bed = make_bed(dims=2, seed=3)
+    own, vox = bed.owner, bed.voxel_um
+    px = vox[-1]
+
+    gids = sorted(b.gid for b in bed.bodies)
+    assert gids == list(range(1, len(gids) + 1)), "body ids must be contiguous 1..n"
+    assert set(np.unique(own).tolist()) - {0} == set(gids), \
+        "every body must own painted voxels"
+    fg = float((own > 0).mean())
+    assert 0.18 < fg < 0.70, f"solid fraction {fg:.3f} is not bed-like"
+
+    planted = [c for c in bed.contacts if c[3] in ("neck", "broad")]
+    bulk = [c for c in bed.contacts if c[3] == "bulk"]
+    assert len(planted) == 2, f"expected 2 planted contacts, got {len(planted)}"
+    assert len(bulk) >= 15, (
+        f"only {len(bulk)} bulk contacts — a fixture for BOUNDARY placement needs many "
+        f"boundaries, not two")
+
+    w_min = 0.15 * bed.metadata["r_eq_um"]
+    nk = bed.metadata["neck_half_width_um"]
+    bd = bed.metadata["broad_half_width_um"]
+    assert nk < w_min, f"planted neck {nk:.2f} um must be inside the forbidden regime {w_min:.2f}"
+    assert bd > 3.0 * w_min, f"planted broad contact {bd:.2f} um must be far outside it"
+
+    # both pairs must MERGE under a plain threshold, or the fixture does not reproduce the
+    # under-segmentation the split move exists to undo
+    from scipy import ndimage as ndi
+    from skimage.filters import threshold_otsu
+    img = bed.image[0, 0, 0, 0]
+    lab_thr, _n = ndi.label(ndi.binary_fill_holes(img > threshold_otsu(img)))
+    for roles in (("neck_a", "neck_b"), ("broad_a", "broad_b")):
+        ga, gb = bed.role_gids(roles[0])[0], bed.role_gids(roles[1])[0]
+        ids = set(np.unique(lab_thr[np.isin(own, [ga, gb])]).tolist()) - {0}
+        assert len(ids) == 1, (
+            f"the {roles[0].split('_')[0]} pair must read as ONE blob after thresholding "
+            f"(the halo bridges the seam) — got {len(ids)}")
+
+    # the concave negative control: as non-convex as a necked pair, with no thin place to cut
+    from skimage.measure import regionprops
+    gc = bed.role_gids("concave")[0]
+    lc, nc = ndi.label(own == gc)
+    assert nc == 1, "the concave body must be one piece"
+    sol_c = float(max(p.solidity for p in regionprops(lc.astype(np.int32))))
+    assert sol_c < 0.90, f"the concave body has no real dent (solidity {sol_c:.3f})"
+
+    b2 = make_bed(dims=2, seed=3)
+    assert np.array_equal(bed.owner, b2.owner) and np.array_equal(bed.image, b2.image), \
+        "the fixture must be bit-identical for a fixed seed"
+    b3 = make_bed(dims=3, seed=3)
+    assert b3.owner.ndim == 3 and b3.metadata.get("z_step_um") == 40.0, "3D must build"
+    _ds, env = bed_to_dataset(bed)
+    assert env.axes.y == own.shape[0] and env.axes.c == 1, "bed_to_dataset axes"
+    _ok(f"shape synth: {bed.metadata['n_bodies']} convex bodies, solid {fg:.3f}, "
+        f"{len(bulk)} bulk contacts plus a planted THIN neck ({nk:.2f} um = {nk / px:.2f} px, "
+        f"inside w_min {w_min / px:.2f} px) and BROAD contact ({bd:.2f} um), both merged by a "
+        f"real threshold; a concave single body at solidity {sol_c:.3f} is the split move's "
+        f"negative control; bit-identical per seed and 3D builds")
+
+
+def test_fit_shape() -> None:
+    """``analysis.fit_shape`` — a convex body per object, stored as half-spaces (V2.22).
+
+    Structural spec first, so the contract is checked even where a dependency is missing, per
+    the house pattern. Then the numbers: a signed distance is only worth having if it is exact
+    on a body whose answer is known, and ``fill`` / ``rms_residual_um`` are only worth having
+    if they separate a convex body from a concave one.
+    """
+    spec = NODES.get("analysis.fit_shape")
+    assert spec is not None, "analysis.fit_shape is not registered"
+    assert spec.category == "analysis"
+    assert spec.reads_domains == frozenset({Domain.VOXEL, Domain.LABEL})
+    assert spec.adds_domains == frozenset({Domain.LABEL})
+    assert spec.resolve_granularity({"dim": "2D"}) is Granularity.WHOLE_PLANE
+    assert spec.resolve_granularity({"dim": "3D"}) is Granularity.WHOLE_VOLUME
+    assert spec.resolve_kernel_axes({"dim": "2D"}) == frozenset({"x", "y"})
+    modes = {m.name: list(m.choices) for m in spec.modes}
+    assert modes.get("model") == ["convex_hull", "obb"], (
+        "only POLYTOPE models may be offered — a sphere or an ellipsoid is not one and would "
+        "need a different field evaluator, so declaring it would be a dead control")
+    assert "dim" in modes
+    if not _HAVE_WATERSHED:
+        _ok("fit_shape: spec OK; RUN SKIPPED (needs scipy + scikit-image)")
+        return
+    try:
+        from nodegraph.synth import make_bed
+    except Exception as exc:                                     # pragma: no cover
+        _ok(f"fit_shape: spec OK; RUN SKIPPED ({type(exc).__name__}: {exc})")
+        return
+    from scipy import ndimage as ndi
+    from nodegraph.catalog._shared.shapes import fit_object_polytope
+    from nodegraph.kernels.convex_polytope import signed_distance
+
+    bed = make_bed(dims=2, seed=3)
+    vox = bed.voxel_um
+
+    def _fit(gid, model="convex_hull"):
+        m = bed.owner == gid
+        sl = ndi.find_objects(m.astype(int))[0]
+        org = [float(s.start) * v for s, v in zip(sl, vox)]
+        return fit_object_polytope(m[sl], voxel_um=vox, model=model, origin_um=org)
+
+    # A body CONTAINS itself, so fill <= 1 is a hard geometric fact — and it only holds because
+    # the hull is fitted to voxel CORNERS. Fitting centres loses half a voxel all round and put
+    # the median fill at 1.016, which is impossible, and fatal for a split proposal that
+    # triggers on fill dropping below a threshold.
+    fills, rmss = [], []
+    for role in ("bulk", "neck_a", "broad_a", "lone"):
+        poly, ex = _fit(bed.role_gids(role)[0])
+        assert poly is not None, f"{role} must fit"
+        assert ex["fill"] <= 1.0 + 1e-9, \
+            f"{role}: fill {ex['fill']:.4f} > 1 — the body is not inside its own hull"
+        fills.append(ex["fill"])
+        rmss.append(ex["rms_residual_um"])
+    poly_c, ex_c = _fit(bed.role_gids("concave")[0])
+    assert ex_c["fill"] < min(fills) - 0.05, (
+        f"the concave body's fill {ex_c['fill']:.3f} must sit clearly below every convex "
+        f"body's (min {min(fills):.3f}) — `fill` is the concavity signal")
+    assert ex_c["rms_residual_um"] > 2.0 * max(rmss), (
+        f"the concave body's fit residual {ex_c['rms_residual_um']:.2f} um must dominate the "
+        f"convex ones (max {max(rmss):.2f}) — this residual IS sigma_rough")
+
+    # |grad s| = 1 on the fitted body: the property that makes an energy imbalance of dE um
+    # displace a boundary by exactly dE um, and therefore the only reason a term weight can be
+    # calibrated against a one-voxel budget instead of tuned.
+    poly, ex = _fit(bed.role_gids("lone")[0])
+    rng = np.random.default_rng(0)
+    q = poly.centroid_um[None, :] + rng.uniform(-4.0, 4.0, size=(200, 2))
+    h = 1e-6
+    gmag = np.linalg.norm(np.stack(
+        [(signed_distance(q + h * e, poly) - signed_distance(q - h * e, poly)) / (2 * h)
+         for e in np.eye(2)], axis=1), axis=1)
+    assert np.allclose(gmag, 1.0, atol=1e-5), \
+        f"|grad s| must be 1 (max deviation {np.abs(gmag - 1).max():.2e})"
+
+    poly_o, ex_o = _fit(bed.role_gids("lone")[0], model="obb")
+    assert poly_o is not None and poly_o.n_faces == 4, \
+        f"a 2D oriented bounding box has 4 facets, got {poly_o.n_faces}"
+    assert ex_o["fill"] <= ex["fill"] + 1e-9, \
+        "an oriented bounding box cannot fit tighter than the convex hull"
+    _ok(f"fit_shape: spec OK; convex bodies fill {min(fills):.3f}-{max(fills):.3f} with residual "
+        f"<= {max(rmss):.2f} um (about one voxel, i.e. sampling-limited rather than surface "
+        f"roughness), while the concave control reads fill {ex_c['fill']:.3f} and residual "
+        f"{ex_c['rms_residual_um']:.2f} um — both statistics separate it; |grad s| = 1 to "
+        f"{np.abs(gmag - 1).max():.1e}; obb gives 4 facets and cannot fit tighter")
+
+
+
+def test_background_probability() -> None:
+    """``analysis.background_probability`` — p(background) as a PROBABILITY (V2.22 space 1).
+
+    Graded on calibration, not only on discrimination. A threshold node is scored by how
+    often it is right; this one is scored by whether 0.3 means 0.3, because the whole reason
+    it exists is that something downstream will MULTIPLY it with other evidence, and a
+    mis-calibrated factor corrupts the product silently. The synthetic bed is the instrument:
+    it carries exact per-voxel ownership, so background is known rather than estimated.
+
+    The parametric form here replaced a derived one that discriminated well (AUC 0.907) and
+    was badly mis-calibrated (ECE 0.435), which is why calibration is asserted at all.
+    """
+    spec = NODES.get("analysis.background_probability")
+    assert spec is not None, "analysis.background_probability is not registered"
+    assert spec.category == "analysis"
+    assert spec.adds_domains == frozenset({Domain.VOXEL})
+    assert spec.resolve_granularity({"dim": "2D"}) is Granularity.WHOLE_PLANE
+    assert spec.resolve_granularity({"dim": "3D"}) is Granularity.WHOLE_VOLUME
+    assert spec.resolve_kernel_axes({"dim": "3D"}) == frozenset({"z", "y", "x"})
+
+    from nodegraph.kernels.background_probability import (
+        DEFAULT_CEILING, background_probability, expected_calibration_error, fit_logistic,
+        normalise)
+
+    # monotone, bounded, and it never claims more than the ceiling
+    u = np.linspace(-0.5, 2.0, 400)
+    p = background_probability(u, normalised=True)
+    assert np.all(np.diff(p) <= 1e-7), "p(background) must fall as intensity rises"
+    assert p.max() <= DEFAULT_CEILING + 1e-6 and p.min() >= 0.0
+    assert p[0] > 0.8 * DEFAULT_CEILING and p[-1] < 0.01, "must span its range"
+
+    # the fitter recovers parameters it generated, so a new instrument can be calibrated
+    rng = np.random.default_rng(0)
+    ub = rng.normal(0.10, 0.05, 6000)
+    um = rng.normal(0.70, 0.15, 6000)
+    got = fit_logistic(ub, um)
+    assert 0.15 < got["midpoint"] < 0.65, f"fit_logistic midpoint {got['midpoint']}"
+    assert got["width"] > 0.0
+
+    if not _HAVE_SKIMAGE:
+        _ok("background probability: spec + kernel OK; RUN SKIPPED (scipy/skimage absent)")
+        return
+    try:
+        from nodegraph.synth import bed_to_dataset, make_bed
+    except Exception as exc:                                     # pragma: no cover
+        _ok(f"background probability: spec + kernel OK; RUN SKIPPED ({type(exc).__name__})")
+        return
+    from nodegraph.nodes import COMPUTES
+
+    bed = make_bed(dims=2, seed=3)
+    ds0, env = bed_to_dataset(bed)
+    define_node("io.pbgseed", "Seed", outputs=[OutDataset()])
+
+    def _pull(dim, **params):
+        g = Graph()
+        g.add(NodeInstance("S", "io.pbgseed"))
+        g.add(NodeInstance("P", "analysis.background_probability",
+                           modes={"dim": dim}, params=params))
+        g.connect("S", "P")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds0}, meta_seeds={"S": env})
+        return e, e.pull("P")
+
+    eng2, out2 = _pull("2D")
+    lay = out2.get(Domain.VOXEL, "p_background")
+    assert lay is not None, "no p_background layer written"
+    pv = np.asarray(lay.values)
+    assert pv.shape == (env.axes.m, env.axes.t, env.axes.z, env.axes.c,
+                        env.axes.y, env.axes.x), f"wrong shape {pv.shape}"
+    assert np.all(np.isfinite(pv)) and pv.min() >= 0.0 and pv.max() <= 1.0
+
+    # the fixture's own answer: owner == 0 is background
+    truth = (bed.owner == 0)
+    plane = pv[0, 0, 0, 0]
+    # exclude a 2 px band either side of every boundary — within a voxel of an edge the
+    # honest answer is intermediate, and scoring it as either class would punish the model
+    # for being right (the same exclusion the calibration on real data used).
+    from scipy import ndimage as _ndi
+    se = np.ones((5, 5))
+    band = _ndi.binary_dilation(truth, se) & ~_ndi.binary_erosion(truth, se)
+    bg, fg = plane[truth & ~band], plane[(~truth) & ~band]
+    assert bg.size > 500 and fg.size > 500, "fixture gave too few clean voxels"
+    assert bg.mean() > fg.mean() + 0.25, (
+        f"background {bg.mean():.3f} must read far above material {fg.mean():.3f}")
+    s = np.r_[bg, fg]
+    y = np.r_[np.ones(bg.size), np.zeros(fg.size)]
+    ece, _rows = expected_calibration_error(s, y)
+    assert ece < 0.30, f"expected calibration error {ece:.3f} is too large to multiply with"
+
+    # 2D and 3D are genuinely different computations, not merely different footprints — and
+    # the case that proves it is the one the lever exists for: an ATTENUATING stack. Plane 1
+    # holds the same object at a quarter the brightness, as a real confocal stack does with
+    # depth. Per-plane anchors renormalise it and still find the object; per-volume anchors
+    # are set by the bright plane, so the dim one washes out toward background. The synthetic
+    # bed cannot show this, because it EXTRUDES identical planes and the two agree exactly
+    # there — which is what the first version of this assertion tripped over.
+    from nodegraph.provider import ArrayProvider
+    att = np.full((1, 1, 2, 1, 24, 24), 40.0)          # a camera offset in both planes
+    att[0, 0, 0, 0, 6:18, 6:18] = 1000.0
+    att[0, 0, 1, 0, 6:18, 6:18] = 250.0
+    ax_a = AxisSizes(m=1, t=1, z=2, c=1, y=24, x=24)
+    ds_a = Dataset(axes=ax_a).with_image(ArrayProvider(att))
+    env_a = MetaEnvelope(axes=ax_a, metadata={})
+
+    def _pull3(dim):
+        g = Graph()
+        g.add(NodeInstance("S", "io.pbgseed"))
+        g.add(NodeInstance("P", "analysis.background_probability", modes={"dim": dim}))
+        g.connect("S", "P")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds_a}, meta_seeds={"S": env_a})
+        return e, e.pull("P")
+
+    e2, o2 = _pull3("2D")
+    e3, o3 = _pull3("3D")
+    assert e2.entry("P").recipe_hash != e3.entry("P").recipe_hash, \
+        "2D and 3D must produce distinct recipe hashes"
+    a2 = np.asarray(o2.get(Domain.VOXEL, "p_background").values)[0, 0, :, 0]
+    a3 = np.asarray(o3.get(Domain.VOXEL, "p_background").values)[0, 0, :, 0]
+    obj = (slice(8, 16), slice(8, 16))
+    assert a2[0][obj].mean() < 0.15 and a2[1][obj].mean() < 0.15, (
+        f"per-plane anchors must find the object in BOTH planes (got "
+        f"{a2[0][obj].mean():.3f}, {a2[1][obj].mean():.3f})")
+    assert a3[1][obj].mean() > a2[1][obj].mean() + 0.2, (
+        f"per-volume anchors must wash the dim plane's object toward background "
+        f"(volume {a3[1][obj].mean():.3f} vs plane {a2[1][obj].mean():.3f})")
+
+    # the refusals are real, not decorative
+    for bad, why in (({"width": 0.0}, "width"), ({"ceiling": 1.5}, "ceiling"),
+                     ({"lo_pct": 99.0, "hi_pct": 5.0}, "anchors")):
+        try:
+            _pull("2D", **bad)
+        except Exception:
+            pass
+        else:                                                    # pragma: no cover
+            raise AssertionError(f"background probability accepted a bad {why}")
+    _ok(f"background probability: spec OK; on the fixture's own ownership map it reads "
+        f"{bg.mean():.3f} in background against {fg.mean():.3f} in material with "
+        f"ECE {ece:.3f}; monotone and bounded by the ceiling; 2D per-plane and 3D "
+        f"per-volume anchors give different numbers AND different recipe hashes; "
+        f"width/ceiling/anchor refusals all fire")
+
+
 def test_transform() -> None:
     """``transform.rigid`` must move exactly the named channels, and by exactly the
     distance and DIRECTION asked for.
@@ -11593,6 +12240,8 @@ def main() -> int:
     test_nd2_audit_repairs()
     test_nd2_ingest_calibration()
     test_nd2_zstack_home_index_guard()
+    test_nd3_calibration_mapping()
+    test_nd3_ingest_roundtrip()
     test_group_reduce_repairs()
     test_transfer_structure()
     test_checkpoint_dock()
@@ -11604,6 +12253,9 @@ def main() -> int:
     test_align_to()
     test_origin_um_maintenance()
     test_transform()
+    test_shape_synth()
+    test_fit_shape()
+    test_background_probability()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

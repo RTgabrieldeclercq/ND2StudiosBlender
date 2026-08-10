@@ -83,6 +83,15 @@ def _tess_points(ctx: EvalContext, ds: Dataset, ax: AxisSizes, mode: str,
                 plab = lab_all[sel]
                 tess = tessellate_granules(pzyx, plab, vox, tp)
                 for oid, bnd in tess.boundaries.items():
+                    # A negative id is the reserved rejected-point marker
+                    # (NOISE_LABEL = -1), not an object: cluster_points can now emit
+                    # it (noise_resp) and this kernel's min_granule_points cull
+                    # produces it too. The kernel does drop negatives before
+                    # building boundaries, so this is a guard, not a live fix — it
+                    # is here so the node does not silently depend on that, since a
+                    # leaked -1 would mesh every unclaimed point into one element.
+                    if int(oid) < 0:
+                        continue
                     verts = verts_um_to_zyx(bnd.vertices_um, vox)
                     mem = plab == oid
                     elements.append(MeshElement(

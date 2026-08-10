@@ -1,0 +1,130 @@
+[
+ {
+  "h": 720,
+  "kind": "canvas",
+  "nodes": 3,
+  "path": "CodeLog\\img\\nodes\\canvas_r0.png",
+  "slug": "r0",
+  "w": 1500
+ },
+ {
+  "h": 804,
+  "kind": "card",
+  "node": "S",
+  "op": "io.load",
+  "path": "CodeLog\\img\\nodes\\card_io_load.png",
+  "slug": "r0",
+  "w": 756
+ },
+ {
+  "h": 570,
+  "kind": "card",
+  "node": "C",
+  "op": "channel.select",
+  "path": "CodeLog\\img\\nodes\\card_channel_select.png",
+  "slug": "r0",
+  "w": 756
+ },
+ {
+  "h": 1038,
+  "kind": "card",
+  "node": "A",
+  "op": "analysis.segment",
+  "path": "CodeLog\\img\\nodes\\card_analysis_segment.png",
+  "slug": "r0",
+  "w": 756
+ },
+ {
+  "h": 720,
+  "kind": "canvas",
+  "nodes": 4,
+  "path": "CodeLog\\img\\nodes\\canvas_r1.png",
+  "slug": "r1",
+  "w": 1500
+ },
+ {
+  "h": 726,
+  "kind": "card",
+  "node": "T",
+  "op": "analysis.threshold",
+  "path": "CodeLog\\img\\nodes\\card_analysis_threshold.png",
+  "slug": "r1",
+  "w": 756
+ },
+ {
+  "h": 1000,
+  "kind": "canvas",
+  "nodes": 7,
+  "path": "CodeLog\\img\\nodes\\canvas_r2.png",
+  "slug": "r2",
+  "w": 1500
+ },
+ {
+  "h": 570,
+  "kind": "card",
+  "node": "G",
+  "op": "enhance.gaussian",
+  "path": "CodeLog\\img\\nodes\\card_enhance_gaussian.png",
+  "slug": "r2",
+  "w": 756
+ },
+ {
+  "h": 960,
+  "kind": "card",
+  "node": "D",
+  "op": "detect.spots",
+  "path": "CodeLog\\img\\nodes\\card_detect_spots.png",
+  "slug": "r2",
+  "w": 756
+ },
+ {
+  "h": 882,
+  "kind": "card",
+  "node": "V",
+  "op": "analysis.voronoi",
+  "path": "CodeLog\\img\\nodes\\card_analysis_voronoi.png",
+  "slug": "r2",
+  "w": 756
+ },
+ {
+  "h": 804,
+  "kind": "card",
+  "node": "M",
+  "op": "analysis.measure",
+  "path": "CodeLog\\img\\nodes\\card_analysis_measure.png",
+  "slug": "r2",
+  "w": 756
+ },
+ {
+  "h": 1000,
+  "kind": "canvas",
+  "nodes": 6,
+  "path": "CodeLog\\img\\nodes\\canvas_r2p.png",
+  "slug": "r2p",
+  "w": 1500
+ },
+ {
+  "h": 1038,
+  "kind": "card",
+  "node": "D",
+  "op": "detect.particles",
+  "path": "CodeLog\\img\\nodes\\card_detect_particles.png",
+  "slug": "r2p",
+  "w": 756
+ },
+ {
+  "h": 1000,
+  "kind": "canvas",
+  "nodes": 6,
+  "path": "CodeLog\\img\\nodes\\canvas_r3.png",
+  "slug": "r3",
+  "w": 1500
+ },
+ {
+  "h": 1100,
+  "kind": "panel",
+  "op": "analysis.segment",
+  "path": "CodeLog\\img\\nodes\\panel_analysis_segment.png",
+  "w": 376
+ }
+]

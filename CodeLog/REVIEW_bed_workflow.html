@@ -1,0 +1,1254 @@
+<style>
+*{box-sizing:border-box}
+:root{
+  --bg:#0b0f17; --panel:#111827; --panel2:#0f1520; --line:#1f2937;
+  --fg:#e5e7eb; --dim:#9ca3af; --ok:#34d399; --bad:#fb7185; --wait:#fbbf24;
+  --acc:#38bdf8; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#f8fafc;--panel:#fff;--panel2:#f1f5f9;--line:#e2e8f0;
+        --fg:#0f172a;--dim:#52627a;--ok:#059669;--bad:#dc2626;--wait:#b45309;--acc:#0284c7}
+}
+:root[data-theme=light]{--bg:#f8fafc;--panel:#fff;--panel2:#f1f5f9;--line:#e2e8f0;
+  --fg:#0f172a;--dim:#52627a;--ok:#059669;--bad:#dc2626;--wait:#b45309;--acc:#0284c7}
+:root[data-theme=dark]{--bg:#0b0f17;--panel:#111827;--panel2:#0f1520;--line:#1f2937;
+  --fg:#e5e7eb;--dim:#9ca3af;--ok:#34d399;--bad:#fb7185;--wait:#fbbf24;--acc:#38bdf8}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15.5px/1.68 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1200px;margin:0 auto;padding:0 22px 90px}
+header.top{position:sticky;top:0;z-index:10;background:var(--bg);
+  border-bottom:1px solid var(--line);padding:15px 0 12px;margin-bottom:26px}
+header.top .row{max-width:1200px;margin:0 auto;padding:0 22px;display:flex;
+  align-items:baseline;gap:14px;flex-wrap:wrap}
+h1{font-size:19px;margin:0;letter-spacing:.2px}
+h2{font-size:20px;margin:52px 0 6px;padding-bottom:8px;border-bottom:2px solid var(--acc)}
+h3{font-size:17px;margin:38px 0 6px}
+h3 .op{font:600 15px/1 var(--mono);color:var(--acc)}
+h4{font-size:14.5px;margin:20px 0 4px;color:var(--acc)}
+.sub{color:var(--dim);font-size:13.5px}
+.toggle{background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;
+  padding:5px 10px;font:11.5px var(--mono);cursor:pointer;margin-left:auto}
+.toggle:hover{border-color:var(--ok);color:var(--ok)}
+.lede{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--acc);
+  border-radius:0 11px 11px 0;padding:16px 20px;margin:0 0 26px}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+  padding:14px 19px;margin:16px 0}
+.box.warn{border-left:4px solid var(--wait);border-radius:0 11px 11px 0}
+.box.bad{border-left:4px solid var(--bad);border-radius:0 11px 11px 0}
+.box.good{border-left:4px solid var(--ok);border-radius:0 11px 11px 0}
+.box h4{margin-top:0}
+.node{background:var(--panel);border:1px solid var(--line);border-radius:13px;
+  padding:4px 22px 20px;margin:26px 0}
+.node .hdr{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  border-bottom:1px solid var(--line);padding:14px 0 11px;margin-bottom:4px}
+.node .hdr code{font:700 15.5px var(--mono);background:none;padding:0;color:var(--acc)}
+.io{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:11px;
+  margin:15px 0}
+.io div{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:9px 12px;font-size:13.2px}
+.io b{display:block;font:600 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  color:var(--dim);margin-bottom:5px}
+.io code{font-size:.88em}
+.scroll{overflow-x:auto;margin:14px 0}
+table{border-collapse:collapse;font-size:13.4px;width:100%}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:var(--panel2);font-weight:640;color:var(--dim);white-space:nowrap}
+td.n,th.n{text-align:right;font-family:var(--mono);white-space:nowrap}
+tr:nth-child(even) td{background:color-mix(in srgb,var(--panel2) 45%,transparent)}
+code{background:var(--panel2);border-radius:4px;padding:1.5px 5px;font:.88em var(--mono)}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:13px 15px;overflow-x:auto;font:12.5px/1.6 var(--mono);margin:14px 0}
+.pill{display:inline-block;font:600 10.5px/1 var(--mono);letter-spacing:.07em;
+  padding:4px 8px;border-radius:5px;white-space:nowrap;vertical-align:middle}
+.pill.ok{color:var(--ok);border:1px solid var(--ok)}
+.pill.bad{color:var(--bad);border:1px solid var(--bad)}
+.pill.wait{color:var(--wait);border:1px solid var(--wait)}
+.pill.dim{color:var(--dim);border:1px solid var(--line)}
+.pill.new{color:#a78bfa;border:1px solid #a78bfa}
+ul,ol{padding-left:22px}
+li{margin:5px 0}
+.meta{color:var(--dim);font-size:13px;font-family:var(--mono)}
+.toc{background:var(--panel2);border:1px solid var(--line);border-radius:11px;
+  padding:14px 20px;margin:0 0 30px;columns:2;column-gap:34px}
+@media(max-width:700px){.toc{columns:1}}
+.toc a{color:var(--fg);text-decoration:none;border-bottom:1px dotted var(--dim)}
+.toc a:hover{color:var(--acc);border-color:var(--acc)}
+.toc li{margin:3px 0;font-size:13.5px}
+figure{margin:18px 0}
+figure img{width:100%;height:auto;display:block;border:1px solid var(--line);
+  border-radius:9px;background:#000}
+figcaption{color:var(--dim);font-size:12.9px;margin-top:8px;line-height:1.6}
+.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:11px;
+  margin:18px 0}
+.kpi div{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:12px 14px}
+.kpi b{display:block;font:700 20px/1.2 var(--mono);color:var(--acc)}
+.kpi span{color:var(--dim);font-size:12.3px}
+</style>
+
+<header class="top"><div class="row">
+  <h1>Packed-bed granule workflow &mdash; node design review</h1>
+  <span class="sub">V2.22 / V2.23 &middot; for the repository owner</span>
+  <button class="toggle" id="tt">theme</button>
+</div></header>
+
+<div class="wrap">
+
+<div class="lede">
+<p><b>What this document is for.</b> A workflow was designed to turn an <code>.nd2</code>
+series of a packed granule bed into per-object geometry, tracked motion, phase-resolved void
+statistics, and cells bound to the granules they crawl on. It needs <b>eight new nodes</b> plus
+extensions to five existing ones. This review explains each node: what it consumes, what it
+produces, <b>what it does to the image</b>, and why it cannot be an existing node.</p>
+<p>Every figure below is a <b>real transformation on real data</b> &mdash; a 447&nbsp;&micro;m
+crop of condition M19, processed by the code in <code>scripts/_bed_analyze.py</code>. Where a
+node is not yet built, its operation is nonetheless implemented and run, including the
+convex-polytope signed distance and the Gibbs posterior. Nothing here is a schematic.</p>
+<p class="meta">Provenance: <code>CodeLog/live/</code> holds 50 append-only entries, 32 with
+figures. Entry ids cited as <code>e0NN</code>. Nothing is committed yet; nine tracked files are
+modified and the four repository gates are green.</p>
+</div>
+
+<div class="toc"><ul>
+<li><a href="#s1">1. The problem the nodes have to solve</a></li>
+<li><a href="#s2">2. The pipeline, end to end</a></li>
+<li><a href="#s3">3. How the nodes compose</a></li>
+<li><a href="#s4">4. The nodes, one at a time</a></li>
+<li><a href="#s11"><b>5. Comparison to the existing catalog, and adoption</b></a></li>
+<li><a href="#s5">6. Extensions to existing nodes</a></li>
+<li><a href="#s6">7. Deliberately not doing</a></li>
+<li><a href="#s7">8. Code already changed</a></li>
+<li><a href="#s8">9. Data limits that shaped the design</a></li>
+<li><a href="#s9">10. What is open, and in what order</a></li>
+<li><a href="#s10">11. Review checklist</a></li>
+</ul></div>
+
+<h2 id="s1">1. The problem the nodes have to solve</h2>
+
+<p>The bed is <b>jammed</b>: granules touch. Two touching solids of the same colour have
+<b>no intensity boundary between them</b>, so no threshold can separate them &mdash; the split
+has to come from geometry. That single fact generates most of the node list.</p>
+
+<div class="scroll"><table>
+<tr><th>Requirement</th><th>Why existing nodes cannot do it</th></tr>
+<tr><td>Split touching same-colour solids</td><td>Connected components never split. Measured:
+    Otsu components are capped at <b>73.4%</b> exact object count, because that is the true
+    single-object fraction in this data.</td></tr>
+<tr><td>Per-object shape and orientation</td><td>Nothing in the repository does parametric
+    shape fitting or reports object orientation.</td></tr>
+<tr><td>A per-voxel confidence of membership</td><td>No node produces soft assignment. Hard
+    labels cannot express "this voxel is equally likely to belong to either of two touching
+    objects", which at a contact is the truth.</td></tr>
+<tr><td>Objects bound to a parent object</td><td>No parent/child relation exists between two
+    structure layers.</td></tr>
+<tr><td>Assign the empty space between objects to a phase</td><td>No node partitions
+    background by proximity to labelled phases.</td></tr>
+<tr><td>Absolute orientation over time</td><td>Body shape alone leaves a symmetry ambiguity;
+    resolving it needs rigid landmarks.</td></tr>
+</table></div>
+
+<h2 id="s2">2. The pipeline, end to end</h2>
+
+<figure>
+<img src="img/node_pipeline.png" alt="Twelve panels showing the data after each node">
+<figcaption><b>One crop, twelve stages.</b> Each panel is the state of the data <i>after</i>
+that node runs, so the whole chain is legible at once. Read across then down.
+<b>Panels&nbsp;1&ndash;3</b> are the raw channels &mdash; note that the functional bodies (c1)
+and inert bodies (c2) are interleaved and that the GFP channel is nearly empty apart from a
+handful of bright specks. <b>Panel&nbsp;4</b>: those specks become POINT objects &mdash; they
+are cells. <b>Panel&nbsp;5</b>: thresholding both body channels gives a foreground that is
+correct in bulk but contains sub-object debris. <b>Panel&nbsp;6</b>: the size filter removes
+it. <b>Panel&nbsp;7</b>: seeds from intensity maxima &mdash; note there are 38 seeds for what
+the threshold saw as far fewer blobs. <b>Panel&nbsp;8</b>: flooding from those seeds yields
+13 separate instances, each its own colour, with divides running through the contacts.
+<b>Panel&nbsp;9</b>: a convex polytope fitted to each instance. <b>Panel&nbsp;10</b>: the
+signed distance to the nearest fitted surface &mdash; blue inside, red outside, black contour
+at zero. <b>Panel&nbsp;11</b>: the Gibbs posterior; bright yellow where membership is certain,
+dark <i>at every contact and throughout the void</i>, which is the honest answer.
+<b>Panel&nbsp;12</b>: the void assigned to whichever phase's surface is nearer &mdash; dark
+red belongs to the functional phase, dark blue to the inert, grey to neither.</figcaption>
+</figure>
+
+<h2 id="s3">3. How the nodes compose</h2>
+
+<figure>
+<img src="img/node_dataflow.png" alt="Three-column node dataflow diagram">
+<figcaption><b>Three stages, and one edge that matters more than the others.</b> Column A
+turns a raw image into instances. Column B turns instances into geometry, voxel fields and
+phase assignments. Column C handles children, time and the outputs. The <b>green dashed
+edge</b> is the load-bearing one: the LABEL instances produced in column A <i>are</i> the
+parents that cells bind to in column C &mdash; that is what makes "a cell bound to its
+granule" a measurement rather than a label. Grey boxes already exist in the repository;
+coloured boxes are new or extended.</figcaption>
+</figure>
+
+<h2 id="s4">4. The nodes, one at a time</h2>
+
+<!-- ───────────────── select_objects ───────────────── -->
+<div class="node">
+<div class="hdr"><code>analysis.select_objects</code>
+  <span class="pill new">NEW</span><span class="pill ok">validated both directions</span></div>
+
+<div class="io">
+<div><b>reads</b> any domain, chosen per-instance by Mode</div>
+<div><b>writes</b> a filtered layer, or a <code>keep</code> column</div>
+<div><b>modes</b> <code>domain</code>, <code>test</code>(gt/ge/lt/le/eq/ne/between/top_n/finite/<b>area_fraction</b>), <code>action</code>(drop/mark)</div>
+<div><b>granularity</b> <code>WHOLE_SERIES</code> for population tests</div>
+</div>
+
+<p><b>What it does to the image.</b> Drops objects failing a predicate. The predicate that
+matters here is <i>size relative to a reference</i>, and it solves a problem that two other
+approaches could not.</p>
+
+<figure>
+<img src="img/node_select_objects.png" alt="Phantom inert removed at a pure well, real inert preserved">
+<figcaption><b>Top row is a well containing NO inert granules at all.</b> The Nile-Blue
+channel there is empty, but Otsu has no notion of "empty" &mdash; it thresholds the channel's
+own autofluorescence pedestal and returns a mask covering <b>30% of the field</b>, every pixel
+of which is a false positive. The size filter reduces that to <b>0.2%</b>, keeping 1%.
+<b>Bottom row is a genuinely half-inert well</b>, where the same filter keeps <b>90%</b>. One
+primitive, one parameter, validated in both directions against the experimental design.
+</figcaption>
+</figure>
+
+<div class="box bad">
+<h4>Why the obvious alternatives failed</h4>
+<p><b>Plain Otsu</b> produced the 30% phantom phase above, and a downstream void attribution
+built on it assigned <b>89% of a pure well's void to a phase that does not exist in that
+well</b>.</p>
+<p><b>A threshold floor</b> at background + 10&sigma; failed worse. On a channel with a large
+broad foreground the sub-threshold population is wide, so the floor computed
+<b>4791&nbsp;DN &mdash; above the sensor's 4095 ceiling</b>, and the foreground became
+mathematically empty. It also destroyed real signal in a mixed well.</p>
+<p><b>The discriminator is size, not level.</b> A phase with no signal yields scattered
+sub-object specks; a real phase yields object-sized components. This cannot exceed the sensor
+ceiling, introduces no tuned constant (the reference area comes from measured data), and
+clears debris from every channel as a side effect. <span class="pill dim">e047</span></p>
+</div>
+</div>
+
+<!-- ───────────────── shape_seed + refine_labels ───────────────── -->
+<div class="node">
+<div class="hdr"><code>kernels/shape_seed</code> &rarr; <code>analysis.refine_labels</code>
+  <span class="pill new">NEW</span><span class="pill ok">88.9% held out</span></div>
+
+<div class="io">
+<div><b>reads</b> VOXEL foreground (+ optional intensity, optional external height field)</div>
+<div><b>writes</b> VOXEL instance labels + a LABEL table</div>
+<div><b>modes</b> <code>method</code>(<b>competitive_growth</b>/mrf_icm), <code>seeds</code>(<b>intensity_hmax</b>/edt_hmax/external), <code>neighborhood</code>(face/edge/vertex)</div>
+<div><b>granularity</b> <code>WHOLE_VOLUME</code> &mdash; an iterative solver is never tileable</div>
+</div>
+
+<p><b>What it does to the image.</b> This is the node that breaks the jam. It takes one
+connected foreground region and divides it into individual objects by flooding a landscape from
+seeds, so the divide lands where the objects actually meet.</p>
+
+<figure>
+<img src="img/node_refine_labels.png" alt="Foreground, landscape with seeds, and two seeding strategies compared">
+<figcaption><b>Left:</b> the input &mdash; a foreground where several objects have fused into
+one component. <b>Second:</b> the landscape the node floods, with seeds marked; the flood
+divide falls where two objects' basins meet. <b>Third and fourth:</b> the same node with two
+different seed sources. Seeds from the <i>distance transform</i> (the originally planned
+default) give 81.7% held-out exact object count; seeds from <i>intensity</i> give
+<b>88.9%</b>. The node is identical &mdash; the seed source is a Mode, and on this data it is
+worth seven points.</figcaption>
+</figure>
+
+<div class="box good">
+<h4>Why intensity beats distance here, and why that stays a Mode rather than a hard-coded choice</h4>
+<p>These objects are convex polygons with bright interiors separated by dimmer seams. The
+distance transform is <b>blind to the seam</b> and sees only shape, so it over-splits on
+boundary lobing (7.6% of true singles) while missing broad flat contacts entirely. Intensity
+sees the seam directly.</p>
+<p>That is a property of <i>this</i> sample, not a general truth &mdash; for membrane-bounded
+cells or smooth beads the distance transform is the better landscape. Hence a Mode. All
+parameters were fitted on two experimental conditions and scored on a third, three ways round;
+<b>all three splits independently selected the same values</b>, and the held-out score equals
+the in-sample score. <span class="pill dim">e043</span></p>
+</div>
+
+<div class="box warn">
+<h4>Two traps this node must avoid, both of which have burned this project</h4>
+<ul>
+<li><b>A parameter sweep whose optimum sits on its own boundary has found the edge of the box,
+not an optimum.</b> This happened twice before the values above were trusted.</li>
+<li><b>Growth must be competitive and able to lose voxels.</b> Independent per-object growth in
+a contacting bed yields overlapping volumes and a probability that does not normalise.</li>
+</ul>
+</div>
+</div>
+
+<!-- ───────────────── fit_shape ───────────────── -->
+<div class="node">
+<div class="hdr"><code>analysis.fit_shape</code> <span class="pill new">NEW</span></div>
+
+<div class="io">
+<div><b>reads</b> &empty; &mdash; source domain chosen by Mode (label / point / mesh)</div>
+<div><b>writes</b> <code>Domain.LABEL</code> table: <code>id, m,t,c, z,y,x, r0..r2, qw..qz, e1,e2, shape_model, n_support, rms_residual_um, volume_um3, surface_area_um2</code></div>
+<div><b>modes</b> <code>source</code>, <code>model</code>(sphere/ellipsoid/<b>convex_hull</b>/obb), <code>group_by</code>(mtc/mt)</div>
+<div><b>key convention</b> centre in <b>voxels</b>, axes and rotation in <b>&micro;m</b></div>
+</div>
+
+<p><b>What it does to the image.</b> Replaces a blob of voxels with a small set of numbers: a
+centre, a set of bounding facets, an orientation, and a residual. Panel&nbsp;9 of the pipeline
+figure shows the fitted polytopes as cyan outlines over the raw image.</p>
+
+<div class="box">
+<h4>The shape model changed after looking at the data, and it made the node simpler</h4>
+<p>The brief specified <b>superellipsoids with surface roughness</b>. At full resolution the
+objects are unmistakably <b>convex polygons with five to seven straight sides and sharp
+corners</b>. For a convex polytope <code>P = {x : n&#7522;&middot;x &le; d&#7522;}</code>:</p>
+<pre>s(x) = max&#7522; (n&#7522; &middot; x &minus; d&#7522;)</pre>
+<p>&hellip; is negative inside, zero on the boundary, positive outside, convex, and
+<b>exact on the faces</b>. So it <i>is</i> the signed distance the probability field needs,
+with <b>no optimiser</b>. That deletes the entire superellipsoid apparatus &mdash; the
+grid-then-refine search over exponents, the radial residual, the analytic Jacobian, and the
+exponent/roughness confounding. Roughness becomes the residual to the fitted hull rather than
+a second model. Orientation still comes from the inertia tensor, so the rotation kernel is
+unaffected.</p>
+</div>
+
+<div class="box warn">
+<h4>Two conventions worth reviewing carefully</h4>
+<ul>
+<li><b>Centre in voxels, axes in &micro;m.</b> Every other structure table's <code>z,y,x</code>
+are voxel coordinates and the Viewer depends on it &mdash; but <code>r0..r2</code> are lengths
+along <i>rotated</i> body axes that do not align with an anisotropic grid, so &micro;m is the
+only coherent choice.</li>
+<li><b>Stamp <code>voxel_size_um</code> and <code>dims</code> as provenance</b> keyed by layer
+name, following the existing mesh-provenance pattern, so consumers inherit the voxel size the
+fit used instead of re-reading calibration and silently disagreeing after a recalibration.</li>
+</ul>
+</div>
+</div>
+
+<!-- ───────────────── rasterize_shape ───────────────── -->
+<div class="node">
+<div class="hdr"><code>transform.rasterize_shape</code> <span class="pill new">NEW</span></div>
+
+<div class="io">
+<div><b>reads</b> LABEL table + a VOXEL layer for shape</div>
+<div><b>writes</b> VOXEL ids + <b>ordinary float VOXEL layers</b> for the fields</div>
+<div><b>modes</b> <code>field</code>(occupancy/signed_distance/<b>probability</b>/margin), <code>overlap</code>(argmax/<b>nearest_surface</b>/max/sum), <code>channels</code>(<b>all</b>/own)</div>
+<div><b>closes a requirement at zero cost</b> because the output is a plain float layer, <code>view.overlay</code> visualises it with <b>no new node</b></div>
+</div>
+
+<p><b>What it does to the image.</b> Turns the table of fitted shapes back into voxel fields
+&mdash; the inverse of <code>fit_shape</code>. This is where "visualise the probability space
+per voxel" is satisfied.</p>
+
+<figure>
+<img src="img/node_rasterize_shape.png" alt="Signed distance, probability and margin fields, plus a profile through a contact">
+<figcaption><b>Top row:</b> the same instances rendered as three different fields. Signed
+distance is smooth and signed through the boundary. The probability field is confident inside
+objects and <b>collapses at every contact</b>. The margin field <code>p&#8321;&minus;p&#8322;</code>
+makes the contested set explicit &mdash; the dark ridges are exactly where two objects compete,
+and they are only 3&ndash;7% of voxels, which is what makes the downstream refinement cheap.
+<b>Bottom left:</b> a profile straight through a contact. The posterior passes through
+<b>0.5 at the contact</b>. That is not a limitation &mdash; anything reporting 0.99 on a
+contact plane is lying. <b>Bottom right:</b> the maths, including the term most easily
+omitted.</figcaption>
+</figure>
+
+<div class="box">
+<h4>The background class is not optional</h4>
+<pre>p_k(v) = exp(&minus;E_k/T) / ( exp(&minus;E&#8320;/T) + &Sigma;_j exp(&minus;E_j/T) )
+
+  E_k = s_k(v)      signed distance to surface k, in &micro;m
+  E&#8320; = m&#8320;         the BACKGROUND class
+  T             surface localisation uncertainty (&sigma;_PSF + &sigma;_rough), in &micro;m</pre>
+<p>Without the <code>exp(&minus;E&#8320;/T)</code> term the softmax normalises over objects
+only, so a voxel 50&nbsp;&micro;m from everything gets <code>p = 1/K</code> and looks
+confidently owned. At the measured solid fraction, <b>roughly 60% of the field is empty</b>
+&mdash; so this term governs the majority of voxels, not an edge case.</p>
+<p>Two further properties worth checking in review:
+<code>argmax_k p_k = argmin_k s_k</code> is nearest-surface assignment, which is the
+<i>provably correct</i> estimator for two identical touching convex solids (the decision
+surface is the median plane). And because <code>|&nabla;s| = 1</code> for a true signed
+distance, <b>an energy imbalance of &Delta;E &micro;m displaces the boundary by exactly
+&Delta;E &micro;m</b> &mdash; which is the calibration for any intensity or prior term added to
+the energy. Anything exceeding one voxel (1.72&nbsp;&micro;m) moves the boundary more than a
+voxel.</p>
+</div>
+
+<div class="box warn">
+<h4>Memory dictates the representation, and it is not close</h4>
+<div class="scroll"><table>
+<tr><th>Representation</th><th class="n">Per unit</th><th>Verdict</th></tr>
+<tr><td>dense <code>K &times; Z&middot;Y&middot;X</code> float32</td><td class="n">11.7 GB</td>
+    <td><span class="pill bad">impossible</span></td></tr>
+<tr><td>top-M sparse, M = 3</td><td class="n">66 MB</td><td><span class="pill ok">the design</span></td></tr>
+<tr><td>top-1 + margin</td><td class="n">22 MB</td><td>default export</td></tr>
+</table></div>
+<p>Store <code>ids (Z,Y,X,M) uint16</code> + <code>p (Z,Y,X,M) uint8</code> with M = 3: a
+triple point is real, a four-way point is measure-zero and folds into
+<code>p_other = 1 &minus; &Sigma;p</code>. Compute per z-plane over a bounded candidate set
+from a kD-tree at a physical radius, and <b>log candidate-set overflow rather than silently
+truncating</b>.</p>
+</div>
+</div>
+
+<!-- ───────────────── relax_shapes ───────────────── -->
+<div class="node">
+<div class="hdr"><code>analysis.relax_shapes</code> <span class="pill new">NEW</span></div>
+
+<div class="io">
+<div><b>reads</b> VOXEL foreground + LABEL seeds/shapes</div>
+<div><b>writes</b> refined VOXEL labels, refined LABEL shapes, probability field, energy trace</div>
+<div><b>modes</b> <code>schedule</code>(fixed/<b>anneal</b>), <code>moves</code>(none/<b>split_merge</b>)</div>
+</div>
+
+<p><b>What it does.</b> No single figure captures this node, because it is a loop: it
+alternates soft assignment against probability-weighted shape refitting until both stop moving.
+It is the node that makes the original method well posed.</p>
+
+<div class="box good">
+<h4>This resolves a circularity in the specified method</h4>
+<p>The brief asked to "assign centroids from the probability" and to compute the "probability
+from the centroids". That is a fixed point with <b>no initialiser and no proof that a solution
+exists</b>. Written as expectation-maximisation on one explicit scalar energy it becomes well
+posed:</p>
+<pre>initialise   closed-form moment fit of the seed voxels    (needs no probability)
+repeat
+  E-step     probability field at temperature T
+  M-step 1   refit each shape, weighted by p_k(v)          &lt;- "centroid from the probability"
+  M-step 2   project centroids under a spacing prior       &lt;- "weights from known geometry"
+  labels     competitive growth, then energy polish
+  moves      propose a split or a merge; ACCEPT ONLY IF TOTAL ENERGY DECREASES
+until        centroid movement &lt; 0.25 voxel and label churn &lt; 0.1%</pre>
+<p>Each step provably reduces the same scalar, and there is a termination test. The split and
+merge proposals are the "clustering algorithm that relaxes into the most probable
+configuration" from the brief, made concrete.</p>
+</div>
+
+<div class="box warn">
+<h4>A correction to the specified method: annealing temperature alone does nothing</h4>
+<p>With the energy written under a single <code>1/T</code>, <code>argmin_k E_k</code> is
+<b>independent of T</b> &mdash; so annealing T leaves the hard labelling <i>exactly
+unchanged</i>. It only softens the reported probability. "Relaxing the strictness" therefore
+needs <b>two</b> schedules: T for the visualised field and the soft weights, and a separate
+pair for the hard assignment. Without this you build something that appears to relax and never
+moves its answer.</p>
+<p>Relatedly, the surface-energy penalty should be <b>derived, not tuned</b>. A protrusion of
+radius <i>w</i> and length <i>&ell;</i> gains volume <code>&pi;w&sup2;&ell;</code> and costs
+area <code>2&pi;w&ell;</code>, so the cost per unit volume gained is <code>2&gamma;/w</code>,
+which diverges as <i>w</i>&rarr;0. Any protrusion thinner than
+<code>w_min = 2&gamma;/|s|</code> is strictly rejected &mdash; so state the physical claim
+("objects do not have high-aspect-ratio spikes"), solve for &gamma;, and <b>log the implied
+w_min so the user sees what is being forbidden</b>. Floor &gamma; during annealing so no
+schedule stage can ever admit a thinner spike.</p>
+</div>
+</div>
+
+<!-- ───────────────── classify_objects ───────────────── -->
+<div class="node">
+<div class="hdr"><code>analysis.classify_objects</code> <span class="pill new">NEW</span></div>
+
+<div class="io">
+<div><b>reads</b> &empty; &mdash; domain by Mode</div>
+<div><b>writes</b> per-instance class + posterior columns</div>
+<div><b>modes</b> <code>domain</code>, <code>feature</code>(column/ratio/<b>channel_contrast</b>/columns), <code>rule</code>(threshold/otsu/quantile/kmeans/<b>gmm</b>), <code>scope</code>, <code>n_classes</code></div>
+<div><b>granularity</b> <code>WHOLE_SERIES</code> &mdash; a population cut is a series-global statistic</div>
+</div>
+
+<p><b>What it does to the image.</b> Assigns each object to a population. In the pipeline
+figure this is what separates functional from inert bodies before the void is attributed.</p>
+
+<div class="scroll"><table>
+<tr><th>Design point</th><th>Reason</th></tr>
+<tr><td>Feature is <code>log((median_A + &delta;)/(median_B + &delta;))</code></td>
+    <td>Per-object intensity = brightness &times; depth attenuation &times; bleaching &times;
+    illumination nonuniformity. The middle factors are channel-common multiplicative
+    nuisances that a <b>ratio cancels</b>; the log makes what remains two shifted Gaussians of
+    comparable variance.</td></tr>
+<tr><td><b>Erode before measuring</b></td>
+    <td>The single highest-value line in the node. PSF bleed across a contact plane is the
+    dominant error in per-object intensity: two touching objects of different colours each
+    acquire the other's signal and a naive mean pulls both toward the middle. This is the
+    difference between ~99.5% and ~90% accuracy.</td></tr>
+<tr><td><b>BIC guard over 1, 2, 3 components</b></td>
+    <td>If BIC selects one component the channels are <b>not separating the populations</b>,
+    and the node must <b>raise</b> rather than bisect noise into two "populations".</td></tr>
+<tr><td>Three classes, not two</td>
+    <td>Forced by the data: the third population is cells, defined by a different feature
+    (GFP-positivity) than the body ratio. <b>Their voxels must be masked out of the body
+    measurement</b>, because a cell on a functional object contributes inert-channel signal
+    belonging to neither body population.</td></tr>
+<tr><td>Circularity guard</td>
+    <td>Classify on intensity <i>first</i>, bind children <i>second</i>, then at most one
+    optional consistency pass. The primary decision must not depend on children, since child
+    binding needs the class.</td></tr>
+</table></div>
+
+<div class="box bad">
+<h4>Two masks, two purposes &mdash; a silent bug that appeared twice</h4>
+<p>Phase accounting <b>excludes</b> cell voxels so the phases partition the field. Parent
+lookup must <b>not</b> exclude them: a cell crawling on an object is still <i>on</i> it, and
+punching its pixels out of the instance label makes the cell's own centroid land in a hole.
+When this was got wrong, <b>every cell in the dataset read "in void"</b> at all six conditions
+&mdash; it produces plausible zeros rather than an error. It then recurred for the second
+phase's mask. <span class="pill dim">e048</span></p>
+</div>
+</div>
+
+<!-- ───────────────── voronoi ───────────────── -->
+<div class="node">
+<div class="hdr"><code>analysis.voronoi</code> &mdash; new metric
+  <span class="pill wait">EXTENDED</span></div>
+
+<div class="io">
+<div><b>new mode</b> <code>metric</code>(<b>euclidean</b>/power/nearest_surface) &mdash; the existing default is preserved exactly</div>
+<div><b>new socket</b> <code>radius_col</code> &mdash; a <b>column</b>, not a scalar; a scalar collapses power back to Euclidean</div>
+<div><b>writes</b> cell labels, a <code>{name}_contacts</code> pair table, and <code>cell_area</code> / <code>free_area</code> / <code>local_packing_fraction</code> / <code><b>cell_residual</b></code> columns</div>
+</div>
+
+<p><b>What it does to the image.</b> Divides the empty space between objects and attributes it.
+This is the fourth deliverable &mdash; phase-resolved void.</p>
+
+<figure>
+<img src="img/node_voronoi.png" alt="Two phases, the three-phase segmentation, the distance field, and the attributed void">
+<figcaption><b>Left to right:</b> the two body channels overlaid; the three-phase segmentation
+plus cells; the distance to the nearest surface of <i>either</i> phase; and the void assigned
+to whichever phase is closer. Everything beyond 60&nbsp;&micro;m from any object is left
+<b>explicitly unattributed</b> rather than forced into a phase &mdash; that fraction is a
+first-class output, and when it is large it is a signal that the field is bad rather than that
+the bed is loose.</figcaption>
+</figure>
+
+<div class="box good">
+<h4>Ordinary Voronoi on centroids is disqualified, with numbers</h4>
+<p>Against synthetic ground truth where pixel ownership is exactly known, contested-pixel
+accuracy was: watershed <b>99.99%</b>, nearest-surface <b>99.96%</b>, power <b>99.94%</b>,
+<b>ordinary Voronoi 95.39%</b> &mdash; the sole loser, by 4.6 points. Its error is
+<b>systematic against large objects</b>: the larger object penetrates its own bisector, and
+the largest 20% lose 10% of their area on average. The direction held in 11 of 11
+field/threshold configurations.</p>
+<p><b>Nearest-surface assignment <i>is</i> a tessellation</b> &mdash; the Set-Voronoi
+diagram in its exact, sampling-free form. For bodies with disjoint interiors,
+<code>argmin_k s_k(x) = i</code> for any <code>x</code> inside body <i>i</i>, so each body lies
+entirely within its own cell and the local packing fraction is <code>&le; 1</code> by
+construction. The argument uses no sphericity, so it survives non-spherical and even concave
+shapes.</p>
+</div>
+
+<div class="box warn">
+<h4>Three implementation details a reviewer should check</h4>
+<ul>
+<li><b>The power diagram is computable exactly by a kD-tree lift.</b> With
+<code>H = max_i R_i</code>, lift sites to <code>(c_i, &radic;(H&sup2;&minus;R_i&sup2;))</code>
+and queries to <code>(x, 0)</code>; the squared Euclidean distance then equals the power
+distance plus a site-independent constant, so the argmin is identical. Verified at <b>0
+mismatches in 1,048,576 pixels</b> and <b>169&times; faster</b> than brute force. The trick is
+dimension-generic.</li>
+<li><b>Relocate the <code>distance_upper_bound</code> prune.</b> It is the only
+Euclidean-derived optimisation that is invalid, because power distance is not a distance and is
+negative inside a sphere. Compute the argmin unpruned, then gate on the true distance to the
+winner &mdash; which preserves the socket's documented meaning exactly.</li>
+<li><b>Exclude frame-touching cells from every statistic.</b> Clipping a cell at the frame
+produced local packing fractions up to <b>1.25</b> &mdash; a spurious violation of a bound
+that holds by construction, caused purely by truncation.</li>
+</ul>
+</div>
+
+<div class="box">
+<h4>The most valuable column is the residual, and a voxel field cannot supply it</h4>
+<pre>&eta;_i = fraction of cell i that is foreground     (cell fill)
+&phi;_i = |body_i| / |cell_i|                        (own occupancy)
+r_i = &eta;_i &minus; &phi;_i</pre>
+<p><code>r_i = 0</code> for a correct segmentation. A <b>missing object</b> raises
+<code>r_i</code> by exactly the missing object's area over the cell area &mdash; and
+crucially <b>localises the error to one cell</b>. Given that seeding, not partitioning, is the
+measured bottleneck, this is the single most useful diagnostic in the design. Note that
+<code>&phi;_i</code> alone is <i>merge-invariant</i> and therefore useless for this: merging
+two radius-<i>R</i> objects into one radius-<code>&radic;2 R</code> fit leaves it unchanged.</p>
+</div>
+</div>
+
+<!-- ───────────────── bind_structure ───────────────── -->
+<div class="node">
+<div class="hdr"><code>transform.bind_structure</code> <span class="pill new">NEW</span></div>
+
+<div class="io">
+<div><b>reads</b> &empty; &mdash; both domains chosen per-instance by Mode</div>
+<div><b>writes</b> <code>parent</code>, <code>parent_dist_um</code>, <code>parent_u/_v/_w</code> on the child layer; <code>n_children</code> on the parent layer</div>
+<div><b>modes</b> <code>child_domain</code>, <code>parent_domain</code>, <code>method</code>(containment/nearest_centroid/<b>nearest_surface</b>/overlap), <code>frame</code>(global/<b>parent_local</b>)</div>
+</div>
+
+<p><b>What it does to the image.</b> Establishes which parent each child belongs to, and
+re-expresses the child's position in that parent's own coordinate frame.</p>
+
+<figure>
+<img src="img/node_bind_structure.png" alt="Cells linked to their parent objects, the columns written, and the body frame">
+<figcaption><b>Left:</b> each detected child (green circle) joined to its parent object's
+centre by a green line; children with no parent are marked with a red cross and reported as
+orphans rather than assigned to the nearest object. <b>Middle:</b> what the node writes and why
+<code>(u,v,w)</code> is the point. <b>Right:</b> the parent's body frame &mdash; children sit
+at fixed <code>(u,v)</code> if they only follow the parent, and the amber arrows are drift
+<i>in that frame</i>, which is motion of the child relative to its carrier.</figcaption>
+</figure>
+
+<div class="box good">
+<h4>Why <code>parent_local</code> is the whole reason this node exists</h4>
+<p><code>(u,v,w)</code> is the child's centre in the parent's fitted principal frame, divided
+by the parent's own axis lengths. Those three numbers are <b>invariant under the parent's rigid
+motion</b>. So a child holding them constant has followed its parent exactly, and drift in them
+is motion <i>relative to the parent</i>.</p>
+<p>The original plan called that drift "the error signal". For <b>motile</b> children it is the
+<b>measurement</b> &mdash; migration on a moving carrier, with the carrier's motion already
+removed. A single global drift subtraction cannot achieve this: it removes the field's bulk
+motion, not each parent's own.</p>
+</div>
+
+<div class="box bad">
+<h4>It has an unmet prerequisite, and this is the most important open defect</h4>
+<p><code>parent_local</code> requires <b>stable parent identity across frames</b>. Centroid
+nearest-neighbour matching reached only <b>74&ndash;93%</b>, and that was enough to
+<b>invert the result</b>: measured child steps in the parent frame came out
+<b>1.5&ndash;1.76&times; larger</b> than in the image frame at three conditions. A ratio above
+one means the parent's position is jittering more than the child moves, so subtracting it
+<i>adds</i> noise. Apparent parent-transfer rates of 20&ndash;45% over the series are the
+same symptom.</p>
+<p><b>The fix is a better linker, not a better binder.</b> Objects move 8&ndash;19&nbsp;&micro;m
+per frame while being 50&ndash;70&nbsp;&micro;m across, so consecutive instance masks overlap
+heavily &mdash; <b>Hungarian assignment on mask IoU</b> uses shape and extent rather than a
+single point, and degrades gracefully when an object is split differently between frames. It is
+implemented in <code>scripts/_bed_analyze.py</code> behind an explicit gate: <b>&ge; 95%
+mutual match, parent-frame/image-frame ratio &lt; 1.0, apparent transfer &le; 10%</b>. No
+<code>(u,v,w)</code> number should be quoted until it passes. <span class="pill dim">e049</span></p>
+</div>
+</div>
+
+<!-- ───────────────── pose_from_landmarks ───────────────── -->
+<div class="node">
+<div class="hdr"><code>analysis.pose_from_landmarks</code> <span class="pill new">NEW</span>
+  <span class="pill dim">for a future acquisition</span></div>
+
+<div class="io">
+<div><b>reads</b> &empty; &mdash; child POINT layer + parent LABEL shapes</div>
+<div><b>writes</b> absolute orientation per parent per frame, with covariance and flags</div>
+<div><b>modes</b> <code>method</code>(kabsch/<b>kabsch_ransac</b>), <code>template</code>(fixed/<b>adaptive</b>), <code>correspondence</code>(nearest/<b>hungarian</b>/relaxation)</div>
+</div>
+
+<p><b>What it does.</b> Recovers absolute rotation from a constellation of rigid landmarks on
+or in an object. Body shape alone leaves a symmetry ambiguity; landmarks remove it.</p>
+
+<div class="box">
+<h4>Retained at the owner's direction, for interior beads</h4>
+<p>A future acquisition will place <b>beads inside the objects</b>. Interior landmarks are
+strictly better than surface ones for this: body coordinates are fixed by construction, there
+is no occlusion inside a contact facet (and contacts are where this data is hardest), and
+binding reduces to <code>method=containment</code> &mdash; which retires the surface-offset
+nuisance parameter and the orphan/crosstalk branches from the critical path. They remain
+available as general options.</p>
+<p><b>Particle-tracking velocimetry composes rather than competes.</b> Kabsch <i>consumes</i>
+correspondences; PTV <i>produces</i> them. The padded Hungarian assignment already specified
+<i>is</i> a global-nearest-neighbour PTV matcher; what classical PTV adds is
+<b>neighbour-consistency relaxation</b>, which is exactly right here because beads inside one
+object move rigidly together, so the neighbourhood <i>is</i> the object. Hence a
+<code>correspondence</code> Mode, still a general point-set primitive.</p>
+</div>
+
+<div class="box warn">
+<h4>Three things that will silently corrupt this node if omitted</h4>
+<ul>
+<li><b>Every rotation error metric must be symmetry-quotiented.</b> A triaxial body is
+invariant under a four-element group, so a <i>correct</i> fit may legitimately return any of
+four orientations and a naive quaternion distance fails ~75% of the time on correct code. The
+natural response is to loosen the threshold until it passes, which destroys the test.</li>
+<li><b>The reflection guard in Kabsch is mandatory.</b> Without
+<code>D = diag(1,1,sign(det(VU&#7488;)))</code>, a noisy near-planar constellation returns a
+reflection with determinant &minus;1 &mdash; which is not a rotation, and it corrupts the track
+silently.</li>
+<li><b>Below two usable landmarks, do not fabricate a number.</b> Report the free axis as NaN
+with an explicit flag. A confident angle here is the worst possible failure because it looks
+like data. Above the Nyquist rate, aliasing is mathematically irrecoverable from body shape
+alone &mdash; surface it as a computed flag rather than hiding it.</li>
+</ul>
+</div>
+</div>
+
+<!-- ───────────────── field quality ───────────────── -->
+<div class="node">
+<div class="hdr">A field-quality gate <span class="pill new">NEW &mdash; added by measurement</span></div>
+
+<div class="io">
+<div><b>reads</b> VOXEL, per <code>(m,t,c,z)</code></div>
+<div><b>writes</b> a per-plane quality record + QC flags</div>
+<div><b>two tests</b> <b>level</b> (does the channel carry the signal the design implies?) and <b>continuity</b> (does a phase fraction move discontinuously between adjacent frames?)</div>
+</div>
+
+<p><b>Why it is a node and not a footnote.</b> Roughly <b>one field in three</b> is unusable,
+and this is <i>distinct from object rejection</i> &mdash; <code>select_objects</code> drops bad
+<i>objects</i>; nothing currently drops a bad <i>field</i>. Two distinguishable failure modes
+were observed:</p>
+<ul>
+<li><b>Level failure.</b> One field's raw inert signal was 0.010 against a design specifying
+25% inert &mdash; the channel carries nothing to segment.</li>
+<li><b>Continuity failure.</b> Another field's void fraction jumped <b>0.61 &rarr; 0.93 in a
+single 47-minute frame</b>, held, then jumped back. Physical compaction of a packed bed is
+gradual; a step that size between adjacent frames is an acquisition event.</li>
+</ul>
+
+<div class="box bad">
+<h4>The lesson that made this a gate: separate a broken method from bad data</h4>
+<p>The first version of the segmentation gate failed the level-failure field as "real signal
+destroyed by the filter" &mdash; but the raw channel had no signal to begin with, so the filter
+was not on trial. <b>A gate that fails on bad data teaches nothing about the method.</b> The
+gate now judges the method only on fields that carry signal, and flags the rest separately.</p>
+</div>
+</div>
+
+<h2 id="s11">5. How this compares to the existing 72 nodes &mdash; and what adoption costs</h2>
+
+<p>Before proposing anything, every one of the 72 shipped ops was checked against every
+capability the workflow needs. <b>The audit removed three of the eight proposed nodes.</b>
+That result is presented first because it is the strongest thing that can be said about the
+remainder: the proposal has been pruned rather than padded.</p>
+
+<h3>5.1 Capability audit against the shipped catalog</h3>
+
+<div class="scroll"><table>
+<tr><th>Capability needed</th><th>Closest existing op</th><th>What it already does</th>
+    <th>Gap</th><th>Verdict</th></tr>
+
+<tr><td>Remove a phantom phase from a channel with no signal</td>
+    <td><code>analysis.segment</code></td>
+    <td>Already ships <code>min_area</code> / <code>max_area</code> / <code>min_volume</code> /
+    <code>max_volume</code> &mdash; a <b>calibration-aware &micro;m&sup2;/&micro;m&sup3; size
+    filter</b>, plus <code>fill_holes</code></td>
+    <td>None for the mask case. The reference area is absolute rather than relative to a
+    measured single-object area</td>
+    <td><span class="pill ok">ALREADY EXISTS</span> &mdash; this is a
+    <b>parameter change</b>, not a node</td></tr>
+
+<tr><td>Split touching objects</td>
+    <td><code>analysis.segment</code> <code>method=watershed</code></td>
+    <td>Distance-transform watershed with <code>min_distance</code> (documented as "THE
+    over/under-splitting knob"), an optional external <code>mask</code> input,
+    <code>connectivity</code>, plus <b>StarDist and CellSAM</b> as alternative methods</td>
+    <td>The landscape is the distance transform only. No intensity-seeded landscape, no
+    external height field, no energy polish</td>
+    <td><span class="pill wait">MODE ON EXISTING</span> &mdash; <code>refine_labels</code>
+    should be <b>withdrawn as a separate node</b></td></tr>
+
+<tr><td>Link objects frame to frame</td><td><code>track.link</code> <code>target=label</code></td>
+    <td><b>Already links by maximum IoU overlap</b>, whole-series, per (m,c)</td>
+    <td>Greedy per-object max-IoU rather than a one-to-one assignment, and no mutual-match
+    gate</td>
+    <td><span class="pill ok">ALREADY EXISTS</span> &mdash; the linking failure in
+    &sect;<a href="#s4">4</a> came from <b>my script using centroid distance</b>, not from a
+    gap in the repo</td></tr>
+
+<tr><td>Per-object shape descriptors</td><td><code>analysis.measure</code></td>
+    <td>regionprops shape columns in &micro;m: <b>eccentricity, perimeter, solidity</b>, plus
+    intensity stats, with an optional <code>raw</code> input so you can segment on enhanced and
+    measure on raw</td>
+    <td>No fitted <i>model</i>: no bounding facets, no quaternion, no fit residual, no analytic
+    volume</td>
+    <td><span class="pill new">GENUINELY NEW</span> &mdash; but note <b>solidity, the single
+    best merge discriminator measured, already exists as a column</b></td></tr>
+
+<tr><td>Population assignment from a feature</td>
+    <td><code>analysis.cluster_points</code>, <code>analysis.histogram_threshold</code></td>
+    <td>GMM / KMeans with a <b>BIC model-order sweep</b>, &micro;m-scaled so anisotropy does not
+    bias the fit</td>
+    <td>Point domain only; no cross-channel contrast feature; no eroded-core measurement</td>
+    <td><span class="pill wait">MOSTLY EXISTS</span> &mdash; <code>classify_objects</code> is
+    largely <code>cluster_points</code> generalised to LABEL with one new feature</td></tr>
+
+<tr><td>Tessellate space around objects</td><td><code>analysis.voronoi</code></td>
+    <td>Nearest-seed in &micro;m space, per-region arenas or a mask, territory raster + table
+    with area and local density, and a 3-D surface MESH</td>
+    <td>Euclidean on centroids only; no per-seed radius; no residual column</td>
+    <td><span class="pill wait">EXTEND</span> &mdash; a metric Mode plus three columns</td></tr>
+
+<tr><td>Rasterise a field back to voxels</td><td><code>transform.rasterize_field</code></td>
+    <td>Interpolates a POINT vector/scalar field to full-resolution voxel layers, inheriting
+    2-D/3-D from the field</td>
+    <td>Interpolates <i>samples</i>; cannot evaluate an <b>analytic implicit surface</b>, which
+    is what a signed distance or a Gibbs posterior requires</td>
+    <td><span class="pill new">GENUINELY NEW</span></td></tr>
+
+<tr><td>Move an attribute between structure layers</td>
+    <td><code>transform.transfer_structure</code></td>
+    <td>All 15 domain pairs across Voxel&harr;Label&harr;Point&harr;Track, with reducers</td>
+    <td>Moves an attribute across an <i>existing</i> relation. It cannot <b>establish</b> which
+    parent a child belongs to, nor express a position in a parent's frame</td>
+    <td><span class="pill new">GENUINELY NEW</span></td></tr>
+
+<tr><td>Per-object motion over time</td><td><code>analysis.object_metrics</code></td>
+    <td>Whole-series velocity, speed, KNN distances, divergence, curl, intensity fold change</td>
+    <td>No angular metrics</td>
+    <td><span class="pill wait">EXTEND</span> &mdash; three columns behind a gate</td></tr>
+
+<tr><td>Soft per-voxel membership</td><td><i>nothing</i></td>
+    <td>&mdash;</td><td>Everything</td>
+    <td><span class="pill new">GENUINELY NEW</span></td></tr>
+
+<tr><td>Energy-based relaxation with split/merge</td><td><i>nothing</i></td>
+    <td>&mdash;</td><td>Everything</td>
+    <td><span class="pill new">GENUINELY NEW</span></td></tr>
+
+<tr><td>Absolute orientation from landmarks</td><td><i>nothing</i></td>
+    <td>&mdash;</td><td>Everything</td>
+    <td><span class="pill new">GENUINELY NEW</span> &mdash; and not needed until the next
+    acquisition</td></tr>
+</table></div>
+
+<div class="box bad">
+<h4>What the audit cost the proposal &mdash; three retractions</h4>
+<ol>
+<li><b><code>analysis.refine_labels</code> should be withdrawn as a node.</b> Its function is
+watershed-with-a-better-landscape, and <code>analysis.segment</code> already floods a masked
+region with a seed-spacing control and <i>four</i> methods including two foundation models.
+Adding a competing segmentation node would fragment the most important node in the catalog.
+The 88.9% result is worth having &mdash; but it belongs as a <code>seeds</code> Mode on
+<code>segment</code>, alongside a <code>height</code> input for an external landscape.</li>
+<li><b>The phantom-phase fix needs no node at all.</b> It is <code>min_area</code> on
+<code>analysis.segment</code>, a socket that already exists and is already calibration-aware.
+What <code>select_objects</code> adds beyond that is filtering an arbitrary <i>table</i> and a
+<i>relative</i> area test &mdash; useful, much narrower than originally claimed.</li>
+<li><b>The linking defect was mine, not the repository's.</b> <code>track.link</code> already
+links labels by maximum IoU. The measured 74&ndash;93% match rate came from my batch script
+using centroid nearest-neighbour. The genuine improvement available &mdash; one-to-one
+assignment plus a mutual gate &mdash; is a change inside an existing node, and the gate matters
+more than the algorithm.</li>
+</ol>
+<p>So the honest count is <b>four genuinely new nodes</b> (<code>fit_shape</code>,
+<code>rasterize_shape</code>, <code>relax_shapes</code>, <code>bind_structure</code>), one
+deferred to a future acquisition (<code>pose_from_landmarks</code>), and the rest
+<b>extensions to nodes that already exist</b>.</p>
+</div>
+
+<h3>5.2 The case for adopting the four</h3>
+
+<p>Each of the four fills a gap where the catalog currently has <i>nothing</i>, and each one
+unlocks something the existing set cannot express at any parameter setting.</p>
+
+<div class="scroll"><table>
+<tr><th>Node</th><th>What becomes possible that is impossible today</th><th>Who benefits beyond
+    this sample</th></tr>
+<tr><td><code>analysis.fit_shape</code></td>
+    <td>An object gains an <b>orientation</b> and a <b>model residual</b>. Today an object has
+    an area and an eccentricity; it has no facing, and no measure of how well it matches an
+    expected shape.</td>
+    <td>Any anisotropic object whose direction matters &mdash; fibres, crystals, nuclei,
+    cells with a long axis. The residual is a general <b>outlier detector</b>: "this object is
+    not the shape the others are".</td></tr>
+<tr><td><code>transform.rasterize_shape</code></td>
+    <td>A <b>per-voxel confidence</b> layer, and with it an honest answer at boundaries. Today
+    every assignment is hard, so a voxel exactly between two objects is silently given to one.
+    Because the output is an ordinary float layer, <b>the existing viewer displays it with no
+    new code</b>.</td>
+    <td>Anyone who needs to know <i>where a segmentation is unsure</i> &mdash; for QC, for
+    active learning, or to restrict expensive downstream work to the contested 3&ndash;7% of
+    voxels.</td></tr>
+<tr><td><code>transform.bind_structure</code></td>
+    <td>A <b>parent/child relation between two structure layers</b>, and coordinates in the
+    parent's own frame. Today <code>transfer_structure</code> can move a value along a relation
+    but nothing can create one.</td>
+    <td>Any nested-object problem: puncta in nuclei, vesicles in cells, spots on beads,
+    receptors on membranes. The parent-local frame generalises to <b>any motion measured
+    relative to a moving carrier</b>.</td></tr>
+<tr><td><code>analysis.relax_shapes</code></td>
+    <td>An <b>iterative solver with an explicit objective</b>, so segmentation stops being a
+    one-shot decision. Split and merge proposals accepted only on energy improvement give a
+    principled answer to "is this one object or two", which is currently a threshold.</td>
+    <td>The largest and riskiest of the four &mdash; see 5.4. Its value is the objective
+    itself: a number that says which of two segmentations is better.</td></tr>
+</table></div>
+
+<div class="box good">
+<h4>Four properties that should make adoption low-risk</h4>
+<ul>
+<li><b>No new dependencies.</b> scipy, scikit-image and scikit-learn are already required by
+existing nodes; the Hungarian solver and convex hulls come from scipy. Nothing here needs
+torch, and unlike the existing StarDist and CellSAM paths <b>nothing here needs a model
+checkpoint or network access</b>.</li>
+<li><b>Three core files stay untouched.</b> Per-object numbers go in a LABEL structure table
+rather than through the MESH domain, so the file holding the CSR and memo-hash invariants is
+not edited. No new domain, and therefore <b>no new bridge</b>.</li>
+<li><b>The defaults are measured, not guessed.</b> Every calibrated constant traces to a logged
+measurement, and the seeding parameters were validated on held-out experimental conditions with
+three independent splits agreeing.</li>
+<li><b>Backward compatibility is explicit.</b> Every extension preserves the current default
+&mdash; <code>analysis.voronoi</code>'s new metric defaults to <code>euclidean</code>, so the
+baseline stays semantically identical and the catalog snapshot changes only by addition.</li>
+</ul>
+</div>
+
+<h3>5.3 Where the new nodes are <i>worse</i> than what exists</h3>
+
+<div class="box bad">
+<ol>
+<li><b>The seeding method is validated on one sample; <code>segment</code>'s four methods are
+validated on many.</b> StarDist and CellSAM are trained on large annotated corpora and
+generalise across microscopes. The intensity-h-maxima landscape was tuned on three conditions
+of one dataset and beat the distance transform <i>because these objects have bright interiors
+and dim seams</i>. On membrane-bounded cells it will very likely lose. It must ship as a Mode
+with that caveat in its documentation, never as a new default.</li>
+<li><b><code>fit_shape</code>'s simple models duplicate <code>measure</code>.</b>
+<code>sphere</code>, <code>ellipsoid</code> and <code>obb</code> are recoverable from
+regionprops inertia axes, which <code>analysis.measure</code> already exposes. Only
+<code>convex_hull</code> is clearly additive. A reviewer could reasonably ask that the
+redundant models be dropped.</li>
+<li><b>"Probability" is a Gibbs posterior, not a calibrated probability.</b> Until the
+temperature is calibrated against ground truth &mdash; reporting reliability, Brier score,
+expected calibration error &mdash; the field should be <b>labelled "confidence" in the UI</b>.
+Shipping a layer called probability that is not one is worse than shipping nothing.</li>
+<li><b><code>relax_shapes</code> is the least de-risked thing in the proposal.</b> It is an
+iterative solver whose runtime, convergence and failure modes on unfamiliar data are unknown.
+The energy decreases monotonically at fixed schedule parameters &mdash; that is assertable in a
+test &mdash; but the objective itself changes between annealing stages, so across stages only
+monitoring is possible. If it does not converge on a user's data there is no obvious fallback
+except disabling it.</li>
+<li><b>Adding a competing segmentation node would be a real regression</b>, which is precisely
+why <code>refine_labels</code> is withdrawn above. A catalog with two nodes that both split
+touching objects is worse than one node with an extra Mode, regardless of which performs
+better.</li>
+<li><b>The 2-D restriction is a limitation of the data, but users will meet it as a limitation
+of the nodes.</b> Volumes come from a slab sum over linked planes, and any object seen in one
+plane gets no volume at all. On a properly sampled isotropic stack that refusal is
+unnecessary, and the nodes will need a genuine 3-D path before they are broadly useful.</li>
+</ol>
+</div>
+
+<h3>5.4 What adoption actually costs</h3>
+
+<div class="scroll"><table>
+<tr><th>Cost</th><th>Size</th><th>Notes</th></tr>
+<tr><td><b>Socket documentation</b></td><td class="n">~65 descriptions</td>
+    <td>The gate requires &ge;120 characters for the flagship set, never echoing the label, and
+    memo-neutral. For scale, <code>analysis.segment</code> alone carries ~29 documented
+    sockets. This is real work and should be scheduled per increment, not deferred.</td></tr>
+<tr><td><b>Mode option documentation</b></td><td class="n">~75 at &ge;60 chars</td>
+    <td>The exemption set must stay empty.</td></tr>
+<tr><td><b>Selftest floors to raise</b></td><td class="n">5</td>
+    <td>Two <code>len(shipped) &ge; 54</code>, one <code>audited &ge; 54</code>, the
+    <code>n_in</code>/<code>n_out</code> socket floors, and the annotated-param floor. They will
+    not <i>fail</i> on addition, which is exactly why they must be raised deliberately &mdash; a
+    floor left at 54 while the catalog holds 76 has silently stopped guarding.</td></tr>
+<tr><td><b>Per-node tests</b></td><td class="n">~8 new test groups</td>
+    <td>House style is structural-spec-first so a dependency-gated node still gets its full
+    contract checked before any skip. Plus a cross-node dataflow group asserting raster/table id
+    agreement, provenance survival, and memo isolation.</td></tr>
+<tr><td><b>Granularity risk</b></td><td>2 nodes</td>
+    <td><code>relax_shapes</code> and any refinement are <code>WHOLE_VOLUME</code>; a population
+    classifier is <code>WHOLE_SERIES</code>. Misdeclaring these is the specific trap the
+    engine's checks exist to catch, and it degrades performance silently rather than
+    failing.</td></tr>
+<tr><td><b>Memory</b></td><td class="n">11.7 GB if done naively</td>
+    <td>The one choice that is unrecoverable rather than merely slow. The top-3 sparse
+    representation is 66 MB; a dense field is not an option at this scale.</td></tr>
+<tr><td><b>Maintenance surface</b></td><td class="n">+4 ops, +5 extended</td>
+    <td>72 &rarr; 76 ops, about +6%. The four new ones introduce concepts the catalog does not
+    currently contain &mdash; a fitted model, a soft field, a parent relation, an energy &mdash;
+    so they carry conceptual as well as code weight.</td></tr>
+</table></div>
+
+<h3>5.5 A tiered adoption path, so none of this is all-or-nothing</h3>
+
+<p>The tiers are ordered by value per unit of new surface. Each one is independently useful and
+each ends with the four gates green.</p>
+
+<div class="scroll"><table>
+<tr><th>Tier</th><th>New ops</th><th>Change</th><th>What it buys</th></tr>
+<tr><td><b>0</b> <span class="pill ok">done</span></td><td class="n">0</td>
+    <td>Increment&nbsp;0 defect clearing, already complete and catalog-identical</td>
+    <td>Unblocks 3-D per-object motion, which was unavailable; kills a silent
+    wrong-method-dispatch bug</td></tr>
+<tr><td><b>1</b></td><td class="n">0</td>
+    <td><b>Parameters and Modes only.</b> <code>min_area</code> on <code>segment</code> for the
+    phantom fix; a <code>seeds</code> Mode and a <code>height</code> input on
+    <code>segment</code>; one-to-one assignment plus a mutual-match gate in
+    <code>track.link</code>; angular columns on <code>object_metrics</code></td>
+    <td><b>Most of the measured benefit for zero new nodes.</b> Object count from 73.4% to
+    88.9%, phantom phases eliminated, linking gated so a bad series is reported rather than
+    silently used</td></tr>
+<tr><td><b>2</b></td><td class="n">+2</td>
+    <td><code>analysis.fit_shape</code> and <code>transform.rasterize_shape</code></td>
+    <td>Orientation, fit residual as an outlier detector, and a per-voxel confidence layer that
+    <b>the existing viewer already knows how to display</b></td></tr>
+<tr><td><b>3</b></td><td class="n">+1</td>
+    <td><code>transform.bind_structure</code></td>
+    <td>Parent/child relations and parent-local coordinates &mdash; the nested-object capability,
+    useful well beyond this sample. <b>Depends on Tier&nbsp;1's linking gate</b></td></tr>
+<tr><td><b>4</b></td><td class="n">+1</td>
+    <td><code>analysis.relax_shapes</code>, plus the <code>voronoi</code> metric and residual
+    columns</td>
+    <td>An explicit objective over segmentations, and phase-resolved void. The riskiest tier;
+    take it last and only if Tiers 2&ndash;3 prove out</td></tr>
+<tr><td><b>5</b></td><td class="n">+1</td>
+    <td><code>analysis.pose_from_landmarks</code></td>
+    <td>Defer until the acquisition with interior beads exists. Building it now means
+    maintaining an unexercised node</td></tr>
+</table></div>
+
+<div class="box good">
+<h4>If only one tier is adopted, it should be Tier&nbsp;1</h4>
+<p>It adds <b>no new ops</b>, changes no defaults, touches no core files, and captures the two
+largest measured improvements: the object-count jump from the ceiling of connected components,
+and a linking gate that turns a silent failure into a reported one. Everything above it is
+optional and independently justifiable.</p>
+</div>
+
+<h2 id="s5">6. Extensions to existing nodes</h2>
+
+<div class="scroll"><table>
+<tr><th>Node</th><th>Change</th><th>Why</th></tr>
+<tr><td><code>analysis.cluster_points</code></td>
+    <td>New modes <code>space</code>, <code>group_by</code>(mtc/<b>mt</b>/all),
+    <code>k_from</code>, <code>assign</code>(hard/<b>soft</b>), <code>covariance</code>,
+    <code>noise</code>; <code>method</code> gains dbscan / hdbscan / agglomerative</td>
+    <td><code>group_by=mt</code> is the load-bearing one: it makes the two populations <b>one
+    competing population</b>. The current per-<code>(m,t,c)</code> loop clusters them
+    separately so they never contend, which is wrong for a contacting bed.</td></tr>
+<tr><td><code>analysis.tessellate</code></td>
+    <td>Fifth <code>boundary</code> choice <code>parametric</code>; <code>kernel_axes</code>
+    becomes a Mapping with <code>footprint_mode="boundary"</code></td>
+    <td>Emits an analytic watertight surface from a shape table. The static axes declaration
+    <b>over-claims</b>, because <code>parametric</code> reads no image at all.</td></tr>
+<tr><td><code>detect.particles</code></td>
+    <td>Optional <code>source</code> VOXEL layer socket</td>
+    <td>Lets seeds be maxima of the probability or margin field, following the existing
+    external-mask precedent. Closes a requirement with no new node.</td></tr>
+<tr><td><code>analysis.object_metrics</code></td>
+    <td>Angular metrics: <code>rot_angle_deg</code>, <code>omega_deg_s</code>,
+    <code>axis_drift_deg</code>, behind a gate that refuses with "run fit_shape first" when
+    the table carries no orientation</td>
+    <td>Completes the motion half of the deliverable. Unblocked by the Increment&nbsp;0
+    changes below.</td></tr>
+<tr><td><code>analysis.segment</code></td>
+    <td>Optional external <code>height</code> layer for watershed</td>
+    <td>So the probability field can be flooded directly rather than re-derived.</td></tr>
+</table></div>
+
+<h2 id="s6">7. Deliberately not doing</h2>
+
+<div class="box">
+<ul>
+<li><b>Not routing per-object shape through the MESH domain.</b> Carrying per-element shape
+parameters through a topology domain means editing the one file holding the CSR, object-dtype
+and memo-hash invariants. Per-object <i>numbers</i> belong in a LABEL structure table &mdash;
+zero core changes, and exactly how the existing measure node re-emits its label layer.
+<b>Consequence: three core files are untouched by this plan.</b></li>
+<li><b>Not adding a <code>CONTACT</code> domain</b> for the adjacency relation. It would need a
+bridge entry, and that is fatal by construction: every existing bridge keys on a <i>single</i>
+id, so <code>CONTACT &rarr; LABEL</code> is ambiguous (does object <i>a</i> take row
+<code>(a,b)</code>, or <code>(b,a)</code>, summed, maxed?). The reduction must be
+<b>chosen</b>, which makes it a node parameter, not a bridge. A pair table on
+<code>Domain.LABEL</code> is already a legal, tested shape &mdash; the track-membership table
+ships with no id or coordinate columns today.</li>
+<li><b>Not fitting 3-D shapes.</b> Sampling is 23&times; anisotropic and
+3.9&ndash;5.1&times; undersampled in plane. A fitted ellipsoid would report precision the data
+cannot support. Volume comes from a slab sum over linked planes, with a refusal for any object
+seen in only one plane.</li>
+<li><b>Not using the brightfield channel.</b> It was proposed as "the only direct observable of
+a contact plane". It shows a fibrous texture with no object outlines, so the term is
+<b>dropped</b> rather than left as a dead hook.</li>
+<li><b>Not measuring in-plane coordination number.</b> In 2-D, mean cell degree is pinned near
+six by Euler's formula (measured 1338 edges against 1356 predicted), so it carries <b>zero</b>
+packing information. No coordination-based prior and no coordination-based validation.</li>
+</ul>
+</div>
+
+<h2 id="s7">8. Code already changed</h2>
+
+<p>One increment is complete. It is <b>catalog-identical by design</b> &mdash; it clears
+defects that would silently corrupt later work without adding a node. Verified:
+<code>CATALOG IDENTICAL &mdash; 72 ops, same order, same declarations</code>.</p>
+
+<div class="scroll"><table>
+<tr><th>File</th><th class="n">&Delta;</th><th>Change and why</th></tr>
+<tr><td><code>kernels/granule_cluster.py</code></td><td class="n">+176/&minus;26</td>
+    <td>Explicit dispatch with <code>raise ValueError</code>; surfaced the estimator's soft
+    responsibilities, covariances and axis lengths. <b>The dispatch previously ran GMM for any
+    unrecognised method string</b> &mdash; with more methods planned that becomes a correctness
+    bug no test catches. The covariance eigenstructure was computed and thrown away; note the
+    semi-axis needs a <code>&radic;5</code> factor for a uniform solid, and omitting it makes
+    axes 2.24&times; too small.</td></tr>
+<tr><td><code>catalog/_shared/objects.py</code></td><td class="n">+38/&minus;11</td>
+    <td>Velocity returns <code>(vz, vy, vx)</code>; the volumetric refusal becomes a parameter.
+    <b>This was a blocker.</b> The module hard-refused every subpixel table and had no
+    <code>vz</code> at all, so <b>there was no per-object motion column in 3-D</b> &mdash; the
+    "position over time" half of the deliverable was unavailable.</td></tr>
+<tr><td><code>catalog/analysis/object_metrics.py</code></td><td class="n">+52/&minus;8</td>
+    <td>Per-metric refusal instead of blanket; <code>vz</code> only for volumetric tables;
+    calibration read only when needed (memo-fence discipline). Only two metrics are genuinely
+    planar; refusing everything else was over-broad.</td></tr>
+<tr><td><code>catalog/analysis/object_field.py</code></td><td class="n">+4/&minus;2</td>
+    <td>Unpacks and discards the axial component, <b>with a comment</b>, so the discard is not
+    read as an oversight later.</td></tr>
+<tr><td><code>catalog/analysis/tessellate.py</code></td><td class="n">+9</td>
+    <td>Skips the reserved negative label. The kernel already drops it, so this is <b>a guard,
+    not a live fix</b> &mdash; stated as such, so the node does not silently depend on kernel
+    behaviour.</td></tr>
+<tr><td><code>kernels/mesh_raster.py</code></td><td class="n">+11/&minus;4</td>
+    <td>Adds <code>parametric</code> explicitly to the concave/watertight branch. It previously
+    fell through to a correct-by-accident default.</td></tr>
+<tr><td><code>selftest.py</code></td><td class="n">+39</td>
+    <td>Parity test re-pointed to the new contract, asserting both what now works and what
+    still correctly refuses.</td></tr>
+<tr><td><code>scripts/catalog_baseline.json</code></td><td class="n">+8/&minus;8</td>
+    <td>Re-blessed for the documentation changes, <b>in the same change as the code</b>, so
+    neither is independently unverifiable.</td></tr>
+</table></div>
+
+<h4>New paths</h4>
+<div class="scroll"><table>
+<tr><th>Path</th><th>Contents</th></tr>
+<tr><td><code>scripts/_bed_analyze.py</code></td><td>The analysis as a cluster-runnable CLI:
+    <code>convert</code> (ND2 &rarr; chunked zarr) / <code>analyze</code> (one JSON per plane,
+    array-parallel, resumable) / <code>link</code> (gated) / <code>reduce</code>. Every
+    calibrated constant carries the evidence-log id that established it. Verified to reproduce
+    the recorded numbers exactly.</td></tr>
+<tr><td><code>.claude/skills/evidence-log/</code></td><td>The collaborative review loop as a
+    reusable skill: an append-only log with a reply box, two posterity exports, and a
+    <b>blind stratified labelling sheet</b>. That sheet produced <b>585 hand labels</b> which
+    became the acceptance gate for the seeding node, moved a threshold from 0.93 to 0.798, and
+    retracted one headline claim.</td></tr>
+<tr><td><code>CodeLog/ClaudesPlan/V2.22*.md</code>, <code>V2.23*.md</code></td>
+    <td>The design specification and the remaining-work plan. Restores a per-work-package doc
+    habit that several prior packages dropped &mdash; its absence is why this project had to
+    reconstruct its own state from git commit bodies.</td></tr>
+<tr><td><code>CodeLog/live/</code>, <code>CodeLog/img/</code></td>
+    <td>The evidence record and the figures in this document.</td></tr>
+</table></div>
+
+<h2 id="s8">9. Data limits that shaped the design</h2>
+
+<div class="kpi">
+  <div><b>88.9%</b><span>held-out exact object count, from a 73.4% ceiling</span></div>
+  <div><b>585</b><span>hand labels, 99% coverage, zero "not an object"</span></div>
+  <div><b>&asymp;0.60</b><span>void fraction, consistent across conditions</span></div>
+  <div><b>23&times;</b><span>voxel anisotropy</span></div>
+  <div><b>47.3 min</b><span>frame interval, derived &mdash; the file declares none</span></div>
+  <div><b>1 in 3</b><span>fields unusable</span></div>
+</div>
+
+<div class="scroll"><table>
+<tr><th>Limit</th><th>Measured</th><th>Design consequence</th></tr>
+<tr><td><b>One body channel is saturated</b></td>
+    <td class="n">p99.9 pinned at the 12-bit ceiling; 0.2&ndash;9.1% of the field clipped in
+    every frame</td>
+    <td><b>Geometry usable, intensity not.</b> This kills the intensity term in the relaxation
+    energy for that channel, so <code>&lambda;_I</code> must be <b>per-channel</b> and default
+    to zero where saturation exceeds a threshold, rather than silently trusting clipped
+    values.</td></tr>
+<tr><td>Spatial undersampling</td>
+    <td class="n">Nyquist wants 0.34&ndash;0.44 &micro;m; actual 1.72 &micro;m</td>
+    <td>3.9&ndash;5.1&times; undersampled, so <b>sub-voxel boundary claims are meaningless</b>.
+    The limit is sampling, not diffraction.</td></tr>
+<tr><td>Axial sampling</td><td class="n">40 &micro;m step vs 50&ndash;70 &micro;m objects;
+    usable range z = 0&ndash;3 of 7</td>
+    <td>Consecutive-plane overlap is enough to <b>link</b> an object and bound its extent, not
+    to constrain <b>tilt</b>. Hence dimension-generic nodes operating in 2-D per plane, with
+    volumes from a slab sum.</td></tr>
+<tr><td>Shape</td><td>convex polygons, 5&ndash;7 straight sides</td>
+    <td>Replaced the superellipsoid model, <b>deleting the entire optimiser</b>.</td></tr>
+<tr><td>Cross-channel coupling</td>
+    <td class="n">16&ndash;19 DN at three zero-controls vs 346&ndash;947 DN at five mixed
+    wells</td>
+    <td>Chemical, not optical, and <b>confined to the cells</b>. So no pixel-wise unmixing
+    anywhere &mdash; it becomes a three-class object model instead.</td></tr>
+</table></div>
+
+<div class="box bad">
+<h4>The recurring error worth knowing about, since it shaped several gates</h4>
+<p><b>A blanket correction where the effect is conditional</b>, three times: a global
+cross-channel coefficient for an effect confined to one object class; a threshold floor applied
+to a channel that never needed one, which pushed the cut past the sensor ceiling; and cell
+pixels subtracted from a mask used for <i>parent lookup</i>, which made every child read "in
+void" &mdash; twice, once per phase. Plus <b>a parameter sweep whose optimum sat on its own
+boundary</b>, twice, and <b>a gate that failed on bad data</b> and so reported a method failure.
+All are now rules with provenance in the skill, and the gates in
+<code>_bed_analyze.py</code> exist to catch them.</p>
+</div>
+
+<h2 id="s9">10. What is open, and in what order</h2>
+
+<pre>Phase 0  cluster-runnable CLI + zarr convert       &larr; nothing runs without this  [DONE]
+   |
+   +-- Phase 1  overlap linking (Hungarian on IoU)  &larr; BLOCKS all dynamics
+   |      |
+   |      +-- per-object velocity, parent-frame migration (requote)
+   |
+   +-- Phase 2a finder validity at z = 0-3          &larr; independent of Phase 1
+   |      |
+   |      +-- Phase 2b z-linking -> volumes         &larr; needs 2a AND the Phase 1 linker
+   |
+   +-- Phase 3  full 1260-plane sweep               &larr; needs 0; better with 1 and 2
+          |
+          +-- Phase 4  design regressions + clustering
+                 |
+                 +-- Phase 5  build the nodes, with every default now measured</pre>
+
+<div class="box warn">
+<h4>Do Phase 1 before any large run</h4>
+<p>A 1260-plane sweep with linking at 74&ndash;93% produces 1260 planes of unusable dynamics at
+<b>identical per-plane cost</b>. The compute is not the constraint &mdash; 1260 planes is about
+two core-hours &mdash; the I/O is, which is why <code>convert</code> to chunked zarr comes
+first: random-access reads out of the source file do not parallelise because the reader holds
+file state.</p>
+</div>
+
+<h4>Genuinely undesigned</h4>
+<ul>
+<li><b>Where a curve-shaped output lives.</b> Radial-distribution functions are functions of
+<i>r</i>, and no current domain holds one. A structure table whose rows are <i>r</i>-bins is
+the likely answer; it needs a decision before building.</li>
+<li><b>The clustering statistic's false-positive control.</b> The primary test should be a
+join-count permutation on the contact network, <b>size-stratified</b> &mdash; the design varies
+the two populations' sizes independently, so in one condition they differ by &gt;2.5&times; by
+construction and a naive pair-correlation would report clustering from excluded volume alone.
+It must be shown to report <i>non</i>-significance on a randomly relabelled packing before any
+claim.</li>
+<li><b>Excluding void outside the bed</b> (above the top layer, at the frame) so it does not
+contaminate porosity.</li>
+</ul>
+
+<h2 id="s10">11. Review checklist</h2>
+
+<ol>
+<li><b>Increment&nbsp;0 must remain catalog-identical apart from documentation.</b> Any
+<code>OPS LOST</code> or <code>REGISTRATION ORDER changed</code> during a pure addition means a
+node was clobbered, most likely by a test fixture registering a real op key.</li>
+<li><b>Confirm the charter holds:</b> every node is a general primitive, and no op key contains
+a sample-specific word. Domain specificity belongs in defaults, layer names, docs and a preset
+graph.</li>
+<li><b>Check every new Mode choice is actually implemented.</b> The docs gate accepts prose;
+the dead-control rule does not. A declared-but-unimplemented option is worse than a missing
+one.</li>
+<li><b>Verify the two-mask distinction survives any refactor</b> &mdash; phase accounting
+excludes children, parent lookup does not. That bug appeared twice and is silent: it produces
+plausible zeros rather than an error.</li>
+<li><b>Sanity-check the seeding parameters on a condition not used to fit them.</b> They were
+validated on three of twenty-one conditions; any other is an independent test.</li>
+<li><b>Decide whether <code>CodeLog/live/</code> belongs in git.</b> ~14&nbsp;MB of figures plus
+the 585 labels. For: it is the provenance for every calibrated constant in the batch script,
+and the labels are irreplaceable. Against: size. Middle option: commit the log, the markdown
+export and the labels while ignoring the figure directory.</li>
+<li><b>Confirm the compute is where you expect.</b> The memory table in
+&sect;<a href="#s4">4</a> is the one place where a wrong choice is unrecoverable rather than
+slow &mdash; a dense probability field is 11.7&nbsp;GB per unit.</li>
+</ol>
+
+<div class="box">
+<p class="meta">Every figure in this document is a real transformation on real data, generated
+from the code in the repository. Every number traces to a logged entry with its own figure; the
+log is append-only, so withdrawn claims remain visible alongside the reasons they were
+withdrawn.</p>
+</div>
+
+</div>
+
+<script>
+const th=localStorage.getItem('_theme');
+if(th)document.documentElement.setAttribute('data-theme',th);
+const b=document.getElementById('tt');
+if(b)b.onclick=()=>{const r=document.documentElement;
+  const c=r.getAttribute('data-theme')||
+    (matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
+  const n=c==='dark'?'light':'dark';
+  r.setAttribute('data-theme',n);localStorage.setItem('_theme',n);};
+</script>

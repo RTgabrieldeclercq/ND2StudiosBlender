@@ -1994,11 +1994,16 @@ class EngineRunner(QObject):
         ``observe`` overrides the progress sink (the ingest pool passes an un-epoched one);
         by default it reports under ``epoch``, or the current one."""
         path = _clean_source_path(cfg.get("path", ""))
-        if path and not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"No such ND2/TIFF file:\n  {path!r}\n"
-                f"Reload it via File → Load ND2/TIFF file… (or fix the node's 'path' "
-                f"field). Leave it empty for the synthetic demo source.")
+        if path:
+            # an .nd3 path may carry a '#image_id' fragment (the one-image
+            # escape hatch) — probe the FILE part, or every fragment path
+            # would be reported missing.
+            from nodelab_v2.ingest import split_fragment
+            if not os.path.isfile(split_fragment(path)[0]):
+                raise FileNotFoundError(
+                    f"No such image file (ND2/ND3/TIFF):\n  {path!r}\n"
+                    f"Reload it via File → Load ND2/ND3/TIFF file… (or fix the node's "
+                    f"'path' field). Leave it empty for the synthetic demo source.")
         key = source_key(path)
         self._node_source_key[node_id] = key
         hit = self._providers.get(key)
@@ -2029,7 +2034,15 @@ class EngineRunner(QObject):
             # derived cache, so relocating it costs nothing but has to stay UNIQUE per
             # source — hence the path digest, or two files of the same basename in
             # different folders would fight over one store.
-            base = os.path.splitext(path)[0] + ".b2nd_store"
+            # An .nd3 '#image_id' fragment must land in its OWN store:
+            # splitext("well.nd3#DAPI") strips ".nd3#DAPI", so the fragment
+            # load and the whole-file load would otherwise share
+            # "well.b2nd_store" — one image's pixels served under the other's
+            # metadata. nd3 ids are [A-Za-z0-9_.-]+, filesystem-safe as a tag.
+            from nodelab_v2.ingest import split_fragment
+            file_part, frag = split_fragment(path)
+            base = (os.path.splitext(file_part)[0]
+                    + (f".{frag}" if frag else "") + ".b2nd_store")
             target_dir = store_dir(os.path.dirname(base))
             if os.path.abspath(target_dir) == os.path.abspath(os.path.dirname(base)):
                 store = base

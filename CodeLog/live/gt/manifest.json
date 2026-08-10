@@ -1,0 +1,321 @@
+{
+ "tiles": [
+  {
+   "id": "M01",
+   "file": "img/M01.png",
+   "m": 0,
+   "t": 0,
+   "z": 3,
+   "what": "pure F, SMALL",
+   "h": 1024,
+   "w": 1024,
+   "um_per_px": 1.7183,
+   "stretch": {
+    "r": {
+     "lo_dn": 90.0,
+     "hi_dn": 3806.0,
+     "p99_7_dn": 3806.0,
+     "gamma": 0.72,
+     "signal_frac": 0.7155561447143555,
+     "empty": false,
+     "channel": 1,
+     "label": "R-B 571 - functional granules (F)"
+    },
+    "g": {
+     "lo_dn": 90.0,
+     "hi_dn": 2694.0,
+     "p99_7_dn": 2694.0,
+     "gamma": 0.72,
+     "signal_frac": 0.0598297119140625,
+     "empty": false,
+     "channel": 0,
+     "label": "GFP 499 - cells on the granule surfaces"
+    },
+    "b": {
+     "lo_dn": 90.0,
+     "hi_dn": 490.0,
+     "p99_7_dn": 119.0,
+     "gamma": 0.72,
+     "signal_frac": 2.86102294921875e-06,
+     "empty": true,
+     "channel": 2,
+     "label": "Nile Blue 649 - inert granules (I)"
+    }
+   },
+   "empty_channels": [
+    "b"
+   ]
+  },
+  {
+   "id": "M08",
+   "file": "img/M08.png",
+   "m": 7,
+   "t": 0,
+   "z": 3,
+   "what": "pure F, MEDIUM",
+   "h": 1024,
+   "w": 1024,
+   "um_per_px": 1.7183,
+   "stretch": {
+    "r": {
+     "lo_dn": 90.0,
+     "hi_dn": 4095.0,
+     "p99_7_dn": 4095.0,
+     "gamma": 0.72,
+     "signal_frac": 0.722020149230957,
+     "empty": false,
+     "channel": 1,
+     "label": "R-B 571 - functional granules (F)"
+    },
+    "g": {
+     "lo_dn": 90.0,
+     "hi_dn": 1431.0,
+     "p99_7_dn": 1431.0,
+     "gamma": 0.72,
+     "signal_frac": 0.020284652709960938,
+     "empty": false,
+     "channel": 0,
+     "label": "GFP 499 - cells on the granule surfaces"
+    },
+    "b": {
+     "lo_dn": 90.0,
+     "hi_dn": 490.0,
+     "p99_7_dn": 129.0,
+     "gamma": 0.72,
+     "signal_frac": 6.67572021484375e-05,
+     "empty": true,
+     "channel": 2,
+     "label": "Nile Blue 649 - inert granules (I)"
+    }
+   },
+   "empty_channels": [
+    "b"
+   ]
+  },
+  {
+   "id": "M15",
+   "file": "img/M15.png",
+   "m": 14,
+   "t": 0,
+   "z": 3,
+   "what": "pure F, LARGE",
+   "h": 1024,
+   "w": 1024,
+   "um_per_px": 1.7183,
+   "stretch": {
+    "r": {
+     "lo_dn": 90.0,
+     "hi_dn": 4095.0,
+     "p99_7_dn": 4095.0,
+     "gamma": 0.72,
+     "signal_frac": 0.9014368057250977,
+     "empty": false,
+     "channel": 1,
+     "label": "R-B 571 - functional granules (F)"
+    },
+    "g": {
+     "lo_dn": 90.0,
+     "hi_dn": 1462.2750244140625,
+     "p99_7_dn": 1462.2750244140625,
+     "gamma": 0.72,
+     "signal_frac": 0.017342567443847656,
+     "empty": false,
+     "channel": 0,
+     "label": "GFP 499 - cells on the granule surfaces"
+    },
+    "b": {
+     "lo_dn": 90.0,
+     "hi_dn": 490.0,
+     "p99_7_dn": 137.0,
+     "gamma": 0.72,
+     "signal_frac": 0.0001087188720703125,
+     "empty": true,
+     "channel": 2,
+     "label": "Nile Blue 649 - inert granules (I)"
+    }
+   },
+   "empty_channels": [
+    "b"
+   ]
+  },
+  {
+   "id": "M04",
+   "file": "img/M04.png",
+   "m": 3,
+   "t": 0,
+   "z": 3,
+   "what": "50% F small + inert medium",
+   "h": 1024,
+   "w": 1024,
+   "um_per_px": 1.7183,
+   "stretch": {
+    "r": {
+     "lo_dn": 90.0,
+     "hi_dn": 3099.0,
+     "p99_7_dn": 3099.0,
+     "gamma": 0.72,
+     "signal_frac": 0.17370128631591797,
+     "empty": false,
+     "channel": 1,
+     "label": "R-B 571 - functional granules (F)"
+    },
+    "g": {
+     "lo_dn": 90.0,
+     "hi_dn": 1398.0,
+     "p99_7_dn": 1398.0,
+     "gamma": 0.72,
+     "signal_frac": 0.01764965057373047,
+     "empty": false,
+     "channel": 0,
+     "label": "GFP 499 - cells on the granule surfaces"
+    },
+    "b": {
+     "lo_dn": 90.0,
+     "hi_dn": 1249.0,
+     "p99_7_dn": 1249.0,
+     "gamma": 0.72,
+     "signal_frac": 0.3160867691040039,
+     "empty": false,
+     "channel": 2,
+     "label": "Nile Blue 649 - inert granules (I)"
+    }
+   },
+   "empty_channels": []
+  },
+  {
+   "id": "M11",
+   "file": "img/M11.png",
+   "m": 10,
+   "t": 0,
+   "z": 3,
+   "what": "50% F medium + inert medium",
+   "h": 1024,
+   "w": 1024,
+   "um_per_px": 1.7183,
+   "stretch": {
+    "r": {
+     "lo_dn": 90.0,
+     "hi_dn": 4095.0,
+     "p99_7_dn": 4095.0,
+     "gamma": 0.72,
+     "signal_frac": 0.22630786895751953,
+     "empty": false,
+     "channel": 1,
+     "label": "R-B 571 - functional granules (F)"
+    },
+    "g": {
+     "lo_dn": 90.0,
+     "hi_dn": 490.0,
+     "p99_7_dn": 473.0,
+     "gamma": 0.72,
+     "signal_frac": 0.005359649658203125,
+     "empty": false,
+     "channel": 0,
+     "label": "GFP 499 - cells on the granule surfaces"
+    },
+    "b": {
+     "lo_dn": 90.0,
+     "hi_dn": 706.0,
+     "p99_7_dn": 706.0,
+     "gamma": 0.72,
+     "signal_frac": 0.25115108489990234,
+     "empty": false,
+     "channel": 2,
+     "label": "Nile Blue 649 - inert granules (I)"
+    }
+   },
+   "empty_channels": []
+  },
+  {
+   "id": "M19",
+   "file": "img/M19.png",
+   "m": 18,
+   "t": 0,
+   "z": 3,
+   "what": "75% F large + inert large",
+   "h": 1024,
+   "w": 1024,
+   "um_per_px": 1.7183,
+   "stretch": {
+    "r": {
+     "lo_dn": 90.0,
+     "hi_dn": 4095.0,
+     "p99_7_dn": 4095.0,
+     "gamma": 0.72,
+     "signal_frac": 0.6063032150268555,
+     "empty": false,
+     "channel": 1,
+     "label": "R-B 571 - functional granules (F)"
+    },
+    "g": {
+     "lo_dn": 90.0,
+     "hi_dn": 765.0,
+     "p99_7_dn": 765.0,
+     "gamma": 0.72,
+     "signal_frac": 0.0075702667236328125,
+     "empty": false,
+     "channel": 0,
+     "label": "GFP 499 - cells on the granule surfaces"
+    },
+    "b": {
+     "lo_dn": 90.0,
+     "hi_dn": 604.0,
+     "p99_7_dn": 604.0,
+     "gamma": 0.72,
+     "signal_frac": 0.1366901397705078,
+     "empty": false,
+     "channel": 2,
+     "label": "Nile Blue 649 - inert granules (I)"
+    }
+   },
+   "empty_channels": []
+  }
+ ],
+ "classes": [
+  {
+   "key": "F",
+   "label": "functional granule",
+   "hint": "red \u2014 R-B 571, carries cells",
+   "color": "#fb7185",
+   "shape": "polygon",
+   "ch": "r",
+   "hotkey": "1"
+  },
+  {
+   "key": "I",
+   "label": "inert granule",
+   "hint": "blue \u2014 Nile Blue 649",
+   "color": "#60a5fa",
+   "shape": "polygon",
+   "ch": "b",
+   "hotkey": "2"
+  },
+  {
+   "key": "?",
+   "label": "cannot tell",
+   "hint": "ambiguous colour or boundary",
+   "color": "#fbbf24",
+   "shape": "polygon",
+   "fallback": true,
+   "hotkey": "3"
+  },
+  {
+   "key": "x",
+   "label": "not a granule",
+   "hint": "debris, haze, artefact",
+   "color": "#a78bfa",
+   "shape": "polygon",
+   "hotkey": "4"
+  },
+  {
+   "key": "cell",
+   "label": "cell",
+   "hint": "green \u2014 GFP 499",
+   "color": "#34d399",
+   "shape": "circle",
+   "ch": "g",
+   "hotkey": "5"
+  }
+ ],
+ "ambig_margin": 0.25
+}

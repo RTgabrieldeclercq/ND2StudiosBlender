@@ -22,8 +22,12 @@ from nodegraph.catalog._shared.objects import (
 # ── per-object derived metrics (CT compute_spatial_metrics + self/frame fold) ───
 
 #: ``metrics`` → the column(s) each one writes onto the member layer.
+#:
+#: ``velocity`` writes ``vz`` **only for a volumetric (``z_kind='subpixel'``) member
+#: table** — on a plane-index table there is no axial displacement to difference, and an
+#: all-NaN column on every 2-D workflow is noise rather than information.
 _OBJECT_METRIC_COLUMNS: Dict[str, Tuple[str, ...]] = {
-    "velocity": ("vy", "vx"),
+    "velocity": ("vy", "vx", "vz"),
     "speed": ("speed",),
     "neighbors": ("neighbor_dist_mean", "neighbor_dist_std"),
     "divergence": ("local_divergence",),
@@ -31,6 +35,12 @@ _OBJECT_METRIC_COLUMNS: Dict[str, Tuple[str, ...]] = {
     "frame_fold": ("frame_fold",),
     "self_fold": ("self_fold",),
 }
+#: Metrics that are defined only in a plane, so a volumetric member table refuses THEM
+#: rather than the whole node. A 2-D curl is a scalar where a 3-D one is a vector, and
+#: the divergence here is fitted from an in-plane neighbourhood — neither has a correct
+#: volumetric answer to give. Everything else (a centroid speed, crowding, a fold change)
+#: is perfectly well defined in a volume, which is why the refusal is per-metric.
+_OBJECT_METRICS_PLANAR = frozenset({"divergence", "curl"})
 #: metrics that need a ``track_id`` column on the member layer (run ``track.objects``
 #: or ``track.link`` first) — everything built on per-object velocity, plus self_fold.
 _OBJECT_METRICS_TRACKED = frozenset({"velocity", "speed", "divergence", "curl",
@@ -182,8 +192,21 @@ def _compute_object_metrics(ctx: EvalContext) -> Dataset:
     Footprint ``WHOLE_SERIES`` with no image access (``kernel_axes`` empty) — every input
     is already a structure column, and velocity needs the whole T axis at once."""
     ds = ctx.inputs[0]
-    domain, layer, cols, zk = _object_table(ctx, ds, node="object metrics")
+    domain, layer, cols, zk = _object_table(ctx, ds, node="object metrics",
+                                            allow_3d=True)
     names = _object_metric_names(ctx.params.get("metrics", ""))
+    is_3d = (zk == "subpixel")
+    planar = sorted(_OBJECT_METRICS_PLANAR & set(names))
+    if is_3d and planar:
+        raise ValueError(
+            f"object metrics: {planar} are in-plane estimators and the {domain.value} "
+            f"layer {layer!r} is volumetric (z_kind='subpixel'). A 2-D curl is a scalar "
+            f"but a 3-D one is a vector, and the divergence here is fitted from an "
+            f"in-plane neighbourhood, so there is no correct value to report rather than "
+            f"a misleading one. Ask for "
+            f"{sorted(set(_OBJECT_METRIC_COLUMNS) - _OBJECT_METRICS_PLANAR)} instead — "
+            f"those are all defined in a volume and 'velocity' additionally reports 'vz' "
+            f"here — or z-project / segment on the 2D lever if you want the planar fields.")
     n = len(cols["id"])
     px = ctx.calib("pixel_size_um") or 0.1
     need_track = bool(set(names) & _OBJECT_METRICS_TRACKED)
@@ -218,11 +241,26 @@ def _compute_object_metrics(ctx: EvalContext) -> Dataset:
 
     vy = vx = None
     if need_track and {"velocity", "speed", "divergence", "curl"} & set(names):
-        vy, vx = _object_velocity(np.asarray(track, dtype=np.int64), tt, y_um, x_um, dt_s)
+        # z_step_um is read ONLY on a volumetric table, so a 2-D pull is not memo-fenced
+        # on a calibration key it could never have consumed (the rule _frame_interval_s
+        # states for dt_s). z is in plane indices, so the axial scale is the z STEP —
+        # using pixel_size_um here would silently report a lateral scale on an axis that
+        # is 23x coarser on a typical confocal stack.
+        z_um = None
+        if is_3d:
+            dz = ctx.calib("z_step_um")
+            z_um = np.asarray(cols["z"], dtype=float) * (float(dz) if dz else 1.0)
+        vz, vy, vx = _object_velocity(np.asarray(track, dtype=np.int64), tt,
+                                      y_um, x_um, dt_s, z_um=z_um)
         if "velocity" in names:
             out["vy"], out["vx"] = vy, vx
+            if is_3d:
+                out["vz"] = vz
         if "speed" in names:
-            out["speed"] = np.hypot(vy, vx)
+            # 3-norm only where vz is a real measurement: folding an all-NaN vz into the
+            # 2-D case would turn every existing speed column into NaN.
+            out["speed"] = (np.sqrt(vz * vz + vy * vy + vx * vx) if is_3d
+                            else np.hypot(vy, vx))
 
     if {"neighbors", "divergence", "curl"} & set(names):
         k = max(1, int(ctx.params.get("n_neighbors", 6)))
@@ -290,7 +328,8 @@ register_node(
                  vocab=tuple(_OBJECT_METRIC_COLUMNS),
                  description=
                  "Which metrics to compute, comma-separated, each writing its own "
-                 "column(s): `velocity`->vy,vx (um/s), `speed`->speed (um/s), "
+                 "column(s): `velocity`->vy,vx and, on a volumetric table, vz (um/s), "
+                 "`speed`->speed (um/s), "
                  "`neighbors`->neighbor_dist_mean,neighbor_dist_std (um), "
                  "`divergence`->local_divergence (1/s, positive = neighbours spreading "
                  "apart), `curl`->local_curl (1/s, local rotation), `frame_fold`->intensity "
@@ -305,12 +344,15 @@ register_node(
                          "→ `vy`,`vx` in µm/s: the object's DISPLACEMENT per second along y "
                          "and x, signed. Keep it when direction matters (do cells move up the "
                          "gradient?); it averages toward zero over a round trip, which `speed` "
-                         "does not. Needs a track_id column.",
+                         "does not. A volumetric table also gets `vz`, scaled by the z STEP — "
+                         "trust it only where the z sampling resolves the object. Needs a "
+                         "track_id column.",
                      "speed":
                          "→ `speed` in µm/s: the magnitude of that velocity, always positive. "
                          "The measure of how ACTIVE an object is regardless of direction — and "
                          "the one that inflates with tracking noise, since every spurious "
-                         "jitter adds to it rather than cancelling. Needs a track_id column.",
+                         "jitter adds to it rather than cancelling. Includes the axial term on "
+                         "a volumetric table. Needs a track_id column.",
                      "neighbors":
                          "→ `neighbor_dist_mean`,`neighbor_dist_std` in µm: distance to the N "
                          "nearest neighbours, averaged and spread. The mean is a local density "
@@ -384,4 +426,6 @@ register_node(
     description="Per-object derived metrics onto the member layer: velocity/speed (µm/s), "
                 "K-nearest-neighbour distances (µm), local divergence/curl (1/s), and "
                 "frame- or self-normalized intensity fold change. Ports Cell-Tracker's "
-                "compute_spatial_metrics + self-fold + mean_velocity; 2D, per (m,t,z,c).")
+                "compute_spatial_metrics + self-fold + mean_velocity; per (m,t,z,c). A "
+                "volumetric member table adds `vz` and refuses only the two in-plane "
+                "metrics, `divergence` and `curl`.")

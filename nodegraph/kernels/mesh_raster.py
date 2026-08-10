@@ -221,14 +221,21 @@ def interior_test_for(provenance: Dict[str, Any], closed: bool) -> str:
     ``closed`` topology when a hand-built mesh carries no provenance.
 
     ``convex_hull`` keeps the cheap, exactly-correct ``find_simplex`` path. Anything that
-    can be concave (``alpha_shape`` with a finite alpha, ``label_surface``) uses the
-    faces-based parity test — but only if the surface is actually watertight, since parity
-    on an open surface is meaningless.
+    can be concave (``alpha_shape`` with a finite alpha, ``label_surface``,
+    ``parametric``) uses the faces-based parity test — but only if the surface is
+    actually watertight, since parity on an open surface is meaningless.
+
+    ``parametric`` (an analytic superquadric surface) is listed explicitly rather than
+    left to the fallback: a superquadric is convex only for exponents below 1, and
+    becomes pinched / star-shaped above it, so it must not inherit the convex test.
+    The fallback already resolved it the same way, but by accident — an unrecognised
+    boundary and a known-concave one are different situations and should not share a
+    line by coincidence.
     """
     boundary = str(provenance.get("boundary", "")) or None
     if boundary == "convex_hull":
         return "convex"
-    if boundary in ("alpha_shape", "label_surface"):
+    if boundary in ("alpha_shape", "label_surface", "parametric"):
         return "watertight" if closed else "convex"
     return "watertight" if closed else "convex"
 

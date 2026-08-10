@@ -19,6 +19,9 @@ Every ``nd2`` import here goes through :func:`nodelab_v2.nd2_compat.import_nd2`,
 applies the SDK bug shims (a zero-range ZStackLoop divides by zero in ``nd2 <= 0.11.3`` and
 takes the whole file with it) before any ``ND2File`` is opened. It stays a *lazy*, in-function
 import: this module must remain importable — and its TIFF half usable — with no SDK present.
+
+``.nd3`` (the MEBP HDF5 container) dispatches from the same four seams to
+:mod:`nodelab_v2.nd3_ingest`, which is lazy about h5py for the same reason.
 """
 from __future__ import annotations
 
@@ -151,7 +154,11 @@ def read_calibration(path: str) -> Dict[str, Any]:
     :data:`~nodegraph.dataset.CALIBRATION_KEYS` (dropping absent / ``None`` scalars;
     ``channel_emission_nm`` stays a per-channel list even when some channels have no
     emission — e.g. a transmitted-light channel is ``None``). ND2 reuses the proven v1
-    ``read_nd2_metadata_extended``; TIFF is best-effort (:func:`_tiff_calibration`)."""
+    ``read_nd2_metadata_extended``; TIFF is best-effort (:func:`_tiff_calibration`);
+    ND3 maps the container's own ``meta_json`` (:func:`nodelab_v2.nd3_ingest.nd3_calibration`)."""
+    if _is_nd3(path):
+        from nodelab_v2.nd3_ingest import nd3_calibration
+        return nd3_calibration(path)
     if _is_tiff(path):
         import tifffile
         with tifffile.TiffFile(path) as tf:
@@ -274,6 +281,20 @@ STAGE_KEYS = ("stage_xy_um", "stage_z_um")
 PLACEMENT_KEYS = ("z_home_index", "z_bottom_to_top", "frame_time_jd",
                   "stage_layout_source", "acquisition_start")
 
+#: ND3 plate/dataset provenance (2026-08-08) — where an ``.nd3`` image sits on
+#: the *plate* and which acquisition profile wrote it: ``plate_frame`` (the
+#: A1-relative frame dict, verbatim from ``meta_json``), ``wells_um`` (mapped
+#: well centres in absolute stage µm), ``plate_id`` / ``well`` (identity), and
+#: ``nd3_profile`` (e.g. ``"mebp.fluor_well/1"``). Same status as
+#: :data:`STAGE_KEYS` / :data:`PLACEMENT_KEYS`: non-calibration provenance
+#: riding the payload for readouts and future tools — not part of the locked
+#: :data:`~nodegraph.dataset.CALIBRATION_KEYS`, and no ``meta_transform``
+#: keeps it true across a crop or resample. ``channel_display_levels`` (the
+#: file's frozen per-channel ``[lo, hi]`` display window, or ``None`` per
+#: channel) rides alongside for a future LUT-seeding feature.
+ND3_PLATE_KEYS = ("plate_frame", "wells_um", "plate_id", "well",
+                  "nd3_profile")
+
 
 def _nd2_bit_depth(path: str) -> Any:
     """The ND2's *significant* bit depth (e.g. 12) — the real sensor range, which the
@@ -314,6 +335,9 @@ def read_channel_display(path: str) -> Dict[str, Any]:
     locked calibration schema. TIFF carries no optics or stage log, so it degrades to
     ``Ch0…`` names (emission absent → a neutral grey tint downstream) and cannot be
     placed at all — which the overlay node reports rather than guesses."""
+    if _is_nd3(path):
+        from nodelab_v2.nd3_ingest import nd3_channel_display
+        return nd3_channel_display(path)
     if _is_tiff(path):
         ax = _tiff_axes(path)
         out: Dict[str, Any] = {"channel_names": [f"Ch{i}" for i in range(ax.c)]}
@@ -401,6 +425,7 @@ def read_nd2(path: str, progress: Optional[ProgressFn] = None
 #: file extensions this ingest layer reads (case-insensitive).
 _ND2_EXT = (".nd2",)
 _TIFF_EXT = (".tif", ".tiff")
+_ND3_EXT = (".nd3",)
 
 #: tifffile axis letters → the ND2 letter space understood by :func:`_to_6d`
 #: (``S`` sample-planes read as channels; ``I``/``Q`` sequence axes read as time).
@@ -483,6 +508,15 @@ def _is_tiff(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in _TIFF_EXT
 
 
+def _is_nd3(path: str) -> bool:
+    """True for an ``.nd3`` path, **fragment-aware**: ``well.nd3#DAPI`` (the
+    one-image escape hatch, see :func:`nodelab_v2.nd3_ingest.split_fragment`)
+    is an nd3 path even though ``splitext`` sees the fragment as part of the
+    extension."""
+    from nodelab_v2.nd3_ingest import split_fragment
+    return os.path.splitext(split_fragment(path)[0])[1].lower() in _ND3_EXT
+
+
 def _tiff_axes(path: str) -> AxisSizes:
     """Canonical :class:`AxisSizes` for a TIFF from its series shape/axes — **no pixel
     read** (uses ``series.shape``, not ``asarray``)."""
@@ -498,8 +532,12 @@ def _tiff_axes(path: str) -> AxisSizes:
 
 def read_image(path: str, progress: Optional[ProgressFn] = None
                ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Read an ``.nd2`` **or** ``.tif``/``.tiff`` into a canonical ``(M,T,Z,C,Y,X)``
-    numpy array + its calibration dict — the format-dispatching reader."""
+    """Read an ``.nd2``, ``.nd3`` **or** ``.tif``/``.tiff`` into a canonical
+    ``(M,T,Z,C,Y,X)`` numpy array + its calibration dict — the
+    format-dispatching reader."""
+    if _is_nd3(path):
+        from nodelab_v2.nd3_ingest import read_nd3
+        return read_nd3(path, progress)
     return (read_tiff(path, progress) if _is_tiff(path)
             else read_nd2(path, progress))
 
@@ -508,7 +546,10 @@ def read_meta_only(path: str) -> Tuple[AxisSizes, Dict[str, Any], Dict[str, Any]
     """``(axes, calibration, channel_display)`` for ``path`` **without realizing pixels**
     — the cheap read the File-menu loader uses to seed a node's envelope + per-channel
     output sockets the instant a file is picked (the heavy ingest happens lazily on the
-    first pull). Works for ND2 and TIFF."""
+    first pull). Works for ND2, ND3 and TIFF."""
+    if _is_nd3(path):
+        from nodelab_v2.nd3_ingest import nd3_meta_only
+        return nd3_meta_only(path)
     calib = read_calibration(path)
     disp = read_channel_display(path)
     if _is_tiff(path):
@@ -558,7 +599,10 @@ def ingest_image(path: str, store_path: Optional[str] = None,
     The other three combinations keep the read-then-write split (:data:`_READ_SHARE`):
     ``tifffile``'s ``series.asarray()`` has no lazy form, and an in-memory ingest realizes
     the array by definition."""
-    stream = bool(store_path) and not _is_tiff(path)
+    # nd3 materializes (v1): payloads are modest (mosaic canvases are
+    # downscaled), and a raw h5py dataset dies with its File — the lazy path
+    # would need a reopen-per-slab wrapper. See read_nd3's docstring.
+    stream = bool(store_path) and not (_is_tiff(path) or _is_nd3(path))
     read_p = write_p = None
     if progress is not None:
         share = 0.0 if stream else _READ_SHARE
@@ -665,7 +709,15 @@ def ensure_store_levels(store_path: str, levels: int = PYRAMID_LEVELS,
     return B2ndProvider.ensure_levels(store_path, levels, progress=progress)
 
 
+def split_fragment(path: str):
+    """Re-export of :func:`nodelab_v2.nd3_ingest.split_fragment` so callers
+    (the runner's source resolution) keep importing one ingest module."""
+    from nodelab_v2.nd3_ingest import split_fragment as _sf
+    return _sf(path)
+
+
 __all__ = ["read_calibration", "read_channel_display", "lazy_nd2", "read_nd2",
            "read_tiff", "read_image", "read_meta_only", "ingest_image", "ingest_nd2",
            "open_store", "verify_store", "ensure_store_levels", "PYRAMID_LEVELS",
-           "CHANNEL_DISPLAY_KEYS", "STAGE_KEYS", "PLACEMENT_KEYS"]
+           "CHANNEL_DISPLAY_KEYS", "STAGE_KEYS", "PLACEMENT_KEYS",
+           "ND3_PLATE_KEYS", "split_fragment"]

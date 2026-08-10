@@ -80,19 +80,21 @@ def ensure_ops() -> None:
     spec = NODES.get("io.load")
     if spec is None or spec.input("path") is None:
         define_node(
-            "io.load", "Load ND2/TIFF file", category="io",
+            "io.load", "Load ND2/ND3/TIFF file", category="io",
             inputs=[InString("path", "Path", field=False, default="",
                              path_kind="open_file",
-                             path_filter="Images (*.nd2 *.tif *.tiff);;ND2 (*.nd2);;"
-                                         "TIFF (*.tif *.tiff);;All files (*)",
+                             path_filter="Images (*.nd2 *.nd3 *.tif *.tiff);;ND2 (*.nd2);;"
+                                         "ND3 (*.nd3);;TIFF (*.tif *.tiff);;All files (*)",
                              path_hint="empty = synthetic demo · or Browse…",
-                             description="The ND2 or TIFF to open. Browse… fills this in; "
-                                         "an empty path runs the synthetic demo stack "
-                                         "instead, so the graph is testable with no file.")],
+                             description="The ND2, ND3 or TIFF to open. Browse… fills this "
+                                         "in; an empty path runs the synthetic demo stack "
+                                         "instead, so the graph is testable with no file. "
+                                         "A multi-image .nd3 loads one image via a "
+                                         "'#image_id' suffix, e.g. well.nd3#DAPI.")],
             outputs=[OutDataset("image")],
             adds_domains=frozenset({Domain.VOXEL}),   # the source of the image domain
-            description="Open an ND2 or TIFF as the pipeline source (the GUI ingests it "
-                        "once to a b2nd store next to the file; empty path = synthetic "
+            description="Open an ND2, ND3 or TIFF as the pipeline source (the GUI ingests "
+                        "it once to a b2nd store next to the file; empty path = synthetic "
                         "demo). Exposes one output per channel + a combined 'All "
                         "channels' output.")
     if NODES.get("view.viewer") is None:

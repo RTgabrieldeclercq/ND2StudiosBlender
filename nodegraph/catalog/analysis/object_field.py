@@ -164,8 +164,10 @@ def _compute_object_field(ctx: EvalContext) -> Dataset:
     x_px = np.asarray(cols["x"], dtype=float)
     vy = vx = None
     if need_track:
-        vy, vx = _object_velocity(np.asarray(track, dtype=np.int64), tt,
-                                  y_px * px, x_px * px, dt_s)
+        # z_um deliberately not passed: this node is 2D-only (see _object_table), so
+        # there is no axial component to report and vz is discarded.
+        _vz, vy, vx = _object_velocity(np.asarray(track, dtype=np.int64), tt,
+                                       y_px * px, x_px * px, dt_s)
 
     gy_px = np.arange(0, ax.y, step_px, dtype=float)
     gx_px = np.arange(0, ax.x, step_px, dtype=float)

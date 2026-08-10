@@ -1,0 +1,75 @@
+{
+  "format_version": "2.0",
+  "graph": {
+    "edges": [
+      {
+        "dst": "T",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "C",
+        "src_socket": "out"
+      },
+      {
+        "dst": "C",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "S",
+        "src_socket": "out"
+      },
+      {
+        "dst": "A",
+        "dst_socket": "data",
+        "kind": "forward",
+        "src": "T",
+        "src_socket": "out"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "A",
+        "modes": {
+          "dim": "2D",
+          "level": "otsu",
+          "method": "watershed"
+        },
+        "op_key": "analysis.segment",
+        "params": {
+          "fill_holes": true,
+          "mask": "fg",
+          "min_area": 1079.73,
+          "min_distance": 33.84714332649184,
+          "name": "grains"
+        }
+      },
+      {
+        "id": "C",
+        "modes": {},
+        "op_key": "channel.select",
+        "params": {
+          "channels": [
+            1
+          ]
+        }
+      },
+      {
+        "id": "S",
+        "modes": {},
+        "op_key": "io.bedseed",
+        "params": {}
+      },
+      {
+        "id": "T",
+        "modes": {
+          "method": "otsu",
+          "scope": "plane"
+        },
+        "op_key": "analysis.threshold",
+        "params": {
+          "name": "fg"
+        }
+      }
+    ]
+  },
+  "groups": [],
+  "zones": []
+}
