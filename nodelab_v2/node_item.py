@@ -45,7 +45,7 @@ from __future__ import annotations
 import html
 import re
 import textwrap
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -76,6 +76,10 @@ _PICK_GLYPH_W = 15.0
 #: Widest a value pill may grow. Leaves room on a 214 px card for the row label and, on a
 #: pickable param, the ◎ glyph. Longer values elide — the full text is in the inspector.
 _PILL_MAX_W = 116.0
+#: Cap for the granularity band's population pill (V2.27) — tighter than a row pill's, so it
+#: clears the footprint chip to its left. The vocabulary is capped to match
+#: (``_shared.scope.SCOPE_TOKEN_MAX``); a longer token elides rather than overrunning the chip.
+_FOOT_PILL_MAX_W = 96.0
 
 #: Screen pixels of horizontal drag per step while scrubbing a value pill. Small enough that
 #: a deliberate nudge moves one step, large enough that crossing the card is not a hundred.
@@ -185,8 +189,9 @@ class Ctl(NamedTuple):
     """One hit-testable control on a card: where it is, what it does, what it edits.
 
     ``kind`` is ``"value"`` (a param pill), ``"mode"`` (a mode pill), ``"pick"`` (the ◎
-    glyph) or ``"pin"`` (the ƒmd badge). ``obj`` is the ``SocketSpec`` or ``ModeSpec``
-    behind it."""
+    glyph), ``"pin"`` (the ƒmd badge) or ``"scope"`` (the population pill in the granularity
+    band — V2.27, the only control not derived from a row's y). ``obj`` is the ``SocketSpec``
+    or ``ModeSpec`` behind it."""
 
     rect: QRectF
     kind: str
@@ -330,8 +335,17 @@ def socket_hover_text(spec, extra: Sequence[str] = (), *, head: str = "") -> str
 
 
 def mode_identity(m) -> str:
-    """The one-line identity of an in-body Mode: ``name — mode · N options``."""
-    kind = "2D / 3D lever" if getattr(m, "is_dim_lever", False) else "mode"
+    """The one-line identity of an in-body Mode: ``name — mode · N options``.
+
+    The two ROLES name themselves, so the pill, the menu and the inspector row all label the
+    control the same way: the 2D/3D lever, and (V2.27) the statistics population, which is
+    edited from the card's granularity band rather than from a body row."""
+    if getattr(m, "is_dim_lever", False):
+        kind = "2D / 3D lever"
+    elif getattr(m, "is_scope", False):
+        kind = "statistics population"
+    else:
+        kind = "mode"
     return f"{m.name} — {kind} · {len(m.choices)} options"
 
 
@@ -756,8 +770,64 @@ class NodeItem(QGraphicsObject):
             self.update()
 
     def granularity(self) -> str:
+        """The resolved read footprint's name, or ``""`` when it does not resolve.
+
+        The empty string is the V2.27 correction: this returned the literal ``"tileable"``,
+        so a node whose footprint resolved to ``None`` painted the GREEN chip — "cheapest
+        possible read" — for a footprint that is unknown. It is false twice over on the two
+        nodes that hit it: ``io.load`` reads from disk and ``view.viewer`` is a sink. The band
+        now renders ``—`` in the muted colour instead (:meth:`_foot_slots`)."""
         g = self.spec.resolve_granularity(self.state()) if self.spec else None
-        return g.value if g is not None else "tileable"
+        return g.value if g is not None else ""
+
+    def _scope_mode(self):
+        """The statistics-population Mode this card's footprint band EDITS, or ``None`` when
+        the band is a plain readout (V2.27).
+
+        The band is a control iff the node declares a ``role="scope"`` Mode and that Mode is
+        active in the current state. Deliberately NOT keyed on ``spec.footprint_mode``: on
+        three of the four nodes that declare a non-default one, that Mode is not a population —
+        ``util.zproject``'s is ``method``, so a band bound to it would offer max/mean/**none**,
+        i.e. a footprint control that changes the reducer or switches the node off. And all
+        four already show that Mode as a body pill, so it would be a duplicate control.
+
+        Duck-typed against the registry on purpose: the GUI must stay inert-but-correct on a
+        build whose engine half is older, and a hot-reloaded node must never be able to crash
+        a paint."""
+        spec = self.spec
+        if spec is None or self._is_group or self._is_reroute or self.rec.collapsed:
+            return None
+        fn = getattr(spec, "scope_mode", None)
+        m = fn() if callable(fn) else None
+        if m is None:
+            m = next((x for x in spec.modes if getattr(x, "is_scope", False)), None)
+        if m is None or not getattr(m, "choices", ()):
+            return None
+        return m if m in spec.active_modes(self.state()) else None
+
+    def _foot_slots(self) -> Tuple[str, str, Optional[str]]:
+        """``(caption, chip_text, pill_text | None)`` — THE source of the footprint band's
+        strings, read by :meth:`paint` AND by :meth:`controls`.
+
+        One function for the same reason the pill rects are shared: the probe has to be able to
+        assert the band headlessly, and a second derivation is how a chip comes to disagree
+        with the menu behind it.
+
+        The chip stays a FACT (the read cost, in the cost colour) and the pill is the CONTROL —
+        the card's existing grammar, and what keeps the band honest: a per-label population
+        still reads a whole volume, so painting ``PER LABEL`` in the green TILEABLE colour would
+        assert exactly the misdeclaration ``analysis.threshold`` was corrected for. When a pill
+        is present the chip ABBREVIATES, because ``WHOLE VOLUME`` ends at x≈129 and the pill
+        starts at 106."""
+        if self._is_group:
+            return "subgraph", "GROUP", None
+        gname = self.granularity()
+        m = self._scope_mode()
+        if m is None:
+            return "footprint", (gname.replace("_", " ").upper() if gname else "—"), None
+        val = self.rec.modes.get(m.name, m.resolved_default())
+        return ("footprint", (T.gran_abbr(gname) if gname else "—"),
+                f"{str(val).replace('_', ' ')} ▾")
 
     # H11: the incoming z is KNOWN to be 1 (unknown never counts as 1)
     def z_is_one(self) -> bool:
@@ -875,6 +945,19 @@ class NodeItem(QGraphicsObject):
                 self.scene().removeItem(sock)
         self._sockets.clear()
 
+    def _modes_on_rows(self, m) -> bool:
+        """Whether Mode ``m`` gets a BODY ROW, i.e. its own pill under the sockets.
+
+        The two roles are drawn elsewhere and must be excluded here: the 2D/3D lever is the
+        header switch, and the statistics population is the granularity band's pill (V2.27).
+
+        **This predicate has to be used by both `_layout` and `refresh`.** If they disagree,
+        ``refresh``'s ``want != have`` is permanently true, so every ``doc.touch()`` — every
+        edit anywhere in the graph — destroys and recreates every ``SocketItem`` on this card,
+        re-anchors every wire, and drops ``_hot_ctl``/``_scrub`` mid-drag. One function, two
+        callers, no way to update one and forget the other."""
+        return not m.is_dim_lever and m is not self._scope_mode()
+
     def _layout(self) -> None:
         self.prepareGeometryChange()
         self._clear_sockets()
@@ -896,7 +979,7 @@ class NodeItem(QGraphicsObject):
             self._rows.append(("in", s, y))
             y += T.ROW_H
         for m in self._active_modes():
-            if m.is_dim_lever:
+            if not self._modes_on_rows(m):
                 continue
             self._rows.append(("mode", m, y))
             y += T.ROW_H
@@ -911,6 +994,7 @@ class NodeItem(QGraphicsObject):
         self._height = y + T.PAD_BOTTOM
         if self._switch is not None:
             self._switch.set_allow_3d(not self.z_is_one())
+        self._apply_card_tip()
         self.update()
 
     def _layout_reroute(self) -> None:
@@ -951,6 +1035,8 @@ class NodeItem(QGraphicsObject):
         self._height = T.HEADER_H + max(0, band) * 12 + 12
         if self._switch is not None:
             self._switch.set_allow_3d(not self.z_is_one())
+        # a collapsed card paints no band, so the tooltip is the ONLY footprint readout it has
+        self._apply_card_tip()
         self.update()
 
     def refresh(self) -> None:
@@ -960,7 +1046,7 @@ class NodeItem(QGraphicsObject):
         # gates a Mode away without changing any socket name must still relayout.
         want = ([s.name for s in self._active_inputs()],
                 [s.name for s in self._active_outputs()],
-                [m.name for m in self._active_modes() if not m.is_dim_lever])
+                [m.name for m in self._active_modes() if self._modes_on_rows(m)])
         have = ([k[1] for k in self._sockets if k[0] == "in"],
                 [k[1] for k in self._sockets if k[0] == "out"],
                 [r[1].name for r in self._rows if r[0] == "mode"])
@@ -1023,7 +1109,7 @@ class NodeItem(QGraphicsObject):
         self._layout()
         if self.scene() is not None and hasattr(self.scene(), "reroute"):
             self.scene().reroute()
-        self.doc.touch()
+        self.doc.touch(self.node_id)
         self.changed.emit(self)
 
     def socket(self, io: str, name: str) -> Optional[SocketItem]:
@@ -1203,26 +1289,29 @@ class NodeItem(QGraphicsObject):
         if self.rec.collapsed:
             return                     # header-only compact card (sockets at edges)
 
-        # granularity chip (a group instance shows a GROUP badge instead — it is opaque)
-        if self._is_group:
-            gcol = T.category_color("group")
-            foot_txt, chip_txt = "subgraph", "GROUP"
-        else:
-            gname = self.granularity()
-            gcol = T.gran_color(gname)
-            foot_txt, chip_txt = "footprint", gname.replace("_", " ").upper()
+        # The granularity band: a footprint CHIP (a fact, coloured by read cost) and — when the
+        # node declares a statistics population — a PILL beside it (the control). Both strings
+        # come from `_foot_slots` so the menu can never disagree with what is painted.
+        foot_txt, chip_txt, pill_txt = self._foot_slots()
+        gcol = (T.category_color("group") if self._is_group
+                else T.gran_color(self.granularity()))
         p.setFont(QFont(T.SANS, 7))
         p.setPen(T.MUTED)
         p.drawText(QRectF(12, T.HEADER_H, 56, T.GRAN_H - 8), Qt.AlignVCenter, foot_txt)
         cf = QFont(T.MONO, 6); cf.setBold(True)
         p.setFont(cf)
-        cw = QFontMetricsF(cf).horizontalAdvance(chip_txt) + 12
-        chip = QRectF(64, T.HEADER_H + 3, cw, T.GRAN_H - 14)
+        chip = self._gran_chip_rect(chip_txt)
         p.setPen(QPen(T.alpha(gcol, 120), 1))
         p.setBrush(T.alpha(gcol, 36))
         p.drawRoundedRect(chip, 4, 4)
         p.setPen(gcol)
         p.drawText(chip, Qt.AlignCenter, chip_txt)
+        if pill_txt:
+            # the pill palette, NOT the cost colour: a per-label population still reads a whole
+            # volume, so tinting the control by cost would assert a footprint it does not have.
+            self._paint_pill_at(
+                p, self._foot_pill_rect(pill_txt, chip_txt), pill_txt, "", False,
+                hot=(self._hot_ctl is not None and self._hot_ctl.kind == "scope"))
         p.setPen(QPen(T.BORDER, 1, Qt.DashLine))
         p.drawLine(QPointF(12, T.HEADER_H + T.GRAN_H - 4),
                    QPointF(T.NODE_W - 12, T.HEADER_H + T.GRAN_H - 4))
@@ -1332,6 +1421,40 @@ class NodeItem(QGraphicsObject):
         return QRectF(pill.left() - _PICK_GLYPH_W - 3, pill.top(),
                       _PICK_GLYPH_W, pill.height())
 
+    @staticmethod
+    def _gran_chip_rect(chip_txt: str) -> QRectF:
+        """The footprint chip — a FACT, not a control, but its rect is needed by
+        :meth:`controls`' neighbour check and by the probe, so it is derived here rather than
+        inline in :meth:`paint` like every other rect on the card used to be."""
+        cf = QFont(T.MONO, 6)
+        cf.setBold(True)
+        return QRectF(64, T.HEADER_H + 3,
+                      QFontMetricsF(cf).horizontalAdvance(chip_txt) + 12, T.GRAN_H - 14)
+
+    @classmethod
+    def _foot_pill_rect(cls, txt: str, chip_txt: str = "") -> QRectF:
+        """The population pill in the granularity band (V2.27).
+
+        Right-aligned to ``NODE_W - 12`` like every other pill, so the band's control lines up
+        with the rows'. Two caps, and the second is the load-bearing one:
+
+        * ``_FOOT_PILL_MAX_W``, so a long population token does not make the pill span the card;
+        * **the footprint chip's real right edge**, so the two can never overlap whatever either
+          of them says. A constant cap was tried and was wrong by 5 px on the very first case
+          (``PLANE`` + ``plane ▾``) — the chip's width depends on its text, so the only cap that
+          holds for every footprint × population pair is measured from the chip itself.
+
+        The text elides inside the rect (``_paint_pill_at``), so squeezing is safe; overlapping
+        is not, because two rounded rects sharing pixels reads as a rendering bug.
+
+        Vertically it sits inside the band and above the dashed rule at ``HEADER_H + GRAN_H - 4``
+        — which is what makes it impossible for this rect to reach row 0."""
+        fm = QFontMetricsF(QFont(T.MONO, 8))
+        right = T.NODE_W - 12
+        room = right - (cls._gran_chip_rect(chip_txt).right() + 6) if chip_txt else right
+        w = min(max(fm.horizontalAdvance(txt) + 14, 34), _FOOT_PILL_MAX_W, max(34.0, room))
+        return QRectF(right - w, T.HEADER_H + 4, w, T.GRAN_H - 12)
+
     def controls(self) -> List[Ctl]:
         """Every interactive control on this card, in hit-test order (front to back).
 
@@ -1342,6 +1465,14 @@ class NodeItem(QGraphicsObject):
         if self._is_reroute or self.rec.collapsed or self.spec is None:
             return []
         out: List[Ctl] = []
+        # the footprint band's population pill, ABOVE the rows (V2.27) — the rows start at
+        # HEADER_H + GRAN_H, so this is the one control not derived from a row's y.
+        _scope = self._scope_mode()
+        if _scope is not None:
+            _pill_txt = self._foot_slots()[2]
+            if _pill_txt:
+                out.append(Ctl(self._foot_pill_rect(_pill_txt, self._foot_slots()[1]),
+                               "scope", _scope))
         for kind, obj, y in self._rows:
             if kind == "mode":
                 val = self.rec.modes.get(obj.name, obj.resolved_default())
@@ -1467,10 +1598,52 @@ class NodeItem(QGraphicsObject):
         self._frames, self._frame = frames, frame
         # the card itself stays graphic (rail + dot); the numbers live in the tooltip and
         # the status bar, so a busy canvas doesn't turn into a wall of tiny text.
-        txt = self._run_text()
-        label = self._group_name or (self.spec.label if self.spec else self.rec.op_key)
-        self.setToolTip(f"{self.rec.id} · {label}\n{txt}" if txt else "")
+        self._apply_card_tip()
         self.update()
+
+    def _footprint_line(self) -> str:
+        """One plain-text line naming the footprint and WHAT DECIDES IT (V2.27).
+
+        The band is a control on some nodes and a readout on others, and a readout that does not
+        say who set it reads as broken. Before this, the inspector told the four nodes with a
+        non-default ``footprint_mode`` that they were "Dimension-agnostic", which is false — the
+        footprint is mode-resolved there, just not by a lever."""
+        spec = self.spec
+        if spec is None or self._is_group:
+            return ""
+        gran = self.granularity().replace("_", " ") or "undeclared"
+        m = next((x for x in spec.modes if getattr(x, "is_scope", False)), None)
+        if m is not None:
+            # "population: X → reads Y", never "footprint: X" — on `enhance.normalize` the two
+            # genuinely differ (population `plane`, footprint WHOLE_SERIES, because its
+            # footprint is keyed on `bounds`), and naming the population "footprint" would
+            # collapse the very distinction the band is drawn to show.
+            val = str(self.rec.modes.get(m.name, m.resolved_default())).replace("_", " ")
+            return f"population: {val} → reads {gran}"
+        if spec.has_dim_lever():
+            return f"footprint: {gran} (set by the 2D / 3D lever)"
+        fp = getattr(spec, "footprint_mode", "") or ""
+        if isinstance(spec.granularity, Mapping) and fp:
+            return f"footprint: {gran} (set by the `{fp}` mode)"
+        if not self.granularity():
+            return "footprint: undeclared — this node is a source or a sink"
+        return f"footprint: {gran} (dimension-agnostic)"
+
+    def _apply_card_tip(self) -> None:
+        """The card's hover tooltip: identity, the footprint line, then the run note.
+
+        Called from :meth:`_layout` as well as :meth:`set_run_state`, because until V2.27 the
+        only writer was the run path — so a card that had never been pulled had no tooltip at
+        all, and the footprint was unreadable on a COLLAPSED card, which paints no band."""
+        label = self._group_name or (self.spec.label if self.spec else self.rec.op_key)
+        parts = [f"{self.rec.id} · {label}"]
+        foot = self._footprint_line()
+        if foot:
+            parts.append(foot)
+        txt = self._run_text()
+        if txt:
+            parts.append(txt)
+        self.setToolTip("\n".join(parts) if len(parts) > 1 else "")
 
     @staticmethod
     def _read_levels(levels: Optional[dict]):
@@ -1706,7 +1879,7 @@ class NodeItem(QGraphicsObject):
         self.rec.params[name] = value
         self.rec.set_locked(self.rec.locked | {name})
         if notify:
-            self.doc.touch()
+            self.doc.touch(self.node_id)
             self.changed.emit(self)
         self.update()
 
@@ -1729,6 +1902,8 @@ class NodeItem(QGraphicsObject):
         elif ctl.kind == "mode":
             self._open_menu(ctl, list(ctl.obj.choices),
                             self.rec.modes.get(ctl.obj.name, ctl.obj.resolved_default()))
+        elif ctl.kind == "scope":
+            self._open_scope_menu(ctl)
         elif ctl.kind == "value":
             s = ctl.obj
             if s.type is SocketType.BOOL:
@@ -1776,7 +1951,7 @@ class NodeItem(QGraphicsObject):
             return
         ctl, _x0, _v0, moved = sc
         if moved:
-            self.doc.touch()                  # the one re-propagation for the whole drag
+            self.doc.touch(self.node_id)                  # the one re-propagation for the whole drag
             self.changed.emit(self)
         else:
             self._open_inline_edit(ctl)       # a click, not a drag → type the value
@@ -1791,7 +1966,7 @@ class NodeItem(QGraphicsObject):
         else:
             self.rec.params[s.name] = self.resolved(s)
             self.rec.set_locked(self.locked | {s.name})
-        self.doc.touch()
+        self.doc.touch(self.node_id)
         self.changed.emit(self)
         self.update()
 
@@ -1832,15 +2007,70 @@ class NodeItem(QGraphicsObject):
         text = chosen.text()
         if ctl.kind == "mode":
             if text != current:
-                self.rec.modes[ctl.obj.name] = text
-                # a mode can gate sockets in or out, so the card must re-lay-out
-                self._layout()
-                if self.scene() is not None and hasattr(self.scene(), "reroute"):
-                    self.scene().reroute()
-                self.doc.touch()
-                self.changed.emit(self)
+                self._write_mode(ctl.obj.name, text)
         elif text != current:
             self._write_param(ctl.obj.name, text)
+
+    def _write_mode(self, name: str, value: str) -> None:
+        """Commit a mode change from the card — THE one mode-write path (V2.27).
+
+        Extracted so the granularity band and the mode pill cannot drift: all four steps are
+        load-bearing. A mode can gate sockets in or out, so the card must re-lay-out and the
+        scene must re-route, or wires stay anchored to ports that have moved; ``doc.touch``
+        re-propagates the envelope and invalidates the runner's in-flight pulls for this node's
+        cone; and ``changed`` is what rebuilds the inspector."""
+        self.rec.modes[name] = value
+        self._layout()
+        if self.scene() is not None and hasattr(self.scene(), "reroute"):
+            self.scene().reroute()
+        self.doc.touch(self.node_id)
+        self.changed.emit(self)
+
+    def _open_scope_menu(self, ctl: Ctl) -> None:
+        """The granularity band's population menu (V2.27) — clicking the footprint.
+
+        Its own opener rather than a ``kind`` handled by :meth:`_open_menu`, for a specific
+        reason: that method's tail falls through to ``self._write_param(ctl.obj.name, text)``
+        for any non-``"mode"`` kind, so a ``"scope"`` Ctl reaching it would write a **param
+        named after a Mode** — which serializes into the graph file and folds into
+        ``node_recipe_hash`` while being invisible in the inspector. A separate opener makes
+        that unreachable.
+
+        It also carries what a plain mode menu cannot: the READ COST. A disabled header names
+        the footprint currently resolved, and each option is annotated with the footprint it
+        would imply — so the one menu that changes the population also states what the change
+        costs, at the moment of choosing. That is the whole reason the population is edited
+        here rather than from an anonymous dropdown."""
+        view, r = self._view_and_rect(ctl)
+        m = ctl.obj
+        if view is None or not getattr(m, "choices", ()):
+            return
+        state = self.state()
+        current = self.rec.modes.get(m.name, m.resolved_default())
+        menu = QMenu()
+        menu.setStyleSheet(T.menu_qss())
+        menu.setToolTipsVisible(True)
+        # the FULL footprint name, never the chip's abbreviation: "reads plane" would be
+        # ambiguous with the `plane` POPULATION listed directly underneath it.
+        head = menu.addAction(f"reads {self.granularity().replace('_', ' ') or 'undeclared'}")
+        head.setEnabled(False)
+        docs = getattr(m, "choice_docs", None) or {}
+        for c in m.choices:
+            act = menu.addAction(c)
+            act.setCheckable(True)
+            act.setChecked(c == current)
+            implied = None
+            if self.spec is not None:
+                implied = self.spec.resolve_granularity({**state, m.name: c})
+            note = (f"reads {implied.value.replace('_', ' ')}" if implied is not None
+                    else "footprint undeclared")
+            act.setToolTip(option_hover_text(c, docs.get(c, ""), head_note=note))
+        chosen = menu.exec(view.viewport().mapToGlobal(
+            QPoint(int(r.left()), int(r.bottom() + 2))))
+        if chosen is None or not chosen.isEnabled():
+            return
+        if chosen.text() != current:
+            self._write_mode(m.name, chosen.text())
 
     def _open_layer_menu(self, ctl: Ctl) -> None:
         """A popup of the layers actually present on this socket's wire (2026-08-04).

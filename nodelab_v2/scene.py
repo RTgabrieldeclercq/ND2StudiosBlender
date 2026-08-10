@@ -148,12 +148,20 @@ class LinkSearchPopup(QWidget):
 #: canvas, running only while at least one card is in an indeterminate running state.
 PROGRESS_TICK_MS = 60
 
+#: Run states that describe work IN FLIGHT rather than a result. Only these are swept when a
+#: card stops belonging to any live run — a terminal ``done``/``cached``/``error`` is a fact
+#: about a branch that already finished and survives an unrelated branch starting.
+TRANSIENT_RUN_STATES = ("queued", "running", "decoding")
+
 
 class GraphScene(QGraphicsScene):
     """Document-mirroring scene + the wire-drag state machine."""
 
     node_activated = Signal(str)      # double-clicked node id → view/pull it (G7)
     pull_requested = Signal(str)      # context menu → pull/view this node
+    #: context menu → open this node's result BESIDE the viewed one (the Viewer's
+    #: side-by-side compare pane). The window owns both panes, so it routes.
+    compare_requested = Signal(str)
     #: a node was removed through the canvas (badge / key / menu) — the window reports it
     nodes_deleted = Signal(object)    # [node_id, …]
     #: a card's ◎ glyph was clicked — a :class:`~nodelab_v2.picker.PickRequest`, forwarded
@@ -181,6 +189,10 @@ class GraphScene(QGraphicsScene):
         #: run states survive a `sync()` (an edit mid-run must not blank the cards), so
         #: they live here keyed by node id, not only on the items.
         self._run: Dict[str, tuple] = {}      # node_id → (state, fraction, note, seconds)
+        #: target node_id → the nodes that run claims, one entry per LIVE run (queued or
+        #: running). What keeps two branches' cards from erasing each other; see
+        #: :meth:`set_run_plan`.
+        self._plans: Dict[str, frozenset] = {}
         #: source cards mid-ingest — exempt from a pull's canvas reset (see
         #: :meth:`set_ingesting`).
         self._ingesting: frozenset = frozenset()
@@ -292,7 +304,7 @@ class GraphScene(QGraphicsScene):
         """A wire flows while the pull is still in flight and its **source has already
         produced** — so the animation traces where data actually moved, not every wire."""
         produced = {nid for nid, v in self._run.items() if v[0] in ("done", "cached")}
-        busy = any(v[0] in ("queued", "running", "decoding") for v in self._run.values())
+        busy = any(v[0] in TRANSIENT_RUN_STATES for v in self._run.values())
         for e in self.edge_items:
             e.set_flow(busy and e.model_edge[0] in produced)
 
@@ -324,22 +336,73 @@ class GraphScene(QGraphicsScene):
 
     def set_run_plan(self, target: str, node_ids: Iterable[str]) -> None:
         """A pull was submitted: mark every participating node ``queued`` and clear the
-        cards that aren't in this run (their last result says nothing about this one) —
-        except any card mid-ingest, which is reporting work of its own."""
-        planned = {n for n in node_ids}
+        cards that belong to no live run — their last result says nothing about this one.
+        A card mid-ingest is exempt; it is reporting work of its own.
+
+        **Plans accumulate, one per live target** (2026-08-06). This used to clear every card
+        outside the new plan, which was right when one pull existed at a time and wrong the
+        moment a second branch could be queued behind the first: starting branch B wiped
+        branch A's cards, so the finished branch stopped saying it was finished and the
+        canvas could never show two branches in different states. Now a card is only cleared
+        when no live plan claims it, and :meth:`clear_run_plan` retires a plan when its run
+        ends. Nodes shared by both branches (the source, the channel taps) sit in both plans
+        and survive either one ending, which is what they should do."""
+        self._plans[target] = frozenset(node_ids)
+        claimed = self.planned_nodes()
         busy = self._ingesting
         for nid in list(self._run):
-            if nid not in busy:
+            if (nid not in busy and nid not in claimed
+                    and self._run[nid][0] in TRANSIENT_RUN_STATES):
                 self._run.pop(nid, None)
         for nid, item in self.node_items.items():
             if nid in busy:
                 continue
-            if nid in planned:
-                self._set_state(nid, "queued")
-            else:
-                item.set_run_state("")
+            if nid in self._plans[target]:
+                # only a card with nothing to say is moved to `queued`: one already `running`
+                # or `done` for a still-live plan keeps what it is reporting
+                if self._run.get(nid, ("",))[0] in ("", "queued"):
+                    self._set_state(nid, "queued")
+            elif nid not in claimed:
+                # A TERMINAL badge survives (2026-08-06). Clearing every unclaimed card was
+                # right when one pull existed at a time — the canvas described "the last run",
+                # full stop. With branches it erased the answer the user had just waited for:
+                # finish branch A, start branch B, and A's `done` card went blank, which is
+                # the "previous nodes stop displaying their progress" report. What A ran is
+                # still true; only work in FLIGHT for a run nobody is waiting on is stale, so
+                # only that is swept. A stale `done` is retired by the edit that invalidates
+                # it (:meth:`clear_run_states_for`), not by an unrelated branch starting.
+                if self._run.get(nid, ("",))[0] in TRANSIENT_RUN_STATES:
+                    self._run.pop(nid, None)
+                    item.set_run_state("")
         self._sync_flows()
         self._sync_anim()
+
+    def clear_run_states_for(self, node_ids: Iterable[str]) -> None:
+        """Drop the run badge on ``node_ids`` — an edit made whatever they last reported
+        untrue. The counterpart to terminal badges surviving :meth:`set_run_plan`: a `done`
+        that outlives the result it describes is worse than no badge at all."""
+        for nid in node_ids:
+            if nid in self._ingesting:
+                continue                      # its own ingest is still reporting
+            if self._run.pop(nid, None) is not None:
+                item = self.node_items.get(nid)
+                if item is not None:
+                    item.set_run_state("")
+        self._sync_flows()
+        self._sync_anim()
+
+    def clear_run_plan(self, target: str) -> None:
+        """Retire ``target``'s plan — its run finished, failed or was cancelled.
+
+        The cards keep whatever they last reported (``done``/``error``): that IS the record
+        of the finished branch, and it stays on screen until a run that actually claims those
+        nodes replaces it. Only the plan's CLAIM goes, so the next :meth:`set_run_plan` is
+        free to clear them."""
+        self._plans.pop(target, None)
+
+    def planned_nodes(self) -> frozenset:
+        """Every node claimed by a live run plan — the union across branches."""
+        return frozenset().union(*self._plans.values()) if self._plans else frozenset()
 
     def on_node_progress(self, event: str, node_id: str, info: dict) -> None:
         """Sink for :attr:`~nodelab_v2.runner.EngineRunner.node_progress`."""
@@ -372,10 +435,17 @@ class GraphScene(QGraphicsScene):
         nothing else claimed the failure (e.g. the plane decode blew up after every
         compute had returned)."""
         blamed = any(v[0] == "error" for v in self._run.values())
+        if node_id is not None:
+            self.clear_run_plan(node_id)          # this run no longer claims anything
+        # Sweeping the unreached cards is scoped to the nodes NO other live run still wants
+        # (2026-08-06). Unscoped, the first branch to land wiped the branch queued behind it —
+        # its cards went blank while it was still going to run, which reads as "nothing is
+        # happening" at exactly the moment the user is waiting to be told otherwise.
+        still_claimed = self.planned_nodes()
         for nid, item in self.node_items.items():
-            if nid in self._ingesting:
-                continue          # its own ingest is still running — not this pull's card
-            if self._run.get(nid, ("",))[0] in ("queued", "running", "decoding"):
+            if nid in self._ingesting or nid in still_claimed:
+                continue          # its own ingest / another branch's run — not this pull's
+            if self._run.get(nid, ("",))[0] in TRANSIENT_RUN_STATES:
                 self._run.pop(nid, None)
                 item.set_run_state("")
         if failed and not blamed and node_id is not None:
@@ -387,8 +457,25 @@ class GraphScene(QGraphicsScene):
 
     def clear_run_states(self) -> None:
         self._run.clear()
+        self._plans.clear()
         for item in self.node_items.values():
             item.set_run_state("")
+        self._sync_flows()
+        self._sync_anim()
+
+    def set_queued(self, target: str, node_ids: Iterable[str]) -> None:
+        """A pull was QUEUED behind one already running: claim its nodes and mark the ones
+        that are otherwise idle ``queued``, without disturbing the run in progress.
+
+        The visible difference between "the app ignored my second click" and "your second
+        branch is lined up and will start when this one lands" — which, before the queue
+        existed, it genuinely did not do."""
+        self._plans[target] = frozenset(node_ids)
+        for nid in self._plans[target]:
+            if nid in self._ingesting or nid not in self.node_items:
+                continue
+            if self._run.get(nid, ("",))[0] == "":
+                self._set_state(nid, "queued")
         self._sync_flows()
         self._sync_anim()
 
@@ -692,6 +779,12 @@ class GraphScene(QGraphicsScene):
         menu.addSeparator()
         menu.addAction("View / pull this node\tF5").triggered.connect(
             lambda: self.pull_requested.emit(nid))
+        cmp_act = menu.addAction("Compare beside viewed\tF8")
+        cmp_act.setToolTip(
+            "Open this node's result in a second Viewer pane, side by side with the one "
+            "being viewed. When both results span the same M/T/Z, one set of sliders "
+            "drives both panes; otherwise each pane keeps its own.")
+        cmp_act.triggered.connect(lambda: self.compare_requested.emit(nid))
         if node.op_key == LOAD_OP and str((rec.params.get("path") if rec else "") or ""):
             act = menu.addAction("Ingest this file now")
             act.setToolTip("Write this file's .b2nd store now, on its own worker. Other "

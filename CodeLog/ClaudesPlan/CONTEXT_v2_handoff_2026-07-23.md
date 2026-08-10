@@ -1,5 +1,10 @@
 # CONTEXT — nodegraph v2 handoff (fresh-chat brief) · 2026-07-23
 
+> **⚠️ UPDATE 2026-08-05 — superseded as fresh-session orientation** by
+> [`/CLAUDE.md`](../../CLAUDE.md) + [`/codemap/`](../../codemap/), which are generated from the
+> live code and gated against it. Kept as the dated record. Also note the per-node catalog
+> split (V2.20): nodes are no longer in `nodegraph/nodes.py`.
+
 > **⚠️ UPDATE 2026-07-29 — NodeLab v1 IS REMOVED; the parity gate below is GONE.**
 > `nodelab/`, `nd2studios/` (the vendored `pipeline_kit` backend), both v1 scripts, and the
 > legacy `build-node`/`wire-node` skills were deleted; `run.py --legacy` no longer exists.

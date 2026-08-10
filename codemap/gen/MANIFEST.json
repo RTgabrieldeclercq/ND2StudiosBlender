@@ -1,0 +1,26 @@
+{
+ "counts": {
+  "imports": 1123,
+  "modules": 243,
+  "nodes": 78,
+  "sockets": 668,
+  "symbols": 3163,
+  "vocab": 38
+ },
+ "fp": {
+  "imports": "10770766ba899bf978aa8a8d75730109",
+  "modules": "536f7472c641cc10f168077d0f10a095",
+  "nodes": "d98f15e149181b5840f33b3670970c4e",
+  "sockets": "d062cfc5e6706a1e1fc8f6073e13bd93",
+  "symbols": "e4129388d000f9981aaa422218e05a30",
+  "vocab": "045f0fb2e3ad3132d9c3a8be66c26929"
+ },
+ "fp_all": "2bec13fbdafa501697c532168de10f8b",
+ "loc": {
+  "nodegraph": 75323,
+  "nodelab_v2": 33693,
+  "scripts": 14427
+ },
+ "n_catalog_ops": 75,
+ "schema": 1
+}

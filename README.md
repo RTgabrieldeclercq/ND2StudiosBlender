@@ -10,10 +10,15 @@ pip install -r requirements.txt
 python run.py
 ```
 
-**Docs:** [MANUAL.md](MANUAL.md) — how to use it (window, workflows, all 54 nodes, shortcuts,
+**Docs:** [MANUAL.md](MANUAL.md) — how to use it (window, workflows, every node, shortcuts,
 troubleshooting). [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md)
 — how it works (data model, node contracts, domains/bridges, metadata intelligence, engine,
 memo, streaming, GUI seam, invariants).
+[codemap/STATE.md](codemap/STATE.md) — the current node count and gate status, generated.
+
+**Working on this with an AI agent?** Start at [CLAUDE.md](CLAUDE.md), which routes into
+[codemap/](codemap/) — a generated, greppable index of every node, socket, module and symbol,
+so a session does not have to read a 2,500-line manual to find one parameter's unit.
 
 ## What makes it different
 
@@ -45,7 +50,8 @@ ND2Studios_Blender/
 │   ├── streaming.py        # per-tile streaming providers + tile/field cache
 │   ├── memo.py             # two-hash memo + byte-budget LRU
 │   ├── registry.py         # NodeSpec, the 2D/3D DimMode lever, Granularity
-│   ├── nodes.py            # the node catalog
+│   ├── catalog/            # the node catalog — one file per node (nodes.py is a facade)
+│   ├── codemap.py          # generator for codemap/ (the agent-facing index)
 │   ├── zones.py groups.py  # unroll / expand
 │   ├── serialize.py        # *.nd2graph.json
 │   ├── selftest.py         # `python -m nodegraph.selftest` — the core gate
@@ -58,6 +64,7 @@ ND2Studios_Blender/
 │   ├── spreadsheet.py export.py          # tables + CSV / Parquet / Arrow
 │   ├── ingest.py nd2_meta.py             # ND2 / TIFF → engine + calibration
 │   └── window.py app.py theme.py …
+├── codemap/                # the agent-facing index (gen/ is generated; *.md hand-written)
 ├── CodeLog/                # design records, handoffs, changelog
 └── scripts/                # verification probes + benchmarks
 ```
@@ -65,9 +72,14 @@ ND2Studios_Blender/
 ## Gates
 
 ```
-PYTHONUTF8=1 python -m nodegraph.selftest                      # headless core
+PYTHONUTF8=1 python -B -m nodegraph.selftest                     # headless core
 PYTHONUTF8=1 python scripts/_nodelab_v2_phase5_probe.py out.png  # driven GUI probe
+python scripts/_catalog_snapshot.py                              # catalog identity
+python scripts/_codemap.py                                       # codemap/ still matches the code
 ```
+
+`-B` because a stale `.pyc` from a moved module fabricates failures in tests you did not
+touch. The last two default to *checking*; re-blessing either is an explicit subcommand.
 
 `PYTHONUTF8=1` on Windows only because some `[ok]` lines carry `µ`/`σ`/`↔` glyphs a cp1252
 console chokes on. Heavier, not in the fast gate: `scripts/_ingest_nd2_smoke.py` (real ND2),
@@ -76,7 +88,8 @@ console chokes on. Heavier, not in the fast gate: `scripts/_ingest_nd2_smoke.py`
 ## Adding a node
 
 Read the **`wire-node-v2`** skill (concepts) then follow **`build-node-v2`** (procedure).
-A node is `register_node(compute, op_key=..., **spec)` in [nodegraph/nodes.py](nodegraph/nodes.py):
+A node is one file — `register_node(compute, op_key=..., **spec)` in
+[nodegraph/catalog/](nodegraph/catalog/)`<category>/<name>.py`:
 declare a per-dim `granularity`/`kernel_axes` footprint, put a unit + derivation on every
 spatial parameter, add a `meta_transform` if it changes axes or calibration, read
 calibration through `ctx.calib` so it folds into the memo, and land an end-to-end pull in

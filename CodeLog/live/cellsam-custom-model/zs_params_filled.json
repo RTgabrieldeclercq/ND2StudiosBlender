@@ -1,0 +1,60 @@
+{
+  "hk_2025_af647": {
+    "file": "H:/HK_segmentation/2025.09.07_EDF_Count_Intensity_ColocalizationDrawROI.nd2",
+    "channel": "AF647",
+    "camera": "AX",
+    "params": {
+      "emission_nm": 655.0,
+      "na": 0.8,
+      "psf_pixel_um": 0.0,
+      "background": 42.0,
+      "beta1": 1.0,
+      "beta2": 0.0,
+      "alpha": 1.0,
+      "learning_rate": 5e-05,
+      "batch_size": 4,
+      "patch": 128,
+      "train_units": 1,
+      "upsample": true,
+      "denoise_weight": 0.5,
+      "hess_weight": 0.02,
+      "damping_length": 0,
+      "damping_width": 1,
+      "seed": 0
+    },
+    "notes": {
+      "n_planes_available": 1,
+      "beta_source": "DEFAULTS - unverified; measure via photon transfer or dark frames",
+      "iterations": "budget / t_step; calibrate with a 50-step run first"
+    }
+  },
+  "monolayer_red": {
+    "file": "C:/Users/McGheeLab - Analysis/Desktop/Alex data/Monolayer_stain.nd2",
+    "channel": "W1 - Red",
+    "camera": "Kinetix, A21F723038",
+    "params": {
+      "emission_nm": 600.0,
+      "na": 0.75,
+      "psf_pixel_um": 0.0,
+      "background": 94.0,
+      "beta1": 1.18,
+      "beta2": 2.01,
+      "alpha": 1.0,
+      "learning_rate": 5e-05,
+      "batch_size": 4,
+      "patch": 128,
+      "train_units": 8,
+      "upsample": true,
+      "denoise_weight": 0.5,
+      "hess_weight": 0.02,
+      "damping_length": 0,
+      "damping_width": 1,
+      "seed": 0
+    },
+    "notes": {
+      "n_planes_available": 160,
+      "beta_source": "camera_hints",
+      "iterations": "budget / t_step; calibrate with a 50-step run first"
+    }
+  }
+}

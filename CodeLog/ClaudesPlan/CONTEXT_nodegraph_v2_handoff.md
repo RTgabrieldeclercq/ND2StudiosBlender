@@ -1,5 +1,13 @@
 # CONTEXT — nodegraph v2 continuation brief (handoff for a fresh chat)
 
+> ⚠️ **HISTORICAL — superseded as fresh-session orientation on 2026-08-05** by
+> [`/CLAUDE.md`](../../CLAUDE.md) + [`/codemap/`](../../codemap/), which are generated from the
+> live code and gated against it. This file is the dated record of the v2 build. It predates
+> the v1 removal (2026-07-29): gate commands naming `_pipeline_kit_parity.py`,
+> `_pipeline_graph_selftest.py` or `_lablink_conformance.py` refer to scripts that no longer
+> exist, and it still describes nodes as living in `nodegraph/nodes.py` (they moved to
+> `nodegraph/catalog/` in V2.20).
+
 > **For the clean "everything that REMAINS" map, read [`CONTEXT_v2_remaining.md`](CONTEXT_v2_remaining.md)
 > (2026-07-21).** This file is the running build log (what's been done, per section); the
 > remaining doc is the forward-looking roadmap organized by area with gates, gotchas, and pointers.

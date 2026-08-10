@@ -1,21 +1,37 @@
-"""Parameter iteration — the ``flow.iterate`` cone rewrite (nodegraph v2, V2.19).
+"""Parameter iteration — the ``flow.iterate`` **segment** rewrite (nodegraph v2, V2.22).
 
 A **Repeat zone** iterates *data* with state carried across iterations. This module
-iterates **parameters**: a ``flow.iterate`` card drives one or more params of nodes
-downstream of it and collects their results back, so the same chain is evaluated once per
-parameter value and exactly one of those results is preserved.
+iterates **parameters**: a ``flow.iterate`` card drives one or more params of the nodes in a
+declared stretch of the graph, so that stretch is evaluated once per parameter value and
+exactly one of those results is preserved.
 
-**The wire is a loop; the computation is not.** The Iterate card's variable output feeds a
-param of some node, that node's result flows on and eventually returns to the card's
-``collect`` input — a cycle on the canvas. The driver wires therefore carry
-``kind="driver"`` and sit in :data:`~nodegraph.graph.NON_DAG_KINDS`, invisible to
-``preds``/``topo_order``, and :func:`unroll` expands the whole thing into a flat DAG the
-stock :class:`~nodegraph.engine.Engine` runs unchanged. Same shape as
+**The segment IS the wiring.** The card has no data route through it. You wire two things:
+the variable outputs onto the params you want iterated, and the **segment** — ``from``, the
+first node of the series to re-run, and ``to``, the last. Everything between them is cloned
+per iteration; everything above ``from`` is loop-invariant and computed once.
+
+**The result leaves through ``to``, not through the card.** The rewrite clones the segment
+and then mints a *selector* — a ``flow.iterate`` node carrying :data:`ITERS_KEY` — **under
+the end node's own id**. So every consumer of that node, wired before the Iterate card
+existed, keeps reading it and now gets the preserved iteration. Nothing downstream is
+re-routed, and iteration happens *automatically* the moment anything below the segment is
+pulled, which is the whole point of the design: the card is a control, like Blender's
+Random Value, not a stage in the pipeline. The card's own ``out`` serves the same payload
+(it reads the selector through its ``to`` wire) for anyone who prefers an explicit route.
+
+**The wire is a loop; the computation is not.** The card's variable output feeds a param of
+a node inside the segment, whose result flows on and returns to the card's ``to`` input — a
+cycle on the canvas. The driver wires therefore carry ``kind="driver"`` and sit in
+:data:`~nodegraph.graph.NON_DAG_KINDS`, invisible to ``preds``/``topo_order``, and
+:func:`unroll` expands the whole thing into a flat DAG the stock
+:class:`~nodegraph.engine.Engine` runs unchanged. Same shape as
 :func:`nodegraph.zones.unroll`, same reason.
 
-**The cone.** What gets cloned is the set of nodes on some path from a driven node to a
-collect source — everything whose result the swept param can change, and nothing else. A
-node feeding the cone from outside is loop-invariant and feeds every iteration.
+**The cone.** What gets cloned is the set of nodes on some path from a driven node to
+``to`` — everything whose result the swept param can change, and nothing else — intersected
+with the descendants of ``from`` when one is wired. An unwired ``from`` therefore means
+"start wherever the driven params are", which is the one-wire case; wiring it PINS the
+start so the stretch cannot silently grow when a param further up is driven later.
 
 **Two rewrites, one node.**
 
@@ -36,9 +52,9 @@ so a stateful advance would need a second output socket it cannot have. Replayin
 O(N²) edges for N ≤ :data:`MAX_ITERATIONS` iterations of pure arithmetic — free next to
 one segmentation.
 
-**Choosing the target.** :func:`candidate_targets` scrapes the chain feeding ``collect`` and
-returns every param and Mode this card could legally drive, so the GUI's "iterate on"
-dropdown is a view of the graph rather than a list anyone maintains. It filters through
+**Choosing the target.** :func:`candidate_targets` scrapes the segment and returns every
+param and Mode this card could legally drive, so the GUI's "iterate on" dropdown is a view
+of the graph rather than a list anyone maintains. It filters through
 :func:`_check_target` — the same predicate the rewrite refuses on — which is the whole point:
 a menu built from a different rule than the refusals would become a way to construct exactly
 the configurations those refusals exist to prevent.
@@ -69,6 +85,31 @@ ITERATE_OP = "flow.iterate"
 #: The hidden per-iteration search node minted by the FEEDBACK rewrite. Never placed by a
 #: user and hidden from the palette: it exists only between two clones.
 ADVANCE_OP = "flow.advance"
+
+#: The two segment input sockets. ``SEG_TO`` is where the series ENDS — the node whose id
+#: the rewrite's selector takes over, and therefore the one place a result can leave. It is
+#: ``multi`` for one reason: the selector minted under that node's id reuses this very
+#: socket to receive one payload per iteration, so the card and the selector are the same
+#: node type reading the same port in two roles.
+#:
+#: ``SEG_FROM`` is optional and takes no payload at all — the rewrite reads it as a
+#: STRUCTURAL reference (which node the stretch starts at) and consumes it, exactly like a
+#: driver wire. It is a Dataset socket because the thing it points at is a node, and a wire
+#: from that node's output is how you point at one.
+SEG_FROM, SEG_TO = "from", "to"
+
+#: Written by :func:`unroll` onto the CARD when it has minted a selector elsewhere: the card
+#: is then a plain pass-through of what its ``to`` wire hands it. Without it the card would
+#: run its own preserve logic over the single already-selected payload and stamp iteration
+#: 0's values onto whatever the selector actually chose — a caption that disagrees with the
+#: pixels under it, which is the failure mode this whole module is written against.
+PASSTHROUGH_KEY = "__passthrough__"
+
+#: Written by :func:`unroll` onto the SELECTOR: which card's sweep it is running. The
+#: selector wears another node's id, so without this the GUI — handed a payload from
+#: ``measure`` — would have no way back to the Iterate card whose results table and
+#: iteration strip that payload belongs to.
+OWNER_KEY = "__owner__"
 
 #: A driver edge whose destination is a **Mode** rather than a value socket uses this
 #: reserved ``dst_socket`` prefix (``"__mode__:method"``). Modes have no port, so the GUI
@@ -102,6 +143,10 @@ SWEEP_KEY = "__sweep__"
 #: through and it can never shadow a real calibration name (`wire-node-v2` §7b).
 SWEEP_ROWS_KEY = "__sweep_rows__"
 SWEEP_LABELS_KEY = "__sweep_labels__"
+#: …and which CARD the table belongs to. The selector wears the end node's id, so a GUI
+#: handed this payload knows it is looking at an iterated result but not whose — and the
+#: results table, the iteration strip and the "keep this one" edit all live on the card.
+SWEEP_OWNER_KEY = "__sweep_owner__"
 
 #: ``mode`` values.
 MODE_SWEEP, MODE_FEEDBACK = "sweep", "feedback"
@@ -199,12 +244,32 @@ class IteratePlan:
     variables: Tuple[Variable, ...]
     iterations: Tuple[Iteration, ...]
     cone: FrozenSet[str]
-    collect_src: Tuple[str, ...]
+    #: the segment's END — the node whose id the selector takes over, and the only place a
+    #: result leaves the iteration.
+    end: str
+    #: the segment's pinned START(s), empty when ``from`` is unwired (the cone then begins
+    #: at the driven nodes themselves).
+    start: Tuple[str, ...]
     minted: Tuple[int, ...]         # the iteration indices unroll will actually mint
+    picked: int = 0                 # the card's `index` param, clamped to the iterations
 
     @property
     def n(self) -> int:
         return len(self.iterations)
+
+    @property
+    def view_index(self) -> int:
+        """Which iteration a node INSIDE the segment resolves to when it is viewed on its
+        own — the picked ``index`` if that iteration is minted, else the first that is.
+
+        A cone node has one result per clone and no card of its own, so "view the node I am
+        tuning" has to mean *some* iteration. It means the one the iteration strip is on,
+        whatever ``preserve`` says: under ``best`` the winner is not known until the run has
+        happened, and freezing the view on a number nobody chose would make stepping through
+        the strip do nothing to the node actually being tuned."""
+        if self.picked in self.minted:
+            return self.picked
+        return self.minted[0] if self.minted else 0
 
     def rows(self) -> List[Dict[str, Any]]:
         """The results-table skeleton — one row per iteration, values only. The GUI's
@@ -421,6 +486,30 @@ def _check_target(graph: Graph, plan_mode: str, target: Target) -> None:
                 f"data-access footprint and can be outright invalid (3D on a z==1 series, "
                 f"or a method that refuses 3D), so iterations would raise rather than "
                 f"compare. Sweep a parameter instead, or place two nodes.")
+        # The lever is not the only footprint-selecting Mode (V2.27). `NodeSpec.footprint_mode`
+        # names whichever one keys a Mapping granularity, and the refusal above applies verbatim
+        # to those: `util.zproject`'s `method` has a `none` branch that changes the OUTPUT AXES,
+        # so the graph downstream is structurally different per iteration and
+        # `_require_same_grid` starts refusing mid-sweep; `view.overlay`'s `output` changes the
+        # data rather than a parameter.
+        #
+        # The `role="scope"` mode is the deliberate exception, and the only one worth sweeping:
+        # comparing per-plane against per-label IS the comparison a user wants, it changes no
+        # axis, and every iteration remains self-consistent (the footprint is re-resolved per
+        # pull from the clone's own baked mode). Its cost is not uniform, though — a wide scope
+        # can move the level derivation onto the streaming surrogate, which is an APPROXIMATION
+        # for li/triangle — so the sweep is permitted and the asymmetry is named here rather
+        # than discovered as two iterations computed by different algorithms.
+        if (not mode.is_scope
+                and isinstance(getattr(spec, "granularity", None), Mapping)
+                and target.name == getattr(spec, "footprint_mode", "")):
+            raise ValueError(
+                f"{label}.{target.name} cannot be swept: it is this node's `footprint_mode`, so "
+                f"each value selects a different data-access footprint — and unlike a "
+                f"statistics population (role='scope', which IS sweepable) such a mode can "
+                f"change the node's output axes or its output kind, which makes the graph "
+                f"downstream structurally different per iteration rather than comparable. "
+                f"Sweep a parameter, or place two nodes and compare their results.")
         if plan_mode == MODE_FEEDBACK:
             raise ValueError(
                 f"a Mode ({label}.{target.name}) can only be swept, not driven in feedback "
@@ -507,8 +596,9 @@ def _resolve_variables(graph: Graph, node: NodeInstance, spec: Optional[NodeSpec
         out.append(Variable(k, kind, source, tuple(values), tgts, bracket))
     if not out:
         raise ValueError(
-            f"{node.id}: no variable is wired to anything — drag a wire from a variable "
-            f"output onto the parameter you want to iterate")
+            f"{node.id}: no variable points at anything yet — choose a parameter in the "
+            f"card's V0 dropdown (it lists every one inside the segment), or drag a "
+            f"variable output onto the control itself")
     return tuple(out)
 
 
@@ -535,17 +625,32 @@ def iterate_nodes(graph: Graph) -> Tuple[str, ...]:
     return tuple(sorted(nid for nid, n in graph.nodes.items() if n.op_key == ITERATE_OP))
 
 
-def is_driving(graph: Graph, node_id: str) -> bool:
-    """True when this Iterate node has at least one driver wire attached.
+def segment_ends(graph: Graph, node_id: str) -> Tuple[str, ...]:
+    """The node(s) wired into this card's ``to`` — the segment's END. More than one is a
+    refusal in :func:`plan`, not here: the GUI needs to describe the mistake."""
+    return tuple(e.src for e in graph.preds(node_id) if e.dst_socket == SEG_TO)
 
-    :func:`unroll` skips the ones that do not, rather than refusing. An Iterate that drives
-    nothing turns up constantly in ordinary editing — the moment it is placed, the moment a
-    target is muted or deleted — and failing the whole run-graph build over a half-finished
-    edit would be hostile. Nothing is lost by passing it over: with no rewrite the node keeps
-    no ``__iters__``, so its compute takes the not-rewritten branch and refuses at pull time
-    if the sockets really do describe a sweep. The dangerous case is still caught; the
-    mid-edit case is not punished for it."""
-    return any(e.kind == "driver" and e.src == node_id for e in graph.edges)
+
+def segment_starts(graph: Graph, node_id: str) -> Tuple[str, ...]:
+    """The node(s) wired into this card's ``from`` — the segment's pinned START. Empty is
+    the ordinary case: the stretch then begins at whatever params are driven."""
+    return tuple(e.src for e in graph.preds(node_id) if e.dst_socket == SEG_FROM)
+
+
+def is_driving(graph: Graph, node_id: str) -> bool:
+    """True when this Iterate node has both halves of a rewrite: at least one driver wire
+    AND a segment end to collect at.
+
+    :func:`unroll` skips the ones that do not, rather than refusing. A half-wired Iterate
+    turns up constantly in ordinary editing — the moment it is placed, the moment a target
+    is muted or deleted, every moment between wiring the driver and wiring the segment —
+    and failing the whole run-graph build over a half-finished edit would be hostile.
+    Nothing is lost by passing it over: with no rewrite the node keeps no ``__iters__``, so
+    its compute takes the not-rewritten branch and refuses at pull time if the sockets
+    really do describe a sweep. The dangerous case is still caught; the mid-edit case is not
+    punished for it."""
+    return (any(e.kind == "driver" and e.src == node_id for e in graph.edges)
+            and bool(segment_ends(graph, node_id)))
 
 
 def _forward_maps(graph: Graph) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
@@ -642,25 +747,28 @@ def candidate_targets(graph: Graph, node_id: str, *,
                       mode: Optional[str] = None) -> Tuple[TargetOption, ...]:
     """Every parameter and Mode this Iterate node could legally drive, in chain order.
 
-    The candidate SET is the nodes upstream of ``collect`` (including its sources) and
-    nothing else — that is exactly the set :func:`plan` requires a driven node to be in, so
-    the menu cannot offer a target whose own refusal ("not upstream of collect, so the sweep
-    would silently do nothing") is the next thing the user would see. With nothing wired
-    into ``collect`` yet there is no chain to scrape and the result is empty: collect first,
-    then choose.
+    The candidate SET is the SEGMENT: everything upstream of ``to``, narrowed to the
+    descendants of ``from`` when one is pinned. That is exactly the set :func:`plan`
+    requires a driven node to be in, so the menu cannot offer a target whose own refusal
+    ("outside the segment, so the sweep would silently do nothing") is the next thing the
+    user would see. With no segment end wired there is no series to scrape and the result is
+    empty: wire the segment first, then choose.
 
-    Ordered by :meth:`~nodegraph.graph.Graph.topo_order`, so the menu reads down the chain
-    from the source to the collected end rather than in dictionary order.
+    Ordered by :meth:`~nodegraph.graph.Graph.topo_order`, so the menu reads down the series
+    from its start to its end rather than in dictionary order.
     """
     node = graph.nodes.get(node_id)
     if node is None or node.op_key != ITERATE_OP:
         return ()
     plan_mode = str(mode or node.state(node.spec()).get("mode") or MODE_SWEEP)
-    collect_src = [e.src for e in graph.preds(node_id) if e.dst_socket == "collect"]
-    if not collect_src:
+    ends = segment_ends(graph, node_id)
+    if not ends:
         return ()
-    _, pred = _forward_maps(graph)
-    reach = _closure(pred, collect_src)
+    succ, pred = _forward_maps(graph)
+    reach = _closure(pred, ends)
+    starts = segment_starts(graph, node_id)
+    if starts:
+        reach &= _closure(succ, starts)
     reach.discard(node_id)
     try:
         order = [nid for nid in graph.topo_order() if nid in reach]
@@ -729,27 +837,51 @@ def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None
     search = str(state.get("search") or SEARCH_GOLDEN)
     direction = str(state.get("direction") or "max")
 
-    collect_src = tuple(e.src for e in graph.preds(node_id) if e.dst_socket == "collect")
-    if not collect_src:
+    ends = segment_ends(graph, node_id)
+    starts = segment_starts(graph, node_id)
+    if not ends:
         raise ValueError(
-            f"{node_id}: nothing is wired into 'collect' — connect the END of the chain "
-            f"you are iterating back into it, so the sweep knows what to compare")
+            f"{node_id}: the segment has no END — wire the LAST node of the series you want "
+            f"iterated into this card's 'to' input. That node is where the iterated result "
+            f"comes out, so everything already reading it keeps working.")
+    if len(ends) > 1:
+        raise ValueError(
+            f"{node_id}: the segment's 'to' has {len(ends)} wires ({', '.join(ends)}), and a "
+            f"series has one end. Keep the LAST node; a branch that must also see the "
+            f"iteration should be moved below it.")
+    end = ends[0]
 
     variables = _resolve_variables(graph, node, spec, state, envs, mode)
 
-    # ── the cone: driven ∪ descendants(driven), intersected with ancestors(collect) ──
+    # ── the cone: driven ∪ descendants(driven), ∩ ancestors(to), ∩ descendants(from) ──
     succ, pred = _forward_maps(graph)
     driven = {t.node_id for v in variables for t in v.targets}
     downstream = _closure(succ, driven)
-    upstream = _closure(pred, collect_src)
-    cone = frozenset(downstream & upstream)
+    upstream = _closure(pred, [end])
+    cone = downstream & upstream
+    if starts:
+        # A pinned start does two things at once: it bounds the clone set, and it declares
+        # everything ABOVE it loop-invariant. Both fall out of the intersection — a node
+        # upstream of `from` simply is not in the cone, so it is computed once and feeds
+        # every iteration.
+        cone &= _closure(succ, starts)
+    cone = frozenset(cone)
 
     stranded = sorted(n for n in driven if n not in cone)
     if stranded:
+        above = sorted(n for n in stranded if starts and n not in _closure(succ, starts))
         raise ValueError(
-            f"{node_id}: driven node(s) {stranded} are not upstream of the 'collect' input, "
-            f"so cloning them would change nothing and the sweep would silently do nothing. "
-            f"Wire 'collect' to a node downstream of them.")
+            f"{node_id}: driven node(s) {stranded} are outside the segment, so cloning them "
+            f"would change nothing and the sweep would silently do nothing. "
+            + (f"They sit ABOVE 'from' ({', '.join(starts)}) — move the segment start up to "
+               f"cover them, or drive a parameter inside it."
+               if above else
+               f"Wire 'to' to a node BELOW them (the segment's end is {end!r})."))
+    if end not in cone:
+        raise ValueError(
+            f"{node_id}: nothing inside the segment is driven — {end!r} is not downstream of "
+            f"any parameter this card iterates, so every iteration would produce the same "
+            f"result. Point a variable at a parameter inside the segment.")
 
     docked = sorted(n for n in cone if _is_frozen_dock(graph.nodes[n]))
     if docked:
@@ -766,23 +898,25 @@ def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None
             f"Nested iteration is not supported — sweep several parameters from ONE Iterate "
             f"card instead (raise 'Variables' and set Combine to 'grid').")
 
-    # An edge into ANY Iterate node's `collect` is a collection point, not an escaping
-    # branch — exempting it is what lets the two genuinely-different multi-Iterate mistakes
-    # (overlapping cones, one param driven twice) reach their own specific messages instead
-    # of all being reported as "this branch escapes".
-    def _is_collect(e: Edge) -> bool:
+    # A branch leaving the segment's END is the intended exit — the selector minted under
+    # that node's id serves it the preserved iteration, so it needs no re-routing at all.
+    # A branch leaving any OTHER node in the segment is the real hazard: that node exists
+    # only as clones afterwards, so its outside consumer would have no single iteration to
+    # read. An edge into ANY Iterate card's segment sockets is a reference, not a branch.
+    def _is_segment_ref(e: Edge) -> bool:
         dst = graph.nodes.get(e.dst)
-        return (dst is not None and dst.op_key == ITERATE_OP and e.dst_socket == "collect")
+        return (dst is not None and dst.op_key == ITERATE_OP
+                and e.dst_socket in (SEG_FROM, SEG_TO))
 
     escapes = sorted({(e.src, e.dst) for e in graph.edges
-                      if is_dag_edge(e) and e.src in cone and e.dst not in cone
-                      and e.dst != node_id and not _is_collect(e)})
+                      if is_dag_edge(e) and e.src in cone and e.src != end
+                      and e.dst not in cone and not _is_segment_ref(e)})
     if escapes:
         src, dst = escapes[0]
         raise ValueError(
-            f"{node_id}: {src!r} is inside the iterated chain but also feeds {dst!r} outside "
-            f"it, which has no single iteration to read. Route that branch out of the "
-            f"Iterate node's output instead, or move it upstream of the driven node."
+            f"{node_id}: {src!r} is inside the segment but also feeds {dst!r} outside it, "
+            f"which has no single iteration to read. Move the segment's end ('to') down to "
+            f"{src!r} or below, so that branch leaves from the end instead."
             + (f" ({len(escapes) - 1} more like it.)" if len(escapes) > 1 else ""))
 
     # ── iterations ──────────────────────────────────────────────────────────────
@@ -818,6 +952,8 @@ def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None
             f"produce one.")
 
     # ── which clones to mint ────────────────────────────────────────────────────
+    picked = max(0, min(len(iterations) - 1,
+                        int(_as_float(_param(spec, node.params, "index", 0), 0))))
     if sweep_all or mode == MODE_FEEDBACK or preserve == PRESERVE_BEST:
         minted = tuple(range(len(iterations)))
     elif preserve == PRESERVE_FIRST:
@@ -825,8 +961,7 @@ def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None
     elif preserve == PRESERVE_LAST:
         minted = (len(iterations) - 1,)
     else:
-        idx = int(_as_float(_param(spec, node.params, "index", 0), 0))
-        minted = (max(0, min(len(iterations) - 1, idx)),)
+        minted = (picked,)
 
     return IteratePlan(
         node_id=node_id, mode=mode, preserve=preserve, combine=combine, search=search,
@@ -834,7 +969,7 @@ def plan(graph: Graph, node_id: str, *, envs: Optional[Mapping[str, Any]] = None
         tol=_as_float(_param(spec, node.params, "tol", 0.0), 0.0),
         target_value=_as_float(_param(spec, node.params, "target", 0.0), 0.0),
         variables=variables, iterations=iterations, cone=cone,
-        collect_src=collect_src, minted=minted)
+        end=end, start=tuple(starts), minted=minted, picked=picked)
 
 
 # ── the rewrite ───────────────────────────────────────────────────────────────
@@ -874,7 +1009,14 @@ def _clone_params(p: IteratePlan, base: NodeInstance, i: int) -> Tuple[dict, dic
 
 def _apply(p: IteratePlan, nodes: Dict[str, NodeInstance],
            edges: List[Edge]) -> Tuple[Dict[str, NodeInstance], List[Edge]]:
-    cone, nid = p.cone, p.node_id
+    """Clone the segment, then mint the selector **under the end node's own id**.
+
+    That last step is the whole exit strategy. Everything wired to the end node — a Viewer,
+    an Export, three branches drawn months before the Iterate card existed — keeps its edge
+    and starts reading the preserved iteration, because the id it points at is still there
+    and is now the thing that chooses. Nothing downstream is re-routed and nothing downstream
+    knows an iteration happened."""
+    cone, nid, end = p.cone, p.node_id, p.end
     # snapshot the originals BEFORE the cone leaves the working dict — the clones are built
     # from them, and with two Iterate plans in one graph the second pass would otherwise
     # look for nodes the first has already replaced.
@@ -883,6 +1025,13 @@ def _apply(p: IteratePlan, nodes: Dict[str, NodeInstance],
     for e in edges:
         if e.kind == "driver" and e.src == nid:
             continue                                   # consumed: baked or re-wired below
+        if e.src == end:
+            # Every edge leaving the end node is kept VERBATIM: its id now belongs to the
+            # selector, so each of these — including the card's own `to` wire, which is how
+            # the card gets the selected payload to pass through — reads the preserved
+            # iteration without being touched.
+            kept.append(e)
+            continue
         if e.src in cone or e.dst in cone:
             continue                                   # re-emitted per iteration
         kept.append(e)
@@ -891,8 +1040,6 @@ def _apply(p: IteratePlan, nodes: Dict[str, NodeInstance],
 
     inner = [e for e in edges if is_dag_edge(e) and e.src in cone and e.dst in cone]
     incoming = [e for e in edges if is_dag_edge(e) and e.src not in cone and e.dst in cone]
-    collect = [e for e in edges
-               if is_dag_edge(e) and e.dst == nid and e.dst_socket == "collect"]
 
     for i in p.minted:
         for c in sorted(cone):
@@ -905,8 +1052,8 @@ def _apply(p: IteratePlan, nodes: Dict[str, NodeInstance],
                              e.src_socket, e.dst_socket))
         for e in incoming:                             # loop-invariant: feeds every iteration
             kept.append(Edge(e.src, iter_id(e.dst, nid, i), e.src_socket, e.dst_socket))
-        for e in collect:
-            kept.append(Edge(iter_id(e.src, nid, i), nid, e.src_socket, "collect"))
+        # …and every iteration's END feeds the selector, in iteration order.
+        kept.append(Edge(iter_id(end, nid, i), end, "out", SEG_TO))
 
     if p.mode == MODE_FEEDBACK:
         var = p.variables[0]
@@ -920,22 +1067,56 @@ def _apply(p: IteratePlan, nodes: Dict[str, NodeInstance],
                 "__metric__": p.metric, "__lo__": lo, "__hi__": hi,
                 "__target__": p.target_value, "__index__": i})
             for j in range(i):                         # every earlier probe, in order
-                for e in collect:
-                    kept.append(Edge(iter_id(e.src, nid, j), aid, e.src_socket, "probes"))
+                kept.append(Edge(iter_id(end, nid, j), aid, "out", "probes"))
             for t in var.targets:
                 kept.append(Edge(aid, iter_id(t.node_id, nid, i), "value", t.name))
 
-    node = nodes[nid]
-    nodes[nid] = NodeInstance(
-        nid, node.op_key,
-        params={**node.params, ITERS_KEY: [
+    card = nodes[nid]
+    # The SELECTOR: the card's own settings (preserve / metric / index / modes) under the end
+    # node's id, plus the per-iteration table only the rewrite knows.
+    nodes[end] = NodeInstance(
+        end, ITERATE_OP,
+        params={**card.params, ITERS_KEY: [
             {"index": i,
              "values": [None if p.mode == MODE_FEEDBACK else p.iterations[i].values[j]
                         for j in range(len(p.variables))]}
             for i in p.minted],
-            "__labels__": [v.label for v in p.variables]},
-        modes=dict(node.modes))
+            "__labels__": [v.label for v in p.variables],
+            OWNER_KEY: nid},
+        modes=dict(card.modes))
+    # …and the card itself becomes a pass-through of what the selector hands back, so the
+    # two never disagree about which iteration won or what its values were.
+    nodes[nid] = NodeInstance(nid, card.op_key,
+                              params={**card.params, PASSTHROUGH_KEY: True},
+                              modes=dict(card.modes))
     return nodes, kept
+
+
+def aliases(graph: Graph, *, envs: Optional[Mapping[str, Any]] = None,
+            sweep_all: Iterable[str] = ()) -> Dict[str, str]:
+    """``original id → the clone a viewer should show`` for every node INSIDE a segment.
+
+    A cone node is replaced by its clones, so its own id is gone from the run graph and a
+    GUI that pulls "the node I clicked" would get a KeyError. This says which clone to pull
+    instead — :attr:`IteratePlan.view_index`'s, i.e. the one the iteration strip is on — so
+    a node being tuned can be viewed at the iteration under discussion. The segment's END is
+    deliberately NOT aliased: its id still exists and belongs to the selector.
+
+    Never raises: an unplannable card contributes nothing, exactly as it does to
+    :func:`unroll`, because this runs on every selection change in the GUI."""
+    out: Dict[str, str] = {}
+    all_sweep = set(sweep_all)
+    for nid in iterate_nodes(graph):
+        if not is_driving(graph, nid):
+            continue
+        try:
+            p = plan(graph, nid, envs=envs, sweep_all=(nid in all_sweep))
+        except (ValueError, KeyError):
+            continue
+        for c in p.cone:
+            if c != p.end:
+                out[c] = iter_id(c, nid, p.view_index)
+    return out
 
 
 def unroll(graph: Graph, *, envs: Optional[Mapping[str, Any]] = None,
@@ -971,13 +1152,13 @@ def unroll(graph: Graph, *, envs: Optional[Mapping[str, Any]] = None,
             shared = sorted(plans[a].cone & plans[b].cone)
             if shared:
                 raise ValueError(
-                    f"the chains iterated by {plans[a].node_id} and {plans[b].node_id} "
+                    f"the segments iterated by {plans[a].node_id} and {plans[b].node_id} "
                     f"overlap at {shared} — a node cannot be cloned by two sweeps at once "
                     f"(which iteration of the first would each iteration of the second "
                     f"read?). Sweep both parameters from ONE Iterate card instead: raise "
                     f"'Variables' and set Combine to 'grid'.")
-    # Two Iterate nodes cannot share a cone node (an escape refusal and the nesting refusal
-    # between them see to that), so the plans compose by simple sequential application.
+    # Two Iterate nodes cannot share a cone node (the overlap refusal above sees to that),
+    # so the plans compose by simple sequential application.
     nodes: Dict[str, NodeInstance] = dict(graph.nodes)
     edges: List[Edge] = list(graph.edges)
     for p in plans:
@@ -987,7 +1168,9 @@ def unroll(graph: Graph, *, envs: Optional[Mapping[str, Any]] = None,
 
 __all__ = [
     "ITERATE_OP", "ADVANCE_OP", "MODE_TARGET_PREFIX", "MAX_VARIABLES", "MAX_ITERATIONS",
-    "ITERS_KEY", "SWEEP_KEY", "SWEEP_ROWS_KEY", "SWEEP_LABELS_KEY",
+    "ITERS_KEY", "SWEEP_KEY", "SWEEP_ROWS_KEY", "SWEEP_LABELS_KEY", "SWEEP_OWNER_KEY",
+    "SEG_FROM", "SEG_TO", "PASSTHROUGH_KEY", "OWNER_KEY",
+    "segment_ends", "segment_starts", "aliases",
     "MODE_SWEEP", "MODE_FEEDBACK", "is_driving",
     "PRESERVE_FIRST", "PRESERVE_LAST", "PRESERVE_BEST", "PRESERVE_PICKED",
     "COMBINE_ZIP", "COMBINE_GRID", "SRC_LIST", "SRC_LINEAR", "SRC_LOG", "SRC_AROUND",

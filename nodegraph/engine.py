@@ -201,6 +201,33 @@ class _RecordingMetadata(_ABCMapping):
 Observer = Callable[[str, str, Dict[str, Any]], None]
 
 
+class PullCancelled(BaseException):
+    """A pull was cancelled cooperatively mid-run (see ``Engine.should_stop``).
+
+    ``BaseException``, not ``Exception``, deliberately: computes and kernels use
+    ``except Exception`` for their own fallback paths (a solver retry, an optional
+    dependency), and a cancellation that one of those swallowed would leave the run
+    grinding on exactly as if it had never been asked to stop. Anything that catches
+    this must re-raise or return promptly — the caller that set ``should_stop`` no
+    longer wants the payload.
+    """
+
+
+def _check_stop(should_stop: Optional[Callable[[], bool]], node_id: str) -> None:
+    """Raise :class:`PullCancelled` when the driver has withdrawn interest in this pull.
+
+    Polled at the engine's natural interruption points: the top of every node
+    evaluation (:meth:`Engine._entry`) and every fractional progress tick out of an
+    eager compute (:meth:`EvalContext.progress` — which is also what
+    :meth:`EvalContext.progress_frame` routes through). Those are exactly the
+    boundaries at which no partial state is in flight: the memo only records a node
+    when its compute *returns*, so an abort here discards at most the unit being
+    worked and never publishes a torn result. Latency is therefore one unit of the
+    running compute — or the whole node, for an opaque call that never ticks."""
+    if should_stop is not None and should_stop():
+        raise PullCancelled(node_id)
+
+
 def _frame_levels(done: int, total: int, frames: Optional[int],
                   sub: Optional[int], sub_total: Optional[int],
                   sub_unknown: bool = False) -> Dict[str, Any]:
@@ -336,6 +363,12 @@ class EvalContext:
     fields: Any = None                      # the engine's FieldCache (C1)
     spec: Any = None                        # the node's NodeSpec (C8 per-channel derive)
     observer: Optional[Observer] = None     # run-progress sink (per-node progress)
+    #: cooperative-cancel poll (``Engine.should_stop``, snapshotted per node). Checked on
+    #: every :meth:`progress` tick, so an eager compute that reports honestly is also one
+    #: that stops promptly. Only meaningful for work done INSIDE the compute call — the
+    #: same boundary as ``progress`` itself; a lazy provider's read-time closures must
+    #: not consult it (they outlive the pull that created them).
+    should_stop: Optional[Callable[[], bool]] = None
     #: this node's entry in ``Engine.seeds``, when it has one.
     #:
     #: A seed is normally the payload *itself* — the branch below at ``_entry`` returns it
@@ -383,7 +416,13 @@ class EvalContext:
         counting something countable.
 
         Use :meth:`progress_frame` when the frame loop is the compute's own structure and
-        there is no flat unit count to report."""
+        there is no flat unit count to report.
+
+        Raises :class:`PullCancelled` when the driver has cancelled this pull — a tick
+        is a unit boundary, which is precisely where an eager compute can stop without
+        leaving partial state (checked before the observer-less early return, so a
+        headless caller that sets ``should_stop`` without observing still stops)."""
+        _check_stop(self.should_stop, self.node_id)
         if self.observer is None:
             return
         total = int(total)
@@ -588,6 +627,13 @@ class Engine:
         # per-node run progress (see :data:`Observer`). Never affects results, and its
         # exceptions are swallowed — an engine run must not depend on who is watching.
         self.observer = observer
+        # Cooperative cancellation: set per pull, like `observer`, by whatever drives the
+        # engine (the GUI runner points it at the job's cancel flag). Polled at the top of
+        # every node evaluation and at every eager progress tick; when it returns True the
+        # pull unwinds with :class:`PullCancelled` instead of computing on for a caller
+        # that has already thrown the result away. `None` (the headless default) never
+        # polls — a pull then runs to completion exactly as before.
+        self.should_stop: Optional[Callable[[], bool]] = None
 
     # ── observation ───────────────────────────────────────────────────────────
     def _emit(self, event: str, node_id: str, **info: Any) -> None:
@@ -657,6 +703,7 @@ class Engine:
             f"connect a Dataset into it before running this node")
 
     def _entry(self, node_id: str, stack: Set[str]) -> Entry:
+        _check_stop(self.should_stop, node_id)   # a node boundary — nothing is in flight
         if node_id in stack:
             raise ValueError(f"cycle through {node_id!r} (rejected outside zones)")
         node = self.graph.nodes[node_id]
@@ -756,6 +803,7 @@ class Engine:
             provider=self.providers.get(node_id),
             by_name=by_name, tiles=self.tiles, fields=self.fields, spec=spec,
             observer=self.observer, seed=self.seeds.get(node_id),
+            should_stop=self.should_stop,
         )
         fn = self.computes.get(node.op_key)
         # per-node progress: the window between "start" and "done" is exactly the time
@@ -772,6 +820,8 @@ class Engine:
             else:
                 raise KeyError(
                     f"no compute for op {node.op_key!r} and no seed for node {node_id!r}")
+        except PullCancelled:
+            raise             # cancelled, not failed — a sink must not report an error
         except BaseException as exc:      # noqa: BLE001 — observe, then re-raise verbatim
             self._emit("error", node_id, op_key=node.op_key,
                        seconds=time.perf_counter() - t0, error=repr(exc))
@@ -779,6 +829,12 @@ class Engine:
         self._emit("done", node_id, op_key=node.op_key,
                    seconds=time.perf_counter() - t0)
         rc.freeze()          # a late ctx.calib from a lazy closure is a hard error (C1)
+        # The abort window is exactly the compute call. A lazy payload's closures keep
+        # this ctx alive in the memo, and a convention-breaking read-time progress tick
+        # must never trip the cancel of the pull that HAPPENED to build the entry — so
+        # the poll goes inert the moment the compute returns, the same discipline as
+        # rc.freeze() above.
+        ctx.should_stop = None
         self.compute_count += 1
         # C7: a compute that returns `ctx.inputs[0].with_image(...)` carries the input's
         # strict metadata wrapper into the OUTPUT via dataclasses.replace. Launder it so
@@ -810,4 +866,5 @@ class Engine:
         return all(value_digest(md.get(k)) == d for k, d in entry.reads)
 
 
-__all__ = ["ReadContext", "EvalContext", "Compute", "Engine", "Observer"]
+__all__ = ["ReadContext", "EvalContext", "Compute", "Engine", "Observer",
+           "PullCancelled"]

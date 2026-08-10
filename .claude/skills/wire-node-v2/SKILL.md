@@ -6,7 +6,9 @@ description: >-
   adding any v2 node type, changing a node's sockets/modes, touching the 2D/3D lever,
   declaring a data-access footprint (Granularity/kernel_axes), adding a meta_transform,
   or wiring domain transfer / structure bridges. This is the ONLY node-concepts reference
-  (the legacy v1 `wire-node` was deleted with v1 on 2026-07-29). Triggers: "add a node", "new pipeline node",
+  (the legacy v1 `wire-node` was deleted with v1 on 2026-07-29). Eleven detail sections are
+  summarised in the skill and held in full under `references/`, read only when needed.
+  Triggers: "add a node", "new pipeline node",
   "nodegraph node", "wire a node", "node sockets", "2D/3D lever", "DimMode", "Granularity",
   "meta_transform", "domain transfer", "structure bridge", "metadata-intelligent param",
   "socket contract", "layer_in", "layer_out", "layer picker", "ctx.layer",
@@ -23,6 +25,28 @@ GUI lives only in `nodelab_v2/`). Nodes are pure, typed functions of a lazy
 > **This is the concepts/contracts reference.** To actually build or modify a v2
 > node, use the **`build-node-v2`** skill — it runs the procedure (grill → write →
 > footprint/metadata gate → verify gate) and links back here.
+
+**Eleven detail sections live in [`references/`](references/)** and are summarised in place
+below — the rule stays here, the worked examples and the failures that motivated it moved
+out. Most node work never needs them, and loading 830 lines to reach the socket contract was
+costing about 14k tokens a task. **Section numbers are frozen**: `§4d` is still `§4d`
+whether you read the summary here or the leaf, because roughly fifteen places across the skills
+and the design record cite them, and `selftest::test_codemap` now fails on a reference that
+stops resolving.
+
+| leaf | what it covers |
+|---|---|
+| [`4d`](references/4d-path-sockets.md) | filesystem-path sockets — `path_kind` |
+| [`4e`](references/4e-choice-docs.md) | `choice_docs` — one explanation per dropdown option |
+| [`4f`](references/4f-reads-domains-by-mode.md) | the domain rail declared per branch |
+| [`4g`](references/4g-derivable-layer-names.md) | inferring a layer name instead of defaulting to one |
+| [`5b`](references/5b-available-in-any-mode.md) | `available_in` gates any mode, not just `dim` |
+| [`5c`](references/5c-mode-gated-modes.md) | a Mode gated on another Mode |
+| [`7b`](references/7b-provenance-inheritance.md) | stamp-and-inherit for non-calibration config |
+| [`7c`](references/7c-calibration-current-data.md) | calibration describes the current data |
+| [`7d`](references/7d-raw-socket.md) | the optional `raw` socket — measure unenhanced pixels |
+| [`7e`](references/7e-layer-from.md) | a second input for a second domain — `layer_from` |
+| [`12`](references/12-numba-vs-numpy.md) | when numba beats numpy, and `cache=True` |
 
 ---
 
@@ -50,7 +74,10 @@ graph state.
 
 A node type = a **`NodeSpec`** (registered in the global `NODES` registry) + a
 **`compute(ctx) -> Dataset`** function (recorded in `COMPUTES`, keyed by `op_key`).
-Both are created by one call in [`nodes.py`](../../../nodegraph/nodes.py):
+Both are created by one call in the node's **own module**,
+`nodegraph/catalog/<category>/<name>.py` (the per-node split, V2.20 — that is what gives each
+node its own memo fingerprint). [`nodes.py`](../../../nodegraph/nodes.py) is now just a facade
+whose import loads the catalog; nothing is defined there any more:
 
 ```python
 register_node(compute_fn, op_key="enhance.median", label="Median",
@@ -58,7 +85,7 @@ register_node(compute_fn, op_key="enhance.median", label="Median",
               modes=[DimMode()], granularity=..., kernel_axes=..., meta_transform=...)
 ```
 
-`register_node` (nodes.py) = `define_node(**spec)` (registry.py, builds + registers the
+`register_node` (`catalog/_base.py`) = `define_node(**spec)` (registry.py, builds + registers the
 `NodeSpec`) + `COMPUTES[op_key] = compute_fn`. The `Engine` looks up the compute by
 `op_key` and runs it inside the pull/memo/ReadContext harness. Importing `nodegraph.nodes`
 registers every node (its module-level `register_node` calls fire).
@@ -134,7 +161,7 @@ is checked structurally.
    socket in every state.
 4. **A layer-name socket declares its direction and domain** (§4c).
 5. **A default is declared exactly ONCE — in the `SocketSpec`.**
-6. **Every param socket carries a `description`** — the GUI's hover text (§4d).
+6. **Every param socket carries a `description`** — the GUI's hover text (§4h).
 
 **Clause 5 is the subtle one.** Because params are raw overrides, computes used to repeat
 their socket's default inline: `ctx.params.get("mask", "mask")`. That is a *second* copy —
@@ -181,41 +208,23 @@ follows the *primary* Dataset edge only, so a `reference`/`raw` second input nev
 
 ### 4d. Filesystem-path sockets — `path_kind` (V2.15)
 
-A STRING socket whose value is a **path on the machine that runs the graph** is not free
-text either. Declare it and the inspector puts a **Browse…** button beside the field:
+A STRING socket holding a filesystem path declares
+`path_kind="open_file"|"save_file"|"directory"` (plus `path_filter` / `path_hint`) and the
+inspector gives it a **Browse…** button. `path_kind` is the **only** thing the GUI keys on, so
+a typo or a non-STRING socket is refused at registration — a silently-ignored annotation would
+look exactly like a plain text field. Presentation-only, never hashed. Use `path_hint` to say
+what an *empty* value means.
 
-```python
-InString("model_path", "Local weights", field=False, default="",
-         path_kind="open_file",                       # open_file | save_file | directory
-         path_filter="PyTorch checkpoint (*.pt *.pth);;All files (*)",
-         path_hint="empty = published · or Browse…")  # placeholder while empty
-```
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/4d-path-sockets.md](references/4d-path-sockets.md).
 
-* `path_kind` is the **only** thing the GUI keys on. Before V2.15 the inspector matched the
-  literal socket *name* `"path"`, so `sd_model_path` / `model_path` were typing-only —
-  which is exactly the failure this declaration exists to prevent. A typo or a non-STRING
-  socket is **refused at registration** (`NodeRegistry.register`, `registry.PATH_KINDS`),
-  because a silently-ignored value would just look like a plain text field.
-* `directory` gets `getExistingDirectory`, not a file dialog — a StarDist local model is a
-  *folder* (`config.json` + `weights_best.h5`) and no file dialog can return one.
-* `path_hint` is the place to say what an **empty** value means; it differs per socket
-  (`io.load` → the synthetic demo; a model path → fall back to the pretrained name).
-* All three are **presentation-only, never hashed** (like `description`), so annotating an
-  existing socket cannot invalidate a memo entry or a saved graph.
+### 4h. `description` — the hover text (clause 6, V2.13)
 
-**Two traps if you touch the catalog itself:**
+<!-- Numbered 4h, out of sequence, because this section and §4d (path sockets) were BOTH
+     called 4d until 2026-08-05, and each was cited from a different file meaning a different
+     thing. §4d keeps its number because build-node-v2 §0 cites it for path sockets; this one
+     moved to the next free letter so both citations resolve. `selftest::test_codemap` now
+     fails if any two sections in a skill share a number again. -->
 
-* **Do not key anything on `LayerKey`.** It is `(domain, layer, name)`, but the user-facing
-  name is in a *different slot per family*: `with_layer` leaves `layer=None`, so a lattice
-  layer is `(VOXEL, None, "mask")`; `with_structure` files each COLUMN as
-  `(POINT, "spots", "y")`. Keying on slot 1 collapses every Voxel layer to `(VOXEL, None)`.
-  `layer_names` stores the user-facing name per domain to sidestep this.
-* **The catalog is NOT monotone.** `reshaped_axes(drop_stale=True)` discards lattice layers
-  whose shape no longer matches, so an axis-changing node (crop/resample/zproject/stack/
-  channel.select) *removes* layers. The drop is derived centrally from the axis delta — you
-  do not declare it — but do not assume "layers only accumulate".
-
-### 4d. `description` — the hover text (clause 6, V2.13)
 
 Every param socket carries prose saying **what it does and how it moves the result**. It is
 `SocketSpec.description`, and the GUI renders it as the tooltip on both hover surfaces — the
@@ -257,120 +266,42 @@ is in the repo, so it is readable.
 
 ### 4e. `choice_docs` — one explanation per DROPDOWN OPTION (V2.21)
 
-A `description` can only describe the control. For a dropdown that is not enough: the menu
-then offers six bare tokens (`otsu`, `li`, `yen`, …) whose *differences* are the entire
-reason the user opened it, and naming a method is not explaining it. So **every dropdown
-documents every option**, on both spec types, and `Mode` additionally carries its own
-`description` (it had none before V2.21):
+A `description` describes the control; a dropdown must also
+explain **every option**, because the differences between `otsu`, `li` and `yen` are the whole
+reason the menu was opened. Both `ModeSpec` and `SocketSpec` take `choice_docs={choice: prose}`
+(and a `Mode` carries its own `description`). Write each option **relative to its siblings**:
+what it assumes about the data, and which way the result moves if you pick it. Three
+vocabularies are canned centrally — `registry.DIM_CHOICE_DOCS`, `domains.domain_docs`,
+`reducers.reducer_docs` — do not rewrite them per node. Presentation-only and memo-neutral;
+enforced by `selftest::test_option_docs`.
 
-* `ModeSpec.description` + `ModeSpec.choice_docs` — `{choice: prose}`.
-* `SocketSpec.choice_docs` — the same, for `choices` (pick one) and `vocab` (pick many).
-
-```python
-Mode("method", ["otsu", "li"], label="Level",
-     description="How the intensity cut is chosen — the methods differ in what they "
-                 "ASSUME the histogram looks like.",
-     choice_docs={
-         "otsu": "Maximizes between-class variance: the classic bimodal split. Biased LOW "
-                 "(mask too generous) when the foreground covers only a few percent.",
-         "li":   "Minimum cross-entropy. Handles a SMALL, sparse foreground far better than "
-                 "Otsu — the first thing to try when Otsu's masks come out too generous.",
-     })
-```
-
-**Write it RELATIVE to the siblings.** What this option assumes about the data, and which
-way the result moves if you pick it — that is what a menu is for. Say when an option is
-cheap/expensive, when it needs something the others do not (a track column, a raster, a
-download), and when it is refused in some state. Option prose is held to a lower length bar
-than a param description (`_OPTION_DOC_MIN`, 60 chars) because "assumes two intensity
-classes" is a complete answer.
-
-Three vocabularies are **canned centrally** — do not re-write them per node:
-`registry.DIM_CHOICE_DOCS` (the 2D/3D lever, carried by `DimMode()` for free),
-`domains.domain_docs(names)`, and `reducers.reducer_docs(names)`. Each lives beside the
-thing it describes, for the reason `DOMAIN_COLOR` does: it is a property of the data model,
-not of a node, and five hand-written copies would only differ where one had rotted.
-
-Same contract as `description`: **presentation-only and memo-neutral** — a Mode's docs
-cannot reach the recipe hash, because the engine folds the resolved mode STATE (`__modes__`)
-and never the `ModeSpec`. Registration refuses a `choice_docs` key that matches no option
-(it would render no tooltip, indistinguishable from never writing one), a blank explanation,
-and — new in V2.21, since Modes were previously unvalidated — a Mode `default` outside its
-own `choices`. Rendered by `mode_hover_text` / `option_hover_text` on four surfaces: the
-inspector row, each combo item, each vocab tick box, and the node card's popup menu (which
-needs `setToolTipsVisible(True)`, or QMenu swallows the prose). Enforced by
-`selftest::test_option_docs`, exemptions in `_OPTION_DOC_EXEMPT` on the same
-external-paper-only grounds.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/4e-choice-docs.md](references/4e-choice-docs.md).
 
 
 ### 4f. `reads_domains_by_mode` — the domain rail per BRANCH (V2.22)
 
-`NodeSpec.reads_domains` says which domains must be present on the incoming Dataset; it drives
-the card's input rail, the wire tint, and the red missing-domain chips. A node whose **branches
-read different structure** cannot state that once, and the catalog had drifted both ways:
+`reads_domains` is static, so a node whose
+**branches read different structure** cannot state its requirement once — and both failures are
+silent, because nothing at pull time reads the rail. Over-claiming paints a red missing-domain
+chip on a graph that is fine; under-claiming advertises no requirement at all. Declare the
+conditional half as `reads_domains_by_mode={mode: {value: frozenset(...)}}`. It is a **UNION
+over every listed mode**, unlike the single-key mapping `granularity` uses. Resolve it with
+`spec.resolve_reads_domains(state)` / `missing_domains(incoming, state)`, never by reading the
+raw field. Do not reach for it when the domain is simply the image.
 
-* **over-claiming** — `analysis.object_field` declared the static union `{LABEL, POINT}`, so a
-  pure-Label graph that was fine got a red PT chip;
-* **under-claiming** — `analysis.voronoi` declared `{POINT}` while `bound=per_region` also goes
-  through `_label_raster` and needs a whole Label instance. The node that combines dots with
-  labels advertised no labels requirement at all (reported 2026-08-03).
-
-Both are silent — nothing at pull time reads the rail, so it just tells the user the wrong thing.
-Declare the conditional half instead:
-
-```python
-reads_domains=frozenset({Domain.POINT}),          # unconditional (the seeds)
-reads_domains_by_mode={"bound": {
-    "per_region": frozenset({Domain.VOXEL, Domain.LABEL}),   # _label_raster wants the table
-    "mask":       frozenset({Domain.VOXEL}),                 # any non-zero raster
-    "frame":      frozenset(),                               # reads no layer at all
-}},
-```
-
-* It is a **UNION over every listed mode**, not the single-key `Mapping` `granularity` uses —
-  because the requirements are not keyed by one dropdown. `transform.transfer_structure` reads
-  what `from_domain` names AND what `to_domain` names; `flow.iterate` needs a Global under
-  `preserve=best` **OR** `mode=feedback`. An unlisted value contributes nothing.
-* Resolve it with **`spec.resolve_reads_domains(state)`** / **`missing_domains(incoming, state)`**
-  — never read the raw field. The GUI already does (`node_item.reads_domains`,
-  `document.missing_domains`).
-* Registration refuses a mode name that does not exist, a value that mode cannot take, and a
-  non-`Domain` entry — each would contribute nothing in every state, i.e. look exactly like
-  never having written it.
-* **Don't reach for it when the domain is the image.** `analysis.segment` keeps a static
-  `{VOXEL}`: that is the image domain every source supplies, not a per-method layer.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/4f-reads-domains-by-mode.md](references/4f-reads-domains-by-mode.md).
 
 ### 4g. A layer name is DERIVABLE — infer it (`_resolve_layer`, 2026-08-04)
 
-A layer-name socket has to carry some default, and a **literal** default is right for exactly
-one upstream producer. `analysis.voronoi` shipped `points="particles"` — what `detect.particles`
-emits — so a graph seeded from `detect.spots` (`spots`) or `transform.label_to_points`
-(`<labels>_points`) was refused with *"no Point layer 'particles' on the input Dataset (it
-carries ['points'])"*: an error that prints the right answer one clause after declining to use
-it. There was nothing to decide; a single Point table was on the wire.
+A layer-name socket's **literal** default is right
+for exactly one upstream producer, and wrong for every other graph — which then fails with an
+error that prints the right answer one clause after declining to use it. Treat a layer name the
+way you treat a spatial param: **derivable from the incoming data ⇒ the node derives it.**
+Default to `""`, resolve with `_resolve_layer(...)` (`_shared/labels.py`), and **report the
+inference on the progress rail** — inferring silently is how a node quietly analyses the wrong
+layer. Never guess between two candidates or across a domain boundary: raise and list them.
 
-Treat that the way you treat a spatial param: **derivable from the incoming data ⇒ the node
-derives it** (§7). Use `_resolve_layer(candidates, want, …)` (`_shared/labels.py`):
-
-| state | behaviour |
-|---|---|
-| socket set, name **present** | use it — an explicit name always wins |
-| socket **empty**, one candidate | use it, and report on the progress rail |
-| socket set but name **absent**, one candidate | use the candidate, saying the socket is stale |
-| **zero** candidates | raise, naming what to wire upstream |
-| **two or more** candidates | raise, listing them — never guess |
-
-* **Default `""`, not a literal.** Say in the `description` what empty means ("leave it empty and
-  the only Point table on `data` is used"), the same job `path_hint` does for a path socket.
-* **Candidates are per-purpose, not per-domain.** `per_region` needs a whole Label **instance**
-  (`_label_instances`: a raster *plus* the table that divides it into objects), so a plain `mask`
-  or a `distance` field beside a label raster is still unambiguous. `mask` takes any raster
-  (`_voxel_layers`) and so is ambiguous more often — correctly.
-* **Report the inference.** `ctx.progress(…, "using seeds: Point table 'points' (the only one on
-  the `data` input)")`. Inferring silently is how you get a node that quietly analyses the wrong
-  layer.
-* Never infer across a **domain** boundary or between candidates: two Point tables on one wire is
-  a real question, and picking one would tessellate the wrong cloud with no symptom.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/4g-derivable-layer-names.md](references/4g-derivable-layer-names.md).
 
 ---
 
@@ -400,70 +331,29 @@ distinctly, and serialization is unchanged.
 
 ### 5b. `available_in` gates ANY mode, not just `dim` (2026-07-28)
 
-**A socket the selected mode never reads must be HIDDEN, not shown and discarded.** The
-key of `available_in` is any mode name — `{"method": frozenset({"fixed"})}`,
-`{"boundary": frozenset({"alpha_shape"})}` — and a socket may gate on several modes at
-once (`analysis.histogram_threshold` gates each threshold on **method × direction**, so
-1–2 live fields show instead of all 8). When adding a node with a non-dim `Mode`, read
-the kernel and gate every param that only one branch consumes; a param that is live in
-*every* branch stays ungated (`detect.particles`: `min_size` filters blobs in both LoG
-and components — leave it alone; `analysis.boundary_band`: `band_voxels` is dilation
-iterations *and* the `edt` fallback threshold, so only `band_um` is gated).
+**A socket the selected mode never reads must be
+HIDDEN, not shown and discarded.** `available_in` keys on *any* mode name, not just `dim`, and
+one socket may gate on several modes at once. Gating is **edit-time only**: the engine still
+passes every declared param, so a compute's `ctx.params.get(name, default)` fallback must stay
+correct, and the mode already folds into the recipe hash, so hiding a socket never alters a
+memo key. `available_in` cannot see whether an optional socket is *wired*, so a param whose
+liveness depends on a wire stays ungated on purpose — hiding a control that still has an effect
+is the same bug in reverse.
 
-Two things this does **not** change: the engine still passes every declared param to the
-compute (gating is edit-time only, so a compute's `ctx.params.get(name, default)`
-fallback must stay correct), and the mode already folds into the recipe hash, so hiding
-a socket never alters a memo key.
-
-`available_in` can only see **mode state**, not whether an optional socket is wired — so
-a param whose liveness depends on a wire (DVC/DIC `reference_frame`: dead under
-`previous_frame`, but live again when an external `reference` Dataset is connected)
-stays ungated on purpose. Don't gate those; hiding a control that still has an effect is
-the same bug in reverse.
-
-Both halves must be verified: `NodeSpec.active_inputs(state)` in `nodegraph.selftest`,
-**and** the GUI — the node card re-lays-out via `scene.sync → item.refresh`, and the
-inspector rebuilds via `_set_mode`'s deferred `_rebuild` (covered by the "mode gate"
-check in `scripts/_nodelab_v2_phase5_probe.py`).
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/5b-available-in-any-mode.md](references/5b-available-in-any-mode.md).
 
 ---
 
 ### 5c. A MODE can be gated on another Mode too — `ModeSpec.available_in` (V2.12)
 
-`available_in` is **not socket-only**. A `ModeSpec` takes the same mapping, resolved by
-`ModeSpec.active_in(state)` / **`NodeSpec.active_modes(state)`**, and it exists because a
-node that unifies several algorithms behind one `method` Mode usually has a *second* Mode
-only some methods read. `analysis.segment`'s `level` (which foreground cut: otsu/li/…/fixed)
-is gated to `{"method": {"threshold", "watershed"}}` — its two learned detectors never
-threshold, so the dropdown is **hidden**, not shown and ignored. Ungated it would be the
-same dead control §4b clause 2 forbids for sockets, one level up.
+`available_in` is **not socket-only**. A `ModeSpec` takes
+the same mapping, so a second Mode that only some methods read is hidden rather than shown and
+ignored — the dead control §4b clause 2 forbids for sockets, one level up. A Mode must never
+gate on itself. **What gating cannot fix:** a lever whose *value* the compute still resolves —
+do not gate the `dim` lever away for a 2D-only method, because the state still resolves `dim`
+from its `derive` and hands the compute `WHOLE_VOLUME`. Refuse instead, naming the fix.
 
-```python
-modes=[DimMode(),
-       Mode("method", ["threshold", "watershed", "stardist", "cellsam"]),
-       Mode("level", [...], available_in={"method": frozenset({"threshold", "watershed"})})]
-```
-
-Rules, all enforced by `selftest::test_param_socket_contract` clause (a0):
-
-* the referenced mode and values must exist (a typo hides the Mode in *every* state — and
-  unlike a socket there is no `inputs` list where its absence is obvious);
-* **a Mode must never gate on itself** — its visibility would depend on the value it is
-  choosing.
-
-**Gating is edit-time only, exactly like a socket's.** `default_state()` still includes
-hidden Modes, so a gated-away Mode keeps its value: the compute's
-`ctx.params["__modes__"].get(name)` still resolves, and the mode still folds into the
-recipe hash, so hiding one never changes a memo key. Both GUI halves read
-`active_modes`: the inspector's Mode section (`inspector._rebuild`) and the card's mode
-rows (`node_item._layout`) — and `NodeItem.refresh()` compares the active **mode** name
-list alongside the socket lists, or a method switch that gates only a Mode would not
-relayout.
-
-**What gating cannot fix:** a lever whose *value* the compute still resolves. Do not gate
-the `dim` lever away for a 2D-only method — the state would still resolve `dim` from its
-`derive` and hand the compute `WHOLE_VOLUME`. Refuse instead, naming the fix
-(`analysis.segment` refuses 3D for stardist/cellsam and says "set the lever to 2D").
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/5c-mode-gated-modes.md](references/5c-mode-gated-modes.md).
 
 ## 6. Data-access footprint — `Granularity` + `kernel_axes`
 
@@ -523,182 +413,57 @@ resolves it to px/frames from the *incoming edge's* metadata (per-edge, V2.03 §
 
 ### 7b. Provenance inheritance — a node stamps context a downstream node reads
 
-When a downstream node's behaviour is **determined by how an upstream node ran** — not
-by a value the user should re-type — the upstream node should **stamp that config** and
-the downstream node should **inherit it**, instead of exposing a redundant/conflictable
-control. This is metadata intelligence at the *structural* (non-calibration) level.
+When a downstream node's behaviour is determined by
+**how an upstream node ran** — not by a value the user should re-type — the upstream node
+stamps that config and the downstream node inherits it, rather than exposing a control that
+could disagree with the data. Structure dimensionality (`z_kind`) is preserved automatically by
+`with_structure`; read it back with `ds.structure_zkind(domain, layer)`, which is why
+`transform.rasterize_field` needs no `DimMode` lever. For anything else: stamp with
+`ds.with_metadata(...)` under a **namespaced non-calibration** key, and inherit by reading
+`ctx.inputs[0].metadata.get(key)` directly. **Derive, don't ask.**
 
-**The built-in generic case — structure dimensionality (`z_kind`).** A structure table's
-`z_kind` (`"plane_index"` = 2D per-plane, `"subpixel"` = 3D) is lost when
-`with_structure` explodes the table into per-column `AttributeLayer`s. So `with_structure`
-**automatically preserves it** into a namespaced `__struct_zkind__` metadata map (keyed by
-domain+layer) — **every structure-producing node self-describes its dimensionality for
-free, no per-node code**. A consumer inherits it with **`ds.structure_zkind(domain, layer)`**
-(→ `"plane_index"`/`"subpixel"`/`None`). This is why `transform.rasterize_field` has **no
-`DimMode` lever**: it routes 2D-per-plane vs 3D-volumetric off the *field's own* `z_kind`,
-so a 2D per-plane field on a `z>1` image is never misread as a 3D grid (its plane-index
-`z` treated as a coordinate). `analysis.accumulate_field` inherits its dim the same way.
-
-**The general pattern (for config beyond dim):**
-- **Stamp on the output** with `ds.with_metadata(key=value, ...)` — the sanctioned write
-  path. Use a **namespaced** non-calibration key (e.g. `dvc_reference_mode`,
-  `dvc_strain_type`) so it never collides with `CALIBRATION_KEYS`. Example: `analysis.dvc_field`
-  stamps `dvc_reference_mode` / `dvc_strain_*` alongside its Point output (dim is NOT
-  stamped here — it rides the generic `z_kind`).
-- **Inherit in the consumer** by reading `ctx.inputs[0].metadata.get("key")` **directly**
-  (or `ds.structure_zkind(...)` for dim). Allowed *because the key is not a calibration
-  key* — `_StrictCalibMetadata` passes non-calibration reads through (only `CALIBRATION_KEYS`
-  trip C7). Memo-safe without recording: the marker rides the upstream payload, so a change
-  upstream bumps the upstream **revision**, which already folds into the consumer's
-  `recipe_hash` (and `output_fingerprint` folds `__struct_zkind__` via `metadata`).
-- **Derive, don't ask.** A consumer that inherits its dim/reference/measure from the
-  provenance needs **no `DimMode` lever and no reference param** — a lever could disagree
-  with the data and silently corrupt it. Fix a plain `granularity`/`kernel_axes` (a superset
-  like `frozenset({"z","y","x"})`) instead; the compute loops the units internally.
-- **Refuse the wrong input.** Inherited provenance also lets the consumer **validate**:
-  `analysis.accumulate_field` raises if the marker is absent (not a DVC field) or says
-  `fixed_frame` (already cumulative — nothing to accumulate), and re-stamps its own output
-  `dvc_reference_mode="cumulative"` so a second accumulate is refused too.
-- Contrast with **calibration** provenance: pixel/z/dt still flow through the envelope and
-  are read via `ctx.calib` (§7) — only *structural config that isn't a physical unit* uses
-  this stamp-and-inherit pattern.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/7b-provenance-inheritance.md](references/7b-provenance-inheritance.md).
 
 ### 7c. Calibration describes the CURRENT data, not the file (2026-07-28)
 
-**Every node reads its INPUT envelope, so calibration is always the most up-to-date value
-— which means a node that changes what its numbers MEAN must restamp the affected key in
-lockstep.** This is the same law as §8 (an axis-changing node restamps pixel size); it
-just also applies to keys that are not geometry. Read it as: *the envelope is a running
-description of the data on this wire, never a record of the acquisition.*
+The envelope is a **running description of the
+data on this wire**, never a record of the acquisition — so a node that changes what its
+numbers MEAN must restamp the affected key in lockstep. `bit_depth` is the intensity-domain
+instance: a node that widens the value scale restamps it, one whose output is no longer integer
+counts **drops** it, and one that merely redistributes intensities inside the same range does
+not restamp at all. Declare **both halves** (the `meta_transform` for edit time, the payload
+stamp for pull time), and do not re-derive a relative change in the compute — `ctx.calib`
+already returns the post-transform value, so sync to it or a re-pull widens twice.
 
-**`bit_depth` is the intensity-domain instance.** It is a calibration key (ND2
-`bitsPerComponentSignificant` — most files are **12**-bit, not 16), so:
-
-- A node that **widens the value scale** restamps it. Summing `n` samples of a `b`-bit
-  signal needs `b + ceil(log2 n)` bits → `metadata.bit_depth_after_sum(env, n)`, used by
-  `z_project`/`stack_time` for their `sum` combiners only (mean/median/max/min stay inside
-  the input range). A 12-bit series summed over T=8 becomes 15-bit *for every node after
-  it*, and chains (`sum` → `sum` → 17-bit).
-- A node whose output **is no longer integer counts** DROPS it: `metadata.value_rescaled`
-  is the ready-made meta_transform (percentile `enhance.normalize` → `[0,1]` floats).
-  Absent `bit_depth` is the honest signal "no declared integer scale", and consumers must
-  handle it: `analysis.threshold`'s fixed level derives mid-range from the depth and falls
-  back to `0.5` without one; `analysis.histogram_threshold` refuses `[0,1]` input outright.
-- A node that only **redistributes** intensities inside the same range does NOT restamp —
-  `enhance.clahe` rescales its equalized result back to the input's `[min,max]`, and γ
-  (`(a/mx)**g * mx`) preserves the plane max. Check the backend's actual output range
-  before deciding (skimage's `equalize_adapthist` returns `[0,1]`; the node's own
-  post-scaling is what saves it).
-
-**Both halves, as always.** Declare the `meta_transform` so *edit-time* propagation
-predicts the new value (the GUI's widget re-seed and every `derive` read it before any
-pull), and stamp the payload in the compute so the pulled Dataset agrees. And per §8, do
-NOT re-derive a relative change in the compute — `ctx.calib` already returns the
-**post-transform** value, so sync the payload to it (`bd_out = ctx.calib("bit_depth")`)
-or a re-pull would widen twice.
-
-**Consumers read it through `ctx.calib("bit_depth")`**, which memo-fences the read — so
-re-ingesting the same file at another depth, or flipping an upstream combiner to `sum`,
-invalidates exactly the nodes that cared.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/7c-calibration-current-data.md](references/7c-calibration-current-data.md).
 
 ### 7d. The optional `raw` socket — measure on unenhanced pixels (2026-07-28)
 
-Enhancement is for *finding* objects; the numbers you report should come from the pixels
-the camera recorded. A node that MEASURES intensities therefore takes an optional second
-Dataset input, `_InRaw()` (`nodes.py`), resolved by **`_intensity_provider(ctx, ds)` →
-`(provider, is_raw)`**. Wired: those pixels are measured. Unwired: its own image, exactly
-as before. On `analysis.measure` (all stats) and `analysis.histogram_threshold` (the region
-table's intensity columns, re-measured via the vendored `_measure_regions`).
+Enhancement is for *finding* objects; the numbers you report
+should come from the pixels the camera recorded. A node that MEASURES intensities takes an
+optional second Dataset, resolved by `_intensity_provider(ctx, ds)`. Four rules generalise to
+any second-Dataset input: **override measurement only, never segmentation**; **declare it after
+`data`**, so `dataset_preds[0]` stays the calibration/env source whichever edge was wired
+first; **refuse a geometry mismatch** with `_require_same_grid(...)` rather than hand-rolling
+one (it checks the sampling provenance as well as the shape, which is what catches a drift
+correction that moved the content without changing it); and the memo needs nothing, because a
+new predecessor re-keys the node on its own.
 
-Four rules make it safe, and they generalize to any "second Dataset input" node:
-
-- **Override MEASUREMENT only, never segmentation.** The mask, the label raster and every
-  threshold stay on the main input — the chain the user tuned. So geometry and calibration
-  remain one consistent story and only the *reported* numbers change. A node that wants to
-  *threshold* raw pixels needs no lever: wire the raw Dataset into its main input.
-- **Declare it AFTER `data`.** `graph.dataset_preds` sorts by declared socket position, so
-  `data` stays `dpreds[0]` = the calibration/domain env source no matter which edge the
-  user wired first. Never let an auxiliary input become the env.
-- **Refuse a geometry mismatch** with **`_require_same_grid(main, other, socket=…,
-  consequence=…)`** (`_shared/sampling.py`) — do NOT hand-roll it. Two branches read
-  voxel-for-voxel must agree on BOTH halves: `AxisSizes` (catches a crop/resample/project)
-  *and* the sampling provenance `__sampling__` (catches everything shape-preserving that
-  moves the content — `align.drift` and `registration.stabilize` are exactly that, and a
-  shape-only guard waved them through while the node measured each object where it used to
-  be). `consequence` is the only per-node part: say what goes wrong *here*.
-- **A stamp may declare the AXES its effect is confined to**, as a `"<axes>:"` prefix —
-  `CHANNEL_STAMP` (`"c:"`) for a channel tap, `Z_STAMP` (`"z:"`) for a Z-collapse. The rule
-  `_sampling_of`/`_require_same_grid` apply is one sentence: **a stamp confined to axes that
-  are singleton on BOTH sides cannot misalign anything.** That is what lets "segment ch0,
-  measure ch1" and "dots from a Z-projection, areas from a single-plane Z-crop" through
-  while a lateral crop, a drift and a resample stay refused. If you write a node that
-  collapses or reindexes ONE axis and leaves every other address alone, mark its stamp;
-  `util.crop` decides **per call** (a pure z-crop is lateral identity, a windowed one moves
-  the corner), which is the discrimination the exemption rests on. An unmarked stamp is
-  never dropped — that is the safe default, so an unparsable prefix costs correctness
-  nothing. `m`/`t` are deliberately NOT exempt: collapsing them picks a position or
-  timepoint, and calling frame 3 and frame 7 one grid is a content decision the guard has no
-  basis to make.
-- **The memo needs nothing.** A new predecessor folds into `recipe_hash` automatically, so
-  wiring or unwiring the second input re-keys the node on its own.
-
-Why not a Mode toggle: a lever cannot say *which* raw Dataset, and a hidden "read the
-source" path would break the "pure function of its inputs" law the memo depends on. An
-explicit socket is visible in the graph, diffable, and serializes for free. Same shape as
-`analysis.dvc_field`/`dic_correlate`'s optional `reference` input.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/7d-raw-socket.md](references/7d-raw-socket.md).
 
 #### 7e. A second input for a second DOMAIN — `layer_from` (V2.22)
 
-`raw`/`reference` bring in *pixels*. The other reason to take a second Dataset is that the
-node **combines two domains that different branches produce**: `analysis.voronoi` needs a
-Point table (the seed dots) *and* a Label raster (the areas to clip them to), and no single
-wire can carry a Point table plus someone else's labels. Reported as "I can only connect
-one data at a time" (2026-08-03).
+The other reason to take a second Dataset is that the node
+**combines two domains that different branches produce** — seed points from one wire, the label
+raster to clip them to from another. Same rules as §7d, plus: the layer socket must name the
+input it reads (`layer_from="areas"`), or the picker lists names off a wire the compute never
+reads; it falls back to the primary when unwired; refuse the input in a mode that ignores it;
+never `available_in`-gate a Dataset input (hiding a socket that already has a wire leaves the
+edge dangling — refuse instead); copy what it used onto the output under a name of the node's
+own choosing via `extra_layers`; and set `view_source=True` only when the wire carries
+genuinely different content.
 
-Same four rules as above, plus one:
-
-- **The layer socket must name the input it reads** — `layer_from="areas"` on the
-  `layer_in` socket. `document.layer_choices` follows the **primary** edge by design (a
-  `raw`/`reference` input's layers must never be offered as if they were on the payload
-  wire), so without this the picker lists names off a wire the compute never reads and the
-  user sees a valid-looking layer that "does not exist". Registration refuses a
-  `layer_from` naming a non-existent input, or the primary (already the default).
-- **The picker exists on BOTH surfaces.** `inspector._layer_box` (an editable combo) and
-  `node_item._open_layer_menu` (the card's pill popup). Until 2026-08-04 only the inspector
-  had one, so on the canvas a layer socket could only be typed — and a node left holding its
-  factory-default layer name while the wire carried another failed at pull time, several
-  nodes downstream, with a menu one click away that had the right answer in it. Both keep
-  free text reachable: the edit-time prediction is honest but incomplete.
-- **Falls back to the primary when unwired**, in the compute *and* the picker — that is
-  what keeps every single-wire graph that predates the socket working unchanged.
-- **Refuse the input in a mode that ignores it.** `analysis.voronoi` raises if `areas` is
-  wired under `bound=frame`, which reads no area layer at all — clause 2 of the socket
-  contract applied to a Dataset input.
-- **Do NOT `available_in`-gate a Dataset input.** No node in the catalog does: hiding a
-  socket that already has a wire leaves the edge dangling. Refuse instead.
-
-- **Put what it used on the OUTPUT.** The payload is built on `dataset_preds[0]`, so it inherits
-  the primary wire's layers and *nothing* from the auxiliary one. Viewing `analysis.voronoi`
-  therefore showed the seeds' branch labels and points with no trace of the areas the cells were
-  clipped to — and the inherited raster is usually *also* called `labels`, so the overlay looked
-  like the area layer while showing a different branch's. Copy it under a name of the node's own
-  choosing (`f"{name}_areas"`), declared via `extra_layers`; never under the source name, which
-  collides with what the primary branch already means by it.
-- **Declare it `view_source=True` if its IMAGE should be visible.** One payload has one image, so
-  the Viewer can only draw the primary's channel — "I can only see the UV channel" on a graph
-  whose areas came from the Red one. `InDataset("areas", view_source=True)` makes the runner
-  composite it (`overlay_chain` yields it; `_view_source_entry` synthesizes the placement, since
-  these nodes stamp no recipe — display config in a payload would ride the memo key).
-  **Opt-in per socket, and most sockets must NOT have it:** `raw` is the unenhanced version of
-  the *same* pixels and would draw the field twice, and a `reference` is another timepoint of
-  the same channel. The test is whether the wire carries genuinely different content, which is
-  the same condition as reading a *domain* off it rather than intensities. Placement is
-  field-for-field at scale 1 (`on_unplaceable="index"`), not by stage position: stage placement
-  refuses without a stage log, which a sibling branch does not need and a TIFF never has.
-
-The domain rail composes for free: `document.input_domains` unions **every** Dataset
-predecessor, so the LABEL arriving on the second wire satisfies the `reads_domains_by_mode`
-requirement declared for `bound=per_region` (§4f).
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/7e-layer-from.md](references/7e-layer-from.md).
 
 ---
 
@@ -779,44 +544,13 @@ lands on the right domain/layer.
 
 ## 12. Compute performance — numba vs numpy/scipy (when to reach for it)
 
-A compute body is fast **by default** when it bottoms out in one vectorized numpy op
-or a scipy/skimage/cv2 call — those are already compiled C/Fortran/MKL and numba
-**cannot beat them**. Reach for numba **only** when the hot cost is a *Python loop of
-many small array ops* or a *sequential, data-dependent algorithm that won't vectorize*.
+A compute body is fast **by default** when it bottoms out in
+one vectorized numpy op or a scipy/skimage/cv2 call — those are already compiled C/MKL and
+numba cannot beat them. Reach for numba **only** when the hot cost is a Python loop of many
+small array ops, or a sequential data-dependent algorithm that will not vectorize. **`cache=True`
+is mandatory in this engine**: per-tile streaming plus Windows `spawn` process pools mean every
+worker re-JITs otherwise (~0.3–2 s each), which can go net-negative on a short interactive pull.
+Keep the kernel a pure numeric helper — arrays in, arrays out, no `ctx`, no `Dataset`, no scipy
+inside `njit`. Do not stack `parallel=True` against a process pool.
 
-**The decision rule** — ask of the hot path: *is wall-time dominated by one big compiled
-call, or by a Python loop doing thousands of tiny ops?*
-
-| The compute's hot path… | Use | Why |
-|---|---|---|
-| one big `ndimage.*` / `skimage.*` / `cv2.*` / `np.fft` / vectorized numpy | **numpy/scipy** | already C/MKL; numba ties or loses **and** adds compile latency |
-| element-wise math numpy expands into N temporaries (`a*b + c*d - e`) | **numba** `njit` | fuses one pass, no temp arrays (memory-bandwidth bound) |
-| a Python `for` over 10³–10⁶ items, each a few small numpy calls | **numba** `njit` | erases per-call dispatch + alloc overhead (the real win: 10–100×) |
-| sequential/data-dependent (greedy NMS, region-grow, per-subset solve, ODE step) | **numba** `njit` | can't vectorize; numpy forces slow-Python or wasteful over-compute |
-| the above **and** embarrassingly parallel per element | **numba** `njit(parallel=True)` + `prange` | frees the GIL, uses all cores in-process |
-
-**Codebase idiom** (match it — see `kernels/bead_detect.py`, `kernels/track_objects.py`):
-`import numba as nb`; module-level `@nb.njit(cache=True)` kernels with explicit dtypes;
-`@nb.njit(parallel=True, cache=True)` + `nb.prange` for the parallel ones. Keep the
-kernel a **pure numeric helper** (arrays in, arrays out) — no `ctx`, no `Dataset`, no
-scipy calls inside `njit` (numba can't call them; keep `map_coordinates`/`label`/FFT
-outside the kernel and pass the arrays in).
-
-**Non-negotiable gotchas for THIS engine** (streaming + spawn):
-- **`cache=True` is mandatory.** v2 does per-tile streaming eval and the DVC path fans
-  across processes with `ProcessPoolExecutor` — Windows uses **spawn**, so every worker
-  is a fresh interpreter that re-JITs on first call (~0.3–2 s each). `cache=True` writes
-  the compiled artifact to disk so workers/tiles/re-runs load instead of recompiling.
-  Without it numba can go **net-negative** on short interactive pulls.
-- **First-ever call still pays one cold compile.** Fine for a long analysis solve; weigh
-  it for a tiny per-tile pointwise op (there, a numba port may not be worth it at all —
-  vectorized numpy already wins those).
-- **Confirm the numba cache dir is writable** in the packaged/frozen app, or every run
-  recompiles cold.
-- **Don't stack redundant parallelism.** If the node already fans across processes
-  (DVC IC-GN), `parallel=True` inside the kernel competes with the pool — prefer a
-  serial `njit` kernel per worker, or `prange` only on the non-fanned path.
-
-Backends stay **lazily imported inside the compute** (§2); a numba kernel is a
-module-level helper, so importing it at module top is fine (numba is a declared dep) —
-but never let a kernel's presence pull scipy/skimage to module top.
+**Full section** — examples, the enforcement details and the cases that motivated it: [references/12-numba-vs-numpy.md](references/12-numba-vs-numpy.md).

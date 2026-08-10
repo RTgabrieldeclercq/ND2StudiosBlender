@@ -29,9 +29,10 @@ from nodegraph.groups import (
 )
 from nodegraph.iterate import (
     ITERATE_OP, MAX_VARIABLES as _MAX_VARIABLES, MODE_TARGET_PREFIX,
-    SWEEP_KEY as _SWEEP_KEY, TYPE_NUMBER as _TYPE_NUMBER, TYPE_TEXT as _TYPE_TEXT,
-    unroll as _iterate_unroll, var_mode_names as _var_mode_names,
-    var_out_names as _var_out_names,
+    SEG_FROM as _SEG_FROM, SEG_TO as _SEG_TO, SWEEP_KEY as _SWEEP_KEY,
+    TYPE_NUMBER as _TYPE_NUMBER, TYPE_TEXT as _TYPE_TEXT,
+    aliases as _iterate_aliases, unroll as _iterate_unroll,
+    var_mode_names as _var_mode_names, var_out_names as _var_out_names,
 )
 from nodegraph.metadata import MetaEnvelope, propagate_meta
 from nodegraph.registry import InDataset, InString, NODES, OutDataset
@@ -173,13 +174,37 @@ class GraphDocument:
         #: avoid.
         self._held_nodes: frozenset = frozenset()
         self._listeners: List[Callable[[], None]] = []
+        #: The nodes the most recent edit touched, or ``None`` for "unknown / everything".
+        #: Read by listeners during their change callback (see :meth:`_notify`); meaningless
+        #: outside one, since the next edit overwrites it.
+        self.last_touched: Optional[frozenset] = None
 
     # ── listeners ────────────────────────────────────────────────────────────
     def on_change(self, fn: Callable[[], None]) -> None:
         self._listeners.append(fn)
 
-    def _notify(self) -> None:
+    def _notify(self, touched: Optional[Iterable[str]] = None) -> None:
+        """Bump the revision, re-propagate envelopes, and tell the listeners.
+
+        ``touched`` names the nodes this edit changed, and is published as
+        :attr:`last_touched` for the listeners to read (2026-08-06). The runner uses it to
+        cancel only the in-flight pulls that edit could affect, instead of every pull there
+        is — which is what lets a finished branch be adjusted while another is still running.
+
+        ``None`` means "unknown, assume everything", and it is the DEFAULT on purpose: a
+        structural edit (a rewire, a group expansion) changes which nodes feed which and a
+        cone computed against the old graph no longer describes the new one. Only an edit
+        that provably touches a known set should narrow it, so a call site that has not
+        been considered stays conservative rather than silently keeping a doomed run alive.
+
+        A **delete** is the one structural edit that DOES narrow (:meth:`remove_node`):
+        every run the deleted node could possibly affect — its own and anything downstream
+        of it — carries it in the cone recorded when that run started, and the old-graph
+        cone is the right thing to test because those runs were planned against the old
+        graph. Runs on other branches provably never read it, and cancelling them anyway
+        is what made deleting any card silently kill every computation in flight."""
         self.revision += 1
+        self.last_touched = None if touched is None else frozenset(touched)
         self.propagate()
         for fn in list(self._listeners):
             fn()
@@ -199,7 +224,9 @@ class GraphDocument:
             raise ValueError(f"duplicate node id {nid!r}")
         rec = NodeRecord(nid, op_key, params=params, modes=modes, x=x, y=y)
         self.nodes[nid] = rec
-        self._notify()
+        # A brand-new id cannot be in any in-flight run's cone, so naming it here cancels
+        # nothing — while still being honest about what changed (unlike an empty set).
+        self._notify((nid,))
         return rec
 
     def remove_node(self, node_id: str) -> None:
@@ -211,7 +238,11 @@ class GraphDocument:
         self.meta_seeds.pop(node_id, None)
         self._prune_frames(node_id)
         self._drop_orphan_group(op_key)          # a removed instance drops its unused def
-        self._notify()
+        # Narrowed, not `None`: a delete cancels exactly the runs whose cone contains this
+        # node (its own — which then ABORTS on the worker — and anything downstream), and
+        # leaves every other branch running and queued. See :meth:`_notify` for why a
+        # delete may narrow when other structural edits must not.
+        self._notify((node_id,))
 
     def _drop_orphan_group(self, op_key: str) -> None:
         """If ``op_key`` is a group-instance op_key with no remaining instances, drop the
@@ -220,9 +251,14 @@ class GraphDocument:
         if name and not any(group_name_of(r.op_key) == name for r in self.nodes.values()):
             self._groups = [g for g in self._groups if g.name != name]
 
-    def touch(self) -> None:
-        """Signal a param/mode edit (values live in shared dicts — no copy needed)."""
-        self._notify()
+    def touch(self, node_id: Optional[str] = None) -> None:
+        """Signal a param/mode edit (values live in shared dicts — no copy needed).
+
+        ``node_id`` names the card that was edited. It narrows the invalidation to the pulls
+        that node can affect, so nudging a threshold on one branch no longer cancels another
+        branch's running segmentation. Omitting it keeps the conservative "cancel everything"
+        behaviour, which is still correct — just wasteful."""
+        self._notify(None if node_id is None else (node_id,))
 
     def clear(self) -> None:
         """Empty the document (File → New)."""
@@ -254,19 +290,37 @@ class GraphDocument:
         if fid in self.frames:
             raise ValueError(f"duplicate frame id {fid!r}")
         self.frames[fid] = FrameRecord(fid, title, mem, color)
-        self._notify()
+        self._notify(())          # a frame is canvas decoration: it reaches no run graph
         return self.frames[fid]
 
     def remove_frame(self, frame_id: str) -> None:
         if frame_id in self.frames:
             del self.frames[frame_id]
-            self._notify()
+            self._notify(())      # GUI-only, like add_frame
 
     def rename_frame(self, frame_id: str, title: str) -> None:
         fr = self.frames.get(frame_id)
         if fr is not None:
             fr.title = str(title)
-            self._notify()
+            self._notify(())      # GUI-only, like add_frame
+
+    def downstream_of(self, node_ids: Iterable[str]) -> frozenset:
+        """``node_ids`` plus every node they transitively FEED.
+
+        The reach of an edit, and the mirror of the runner's ``planned_nodes`` (which walks
+        upstream — what a pull *reads*). Changing a threshold cannot alter what fed it, but
+        it invalidates every result computed from it, so this is the set whose run badges
+        have stopped being true. Follows the forward edge layer only; a zone back-edge is
+        preserved verbatim and never carries a fresh result."""
+        seen = set(node_ids)
+        stack = list(seen)
+        while stack:
+            nid = stack.pop()
+            for src, _ss, dst, _ds in self.edges:
+                if src == nid and dst not in seen:
+                    seen.add(dst)
+                    stack.append(dst)
+        return frozenset(seen)
 
     def _prune_frames(self, node_id: str) -> None:
         """Drop a removed node from every frame; a frame left with no members is
@@ -284,16 +338,24 @@ class GraphDocument:
             rec.x, rec.y = float(x), float(y)   # position is not a model edit: no notify
 
     def set_muted(self, node_id: str, muted: bool) -> None:
+        """Mute/unmute a node (G3 pass-through). A REAL graph change — the run graph bypasses
+        a muted node — so it is scoped to that node: runs whose cone contains it are
+        cancelled, everything else keeps going."""
         rec = self.nodes.get(node_id)
         if rec is not None and rec.muted != muted:
             rec.muted = muted
-            self._notify()
+            self._notify((node_id,))
 
     def set_collapsed(self, node_id: str, collapsed: bool) -> None:
+        """Fold/unfold a card. GUI-ONLY, so it notifies with an EMPTY touched set: folding a
+        card must not disturb a pull (2026-08-06). It used to notify unscoped, which since
+        the cooperative cancel lands as "abort every run in flight" — collapsing a card while
+        a segmentation ran killed it outright, with no error to show for it. Position
+        (:meth:`set_pos`) does not notify at all for the same reason."""
         rec = self.nodes.get(node_id)
         if rec is not None and rec.collapsed != collapsed:
             rec.collapsed = collapsed
-            self._notify()
+            self._notify(())
 
     # ── instance-aware socket resolution (per-channel outputs) ─────────────────
     def output_specs(self, node_id: str) -> list:
@@ -579,6 +641,45 @@ class GraphDocument:
 
     def edge_into(self, dst: str, dst_socket: str) -> Optional[EdgeTuple]:
         return next((e for e in self.edges if e[2] == dst and e[3] == dst_socket), None)
+
+    # ── iterate: the segment (V2.22) ─────────────────────────────────────────
+    def iterate_aliases(self, *, sweep_all: frozenset = frozenset()) -> Dict[str, str]:
+        """``node id → the clone to pull instead`` for every node INSIDE an Iterate
+        segment. The segment's END keeps its own id (the selector wears it), so it is
+        absent here and needs no translation."""
+        try:
+            return _iterate_aliases(self.to_graph(for_run=True, materialize=True),
+                                    envs=self.envs, sweep_all=sweep_all)
+        except Exception:            # noqa: BLE001 — a mid-edit graph aliases nothing
+            return {}
+
+    def iterate_card_at(self, node_id: str) -> Optional[str]:
+        """The Iterate card whose segment ENDS at ``node_id`` — i.e. whose iterations that
+        node's payload is a choice between. ``node_id`` itself when it IS a card.
+
+        This is what puts the iteration strip on the right node. After the rewrite the
+        selector wears the end node's id, so the end node is exactly the place where
+        "which iteration am I looking at?" is a question with an answer."""
+        rec = self.nodes.get(node_id or "")
+        if rec is None:
+            return None
+        if rec.op_key == ITERATE_OP:
+            return node_id
+        for nid, other in self.nodes.items():
+            if other.op_key != ITERATE_OP:
+                continue
+            if any(e[0] == node_id and e[2] == nid and e[3] == _SEG_TO
+                   for e in self.edges):
+                return nid
+        return None
+
+    def iterate_segment(self, iterate_id: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        """``(starts, ends)`` — what is wired into this card's ``from`` and ``to``."""
+        starts = tuple(e[0] for e in self.edges
+                       if e[2] == iterate_id and e[3] == _SEG_FROM)
+        ends = tuple(e[0] for e in self.edges
+                     if e[2] == iterate_id and e[3] == _SEG_TO)
+        return starts, ends
 
     # ── iterate targets (V2.22) ──────────────────────────────────────────────
     def iterate_targets(self, iterate_id: str, slot: int) -> List[EdgeTuple]:
@@ -1314,8 +1415,23 @@ class GraphDocument:
         return spec.missing_domains(self.input_domains(node_id), rec.state())
 
     def set_meta_seed(self, node_id: str, env: MetaEnvelope) -> None:
+        """Record a source's RESOLVED envelope (the G8 live re-seed, delivered by the runner
+        after a pull resolved a file).
+
+        Notified with an EMPTY touched set, which means "changed nothing a run can see"
+        (2026-08-06) — deliberately different from ``None``, "changed something unknown". The
+        envelope is display metadata the engine already resolved for itself during the run
+        that is delivering it, so it cannot invalidate that run's answer or anyone else's.
+
+        Saying ``None`` here is not a harmless over-approximation, it is a bug with a long
+        history: the delivery path already had to be written so staleness was judged BEFORE
+        this call, because the notification loops back through the window and cancels
+        in-flight work. Once a QUEUE existed, that same loop-back also emptied it — so
+        asking for two branches ran the first, silently discarded the second, and left its
+        card sitting on ``queued`` forever. Caught on the real 16-position file; no synthetic
+        fixture reaches it, because it needs a source whose envelope is resolved late."""
         self.meta_seeds[node_id] = env
-        self._notify()
+        self._notify(())
 
     # ── save / load (G6) ─────────────────────────────────────────────────────
     def to_dict(self) -> Dict[str, Any]:
@@ -1356,7 +1472,8 @@ class GraphDocument:
                 collapsed=bool(extra.get("collapsed", False)))
         for e in graph.edges:
             if e.kind in ("forward", "driver"):      # back-edges ride in _back_edges
-                self.edges.append((e.src, e.src_socket, e.dst, e.dst_socket))
+                self.edges.append((e.src, e.src_socket, e.dst,
+                                   self._migrate_socket(e.dst, e.dst_socket)))
         # GUI frames (only members that survived the load are kept; empty ⇒ dropped)
         self.frames = {}
         ui_frames = ui.get("frames", {}) if isinstance(ui.get("frames", {}), dict) else {}
@@ -1369,6 +1486,20 @@ class GraphDocument:
                 self.frames[fid] = FrameRecord(fid, fd.get("title", "Frame"), mem,
                                                tuple(col) if col else None)
         self._notify()
+
+    #: Sockets renamed after files had already been saved against them: ``{op_key: {old:
+    #: new}}``. A wire into a socket the spec no longer declares is not drawable, not
+    #: connectable and invisible to the rewrite — the graph would open looking subtly fine
+    #: and quietly stop iterating — so the loader repoints it. ``flow.iterate``'s ``collect``
+    #: became the segment's ``to`` in V2.22, and it means the same thing: the end of the
+    #: series.
+    _SOCKET_RENAMES: Dict[str, Dict[str, str]] = {ITERATE_OP: {"collect": _SEG_TO}}
+
+    def _migrate_socket(self, node_id: str, socket: str) -> str:
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return socket
+        return self._SOCKET_RENAMES.get(rec.op_key, {}).get(socket, socket)
 
     @property
     def has_unedited_structure(self) -> bool:

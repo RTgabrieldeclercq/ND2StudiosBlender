@@ -1,0 +1,31 @@
+{
+  "source": "H:/HK_segmentation/2025.09.07_EDF_Count_Intensity_ColocalizationDrawROI.nd2",
+  "layer": "Binary from ROI",
+  "annotation": "hand-drawn (user-confirmed, e005 reply)",
+  "input_channel": "AF647",
+  "um_per_px": 0.19013024558407263,
+  "n_objects": 44,
+  "dropped_1px_sliver_ids": [
+    33
+  ],
+  "kept_small_ids_px": [
+    [
+      34,
+      2
+    ]
+  ],
+  "multi_part_labels_kept": true,
+  "fidelity_checks": {
+    "mask_shape_equals_image_plane": true,
+    "layer_name": "Binary from ROI",
+    "oai_outputNames_match": true,
+    "oai_input_channel": "AF647",
+    "channels_in_file": [
+      "DAPI",
+      "GFP",
+      "AF555",
+      "AF647"
+    ],
+    "um_per_px": 0.19013024558407263
+  }
+}

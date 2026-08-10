@@ -31,7 +31,7 @@ moving down it, which is when the question is actually being asked.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence
+from typing import List, Mapping, Optional, Sequence
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QPen
@@ -286,6 +286,7 @@ class InspectorPanel(QScrollArea):
         self.setStyleSheet(_inspector_qss())
         self._node: Optional[NodeItem] = None
         self._auto_boxes = []              # (node, socket, box) — live ƒmd refresh (G8)
+        self._last_trained_note = ""
         self._last_dir = ""                # last browsed folder (seeds the next dialog)
         # carries a refused target choice across the rebuild the choice triggers, so the
         # reason is shown in the panel instead of being swallowed by the combo's signal
@@ -465,10 +466,11 @@ class InspectorPanel(QScrollArea):
         self._v.addWidget(hd)
         self._v.addWidget(self._sep())
 
-        # footprint
+        # footprint — the read COST (a fact), plus the statistics POPULATION (a control, V2.27)
         fp = self._section("Footprint")
-        chip = QLabel(node.granularity().replace("_", " ").upper())
-        gcol = T.gran_color(node.granularity())
+        gname = node.granularity()
+        chip = QLabel(gname.replace("_", " ").upper() if gname else "—")
+        gcol = T.gran_color(gname)
         chip.setStyleSheet(
             f"color:{_h(gcol)}; border:1px solid {_h(T.alpha(gcol,120))};"
             f"background:{_h(T.alpha(gcol,36))}; border-radius:4px; padding:3px 7px;"
@@ -476,9 +478,33 @@ class InspectorPanel(QScrollArea):
         cf = chip.font(); cf.setPointSize(8); chip.setFont(cf)
         frow = QHBoxLayout(); frow.addWidget(chip); frow.addStretch(1)
         fp._lay.addLayout(frow)  # type: ignore[attr-defined]
-        note = QLabel("The 2D / 3D switch resolves this footprint and the active sockets; "
-                      "it folds into the memo key, so 2D and 3D cache separately."
-                      if spec.has_dim_lever() else "Dimension-agnostic — no 2D/3D switch.")
+        # The population lives HERE rather than in the Mode section below, so the panel matches
+        # the card: one place that says how much is read and what decides it. `_mode_row` brings
+        # its own hover prose, per-item option tips and commit path, so there is no second
+        # editor to keep in step — and `_scope_mode` is what keeps it out of Mode (line ~518).
+        scope_mode = node._scope_mode() if hasattr(node, "_scope_mode") else None
+        if scope_mode is not None:
+            fp._lay.addWidget(self._mode_row(node, scope_mode))  # type: ignore[attr-defined]
+        # Name the resolver. The old text told every node without a lever it was
+        # "Dimension-agnostic", which is false for the four whose footprint is resolved by a
+        # named `footprint_mode` (`bounds`, `method`, `output`, `scope`) — and for a source,
+        # whose footprint is not declared at all.
+        if scope_mode is not None:
+            ntxt = (f"`{scope_mode.name}` chooses the statistics population above, and the "
+                    f"footprint follows from it. Populations fold into the memo key, so each "
+                    f"one caches separately.")
+        elif spec.has_dim_lever():
+            ntxt = ("The 2D / 3D switch resolves this footprint and the active sockets; "
+                    "it folds into the memo key, so 2D and 3D cache separately.")
+        elif isinstance(spec.granularity, Mapping) and spec.footprint_mode:
+            ntxt = (f"The `{spec.footprint_mode}` mode below resolves this footprint — this "
+                    f"node has no 2D / 3D switch.")
+        elif not gname:
+            ntxt = "Undeclared — this node is a source or a sink rather than a compute."
+        else:
+            ntxt = "Dimension-agnostic — no 2D/3D switch."
+        self._last_footprint_note = ntxt      # asserted by the phase-5 GUI gate
+        note = QLabel(ntxt)
         note.setProperty("role", "muted"); note.setWordWrap(True)
         nf = note.font(); nf.setPointSize(9); note.setFont(nf)
         fp._lay.addWidget(note)  # type: ignore[attr-defined]
@@ -489,6 +515,24 @@ class InspectorPanel(QScrollArea):
         params = [s for s in node._active_inputs() if s.type is not SocketType.DATASET]
         if params:
             sec = self._section("Parameters", str(len(params)))
+            # What the LOADED MODEL says, at the top of the params it speaks for (V2.23b).
+            # Reported as "loading in the model does not change any of the parameters": for a
+            # published checkpoint with no sidecar, and for a path that is not a model folder,
+            # the resolver correctly finds nothing — and a panel that then shows plain defaults
+            # with no badge and no reason is indistinguishable from a broken feature. The two
+            # states are now told apart in words, above the values they explain.
+            tnote = spec.note_for_trained(node.rec.params, node.state())
+            self._last_trained_note = tnote   # asserted by the phase-5 GUI gate
+            if tnote:
+                lab = QLabel(("✓  " if node.trained() else "•  ") + tnote)
+                lab.setWordWrap(True)
+                lab.setProperty("role", "muted")
+                lf = lab.font(); lf.setPointSize(9); lab.setFont(lf)
+                # Tinted only when something WAS adopted, so the eye can tell the two apart
+                # without reading: the values above are the checkpoint's, or they are not.
+                if node.trained():
+                    lab.setStyleSheet(f"color:{_h(T.OK if hasattr(T, 'OK') else T.ACCENT)};")
+                sec._lay.addWidget(lab)     # type: ignore[attr-defined]
             for s in params:
                 sec._lay.addWidget(self._param_row(node, s))  # type: ignore[attr-defined]
             self._v.addWidget(sec)
@@ -496,7 +540,10 @@ class InspectorPanel(QScrollArea):
 
         # in-body modes (non-dim), mode-gated like the sockets above: a Mode the selected
         # method never reads is hidden, not shown and ignored (V2.12 `ModeSpec.available_in`)
-        modes = [m for m in spec.active_modes(node.state()) if not m.is_dim_lever]
+        # ...and NOT the population mode, which the Footprint section above already edits;
+        # listing it twice would give one value two combos that have to agree.
+        modes = [m for m in spec.active_modes(node.state())
+                 if not m.is_dim_lever and m is not scope_mode]
         if modes:
             sec = self._section("Mode")
             for m in modes:
@@ -560,6 +607,10 @@ class InspectorPanel(QScrollArea):
         if self._iterate_error:
             blurb(self._iterate_error, T.ERROR)
             self._iterate_error = ""
+        if not doc.iterate_segment(node.node_id)[1]:
+            # The picker has already said to wire 'To', in the same words the plan would
+            # refuse in. One complaint per mistake.
+            return sec
 
         try:
             plan = iterate_plan(graph, node.node_id, envs=doc.envs)
@@ -570,8 +621,8 @@ class InspectorPanel(QScrollArea):
             blurb(str(exc), T.ERROR)
             return sec
         except Exception:                     # noqa: BLE001 — a mid-edit graph, not a bug
-            blurb("Pick a parameter above (or drag a variable output onto one), and wire "
-                  "the end of that chain back into Collect.", italic=True)
+            blurb("Wire the end of the series into 'To', then pick a parameter above.",
+                  italic=True)
             return sec
 
         n = plan.n
@@ -583,6 +634,9 @@ class InspectorPanel(QScrollArea):
         drives = ", ".join(f"{t.node_id}.{t.name}"
                            for v in plan.variables for t in v.targets)
         blurb(f"drives {drives}")
+        blurb(f"{len(plan.cone)} node{'s' if len(plan.cone) != 1 else ''} re-run per "
+              f"iteration; the result comes out of {plan.end}, so anything reading that "
+              f"node already gets it.")
         if minted < n:
             blurb("Only the kept iteration is computed, so a finished graph costs one run "
                   "instead of %d. Press Run sweep to compute them all and compare." % n)
@@ -646,13 +700,18 @@ class InspectorPanel(QScrollArea):
             f = lbl.font(); f.setPointSize(9); f.setItalic(True); lbl.setFont(f)
             v.addWidget(lbl)
 
-        if doc.edge_into(nid, "collect") is None:
-            note("Wire the END of the chain you want to tune into Collect. This menu then "
-                 "lists every parameter in that chain.")
+        starts, ends = doc.iterate_segment(nid)
+        if not ends:
+            note("Wire the LAST node of the series you want iterated into 'To'. That node "
+                 "is where the result comes out — everything already reading it keeps "
+                 "working — and this menu then lists every parameter in the series.")
             return host
+        note(("segment: %s → %s" % (" + ".join(starts), ", ".join(ends))) if starts else
+             ("segment: ends at %s (starts wherever a parameter is driven — wire 'From' to "
+              "pin it)" % ", ".join(ends)))
         options = candidate_targets(graph, nid)
         if not options:
-            note("Nothing upstream of Collect has a parameter this card can drive.")
+            note("Nothing inside the segment has a parameter this card can drive.")
             return host
 
         state = node.state()
@@ -1433,12 +1492,12 @@ class InspectorPanel(QScrollArea):
         rec = node.rec
         rec.params[name] = value
         rec.set_locked(rec.locked | {name})     # editing pins (sticky __locked__)
-        node.doc.touch()
+        node.doc.touch(node.node_id)
         # don't full-rebuild (keeps focus in the box); the card refreshes via sync
 
     def _set_mode(self, node: NodeItem, name: str, value: str) -> None:
         node.rec.modes[name] = value            # modes are NOT params (serialize split)
-        node.doc.touch()
+        node.doc.touch(node.node_id)
         # A mode change can reconfigure the ACTIVE socket set (`available_in`), so the
         # form has to be rebuilt: `doc.touch()` only re-seeds the auto boxes
         # (refresh_derived) and re-lays-out the card (scene.sync → item.refresh), which
@@ -1456,7 +1515,7 @@ class InspectorPanel(QScrollArea):
             rec.params[name] = (_pin_value(node, spec_sock)
                                 if spec_sock is not None else 0.0)
             rec.set_locked(rec.locked | {name})                 # pin the derived value
-        node.doc.touch()
+        node.doc.touch(node.node_id)
         self._rebuild()
 
 

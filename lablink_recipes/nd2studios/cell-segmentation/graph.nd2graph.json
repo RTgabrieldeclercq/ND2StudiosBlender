@@ -1,0 +1,96 @@
+{
+ "format_version": "2.0",
+ "graph": {
+  "nodes": [
+   {
+    "id": "load",
+    "op_key": "io.load",
+    "params": {},
+    "modes": {}
+   },
+   {
+    "id": "pick",
+    "op_key": "channel.select",
+    "params": {
+     "channels": [
+      0
+     ]
+    },
+    "modes": {}
+   },
+   {
+    "id": "background",
+    "op_key": "enhance.tophat",
+    "params": {
+     "radius": 5.0
+    },
+    "modes": {
+     "dim": "2D",
+     "variant": "white"
+    }
+   },
+   {
+    "id": "segment",
+    "op_key": "analysis.segment",
+    "params": {
+     "name": "labels",
+     "min_area": 0.0,
+     "max_area": 0.0,
+     "fill_holes": true,
+     "min_distance": 0.5
+    },
+    "modes": {
+     "dim": "2D",
+     "method": "watershed",
+     "level": "otsu"
+    }
+   },
+   {
+    "id": "measure",
+    "op_key": "analysis.measure",
+    "params": {
+     "labels": "labels",
+     "stats": "mean,max,min,sum,median,count"
+    },
+    "modes": {}
+   }
+  ],
+  "edges": [
+   {
+    "src": "load",
+    "dst": "pick",
+    "src_socket": "out",
+    "dst_socket": "data",
+    "kind": "forward"
+   },
+   {
+    "src": "pick",
+    "dst": "background",
+    "src_socket": "out",
+    "dst_socket": "data",
+    "kind": "forward"
+   },
+   {
+    "src": "background",
+    "dst": "segment",
+    "src_socket": "out",
+    "dst_socket": "data",
+    "kind": "forward"
+   },
+   {
+    "src": "segment",
+    "dst": "measure",
+    "src_socket": "out",
+    "dst_socket": "data",
+    "kind": "forward"
+   },
+   {
+    "src": "pick",
+    "dst": "measure",
+    "src_socket": "out",
+    "dst_socket": "raw",
+    "kind": "forward"
+   }
+  ]
+ }
+}

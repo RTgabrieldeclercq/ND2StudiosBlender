@@ -579,6 +579,25 @@ def main(argv) -> int:
     app.processEvents()
     assert picked[-1][0] == "dir", "a local StarDist model is a FOLDER, not a file"
     assert seg.params["sd_model_path"] == r"C:\models\sd", seg.params
+    # V2.23b: picking a model must SAY what it found, because finding nothing is a legitimate
+    # outcome (not downloaded, wrong folder) and is otherwise indistinguishable from a broken
+    # feature — reported as "loading in the model does not change any of the parameters".
+    # `C:\models\sd` does not exist here, which is precisely the silent case: assert the panel
+    # names the reason and the fix rather than quietly showing this app's own defaults.
+    win.inspector._rebuild()
+    app.processEvents()
+    _tn = win.inspector._last_trained_note
+    assert _tn and "config.json" in _tn, \
+        f"a model path with no config.json must explain itself, got {_tn!r}"
+    assert not win.scene.node_items["pb"].trained(), "nothing can be adopted from a fake path"
+    # ...and the same node with the method that loads no such model says nothing at all,
+    # rather than carrying a line about a file it never reads.
+    seg.modes["method"] = "threshold"; doc.touch(); win.inspector._rebuild()
+    app.processEvents()
+    assert not win.inspector._last_trained_note, \
+        f"a non-model method must add no model line, got {win.inspector._last_trained_note!r}"
+    seg.modes["method"] = "stardist"; doc.touch(); win.inspector._rebuild()
+    app.processEvents()
     seg.modes["method"] = "cellsam"; doc.touch(); win.inspector._rebuild()
     app.processEvents()
     assert len(_browse_btns()) == 1, "cellsam exposes exactly one path socket"
@@ -1442,7 +1461,11 @@ def main(argv) -> int:
     assert "n4" in items["n4"].toolTip()
     assert items["n3"].run_state() in ("done", "cached")
     assert items["n7"].run_state() == ""          # not in this pull → no stale state
-    assert not items["n7"].toolTip()
+    # …and it carries no RUN note. Since V2.27 every card's tooltip names the node and
+    # its footprint whether or not it has ever been pulled (`_apply_card_tip`, called
+    # from `_layout`), so "no stale state" is about the run text, not the whole tooltip.
+    assert items["n7"]._run_text() == "", items["n7"]._run_text()
+    assert "footprint" in items["n7"].toolTip(), items["n7"].toolTip()
     assert not any(i.run_state() in ("queued", "running", "decoding")
                    for i in items.values())      # everything settled
     assert not any(e.flow for e in win.scene.edge_items)   # nothing in flight → no flow
@@ -1626,6 +1649,109 @@ def main(argv) -> int:
     assert not win.view.is_maximized() and not win._max_act.isChecked()
     assert win._center.sizes() == docked_sizes, (win._center.sizes(), docked_sizes)
     _ok("Restore: Viewer docks back at its old split size, full controls returned")
+
+    # ── V2.28: the side-by-side compare pane ──────────────────────────────────
+    #
+    # A second ViewerPanel opens beside the primary in a horizontal splitter. When both
+    # results span the same M/T/Z the panes share ONE cursor — the primary's strips move
+    # both and the compare pane drops its own row; different extents give it its own.
+    done_cmp: list = []
+    win.runner.finished.connect(lambda nid, *a: done_cmp.append(nid))
+
+    def _wait_pull(nid, timeout=120):
+        t0 = time.time()
+        while nid not in done_cmp and time.time() - t0 < timeout:
+            app.processEvents()
+            time.sleep(0.01)
+        assert nid in done_cmp, f"{nid} never finished (got {done_cmp})"
+
+    win.pull_node("n3")                     # primary: the 3D gaussian (z=5)
+    _wait_pull("n3")
+    done_cmp.clear()
+    win.open_compare("n4")                  # same source chain → same M/T/Z → LINKED
+    _wait_pull("n4")
+    for _ in range(3):
+        app.processEvents()
+    assert win._viewed == "n3" and win._viewed2 == "n4"
+    # structure: the centre's top slot is the horizontal split, primary pane FIRST
+    assert win._center.widget(0) is win._viewer_split
+    assert win._viewer_split.count() == 2
+    assert win._viewer_split.widget(0) is win.viewer
+    assert win._viewer_split.widget(1) is win._compare_box
+    assert win.viewer2.has_image(), "the compare pane must show n4's pixels"
+    assert "n4" in win.viewer2._status.text()
+    assert "pulled in" in win.viewer._status.text()    # the primary KEPT its result
+    # metadata match (same M/T/Z) → linked: one cursor, the compare pane's row is gone
+    assert win._compare_linked is True
+    assert not win.viewer2._axes_box.isVisible()
+    assert "linked" in win._compare_box._title.text()
+    _ok("Compare (V2.28): a second Viewer pane opens beside the first (primary left, "
+        "compare right), shows its own node's result, and LINKS to one cursor when the "
+        "two results' M/T/Z extents match")
+
+    # the one cursor: the primary's strip moves the compare pane's silently and fetches
+    # its plane off the decode lane — no bounce, and no re-pull of either node
+    npull = len(pulled)
+    win.viewer._sliders["z"].setValue(3)
+    for _ in range(5):
+        app.processEvents()
+    assert win.viewer2._sliders["z"].value() == 3, "linked cursor must mirror"
+    t0 = time.time()
+    while win.runner.busy and time.time() - t0 < 30:
+        app.processEvents()
+        time.sleep(0.005)
+    assert len(pulled) == npull, "a linked scrub must not re-pull either node"
+    _ok("Compare: the primary's strips move BOTH panes; scrubbing linked panes stays "
+        "on the coords-only fast path (no pull slot, both nodes' views held at once)")
+
+    # DIFFERENT metadata unlinks: a Z-Project (z 5 → 1) gets its own cursor row back
+    zp = doc.add_node("util.zproject", x=1060, y=430)
+    doc.connect("n3", "out", zp.id, "data")
+    done_cmp.clear()
+    win.open_compare(zp.id)
+    _wait_pull(zp.id)
+    for _ in range(3):
+        app.processEvents()
+    assert win._viewed2 == zp.id
+    assert win._compare_linked is False
+    assert win.viewer2._axes_box.isVisible(), "different M/T/Z → the pane's own sliders"
+    assert "own cursor" in win._compare_box._title.text()
+    _ok("Compare: a result with different M/T/Z (Z-Project, z 5→1) keeps its own "
+        "sliders — the link is re-derived from the payloads' own axes on every delivery")
+
+    # close: one pane again, the centre exactly as it was
+    win.close_compare()
+    app.processEvents()
+    assert win._viewed2 is None
+    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
+    assert win._viewer_split.parent() is None
+    # reopen: the primary must come back at index 0 (the box is still in the splitter
+    # from last time — a plain addWidget would flip the panes)
+    win.open_compare("n4")
+    app.processEvents()
+    assert win._viewer_split.widget(0) is win.viewer
+    assert win._viewer_split.widget(1) is win._compare_box
+    # …and maximizing with a compare open closes it first (one HUD frame, one panel)
+    win.set_maximized(True)
+    for _ in range(3):
+        app.processEvents()
+    assert win._viewed2 is None and win._center.widget(0) is win.view
+    win.set_maximized(False)
+    app.processEvents()
+    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
+    # DELETING the compared node closes the pane: a pane still showing the result of a node
+    # that is no longer on the canvas is a lie, and it is the one the user cannot detect
+    done_cmp.clear()
+    win.open_compare(zp.id)
+    _wait_pull(zp.id)                       # settle first: deleting mid-pull is a
+    assert win._viewed2 == zp.id            # different test, and not this one
+    doc.remove_node(zp.id)                  # also leaves the demo graph as the next
+    app.processEvents()                     # sections (and the screenshots) expect it
+    assert win._viewed2 is None, "deleting the compared node must close its pane"
+    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
+    _ok("Compare: close restores the single-pane centre; reopen keeps primary-left; "
+        "maximize closes the compare pane first; deleting the compared node closes its "
+        "pane rather than leaving a result with no node; no dangling split")
 
     # ── G10 + screenshots (dark + light + maximized) ─────────────────────────
     app.processEvents()
@@ -2317,6 +2443,249 @@ def main(argv) -> int:
         "(240x200), with the 3D-only Z range taken from the Z strip's picks; and on the "
         "canvas a float scrubs (clamped), a bool toggles and the fmd badge pins/unpins")
 
+    # ── P4: the footprint band is a CONTROL (V2.27) ─────────────────────────────
+    #
+    # "Clicking the footprint changes whole plane / whole volume to per-label" — the band's
+    # granularity chip kept its meaning (a FACT: the read cost, in the cost colour) and gained a
+    # PILL beside it that edits the node's statistics population. Everything below is driven
+    # through the real handlers, because the whole feature is a hit-test + a menu + a mode write,
+    # and each of those has a way to be silently wrong: a rect painted where it cannot be
+    # clicked, a menu that writes a PARAM named after a Mode, or a layout filter that disagrees
+    # with `refresh` and relayouts the card on every keystroke.
+    from nodegraph.registry import NODES as _NODES
+    from nodelab_v2.document import GraphDocument as _GDf
+    from nodelab_v2.scene import GraphScene as _GSf
+    from PySide6.QtWidgets import QGraphicsView as _QGV
+    _pop_pair = next(((s, m) for s in _NODES.all() for m in s.modes
+                      if getattr(m, "is_scope", False)), None)
+    assert _pop_pair is not None, \
+        "the engine half must ship at least one role='scope' Mode for the band to edit"
+    _pspec, _pmode = _pop_pair
+    # analysis.threshold's scope is available_in-gated to the histogram methods, so `fixed`
+    # (its default) legitimately has NO population — pick a state where the Mode is live.
+    _fdoc = _GDf()
+    _frec = _fdoc.add_node("analysis.threshold", node_id="fb", x=0, y=0,
+                           modes={"method": "otsu"})
+    _gdoc_rec = _fdoc.add_node("enhance.gaussian", node_id="fg", x=200, y=0)
+    _zrec = _fdoc.add_node("util.zproject", node_id="fz", x=400, y=0)
+    _fitem, _gitem2, _zitem = (_PItem(_frec, _fdoc), _PItem(_gdoc_rec, _fdoc),
+                               _PItem(_zrec, _fdoc))
+    for _it in (_fitem, _gitem2, _zitem):
+        _it._layout()
+
+    # (a) the control exists, and it is inside the band it is painted in
+    _fctl = [c for c in _fitem.controls() if c.kind == "scope"]
+    assert len(_fctl) == 1, f"expected one scope control on Threshold, got {len(_fctl)}"
+    _fctl = _fctl[0]
+    assert _fctl.obj is _fitem.spec.scope_mode()
+    assert _fitem.card_rect().contains(_fctl.rect.center()), \
+        "the population pill must lie inside the card it is painted on"
+    assert _fctl.rect.top() >= T.HEADER_H, "the pill must not reach into the header"
+    assert _fctl.rect.bottom() <= T.HEADER_H + T.GRAN_H - 4, \
+        "the pill must stay ABOVE the band's dashed rule — that is what makes it impossible " \
+        "for it to overlap row 0, which starts at HEADER_H + GRAN_H"
+    _chip_txt = _fitem._foot_slots()[1]
+    assert not _fctl.rect.intersects(_fitem._gran_chip_rect(_chip_txt)), \
+        f"the pill overlaps the footprint chip ({_fctl.rect} vs " \
+        f"{_fitem._gran_chip_rect(_chip_txt)}) — the cap must be measured from the chip's " \
+        f"real right edge, since the chip's width depends on its own text"
+    # by VALUE: controls() rebuilds its Ctl tuples per call, so identity never holds — what
+    # matters is that hit-testing the painted centre returns the same control
+    assert _fitem.control_at(_fctl.rect.center()) == _fctl
+    assert all(_fitem.card_rect().contains(c.rect.center()) for c in _fitem.controls())
+
+    # (b) the chip stays a fact, abbreviated so it clears the pill; the pill is the population
+    _cap, _chip, _pill = _fitem._foot_slots()
+    assert (_cap, _chip, _pill) == ("footprint", T.gran_abbr("whole_plane"), "plane ▾"), \
+        f"band slots {(_cap, _chip, _pill)}"
+    assert _fitem._footprint_line() == "population: plane → reads whole plane"
+
+    # (c) the population Mode is NOT also a body row, and `refresh` agrees with `_layout`.
+    # A disagreement makes `want != have` permanently true, so EVERY doc.touch() destroys and
+    # recreates every SocketItem on the card and drops a drag in progress.
+    assert _pmode.name not in [r[1].name for r in _fitem._rows if r[0] == "mode"], \
+        "the population must not appear as a body pill as well as the band's"
+    _sock_id = id(_fitem._sockets[("in", "data")])
+    _fitem.refresh(); _fitem.refresh()
+    assert id(_fitem._sockets[("in", "data")]) == _sock_id, \
+        "refresh() rebuilt the card's sockets — `_layout` and `refresh` are filtering the " \
+        "mode rows differently (`_modes_on_rows` must be the single predicate)"
+
+    # (d) the menu: every choice, its prose, AND the footprint each would imply
+    _menu_seen = {}
+
+    class _FootMenu(_QMenu):
+        def exec(self, *a, **k):                          # noqa: A003 - Qt name
+            _menu_seen["items"] = [(x.text(), x.toolTip(), x.isEnabled())
+                                   for x in self.actions()]
+            _menu_seen["tips"] = self.toolTipsVisible()
+            return None
+
+    _scene_for_menu = _GSf(_fdoc)
+    _view_for_menu = _QGV(_scene_for_menu)
+    _scene_for_menu.sync()
+    _mitem = _scene_for_menu.node_items["fb"]
+    _mctl = next(c for c in _mitem.controls() if c.kind == "scope")
+    _before = dict(_mitem.rec.modes)
+    _NI.QMenu = _FootMenu
+    try:
+        _mitem.mousePressEvent(_FakePress(_mctl.rect.center()))
+    finally:
+        _NI.QMenu = _QMenu
+    assert _menu_seen.get("tips") is True, "a QMenu swallows action tooltips unless told not to"
+    _entries = _menu_seen.get("items", [])
+    assert _entries and not _entries[0][2], \
+        "the first entry must be a DISABLED header naming the footprint being read"
+    assert "whole plane" in _entries[0][0], _entries[0][0]
+    _texts = [t for t, _tip, en in _entries if en]
+    assert _texts == list(_pmode.choices), \
+        f"the menu must offer exactly the Mode's choices, got {_texts}"
+    for _t, _tip, _en in _entries[1:]:
+        assert f"<b>{_t}</b>" in _tip, f"option {_t} lost its prose"
+        assert "reads " in _tip, \
+            f"option {_t} must be annotated with the footprint it implies — the cost belongs " \
+            f"in the menu that changes it"
+    assert "whole series" in dict((t, tip) for t, tip, _e in _entries)["series"], \
+        "the `series` option must say it reads the whole series"
+    assert dict(_mitem.rec.modes) == _before, "dismissing the menu must change nothing"
+
+    # (e) a click commits, and BOTH band strings follow
+    class _PickFoot(_QMenu):
+        def exec(self, *a, **k):                          # noqa: A003 - Qt name
+            return next(x for x in self.actions()
+                        if x.isEnabled() and x.text() == "volume")
+
+    _NI.QMenu = _PickFoot
+    try:
+        _mitem.mousePressEvent(_FakePress(_mctl.rect.center()))
+    finally:
+        _NI.QMenu = _QMenu
+    assert _mitem.rec.modes.get("scope") == "volume", \
+        f"the click did not commit ({_mitem.rec.modes})"
+    assert _mitem.granularity() == "whole_volume", \
+        "the resolved footprint must follow the population — that is the whole point of " \
+        "editing it from the footprint band"
+    assert _mitem._foot_slots()[1] == T.gran_abbr("whole_volume"), "the chip did not follow"
+    assert _mitem._foot_slots()[2] == "volume ▾", "the pill did not follow"
+    # and it wrote a MODE, not a param named after one (which would serialize into the graph
+    # and fold into the recipe hash while being invisible in the inspector)
+    assert "scope" not in _mitem.rec.params, \
+        "the band wrote a PARAM called `scope` — _open_scope_menu must own its own write " \
+        "rather than falling through _open_menu's _write_param tail"
+
+    # (f) the inert cases stay inert, and each says what decides its footprint
+    assert not [c for c in _gitem2.controls() if c.kind == "scope"], \
+        "a dim-levered node's band must stay a readout — the lever is 11 px above it, and a " \
+        "chip menu would have to re-implement the H11 z==1 refusal to be safe"
+    assert "2D / 3D lever" in _gitem2._footprint_line()
+    assert not [c for c in _zitem.controls() if c.kind == "scope"], \
+        "util.zproject's footprint_mode is `method` — a band bound to footprint_mode would " \
+        "offer max/mean/none here, i.e. a footprint control that changes the reducer"
+    assert _zitem._foot_slots()[1] == "WHOLE VOLUME" and "`method`" in _zitem._footprint_line(), \
+        f"zproject's band must read its footprint, never its reducer ({_zitem._foot_slots()})"
+    # a collapsed card and a reroute have no controls at all; the tooltip still carries the
+    # footprint, which is the only readout a collapsed card has
+    _frec.collapsed = True
+    _fitem.refresh()
+    assert _fitem.controls() == [] and "population" in _fitem._footprint_line()
+    _frec.collapsed = False
+    _fitem.refresh()
+
+    # (g) available_in gating: `fixed` has no population, so the band reverts to a readout
+    _frec.modes["method"] = "fixed"
+    _fitem.refresh()
+    assert not [c for c in _fitem.controls() if c.kind == "scope"], \
+        "under method=fixed there is no histogram and so no population — the band must be a " \
+        "plain readout rather than a control that changes nothing"
+    assert _fitem._foot_slots()[2] is None and " " in _fitem._foot_slots()[1], \
+        "with no pill the chip goes back to its FULL name (there is nothing to clear)"
+    _frec.modes["method"] = "otsu"
+    _fitem.refresh()
+
+    # (h) inspector parity: one combo, in Footprint, not two
+    _finsp = _PInsp()
+    _finsp.set_node(_fitem)
+    _scombos = [c for c in _finsp.findChildren(_NoWheelCombo)
+                if [c.itemText(i) for i in range(c.count())] == list(_pmode.choices)]
+    assert len(_scombos) == 1, \
+        f"the population needs exactly ONE combo ({len(_scombos)} found) — it moved into the " \
+        f"Footprint section, so the Mode section must exclude it"
+    # the row (not the combo) carries the control's own prose; the combo carries per-ITEM tips
+    assert "statistics population" in _scombos[0].parentWidget().toolTip(), \
+        "the row's hover must name the ROLE — mode_identity's third arm, so the pill, the " \
+        "menu and this row all label the control the same way"
+    assert _scombos[0].currentText() == _fitem.rec.modes.get("scope", "plane"), \
+        "the combo must open on the value the card is showing"
+    assert any(_scombos[0].itemData(i, _Qt.ToolTipRole) for i in range(_scombos[0].count())), \
+        "each population option needs its own item tip, as every other Mode combo has"
+    assert "`scope`" in _finsp._last_footprint_note, \
+        f"the note must name the resolver: {_finsp._last_footprint_note!r}"
+    _finsp.set_node(_gitem2)
+    assert "2D / 3D switch" in _finsp._last_footprint_note
+    _finsp.set_node(_zitem)
+    assert "`method`" in _finsp._last_footprint_note, \
+        "the note used to tell every lever-less node it was 'Dimension-agnostic', which is " \
+        "false for the four whose footprint a named mode resolves"
+
+    # (i) a RAGGED structure table must not crash the paint (reported 2026-08-06). A structure
+    # instance is one array per column under one layer name, and nothing revalidates that they
+    # still agree after a second node writes onto it. When they do not, `_build_palette` sized
+    # its row map from `id` and its frame selection from `m`/`t`, and indexed past the end:
+    # "IndexError: index 208 is out of bounds for axis 0 with size 208" — a crashed RUN, from a
+    # colour. Every consumer here promises the opposite ("a colour is never worth a crash"), so
+    # the columns are clipped to the row set they all agree on, and said once on stderr.
+    from nodelab_v2.viewer import ViewerPanel as _VP
+    from nodegraph.structure import StructureTable as _RST
+    from nodegraph.provider import ArrayProvider as _RAP
+    from nodegraph.dataset import Dataset as _RDS
+    from nodegraph.domains import Domain as _RD
+    _rax = AxisSizes(m=1, t=1, z=1, c=1, y=32, x=32)
+    _rl6 = np.zeros(_rax.shape_for(_RD.VOXEL), np.int64)
+    _rl6[0, 0, 0, 0][2:10, 2:10] = 1
+    _rl6[0, 0, 0, 0][14:22, 14:22] = 2
+    _rds = (_RDS(axes=_rax, metadata={"pixel_size_um": 0.5})
+            .with_image(_RAP(np.zeros(_rax.shape_for(_RD.VOXEL))))
+            .with_layer(_RD.VOXEL, "labels", _rl6)
+            .with_structure(_RST(_RD.LABEL, {
+                "id": np.arange(1, 4, dtype=np.int64),
+                "m": np.zeros(3, np.int64), "t": np.zeros(3, np.int64),
+                "c": np.zeros(3, np.int64), "z": np.zeros(3, float),
+                "y": np.array([5.0, 17.0, 25.0]), "x": np.array([5.0, 17.0, 25.0]),
+            }, layer="labels", z_kind="plane_index"))
+            # ...then a SHORTER `id`, the way a second node writing against another row set does
+            .with_structure(_RST(_RD.LABEL, {"id": np.arange(1, 3, dtype=np.int64),
+                                            "level": np.array([400.0, 80.0])},
+                                 layer="labels", z_kind="plane_index")))
+    _rpane = _VP()
+    _rpane._dataset, _rpane._axes = _rds, _rax
+    _rmem = _rpane._member_layers()
+    assert _rmem, "the ragged layer must still be OFFERED, clipped — not dropped"
+    for _k, _c in _rmem.items():
+        assert len({len(v) for v in _c.values()}) == 1, \
+            f"columns still disagree after clipping: {[(n, len(v)) for n, v in _c.items()]}"
+        assert len(_c["id"]) == 2, "clipped to the SHORTEST column, i.e. the rows all agree on"
+    _rpane._build_palette()            # the call that crashed; must not raise
+    assert _rpane._point_count() >= 0
+    assert _rpane._warned_ragged, "a table that disagrees with itself must be reported once"
+
+    _ok("P4 footprint band (V2.27): the card's granularity band is now a CONTROL — the chip "
+        "keeps its meaning (the read cost, in the cost colour) and a population pill beside it "
+        "edits the node's role='scope' Mode. The pill is inside the card and inside the band "
+        "above the dashed rule (so it can never reach row 0), and clears the chip with the cap "
+        "measured from the chip's REAL right edge — a constant cap was wrong by 5 px on the "
+        "first pair tried. The menu carries a disabled header naming the footprint being read "
+        "plus, per option, its prose AND the footprint it would imply, so the one control that "
+        "changes the population states the cost at the moment of choosing; dismissing changes "
+        "nothing, a click re-resolves the footprint and BOTH band strings follow, and it writes "
+        "a MODE (a `scope` param would serialize into the graph and re-key the memo while "
+        "staying invisible). The population is absent from the body rows and `refresh` agrees "
+        "with `_layout`, so a card is not rebuilt on every touch. Inert where there is no "
+        "population: a dim-levered node (the lever owns that state, incl. the H11 refusal), "
+        "util.zproject (whose footprint_mode is its REDUCER), a collapsed card and method=fixed "
+        "— each naming what decides its footprint instead of going quiet. One inspector combo, "
+        "in Footprint, and the note names the real resolver rather than calling every "
+        "lever-less node dimension-agnostic")
+
     # ── P3: the hover readout ───────────────────────────────────────────────────
     # Hovering a pixel must answer four things at once: where it is in the node's grid,
     # where that is in microns, where it is on the STAGE, and what every shown channel
@@ -2687,7 +3056,11 @@ def main(argv) -> int:
             app.processEvents()
             time.sleep(0.005)
         app.processEvents()
-        _prov = win.runner._viewer_provider
+        # the held display state is per NODE since V2.28 (`_views`, one _HeldView per
+        # Viewer pane) rather than a set of `_viewer_*` singletons
+        _view = win.runner._view_of("n3")
+        assert _view is not None, "the pulled node must hold a display view"
+        _prov = _view.provider
         assert getattr(_prov, "volume_unit", False), type(_prov).__name__
 
         # (a) the cache is the RUNNER's and the engine got it
@@ -2706,7 +3079,7 @@ def main(argv) -> int:
         assert win.runner._engine.tiles is win.runner._tiles, \
             "the rebuilt engine must keep the SAME tile cache or every memo-hit lazy " \
             "provider re-runs its whole unit per plane"
-        assert win.runner._viewer_provider._cache is not _NOC, \
+        assert win.runner._view_of("n3").provider._cache is not _NOC, \
             "the held lazy provider must still read through a LIVE cache after a rebuild"
 
         # (c) prefetch is gated on what a neighbouring plane costs
@@ -2720,10 +3093,11 @@ def main(argv) -> int:
         # (b) a COLD frame never decodes on the GUI thread; a warm one never leaves it
         _c = win.viewer.coords()
         _chans = win.viewer.channels()
-        _cold = (_c[0], _c[1], (_c[2] + 1) % max(1, win.runner._viewer_axes.z), _c[3])
+        _vax = win.runner._view_of("n3").axes
+        _cold = (_c[0], _c[1], (_c[2] + 1) % max(1, _vax.z), _c[3])
         _seen.clear()
         _reads.clear()
-        assert win.runner._viewer_axes.z > 1, "the fixture needs a z axis to scrub"
+        assert _vax.z > 1, "the fixture needs a z axis to scrub"
         win.runner.request_plane("n3", _cold, _chans)
         assert not _seen, "a cold frame must NOT be painted from the emitting call"
         assert win.runner._decode_busy, "a cold frame must go to the pool"
@@ -2744,7 +3118,7 @@ def main(argv) -> int:
         # a volume-unit job carries a whole unit's working set, so one per pool thread is
         # not an option
         win.runner._planes.clear()
-        _zmax = max(1, win.runner._viewer_axes.z)
+        _zmax = max(1, win.runner._view_of("n3").axes.z)
         for _dz in range(1, 5):
             win.runner.request_plane(
                 "n3", (_c[0], _c[1], (_c[2] + _dz) % _zmax, _c[3]), _chans)
@@ -2781,6 +3155,129 @@ def main(argv) -> int:
         "in flight, one latest-wins pending slot, never on the GUI thread — and an edit "
         "mid-decode drops the frame; and prefetch is cost-gated: 8 planes ahead on a "
         "store-backed provider, 0 across frames of a whole-unit compute")
+
+    # ── V1b PLAY on a whole-unit chain: instant, and paced by the frames ──────────────
+    # Reported 2026-08-06 as "the 3D deconvolved set can't load frames" — pressing play on
+    # exactly the provider the section above sets up. V2.23 had made play mean "decode the
+    # series, THEN run it", which is right when a frame is a decompress and catastrophic when
+    # it is a whole-volume Richardson–Lucy: the preload queued the entire T range at the
+    # byte-backed width (four concurrent volumes, ~130 s and ~30 GB of working set each) and
+    # HELD playback behind it. Nothing reached the screen, and the four volumes crowded out
+    # the frame being displayed. The two halves of the fix are both here.
+    win.pull_node("n3")                  # the section above ends on an invalidate
+    t0 = time.time()
+    while win.runner._busy and time.time() - t0 < 180:
+        app.processEvents()
+        time.sleep(0.005)
+    app.processEvents()
+    _view3 = win.runner._view_of("n3")
+    assert _view3 is not None and getattr(_view3.provider, "volume_unit", False), \
+        "this probe needs the whole-unit provider the section above pulled"
+    assert win.runner.frames_are_reads("n3") is False, \
+        "a frame of a lazy chain is the node RUNNING, not a read — the whole policy hangs " \
+        "off this one predicate"
+    assert win.runner.preload_series("n3", win.viewer.coords(),
+                                     win.viewer.channels()) == 0, \
+        "play must not queue a whole-unit series ahead of the cursor — that IS the bug"
+    win.viewer._play_btns["t"].setChecked(True)          # → _on_play → playing → _on_playing
+    app.processEvents()
+    try:
+        assert not win.viewer.play_gated(), \
+            "playback must start IMMEDIATELY on a computed series — the gate was a wait of " \
+            "hours with nothing on screen"
+        assert win.viewer._play_timer.isActive(), "…and the timer must actually be running"
+        assert win.viewer._play_paced, \
+            "a computed series advances on DELIVERY: a wall clock would spin the cursor " \
+            "through frames that cannot answer at 8 fps and show one stale volume a couple " \
+            "of minutes later"
+        # the pacing holds the cursor while a frame is outstanding, and one delivery frees it
+        win.viewer._awaiting_frame = True
+        win.viewer._awaiting_since = time.perf_counter()
+        _t_before = win.viewer._sliders["t"].value()
+        win.viewer._tick_play()
+        assert win.viewer._sliders["t"].value() == _t_before, \
+            "a tick must not advance past a frame that is still computing"
+        win.viewer.show_planes("n3", {}, _view3.axes, 0.0)     # the frame lands
+        assert not win.viewer._awaiting_frame, "a delivery releases the next advance"
+        win.viewer._tick_play()
+        assert win.viewer._sliders["t"].value() != _t_before, "…and then it advances"
+    finally:
+        win.viewer._play_btns["t"].setChecked(False)
+        app.processEvents()
+    assert not win.viewer._play_timer.isActive() and win.viewer._playing_axis is None
+
+    # …while a store-backed series keeps the V2.23 behaviour it was written for: the frames
+    # are bytes, the preload is over in a second or two, and waiting for it is what makes
+    # playback smooth instead of "loading every time" (reported 2026-08-05).
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodelab_v2.runner import EngineRunner as _ERn
+    from nodelab_v2.runner import _HeldView as _HV
+    _bytes_view = _HV(_AP(np.zeros((1, 4, 1, 1, 32, 32), np.uint16)),
+                      AxisSizes(m=1, t=4, z=1, c=1, y=32, x=32),
+                      win.doc.revision, None, np.uint16)
+    win.runner._views["n3"] = _bytes_view
+    assert win.runner.frames_are_reads("n3") is True
+    assert _ERn._preload_jobs(_bytes_view.provider) == _ERn.PRELOAD_JOBS
+
+    # …and a PER-PLANE computed series (a stitched mosaic, a Z-projection — the recorded
+    # 2026-08-10 stutter) sits between the two: play HOLDS it while its frames prepare at
+    # the full preload width, exactly like bytes — but the hold is capped by measured cost
+    # (PLAY_PREPARE_MAX_S), so a chain that computes for minutes releases playback rather
+    # than holding a blank stare. Cheap identity kernel → the prepare finishes in
+    # milliseconds and the deterministic endpoint is "gate down, timer running".
+    from nodegraph.streaming import MapComputeProvider as _MCP
+    from nodegraph.streaming import TileCache as _TCache
+    from nodelab_v2.window import PLAY_PREPARE_MAX_S as _PREP_CAP
+    _pbase = _AP(np.zeros((1, 6, 1, 1, 32, 32), np.uint16))
+    _mapp = _MCP(_pbase, lambda p, *a: p, fp="probe-perplane", cache=_TCache())
+    win.runner._views["n3"] = _HV(_mapp, _pbase.axes, win.doc.revision, None, np.uint16)
+    win.runner._planes.clear()   # planes cached by the sections above share this node id —
+    # a warm series would make the preload a no-op and this probe about nothing
+    assert _ERn._preload_jobs(_mapp) == _ERn.PRELOAD_JOBS, \
+        "a per-plane compute must warm at the full measured width (2026-08-10) — one job " \
+        "never outruns playback consuming a frame per frame"
+    win.viewer._play_btns["t"].setChecked(True)      # → _on_play → playing → _on_playing
+    try:
+        # synchronous half: the handler ran inside setChecked, so the gate is up and the
+        # timer is parked BEFORE any preload tick can possibly have been delivered
+        assert win.viewer.play_gated(), \
+            "a per-plane computed series must be HELD while its frames prepare — playing " \
+            "it cold is the recorded stutter: every frame at its own decode latency"
+        assert not win.viewer._play_timer.isActive(), \
+            "…which means the wall-clock timer must not be running yet"
+        assert win.viewer._play_paced, \
+            "pacing stays on DELIVERY for a computed series — over warm frames it advances " \
+            "at the wall clock anyway, and at the cache edge it stays honest"
+        _t0 = time.time()
+        while win.runner.preloading() and time.time() - _t0 < 60:
+            app.processEvents()
+            time.sleep(0.005)
+        app.processEvents()                          # the finished signal drops the gate
+        assert not win.viewer.play_gated(), \
+            "the preload finished — the gate must drop on its own"
+        assert win.viewer._play_timer.isActive(), \
+            "…and playback must actually be running off the warm frames"
+    finally:
+        win.viewer._play_btns["t"].setChecked(False)
+        app.processEvents()
+    # the ETA half of the cap, pinned as arithmetic: two ticks in, a preparation whose
+    # measured rate projects past PLAY_PREPARE_MAX_S releases the hold — without cancelling
+    # the preload, which keeps warming behind the now-running playback
+    win.viewer.set_play_gate(True)
+    win._preload_hold_t0 = time.monotonic() - (_PREP_CAP + 1.0)
+    win._on_preload_progress("n3", 2, 1000)
+    assert not win.viewer.play_gated(), \
+        "a hold whose ETA projects past PLAY_PREPARE_MAX_S must release playback"
+    win._drop_play_gate("n3")                        # already down: must be a quiet no-op
+    win.runner._views.pop("n3", None)
+
+    _ok("V1b play policy by COST (2026-08-06 whole-unit; 2026-08-10 per-plane): a "
+        "whole-volume chain queues nothing, raises no gate and starts playing on the spot, "
+        "paced by delivery; a per-plane computed series (stitch / Z-projection) is held "
+        "like bytes while it warms at the full measured preload width, and the hold is "
+        "capped by the preload's own measured rate plus a wall-clock watchdog, so a "
+        "long-running chain releases playback instead of holding a blank stare; a "
+        "byte-backed series keeps the V2.23 preload that made it smooth")
 
     # ── V2 the store's pyramid: built on ingest, and REPAIRED when a store is short ──
     # An ingest killed between pyramid levels leaves a complete level_0 and no pyramid, and
@@ -2882,8 +3379,9 @@ def main(argv) -> int:
     assert _vp._detail_rect is None
 
     # now zoom in and drive the debounce the way a wheel event would
-    _prov = win.runner._viewer_provider
-    _ax = win.runner._viewer_axes
+    _dview = win.runner._view_of(_node)
+    assert _dview is not None, "the viewed node must hold a display view"
+    _prov, _ax = _dview.provider, _dview.axes
     assert _prov is not None and _ax is not None
     _rect = (0.30, 0.30, 0.55, 0.55)
     win.runner.request_detail(_node, _vp.coords(), sorted(_vp._planes), _rect,
@@ -2912,7 +3410,7 @@ def main(argv) -> int:
             _lv, _lax = _l, _cand
             break
     _m, _t, _z, _ = win.runner._clamp_coords(
-        win.runner._payload_coords(_vp.coords(), win.runner._viewer_pin), _ax)
+        win.runner._payload_coords(_vp.coords(), _dview.pin), _ax)
     _ref = np.asarray(_prov.get_region(
         _lv, _m, _t, _z, _ch,
         int(round(_drect[1] * _lax.y)), int(round(_drect[3] * _lax.y)),
@@ -3151,7 +3649,9 @@ def main(argv) -> int:
     from nodelab_v2.document import GraphDocument as _GDoc
     from nodelab_v2.inspector import InspectorPanel as _Insp
     from nodelab_v2.node_item import NodeItem as _NItem
-    from nodegraph.iterate import ITERATE_OP as _IT_OP, SWEEP_KEY as _SW_KEY
+    from nodegraph.iterate import (
+        ITERATE_OP as _IT_OP, SEG_FROM as _SEG_FROM, SEG_TO as _SEG_TO,
+        SWEEP_KEY as _SW_KEY)
 
     idoc = _GDoc()
     idoc.add_node("io.load", node_id="IL")
@@ -3166,7 +3666,7 @@ def main(argv) -> int:
     idoc.connect("IL", "image", "ITH", "data")
     idoc.connect("ITH", "out", "ILB", "data")
     idoc.connect("ILB", "out", "IRS", "data")
-    idoc.connect("IRS", "out", "ITT", "collect")
+    idoc.connect("IRS", "out", "ITT", _SEG_TO)      # the SEGMENT's end (V2.22)
 
     # the driver wire closes a loop on the canvas and MUST be allowed…
     _ok_drv, _why = idoc.can_connect("ITT", "var0", "ITH", "threshold")
@@ -3190,6 +3690,11 @@ def main(argv) -> int:
     assert sorted(n for n in _run.nodes if "#ITT@" in n) == \
         ["ILB#ITT@1", "IRS#ITT@1", "ITH#ITT@1"]
     assert _run.nodes["ITH#ITT@1"].params["threshold"] == 0.4
+    # the segment's END keeps its id, wearing the selector: that is what lets an iteration
+    # happen automatically when anything below it is pulled, with nothing re-routed
+    assert _run.nodes["IRS"].op_key == _IT_OP, "the selector must wear the end node's id"
+    assert _run.nodes["ITT"].params.get("__passthrough__") is True, \
+        "the card only passes the selected payload on; it must not choose twice"
     assert not any(e.kind == "driver" for e in _run.edges), \
         "no driver edge may survive into the graph the engine walks"
     assert len([n for n in idoc.to_graph(
@@ -3280,6 +3785,36 @@ def main(argv) -> int:
     assert [e for e in idoc.edges if e[0] == "ITT"] == \
         [("ITT", "var0", "ITH", "threshold")]
 
+    # the SEGMENT (V2.22): the card is a control, not a stage. Nothing routes through it,
+    # the result leaves through the series' own end node, and the two GUI consequences are
+    # that the iteration strip belongs to that end node and that viewing a node INSIDE the
+    # segment — the most ordinary thing to do while tuning a swept param — resolves to a
+    # clone instead of raising on an id the rewrite deleted.
+    _starts, _ends = idoc.iterate_segment("ITT")
+    assert (_starts, _ends) == ((), ("IRS",)), (_starts, _ends)
+    assert idoc.iterate_card_at("IRS") == "ITT", \
+        "the strip belongs to the segment's END — that is where the selector sits"
+    assert idoc.iterate_card_at("ITT") == "ITT" and idoc.iterate_card_at("ILB") is None, \
+        "a node in the MIDDLE is served by one clone; there is nothing to select there"
+    _al = idoc.iterate_aliases()
+    assert _al == {"ITH": "ITH#ITT@1", "ILB": "ILB#ITT@1"}, _al
+    _saved_doc = win.runner.document          # the probe's idoc is not the window's
+    win.runner.document = idoc
+    try:
+        assert win.runner._pull_id("ILB", _run) == "ILB#ITT@1", \
+            "double-clicking a node inside the segment must pull its clone, not KeyError"
+        assert win.runner._pull_id("IRS", _run) == "IRS" and \
+            win.runner._pull_id("IL", _run) == "IL"
+    finally:
+        win.runner.document = _saved_doc
+    # a branch off the END needs no re-routing: it reads the selector
+    idoc.add_node("view.viewer", node_id="IVW")
+    idoc.connect("IRS", "out", "IVW", "data")
+    _run2 = idoc.to_graph(for_run=True, materialize=True, unroll_iterate=True)
+    assert [e.src for e in _run2.preds("IVW")] == ["IRS"], \
+        "the rewrite must leave a consumer of the end node pointing at the same id"
+    idoc.remove_node("IVW")
+
     iinsp.set_node(None)
     iinsp.setParent(None)
 
@@ -3316,8 +3851,11 @@ def main(argv) -> int:
         "shows the slot's existing wire as its selection, hides what another slot already "
         "took, and BUILDS the same driver edge a drag would — its spare row raising "
         "`variables` and a dropdown target moving the slot onto its string output; the "
-        "Viewer's iteration strip shows, selects and hides; and the wire round-trips "
-        "through save/load")
+        "V2.22 SEGMENT puts the selector on the series' END — the strip belongs to that "
+        "node, a branch hanging off it is left pointing at the same id, and a node INSIDE "
+        "the segment resolves to the strip's clone instead of raising on an id the rewrite "
+        "deleted; the Viewer's iteration strip shows, selects and hides; and the wire "
+        "round-trips through save/load")
 
     # ── C1: TWO channel branches, told apart end to end (2026-08-03) ───────────
     #
@@ -3602,6 +4140,327 @@ def main(argv) -> int:
         "as CANCELLING in the shader — one intensity renders identically across frames with "
         "different extremes, and identically to the raw uint16 path, which is why keying it "
         "to bit_depth was tried and reverted as a no-op that only cost clipping headroom")
+
+    # ── C4: two branches run independently and the finished one stays usable ──
+    #
+    # Asked for as "show that the two are running independently, and if one is done earlier
+    # let us view the finished one and manipulate it". Four separate things had to change and
+    # each is pinned here, because each failed silently rather than loudly:
+    #
+    #   1. the second request was DISCARDED, not queued (one `_pending` slot, latest-wins),
+    #   2. a result was retired the moment anything else was pending — so the first branch's
+    #      payload was thrown away exactly when the user wanted to look at it,
+    #   3. one global epoch meant editing the finished branch cancelled the running one,
+    #   4. `set_run_plan` cleared every card outside the newest plan, so the branches could
+    #      never be shown in different states at the same time.
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=1, c=2, y=64, x=64)
+    win.file_new()
+    app.processEvents()
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner._raw_src.clear()
+    win.runner.invalidate()
+    bdoc = win.doc
+    bdoc.add_node("io.load", node_id="bl", x=0, y=0)
+    bdoc.set_meta_seed("bl", MetaEnvelope(axes=_RN._SYNTH_AXES,
+                                         metadata=dict(_RN._SYNTH_META)))
+    bdoc.add_node("channel.split", node_id="bs", x=180, y=0)
+    bdoc.connect("bl", "image", "bs", "data")
+    for _k, _y in ((0, -120), (1, 120)):
+        bdoc.add_node("enhance.gamma", node_id=f"bg{_k}", x=380, y=_y,
+                      params={"gamma": 0.7 + 0.2 * _k})
+        bdoc.connect("bs", f"ch{_k}", f"bg{_k}", "data")
+    app.processEvents()
+
+    # (1) a request made while another runs is QUEUED, not dropped
+    _q: list = []
+    _cancels: list = []
+    win.runner.queued.connect(lambda nid, d: _q.append((nid, d)))
+    win.runner.cancelled.connect(_cancels.append)
+    win.runner._busy = True                       # pretend a long branch is running
+    win.runner.pull("bg0")
+    win.runner.pull("bg1")
+    assert win.runner.queued_nodes() == ("bg0", "bg1"), win.runner.queued_nodes()
+    assert [n for n, _d in _q] == ["bg0", "bg1"], _q
+    win.runner.pull("bg0")                        # a repeat KEEPS its place, adds no second
+    assert win.runner.queued_nodes() == ("bg0", "bg1"), win.runner.queued_nodes()
+    assert win.runner.queue_depth() == 2
+
+    # (2) the queued branches' cards say `queued` while the other one holds `running`
+    win.scene.set_run_plan("bgX", ["bl", "bs", "bgX"])   # the (fictional) running branch
+    win.scene._set_state("bgX", "running")
+    win.scene.set_queued("bg0", win.runner.planned_nodes("bg0"))
+    assert win.scene._run.get("bgX", ("",))[0] == "running", win.scene._run.get("bgX")
+    assert win.scene._run.get("bg0", ("",))[0] == "queued", win.scene._run.get("bg0")
+    win.runner._queue.clear()
+    win.runner._busy = False
+
+    # (3) both branches really do produce their OWN result, one after the other
+    _pulls.clear()
+    win.pull_node("bg0")
+    _await_pull()
+    win.pull_node("bg1")
+    _await_pull()
+    _r0 = win.runner._results.get(("bg0", win.doc.revision))
+    _r1 = win.runner._results.get(("bg1", win.doc.revision))
+    assert _r0 is not None and _r1 is not None, sorted(win.runner._results)
+    _p0 = _r0[0].image.read_region(0, 0, 0, 0, 0, 0, 8, 0, 8)
+    _p1 = _r1[0].image.read_region(0, 0, 0, 0, 0, 0, 8, 0, 8)
+    assert not np.allclose(_p0, _p1), \
+        "both branches produced the SAME pixels — the two channel taps collapsed"
+
+    # (4) the finished branch is served WITHOUT the pull slot, while another run holds it
+    win.runner._busy = True
+    _served: list = []
+    _fin = win.runner.finished.connect(lambda nid, *a: _served.append(nid))
+    assert win.runner._serve_finished("bg0", None, None), \
+        "a finished branch must be viewable while another branch runs"
+    app.processEvents()
+    assert _served == ["bg0"], _served
+    assert win.runner.queue_depth() == 0, "serving from cache must not queue a pull"
+    win.runner.finished.disconnect(_fin)
+    win.runner._busy = False
+
+    # (5) editing the finished branch does NOT cancel the other one
+    win.runner._runs.clear(); win.runner._run_cones.clear()
+    win.runner._runs[9001] = "bg1"                       # pretend bg1 is still computing
+    win.runner._run_cones[9001] = frozenset(win.runner.planned_nodes("bg1"))
+    _cancels.clear()
+    bdoc.nodes["bg0"].params["gamma"] = 0.55
+    bdoc.touch("bg0")                                    # the inspector's edit path
+    app.processEvents()
+    assert 9001 in win.runner._runs, \
+        "editing the FINISHED branch cancelled the branch still running — one global epoch"
+    assert _cancels == [], _cancels
+    # ...while an edit inside its OWN cone does cancel it
+    bdoc.nodes["bg1"].params["gamma"] = 0.45
+    bdoc.touch("bg1")
+    app.processEvents()
+    assert 9001 not in win.runner._runs, "an edit in a run's own cone must cancel it"
+    assert _cancels == ["bg1"], _cancels
+    # ...and a structural edit (unknown scope) still cancels everything, as before
+    win.runner._runs[9002] = "bg0"
+    win.runner._run_cones[9002] = frozenset(["bg0"])
+    bdoc.touch()                                          # no node named → assume everything
+    app.processEvents()
+    assert not win.runner._runs, "an unscoped edit must still cancel every in-flight run"
+
+    # (6) the G8 source re-seed must cancel NOTHING and must not empty the queue.
+    #
+    # Found on the real 16-position ND2, not here: `set_meta_seed` fires from inside the
+    # delivery of a finished pull, loops back through the window's change handler, and used
+    # to arrive as "something changed, scope unknown" — which drained the queue, so asking
+    # for two branches ran the first, silently dropped the second, and left its card on
+    # `queued` for good. It reports an EMPTY touched set, which means "changed nothing a run
+    # can see", and that is a different thing from `None`.
+    win.runner._runs[9003] = "bg1"
+    win.runner._run_cones[9003] = frozenset(win.runner.planned_nodes("bg1"))
+    win.runner._queue["bg0"] = ("bg0", None, None)
+    _cancels.clear()
+    bdoc.set_meta_seed("bl", MetaEnvelope(axes=_RN._SYNTH_AXES,
+                                          metadata=dict(_RN._SYNTH_META)))
+    app.processEvents()
+    assert 9003 in win.runner._runs, \
+        "the source re-seed cancelled a live run — it resolves metadata that run already had"
+    assert win.runner.queued_nodes() == ("bg0",), \
+        f"the source re-seed emptied the queue — {win.runner.queued_nodes()}"
+    assert _cancels == [], _cancels
+    win.runner._queue.clear(); win.runner._runs.clear(); win.runner._run_cones.clear()
+
+    # (7) a FINISHED branch keeps its badge when the next branch starts.
+    #
+    # Reported as "queuing is now causing previous nodes to stop displaying their progress".
+    # `set_run_plan` cleared every card no live plan claimed — right when the canvas described
+    # "the last run" and one pull existed at a time, wrong once each branch has its own
+    # answer: finishing branch A and then starting branch B blanked A's `done` card, erasing
+    # the result the user had just waited minutes for.
+    win.scene.clear_run_states()
+    win.scene.set_run_plan("bg0", ["bl", "bs", "bg0"])
+    win.scene.finish_run("bg0", seconds=1.0)
+    assert win.scene._run.get("bg0", ("",))[0] == "done", win.scene._run.get("bg0")
+    win.scene.set_run_plan("bg1", ["bl", "bs", "bg1"])       # the next branch starts
+    assert win.scene._run.get("bg0", ("",))[0] == "done", (
+        "starting the next branch erased the finished branch's `done` badge")
+    assert win.scene._run.get("bg1", ("",))[0] == "queued", win.scene._run.get("bg1")
+    # ...but a badge the EDIT invalidated is still retired, on the node and downstream
+    assert bdoc.downstream_of(["bs"]) >= {"bs", "bg0", "bg1"}, bdoc.downstream_of(["bs"])
+    win.scene.clear_run_states_for(bdoc.downstream_of(["bg0"]))
+    assert win.scene._run.get("bg0", ("",))[0] == "", "a stale badge survived its edit"
+    win.scene.clear_run_states()
+
+    # (8) COSMETIC edits must not cancel a run, and a preview must not queue.
+    #
+    # The other half of the same report: with the cooperative cancel in place, an unscoped
+    # notify is no longer "drop the result", it ABORTS the pull. Collapsing a card or
+    # renaming a canvas frame did that — neither reaches a run graph at all. And
+    # click-to-preview (which fires on every settled selection) went from latest-wins to
+    # ENQUEUEING, so clicking around during a long run silently committed the machine to
+    # every card touched.
+    win.runner._runs[9101] = "bg1"
+    win.runner._run_cones[9101] = frozenset(["bl", "bs", "bg1"])
+    _cancels.clear()
+    _fr = bdoc.add_frame("probe-frame", members=["bg0"])
+    bdoc.set_collapsed("bg0", True)
+    bdoc.rename_frame(_fr.id, "probe-frame-2")
+    app.processEvents()
+    assert 9101 in win.runner._runs, \
+        "a cosmetic edit (collapse / frame rename) aborted a running pull"
+    assert _cancels == [], _cancels
+    bdoc.set_collapsed("bg0", False)
+    bdoc.remove_frame(_fr.id)
+    # a preview is dropped while busy; an explicit pull still queues
+    win.runner._busy = True
+    win.runner._queue.clear()
+    win.runner.pull("bg0", None, None, queue=False)
+    assert win.runner.queued_nodes() == (), \
+        f"click-to-preview queued a pull: {win.runner.queued_nodes()}"
+    win.runner.pull("bg0", None, None)
+    assert win.runner.queued_nodes() == ("bg0",), win.runner.queued_nodes()
+    win.runner._busy = False
+    win.runner._queue.clear(); win.runner._runs.clear(); win.runner._run_cones.clear()
+
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
+    _ok("C4 independent branches (2026-08-06): a second branch requested mid-run is QUEUED "
+        "(repeat requests keep their place, never duplicate) instead of silently replacing "
+        "the pending one; the queued cards read `queued` while the running one reads "
+        "`running`; both branches produce their own distinct pixels; a FINISHED branch is "
+        "re-served from cache without taking the pull slot, so it can be viewed while the "
+        "other still computes; an edit cancels only the runs whose cone contains it — "
+        "re-tuning the finished branch leaves the running one alive, where one global epoch "
+        "used to kill it with no error and no card state to show for it; and the G8 source "
+        "re-seed, which fires from inside a delivery, cancels nothing and leaves the queue "
+        "intact (it used to drain it, so the second branch never ran at all); a FINISHED "
+        "branch keeps its `done` badge when the next branch starts, while the edit that "
+        "actually invalidates it retires it on the node and everything downstream; a "
+        "cosmetic edit (collapse, frame rename) no longer ABORTS a running pull now that "
+        "cancellation is cooperative; and click-to-preview is dropped rather than queued, so "
+        "clicking around during a long run stops committing the machine to every card")
+
+    # ── C5: deleting a node cancels ITS runs — and lets the others run instead ──
+    #
+    # The 2026-08-06 ask verbatim: "deleting a node should cancel its run state to let
+    # other nodes be run instead". Pinned in five parts: (1) run-graph ids map back to the
+    # document card that owns them, so a delete matches runs computing its Iterate clones
+    # or inlined group bodies; (2) a delete NARROWS — the other branch's run and queued
+    # request both survive it; (3) the deleted node's own queued request is dropped on the
+    # spot; (4) when the deleted node's run is the one ON the worker, the job's cancel
+    # flag latches (a bake is never latched); (5) end to end on the real worker — the
+    # running pull of a deleted node aborts mid-compute and the branch queued behind it
+    # runs and delivers. The engine half of the abort (should_stop → PullCancelled, no
+    # torn memo entry) is gated Qt-free in nodegraph.selftest's test_engine_cancel.
+
+    # (1) run-graph id → document id
+    assert _RN._doc_id_of("n7") == "n7"
+    assert _RN._doc_id_of("bg0#it2@3") == "bg0"        # an Iterate clone
+    assert _RN._doc_id_of("it2#adv@0") == "it2"        # the zone's advance node
+    assert _RN._doc_id_of("body%inst") == "inst"       # an inlined group body node
+    assert _RN._doc_id_of("b%mid%g7#it1@0") == "g7"    # nested groups inside a zone
+
+    # (2) deleting one branch leaves the other branch's run AND queued request alone
+    win.runner._runs[9101] = "bg1"
+    win.runner._run_cones[9101] = frozenset(["bl", "bs", "bg1"])
+    win.runner._queue["bg1"] = ("bg1", None, None)
+    _cancels.clear()
+    bdoc.remove_node("bg0")
+    app.processEvents()
+    assert 9101 in win.runner._runs, \
+        "deleting one branch cancelled the OTHER branch's run — a delete must narrow"
+    assert win.runner.queued_nodes() == ("bg1",), win.runner.queued_nodes()
+    assert _cancels == [], _cancels
+
+    # (3)+(4) deleting the node whose run is ON the worker: run dead, queued request
+    # dropped, and the job's cancel flag latched for the engine to poll
+    from types import SimpleNamespace as _SNS
+    _act = _SNS(epoch=9101, bake=None, cancelled=False)
+    win.runner._active = _act
+    bdoc.remove_node("bg1")
+    app.processEvents()
+    assert 9101 not in win.runner._runs
+    assert win.runner.queued_nodes() == (), win.runner.queued_nodes()
+    assert _act.cancelled is True, \
+        "the deleted node's RUNNING job must latch its cancel flag — otherwise the " \
+        "engine grinds the dead pull to completion with the queue waiting behind it"
+    assert set(_cancels) == {"bg1"}, _cancels          # its run + its queued request
+    # ...while a bake job is never latched: its checkpoint resolves outside staleness
+    win.runner._runs[9102] = "bs"
+    win.runner._run_cones[9102] = frozenset(["bl", "bs"])
+    _bact = _SNS(epoch=9102, bake={"hold": False}, cancelled=False)
+    win.runner._active = _bact
+    bdoc.remove_node("bs")
+    app.processEvents()
+    assert 9102 not in win.runner._runs and _bact.cancelled is False, \
+        "a bake must never be cancel-latched — its result is a directory that exists"
+    win.runner._active = None
+
+    # (5) end to end: the slow branch's gamma is wrapped to tick progress and sleep per
+    # unit — keyed to the one node id, so the fast branch runs the stock compute. Delete
+    # the slow node mid-compute; its pull must abort (the wrap records whether the loop
+    # ever completed) and the branch queued behind it must run and deliver.
+    win.file_new()
+    app.processEvents()
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner._raw_src.clear()
+    win.runner.invalidate()
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=1, c=2, y=64, x=64)
+    cdoc = win.doc
+    cdoc.add_node("io.load", node_id="cl", x=0, y=0)
+    cdoc.set_meta_seed("cl", MetaEnvelope(axes=_RN._SYNTH_AXES,
+                                          metadata=dict(_RN._SYNTH_META)))
+    cdoc.add_node("channel.split", node_id="cs", x=180, y=0)
+    cdoc.connect("cl", "image", "cs", "data")
+    for _k in (0, 1):
+        cdoc.add_node("enhance.gamma", node_id=f"cg{_k}", x=380, y=_k * 200,
+                      params={"gamma": 0.8})
+        cdoc.connect("cs", f"ch{_k}", f"cg{_k}", "data")
+    app.processEvents()
+
+    from nodegraph.nodes import COMPUTES as _COMP
+    _real_gamma = _COMP["enhance.gamma"]
+    _slow_done = {"finished": False}
+
+    def _slow_gamma(ctx):
+        if ctx.node_id != "cg0":
+            return _real_gamma(ctx)
+        for _i in range(600):                          # ≥6 s unless the abort fires
+            ctx.progress(_i + 1, 600, "slow")
+            time.sleep(0.01)
+        _slow_done["finished"] = True
+        return _real_gamma(ctx)
+
+    _COMP["enhance.gamma"] = _slow_gamma
+    _events: list = []
+    _prog = win.runner.node_progress.connect(
+        lambda ev, nid, info: _events.append((ev, nid)))
+    try:
+        _pulls.clear()
+        win.pull_node("cg0")                           # the slow branch takes the slot
+        _t0 = time.time()
+        while ("start", "cg0") not in _events and time.time() - _t0 < 30.0:
+            app.processEvents()
+            time.sleep(0.005)
+        assert ("start", "cg0") in _events, "the slow pull never started"
+        win.runner.pull("cg1")                         # queue the branch we want instead
+        assert win.runner.queued_nodes() == ("cg1",), win.runner.queued_nodes()
+        win.scene.delete_nodes(["cg0"])                # the canvas delete path
+        _await_pull(limit=60.0)                        # cg1's result, behind the abort
+        assert _pulls and _pulls[-1][0] == "cg1", _pulls
+        assert not _slow_done["finished"], \
+            "the deleted node's compute ran to completion — the abort never fired"
+        assert "cg0" not in cdoc.nodes
+    finally:
+        _COMP["enhance.gamma"] = _real_gamma
+        win.runner.node_progress.disconnect(_prog)
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
+
+    _ok("C5 delete cancels the node's own runs (2026-08-06): a delete narrows the "
+        "invalidation to the deleted node's cone, so the other branch's run and queued "
+        "request survive it; the deleted node's queued request is dropped where it "
+        "stands; the running job's cancel flag latches (never for a bake) and the engine "
+        "aborts the pull mid-compute — measured end to end: the deleted node's slow pull "
+        "unwound without finishing and the branch queued behind it ran and delivered; "
+        "run-graph clone ids (`n#it@i`, `body%inst`) map back to their document card so "
+        "a delete also cancels runs computing a card's Iterate clones or group body")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

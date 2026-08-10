@@ -17,6 +17,7 @@ button, or a header double-click puts the Viewer back in the splitter at its old
 """
 from __future__ import annotations
 
+import time
 import uuid
 from typing import List, Optional
 
@@ -25,12 +26,13 @@ from nodegraph import hotreload
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDockWidget, QFileDialog, QInputDialog, QLabel, QMainWindow,
-    QMessageBox, QProgressBar, QSplitter, QVBoxLayout, QWidget,
+    QApplication, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QMainWindow, QMessageBox, QProgressBar, QSplitter, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from nodegraph.iterate import (
-    ITERATE_OP, SWEEP_KEY, SWEEP_ROWS_KEY, plan as iterate_plan)
+    ITERATE_OP, SWEEP_KEY, SWEEP_OWNER_KEY, SWEEP_ROWS_KEY, plan as iterate_plan)
 from nodelab_v2 import theme as T
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
@@ -71,6 +73,18 @@ PROGRESS_BAR_H = 5     # one of the two stacked bars (frame above, within-frame 
 #: separate sources and leave room to drop a first processing node beside each.
 SOURCE_STACK_GAP = 34
 PROGRESS_BAR_GAP = 2
+
+#: The longest a pressed ▶ may hold playback while its frames prepare (seconds). The hold
+#: is a bet that preparation is short — true for a byte-backed series (decompresses, over
+#: in a second or two) and for a cheap per-plane compute like a stitched mosaic (~0.5 s a
+#: frame at the preload's width). A series whose preparation PROJECTS past this cap loses
+#: the bet and starts playing immediately off whatever is warm, frames landing as they
+#: compute, while the preload keeps warming behind it — so the cap is never a cliff, only
+#: the moment honesty beats smoothness. Enforced twice: by the ETA check in
+#: :meth:`MainWindow._on_preload_progress` (drops the hold as soon as the measured rate
+#: says the wait would run long) and by a wall-clock watchdog armed at ▶ (drops it even if
+#: no tick ever arrives, so a wedged preload cannot strand a lit play button).
+PLAY_PREPARE_MAX_S = 8.0
 
 
 def _as_float(v) -> Optional[float]:
@@ -129,6 +143,48 @@ QTabBar::tab:hover {{ background:{T.PANEL_HI.name()}; }}
 FILE_FILTER = "nd2graph (*.nd2graph.json);;All files (*)"
 
 
+class _CompareBox(QWidget):
+    """The compare pane's frame: a slim header naming what the second ViewerPanel shows
+    — and whether its cursor is LINKED to the primary's — plus the close button. The
+    header exists because a bare second image is ambiguous: two similar results side by
+    side need the pane itself to say which node it is and why its sliders are (or are
+    not) there."""
+
+    def __init__(self, panel, on_close) -> None:
+        super().__init__()
+        self.panel = panel
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self._head = QWidget()
+        self._head.setObjectName("compareHead")
+        h = QHBoxLayout(self._head)
+        h.setContentsMargins(9, 2, 4, 2)
+        h.setSpacing(6)
+        self._title = QLabel("compare")
+        close = QToolButton()
+        close.setText("✕")
+        close.setAutoRaise(True)
+        close.setToolTip("Close the compare pane (Shift+F8)")
+        close.clicked.connect(on_close)
+        h.addWidget(self._title, 1)
+        h.addWidget(close)
+        v.addWidget(self._head)
+        v.addWidget(panel, 1)
+        self.restyle()
+
+    def set_title(self, text: str) -> None:
+        self._title.setText(text)
+
+    def restyle(self) -> None:
+        self._head.setStyleSheet(
+            f"QWidget#compareHead {{ background:{T.BODY.name()}; "
+            f"border-bottom:1px solid {T.BORDER.name()}; }}")
+        self._title.setStyleSheet(
+            f"color:{T.MUTED.name()}; font-size:10px; font-weight:800;")
+        self.panel.restyle()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -141,6 +197,16 @@ class MainWindow(QMainWindow):
         self.view = GraphView(self.scene)
         self.runner = EngineRunner(self.doc)
         self._viewed: Optional[str] = None
+        # ── the side-by-side compare pane (V2.28) ──────────────────────────────
+        # A SECOND ViewerPanel, created on first use (open_compare) and shown beside the
+        # primary one in a horizontal splitter. `_viewed2` is the node it shows;
+        # `_compare_linked` whether the two panes' M/T/Z extents match, in which case the
+        # compare pane drops its own cursor row and the primary's strips move both.
+        self.viewer2: Optional[ViewerPanel] = None
+        self._viewed2: Optional[str] = None
+        self._compare_box: Optional[_CompareBox] = None
+        self._viewer_split: Optional[QSplitter] = None
+        self._compare_linked = False
 
         # centre: a DOMINANT Viewer on top over the node canvas, split vertically. With
         # the console removed, the whole window height is split here, so the image gets
@@ -213,6 +279,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, ldock)
         self.tabifyDockWidget(idock, ldock)
         self._lablink_dock = ldock
+        self.lablink.send.load_into_graph.connect(self.lablink_load_result)
         idock.raise_()
 
         # Console removed — the reclaimed bottom-dock space goes to the central splitter
@@ -287,10 +354,11 @@ class MainWindow(QMainWindow):
         self.doc.on_change(self._on_doc_changed)
         self.doc.on_change(self.inspector.refresh_derived)   # G8 live ƒmd re-seed
         self.scene.pull_requested.connect(self.pull_node)
+        self.scene.compare_requested.connect(self.open_compare)
         self.scene.nodes_deleted.connect(self._on_nodes_deleted)
         self.runner.started.connect(
             lambda nid: (self.statusBar().showMessage(f"pulling {nid}…"),
-                         self.viewer.show_running(nid),
+                         [p.show_running(nid) for p in self._panes_showing(nid)],
                          self._set_led("busy"),
                          self.minimap.set_state("busy")))
         self.runner.finished.connect(self._on_run_finished)
@@ -308,6 +376,13 @@ class MainWindow(QMainWindow):
         # status bar counts the nodes that actually ran.
         self.runner.plan.connect(self._on_run_plan)
         self.runner.node_progress.connect(self._on_node_progress)
+        # A second branch requested while the first runs (2026-08-06): its cards go `queued`
+        # and the status bar says how many are lined up, so a queued pull is visibly waiting
+        # rather than indistinguishable from a click that did nothing.
+        self.runner.queued.connect(self._on_run_queued)
+        # ...and a run dropped by an edit inside its cone has to leave the running state, or
+        # its card spins for a result that will never arrive.
+        self.runner.cancelled.connect(self._on_run_cancelled)
         self.viewer.request_changed.connect(self._on_view_request)
         self.viewer.selection_changed.connect(self._on_frame_selection)
         self.viewer.iteration_changed.connect(self._on_iteration_changed)
@@ -414,6 +489,21 @@ class MainWindow(QMainWindow):
         again.setShortcut("Shift+F5")
         again.triggered.connect(lambda: self._viewed and self.pull_node(self._viewed))
         m_run.addAction(again)
+        comp = QAction("&Compare selected beside viewed", self)
+        comp.setShortcut("F8")
+        comp.setToolTip(
+            "Open the selected node's result in a second Viewer pane, side by side with "
+            "the one being viewed.\n\n"
+            "When both results span the same M/T/Z, the panes share ONE cursor — the "
+            "primary's strips move both — and the compare pane drops its own. Results "
+            "with different extents each keep their own strips. Also on a card's "
+            "right-click menu.")
+        comp.triggered.connect(self.compare_selected)
+        m_run.addAction(comp)
+        close_comp = QAction("Close compare &pane", self)
+        close_comp.setShortcut("Shift+F8")
+        close_comp.triggered.connect(self.close_compare)
+        m_run.addAction(close_comp)
         ingest = QAction("&Ingest all source files", self)
         ingest.setShortcut("Ctrl+I")
         ingest.setToolTip(
@@ -541,6 +631,14 @@ class MainWindow(QMainWindow):
         ungrp.setShortcut("Ctrl+Shift+G")
         ungrp.triggered.connect(self.ungroup_selection)
         m_graph.addAction(ungrp)
+        m_graph.addSeparator()
+        publish = QAction("&Publish as a LabLink recipe…", self)
+        publish.setToolTip(
+            "Offer this pipeline to a hub: choose which params a remote caller may turn, "
+            "validate against this build's node catalogue, and submit it for an operator to "
+            "install.")
+        publish.triggered.connect(self.publish_recipe)
+        m_graph.addAction(publish)
 
         m_view = self.menuBar().addMenu("&View")
         fit = QAction("&Fit graph", self)
@@ -681,6 +779,8 @@ class MainWindow(QMainWindow):
         for panel in (self.palette, self.inspector, self.viewer, self.sheet,
                       self.minimap, self.welcome, self.view, self.lablink):
             panel.restyle()
+        if self._compare_box is not None:
+            self._compare_box.restyle()   # restyles viewer2 with it
         self._paint_led()          # the LED colors come from the tokens, not from QSS
         self._sync_solo_chip()     # ditto for the solo chip's amber
         self.view.setBackgroundBrush(T.BG)
@@ -705,6 +805,10 @@ class MainWindow(QMainWindow):
             return
         self._maximized = on
         if on:
+            # the compare pane cannot follow the Viewer into the mini-map — one HUD
+            # frame, one panel — so maximizing ends the comparison rather than
+            # stranding a headless second pane in the splitter
+            self.close_compare()
             self._center_sizes = self._center.sizes()
             self.viewer.set_compact(True)
             self.minimap.attach(self.viewer)
@@ -761,16 +865,36 @@ class MainWindow(QMainWindow):
         starts an ingest — see :meth:`pull_node`."""
         nid, self._follow_pending = self._follow_pending, None
         if nid and nid in self.doc.nodes and nid != self._viewed:
-            self.pull_node(nid, allow_ingest=False)
+            # `queue=False`: a preview shows what is already computed and otherwise does
+            # nothing. It must never enqueue — this fires on every settled selection, so
+            # queueing here would turn clicking around during a long run into a committed
+            # backlog of pulls nobody asked for.
+            self.pull_node(nid, allow_ingest=False, queue=False)
 
     # ── document plumbing ─────────────────────────────────────────────────────
     def _on_doc_changed(self) -> None:
-        self.runner.invalidate()          # an edit supersedes in-flight results
+        # Only the runs this edit could have changed (2026-08-06). `last_touched` is the node
+        # the inspector or the card just wrote, or None for a structural edit that no single
+        # node accounts for — in which case every in-flight pull still goes, as before. This
+        # is what lets a finished branch be re-tuned while another branch is still computing.
+        touched = self.doc.last_touched
+        self.runner.invalidate(touched)
+        # A terminal `done` badge now OUTLIVES an unrelated branch starting (so a finished
+        # branch keeps saying so), which means the edit that actually invalidates a result has
+        # to retire it — or the card claims a result that no longer describes the node. The
+        # edited nodes and everything DOWNSTREAM of them are what a param change can alter;
+        # an unscoped edit retires the lot.
+        if touched is None:
+            self.scene.clear_run_states()
+        elif touched:
+            self.scene.clear_run_states_for(self.doc.downstream_of(touched))
         if self._viewed is not None and self._viewed not in self.doc.nodes:
             self._viewed = None           # the previewed node was deleted/reloaded away
             self.scene.set_viewed(None)
             self.minimap.set_state("idle")
             self._sync_minimap_title()
+        if self._viewed2 is not None and self._viewed2 not in self.doc.nodes:
+            self.close_compare()          # its node was deleted — an empty pane lies
         self._sync_solo(self._viewed)     # a rewired source changes the frame count
         name = self.doc.path or "untitled"
         self.statusBar().showMessage(f"{name} — rev {self.doc.revision}")
@@ -1015,14 +1139,15 @@ class MainWindow(QMainWindow):
             self._view_after_ingest = None
             self.pull_node(node_id)          # now immediate: the store is warm
 
-    def pull_node(self, node_id: str, *, allow_ingest: bool = True) -> None:
+    def pull_node(self, node_id: str, *, allow_ingest: bool = True,
+                  queue: bool = True) -> None:
         """Double-click / F5 on a card: compute it and show it in the Viewer.
 
         On a **source** card whose file has not been ingested yet, this starts that file's
         ingest instead (:meth:`~nodelab_v2.runner.EngineRunner.ingest_source`) and views it
-        once it lands. The difference is which lane the work runs in: a pull is one at a
-        time and latest-wins, so ingesting through it meant a second file could not start
-        until the first had finished — and on a 40-minute ND2 that is the whole session.
+        once it lands. The difference is which lane the work runs in: pulls are one at a
+        time (queued), so ingesting through it meant a second file could not start until the
+        first had finished — and on a 40-minute ND2 that is the whole session.
         Ingests run several at once on their own pool, so you can double-click every source
         card you just loaded and let them all go.
 
@@ -1052,7 +1177,152 @@ class MainWindow(QMainWindow):
         # frame chooser's extent has to be right before the coords it produces are sent.
         self._sync_solo(node_id)
         self.runner.set_frame_selection(*self.viewer.frame_selection())
-        self.runner.pull(node_id, self.viewer.coords(), self.viewer.channels())
+        self.runner.pull(node_id, self.viewer.coords(), self.viewer.channels(),
+                         queue=queue)
+
+    # ── the side-by-side compare pane (V2.28) ─────────────────────────────────
+    def _panes_showing(self, node_id: str) -> List:
+        """Which Viewer pane(s) a delivery for ``node_id`` lands in.
+
+        The primary pane keeps its historic contract — it shows whatever finishes
+        (first-to-land is viewable while the rest queue) — EXCEPT a result that belongs
+        exclusively to the compare pane. A node shown in both panes gets both."""
+        panes: List = []
+        if node_id == self._viewed or node_id != self._viewed2:
+            panes.append(self.viewer)
+        if (self._viewed2 is not None and node_id == self._viewed2
+                and self.viewer2 is not None):
+            panes.append(self.viewer2)
+        return panes
+
+    def compare_selected(self) -> None:
+        """Run → *Compare selected beside viewed* (F8)."""
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
+        if not sel:
+            self.statusBar().showMessage(
+                "select a node first — F8 opens it beside the viewed one")
+            return
+        self.open_compare(sel[0].node_id)
+
+    def open_compare(self, node_id: str) -> None:
+        """Open ``node_id``'s result in a second Viewer pane, side by side with the
+        primary one.
+
+        The two panes' cursors LINK automatically when both results span the same
+        M/T/Z — the compare pane then drops its own strips and the primary's move both
+        — and stay independent otherwise (:meth:`_sync_compare_link`). The pane is a
+        display surface only: picks, the troubleshooting scope and the iteration strip
+        stay with the primary pane."""
+        if node_id not in self.doc.nodes:
+            self.statusBar().showMessage(f"{node_id} is not on the canvas")
+            return
+        state = self.runner.source_state(node_id)
+        if state in ("cold", "running", "missing"):
+            self.statusBar().showMessage(
+                f"{self._source_label(node_id)} is not ingested yet — double-click its "
+                f"card first, then compare" if state != "missing" else
+                f"{self._source_label(node_id)}: no such file — fix the card's path")
+            return
+        if self._maximized:
+            self.set_maximized(False)   # the pane lives in the splitter the HUD vacated
+        self._ensure_compare_ui()
+        self._viewed2 = node_id
+        self._compare_linked = False
+        self.viewer2.set_axes_hidden(False)
+        self._sync_compare_title()
+        self._sync_solo(self._viewed)          # ranges the compare pane's chooser too
+        self._open_viewer()
+        self.runner.set_frame_selection(*self.viewer.frame_selection())
+        self.runner.pull(node_id, self.viewer2.coords(), self.viewer2.channels())
+
+    def close_compare(self) -> None:
+        """Put the Viewer back to one pane. The compare panel is kept (hidden) for the
+        next open, so its LUTs and channel choices survive a close/reopen."""
+        opened = self._viewer_split is not None and self._viewer_split.parent() is not None
+        if self._viewed2 is None and not opened:
+            return
+        self._viewed2 = None
+        self._compare_linked = False
+        if opened:
+            sizes = self._center.sizes()
+            self._center.insertWidget(0, self.viewer)   # reparents the panel back
+            self._viewer_split.setParent(None)          # takes the compare box with it
+            self._center.setSizes(sizes)
+        if self.viewer2 is not None:
+            self.viewer2.set_axes_hidden(False)
+        self.statusBar().showMessage("compare pane closed")
+
+    def _ensure_compare_ui(self) -> None:
+        """Build the second pane on first use; re-attach it on every later open."""
+        if self.viewer2 is None:
+            self.viewer2 = ViewerPanel()
+            self.viewer2.request_changed.connect(self._on_view_request2)
+            self.viewer2.display_limits.connect(self.runner.set_display_limits)
+            # the same window-owned callbacks the primary pane gets — they are all
+            # per-node, so both panes share them
+            self.viewer2.raw_plane_cb = self.runner.raw_plane
+            self.viewer2.detail_cb = self._request_detail
+            self.viewer2.own_layers_cb = self.doc.own_label_layers
+            self.runner.detail_ready.connect(self.viewer2.on_detail_ready)
+            self._compare_box = _CompareBox(self.viewer2, self.close_compare)
+            self._viewer_split = QSplitter(Qt.Horizontal)
+            self._viewer_split.setChildrenCollapsible(False)
+        if self._viewer_split.parent() is None:
+            sizes = self._center.sizes()
+            self._center.insertWidget(0, self._viewer_split)
+            # primary at index 0 ALWAYS — on a reopen the compare box is still inside
+            # the splitter from last time, so a plain addWidget would append the
+            # primary pane after it and flip the two panes
+            self._viewer_split.insertWidget(0, self.viewer)  # reparents from the centre
+            if self._compare_box.parent() is not self._viewer_split:
+                self._viewer_split.addWidget(self._compare_box)
+            self._compare_box.show()
+            self._viewer_split.show()
+            self._center.setSizes(sizes)
+            w = max(2, self._viewer_split.width())
+            self._viewer_split.setSizes([w // 2, w // 2])
+
+    def _sync_compare_link(self) -> None:
+        """Link or unlink the two panes' cursors from their METADATA: linked iff both
+        panes hold a result and the M/T/Z extents agree, per the payloads' own axes.
+        Linked, the compare pane's cursor row disappears (one set of sliders, moving
+        both); unlinked, it keeps its own. Re-derived after every delivery, because a
+        re-pull can change either side's extents."""
+        if self._viewed2 is None or self.viewer2 is None:
+            return
+        a, b = self.viewer.axes(), self.viewer2.axes()
+        linked = (a is not None and b is not None
+                  and (a.m, a.t, a.z) == (b.m, b.t, b.z))
+        self._compare_linked = linked
+        self.viewer2.set_axes_hidden(linked)
+        self._sync_compare_title()
+        if linked:
+            m, t, z, _c = self.viewer.coords()
+            m2, t2, z2, _c2 = self.viewer2.coords()
+            if (m, t, z) != (m2, t2, z2):
+                self.viewer2.set_cursor(m, t, z)
+                self.runner.request_plane(self._viewed2, self.viewer2.coords(),
+                                          self.viewer2.channels())
+
+    def _sync_compare_title(self) -> None:
+        if self._compare_box is None:
+            return
+        if self._viewed2 is None:
+            self._compare_box.set_title("compare")
+            return
+        rec = self.doc.nodes.get(self._viewed2)
+        spec = rec.spec() if rec is not None else None
+        label = spec.label if spec else (rec.op_key if rec is not None else "?")
+        tag = ("linked — one cursor moves both panes" if self._compare_linked
+               else "own cursor (different M/T/Z)")
+        self._compare_box.set_title(f"compare · {self._viewed2} · {label} — {tag}")
+
+    def _on_view_request2(self) -> None:
+        """The compare pane's cursor or channel set moved (its own strips are only
+        visible while UNLINKED; its channel toggles fire this either way)."""
+        if self._viewed2 is not None and self.viewer2 is not None:
+            self.runner.request_plane(self._viewed2, self.viewer2.coords(),
+                                      self.viewer2.channels())
 
     # ── dock / bake (V2.18) ───────────────────────────────────────────────────
     def _selected_dock(self) -> Optional[str]:
@@ -1480,12 +1750,15 @@ class MainWindow(QMainWindow):
 
     # ── iterate (V2.19) ───────────────────────────────────────────────────────
     def _iterate_owner(self, node_id: Optional[str]) -> Optional[str]:
-        """The Iterate node whose iteration strip belongs to ``node_id`` — itself, if it
-        is one. Only the Iterate node's OWN output is a choice between iterations; a node
-        inside its cone has one result per clone, and the clones are rewrite artifacts with
-        no card to select."""
-        rec = self.doc.nodes.get(node_id or "")
-        return node_id if rec is not None and rec.op_key == ITERATE_OP else None
+        """The Iterate card whose iteration strip belongs to ``node_id``.
+
+        Two nodes qualify (V2.22): the card itself, and the **end of its segment** — the
+        node whose id the rewrite's selector wears, and therefore the one place downstream
+        where the payload really is a choice between iterations. A node in the MIDDLE of the
+        segment does not: it is served by one clone (see
+        :meth:`~nodelab_v2.document.GraphDocument.iterate_aliases`), so there is nothing to
+        select there and a strip would imply otherwise."""
+        return self.doc.iterate_card_at(node_id or "")
 
     def _sync_iteration_strip(self, node_id: Optional[str]) -> None:
         """Show the viewer's iteration strip for an Iterate node, captioned with the value
@@ -1524,7 +1797,11 @@ class MainWindow(QMainWindow):
         rec.params["index"] = int(index)
         rec.modes["preserve"] = "picked"
         self.doc.touch()
-        self.pull_node(owner)
+        # Re-pull what is being VIEWED, not the card: the strip normally appears while the
+        # user is looking at the segment's end node, and re-pulling the card there would
+        # move the viewer off the node they are tuning to answer a question they asked
+        # about it.
+        self.pull_node(self._viewed or owner)
 
     def _on_iterate_action(self, node_id: str, action: str) -> None:
         """Run sweep / stop sweeping, from the Iterate panel."""
@@ -1555,18 +1832,25 @@ class MainWindow(QMainWindow):
         it and re-run the sweep forever. Written straight onto ``rec.params`` for the same
         reason: ``touch()`` would bump the document revision and cost a rebuild for a value
         nothing computes from."""
-        rec = self.doc.nodes.get(node_id)
         md = getattr(payload, "metadata", None)
-        if rec is None or rec.op_key != ITERATE_OP or not isinstance(md, dict):
+        if not isinstance(md, dict):
             return
         rows = md.get(SWEEP_ROWS_KEY)
         if not rows:
+            return
+        # WHOSE table this is comes off the payload, not off the node that produced it: the
+        # selector wears the segment END's id (V2.22), so the pull that carries a results
+        # table is usually of an ordinary analysis node. The card named in the payload is
+        # the one whose panel shows the table and whose `index` the strip edits.
+        owner = str(md.get(SWEEP_OWNER_KEY) or node_id)
+        rec = self.doc.nodes.get(owner)
+        if rec is None or rec.op_key != ITERATE_OP:
             return
         rec.params[SWEEP_KEY] = {"rows": [
             {"iter": r.get("iter"), "metric": r.get("metric"), "won": r.get("won")}
             for r in rows]}
         shown = getattr(self.inspector, "_node", None)
-        if shown is not None and getattr(shown, "node_id", None) == node_id:
+        if shown is not None and getattr(shown, "node_id", None) == owner:
             self.inspector.set_node(shown)      # redraw the table with the new metrics
 
     def _start_bake(self, node_id: str, *, scoped: bool = False) -> None:
@@ -1784,6 +2068,11 @@ class MainWindow(QMainWindow):
         on = self.runner.solo_frame
         self.viewer.set_solo(self.doc.source_scope_totals(node_id)
                             if (on and node_id) else None)
+        # the compare pane's chooser has to span ITS node's source extent for the same
+        # reason — a linked cursor is expressed in global frame indices
+        if self.viewer2 is not None and self._viewed2 is not None:
+            self.viewer2.set_solo(self.doc.source_scope_totals(self._viewed2)
+                                  if on else None)
         self._sync_solo_chip()
 
     def _scope_tag(self) -> str:
@@ -1832,9 +2121,18 @@ class MainWindow(QMainWindow):
             self._sync_solo_chip()
             self.runner.request_plane(self._viewed, self.viewer.coords(),
                                       self.viewer.channels())
+        # LINKED compare: the primary's strips are the one cursor, so its move carries
+        # the other pane with it — mirror silently, then ask for that pane's planes.
+        if self._compare_linked and self._viewed2 is not None and self.viewer2 is not None:
+            m, t, z, _c = self.viewer.coords()
+            self.viewer2.set_cursor(m, t, z)
+            self.runner.request_plane(self._viewed2, self.viewer2.coords(),
+                                      self.viewer2.channels())
 
     def _on_playing(self, on: bool, axis: str) -> None:
-        """Play pressed: decode the series first, then let it run (V2.23).
+        """Play pressed: warm the series ahead of the cursor, and hold playback only for a
+        wait that is actually short (V2.23; cost-gated 2026-08-06; the hold itself
+        cost-capped 2026-08-10).
 
         Pressing play says every frame is wanted, in order — the one statement that licenses
         reading them all, which the scrub prefetcher deliberately will not infer from a cursor
@@ -1843,15 +2141,30 @@ class MainWindow(QMainWindow):
         frames are separate reads, while Z of one volume comes back with the read that displayed
         its neighbour.
 
-        **Playback is HELD while that happens**, which is the difference between "smooth" and
-        "loads every time" (reported 2026-08-05). A computed chain cannot be played at 1 s a
-        frame; letting the timer run against cold frames just means every tick waits on a
-        decode. So the gate goes up, the progress bar says what is happening, and the timer
-        starts when the frames are resident — the same "load it, then play it" an ingested file
-        gets for free because its frames were already cheap.
+        **Any series the preload will read is HELD while it prepares — but never past**
+        :data:`PLAY_PREPARE_MAX_S`. The hold is the difference between "smooth" and "loads
+        every time" (reported 2026-08-05), and it is as right for a cheap per-plane compute
+        as for a byte read: a stitched mosaic or a Z-projection warms in seconds, and playing
+        it cold means every frame lands at its own decode latency — the ~9 fps, 33–267 ms
+        jitter recorded on the stitched series (2026-08-10). What the hold must never become
+        is a wait with nothing on screen, so it is capped by measured cost, not by provider
+        type: the moment the preload's own tick rate projects past the cap (or the watchdog
+        fires without a tick), the gate drops and playback runs off whatever is warm, frames
+        landing as they compute, while the preload keeps warming behind it.
 
-        A series too big for the budget preloads what fits and plays anyway: a partly-warm
-        playback is what was happening before, so it is a floor rather than a regression."""
+        **A whole-volume chain is never held and never preloaded** — there "every frame" is
+        the node running once per frame, ~130 s and ~30 GB of working set each, so the gate
+        was a wait of hours with nothing on screen: pressing play on the 3D-deconvolved set
+        stopped showing frames at all (2026-08-06). ``preload_series`` refuses those
+        (:meth:`EngineRunner._preload_jobs` = 0), no gate is raised, and playback advances as
+        each frame lands (:meth:`ViewerPanel.set_play_pacing`) rather than on a wall clock
+        nothing can keep up with."""
+        reads = (self._viewed is not None
+                 and self.runner.frames_are_reads(self._viewed))
+        if on:
+            # decided for EVERY axis, not just T: a cold Z step through a whole-volume chain
+            # is the same 130 s wait, and the first one pays it for the rest of the volume
+            self.viewer.set_play_pacing(not reads)
         if axis != "t":
             return
         if not on:
@@ -1864,19 +2177,54 @@ class MainWindow(QMainWindow):
         n = self.runner.preload_series(self._viewed, self.viewer.coords(),
                                       self.viewer.channels())
         if not n:
-            return                       # already resident: play immediately, as before
-        fits = self.runner.series_fits(planes=len(self.viewer.channels()))
+            return                       # already resident, or too costly to read ahead at
+                                         # all — either way, play immediately
+        # named explicitly: with a compare pane open the most recently held view may be the
+        # OTHER pane's node, and this sentence is about the series being played here
+        fits = self.runner.series_fits(planes=len(self.viewer.channels()),
+                                       node_id=self._viewed)
+        self._preload_hold_t0 = time.monotonic()
         self.viewer.set_play_gate(
             True, f"preparing {n} frame{'s' if n != 1 else ''} for smooth playback…"
                   + ("" if fits else "  (larger than the display memory budget — the tail "
                                      "will re-read)"))
         self._set_progress(0.0)
+        # the wall-clock half of the cap: a preload whose first frame never finishes emits
+        # no tick for the ETA check to judge, and a lit play button showing nothing is the
+        # exact state the 2026-08-06 report describes. Checked against `play_gated`, so a
+        # gate that already dropped (finished, cancelled, ETA) makes this a no-op.
+        node = self._viewed
+        QTimer.singleShot(int(PLAY_PREPARE_MAX_S * 1000),
+                          lambda: self._drop_play_gate(node))
 
     def _on_preload_progress(self, node_id: str, done: int, total: int) -> None:
-        if node_id == self._viewed and total:
-            self._set_progress(done / float(total))
-            self.statusBar().showMessage(
-                f"preparing frames for playback — {done}/{total}")
+        if node_id != self._viewed or not total:
+            return
+        self._set_progress(done / float(total))
+        self.statusBar().showMessage(
+            f"preparing frames for playback — {done}/{total}")
+        # The ETA half of the PLAY_PREPARE_MAX_S cap: judged on the preload's own measured
+        # rate, so a stitched mosaic that warms in three seconds keeps its hold (and plays
+        # smoothly from memory) while a chain that computes for minutes releases playback
+        # after the first couple of frames rather than at the watchdog. Two ticks before
+        # judging — one frame's wall time divided by one is not a rate.
+        if self.viewer.play_gated() and done >= 2:
+            elapsed = time.monotonic() - getattr(self, "_preload_hold_t0", 0.0)
+            if elapsed * total / done > PLAY_PREPARE_MAX_S:
+                self._drop_play_gate(node_id)
+
+    def _drop_play_gate(self, node_id: str) -> None:
+        """Release a held playback whose preparation is running long — the frames keep
+        warming behind it (the preload is NOT cancelled), so playback smooths out lap by
+        lap instead of holding a blank stare. No-op unless ``node_id`` is still the viewed
+        node with its gate up: the watchdog that arms this at ▶ may fire long after the
+        preload finished, the node changed, or playback stopped."""
+        if node_id != self._viewed or not self.viewer.play_gated():
+            return
+        self.viewer.set_play_gate(False)
+        self.statusBar().showMessage(
+            "playing while the rest of the series prepares — each frame shows as it "
+            "lands", 4000)
 
     def _on_preload_finished(self, node_id: str, completed: bool) -> None:
         """Frames are in: drop the gate and let the timer run.
@@ -1885,28 +2233,36 @@ class MainWindow(QMainWindow):
         up there would strand playback in a paused state whose button says it is playing, which
         is worse than playing a frame cold."""
         self._set_progress(None)
+        if completed and node_id == self._viewed:
+            # said whether or not the gate is still up: a hold released early by the cap
+            # reaches this point playing cold, and this is the moment it turns warm
+            self.statusBar().showMessage("playing from memory", 2500)
         if self.viewer.play_gated():
             self.viewer.set_play_gate(False)
-            if completed and node_id == self._viewed:
-                self.statusBar().showMessage("playing from memory", 2500)
 
     def _on_run_finished(self, node_id, payload, plane, axes, seconds) -> None:
         if plane:
             self._open_viewer()       # there is something to see now — unfold the pane
-        self.viewer.show_result(node_id, plane, axes, seconds, dataset=payload,
-                                overlay=self.runner.overlay_channels(node_id),
-                                overlay_note=self.runner.overlay_note(node_id),
-                                overlay_style=self.runner.overlay_style(node_id))
-        # flicker is a property of TIME, not of the composite, so it is driven here rather
-        # than folded into the style map the shader reads
-        self.viewer.set_overlay_flicker(self.runner.overlay_flicker_hz(node_id))
+        panes = self._panes_showing(node_id)
+        for pane in panes:
+            pane.show_result(node_id, plane, axes, seconds, dataset=payload,
+                             overlay=self.runner.overlay_channels(node_id),
+                             overlay_note=self.runner.overlay_note(node_id),
+                             overlay_style=self.runner.overlay_style(node_id))
+            # flicker is a property of TIME, not of the composite, so it is driven here
+            # rather than folded into the style map the shader reads
+            pane.set_overlay_flicker(self.runner.overlay_flicker_hz(node_id))
         if self._maximized:
             # a new axes shape rebuilds the channel/LUT controls, and fresh widgets are
             # visible — re-fold them so the mini-map keeps its compact strip
             self.viewer.set_compact(True, force=True)
-        self.sheet.show_dataset(node_id, payload)
-        self._record_sweep(node_id, payload)
-        self._sync_iteration_strip(node_id)
+        if self.viewer in panes:
+            # the spreadsheet, sweep table and iteration strip follow the PRIMARY pane:
+            # a compare delivery must not yank them off the node being tuned
+            self.sheet.show_dataset(node_id, payload)
+            self._record_sweep(node_id, payload)
+            self._sync_iteration_strip(node_id)
+        self._sync_compare_link()
         self.minimap.set_state("live")
         self._idle_led()                      # …unless files are still ingesting
         self._set_progress(None)              # the run is over — no bar to show
@@ -1925,6 +2281,25 @@ class MainWindow(QMainWindow):
         self._run_computed = 0
         self._run_cached = 0
         self.scene.set_run_plan(target, self._run_plan)
+
+    def _on_run_queued(self, node_id: str, depth: int) -> None:
+        """A pull joined the queue behind the running one: claim its cards as ``queued`` and
+        say so in the status bar. The branch is lined up, not lost."""
+        plan = [n for n in self.runner.planned_nodes(node_id) if n in self.doc.nodes]
+        self.scene.set_queued(node_id, plan)
+        running = self._run_target or "a node"
+        self.statusBar().showMessage(
+            f"{node_id} queued behind {running} — {depth} waiting")
+
+    def _on_run_cancelled(self, node_id: str) -> None:
+        """A queued or running pull was dropped because an edit landed inside its cone.
+        Retire its claim and clear the cards nothing else wants, so no card is left
+        reporting work that will never finish."""
+        self.scene.clear_run_plan(node_id)
+        self.scene.finish_run(None)
+        if not self.runner.busy:
+            self._set_led("idle")
+            self.minimap.set_state("idle")
 
     def _set_progress(self, fraction, levels: Optional[dict] = None) -> None:
         """Show the status-bar bars, or hide them when there is no honest number to show
@@ -2004,8 +2379,9 @@ class MainWindow(QMainWindow):
 
     def _on_plane_ready(self, node_id, planes, axes, seconds) -> None:
         # fast-path display update (scrub/play): no dataset re-delivery, no spreadsheet
-        # refresh — only the viewer's frame changes.
-        self.viewer.show_planes(node_id, planes, axes, seconds)
+        # refresh — only the showing pane's frame changes.
+        for pane in self._panes_showing(node_id):
+            pane.show_planes(node_id, planes, axes, seconds)
         # A COLD frame is decoded off the GUI thread and announces itself as "reading
         # planes" while it runs (EngineRunner._serve_from_cache); the frame landing is the
         # end of that, so the rail goes back to idle. A warm frame never raised it.
@@ -2028,7 +2404,8 @@ class MainWindow(QMainWindow):
         # …and the card that raised keeps its red 'error' state (the engine's error event
         # named it, which is more precise than the pulled node).
         self.scene.finish_run(node_id, failed=True)
-        self.viewer.show_error(node_id, trace)
+        for pane in self._panes_showing(node_id):
+            pane.show_error(node_id, trace)
         self._set_led("error")
         self._set_progress(None)              # a failed run must not leave a stale bar
         self.minimap.set_state("error")
@@ -2037,7 +2414,7 @@ class MainWindow(QMainWindow):
 
     # ── file (G6) ────────────────────────────────────────────────────────────
     def file_new(self) -> None:
-        self.doc.clear()
+        self.doc.clear()          # → _on_doc_changed closes the compare pane too
         self._viewed = None
         self.scene.set_viewed(None)
         self.minimap.set_state("idle")
@@ -2108,14 +2485,61 @@ class MainWindow(QMainWindow):
         A file the reader refuses does not cost the others: failures are collected and
         reported once, after every readable file has been placed.
         """
-        import os
-
         paths, _f = QFileDialog.getOpenFileNames(
             self, "Load ND2 / TIFF file(s)", "",
             "Microscopy images (*.nd2 *.tif *.tiff);;ND2 (*.nd2);;"
             "TIFF (*.tif *.tiff);;All files (*)")
         if not paths:
             return
+        self._load_source_paths(paths)
+
+    def publish_recipe(self) -> None:
+        """Graph → Publish as a LabLink recipe…
+
+        The window owns the document, so it is the window that hands it over — the panel and
+        the dialog only ask. Passes the dock's connected hub when there is one, so Submit is
+        available without asking for a URL and token a second time.
+        """
+        from nodelab_v2.lablink.authoring import publish_document
+
+        written = publish_document(self, self.doc,
+                                   hub=getattr(self.lablink.send, "_hub", None),
+                                   suggested_name="")
+        if written:
+            self.statusBar().showMessage(f"recipe written to {written}")
+
+    def lablink_load_result(self, path: str) -> None:
+        """A hub returned an image; put it on the canvas as a source node.
+
+        This is what makes a processed result a *starting point* rather than a file on disk:
+        the returned stack becomes an ``io.load`` card like any other, so the next thing
+        done with it happens here, in a graph that can be saved and published in turn.
+
+        The readers cover ND2 and TIFF only, so a returned PNG quicklook previews in the dock
+        and stops there — said plainly rather than failing with a reader error.
+        """
+        import os
+
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "LabLink", f"that result is no longer at {path}")
+            return
+        if not path.lower().endswith((".nd2", ".tif", ".tiff")):
+            QMessageBox.information(
+                self, "LabLink",
+                f"{os.path.basename(path)} is not an ND2 or TIFF, so there is no reader "
+                f"for it here. The dock's preview is the way to look at it.")
+            return
+        self._load_source_paths([path])
+        self.statusBar().showMessage(
+            f"loaded {os.path.basename(path)} from the hub — it is a source node now")
+
+    def _load_source_paths(self, paths: list) -> None:
+        """Drop one ``io.load`` card per path, stacked, selected, and scrolled into view.
+
+        Split out of :meth:`file_load_source` so the File menu and a returned LabLink result
+        take the identical path — including the per-file failure collection, which is what
+        keeps one unreadable file from costing the others."""
+        import os
 
         c = self.view.mapToScene(self.view.viewport().rect().center())
         x, y = c.x() - 107, c.y() - 40

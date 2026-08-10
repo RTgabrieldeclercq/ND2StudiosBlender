@@ -4,7 +4,7 @@ description: >-
   The step-by-step procedure for BUILDING a new node or MODIFYING an existing one in the
   nodegraph v2 engine (the greenfield rebuild under `nodegraph/`). Invoke whenever you are
   about to add a v2 node type, change a node's sockets/modes/compute, declare a Granularity
-  or meta_transform, or edit `nodegraph/nodes.py`. It grills the design, then writes, then
+  or meta_transform, or edit anything under `nodegraph/catalog/`. It grills the design, then writes, then
   runs a hard metadata/footprint gate and the nodegraph.selftest verify gate. Concepts live
   in wire-node-v2. This is the ONLY node-building skill (the legacy v1 `build-node` was
   deleted with v1 on 2026-07-29). Triggers:
@@ -79,9 +79,16 @@ Write the resolved spec into the compute's docstring — it is the record.
 
 ---
 
-## §1 — Build (write it in `nodegraph/nodes.py`)
+## §1 — Build (one file: `nodegraph/catalog/<category>/<name>.py`)
 
-One `register_node(compute, **spec)` per node. Templates (match the existing catalog):
+One `register_node(compute, **spec)` per node, in its **own module** under
+`nodegraph/catalog/` — that per-node split (V2.20) is what gives each node its own memo
+fingerprint. `nodegraph/nodes.py` is now only a facade that loads the catalog; do not add
+definitions there. Add the module to `nodegraph/catalog/__init__.py`'s `MODULES` tuple in the
+position you want it to appear in the link-drag search menu. Shared helpers go in
+`catalog/_shared/`, never in another node's module.
+
+Templates (match the existing catalog):
 
 ### Enhancement filter with a 2D/3D lever (the common case)
 
@@ -278,8 +285,13 @@ scale-invariance in the docstring.
 ## §4 — Verify gate (run ALL; fix red before "done")
 
 ```bash
+# 0. regenerate the agent codemap FIRST — the selftest's `test_codemap` fails on a stale map,
+#    so this is not optional and not last. Then READ the diff: it should show your op and
+#    nothing else. An unexpected line there is a finding, not noise.
+PYTHONUTF8=1 python scripts/_codemap.py write && git diff --stat codemap/
+
 # 1. the headless core + catalog selftest — the v2 node gate (add coverage for your node)
-PYTHONUTF8=1 python -m nodegraph.selftest            # must end "ALL NODEGRAPH SELF-TESTS PASSED"
+PYTHONUTF8=1 python -B -m nodegraph.selftest         # must end "ALL NODEGRAPH SELF-TESTS PASSED"
 
 # 2. the driven GUI probe — sockets/inspector/pull still behave (skip only for a pure
 #    docstring edit). Was preceded here by a v1 `pipeline_kit` parity gate; v1 was
@@ -315,7 +327,15 @@ Build the test image with a deterministic pattern (avoid RNG); guard the group w
 - [ ] **If a numba kernel was added:** it's a module-level `@nb.njit(cache=True)` pure
       numeric helper (no `ctx`/`Dataset`/scipy inside), and the numba↔numpy equivalence
       was checked on a fixture (see `scripts/_bench_nms_numba.py` for the pattern).
-- [ ] §4 green: `nodegraph.selftest` (with new coverage), v1 parity clean, force-import.
+- [ ] **Map regenerated and the diff READ.** `scripts/_codemap.py write`, then
+      `git diff codemap/` shows your op, its sockets, the new module — and nothing else.
+      If a curated entry fired, re-read it and `_codemap.py bless <ID> --verified <today>`.
+- [ ] **A row in the manual's node reference, `MANUAL.md` §15.** Gate-enforced by
+      `selftest::test_codemap`: that section is the curated judgement layer and is
+      deliberately not generated, so a new node needs prose written by hand. Say what it is
+      *for* and what will bite — the machine facts are already in `codemap/gen/nodes.jsonl`.
+- [ ] §4 green: `nodegraph.selftest` (with new coverage) and the driven GUI probe,
+      force-import, `scripts/_catalog_snapshot.py save` if the catalog change is intended.
 
 ---
 
@@ -323,3 +343,9 @@ Build the test image with a deterministic pattern (avoid RNG); guard the group w
 §4c layer-name sockets** · §5 the 2D/3D lever + variant sockets · §6 Granularity · §7 metadata intelligence (`unit`/`derive`, `ctx.calib`,
 `to_pixels_v2`) · §8 `meta_transform` · §9 structure/transfer/bridges · §10 the memo
 invariant.
+
+Every section above is stated in full in that skill's body. Eleven narrower ones — §4d path
+sockets, §4e `choice_docs`, §4f the per-branch domain rail, §4g inferred layer names, §5b/§5c
+mode gating, §7b provenance, §7c calibration restamping, §7d/§7e second Dataset inputs, §12
+numba — are summarised there and held in full under `wire-node-v2/references/`. Follow the
+pointer when the summary is not enough; the section numbers are the same either way.

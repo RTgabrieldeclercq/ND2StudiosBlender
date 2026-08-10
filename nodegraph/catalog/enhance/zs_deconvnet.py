@@ -29,6 +29,7 @@ from nodegraph.trained import (
     INFERENCE_KEY as _INFERENCE_KEY,
     read_json as _read_model_json,
     zs_signature_of as _zs_signature_of,
+    zs_note as _zs_note_of,
     zs_trained as _zs_trained_of,
 )
 
@@ -157,6 +158,11 @@ def _zs_trained(params, modes) -> Dict[str, Any]:
     the compute have to agree about it (wire-node-v2 §8).
     """
     return _zs_trained_of(params, modes)
+
+
+def _zs_note(params, modes) -> str:
+    """``NodeSpec.trained_note`` — see :func:`nodegraph.trained.zs_note`."""
+    return _zs_note_of(params, modes)
 
 
 def _zs_inference_record(*, arch: str, is_3d: bool, upsample: bool, insert_xy: int,
@@ -1056,6 +1062,9 @@ register_node(
     # same resolver, so an adopted `upsample` moves the predicted axes and the produced axes
     # together (§8). See `_zs_trained`.
     trained_params=_zs_trained,
+    # A published checkpoint carries NO sidecar, so nothing is adopted — which is
+    # correct and looks broken. This line says so (V2.23b).
+    trained_note=_zs_note,
     description="Zero-shot deconvolution network (Qiao et al. 2024): a dual-stage CNN "
                 "trained self-supervised on the incoming data itself — no ground truth — or "
                 "a published checkpoint run inference-only. Denoises and sharpens past the "

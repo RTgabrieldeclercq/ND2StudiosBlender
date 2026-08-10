@@ -31,7 +31,7 @@ from nodegraph.registry import PICK_KINDS
 #: Kinds resolved from the viewer's CURRENT state with no gesture at all — "use the channel
 #: I am looking at", "use this timepoint". They commit the moment they are armed, because
 #: there is nothing to aim: the answer is already on screen.
-INSTANT_KINDS = frozenset({"channel", "frame", "channels", "zrange"})
+INSTANT_KINDS = frozenset({"channel", "frame", "channels", "zrange", "frames"})
 
 #: Kinds committed off the intensity histogram rather than the image. The user is already
 #: dragging these handles to make the image readable; the pick is the missing path from
@@ -66,6 +66,8 @@ PICK_HELP: Dict[str, str] = {
     "channels": "Taking the channels the viewer has switched on.",
     "frame": "Taking the timepoint the viewer is showing.",
     "zrange": "Taking the Z planes picked on the Z strip (all of them if none are picked).",
+    "frames": "Taking the M / T / Z boxes ticked on the strips — or, for an axis with "
+              "nothing ticked, the frame you are looking at.",
     "percentile": "Set the histogram handles where you want them, then Apply.",
     "gamma": "Drag the histogram's gamma dot, then Apply.",
 }
@@ -91,6 +93,7 @@ PICK_ACTION: Dict[str, str] = {
     "channels": "Use the viewer's channels",
     "frame": "Use the current frame",
     "zrange": "Use the picked Z planes",
+    "frames": "Use the selected frames",
     "percentile": "Take the histogram window",
     "gamma": "Take the histogram gamma",
 }
@@ -697,7 +700,9 @@ def polygon_area(pts: Sequence[Tuple[float, float]]) -> float:
 
 def instant_values(req: PickRequest, *, channel: int, frame: int,
                    channels: Sequence[int], z_picks: Sequence[int] = (),
-                   z_total: int = 0) -> Dict[str, Any]:
+                   z_total: int = 0, m_picks: Sequence[int] = (),
+                   t_picks: Sequence[int] = (), position: int = 0,
+                   plane: int = 0) -> Dict[str, Any]:
     """Resolve an :data:`INSTANT_KINDS` pick from the viewer's current cursor state."""
     if req.kind == "channel":
         return {req.socket: int(channel)}
@@ -707,7 +712,42 @@ def instant_values(req: PickRequest, *, channel: int, frame: int,
         return {req.socket: ",".join(str(int(c)) for c in channels)}
     if req.kind == "zrange":
         return _zrange_values(req, z_picks, z_total)
+    if req.kind == "frames":
+        return _frames_values(req, m_picks, t_picks, z_picks,
+                             cursor=(int(position), int(frame), int(plane)))
     return {}
+
+
+def _frames_values(req: PickRequest, m_picks: Sequence[int], t_picks: Sequence[int],
+                   z_picks: Sequence[int], *,
+                   cursor: Tuple[int, int, int]) -> Dict[str, Any]:
+    """The M/T/Z strip selections → ONE frame-spec string (``"m0-2,t3,z1-4"``).
+
+    One value, not three, because the thing being selected is one thing: "these frames". It
+    is also what makes the gesture work for a SINGLE frame — an axis with nothing ticked
+    takes the index **the cursor is on**, so looking at position 2, timepoint 7 and pressing
+    Pick crops to exactly the frame on screen without ticking anything first. That includes
+    ``z``: what is displayed is one plane, so "the frame I am looking at" is that plane, and
+    since the spec lands in a visible, editable socket, deleting the ``z`` section is how you
+    say "the whole volume of that frame".
+
+    The picks stay SPARSE, which is the whole reason the socket takes text: the strips are
+    multi-selects, so ticking timepoints 2, 5 and 9 is a statement about three frames, and
+    taking their span (what :func:`_zrange_values` must do for a pair of INT bounds) would
+    silently re-admit the six in between. Contiguous runs collapse to ``0-3`` through the
+    canonical formatter, so one selection has exactly one spelling and the value stays
+    hand-editable, indistinguishable from a typed one.
+    """
+    # The formatter lives next to the PARSER (`nodegraph.metadata`) rather than here, and is
+    # deliberately not `framestrip.compact_list`, which looks like the same function and is
+    # not: that one is a tooltip formatter (en-dashes, ", " separators, "—" for empty, and
+    # elision past six runs), so its output is both unparseable and, on a long selection,
+    # incomplete. This is a VALUE, and it must round-trip through the socket's own parser.
+    from nodegraph.metadata import format_frame_spec
+    picked = {"m": m_picks, "t": t_picks, "z": z_picks}
+    return {req.socket: format_frame_spec(
+        {a: (sorted({int(i) for i in picked[a]}) or [cur])
+         for a, cur in zip(("m", "t", "z"), cursor)})}
 
 
 def _zrange_values(req: PickRequest, z_picks: Sequence[int],

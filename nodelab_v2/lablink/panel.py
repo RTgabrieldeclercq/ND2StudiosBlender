@@ -10,7 +10,12 @@ from LabLink's own read-only console API. The panel cannot see inside a hub-spaw
 not pretend to: it reads the one authoritative source there is and says so.
 
 **Sending work** — the client side. Point at somebody else's hub, browse the recipes its
-operator curated, turn the knobs they whitelisted, run, and pull the results back.
+operator curated, turn the knobs they whitelisted, and **keep the session open while you
+tune**: the hub holds the worker and its cache warm, so the second run after a knob change
+costs milliseconds instead of the whole pipeline. Results render here rather than only landing
+on disk, because a knob change that has to be judged somewhere else does not get judged. The
+machinery for that lives in :mod:`nodelab_v2.lablink.tuning`; this module is the layout and
+the wiring.
 
 **Nothing here touches the network on the GUI thread.** Every call goes through
 :class:`_Task`, a one-shot ``QThread``. A blocking ``urllib`` call on the UI thread freezes
@@ -18,28 +23,36 @@ the whole editor for the socket timeout — 40 s, or the length of a long poll �
 panel's job is to make a *remote* machine's state legible, which means it is talking to
 something slow and occasionally absent by definition.
 
-Qt. The only module in :mod:`nodelab_v2.lablink` that imports PySide6, deliberately: the
-worker must stay importable on a box with no display.
+Qt — one of the three modules here that import PySide6, with
+:mod:`~nodelab_v2.lablink.tuning` and :mod:`~nodelab_v2.lablink.authoring`. Everything else
+in the package stays Qt-free deliberately: the worker has to be importable on a hub with no
+display.
 """
 from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
-    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QPlainTextEdit, QProgressBar,
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from nodelab_v2 import theme as T
+from nodelab_v2.lablink import presets as PR
 from nodelab_v2.lablink import protocol as P
-from nodelab_v2.lablink.client import HubClient, LabLinkError
+from nodelab_v2.lablink import sidecar as SC
+from nodelab_v2.lablink import tuning as TUNE
+from nodelab_v2.lablink.client import HubClient, LabLinkError, repair_name
 
 #: How often the Serving tab re-reads a local hub's console state.
 POLL_MS = 3000
@@ -395,81 +408,192 @@ def _console_state(port: int) -> Dict[str, Any]:
 # ── sending work ────────────────────────────────────────────────────────────────
 
 class SendPanel(_TaskHost):
-    """Send this machine's work to somebody else's hub."""
+    """Send this machine's work to somebody else's hub, and tune it against a warm session.
+
+    The shape of this tab is the shape of the workflow it exists for: connect once, choose a
+    recipe, upload once, then **run / look / adjust / run again** against a session that
+    stays open. The hub keeps the worker and its cache warm between commands, so the second
+    run after a knob change recomputes only what that knob invalidated — a run that costs a
+    second cold comes back in milliseconds. A panel that opened a fresh session per attempt
+    would throw that away and pay the cold cost every time, which is what this one used to
+    do.
+    """
+
+    #: A returned image the editor should open as a source node. The panel only *asks*; the
+    #: window owns the document and does it — the same rule every other panel here follows.
+    load_into_graph = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._hub: Optional[HubClient] = None
         self._recipes: Dict[str, Dict[str, Any]] = {}
-        self._knob_widgets: Dict[str, QWidget] = {}
-        self._input_path = ""
+        self._presets = PR.PresetStore()
+        self._session = TUNE.SessionController(self)
+        self._last: Optional[TUNE.RunOutcome] = None
+        self._last_record: Optional[PR.RunRecord] = None
+        self._sidecar_dir = ""
+        #: What has actually been uploaded to the live session, so a changed file is re-sent.
+        self._sent_path = ""
+        self._settings = _load_settings()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
+        root.addWidget(self._build_hub_box())
+        root.addWidget(self._build_recipe_box())
+        root.addWidget(self._build_data_box())
+
+        self._knobs_box = QGroupBox("Knobs the recipe allows")
+        kb = QVBoxLayout(self._knobs_box)
+        kb.setContentsMargins(8, 8, 8, 8)
+        self._knobs = TUNE.KnobForm()
+        kb.addWidget(self._knobs)
+        root.addWidget(self._knobs_box)
+
+        root.addWidget(self._build_run_box())
+
+        self._card = TUNE.ResultCard()
+        self._card.load_into_graph.connect(self.load_into_graph)
+        root.addWidget(self._card, 1)
+
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumHeight(140)
+        root.addWidget(self._log)
+
+        self._wire_session()
+        self._sync_buttons()
+
+    # ── construction ────────────────────────────────────────────────────────────
+    def _build_hub_box(self) -> QWidget:
         conn = QGroupBox("Hub")
         cl = QGridLayout(conn)
-        self._url = QLineEdit(f"http://10.132.157.104:{P.DEFAULT_PORT}")
+        self._url = QLineEdit(self._settings.get("url")
+                              or f"http://localhost:{P.DEFAULT_PORT}")
         self._url.setPlaceholderText("http://<hub>:8765")
         self._token = QLineEdit()
         self._token.setEchoMode(QLineEdit.EchoMode.Password)
         self._token.setPlaceholderText("the site token, or this node's own once enrolled")
-        self._node = QLineEdit()
+        self._token.setToolTip(
+            "Not saved to disk. The token is anti-misdirection rather than security — it "
+            "stops you sending into the wrong machine on a shared subnet — but writing it "
+            "into a settings file is still the wrong place for it.")
+        self._node = QLineEdit(self._settings.get("node") or "")
         self._node.setPlaceholderText("optional: this machine's enrolled node id")
         self._node.setToolTip(
             "Only once ENROLLED. Sending a node id the hub does not know is a 401, not a "
             "quiet fallback to the site token.")
         self._connect = QPushButton("Connect")
         self._connect.clicked.connect(self._do_connect)
+        self._enroll = QPushButton("Enrol this machine…")
+        self._enroll.setToolTip(
+            "Mint a node identity for this machine so an operator can revoke exactly this "
+            "one. Do it ONCE — enrolling on every launch fills their node list with "
+            "entries they cannot tell apart.")
+        self._enroll.clicked.connect(self._do_enroll)
+        self._enroll.setEnabled(False)
         cl.addWidget(QLabel("URL"), 0, 0)
         cl.addWidget(self._url, 0, 1)
         cl.addWidget(QLabel("Token"), 1, 0)
         cl.addWidget(self._token, 1, 1)
         cl.addWidget(QLabel("Node id"), 2, 0)
         cl.addWidget(self._node, 2, 1)
-        cl.addWidget(self._connect, 0, 2, 3, 1)
-        root.addWidget(conn)
+        cl.addWidget(self._connect, 0, 2)
+        cl.addWidget(self._enroll, 2, 2)
+        return conn
 
+    def _build_recipe_box(self) -> QWidget:
         pick = QGroupBox("Recipe")
         pl = QFormLayout(pick)
         self._recipe = QComboBox()
         self._recipe.currentTextChanged.connect(self._recipe_changed)
         pl.addRow("Workflow / recipe", self._recipe)
+
+        row = QHBoxLayout()
+        self._preset = QComboBox()
+        self._preset.setToolTip(
+            "Knob settings you saved for this recipe. They live on this machine and are "
+            "applied when you run; nothing is sent to the hub until then.")
+        self._preset.activated.connect(self._apply_preset)
+        self._save_preset = QPushButton("Save as…")
+        self._save_preset.clicked.connect(self._do_save_preset)
+        self._delete_preset = QPushButton("Delete")
+        self._delete_preset.clicked.connect(self._do_delete_preset)
+        self._promote = QPushButton("Promote to recipe…")
+        self._promote.setToolTip(
+            "Turn these knob values into a derived recipe an operator can install, so "
+            "somebody else can run exactly this.")
+        self._promote.clicked.connect(self._do_promote)
+        for widget in (self._preset, self._save_preset, self._delete_preset,
+                       self._promote):
+            row.addWidget(widget)
+        pl.addRow("Preset", _wrap(row))
+
         self._recipe_note = _muted(QLabel("connect to a hub to see what its operator "
                                           "offers"))
         self._recipe_note.setWordWrap(True)
         pl.addRow(self._recipe_note)
-        root.addWidget(pick)
+        return pick
 
-        self._knobs_box = QGroupBox("Knobs the recipe allows")
-        self._knobs_form = QFormLayout(self._knobs_box)
-        root.addWidget(self._knobs_box)
-
-        send = QGroupBox("Data and run")
+    def _build_data_box(self) -> QWidget:
+        send = QGroupBox("Data")
         sl = QGridLayout(send)
         self._file = QLineEdit()
         self._file.setPlaceholderText("optional — leave empty for the recipe's own source")
+        self._file.textChanged.connect(self._file_changed)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
-        self._dest = QLineEdit(os.path.join(os.path.expanduser("~"), "lablink-results"))
-        self._run = QPushButton("Run on the hub")
-        self._run.clicked.connect(self._do_run)
-        self._run.setEnabled(False)
+        self._dest = QLineEdit(self._settings.get("dest")
+                               or os.path.join(os.path.expanduser("~"), "lablink-results"))
+        self._meta_note = _muted(QLabel(""))
+        self._meta_note.setWordWrap(True)
         sl.addWidget(QLabel("Send file"), 0, 0)
         sl.addWidget(self._file, 0, 1)
         sl.addWidget(browse, 0, 2)
         sl.addWidget(QLabel("Results into"), 1, 0)
         sl.addWidget(self._dest, 1, 1, 1, 2)
-        sl.addWidget(self._run, 2, 1, 1, 2)
-        root.addWidget(send)
+        sl.addWidget(self._meta_note, 2, 0, 1, 3)
+        return send
 
+    def _build_run_box(self) -> QWidget:
+        box = QWidget()
+        row = QGridLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        self._run = QPushButton("Run on the hub")
+        self._run.clicked.connect(self._do_run)
+        self._cancel = QPushButton("Cancel")
+        self._cancel.setToolTip(
+            "Cancellation is cooperative at step boundaries: the hub asks the worker to "
+            "stop at the next node it has not started, and escalates to killing it if a "
+            "single long step never checks.")
+        self._cancel.clicked.connect(self._session.cancel)
+        self._end = QPushButton("End session")
+        self._end.setToolTip(
+            "Close the session and free the hub's slot. The warm cache goes with it, so "
+            "the next run pays the full cost again.")
+        self._end.clicked.connect(self._do_end)
         self._bar = QProgressBar()
         self._bar.setVisible(False)
-        root.addWidget(self._bar)
-        self._log = QPlainTextEdit()
-        self._log.setReadOnly(True)
-        root.addWidget(self._log, 1)
+        self._state_note = _muted(QLabel("not connected"))
+        row.addWidget(self._run, 0, 0)
+        row.addWidget(self._cancel, 0, 1)
+        row.addWidget(self._end, 0, 2)
+        row.addWidget(self._state_note, 0, 3)
+        row.addWidget(self._bar, 1, 0, 1, 4)
+        row.setColumnStretch(3, 1)
+        return box
+
+    def _wire_session(self) -> None:
+        s = self._session
+        s.opened.connect(self._session_opened)
+        s.state_changed.connect(self._session_state)
+        s.progress.connect(self._session_progress)
+        s.ran.connect(self._session_ran)
+        s.fetched.connect(self._session_fetched)
+        s.failed.connect(self._session_failed)
+        s.log.connect(self._say)
+        s.lost.connect(self._session_lost)
 
     # ── connect ─────────────────────────────────────────────────────────────────
     def _do_connect(self) -> None:
@@ -501,6 +625,18 @@ class SendPanel(_TaskHost):
                   f"{hello.get('version')}, {caps.get('sessions_open')}/"
                   f"{caps.get('sessions_limit')} session(s) in use, "
                   f"max file {_human_bytes(hello.get('max_file_bytes'))}")
+        protocol = hello.get("protocol")
+        if protocol != P.WORKER_PROTOCOL_VERSION:
+            # Fail closed on a protocol we do not understand, rather than guessing.
+            self._say(f"WARNING: this hub speaks protocol {protocol!r} and this build "
+                      f"knows {P.WORKER_PROTOCOL_VERSION}. Anything below may be wrong.")
+        if not caps.get("recipe_metadata_requirements"):
+            # Absent means "this hub cannot tell you", which is not the same as "no recipe
+            # requires anything" — reading it as the latter fails OPEN.
+            self._say("note: this hub does not publish per-recipe metadata requirements, "
+                      "so an empty requirement list here means 'cannot say', not 'none'.")
+        self._enroll.setEnabled(bool(caps.get("enroll")) and not self._node.text().strip())
+
         self._recipes.clear()
         self._recipe.clear()
         broken = []
@@ -521,198 +657,405 @@ class SendPanel(_TaskHost):
                 self._say(f"    {line}")
         if not self._recipes:
             self._say("this hub offers no usable recipes.")
-        self._run.setEnabled(bool(self._recipes))
+        self._save_settings()
+        self._sync_buttons()
 
     def _connect_failed(self, message: str) -> None:
         self._connect.setEnabled(True)
         self._say(f"could not connect: {message}")
 
-    # ── recipe + knobs ──────────────────────────────────────────────────────────
+    def _do_enroll(self) -> None:
+        hub = self._hub
+        if hub is None:
+            return
+        label, ok = QInputDialog.getText(
+            self, "Enrol this machine",
+            "A name the operator will see for this machine:",
+            text=os.environ.get("COMPUTERNAME", "") or "microscope-pc")
+        if not ok:
+            return
+        self._enroll.setEnabled(False)
+        self.spawn(lambda: hub.enroll(label=label.strip()), self._enrolled,
+                   lambda m: (self._say(f"enrolment failed: {m}"),
+                              self._enroll.setEnabled(True)))
+
+    def _enrolled(self, node_id: str) -> None:
+        self._node.setText(node_id)
+        self._say(f"enrolled as node {node_id!r}. Saved — do not enrol again on this "
+                  f"machine.")
+        self._save_settings()
+
+    # ── recipe + presets ────────────────────────────────────────────────────────
     def _recipe_changed(self, key: str) -> None:
-        while self._knobs_form.rowCount():
-            self._knobs_form.removeRow(0)
-        self._knob_widgets.clear()
         meta = self._recipes.get(key)
+        self._knobs.set_recipe(meta or {})
+        self._reload_presets()
         if not meta:
+            self._recipe_note.setText("connect to a hub to see what its operator offers")
             return
         runtime = meta.get("expected_runtime_s") or {}
-        self._recipe_note.setText(
-            f"{meta.get('title') or meta.get('name')} — target {meta.get('target')!r}, "
-            f"{meta.get('node_count')} node(s), typically "
-            f"{runtime.get('typical', '?')}s (worst {runtime.get('worst', '?')}s). "
-            f"{meta.get('description') or ''}")
-        for knob in meta.get("knobs") or []:
-            self._add_knob(knob)
+        needs = meta.get("requires_metadata") or []
+        note = (f"{meta.get('title') or meta.get('name')} — target "
+                f"{meta.get('target')!r}, {meta.get('node_count')} node(s), typically "
+                f"{runtime.get('typical', '?')}s (worst {runtime.get('worst', '?')}s). "
+                f"{meta.get('description') or ''}")
+        if needs:
+            note += (f"\nDerives from: {', '.join(needs)} — a file that does not supply "
+                     f"these is refused rather than run with defaults.")
+        self._recipe_note.setText(note)
+        self._file_changed()
+        self._sync_buttons()
 
-    def _add_knob(self, knob: Dict[str, Any]) -> None:
-        name = str(knob.get("name"))
-        ktype = str(knob.get("type") or "float")
-        unit = str(knob.get("unit") or "")
-        label = str(knob.get("label") or name) + (f"  [{unit}]" if unit else "")
-        widget: QWidget
-        # The first entry of every dropdown is the DO-NOT-SEND one, and it is labelled
-        # rather than left blank: an empty combo box reads as a broken control, when what
-        # it actually means is "the operator already chose, leave it alone". Its userData is
-        # empty, which is what _collect_knobs keys the omission on — so the label can say
-        # anything without changing what goes on the wire.
-        if ktype == "enum" and knob.get("enum"):
-            widget = QComboBox()
-            widget.addItem(_leave_alone(knob), "")
-            for choice in knob["enum"]:
-                widget.addItem(str(choice), str(choice))
-        elif ktype == "bool":
-            widget = QComboBox()
-            widget.addItem(_leave_alone(knob), "")
-            widget.addItem("true", "true")
-            widget.addItem("false", "false")
-        elif ktype == "int":
-            widget = QLineEdit()
-            widget.setPlaceholderText(_knob_hint(knob))
-        elif ktype in ("string", "channel_list"):
-            widget = QLineEdit()
-            widget.setPlaceholderText(_knob_hint(knob))
-        else:
-            widget = QLineEdit()
-            widget.setPlaceholderText(_knob_hint(knob))
-        tip = str(knob.get("help") or "")
-        if knob.get("derive") or knob.get("unset_means") == "derive":
-            tip += ("\n\nLEAVE THIS EMPTY unless you mean to override the microscope: "
-                    "unset, the hub derives it from your file's own calibration. Pinning "
-                    "it silently overrides that.")
-        widget.setToolTip(tip.strip())
-        self._knobs_form.addRow(label, widget)
-        self._knob_widgets[name] = widget
+    def _current(self) -> Optional[Dict[str, Any]]:
+        return self._recipes.get(self._recipe.currentText())
 
-    def _collect_knobs(self) -> Dict[str, Any]:
-        """Read the widgets into a knob dict, omitting everything left blank.
+    def _reload_presets(self) -> None:
+        self._preset.clear()
+        self._preset.addItem("— none —", "")
+        meta = self._current()
+        if not meta:
+            return
+        problem = self._presets.problem()
+        if problem:
+            self._say(problem)
+        for preset in self._presets.for_recipe(meta["workflow"], meta["name"]):
+            self._preset.addItem(preset.name, preset.name)
 
-        Blank means *absent*, never zero and never the default: a knob the recipe marks
-        ``unset_means: "derive"`` must be left out so the hub derives it, and a knob with a
-        declared default is already chosen by the operator.
-        """
-        meta = self._recipes.get(self._recipe.currentText()) or {}
-        specs = {str(k.get("name")): k for k in (meta.get("knobs") or [])}
-        out: Dict[str, Any] = {}
-        for name, widget in self._knob_widgets.items():
-            spec = specs.get(name) or {}
-            ktype = str(spec.get("type") or "float")
-            if isinstance(widget, QComboBox):
-                # userData, not the visible text: the "leave alone" row carries a label.
-                text = str(widget.currentData() or "").strip()
-            else:
-                text = widget.text().strip()
-            if not text:
-                continue
-            if ktype == "bool":
-                out[name] = text == "true"
-            elif ktype == "int":
-                out[name] = int(text)
-            elif ktype == "float":
-                out[name] = float(text)
-            elif ktype == "channel_list":
-                out[name] = [int(p) for p in text.replace(" ", "").split(",") if p]
-            else:
-                out[name] = text
-        return out
+    def _apply_preset(self) -> None:
+        meta = self._current()
+        name = str(self._preset.currentData() or "")
+        if not meta or not name:
+            return
+        preset = self._presets.get(meta["workflow"], meta["name"], name)
+        if preset is None:
+            return
+        applied = PR.apply_preset(preset, meta)
+        self._knobs.set_values(applied.knobs)
+        for warning in applied.warnings():
+            # Never silently dropped: a recipe can change under a preset, and a preset that
+            # quietly does something else is worse than one that refuses.
+            self._say(f"preset {name!r}: {warning}")
+        if applied.clean and not applied.warnings():
+            self._say(f"applied preset {name!r}")
 
+    def _do_save_preset(self) -> None:
+        meta = self._current()
+        if not meta:
+            return
+        knobs, problem = self._knobs.validate(meta)
+        if problem:
+            self._say(f"not saved — {problem}")
+            return
+        name, ok = QInputDialog.getText(self, "Save these knobs",
+                                        "A name you will recognise later:")
+        if not ok or not name.strip():
+            return
+        preset = PR.Preset(
+            name=name.strip(), workflow=meta["workflow"], recipe=meta["name"],
+            knobs=knobs, hub=self._url.text().strip(),
+            saved=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        try:
+            self._presets.save(preset)
+        except (OSError, ValueError) as exc:
+            self._say(f"could not save the preset: {exc}")
+            return
+        self._reload_presets()
+        index = self._preset.findData(preset.name)
+        if index >= 0:
+            self._preset.setCurrentIndex(index)
+        self._say(f"saved preset {preset.name!r} ({len(knobs)} knob(s))")
+
+    def _do_delete_preset(self) -> None:
+        meta = self._current()
+        name = str(self._preset.currentData() or "")
+        if not meta or not name:
+            return
+        if self._presets.delete(meta["workflow"], meta["name"], name):
+            self._say(f"deleted preset {name!r}")
+            self._reload_presets()
+
+    def _do_promote(self) -> None:
+        meta = self._current()
+        if not meta:
+            return
+        knobs, problem = self._knobs.validate(meta)
+        if problem:
+            self._say(f"cannot promote — {problem}")
+            return
+        from nodelab_v2.lablink.authoring import promote_preset
+        promote_preset(self, hub=self._hub, recipe_meta=meta, knobs=knobs,
+                       say=self._say)
+
+    # ── data ────────────────────────────────────────────────────────────────────
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Send a file to the hub", "",
+            self, "Send a file to the hub", self._settings.get("last_dir", ""),
             "Images (*.nd2 *.tif *.tiff);;All files (*)")
         if path:
             self._file.setText(path)
+            self._settings["last_dir"] = os.path.dirname(path)
+            self._save_settings()
+
+    def _file_changed(self) -> None:
+        """Say up front what this file can and cannot answer for the chosen recipe.
+
+        Before the upload, not after: `missing_metadata` is a refusal that arrives once the
+        bytes have crossed, and the whole point of reading the sidecar draft here is that a
+        person finds out while they can still pick a different file.
+        """
+        path = self._file.text().strip()
+        meta = self._current()
+        if not path or not os.path.isfile(path) or not meta:
+            self._meta_note.setText("")
+            return
+        needs = [str(f) for f in (meta.get("requires_metadata") or [])]
+        if not needs:
+            self._meta_note.setText("")
+            return
+        self.spawn(lambda: SC.draft(path), self._show_meta_state,
+                   lambda m: self._meta_note.setText(f"could not read this file: {m}"))
+
+    def _show_meta_state(self, draft: Any) -> None:
+        meta = self._current()
+        if not meta:
+            return
+        needs = [str(f) for f in (meta.get("requires_metadata") or [])]
+        unmet = draft.unmet(needs)
+        if unmet:
+            self._meta_note.setText(
+                f"This file does not supply {', '.join(unmet)}, which this recipe derives "
+                f"from. Running it would be refused — use 'Fix metadata…' to supply them.")
+        else:
+            self._meta_note.setText(
+                f"metadata this recipe needs: all present ({', '.join(needs)})")
 
     # ── run ─────────────────────────────────────────────────────────────────────
     def _do_run(self) -> None:
+        meta = self._current()
         hub = self._hub
-        meta = self._recipes.get(self._recipe.currentText())
         if hub is None or not meta:
             return
-        try:
-            knobs = self._collect_knobs()
-        except ValueError as exc:
-            self._say(f"a knob value is not a number: {exc}")
+        knobs, problem = self._knobs.validate(meta)
+        if problem:
+            self._say(f"not sent — {problem}")
             return
-        path = self._file.text().strip()
         dest = self._dest.text().strip() or "."
-        workflow, recipe = meta["workflow"], meta["name"]
-        self._run.setEnabled(False)
-        self._bar.setVisible(True)
-        self._bar.setRange(0, 0)                       # indeterminate until told otherwise
-        self._say(f"opening a session for {workflow}/{recipe} …")
+        path = self._file.text().strip()
+        self._save_settings()
 
-        # Progress arrives on the task thread; hop it onto the GUI thread by signal rather
-        # than touching widgets from there.
-        def work() -> Dict[str, Any]:
-            lines: List[str] = []
-            with hub.open_session(workflow, recipe, label="ND2Studios editor",
-                                 knobs=knobs) as session:
-                lines.append(f"session {session.id} ready "
-                             f"(quota {session.quota_mb} MB)")
-                refs = []
-                if path:
-                    ref = session.send_data(path)
-                    lines.append(f"sent {ref.name!r} ({_human_bytes(ref.size)}"
-                                 + (", name repaired for the exchange" if ref.repaired
-                                    else "") + ")")
-                    refs.append(ref)
-                result = session.run(inputs=refs, check=False,
-                                     on_progress=lambda p: lines.append("  " + p.text))
-                lines.append(f"{result.state} in {result.duration_s}s — "
-                             f"{result.progress.computed} computed, "
-                             f"{result.cached_steps} cached")
-                if not result.ok:
-                    lines.append(f"the hub reported: {result.code} — {result.message}")
-                    lines.append("the session stayed usable; change a knob and run again.")
-                if result.held():
-                    session.pull()
-                    lines.append(f"pulled held artifact(s): "
-                                 f"{', '.join(result.held())}")
-                got = session.fetch_all(dest) if (result.ok or result.artifacts) else []
-                for written in got:
-                    lines.append(f"got {os.path.basename(written)} "
-                                 f"({_human_bytes(os.path.getsize(written))}, verified)")
-            return {"lines": lines, "state": result.state}
+        if not self._session.alive and self._session.state != "opening":
+            self._say(f"opening a session for {meta['workflow']}/{meta['name']} …")
+            self._session.open(hub, meta["workflow"], meta["name"], knobs=knobs)
+            self._sent_path = ""
+        # Uploaded once per session, and again whenever the FILE changes — otherwise a warm
+        # session keeps running the first file after somebody picks a second one, and every
+        # number is attributed to the wrong image with nothing reporting it.
+        if path and path != self._sent_path:
+            sidecar = self._write_sidecar(path, meta)
+            self._session.send_file(path, sidecar_path=sidecar)
+            self._sent_path = path
+        self._session.run(knobs, results_dir=dest)
+        self._sync_buttons()
 
-        self.spawn(work, self._ran, self._run_failed)
+    def _write_sidecar(self, path: str, meta: Dict[str, Any]) -> str:
+        """Build and stage the ``.job.json`` that travels with this image.
 
-    def _ran(self, info: Dict[str, Any]) -> None:
-        self._run.setEnabled(True)
-        self._bar.setVisible(False)
-        for line in info.get("lines") or []:
-            self._say(line)
-        self._say(f"— finished ({info.get('state')}) —")
+        Written from the file's own calibration and never from a guess: a field the reader
+        could not answer stays absent, so the worker refuses rather than computing different
+        numbers from an invented one.
+        """
+        try:
+            draft = SC.draft(path, recipe=str(meta.get("name") or ""))
+        except Exception as exc:                         # noqa: BLE001
+            self._say(f"could not read this file's calibration: {exc}")
+            return ""
+        self._sidecar_dir = self._sidecar_dir or tempfile.mkdtemp(prefix="nd2s-lablink-")
+        try:
+            out = SC.write_sidecar(draft, self._sidecar_dir,
+                                   image_name=repair_name(os.path.basename(path)))
+        except OSError as exc:
+            self._say(f"could not write the sidecar: {exc}")
+            return ""
+        if draft.invented or draft.absent:
+            self._say(f"sidecar written from the file: {', '.join(draft.from_file)}"
+                      + (f"; not stated: {', '.join(draft.absent + draft.invented)}"
+                         if (draft.absent or draft.invented) else ""))
+        for note in draft.notes:
+            self._say(f"  {note}")
+        return out
 
-    def _run_failed(self, message: str) -> None:
-        self._run.setEnabled(True)
-        self._bar.setVisible(False)
-        self._say(f"the run could not complete: {message}")
+    def _do_end(self) -> None:
+        self._session.close()
+        self._say("closing the session — the hub's slot is freed and the warm cache goes.")
+
+    # ── session signals ─────────────────────────────────────────────────────────
+    def _session_opened(self, info: Dict[str, Any]) -> None:
+        self._say(f"session {info['id']} ready (quota {info.get('quota_mb')} MB). "
+                  f"It stays open: change a knob and run again to use the warm cache.")
+
+    def _session_state(self, state: str) -> None:
+        self._state_note.setText({
+            "idle": "not connected",
+            "opening": "starting the hub's worker…",
+            "ready": f"session {self._session.session_id} warm",
+            "running": "running…",
+            "closing": "closing…",
+            "closed": "session closed",
+        }.get(state, state))
+        self._bar.setVisible(state == "running")
+        if state == "running":
+            self._bar.setRange(0, 0)
+        self._sync_buttons()
+
+    def _session_progress(self, progress: Any) -> None:
+        # `determinate: false` means the percentage is not known, so none is shown — a bar
+        # that invents one is worse than a bar that says "7 of 12".
+        text = str(getattr(progress, "text", "") or "")
+        if getattr(progress, "determinate", False) and progress.total:
+            self._bar.setRange(0, int(progress.total))
+            self._bar.setValue(int(progress.done))
+        else:
+            self._bar.setRange(0, 0)
+        # `%` doubled: QProgressBar's format string eats %p/%v/%m, so a node label containing
+        # a literal percentage would render as a number from somewhere else entirely.
+        self._bar.setFormat(text.replace("%", "%%"))
+        self._state_note.setText(text or "running…")
+
+    def _session_ran(self, outcome: Any) -> None:
+        self._last = outcome
+        self._card.show_outcome(outcome)
+        if outcome.ok:
+            self._say(f"run {outcome.cmd_seq} done in {outcome.duration_s}s — "
+                      f"{outcome.speedup_note or 'no step breakdown reported'}")
+        else:
+            self._say(f"run {outcome.cmd_seq} {outcome.state}: {outcome.code} — "
+                      f"{outcome.message}")
+            self._say("the session stayed usable; change a knob and run again.")
+        if outcome.held:
+            self._card.show_held(outcome.held)
+            self._say(f"held on the hub until pulled: {', '.join(outcome.held)}")
+        self._sync_buttons()
+
+    def _session_fetched(self, outcome: Any) -> None:
+        for path in outcome.fetched:
+            self._say(f"got {os.path.basename(path)} "
+                      f"({_human_bytes(os.path.getsize(path))}, verified)")
+        self._card.show_results(outcome)
+        self._write_run_record(outcome)
+
+    def _write_run_record(self, outcome: Any) -> None:
+        """Leave the results folder able to say what produced it.
+
+        The hub carries the recipe name in its channel *listing* only, so it is gone the
+        moment a file is downloaded. Without this, a folder of results a week later is an
+        image nobody can reproduce or tune further.
+        """
+        meta = self._current() or {}
+        if not outcome.results_dir:
+            return
+        record = PR.RunRecord(
+            recipe=str(meta.get("name") or ""), workflow=str(meta.get("workflow") or ""),
+            hub=self._url.text().strip(), knobs=dict(outcome.knobs or {}),
+            cmd_id=outcome.cmd_id, cmd_seq=outcome.cmd_seq,
+            session=self._session.session_id, duration_s=outcome.duration_s,
+            cached_steps=outcome.cached_steps, computed_steps=outcome.computed_steps,
+            inputs=[{"name": r.name, "sha256": r.sha256}
+                    for r in self._session.inputs],
+            artifacts=[{"name": a.get("returned_as") or a.get("name"),
+                        "sha256": a.get("sha256"), "kind": a.get("kind"),
+                        "bytes": a.get("bytes")} for a in (outcome.artifacts or [])],
+            requires_metadata=[str(f) for f in (meta.get("requires_metadata") or [])],
+            ran=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            fidelity="full" if outcome.knobs else "recipe-name-only")
+        try:
+            PR.write_run_record(record, outcome.results_dir)
+            self._last_record = record
+        except OSError as exc:
+            self._say(f"could not write the run record: {exc}")
+
+    def _session_failed(self, where: str, message: str) -> None:
+        self._say(f"{where}: {message}")
+        self._sync_buttons()
+
+    def _session_lost(self, message: str) -> None:
+        # Surfaced, never silently reopened: reopening and rerunning would hide a result the
+        # person may already be looking at, and the warm cache is gone either way.
+        self._say(f"the session is gone: {message}")
+        self._say("its warm cache went with it. Run again to open a new one — the first "
+                  "run will pay the full cost.")
+        self._sync_buttons()
+
+    # ── enabling ────────────────────────────────────────────────────────────────
+    def _sync_buttons(self) -> None:
+        has_recipe = self._current() is not None
+        running = self._session.state == "running"
+        # `opening` counts as busy: a second press while the hub is still starting its worker
+        # would open a SECOND session, and on a hub with one slot per workflow the second is
+        # refused while the first is still the one you wanted.
+        busy = running or self._session.state in ("opening", "closing")
+        self._run.setEnabled(has_recipe and not busy and self._hub is not None)
+        self._run.setText("Run again (warm)" if self._session.alive and not busy
+                          else "Run on the hub")
+        self._cancel.setEnabled(running)
+        self._end.setEnabled(self._session.alive or running)
+        for widget in (self._save_preset, self._promote):
+            widget.setEnabled(has_recipe)
+        self._delete_preset.setEnabled(bool(self._preset.currentData()))
+
+    # ── settings ────────────────────────────────────────────────────────────────
+    def _save_settings(self) -> None:
+        self._settings.update({
+            "url": self._url.text().strip(),
+            "node": self._node.text().strip(),
+            "dest": self._dest.text().strip(),
+        })
+        _store_settings(self._settings)
 
     # ── log ─────────────────────────────────────────────────────────────────────
     def _say(self, text: str) -> None:
         self._log.appendPlainText(text)
 
-
-def _leave_alone(knob: Dict[str, Any]) -> str:
-    """The label on a dropdown's do-not-send row, naming what will happen instead."""
-    if knob.get("unset_means") == "derive" or knob.get("derive"):
-        return "— derived from the file —"
-    default = knob.get("default")
-    if default is not None:
-        return f"— recipe default: {default} —"
-    return "— leave to the recipe —"
+    def shutdown(self) -> None:
+        """Close any live session, then join the request threads."""
+        self._session.shutdown()
+        self.stop_tasks()
 
 
-def _knob_hint(knob: Dict[str, Any]) -> str:
-    if knob.get("unset_means") == "derive" or knob.get("derive"):
-        return "leave empty — derived from the file"
-    default = knob.get("default")
-    bits = []
-    if knob.get("min") is not None or knob.get("max") is not None:
-        bits.append(f"{knob.get('min', '−∞')} … {knob.get('max', '∞')}")
-    if default is not None:
-        bits.append(f"default {default}")
-    return "  ".join(bits) or "optional"
+# ── this machine's remembered connection ────────────────────────────────────────
+#
+# The token is deliberately NOT here. It is anti-misdirection rather than security, but a
+# secret written into a settings file is a secret in the wrong place, and the integration
+# checklist is explicit about it.
+
+_SETTINGS_FILE = Path.home() / ".nd2studios" / "lablink.json"
+
+
+def _load_settings() -> Dict[str, Any]:
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return dict(doc) if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _store_settings(settings: Dict[str, Any]) -> None:
+    try:
+        _SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump({k: v for k, v in settings.items() if k != "token"},
+                      fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except OSError:
+        pass            # remembering a URL is a convenience, never a reason to fail
+
+
+def _wrap(layout: QHBoxLayout) -> QWidget:
+    """A bare layout as a widget, so it can go in a QFormLayout row."""
+    holder = QWidget()
+    layout.setContentsMargins(0, 0, 0, 0)
+    holder.setLayout(layout)
+    return holder
 
 
 # ── the dock ────────────────────────────────────────────────────────────────────
@@ -750,7 +1093,10 @@ class LabLinkPanel(QTabWidget):
         """
         self.serve._set_polling(False)
         self.serve.stop_tasks()
-        self.send.stop_tasks()
+        # The send tab owns a live session as well as request threads, and closing it is
+        # not optional — a leaked session holds one of very few hub slots until an idle
+        # timer expires many minutes later.
+        self.send.shutdown()
 
 
 __all__ = ["LabLinkPanel", "ServePanel", "SendPanel"]

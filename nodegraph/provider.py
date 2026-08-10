@@ -963,6 +963,17 @@ class FrameSubsetProvider(TileProvider):
         # (`StreamProvider._fanout_ok`) reading the same as it would without the pick.
         self.depth = getattr(base, "depth", 0)
         self.cum_halo = getattr(base, "cum_halo", 0)
+        # A pure index remap adds no compute, so it inherits its base's COST model whole —
+        # the same rule (and the same words) as :class:`~nodegraph.streaming.WindowView`. A
+        # window of a plane-unit provider still costs a whole plane underneath, and dropping
+        # the flag here would put back the cliff it exists to fence: ``util.stitch``'s
+        # windowed path re-reads every overlapping tile uncached, so a consumer walking a
+        # 26x26 grid would pay for the whole mosaic 676 times. It went unnoticed while this
+        # view was only ever wrapped around a run-scope SOURCE (a file provider, which is
+        # neither plane- nor volume-unit); ``util.crop``'s frames mode puts it downstream of
+        # arbitrary nodes, where the flags are real.
+        self.plane_unit = bool(getattr(base, "plane_unit", False))
+        self.volume_unit = bool(getattr(base, "volume_unit", False))
 
     @property
     def frames(self) -> tuple:

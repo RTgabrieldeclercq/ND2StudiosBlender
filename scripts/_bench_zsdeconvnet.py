@@ -137,6 +137,173 @@ def case_3d(models: str, z_window: int = 0) -> bool:
     return ok
 
 
+def case_metrics(models: str, zenodo: str = "") -> bool:
+    """TIER 0 — validate the METRIC before trusting it on data with no ground truth.
+
+    `WF2D_Lysosome` is the one published case that ships a high-SNR `ClearGT.tif` beside its
+    `NoisyInput.tif`, so the paper's Eq. 13-14 protocol can be run exactly as described and
+    the answer is known in advance: the authors' own ZS-DeconvNet output must score BETTER
+    against the clear reference than the raw noisy input does. That is their Fig. 1d claim,
+    and reproducing its ORDERING is what says this implementation of PSNR / RSP / RSE is
+    right. Without this step, a validation report on WellA3 would be numbers with no
+    demonstrated meaning.
+
+    The lysosome PSF ships only as an `.mrc` OTF, which this port deliberately does not read,
+    so the PSF is derived from the acquisition's optics (TIRF, 1.49 NA objective per the
+    paper's Methods, 560 nm emission per the OTF filename, 0.0313 um/px on the 2x SR grid).
+    When `--zenodo` is given the check is REPEATED with the real measured microtubule PSF: the
+    ordering must not depend on which PSF is used, and if it did, the metric would be
+    measuring the PSF rather than the image.
+    """
+    import tifffile
+    from nodegraph.catalog._shared.psf import diffraction_sigmas
+    d = os.path.join(models, "WF2D_Lysosome")
+    gt = np.asarray(tifffile.imread(os.path.join(d, "test_data", "ClearGT.tif")),
+                    dtype=np.float64)
+    noisy = np.asarray(tifffile.imread(os.path.join(d, "test_data", "NoisyInput.tif")),
+                       dtype=np.float64)
+    dec = np.asarray(tifffile.imread(os.path.join(d, "saved_model", "Inference_demo",
+                                                  "img0_deconved.tif")), dtype=np.float64)
+    den = np.asarray(tifffile.imread(os.path.join(d, "saved_model", "Inference_demo",
+                                                  "img0_denoised.tif")), dtype=np.float64)
+    print("TIER 0  metric validation on WF2D_Lysosome (ships a high-SNR ClearGT)")
+    print(f"   ClearGT {gt.shape}  NoisyInput {noisy.shape}  "
+          f"published deconved {dec.shape}  denoised {den.shape}")
+
+    psfs = [("derived Gaussian (1.49 NA, 560 nm, 0.0313 um/px)",
+             zsk.gaussian_psf_from_sigmas(
+                 diffraction_sigmas(560.0, 1.49, 0.0313, None, False)))]
+    if zenodo:
+        for root, _dirs, files in os.walk(zenodo):
+            for fn in files:
+                if fn.lower().startswith("psf") and fn.lower().endswith((".tif", ".tiff")):
+                    psfs.append((f"measured {fn}",
+                                 zsk.crop_psf(zsk.load_psf_tif(os.path.join(root, fn)))))
+                    break
+    ok = True
+    for label, psf in psfs:
+        print(f"   -- PSF: {label}  {psf.shape} --")
+        rows = []
+        # `blur` per CANDIDATE, not per run: only the 2x deconvolved head is super-resolved
+        # and so needs pushing back through the optics. Blurring the other two would add a
+        # second PSF the ClearGT never had and quietly suppress their noise (see
+        # `degrade_to_reference`) — which is exactly how a first cut made the raw noisy frame
+        # score level with ZS-DeconvNet's own output.
+        for name, img, blur in (("raw noisy input", noisy, False),
+                                ("published denoised", den, False),
+                                ("published deconved", dec, True)):
+            m = zsk.resolution_scaled_metrics(img, gt, psf, blur=blur)
+            rows.append((name, m))
+            print(f"      {name:20s} PSNR {m['psnr']:6.2f} dB   RSP {m['rsp']:.4f}   "
+                  f"RSE {m['rse']:.4f}")
+        base = rows[0][1]["psnr"]
+        better = [n for n, m in rows[1:] if m["psnr"] > base]
+        good = len(better) == 2
+        ok = ok and good
+        print(f"      -> both ZS-DeconvNet heads beat the raw input: "
+              f"{'YES' if good else 'NO (' + ', '.join(better) + ' only)'}")
+
+    # and the SQUIRREL reading of the same machinery: reference = the NOISY input, i.e. no
+    # ground truth at all. This is the mode WellA3 has to use, so check it agrees in ORDER.
+    print("   -- SQUIRREL mode (reference = the noisy input, NO ground truth) --")
+    psf = psfs[0][1]
+    for name, img, blur in (("published denoised", den, False),
+                            ("published deconved", dec, True)):
+        m = zsk.resolution_scaled_metrics(img, noisy, psf, blur=blur)
+        print(f"      {name:20s} RSP {m['rsp']:.4f}   RSE {m['rse']:.4f}   "
+              f"(self-consistency, no GT)")
+    fr = zsk.faint_signal_retention(noisy, dec, psf=psf)
+    print(f"      faint-signal retention on the published output: n={fr['n']} points, "
+          f"median contrast retained {fr['median_retained']:.2f}, "
+          f"lost >50%: {100 * fr['lost_fraction']:.1f}%")
+    print(f"   TIER 0: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def case_validate(models: str, inp: str, weights: str, *, tile: int, upsample: bool,
+                  background: float, na: float, emission: float, pixel_um: float,
+                  limit: int, out_dir: str) -> bool:
+    """TIER 1/2 — validate YOUR OWN trained model's output, with no ground truth.
+
+    Runs inference on `--input` with `--weights`, then for each plane reports:
+      * **self-consistency** — re-blur the output with the PSF and compare to the measured
+        input (the reference's `out_mul_otf`, and the paper's Eq. 5 degradation term read as
+        a score). Catches structure the network INVENTED.
+      * **SQUIRREL** RSP / RSE and an error MAP, per the Discussion's recommendation.
+      * **faint-signal retention** — the paper's Supplementary Fig. 28a failure, which
+        re-blurring is blind to.
+
+    PNGs go to `--out-dir` so the error map can be looked at rather than summarized: a single
+    RSP cannot say "the disagreement is all on the three brightest cells".
+    """
+    import tifffile
+    from nodegraph.catalog._shared.psf import diffraction_sigmas
+    planes = []
+    if inp.lower().endswith(".nd2"):
+        import nd2
+        with nd2.ND2File(inp) as f:
+            arr = f.asarray()
+        flat = arr.reshape((-1,) + arr.shape[-2:])
+        step = max(1, len(flat) // max(1, limit))
+        planes = [np.asarray(flat[i], dtype=np.float32)
+                  for i in range(0, len(flat), step)][:limit]
+    else:
+        a = np.asarray(tifffile.imread(inp), dtype=np.float32)
+        planes = [a] if a.ndim == 2 else [np.asarray(p) for p in a[:limit]]
+    if not planes:
+        print("validate: no planes read from --input")
+        return False
+    psf = zsk.gaussian_psf_from_sigmas(
+        diffraction_sigmas(emission, na, pixel_um, None, False))
+    print(f"TIER 1/2  validating {os.path.basename(weights)} on {len(planes)} plane(s) of "
+          f"{os.path.basename(inp)}")
+    print(f"   PSF sigma {tuple(round(s, 3) for s in zsk.psf_sigma(psf))} px, "
+          f"kernel {psf.shape}  (derived: {emission} nm, NA {na}, {pixel_um} um/px)")
+    os.makedirs(out_dir, exist_ok=True)
+    rsps, rses, rets = [], [], []
+    for i, pl in enumerate(planes):
+        t = time.time()
+        den, dec = zsk.infer_2d(pl, arch="unet2d", weights_path=weights, tile=tile,
+                                overlap=20, upsample=upsample, insert_xy=16, norm_low=0.0)
+        out = dec if upsample else den
+        m = zsk.resolution_scaled_metrics(out, np.maximum(pl - background, 0.0), psf)
+        fr = zsk.faint_signal_retention(np.maximum(pl - background, 0.0), out,
+                                        psf=psf)
+        rsps.append(m["rsp"]); rses.append(m["rse"]); rets.append(fr["median_retained"])
+        print(f"   plane {i + 1}/{len(planes)} ({time.time() - t:5.1f}s)  "
+              f"RSP {m['rsp']:.4f}  RSE {m['rse']:.4f}  "
+              f"faint retained {fr['median_retained']:.2f} "
+              f"(lost>50%: {100 * fr['lost_fraction']:4.1f}% of {fr['n']})")
+        if i == 0:
+            try:
+                from PIL import Image
+
+                def png(a, name, lo=1, hi=99.8):
+                    v = np.asarray(a, dtype=np.float64)
+                    p0, p1 = np.percentile(v, lo), np.percentile(v, hi)
+                    u = np.clip((v - p0) / max(p1 - p0, 1e-9), 0, 1)
+                    Image.fromarray((u * 255).astype(np.uint8)).save(
+                        os.path.join(out_dir, name))
+                png(pl, "01_input.png")
+                png(out, "02_output.png")
+                png(m["degraded"], "03_output_reblurred.png")
+                png(m["error_map"], "04_error_map.png", 0, 99.5)
+                print(f"      wrote input / output / re-blurred / error-map PNGs to "
+                      f"{out_dir}")
+            except Exception as exc:                      # noqa: BLE001
+                print("      (PNG report skipped:", exc, ")")
+    print(f"   MEAN over {len(planes)} plane(s): RSP {np.nanmean(rsps):.4f}  "
+          f"RSE {np.nanmean(rses):.4f}  faint retained {np.nanmean(rets):.2f}")
+    # Thresholds are advisory, and deliberately loose: RSP is a self-consistency score, not
+    # an accuracy score, so a high value only says "nothing was invented" — it says nothing
+    # about whether the sharpening is real. Named so the report cannot be over-read.
+    ok = bool(np.nanmean(rsps) > 0.9 and np.nanmean(rets) > 0.5)
+    print(f"   TIER 1/2: {'PLAUSIBLE (self-consistent, faint signal retained)' if ok else 'SUSPECT — inspect 04_error_map.png'}")
+    print("   NOTE: RSP near 1 means the output is consistent with the measurement. It is "
+          "NOT evidence of a resolution gain — for that you need a high-SNR reference.")
+    return ok
+
+
 def case_psf(zenodo: str) -> bool:
     """Is the metadata-DERIVED Gaussian PSF a fair stand-in for a MEASURED one?
 
@@ -240,15 +407,33 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="", help="extracted `saved_models` directory")
     ap.add_argument("--zenodo", default="", help="extracted Zenodo `2D data` directory")
-    ap.add_argument("--case", default="all", choices=("all", "2d", "3d"))
+    ap.add_argument("--case", default="all", choices=("all", "2d", "3d", "metrics"))
+    ap.add_argument("--validate", default="",
+                    help="validate YOUR trained model: path to an .nd2/.tif to run on "
+                         "(requires --weights)")
+    ap.add_argument("--weights", default="", help="the checkpoint --validate should use")
+    ap.add_argument("--tile", type=int, default=256)
+    ap.add_argument("--upsample", type=int, default=0)
+    ap.add_argument("--background", type=float, default=40.0)
+    ap.add_argument("--na", type=float, default=0.45)
+    ap.add_argument("--emission", type=float, default=499.0)
+    ap.add_argument("--pixel-um", type=float, default=1.7182777601481225)
+    ap.add_argument("--limit", type=int, default=4,
+                    help="how many planes --validate samples (evenly strided)")
+    ap.add_argument("--out-dir", default="zsdeconv_validation",
+                    help="where --validate writes its PNG report")
     ap.add_argument("--z-window", type=int, default=0,
                     help="override the 3D z tile (the reference's 78 needs >64 GiB)")
     ap.add_argument("--train", type=int, default=0,
                     help="also run N zero-shot training iterations on --zenodo data")
     args = ap.parse_args()
-    if not args.models and not args.zenodo:
-        ap.error("give --models (golden parity) and/or --zenodo (PSF / training)")
+    if not args.models and not args.zenodo and not args.validate:
+        ap.error("give --models (golden parity / metrics), --zenodo (PSF / training) "
+                 "and/or --validate <image> --weights <ckpt>")
+    if args.validate and not args.weights:
+        ap.error("--validate needs --weights (the checkpoint to validate)")
     results = {}
+    root = ""
     if args.models:
         root = args.models
         if not os.path.isdir(os.path.join(root, "WF2D_Lysosome")) and \
@@ -258,6 +443,18 @@ def main() -> int:
             results["2D golden"] = case_2d(root)
         if args.case in ("all", "3d"):
             results["3D golden"] = case_3d(root, args.z_window)
+        if args.case in ("all", "metrics"):
+            results["metrics (tier 0)"] = case_metrics(root, args.zenodo)
+    if args.validate:
+        # Tier 0 first when it is available, so the report below is numbers whose meaning has
+        # just been demonstrated rather than asserted.
+        if root and "metrics (tier 0)" not in results:
+            results["metrics (tier 0)"] = case_metrics(root, args.zenodo)
+        results["validate (tier 1/2)"] = case_validate(
+            root, args.validate, args.weights, tile=args.tile,
+            upsample=bool(args.upsample), background=args.background, na=args.na,
+            emission=args.emission, pixel_um=args.pixel_um, limit=args.limit,
+            out_dir=args.out_dir)
     if args.zenodo:
         results["PSF"] = case_psf(args.zenodo)
         if args.train:

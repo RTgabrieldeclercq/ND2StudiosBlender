@@ -4,20 +4,36 @@ from __future__ import annotations
 
 import numpy as np
 
-from typing import Dict, Tuple
+from typing import Dict, Optional
 
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.field import FieldCache, FieldContext
 from nodegraph.parallel import map_units
-from nodegraph.registry import Granularity, InDataset, InFloat, InString, Mode, OutDataset
+from nodegraph.registry import InDataset, InFloat, InString, Mode, OutDataset
 from nodegraph.spill import dense_output, spill_budget
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.map_image import _FIELD_TYPES
 from nodegraph.catalog._shared.planes import _each_plane
 from nodegraph.catalog._shared.progress import _parallel_progress
+from nodegraph.catalog._shared.labels import (
+    _label_raster,
+    _resolve_label_instance,
+    _resolve_layer,
+    _voxel_layers,
+)
+from nodegraph.catalog._shared.scope import (
+    SCOPES,
+    STRUCTURE_SCOPES,
+    ScopeMode,
+    roi_populations,
+    scope_declarations,
+    scope_is_3d,
+    scope_key,
+    unit_populations,
+)
 
 # ── analysis: threshold → label → measure ─────────────────────────────────────
 
@@ -26,36 +42,143 @@ _THRESHOLD_METHODS = ("fixed", "otsu", "li", "yen", "triangle", "mean")
 #: the methods that DERIVE their level from a histogram, i.e. the ones for which the
 #: statistics ``scope`` (and the read footprint that follows from it) is live.
 _THRESHOLD_HISTOGRAM = frozenset(_THRESHOLD_METHODS) - {"fixed"}
-#: statistics populations for a histogram threshold, finest → coarsest. The first three
-#: mirror ``enhance.normalize``'s ``scope`` exactly (same words, same meaning, so the two
-#: nodes read the same way); ``dataset`` is the extra one that pools across MULTIPOINTS.
-_THRESHOLD_SCOPES = ("plane", "volume", "series", "dataset")
-#: How much of the series each scope must read — the honest footprint, resolved through
-#: ``NodeSpec.footprint_mode="scope"``. ``fixed`` never reads a second plane, but a Mode
-#: map is keyed by ONE mode's values, so the ``fixed`` case is covered by ``plane``'s
-#: entry being the cheapest that is still correct for it (a fixed cut is pointwise, and
-#: ``WHOLE_PLANE`` over-declares harmlessly where ``TILEABLE`` under-declared fatally).
-_THRESHOLD_GRAN: Dict[str, Granularity] = {
-    "plane": Granularity.WHOLE_PLANE,        # the plane's own histogram
-    "volume": Granularity.WHOLE_VOLUME,      # pooled over z
-    "series": Granularity.WHOLE_SERIES,      # pooled over t (and z)
-    "dataset": Granularity.MULTI_VIEW,       # pooled over m as well — the widest read
-}
-def _threshold_scope_key(scope: str, unit: Tuple[int, int, int, int]) -> tuple:
-    """The statistics-group key a ``(m,t,z,c)`` unit belongs to under ``scope``.
+#: This node's slice of the SHARED population vocabulary
+#: (:mod:`nodegraph.catalog._shared.scope`, V2.27). The four words and the group-key rule used
+#: to live here and were copy-pasted into ``analysis.filter_labels`` and ``enhance.normalize``;
+#: they are now declared once. ``_SCOPE_GRAN``/``_SCOPE_READS`` are derived from that one table
+#: by :func:`scope_declarations`, so the footprint and the required domains cannot drift apart —
+#: and the map is total over these choices, which ``NodeRegistry._check_footprint`` now requires
+#: (a missing key resolves to ``None``, which silently drops the node off the tiled read path).
+#:
+#: ``fixed`` never reads a second plane, but a Mode map is keyed by ONE mode's values, so the
+#: ``fixed`` case is covered by ``plane``'s entry being the cheapest that is still correct for it
+#: (a fixed cut is pointwise, and ``WHOLE_PLANE`` over-declares harmlessly where ``TILEABLE``
+#: under-declared fatally).
+_THRESHOLD_SCOPES = SCOPES
+_SCOPE_GRAN, _SCOPE_READS = scope_declarations(_THRESHOLD_SCOPES)
 
-    Channel is never pooled over at any scope: two channels are two different stains with
-    different dynamic ranges, and one shared cut would threshold the dim one into nothing.
-    That matches every other per-channel decision in the catalog (``ctx.channel(c)``) and
-    ``enhance.normalize``, whose ``series`` scope is likewise "per (m,c)"."""
-    m, t, z, c = unit
-    if scope == "plane":
-        return (m, t, z, c)
-    if scope == "volume":
-        return (m, t, c)
-    if scope == "series":
-        return (m, c)
-    return (c,)                                # dataset: everything but the channel
+
+def _population_level(px: np.ndarray, fn) -> Optional[float]:
+    """One histogram level over a single population's values, or ``None`` when the population
+    has none.
+
+    Two degeneracies are excluded before ``fn`` runs, because both produce a *number* rather
+    than an error and the number is meaningless:
+
+    * **fewer than two values** — there is nothing to split;
+    * **zero spread** — every value identical, so ``>=`` would select all of it or none, and
+      which one is an artefact of the tie-break rather than a fact about the data.
+
+    The remaining failures are the method's own (``threshold_li`` can return non-finite on a
+    pathological histogram), and they resolve to ``None`` too, so the caller has ONE
+    "this population has no level" signal to handle instead of three."""
+    if px.size < 2 or float(np.ptp(px)) <= 0.0:
+        return None
+    try:
+        lvl = float(fn(px))
+    except (ValueError, RuntimeError):
+        return None
+    return lvl if np.isfinite(lvl) else None
+
+
+def _threshold_structure(ctx: EvalContext, ds: Dataset, prov, ax, *, scope: str,
+                         fn) -> Dataset:
+    """The ``per_label`` / ``per_roi`` apply pass: one level per OBJECT, derived from only that
+    object's voxels (V2.27).
+
+    Structurally simpler than the lattice path above, and that is a property of the vocabulary
+    rather than an accident: a per-object population lives **inside one unit**, so it is complete
+    the moment that unit is read. There is nothing to pool across units, hence no staged buffer,
+    no streaming histogram fold and no surrogate — the three cost strategies the lattice scopes
+    need exist only because their populations span the series. (A per-TRACK scope would not have
+    this property, which is why the vocabulary does not have one.)
+
+    **Dimensionality is inherited, not levered** (`wire-node-v2` §7b): a ``per_label`` population
+    is a volume exactly when the segmentation that produced it was volumetric, which its Label
+    table's ``z_kind`` records. ``ctx.is_volume`` must NOT be consulted — the footprint declares
+    the conservative ``WHOLE_VOLUME`` for both structure scopes (``resolve_granularity`` cannot
+    see the data), so it reads True even for a per-plane segmentation, and trusting it would
+    pool a cell with whatever sits above it in the next plane.
+
+    ``per_roi`` has no such provenance — a mask is just a mask — so its arenas are the connected
+    components of each PLANE, 8-connected. That is also the useful reading: a drawn ROI
+    broadcast down a stack gives each plane its own level, and a single-blob mask gives exactly
+    one population, i.e. "derive the level from the foreground only".
+
+    A population with no usable histogram is SKIPPED (its voxels stay background) and counted on
+    the progress rail. This node emits a mask and nothing else, so the count is the only place
+    it can be reported; ``analysis.histogram_threshold`` has a per-region table and reports each
+    skipped region individually, with a tunable sample-count floor."""
+    want = ctx.layer("regions")
+    if scope == "per_label":
+        layer, note = _resolve_label_instance(
+            ds, want, node="threshold", socket="regions",
+            remedy="scope=per_label derives one level per REGION, so it needs a label raster "
+                   "AND its table — run analysis.segment / analysis.label upstream, or pick a "
+                   "lattice scope (plane/volume/series/dataset)")
+        pop6, zk = _label_raster(ds, layer, node="threshold")
+        is_3d = scope_is_3d(zk, ax.z)
+    else:
+        layer, note = _resolve_layer(
+            _voxel_layers(ds), want, node="threshold", socket="regions",
+            what="Voxel mask", where="the `data` input",
+            remedy="scope=per_roi derives one level per connected region of a MASK, so it "
+                   "needs one — draw it with analysis.roi_mask, or threshold once to make it",
+            ctx=ctx)
+        attr = ds.get(Domain.VOXEL, layer)
+        if attr is None:                             # pragma: no cover - _resolve_layer
+            raise ValueError(f"threshold: no Voxel layer {layer!r}")
+        pop6, is_3d = np.asarray(attr.values), False
+    units = ([(m, t, None, c) for m in range(ax.m) for t in range(ax.t)
+              for c in range(ax.c)] if is_3d else list(_each_plane(ax)))
+    out = dense_output((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), np.uint8,
+                       tag=f"mask_{ctx.node_id}")
+    mask = out.array
+    n_pop = n_skipped = 0
+    if note:
+        ctx.progress(0, len(units), "using " + note, frames=ax.t)
+    label_note = f"thresholding per {'label' if scope == 'per_label' else 'ROI'}"
+    tick = _parallel_progress(ctx, len(units), label_note, frames=ax.t)
+    for m, t, z, c in units:
+        if is_3d:
+            pop = pop6[m, t, :, c]
+            img = np.asarray(prov.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x),
+                             dtype=float)
+        else:
+            pop = pop6[m, t, z, c]
+            img = np.asarray(prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x), dtype=float)
+        if scope == "per_roi":
+            pop = roi_populations(pop, 8)             # a mask carries no ids; make them
+        for _pid, idx, vals in unit_populations(pop, img):
+            n_pop += 1
+            lvl = _population_level(vals, fn)
+            if lvl is None:
+                n_skipped += 1
+                continue
+            sel = idx[vals >= lvl]
+            if sel.size == 0:
+                continue
+            # Index the 6-D array through unravelled COORDINATES. `mask[m, t, :, c]` is a
+            # non-contiguous view (c sits between z and y), so `.reshape(-1)[idx] = 1` would
+            # write into a COPY and the whole 3D branch would come back empty, silently.
+            co = np.unravel_index(sel, pop.shape)
+            at = ((m, t, co[0], c, co[1], co[2]) if is_3d
+                  else (m, t, z, c, co[0], co[1]))
+            mask[at] = 1
+        tick()
+    if n_pop == 0:
+        raise ValueError(
+            f"threshold: scope={scope} found no region at all in {layer!r}, so there is "
+            f"nothing to derive a level inside. Check the segmentation (or the mask) upstream, "
+            f"or pick a lattice scope.")
+    if n_skipped:
+        # advisory, on the rail: this node's only output is a mask, so there is no per-region
+        # column to carry a NaN. Reported rather than silent — a skipped region is a hole in
+        # the result, and `analysis.histogram_threshold` is where each one is named.
+        ctx.progress(len(units), len(units),
+                     f"{n_skipped} of {n_pop} population(s) skipped: no spread to threshold",
+                     frames=ax.t)
+    return ds.with_layer(Domain.VOXEL, ctx.layer("name"), out.seal())
 
 
 #: Bins skimage itself uses when a threshold method histograms internally. Matching it is
@@ -295,8 +418,14 @@ def _compute_threshold(ctx: EvalContext) -> Dataset:
     per-channel decision in the catalog is made the same way (``ctx.channel(c)``,
     ``enhance.normalize``'s per-``(m,c)`` series scope).
 
-    ``fixed`` reads no histogram, so ``scope`` is Mode-gated away under it (§5c) and the
-    footprint drops to TILEABLE (``footprint_mode="scope"``)."""
+    ``fixed`` reads no histogram, so ``scope`` is Mode-gated away under it (§5c).
+
+    The footprint is keyed on ``scope`` (``footprint_mode="scope"``) and does **not** drop to
+    TILEABLE under ``fixed`` — the claim made here until V2.27. A Mode map is keyed by one
+    mode's values, so there is no ``fixed`` entry to resolve; a gated-away Mode keeps its value
+    (`registry` ``active_modes``), and the retained ``scope`` therefore still decides what is
+    declared. ``plane``'s ``WHOLE_PLANE`` over-declares a pointwise cut harmlessly, which is why
+    the state is correct even though the sentence was not."""
     ds = ctx.inputs[0]
     prov = ds.image
     ax = prov.axes
@@ -323,11 +452,16 @@ def _compute_threshold(ctx: EvalContext) -> Dataset:
         fn = {"otsu": skf.threshold_otsu, "li": skf.threshold_li,
               "yen": skf.threshold_yen, "triangle": skf.threshold_triangle,
               "mean": skf.threshold_mean}[method]
+        # A per-object population lives inside ONE unit, so it needs none of the staged /
+        # fused / streaming machinery below — that exists to pool across units. Branch out
+        # before any of it is set up.
+        if scope in STRUCTURE_SCOPES:
+            return _threshold_structure(ctx, ds, prov, ax, scope=scope, fn=fn)
         # Group the unit indices by the scope's key. `dataset` collapses to a single group,
         # which is bit-identical to the pre-fix single `fn(whole.ravel())`.
         groups: Dict[tuple, list] = {}
         for i, unit in enumerate(units):
-            groups.setdefault(_threshold_scope_key(scope, unit), []).append(i)
+            groups.setdefault(scope_key(scope,unit), []).append(i)
         # Every plane is read regardless of scope — the population differs, not the reads —
         # but whether every plane is RETAINED is exactly the question. Staging the lot as
         # float64 is `n_units × y × x × 8` bytes, which on the lab's 640 series
@@ -392,7 +526,7 @@ def _compute_threshold(ctx: EvalContext) -> Dataset:
             thr_here = (float(a[0]) if a.size and np.ptp(a) == 0
                         else (float(fn(a)) if a.size else 0.0))
         else:
-            thr_here = levels.get(_threshold_scope_key(scope, (m, t, z, c)), thr) \
+            thr_here = levels.get(scope_key(scope,(m, t, z, c)), thr) \
                 if levels else thr
         if use_field:
             win = {"m": (m, m + 1), "t": (t, t + 1), "z": (z, z + 1), "c": (c, c + 1)}
@@ -442,6 +576,25 @@ register_node(
                     "their own level from the histogram and ignore this. Can be driven by a "
                     "FIELD for a per-voxel cut, which is how you threshold against a "
                     "background estimate instead of a constant."),
+            # ONE socket for both structure scopes, gated to them: under `per_label` it names a
+            # Label instance (raster + table), under `per_roi` any Voxel mask. Two sockets would
+            # mean one of them was always dead. Ships EMPTY so the layer is inferred from the
+            # wire when there is only one candidate (§4g) — no literal default is right for
+            # `labels` (Segmentation), `CELLS` (a renamed one) and `roi_mask` at once.
+            InString("regions", "Regions", field=False, default="",
+                     layer_in=Domain.VOXEL,
+                     available_in={"scope": frozenset(STRUCTURE_SCOPES)},
+                     description=
+                     "Which objects define the populations, when Scope is per label or per ROI. "
+                     "Under `per_label` this must be a real Label instance — a raster whose ids "
+                     "divide the foreground into objects, plus the table that proves it (the "
+                     "output of Segmentation or Connected Components); a bare mask is refused, "
+                     "because thresholding 'inside' one undivided region is just a global "
+                     "threshold. Under `per_roi` any binary mask works, including a drawn "
+                     "analysis.roi_mask, and its connected components become the arenas. Leave "
+                     "it EMPTY and the only candidate on the wire is used, which is what you "
+                     "want on a single-branch graph. Inert under the four lattice scopes.",
+                     ),
             InString("name", "Output layer", field=False, default="mask",
                      layer_out=(Domain.VOXEL,),
                      description=
@@ -497,43 +650,28 @@ register_node(
                 }),
            # Gated to the histogram methods (wire-node-v2 §5c): a `fixed` cut reads no
            # histogram, so a population picker under it would be a dead control.
-           Mode("scope", list(_THRESHOLD_SCOPES), default="plane", label="Scope",
-                available_in={"method": _THRESHOLD_HISTOGRAM},
-                description=
-                "Which pixels are pooled into the histogram the level is derived from — the "
-                "setting that decides what a mask is reproducible FROM. It never changes "
-                "which planes are read (all of them are), only which of them have to agree "
-                "on one cut, and it never pools across channels: two stains with different "
-                "dynamic ranges under one level thresholds the dim one into nothing.",
-                choice_docs={
-                    "plane":
-                        "One level per (Y,X) plane, from that plane's own histogram. The "
-                        "default, the most adaptive, and what every ImageJ user expects; the "
-                        "price is that a plane containing no objects gets a level derived "
-                        "from noise and comes out full of speckle.",
-                    "volume":
-                        "One level per (Z,Y,X) volume — per position, timepoint and channel. "
-                        "A Z stack of one object is cut as one thing, so a dim top slice is "
-                        "not pushed to its own mid-grey and the mask stays connected through "
-                        "z.",
-                    "series":
-                        "One level per (position, channel), pooled over the whole timelapse. "
-                        "The mask cannot drift just because the field bleached, which is what "
-                        "you want before measuring an area time course — a per-plane level "
-                        "would silently track the bleaching and report constant area.",
-                    "dataset":
-                        "One level per channel, pooled over EVERYTHING else including every "
-                        "multipoint. Right for a tiled acquisition of one continuous "
-                        "specimen; wrong for a plate, where it makes a well's mask depend on "
-                        "which other wells share the file. Measured on the lab's 49-position "
-                        "WellA3 plate: pooling three positions instead of one moved a "
-                        "position's foreground fraction by −47%. It is also the pre-2026-07-30 "
-                        "behaviour, kept for graphs tuned against it.",
-                })],
+           #
+           # The shared factory (V2.27) carries the vocabulary, the per-choice prose and
+           # `role="scope"` — which is what makes the card's footprint band edit this Mode
+           # instead of merely displaying what it resolved to. The description stays local
+           # because this node pools PIXELS INTO A HISTOGRAM, which is more specific than the
+           # facility's general "values into a statistic".
+           ScopeMode(_THRESHOLD_SCOPES, default="plane",
+                     available_in={"method": _THRESHOLD_HISTOGRAM},
+                     description=
+                     "Which pixels are pooled into the histogram the level is derived from — the "
+                     "setting that decides what a mask is reproducible FROM. It never changes "
+                     "which planes are read (all of them are), only which of them have to agree "
+                     "on one cut, and it never pools across channels: two stains with different "
+                     "dynamic ranges under one level thresholds the dim one into nothing.")],
     # Keyed by `scope`, not by a dim lever this node does not have — see
     # NodeSpec.footprint_mode. The shipped TILEABLE was a misdeclaration: every histogram
     # method has always read every plane.
-    granularity=_THRESHOLD_GRAN, footprint_mode="scope", kernel_axes=frozenset(),
+    granularity=_SCOPE_GRAN, footprint_mode="scope", kernel_axes=frozenset(),
+    # per_label needs a whole Label INSTANCE on the wire and per_roi only a mask, so the
+    # requirement is stated per BRANCH — a static union would paint a red LABEL chip on
+    # every plane-scoped graph that works. Derived from the same table as the footprint.
+    reads_domains_by_mode=_SCOPE_READS,
     description="Binarize to a Voxel mask — fixed, or a histogram method "
                 "(otsu/li/yen/triangle/mean) whose level is derived over the chosen "
                 "Scope: per plane (default), per volume, per position's whole series, or "

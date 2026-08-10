@@ -23,6 +23,7 @@ from nodegraph.structure import StructureTable
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.labels import _label_raster, _resolve_label_instance
 from nodegraph.catalog._shared.planes import _each_plane
+from nodegraph.catalog._shared.scope import LATTICE_SCOPES, ScopeMode, scope_row_key
 
 # ── Filter Labels (a cut on the POPULATION of per-label values) ─────────────────
 #
@@ -41,33 +42,22 @@ from nodegraph.catalog._shared.planes import _each_plane
 #: sample per label, not per voxel); ``fixed`` and ``percentile`` are the explicit forms.
 _FILTER_METHODS: Tuple[str, ...] = ("otsu", "li", "yen", "triangle", "mean",
                                     "fixed", "percentile")
-#: statistics scopes, the same four words (and the same meanings) as ``analysis.threshold``'s
-#: — this node groups TABLE ROWS by their own m/t/z/c columns rather than voxels by their
-#: address, but "which population is the level derived over" is the identical question and
-#: must not read differently in two places.
-_FILTER_SCOPES: Tuple[str, ...] = ("plane", "volume", "series", "dataset")
+#: This node's slice of the shared population vocabulary
+#: (:mod:`nodegraph.catalog._shared.scope`, V2.27) — the same four words, and the same meanings,
+#: as ``analysis.threshold``'s. This node groups TABLE ROWS by their own m/t/z/c columns rather
+#: than voxels by their address, but "which population is the cut derived over" is the identical
+#: question and must not read differently in two places.
+#:
+#: The two STRUCTURE scopes are deliberately not offered: this node's members already *are* the
+#: objects, so a per-object population would be one row and the cut derived from it would be
+#: that row's own value — every label would then survive, whichever side was kept.
+_FILTER_SCOPES: Tuple[str, ...] = LATTICE_SCOPES
 #: the per-label columns that are common enough to name in the socket's own documentation.
 #: NOT a closed set: the socket takes any column on the table, which is the point.
 _KNOWN_COLUMNS: Tuple[str, ...] = (
     "mean_intensity", "max_intensity", "min_intensity", "total_intensity",
     "median_intensity", "area", "area_um2", "volume_um3", "eccentricity", "solidity",
     "extent", "perimeter", "axis_major", "axis_minor", "n_sub", "frac_above", "level")
-
-
-def _scope_key(scope: str, m: np.ndarray, t: np.ndarray, z: np.ndarray,
-               c: np.ndarray) -> np.ndarray:
-    """One integer group key per table ROW, under ``scope``.
-
-    Channel is never pooled over at any scope, exactly as in ``analysis.threshold``: two
-    channels are two stains with different dynamic ranges, and one shared cut would drop
-    every object in the dim one."""
-    if scope == "plane":
-        return ((m * (t.max() + 1) + t) * (z.max() + 1) + z) * (c.max() + 1) + c
-    if scope == "volume":
-        return (m * (t.max() + 1) + t) * (c.max() + 1) + c
-    if scope == "series":
-        return m * (c.max() + 1) + c
-    return c.copy()                                    # dataset: everything but the channel
 
 
 def _population_cut(values: np.ndarray, *, method: str, level: float,
@@ -197,13 +187,15 @@ def _compute_filter_labels(ctx: EvalContext) -> Dataset:
             f"each against itself. Use scope=volume (per m,t,c), which is the finest grouping "
             f"a volumetric segmentation has.")
 
-    def _axis(k: str) -> np.ndarray:
-        return np.asarray(cols[k], dtype=np.int64) if k in cols \
-            else np.zeros(ids.size, dtype=np.int64)
-
-    zi = (np.rint(np.asarray(cols["z"], dtype=float)).astype(np.int64)
-          if scope == "plane" else np.zeros(ids.size, dtype=np.int64))
-    keys = _scope_key(scope, _axis("m"), _axis("t"), zi, _axis("c"))
+    # `z` is a float column (a centroid), so the plane scope needs it rounded to the plane
+    # index it actually is; the guard above has already refused the volumetric case where that
+    # rounding would be meaningless. Every other axis is already integral.
+    key_cols = {k: np.asarray(cols[k], dtype=np.int64) for k in ("m", "t", "c") if k in cols}
+    key_cols["z"] = (np.rint(np.asarray(cols["z"], dtype=float)).astype(np.int64)
+                     if "z" in cols else np.zeros(ids.size, dtype=np.int64))
+    for k in ("m", "t", "c"):                      # a scope this node offers may omit them
+        key_cols.setdefault(k, np.zeros(ids.size, dtype=np.int64))
+    keys = scope_row_key(scope, key_cols)
 
     finite = np.isfinite(values)
     if not finite.any():
@@ -399,7 +391,12 @@ register_node(
                      "where the artefacts are the high values (a huge merged blob's `area`, a "
                      "saturated speck's `max_intensity`).",
              }),
-        Mode("scope", list(_FILTER_SCOPES), default="series",
+        # The shared factory (V2.27) stamps `role="scope"`, which is what makes the card's
+        # footprint band edit this Mode. The description and the per-choice prose stay LOCAL:
+        # this node's populations are table ROWS and its statistic is a cut on a column, both
+        # more specific than the facility's general wording, and its `plane` scope carries a
+        # refusal the shared text cannot mention.
+        ScopeMode(_FILTER_SCOPES, default="series",
              description=
              "Which labels form the population the cut is derived over — the same four words, "
              "with the same meanings, as Threshold's `scope`, except that here they group "

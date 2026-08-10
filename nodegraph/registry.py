@@ -73,6 +73,8 @@ PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 #: * ``channels``   — tick the channels to keep, by their real names
 #: * ``frame``      — adopt the timepoint the viewer is showing
 #: * ``zrange``     — adopt the Z planes picked on the viewer's Z strip
+#: * ``frames``     — adopt the M/T/Z selection from the strips (the frame the cursor is on,
+#:                    for an axis with nothing ticked) as one ``"m0-2,t3"`` spec
 #: * ``percentile`` — adopt the contrast window the histogram handles are sitting on
 #: * ``gamma``      — adopt the histogram's gamma dot
 #:
@@ -81,13 +83,17 @@ PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 #: from "this param was never annotated".
 PICK_KINDS: FrozenSet[str] = frozenset({
     "shapes", "area", "level", "radius", "distance", "grid", "rect",
-    "channel", "channels", "frame", "zrange", "percentile", "gamma",
+    "channel", "channels", "frame", "zrange", "frames", "percentile", "gamma",
 })
 
 #: Pick kinds that write a whole GROUP of sockets from one gesture and therefore require
 #: :attr:`SocketSpec.pick_bounds`. ``pick_peer`` covers the two-socket case where the pair is
 #: an interval aimed in two phases; these are different — one gesture yields every member at
 #: once (a rectangle *is* four numbers), so there is nothing to order and no second phase.
+#:
+#: ``frames`` is deliberately NOT here: a selection across three axes is one VALUE (``util.crop``'s
+#: ``"m0-2,t3"`` spec) rather than three sockets written together, so there is no group to
+#: declare — which is the simpler shape wherever the picked thing is one thing.
 BOUND_PICK_KINDS: FrozenSet[str] = frozenset({"rect", "zrange"})
 
 #: Which SocketTypes each pick kind may annotate. A gesture produces a particular KIND of
@@ -99,6 +105,9 @@ BOUND_PICK_KINDS: FrozenSet[str] = frozenset({"rect", "zrange"})
 _PICK_SOCKET_TYPES: Dict[str, Tuple[SocketType, ...]] = {
     "shapes": (SocketType.STRING,),
     "channels": (SocketType.STRING,),
+    # A whole SELECTION ("m0-2,t3"), so STRING like ``channels`` and unlike ``frame``/
+    # ``zrange``: the picks span three axes and can be sparse on each, which no number holds.
+    "frames": (SocketType.STRING,),
     "channel": (SocketType.INT,),
     "frame": (SocketType.INT,),
     "rect": (SocketType.INT,),
@@ -345,6 +354,29 @@ class ModeSpec:
     def is_dim_lever(self) -> bool:
         return self.role == "dim_lever"
 
+    @property
+    def is_scope(self) -> bool:
+        """True for the STATISTICS-POPULATION mode (V2.27) — ``role="scope"``.
+
+        The second role, and the mirror of :attr:`is_dim_lever`: the lever says how much of
+        the data one kernel call sees, this says which voxels are pooled into the *statistic*
+        a data-derived parameter is computed from — the plane's histogram, the volume's, or
+        one population per label region.
+
+        It exists as a role rather than a naming convention because the GUI edits it from the
+        card's footprint band (``nodelab_v2.node_item``), and the band cannot be keyed on
+        :attr:`NodeSpec.footprint_mode` instead: on three of the four nodes that declare a
+        non-default one, that Mode is not a population at all. ``util.zproject``'s is
+        ``method``, so a band bound to it would offer max/mean/**none** — i.e. a footprint
+        control that changes the reducer, or switches the node off. ``enhance.normalize`` is
+        the clean proof of the split: its population IS a ``scope`` Mode while its
+        ``footprint_mode`` is ``bounds``, and the two must stay independent.
+
+        The vocabulary itself lives in :mod:`nodegraph.catalog._shared.scope` — not here,
+        because this module must not import the catalog. ``selftest::test_scope_facility``
+        closes that loop by checking every declared scope Mode against it."""
+        return self.role == "scope"
+
     def active_in(self, state: Mapping[str, str]) -> bool:
         """True if this Mode is shown in mode ``state`` (V2.12) — mirrors
         :meth:`SocketSpec.active_in`."""
@@ -440,6 +472,34 @@ class NodeSpec:
     #: disagreement is refused instead (``enhance.zs_deconvnet``'s ``arch_3d`` and the dim
     #: lever).
     trained_params: Optional[Callable[..., Any]] = None
+    #: One line for the GUI naming WHICH file :attr:`trained_params` read, or why it found
+    #: nothing (V2.23b): ``(params, modes) -> str``, ``""`` for nothing to say.
+    #:
+    #: It exists because the empty answer is the ambiguous one. "This model has no training
+    #: record" and "this feature is not working" look identical in a panel — reported exactly
+    #: that way ("loading in the model does not change any of the parameters") for the two
+    #: legitimate empty cases: a published checkpoint that carries no sidecar, and a model path
+    #: that is not a model directory. A resolver returning ``{}`` is correct in both; saying so
+    #: is what makes it usable.
+    #:
+    #: Presentation-only and memo-neutral, exactly like ``description``: nothing hashes it and
+    #: no compute may read it, so its wording is a zero-risk edit.
+    trained_note: Optional[Callable[..., Any]] = None
+
+    def note_for_trained(self, params: Mapping[str, Any],
+                         modes: Mapping[str, Any]) -> str:
+        """Resolve :attr:`trained_note`, swallowing everything — ``""`` when there is no
+        hook, it raises, or it returns a non-string. Same total-function seam as
+        :meth:`trained`, and for the same reason: this runs on every inspector rebuild, and a
+        broken explanation must never take the panel down with it."""
+        fn = self.trained_note
+        if fn is None:
+            return ""
+        try:
+            got = fn(dict(params or {}), dict(modes or {}))
+        except Exception:  # noqa: BLE001 — a note must never break the panel
+            return ""
+        return got if isinstance(got, str) else ""
 
     def trained(self, params: Mapping[str, Any],
                 modes: Mapping[str, Any]) -> Dict[str, Any]:
@@ -480,6 +540,14 @@ class NodeSpec:
 
     def has_dim_lever(self) -> bool:
         return self.dim_lever() is not None
+
+    def scope_mode(self) -> Optional[ModeSpec]:
+        """The statistics-population mode, if this node bears one (V2.27) — see
+        :attr:`ModeSpec.is_scope`. At most one per spec (``_check_footprint``)."""
+        return next((m for m in self.modes if m.is_scope), None)
+
+    def has_scope_mode(self) -> bool:
+        return self.scope_mode() is not None
 
     # ── variant resolution (V2.03 §3 B1) ──────────────────────────────────────
     def active_inputs(self, state: Mapping[str, str]) -> tuple:
@@ -783,6 +851,7 @@ class NodeRegistry:
         for m in spec.modes:
             self._check_mode(spec, m)
         self._check_reads_domains(spec)
+        self._check_footprint(spec)
         self._by_key[spec.op_key] = spec
         self._owner[spec.op_key] = _defining_module()
         self._counter += 1
@@ -1014,6 +1083,72 @@ class NodeRegistry:
                              f"{list(m.choices)}")
         _check_choice_docs(where, m.choice_docs, tuple(m.choices), "choices")
 
+    @staticmethod
+    def _check_footprint(spec: NodeSpec) -> None:
+        """Validate the footprint declaration (V2.27) — ``granularity`` / ``kernel_axes`` /
+        ``footprint_mode``, which went **entirely unvalidated** until now.
+
+        Every failure below is silent AND expensive, which is the combination that earns a
+        registration check. :meth:`NodeSpec.resolve_granularity` is
+        ``g.get(state.get(self.footprint_mode, ""))`` — total, and ``None`` on any miss. So a
+        Mapping that forgets one of its Mode's choices, or a ``footprint_mode`` naming a Mode
+        that does not exist, resolves to ``None`` in that state and nothing raises. Downstream,
+        ``None`` is not in ``_shared/map_image.py``'s lazy whitelist, so the node abandons the
+        tiled path and allocates the WHOLE SERIES as float64 — 5 GiB per raster on a 16-position
+        2048²×10 stack, reached without a single error message. The GUI is worse than silent:
+        the card paints the green ``TILEABLE`` chip, i.e. "cheapest possible read", for a
+        footprint that failed to resolve.
+
+        Four checks, each closing one of those:
+
+        * a Mapping ``granularity``/``kernel_axes`` requires ``footprint_mode`` to name a real
+          Mode on this spec;
+        * the Mapping must carry a key for **every** choice of that Mode — coverage, not merely
+          overlap, because the uncovered value is exactly the one that resolves to ``None``;
+        * every ``granularity`` value is a real :class:`Granularity` member;
+        * at most one ``role="scope"`` Mode per spec, since
+          :meth:`NodeSpec.scope_mode` returns the first and a second one would be a control
+          that silently does nothing.
+
+        Audited against the shipped catalog when this landed: all 79 registered ops pass with
+        no fixes, so this is a ratchet on new work rather than a migration."""
+        mode_names = {m.name for m in spec.modes}
+        for field_name, value in (("granularity", spec.granularity),
+                                  ("kernel_axes", spec.kernel_axes)):
+            if not isinstance(value, Mapping):
+                continue
+            if spec.footprint_mode not in mode_names:
+                raise ValueError(
+                    f"{spec.op_key}: {field_name} is keyed per mode value, but "
+                    f"footprint_mode={spec.footprint_mode!r} is not a Mode on this node "
+                    f"({sorted(mode_names) or 'it has none'}) — every state would resolve to "
+                    f"None, which drops the node off the tiled read path and allocates the "
+                    f"whole series eagerly, with no error. Name the Mode that decides the "
+                    f"footprint, or declare a single {field_name} value.")
+            choices = tuple(next(m.choices for m in spec.modes
+                                 if m.name == spec.footprint_mode))
+            missing = [c for c in choices if c not in value]
+            if missing:
+                raise ValueError(
+                    f"{spec.op_key}: {field_name} is keyed by {spec.footprint_mode!r} but has "
+                    f"no entry for {missing} — those values resolve to None, which reads as "
+                    f"'undeclared' (whole-series eager realize, and a green TILEABLE chip on "
+                    f"the card). Give every choice a value; over-declaring is safe, absent is "
+                    f"not.")
+        gran = spec.granularity
+        vals = list(gran.values()) if isinstance(gran, Mapping) else \
+            ([gran] if gran is not None else [])
+        bad = [v for v in vals if not isinstance(v, Granularity)]
+        if bad:
+            raise ValueError(
+                f"{spec.op_key}: granularity holds {bad!r}, which is not a Granularity member")
+        scopes = [m.name for m in spec.modes if m.is_scope]
+        if len(scopes) > 1:
+            raise ValueError(
+                f"{spec.op_key}: two modes claim role='scope' ({scopes}) — NodeSpec.scope_mode "
+                f"returns the first, so the second would be a live-looking population control "
+                f"that nothing reads, and the card's footprint band could only edit one.")
+
     def get(self, op_key: str) -> Optional[NodeSpec]:
         return self._by_key.get(op_key)
 
@@ -1044,7 +1179,8 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                     Mapping[str, Mapping[str, FrozenSet[Domain]]]] = None,
                 adds_domains: FrozenSet[Domain] = frozenset(),
                 extra_layers: Optional[Callable[..., Any]] = None,
-                trained_params: Optional[Callable[..., Any]] = None) -> NodeSpec:
+                trained_params: Optional[Callable[..., Any]] = None,
+                trained_note: Optional[Callable[..., Any]] = None) -> NodeSpec:
     """Build and register a :class:`NodeSpec`."""
     return NODES.register(NodeSpec(
         op_key=op_key, label=label, category=category,
@@ -1059,6 +1195,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
         adds_domains=frozenset(adds_domains),
         extra_layers=extra_layers,
         trained_params=trained_params,
+        trained_note=trained_note,
     ))
 
 

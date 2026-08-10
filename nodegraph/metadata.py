@@ -135,10 +135,12 @@ def bit_depth_after_sum(env: MetaEnvelope, n: int) -> Dict[str, Any]:
 def value_rescaled(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """The meta_transform of a node whose output is no longer raw integer counts —
     percentile Normalize and CLAHE both return [0,1] floats. It DROPS ``bit_depth``:
-    absent means "no declared integer scale", which is the honest signal for a
-    raw-count consumer downstream (``analysis.histogram_threshold`` refuses such an
-    input outright; ``analysis.threshold``'s fixed level falls back to its 0.5
-    normalized-data default). Axis-preserving — only the intensity meaning changes."""
+    absent means "no declared integer scale", which is the honest signal every
+    raw-count consumer downstream keys on: ``analysis.threshold``'s fixed level falls back to
+    its 0.5 normalized-data default, and ``analysis.histogram_threshold`` switches its absolute
+    thresholds into the DATA'S OWN units, so a cut of 0.35 means 0.35 (V2.28 — it used to refuse
+    such an input outright, which left normalized data with no way to be thresholded at all).
+    Axis-preserving — only the intensity meaning changes."""
     return env.with_metadata(bit_depth=None)
 
 
@@ -155,6 +157,27 @@ def flatten_field(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnv
     Axis-preserving either way — only the meaning of the numbers can change."""
     return (env.with_metadata(bit_depth=None)
             if (modes or {}).get("method") == "ratio" else env)
+
+
+def subtract_background(env: MetaEnvelope, params: Mapping,
+                        modes: Mapping) -> MetaEnvelope:
+    """``enhance.subtract_background``: only ``combine="divide"`` leaves the count scale.
+
+    The same rule as :func:`flatten_field`, over two Modes instead of one. Subtracting a
+    background — clipped or signed — returns counts, so ``bit_depth`` survives; dividing by
+    it returns "times the local background", which is dimensionless and centred near 1, so
+    the key is dropped exactly as :func:`value_rescaled` does for a percentile Normalize
+    (§7c). ``output="background"`` returns the *estimate*, which is in the input's own counts
+    whatever the arithmetic would have been — so the ``combine`` state is read only for the
+    ``corrected`` output, mirroring the ``available_in`` gate on that socket and the
+    compute's own branch. Both defaults are spelled the way the compute spells them, since
+    this runs on every keystroke against a state that may predate either Mode.
+
+    Axis-preserving either way — only the meaning of the numbers can change."""
+    m = modes or {}
+    dimensionless = (str(m.get("output") or "corrected") == "corrected"
+                     and str(m.get("combine") or "subtract") == "divide")
+    return env.with_metadata(bit_depth=None) if dimensionless else env
 
 
 # ── spatial provenance: WHERE the data is (origin_um) ──────────────────────────
@@ -250,6 +273,90 @@ def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[st
         changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
                         else None)
     return changes
+
+
+#: EVERY metadata key that is a **list indexed by timepoint**. The per-T member of the same
+#: family as :data:`PER_CHANNEL_KEYS` and :data:`PER_POSITION_KEYS`, and it exists for the
+#: third time for the same reason: ``frame_time_jd[t]`` is read POSITIONALLY, so a
+#: full-length list left behind by a node that narrowed T does not look stale — it looks
+#: like the wrong TIME. That one is the sharpest of the three, because
+#: :func:`~nodegraph.placement.paired_t` uses it as the only clock two files share: a stale
+#: list silently pairs frame 0 of one acquisition against frame 0 of the other's ORIGINAL
+#: numbering, and channel.merge then reads two different moments as one.
+#:
+#: One member today. ``frame_timestamps_s`` is deliberately absent: it never reaches a
+#: Dataset (:data:`nodelab_v2.ingest.PLACEMENT_KEYS` does not carry it), and ``dt_s`` is a
+#: scalar INTERVAL rather than a per-T list, so a subset re-spaces it instead of reindexing
+#: it (see :func:`respaced`).
+PER_TIME_KEYS: Tuple[str, ...] = ("frame_time_jd",)
+
+
+def time_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
+    """The ``{key: subset}`` changes that reindex every :data:`PER_TIME_KEYS` list in
+    ``metadata`` onto the timepoints ``keep`` (already validated indices, in output order).
+
+    The per-T twin of :func:`channel_subset` / :func:`position_subset`, with the same two
+    rules: a key that is absent or not a list is left alone rather than invented, and a list
+    too SHORT to cover an index in ``keep`` is dropped whole rather than silently shortened,
+    because a partial positional list reports some other frame's time instead of admitting
+    it does not know.
+    """
+    changes: Dict[str, Any] = {}
+    for key in PER_TIME_KEYS:
+        vals = metadata.get(key)
+        if not isinstance(vals, (list, tuple)):
+            continue
+        changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
+                        else None)
+    return changes
+
+
+def respaced(value: Any, keep: Sequence[int]) -> Any:
+    """A scalar axis SPACING (``dt_s``, ``z_step_um``) after the axis is subset to ``keep``.
+
+    Three answers, and the middle one is the reason this is not just a pass-through:
+
+    * a **contiguous** run (or a single index) keeps the spacing — nothing was skipped, so
+      the interval between surviving neighbours is the source's own;
+    * a **uniformly strided** run multiplies it — keeping every 3rd plane of a 0.5 µm stack
+      really is a 1.5 µm stack, and a 3D measurement downstream reads this number to turn
+      voxels into µm³. Leaving it at 0.5 would under-report every volume by 3×;
+    * an **irregular** pick (planes 2, 5, 6) has no single spacing at all, so the key is
+      DROPPED (``None`` → removed). Absent means "unknown", which a consumer can refuse or
+      degrade on; a fabricated average would be believed.
+
+    ``None`` in, ``None`` out: a file that never carried the spacing does not gain one.
+    """
+    if value is None or len(keep) < 2:
+        return value
+    steps = {int(keep[i + 1]) - int(keep[i]) for i in range(len(keep) - 1)}
+    if len(steps) != 1:
+        return None
+    try:
+        return float(value) * float(steps.pop())
+    except (TypeError, ValueError):
+        return None
+
+
+def z_home_after(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
+    """``{"z_home_index": …}`` for a Z axis subset to ``keep``, or ``{}`` if nothing to say.
+
+    ``z_home_index`` names WHICH slice ``stage_z_um`` is the focus of
+    (:data:`nodelab_v2.ingest.PLACEMENT_KEYS`), so it is an index into the z axis and a
+    subset moves it: the home plane's new address is its position within ``keep``. If the
+    home plane was cropped away there is no such position, and the key is dropped rather
+    than left pointing at whichever plane inherited its old number — the same
+    stale-positional-index failure :func:`position_subset` guards on M.
+    """
+    home = metadata.get("z_home_index")
+    if home is None:
+        return {}
+    try:
+        idx = int(home)
+    except (TypeError, ValueError):
+        return {}
+    picks = [int(z) for z in keep]
+    return {"z_home_index": picks.index(idx) if idx in picks else None}
 
 
 def drop_position_keys(metadata: Mapping[str, Any]) -> Dict[str, Any]:
@@ -354,6 +461,167 @@ def parse_channels(raw) -> Optional[List[int]]:
     return items or None
 
 
+def parse_indices(raw) -> Optional[List[int]]:
+    """An index-list param → sorted unique indices, or ``None`` for "every index".
+
+    The frame-axis counterpart of :func:`parse_channels`, and it accepts one thing that
+    parser does not: a **RANGE**, ``"3-8"``, meaning 3 through 8 **inclusive**. Inclusive
+    because that is what a human writing a range means, and the alternative — matching the
+    exclusive ``y1``/``x1`` slice bounds on the same node — would make ``"0-0"`` select
+    nothing. The two spellings compose (``"0-3,7,10-12"``), which is what makes one socket
+    serve both "the range I want" and "the sparse set the strips picked".
+
+    Deliberately total, like :func:`parse_channels`: a token that is not an index is
+    skipped, and a half-typed ``"3-"`` reads as ``3`` rather than raising, so the node keeps
+    previewing while somebody is still typing. Reversed (``"8-3"``) is read as the same span
+    — an interval has no direction here, and the axes are always walked in acquisition
+    order (:class:`~nodegraph.provider.FrameSubsetProvider` sorts).
+
+    Negative values are simply out of range, not "from the end": ``-`` is the range
+    separator, so a leading minus would be ambiguous, and :func:`frame_spec_picks` drops
+    out-of-range indices anyway. A list of ints (what a GUI pick commits) passes through.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    out: List[int] = []
+    if isinstance(raw, str):
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            lo_txt, sep, hi_txt = tok.partition("-")
+            try:
+                lo = int(lo_txt)
+            except ValueError:
+                continue
+            if not sep:
+                out.append(lo)
+                continue
+            try:
+                hi = int(hi_txt)
+            except ValueError:
+                out.append(lo)                 # "3-" mid-type: the one index we do have
+                continue
+            out.extend(range(min(lo, hi), max(lo, hi) + 1))
+    else:
+        for item in raw:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    return sorted(set(out)) or None
+
+
+def format_indices(values: Sequence[int]) -> str:
+    """Sorted indices → the shortest index-list string that means them: ``"0-3,7,10-12"``.
+
+    The inverse of :func:`parse_indices`, and it must round-trip through it exactly, which is
+    the reason it lives here beside it rather than in the GUI layer that needs it: a picked
+    param has to be indistinguishable from a typed one, and a formatter that drifted from the
+    parser would produce a value the node then read as something else.
+
+    Canonical: because the input is sorted and de-duplicated (:func:`frame_spec_picks`), one
+    selection has exactly one spelling. That is what lets the result be used as sampling
+    PROVENANCE, which is compared rather than merely displayed.
+    """
+    out: List[str] = []
+    run: List[int] = []
+
+    def flush() -> None:
+        if run:
+            out.append(str(run[0]) if len(run) == 1 else f"{run[0]}-{run[-1]}")
+
+    for v in values:
+        if run and int(v) == run[-1] + 1:
+            run.append(int(v))
+            continue
+        flush()
+        run = [int(v)]
+    flush()
+    return ",".join(out)
+
+
+#: The axes a frame spec may name, in the order :func:`format_frame_spec` writes them.
+FRAME_SPEC_AXES: Tuple[str, ...] = ("m", "t", "z")
+
+
+def parse_frame_spec(raw) -> Dict[str, List[int]]:
+    """A frame spec — ``"m0-2,t3,z1-4"`` — → ``{axis: indices}``, absent axis = keep every one.
+
+    ONE param for the whole selection, because the thing the user is selecting is one thing:
+    "these frames". Three separate sockets said the same and made the reader assemble it.
+
+    The grammar is whatever a person is likely to type, which means two spellings have to
+    work and do: a token that STARTS with an axis letter opens that axis's list, and a token
+    with no letter CONTINUES the axis most recently named. Commas and spaces separate tokens
+    interchangeably, so ``"m0-2,t3,z1-4"`` and ``"m0,2 t3,7"`` both read correctly — in the
+    first the comma divides axes, in the second it divides indices, and neither reading has to
+    be guessed at. Within an axis the syntax is :func:`parse_indices`', ranges included.
+
+    A leading token with no axis letter is read as **T**: this project's own vocabulary uses
+    "frame" for a timepoint (``pick_kind="frame"`` is "the timepoint the viewer is showing",
+    :func:`frame_slice` is the per-T slice), so bare ``"3"`` means timepoint 3 rather than
+    quietly doing nothing, which is what a typed number that matched no axis would otherwise
+    do. Repeating an axis extends it (``"t1 t5"`` is ``t={1,5}``) rather than replacing it,
+    which is the reading that cannot silently discard something the user typed.
+
+    Total, like :func:`parse_indices` and for the same reason: it runs on every keystroke, so
+    ``"m"``, ``"m0-"`` and ``"q7"`` all resolve to something rather than raising. An axis
+    letter with nothing after it yet contributes no indices, so it reads as "not asked for"
+    until a number arrives — the node keeps previewing the whole series instead of flickering
+    to an empty selection mid-word."""
+    out: Dict[str, List[int]] = {}
+    if raw is None:
+        return out
+    text = raw if isinstance(raw, str) else str(raw)
+    axis = "t"
+    for tok in text.replace(",", " ").split():
+        head = tok[0].lower()
+        if head.isalpha():
+            if head not in FRAME_SPEC_AXES:
+                continue                  # an axis this node cannot subset (c, y, x): ignored
+            axis, tok = head, tok[1:]
+        idx = parse_indices(tok)
+        if idx:
+            out.setdefault(axis, []).extend(idx)
+    return {a: sorted(set(v)) for a, v in out.items()}
+
+
+def format_frame_spec(picks: Mapping[str, Sequence[int]]) -> str:
+    """``{axis: indices}`` → the canonical spec string ``"m0-2,t3,z1-4"``.
+
+    The inverse of :func:`parse_frame_spec` and the thing a GUI pick commits, so it must
+    round-trip exactly: a picked value has to be indistinguishable from a typed one, editable
+    in place, and identical for the same selection every time (the sampling stamp compares
+    it). Axes are written in :data:`FRAME_SPEC_AXES` order and empty ones omitted."""
+    return ",".join(f"{a}{format_indices(sorted(set(picks[a])))}"
+                    for a in FRAME_SPEC_AXES if picks.get(a))
+
+
+def frame_spec_picks(raw, m: int, t: int, z: int
+                     ) -> Dict[str, Optional[Tuple[int, ...]]]:
+    """A frame spec resolved against real axis lengths: ``{axis: kept indices}``.
+
+    Three distinct answers per axis, and the third is the one that matters:
+
+    * ``None`` — that axis was not named, so every index is kept.
+    * a non-empty tuple — the surviving indices, sorted, out-of-range ones dropped.
+    * ``()`` — the axis WAS named and nothing survived (``"t9"`` on a 3-frame series).
+      Kept distinct from ``None`` so the two halves of the node can differ in the one way
+      they must: the compute REFUSES it (an empty axis is a degenerate payload that travels
+      until something indexes into it — ``channel.select``'s worked example), while the
+      advisory ``meta_transform`` holds the pre-edit envelope, because it re-runs on every
+      keystroke and "t9" is seen while somebody types "t90".
+
+    Shared by ``util.crop``'s frames mode and :func:`crop`, so the predicted extent and the
+    produced extent cannot drift (build-node-v2 §2)."""
+    spec = parse_frame_spec(raw)
+    sizes = {"m": int(m), "t": int(t), "z": int(z)}
+    return {a: (None if a not in spec
+                else tuple(i for i in spec[a] if 0 <= i < sizes[a]))
+            for a in FRAME_SPEC_AXES}
+
+
 #: EVERY metadata key that is a **list indexed by channel**. A node that narrows or
 #: reorders the channel axis must subset all of them together or the survivors stop
 #: describing the channels that are left — and because they are read POSITIONALLY
@@ -418,7 +686,15 @@ def crop(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     predicted (header) extent equals the realized payload extent for one-sided and
     out-of-range crops alike (adversarial review 2026-07-21). A ``max(1, …)`` floor
     keeps the advisory transform crash-free where the payload would raise on an empty
-    region."""
+    region.
+
+    ``region == "frames"`` is the other half of the node (V2.27) and goes to
+    :func:`crop_frames`: the same node narrows M/T/Z by index instead of cutting a window
+    out of a plane. The branch is on the MODE rather than on which params are set, so a
+    graph carrying stale bounds from the other mode is unaffected by them — exactly what the
+    sockets' ``available_in`` gating promises the user."""
+    if (modes or {}).get("region") == "frames":
+        return crop_frames(env, params, modes)
     ax = env.axes
 
     def span(a, b, n):
@@ -447,6 +723,69 @@ def crop(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     dz = (lo(params.get("z0"), ax.z) * float(zs)
           if (zs and modes.get("dim") == "3D") else 0.0)
     return env.with_axes(new_axes).with_metadata(**shift_origin_um(env, dz, dy, dx))
+
+
+def crop_frames(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.crop``'s frames mode: narrow M / T / Z to the picked indices (V2.27).
+
+    Not a window but a **subset** — the picks may be sparse, because that is what the
+    viewer's M/T/Z strips produce and a span would silently re-admit the frames between the
+    ones somebody ticked. Every axis is independent and the result is their cross product,
+    the same reading :class:`~nodegraph.provider.FrameSubsetProvider` already implements for
+    the run scope.
+
+    Four kinds of metadata move with it, and every one of them is a positional-staleness
+    trap of the kind that does not LOOK stale:
+
+    * per-M lists (:func:`position_subset`) — a survivor at full length reports another
+      field's stage coordinate, which reads as a handedness bug;
+    * per-T lists (:func:`time_subset`) — ``frame_time_jd`` is the only clock two files
+      share, so a stale one mis-pairs a merge;
+    * the axis SPACINGS ``dt_s`` / ``z_step_um`` (:func:`respaced`) — a strided pick really
+      does re-space the axis, and this number is what a 3D measurement multiplies by;
+    * ``z_home_index`` (:func:`z_home_after`) and ``origin_um`` — both name a position on
+      the z axis, so cutting planes off the bottom moves them.
+
+    ``pixel_size_um`` and the lateral extent are untouched: nothing is cut out of a plane
+    here. Total, like every transform: an unparseable or fully-out-of-range request holds the
+    pre-edit envelope and lets the payload raise the real message
+    (:func:`frame_spec_picks`).
+    """
+    ax = env.axes
+    picks = frame_spec_picks(params.get("frames"), ax.m, ax.t, ax.z)
+    ms, ts, zs = picks["m"], picks["t"], picks["z"]
+    if ms == () or ts == () or zs == ():
+        return env
+    keep_m = ms if ms is not None else tuple(range(ax.m))
+    keep_t = ts if ts is not None else tuple(range(ax.t))
+    keep_z = zs if zs is not None else tuple(range(ax.z))
+    new_axes = replace(ax, m=len(keep_m), t=len(keep_t), z=len(keep_z))
+
+    changes: Dict[str, Any] = {}
+    if ms is not None:
+        changes.update(position_subset(env.metadata, keep_m))
+    if ts is not None:
+        changes.update(time_subset(env.metadata, keep_t))
+        changes["dt_s"] = respaced(env.metadata.get("dt_s"), keep_t)
+    z_step = env.metadata.get("z_step_um")
+    if zs is not None:
+        changes["z_step_um"] = respaced(z_step, keep_z)
+        changes.update(z_home_after(env.metadata, keep_z))
+    # The z shift uses the SOURCE spacing, deliberately: `origin_um` is where plane 0 sits,
+    # so the corner moves by however many real planes were dropped below the first kept one.
+    # Computing it from the RESPACED step would scale the shift by the stride as well.
+    out = env.with_axes(new_axes).with_metadata(**changes)
+    if zs is not None and z_step and keep_z and keep_z[0]:
+        try:
+            dz = float(z_step) * int(keep_z[0])
+        except (TypeError, ValueError):
+            dz = 0.0
+        if dz:
+            # Applied to `out`, not `env`: `read_origin_um` validates the list against
+            # `axes.m`, and after an M subset only the already-narrowed list on the
+            # already-narrowed axes passes that check.
+            out = out.with_metadata(**shift_origin_um(out, dz, 0.0, 0.0))
+    return out
 
 
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
@@ -596,7 +935,7 @@ META_TRANSFORMS: Dict[str, MetaTransform] = {
     "stack_time": stack_time, "frame_slice": frame_slice,
     "channel_select": channel_select, "crop": crop, "stitch": stitch,
     "value_rescaled": value_rescaled, "flatten_field": flatten_field,
-    "zs_deconvnet": zs_deconvnet,
+    "zs_deconvnet": zs_deconvnet, "subtract_background": subtract_background,
 }
 
 
@@ -770,7 +1109,10 @@ __all__ = [
     "identity", "resample", "z_project", "stack_time", "frame_slice",
     "channel_select", "crop", "stitch", "value_rescaled", "bit_depth_after_sum",
     "propagate_meta", "envelope_symbols", "parse_channels",
+    "parse_indices", "format_indices", "crop_frames",
+    "FRAME_SPEC_AXES", "parse_frame_spec", "format_frame_spec", "frame_spec_picks",
     "PER_CHANNEL_KEYS", "channel_subset",
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys",
+    "PER_TIME_KEYS", "time_subset", "respaced", "z_home_after",
     "eval_derive", "resolve_dim_default",
 ]

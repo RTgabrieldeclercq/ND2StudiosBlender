@@ -1,0 +1,454 @@
+# evidence log — evidence log
+
+Exported 2026-08-06 06:22. 18 entries, oldest first. Append-only: withdrawn claims are still here and marked, because the reason a decision changed is part of the record.
+
+## `e001` On a fixture with known truth, brightest wins - and the two cheap rules fail in opposite directions
+
+*FOUND — **REJECTED** · 2026-08-05 13:14:23*
+
+Two elongated cells, each an ellipse body with a thin dim thread off both poles, plus one detached speck of debris belonging to neither. The 'current segmentation' is the bodies only, which is the ~80%-capture situation. Scored over the CONTESTED voxels only - the ones no rule gets for free - so the numbers are not diluted by the bodies everyone keeps.
+
+**Why:** This is the decision that fixes the node's sockets and its footprint, so it should not be taken from a diagram. It also settles whether the existing `transform.grow_points` could have done the job: it grows by a fixed physical reach, so reaching a 46 px thread means inflating the body by 46 px too. `missed` and `invented` cannot both be driven to zero geometrically.
+
+*`missed` = real thread left as background. `wrong cell` = given to the other cell. `invented` = debris or background claimed. Lower is better in the last three.*
+
+| rule | contested right | thread missed | wrong cell | invented |
+|---|---|---|---|---|
+| brightest | 100.0% | 0 | 0 | 0 |
+| geodesic | 99.2% | 0 | 274 | 0 |
+| fragment | 100.0% | 0 | 0 | 0 |
+| euclidean | 99.7% | 0 | 97 | 25 |
+
+![Read the bottom four panels against the TRUTH panel above them. Watch the detach](img/rules_synthetic.png)
+
+*Read the bottom four panels against the TRUTH panel above them. Watch the detached speck at top right: whether a rule claims it is the whole difference between euclidean and the connectivity-aware rules. Then watch where each thread STOPS.*
+
+> **Their note:** Operator: "instead of this, let's run the example file I mentioned." Withdrawn as the basis for choosing a default -- the decision moves to the real frame (Fibro_test.tif). Kept because it is why the fixture was rebuilt: its geodesic row was my own bug (see e002), and its fixture had no thread joining two cells, so brightest and fragment both scored 100% without being distinguished. Neither the numbers nor the figure in this entry should be quoted.
+
+---
+
+## `e002` RETRACTED: the geodesic row of e001 was my bug, not geodesic's behaviour
+
+*MY ERROR — **CONFIRMED** · 2026-08-05 13:18:23*
+
+e001 reported geodesic at 99.2% with 274 voxels given to the wrong cell, and its figure showed BOTH of cell 2's threads coming out in cell 1's colour. That is not what geodesic assignment does - it is what my implementation did.
+
+**Why:** I read `MCP_Geometric.find_costs`'s `traceback` as an index into the list of start points and used it to look up each seed's label. It is not: it holds neighbour-OFFSET indices, -1..7 for an 8-neighbourhood, so the lookup indexed an 8-element space into a several-hundred-element seed array and returned an unrelated id. Retracted: geodesic's 99.2% / 274 figure, and the geodesic panel of e001's figure. The correct multi-source form is a watershed on a CONSTANT cost surface, which I checked against a per-label MCP_Geometric reference (0 disagreements). Everything else in e001 stands, but the fixture it used could not separate the rules anyway - see the next entry.
+
+```
+traceback dtype: int16 unique: [-1 0 1 2 3 4 5 6 7]
+n starts: 2          <- only 2 seeds
+offsets len: 8       <- but 8 distinct traceback values
+--> values are neighbour-OFFSET indices, not start indices: True
+```
+
+> **Their note:** Operator: "Keep that retracted." The retraction stands as the record; the geodesic figure quoted in e001 is not to be used.
+
+---
+
+## `e003` Four assignment rules on a discriminating fixture - which one do you want on your real frames?
+
+*NEEDS YOU — **CONFIRMED** · 2026-08-05 13:18:24*
+
+The previous fixture could not tell these apart: its threads were all unambiguous, so two rules scored 100% for free. This one adds the two cases that separate them - a small cell sitting near another cell's thread but not connected to it, and a thread that JOINS two cells with its dim point off-centre at 35% along.
+
+**Why:** This choice fixes the node's sockets and its footprint, so it is worth getting right before any of it is written. It also settles whether `transform.grow_points` could have done this job: that node grows by a fixed physical reach, so reaching a 100 px thread means inflating the cell body by 100 px as well - `missed` and `invented` cannot both go to zero geometrically. Note the bridge column has no right answer, only consequences: whatever fraction a rule gives to cell 1 is area that comes off cell 2 in every downstream measurement.
+
+*First four columns are scored on the unambiguous voxels only. `missed` = real thread left as background; `wrong cell` = handed to a cell it has no signal path to; `invented` = debris claimed. The last column is not right or wrong - it is how the bridge got divided.*
+
+| rule | unambiguous right | missed | wrong cell | invented | bridge -> cell 1 |
+|---|---|---|---|---|---|
+| brightest | 100.0% | 0 | 0 | 0 | 33% |
+| geodesic | 100.0% | 0 | 0 | 0 | 50% |
+| fragment | 100.0% | 0 | 0 | 0 | 100% |
+| euclidean | 99.8% | 0 | 96 | 25 | 50% |
+
+| | value | note |
+|---|---|---|
+| clean on all three error types | brightest, geodesic, fragment | no missed, no stolen, no invented |
+| bridge dim point | 35% along | where `brightest` should cut, if brightness is the right signal to cut on |
+| bridge midpoint | 50% along | where `geodesic` should cut - it ignores brightness |
+
+![Look at cell 3, the small blue body at top left, and at cell 1's thread passing ](img/rules_synthetic_v2.png)
+
+*Look at cell 3, the small blue body at top left, and at cell 1's thread passing beside it. Under `euclidean` the near half of that thread turns blue - stolen across a gap it has no signal connection to. Then look at the debris speck top right: `euclidean` claims that too.*
+
+![One row per rule, same crop. `fragment` gives the ENTIRE bridge to one cell - th](img/rules_bridge_zoom.png)
+
+*One row per rule, same crop. `fragment` gives the ENTIRE bridge to one cell - the flat 0% or 100% - which is the column that matters if you measure per-cell area. Compare where `brightest` hands over (at the dim notch) against `geodesic` (near the middle).*
+
+**What I need from you:** Which rule should I build as the default - and should the others be selectable modes or left out? If you would rather judge this on your own frames first, say so and tell me which segmentation method produces your current ~80% result, and I will run the same four rules on real data before you decide.
+
+> **Their note:** Operator: run the four rules on `Fibro_test.tif` before choosing a default. Done - raw and deconvolved, see e012/e015. Answered by doing rather than by picking a rule.
+
+---
+
+## `e004` The four rules on a real frame (tif_Fibro_test_raw) - which one do you want?
+
+*NEEDS YOU — **CONFIRMED** · 2026-08-05 19:08:31*
+
+Source: `Fibro_test.tif`, a single exported frame at 1.7183 um/px (no deconvolution, CellSAM tiled+fast). Temporal gain is absent because it fits over T and this is one frame. The leftover is signal above Otsu (754) that CellSAM did not claim. 1890 cells, 9561 leftover px (0.91% of the frame).
+
+**Why:** On the synthetic fixture three rules were clean and only the bridge column separated them. What decides it here is the fragment census below: it counts how often a leftover piece actually touches TWO cells on your data. If that number is small, `fragment` is the simpler node and loses nothing; if it is large, only the splitting rules keep per-cell areas honest.
+
+| | value | note |
+|---|---|---|
+| leftover fragments | 897 | connected pieces |
+| touching no label | 580 | 1089 px - debris no rule should claim |
+| touching one label | 186 | 3000 px - unambiguous, all rules agree |
+| touching 2+ labels | 131 | 5472 px - BRIDGES; this is the number that decides fragment vs splitting |
+| otsu level | 754.1 | the leftover cut, reproducible rather than hand-picked - it becomes a socket on the node |
+
+*`px left behind` is leftover no rule could reach - for the connectivity-aware rules that is mostly the debris. Watch the last column: one cell gaining a large fraction usually means it swallowed a neighbour's process.*
+
+| rule | px claimed | px left behind | cells that grew | median area change | worst cell |
+|---|---|---|---|---|---|
+| brightest | 8472 | 1089 | 274 | +0.0% | +168% |
+| geodesic | 8472 | 1089 | 335 | +0.0% | +168% |
+| fragment | 8472 | 1089 | 247 | +0.0% | +168% |
+| euclidean | 9561 | 0 | 674 | +0.0% | +95% |
+
+![Whole frame. Compare the four bottom panels against the leftover panel: which of](img/tif_Fibro_test_raw_full.png)
+
+*Whole frame. Compare the four bottom panels against the leftover panel: which of them put the thread signal onto the cell you would have drawn it onto?*
+
+![The densest leftover neighbourhood, where the rules disagree most. This is the c](img/tif_Fibro_test_raw_zoom.png)
+
+*The densest leftover neighbourhood, where the rules disagree most. This is the crop to judge on - look for a thread handed to a cell it does not belong to, and for two cells joined into one.*
+
+**What I need from you:** Looking at the zoom: which rule assigns the threads the way you would by hand? If none of them do, say what they get wrong and I will add the case to the fixture rather than tune to this one frame.
+
+> **Their note:** Operator: "Let's keep brightness and fragment, and do a single cell deep dive into them. First, we need to enhance our method of selecting nearby areas that are potentially extensions of a cell." Shortlist fixed at brightest + fragment; geodesic and euclidean are out. Candidate selection came first (e015) and the single-cell deep dive is next.
+
+---
+
+## `e005` The leftover LEVEL, not the assignment rule, is what decides how much of a cell you get back
+
+*FOUND — **REJECTED** · 2026-08-05 19:29:29*
+
+Swept the leftover cut from just above background (53) up through Otsu (754) on Fibro_test, 1890 CellSAM cells. At Otsu the leftover is under 1% of the frame and every rule produces the same picture; the thin polar processes are dimmer than Otsu and are simply not in the leftover at that setting.
+
+**Why:** I first reported this comparison at Otsu alone, which is the top of the range, and at that level the four rules are indistinguishable - a single-point comparison there would have justified picking whichever rule I preferred. The column that matters is `% of leftover area on bridges`: leftover pieces touching two or more cells. It is already 57% at Otsu and rises as the level drops, because dimmer signal joins neighbouring cells into one connected sheet. Every one of those pixels is area that `fragment` must give entirely to a single cell.
+
+*`worst cell` is the largest per-cell area increase at that level. Watch `fragment`'s column against `brightest`'s: where they diverge, a single cell has swallowed a shared region whole.*
+
+| level | leftover px | of frame | fragments | % area on bridges | worst cell: brightest | geodesic | fragment | euclidean |
+|---|---|---|---|---|---|---|---|---|
+| 123 | 108515 | 10.3% | 10036 | 73% | +1067% | +990% | +1078% | +1700% |
+| 228 | 42365 | 4.0% | 4435 | 74% | +463% | +283% | +530% | +408% |
+| 334 | 26431 | 2.5% | 2296 | 76% | +409% | +256% | +458% | +193% |
+| 474 | 17876 | 1.7% | 1483 | 70% | +347% | +241% | +374% | +156% |
+| 614 | 13065 | 1.2% | 1066 | 61% | +256% | +256% | +256% | +109% |
+| 754 | 9561 | 0.9% | 897 | 57% | +168% | +168% | +168% | +95% |
+
+![Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being](img/sweep_Fibro_test_raw.png)
+
+*Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being redistributed: at the bottom row it is almost nothing, at the top it is a connected web between cells. Compare columns 3 and 4 in the top rows - that is where `fragment` starts handing whole shared regions to one cell.*
+
+> **Their note:** Superseded by e006, which is the same sweep re-run after the fragment adjacency was vectorized. This first pass reported only the bridge fraction and worst-cell growth; it had no measure of how often the rules actually disagree, which turned out to be the number that matters. Its figures and numbers are not wrong, just incomplete - read e006 instead.
+
+---
+
+## `e006` The leftover LEVEL, not the assignment rule, is what decides how much of a cell you get back
+
+*FOUND · 2026-08-05 19:31:08*
+
+Swept the leftover cut from just above background (53) up through Otsu (754) on Fibro_test, 1890 CellSAM cells. At Otsu the leftover is under 1% of the frame and every rule produces the same picture; the thin polar processes are dimmer than Otsu and are simply not in the leftover at that setting.
+
+**Why:** I first reported this comparison at Otsu alone, which is the top of the range, and at that level the four rules are indistinguishable - a single-point comparison there would have justified picking whichever rule I preferred. The column that matters is `% of leftover area on bridges`: leftover pieces touching two or more cells. It is already 57% at Otsu and rises as the level drops, because dimmer signal joins neighbouring cells into one connected sheet. Every one of those pixels is area that `fragment` must give entirely to a single cell.
+
+*The `differs` columns are the fraction of reclaimed pixels each rule puts on a DIFFERENT cell than `brightest` does - the direct measure of whether this choice matters here, rather than a proxy for it. `worst cell` is the largest single-cell area increase, and it is a warning: a label that grows several-fold has flooded a connected web, which is what the reach cap exists to bound.*
+
+| level | leftover px | of frame | fragments | % area on bridges | geodesic differs | fragment differs | euclidean differs | worst cell brightest | worst cell fragment |
+|---|---|---|---|---|---|---|---|---|---|
+| 123 | 108515 | 10.3% | 10036 | 73% | 33.3% | 38.6% | 46.6% | +1067% | +1078% |
+| 228 | 42365 | 4.0% | 4435 | 74% | 35.9% | 34.0% | 50.9% | +463% | +530% |
+| 334 | 26431 | 2.5% | 2296 | 76% | 38.3% | 36.4% | 52.6% | +409% | +458% |
+| 474 | 17876 | 1.7% | 1483 | 70% | 35.3% | 33.0% | 54.1% | +347% | +374% |
+| 614 | 13065 | 1.2% | 1066 | 61% | 30.8% | 24.6% | 53.8% | +256% | +256% |
+| 754 | 9561 | 0.9% | 897 | 57% | 29.3% | 22.4% | 52.1% | +168% | +168% |
+
+![Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being](img/sweep_Fibro_test_raw.png)
+
+*Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being redistributed: at the bottom row it is almost nothing, at the top it is a connected web between cells. Compare columns 3 and 4 in the top rows - that is where `fragment` starts handing whole shared regions to one cell.*
+
+---
+
+## `e007` Built a blind labelling sheet over 65 contested pieces
+
+*DID — **REJECTED** · 2026-08-05 19:35:20*
+
+At level 334 on Fibro_test, 65 leftover fragments have their bulk assigned to different cells by `brightest` and `geodesic`. Each tile shows the raw signal, the disputed piece tinted white, and the two candidate cells outlined in orange and blue.
+
+**Why:** Nothing else I can compute ranks these two rules - they disagree on about a third of reclaimed area and both were clean on the synthetic fixture. Labels score every rule at once and out-of-sample, and become the target a fixture has to reproduce. Which candidate is drawn as 1 and which as 2 is shuffled per tile, so a label cannot anchor to my prediction; the join back to which rule chose which cell lives in manifest.json and happens after the fact.
+
+| | value | note |
+|---|---|---|
+| contested fragments | 65 | bulk assigned differently |
+| tiles built | 65 | largest first, then stratified by area |
+| level used | 334 | the sweep's most-contested setting (76% of leftover area on bridges) |
+| tile size | 260 um | 151 px at 1.718 um/px, fixed for every tile |
+
+> **Their note:** Superseded by e008. The tiles in this first build were unusable: PIL's default bitmap font rendered the 1/2 markers at ~11 px so the labeller could not tell which cell was which, and the disputed piece was tinted white, which painted over the very brightness a labeller needs in order to judge it. Rebuilt with a scaled font, a pink OUTLINE that leaves the interior intact, and a tighter 165 um tile.
+
+---
+
+## `e008` Built a blind labelling sheet over 65 contested pieces
+
+*DID · 2026-08-05 19:37:07*
+
+At level 334 on Fibro_test, 65 leftover fragments have their bulk assigned to different cells by `brightest` and `geodesic`. Each tile shows the raw signal, the disputed piece tinted white, and the two candidate cells outlined in orange and blue.
+
+**Why:** Nothing else I can compute ranks these two rules - they disagree on about a third of reclaimed area and both were clean on the synthetic fixture. Labels score every rule at once and out-of-sample, and become the target a fixture has to reproduce. Which candidate is drawn as 1 and which as 2 is shuffled per tile, so a label cannot anchor to my prediction; the join back to which rule chose which cell lives in manifest.json and happens after the fact.
+
+| | value | note |
+|---|---|---|
+| contested fragments | 65 | bulk assigned differently |
+| tiles built | 65 | largest first, then stratified by area |
+| level used | 334 | the sweep's most-contested setting (76% of leftover area on bridges) |
+| tile size | 165 um | 97 px at 1.718 um/px, fixed for every tile |
+
+---
+
+## `e009` The four rules on a real frame (tif_Fibro_test_dc) - which one do you want?
+
+*NEEDS YOU — **REJECTED** · 2026-08-05 22:23:36*
+
+Source: `Fibro_test.tif`, a single exported frame, segmented at 0.8591 um/px (ZS-DeconvNet (which upsamples 2x, halving the pixel size) then CellSAM tiled+fast). Temporal gain is absent because it fits over T and this is one frame. The leftover is signal above Otsu (0) that CellSAM did not claim. 2461 cells, 19595 leftover px (0.47% of the frame).
+
+**Why:** On the synthetic fixture three rules were clean and only the bridge column separated them. What decides it here is the fragment census below: it counts how often a leftover piece actually touches TWO cells on your data. If that number is small, `fragment` is the simpler node and loses nothing; if it is large, only the splitting rules keep per-cell areas honest.
+
+| | value | note |
+|---|---|---|
+| leftover fragments | 988 | connected pieces |
+| touching no label | 526 | 2744 px - debris no rule should claim |
+| touching one label | 224 | 3988 px - unambiguous, all rules agree |
+| touching 2+ labels | 238 | 12863 px - BRIDGES; this is the number that decides fragment vs splitting |
+| otsu level | 0.1 | the leftover cut, reproducible rather than hand-picked - it becomes a socket on the node |
+
+*`px left behind` is leftover no rule could reach - for the connectivity-aware rules that is mostly the debris. Watch the last column: one cell gaining a large fraction usually means it swallowed a neighbour's process.*
+
+| rule | px claimed | px left behind | cells that grew | median area change | worst cell |
+|---|---|---|---|---|---|
+| brightest | 16851 | 2744 | 327 | +0.0% | +221% |
+| geodesic | 16851 | 2744 | 391 | +0.0% | +394% |
+| fragment | 16851 | 2744 | 308 | +0.0% | +669% |
+| euclidean | 19595 | 0 | 802 | +0.0% | +299% |
+
+![Whole frame. Compare the four bottom panels against the leftover panel: which of](img/tif_Fibro_test_dc_full.png)
+
+*Whole frame. Compare the four bottom panels against the leftover panel: which of them put the thread signal onto the cell you would have drawn it onto?*
+
+![The densest leftover neighbourhood, where the rules disagree most. This is the c](img/tif_Fibro_test_dc_zoom.png)
+
+*The densest leftover neighbourhood, where the rules disagree most. This is the crop to judge on - look for a thread handed to a cell it does not belong to, and for two cells joined into one.*
+
+**What I need from you:** Looking at the zoom: which rule assigns the threads the way you would by hand? If none of them do, say what they get wrong and I will add the case to the fixture rather than tune to this one frame.
+
+> **Their note:** Superseded by e012/e013. This was the single-level comparison on the deconvolved frame, logged automatically by the same run whose sweep was broken; its own numbers are sound but it asks the rule question at one arbitrary level, which is the framing e006 already established is not answerable that way.
+
+---
+
+## `e010` The leftover LEVEL, not the assignment rule, is what decides how much of a cell you get back
+
+*FOUND — **REJECTED** · 2026-08-05 22:25:12*
+
+Swept the leftover cut from just above background (0) up through Otsu (0) on Fibro_test, 2461 CellSAM cells. At Otsu the leftover is under 1% of the frame and every rule produces the same picture; the thin polar processes are dimmer than Otsu and are simply not in the leftover at that setting.
+
+**Why:** I first reported this comparison at Otsu alone, which is the top of the range, and at that level the four rules are indistinguishable - a single-point comparison there would have justified picking whichever rule I preferred. The column that matters is `% of leftover area on bridges`: leftover pieces touching two or more cells. It is already 57% at Otsu and rises as the level drops, because dimmer signal joins neighbouring cells into one connected sheet. Every one of those pixels is area that `fragment` must give entirely to a single cell.
+
+*The `differs` columns are the fraction of reclaimed pixels each rule puts on a DIFFERENT cell than `brightest` does - the direct measure of whether this choice matters here, rather than a proxy for it. `worst cell` is the largest single-cell area increase, and it is a warning: a label that grows several-fold has flooded a connected web, which is what the reach cap exists to bound.*
+
+| level | leftover px | of frame | fragments | % area on bridges | geodesic differs | fragment differs | euclidean differs | worst cell brightest | worst cell fragment |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 1465523 | 34.9% | 2553 | 100% | 36.4% | 89.0% | 35.7% | +9226% | +6611% |
+| 0 | 1465523 | 34.9% | 2553 | 100% | 36.4% | 89.0% | 35.7% | +9226% | +6611% |
+| 0 | 29808 | 0.7% | 1461 | 73% | 45.7% | 31.1% | 59.2% | +241% | +722% |
+| 0 | 29808 | 0.7% | 1461 | 73% | 45.7% | 31.1% | 59.2% | +241% | +722% |
+| 0 | 29808 | 0.7% | 1461 | 73% | 45.7% | 31.1% | 59.2% | +241% | +722% |
+| 0 | 29808 | 0.7% | 1461 | 73% | 45.7% | 31.1% | 59.2% | +241% | +722% |
+
+![Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being](img/sweep_Fibro_test_dc.png)
+
+*Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being redistributed: at the bottom row it is almost nothing, at the top it is a connected web between cells. Compare columns 3 and 4 in the top rows - that is where `fragment` starts handing whole shared regions to one cell.*
+
+> **Their note:** Superseded by e012, and its table is WRONG - do not read the levels off it. The level spacing rounded each value to one decimal place, which is harmless on a 0-4095 count scale and destroys the sweep on the 0-1 float scale ZS-DeconvNet outputs: four of the six levels collapsed onto 0.1 and the table reports the same row four times as though it had covered a range. Fixed by not rounding at all; e012 is the corrected sweep, with six genuinely distinct levels.
+
+---
+
+## `e011` Built a blind labelling sheet over 54 contested pieces
+
+*DID — **REJECTED** · 2026-08-05 22:25:17*
+
+At level 0 on Fibro_test, 54 leftover fragments have their bulk assigned to different cells by `brightest` and `geodesic`. Each tile shows the raw signal, the disputed piece tinted white, and the two candidate cells outlined in orange and blue.
+
+**Why:** Nothing else I can compute ranks these two rules - they disagree on about a third of reclaimed area and both were clean on the synthetic fixture. Labels score every rule at once and out-of-sample, and become the target a fixture has to reproduce. Which candidate is drawn as 1 and which as 2 is shuffled per tile, so a label cannot anchor to my prediction; the join back to which rule chose which cell lives in manifest.json and happens after the fact.
+
+| | value | note |
+|---|---|---|
+| contested fragments | 54 | bulk assigned differently |
+| tiles built | 54 | largest first, then stratified by area |
+| level used | 0 | the sweep's most-contested setting (76% of leftover area on bridges) |
+| tile size | 165 um | 193 px at 0.859 um/px, fixed for every tile |
+
+> **Their note:** Superseded by e013. Built from the broken sweep's level (see e010), so it sat at Otsu itself - the LEAST contested end of the range - and found only 54 disputed pieces. e013 rebuilds it at the corrected 0.0596, where 77% of leftover area is on bridges, and finds 101.
+
+---
+
+## `e012` The leftover LEVEL, not the assignment rule, is what decides how much of a cell you get back
+
+*FOUND · 2026-08-05 22:27:13*
+
+Swept the leftover cut from just above background (0.006965) up through Otsu (0.1387) on Fibro_test, 2461 CellSAM cells. At Otsu the leftover is under 1% of the frame and every rule produces the same picture; the thin polar processes are dimmer than Otsu and are simply not in the leftover at that setting.
+
+**Why:** I first reported this comparison at Otsu alone, which is the top of the range, and at that level the four rules are indistinguishable - a single-point comparison there would have justified picking whichever rule I preferred. The column that matters is `% of leftover area on bridges`: leftover pieces touching two or more cells. It is already 57% at Otsu and rises as the level drops, because dimmer signal joins neighbouring cells into one connected sheet. Every one of those pixels is area that `fragment` must give entirely to a single cell.
+
+*The `differs` columns are the fraction of reclaimed pixels each rule puts on a DIFFERENT cell than `brightest` does - the direct measure of whether this choice matters here, rather than a proxy for it. `worst cell` is the largest single-cell area increase, and it is a warning: a label that grows several-fold has flooded a connected web, which is what the reach cap exists to bound.*
+
+| level | leftover px | of frame | fragments | % area on bridges | geodesic differs | fragment differs | euclidean differs | worst cell brightest | worst cell fragment |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.02014 | 145665 | 3.5% | 9942 | 70% | 36.8% | 38.8% | 48.0% | +1029% | +378% |
+| 0.03989 | 71857 | 1.7% | 4034 | 75% | 46.8% | 35.5% | 56.6% | +315% | +841% |
+| 0.05965 | 51005 | 1.2% | 2392 | 77% | 48.0% | 36.6% | 59.4% | +283% | +794% |
+| 0.08599 | 35763 | 0.9% | 1676 | 75% | 46.9% | 30.4% | 59.3% | +250% | +745% |
+| 0.1123 | 25833 | 0.6% | 1273 | 70% | 42.7% | 27.8% | 59.4% | +235% | +705% |
+| 0.1387 | 19595 | 0.5% | 988 | 66% | 38.2% | 28.4% | 59.6% | +221% | +669% |
+
+![Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being](img/sweep_Fibro_test_dc.png)
+
+*Rows are increasing leftover level, top = dimmest cut. Column 2 is what is being redistributed: at the bottom row it is almost nothing, at the top it is a connected web between cells. Compare columns 3 and 4 in the top rows - that is where `fragment` starts handing whole shared regions to one cell.*
+
+---
+
+## `e013` Built a blind labelling sheet over 101 contested pieces
+
+*DID · 2026-08-05 22:27:19*
+
+At level 0.05965 on Fibro_test, 101 leftover fragments have their bulk assigned to different cells by `brightest` and `geodesic`. Each tile shows the raw signal, the disputed piece tinted white, and the two candidate cells outlined in orange and blue.
+
+**Why:** Nothing else I can compute ranks these two rules - they disagree on about a third of reclaimed area and both were clean on the synthetic fixture. Labels score every rule at once and out-of-sample, and become the target a fixture has to reproduce. Which candidate is drawn as 1 and which as 2 is shuffled per tile, so a label cannot anchor to my prediction; the join back to which rule chose which cell lives in manifest.json and happens after the fact.
+
+| | value | note |
+|---|---|---|
+| contested fragments | 101 | bulk assigned differently |
+| tiles built | 101 | largest first, then stratified by area |
+| level used | 0.05965 | the sweep's most-contested setting (76% of leftover area on bridges) |
+| tile size | 165 um | 193 px at 0.859 um/px, fixed for every tile |
+
+---
+
+## `e014` Requiring a candidate to TOUCH a cell beats raising the intensity cut
+
+*FOUND — **REJECTED** · 2026-08-06 06:18:44*
+
+Four ways of choosing which leftover signal is a plausible cell extension, on the deconvolved frame (2461 cells, 0.859 um/px). `attached` takes a much more permissive intensity cut (0.0624 instead of 0.1387) and then keeps only the pieces physically continuous with a cell.
+
+**Why:** The operator's instruction was to improve candidate selection before picking an assignment rule, and the level sweep says the same thing: the cut moves the result far more than the rule does. Attachment is a better filter than brightness because it encodes what an extension actually IS - continuous with the cell - so it can reach further down in intensity along a real process while discarding bright debris entirely. `orphan` is the share of selected area sitting on fragments that touch no cell at all: 11-14% under the global cut, 0% by construction for the rest.
+
+*`median width` separates thin processes from blobs of haze; `95th pct reach` is how far from its cell the selected signal sits. Both describe WHAT WAS SELECTED - neither says the selection is correct.*
+
+| selector | px | of frame | fragments | orphan area | median width um | 95th pct reach um | worst cell brightest | worst cell fragment | brightest vs fragment |
+|---|---|---|---|---|---|---|---|---|---|
+| global | 19595 | 0.47% | 988 | 14% | 3.4 | 14 | +221% | +669% | 28% |
+| attached | 42567 | 1.01% | 1478 | 0% | 3.8 | 15 | +280% | +790% | 37% |
+| reach | 42516 | 1.01% | 1478 | 0% | 3.8 | 15 | +280% | +790% | 37% |
+| tubular | 39587 | 0.94% | 1461 | 0% | 3.4 | 15 | +256% | +758% | 37% |
+
+**What these numbers cannot see.** Every column here is a property of the candidate mask, not of the truth. None of them can tell a real process from a bright artefact that happens to touch a cell, and none can say whether a thread was recovered along its full length or cut short. That needs a drawn boundary to score against - the `x um of boundary error` instrument, which does not exist yet on this project.
+
+![One row per selector, same crop. Column 1 is what each would hand to the assignm](img/candidates_Fibro_test.png)
+
+*One row per selector, same crop. Column 1 is what each would hand to the assignment rule. Compare `global` against `attached`: the pink specks floating in open background under `global` are what attachment removes, and the extra pink hugging the cell edges is what the lower cut recovers.*
+
+> **Their note:** Superseded by the re-run. Its `tubular` row is meaningless: the ridge threshold was written as `percentile(response, ridge_pct - 90)`, i.e. the 7th percentile, which keeps 93% of the mask - so the selector that claimed to isolate thin processes was a near-copy of `attached` (39,587 px vs 42,567). Its `reach` row is also a no-op at the 25 um default. Both fixed in the re-run.
+
+---
+
+## `e015` Requiring a candidate to TOUCH a cell beats raising the intensity cut
+
+*FOUND · 2026-08-06 06:20:03*
+
+Four ways of choosing which leftover signal is a plausible cell extension, on the deconvolved frame (2461 cells, 0.859 um/px). `attached` takes a much more permissive intensity cut (0.0624 instead of 0.1387) and then keeps only the pieces physically continuous with a cell.
+
+**Why:** The operator's instruction was to improve candidate selection before picking an assignment rule, and the level sweep says the same thing: the cut moves the result far more than the rule does. Attachment is a better filter than brightness because it encodes what an extension actually IS - continuous with the cell - so it can reach further down in intensity along a real process while discarding bright debris entirely. `orphan` is the share of selected area sitting on fragments that touch no cell at all: 11-14% under the global cut, 0% by construction for the rest.
+
+*`median width` separates thin processes from blobs of haze; `95th pct reach` is how far from its cell the selected signal sits. Both describe WHAT WAS SELECTED - neither says the selection is correct.*
+
+| selector | px | of frame | fragments | orphan area | median width um | 95th pct reach um | worst cell brightest | worst cell fragment | brightest vs fragment |
+|---|---|---|---|---|---|---|---|---|---|
+| global | 19595 | 0.47% | 988 | 14% | 3.4 | 14 | +221% | +669% | 28% |
+| attached | 42567 | 1.01% | 1478 | 0% | 3.8 | 15 | +280% | +790% | 37% |
+| reach | 33204 | 0.79% | 1505 | 1% | 2.4 | 7 | +196% | +196% | 33% |
+| tubular | 23412 | 0.56% | 1062 | 5% | 2.4 | 13 | +187% | +589% | 34% |
+
+**What these numbers cannot see.** Every column here is a property of the candidate mask, not of the truth. None of them can tell a real process from a bright artefact that happens to touch a cell, and none can say whether a thread was recovered along its full length or cut short. That needs a drawn boundary to score against - the `x um of boundary error` instrument, which does not exist yet on this project.
+
+![One row per selector, same crop. Column 1 is what each would hand to the assignm](img/candidates_Fibro_test.png)
+
+*One row per selector, same crop. Column 1 is what each would hand to the assignment rule. Compare `global` against `attached`: the pink specks floating in open background under `global` are what attachment removes, and the extra pink hugging the cell edges is what the lower cut recovers.*
+
+---
+
+## `e016` CORRECTION: I said a reach cap was mandatory to bound runaway growth. At the default I proposed, it does nothing
+
+*MY ERROR · 2026-08-06 06:21:36*
+
+I reported that even `brightest` grows one cell +1067% and concluded a `max_reach` guard was mandatory and would bound the worst case. Measured: at 25 um the cap removes 51 pixels out of 42,567 and the worst cell is unchanged at +280%. 95% of candidate signal already sits within 15 um of a cell, so a cap anywhere near that value is inert.
+
+**Why:** The guard is still worth having, but for a different reason and at a different value than I gave. At 8 um it does bite - and it collapses the difference between the two rules on the worst cell, +196% for BOTH brightest and fragment, where uncapped they were +280% and +790%. So the cap is not a safety net bolted beside the rule; at a value that matters it substantially IS the rule, which changes how it should be documented and defaulted.
+> 
+> It also has a side effect I had not predicted and would have shipped: clipping the candidate mask by distance SEVERS pieces from the cell they touch, so `orphan` area rises from 0% to 1% (reach) and 5% (tubular) - fragments that no longer touch any label and therefore cannot be assigned at all. A distance limit belongs inside the assignment, bounding how far a label may flood, not as a pre-filter on the candidate mask.
+
+*The 25 um row is the retraction: identical to `attached` on every column. The 8 um row is where a cap starts to matter - and note it equalizes the two rules' worst case.*
+
+| selector | px | orphan area | median width um | 95th pct reach um | worst brightest | worst fragment |
+|---|---|---|---|---|---|---|
+| global | 19595 | 14% | 3.4 | 14 | +221% | +669% |
+| attached | 42567 | 0% | 3.8 | 15 | +280% | +790% |
+| reach 25um | 42516 | 0% | 3.8 | 15 | +280% | +790% |
+| reach 8um | 33204 | 1% | 2.4 | 7 | +196% | +196% |
+| tubular | 23412 | 5% | 2.4 | 13 | +187% | +589% |
+
+---
+
+## `e017` On this frame CellSAM already covers most of the signal - the leftover is 1% of the field and is mostly contested territory BETWEEN touching cells
+
+*FOUND — **AWAITING YOUR CALL** · 2026-08-06 06:21:36*
+
+Looking at the candidate figure rather than the table: the field is close to confluent, 2,461 cells, and the labels already cover nearly all visible cytoplasm. Even the most permissive attached selector finds 1.01% of the frame, in 1,478 pieces of median width 3.8 um sitting within 15 um of a cell.
+
+**Why:** This does not match the picture I had been working from - 20% of each cell missing as long thin polar threads waiting to be reclaimed. What is actually unclaimed here is small, close-in, and largely between cells that touch, which is why 57-77% of it is on bridges however the level is set. Two readings fit, and they lead to different work: either the threads live well below this level and the cut has to go much lower (at level 0.02 the leftover is 3.5% of the frame), or the complaint is about the SHAPE of the outlines rather than missing area - CellSAM returning an ellipse where the cell is a spiky spindle, which reclaiming leftover signal cannot fix because the signal is already inside somebody's label. Worth settling before building the node, because only the first reading is a reclaim problem at all.
+
+**Blind spots.** Every number here describes the candidate mask, not the truth: none can tell a real process from a bright artefact touching a cell, and none can say whether a thread was recovered along its full length. The instrument for that is a drawn boundary (SKILL.md §4), which this project does not have yet.
+
+![Column 1, any row: how little pink there is. That is the whole pool of signal av](img/candidates_Fibro_test.png)
+
+*Column 1, any row: how little pink there is. That is the whole pool of signal available to reclaim at this level. Compare the grey cell shapes against the label colours in columns 2-3 - the labels already cover them.*
+
+**What I need from you:** Which is it: are the missing threads dimmer than this cut (so I should push the level far lower and re-run), or are the outlines the wrong SHAPE over signal that is already claimed (a different problem, not fixable by reclaiming leftover)? A drawn outline on two or three cells would answer it definitively and give me an instrument that can score boundary error in microns.
+
+---
+
+## `e018` Locked: deconvolved input, and a two-rule shortlist of brightest + fragment
+
+*DECISION · 2026-08-06 06:22:18*
+
+Operator's calls, recorded so the node is not built against a different set of assumptions later.
+
+**Input**: the ZS-DeconvNet path, not the raw frame - 'the resolution is better than the conventional deconvolve method'. Everything from e012 onward uses it (2048x2048 at 0.8591 um/px, 2,461 cells).
+
+**Rules**: keep `brightest` and `fragment`. Drop `geodesic` and `euclidean`.
+
+**Order of work**: improve candidate selection first, then a single-cell deep dive on the two surviving rules.
+
+**Why:** Two of these override what the evidence on its own would have picked, and that is the operator's call to make - but the record should show the disagreement rather than quietly absorb it. I had argued `fragment` was ruled out: 57-77% of leftover area sits on pieces touching two or more cells, and `fragment` must hand each of those wholly to one cell, which is why its worst cell runs +589% to +790% against brightest's +187% to +280%. Keeping it in the shortlist is deliberate and reasonable for a deep dive - a per-cell look is exactly the way to find out whether that worst case is a real cell or an artefact of one bad fragment. I had also argued for `geodesic` as a live option; it is now out, and the 101-tile sheet in e013 was built to settle brightest-vs-geodesic, so it no longer has a question to answer.
+
+| | value | note |
+|---|---|---|
+| input | deconvolved | 2048x2048, 0.8591 um/px, 2461 cells - upsampled 2x by ZS-DeconvNet |
+| rules kept | brightest, fragment | operator's decision |
+| rules dropped | geodesic, euclidean | euclidean on evidence; geodesic by decision |
+| label_dc sheet | 101 tiles, now moot | built to rank brightest vs geodesic - geodesic is out, so the attribution question it asks no longer decides anything |
+| next | single-cell deep dive | brightest vs fragment on one cell at a time |
+
+---

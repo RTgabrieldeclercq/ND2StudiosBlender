@@ -53,13 +53,22 @@ Four rules here are load-bearing, and each one is a real failure mode rather tha
   session directory and the events carry paths; :func:`emit` additionally *truncates*
   oversize strings rather than letting a long traceback take the session down.
 
-**Cancellation is cooperative at node boundaries, and that is the honest guarantee.** The
-engine has no cancellation point inside a compute — a single CNN inference or an upstream
-solver simply runs to completion — so :meth:`Worker._cancellable_computes` wraps the
-compute table and raises at the *next node that has not started yet*. We advertise exactly
-that in ``hello`` (``cooperative_cancel: "at_step_boundary"``) so the hub's escalation
-ladder (cancel → grace → SIGTERM → SIGKILL) is applied against a truthful claim. A long
-single node will be killed, and losing the warm cache is the correct outcome there.
+**Cancellation is cooperative at node boundaries, and that is the honest guarantee.** A
+single CNN inference or an upstream solver runs to completion whatever anyone asks, so
+:meth:`Worker._cancellable_computes` wraps the compute table and raises at the *next node
+that has not started yet*. We advertise exactly that in ``hello``
+(``cooperative_cancel: "at_step_boundary"``) so the hub's escalation ladder (cancel →
+grace → SIGTERM → SIGKILL) is applied against a truthful claim. A long single node will be
+killed, and losing the warm cache is the correct outcome there.
+
+The engine additionally offers ``Engine.should_stop``, polled at every eager
+``ctx.progress`` tick as well as at node boundaries (the GUI runner uses it, so deleting a
+running node aborts its pull mid-compute). This worker deliberately does **not** wire it:
+it would land cancels sooner for the subset of nodes that report progress, but the
+advertised guarantee — and therefore the hub's ladder — would be unchanged, and a second
+cancellation path raising a second exception type through the same run is more ways to be
+wrong than the responsiveness is worth. If that trade ever changes, the ``hello`` claim is
+a floor, not a ceiling, and ``PullCancelled`` must be caught alongside :class:`Cancelled`.
 
 Qt-free by construction: nothing in this module's import graph reaches PySide6, which is
 why the tabulation lives in :mod:`nodelab_v2.tables` rather than in the spreadsheet panel.
@@ -74,10 +83,12 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import replace as _dc_replace
 from queue import Queue
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from nodelab_v2.lablink import protocol as P
+from nodelab_v2.lablink import sidecar as SC
 
 # ── the wire ────────────────────────────────────────────────────────────────────
 
@@ -173,7 +184,8 @@ class Cancelled(Exception):
 class WorkerFault(Exception):
     """A command failed with a specific LWP error code."""
 
-    def __init__(self, code: str, message: str, detail: str = ""):
+    def __init__(self, code: str, message: str, detail: str = "",
+                 fields: Optional[Sequence[str]] = None):
         super().__init__(message)
         if code in P.HUB_ONLY_ERROR_CODES:
             # Emitting one of these would report a LINK failure for a compute problem and
@@ -182,6 +194,11 @@ class WorkerFault(Exception):
         self.code = code
         self.message = message
         self.detail = detail
+        #: Machine-readable names the refusal is *about* — the metadata fields a
+        #: ``missing_metadata`` names. A client can often regenerate a sidecar from the
+        #: acquisition without asking anyone, but only if it is told which fields rather
+        #: than having to parse them back out of a sentence.
+        self.fields: Tuple[str, ...] = tuple(fields or ())
 
 
 # ── optional dependency census ──────────────────────────────────────────────────
@@ -254,7 +271,17 @@ class Worker:
 
         # session state that survives commands — this IS the warmth
         self.knobs: Dict[str, Any] = {}
+        #: Every knob's resolved value AND where it came from (``node`` / ``graph`` /
+        #: ``derive``) — the record :meth:`_metrics` persists. Kept separately from
+        #: :attr:`knobs`, which holds only what a node explicitly pinned: a knob left at the
+        #: recipe's default or left to derive is absent from that dict by design, and writing
+        #: it as the record of the run would silently omit most of what produced the numbers.
+        self.effective: Dict[str, Dict[str, Any]] = {}
         self.inputs: Dict[str, Dict[str, Any]] = {}      # role -> {path, name, sha256}
+        #: role -> the parsed sidecar overriding that input's own metadata. A sidecar may
+        #: arrive before or after its image, so it is resolved at run time rather than at
+        #: upload time.
+        self.sidecars: Dict[str, Dict[str, Any]] = {}
         self._providers: Dict[str, Tuple[Any, Any]] = {}  # abs path -> (provider, envelope)
         self._memo: Any = None
         self._tiles: Any = None
@@ -295,6 +322,13 @@ class Worker:
                  "zones": True,                  # Repeat/Sim unrolling
                  "iterate": True,                # flow.iterate sweeps
                  "docks": True,                  # io.dock checkpoints
+                 # We read a `*.job.json` beside an input and let it OVERRIDE the file's own
+                 # metadata, and we refuse a run whose recipe requires a field nothing
+                 # supplies. Advertised so an operator can tell a hub that enforces the
+                 # declaration from one that quietly defaults it.
+                 "image_job_sidecar": P.SIDECAR_FORMAT,
+                 "enforces_required_metadata": True,
+                 "requirable_metadata": list(P.REQUIRABLE_METADATA),
              },
              deps={"python": "%d.%d.%d" % sys.version_info[:3],
                    "numpy": _version_of("numpy")},
@@ -358,10 +392,13 @@ class Worker:
         emit(id=mid, ev=ev, **data)
         return True
 
-    def _fault(self, mid: Any, code: str, message: str, detail: str = "") -> None:
+    def _fault(self, mid: Any, code: str, message: str, detail: str = "",
+               fields: Sequence[str] = ()) -> None:
         payload: Dict[str, Any] = {"code": code, "message": message, "fatal": False}
         if detail:
             payload["detail"] = detail
+        if fields:
+            payload["fields"] = list(fields)
         self._answer(mid, "error", **payload)
 
     # ── dispatch ────────────────────────────────────────────────────────────────
@@ -378,7 +415,7 @@ class Worker:
             try:
                 self.dispatch(mid, name, cmd)
             except WorkerFault as exc:
-                self._fault(mid, exc.code, exc.message, exc.detail)
+                self._fault(mid, exc.code, exc.message, exc.detail, exc.fields)
             except Cancelled as exc:
                 self._fault(mid, "cancelled", str(exc) or "cancelled by request")
             except MemoryError:
@@ -470,7 +507,9 @@ class Worker:
         self.graph = graph
         self.targets = tuple(graph.topo_order())
         self.knobs = {}
+        self.effective = {}
         self.inputs = {}
+        self.sidecars = {}
         self.held = {}
         note(f"opened recipe {recipe.get('name')!r}: {len(graph.nodes)} node(s), "
              f"target {recipe.get('target')!r}")
@@ -636,15 +675,39 @@ class Worker:
             param = spec.get("param")
             if value is None:
                 store.pop(param, None)
-                effective[name] = {"value": None, "source": "derive"}
+                # Popped from `self.knobs` too. Without this, setting a knob and later
+                # putting it back to derived left the old value in the dict that
+                # `_metrics` persists — so the run record claimed a pinned number for a
+                # value the run actually derived from the file.
+                self.knobs.pop(name, None)
             else:
                 store[param] = value
                 self.knobs[name] = value
-                effective[name] = {"value": value, "source": "node"}
         # Report everything in effect, not just what this call changed: the echo is the
         # record of what actually ran, and a node logging it wants the whole state.
-        for name, spec in by_name.items():
-            if name in effective or not name:
+        effective = self._effective_knobs()
+        self.effective = effective
+        self._answer(mid, "result", effective=effective)
+
+    def _effective_knobs(self) -> Dict[str, Dict[str, Any]]:
+        """Every declared knob's value and where it came from, read off the live graph.
+
+        Derived from the graph rather than accumulated as commands arrive, so it cannot go
+        stale: the graph is what the engine will actually read, and any bookkeeping kept
+        alongside it is one more thing that can disagree with it.
+
+        ``source`` is the load-bearing part. ``node`` was pinned by the caller, ``graph`` is
+        the recipe author's own value, and ``derive`` means the engine works it out from the
+        file's calibration. All three are needed to reproduce a result; only ``node`` values
+        appear in :attr:`knobs`, which is why persisting that dict alone loses most of the
+        record.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        if self.graph is None:
+            return out
+        for spec in (self.recipe.get("knobs") or []):
+            name = spec.get("name")
+            if not name:
                 continue
             rec = self.graph.nodes.get(spec.get("node"))
             if rec is None:
@@ -652,10 +715,11 @@ class Worker:
             store = rec.modes if (spec.get("kind") == "mode") else rec.params
             param = spec.get("param")
             if param in store:
-                effective[name] = {"value": store[param], "source": "graph"}
+                out[name] = {"value": store[param],
+                             "source": "node" if name in self.knobs else "graph"}
             else:
-                effective[name] = {"value": None, "source": "derive"}
-        self._answer(mid, "result", effective=effective)
+                out[name] = {"value": None, "source": "derive"}
+        return out
 
     # ── input ───────────────────────────────────────────────────────────────────
     def cmd_input(self, mid: Any, cmd: dict) -> None:
@@ -697,6 +761,16 @@ class Worker:
                               f"with role {role!r}. It declares: {offered}")
         node_id = spec.get("node")
 
+        # A sidecar is an input like any other as far as the hub is concerned: it labels
+        # every file with the recipe's declared role regardless of name, so the SUFFIX is
+        # the only thing that distinguishes calibration from pixels. Without this branch a
+        # `.job.json` would be handed to the image reader, which is not a confusing failure
+        # so much as a completely misleading one.
+        sent_name = str(cmd.get("name") or os.path.basename(path))
+        if SC.is_sidecar(sent_name) or SC.is_sidecar(path):
+            self._accept_sidecar(mid, role, path, sent_name, declared)
+            return
+
         from nodelab_v2.ingest import read_channel_display
         provider, envelope = self._provider_for(path)
         try:
@@ -718,6 +792,97 @@ class Worker:
                          if isinstance(v, (int, float, str, bool)) or v is None},
             channels=channels,
             store=self._store_path_for(path))
+
+    def _accept_sidecar(self, mid: Any, role: str, path: str, name: str,
+                        sha256: str) -> None:
+        """Record a ``*.job.json`` as the calibration for ``role``'s image.
+
+        Parsed here rather than at run time so a malformed one is reported against the upload
+        that carried it, while the person who wrote it is still looking at it. A sidecar we
+        cannot read is ``input_error`` and not ``missing_metadata``: the file arrived, it is
+        simply not a sidecar, and telling someone to "add fields" to a document that failed
+        to parse sends them looking in the wrong place.
+        """
+        try:
+            doc = SC.read_sidecar(path)
+            resolved = SC.sidecar_metadata(doc)
+        except SC.SidecarError as exc:
+            raise WorkerFault("input_error", str(exc)) from None
+
+        image = self.inputs.get(role)
+        expected = SC.sidecar_path_for(str(image.get("name"))) if image else ""
+        if expected and os.path.basename(name) != os.path.basename(expected):
+            # Not fatal: the hub repairs names for its own rules, so a mismatch here is more
+            # often a repaired name than a wrong pairing. Said out loud because the one case
+            # it is NOT is a sidecar describing a different file entirely, and that silently
+            # recalibrates the run.
+            note(f"sidecar {name!r} does not pair by name with the {role!r} image "
+                 f"{image.get('name')!r}; using it anyway, as the exchange may have "
+                 f"repaired either name")
+
+        self.sidecars[role] = {"path": path, "name": name, "sha256": sha256,
+                               "doc": doc, "metadata": resolved}
+        note(f"sidecar for {role!r} supplies: {', '.join(sorted(resolved)) or '(nothing)'}")
+        self._answer(mid, "result", sidecar=True, role=role, format=doc.get("format"),
+                     supplies=sorted(resolved))
+
+    def _metadata_for(self, role: str, base: Dict[str, Any]) -> Dict[str, Any]:
+        """``base`` metadata with ``role``'s sidecar laid over it.
+
+        The sidecar wins, and that is the whole point of it existing: a TIFF reports the
+        container's 16-bit depth for a 12-bit sensor and calls a GFP channel ``Ch0``, so the
+        file's own answer is not merely incomplete but confidently wrong, and only an
+        explicit override can correct it.
+        """
+        sidecar = self.sidecars.get(role)
+        if not sidecar:
+            return base
+        out = dict(base)
+        overridden = sorted(k for k in sidecar["metadata"]
+                            if k in base and base[k] != sidecar["metadata"][k])
+        out.update(sidecar["metadata"])
+        if overridden:
+            note(f"sidecar overrides the {role!r} file's own {', '.join(overridden)}")
+        return out
+
+    def _require_metadata(self, role: str, metadata: Dict[str, Any]) -> None:
+        """Refuse the run if the recipe declares metadata this job does not supply.
+
+        Refused, never defaulted. A pipeline that derives from the objective's NA does not
+        *fail* without it — it silently produces different numbers, and no layer anywhere
+        reports that. This is the only reason a job missing a field gets told so instead of
+        quietly finishing.
+
+        ``missing_metadata`` rather than ``missing_input`` deliberately: one means "send a
+        file", the other means "add fields to the file you already sent", and collapsing them
+        tells someone to re-upload something that was never the problem.
+        """
+        required = [str(f) for f in (self.recipe.get("requires_metadata") or [])]
+        if not required:
+            return
+        unknown = SC.unknown_requirements(required)
+        if unknown:
+            # A recipe asking for a field no sidecar can carry can never be satisfied, so
+            # this is the recipe's bug and not the data's.
+            raise WorkerFault(
+                "bad_recipe",
+                f"recipe {self.recipe.get('name')!r} requires metadata this worker has no "
+                f"vocabulary for: {', '.join(unknown)}",
+                f"requirable fields are: {', '.join(P.REQUIRABLE_METADATA)}")
+        missing = SC.missing_metadata(required, metadata)
+        if not missing:
+            return
+        sent = self.sidecars.get(role)
+        hint = ("this input has no sidecar, so nothing overrode what the file itself "
+                "reports" if not sent else
+                f"the sidecar supplied {', '.join(sorted(sent['metadata'])) or 'nothing'}")
+        raise WorkerFault(
+            "missing_metadata",
+            f"recipe {self.recipe.get('name')!r} derives from "
+            f"{', '.join(missing)}, which the {role!r} input does not supply. The file is "
+            f"fine; it omits fields this analysis needs. Send a "
+            f"{P.SIDECAR_SUFFIX} sidecar carrying them.",
+            hint, fields=missing)
 
     def _store_path_for(self, path: str) -> str:
         """Where this file's ``.b2nd`` ingest store lives.
@@ -856,17 +1021,28 @@ class Worker:
         from nodegraph.provider import SyntheticProvider
         from nodelab_v2.ops import LOAD_OP
 
-        by_node = {v["node"]: v for v in self.inputs.values() if v.get("node")}
+        by_node = {v["node"]: (role, v) for role, v in self.inputs.items()
+                   if v.get("node")}
         seeds: Dict[str, Any] = {}
         meta_seeds: Dict[str, Any] = {}
         for nid, rec in self.graph.nodes.items():
             if rec.op_key != LOAD_OP:
                 continue
-            sent = by_node.get(nid)
+            role, sent = by_node.get(nid, ("", None))
             if sent is not None:
                 provider, envelope = self._provider_for(sent["path"])
                 metadata = dict(envelope.metadata)
                 metadata.update(sent.get("display") or {})
+                # The sidecar goes on LAST — it is the only thing entitled to correct what
+                # the file itself claims — and the requirement check runs against the result,
+                # so it is answering "does this job have what the graph needs" rather than
+                # "did the file happen to carry it".
+                metadata = self._metadata_for(role, metadata)
+                self._require_metadata(role, metadata)
+                # `replace`, not a fresh MetaEnvelope: it carries four more fields than axes
+                # and metadata (layers, unknown_axes, domains, the layer catalog), and
+                # rebuilding it from two of them would silently drop the rest.
+                envelope = _dc_replace(envelope, metadata=dict(metadata))
             else:
                 path = str(rec.params.get("path") or "").strip()
                 if path:
@@ -875,6 +1051,7 @@ class Worker:
                     # whitelist forbids 'path' outright), so it is honoured.
                     provider, envelope = self._provider_for(os.path.abspath(path))
                     metadata = dict(envelope.metadata)
+                    self._require_metadata(role or "(recipe path)", metadata)
                 else:
                     from nodegraph.dataset import AxisSizes
                     axes = AxisSizes(m=1, t=2, z=4, c=2, y=256, x=256)
@@ -1043,6 +1220,9 @@ class Worker:
         can: it is a plain dict on the engine, each entry called once per node evaluation,
         and raising from it propagates out of ``pull`` verbatim after the engine has
         emitted that node's ``error``. Which is exactly the semantics we advertise.
+
+        Not ``Engine.should_stop`` (which would also land inside an eager compute) — see
+        the module docstring for why this worker keeps the one path it advertises.
         """
         def wrap(fn: Any) -> Any:
             def guarded(ctx: Any) -> Any:
@@ -1155,6 +1335,11 @@ class Worker:
 
     def _metrics(self, engine: Any, counters: Dict[str, int],
                  started: float) -> Dict[str, Any]:
+        # The FULL effective set, not `self.knobs`. That dict holds only what a node pinned,
+        # so a recipe default or a derived value was absent from the one artifact that is
+        # supposed to record what produced the numbers — and a result whose record omits
+        # most of its inputs cannot be reproduced or reopened.
+        effective = self._effective_knobs()
         info: Dict[str, Any] = {
             "recipe": self.recipe.get("name"),
             "run": self.runs,
@@ -1163,17 +1348,31 @@ class Worker:
             "nodes_computed": counters["computed"],
             "nodes_cached": counters["cached"],
             "nodes_failed": counters["failed"],
-            "knobs": dict(self.knobs),
+            "knobs": {name: rec["value"] for name, rec in effective.items()},
+            "knob_sources": {name: rec["source"] for name, rec in effective.items()},
             "software": P.SOFTWARE_NAME,
             "software_version": P.SOFTWARE_VERSION,
             "worker_version": P.WORKER_VERSION,
         }
+        required = [str(f) for f in (self.recipe.get("requires_metadata") or [])]
+        if required:
+            info["requires_metadata"] = required
         rss = _rss_bytes()
         if rss is not None:
             info["rss_bytes"] = rss
         for role, sent in self.inputs.items():
-            info.setdefault("inputs", {})[role] = {
-                "name": sent.get("name"), "sha256": sent.get("sha256")}
+            entry = {"name": sent.get("name"), "sha256": sent.get("sha256")}
+            # Whether a sidecar corrected this input, and what it supplied. Without it, two
+            # runs of the same recipe on the same file can differ and the record shows no
+            # reason why.
+            sidecar = self.sidecars.get(role)
+            if sidecar:
+                entry["sidecar"] = {
+                    "name": sidecar.get("name"),
+                    "sha256": sidecar.get("sha256"),
+                    "supplies": sorted(sidecar.get("metadata") or {}),
+                }
+            info.setdefault("inputs", {})[role] = entry
         return info
 
     def _summary(self, payload: Any, counters: Dict[str, int]) -> Dict[str, Any]:
@@ -1291,6 +1490,216 @@ def _as_bytes(value: Any) -> Optional[int]:
     return n if n > 0 else None
 
 
+# ── recipe checking (tier 2, before anything is uploaded) ───────────────────────
+
+def _local_tier1(manifest: Dict[str, Any], graph: Any) -> List[str]:
+    """The manifest-only rules a *generator* gets wrong, checked here as well as on the hub.
+
+    These are tier-1 rules: the hub enforces every one of them at install, so this is not
+    the thing standing between a bad recipe and a run. It is the difference between finding
+    out now and finding out after an operator has been asked to install something. Each rule
+    below is one whose failure produces a knob that silently does nothing.
+    """
+    problems: List[str] = []
+    knobs = manifest.get("knobs") or []
+    seen_slots: Dict[Tuple[str, str, str], str] = {}
+    names: Dict[str, int] = {}
+
+    for knob in knobs:
+        if not isinstance(knob, dict):
+            problems.append(f"every knob must be an object; got {type(knob).__name__}")
+            continue
+        name = str(knob.get("name") or "")
+        param = str(knob.get("param") or "")
+        kind = str(knob.get("kind") or "param")
+        names[name] = names.get(name, 0) + 1
+
+        reason = P.FORBIDDEN_KNOB_PARAMS.get(param)
+        if reason:
+            problems.append(
+                f"knob {name!r} exposes {param!r}, which is {reason} and may never be a "
+                f"knob. A generator should filter it out of the offer list, not let "
+                f"somebody pick it and meet a refusal.")
+
+        slot = (str(knob.get("node") or ""), param, kind)
+        if slot in seen_slots:
+            problems.append(
+                f"knobs {seen_slots[slot]!r} and {name!r} both write "
+                f"{slot[0]}.{param} ({kind}) — whichever applied last would win, "
+                f"unpredictably")
+        else:
+            seen_slots[slot] = name
+
+        derives = knob.get("unset_means") == "derive"
+        if derives and "default" in knob:
+            problems.append(
+                f"knob {name!r} sets both a 'default' and unset_means 'derive'. A default "
+                f"pins the value, which is what derive exists not to do.")
+        if derives:
+            rec = getattr(graph, "nodes", {}).get(knob.get("node"))
+            store = (rec.modes if kind == "mode" else rec.params) if rec else {}
+            if param in store:
+                problems.append(
+                    f"knob {name!r} declares unset_means 'derive' but the graph already "
+                    f"pins {slot[0]}.{param}. As written the recipe would ignore the "
+                    f"file's own calibration and nothing anywhere would report it.")
+        if str(knob.get("type") or "float") == "string" and not knob.get("enum"):
+            max_len = knob.get("max_len")
+            if not knob.get("pattern") or not isinstance(max_len, int) \
+                    or not 0 < max_len <= 64:
+                problems.append(
+                    f"string knob {name!r} must declare either an 'enum', or both a "
+                    f"'pattern' and a 'max_len' of 64 or less. An unbounded string from a "
+                    f"caller is not something a recipe should accept.")
+
+    for name, count in names.items():
+        if count > 1:
+            problems.append(f"knob name {name!r} is declared {count} times")
+
+    # Every conditional knob's controller must be a closed-set knob of this recipe that
+    # declares a default and is not itself conditional — otherwise the dependent knob is
+    # silently never read.
+    by_name = {str(k.get("name")): k for k in knobs if isinstance(k, dict)}
+    for knob in knobs:
+        if not isinstance(knob, dict):
+            continue
+        cond = knob.get("applies_when")
+        if not cond:
+            continue
+        name = str(knob.get("name") or "")
+        if not isinstance(cond, dict) or not cond.get("knob"):
+            problems.append(f"knob {name!r}: 'applies_when' needs a 'knob'")
+            continue
+        controller = str(cond.get("knob"))
+        ctrl = by_name.get(controller)
+        if ctrl is None:
+            problems.append(
+                f"knob {name!r} is conditional on {controller!r}, which this recipe does "
+                f"not declare")
+            continue
+        if str(ctrl.get("type") or "float") not in ("enum", "bool"):
+            problems.append(
+                f"knob {name!r} is conditional on {controller!r}, which is a "
+                f"{ctrl.get('type')} knob. Only a closed set of values can be tested.")
+        if "default" not in ctrl:
+            problems.append(
+                f"knob {name!r} is conditional on {controller!r}, which declares no "
+                f"'default'. With nothing to test when the caller omits it, every knob "
+                f"depending on it goes dead.")
+        if ctrl.get("applies_when"):
+            problems.append(
+                f"knob {name!r} is conditional on {controller!r}, which is itself "
+                f"conditional. Conditions may not be chained.")
+        allowed = ctrl.get("enum") or ([True, False] if
+                                       str(ctrl.get("type")) == "bool" else [])
+        wanted = ([cond["equals"]] if "equals" in cond else list(cond.get("in") or []))
+        for value in wanted:
+            if allowed and not any(
+                    isinstance(value, bool) == isinstance(a, bool) and value == a
+                    for a in allowed):
+                problems.append(
+                    f"knob {name!r} tests {controller!r} against {value!r}, which is not a "
+                    f"value it can take ({', '.join(map(repr, allowed))}) or is the wrong "
+                    f"type")
+    return problems
+
+def check_recipe_dir(directory: str) -> Tuple[bool, List[str]]:
+    """``(ok, problems)`` for a recipe directory, run against THIS build's node catalogue.
+
+    This is the only place tier 2 *can* run before submission. The hub has no node
+    catalogue — it cannot know whether ``analysis.segment`` really has a ``min_area``
+    socket, what unit that socket is in, or which mode values are real — so those four
+    checks are delegated to the worker and would otherwise surface at a stranger's session
+    start, after they had transferred a file.
+
+    Reports **every** problem rather than the first: fixing a generated manifest one refusal
+    at a time is miserable, and a generator wants the whole list in one pass.
+    """
+    problems: List[str] = []
+    manifest_path = os.path.join(directory, "recipe.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except OSError as exc:
+        return False, [f"cannot read {manifest_path}: {exc}"]
+    except ValueError as exc:
+        return False, [f"{manifest_path} is not valid JSON: {exc}"]
+    if not isinstance(manifest, dict):
+        return False, [f"{manifest_path}: top level must be an object"]
+
+    # The two structural things worth checking here because they make every later message
+    # meaningless if wrong, and because a generator gets them wrong first.
+    name = str(manifest.get("name") or "")
+    dirname = os.path.basename(os.path.abspath(directory).rstrip(os.sep))
+    if name != dirname:
+        problems.append(
+            f"manifest name {name!r} must equal the directory name {dirname!r} — a caller "
+            f"asks by name and the hub finds it by directory")
+    graph_rel = str(manifest.get("graph") or "")
+    if not graph_rel:
+        return False, problems + ["manifest has no 'graph'"]
+    if os.path.isabs(graph_rel) or ".." in graph_rel.replace("\\", "/").split("/"):
+        return False, problems + [
+            f"'graph' must be a plain relative path inside the recipe directory, not "
+            f"{graph_rel!r}"]
+
+    graph_path = os.path.join(directory, graph_rel)
+    try:
+        with open(graph_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except OSError as exc:
+        return False, problems + [f"cannot read the graph {graph_path}: {exc}"]
+    except ValueError as exc:
+        return False, problems + [f"{graph_path} is not valid JSON: {exc}"]
+
+    import nodegraph.catalog     # noqa: F401 — importing registers the catalog
+    from nodegraph.serialize import from_dict
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    try:
+        graph, zones, _groups = from_dict(raw)
+    except ValueError as exc:
+        return False, problems + [f"the graph is not a readable nd2graph document: {exc}"]
+
+    if zones and not manifest.get("allow_zones"):
+        problems.append(
+            f"the graph contains {len(zones)} zone(s), which multiply the work by their "
+            f"iteration count, but the manifest does not set 'allow_zones'")
+
+    payload = {"name": manifest.get("name"),
+               "target": (manifest.get("targets") or {}).get("primary"),
+               "allow_zones": manifest.get("allow_zones", False),
+               "inputs": manifest.get("inputs") or [],
+               "knobs": manifest.get("knobs") or [],
+               "outputs": manifest.get("outputs") or []}
+    problems.extend(Worker(directory).validate_recipe(payload, graph))
+    problems.extend(_local_tier1(manifest, graph))
+
+    # A requirement naming a field no sidecar can carry can never be satisfied, so it is a
+    # recipe bug and belongs in this report rather than in a refusal on every future job.
+    required = [str(f) for f in ((manifest.get("requires") or {}).get("metadata") or [])]
+    unknown = SC.unknown_requirements(required)
+    if unknown:
+        problems.append(
+            f"requires.metadata names {', '.join(unknown)}, which no image-job sidecar can "
+            f"supply. Requirable fields: {', '.join(P.REQUIRABLE_METADATA)}")
+    return (not problems), problems
+
+
+def _report_check(directory: str) -> int:
+    """Print a ``--check-recipe`` verdict and return the process exit code."""
+    ok, problems = check_recipe_dir(directory)
+    name = os.path.basename(os.path.abspath(directory).rstrip(os.sep))
+    if ok:
+        note(f"ok    tier 2: every knob resolves against this node catalogue ({name})")
+        note("This recipe is ready to submit.")
+        return 0
+    note(f"FAIL  tier 2: {len(problems)} problem(s) against this node catalogue ({name}):")
+    for problem in problems:
+        note(f"        - {problem}")
+    return 1
+
+
 # ── entry point ─────────────────────────────────────────────────────────────────
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1303,7 +1712,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--print-hello", action="store_true",
                     help="emit the handshake and exit — the cheapest check that this "
                          "machine can serve LabLink at all.")
+    ap.add_argument("--check-recipe", metavar="DIR", default="",
+                    help="validate a recipe directory against this build's node catalogue "
+                         "(tier 2) and exit. Run this until clean BEFORE submitting: the "
+                         "hub cannot make these checks, so otherwise they surface at "
+                         "somebody else's session start, after they transferred a file.")
     args = ap.parse_args(argv)
+
+    if args.check_recipe:
+        try:
+            import numpy         # noqa: F401
+        except BaseException as exc:      # noqa: BLE001
+            note(f"cannot check a recipe without the node catalogue: {exc}")
+            return 3
+        return _report_check(args.check_recipe)
 
     session = args.session or os.environ.get(P.SESSION_DIR_ENV) or os.getcwd()
     try:

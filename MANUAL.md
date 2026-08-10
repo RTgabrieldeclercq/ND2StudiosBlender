@@ -9,8 +9,13 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 [`nodelab_v2/`](nodelab_v2/). For how it works internally, see
 [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md).
 
-> **State as of 2026-08-05:** catalog **74 node types** — 77 registered ops, counting the
-> three the GUI layer adds (`io.load`, `io.dock`, `view.viewer`). V2.12 folded Watershed +
+> **State:** node counts and gate results now live in
+> [codemap/STATE.md](codemap/STATE.md), generated from the live registry — it is the only file
+> in this repo allowed to carry a number, because for a while this paragraph said 76 while the
+> engineering notes said 55. What follows is the narrative of how it got here. V2.27 made the card's
+> **footprint band a control** ([§8d](#8d-the-footprint-band-choosing-the-statistics-population-v227)): clicking the footprint chooses the *statistics population* a data-derived level comes from — per plane, per volume, per series, per dataset, or **per label / per ROI**, which cuts each cell against its own histogram. That folded the separate Threshold Per Label node into `analysis.threshold` and `analysis.histogram_threshold` as one shared vocabulary. V3.00 opened the **write
+> end**: `io.write_tiff` ([§11](#11-spreadsheet--export)) streams the Dataset on a wire to an
+> OME/ImageJ/plain TIFF one plane at a time, carrying the wire's own calibration out verbatim. V2.12 folded Watershed +
 > StarDist into the one **Segmentation** node and added CellSAM; V2.13 ported the last of
 > Cell-Tracker's processing — Flatten Illumination, Temporal Gain, Remove Blobs, Object
 > Metrics, Object Field — and **Stitch (M→1)** put the first node behind the `MULTI_VIEW`
@@ -18,15 +23,13 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 > ([§6](#tuning-the-run-to-your-machine-v214)), parameter picking
 > ([§8b](#8b-picking-parameters-off-the-image-v216)), docking
 > ([§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218)), parameter iteration
-> ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219)) and live node editing
-> ([§12d](#12d-editing-a-node-while-nodelab-is-running-v220)). Headless gate
-> `python -m nodegraph.selftest` → **105 `[ok]` lines green**; driven GUI gate
-> `scripts/_nodelab_v2_phase5_probe.py` → **ALL PASS** (67 `[ok]`); catalog gate
-> `python scripts/_catalog_snapshot.py check` → its committed baseline **predates V2.22**
-> (the `layer_from`/`view_source` socket fields and the last five nodes), so it currently
-> reports differences that are all *intended* catalog changes; re-bless it with
-> `_catalog_snapshot.py save` when you want it to guard a refactor again. On Windows, run all
-> three under `PYTHONUTF8=1` — they print `σ`/`→` and a cp1252 console raises
+> ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)) and live node editing
+> ([§12d](#12d-editing-a-node-while-nodelab-is-running-v220)). The gates are listed in
+> [codemap/STATE.md](codemap/STATE.md) with the exact pass strings; the catalog baseline was
+> re-blessed on 2026-08-05 after every one of its 968 differences was attributed to the two
+> new `SocketSpec` fields and the seven nodes added since V2.22, so it guards refactors again,
+> and running it bare now *checks* rather than silently re-blessing. On Windows, run them all
+> under `PYTHONUTF8=1` — they print `σ`/`→` and a cp1252 console raises
 > `UnicodeEncodeError` inside the reporting line itself, which reads like a failure but is
 > not one. There is exactly one editor — the first-generation `nodelab`/`pipeline_kit` app
 > was removed on 2026-07-29 and `--legacy` no longer exists.
@@ -50,7 +53,7 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 11. [Spreadsheet & export](#11-spreadsheet--export)
 12. [Organising a big graph: frames, reroutes, groups, zones](#12-organising-a-big-graph-frames-reroutes-groups-zones)
     - [Docking: bake a chain to disk and free the memory](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218)
-    - [Iterating a parameter: sweeps and searches](#12c-iterating-a-parameter-sweeps-and-searches-v219)
+    - [Iterating a parameter: sweeps and searches](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)
     - [Editing a node while NodeLab is running](#12d-editing-a-node-while-nodelab-is-running-v220)
 13. [Saving & loading](#13-saving--loading)
 14. [Keyboard & mouse reference](#14-keyboard--mouse-reference)
@@ -637,6 +640,19 @@ iterations, real optics — NA 0.8, 663 nm, 0.287/0.288 µm sampling):
 | Scrub z inside that volume | **0.00 s** — every plane of it was cached |
 | Step T or position by one | **~130 s** — a different volume |
 | Come back to a volume you have seen | 0.00 s while it is still in the tile cache |
+| **Press ▶ on T** | starts instantly, then one frame per volume — see below |
+
+**Pressing play here is honest, not instant.** On a stored file — and on a per-plane computed
+series like a stitch or a Z-projection — play preloads the series and starts when it is warm
+(capped at ~8 s; a longer prepare releases playback early). On a **whole-volume** chain that
+preload would be a wait of hours with nothing on screen, so it is not done at all: play starts
+immediately, off whatever is already cached, and
+the cursor then **advances as each frame lands** rather than on the fps clock — nothing here can
+answer at 8 fps, and a wall clock would race the cursor through the series while one stale volume
+appeared every couple of minutes. So a 3D-deconvolved series plays at one frame per volume, in
+order, with every frame actually shown; the strip reads `computing Ns` while it waits. This is
+for walking a result, not for watching it at speed — if you want speed, bake the branch to a
+**Dock** node first and play *that*, whose frames are then stored bytes.
 
 So the shape to expect is: one wait per `(position, timepoint)`, then free z-scrubbing
 inside it. The window stays responsive throughout — the decode runs on a worker and the
@@ -717,11 +733,38 @@ Two safety properties make `auto` safe to try on real data:
   push their own transfer + kernel at a single card and it thrashes — measured as a **33×
   regression** before the queue was added.
 
+### Deleting a node while it runs
+
+Deleting a card **cancels the runs that were computing it**, and only those. That is the
+way to abandon a branch you no longer want and let the ones you do want have the machine:
+delete the node, and the pull stops instead of holding the slot to the end.
+
+- **The deleted node's own pull stops mid-work.** It stops at the next node boundary or the
+  next tick of the running node's progress rail — so a node that reports progress stops
+  within one unit, and a single opaque call (a CellSAM or StarDist inference, an upstream
+  solver) still finishes that call first. Nothing partial is kept: whatever had already
+  finished upstream stays in the memo and is a hit next time, and the abandoned node
+  recomputes from scratch when you next ask for it.
+- **Anything queued behind it starts immediately.** A request waiting for the slot does not
+  wait out the branch you just deleted.
+- **Other branches are untouched.** A run that never reads the deleted node keeps going,
+  keeps its rails moving, and still delivers — deleting a card on one branch does not
+  disturb a half-hour segmentation on another.
+- **A queued request for the deleted node is dropped**, rather than left holding a place in
+  line for a card that no longer exists.
+
+Deleting a node that is being **baked or held** is the exception: a bake's result is a
+directory on disk that is already partly written, so it runs to the end and records itself.
+Stop a bake with its own Stop control, not by deleting the dock.
+
 ### When something fails
 
 The card turns red, the status LED goes red, and the **Console** gets the full traceback
 with *Copy all*. Dependency-gated nodes raise a one-line install hint (e.g. "install
 scikit-learn") rather than a mysterious `ImportError` deep in a kernel.
+
+A **cancelled** run is not a failed one: no card goes red, nothing lands in the Console.
+The cards simply leave `queued`/`running` and the slot moves on.
 
 ---
 
@@ -729,7 +772,8 @@ scikit-learn") rather than a mysterious `ImportError` deep in a kernel.
 
 The Viewer renders the pulled Dataset as a **multi-channel colour composite**. There is no
 title bar — the image fills the top; all controls sit in one strip beneath it, and the
-viewed node's name is folded into the status line at the bottom.
+viewed node's name is folded into the status line at the bottom. Two results can be open at
+once, side by side — see [the compare pane](#two-results-side-by-side--the-compare-pane-v228).
 
 ### Navigation
 
@@ -740,7 +784,9 @@ viewed node's name is folded into the status line at the bottom.
   the pointer leaves the strip, clamping at whichever end you passed. The box you are on is
   filled with the accent colour; the wheel and the arrow keys step one frame. Playback
   advances one axis frame-by-frame, self-throttled to the target fps, and reports the
-  achieved rate beside the strip.
+  achieved rate beside the strip. On a series whose frames are **computed** rather than read
+  it advances as each frame lands instead — the fps spinner is then a ceiling nothing reaches,
+  and the strip reads `computing Ns` while a frame is being produced.
 * **Ctrl+click a strip to *pick* boxes** (ctrl+drag paints a run, shift+click extends from
   the last one, right-click offers pick all / invert / clear). Picked boxes are outlined in
   the accent colour and counted in the `4/199 ·3` readout. Picks are the run scope for
@@ -875,6 +921,38 @@ Settings persist as JSON in three layers, later wins: built-in defaults → the 
 shipped in the package (meant to be committed) → this machine's file. Partial files merge,
 so a file written by an older build still loads.
 
+### Two results side by side — the compare pane (V2.28)
+
+Right-click a card → **Compare beside viewed**, or select it and press `F8`, and its result
+opens in a **second Viewer pane** beside the one you are already looking at. The pane you
+were viewing stays on the left and keeps its result; the compared node goes on the right,
+with a header naming it. Drag the divider to change the split; `Shift+F8`, or the pane's
+`✕`, closes it.
+
+**The sliders link themselves from the metadata.** When both results span the same M/T/Z,
+there is only ever *one* cursor: the left pane's strips move **both** panes together, and
+the right pane's own cursor row disappears so there is nothing to get out of step. That is
+the case you want for a before/after — a raw channel against its deconvolution, two
+thresholds of the same stack — where scrubbing has to compare the same frame.
+
+When the two results do **not** span the same axes, the right pane keeps its own strips and
+each pane scrubs independently. A Z-Project beside its input is the obvious example: one has
+five planes and the other has one, so a shared Z cursor would be meaningless. The link is
+re-derived from the payloads' own axes after every pull, so it follows what the graph
+actually produces — change a node so the extents match and the panes link on the next pull.
+
+Each pane keeps its **own channels, contrast, LUT, zoom and overlays**, which is what makes
+the comparison useful: you can hold two different windows on the same intensities, or show
+different channels of each. Both panes scrub on the same fast path as a single one — the
+runner now holds one display state per pane, so moving the linked cursor is a cache read for
+both, not a re-run of either.
+
+The compare pane is a **display surface only**. Parameter picking, troubleshooting mode
+(`F9`), the iteration strip, the spreadsheet and export all stay with the left pane, so the
+node you are tuning is never in doubt. Comparing a node whose file has not been ingested yet
+is refused with a note rather than starting a multi-minute ingest, and maximising the canvas
+(`Ctrl+Space`) closes the compare pane first — there is one mini-map, and it holds one panel.
+
 ### Maximised canvas + mini-map
 
 `Ctrl+Space` (or the `⛶` button, or **View → Maximize node canvas**) gives the whole centre
@@ -1001,7 +1079,8 @@ Viewer.
 | **Eyedropper** | click a pixel; its intensity becomes the level | Threshold, Segmentation's fixed level, Histogram Threshold's low/high, Spot/Particle Detection, Remove Blobs, Normalize's `low_value`/`high_value` under bounds `absolute` |
 | **Measure on the image** | click two points; the value is the distance between them | Track Linking / Track Objects `max_distance`, Particle Detection & watershed seed `min_distance`, Voronoi Cells' max reach |
 | **Drag the crop rectangle** | drag one box; **all four bounds** are set at once and everything outside it dims | Crop `y0`/`y1`/`x0`/`x1` |
-| **Use the picked Z planes** | tick planes on the Z strip; their span becomes the Z window | Crop `z0`/`z1` (3D only) |
+| **Use the picked Z planes** | tick planes on the Z strip; their span becomes the Z window | Crop `z0`/`z1` (3D only, `What to crop: spatial`) |
+| **Use the selected frames** | tick boxes on the M / T / Z strips — or just sit on a frame; the whole selection lands in **one** socket as `m0-2,t3,z1-4`, sparse picks and all, and an axis with nothing ticked takes **the frame you are looking at** | Crop `frames` (`What to crop: frames`) |
 | **Drag the grid** | drag one subset box; the lattice previews at that spacing | DVC/DIC subset size + stride, Segmentation's tiling, Object Field's grid, Temporal Gain's tile |
 | **Draw the region** | rect / ellipse / circle / polygon / freehand, with Add, Cut, Invert, Clear and Undo | ROI Mask's `shapes` (which DIC then consumes as its ROI) |
 | **Take the histogram** | put the LUT handles where you want them, then Apply | Normalize's percentiles, Histogram Threshold's percentiles, Gamma |
@@ -1075,8 +1154,19 @@ for no reason other than the constant.
 Two things make that affordable rather than merely possible: the display copy is narrowed to the
 payload's own bit depth (a mosaic frame is 98 MiB of uint16, not the 392 MiB of float64 a feather
 blend has to be *computed* in), and pressing **play** preloads the whole T range into the plane
-cache, so playback after the first pass is a texture upload per frame — 0.1 ms. If the series is
-larger than the budget the status line says so, and the tail re-reads.
+cache, so playback after that is a texture upload per frame — 0.1 ms. Playback waits for the
+preload — the difference between smooth and reloading every lap — but never past ~8 s: the hold
+is judged on the preload's own measured rate, and a series that projects past the cap starts
+playing immediately off whatever is warm while the rest keeps preparing behind it. This covers
+*stored bytes* (warm in a second or two) **and per-plane computed series alike** — a live
+**Stitch**, a **Z-Project**, or the projection of a stitch each cost a fraction of a second per
+frame, so holding briefly and then playing from memory is what makes them smooth instead of
+stuttering at decode cadence for the whole first lap. If the series is larger than the budget
+the status line says so, and the tail re-reads.
+
+A series whose frames are **whole-volume computes** (3D Deconvolve and kin) is never preloaded
+and never waits — see
+[What a 3D whole-volume node costs](#what-a-3d-whole-volume-node-costs-while-you-look-at-it).
 
 For a fixed cap regardless of any of this, set `NODELAB_MAX_DISPLAY_DIM`. For a camera frame
 none of it applies — the cap was never reached and you were always seeing every pixel.
@@ -1159,6 +1249,44 @@ Two limits worth knowing before you reach for it on a long series:
   here, but it halves how many frames stay resident.
 
 ---
+
+## 8d. The footprint band: choosing the statistics population (V2.27)
+
+Every card carries a **footprint band** under its title. The chip on the left is a *fact* — how
+much data this node has to read per step, coloured by cost (green tileable → purple whole
+series). On nodes that derive a number from the data, a **pill** sits beside it, and that pill is
+a control: **click the footprint to change the statistics population.**
+
+The population is which values get pooled into the statistic — the thing that decides what a
+result is reproducible *from*. Six choices, shared by every node that has one:
+
+| Population | The statistic comes from |
+|---|---|
+| `plane` | that (Y,X) plane's own values — the most adaptive, and what ImageJ means by "Otsu" |
+| `volume` | the (Z,Y,X) stack, per position/timepoint/channel |
+| `series` | one position's whole timelapse, so a bleaching series cannot drift |
+| `dataset` | everything but the channel, positions included |
+| `per_label` | **one population per label region** — each cell judged on its own pixels |
+| `per_roi` | one per connected region of a mask, including a drawn ROI |
+
+No population ever pools across channels: two stains have different dynamic ranges, and one
+shared level thresholds the dim one into nothing.
+
+**Why `per_label` is not just a convenience.** Take a bright cell (body 400, punctum 900) beside
+a dim one (body 80, punctum 180). The dim cell's punctum is *darker than the bright cell's
+background*, so **no single level anywhere can select both** — raise it and you lose the dim
+punctum, lower it and you take the whole bright cell. Per label, each cell is cut against its own
+histogram and both puncta come out. That is why the control exists.
+
+The menu states the cost as you choose: a disabled header names the footprint being read now, and
+each option is annotated with the one it would imply. A population folds into the memo key, so
+each choice caches separately and flipping back is free.
+
+**Where the band is a readout instead.** Most nodes have no population to choose, and the band
+says what decides their footprint rather than going quiet: a filter's footprint comes from the
+[2D/3D lever](#9-the-2d3d-lever), Z Project's from its reducer, Overlay's from its output mode.
+Hover the card for the line. Threshold's pill also disappears under `method = fixed` — an
+absolute cut reads no histogram, so there is no population to pick.
 
 ## 9. The 2D/3D lever
 
@@ -1265,6 +1393,56 @@ Voxel/lattice attributes are per-voxel rasters — those belong in the Viewer, n
 |---|---|
 | `.csv` | one file; several tables are written in long form with leading `domain` / `layer` columns |
 | `.parquet` / `.arrow` | one table, same long form, via pyarrow |
+
+### Exporting IMAGES — the Export TIFF node (V3.00)
+
+Tables come out through the menu; **pixels come out through a node**. Drop an **Export
+TIFF** (`io.write_tiff`) anywhere in the graph, point `File` at a destination, and the
+Dataset on that wire is written when the node runs. It is a **tap, not a terminal** — the
+Dataset passes through byte-identical, so you can keep wiring downstream and a Viewer after
+it still shows exactly what went to disk.
+
+Being a node rather than a menu item is the point: the export is part of the saved graph, it
+diffs, it re-runs on another machine, and it runs headlessly and under LabLink
+([§17](#17-headless--scripted-use)) without anyone clicking anything.
+
+**It streams.** One `(Y,X)` plane is read and handed to the encoder at a time, so peak memory
+is a single plane no matter how long the series — a 49-position timelapse exports on a laptop.
+Encoding runs across all cores behind the read. Measured write throughput on this machine:
+**~1.4 GB/s uncompressed**, **~230 MB/s zlib** at Level 1, **~33 MB/s lzma**. How much the
+compressed options *shrink* the file depends entirely on the data — watch the first export
+rather than trusting a rule of thumb.
+
+**`zstd` would be the right default and is not available here.** It needs the `imagecodecs`
+package (not installed) or Python 3.14's built-in zstd; this is Python 3.12, so selecting it
+is **refused up front** with that explanation rather than failing partway through a large
+export. `pip install imagecodecs` makes it — and LZW — work.
+
+**The metadata is the envelope on that wire, transcribed verbatim.** Physical XY and Z
+sizes, frame interval, significant bits (a 12-bit ND2 says **12**, so no reader auto-contrasts
+against 65535), per-channel names and emission wavelengths, and a per-plane stage position and
+time offset. Because it is read from the wire and not from the file, **an export after a crop
+describes the cropped data** — the corner moved by the cut, the sampling unchanged. A value
+the envelope does not hold is left **out** rather than defaulted: a single-plane file gets no
+Z spacing, and a file whose timestamps the SDK never filled in gets no frame interval. Absent
+reads as "unknown" to every OME consumer; a fabricated `1.0` reads as a measurement.
+
+Pick `Model` by **which program has to open it**: `ome` for anything that will be measured
+(and the only one that can hold several positions in one file), `imagej` when the destination
+is Fiji and you want it to open instantly and calibrated, `plain` only for code that just
+wants planes.
+
+**What `Existing = skip` actually checks.** Every file this node writes carries a private
+stamp — a digest of the pixel source, the positions and the whole metadata block. `skip`
+rewrites *unless that stamp proves the file on disk is already this exact export*. So an
+identical re-run costs no I/O, deleting the file brings it back, and **changing anything
+upstream still produces a fresh file** — a stale export under the name of a new one is not
+reachable. (An unchanged graph re-pulled in one session never reaches the node at all: the
+memo answers first, which is cheaper still.) Use `overwrite` when something outside the graph
+may have touched the file, and `refuse` for a destination that must be written exactly once.
+
+Writes go to `<path>.part` and are renamed on success, so an interrupted export cannot leave
+a truncated file wearing the real name.
 
 ---
 
@@ -1470,35 +1648,58 @@ so and offers to bake again.
 
 ---
 
-## 12c. Iterating a parameter: sweeps and searches (V2.19)
+## 12c. Iterating a parameter: sweeps and searches (V2.19, segment rewrite V2.22)
 
 A **Repeat zone** iterates *data*. The **Iterate** node (`flow.iterate`, the `flow` category)
-iterates *parameters*: it runs the chain in front of it once per value and keeps one result.
+iterates *parameters*: it re-runs a stretch of your graph once per value and keeps one result.
+
+**Nothing flows through the card.** Iterate is a control — like Blender's *Random Value* — not
+a stage in the pipeline. You never re-route your chain into it and out again; you point it at
+a stretch of graph and at the parameters you want varied, and the result comes out of that
+stretch's own last node, where it always did.
 
 ### Wiring one up
 
-1. Drop an **Iterate** card after the chain you want to tune.
-2. Wire the **end** of that chain into the Iterate node's **Collect** input.
+1. Drop an **Iterate** card anywhere near the chain you want to tune.
+2. Wire the **segment**: the output of the LAST node of the series into the card's **To**, and
+   — optionally — the FIRST node's output into **From**. That pair is the stretch that
+   re-runs.
 3. In the Iterate panel, pick what to iterate from the **V0** dropdown. It lists every
-   parameter and every mode dropdown of every node in the chain feeding Collect — read down
-   the chain, node by node — and choosing one wires it. Use the **+** row below it to add a
-   second parameter; that raises **Variables** for you.
+   parameter and every mode dropdown of every node inside the segment — read down the series,
+   node by node — and choosing one wires it. Use the **+** row below it to add a second
+   parameter; that raises **Variables** for you.
 
-The list is *scraped from your graph*, not a fixed menu: a param that this card could not
+That is all. **The result leaves through the series' end node**, so anything already reading
+that node — a Viewer, an Export, a branch you drew last month — keeps working and now gets
+the kept iteration, and the sweep simply *runs* whenever you view any of it. The card's own
+output serves the same payload if you prefer an explicit wire, but nothing requires it.
+
+**From is optional.** Leave it empty and the series starts wherever the driven parameters
+are. Wire it to pin the start: everything above it becomes **loop-invariant** — computed once
+and shared by every iteration — and the stretch cannot quietly grow the day you point a
+variable at a node further up.
+
+The V0 list is *scraped from your graph*, not a fixed menu: a param that this card could not
 legally drive is never in it (see [what it refuses](#what-it-refuses-and-why)), and a param
 another slot already drives is dropped from the others' lists. Picking a mode dropdown or a
 text field also sets that variable's **Type** to `text` for you, because a number and a name
 leave the card on different outputs.
 
-You can still do it by hand: drag from the card's **V0** output onto the parameter itself.
-The dropdown builds exactly that wire, so the two are the same edit — the menu is just the
-way that does not require hunting for the control. (Mode dropdowns grow a port as soon as an
-Iterate node exists in the graph; the 2D/3D lever deliberately does not, because sweeping it
-would produce errors rather than comparisons.)
+You can still point a variable by hand: drag from the card's **V0** output onto the parameter
+itself. The dropdown builds exactly that wire, so the two are the same edit — the menu is
+just the way that does not require hunting for the control. (Mode dropdowns grow a port as
+soon as an Iterate node exists in the graph; the 2D/3D lever deliberately does not, because
+sweeping it would produce errors rather than comparisons.)
 
-The driver wire and Collect close a loop on the canvas, which is intended — the driver wire
-is not a data route, so it never makes the graph cyclic. Everything between the driven node
-and Collect is the **iterated chain**, and it is what gets run once per value.
+The driver wire and the To wire close a loop on the canvas, which is intended — the driver
+wire is not a data route, so it never makes the graph cyclic.
+
+> **Viewing a node inside the segment.** Double-click it as usual. It has one result per
+> iteration and no card of its own, so you are shown the one the **ITER** strip is on —
+> which is what you want while tuning: move the strip and the node you are tuning follows.
+
+> **Opening a V2.19 graph.** The old **Collect** input became **To** — same wire, same
+> meaning (the end of the series) — and files saved against it are migrated on load.
 
 ### Choosing the values
 
@@ -1523,7 +1724,7 @@ anything, and refuses past 64.
 * **first** / **last** — the ends of the sweep.
 * **best** — the one with the highest (or lowest) **metric**. A metric is a `Global` scalar,
   which is what the **Reduce → Scalar** node (`analysis.reduce_scalar`) exists to produce:
-  put one inside the iterated chain, point it at a domain + column + reducer (`count` on any
+  put one inside the segment, point it at a domain + column + reducer (`count` on any
   Label column gives the object count), name it, and name that same name in the Iterate
   node's Metric field.
 
@@ -1543,7 +1744,7 @@ returns to computing only the kept one; nothing is thrown away.
 
 ### Searching instead of sweeping
 
-Set **Mode** to `feedback` and the node stops enumerating and starts *searching* one numeric
+Set **Mode** to `feedback` and the card stops enumerating and starts *searching* one numeric
 variable inside its range:
 
 * **golden** — golden-section search for the value that maximizes (or minimizes) the metric.
@@ -1558,12 +1759,16 @@ or a parameter that changes the image's axes — those values have to be known b
 
 Each of these would otherwise produce a plausible, wrong answer rather than an error:
 
-* a driven node that is not upstream of Collect (the sweep would change nothing);
-* a **frozen** Dock inside the chain — held or docked (every iteration would read the same
+* a driven node outside the segment (the sweep would change nothing) — the message says
+  whether to move **To** down or **From** up;
+* a segment with **nothing driven inside it** (N identical iterations);
+* two wires into **To** — a series has one end;
+* a **frozen** Dock inside the segment — held or docked (every iteration would read the same
   frozen pixels);
-* another Iterate node inside, or overlapping, this one's chain;
+* another Iterate node inside, or overlapping, this one's segment;
 * one parameter driven by two Iterate cards;
-* a branch leaving the chain to somewhere outside it (which iteration would it read?);
+* a branch leaving the **middle** of the segment for somewhere outside it (which iteration
+  would it read?) — a branch off the segment's **end** is the normal exit and is fine;
 * a parameter that is already fed by a **wire** (a wired value beats a swept one, so every
   row would come out identical);
 * a field that only **names** the layer a node writes (same pixels, N different names);
@@ -1718,6 +1923,8 @@ print(report.summary(), report.removed, report.added)
 | `Ctrl+A` | Select all nodes |
 | `F5` | Pull selected node |
 | `Shift+F5` | Pull viewed node again |
+| `F8` | **Compare selected beside viewed** — a second Viewer pane; one cursor when the M/T/Z match |
+| `Shift+F8` | Close the compare pane |
 | `F6` | **Bake selected dock** — freeze everything above a Dock Data node to disk |
 | `F9` | **Troubleshoot: picked frames only** — scope every pull to the picked M/T/Z boxes (or the viewed frame) |
 | `Ctrl+R` | **Reload node code** — run the node/kernel files as they are on disk now, without restarting |
@@ -1744,7 +1951,7 @@ print(report.summary(), report.removed, report.added)
 | Click a mode pill (`▾`) / checkbox pill | open its menu / toggle it |
 | Click the `ƒmd` badge | pin the derived value, or unpin back to auto |
 | Click the ring (`○`) | pick that parameter off the image |
-| Right-click a node / wire / frame | context menu (Delete, Dissolve, …) |
+| Right-click a node / wire / frame | context menu (Delete, Dissolve, Compare beside viewed, …) |
 | `M` | mute / unmute selected |
 | `C` | collapse / expand selected |
 | `Esc` | cancel a wire drag; leave maximised canvas |
@@ -1773,6 +1980,14 @@ print(report.summary(), report.removed, report.added)
 Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdowns ·
 `µm`/`µm²`/`µm³` = the parameter's unit · *(dep)* = needs an optional package.
 
+> The **machine** facts about each node — every socket with its unit, default and hover prose,
+> the footprint per mode, the domains, the owning file — are generated into
+> [codemap/gen/nodes.jsonl](codemap/gen/nodes.jsonl) and `sockets.jsonl`. What follows is
+> deliberately *not* derived from them: it is the measured, curated judgement about when to use
+> each node and what will bite you, which no generator can produce. A gate
+> (`selftest::test_codemap`) checks that this section lists every registered node exactly once,
+> so a new node cannot ship undocumented here.
+
 ### Source & channel
 
 | Node | `op_key` | What it does |
@@ -1782,11 +1997,12 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Split Channels | `channel.split` | Fan a multi-channel Dataset into per-channel outputs; `out` still carries the full bundle. |
 | **Merge Channels** | `channel.merge` | Put **two acquisitions on one channel axis**, placed by absolute stage position and focus — two files become a single multi-channel image every downstream node can measure across. Where **Overlay** records a placement for the Viewer and changes nothing a node reads, this returns real merged data, and it is **lazy**: a plane costs a plane (measured on the WellA3 pair — pull 0.025 s, +0 MiB, against `view.overlay`'s `resample` at 25 s and +12.4 GiB for the same co-registration). **Each channel shows its OWN plane nearest the viewed focus**, so scrolling Z walks acquired planes on both sides instead of interpolating one to fit the other. `Z grid` = `union` (default: span both focus ranges at the finer step, so which file you wired as primary cannot decide whether the other's stack is reachable) or `primary` (keep this input's grid exactly, naming the secondary planes it cannot address). Lateral placement is nearest-neighbour, so every value is a real sample of its source. `If unplaceable` = `refuse`/`align_by_index` as Overlay, and it matters more here because this output is measured. C and Z both show **?** until the first pull — the edit-time pass is shown only the primary's envelope, so both are honestly unknown. **Which input you make the primary decides the output grid**: wire the FINE-pixel file as the primary or its detail is minified away (a 0.287 µm/px stack into a 1.718 µm/px mosaic loses 6× linear — the node warns, and a minified secondary is area-averaged rather than point-sampled so at least the noise is not amplified). `Flip X`/`Flip Y` go **inert** when the secondary is an already-stitched canvas: the stitch answered that question to place its tiles, so flipping again would mirror the mosaic 456 px out of place. |
 | Dock Data | `io.dock` | Bake everything upstream to a disk checkpoint, then serve it as a new source — the chain behind it greys out and is released from memory. See [§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218). |
+| **Export TIFF** | `io.write_tiff` | Write the Dataset on this wire to a TIFF, and **hand it through unchanged** — so it is a tap, not a terminal: drop it mid-chain, keep wiring downstream, and a Viewer after it still shows what was written. **Streams one plane at a time** (`get_region` per `(m,t,z,c)`, never a volume), so peak memory is a single plane and a 49-position series exports without ever being materialized. `File` is a **save-file browse**; empty is refused rather than guessed. `Layer` (empty = the image) exports a Voxel raster instead — a mask or label image at its own dtype, which is how a segmentation reaches Fiji or QuPath as real ids. Model `ome` (default: OME-XML with physical XY/Z, frame interval, significant bits, channel names + emission wavelengths, and a per-plane stage position and time offset; the only model that holds several positions in one file, BigTIFF when needed) / `imagej` (Fiji's own `spacing`/`unit`/`finterval` — opens natively with no import dialog, but one position, no stage log, 4 GB ceiling) / `plain` (pixels + XY resolution only; **loses** Z spacing, interval, channel identity and position). Compression `none` (~1.4 GB/s here)/`zlib` (default; lossless, ~230 MB/s at Level 1 — how much smaller depends entirely on the data)/`lzma` (smallest, ~33 MB/s)/`zstd`, with `Level` for the two that take one — **`zstd` is refused up front on this installation**, which needs `imagecodecs` or Python 3.14. `One file per position` writes `<name>_m00.<ext>` per multipoint (required by `imagej`/`plain` for a multi-position export). **The calibration written is the envelope on THIS wire, not the source file's** — export after a crop and the file says where the *cropped* field is, at the sampling it actually has; a key the envelope does not hold is **omitted**, never defaulted to 1.0. `Existing` = `skip` (default) / `overwrite` / `refuse`. Full description, including what `skip` actually checks: [§11](#11-spreadsheet--export). |
 | Reroute | `rr.reroute` | Identity pass-through for wire tidiness (created by double-clicking a wire; hidden from the palette). |
 | Viewer tap | `view.viewer` | Pure pass-through inspection tap. |
 | **Overlay** | `view.overlay` | Draw a **second Dataset inside this one's field**, placed by absolute stage position, pixel size and focus — so two files that ran through different graphs line up on the microscope's own coordinates. Controls: blend `add/over/difference/checkerboard/wipe/flicker`, `opacity`, a µm `offset_y`/`offset_x`/`offset_z` nudge, `t_shift`, `flip_x`/`flip_y` handedness, `min_coverage`, `secondary_channel`. Output `display` (default) records **where** the secondary goes and changes nothing a downstream node reads — the payload passes straight through, and `opacity`/`wipe_pos`/`flicker_hz` are outside the recipe hash, so dragging one repaints rather than re-runs; `resample` bakes the secondary onto the primary's grid as real pixels. Overlays **chain**: wiring one into another's primary appends a third source, so N-way needs no N-ary socket. `If unplaceable` = `refuse` (default) declines when the files cannot prove they line up; `align_by_index` overrides and stays loud about it — every refusal reappears as a warning. The pairing, the nudge and the time shift are decisions about the experiment, not the window, which is why this is a node and not a Viewer setting. See [§7](#7-the-viewer). |
 
-### Enhancement (19)
+### Enhancement (20)
 
 | Node | `op_key` | Key controls | Notes |
 |---|---|---|---|
@@ -1809,21 +2025,21 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | **Flatten Illumination** | `enhance.flatten_field` | method `subtract/subtract_mean/divide_mean/ratio`, reference `per_plane/time_averaged`, `sigma` µm, `bg_floor` | no lever (lateral background). Ports Cell-Tracker's Background Subtract + Spatial Flatness + Local Contrast; `ratio` **drops `bit_depth`** |
 | **Temporal Gain** | `enhance.temporal_gain` | reference `series_mean/rolling_mean/exponential_fit`, extent `global/tile/gaussian`, `window`, `threshold`, `tile_size` µm, `local_sigma` µm | no lever; per (m,z,c) T-series. Ports Bleach Correction + Temporal Fold Correction (+ the exponential decay model CT's UI promised but never ran). Refuses T=1 |
 | **Remove Blobs** | `enhance.remove_blobs` | detector `log/dog`, action `zero/interpolate/median`, `min_radius`/`max_radius` µm (per channel), `threshold`, `expand`, `fill_radius` µm | per-plane, no lever (sensor/glass artifacts are per-plane). Ports Blob Subtract |
+| **Subtract Background** | `enhance.subtract_background` | **Estimator** `rolling_ball` (default) / `ellipsoid` / `opening` / `minimum` / `median` / `percentile` / `gaussian` / `polynomial` / `global_percentile`; **Polarity** `dark_background`/`light_background`; **Output** `corrected`/`background`; **Arithmetic** `subtract`/`subtract_signed`/`divide`; per-estimator: `radius`(+`_z`) µm, `sigma`(+`_z`) µm, `percentile`, `degree`, `height`, `shrink`, plus `presmooth` and `bg_floor` | lever, **true 3D** (the ball becomes an anisotropic ellipsoid; the box, Gaussian and polynomial all take a third axis). ImageJ's `Process > Subtract Background` under the name you'd search for, with its three checkboxes as Modes — "Light background" = `polarity`, "Create background" = `output`, "Disable smoothing" = `presmooth` off — generalized to the eight other popular estimators. **`shrink` is what makes it usable:** the rolling ball is polynomial in the radius with degree = dimensionality (measured here: 8.7 s per 2048² plane at r = 29 px, 105 s at 120 px), so `auto` follows ImageJ's own factor table (1/2/4/8) for 10–86× at under 3 % error, and stays off for the two estimators scipy already runs radius-independently. `subtract_signed` is the one to use before measuring intensities — the default clip at 0 folds the negative half of the background noise back and biases every mean upward. `divide` **drops `bit_depth`**. Distinct from its two neighbours: `enhance.tophat` *is* the `opening` estimator with the arithmetic fixed, and `enhance.flatten_field` is the Cell-Tracker port, which keeps the two things this node leaves out — a mean-restoring arithmetic, and a background **averaged over T** |
 
-### Segmentation & analysis (26)
+### Segmentation & analysis (25)
 
 | Node | `op_key` | Key controls | Produces |
 |---|---|---|---|
-| Threshold | `analysis.threshold` | method `fixed/otsu/li/yen/triangle/mean`, `threshold` (fixed only), `name` | Voxel mask |
+| Threshold | `analysis.threshold` | method `fixed/otsu/li/yen/triangle/mean`, **Scope** `plane/volume/series/dataset/per_label/per_roi`, `regions` (structure scopes), `threshold` (fixed only), `name` | Voxel mask. **Scope is the statistics population** — click the footprint band on the card to change it ([§8d](#8d-the-footprint-band-choosing-the-statistics-population-v227)). `per_label` derives a level inside EACH region from that region's own pixels, so a bright cell and a dim one are cut at different absolute levels — unreachable with any single global cut; `per_roi` does the same per connected region of a mask (a drawn ROI, or a single-blob mask = "ignore the background"). 2D vs 3D under `per_label` is inherited from the Label instance's own provenance, never levered |
 | Multi-Otsu | `analysis.multiotsu` | `classes`, `name` | Voxel class raster (0..K-1) |
 | Local Threshold | `analysis.threshold_local` | `block_size` µm, `offset`, `name` | Voxel mask (uneven illumination) |
 | Connected Components | `analysis.label` | `mask`, `connectivity` (8 / 26 default), `name` | Voxel raster **+ Label table** |
 | **Segmentation** | `analysis.segment` | method **threshold** (`level` otsu/li/yen/triangle/mean/fixed, `connectivity`) · **watershed** (optional `mask` layer, `min_distance` µm) · **stardist** (`prob_thresh`, `nms_thresh`, `scale`, `model_name`) · **cellsam** (`bbox_threshold`, `cellsam_model`, `model_path`, `normalize`, `postprocess`, `remove_boundaries`, `tile`+`tile_size`/`tile_overlap` px, `fast`); shared: `name`, `fill_holes`, min/max **area µm²** (2D) or **volume µm³** (3D) | Voxel label raster **+ Label table**; lever: 2D = per-plane instances, 3D = z-connected *(the two learned methods refuse 3D)*. CellSAM `fast` = **~5× on a GPU** (batched mask decoder); not bit-identical, so it is off by default — see below |
 | Distance Transform | `analysis.edt` | `mask`, `name` | µm distance field (anisotropic in 3D) |
 | Measure | `analysis.measure` | **Members** `label` (`labels`, `stats`, `shape`) · `point` (`points`); optional **`raw`** Dataset in both | `label`: per-region stats on the Label table, and `shape` adds µm-aware regionprops geometry (`eccentricity`, `perimeter`, `solidity`, `extent`, `axis_major`, `axis_minor`, `orientation`) — the 2-D-only three are refused on a 3D Label table. `point`: each detection's physical position `x_um`/`y_um`/`z_um` **and** `mean_intensity`, the value of the voxel it sits on. `stats`/`shape` are hidden there — a point has no region to reduce over. The pixel `x`/`y`/`z` columns are left alone, so everything reading them as indices keeps working; leave `points` **empty** and the only Point table on the wire is used |
-| Histogram Threshold | `analysis.histogram_threshold` | method `single/hysteresis/percentile/relative` × direction `below/above/between/outside`, morphology cleanup, area filters µm², optional `raw` | mask + Label raster + region table (2D) |
-| **Threshold Per Label** | `analysis.threshold_per_label` | method `otsu/li/yen/triangle/mean/percentile/relative` × direction `above/below`, `labels`, `min_pixels`, `sub_labels`+`connectivity`, `label_channel`/`signal_channel`, `name`/`sub_name`, optional `raw` | **Thresholds INSIDE each label separately** — every parent region derives its own level from its own pixel histogram, so a bright cell and a dim one are cut at different absolute levels and no single global cut can reproduce the result. Writes a 0/1 sub-mask, re-CCL'd **sub-objects with a `parent_id` join** (labelled one parent at a time, so two touching cells can never merge their sub-objects), and per-parent `level`/`n_above`/`frac_above`/`n_sub`. 2D vs 3D is **inherited** from the Label instance's own provenance, not levered. A region under `min_pixels` or with no spread is skipped and reported as **NaN**, never handed the frame's global level; `label_channel`+`signal_channel` express "cells segmented on ch0, signal in ch1", which `raw` cannot (it redirects the chain, not the channel) |
-| **Filter Labels** | `analysis.filter_labels` | method `otsu/li/yen/triangle/mean/fixed/percentile` × keep `above/below` × scope `plane/volume/series/dataset`, `labels`, `column`, `level`/`percentile`, `name` | **Keeps or drops whole labels** by cutting one per-label *column* — `mean_intensity`, `area`, `eccentricity`, `n_sub`, anything the table carries — with the cut derived from the population of label values (or given as a fixed level / percentile). Reads the table, never the pixels, so it filters whatever was measured upstream. Surviving **ids are preserved** with gaps, so a measurement or track made upstream still joins; the input layer stays on the wire. Every original column reaches the output plus `cut`. A non-finite value can neither set the cut nor survive it |
+| Histogram Threshold | `analysis.histogram_threshold` | method `single/hysteresis/percentile/relative` × direction `below/above/between/outside`, **Scope** `plane/per_label/per_roi` + `regions`/`min_pixels`, `full_scale`, morphology cleanup, area filters µm², optional `raw` | mask + Label raster + region table (2D). **Scope = per_label runs this whole engine — morphology, area filters and all — once per REGION**, on that region's own bounding box, so each cell is cut at its own level and two touching cells can never merge their sub-objects. The children carry `parent_id` + `level` (so "puncta per cell" is a groupby) and the parents gain `level`/`n_above`/`frac_above`/`n_sub`, NaN where a region was skipped for want of `min_pixels` samples or of any spread. `single`/`hysteresis` are absolute raw counts and have no population, so pairing them with a per-object Scope is refused; a VOLUMETRIC Label instance is refused too (this engine is 2D — use Threshold's `per_label` for that). This replaced the separate Threshold Per Label node in V2.27. **Absolute cuts are FLOAT and read in the image's own units** (V2.28): raw counts while the file declares a bit depth, and the data's own scale once it does not — so on normalized [0,1] data a hysteresis of `strict` 0.7 / `permissive` 0.3 is exactly what you type, where the node used to refuse fractional input outright. `full_scale` pins the one case the Dataset cannot answer: a float image whose range is neither counts nor [0,1] |
+| **Filter Labels** | `analysis.filter_labels` | method `otsu/li/yen/triangle/mean/fixed/percentile` × keep `above/below` × **Scope** `plane/volume/series/dataset` (the shared vocabulary, editable from the card's footprint band), `labels`, `column`, `level`/`percentile`, `name` | **Keeps or drops whole labels** by cutting one per-label *column* — `mean_intensity`, `area`, `eccentricity`, `n_sub`, anything the table carries — with the cut derived from the population of label values (or given as a fixed level / percentile). Reads the table, never the pixels, so it filters whatever was measured upstream. Surviving **ids are preserved** with gaps, so a measurement or track made upstream still joins; the input layer stays on the wire. Every original column reaches the output plus `cut`. A non-finite value can neither set the cut nor survive it |
 | Spot Detection | `detect.spots` | `min/max_radius` µm (+ `_z`), method `log/dog`, polarity `bright/dark` | Point table; lever |
 | Particle Detection | `detect.particles` | `min_distance` µm, `threshold`, `min_intensity`, `min_size`, `subpixel`, mode `log/components` | Point table; lever. `min_size` (voxels — area in 2D, volume in 3D) defaults to 4 and is the main defence against single-voxel shot noise; lower it toward 1 if small spots are being missed. See [§15.1](#151-particle-detection-on-a-noisy-stack). |
 | Extract Boundary | `analysis.extract_boundary` | `labels`, `name` | boundary Points (2D contours / 3D surface verts) |
@@ -1838,7 +2054,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Accumulate DVC Field | `analysis.accumulate_field` | `source`, `name` | cumulative Lagrangian disp+strain; **inherits** its config from the upstream DVC (refuses `fixed_frame`/no provenance) |
 | DIC (pyALDIC) | `analysis.dic_correlate` | reference lever + optional `reference` Dataset, solver `aldic/local`, `winsize/winstepsize/search_range` px, ICGN/ADMM iterations, smoothness, `compute_strain`, optional `roi` mask | 2D Point displacement (+ optional strain) field *(dep: al-dic)*. Solves the whole T stack in **one** solver call per (m, z) — 2.3–3.2× faster than the per-frame pairing it replaced, for bit-identical displacements. Validated against pyALDIC's own synthetic suite (`scripts/dic_synthetic_bench.py`) |
 | Track Linking | `track.link` | target `label/point`, `max_distance` µm, `iou_threshold` | Track membership (IoU overlap / nearest neighbour) |
-| **Reduce → Scalar** | `analysis.reduce_scalar` | `domain` (voxel…track), `source` column/layer, `table` (only when a name is ambiguous), `reducer` `count/mean/sum/max/min/median`, `name` | ONE number on the **Global** domain — the score an Iterate node's `best` mode compares ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219)), and the only node in the catalog that writes Global. An empty domain is a result (`count` → 0), not an error; a wrong column name still is |
+| **Reduce → Scalar** | `analysis.reduce_scalar` | `domain` (voxel…track), `source` column/layer, `table` (only when a name is ambiguous), `reducer` `count/mean/sum/max/min/median`, `name` | ONE number on the **Global** domain — the score an Iterate node's `best` mode compares ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)), and the only node in the catalog that writes Global. An empty domain is a result (`count` → 0), not an error; a wrong column name still is |
 | Track Objects | `track.objects` | target `label/point`, method `centroid/serialtrack/topology/fingerprint/overlap` + per-method params | Track table **+ `track_id` write-back**; *(dep: numba/pandas)*. `serialtrack` is 1–2 orders of magnitude slower than the rest |
 
 ### Registration (3)
@@ -1855,7 +2071,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 |---|---|---|---|
 | **Transform** | `transform.rigid` | `channels` (tick by name), `shift_x`/`shift_y` µm (+ `shift_z` µm-axial in 3D), `angle` degrees, interp `linear/nearest/cubic`, lever | Move **selected channels** inside a **fixed frame** — translate and rotate in-plane about the centre; what leaves the frame is cropped and what it vacates is zero. Channels not named pass through at their raw position **on the same wire**, so a corrected and an untouched channel arrive downstream addressable voxel-for-voxel — the reason this is one node rather than a split/transform/merge chain. Axes, pixel size and `origin_um` are unchanged (only content moves), but the move IS stamped as sampling provenance, so `analysis.measure`'s `raw` guard sees it. Positive: X right, Y down, angle clockwise as displayed (ImageJ's sign). Voxel layers ride along (integer rasters always nearest, so ids survive); a Label/Point/Track table on the wire is **refused** — put Transform before segmentation |
 | Z-Project | `util.zproject` | method `max/mean/sum/min/median/none` | Z→1; drops `z_step_um`, marks `z_collapsed`; `sum` widens `bit_depth`. **`none` is the reset** — the node becomes a pass-through and the full Z stack comes back with `z_step_um` intact, `z_collapsed` unstamped and the pixels untouched, so a downstream lever can go back to 3D without rewiring the graph (it also stamps no sampling provenance and costs nothing — the footprint drops to `tileable`). Streams as a tree-reduce (no plane is ever realized) and forwards the source's display pyramid, so it scrubs on a stitched mosaic; on screen a coarse level of `max`/`min`/`median` is very slightly smoothed (~1% of the display range, measured), while level 0 — everything a node reads, measures or exports — is exact |
-| Crop | `util.crop` | `y0/y1/x0/x1` px — **drag one rectangle** ([§8b](#8b-picking-parameters-off-the-image-v216)) (+ `z0/z1` from the Z strip in 3D) | pixel size preserved; lever |
+| **Crop** | `util.crop` | **What to crop `spatial/frames`**. `spatial`: `y0/y1/x0/x1` px — **drag one rectangle** ([§8b](#8b-picking-parameters-off-the-image-v216)) (+ `z0/z1` from the Z strip in 3D). `frames`: one `frames` selector — **use the selected frames** | Two questions, two modes. **`spatial`** cuts a window out of every image: fewer pixels per image, the same number of images, pixel size preserved and `origin_um` moved to the cut corner; lever (Z is cut only in 3D). **`frames`** keeps only the M / T / Z indices you name — full extent, fewer images — as **one** selection: `"m0-2,t3,z1-4"`. An axis you do not name is kept whole, so `"t3"` is timepoint 3 of every position and **`"m0,t3"` is a single frame**; each axis may be **sparse** (`"t0,3,7"`), which a start/end pair could not say; ranges are inclusive at both ends; a bare list with no letter is read as timepoints. Empty = keep everything; naming an axis and keeping nothing on it is refused rather than shipped as an empty axis. Lazy either way (a pure index view — no pixels are copied). Everything indexed by a cut axis follows the selection: per-position stage/origin/alignment records, per-frame acquisition times, lattice layers (a mask **survives** a frames crop instead of being dropped), and structure rows — a Point/Label/Track row on a dropped frame is removed and the rest renumbered, so the row COUNT downstream changes. The axis spacings answer honestly: keeping every Nth frame or plane multiplies `dt_s` / `z_step_um` by the stride, and an unevenly spaced selection **drops** the key rather than reporting an interval true of no pair; cutting planes off the bottom moves `origin_um` and re-addresses `z_home_index`. A **Mesh** is dropped rather than half-filtered (its element/vertex/face buckets are joined by CSR ranges) unless nothing about it moves |
 | Resample | `util.resample` | `scale_xy`, `scale_z` | pixel size scales inversely; lever |
 | Stack (T→1) | `util.stack` | method `mean/median/sigma_clip/trimmed_mean/max/sum` | SNR stacking; drops `dt_s`; `sum` widens `bit_depth` |
 | Stitch (M→1) | `util.stitch` | layout `stage/stage+refine/grid`, blend `feather/max/mean/overwrite`, `flip_x`/`flip_y`, `refine_*`, `grid_cols` | M→1 mosaic from the file's stage log; Y/X **grow to an extent the header reports UNKNOWN** (it depends on the position log, which rides the payload); one canvas plane streamed at a time; refuses a missing/short stage log, an M axis of repeat visits, and any Dataset carrying a structure table |
@@ -1870,7 +2086,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 
 | Node | `op_key` | Key controls | Notes |
 |---|---|---|---|
-| Iterate | `flow.iterate` | mode `sweep/feedback`, `variables` 1–4, combine `grid/zip`, preserve `picked/first/last/best`, per-variable source `list/linear/log/around`, `metric`, `index`, search `golden/secant`, `target`, `tol` | Runs the chain in front of it once per parameter value and keeps one result. Drive any param or dropdown, collect the chain's end. See [§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219). |
+| Iterate | `flow.iterate` | segment `from`/`to`, mode `sweep/feedback`, `variables` 1–4, combine `grid/zip`, preserve `picked/first/last/best`, per-variable source `list/linear/log/around`, `metric`, `index`, search `golden/secant`, `target`, `tol` | Re-runs a stretch of the graph once per parameter value and keeps one result. Wire the series' end into `To`, point a variable at any param or dropdown inside it; the result leaves through that end node, so the sweep runs whenever you view it. See [§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222). |
 
 ### Abstraction (7)
 
@@ -2169,7 +2385,24 @@ session, streams a file and a few knobs, and the second run after a knob change 
 milliseconds instead of the whole pipeline. NodeLab plugs into both ends of that.
 
 Everything lives in `nodelab_v2/lablink/`. The **LabLink** dock (tabbed beside Properties
-and Spreadsheet) is the front end for both halves.
+and Spreadsheet) is the front end for both halves, and **Graph → Publish as a LabLink
+recipe…** is how a pipeline built here becomes one a hub can run.
+
+| module | half | what it is |
+|---|---|---|
+| `worker.py` | serving | the headless process a hub spawns, one per session |
+| `artifacts.py` | serving | what comes back: CSV + preview, PNG quicklook, metrics, TIFF stack |
+| `client.py` | sending | the stdlib-only session client |
+| `protocol.py` | both | the wire contract, mirrored from LabLink rather than imported |
+| `sidecar.py` | both | the `*.job.json` that overrides what an image file claims |
+| `recipe.py` | authoring | generates a manifest from a graph + the node catalogue |
+| `presets.py` | sending | named knob sets, and the record of what actually ran |
+| `panel.py`, `tuning.py`, `authoring.py` | GUI | the three modules that import PySide6 |
+
+> **There are two `nd2studios_worker.py` files, and only one of them runs.** This repo's is a
+> 50-line launcher into `nodelab_v2/lablink/worker.py`; the LabLink repo also carries a
+> 1,269-line standalone implementation of the same worker. The live `hub.json` points at
+> **ours**, so ours is canonical — do not "fix" this one to match a file that is not running.
 
 ### What a remote machine is allowed to ask for
 
@@ -2252,23 +2485,84 @@ A recipe is two hub-owned files in one directory:
 ```
 
 The graph is a plain `*.nd2graph.json`, read by the same `nodegraph.serialize` the editor
-writes, so **authoring a recipe starts by building the graph in NodeLab and saving it.**
-`lablink_recipes/nd2studios/selftest-synthetic/` is a worked example: five nodes, eight
-knobs, four outputs, and an empty `io.load` path so it runs against the synthetic demo
-source with no data files at all.
+writes, so there is no second format to learn. `lablink_recipes/nd2studios/` holds two
+worked examples: `selftest-synthetic` (five nodes, an empty `io.load` path so it runs
+against the synthetic demo source with no data files at all) and `cell-segmentation`
+(twelve knobs, four of them conditional on its 2D/3D lever).
+
+#### Generating a manifest — Graph → Publish as a LabLink recipe…
+
+**Do not hand-write one.** This editor is the only party holding both things every check
+runs against — the graph, and the node catalogue that says what each socket is called and
+what unit it is in — so it generates a manifest that is *unable* to fail validation. The
+dialog derives everything except the bounds:
+
+| knob field | taken from |
+|---|---|
+| `node`, `param` | the graph node and the socket or mode you tick |
+| `kind` | `param` for a socket, `mode` for a mode |
+| `unit` | the socket's own declared unit, verbatim |
+| `type`, `enum` | the socket's `SocketType`, the mode's own `choices` |
+| `label`, `help` | the node's own UI strings |
+| `default` | the value the graph pins |
+| `unset_means: "derive"` | offered when the socket has a derive expression and the graph does not pin it |
+| `applies_when` | the socket's own `available_in` mode gate |
+| `requires.metadata` | measured: a µm-denominated param needs `pixel_size_um` to become pixels, pinned or not |
+
+**`min`/`max` are the one thing it asks you for**, because `SocketSpec` carries no numeric
+bounds by design — the editor's spin boxes go to 1e12 and the compute validates instead. A
+recipe's bounds say what a *remote caller* may ask for, which is a different question from
+what the maths accepts, and a numeric knob with no bounds is refused rather than published
+unbounded.
+
+Two things the generator does that are easy to miss:
+
+* **Node ids are made readable.** The editor names nodes `n1`, `n2`, … and an operator
+  reading `"node": "n7"` before deciding whether to run your code learns nothing, so the
+  published graph gets slugs (`load`, `segment`, `tophat`) remapped atomically across nodes,
+  edges, zones and groups.
+* **It offers knobs that are only reachable under another mode.** A param gated on `dim ==
+  "3D"` is inactive while the graph sits at 2D, but the recipe is about to expose `dim` — so
+  it is offered, with the condition declared.
 
 Validation happens in two tiers, and the split matters when you are debugging a refusal:
 
 * **Tier 1, on the hub** (`--check-config`) — everything checkable from the manifest and
-  the graph JSON alone. No third-party imports, so it runs on an instrument PC.
-* **Tier 2, in this worker, at `open`** — the four things that need the node catalogue, and
-  therefore numpy: each knob's socket exists on its node and its **unit matches the
-  socket's own**; each mode knob's values are real choices of that node; **every node with
-  a 2D/3D lever sets it explicitly** (a graph that does not would run 2D on a z-stack,
-  silently); and each output kind is one the worker can produce. A failure is a
-  `bad_recipe` naming the node and the fix.
+  the graph JSON alone. No third-party imports, so it runs on an instrument PC. The dialog
+  and `--check-recipe` run the subset a generator can get wrong, so you see it first.
+* **Tier 2, here** — the four things that need the node catalogue, and therefore numpy: each
+  knob's socket exists on its node and its **unit matches the socket's own**; each mode
+  knob's values are real choices of that node; **every node with a 2D/3D lever sets it
+  explicitly** (a graph that does not would run 2D on a z-stack, silently); and each output
+  kind is one the worker can produce. The dialog's *Validate* runs both, and so does:
 
-Writing a knob, three rules that are easy to get wrong:
+```powershell
+python nd2studios_worker.py --check-recipe lablink_recipes/nd2studios/cell-segmentation
+```
+
+Run that until clean before submitting. The hub **cannot** make these checks — it has no
+catalogue — so otherwise they surface at a stranger's session start, after they have
+transferred a file.
+
+#### Getting it installed
+
+Submission is an ordinary file upload and installation is a local command an operator runs.
+There is no recipe endpoint and there is not going to be one: a person with write access to
+`recipes_dir` decides which pipelines exist, and that is the boundary the whole design holds.
+
+*Submit to hub…* writes the pair into `~/.nd2studios/lablink-outbox/<name>/` (so there is
+always a local copy of exactly what was sent) and uploads both files to a channel —
+`recipe-inbox` by default. It then prints the operator's command and the two sha256s:
+
+```powershell
+python -m lablink hub recipe install --config hub.json --root <store> --from-channel recipe-inbox
+```
+
+That stages the candidate under a byte cap, runs tier 1, prints the knob table, who
+submitted it and what the bytes hashed to, says out loud that tier 2 was *not* run there,
+and asks for confirmation.
+
+Writing a knob by hand, if you must — the rules that are easy to get wrong:
 
 | In `recipe.json` | Means |
 |---|---|
@@ -2276,20 +2570,99 @@ Writing a knob, three rules that are easy to get wrong:
 | `"kind": "mode"` | writes the node's **modes** (a dropdown) — the wrong one is a silent no-op |
 | `"unit": "um"` | must equal the socket's declared unit, or the number silently means something else |
 | `"unset_means": "derive"` | leave it out and the value is derived from **the file's own calibration**. Do not also pin it in the graph — the hub refuses that combination, because as written the recipe would ignore the microscope and nothing would report it |
+| `"applies_when"` | this knob is only read when another holds a given value. Pinning one whose condition is unmet is **refused, not ignored** |
 
-`path`, `model_path`, `__locked__`, `__title__` and `__channels__` may never be knobs.
-The first two would let a remote machine choose which file the hub opens; the dunders are
-editor bookkeeping that would change the cache key without changing the result.
+`path`, `model_path`, `store_path`, `urlpath`, `__locked__`, `__title__` and `__channels__`
+may never be knobs. The paths would let a remote machine choose which file the hub opens;
+the dunders are editor bookkeeping that would change the cache key without changing the
+result. The generator **filters them out of the offer list** rather than letting you pick one
+and meet a refusal.
 
 ### Half 2: sending work out — this machine as a node
 
 The **Send work** tab: enter a hub URL and token, press *Connect*, and it lists the recipes
 that hub's operator offers (plus, deliberately, any that **failed** validation on the hub —
 "the recipe I was told to use is not in the list" is otherwise unanswerable from this side).
-Pick one and its knobs appear with their real bounds, units and defaults. Every dropdown's
-first row is `— recipe default: … —` or `— derived from the file —`: leaving it there sends
-nothing for that knob, which is what you want unless you mean to override the operator's
-choice or the microscope's own calibration.
+Pick one and its knobs appear as real bounded controls: a spin box carrying the recipe's own
+`min`/`max` and unit, a closed dropdown for an enum, a length- and pattern-checked box for a
+string. *Enrol this machine…* mints a node identity so an operator can revoke exactly this
+one — **do it once**; enrolling on every launch fills their node list with entries they
+cannot tell apart. The URL, node id and results folder are remembered in
+`~/.nd2studios/lablink.json`; the token deliberately is not.
+
+#### The warm loop, which is the entire point
+
+The session **stays open** between runs. Press *Run on the hub* once and it becomes *Run
+again (warm)*: the hub keeps the worker and its cache alive, so changing one knob and running
+again recomputes only what that knob invalidated. Measured on the shipped self-test recipe:
+0.31 s cold, **0.03 s** for an identical re-run, 0.25 s after one knob change. The panel
+reports how many steps came from the cache after every run, because that number is the
+feature. *End session* frees the hub's slot and throws the cache away.
+
+Three knob states, and they are three different things on the wire:
+
+| the control says | what is sent | means |
+|---|---|---|
+| `auto` | the knob is **omitted** | use the recipe's declared default, or derive it from the file |
+| `derive` | an explicit `null` | derive it from the file — and this is how you *undo* a value you set earlier in the same session |
+| `set` | the value | including a pinned `0`, which is a real zero and silently overrides the file's own optics |
+
+The dock sends the **full set on every command**, because each command resolves its knobs
+independently against the recipe's defaults — a knob left out reverts for that command, and
+the hub's `knobs` echo (the only record of what actually ran) comes back empty for a command
+that carried none.
+
+A knob whose `applies_when` is unmet **greys out** with its reason attached, and is sent as
+`null` rather than as a value: the engine filters by area in 2D and by *volume* in 3D, so a
+minimum-area value on a 3D run is read by nothing, and the hub refuses it rather than
+ignoring it — a value that silently does nothing looks exactly like one that worked.
+
+#### Metadata travels with the image
+
+Every image is uploaded with a `*.job.json` sidecar written from the file's own calibration,
+because a TIFF does not merely omit optical metadata — it **invents** it, reporting the
+container's 16-bit depth for a 12-bit sensor and `Ch0` for a channel called `GFP`. Missing
+values can be detected; invented ones cannot. The sidecar **overrides** what the file claims,
+and the panel says up front which fields a recipe needs and whether this file answers them —
+before the upload, not after. What the reader could not answer is left **absent** rather than
+guessed: a single-plane TIFF's fabricated `z_step_um` is dropped, and `Ch0`/`Ch1` are treated
+as the placeholders they are. A recipe declaring `requires.metadata` that the job does not
+supply is refused `missing_metadata` with `error.fields` naming them — refused, never
+defaulted, because a pipeline that derives from the objective's NA does not *fail* without it,
+it silently produces different numbers.
+
+#### Judging the result, and reusing it
+
+Returned quicklooks, table previews and metrics render **in the dock**, right after each run,
+so a knob change can be judged without leaving it. *Load into graph* drops a returned stack
+onto the canvas as an `io.load` source node — which is what makes a processed result a
+starting point rather than a file on disk. (The readers cover ND2 and TIFF; a returned PNG
+previews in the dock and stops there.) Artifacts the recipe held back are pulled on request
+rather than all at once, which is the point of `policy: "pull"` on a multi-gigabyte label
+volume.
+
+Every fetch writes `lablink-run.json` **into the results folder**, so the folder describes
+itself: the recipe, the hub's full knob echo, the input and artifact hashes, and the timings.
+The hub carries the recipe name in its channel *listing* only, so it is gone the moment a
+file is downloaded — without this, a folder of results a week later is an image nobody can
+reproduce.
+
+#### Presets, and promoting one to a recipe
+
+*Save as…* stores the current knob values as a named **preset** in
+`~/.nd2studios/lablink-presets.json`. It stores the full effective set, explicit nulls
+included, so applying it is deterministic rather than inheriting whatever the last attempt
+left in force. Applying a preset **validates it against the recipe as it is now** and reports
+what no longer fits — a recipe has no version, so an operator can rename a knob or narrow a
+bound under you, and a preset that quietly did something else would be worse than one that
+complains.
+
+*Promote to recipe…* turns a preset into a **derived recipe**: the parent's pipeline unchanged,
+your tuned values as its published defaults, validated and submitted like any other. It needs
+the parent recipe's graph on this machine — `GET /workflows` publishes a recipe's knobs but
+never its graph, and the manifest format has no inheritance — so it looks in
+`~/.nd2studios/lablink-outbox/` and then `lablink_recipes/nd2studios/`, and says so plainly
+when neither has it.
 
 The same thing in a script:
 
@@ -2330,11 +2703,15 @@ Notes on the client, each of which is a rule the protocol enforces:
 ### Cancelling, and what it actually guarantees
 
 Cancellation is **cooperative at node boundaries**, and the worker advertises exactly that
-rather than claiming more. The engine has no cancellation point *inside* a compute — one
-CNN inference or one upstream solver simply runs to completion — so a cancel takes effect at
-the next node that has not started. A single long node will therefore be terminated by the
-hub's escalation ladder (cancel → grace → SIGTERM → SIGKILL), and losing the warm cache is
-the correct outcome there.
+rather than claiming more. One CNN inference or one upstream solver runs to completion
+whatever anyone asks, so a cancel takes effect at the next node that has not started. A
+single long node will therefore be terminated by the hub's escalation ladder (cancel →
+grace → SIGTERM → SIGKILL), and losing the warm cache is the correct outcome there.
+
+The desktop app cancels *sooner* than this — it also stops inside any node that reports
+progress (see [Deleting a node while it runs](#deleting-a-node-while-it-runs)) — but the
+LabLink worker deliberately keeps the single path it advertises, so what the hub's ladder
+is applied against stays exactly what the worker claimed in `hello`.
 
 Long runs stay alive through the hub's **silence timeout** because the worker emits a `beat`
 every few seconds and a `progress` line during the one-time ingest. That timeout is what
@@ -2344,14 +2721,20 @@ per-node progress is load-bearing rather than cosmetic.
 ### Verifying the whole thing
 
 ```powershell
-python -m nodegraph.selftest              # includes test_lablink (offline, no hub needed)
+python -B -m nodegraph.selftest           # includes test_lablink (offline, no hub needed)
+python nd2studios_worker.py --check-recipe lablink_recipes/nd2studios/cell-segmentation
 python -m lablink hub doctor --config hub.json --root lablink_data
 python tools_stress.py --url http://<hub>:8765 --token <token>    # LabLink's own suite
 ```
 
-`test_lablink` is the one that catches drift over time: it re-validates the shipped recipe
-against the live node catalog, so a rename or a unit change in a node breaks the test rather
-than a session six weeks later.
+`test_lablink` is the one that catches drift over time. Twelve sections, and the ones that
+earn their keep are the ones guarding a *silent* failure: the shipped recipes re-validated
+against the live node catalog (so a rename or a unit change in a node breaks the test rather
+than a session six weeks later); every knob bound the manifests declare actually enforced,
+including `pattern` matched the way the hub matches it (`fullmatch` — an unanchored pattern
+makes `re.match` approve what the hub then refuses); the sidecar's nested-to-flat mapping
+keeping its per-channel holes; the run record naming every knob rather than only the pinned
+ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-recipe` runs.
 
 ---
 
@@ -2392,9 +2775,15 @@ than a session six weeks later.
 | **LabLink**: `bad_recipe` about a 2D/3D lever | a node with a `dim` lever does not set it. Left unset it runs the default on whatever arrives, so a z-stack would be processed plane by plane and look plausible. Set `modes.dim` in the graph |
 | **LabLink**: a knob appears to do nothing | almost always `kind` — `"param"` writes the node's params and `"mode"` writes its modes, they are read from different places, and the wrong one is a silent no-op |
 | **LabLink**: a session dies mid-run with `silence_timeout` | the worker emitted nothing for the recipe's `silence_timeout_s`. Ours beats every few seconds, so this means a single node genuinely blocked longer than the limit — raise `limits.silence_timeout_s` for that workflow rather than lowering it, and consider a Dock before the expensive node |
-| **LabLink**: a cancel did not stop anything | cancellation is cooperative **at node boundaries** — the engine has no cancellation point inside a compute. A long single node runs to completion or is killed by the hub's ladder; there is no third option, and the worker advertises exactly that |
+| **LabLink**: a cancel did not stop anything | the worker's cancellation is cooperative **at node boundaries** only. A long single node runs to completion or is killed by the hub's ladder; there is no third option, and the worker advertises exactly that. The desktop app stops sooner (also at progress ticks), deliberately — the worker keeps the one path it claimed in `hello` |
 | **LabLink**: every long poll looks like a dead hub | a client socket timeout at or below the hub's `longpoll_max_s` (25 s) trips on its own successful waits. `HubClient` clamps above it; a hand-rolled client must too |
 | **LabLink**: a result never arrives although the run said `done` | it was declared `policy: "pull"` and is held on the hub on purpose (a 3 GB label volume should not cross the network by default). Call `pull()`, then fetch by `returned_as` |
+| **LabLink**: `missing_metadata` naming a field | the file is fine; it omits something the recipe's graph derives from. `error.fields` names them. A µm-denominated knob needs `pixel_size_um` to become pixels at all, so this is refused rather than run with an invented value — supply the fields in the sidecar (the dock prompts) or pick a file that carries them |
+| **LabLink**: a knob is greyed out in the dock | its `applies_when` is unmet — the area knobs are read in 2D and the volume knobs in 3D. Change the controlling knob and it enables. Pinning it anyway would be refused by the hub, not ignored |
+| **LabLink**: the second run is as slow as the first | the session was not reused. The button should read *Run again (warm)* and the log should report steps served from the cache; if it says *Run on the hub*, the previous session ended (look for `session_gone`/`worst_exited` above) and the cache went with it |
+| **LabLink**: a preset applies but some knobs are missing | the recipe changed under it — a recipe has no version, so an operator can rename a knob or narrow a bound. The log names every knob that no longer fits rather than dropping it silently |
+| **LabLink**: *Promote to recipe…* says it cannot find the parent | promoting needs the parent recipe's **graph**, and a hub publishes a recipe's knobs but never its graph. Put the recipe directory in `~/.nd2studios/lablink-outbox/` and it will work |
+| **LabLink**: a generated recipe is refused for a knob name declared twice | two nodes with a 2D/3D lever both want to be called `dim`. The dialog disambiguates as a set (`dim`, `tophat_dim`); a hand-edited name can still collide |
 
 ---
 

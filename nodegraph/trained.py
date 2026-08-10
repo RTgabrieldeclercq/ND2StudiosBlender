@@ -200,6 +200,38 @@ def stardist_config(params: Mapping[str, Any],
     return read_json(os.path.join(d, "config.json")) if d else None
 
 
+def stardist_note(params: Mapping[str, Any], modes: Mapping[str, Any]) -> str:
+    """One line for the GUI saying WHICH file the StarDist auto values came from — or why
+    there are none (V2.23b).
+
+    This exists because the silent case is indistinguishable from a broken feature. Reported
+    as "loading in the model does not change any of the parameters": a path that is not a
+    model directory, and a pretrained checkpoint that has not been downloaded yet, both
+    resolve to "this model states nothing" — which is the correct answer for
+    :func:`stardist_trained` and a useless one for the person looking at the panel. The
+    values silently stayed at their socket defaults with no badge and no reason.
+    """
+    is_3d = str((modes or {}).get("dim") or "2D").upper() == "3D"
+    local = _clean_path(params.get("sd_model_path"))
+    d = stardist_model_dir(params, modes)
+    if not d:
+        if local:
+            return (f"{os.path.basename(local.rstrip('/\\')) or local} is not a StarDist "
+                    f"model folder (no config.json in it) — pick the folder that HOLDS "
+                    f"config.json and weights_best.h5")
+        name = str((params.get("model_name_3d") if is_3d else params.get("model_name"))
+                   or ("3D_demo" if is_3d else "2D_versatile_fluo"))
+        return (f"{name} is not downloaded yet — its tuned thresholds appear here after the "
+                f"first run fetches it")
+    got = stardist_trained(params, modes)
+    where = os.path.basename(d.rstrip("/\\")) or d
+    if not got:
+        return (f"{where} records no usable thresholds.json — the values below are this "
+                f"app's defaults, not the checkpoint's")
+    return (f"prob/nms below come from {where}'s own thresholds.json "
+            f"({', '.join(f'{k.split(chr(95))[0]} {v:g}' for k, v in sorted(got.items()))})")
+
+
 def stardist_trained(params: Mapping[str, Any],
                      modes: Mapping[str, Any]) -> Dict[str, Any]:
     """``{socket_name: trained_value}`` for ``analysis.segment``'s StarDist sockets.
@@ -297,6 +329,38 @@ def zs_signature_of(sidecar: Mapping[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in dict(sidecar).items() if k != INFERENCE_KEY}
 
 
+def zs_note(params: Mapping[str, Any], modes: Mapping[str, Any]) -> str:
+    """One line for the GUI saying which sidecar the ZS-DeconvNet auto values came from — or
+    why there are none (V2.23b). Same reason as :func:`stardist_note`.
+
+    The most important case is the one that is NOT a mistake: the authors' published
+    checkpoints carry no sidecar, so nothing can be adopted and every setting is the user's to
+    match. Saying so is the difference between a feature that looks broken and one that has
+    told you what it knows.
+    """
+    if str((modes or {}).get("mode") or "zero_shot") != "pretrained":
+        return ""                      # zero_shot is training a model; nothing to adopt
+    wp = _clean_path(params.get("weights_path"))
+    if not wp:
+        return ""                      # no checkpoint chosen yet — the socket says that
+    side = zs_sidecar_path(wp)
+    doc = read_json(side)
+    if not doc:
+        return (f"no training record beside {os.path.basename(wp)} — the authors' published "
+                f"checkpoints carry none, so `arch`, the 2D/3D lever, `upsample` and the "
+                f"padding margins are yours to match to how it was trained")
+    got = zs_trained(params, modes)
+    if not got:
+        return (f"{os.path.basename(side)} records nothing this node can adopt — check "
+                f"`arch`, the lever and `upsample` against how it was trained")
+    if not isinstance(doc.get(INFERENCE_KEY), dict):
+        return (f"{os.path.basename(side)} is an OLDER record — only `upsample` is stated "
+                f"({got.get('upsample')}); the padding margins are yours to match")
+    return (f"auto values below come from {os.path.basename(side)}, written when this "
+            f"checkpoint was trained ("
+            f"{', '.join(f'{k} {v}' for k, v in sorted(got.items()))})")
+
+
 def zs_trained(params: Mapping[str, Any], modes: Mapping[str, Any]) -> Dict[str, Any]:
     """``{socket_name: trained_value}`` for ``enhance.zs_deconvnet``, from the sidecar
     beside ``weights_path``.
@@ -339,7 +403,7 @@ def zs_trained(params: Mapping[str, Any], modes: Mapping[str, Any]) -> Dict[str,
 
 __all__ = [
     "read_json", "clear_cache",
-    "stardist_model_dir", "stardist_config", "stardist_trained",
+    "stardist_model_dir", "stardist_config", "stardist_trained", "stardist_note",
     "INFERENCE_KEY", "ZS_INFERENCE_SOCKETS",
-    "zs_sidecar_path", "zs_signature_of", "zs_trained",
+    "zs_sidecar_path", "zs_signature_of", "zs_trained", "zs_note",
 ]

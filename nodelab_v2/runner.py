@@ -1,7 +1,9 @@
 """EngineRunner — canvas → Engine off the UI thread (G7, LOCKED 2026-07-22: one worker
 thread + **epoch registry**, no qasync — the engine is synchronous CPU work, so a worker
 thread + queued-signal delivery is the whole bridge; stale results are dropped by epoch on
-arrival. One pull runs at a time (latest-wins queueing).
+arrival. One pull runs at a time; the branches asked for behind it are QUEUED, each with
+its own run id, so several can be in flight from the user's point of view and the first to
+land is viewable and editable while the rest are still going.
 
 The pull runs on ONE persistent, Python-created thread (:class:`_PullThread`), not on a
 ``QThreadPool``. That is a correctness requirement, not a preference: a pool's recycled
@@ -53,7 +55,7 @@ import time
 import traceback
 from collections import OrderedDict
 from dataclasses import replace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -61,7 +63,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from nodegraph.checkpoint import checkpoint_envelope
 from nodegraph.dataset import AxisSizes, Dataset
-from nodegraph.engine import Engine
+from nodegraph.engine import Engine, PullCancelled
 from nodegraph.graph import Graph
 from nodegraph.memo import Memo
 from nodegraph.metadata import MetaEnvelope, position_subset
@@ -152,6 +154,14 @@ def ensure_gui_ops() -> None:
 #: RAM-derived :class:`PlaneCache` holds a quarter as many frames. Override with
 #: ``NODELAB_MAX_DISPLAY_DIM`` on a machine where that hurts more than the detail helps.
 MAX_DISPLAY_DIM = int(os.environ.get("NODELAB_MAX_DISPLAY_DIM", "") or 4096)
+
+#: How many FINISHED branch results to keep for instant re-viewing
+#: (:attr:`EngineRunner._results`). Four covers the shape this exists for — a handful of
+#: per-channel branches off one file, switched between while the slowest is still going —
+#: without turning the runner into a second, unbudgeted memo. The payloads are lazy, so the
+#: cost is the entry, not the pixels; what the cap really bounds is how long an eager node's
+#: realized raster is held against the Memo's own byte budget.
+_FINISHED_RESULTS = 4
 
 #: Share of installed RAM the Viewer may hold in decoded display frames — the budget that
 #: decides whether a big frame is shown WHOLE at full resolution or progressively off the
@@ -498,6 +508,36 @@ def render_plane_native(provider: Any, m: int, t: int, z: int, c: int,
 #: default because a 3D node needs one.
 Pin = Tuple[Tuple[int, ...], Tuple[int, ...], Optional[Tuple[int, ...]]]
 
+
+class _HeldView(NamedTuple):
+    """One node's held display state (V2.28) — everything the coords-only fast path
+    needs to serve that node's planes without re-pulling, as ONE immutable snapshot.
+
+    A snapshot on purpose: these five values are only correct *together* (the dtype
+    decides the display cap that is folded into every plane key, the pin decides how a
+    global cursor addresses the payload), and while they were five separate ``_viewer_*``
+    attributes a worker writing one of them mid-scrub could pair another node's dtype
+    with this node's provider. Kept per NODE (:attr:`EngineRunner._views`) so the Viewer's
+    side-by-side compare pane can scrub two results without each cursor move evicting the
+    other pane's fast path."""
+
+    provider: Any            # the payload's image provider
+    axes: Any                # its AxisSizes
+    rev: int                 # document.revision the provider belongs to
+    pin: Optional[Pin]       # the solo-frame scope it was pulled under
+    dtype: Any               # display narrowing dtype (:func:`_display_dtype`), or None
+
+
+#: how many nodes' display state is held at once — one per Viewer pane (the viewed node
+#: and the compare pane's). Not a cache: an evicted node is re-armed from
+#: :attr:`EngineRunner._results` in O(1) (:meth:`EngineRunner._rearm_view`), so this only
+#: bounds how many payload providers are pinned against the Memo's budget.
+HELD_VIEWS = 2
+
+#: "not passed" marker for ``dtype`` params, where ``None`` is a real value (an
+#: un-narrowed display copy) and the default is "read the node's held view".
+_UNSET = object()
+
 #: PlaneCache namespace for SOURCE (pre-enhancement) planes — see
 #: :meth:`EngineRunner.raw_plane`. A sentinel string rather than a node id so it can
 #: never collide with one.
@@ -610,9 +650,23 @@ class PlaneCache:
 PROGRESS_MIN_INTERVAL_S = 0.05
 
 
+def _doc_id_of(run_id: str) -> str:
+    """The document node id a RUN-graph id answers to.
+
+    The run graph renames two kinds of node: an Iterate clone is
+    ``{doc_id}#{iterate_id}@{i}`` (and the zone's synthetic advance node
+    ``{iterate_id}#adv@{i}`` belongs to the Iterate card itself), and an inlined group
+    body node is ``{body_id}%{instance_id}`` — nesting appends further ``%instance``
+    segments, and the LAST one is the instance that actually sits on the canvas.
+    Everything else passes through unchanged. Used to store run cones in document
+    terms, so a delete or edit of a card matches the runs computing its clones."""
+    head = run_id.split("#", 1)[0]
+    return head.rsplit("%", 1)[-1] if "%" in head else head
+
+
 class _Job:
-    __slots__ = ("epoch", "graph", "revision", "node_id", "coords", "channels",
-                 "sources", "all_sources", "pin", "bake")
+    __slots__ = ("epoch", "graph", "revision", "node_id", "pull_id", "coords", "channels",
+                 "sources", "all_sources", "pin", "bake", "cancelled")
 
     def __init__(self, epoch: int, graph: Graph, revision: int, node_id: str,
                  coords: Optional[Tuple[int, int, int, int]],
@@ -620,11 +674,18 @@ class _Job:
                  sources: Dict[str, Dict[str, Any]],
                  pin: Optional[Pin] = None,
                  bake: Optional[Dict[str, Any]] = None,
-                 all_sources: Optional[frozenset] = None) -> None:
+                 all_sources: Optional[frozenset] = None,
+                 pull_id: Optional[str] = None) -> None:
         self.epoch = epoch
         self.graph = graph
         self.revision = revision
         self.node_id = node_id
+        # The id actually pulled from the run graph, which differs from `node_id` for a
+        # node INSIDE an Iterate segment: that node exists only as per-iteration clones, so
+        # the card the user clicked is served by one of them (V2.22,
+        # `nodegraph.iterate.aliases`). Everything else — progress, delivery, the viewer's
+        # provider handle — stays keyed on `node_id`, the card that was clicked.
+        self.pull_id = pull_id or node_id
         self.coords = coords
         self.channels = channels      # channels to render into a colour composite
         self.sources = sources        # node_id -> {"path": str}: the io.load roots THIS
@@ -636,6 +697,14 @@ class _Job:
         self.all_sources = all_sources if all_sources is not None else frozenset(sources)
         self.pin = pin                # solo-frame scope: the (ms, ts) sources are cut to
         self.bake = bake              # a Dock bake request: {store, precision, sig, …}
+        # Set (GUI thread) by `invalidate` when this run is cancelled while ON the worker;
+        # read (worker thread) through `Engine.should_stop`, so the pull aborts at its next
+        # node boundary or progress tick instead of grinding out a payload nobody will
+        # accept. A plain bool under the GIL — no lock needed for a latch that only ever
+        # goes False→True. Lives on the JOB, not the runner, so closures a finished pull
+        # leaves behind (lazy providers in the memo) can never be tripped by a later
+        # cancellation: their flag is this job's, frozen in whatever state it ended.
+        self.cancelled = False
 
 
 class _PullThread:
@@ -660,11 +729,11 @@ class _PullThread:
     enough. Nothing here needs a Qt event loop; results reach the GUI the way they always
     did, through the runner's queued signals, which are safe to emit from any thread.
 
-    It costs nothing in concurrency: a pull was ALREADY single-slot latest-wins
-    (``_busy``/``_pending``, resolved on the GUI thread), so exactly one job ran at a time
-    anyway. The decode / prefetch / detail jobs stay on the shared pool — they read
-    providers rather than owning native per-thread state, and serializing them would undo
-    the display fast path.
+    It costs nothing in concurrency: one pull runs at a time by design (``_busy``, resolved
+    on the GUI thread), and the branches waiting behind it sit in :attr:`EngineRunner._queue`
+    rather than on another thread. The decode / prefetch / detail jobs stay on the shared
+    pool — they read providers rather than owning native per-thread state, and serializing
+    them would undo the display fast path.
 
     Daemon, so a queued pull can never hold the app open at exit.
     """
@@ -705,25 +774,42 @@ class _Worker(QRunnable):
         try:
             engine = r._ensure_engine(job)
             engine.observer = r._make_observer(job.epoch)
+            # Cooperative cancel: `invalidate` latches `job.cancelled` when it kills this
+            # run (a deleted node, an edit in its cone), and the engine then aborts at its
+            # next node boundary / progress tick — freeing the single pull slot for the
+            # queue instead of computing a payload `_deliver` would drop anyway. Set
+            # unconditionally: the cached engine is reused across pulls, so a stale
+            # callable from the previous job must never survive into this one. A bake
+            # opts out — its cancel story is `_stop_bake`, and its result is a directory
+            # on disk that `_deliver` resolves outside the staleness rule.
+            engine.should_stop = None if job.bake is not None \
+                else (lambda: job.cancelled)
             if job.bake is not None:
                 r._run_bake(engine, job)
                 r._done.emit((job.epoch, job.node_id, None, None, None,
                               time.perf_counter() - t0, None, job.revision,
                               None, None, job.pin))
                 return
-            payload = engine.pull(job.node_id)
+            payload = engine.pull(job.pull_id)
+            if job.cancelled:
+                # cancelled between the last engine poll and here — don't decode planes
+                # for a result that is already dead on arrival
+                raise PullCancelled(job.node_id)
             # An overlay node's picture needs a SECOND chain evaluated. Resolved here, on
             # the worker, because pulling the secondary is real work (and normally a memo
             # hit); the compose itself happens per displayed plane in `_decode_planes`.
-            r._overlay_ctx = r._resolve_overlay(engine, job.graph, job.node_id, payload)
+            r._overlay_ctxs[job.node_id] = r._resolve_overlay(
+                engine, job.graph, job.pull_id, payload)
             plane = None                    # dict {channel_index: 2-D native plane}
             axes = None
             if isinstance(payload, Dataset) and payload.image is not None:
                 axes = payload.axes
-                # Set BEFORE the decode: `_plane_addrs` folds the display cap into every plane
-                # key and the cap's byte estimate depends on whether the planes narrow. Same
-                # write-on-the-worker discipline as `_overlay_ctx` above.
-                r._viewer_dtype = _display_dtype(payload)
+                # The dtype travels WITH this decode rather than through runner state:
+                # `_plane_addrs` folds the display cap into every plane key and the cap's
+                # byte estimate depends on whether the planes narrow, so the value must be
+                # this payload's own whatever the held views do meanwhile. `_deliver`
+                # installs the same value in the node's _HeldView, which is what keeps the
+                # keys written here and the keys probed later identical.
                 if job.coords is not None:
                     # a lazy chain does its real work HERE, under the viewed node's name —
                     # report it as that node's state so the card isn't idle while the
@@ -732,10 +818,20 @@ class _Worker(QRunnable):
                                       {"epoch": job.epoch, "op_key": ""}))
                     plane = r._decode_planes(payload.image, job.node_id,
                                              job.coords, job.channels, axes,
-                                             pin=job.pin, overlay_all=True)
+                                             pin=job.pin, overlay_all=True,
+                                             as_dtype=_display_dtype(payload))
             dt = time.perf_counter() - t0
             r._done.emit((job.epoch, job.node_id, payload, plane, axes, dt, None,
                           job.revision, job.coords, job.channels, job.pin))
+        except PullCancelled:
+            # An aborted pull still delivers a packet — `_deliver` is the ONLY place the
+            # pull slot is freed and the queue advanced, so a cancel that skipped it would
+            # wedge every branch waiting behind this one. No error rides along: the run's
+            # `cancelled` signal already fired from `invalidate`, and the liveness test
+            # drops this packet without painting anything.
+            r._done.emit((job.epoch, job.node_id, None, None, None,
+                          time.perf_counter() - t0, None, job.revision,
+                          None, None, job.pin))
         except Exception:  # noqa: BLE001 — full trace to the GUI, never a dead thread
             r._done.emit((job.epoch, job.node_id, None, None, None,
                           time.perf_counter() - t0, traceback.format_exc(),
@@ -745,7 +841,7 @@ class _Worker(QRunnable):
 class _IngestJob(QRunnable):
     """One source file's ingest, off the GUI thread and **outside the pull slot** (V2.21).
 
-    A pull is single-slot and latest-wins for good reasons (one engine, one held viewer
+    A pull is single-slot (queued, not latest-wins) for good reasons (one engine, one held viewer
     provider, one epoch), but an ingest is none of those things: it is a pure, idempotent
     function of a path — decode the ND2/TIFF once into its own ``.b2nd`` store beside it —
     whose only output is a directory on disk and an entry in
@@ -802,7 +898,8 @@ class _DecodeJob(QRunnable):
     thread."""
 
     def __init__(self, runner: "EngineRunner", gen: int, epoch: int, provider: Any,
-                 node_id: str, coords, channels, axes, pin: Optional[Pin]) -> None:
+                 node_id: str, coords, channels, axes, pin: Optional[Pin],
+                 dtype: Any = None) -> None:
         super().__init__()
         self._r = runner
         self._gen = gen
@@ -813,6 +910,7 @@ class _DecodeJob(QRunnable):
         self._channels = channels
         self._axes = axes
         self._pin = pin
+        self._dtype = dtype        # captured with the provider — one _HeldView, one node
 
     def run(self) -> None:  # worker thread
         r = self._r
@@ -823,7 +921,8 @@ class _DecodeJob(QRunnable):
         try:
             if self._gen == r._decode_gen:        # else: superseded before it ever started
                 planes = r._decode_planes(self._prov, self._node_id, self._coords,
-                                          self._channels, self._axes, pin=self._pin)
+                                          self._channels, self._axes, pin=self._pin,
+                                          as_dtype=self._dtype)
                 axes = self._axes
         except Exception:  # noqa: BLE001 — full trace to the GUI, never a dead thread
             err = traceback.format_exc()
@@ -842,15 +941,20 @@ class _PrefetchJob(QRunnable):
     are simply not in this pull's dataset."""
 
     def __init__(self, runner: "EngineRunner", gen: int,
-                 jobs: List[Tuple[tuple, int, int, int, int]]) -> None:
+                 jobs: List[Tuple[tuple, int, int, int, int]],
+                 prov: Any, dtype: Any) -> None:
         super().__init__()
         self._r = runner
         self._gen = gen
         self._jobs = jobs
+        # captured at CONSTRUCTION, with the keys: reading the runner's held view at run
+        # time could pair another pane's provider with this node's keys if the viewed
+        # node changed while this job sat in the pool's queue.
+        self._prov, self._dtype = prov, dtype
 
     def run(self) -> None:  # worker thread
         r = self._r
-        prov = r._viewer_provider
+        prov = self._prov
         if prov is None:
             return
         for (key, m, t, z, ch) in self._jobs:
@@ -867,7 +971,7 @@ class _PrefetchJob(QRunnable):
                 # displayed-frame path then reads, and a prefetcher decimating to a different
                 # size would have it serve frames of the wrong shape.
                 arr, _lv = render_plane_native(prov, m, t, z, ch, max_dim=int(key[-1]),
-                                               as_dtype=r._viewer_dtype)
+                                               as_dtype=self._dtype)
                 r._planes.put(key, arr)
             except Exception:                # noqa: BLE001 — prefetch is best-effort
                 return
@@ -894,13 +998,17 @@ class _PreloadJob(QRunnable):
     playback when the series is actually ready rather than hoping."""
 
     def __init__(self, runner: "EngineRunner", gen: int,
-                 jobs: List[Tuple[tuple, int, int, int, int]]) -> None:
+                 jobs: List[Tuple[tuple, int, int, int, int]],
+                 prov: Any, dtype: Any) -> None:
         super().__init__()
         self._r, self._gen, self._jobs = runner, gen, jobs
+        # captured at construction, same reason as _PrefetchJob: the keys and the
+        # provider must describe the same node whatever the panes do meanwhile
+        self._prov, self._dtype = prov, dtype
 
     def run(self) -> None:  # worker thread
         r = self._r
-        prov = r._viewer_provider
+        prov = self._prov
         for (key, m, t, z, ch) in self._jobs:
             if self._gen != r._preload_gen or prov is None:
                 return                       # cancelled: an edit, a stop, or a newer preload
@@ -908,7 +1016,7 @@ class _PreloadJob(QRunnable):
                 try:
                     arr, _lv = render_plane_native(prov, m, t, z, ch,
                                                    max_dim=int(key[-1]),
-                                                   as_dtype=r._viewer_dtype)
+                                                   as_dtype=self._dtype)
                     r._planes.put(key, arr)
                 except Exception:            # noqa: BLE001 — one unreadable frame must not
                     pass                     # abandon the rest of the series
@@ -937,11 +1045,15 @@ class _DetailJob(QRunnable):
 
     def __init__(self, runner: "EngineRunner", gen: int, node_id: str, prov: Any,
                  coords: tuple, channels: Sequence[int], axes: Any,
-                 rect01: Tuple[float, float, float, float], budget: int) -> None:
+                 rect01: Tuple[float, float, float, float], budget: int,
+                 *, pin: Any = None, dtype: Any = None) -> None:
         super().__init__()
         self._r, self._gen, self._node_id = runner, gen, node_id
         self._prov, self._coords, self._channels = prov, coords, list(channels)
         self._axes, self._rect01, self._budget = axes, rect01, int(budget)
+        # captured WITH the provider (they are one _HeldView), so a pane switch between
+        # queue and run cannot pair this node's provider with another node's pin/dtype
+        self._pin, self._dtype = pin, dtype
 
     def run(self) -> None:                                    # worker thread
         r = self._r
@@ -950,7 +1062,7 @@ class _DetailJob(QRunnable):
         try:
             planes, rect01 = r.detail_planes(
                 self._prov, self._node_id, self._coords, self._channels, self._axes,
-                self._rect01, self._budget)
+                self._rect01, self._budget, pin=self._pin, dtype=self._dtype)
         except Exception:                    # noqa: BLE001 — detail is best-effort; the
             return                           # overview is already on screen and correct
         if self._gen == r._detail_gen and planes:
@@ -995,6 +1107,14 @@ class EngineRunner(QObject):
     #: at once, none of them is "the run", and none produces a payload to view.
     ingest_started = Signal(str)
     ingest_finished = Signal(str, float, object)
+    #: a pull was QUEUED behind one already running (2026-08-06): ``(node_id, depth)``.
+    #: The card's own "waiting" state — the counterpart to ``started``/``finished``, and the
+    #: reason a second branch is now visibly pending rather than invisibly discarded.
+    queued = Signal(str, int)
+    #: a queued or running pull was DROPPED without producing a result ``(node_id)`` —
+    #: an edit landed inside its cone (:meth:`invalidate`), or the node/graph went away.
+    #: A card must be able to leave the running state on this path too, or it spins forever.
+    cancelled = Signal(str)
 
     _done = Signal(object)                       # internal cross-thread delivery
     _detail_done = Signal(object)                # internal: _DetailJob → GUI thread
@@ -1046,7 +1166,48 @@ class EngineRunner(QObject):
         self._src_locks_guard = threading.Lock()
         self._epoch = 0
         self._busy = False
-        self._pending: Optional[Tuple[str, Any, Any]] = None
+        #: The pull QUEUE — every branch the user asked for, in the order they asked
+        #: (2026-08-06). It was one slot, latest-wins: requesting a second branch while the
+        #: first ran did not queue it, it REPLACED whatever was waiting. So asking for two
+        #: segmentations gave you one result and one silently dropped request, which is what
+        #: made two per-channel branches look like they could not both be run.
+        #:
+        #: De-duplicated by ``node_id`` rather than appended blindly: clicking the same card
+        #: twice while it waits means "show me that node", not "compute it twice", so a repeat
+        #: request UPDATES the queued entry's coords/channels and keeps its place. That also
+        #: keeps the old latest-wins behaviour for the case it was actually right for — a user
+        #: scrubbing the cursor over one waiting node.
+        self._queue: "OrderedDict[str, Tuple[str, Any, Any]]" = OrderedDict()
+        #: run id → the node it is computing, for every pull that is RUNNING or queued.
+        #: Replaces "stale means not the newest epoch" with "stale means this run is no longer
+        #: live", which is the whole difference between one pull at a time and several
+        #: branches in flight: a second branch finishing must not retire the first's result,
+        #: and an edit to one branch must not silently discard the other's.
+        self._runs: Dict[int, str] = {}
+        #: run id → the set of node ids that run computes (its cone), so an edit can cancel
+        #: exactly the runs it can affect and leave the rest alone. Without it "an edit"
+        #: means "every in-flight pull dies", which is precisely what stops you from
+        #: adjusting a finished branch while another one is still going.
+        self._run_cones: Dict[int, frozenset] = {}
+        #: the :class:`_Job` currently ON the worker thread (None before the first pull).
+        #: `invalidate` latches its ``cancelled`` flag when it kills that run, which is what
+        #: turns a logical cancellation into an actual abort: the engine polls the flag at
+        #: node boundaries and progress ticks and unwinds instead of finishing a result
+        #: nobody will accept — a deleted node's half-hour segmentation used to keep the
+        #: pull slot to the end, with every queued branch waiting behind it.
+        self._active: Optional[_Job] = None
+        #: ``(node_id, document revision)`` → ``(payload, axes)`` for the last few branches
+        #: that FINISHED — so clicking a completed branch while another one is still computing
+        #: shows it at once instead of joining the queue behind a job that may take minutes
+        #: (2026-08-06). Without it "you can view the finished one" is only true once
+        #: everything else has stopped, which is not the ask.
+        #:
+        #: Bounded and revision-keyed. The payloads are lazy Datasets whose pixels the Memo
+        #: already holds, so this pins little beyond what a re-pull would hit anyway; the cap
+        #: is what stops a long session from holding every branch's label raster against the
+        #: Memo's own budget. An edit bumps the revision, so a stale entry is never reachable
+        #: — it just ages out.
+        self._results: "OrderedDict[Tuple[str, int], Tuple[Any, Any]]" = OrderedDict()
         self._announced: Dict[str, Any] = {}     # node_id → last announced source key
         self._node_source_key: Dict[str, Any] = {}
         #: (node_id, document revision) → EngineRunner.raw_source result — the hover
@@ -1058,17 +1219,20 @@ class EngineRunner(QObject):
         # because the engine's TileCache was unsynchronized. The cache locks itself now, so
         # the prefetch pool decodes frames concurrently — which is the point of a
         # prefetcher — and a plane read fans its tiles out across cores.
-        self._viewer_provider: Any = None        # held image provider of the viewed node
-        self._viewer_node: Optional[str] = None
-        #: resolved secondary chain for the viewed overlay node (see `_resolve_overlay`).
-        #: Written on the worker, read on the worker — same discipline as the held provider.
-        self._overlay_ctx: Optional[Dict[str, Any]] = None
-        self._viewer_axes: Any = None
-        self._viewer_rev: int = -1               # document.revision the provider belongs to
-        self._viewer_pin: Optional[Pin] = None   # the scope it was pulled for
-        #: dtype the viewed node's display planes may be narrowed to, or ``None`` — set from
-        #: the payload's declared bit depth (see :func:`_display_dtype`).
-        self._viewer_dtype: Any = None
+        #: node_id → its held display state (:class:`_HeldView`), most-recent LAST.
+        #: Capacity :data:`HELD_VIEWS` — one per Viewer pane, so the side-by-side compare
+        #: can scrub both results on the fast path at once.
+        self._views: "OrderedDict[str, _HeldView]" = OrderedDict()
+        #: node_id → its resolved secondary chain (see `_resolve_overlay`), or ``None`` for
+        #: a node that overlays nothing. Per NODE for the same reason :attr:`_views` is
+        #: (V2.28): with two Viewer panes open, a single slot held only the node pulled
+        #: LAST, so the other pane's composed overlay channels dropped out of
+        #: :meth:`_plane_addrs` on its next scrub — the overlay vanished from the pane
+        #: nobody had touched.
+        #:
+        #: The worker only ever assigns one key (an atomic dict store); the GUI thread does
+        #: the bounded trim in :meth:`_deliver`, so no reader can see a half-evicted map.
+        self._overlay_ctxs: Dict[str, Optional[Dict[str, Any]]] = {}
         #: what one texture axis may be, from the live surface (:meth:`set_display_limits`).
         self._texture_limit: int = DEFAULT_TEXTURE_LIMIT
         self._prefetch_gen = 0
@@ -1166,7 +1330,7 @@ class EngineRunner(QObject):
         this same file in flight; this one will finish with it).
 
         This is what a double-click on a source card does. The alternative — pulling it —
-        works, but it runs the ingest *inside* the single latest-wins pull slot, so a second
+        works, but it runs the ingest *inside* the single pull slot, so a second
         file cannot start until the first has finished, the app's one worker is occupied for
         the whole multi-minute decode, and the pull that finally arrives is superseded if
         you touched anything meanwhile. Ingest is the wrong shape for that slot: it is
@@ -1269,21 +1433,23 @@ class EngineRunner(QObject):
         if px != self._texture_limit:
             self._texture_limit = px
 
-    def display_dim(self, axes: Any, *, planes: int = 1, provider: Any = None) -> int:
-        """The display cap for the viewed node's frames — full resolution when one frame of
+    def display_dim(self, axes: Any, *, planes: int = 1, provider: Any = None,
+                    dtype: Any = None) -> int:
+        """The display cap for a node's frames — full resolution when one frame of
         every shown channel is affordable in texture, in RAM, and to PRODUCE.
 
-        ``provider`` decides the last of those and defaults to the held one; it is passed
-        explicitly by :meth:`_decode_planes`, which runs on the worker DURING the pull that
-        will later install it — reading the held one there would answer for the node being
-        replaced, and the answer is folded into every plane key."""
+        ``provider`` decides the last of those and ``dtype`` whether the display copy
+        narrows (half the bytes per pixel). Both are passed EXPLICITLY — from the node's
+        :class:`_HeldView`, or by :meth:`_decode_planes`, which runs on the worker DURING
+        the pull that will later install that view — because the answer is folded into
+        every plane key and reading another node's held state here would have two panes
+        disagree about a key's shape."""
         if axes is None:
             return MAX_DISPLAY_DIM
-        prov = self._viewer_provider if provider is None else provider
         return display_cap(axes, texture_limit=self._texture_limit,
-                           bytes_per_px=(2 if self._viewer_dtype is not None else 8),
+                           bytes_per_px=(2 if dtype is not None else 8),
                            planes=planes,
-                           streaming=isinstance(prov, StreamProvider))
+                           streaming=isinstance(provider, StreamProvider))
 
     # ── viewport detail-on-demand ─────────────────────────────────────────────
     def request_detail(self, node_id: str, coords, channels, rect01, budget: int) -> bool:
@@ -1293,12 +1459,13 @@ class EngineRunner(QObject):
         Latest-wins by generation rather than by a queue: while the user is still zooming,
         every intermediate rect is dead on arrival, and rendering them in order would just
         put the pool behind the cursor."""
-        prov = self._viewer_provider
-        if prov is None or node_id != self._viewer_node or self._viewer_axes is None:
+        view = self._view_of(node_id) or self._rearm_view(node_id)
+        if view is None or view.provider is None or view.axes is None:
             return False
         self._detail_gen += 1
-        self._pool.start(_DetailJob(self, self._detail_gen, node_id, prov, coords,
-                                    channels, self._viewer_axes, rect01, budget))
+        self._pool.start(_DetailJob(self, self._detail_gen, node_id, view.provider,
+                                    coords, channels, view.axes, rect01, budget,
+                                    pin=view.pin, dtype=view.dtype))
         return True
 
     def invalidate_detail(self) -> None:
@@ -1306,7 +1473,8 @@ class EngineRunner(QObject):
         whatever is being read is about to describe something that is no longer shown."""
         self._detail_gen += 1
 
-    def detail_planes(self, prov, node_id, coords, channels, axes, rect01, budget):
+    def detail_planes(self, prov, node_id, coords, channels, axes, rect01, budget,
+                      *, pin: Optional[Pin] = None, dtype: Any = None):
         """``({channel: plane}, rect01)`` for a normalized rect of ``node_id``.
 
         **Never call on the GUI thread** — same contract as :meth:`_decode_planes`, and for
@@ -1325,7 +1493,6 @@ class EngineRunner(QObject):
         the "it disappears when I zoom" report (2026-08-04). Composing it here is also what
         makes zooming show more of the secondary, since the composite is re-sampled from a
         window of the secondary at the patch's own resolution."""
-        pin = self._viewer_pin
         # the SAME re-addressing the display planes get, so a detail patch under the
         # solo-frame scope reads the frame the overview is showing, not the global one
         m, t, z, cur_c = self._clamp_coords(self._payload_coords(coords, pin), axes)
@@ -1347,14 +1514,15 @@ class EngineRunner(QObject):
             if ch in out:
                 continue
             arr = np.asarray(prov.get_region(level, m, t, z, ch, ly0, ly1, lx0, lx1))
-            out[ch] = _fit_plane(arr, budget, as_dtype=self._viewer_dtype)
+            out[ch] = _fit_plane(arr, budget, as_dtype=dtype)
         # the rect the pixels REALLY cover, in normalized coords
         snapped = (lx0 / lax.x, ly0 / lax.y, lx1 / lax.x, ly1 / lax.y)
-        if out and self._overlay_ctx is not None:
+        octx = self._overlay_ctxs.get(node_id)
+        if out and octx is not None:
             ref = next(iter(out.values()))
             composed = self._compose_overlay(
                 node_id, ref.shape[:2], m, t,
-                _z_um_of(self._overlay_ctx["pri_md"], self._overlay_ctx["pri_axes"], m, z),
+                _z_um_of(octx["pri_md"], octx["pri_axes"], m, z),
                 # the SNAPPED rect, in the (fy0, fy1, fx0, fx1) order placement uses: the
                 # patch's pixels cover that box and not the one that was requested
                 region=(ly0 / lax.y, ly1 / lax.y, lx0 / lax.x, lx1 / lax.x))
@@ -1373,25 +1541,126 @@ class EngineRunner(QObject):
     # ── public API (GUI thread) ────────────────────────────────────────────────
     def pull(self, node_id: str,
              coords: Optional[Tuple[int, int, int, int]] = None,
-             channels: Optional[Tuple[int, ...]] = None) -> None:
+             channels: Optional[Tuple[int, ...]] = None,
+             *, queue: bool = True) -> None:
         """Request a full engine pull (+ optional display planes for ``channels``).
-        Establishes/refreshes the held viewer provider. Latest-wins while busy."""
+        Establishes/refreshes the held viewer provider.
+
+        **Queued, not latest-wins** (2026-08-06). A request made while another pull is
+        running joins :attr:`_queue` and is run in turn; it does not replace what was
+        waiting. Asking for a second per-channel branch used to drop whichever request was
+        already pending, so a two-branch graph could only ever produce one result — the
+        "can't both run" half of the two-channel report. A repeat request for a node ALREADY
+        queued updates that entry in place rather than adding a second (see :attr:`_queue`).
+
+        Requests are independent of each other from here on: each gets its own run id, each
+        card reports its own state, and the first to land is viewable and editable while the
+        rest are still going (:meth:`invalidate`).
+
+        ``queue=False`` is for a request the user did not ASK to compute — click-to-preview,
+        which fires on every settled selection while the canvas is maximized (2026-08-06).
+        Such a request is served if the answer is already in hand and otherwise DROPPED. The
+        old single slot was latest-wins, which made previewing free: clicking around while
+        something ran only ever replaced one pending entry. A queue turned each of those
+        clicks into a committed pull, so idly selecting four cards during a long
+        segmentation silently signed the machine up for four more — the opposite of a
+        preview. A pull the user explicitly asked for (double-click, F5, Run) still queues."""
         if node_id not in self.document.nodes:
             return
         if self._busy:
-            self._pending = (node_id, coords, channels)
+            if self._serve_finished(node_id, coords, channels):
+                return
+            if not queue:
+                return          # a preview never commits the machine — see the docstring
+            # assigning an existing key keeps its position, which is exactly the
+            # "keeps its place" rule — no reordering call is needed or wanted
+            self._queue[node_id] = (node_id, coords, channels)
+            self.queued.emit(node_id, len(self._queue))
             return
         self._submit(node_id, coords, channels)
+
+    def _serve_finished(self, node_id: str, coords, channels) -> bool:
+        """Show an already-FINISHED branch straight from :attr:`_results`, without touching
+        the pull slot. ``True`` if it was served.
+
+        This is the half of "run one branch, look at the other" that the queue alone does not
+        give you: the result is in hand and the Memo holds its pixels, so making the user wait
+        behind a half-hour segmentation to see it again would be waiting on nothing. The
+        payload is re-delivered as it stands and the PIXELS come through the ordinary decode
+        lane (:meth:`request_plane` → the shared pool), which is the same path a scrub uses
+        and is already off the pull thread.
+
+        Only for the CURRENT document revision — an edit bumps it, and a re-pull is then
+        genuinely required rather than merely slow."""
+        key = (node_id, self.document.revision)
+        entry = self._results.get(key)
+        if entry is None:
+            return False
+        payload, axes = entry
+        self._results.move_to_end(key)               # keep the branches in active use warm
+        if isinstance(payload, Dataset) and payload.image is not None:
+            self._hold_view(node_id, payload, pin=None)
+        self.finished.emit(node_id, payload, None, axes, 0.0)
+        if coords is not None:
+            # planes off the decode lane, exactly as a cursor move would fetch them
+            self.request_plane(node_id, coords, channels)
+        return True
+
+    def queue_depth(self) -> int:
+        """How many pulls are waiting behind the running one (0 when nothing is queued)."""
+        return len(self._queue)
+
+    def queued_nodes(self) -> Tuple[str, ...]:
+        """The node ids waiting to be pulled, in the order they will run."""
+        return tuple(self._queue)
+
+    # ── held display views (the coords-only fast path's state) ─────────────────
+    def _view_of(self, node_id: str) -> Optional[_HeldView]:
+        return self._views.get(node_id)
+
+    def _hold_view(self, node_id: str, payload: Dataset, *,
+                   pin: Optional[Pin]) -> None:
+        """Snapshot ``payload``'s display state for ``node_id`` and keep it hot.
+        Evicts the least-recently held node past :data:`HELD_VIEWS` — eviction is cheap
+        to undo (:meth:`_rearm_view`), so the cap only bounds pinned providers."""
+        self._views[node_id] = _HeldView(payload.image, payload.axes,
+                                         self.document.revision, pin,
+                                         _display_dtype(payload))
+        self._views.move_to_end(node_id)
+        while len(self._views) > HELD_VIEWS:
+            self._views.popitem(last=False)
+
+    def _rearm_view(self, node_id: str) -> Optional[_HeldView]:
+        """Re-establish ``node_id``'s held view from its remembered FINISHED result —
+        the O(1) recovery that lets two Viewer panes outlive the :data:`HELD_VIEWS` cap
+        and lets a pane scrub a branch that finished while another was running, without
+        re-emitting :attr:`finished` or taking the pull slot.
+
+        Unpinned results only, because :attr:`_results` stores nothing else: a scoped
+        payload holds only its picked frames and re-serving it as the node's whole
+        answer would show a truncated series."""
+        entry = self._results.get((node_id, self.document.revision))
+        if entry is None:
+            return None
+        payload, _axes = entry
+        if not (isinstance(payload, Dataset) and payload.image is not None):
+            return None
+        self._results.move_to_end((node_id, self.document.revision))
+        self._hold_view(node_id, payload, pin=None)
+        return self._views[node_id]
 
     def request_plane(self, node_id: str,
                       coords: Optional[Tuple[int, int, int, int]] = None,
                       channels: Optional[Tuple[int, ...]] = None) -> None:
-        """Coords-only request. When the viewed node + document revision are unchanged
-        (only the M/T/Z cursor or the active-channel set moved), bypass the graph
-        snapshot + ``engine.pull`` entirely and serve the plane straight from the
+        """Coords-only request. When ``node_id`` has a held view at the current document
+        revision (only the M/T/Z cursor or the active-channel set moved), bypass the
+        graph snapshot + ``engine.pull`` entirely and serve the plane straight from the
         :class:`PlaneCache` (decoding a miss synchronously — a single decimated read),
-        then warm adjacent frames. Otherwise fall back to a full :meth:`pull`, which
-        re-establishes the provider handle for this (node, revision).
+        then warm adjacent frames. A node whose view was evicted but whose FINISHED
+        result is still remembered re-arms in O(1) (:meth:`_rearm_view`) — that is what
+        lets the compare pane scrub a second result without re-pulling. Otherwise fall
+        back to a full :meth:`pull`, which re-establishes the view for this
+        (node, revision).
 
         Under the solo-frame scope the held payload contains only the scoped frames, so
         moving the M/T cursor is normally a change of *what was computed*, not of what is
@@ -1401,21 +1670,88 @@ class EngineRunner(QObject):
         most of the interactive scrubbing a troubleshooting session does."""
         if node_id not in self.document.nodes:
             return
-        if (coords is not None and node_id == self._viewer_node
-                and self._viewer_provider is not None
-                and self.document.revision == self._viewer_rev
-                and self._pin_for(coords) == self._viewer_pin):
-            self._serve_from_cache(node_id, coords, channels)
-            return
+        if coords is not None:
+            view = self._view_of(node_id) or self._rearm_view(node_id)
+            if (view is not None and view.provider is not None
+                    and self.document.revision == view.rev
+                    and self._pin_for(coords) == view.pin):
+                self._serve_from_cache(node_id, coords, channels)
+                return
         self.pull(node_id, coords, channels)
 
-    def invalidate(self) -> None:
-        """Drop any in-flight result (edits during a run) and drop the held provider —
-        a graph edit may change pixels, so the next request must re-pull through the
-        engine and the decoded-plane cache is no longer valid."""
+    def invalidate(self, nodes: Optional[Iterable[str]] = None) -> None:
+        """Drop the in-flight results a graph edit could have changed, and drop the held
+        provider — the decoded-plane cache describes pixels the edit may have moved.
+
+        ``nodes`` names what the edit TOUCHED. Only runs whose cone contains one of them are
+        cancelled; every other branch in flight keeps going and still delivers (2026-08-06).
+        That is what makes "adjust the finished branch while the other one is still running"
+        possible at all: before this, one global epoch meant any edit anywhere — a threshold
+        nudged on branch A, a layer renamed, a card moved onto a different channel — silently
+        killed branch B's half-hour segmentation, with no error and no card state to show for
+        it.
+
+        ``nodes=None`` keeps the old meaning, "assume everything": structural edits that no
+        single node accounts for (a file loaded, a graph replaced, an Iterate rewritten) still
+        cancel the lot, because a cone computed against the previous graph cannot be trusted
+        to describe the new one. Callers that KNOW what changed should say so — the accuracy
+        of this is only ever as good as what they pass.
+
+        A cancelled run emits :attr:`cancelled` so its card can leave the running state; a
+        result that arrives for a cancelled id is dropped by :meth:`_deliver`'s liveness test.
+        Cancelling the run that is ON the worker additionally latches its job's ``cancelled``
+        flag, and the engine polls that at every node boundary and progress tick — so the
+        compute actually stops and frees the pull slot for the queue, instead of grinding a
+        dead branch to completion with every other request waiting behind it. Queued requests
+        whose node has left the document are dropped here too (deleting a queued card must
+        not leave a phantom entry holding a place in line).
+        """
+        self._views.clear()
+        self.invalidate_detail()
+        dropped: List[str] = []          # queued requests this call retires
+        if nodes is None:
+            dead = list(self._runs)
+            # Emitted as `cancelled` below rather than discarded silently: a queued card
+            # left on "queued" after the queue was drained is a state the runner will
+            # never resolve.
+            dropped = list(self._queue)
+            self._queue.clear()
+        elif not nodes:
+            # An EMPTY set is a positive statement — "this edit changed nothing a run can
+            # see" — and is what the G8 source re-seed sends. It must cancel nothing and,
+            # above all, must not empty the queue: that notification fires from inside the
+            # delivery of a finished pull, so treating it as a structural edit silently threw
+            # away every branch waiting behind it.
+            dead = []
+        else:
+            touched = frozenset(nodes)
+            dead = [rid for rid, cone in self._run_cones.items() if cone & touched]
+            # A run with no recorded cone is one this registry never saw finish registering;
+            # treat it as affected rather than assume it is safe.
+            dead += [rid for rid in self._runs if rid not in self._run_cones]
+        # A queued request whose node has left the document is dead where it stands.
+        # `_start_next` would skip it when its turn came, but until then it holds a place
+        # in line, inflates `queue_depth`, and — because its card no longer exists — has
+        # nothing left to resolve it.
+        for qid in [q for q in self._queue if q not in self.document.nodes]:
+            del self._queue[qid]
+            dropped.append(qid)
+        for rid in dead:
+            nid = self._runs.pop(rid, None)
+            self._run_cones.pop(rid, None)
+            act = self._active
+            if act is not None and act.epoch == rid and act.bake is None:
+                # the cancelled run is the one on the worker: tell the engine to stop.
+                # Latched before `cancelled` is emitted so no handler can observe a run
+                # that is cancelled on the cards but still uncancellable on the worker.
+                act.cancelled = True
+            if nid is not None:
+                self.cancelled.emit(nid)
+        for qid in dropped:
+            self.cancelled.emit(qid)
+        # The epoch still advances so anything keyed on "the current run" (progress
+        # throttling, the observer's stale check) moves on with the graph.
         self._epoch += 1
-        self._viewer_rev = -1
-        self._viewer_pin = None
         self._prefetch_gen += 1
         # an in-flight display decode is reading pixels the edit may have changed: retire
         # its generation so the result is dropped rather than painted over the new graph
@@ -1428,7 +1764,7 @@ class EngineRunner(QObject):
         self.cancel_preload()
         # the composed overlay belongs to the graph that produced it — an edit can change
         # the placement, the pairing or the secondary chain entirely
-        self._overlay_ctx = None
+        self._overlay_ctxs.clear()
         self._planes.clear()
 
     # ── the solo-frame (troubleshooting) scope ─────────────────────────────────
@@ -1537,8 +1873,8 @@ class EngineRunner(QObject):
                      zip(coords, (axes.m, axes.t, axes.z, axes.c)))
 
     def _plane_addrs(self, node_id, coords, channels, axes,
-                     *, pin: Optional[Pin] = None, provider: Any = None
-                     ) -> List[Tuple[tuple, int, int, int, int]]:
+                     *, pin: Optional[Pin] = None, provider: Any = None,
+                     dtype: Any = _UNSET) -> List[Tuple[tuple, int, int, int, int]]:
         """``(key, m, t, z, ch)`` per requested channel — the :class:`PlaneCache` addresses
         one display update needs, de-duplicated. Shared by the cache probe and the decode so
         the two can never disagree about a key.
@@ -1561,11 +1897,18 @@ class EngineRunner(QObject):
         m, t, z, c = self._clamp_coords(self._payload_coords(coords, pin), axes)
         ovl = self.overlay_channels(node_id)
         wanted = [int(v) for v in (channels if channels else (c,))]
+        if dtype is _UNSET or provider is None:
+            view = self._view_of(node_id)
+            if dtype is _UNSET:
+                dtype = view.dtype if view is not None else None
+            if provider is None and view is not None:
+                provider = view.provider
         # The display CAP is part of the key (V2.23). It decides the plane's shape, several
         # readers write these keys (the decode, the prefetcher, the raw probe), and the limit it
         # comes from can arrive late — a surface coming up raises it. Keying on it turns any
         # disagreement into a cache miss instead of a plane served at the wrong size.
-        cap = self.display_dim(axes, planes=max(1, len(set(wanted))), provider=provider)
+        cap = self.display_dim(axes, planes=max(1, len(set(wanted))), provider=provider,
+                               dtype=dtype)
         out: List[Tuple[tuple, int, int, int, int]] = []
         seen: set = set()
         for ch in wanted:
@@ -1581,13 +1924,15 @@ class EngineRunner(QObject):
         return out
 
     def _cached_planes(self, node_id, coords, channels, axes,
-                       *, pin: Optional[Pin] = None) -> Optional[Dict[int, np.ndarray]]:
+                       *, pin: Optional[Pin] = None, provider: Any = None,
+                       dtype: Any = _UNSET) -> Optional[Dict[int, np.ndarray]]:
         """The requested planes if EVERY one of them is already decoded, else ``None`` —
         a read-only probe, so the GUI thread can decide whether serving this frame is free
         before it commits to doing it there (:meth:`_serve_from_cache`)."""
         out: Dict[int, np.ndarray] = {}
         for key, _m, _t, _z, ch in self._plane_addrs(node_id, coords, channels, axes,
-                                                    pin=pin):
+                                                    pin=pin, provider=provider,
+                                                    dtype=dtype):
             arr = self._planes.get(key)
             if arr is None:
                 return None
@@ -1751,7 +2096,7 @@ class EngineRunner(QObject):
         their image."""
         from nodelab_v2.overlay_compose import (
             compose_secondary_plane, paired_t, secondary_z_index)
-        ctx = self._overlay_ctx
+        ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return {}
         # The composite is sampled onto `out_shape`, so reading the window any finer than that
@@ -1797,7 +2142,7 @@ class EngineRunner(QObject):
 
         The FIRST flickering source decides the rate: two sources blinking out of phase is
         not a comparison of anything."""
-        ctx = self._overlay_ctx
+        ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return 0.0
         for src in ctx.get("sources", ()):
@@ -1812,7 +2157,7 @@ class EngineRunner(QObject):
         appends how many more there are — plus, loudly, any source that had to be dropped
         for want of a shader channel, because a silently missing layer is the one thing this
         readout exists to prevent."""
-        ctx = self._overlay_ctx
+        ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return ""
         srcs = ctx.get("sources", ())
@@ -1828,7 +2173,7 @@ class EngineRunner(QObject):
 
     def overlay_channels(self, node_id: str) -> Dict[int, str]:
         """``{channel index: label}`` the overlay contributes, for the channel strip."""
-        ctx = self._overlay_ctx
+        ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return {}
         out: Dict[int, str] = {}
@@ -1986,7 +2331,7 @@ class EngineRunner(QObject):
     def overlay_style(self, node_id: str) -> Dict[int, Tuple[int, float, float]]:
         """``{channel index: (blend mode, opacity, checker cells)}`` for the overlay's
         channels — what the shader and its CPU mirror need to composite them."""
-        ctx = self._overlay_ctx
+        ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return {}
         out: Dict[int, Tuple[int, float, float]] = {}
@@ -2011,7 +2356,7 @@ class EngineRunner(QObject):
 
     def _decode_planes(self, provider, node_id, coords, channels, axes,
                        *, pin: Optional[Pin] = None, overlay_all: bool = False,
-                       as_dtype: Any = None) -> Dict[int, np.ndarray]:
+                       as_dtype: Any = _UNSET) -> Dict[int, np.ndarray]:
         """Native per-channel planes at ``coords`` (a GLOBAL display cursor), cache-first
         (used by the pull worker and by :class:`_DecodeJob`). Misses decode and are cached.
 
@@ -2028,13 +2373,16 @@ class EngineRunner(QObject):
         **Never call this on the GUI thread.** On a lazy provider a miss runs the node — see
         :class:`_DecodeJob` for the minutes-long freeze that taught us so."""
         out: Dict[int, np.ndarray] = {}
+        if as_dtype is _UNSET:
+            view = self._view_of(node_id)
+            as_dtype = view.dtype if view is not None else None
         addrs = self._plane_addrs(node_id, coords, channels, axes, pin=pin,
-                                  provider=provider)
+                                  provider=provider, dtype=as_dtype)
         if not addrs:
             return out
         nc = int(axes.c)
         cap = addrs[0][0][-1]          # the cap the keys were built with — never re-derived
-        dt = self._viewer_dtype if as_dtype is None else as_dtype
+        dt = as_dtype
         ovl_addrs = [a for a in addrs if a[4] >= nc]
         ref: Optional[np.ndarray] = None
         for key, m, t, z, ch in addrs:
@@ -2048,7 +2396,8 @@ class EngineRunner(QObject):
             out[ch] = arr
             if ref is None:
                 ref = arr
-        if self._overlay_ctx is None or not (ovl_addrs or overlay_all):
+        octx = self._overlay_ctxs.get(node_id)
+        if octx is None or not (ovl_addrs or overlay_all):
             return out
         m, t, z, cur = self._clamp_coords(self._payload_coords(coords, pin), axes)
         if ref is None:
@@ -2065,7 +2414,7 @@ class EngineRunner(QObject):
         # The overlay is composed onto the shape of the plane actually being shown, and
         # placed by µm, so the display decimation costs it nothing and no caller has to
         # track a scale factor.
-        z_um = _z_um_of(self._overlay_ctx["pri_md"], self._overlay_ctx["pri_axes"], m, z)
+        z_um = _z_um_of(octx["pri_md"], octx["pri_axes"], m, z)
         composed = self._compose_overlay(node_id, ref.shape[:2], m, t, z_um)
         keys = {a[4]: a[0] for a in ovl_addrs}
         for ch, plane in composed.items():
@@ -2160,8 +2509,9 @@ class EngineRunner(QObject):
         ax = env.axes
         m, t, z, c = (min(max(0, int(v)), s - 1) for v, s in
                       zip((m, t, z, c), (ax.m, ax.t, ax.z, ax.c)))
+        view = self._view_of(node_id)
         key = ((node_id, None, m, t, z, c) if src_id == node_id
-               and self._viewer_pin is None
+               and (view is None or view.pin is None)
                else (_RAW_TAG, self._node_source_key[src_id], m, t, z, c))
         arr = self._planes.get(key)
         if arr is None:
@@ -2177,9 +2527,13 @@ class EngineRunner(QObject):
         goes to :class:`_DecodeJob` on the pool — decoding it here would run the node on the
         GUI thread and freeze the application for as long as that takes."""
         t0 = time.perf_counter()
-        axes = self._viewer_axes
-        pin = self._viewer_pin
-        warm = self._cached_planes(node_id, coords, channels, axes, pin=pin)
+        view = self._view_of(node_id)
+        if view is None:                     # dropped between request and here: re-pull
+            self.pull(node_id, coords, channels)
+            return
+        axes, pin = view.axes, view.pin
+        warm = self._cached_planes(node_id, coords, channels, axes, pin=pin,
+                                   provider=view.provider, dtype=view.dtype)
         if warm is not None:
             self.plane_ready.emit(node_id, warm, axes, time.perf_counter() - t0)
             self.prefetch(node_id,
@@ -2196,8 +2550,8 @@ class EngineRunner(QObject):
         # at read time (`_Worker.run`), so a cold scrub is visibly working rather than hung
         self._progress.emit(("decode", node_id, {"epoch": self._epoch, "op_key": ""}))
         self._pool.start(_DecodeJob(self, self._decode_gen, self._epoch,
-                                    self._viewer_provider, node_id, coords, channels,
-                                    axes, pin))
+                                    view.provider, node_id, coords, channels,
+                                    axes, pin, view.dtype))
 
     def _deliver_planes(self, packet) -> None:   # GUI thread (queued)
         """Land a :class:`_DecodeJob`'s planes, then run whatever the cursor did meanwhile.
@@ -2239,7 +2593,10 @@ class EngineRunner(QObject):
         and nothing is warmed — correctly, since a neighbouring frame is not in that
         dataset at all and reaching it needs a re-pull. A multi-frame scope does have
         neighbours to warm, and they are the picked ones."""
-        prov, axes = self._viewer_provider, self._viewer_axes
+        view = self._view_of(node_id)
+        if view is None:
+            return
+        prov, axes = view.provider, view.axes
         if prov is None or axes is None or getattr(axes, "t", 1) <= 1:
             return
         span = min(span, self._prefetch_span(prov))
@@ -2250,7 +2607,8 @@ class EngineRunner(QObject):
         chans = tuple(min(max(0, int(ch)), axes.c - 1)
                       for ch in (channels if channels else
                                  (min(max(0, center[3]), axes.c - 1),)))
-        cap = self.display_dim(axes, planes=max(1, len(set(chans))))
+        cap = self.display_dim(axes, planes=max(1, len(set(chans))),
+                               provider=prov, dtype=view.dtype)
         self._prefetch_gen += 1
         gen = self._prefetch_gen
         jobs: List[Tuple[tuple, int, int, int, int]] = []
@@ -2261,20 +2619,24 @@ class EngineRunner(QObject):
                     if self._planes.get(key) is None:
                         jobs.append((key, m, tt, z, ch))
         if jobs:
-            self._pool.start(_PrefetchJob(self, gen, jobs))
+            self._pool.start(_PrefetchJob(self, gen, jobs, prov, view.dtype))
 
-    #: How many preload jobs run at once. Four, measured: on the WellA3 mosaic with a cold tile
-    #: cache one whole-canvas stitch is 1.03 s, four in parallel are 0.51 s each and eight are
-    #: 0.43 s — the source-tile reads parallelize, the paste contends, and the curve is flat past
+    #: How many preload jobs run at once on a series whose frames are affordable to read
+    #: ahead — real bytes AND per-plane computes alike. Four, measured on the per-plane case
+    #: itself: on the WellA3 mosaic (a computed stitch) with a cold tile cache one
+    #: whole-canvas paste is 1.03 s, four in parallel are 0.51 s each and eight are 0.43 s —
+    #: the source-tile reads parallelize, the paste contends, and the curve is flat past
     #: four. Kept low on purpose: these share the pool with the frame being DISPLAYED, and
-    #: starving that to fetch the future is exactly backwards.
+    #: starving that to fetch the future is exactly backwards. The one series that gets NO
+    #: width at all is a whole-volume compute — :meth:`_preload_jobs` returns 0 there.
     PRELOAD_JOBS = 4
 
-    def _frame_bytes(self, axes: Any, chans: int) -> int:
+    def _frame_bytes(self, axes: Any, chans: int, *, provider: Any = None,
+                     dtype: Any = None) -> int:
         """Bytes one displayed frame of ``chans`` channels occupies in the plane cache."""
-        cap = self.display_dim(axes, planes=max(1, chans))
+        cap = self.display_dim(axes, planes=max(1, chans), provider=provider, dtype=dtype)
         return (min(cap, int(axes.y)) * min(cap, int(axes.x))
-                * (2 if self._viewer_dtype is not None else 8) * max(1, chans))
+                * (2 if dtype is not None else 8) * max(1, chans))
 
     def preload_series(self, node_id: str, center, channels, *,
                        pin: Optional[Pin] = None) -> int:
@@ -2299,17 +2661,31 @@ class EngineRunner(QObject):
         * **bounded by the cache that actually holds it.** The frames land in
           :class:`PlaneCache`, so its budget is the ceiling — sizing against a *different*
           number is how a preload evicts its own head and re-decodes every lap.
+        * **cost-gated on the provider** (:meth:`_preload_jobs`). "Every frame is wanted" is a
+          licence to READ them all, never to COMPUTE them all: on a whole-volume chain this
+          queued a preload measured in hours, and playback waited for it.
         """
-        prov, axes = self._viewer_provider, self._viewer_axes
-        if prov is None or axes is None or node_id != self._viewer_node:
+        view = self._view_of(node_id)
+        if view is None or view.provider is None or view.axes is None:
+            return 0
+        prov, axes = view.provider, view.axes
+        jobs = self._preload_jobs(prov)
+        if not jobs:
+            # a frame here IS a whole-volume compute — see `_preload_jobs`. Nothing is queued
+            # and nothing is waited for; the frame the cursor lands on decodes on its own, one
+            # at a time, with the pool to itself. Any older preload is retired with it, so its
+            # progress bar cannot outlive the series it was reading.
+            self.cancel_preload()
             return 0
         m, t0, z, _c = center
         chans = tuple(sorted({min(max(0, int(ch)), axes.c - 1)
                               for ch in (channels or (center[3],))}))
-        cap = self.display_dim(axes, planes=max(1, len(chans)))
+        cap = self.display_dim(axes, planes=max(1, len(chans)),
+                               provider=prov, dtype=view.dtype)
         nt = max(1, int(axes.t))
         room = max(1, min(self._planes.budget, display_ram_bytes())
-                   // max(1, self._frame_bytes(axes, len(chans))))
+                   // max(1, self._frame_bytes(axes, len(chans),
+                                               provider=prov, dtype=view.dtype)))
         start = min(max(0, int(t0)), nt - 1)
         want: List[Tuple[tuple, int, int, int, int]] = []
         for i in range(min(nt, int(room))):
@@ -2327,11 +2703,12 @@ class EngineRunner(QObject):
         # Round-robin rather than contiguous blocks: every job then walks forward through the
         # series roughly together, so the frames nearest the cursor land first whichever job
         # gets a thread.
-        n = max(1, min(self.PRELOAD_JOBS, max(1, self._pool.maxThreadCount() - 1)))
+        n = max(1, min(jobs, max(1, self._pool.maxThreadCount() - 1)))
         for k in range(n):
             share = want[k::n]
             if share:
-                self._pool.start(_PreloadJob(self, self._preload_gen, share))
+                self._pool.start(_PreloadJob(self, self._preload_gen, share,
+                                             prov, view.dtype))
         return len(want)
 
     def cancel_preload(self) -> None:
@@ -2359,14 +2736,69 @@ class EngineRunner(QObject):
     def preloading(self) -> bool:
         return bool(self._preload_total)
 
-    def series_fits(self, axes: Any = None, *, planes: int = 1) -> bool:
-        """Whether the whole T range of the viewed frame fits the budget — i.e. whether a
-        preload can make playback read-free rather than merely warmer."""
-        axes = self._viewer_axes if axes is None else axes
+    def series_fits(self, axes: Any = None, *, planes: int = 1,
+                    node_id: Optional[str] = None) -> bool:
+        """Whether the whole T range of a held node's frames fits the budget — i.e.
+        whether a preload can make playback read-free rather than merely warmer.
+        ``node_id`` names which pane's node; default is the most recently held one."""
+        view = (self._view_of(node_id) if node_id is not None
+                else next(reversed(self._views.values()), None))
+        if axes is None:
+            axes = view.axes if view is not None else None
         if axes is None:
             return False
         ceiling = min(self._planes.budget, display_ram_bytes())
-        return self._frame_bytes(axes, planes) * max(1, int(axes.t)) <= ceiling
+        return (self._frame_bytes(axes, planes,
+                                  provider=view.provider if view else None,
+                                  dtype=view.dtype if view else None)
+                * max(1, int(axes.t)) <= ceiling)
+
+    def frames_are_reads(self, node_id: str) -> bool:
+        """Whether one frame of ``node_id``'s held result is BYTES — a decompress off a store
+        — rather than the node running again.
+
+        The one question the Viewer's playback policy turns on, asked once and answered here
+        so the gate and the pacing cannot disagree about it. A lazy chain's provider computes
+        at read time, which is what makes "play" mean two different things: a stream of
+        uploads on an ingested file, and a queue of computes on a deconvolution. Unknown
+        nodes (never pulled, no held view) answer False — the cautious direction, since it
+        costs a smooth playback and the other costs a frozen one."""
+        view = self._view_of(node_id)
+        if view is None or view.provider is None:
+            return False
+        return not isinstance(view.provider, StreamProvider)
+
+    @staticmethod
+    def _preload_jobs(prov: Any) -> int:
+        """How many whole-series preload decodes may run at once on ``prov`` — the COST
+        question :meth:`_prefetch_span` asks about two neighbours, asked about the whole
+        T range. Zero means do not preload this series at all.
+
+        Pressing play licenses reading every frame. It does not license *computing* every
+        frame. On a ``volume_unit`` chain one "decode" is a whole Richardson–Lucy /
+        ZS-DeconvNet volume — ~130 s and ~30 GB of working set — so the byte-backed job count
+        put four of them on the pool at once and held playback until they finished. That is
+        how pressing play on the 3D-deconvolved series stopped showing frames altogether
+        (2026-08-06): a wait measured in hours, with four volumes' working set crowding out
+        the frame being *displayed* — the same starvation :class:`_DecodeJob` stays
+        single-flight to avoid, re-introduced by the job that runs beside it.
+
+        A PER-PLANE compute (a stitched mosaic, a Z-projection — standalone or over that
+        mosaic) is the other side of that line and warms at the full
+        :data:`PRELOAD_JOBS` width, which was *measured on it* (see the constant: the 4-way
+        numbers are the WellA3 mosaic's own). It warmed one at a time for a while out of
+        pool-sharing caution, and that width could never outrun playback consuming one frame
+        per frame: pressing play on a stitched series stayed at decode cadence — ~9 fps with
+        33–267 ms of jitter, recorded 2026-08-10 — for the whole first lap instead of going
+        smooth after a short prepare. The pool keeps a thread back for the displayed frame
+        either way (:meth:`preload_series` fans out to ``maxThreadCount - 1`` at most).
+
+        So: warm wide on anything priced per plane — bytes or kernel — and never speculate
+        across frames of a whole-unit compute, where the only useful frame is the one being
+        looked at."""
+        if getattr(prov, "volume_unit", False):
+            return 0                               # a neighbour t IS a whole volume
+        return EngineRunner.PRELOAD_JOBS
 
     @staticmethod
     def _prefetch_span(prov: Any) -> int:
@@ -2406,8 +2838,16 @@ class EngineRunner(QObject):
         an edit or another node's pull moving the epoch must not silence its card — the work
         carries on either way, and a bar that stops moving reads as a hang."""
         def observe(event: str, node_id: str, info: Dict[str, Any]) -> None:
-            if epoch is not None and epoch != self._epoch:
-                return                        # superseded pull — stop reporting for it
+            # LIVENESS, the same rule `_deliver_progress` applies on the GUI side: a run
+            # reports for as long as it is live. The old `epoch != self._epoch` test muted
+            # a SURVIVING run's card the moment any narrowed invalidate advanced the epoch
+            # — an edit or a delete on the *other* branch froze this one's bar mid-way.
+            # A bake is live by being in `_bakes` (it never registers in `_runs`; its
+            # result is resolved outside the staleness rule, so it reports to the end).
+            # (GIL-atomic dict probes from the worker thread, like `_Job.cancelled`.)
+            if (epoch is not None and epoch not in self._runs
+                    and epoch not in self._bakes):
+                return                        # a cancelled pull — stop reporting for it
             if event == "progress":
                 now = time.perf_counter()
                 last = self._last_progress.get(node_id, 0.0)
@@ -2441,8 +2881,16 @@ class EngineRunner(QObject):
     def _deliver_progress(self, packet) -> None:     # GUI thread (queued)
         event, node_id, info = packet
         epoch = info.get("epoch")
-        if epoch is not None and epoch != self._epoch:
-            return                            # a stale pull's tail — the cards moved on
+        # LIVENESS again, not "is this the newest" (2026-08-06). ``epoch != self._epoch``
+        # silenced a run's progress the instant any other pull started — so queueing a second
+        # branch froze the first one's bar mid-way and its card sat there looking hung while
+        # it was in fact still working. A run reports for as long as it is live; only a
+        # CANCELLED run's tail is dropped, which is the case this gate was written for.
+        # A bake's liveness lives in `_bakes` — it never registers in `_runs`, and gating
+        # it on `_runs` alone muted every bake's card from the first tick.
+        if (epoch is not None and epoch not in self._runs
+                and epoch not in self._bakes):
+            return                            # a cancelled pull's tail — the cards moved on
         self.node_progress.emit(event, node_id, info)
 
     def planned_nodes(self, node_id: str, graph: Optional[Graph] = None) -> List[str]:
@@ -2504,16 +2952,19 @@ class EngineRunner(QObject):
         graph = self.document.to_graph(for_run=True, materialize=True,
                                        unroll_iterate=True, sweep_all=self._sweep_all,
                                        live_docks=frozenset({node_id}))
-        sources, every = self._sources_for(node_id, graph)
+        pull_id = self._pull_id(node_id, graph)
+        sources, every = self._sources_for(pull_id, graph)
         job = _Job(self._epoch, graph, self.document.revision, node_id, None, None,
                    sources, pin=self._pin_for(coords) if scoped else None,
                    bake={"store": store, "precision": precision, "bake_id": bake_id,
                          "signature": signature, "scoped": bool(scoped),
                          "hold": bool(hold)},
-                   all_sources=every)
+                   all_sources=every, pull_id=pull_id)
         self._busy = True
+        self._active = job          # what the worker is running (never cancel-latched:
+        #                             a bake resolves outside the staleness rule)
         self._bakes[job.epoch] = job.bake
-        self.plan.emit(node_id, self.planned_nodes(node_id, graph))
+        self.plan.emit(node_id, self.planned_nodes(pull_id, graph))
         self.started.emit(node_id)
         self._pull_thread.start(_Worker(self, job))
         return True
@@ -2532,7 +2983,7 @@ class EngineRunner(QObject):
         guard, its refusals and its "a pull is already running" interlock for free."""
         from nodegraph.checkpoint import checkpoint_bytes, write_checkpoint
         spec = job.bake or {}
-        payload = engine.pull(job.node_id)
+        payload = engine.pull(job.pull_id)
         verb = "hold" if spec.get("hold") else "bake"
         if not isinstance(payload, Dataset):
             raise TypeError(
@@ -2542,7 +2993,7 @@ class EngineRunner(QObject):
             # No write, no copy — the whole reason this tier is instant. The envelope is
             # captured alongside because a held dock has no manifest to re-derive one from.
             spec["payload"] = payload
-            spec["env"] = engine.env(job.node_id)
+            spec["env"] = engine.env(job.pull_id)
             return
         observe = self._make_observer(job.epoch)
 
@@ -2552,7 +3003,7 @@ class EngineRunner(QObject):
                     {"fraction": f, "note": note,
                      "done": int(round(f * 1000)), "total": 1000})
 
-        env = engine.env(job.node_id)
+        env = engine.env(job.pull_id)
         man = write_checkpoint(
             payload, spec["store"], precision=spec["precision"],
             bake_id=spec["bake_id"],
@@ -2663,9 +3114,12 @@ class EngineRunner(QObject):
         n = self._memo.drop_nodes(list(node_ids))
         self._tiles.clear()
         self._planes.clear()
-        self._viewer_provider = None
-        self._viewer_node = None
-        self._viewer_rev = -1
+        self._views.clear()
+        # the remembered finished results of the unloaded nodes go too — a scrub would
+        # otherwise re-arm a payload this call exists to release
+        gone = set(node_ids)
+        for key in [k for k in self._results if k[0] in gone]:
+            self._results.pop(key, None)
         self._prefetch_gen += 1
         return n
 
@@ -2700,19 +3154,62 @@ class EngineRunner(QObject):
         self._last_sweep.clear()
         graph = self.document.to_graph(for_run=True, materialize=True,
                                        unroll_iterate=True, sweep_all=self._sweep_all)
-        sources, every = self._sources_for(node_id, graph)
+        pull_id = self._pull_id(node_id, graph)
+        sources, every = self._sources_for(pull_id, graph)
         job = _Job(self._epoch, graph,
                    self.document.revision, node_id, coords, channels, sources,
-                   pin=self._pin_for(coords), all_sources=every)
+                   pin=self._pin_for(coords), all_sources=every, pull_id=pull_id)
         self._busy = True
-        self.plan.emit(node_id, self.planned_nodes(node_id, graph))
+        self._active = job          # the job on the worker — `invalidate` latches its
+        #                             cancel flag so the engine can abort mid-run
+        # Registered LIVE for the whole run. `_deliver` accepts a result iff its id is still
+        # here, and `invalidate` removes the ids it cancels — which is what lets several
+        # branches be in flight without any of them retiring the others.
+        self._runs[self._epoch] = node_id
+        # The cone is stored as DOCUMENT ids: the run graph names iterate clones
+        # `n#it@2` and inlined group bodies `b%inst`, and `invalidate` matches this set
+        # against the ids the document reports touched — a delete or param edit on the
+        # card `n` must hit a run that is computing `n`'s clones.
+        self._run_cones[self._epoch] = frozenset(
+            _doc_id_of(c) for c in self.planned_nodes(pull_id, graph))
+        self.plan.emit(node_id, self.planned_nodes(pull_id, graph))
         self.started.emit(node_id)
         self._pull_thread.start(_Worker(self, job))
+
+    def _start_next(self) -> None:
+        """Free the pull slot and start the next queued branch, if any.
+
+        The single place ``_busy`` is cleared, so no delivery path can leave the queue
+        stalled with work in it — a bake, a stale result and an ordinary one all come
+        through here."""
+        self._busy = False
+        while self._queue:
+            _nid, req = self._queue.popitem(last=False)
+            if req[0] in self.document.nodes:
+                self._submit(*req)
+                return
+            self.cancelled.emit(req[0])      # the node was deleted while it waited
+
+    def _pull_id(self, node_id: str, graph: Graph) -> str:
+        """Which id in the RUN graph serves ``node_id``.
+
+        Itself, except for a node inside an Iterate segment: the rewrite replaced it with
+        one clone per iteration, so the card the user double-clicked has no id of its own
+        any more and is served by the clone for the iteration the strip is on. Without this
+        the pull would raise a bare KeyError on the node the user just clicked — the most
+        ordinary thing to do while tuning a swept parameter is to look at the node being
+        swept."""
+        if node_id in graph.nodes:
+            return node_id
+        alias = self.document.iterate_aliases(sweep_all=self._sweep_all).get(node_id)
+        return alias if alias and alias in graph.nodes else node_id
 
     def _deliver(self, packet) -> None:          # GUI thread (queued)
         (epoch, node_id, payload, plane, axes, dt, err, revision, coords, channels,
          pin) = packet
-        self._busy = False
+        self._run_cones.pop(epoch, None)
+        # `_busy` is cleared by `_start_next` alone (see there), so every exit path below
+        # frees the slot AND starts the next branch, and neither can be forgotten separately.
         # A bake is resolved FIRST and outside the staleness rule. Its real result is a
         # directory on disk that already exists by now, so "the user moved on while it
         # ran" is not a reason to forget it — that would leave an orphaned checkpoint and
@@ -2723,45 +3220,65 @@ class EngineRunner(QObject):
                 self.failed.emit(node_id, err)
             else:
                 self.baked.emit(node_id, spec)
-            pending, self._pending = self._pending, None
-            if pending is not None:
-                self._submit(*pending)
+            self._runs.pop(epoch, None)
+            self._start_next()
             return
         # staleness is judged BEFORE the re-seed side effect below: delivering a
         # resolved source envelope notifies the document → the window calls
-        # invalidate() → the epoch bumps — and would drop the very result being
-        # delivered. The envelope seeding is display-only (the ENGINE resolved its
-        # own meta seeds at run time), so it never stales this result.
-        stale = epoch != self._epoch
+        # invalidate() → and would drop the very result being delivered. The envelope
+        # seeding is display-only (the ENGINE resolved its own meta seeds at run time),
+        # so it never stales this result.
+        #
+        # LIVENESS, not "is this the newest" (2026-08-06). The old test was
+        # ``epoch != self._epoch``, which meant any later request retired this result — so
+        # queueing a second branch threw the first one's payload away the moment it landed,
+        # and the user was left with nothing to look at. A run is stale only if something
+        # actually cancelled it: an edit inside its own cone, or its node going away. Every
+        # other run in flight is a SIBLING, not a successor.
+        stale = self._runs.pop(epoch, None) is None
         # G8 live re-seed: hand newly resolved source envelopes to the document
         for nid, env in self._fresh_envs():
             self.document.set_meta_seed(nid, env)
-        pending, self._pending = self._pending, None
-        if pending is not None:
-            self._submit(*pending)               # latest-wins supersedes this result
+        # A queued request for THIS SAME node does supersede this result — that is a newer
+        # view of the node the user is looking at (a moved cursor, a changed channel set),
+        # and showing the older one first would be a visible flicker backwards. A queued
+        # request for a DIFFERENT node is simply the next branch and retires nothing.
+        if node_id in self._queue:
             stale = True
+        self._start_next()
         if stale:
             return
         if err is not None:
             self.failed.emit(node_id, err)
             return
         # Hold the image provider so subsequent coords-only requests skip the engine
-        # (the fast path). Tie it to the CURRENT document revision — not the job's: the
+        # (the fast path). Tied to the CURRENT document revision — not the job's: the
         # G8 source re-seed just above (``set_meta_seed``) can bump the revision (display
         # metadata only, the graph/pixels are unchanged), and a genuine edit later runs
-        # invalidate() → ``_viewer_rev = -1`` anyway, so the next request re-pulls.
+        # invalidate() → the held views clear, so the next request re-pulls.
+        # Remember the finished branch so switching back to it costs nothing while another
+        # branch is still computing (:meth:`_serve_finished`). Unpinned results only: a
+        # frame-scoped payload holds ONLY those frames, so re-serving it later as if it were
+        # the node's whole answer would quietly show a truncated series.
+        if pin is None and err is None:
+            self._results[(node_id, self.document.revision)] = (payload, axes)
+            self._results.move_to_end((node_id, self.document.revision))
+            while len(self._results) > _FINISHED_RESULTS:
+                self._results.popitem(last=False)
         if isinstance(payload, Dataset) and payload.image is not None:
-            self._viewer_provider = payload.image
-            self._viewer_node = node_id
-            self._viewer_axes = payload.axes
-            self._viewer_rev = self.document.revision
-            self._viewer_pin = pin       # which frame this held payload IS
+            self._hold_view(node_id, payload, pin=pin)   # which frame this held payload IS
+        # The worker only ever ASSIGNS one overlay-context key; the bound is applied here,
+        # on the GUI thread, so no reader can see a half-evicted map. Kept to the nodes with
+        # a held view — those are the panes, and a context for anything else is unreachable.
+        if len(self._overlay_ctxs) > HELD_VIEWS:
+            for nid in [n for n in self._overlay_ctxs if n not in self._views]:
+                self._overlay_ctxs.pop(nid, None)
         self.finished.emit(node_id, payload, plane, axes, dt)
-        if (coords is not None and self._viewer_provider is not None
-                and self._viewer_axes is not None):
+        view = self._view_of(node_id)
+        if coords is not None and view is not None and view.axes is not None:
             self.prefetch(node_id,
                           self._clamp_coords(self._payload_coords(coords, pin),
-                                             self._viewer_axes),
+                                             view.axes),
                           tuple(channels) if channels else None, pin=pin)
 
     def _fresh_envs(self):
@@ -2795,11 +3312,8 @@ class EngineRunner(QObject):
             self._ingesting.pop(nid, None)
         for ck in [k for k in self._raw_src if k[0] not in live]:
             self._raw_src.pop(ck, None)
-        if self._viewer_node is not None and self._viewer_node not in live:
-            self._viewer_node = None
-            self._viewer_provider = None
-            self._viewer_rev = -1
-            self._viewer_pin = None
+        for nid in [n for n in self._views if n not in live]:
+            self._views.pop(nid, None)
 
     def _ensure_engine(self, job: _Job) -> Engine:   # worker thread
         seeds: Dict[str, Any] = {}

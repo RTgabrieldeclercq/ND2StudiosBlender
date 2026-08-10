@@ -100,6 +100,7 @@ TERMINAL_EVENTS = ("result", "error")
 WORKER_ERROR_CODES = frozenset({
     "unsupported", "protocol_error", "bad_request", "bad_recipe", "not_ready",
     "no_such_knob", "knob_out_of_range", "missing_input", "input_error",
+    "missing_metadata",
     "missing_dependency", "compute_error", "cancelled", "resource_exhausted",
     "internal", "worker_exited", "silence_timeout", "hard_timeout", "open_timeout",
 })
@@ -123,6 +124,24 @@ ARTIFACT_KINDS = ("table", "quicklook", "metrics", "image_stack")
 #: should not cross the network by default); ``never`` stays on the hub.
 OUTPUT_POLICIES = ("auto", "pull", "never")
 
+#: Params a recipe may never expose as a knob, and why. The hub's tier 1 refuses these, and
+#: a recipe *generator* must filter them out of the offer list rather than letting somebody
+#: pick one and meet a refusal.
+#:
+#: The two halves fail differently. A path knob would let a caller choose which file the hub
+#: opens, which is the whole security boundary. The editor bookkeeping keys would change the
+#: graph's cache key without changing the computation, silently discarding the warm cache
+#: that is the entire reason the hub exists.
+FORBIDDEN_KNOB_PARAMS = {
+    "path": "a filesystem path",
+    "model_path": "a filesystem path",
+    "store_path": "a filesystem path",
+    "urlpath": "a filesystem path",
+    "__locked__": "editor bookkeeping, stripped before a run",
+    "__title__": "editor bookkeeping, stripped before a run",
+    "__channels__": "editor bookkeeping, stripped before a run",
+}
+
 #: How often the run loop emits a ``beat`` while a single opaque compute is in flight.
 #: The hub's silence timeout is what kills a wedged worker, and it is reset only by a
 #: PARSED protocol line — so a long CNN inference with no internal progress hook must
@@ -134,6 +153,51 @@ BEAT_INTERVAL_S = 5.0
 #: ``--session``; the flag wins, and this is the fallback so a command declared without
 #: the ``{session}`` placeholder still works.
 SESSION_DIR_ENV = "LABLINK_SESSION_DIR"
+
+
+# ── the image-job sidecar ───────────────────────────────────────────────────────
+#
+# A TIFF does not merely OMIT the optical metadata an analysis derives from — it invents
+# it, reporting the container's 16-bit depth for a 12-bit sensor and ``Ch0`` for a channel
+# called ``GFP``. A missing value can be detected and refused; an invented one cannot. So
+# an image travels with a sidecar that OVERRIDES what the file claims, and a recipe
+# declares which fields its graph cannot run correctly without.
+#
+# The upload call is content-agnostic and stays that way, which means a successful upload
+# never implies a valid sidecar. Writing one is :mod:`nodelab_v2.lablink.sidecar`'s job and
+# reading one is the worker's.
+
+#: Suffix pairing a sidecar to its image: ``x.tif`` -> ``x.tif.job.json``. Deliberately not
+#: a bare ``.json`` — an image beside an unrelated ``x.json`` is an ordinary thing, and
+#: pairing on that would silently adopt it as calibration.
+SIDECAR_SUFFIX = ".job.json"
+
+#: A sidecar without this exact string is refused rather than guessed at.
+SIDECAR_FORMAT = "lablink.imagejob/1"
+
+#: Sidecar ``image`` scalars -> the engine calibration keys they populate. These names are
+#: identical on both sides on purpose: the unit is IN the field name, because a
+#: ``pixel_size`` with a separate unit field is the most expensive silent error available
+#: here. Every one of these is in :data:`nodegraph.dataset.CALIBRATION_KEYS`.
+SIDECAR_IMAGE_FIELDS = (
+    "pixel_size_um", "z_step_um", "bit_depth",
+    "objective_magnification", "objective_na",
+)
+
+#: Sidecar ``image.channels[]`` field -> the engine's flat per-channel-LIST key. The two
+#: vocabularies differ in shape because each is the shape its author can get right: nested
+#: per-channel for a person writing one, flat parallel lists for the engine reading one.
+SIDECAR_CHANNEL_FIELDS = {
+    "name": "channel_names",
+    "emission_nm": "channel_emission_nm",
+    "excitation_nm": "channel_excitation_nm",
+}
+
+#: Every metadata name a recipe's ``requires.metadata`` may ask for — the flat engine
+#: vocabulary, not the sidecar's nested one. A recipe naming anything else is asking for a
+#: field no sidecar can supply, so the worker reports it rather than waiting for a file
+#: that will never satisfy it.
+REQUIRABLE_METADATA = tuple(SIDECAR_IMAGE_FIELDS) + tuple(SIDECAR_CHANNEL_FIELDS.values())
 
 
 # ── the session HTTP protocol (the client half) ─────────────────────────────────
@@ -209,7 +273,10 @@ __all__ = [
     "WORKER_PROTOCOL_VERSION", "MAX_WORKER_LINE_BYTES", "WORKER_COMMANDS",
     "CONCURRENT_COMMANDS", "WORKER_EVENTS", "NODE_STATES", "TERMINAL_EVENTS",
     "WORKER_ERROR_CODES", "HUB_ONLY_ERROR_CODES", "EMITTABLE_ERROR_CODES",
-    "ARTIFACT_KINDS", "OUTPUT_POLICIES", "BEAT_INTERVAL_S", "SESSION_DIR_ENV",
+    "ARTIFACT_KINDS", "OUTPUT_POLICIES", "FORBIDDEN_KNOB_PARAMS",
+    "BEAT_INTERVAL_S", "SESSION_DIR_ENV",
+    "SIDECAR_SUFFIX", "SIDECAR_FORMAT", "SIDECAR_IMAGE_FIELDS",
+    "SIDECAR_CHANNEL_FIELDS", "REQUIRABLE_METADATA",
     "H_TOKEN", "H_SHA", "H_META", "H_NODE", "DEFAULT_PORT",
     "DEFAULT_CONSOLE_PORT", "CONSOLE_STATE_PATH",
     "LONGPOLL_MAX_S", "CLIENT_TIMEOUT_S", "SAFE_NAME_CHARS",

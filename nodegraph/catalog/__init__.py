@@ -106,11 +106,25 @@ MODULES: Tuple[str, ...] = (
     "enhance.zs_deconvnet",
     # Appended for the same reason, not slotted beside the other `analysis.threshold*` nodes:
     # this list's order is the link-drag search menu's order, so inserting mid-list shifts
-    # every node after it and re-keys nothing useful. The two are each other's natural
-    # companions — one thresholds inside each label, the other cuts on a per-label column —
-    # so they go in together, in that order.
-    "analysis.threshold_per_label",
+    # every node after it and re-keys nothing useful.
+    #
+    # `analysis.threshold_per_label` sat here until V2.27 and was REMOVED, not renamed: its one
+    # capability — derive the level inside each label — is now the `scope` Mode that
+    # `analysis.threshold` and `analysis.histogram_threshold` both carry, edited from the card's
+    # footprint band. Histogram Threshold absorbed its full product (sub-objects with a
+    # `parent_id` join, the per-parent level/n_above/frac_above/n_sub columns, `min_pixels`), so
+    # keeping the node as well would have been a third way to do one thing.
     "analysis.filter_labels",
+    # Appended last, like everything since V2.20 — the list's order is the link-drag search
+    # menu's order, so a mid-list insert shifts every node after it for no gain. Last is also
+    # where this one BELONGS: it is the write end of the pipeline, and the first catalog node
+    # whose product is a file rather than a Dataset.
+    "io.write_tiff",
+    # Appended last for the same reason, not slotted beside `enhance.tophat` /
+    # `enhance.flatten_field` whose background-removal neighbour it is: this list's order is
+    # the link-drag search menu's order, so a mid-list insert shifts every node after it and
+    # re-keys nothing useful.
+    "enhance.subtract_background",
 )
 
 

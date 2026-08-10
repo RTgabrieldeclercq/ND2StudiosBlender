@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import os
 import threading
+import weakref
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -94,6 +95,8 @@ __all__ = [
     "make_psf_loss_2d", "make_psf_loss_3d", "make_nbr2nbr_loss_3d",
     "sample_patches_2d", "sample_patches_3d", "train_2d", "train_3d",
     "infer_2d", "infer_3d", "fourier_damp",
+    "linear_match", "degrade_to_reference", "resolution_scaled_metrics",
+    "faint_signal_retention",
     "DEFAULTS",
 ]
 
@@ -1297,24 +1300,119 @@ def train_3d(volumes: Sequence[np.ndarray], psf: np.ndarray, *, iterations: int,
 
 # ── inference ─────────────────────────────────────────────────────────────────
 
-def _forward(model, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """One forward pass, in GRAPH mode — ``(denoised, deconvolved)`` as numpy.
+#: Per-model traced forward pass, so a tile does not re-trace the graph. Weak-keyed: the
+#: model cache above owns the models' lifetime, and a dropped model must not be pinned here.
+_FORWARD_FNS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
-    ``predict_on_batch`` rather than an eager ``model(x)``, and the reason is memory rather
-    than speed. Eager keeps every intermediate alive for as long as something references it,
-    and the 3D RCAN is nothing but residual chains — 8 RCABs, each holding a conv, two
-    LeakyReLUs, a channel-attention product and a skip addend, all at FULL tile resolution
-    with 64 channels. At the authors' own 3D inference tile that is ~50 live tensors of
-    2.25 GiB, and TensorFlow's ``mklcpu`` BFC allocator caps its CPU arena at **64 GiB**
-    regardless of installed RAM, so it dies at ~58 GiB in use on a machine with 256 GiB free.
-    ``predict_on_batch`` runs the compiled graph, whose memory planner reuses buffers, and the
-    same tile then completes in 33 s.
+
+def _graph_forward(model):
+    """A cached ``tf.function`` over ``model(x, training=False)`` — this kernel's own graph
+    call, replacing ``Model.predict_on_batch`` (2026-08-05).
+
+    **Why we no longer use ``predict_on_batch``.** It ends with
+    ``tree.map_structure(convert_to_np_if_not_ragged, batch_outputs)``, and Keras resolves
+    that ``tree`` through **optree**, which dispatches containers by EXACT type: a plain
+    ``list`` is a structure, but an unregistered ``list`` SUBCLASS is a *leaf*. When the
+    graph hands back such a subclass — TF and Keras both wrap tracked sequences, and the
+    types they use vary by version — the whole container is passed to ``x.numpy()`` and this
+    node dies with ``AttributeError: 'list' object has no attribute 'numpy'``, several
+    minutes into a real inference (reported 2026-08-05, from ``pretrained`` mode).
+
+    Nothing about that mapping is anything we need: a two-headed model returns two tensors,
+    and converting them is one line we can own. Depending on a third party's container
+    dispatch to do it was the actual defect — the failure mode is invisible until the exact
+    combination of versions that produces a subclass, and no amount of testing on one
+    machine's stack rules it out. :func:`_two_outputs` unpacks with ``isinstance``, which is
+    subclass-tolerant by construction.
+
+    **Graph mode is preserved, and that is the point of this function.** It is memory, not
+    speed: eager keeps every intermediate alive as long as anything references it, and the 3D
+    RCAN is nothing but residual chains — 8 RCABs, each holding a conv, two LeakyReLUs, a
+    channel-attention product and a skip addend, all at FULL tile resolution with 64 channels.
+    At the authors' own 3D inference tile that is ~50 live tensors of 2.25 GiB, and
+    TensorFlow's ``mklcpu`` BFC allocator caps its CPU arena at **64 GiB** regardless of
+    installed RAM, so eager dies at ~58 GiB in use on a machine with 256 GiB free. A
+    ``tf.function`` is the same compiled graph ``predict_on_batch`` builds (its
+    ``make_predict_function`` wraps ``self(x, training=False)`` the same way), so the memory
+    planner still reuses buffers and the same tile completes in 33 s.
 
     Graph and eager agree to ~1e-6 relative (float summation order), which is four orders of
     magnitude below the 1-count quantization of the reference's own uint16 output.
     """
-    out = model.predict_on_batch(x)
-    return np.asarray(out[0]), np.asarray(out[1])
+    fn = _FORWARD_FNS.get(model)
+    if fn is not None:
+        return fn
+    import tensorflow as tf
+
+    # `reduce_retracing` because the LAST tile of a plane can be smaller than the rest when
+    # the extent is not a whole number of windows; without it each such shape traces its own
+    # graph. The model's input shape is otherwise constant for a whole pull.
+    @tf.function(reduce_retracing=True)
+    def _call(xx):
+        return model(xx, training=False)
+
+    # Keyed on the model in a WeakKeyDictionary rather than set as an attribute on it: Keras 3
+    # tracks attribute assignment on a Layer/Model and would take the tf.function into the
+    # model's own object graph, which is both surprising and a route to it being serialized.
+    _FORWARD_FNS[model] = _call
+    return _call
+
+
+def _is_output_container(out) -> bool:
+    """Whether ``out`` holds SEVERAL model outputs, as opposed to being one of them.
+
+    Tolerant on purpose, and asymmetrically so: the crash this exists to prevent came from a
+    type-keyed dispatch table that did not recognize a sequence, so the test here is about
+    BEHAVIOUR (is it a sequence?) rather than identity (is it exactly a ``list``?). The
+    reported traceback named the type ``'list'``, but tracked-sequence wrappers vary across TF
+    and Keras versions and a future one need not subclass ``list`` at all.
+
+    A tensor or array is decisively NOT a container, and that check comes first: both are
+    iterable and sized, so a Sequence test alone would split a single output tensor into its
+    first-axis slices — a far worse failure than the one being fixed, because it would return
+    plausible arrays of the wrong thing.
+    """
+    if isinstance(out, np.ndarray) or hasattr(out, "numpy") or hasattr(out, "dtype"):
+        return False
+    if isinstance(out, (list, tuple)):
+        return True
+    import collections.abc as _abc
+    return isinstance(out, _abc.Sequence) and not isinstance(out, (str, bytes))
+
+
+def _two_outputs(out) -> Tuple[np.ndarray, np.ndarray]:
+    """The dual-stage model's ``(denoised, deconvolved)`` as numpy, from whatever container
+    the graph returned.
+
+    ``isinstance`` rather than an exact type check, deliberately — that is the whole repair
+    described in :func:`_graph_forward`. A tracked ``list`` subclass must unpack exactly like a
+    ``list``, because it *is* one; only a third party's type-keyed dispatch table thinks
+    otherwise.
+
+    One level of nesting is unwrapped so a ``[[den, dec]]`` batch structure reads the same as
+    ``[den, dec]``; anything else is a hard error naming what came back, because silently
+    taking the first two of an unexpected structure is how you get an output that is quietly
+    the wrong head.
+    """
+    seq = list(out) if _is_output_container(out) else [out]
+    if len(seq) == 1 and _is_output_container(seq[0]):
+        seq = list(seq[0])
+    if len(seq) != 2:
+        raise ValueError(
+            f"zs-deconvnet: the network returned {len(seq)} output(s) "
+            f"({type(out).__name__}), but the dual-stage architecture has exactly two heads "
+            f"(denoised, deconvolved). This is a bug in the model build, not a user setting.")
+    return (np.asarray(seq[0].numpy() if hasattr(seq[0], "numpy") else seq[0]),
+            np.asarray(seq[1].numpy() if hasattr(seq[1], "numpy") else seq[1]))
+
+
+def _forward(model, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """One forward pass, in GRAPH mode — ``(denoised, deconvolved)`` as numpy.
+
+    See :func:`_graph_forward` for why this owns its own ``tf.function`` instead of calling
+    ``Model.predict_on_batch``, and :func:`_two_outputs` for the unpacking.
+    """
+    return _two_outputs(_graph_forward(model)(x))
 
 
 def tile_plan(extent: int, window: int, overlap: int) -> Tuple[List[int], int, int]:
@@ -1515,6 +1613,252 @@ def infer_3d(vol: np.ndarray, *, arch: str = "rcan3d", weights_path: str = "",
     if int(damping_length) > 0:
         dec = fourier_damp(dec, int(damping_length), int(damping_width))
     return (prctile_norm(den, norm_low, 100.0), prctile_norm(dec, norm_low, 100.0))
+
+
+# ── validation: the paper's own evaluation protocol ───────────────────────────
+#
+# Methods, "Data post-processing and SR image evaluation" (Eq. 13-14) and the Discussion's
+# pointer to SQUIRREL (ref 54, Culley et al. 2018). Both answer the same question — is this
+# sharp image CONSISTENT with the diffraction-limited measurement? — and both do it the same
+# way: push the sharp image back through the microscope and compare on the measured grid.
+# They differ only in which reference is available and which statistic is reported, so they
+# share one implementation here.
+#
+# What this can and cannot see, stated plainly because it decides how much the numbers are
+# worth: re-blurring detects structure the network ADDED (it will not survive the round trip),
+# and is blind to faint structure the network REMOVED — removing a few dim photons barely
+# moves a re-blurred image. That second failure is the paper's own Supplementary Fig. 28a
+# ("ZS-DeconvNet may mistake extremely low fluorescence signals as photon noise"), which is
+# why :func:`faint_signal_retention` exists alongside these.
+
+def linear_match(img: np.ndarray, ref: np.ndarray) -> Tuple[float, float]:
+    """``(a, b)`` minimizing ``|a*img + b - ref|^2`` — the paper's Eq. 14.
+
+    The network's output is on an arbitrary scale (its input was percentile-normalized and
+    its head is a bare ``relu``), so a raw difference against a reference would measure the
+    scale mismatch and call it error. The paper fits this transform for EVERY method it
+    compares, which is what makes RL / sparse-deconv / ZS-DeconvNet comparable at all —
+    reproduce that or the comparison is meaningless.
+
+    Closed form rather than an optimizer: it is an ordinary least-squares line fit.
+    """
+    x = np.asarray(img, dtype=np.float64).ravel()
+    y = np.asarray(ref, dtype=np.float64).ravel()
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size < 2:
+        return 1.0, 0.0
+    vx = float(x.var())
+    if vx <= 0:
+        return 0.0, float(y.mean())
+    a = float(((x - x.mean()) * (y - y.mean())).mean() / vx)
+    return a, float(y.mean() - a * x.mean())
+
+
+def _blur_edge(a: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Convolve with EDGE-replicated borders, keeping the input's shape.
+
+    ``fftconvolve(mode="same")`` zero-pads, and for a *metric* that is not acceptable: a
+    constant background is attenuated in a border ring the width of the kernel, and since a
+    real image's DC pedestal dwarfs its structure, that ring then dominates the comparison.
+    Measured on the selftest fixture, adding a flat offset of 9 to an otherwise PERFECT
+    candidate dropped its RSP from 1.000 to **0.070** — the metric was reporting the padding
+    convention, not the image. Edge replication makes a constant exactly invariant, so the
+    score is unchanged by any affine rescaling of the input (which is the whole point of
+    pairing it with :func:`linear_match`).
+
+    Padding then cropping keeps the FFT's speed, which matters because the 3D path convolves
+    whole volumes. Note this deliberately does NOT match the reference's training loss, which
+    convolves with ``padding='same'`` zero-padding: there the padding is part of what the
+    network learns against, whereas here it is a measurement artifact.
+    """
+    from scipy.signal import fftconvolve
+    pad = [(int(s) // 2, int(s) // 2) for s in k.shape]
+    padded = np.pad(a, pad, mode="edge")
+    out = fftconvolve(padded, k / (k.sum() or 1.0), mode="same")
+    sel = tuple(slice(lo, lo + n) for (lo, _hi), n in zip(pad, a.shape))
+    return out[sel]
+
+
+def degrade_to_reference(sr: np.ndarray, ref: np.ndarray, psf: np.ndarray, *,
+                         blur: bool = True) -> np.ndarray:
+    """Push a sharp image back through the microscope onto ``ref``'s grid — steps 1-2 of the
+    paper's Eq. 13 protocol, and the ``out_mul_otf`` artifact ``Train_ZSDeconvNet_3D.py``
+    writes every validation interval.
+
+    Convolve with the PSF, then downsample to the reference's shape. An integer ratio is
+    reduced by BLOCK MEAN, which is what a detector actually does when it integrates over a
+    larger pixel; a non-integer ratio falls back to first-order ``zoom``. Getting this
+    backwards (interpolating where a mean belongs) biases the comparison toward whichever
+    image is smoother.
+
+    ``blur=False`` skips the convolution and only resamples. **This is not an optimization —
+    getting it wrong inverts the result.** The paper degrades "**SR** images" (Methods, step
+    1): the PSF is applied because a super-resolved image has to be pushed back through the
+    optics before it can be compared to a diffraction-limited reference. Applying it to a
+    candidate that is ALREADY diffraction-limited — a raw noisy frame, or the denoised head —
+    adds a second blur the reference never had, and since a σ≈2.7 px Gaussian averages ~100
+    pixels it suppresses precisely the noise the comparison is supposed to penalize. Measured
+    on the lysosome case, blurring the raw noisy input lifted it from 30.3 to 37.1 dB — level
+    with ZS-DeconvNet's own output, i.e. the metric stopped being able to tell them apart.
+    So the caller must say what kind of image it is holding; this function cannot know.
+    """
+    a = np.asarray(sr, dtype=np.float64)
+    r = np.asarray(ref, dtype=np.float64)
+    k = np.asarray(psf, dtype=np.float64)
+    if k.ndim != a.ndim:
+        raise ValueError(f"degrade_to_reference: PSF is {k.ndim}D but image is {a.ndim}D")
+    blurred = _blur_edge(a, k) if blur else a
+    if blurred.shape == r.shape:
+        return blurred
+    ratios = [s // t for s, t in zip(blurred.shape, r.shape)]
+    if all(q >= 1 for q in ratios) and \
+            all(s == t * q for s, t, q in zip(blurred.shape, r.shape, ratios)):
+        out = blurred
+        for ax, q in enumerate(ratios):          # block mean, one axis at a time
+            if q > 1:
+                shape = list(out.shape)
+                shape[ax:ax + 1] = [r.shape[ax], q]
+                out = out.reshape(shape).mean(axis=ax + 1)
+        return out
+    from scipy.ndimage import zoom as ndzoom
+    return ndzoom(blurred, [t / s for s, t in zip(blurred.shape, r.shape)], order=1)
+
+
+def resolution_scaled_metrics(sr: np.ndarray, ref: np.ndarray, psf: np.ndarray, *,
+                              blur: bool = True) -> Dict[str, Any]:
+    """Compare a sharp image against a diffraction-limited reference — the paper's Eq. 13-14
+    PSNR **and** the SQUIRREL statistics, which are the same computation read two ways.
+
+    ``ref`` decides what the numbers MEAN, and the distinction matters:
+
+    * a **high-SNR** acquisition of the same field ⇒ this is the paper's PSNR, an accuracy
+      measure (its Fig. 1d/3d numbers);
+    * the **noisy input itself** ⇒ this is SQUIRREL, a self-consistency measure. No ground
+      truth needed, and the Discussion recommends exactly this for spotting hallucination.
+
+    ``blur`` says whether the CANDIDATE is super-resolved and so needs pushing back through
+    the optics first. Pass ``False`` for a candidate already at the reference's resolution (a
+    raw frame, the denoised head) — see :func:`degrade_to_reference`, where getting this wrong
+    is shown to make a noisy input score as well as a deconvolution.
+
+    Returns ``psnr`` (dB, reference min-max normalized to ``[0,1]`` per step 2 so the peak is
+    1.0), ``rsp`` (Resolution-Scaled Pearson → 1 is perfect), ``rse`` (Resolution-Scaled
+    Error, an RMSE on that ``[0,1]`` scale → 0 is perfect), the fitted ``(a, b)``, and the
+    per-pixel ``error_map`` — the map is the useful part, because a single number cannot tell
+    you that the discrepancy is concentrated on three bright objects.
+    """
+    r = np.asarray(ref, dtype=np.float64)
+    lo, hi = float(np.nanmin(r)), float(np.nanmax(r))
+    x = (r - lo) / ((hi - lo) or 1.0)                       # step 2: reference -> [0,1]
+    conv = degrade_to_reference(sr, r, psf, blur=blur)      # steps 1-2
+    a, b = linear_match(conv, x)                            # Eq. 14
+    matched = a * conv + b
+    err = matched - x
+    mse = float(np.nanmean(err ** 2))
+    sx, sm = float(np.nanstd(x)), float(np.nanstd(matched))
+    rsp = (float(np.nanmean((x - np.nanmean(x)) * (matched - np.nanmean(matched)))
+                 / (sx * sm)) if sx > 0 and sm > 0 else float("nan"))
+    return {"psnr": (10.0 * np.log10(1.0 / mse)) if mse > 0 else float("inf"),
+            "rsp": rsp, "rse": float(np.sqrt(mse)), "a": a, "b": b,
+            "error_map": np.abs(err), "degraded": matched, "reference01": x}
+
+
+def _downsample_like(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Block-mean ``img`` onto ``ref``'s grid (an upsampled output), else return it as-is."""
+    a = np.asarray(img, dtype=np.float64)
+    if a.shape == ref.shape:
+        return a
+    q = [s // t for s, t in zip(a.shape, ref.shape)]
+    if all(v >= 1 for v in q) and all(s == t * v
+                                      for s, t, v in zip(a.shape, ref.shape, q)):
+        for ax, v in enumerate(q):
+            if v > 1:
+                shape = list(a.shape)
+                shape[ax:ax + 1] = [ref.shape[ax], v]
+                a = a.reshape(shape).mean(axis=ax + 1)
+        return a
+    raise ValueError(f"_downsample_like: {a.shape} is not an integer multiple of "
+                     f"{ref.shape}")
+
+
+def faint_signal_retention(before: np.ndarray, after: np.ndarray, *,
+                           psf: Optional[np.ndarray] = None, n_sigma: float = 5.0,
+                           bright_percentile: float = 90.0,
+                           max_points: int = 4000) -> Dict[str, Any]:
+    """Did the dimmest REAL structure survive? — the paper's Supplementary Fig. 28a failure.
+
+    The limitation the paper leads with is that ZS-DeconvNet "may mistake extremely low
+    fluorescence signals as photon noise, thereby weakening them in the output".
+    :func:`resolution_scaled_metrics` is blind to it: erasing a few dim photons barely
+    perturbs a re-blurred image, so an output that deleted every faint punctum still scores a
+    good RSP. This measures it directly.
+
+    **Detecting the objects is the whole difficulty, and the obvious way is wrong.** A first
+    cut took local maxima with a fixed prominence, and scored the authors' OWN published
+    output at 0.09 median retention — i.e. it claimed their denoiser destroys 99 % of faint
+    signal. It does not: in a noisy frame most single-pixel local maxima ARE noise, so that
+    metric detected noise and then penalized the network for correctly removing it. (Caught
+    only because the golden data made the right answer knowable — the reason `case_metrics`
+    validates the metric before it is trusted on data with no ground truth.)
+
+    So detection is done the way a spot detector does it:
+
+    * **matched filter** — correlate with the PSF (or a 1 px Gaussian if none is given), which
+      is the optimal linear filter for a PSF-shaped object in white noise and suppresses
+      single-pixel spikes that no optical system could produce;
+    * **noise-relative threshold** — require prominence ``>= n_sigma`` times the robust
+      (MAD-estimated) noise level of that filtered image, rather than an absolute number that
+      means different things on different data. 5 sigma is the usual detection bar;
+    * **intensity-matched comparison** — ``after`` is linearly matched to ``before``
+      (:func:`linear_match`, the paper's own Eq. 14 device) before contrasts are compared, so
+      a denoiser that legitimately changed the overall scale is not scored as signal loss.
+
+    Restricted to objects dimmer than ``bright_percentile`` because a bright nucleus was never
+    at risk and including it would dilute the answer toward 1.0.
+
+    Returns the point count, the median retained contrast ratio (→1 is perfect) and the
+    fraction that lost more than half their contrast.
+    """
+    from scipy.ndimage import maximum_filter, uniform_filter
+    b = np.asarray(before, dtype=np.float64)
+    a_img = _downsample_like(after, b)
+    a, off = linear_match(a_img, b)                    # put both on ONE intensity scale
+    a_img = a * a_img + off
+
+    k = (np.asarray(psf, dtype=np.float64) if psf is not None and np.ndim(psf) == b.ndim
+         else gaussian_psf_from_sigmas((1.0,) * b.ndim).astype(np.float64))
+    k = k / (k.sum() or 1.0)
+
+    def prominence(img: np.ndarray) -> np.ndarray:
+        """Matched-filtered image minus its local background — a band-pass whose peaks are
+        PSF-shaped objects rather than single hot pixels. Edge-replicated for the same reason
+        `_blur_edge` exists: a zero-padded border ring would read as a huge dark 'object'."""
+        m = _blur_edge(img, k)
+        return m - uniform_filter(m, size=9, mode="nearest")
+
+    p_before = prominence(b)
+    p_after = prominence(a_img)
+    # robust noise level of the band-passed image: MAD, so real structure does not inflate it
+    mad = float(np.median(np.abs(p_before - np.median(p_before))))
+    sigma = 1.4826 * mad
+    if sigma <= 0:
+        return {"n": 0, "median_retained": float("nan"), "lost_fraction": float("nan"),
+                "capped": False, "n_sigma": float(n_sigma), "sigma": 0.0}
+    peaks = (maximum_filter(p_before, size=3, mode="nearest") == p_before) & \
+            (p_before >= float(n_sigma) * sigma) & \
+            (b <= float(np.percentile(b, bright_percentile)))
+    idx = np.argwhere(peaks)
+    if idx.size == 0:
+        return {"n": 0, "median_retained": float("nan"), "lost_fraction": float("nan"),
+                "capped": False, "n_sigma": float(n_sigma), "sigma": sigma}
+    order = np.argsort(-p_before[tuple(idx.T)])
+    capped = len(order) > max_points
+    sel = tuple(idx[order[:max_points]].T)
+    ratio = p_after[sel] / np.maximum(p_before[sel], 1e-12)
+    return {"n": int(len(ratio)), "median_retained": float(np.median(ratio)),
+            "lost_fraction": float((ratio < 0.5).mean()), "capped": bool(capped),
+            "n_sigma": float(n_sigma), "sigma": sigma}
 
 
 def fourier_damp(vol: np.ndarray, length: int, width: int) -> np.ndarray:

@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
-from nodegraph.iterate import MAX_VARIABLES as _ITERATE_MAX_VARIABLES
+from nodegraph.iterate import (
+    MAX_VARIABLES as _ITERATE_MAX_VARIABLES, SEG_FROM as _SEG_FROM, SEG_TO as _SEG_TO)
 from nodegraph.registry import (
     Granularity,
     InDataset,
@@ -98,30 +99,42 @@ def _iterate_values(ctx: EvalContext, slot: int, kind: str, source: str) -> Tupl
 def _compute_iterate(ctx: EvalContext) -> Dataset:
     """Choose which iteration's result to preserve, and stamp what won.
 
-    **Resolved spec.** Category ``flow``; ``collect`` is a ``multi`` Dataset input carrying
-    one payload per minted iteration (the rewrite appends them in iteration order, and the
-    engine walks preds in canonical socket order, so the order is stable). Output is one of
-    those payloads plus ``Global`` ``sweep_<var>`` scalars for the values that produced it.
+    **Resolved spec.** Category ``flow``; the segment sockets ``from`` (optional, structural
+    — the rewrite consumes it and no compute ever reads it) and ``to`` (required) say which
+    stretch of the graph is iterated. ``to`` is ``multi`` because this one compute serves two
+    roles: on the CARD it receives a single payload, and on the SELECTOR the rewrite mints
+    under the end node's id it receives one payload per minted iteration, in iteration order
+    (the engine walks preds in canonical socket order, so the order is stable). Output is one
+    of those payloads plus ``Global`` ``sweep_<var>`` scalars for the values that produced it.
     No 2D/3D lever and no axis change of its own: it selects among results, it does not
     touch pixels — ``TILEABLE``, no kernel axes.
 
-    **It degrades to identity.** Pull a ``flow.iterate`` node in a graph nobody rewrote and
-    it returns its single collected input, resolving what it can from its own sockets. That
-    matters because the rewrite lives in the *materialize* path: a hand-built headless graph
-    that skipped it must behave sanely rather than fail obscurely.
+    **Three states, one function.** ``__passthrough__`` → the card after a rewrite: hand back
+    what the selector chose, untouched. ``__iters__`` → the selector: choose and stamp. And
+    neither → a graph nobody rewrote, where it returns its single input rather than failing
+    obscurely, because the rewrite lives in the *materialize* path and a hand-built headless
+    graph may legitimately skip it. That last branch still REFUSES when the sockets describe
+    a real sweep: a silent single run is the failure this node exists to make impossible.
     """
     from nodegraph.iterate import (
-        ITERS_KEY, MAX_VARIABLES, MODE_FEEDBACK, PRESERVE_BEST, PRESERVE_FIRST,
-        PRESERVE_LAST, SEARCH_SECANT, SRC_LIST, SWEEP_LABELS_KEY, SWEEP_ROWS_KEY,
-        TYPE_NUMBER, var_mode_names,
+        ITERS_KEY, MAX_VARIABLES, MODE_FEEDBACK, OWNER_KEY, PASSTHROUGH_KEY, PRESERVE_BEST,
+        PRESERVE_FIRST, PRESERVE_LAST, SEARCH_SECANT, SEG_TO, SRC_LIST, SWEEP_LABELS_KEY,
+        SWEEP_OWNER_KEY, SWEEP_ROWS_KEY, TYPE_NUMBER, var_mode_names,
     )
-    collected = ctx.input("collect")
+    collected = ctx.input(SEG_TO)
     if not collected:
         raise ValueError(
-            "Iterate: nothing is wired into 'collect' — connect the END of the chain you "
-            "are iterating back into it, so the sweep has results to compare")
+            "Iterate: the segment has no END — wire the LAST node of the series you want "
+            "iterated into this card's 'to' input. That node is where the iterated result "
+            "comes out.")
     if not isinstance(collected, tuple):
         collected = (collected,)
+    if ctx.params.get(PASSTHROUGH_KEY):
+        # The CARD, after the rewrite minted a selector under the end node's id. The choice
+        # has already been made there; making it again here — over a single payload, with
+        # the full iteration table still in `params` — would stamp iteration 0's values onto
+        # whatever the selector actually picked.
+        return collected[0]
     modes = ctx.params.get("__modes__", {})
     mode = str(modes.get("mode", "sweep"))
     # Feedback IS an optimization, so its answer is the best probe. Forcing it here (rather
@@ -189,12 +202,13 @@ def _compute_iterate(ctx: EvalContext) -> Dataset:
                 str(modes.get(source_mode) or SRC_LIST))))
         if planned > 1 or len(collected) > 1:
             raise ValueError(
-                f"Iterate: this node describes {planned} iterations but nothing was "
-                f"iterated. Either no variable output is wired to a parameter (drag one "
-                f"onto the control you want to sweep — the target may also have been muted "
-                f"or deleted), or the graph reached the engine without the iterate rewrite "
-                f"(headlessly, build the run graph through nodegraph.iterate.unroll, or "
-                f"nodelab_v2.ops.headless_engine which does it for you).")
+                f"Iterate: this card describes {planned} iterations but nothing was "
+                f"iterated. Either no variable is pointed at a parameter INSIDE the segment "
+                f"(pick one in the card's panel, or drag a variable output onto the control "
+                f"— the target may also have been muted or deleted), or the graph reached "
+                f"the engine without the iterate rewrite (headlessly, build the run graph "
+                f"through nodegraph.iterate.unroll, or nodelab_v2.ops.headless_engine which "
+                f"does it for you).")
         return collected[0]
     for label, value in zip(labels, values):
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -210,7 +224,9 @@ def _compute_iterate(ctx: EvalContext) -> Dataset:
               "values": list(rows[k].get("values", ())) if k < len(rows) else [],
               "won": k == pick}
              for k in range(len(collected))]
-    out = out.with_metadata(**{SWEEP_ROWS_KEY: table, SWEEP_LABELS_KEY: list(labels)})
+    out = out.with_metadata(**{SWEEP_ROWS_KEY: table, SWEEP_LABELS_KEY: list(labels),
+                               SWEEP_OWNER_KEY: str(ctx.params.get(OWNER_KEY) or
+                                                    ctx.node_id)})
     if scores[pick] is not None:
         out = out.with_layer(Domain.GLOBAL, "sweep_metric",
                              np.asarray(float(scores[pick])))
@@ -368,8 +384,25 @@ register_node(
         "mode": {"feedback": frozenset({Domain.GLOBAL}), "sweep": frozenset()},
         "preserve": {"best": frozenset({Domain.GLOBAL})},
     },
+        # `to` is declared FIRST because the engine requires exactly the first active
+        # Dataset socket (`_require_primary_input`) — which is the right one to require: a
+        # segment with no end has nowhere to put a result, while `from` is genuinely
+        # optional. So the ports read To-then-From on the card, and the labels say which.
     inputs=[
-        InDataset("collect", multi=True, label="Collect"),
+        InDataset(_SEG_TO, multi=True, label="To · series end",
+                  description=
+                  "The LAST node of the series to iterate — wire its output here. This is "
+                  "also where the result comes OUT: that node serves the kept iteration to "
+                  "everything already reading it, so nothing downstream is re-wired and the "
+                  "sweep runs by itself whenever any of it is viewed. Required; without it "
+                  "the card iterates nothing."),
+        InDataset(_SEG_FROM, multi=False, label="From · series start",
+                  description=
+                  "The FIRST node of the series to iterate — wire its output here. Optional: "
+                  "leave it empty and the series starts at whatever parameters this card "
+                  "drives. Wiring it PINS the start, so everything above stays loop-invariant "
+                  "(computed once, shared by every iteration) and the stretch cannot quietly "
+                  "grow the day you point a variable at a node further up."),
         InString("metric", "Metric", field=False, default="",
                  layer_in=Domain.GLOBAL,
                  available_in={"preserve": frozenset({"best"})},
@@ -527,9 +560,12 @@ register_node(
         *_ITER_MODES,
     ],
     granularity=Granularity.TILEABLE, kernel_axes=frozenset(),
-    description="Run the chain in front of it once per parameter value and keep one "
-                "result. Wire the end of the chain into Collect, then pick what to iterate "
-                "from the panel's dropdown (it lists every parameter in that chain) or drag "
-                "a variable output onto the control itself, and flip through the results on "
-                "the Viewer's iteration strip. 'best' picks by a Global scalar; 'feedback' "
-                "searches for the value that maximizes it or hits a target.")
+    description="Re-run a stretch of the graph once per parameter value and keep one "
+                "result. Wire the segment — the last node of the series into 'To', "
+                "optionally the first into 'From' — then pick what to iterate from the "
+                "panel's dropdown (it lists every parameter in that stretch). The result "
+                "comes out of the series' own end node, so anything already reading it "
+                "keeps working and the sweep runs by itself whenever you view it. Flip "
+                "through the iterations on the Viewer's strip; 'best' picks by a Global "
+                "scalar and 'feedback' searches for the value that maximizes it or hits a "
+                "target.")

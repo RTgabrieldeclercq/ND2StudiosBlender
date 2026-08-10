@@ -1,6 +1,7 @@
 """Canonical snapshot of the whole node catalog — the behaviour-preservation gate for a
 refactor that MOVES node definitions between modules (the per-node split, V2.20).
 
+    python scripts/_catalog_snapshot.py            # check (the default)
     python scripts/_catalog_snapshot.py check      # against the committed baseline
     python scripts/_catalog_snapshot.py save       # re-bless it (only when a
                                                   # catalog change is intended)
@@ -211,7 +212,11 @@ def _diff(a: dict, b: dict) -> list:
 
 
 def main() -> int:
-    mode = sys.argv[1] if len(sys.argv) > 1 else "save"
+    # `check`, not `save`. The old default meant that running this bare — the obvious thing to
+    # do when you want to know whether the catalog moved — silently overwrote the baseline it
+    # exists to defend and then printed a success line. There is no reading of "I ran the gate
+    # with no arguments" that means "destroy the reference copy".
+    mode = sys.argv[1] if len(sys.argv) > 1 else "check"
     path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "catalog_baseline.json")
     snap = snapshot()

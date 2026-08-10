@@ -1,0 +1,242 @@
+{
+  "format": "lablink.recipe/1",
+  "name": "cell-segmentation",
+  "title": "Cell segmentation and measurement",
+  "description": "Segments cells in one channel and measures them. Selects a channel, removes uneven background with a micron-scale top-hat, separates touching objects with a watershed on an automatic threshold, then measures area and intensity per object -- intensities on the ORIGINAL pixels, not the background-corrected ones, so the numbers are the microscope's. Every spatial knob is in real units and is converted using the image's own calibration, so the same recipe behaves the same across objectives.",
+  "workflow": "nd2studios",
+  "graph": "graph.nd2graph.json",
+  "allow_zones": false,
+  "targets": {
+    "primary": "measure"
+  },
+  "inputs": [
+    {
+      "role": "image",
+      "node": "load",
+      "required": true,
+      "match": [
+        "*.tif",
+        "*.tiff",
+        "*.nd2"
+      ]
+    }
+  ],
+  "knobs": [
+    {
+      "name": "channel",
+      "node": "pick",
+      "param": "channels",
+      "kind": "param",
+      "type": "channel_list",
+      "max_items": 1,
+      "label": "Channel to segment",
+      "help": "Zero-based index into the channels your sidecar declares, in the same order. One channel; segment a second by running again."
+    },
+    {
+      "name": "dim",
+      "node": "segment",
+      "param": "dim",
+      "kind": "mode",
+      "type": "enum",
+      "enum": [
+        "2D",
+        "3D"
+      ],
+      "default": "2D",
+      "label": "2D or 3D",
+      "help": "2D segments each z-plane independently and is the right default for well-separated planes. 3D treats the stack as a volume and needs z_step_um in the sidecar. On a single plane this makes no difference."
+    },
+    {
+      "name": "background_um",
+      "node": "background",
+      "param": "radius",
+      "kind": "param",
+      "type": "float",
+      "unit": "um",
+      "min": 0.1,
+      "max": 200.0,
+      "default": 5.0,
+      "label": "Background scale",
+      "help": "Top-hat radius in microns. Set it a little larger than the objects you want to keep: structure larger than this is treated as background and removed."
+    },
+    {
+      "name": "threshold_method",
+      "node": "segment",
+      "param": "level",
+      "kind": "mode",
+      "type": "enum",
+      "enum": [
+        "otsu",
+        "li",
+        "yen",
+        "triangle",
+        "mean"
+      ],
+      "default": "otsu",
+      "label": "Threshold method",
+      "help": "How the foreground cut-off is chosen automatically. Otsu suits bimodal images; Li and Triangle cope better with sparse or dim objects."
+    },
+    {
+      "name": "separate_touching",
+      "node": "segment",
+      "param": "method",
+      "kind": "mode",
+      "type": "enum",
+      "enum": [
+        "watershed",
+        "threshold"
+      ],
+      "default": "watershed",
+      "label": "Separate touching cells",
+      "help": "watershed splits objects that touch; threshold leaves them merged as one. Use threshold when objects are already well separated -- it is faster and cannot over-split."
+    },
+    {
+      "name": "min_separation_um",
+      "node": "segment",
+      "param": "min_distance",
+      "kind": "param",
+      "type": "float",
+      "unit": "um",
+      "min": 0.0,
+      "max": 100.0,
+      "default": 0.5,
+      "label": "Minimum separation",
+      "help": "How far apart two watershed seeds must be. Roughly the closest two cell centres you expect. Too small over-splits one cell into several."
+    },
+    {
+      "name": "min_area_um2",
+      "node": "segment",
+      "param": "min_area",
+      "kind": "param",
+      "type": "float",
+      "unit": "um2",
+      "min": 0.0,
+      "max": 1000000.0,
+      "default": 0.0,
+      "label": "Minimum object area (2D only)",
+      "help": "Objects smaller than this are discarded -- the debris filter. 0 keeps everything. In real microns, so it means the same thing at any magnification.",
+      "applies_when": {
+        "knob": "dim",
+        "equals": "2D"
+      }
+    },
+    {
+      "name": "max_area_um2",
+      "node": "segment",
+      "param": "max_area",
+      "kind": "param",
+      "type": "float",
+      "unit": "um2",
+      "min": 0.0,
+      "max": 1000000.0,
+      "default": 0.0,
+      "label": "Maximum object area (2D only)",
+      "help": "Objects larger than this are discarded -- catches merged clumps. 0 means no upper limit.",
+      "applies_when": {
+        "knob": "dim",
+        "equals": "2D"
+      }
+    },
+    {
+      "name": "min_volume_um3",
+      "node": "segment",
+      "param": "min_volume",
+      "kind": "param",
+      "type": "float",
+      "unit": "um3",
+      "min": 0.0,
+      "max": 1000000000.0,
+      "default": 0.0,
+      "label": "Minimum object volume (3D only)",
+      "help": "The 3D equivalent of the minimum-area filter.",
+      "applies_when": {
+        "knob": "dim",
+        "equals": "3D"
+      }
+    },
+    {
+      "name": "max_volume_um3",
+      "node": "segment",
+      "param": "max_volume",
+      "kind": "param",
+      "type": "float",
+      "unit": "um3",
+      "min": 0.0,
+      "max": 1000000000.0,
+      "default": 0.0,
+      "label": "Maximum object volume (3D only)",
+      "help": "Upper bound in cubic microns; 0 means no limit.",
+      "applies_when": {
+        "knob": "dim",
+        "equals": "3D"
+      }
+    },
+    {
+      "name": "fill_holes",
+      "node": "segment",
+      "param": "fill_holes",
+      "kind": "param",
+      "type": "bool",
+      "default": true,
+      "label": "Fill holes in objects",
+      "help": "Closes interior gaps so a cell with a dim nucleus counts as one object rather than a ring."
+    },
+    {
+      "name": "stats",
+      "node": "measure",
+      "param": "stats",
+      "kind": "param",
+      "type": "string",
+      "max_len": 64,
+      "pattern": "[a-z]+(,[a-z]+)*",
+      "default": "mean,max,min,sum,median,count",
+      "label": "Statistics per object",
+      "help": "Comma-separated intensity statistics per object, alongside its area and centroid. Valid names: mean, max, min, sum, median, count. An unknown name is refused when the session opens, not silently dropped."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "measurements",
+      "kind": "table",
+      "format": "csv",
+      "from": "measure",
+      "policy": "auto",
+      "filename": "{stem}_measurements.csv"
+    },
+    {
+      "name": "summary",
+      "kind": "metrics",
+      "policy": "auto",
+      "filename": "{stem}_summary.json"
+    },
+    {
+      "name": "outlines",
+      "kind": "quicklook",
+      "from": "segment",
+      "policy": "auto",
+      "filename": "{stem}_outlines.png"
+    },
+    {
+      "name": "labels",
+      "kind": "image_stack",
+      "from": "segment",
+      "policy": "pull",
+      "filename": "{stem}_labels.tif"
+    }
+  ],
+  "requires": {
+    "capabilities": [],
+    "metadata": [
+      "pixel_size_um"
+    ],
+    "min_worker_protocol": 1
+  },
+  "limits": {
+    "silence_timeout_s": 300,
+    "hard_timeout_s": 0
+  },
+  "expected_runtime_s": {
+    "typical": 20,
+    "worst": 600
+  }
+}

@@ -148,6 +148,25 @@ def gran_color(name: str) -> QColor:
     return GRAN.get(name, MUTED)
 
 
+#: Short forms of the footprint names, for a card whose granularity band also carries a
+#: population pill (V2.27). ``WHOLE VOLUME`` is 65 px and would run under a right-aligned
+#: 96 px pill; ``VOL`` is 25 px and clears it. Abbreviating rather than widening the band keeps
+#: every row below it at the y it has always been at.
+GRAN_ABBR = {
+    "tileable": "TILE", "whole_plane": "PLANE", "whole_volume": "VOL",
+    "whole_series": "SER", "multi_view": "MULTI",
+}
+
+
+def gran_abbr(name: str) -> str:
+    """The short footprint name, or the raw name upper-cased when it is unknown.
+
+    ``.get``-safe like :func:`gran_color`, and for the reason recorded above ``DOMAIN``: a
+    subscript on a hand-written table turns a new enum member into a KeyError at import time,
+    which takes the whole window down."""
+    return GRAN_ABBR.get(name, str(name).replace("_", " ").upper())
+
+
 def menu_qss() -> str:
     """Styling for a **parentless** popup :class:`QMenu` (the canvas context menu). The
     window stylesheet can't reach it — a popup created without a parent widget is not in

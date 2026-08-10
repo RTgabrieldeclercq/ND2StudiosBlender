@@ -47,7 +47,7 @@ different box (or a bisect) needs no code edit:
 ``NODEGRAPH_MEMO_BYTES``         persistent Memo budget (default: RAM-derived)
 ``NODEGRAPH_PLANE_CACHE_BYTES``  GUI decoded-plane cache (default: RAM-derived)
 ``NODEGRAPH_FLOAT32``            ``1`` = stream in float32 (opt-in; changes numerics)
-``NODEGRAPH_GPU``                ``auto`` (default) / ``off`` / ``on`` (CuPy dispatch)
+``NODEGRAPH_GPU``                ``off`` (default) / ``auto`` / ``on`` (CuPy dispatch)
 ``NODEGRAPH_STORE_DIR``          redirect ``.b2nd`` ingest stores off slow media
 ===============================  =====================================================
 

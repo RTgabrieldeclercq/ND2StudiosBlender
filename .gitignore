@@ -36,6 +36,20 @@ models/
 /shared_detail.json
 nodelab_v2/scratch_none
 
+# Evidence logs (.claude/skills/evidence-log). The record is `log.jsonl`, the figures in
+# `img/`, `evidence_log.md`, and any `label/manifest.json` + its label CSV — those ARE the
+# justification for a threshold or a size prior and they get committed. Everything below is
+# regenerated from them by `render()` / `--archive`, and the label tiles are re-rendered
+# from the source file, so none of it belongs in history.
+CodeLog/live/**/index.html
+CodeLog/live/**/evidence_archive.html
+# `label*/` rather than `label/`: a sheet gets its own directory per variant (label_dc/ for
+# the deconvolved run) so the browser cannot re-attach an answer to a different tile.
+CodeLog/live/**/label*/img/
+# Cached pulls (realized pixels + label rasters). The size of the data rather than the size
+# of the code, and reproducible by re-running the chain that made them.
+CodeLog/live/**/cache/
+
 # OS / editor
 .DS_Store
 Thumbs.db

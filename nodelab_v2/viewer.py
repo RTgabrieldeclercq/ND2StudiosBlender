@@ -1005,6 +1005,9 @@ class ViewerPanel(QWidget):
         self._pal_key: Optional[int] = None
         self._pal_ds: Any = None                  # pins id(dataset) against reuse
         self._warned_palette = False
+        #: said once per session, not per repaint — a ragged structure table is reported by
+        #: `_member_layers` and would otherwise print on every frame of a scrub
+        self._warned_ragged = False
 
         # ── image (dominant: scroll-zoom + drag-pan; now fills the reclaimed header) ─
         # Prefer the GPU backend (contrast/colour/compositing in a shader, upload-once);
@@ -1069,7 +1072,12 @@ class ViewerPanel(QWidget):
             self._val_lbls[ax] = val
             self._play_btns[ax] = play
             self._fps_spins[ax] = fps
-        cv.addLayout(grid)
+        # The grid lives in a widget of its own so the compare pane can drop its whole
+        # cursor row when both panes share one (:meth:`set_axes_hidden`) — hiding a
+        # layout is not a thing Qt can do.
+        self._axes_box = QWidget()
+        self._axes_box.setLayout(grid)
+        cv.addWidget(self._axes_box)
 
         # ── the ITERATION strip (V2.19) ─────────────────────────────────────────
         # Deliberately NOT a fourth member of `_AXES`: iteration is not an acquisition
@@ -1251,6 +1259,13 @@ class ViewerPanel(QWidget):
         #: playback is held while the series is being decoded (:meth:`set_play_gate`) — the
         #: user asked to play and the answer is "in a moment", not "no".
         self._gated = False
+        #: advance the cursor on DELIVERY rather than on the wall clock — see
+        #: :meth:`set_play_pacing`. Set when the series being played is computed.
+        self._play_paced = False
+        #: paced playback only: the frame the cursor last asked for has not landed yet, and
+        #: since when (the wait is shown on the axis label, so a stall is never silent).
+        self._awaiting_frame = False
+        self._awaiting_since = 0.0
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._tick_play)
         self._last_frame_t: Optional[float] = None
@@ -1401,6 +1416,33 @@ class ViewerPanel(QWidget):
     def channels(self) -> Tuple[int, ...]:
         return tuple(sorted(self._active_channels)) or (0,)
 
+    def axes(self):
+        """The axes of the last delivered payload, or ``None`` before the first pull —
+        what the window compares to decide whether two panes' cursors can be linked."""
+        return self._axes
+
+    def set_cursor(self, m: Optional[int] = None, t: Optional[int] = None,
+                   z: Optional[int] = None) -> None:
+        """Move the M/T/Z cursor WITHOUT emitting :attr:`request_changed` — the linked
+        compare pane's half of "moving both at the same time". The window moves this
+        pane's strips to mirror the other pane's, then asks the runner for this pane's
+        planes itself; letting the move emit would bounce the request between the panes.
+        Values clamp to each strip's range (``None`` leaves that axis alone)."""
+        for ax, v in (("m", m), ("t", t), ("z", z)):
+            if v is None:
+                continue
+            sld = self._sliders[ax]
+            sld.blockSignals(True)
+            sld.setValue(min(max(0, int(v)), sld.maximum()))
+            sld.blockSignals(False)
+            self._sync_axis_label(ax)
+
+    def set_axes_hidden(self, on: bool) -> None:
+        """Drop (or restore) the whole M/T/Z cursor row. The compare pane hides its own
+        row while the two panes' metadata matches — one set of sliders then moves both —
+        and gets it back the moment the panes diverge."""
+        self._axes_box.setVisible(not bool(on))
+
     # ── solo-frame scope ───────────────────────────────────────────────────────
     def set_solo(self, totals: Optional[Tuple[int, int, int]]) -> None:
         """Enter the solo-frame scope with the SOURCE's ``(m_total, t_total, z_total)``, or
@@ -1501,6 +1543,7 @@ class ViewerPanel(QWidget):
         :mod:`view.overlay` node contributes above the payload's own channel count, and
         ``overlay_note`` the placement readout for the status line. Both empty for every
         other node, which is why nothing else has to know overlays exist."""
+        self._frame_landed()
         ovl = dict(overlay or {})
         if ovl != dict(getattr(self, "_overlay_chans", {}) or {}):
             self._axes_key = None          # the channel strip must rebuild for the new set
@@ -1586,6 +1629,7 @@ class ViewerPanel(QWidget):
     def show_planes(self, node_id: str, planes, axes, seconds: float) -> None:
         """Fast-path delivery (scrub/play): the dataset and axes are unchanged, so only
         the displayed frame moves — no axes/channel rebuild, no spreadsheet refresh."""
+        self._frame_landed()          # paced playback advances from HERE, not from the clock
         if axes is not None:
             self._axes = axes
         if not planes:
@@ -2422,10 +2466,34 @@ class ViewerPanel(QWidget):
     def play_gated(self) -> bool:
         return bool(getattr(self, "_gated", False))
 
+    def set_play_pacing(self, on_delivery: bool) -> None:
+        """Choose what advances the cursor during playback: the wall clock, or the frames.
+
+        The default is the wall clock with frame DROPPING, and it is right whenever a frame is
+        a read — the timer holds real time and a frame that arrives late is skipped rather
+        than shown late.
+
+        On a COMPUTED series it is exactly wrong. Nothing there can answer at 8 fps, so every
+        frame the timer asks for is superseded before it lands: the cursor races through the
+        whole T range while one stale volume appears every couple of minutes, under a strip
+        that has long since moved on. That is what "the 3D deconvolved set can't load frames"
+        looks like from the inside (2026-08-06). Advancing on delivery instead plays the
+        series at the speed it can be computed — every frame is shown, in order, and the
+        cursor never claims a frame that is not on screen.
+
+        Idempotent and safe to call while playing; the wait, if any, restarts."""
+        self._play_paced = bool(on_delivery)
+        self._awaiting_frame = False
+
+    def _frame_landed(self) -> None:
+        """A delivery (or a failure) settled the frame paced playback was waiting for."""
+        self._awaiting_frame = False
+
     def _stop_play(self) -> None:
         ax = self._playing_axis
         self._playing_axis = None
         self._gated = False
+        self._awaiting_frame = False
         self._play_timer.stop()
         if ax is not None:
             btn = self._play_btns[ax]
@@ -2443,14 +2511,27 @@ class ViewerPanel(QWidget):
         """Fire on the wall clock: advance the cursor and request the frame. The plane
         request is served from the warm cache (a miss decodes one small plane); if a tick
         arrives while the previous is still working, Qt coalesces the timeout — i.e. the
-        frame is dropped — so playback keeps real-time rather than lagging behind."""
+        frame is dropped — so playback keeps real-time rather than lagging behind.
+
+        Under :meth:`set_play_pacing` the tick does not advance while the last frame is still
+        being computed: dropping frames is the right answer only when the next one is a read.
+        The wait rides on the axis label, so a computed series looks like slow honest
+        playback and a wedged one is visible rather than a lit button doing nothing."""
         ax = self._playing_axis
         if ax is None:
+            return
+        if self._play_paced and self._awaiting_frame:
+            self._sync_axis_label(
+                ax, f" · computing {time.perf_counter() - self._awaiting_since:.0f}s")
             return
         sld = self._sliders[ax]
         nxt = sld.value() + 1
         if nxt > sld.maximum():
             nxt = 0
+        # armed BEFORE the move, so a frame served warm inside `setValue` clears it again on
+        # the way out and paced playback runs at full speed over the part that is resident
+        self._awaiting_frame = True
+        self._awaiting_since = time.perf_counter()
         sld.setValue(nxt)          # → _on_slider → request_changed → request_plane (fast)
 
     def _measure_fps(self) -> None:
@@ -2590,10 +2671,16 @@ class ViewerPanel(QWidget):
         self.cancel_pick(quiet=True)
         if req.surface == "instant":
             m, t, z, c = self.coords()
-            _ms, _ts, zs = self.frame_selection()
+            # The RAW picks plus the cursor, kept separate: a `frames` pick fills an axis with
+            # nothing ticked from the CURSOR (which is what makes it work on the single frame
+            # on screen), while `zrange` reads an empty Z strip as the whole stack. Two
+            # different fallbacks, so the resolution belongs in `picker`, per kind, rather
+            # than being pre-decided here.
+            ms, ts, zs = self.frame_selection()
             self.pick_committed.emit(req.node_id, instant_values(
                 req, channel=c, frame=t, channels=self.channels(),
-                z_picks=zs, z_total=(self._axes.z if self._axes is not None else 0)))
+                z_picks=zs, z_total=(self._axes.z if self._axes is not None else 0),
+                m_picks=ms, t_picks=ts, position=m, plane=z))
             return
         self._pick = PickSession(req, calib or Calibration())
         self._pick_bar.configure(req)
@@ -3656,7 +3743,23 @@ class ViewerPanel(QWidget):
 
     def _member_layers(self):
         """``{(domain, layer): {col: values}}`` for every Point/Label layer that carries
-        a joinable ``id,y,x`` triple — the member position source for Track trajectories."""
+        a joinable ``id,y,x`` triple — the member position source for Track trajectories.
+
+        **Every layer is clipped to its shortest column** (V2.27, reported 2026-08-06). A
+        structure instance is stored as one array per column under one layer name, and nothing
+        revalidates that they still agree once a second node has written onto it — a producer
+        that emits a column with a different row count leaves the instance RAGGED. That is not a
+        hypothetical: it crashed a run here with ``IndexError: index 208 is out of bounds for
+        axis 0 with size 208``, because :meth:`_build_palette` sizes its row map from ``id`` and
+        derives its frame selection from ``m``/``t``, so a short ``id`` beside a long ``m`` puts
+        an out-of-range index in the selection.
+
+        Clipping rather than skipping the layer, because this feeds a PAINT call and the
+        docstring of every consumer here says the same thing: a colour is never worth a crash.
+        The rows that survive are the ones every column agrees on, so the marks that are drawn
+        are drawn correctly; the tail — which no column set can describe consistently — is
+        dropped, and said once on stderr rather than silently, since a table that disagrees with
+        itself is a defect in whatever wrote it and the user should be able to find out."""
         ds = self._dataset
         out: Dict[tuple, Dict[str, np.ndarray]] = {}
         if ds is None or not hasattr(ds, "attributes"):
@@ -3664,8 +3767,25 @@ class ViewerPanel(QWidget):
         for (dom, layer, name), attr in ds.attributes.items():
             if dom in (Domain.POINT, Domain.LABEL):
                 out.setdefault((dom, layer), {})[name] = attr.values
-        return {k: v for k, v in out.items()
-                if {"id", "y", "x"} <= set(v)}
+        keep = {k: v for k, v in out.items() if {"id", "y", "x"} <= set(v)}
+        for key, cols in keep.items():
+            try:
+                lens = {name: len(val) for name, val in cols.items()}
+            except TypeError:                       # a scalar attribute — not a column
+                continue
+            if len(set(lens.values())) <= 1:
+                continue
+            n = min(lens.values())
+            if not self._warned_ragged:
+                self._warned_ragged = True
+                worst = sorted(lens.items(), key=lambda kv: kv[1])
+                print(f"[overlays] {key[0].value} layer {key[1]!r} is ragged — its columns "
+                      f"disagree in length ({worst[0][0]}={worst[0][1]}, "
+                      f"{worst[-1][0]}={worst[-1][1]}); showing the first {n} row(s). Whatever "
+                      f"wrote the shorter column re-emitted it against a different row set.",
+                      file=sys.stderr, flush=True)
+            keep[key] = {name: val[:n] for name, val in cols.items()}
+        return keep
 
     def _track_layers(self):
         """``{layer: {col: values}}`` for every Track-domain table in the dataset."""

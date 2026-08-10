@@ -1,0 +1,46 @@
+{
+  "um_per_px": 0.19013024558407263,
+  "2025_layer_name": "Binary from ROI",
+  "2025_mask_unique": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "2025_tif_vs_layer_agreement_pct": 32.2966,
+  "2025_audit": {
+    "n_components": 59,
+    "coverage_pct": 69.16,
+    "median_um2": 245.0,
+    "min_um2": 0.04,
+    "max_um2": 988.7,
+    "n_below_25px": 14,
+    "median_px": 6778,
+    "equiv_diam_median_um": 17.66
+  },
+  "emp_layer_name": "HomogeneousSegmentation",
+  "emp_audit": {
+    "n_components": 377,
+    "coverage_pct": 85.08,
+    "median_um2": 354.0,
+    "min_um2": 0.04,
+    "max_um2": 1642.2,
+    "n_below_25px": 60,
+    "median_px": 9794,
+    "equiv_diam_median_um": 21.23
+  },
+  "2025_objects": {
+    "n": 45,
+    "multi_part": 9,
+    "n_below_25px": 2,
+    "median_um2": 294.87155540175814
+  },
+  "emp_objects": {
+    "n": 306,
+    "multi_part": 54,
+    "n_below_25px": 0,
+    "median_um2": 398.8556217390338
+  }
+}

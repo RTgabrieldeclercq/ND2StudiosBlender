@@ -1,5 +1,10 @@
 # CONTEXT — nodegraph v2: everything that REMAINS (handoff)
 
+> **⚠️ UPDATE 2026-08-05 — superseded as fresh-session orientation** by
+> [`/CLAUDE.md`](../../CLAUDE.md) + [`/codemap/`](../../codemap/), which are generated from the
+> live code and gated against it. Kept as the dated record. Also note the per-node catalog
+> split (V2.20): nodes are no longer in `nodegraph/nodes.py`.
+
 > **⚠️ UPDATE 2026-07-29 — v1 IS REMOVED.** The `pipeline_kit` parity gate in §0 is gone
 > (and with it the warning not to delete `nd2studios/` — that deletion has now happened
 > deliberately, to the Recycle Bin). §5's "full v1 removal is deferred" is **resolved: it

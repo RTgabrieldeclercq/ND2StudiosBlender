@@ -1,5 +1,12 @@
 # CONTEXT — nodegraph v2 handoff (fresh-chat brief) · 2026-07-22
 
+> ⚠️ **HISTORICAL — superseded as fresh-session orientation on 2026-08-05** by
+> [`/CLAUDE.md`](../../CLAUDE.md) + [`/codemap/`](../../codemap/), which are generated from the
+> live code and gated against it. Kept as the dated record. It predates the v1 removal
+> (2026-07-29), so its `_pipeline_kit_parity.py` gate no longer exists, and it predates the
+> per-node catalog split (V2.20), so "nodes live in `nodegraph/nodes.py`" is no longer true.
+> **The instruction below to "read this first" is 2026-07-22's, not today's.**
+
 > **Read this first.** Self-contained state + what's next for the **nodegraph v2** effort
 > (a greenfield, Blender-geometry-nodes-style node system for the ND2Studios microscope
 > image-analysis app). Depth lives in the sibling docs (§8); this is the orientation +

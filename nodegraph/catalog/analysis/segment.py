@@ -24,7 +24,8 @@ from nodegraph.registry import (
 )
 from nodegraph.spill import dense_output
 from nodegraph.structure import StructureTable, label_components, seeded_watershed
-from nodegraph.trained import stardist_config, stardist_model_dir, stardist_trained
+from nodegraph.trained import (stardist_config, stardist_model_dir,
+                              stardist_note, stardist_trained)
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_GRAN_GLOBAL, _DIM_KAX
@@ -240,6 +241,16 @@ def _as_num(value) -> "float | None":
     except (TypeError, ValueError):
         return None
     return f if f == f and abs(f) != float("inf") else None
+
+
+def _stardist_note(params, modes) -> str:
+    """``NodeSpec.trained_note`` — see :func:`nodegraph.trained.stardist_note`.
+
+    Silent for the three methods that load no such model, so the panel gains a line
+    only where there is a model record to talk about."""
+    if str((modes or {}).get("method") or "threshold") != "stardist":
+        return ""
+    return stardist_note(params, modes)
 
 
 def _stardist_trained(params, modes) -> dict:
@@ -1387,6 +1398,10 @@ register_node(
     # The StarDist thresholds default to what the LOADED CHECKPOINT was trained with rather
     # than to a number this catalog invented (V2.23). See `_stardist_trained`.
     trained_params=_stardist_trained,
+    # ...and one line saying WHICH file they came from, or why there are none:
+    # an empty answer is legitimate (not downloaded yet, wrong folder picked) and
+    # indistinguishable from a broken feature without it (V2.23b).
+    trained_note=_stardist_note,
     description="THE segmentation node: image → a Voxel label raster + a Label table, "
                 "with the algorithm as a `method` Mode — threshold+CCL, "
                 "distance-transform watershed, StarDist (CNN), or CellSAM (SAM + "

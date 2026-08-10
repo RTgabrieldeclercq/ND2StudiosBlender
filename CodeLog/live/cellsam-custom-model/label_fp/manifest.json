@@ -1,0 +1,200 @@
+[
+ {
+  "uid": "c544x792",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 17,
+  "area_um2": 231.5,
+  "cy": 544,
+  "cx": 792
+ },
+ {
+  "uid": "c291x294",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 25,
+  "area_um2": 78.3,
+  "cy": 291,
+  "cx": 294
+ },
+ {
+  "uid": "c012x676",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 26,
+  "area_um2": 95.6,
+  "cy": 12,
+  "cx": 676
+ },
+ {
+  "uid": "c086x813",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 35,
+  "area_um2": 191.2,
+  "cy": 86,
+  "cx": 813
+ },
+ {
+  "uid": "c011x817",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 38,
+  "area_um2": 61.0,
+  "cy": 11,
+  "cx": 817
+ },
+ {
+  "uid": "c542x575",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 42,
+  "area_um2": 296.1,
+  "cy": 542,
+  "cx": 575
+ },
+ {
+  "uid": "c371x026",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 46,
+  "area_um2": 184.7,
+  "cy": 371,
+  "cx": 26
+ },
+ {
+  "uid": "c247x841",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 48,
+  "area_um2": 27.6,
+  "cy": 247,
+  "cx": 841
+ },
+ {
+  "uid": "c086x327",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 49,
+  "area_um2": 62.3,
+  "cy": 86,
+  "cx": 327
+ },
+ {
+  "uid": "c003x565",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 50,
+  "area_um2": 0.8,
+  "cy": 3,
+  "cx": 565
+ },
+ {
+  "uid": "c608x041",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 51,
+  "area_um2": 91.4,
+  "cy": 608,
+  "cx": 41
+ },
+ {
+  "uid": "c537x030",
+  "kind": "fp",
+  "src": "pred",
+  "obj_id": 52,
+  "area_um2": 147.1,
+  "cy": 537,
+  "cx": 30
+ },
+ {
+  "uid": "c286x285",
+  "kind": "fn",
+  "src": "gt",
+  "obj_id": 22,
+  "area_um2": 121.8,
+  "cy": 286,
+  "cx": 285
+ },
+ {
+  "uid": "c291x593",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 47,
+  "area_um2": 88.4,
+  "cy": 291,
+  "cx": 593
+ },
+ {
+  "uid": "c119x730",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 39,
+  "area_um2": 142.0,
+  "cy": 119,
+  "cx": 730
+ },
+ {
+  "uid": "c548x199",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 27,
+  "area_um2": 240.1,
+  "cy": 548,
+  "cx": 199
+ },
+ {
+  "uid": "c188x167",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 7,
+  "area_um2": 271.4,
+  "cy": 188,
+  "cx": 167
+ },
+ {
+  "uid": "c198x597",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 11,
+  "area_um2": 320.5,
+  "cy": 198,
+  "cx": 597
+ },
+ {
+  "uid": "c446x546",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 32,
+  "area_um2": 402.2,
+  "cy": 446,
+  "cx": 546
+ },
+ {
+  "uid": "c585x320",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 16,
+  "area_um2": 487.5,
+  "cy": 585,
+  "cx": 320
+ },
+ {
+  "uid": "c676x176",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 33,
+  "area_um2": 537.9,
+  "cy": 676,
+  "cx": 176
+ },
+ {
+  "uid": "c661x571",
+  "kind": "control",
+  "src": "pred",
+  "obj_id": 45,
+  "area_um2": 823.2,
+  "cy": 661,
+  "cx": 571
+ }
+]

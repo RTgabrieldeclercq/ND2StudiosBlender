@@ -19,10 +19,6 @@ ND2Studios:
     its own work to somebody else's hub — the GPU box down the hall, or a 128 GB server —
     without either side importing the other's code.
 
-:mod:`~nodelab_v2.lablink.panel`
-    The Qt dock: which hub, which sessions, what each one is doing. The only module here
-    that imports PySide6, deliberately.
-
 :mod:`~nodelab_v2.lablink.protocol`
     The wire contract, mirrored from LabLink rather than imported — see that module's
     docstring for why the duplication is the right call and how the drift is caught.
@@ -31,6 +27,34 @@ ND2Studios:
     What comes back: CSV tables with previews, PNG quicklooks and thumbnails, metrics
     blobs. The hub is standard-library-only and must never decode an image, so producing
     every returnable byte is this side's job.
+
+:mod:`~nodelab_v2.lablink.sidecar`
+    The ``*.job.json`` that travels with an image and **overrides** what the file claims. A
+    TIFF does not omit optical metadata so much as invent it, and only an explicit override
+    can correct a value that is confidently wrong rather than merely absent.
+
+:mod:`~nodelab_v2.lablink.recipe`
+    Generates a recipe manifest from a graph plus the node catalogue. This software is the
+    right party to do it: it is the only one holding both things every check runs against,
+    so a generated manifest can be made unable to fail validation.
+
+:mod:`~nodelab_v2.lablink.presets`
+    Named knob sets on this machine, and the record of what a run actually used — the two
+    halves of being able to pick a result up again a week later.
+
+**The three Qt modules**, and everything else stays importable on a box with no display —
+the worker has to run headless on a hub:
+
+:mod:`~nodelab_v2.lablink.panel`
+    The dock: which hub, which sessions, what each one is doing.
+
+:mod:`~nodelab_v2.lablink.tuning`
+    The warm loop — one session held open, bounded knob controls, results rendered where the
+    knobs are.
+
+:mod:`~nodelab_v2.lablink.authoring`
+    The publish dialog: which params a caller may turn, validated before anyone else is
+    involved.
 
 **The security boundary, restated because it is easy to lose.** A node names a recipe and
 sets knobs the recipe whitelists, within ranges the recipe declares. It can never supply a

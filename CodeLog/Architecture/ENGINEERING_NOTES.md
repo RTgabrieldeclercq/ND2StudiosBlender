@@ -6,6 +6,10 @@ GUI seam. Written for someone about to change the code.
 
 Companion documents:
 
+* [../../CLAUDE.md](../../CLAUDE.md) + [../../codemap/](../../codemap/) — **start here if you
+  are an agent.** The generated, grep-first index of every node, socket, module, symbol and
+  import edge, plus curated traces of the main flows. This document is the *why* behind what
+  that index states; go there for "where is X", come here for "why is X like that".
 * [../../MANUAL.md](../../MANUAL.md) — the user manual (what the software does).
 * **`wire-node-v2`** skill — the authoritative *node-concepts* reference (socket contract,
   units/derive, provenance patterns). Read it before adding or editing a node.
@@ -20,8 +24,10 @@ Companion documents:
 > `ARCHITECTURE.md` in this folder describes the **removed** first-generation app and is
 > retained only as history.
 
-**State:** catalog 55 node types; `python -m nodegraph.selftest` → 55 groups green;
-`scripts/_nodelab_v2_phase5_probe.py` → ALL PASS (both verified 2026-07-29).
+**State:** see [../../codemap/STATE.md](../../codemap/STATE.md) — generated from the live
+registry, and the only file in this repo permitted to carry a count. The line that used to sit
+here said 55 node types while the manual said 76 on the same day, which is what a
+hand-maintained number in a 2,100-line document always eventually says.
 
 ---
 
@@ -291,6 +297,10 @@ in default params and docs, not in the node's identity. Hence `boundary_band` (a
 ---
 
 ## 7. The socket contract
+
+> Stated for builders in the **`wire-node-v2`** skill §4b and enforced by
+> `selftest::test_param_socket_contract`. **This section is the rationale** — read it to
+> understand why the clauses are what they are, not to look one up.
 
 Five clauses, each **enforced structurally** by `selftest::test_param_socket_contract`
 (V2.10/V2.11). A 2026-07-28 sweep found 18 of 55 nodes with a defect of this class.
@@ -1472,6 +1482,29 @@ CPU work.
   (there the useful neighbours are the other z of the unit, already cached by the read that
   displayed it).
 * **Latest-wins queueing**, and stale results are dropped by epoch on arrival.
+* **The display state is held PER NODE, as one immutable snapshot** (`_HeldView`, `_views`,
+  V2.28). It used to be five sibling attributes — `_viewer_provider`, `_viewer_axes`,
+  `_viewer_rev`, `_viewer_pin`, `_viewer_dtype` — describing whichever node was pulled last.
+  Two things were wrong with that, and the side-by-side compare pane makes both bite:
+  * **the five are only correct together.** The dtype decides whether the display copy
+    narrows, which decides the display cap, which is *folded into every `PlaneCache` key*
+    (`_plane_key`). A worker installing one node's dtype while the GUI thread reads another
+    node's provider mints keys that describe neither, and the symptom is a plane served at
+    the wrong shape rather than an error. They are now written and read as one tuple, and
+    the jobs (`_DecodeJob`, `_PrefetchJob`, `_PreloadJob`, `_DetailJob`) each **capture**
+    the pair at construction instead of reading runner state at run time — a job can sit in
+    the pool's queue while the panes change under it.
+  * **one slot means one fast path.** With two panes, every cursor move in one pane evicted
+    the other's, so the second pane re-pulled on every scrub. Capacity is `HELD_VIEWS` (2,
+    one per pane) with LRU eviction, and eviction is cheap to undo: `_rearm_view` rebuilds a
+    view in O(1) from the remembered finished result (`_results`, same revision, unpinned,
+    image payloads only) without re-emitting `finished` or taking the pull slot.
+  `_overlay_ctxs` is keyed the same way and for the same reason: a single slot held the
+  last-pulled node's resolved secondary chain, so `_plane_addrs` read the *other* pane's
+  overlay channel index as "a stale index from a node that no longer overlays" and dropped
+  it — the overlay vanished from the pane nobody had touched. The worker only ever assigns
+  one key (an atomic dict store); the bounded trim runs on the GUI thread in `_deliver`, so
+  no reader can observe a half-evicted map.
 
 ### `ops.py` — the two GUI-introduced ops, deliberately Qt-free
 
@@ -1523,6 +1556,30 @@ CPU work.
   `PointMark.key`, and on `TrackPath.color_key` — which is what makes a trajectory paint in
   the same colour as the regions it threads. `None` anywhere means "colour by raw id", the
   pre-palette behaviour, and is what the preview and every direct renderer call use.
+
+### Two panes side by side (`_CompareBox`, V2.28)
+
+A **second `ViewerPanel`** in a horizontal splitter above the canvas, built on first use and
+re-attached on every later open. Three decisions carry the feature:
+
+* **The link is derived from the payloads, not chosen by the user.** `_sync_compare_link`
+  compares the two panes' delivered `axes` after *every* delivery: equal `(m, t, z)` means one
+  cursor — the primary's strips drive both and the compare pane's own cursor row is hidden
+  (`ViewerPanel.set_axes_hidden`) — and unequal means each pane keeps its own. A Z-Project
+  beside its input is the case that makes a shared Z cursor meaningless, and a graph edit can
+  move a pair either way, so the answer is re-derived rather than remembered. Mirroring uses
+  `set_cursor`, which deliberately does **not** emit `request_changed`: the window moves the
+  other pane and asks the runner itself, because letting the move emit would bounce a request
+  between the panes.
+* **Delivery routing is one function** (`_panes_showing`). The primary pane keeps its historic
+  contract — it shows whatever finishes, since first-to-land is viewable while the rest queue —
+  *except* a result that belongs only to the compare pane. The spreadsheet, the sweep table and
+  the iteration strip follow the primary pane alone, so a compare delivery cannot yank them off
+  the node being tuned.
+* **The compare pane is a display surface only.** Picking, the F9 scope, Iterate and export stay
+  with the primary. Maximizing closes the pane first (one mini-map holds one panel), and both
+  panes' cursors scrub on the same coords-only fast path — which is what the per-node
+  `_HeldView` refactor above exists for.
 
 ### The hover readout (`ViewerPanel._hover_text`)
 
@@ -1609,15 +1666,31 @@ label, and the **auto / pinned** toggle backed by the sticky `__locked__` list. 
 rebuilds via a deferred `_rebuild`, and the card re-lays-out via `scene.sync → item.refresh` —
 **both halves must be verified** when you add mode gating.
 
+**The Iterate SEGMENT (V2.22).** `flow.iterate` has no data route through it: it is a control
+card, like Blender's Random Value. You wire a **segment** — `to` (required, the series' last
+node) and `from` (optional, its first) — and the driver wires onto the params. The rewrite
+clones the stretch and then mints the **selector under the END node's own id**, which is the
+load-bearing trick: every consumer of that node keeps its edge and starts reading the
+preserved iteration, so nothing is re-routed and the sweep runs by itself whenever anything
+below it is pulled. The card is left as a `__passthrough__` of the selector's payload — it
+must not choose twice, or it would stamp iteration 0's caption onto whatever the selector
+actually picked. Three consequences the GUI has to honour: the iteration strip belongs to the
+segment's END (`GraphDocument.iterate_card_at`), a node in the MIDDLE has no id in the run
+graph and is pulled through `iterate.aliases` (`EngineRunner._pull_id`), and the results table
+arrives on an ordinary analysis node's payload, so it carries `__sweep_owner__` naming the
+card whose panel owns it. `collect` → `to` is a socket rename, migrated on load by
+`GraphDocument._SOCKET_RENAMES`.
+
 **The Iterate target picker (V2.22).** `flow.iterate`'s panel grows one "iterate on" dropdown
 per variable slot, filled by `nodegraph.iterate.candidate_targets` — the active params and
-Modes of every node upstream of `collect`, in `topo_order`. Two properties are the whole
+Modes of every node inside the segment, in `topo_order`. Two properties are the whole
 design. (1) The menu is filtered by `_check_target`, the *same* predicate the rewrite refuses
 on, so it can never offer a target the run would then reject; if you add a refusal there, the
 menu narrows for free. (2) Choosing writes a **driver edge** through
 `GraphDocument.set_iterate_target` and nothing else — the wire stays the single storage, so
 the canvas, save/load, the "driven by" note on the target's own editor and `unroll` need to
-know nothing about the control. The slot's `v{k}_type` follows the target (a Mode or a string
+know nothing about the control. With no segment end wired the menu is empty by construction:
+there is no series to scrape, and the panel says to wire `To` first. The slot's `v{k}_type` follows the target (a Mode or a string
 param is swept from the slot's STRING output) and the spare `+` row raises `variables`,
 because both are settings the user would otherwise have to discover before the wire would
 connect at all.
@@ -1836,9 +1909,15 @@ Each of these cost real debugging time. They are listed in the order they tend t
 ## 20. Gates, and how to add a node
 
 ```bash
-PYTHONUTF8=1 python -m nodegraph.selftest                        # headless core → 55 groups
+PYTHONUTF8=1 python -B -m nodegraph.selftest                     # headless core
 PYTHONUTF8=1 python scripts/_nodelab_v2_phase5_probe.py out.png  # driven GUI probe
+python scripts/_catalog_snapshot.py                              # catalog identity
+python scripts/_codemap.py                                       # agent map freshness
 ```
+
+`-B`: a stale `.pyc` from a moved module fabricates failures in tests you did not touch. The
+last two default to *checking*; both have an explicit re-bless mode you have to ask for by
+name. Current pass counts live in [../../codemap/STATE.md](../../codemap/STATE.md), not here.
 
 Heavier, not in the fast gate: `scripts/_ingest_nd2_smoke.py` (real ND2),
 `_bench_provider_granularity.py` (the storage keystone), `_bench_ccl_watershed.py`,
@@ -2002,6 +2081,19 @@ Nothing is blocking; these are the honest edges.
     WellA3 640 series once queued sixteen whole-volume deconvolutions). Pressing play is the user
     saying every frame is wanted in order. It stops at the budget rather than evicting its own
     head, because a preload that wraps the LRU re-decodes every lap.
+  - **the playback hold is capped by measured cost, not keyed on provider type** (2026-08-10,
+    "unable to see smooth play of a stitched image"). The 2026-08-06 fix sorted series into
+    "bytes → hold and preload wide" and "computed → never hold, preload on one job", and the
+    second bucket lumped a ~0.25 s/frame stitch in with a ~130 s/frame deconvolution: a
+    single preload job can never outrun playback consuming a frame per frame, so a stitched
+    (or Z-projected) series stayed at decode cadence — measured off the screen recording,
+    ~9 fps with 33–267 ms jitter — for its entire first lap instead of going smooth after a
+    short prepare. The line that matters is per-plane vs whole-volume: `_preload_jobs` now
+    gives every per-plane series (bytes or kernel) the full measured width and only
+    `volume_unit` chains zero, and the window holds any series the preload accepts — capped
+    at `PLAY_PREPARE_MAX_S` (8 s) by the preload's own tick rate plus a wall-clock watchdog,
+    so a chain that computes for minutes releases playback early instead of holding a blank
+    stare, and the 2026-08-06 whole-volume case still raises no hold at all.
 * **A live mosaic has a floor no display trick reaches** (V2.23). Full resolution was a display
   decision; *cheap* is not — a stitched canvas is recomputed per displayed frame. NIS-Elements
   does not keep one live either (its Large Image mode carries the pyramid in the file and

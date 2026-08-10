@@ -1,0 +1,270 @@
+{
+ "CON-01": {
+  "anchors": {
+   "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
+   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-02": {
+  "anchors": {
+   "file:nodegraph/domains.py": "5e53fa24004661cdf8bc2938189a9a9f",
+   "sym:nodegraph.domains.Domain": "9a3c5f1b642fd7e854ee86e10df4f05a"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-03": {
+  "anchors": {
+   "sym:nodegraph.registry.Granularity": "9a3c5f1b642fd7e854ee86e10df4f05a",
+   "sym:nodegraph.registry.NodeSpec.resolve_granularity": "eba004e40640d2e12b30e0516a75a8b5"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-04": {
+  "anchors": {
+   "op:enhance.gaussian": "d354e64aae5fe8ed5324a8cf266e323e",
+   "sym:nodegraph.registry.NodeSpec.resolve_kernel_axes": "fb15ef012ac9969636200d0e9761034e"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-05": {
+  "anchors": {
+   "sym:nodegraph.metadata.envelope_symbols": "ab02a30a825c8dbef3365315aeed8efd",
+   "sym:nodegraph.metadata.eval_derive": "6c4ccb4f183ab970380f06f22128abd3"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-06": {
+  "anchors": {
+   "sym:nodegraph.metadata.MetaEnvelope": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.metadata.propagate_meta": "c29ab8f9379bc2225c97936b97ee242c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-07": {
+  "anchors": {
+   "op:util.crop": "c9d2bc8ba5f2f06917846d6c2c78d4b0",
+   "sym:nodegraph.metadata.propagate_meta": "c29ab8f9379bc2225c97936b97ee242c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-08": {
+  "anchors": {
+   "sym:nodegraph.transfer.plan_transfer": "1aecd40060d14ab86bb45fd18e19e72d",
+   "sym:nodegraph.transfer.register_bridge": "bf5007f18738fee9d754c13e16ded3b6"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-09": {
+  "anchors": {
+   "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
+   "sym:nodegraph.memo.output_fingerprint": "c7ef489c5ab0f7ff143086fc2c284105"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-10": {
+  "anchors": {
+   "sym:nodegraph.revision.next_revision": "0179dce1fa784b46b872c0ccf23b965f"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-11": {
+  "anchors": {
+   "file:nodegraph/provider.py": "f681942e17542d691f8a5617328930f6",
+   "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-12": {
+  "anchors": {
+   "sym:nodegraph.registry.SocketSpec": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "CON-13": {
+  "anchors": {
+   "file:.claude/skills/wire-node-v2/SKILL.md": "9b28e04d28d188c9e017b8356947fab8"
+  },
+  "blessed": "2026-08-06",
+  "file": "codemap/concepts.md"
+ },
+ "CON-14": {
+  "anchors": {
+   "sym:nodegraph.registry.NodeSpec": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/concepts.md"
+ },
+ "INV-01": {
+  "anchors": {
+   "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
+   "sym:nodegraph.revision.next_revision": "0179dce1fa784b46b872c0ccf23b965f"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-02": {
+  "anchors": {
+   "file:nodegraph/streaming.py": "52ec2d69bd9b8f2a54aeb124957f0bb2",
+   "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-03": {
+  "anchors": {
+   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-04": {
+  "anchors": {
+   "op:util.crop": "c9d2bc8ba5f2f06917846d6c2c78d4b0",
+   "sym:nodegraph.metadata.propagate_meta": "c29ab8f9379bc2225c97936b97ee242c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-05": {
+  "anchors": {
+   "sym:nodegraph.metadata.envelope_symbols": "ab02a30a825c8dbef3365315aeed8efd",
+   "sym:nodegraph.metadata.eval_derive": "6c4ccb4f183ab970380f06f22128abd3"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-06": {
+  "anchors": {
+   "sym:nodegraph.metadata.propagate_meta": "c29ab8f9379bc2225c97936b97ee242c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-07": {
+  "anchors": {
+   "file:nodelab_v2/nd2_compat.py": "bbbb6d392c98f40560b209001db2b1cd"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-08": {
+  "anchors": {
+   "file:nodegraph/codemap.py": "4acf756e52b68e530381982b764aa49d",
+   "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-09": {
+  "anchors": {
+   "sym:nodegraph.registry.NodeSpec": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.registry.SocketSpec": "e2b4360003ef3d619631e8bd0a633d3f"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-10": {
+  "anchors": {
+   "file:nodegraph/kernels/README.md": "2c6d2d2aca1dc65918154e85b65f80d7"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-11": {
+  "anchors": {
+   "file:nodegraph/kernels/README.md": "2c6d2d2aca1dc65918154e85b65f80d7"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-12": {
+  "anchors": {
+   "sym:nodegraph.memo.output_fingerprint": "c7ef489c5ab0f7ff143086fc2c284105"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/invariants.md"
+ },
+ "INV-13": {
+  "anchors": {
+   "sym:nodegraph.dataset.Dataset.with_structure": "b63b4c84283bbebd5b30bf2ab37535ac"
+  },
+  "blessed": "2026-08-06",
+  "file": "codemap/invariants.md"
+ },
+ "WF-01": {
+  "anchors": {
+   "sym:nodegraph.engine.Engine.pull": "31fa493846971ee6627efabd17cb70ad",
+   "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
+   "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-02": {
+  "anchors": {
+   "sym:nodegraph.registry.Granularity": "9a3c5f1b642fd7e854ee86e10df4f05a",
+   "sym:nodegraph.registry.NodeSpec.resolve_granularity": "eba004e40640d2e12b30e0516a75a8b5",
+   "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-03": {
+  "anchors": {
+   "sym:nodegraph.hotreload.closure_fingerprint": "8baf11415c5afb688507f1fdadd70e2c",
+   "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
+   "sym:nodegraph.memo.output_fingerprint": "c7ef489c5ab0f7ff143086fc2c284105"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-04": {
+  "anchors": {
+   "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
+   "sym:nodegraph.catalog.module_order": "1ae7d144cb5031219d2c60724c714e67",
+   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-05": {
+  "anchors": {
+   "sym:nodegraph.metadata.MetaEnvelope": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.metadata.eval_derive": "6c4ccb4f183ab970380f06f22128abd3",
+   "sym:nodegraph.metadata.propagate_meta": "c29ab8f9379bc2225c97936b97ee242c"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-06": {
+  "anchors": {
+   "sym:nodegraph.hotreload.dependency_closure": "4f2b8300e47cd918676630c0f9737fff",
+   "sym:nodegraph.hotreload.node_modules": "1ae7d144cb5031219d2c60724c714e67"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-07": {
+  "anchors": {
+   "file:nodelab_v2/ingest.py": "dd5b2c38beee9532054282105d117fb0",
+   "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
+  },
+  "blessed": "2026-08-05",
+  "file": "codemap/workflows.md"
+ }
+}

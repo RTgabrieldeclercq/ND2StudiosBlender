@@ -611,7 +611,13 @@ class HistogramThresholdSegmenter:
         # stitched frames (268 M px × 8 B = ~2 GB) that would otherwise block
         # the worker thread for seconds with no effect on the mask.
         needs_hist = (cfg.method == "percentile")
-        hist = compute_histogram(image, bit_depth=cfg.bit_depth) if needs_hist else None
+        # `mask=reference_mask` (V2.27): the percentile is a rank within a POPULATION, and the
+        # caller may mean a population narrower than the frame — one label region, one ROI.
+        # `compute_histogram` has always accepted the mask; `run` simply never passed it, so
+        # `percentile` was the one method whose population could not be narrowed while
+        # `relative` (below) already could. Unchanged when no mask is given.
+        hist = (compute_histogram(image, bit_depth=cfg.bit_depth, mask=reference_mask)
+                if needs_hist else None)
 
         mask = self._threshold_one(image, hist, reference_mask)
 

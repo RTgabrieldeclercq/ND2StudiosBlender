@@ -16,6 +16,7 @@ from nodegraph.streaming import MapComputeProvider, VolumeComputeProvider, strea
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.map_image import _map_image
 from nodegraph.catalog._shared.planes import _each_plane
+from nodegraph.catalog._shared.scope import ScopeMode
 
 # ── Normalize (percentile — scope Mode, NOT the dim lever, H24) ──────────────────
 
@@ -264,8 +265,14 @@ register_node(
            # Gated to `percentile` (wire-node-v2 §5c): an absolute window has no statistical
            # population, so a population picker under it would be a dead dropdown — exactly
            # what `analysis.threshold` does with this same Scope vocabulary under `fixed`.
-           Mode("scope", ["plane", "volume", "series"], default="plane",
-                label="Scope",
+           #
+           # Declared through the shared factory (V2.27) so it carries `role="scope"`: this node
+           # is the standing PROOF that a population is not a footprint — its `footprint_mode`
+           # is `bounds`, and binding the card's footprint band to that field would have offered
+           # percentile/absolute (which decides *which sockets are live*) instead of the three
+           # populations below. The prose stays local: these percentiles are a black/white point,
+           # not a histogram cut.
+           ScopeMode(("plane", "volume", "series"), default="plane",
                 available_in={"bounds": frozenset({"percentile"})},
                 description=
                 "The population the two percentiles are measured over — how much data has to "

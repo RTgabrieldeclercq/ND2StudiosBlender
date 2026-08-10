@@ -53,12 +53,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from nodelab_v2.lablink import protocol as P
 
@@ -250,6 +251,63 @@ def sha256_of(path: str) -> Tuple[str, int]:
     return h.hexdigest(), total
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    """Equality for a knob condition, strict about ``bool`` versus number.
+
+    Python's ``1 == True`` is the accident that makes a hub comparing loosely and a client
+    comparing strictly disagree about whether a condition holds — and the recipe validator
+    refuses ``"equals": 1`` against a bool knob for exactly this reason. Comparing the
+    bool-ness first is what keeps this side on the strict reading.
+    """
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return bool(a == b)
+
+
+def _condition_text(cond: Mapping[str, Any]) -> str:
+    """An ``applies_when`` rendered for a person: ``"2D"`` or ``one of "2D", "3D"``."""
+    if "equals" in cond:
+        return repr(cond.get("equals"))
+    values = cond.get("in") or ()
+    return "one of " + ", ".join(map(repr, values)) if values else "(unstated)"
+
+
+def knob_applies(spec: Mapping[str, Any], values: Mapping[str, Any],
+                 declared: Mapping[str, Mapping[str, Any]]) -> bool:
+    """Whether a knob's ``applies_when`` condition currently holds.
+
+    Some knobs are inert under some settings of another — the engine filters by area in 2D
+    and by *volume* in 3D, so a minimum-area value on a 3D run is read by nothing. A recipe
+    declares that, and the hub refuses a pinned value for an unmet one rather than ignoring
+    it, because a value that silently does nothing looks exactly like one that worked.
+
+    Shared by the validator and the GUI on purpose: the control that greys out and the check
+    that refuses must agree, or the dock disables a knob the hub would have accepted (or
+    worse, offers one it will refuse after the upload).
+
+    The controlling knob's value is what the caller set, falling back to the controller's own
+    declared ``default`` — which every controller is required to have, precisely so this is
+    answerable before anything has been sent.
+    """
+    cond = spec.get("applies_when")
+    if not isinstance(cond, Mapping) or not cond:
+        return True
+    controller = str(cond.get("knob") or "")
+    ctrl_spec = declared.get(controller)
+    if ctrl_spec is None:
+        # A condition naming a knob this recipe does not declare is a recipe bug that tier 1
+        # refuses at hub start. Not ours to fail on: let the hub speak.
+        return True
+    current = values.get(controller)
+    if current is None:
+        current = ctrl_spec.get("default")
+    if "equals" in cond:
+        return _same_value(current, cond.get("equals"))
+    if "in" in cond:
+        return any(_same_value(current, v) for v in (cond.get("in") or ()))
+    return True
+
+
 class HubClient:
     """Discovery and transport against one hub. Cheap to construct; holds no connection."""
 
@@ -387,6 +445,77 @@ class HubClient:
         raise LabLinkError(f"this hub has no workflow {workflow!r}. It offers: "
                            f"{offered or '(none)'}")
 
+    def recipe_schema(self) -> Dict[str, Any]:
+        """The hub's own recipe vocabulary — every field, closed set and rule.
+
+        Assembled on the hub from its validator's constants, so it cannot drift from what
+        will actually be accepted. A recipe generator should build against this rather than
+        against a copy of the prose; :mod:`nodelab_v2.lablink.recipe` falls back to a
+        vendored snapshot when there is no hub to ask, and says which it used.
+        """
+        return self._json("GET", "/recipe-schema")
+
+    # ── identity ────────────────────────────────────────────────────────────────
+    def enroll(self, *, label: str = "") -> str:
+        """Mint a node identity for this machine and return its id.
+
+        **Enrol once per machine and persist the result.** Enrolling on every launch fills
+        the operator's node list with junk entries they cannot tell apart, and the whole
+        point of a node identity is that an operator can revoke exactly one machine.
+
+        The returned id goes in :data:`~nodelab_v2.lablink.protocol.H_NODE` alongside the
+        token; this sets :attr:`node_id` so subsequent calls on this client present it.
+        """
+        caps = (self.hello().get("capabilities") or {})
+        if not caps.get("enroll"):
+            raise LabLinkError(
+                f"{self.url} does not offer enrolment, so this machine cannot have its own "
+                f"revocable identity there. Use the site token alone.")
+        body: Dict[str, Any] = {}
+        if label:
+            body["label"] = label
+        doc = self._json("POST", "/enroll", body=body, expect=(200, P.HTTP_OPENED))
+        node = str(doc.get("node") or doc.get("id") or "")
+        if not node:
+            raise LabLinkError("the hub accepted the enrolment but named no node id")
+        self.node_id = node
+        return node
+
+    # ── the file exchange, outside any session ──────────────────────────────────
+    def put_file(self, channel: str, path: str, *, name: str = "",
+                 meta: Optional[Dict[str, Any]] = None) -> FileRef:
+        """Upload one file to a named channel, streaming from disk.
+
+        This is the plain exchange upload — the same call a session's :meth:`Session.send_data`
+        makes, without a session. Submitting a recipe uses it, which is why recipe submission
+        needs no new protocol: it inherits hashing, atomic visibility, resume, the size cap
+        and this machine's identity in the hub's ledger.
+        """
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            raise LabLinkError(f"no such file to send: {path}")
+        original = name or os.path.basename(path)
+        safe = repair_name(original)
+        digest, size = sha256_of(path)
+        blob = {"original_name": original}
+        blob.update(meta or {})
+        headers = {P.H_SHA: digest, P.H_META: json.dumps(blob)}
+        max_bytes = self.hello().get("max_file_bytes")
+        if isinstance(max_bytes, int) and max_bytes and size > max_bytes:
+            # Pre-checkable, unlike a session quota — so check it rather than uploading for
+            # ten minutes to be refused at the end.
+            raise LabLinkError(
+                f"{os.path.basename(path)} is {size} bytes; this hub accepts at most "
+                f"{max_bytes}.")
+        with open(path, "rb") as fh:
+            status, body = self.call(
+                "PUT", f"/c/{urllib.parse.quote(channel)}/{urllib.parse.quote(safe)}",
+                stream=fh, stream_len=size, headers=headers,
+                timeout=max(self.timeout, 60.0 + size / (1 << 20)))
+        if status not in (200, P.HTTP_OPENED):
+            raise self._error_for(status, body, f"upload to {channel}")
+        return FileRef(name=safe, sha256=digest, size=size, original_name=original)
+
     # ── sessions ────────────────────────────────────────────────────────────────
     def open_session(self, workflow: str, recipe: str, *, label: str = "",
                      knobs: Optional[Dict[str, Any]] = None,
@@ -403,8 +532,9 @@ class HubClient:
                 f"{self.url} is a LabLink file exchange, not a hub: its /hello reports no "
                 f"session capability, so there is nothing to open a session on.")
         meta = self.recipe_of(workflow, recipe) if validate else {}
-        payload = {"workflow": workflow, "recipe": recipe,
-                   "knobs": self.check_knobs(meta, knobs) if validate else dict(knobs or {})}
+        resolved = (self.resolve_for_send(meta, knobs) if validate
+                    else dict(knobs or {}))
+        payload = {"workflow": workflow, "recipe": recipe, "knobs": resolved}
         if label:
             payload["label"] = label
 
@@ -420,11 +550,18 @@ class HubClient:
                 backoff *= 2
                 continue
             raise self._error_for(status, body, "POST /s")
-        session = Session(self, body if isinstance(body, dict) else {}, recipe_meta=meta)
+        session = Session(self, body if isinstance(body, dict) else {}, recipe_meta=meta,
+                          knobs=resolved)
         session.wait_ready(timeout_s=ready_timeout_s)
         return session
 
     # ── knob validation ─────────────────────────────────────────────────────────
+    @staticmethod
+    def declared_knobs(recipe_meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """``{name: spec}`` for a recipe's knobs, in the order the recipe declared them."""
+        return {str(k.get("name")): dict(k)
+                for k in (recipe_meta.get("knobs") or []) if k.get("name")}
+
     @staticmethod
     def check_knobs(recipe_meta: Dict[str, Any],
                     knobs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -437,9 +574,16 @@ class HubClient:
         A knob whose declaration says ``unset_means: "derive"`` and whose value is absent is
         **left out of the payload**, not defaulted: absent means "work it out from this
         file's calibration", and sending a number instead silently overrides the microscope.
+
+        Every bound the recipe can publish is checked here, including the three that were
+        declared by the shipped recipes and enforced by nobody (``pattern``, ``max_len``,
+        ``max_items``) and the conditional-knob rule: pinning a real value for a knob whose
+        ``applies_when`` is unmet is **refused, not ignored**, because a value that silently
+        does nothing looks exactly like one that worked. Use :meth:`resolve_for_send` to
+        prepare a payload that clears those automatically.
         """
         requested = dict(knobs or {})
-        declared = {str(k.get("name")): k for k in (recipe_meta.get("knobs") or [])}
+        declared = HubClient.declared_knobs(recipe_meta)
         if not declared:
             return requested                  # nothing to check against; let the hub rule
         unknown = sorted(set(requested) - set(declared))
@@ -453,6 +597,12 @@ class HubClient:
             if value is None:
                 out[name] = None              # explicit "put this back to derived"
                 continue
+            if not knob_applies(spec, requested, declared):
+                cond = spec.get("applies_when") or {}
+                raise LabLinkError(
+                    f"knob {name!r} is only read when {cond.get('knob')!r} is "
+                    f"{_condition_text(cond)}, so pinning {value!r} would be refused rather "
+                    f"than ignored. Leave it out, or send null to clear it.")
             ktype = str(spec.get("type") or "float")
             enum = spec.get("enum") or ()
             if ktype == "bool":
@@ -461,12 +611,38 @@ class HubClient:
                         f"knob {name!r} must be true or false, not "
                         f"{type(value).__name__} — JSON 0 and 1 are numbers, not booleans")
             elif ktype in ("enum", "string"):
+                # One branch for both, because that is one branch on the hub: a recipe may
+                # bound an enum by length or shape too, and splitting them here would leave
+                # whichever half we did not think about unchecked on this side.
                 if not isinstance(value, str):
                     raise LabLinkError(f"knob {name!r} must be a string")
                 if enum and value not in enum:
                     raise LabLinkError(
                         f"knob {name!r} = {value!r} is not one of "
                         f"{', '.join(map(repr, enum))}")
+                max_len = spec.get("max_len")
+                if isinstance(max_len, int) and len(value) > max_len:
+                    raise LabLinkError(
+                        f"knob {name!r} is {len(value)} characters; the recipe allows "
+                        f"at most {max_len}")
+                pattern = spec.get("pattern")
+                if pattern:
+                    # `fullmatch`, NOT `match`, because that is what the hub's validator uses
+                    # and the published patterns are unanchored: `cell-segmentation`'s
+                    # `stats` declares `[a-z]+(,[a-z]+)*`, which `match` happily satisfies
+                    # from the `mean` in `"mean, max"` — so this side would accept a value
+                    # the hub then refuses, after the upload.
+                    try:
+                        hit = re.fullmatch(str(pattern), value)
+                    except re.error as exc:
+                        raise LabLinkError(
+                            f"recipe {recipe_meta.get('name')!r} declares an invalid regex "
+                            f"for knob {name!r} ({pattern}): {exc}. That is a recipe bug — "
+                            f"tell the operator.") from None
+                    if not hit:
+                        raise LabLinkError(
+                            f"knob {name!r} = {value!r} does not match the shape this recipe "
+                            f"accepts ({pattern})")
             elif ktype == "channel_list":
                 items = value if isinstance(value, list) else [value]
                 if not items:
@@ -475,10 +651,17 @@ class HubClient:
                     if isinstance(item, bool) or not isinstance(item, int) or item < 0:
                         raise LabLinkError(
                             f"knob {name!r} must be a list of channel indices "
-                            f"(0, 1, …); got {item!r}")
+                            f"(0, 1, ...); got {item!r}")
+                max_items = spec.get("max_items")
+                if isinstance(max_items, int) and max_items and len(items) > max_items:
+                    raise LabLinkError(
+                        f"knob {name!r} names {len(items)} channels; this recipe accepts "
+                        f"at most {max_items}")
+                # No duplicate check: the hub accepts a repeated index, and a local rule the
+                # hub does not have would refuse work that would in fact have run.
                 out[name] = list(items)
                 continue
-            else:
+            elif ktype in ("float", "int"):
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise LabLinkError(
                         f"knob {name!r} must be a number, not {type(value).__name__}")
@@ -494,15 +677,79 @@ class HubClient:
                 if hi is not None and value > hi:
                     raise LabLinkError(
                         f"knob {name!r} = {value} is above the maximum {hi}{unit}")
+            else:
+                # A type this build does not know. Previously this fell into the numeric
+                # branch and a string-valued knob of a new type was reported as "must be a
+                # number" — blaming the value for the client being old.
+                raise LabLinkError(
+                    f"knob {name!r} has type {ktype!r}, which this build does not know how "
+                    f"to check. Update ND2 Studios, or leave this knob at its default.")
             out[name] = value
         return out
+
+    @staticmethod
+    def effective_knobs(recipe_meta: Dict[str, Any],
+                        sent: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The complete picture of what a command runs with, computed locally.
+
+        Needed because the hub's own ``knobs`` echo — documented as "everything in effect,
+        including the recipe's defaults and the ones left derived" — is only populated when
+        the request *carried* knobs. A command that sets nothing therefore comes back with an
+        empty echo, and a run record built from that echo would say nothing about a run that
+        used every one of the recipe's defaults.
+
+        So the echo is used where it exists and this fills the gap: the value sent if one was,
+        else the recipe's declared default, else ``None`` for a knob the file decides. Every
+        declared knob appears, which is what makes the record replayable.
+        """
+        declared = HubClient.declared_knobs(recipe_meta)
+        given = dict(sent or {})
+        out: Dict[str, Any] = {}
+        for name, spec in declared.items():
+            if name in given:
+                out[name] = given[name]
+            elif spec.get("unset_means") == "derive":
+                out[name] = None
+            else:
+                out[name] = spec.get("default")
+        # A knob the recipe no longer declares but the caller sent anyway is kept rather than
+        # dropped: it is evidence about what was asked for, and losing it hides the mismatch.
+        for name, value in given.items():
+            out.setdefault(name, value)
+        return out
+
+    @staticmethod
+    def resolve_for_send(recipe_meta: Dict[str, Any],
+                         knobs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Validate ``knobs`` and turn them into a payload safe to send as a whole set.
+
+        The difference from :meth:`check_knobs` is what happens to a knob whose
+        ``applies_when`` is unmet: here it becomes an explicit ``null`` rather than an error.
+        That is what makes it safe to send *every* knob on *every* command — which the
+        protocol asks for, since each command resolves its knobs independently against the
+        recipe's defaults, so a knob left out reverts for that command.
+
+        ``null`` rather than omitted, deliberately: a warm worker treats an absent knob as
+        unchanged, so omitting an inapplicable knob would leave whatever an earlier command
+        set still in force.
+        """
+        requested = dict(knobs or {})
+        declared = HubClient.declared_knobs(recipe_meta)
+        if not declared:
+            return requested
+        cleared = dict(requested)
+        for name, spec in declared.items():
+            if name in cleared and not knob_applies(spec, requested, declared):
+                cleared[name] = None
+        return HubClient.check_knobs(recipe_meta, cleared)
 
 
 class Session:
     """One warm session. A context manager, because closing is not optional."""
 
     def __init__(self, hub: HubClient, opened: Dict[str, Any], *,
-                 recipe_meta: Optional[Dict[str, Any]] = None):
+                 recipe_meta: Optional[Dict[str, Any]] = None,
+                 knobs: Optional[Dict[str, Any]] = None):
         self.hub = hub
         self.id = str(opened.get("id") or "")
         # From the RESPONSE, never derived from the id — they look mechanical today, and
@@ -519,6 +766,15 @@ class Session:
         self._cursor = int(opened.get("event_seq") or 0)
         self._closed = False
         self.events: List[Dict[str, Any]] = []
+        #: The full knob set in force, carried across commands BY THIS CLIENT rather than by
+        #: the hub. Each command resolves its knobs on their own against the recipe's
+        #: defaults — they do not inherit what was set at ``open`` — so a knob left out of a
+        #: command silently reverts for that command. Keeping the whole set here and sending
+        #: it every time is what makes "change one knob and run again" mean what it looks
+        #: like. It is also what keeps the hub's ``knobs`` echo populated: the hub computes
+        #: that echo only when a command carried knobs, so a bare ``run()`` used to come back
+        #: with an empty record of what ran.
+        self.knobs: Dict[str, Any] = dict(knobs or {})
 
     # ── lifecycle ───────────────────────────────────────────────────────────────
     def __enter__(self) -> "Session":
@@ -637,6 +893,11 @@ class Session:
         Send a ``cmd_id`` for anything expensive. If the response is lost, sending the same
         id again returns *this* command rather than ``409 busy``; without one, a network cut
         on the response leaves no way to tell "my command started" from "it didn't".
+
+        ``knobs`` is a **change set**, not the whole payload: what is passed here is merged
+        into :attr:`knobs` and the merged whole is sent. So ``run(knobs={"level": "li"})``
+        after opening with ``background_um=6.0`` runs with both, which is what the call reads
+        as. Pass ``None`` for a knob to put it back to derived.
         """
         payload: Dict[str, Any] = {"command": command}
         refs = list(inputs)
@@ -646,7 +907,10 @@ class Session:
             # against a different file of the same name.
             payload["inputs"] = [r.as_input() for r in refs]
         if knobs:
-            payload["knobs"] = HubClient.check_knobs(self.recipe_meta, knobs)
+            self.knobs.update(knobs)
+        if self.knobs:
+            # The FULL set, every time — see `self.knobs`.
+            payload["knobs"] = HubClient.resolve_for_send(self.recipe_meta, self.knobs)
         if cmd_id:
             payload["cmd_id"] = cmd_id
 
@@ -717,6 +981,17 @@ class Session:
         """
         _status, body = self.hub.call("POST", self._path("/cancel"), body={})
         return body if isinstance(body, dict) else {}
+
+    def reset(self, *, check: bool = True) -> CommandResult:
+        """Drop the hub's memo and tile caches, keeping the session and its worker alive.
+
+        This is the "free the RAM but stay warm" rung, **not** a return to the recipe's
+        defaults: the knobs in force stay in force, and :attr:`knobs` is deliberately left
+        alone so this client and the worker's graph do not start disagreeing about them.
+        The next run is correct but pays the decode again, so this is a deliberate act for a
+        box that is running out of memory rather than something to do between attempts.
+        """
+        return self.run(command="reset", check=check)
 
     # ── data out ────────────────────────────────────────────────────────────────
     def pull(self, *names: str) -> Dict[str, Any]:
