@@ -6675,6 +6675,98 @@ def test_catalog_piv() -> None:
         "agrees + rehashes, ROI confines + counts drops, calib fenced")
 
 
+def test_catalog_optical_flow() -> None:
+    """Optical Flow (``analysis.optical_flow``) — the dense per-pixel motion sibling of
+    PIV, on scikit-image's TV-L1 / iLK (no extra dependency). Asserts the structural
+    spec (Voxel layers announced via extra_layers, per-method socket gating), a real
+    pull recovering a planted shift in µm on both methods and both pairings, the honest
+    NaN at t=0 / other channels, and per-method recipe-hash separation."""
+    if not _HAVE_SKIMAGE:
+        _ok("catalog (Optical Flow): SKIPPED (scipy/skimage absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+
+    s = NODES.get("analysis.optical_flow")
+    assert s.category == "analysis"
+    assert D.VOXEL in s.adds_domains and not s.reads_domains
+    assert s.granularity is Granularity.WHOLE_SERIES
+    _modes = {mm.name: set(mm.choices) for mm in s.modes}
+    assert _modes.get("method") == {"tvl1", "ilk"}
+    assert _modes.get("reference_mode") == {"previous_frame", "fixed_frame"}
+    _gated = {i.name: i.available_in for i in s.inputs if i.available_in}
+    for _p in ("attachment", "tightness", "num_iter", "tol"):
+        assert _gated.get(_p, {}).get("method") == frozenset({"tvl1"}), (_p, _gated.get(_p))
+    for _p in ("radius", "gaussian"):
+        assert _gated.get(_p, {}).get("method") == frozenset({"ilk"}), (_p, _gated.get(_p))
+    # the derived output layers are ANNOUNCED (extra_layers), including a renamed base
+    assert s.extra_layers is not None
+    assert tuple(s.extra_layers({"name": "of"}, {})) == (
+        (D.VOXEL, "of_y"), (D.VOXEL, "of_x"), (D.VOXEL, "of_mag"))
+
+    # a 3-frame 2-channel graph: channel 0 carries k*(+1 y, +3 x) px/step; px=0.5 µm
+    define_node("io.ofseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(9)
+    patt = gaussian_filter(rng.random((128, 128)), 1.5)
+    img = np.zeros((1, 3, 1, 2, 128, 128))
+    for _t in range(3):
+        img[0, _t, 0, 0] = (patt if _t == 0 else
+                            ndshift(patt, (1.0 * _t, 3.0 * _t), order=3, mode="nearest"))
+        img[0, _t, 0, 1] = patt                             # a channel that does not move
+    px = 0.5
+    ax = AxisSizes(m=1, t=3, z=1, c=2, y=128, x=128)
+    meta = {"pixel_size_um": px}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+
+    def _of(params=None, modes=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.ofseed"))
+        g.add(NodeInstance("F", "analysis.optical_flow",
+                           params=params or {}, modes=modes or {}))
+        g.connect("S", "F", dst_socket="data")
+        return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)})
+
+    e = _of()
+    out = e.pull("F")
+    fy = out.get(D.VOXEL, "flow_y").values
+    fx = out.get(D.VOXEL, "flow_x").values
+    fm = out.get(D.VOXEL, "flow_mag").values
+    assert fy.shape == img.shape and fy.dtype == np.float32
+    inner = (slice(16, -16), slice(16, -16))
+    for _t in (1, 2):                                       # per-step (1, 3) px → µm
+        assert abs(float(np.nanmedian(fy[0, _t, 0, 0][inner])) - 1.0 * px) < 0.08
+        assert abs(float(np.nanmedian(fx[0, _t, 0, 0][inner])) - 3.0 * px) < 0.08
+    assert np.isnan(fy[0, 0, 0, 0]).all(), "t=0 has no pair: NaN, not zero motion"
+    assert np.isnan(fy[0, 1, 0, 1]).all(), "the un-analysed channel stays NaN"
+    med_mag = float(np.nanmedian(fm[0, 1, 0, 0][inner]))
+    assert abs(med_mag - float(np.hypot(1.0, 3.0)) * px) < 0.1, med_mag
+    assert any(k == "pixel_size_um" for k, _ in e.entry("F").reads)
+    assert out.metadata.get("of_method") == "tvl1"
+
+    # iLK agrees on the same field and rehashes; fixed_frame accumulates with self-pair~0
+    e_ilk = _of(modes={"method": "ilk"})
+    o_ilk = e_ilk.pull("F")
+    assert abs(float(np.nanmedian(
+        o_ilk.get(D.VOXEL, "flow_x").values[0, 1, 0, 0][inner])) - 3.0 * px) < 0.1
+    assert e_ilk.entry("F").recipe_hash != e.entry("F").recipe_hash
+    o_fix = _of(modes={"reference_mode": "fixed_frame"}).pull("F")
+    fx_fix = o_fix.get(D.VOXEL, "flow_x").values
+    assert abs(float(np.nanmedian(fx_fix[0, 0, 0, 0]))) < 0.02, "self-pair must be ~0"
+    assert abs(float(np.nanmedian(fx_fix[0, 2, 0, 0][inner])) - 6.0 * px) < 0.15
+
+    # a renamed base writes renamed layers (the extra_layers announcement holds at pull)
+    o_nm = _of(params={"name": "of"}).pull("F")
+    assert o_nm.get(D.VOXEL, "of_mag") is not None
+
+    _ok("catalog (Optical Flow): dense per-pixel motion (TV-L1 + iLK, no new dep) ran "
+        "end-to-end — planted (1,3) px/step recovered in µm on both methods, t=0 and "
+        "the un-analysed channel honestly NaN, magnitude consistent, fixed_frame "
+        "accumulates with self-pair~0, per-method sockets gated, methods rehash, "
+        "derived layers announced and renameable, calib fenced")
+
+
 def test_channel_derive() -> None:
     """C8 / H12 — per-channel derive resolution (``ctx.channel``). A c-iterating node's
     metadata-intelligent param DERIVES from *that channel's* emission λ (distinct λ →
@@ -18677,6 +18769,7 @@ def main() -> int:
     test_catalog_dvc()
     test_catalog_dic()
     test_catalog_piv()
+    test_catalog_optical_flow()
     test_channel_derive()
     test_cluster_points()
     test_mesh_domain()

@@ -128,6 +128,8 @@ MODULES: Tuple[str, ...] = (
     # Appended last for the same reason, not slotted beside `analysis.dic_correlate` /
     # `analysis.dvc_field` whose correlation sibling it is (V3.00 roadmap W5-P2).
     "analysis.piv",
+    # Appended last for the same reason — analysis.piv's dense per-pixel sibling.
+    "analysis.optical_flow",
 )
 
 

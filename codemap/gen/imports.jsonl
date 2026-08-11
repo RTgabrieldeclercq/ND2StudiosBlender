@@ -193,6 +193,12 @@
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.object_metrics"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.object_metrics"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.object_metrics"}
+{"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.optical_flow"}
+{"dst":"nodegraph.catalog._shared.progress","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.optical_flow"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.optical_flow"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.optical_flow"}
+{"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.optical_flow"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.optical_flow"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.piv"}
 {"dst":"nodegraph.catalog._shared.dvc","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.piv"}
 {"dst":"nodegraph.catalog._shared.objects","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.piv"}
