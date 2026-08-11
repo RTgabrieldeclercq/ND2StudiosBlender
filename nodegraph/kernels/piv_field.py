@@ -43,6 +43,13 @@ def openpiv_available() -> bool:
     return find_spec("openpiv") is not None
 
 
+def pivuq_available() -> bool:
+    """True when the external ``pivuq`` package is importable (no import side effects)."""
+    from importlib.util import find_spec
+
+    return find_spec("pivuq") is not None
+
+
 def _require_openpiv():
     """Import the openpiv modules this driver needs, or raise a friendly ImportError."""
     try:
@@ -403,6 +410,79 @@ def run_piv_series(
         if progress_cb is not None:
             progress_cb(int(round(100.0 * i / (n - 1))))
     return out
+
+
+def disparity_uncertainty(
+    frame_a: np.ndarray,
+    frame_b: np.ndarray,
+    res: PIVResult,
+    *,
+    window_size: Optional[int] = None,
+    grid_size: int = 4,
+    min_peaks: int = 2,
+) -> np.ndarray:
+    """Per-vector displacement uncertainty by IMAGE MATCHING (Sciacchitano, Wieneke &
+    Scarano 2013), via the external ``pivuq`` package → ``(Gy, Gx, 2)`` ``[unc_y, unc_x]``
+    in PIXELS on ``res``'s grid.
+
+    Both frames are warped toward each other by the measured field; the residual
+    per-particle position disparities are pooled per window and Eq. (3)'s
+    ``sqrt(mu^2 + (sigma/sqrt(N))^2)`` is the standard uncertainty of the vector. Probed
+    empirically here: a correct field returns δ at the actual error scale (~0.03–0.06 px
+    on the bench fixture, where the true RMSE is 0.031), and a planted +1 px x-error
+    comes back as δx ≈ 1.06 px in the right component. Conventions verified from pivuq
+    source: its ``U`` is ``(u=+x, v=+y ROWS-DOWN)`` and its ``delta`` is ``[x, y]`` —
+    this adapter swaps both to this repo's ``[y, x]``.
+
+    Windows where fewer than ``min_peaks`` particle disparities were found come back
+    **NaN** — no honest estimate exists there (pivuq would report a hard 0). NaN in
+    ``res.displacement_field`` is also NaN here. ``window_size`` defaults to the final
+    interrogation window from ``res.diagnostics``.
+
+    The dense field handed to pivuq is built HERE (``RectBivariateSpline``), because
+    pivuq's own sparse-field upsampler still calls ``scipy.interpolate.interp2d``,
+    which modern scipy has removed — a dense ``(2, H, W)`` input skips that path.
+
+    Install: ``pip install pivuq --no-deps`` (its pinned numba tries to build from
+    source on this Python; the packages already present satisfy it)."""
+    try:
+        from pivuq import disparity
+    except ImportError as exc:  # pragma: no cover - environment-dependent
+        raise ImportError(
+            "PIV uncertainty needs the external 'pivuq' package: "
+            "pip install pivuq --no-deps  (its pinned numba fails to build on this "
+            "Python; numpy/scipy/scikit-image/numba already present satisfy it)"
+        ) from exc
+    from scipy.interpolate import RectBivariateSpline
+
+    frame_a = _as_frame(frame_a, "frame A")
+    frame_b = _as_frame(frame_b, "frame B")
+    h, w = frame_a.shape
+    g = res.grid_coords
+    if window_size is None:
+        window_size = int(res.diagnostics.get("windowsizes", (32,))[-1])
+
+    y1, x1 = g[:, 0, 0], g[0, :, 1]
+    dy = np.nan_to_num(res.displacement_field[..., 0])
+    dx = np.nan_to_num(res.displacement_field[..., 1])
+    kx = int(min(3, len(x1) - 1))
+    ky = int(min(3, len(y1) - 1))
+    yy, xx = np.arange(h), np.arange(w)
+    u_dense = RectBivariateSpline(y1, x1, dx, kx=kx, ky=ky)(yy, xx)
+    v_dense = RectBivariateSpline(y1, x1, dy, kx=kx, ky=ky)(yy, xx)
+
+    _X, _Y, delta, n_peaks, _mu, _sigma = disparity.sws(
+        np.stack([frame_a, frame_b]), np.stack([u_dense, v_dense]),
+        window_size=int(window_size), grid_size=int(grid_size))
+    delta = np.where(n_peaks[None, ...] >= min_peaks, delta, np.nan)
+
+    # sample the grid_size-pitch delta map at the PIV window centres (nearest)
+    n_gy, n_gx = delta.shape[1], delta.shape[2]
+    iy = np.clip(np.round((g[..., 0] - grid_size / 2) / grid_size).astype(int), 0, n_gy - 1)
+    ix = np.clip(np.round((g[..., 1] - grid_size / 2) / grid_size).astype(int), 0, n_gx - 1)
+    unc = np.stack([delta[1][iy, ix], delta[0][iy, ix]], axis=-1)   # → [y, x]
+    unc[~np.isfinite(res.displacement_field)] = np.nan
+    return unc
 
 
 def run_piv_ensemble(

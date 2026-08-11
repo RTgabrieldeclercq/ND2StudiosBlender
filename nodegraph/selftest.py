@@ -6487,7 +6487,7 @@ def test_catalog_piv() -> None:
     from scipy.ndimage import gaussian_filter, shift as ndshift
     from nodegraph.provider import ArrayProvider
     from nodegraph.nodes import COMPUTES
-    from nodegraph.kernels.piv_field import openpiv_available
+    from nodegraph.kernels.piv_field import openpiv_available, pivuq_available
 
     # structural spec — Point output, reference + correlation levers, ROI, WHOLE_SERIES
     s = NODES.get("analysis.piv")
@@ -6635,7 +6635,38 @@ def test_catalog_piv() -> None:
             raised = str(ex)
         assert "velocity" in raised.lower(), (why, raised)
 
-    _ok("catalog (PIV OpenPIV): wired 2D PIV (reference + correlation levers, ROI, Point "
+    # uncertainty (step 5): Sciacchitano image-matching disparity via pivuq — per-vector
+    # unc_y/unc_x µm at the actual error scale on a clean planted shift; NaN where too
+    # few particles matched (honest gaps); refused outright in ensemble mode
+    raised = ""
+    try:
+        _piv({"uncertainty": True}, modes={"reference_mode": "ensemble"}).pull("V")
+    except ValueError as ex:
+        raised = str(ex)
+    assert "uncertainty" in raised.lower() and "per-pair" in raised.lower(), raised
+    if pivuq_available():
+        o_unc = _piv({"uncertainty": True}).pull("V")
+        unames = {a.name for a in o_unc.layers_on(D.POINT) if a.layer == "piv"}
+        assert {"unc_y", "unc_x"} <= unames, sorted(unames)
+        uy = o_unc.get(D.POINT, "unc_y", layer="piv").values
+        finite = np.isfinite(uy)
+        assert finite.mean() > 0.5, f"most vectors should get an estimate: {finite.mean()}"
+        med_unc = float(np.median(uy[finite]))
+        assert 0.0 < med_unc < 0.2 * px, \
+            f"uncertainty on a clean planted shift should sit near the ~0.03 px error " \
+            f"scale, got {med_unc} µm (px={px})"
+        unc_note = "uncertainty emits unc_y/unc_x µm at the error scale (pivuq present)"
+    else:
+        raised = ""
+        try:
+            _piv({"uncertainty": True}).pull("V")
+        except ImportError as ex:
+            raised = str(ex)
+        assert "pivuq" in raised.lower(), f"expected a friendly pivuq ImportError: {raised!r}"
+        unc_note = "uncertainty dep-gated (friendly pivuq ImportError)"
+
+    _ok(f"catalog (PIV OpenPIV): {unc_note}; ensemble+uncertainty refused; " +
+        "wired 2D PIV (reference + correlation levers, ROI, Point "
         "output, WHOLE_SERIES) ran end-to-end — previous_frame recovers a planted (1,3) "
         "px/step shift at t=1,2 in µm with S/N>1 per vector, fixed_frame accumulates with "
         "self-pair~0, ENSEMBLE averages correlation planes to one t=0 field and rehashes, "

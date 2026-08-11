@@ -98,7 +98,11 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     when neither exists rather than mislabel µm/frame as µm/s — and emits ``vy``/``vx``/
     ``speed`` columns (µm/s, names matching ``analysis.object_metrics``). Velocity is
     refused for ``fixed_frame`` or an external reference (cumulative displacement has no
-    per-row rate). Per pair the kernel runs a coarse-to-fine window ladder (each pass 2×
+    per-row rate). ``uncertainty`` (step 5) emits per-vector ``unc_y``/``unc_x`` (µm) via
+    the Sciacchitano-2013 image-matching disparity method — the external ``pivuq``
+    package, lazily imported through :func:`disparity_uncertainty`, whose docstring pins
+    the probed conventions; refused in ``ensemble`` mode (a per-pair method). Per pair
+    the kernel runs a coarse-to-fine window ladder (each pass 2×
     the next, ending at ``window_size``) with symmetric image deformation between passes;
     each pass validates (global limit / global std / median test / signal-to-noise) and
     inpaints failures — mandatory between passes (holes poison the predictor), governed
@@ -113,7 +117,8 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     COARSER than the image (pitch = window × (1 − overlap)) — feed it to
     ``transform.rasterize_field`` for a dense map. Reuses the shared :func:`_dvc_rows`
     flattener, so columns align with the DVC/DIC siblings."""
-    from nodegraph.kernels.piv_field import run_piv_ensemble, run_piv_series
+    from nodegraph.kernels.piv_field import (
+        disparity_uncertainty, run_piv_ensemble, run_piv_series)
 
     ds = ctx.inputs[0]
     prov = ds.image
@@ -159,6 +164,15 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
             "reports CUMULATIVE displacement since the reference, so µm/s is not defined "
             "per row — use previous_frame or ensemble, or divide the disp columns "
             "downstream yourself")
+    # uncertainty: Sciacchitano-2013 image-matching disparity (external pivuq, lazy).
+    # A per-PAIR method: both frames of one pair are warped by that pair's field and the
+    # residual particle disparities are pooled — undefined for the ensemble AVERAGE.
+    want_unc = bool(ctx.params.get("uncertainty", False))
+    if want_unc and ref_mode == "ensemble":
+        raise ValueError(
+            "PIV uncertainty is a per-pair method (both frames of a pair are warped by "
+            "that pair's own field) — it is not defined for the ensemble-averaged field. "
+            "Use previous_frame/fixed_frame, or turn Uncertainty off for ensemble runs")
     try:
         dt_s = _frame_interval_s(ctx, needed=want_vel, wanted=("velocity",),
                                  node="analysis.piv")
@@ -206,8 +220,8 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     rows: list = []
     n_dropped = 0
 
-    def _emit(res, m: int, t: int, z: int) -> None:
-        """One PIVResult → filtered Point rows (+ velocity columns when asked)."""
+    def _emit(res, m: int, t: int, z: int, unc=None) -> None:
+        """One PIVResult → filtered Point rows (+ velocity/uncertainty columns)."""
         nonlocal n_dropped
         row = _dvc_rows(res, vox, m=m, t=t, c=c, z_plane=z)
         row["replaced"] = res.flags.reshape(-1).astype(np.int64)
@@ -215,6 +229,9 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
             row["vy"] = row["disp_y"] / dt_s
             row["vx"] = row["disp_x"] / dt_s
             row["speed"] = row["disp_mag_um"] / dt_s
+        if unc is not None:                               # px → µm, [y, x] components
+            row["unc_y"] = unc[..., 0].reshape(-1) * vox[0]
+            row["unc_x"] = unc[..., 1].reshape(-1) * vox[1]
         keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
         if not keep.all():
             n_dropped += int((~keep).sum())
@@ -236,13 +253,19 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
                     roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
                 _emit(res, m, 0, z)
             else:
+                seq = _PIVPlaneSeq(plan)
                 series = run_piv_series(
-                    _PIVPlaneSeq(plan), params, vox, pairing=pairing,
+                    seq, params, vox, pairing=pairing,
                     roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
                 for i, t in enumerate(result_t):
                     if i >= len(series):
                         break
-                    _emit(series[i], m, t, z)
+                    unc = None
+                    if want_unc:                          # re-fetch this result's pair
+                        unc = disparity_uncertainty(
+                            seq[0 if pairing == "fixed_head" else i], seq[i + 1],
+                            series[i], window_size=window)
+                    _emit(series[i], m, t, z, unc)
             bar.finish_unit(note=f"m={m} z={z}")
 
     # Provenance (§7b): PIV-specific keys (NOT the dvc_* keys accumulate_field consumes —
@@ -395,6 +418,18 @@ register_node(
                 "a reasonable tightening for smooth flows. Beware genuinely bimodal fields "
                 "(a jet through still fluid) where a tight value flags the minority "
                 "population wholesale."),
+        InBool("uncertainty", "Uncertainty", field=False, default=False,
+               description=
+               "Also emit `unc_y`/`unc_x` columns (µm): the standard uncertainty of each "
+               "vector by IMAGE MATCHING (Sciacchitano 2013) — both frames are warped "
+               "onto each other by the measured field and the residual per-particle "
+               "misalignments pooled per window. A well-measured vector reads at the "
+               "actual error scale (~0.03 px-equivalent on the bench); a wrong one reads "
+               "its own error. NaN where fewer than 2 particles matched — no honest "
+               "estimate exists there, which on sparse or featureless data may be most "
+               "rows. Refused in `ensemble` mode (a per-pair method). Costs roughly one "
+               "extra pass per pair *(dep: pivuq — install with pip install pivuq "
+               "--no-deps)*."),
         InBool("velocity", "Velocity", field=False, default=False,
                description=
                "Also emit `vy`, `vx` and `speed` columns in µm/s — the µm displacement "
@@ -507,7 +542,8 @@ register_node(
                 "Point displacement field per frame pair; previous/fixed self-reference, "
                 "ENSEMBLE correlation averaging (one time-averaged field — the micro-PIV "
                 "method for sparse seeding), or an external reference Dataset + optional "
-                "ROI mask; optional vy/vx/speed µm/s via the file's dt_s. The FLOW "
-                "sibling of DIC — independent windows, far faster, per-vector "
+                "ROI mask; optional vy/vx/speed µm/s via the file's dt_s and optional "
+                "per-vector unc_y/unc_x µm (Sciacchitano image-matching, dep: pivuq). "
+                "The FLOW sibling of DIC — independent windows, far faster, per-vector "
                 "confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: "
                 "friendly ImportError at run time until installed).")

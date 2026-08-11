@@ -61,8 +61,26 @@ run_piv_ensemble(
     cancelled_cb: Optional[Callable[[], bool]] = None,
 ) -> PIVResult                          # ONE time-averaged field for the whole series
 
+disparity_uncertainty(
+    frame_a, frame_b,                  # the SAME pair the field was measured on
+    res: PIVResult,
+    *,
+    window_size: Optional[int] = None, # default: res's final interrogation window
+    grid_size: int = 4,
+    min_peaks: int = 2,
+) -> np.ndarray                         # (Gy, Gx, 2) [unc_y, unc_x] px on res's grid
+
 openpiv_available() -> bool             # find_spec probe, no import side effects
+pivuq_available() -> bool               # ditto, for the uncertainty dependency
 ```
+
+`disparity_uncertainty` is the **image-matching UQ** of Sciacchitano, Wieneke & Scarano
+(2013), via the external **`pivuq`** package (lazy; `pip install pivuq --no-deps` — its
+pinned numba fails to build here and the packages already present satisfy it). Probed
+conventions (see the function docstring): pivuq's `U` is `(u=+x, v=+y ROWS-DOWN)` and its
+`delta` is `[x, y]` — the adapter swaps both to `[y, x]`; the dense field is built HERE
+because pivuq's own sparse upsampler still calls the scipy-removed `interp2d`. Windows
+with fewer than `min_peaks` matched particles return **NaN**, not pivuq's misleading 0.
 
 `run_piv_ensemble` is **ensemble (correlation-averaged) PIV** — Meinhart, Wereley &
 Santiago (2000): at every pass the correlation planes of ALL pairs are summed before
@@ -188,6 +206,7 @@ Field names/layouts match `DVCResult` where they overlap, so the catalog's share
 | `numpy` | import-time | arrays throughout. |
 | `scipy` | **lazy** (inside `_deform_pass` / `_roi_on_grid`) | `RectBivariateSpline` predictor interp, `map_coordinates` deformation + ROI sampling. |
 | `openpiv` | **lazy** (inside `_require_openpiv`) | ALL the correlation math. **GPLv3.** Pulls `scikit-image`, `imageio`, `matplotlib`, `natsort`, `tqdm`. Absent → friendly `ImportError` only when `run_piv_*` is called; module import still succeeds. |
+| `pivuq` | **lazy** (inside `disparity_uncertainty`) | the image-matching UQ (MIT). Install `--no-deps` (numba pin fails to build; numpy/scipy/scikit-image/numba already present satisfy it). Absent → friendly `ImportError` on the uncertainty path only. |
 
 Install the solver: `pip install openpiv` (verified against 0.25.4).
 
