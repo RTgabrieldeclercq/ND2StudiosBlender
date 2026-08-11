@@ -2068,7 +2068,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | DVC (ALDVC) | `analysis.dvc_field` | reference `fixed_frame/previous_frame` + optional external `reference` Dataset, `subset_size/spacing` px, `search_radius`, correlation `zncc/phase`, strain `infinitesimal/green-lagrange/almansi/hencky`, `newFFTSearch` | Point displacement+strain field (µm); lever |
 | Accumulate DVC Field | `analysis.accumulate_field` | `source`, `name` | cumulative Lagrangian disp+strain; **inherits** its config from the upstream DVC (refuses `fixed_frame`/no provenance) |
 | DIC (pyALDIC) | `analysis.dic_correlate` | reference lever + optional `reference` Dataset, solver `aldic/local`, `winsize/winstepsize/search_range` px, ICGN/ADMM iterations, smoothness, `compute_strain`, optional `roi` mask | 2D Point displacement (+ optional strain) field *(dep: al-dic)*. Solves the whole T stack in **one** solver call per (m, z) — 2.3–3.2× faster than the per-frame pairing it replaced, for bit-identical displacements. Validated against pyALDIC's own synthetic suite (`scripts/dic_synthetic_bench.py`) |
-| PIV (OpenPIV) | `analysis.piv` | reference `previous_frame/fixed_frame` + optional external `reference` Dataset, correlation `circular/linear`, `window_size` px + `passes` + `overlap`, subpixel fit, validation (`max_disp`, S/N, median test `universal/classic/off`, std), `replace`, `smooth`, optional `roi` mask | 2D Point displacement field per frame **pair** (µm; +y down) with per-vector correlation S/N (`qfactor`) and a `replaced` flag *(dep: openpiv, GPLv3)*. The FLOW sibling of DIC: independent windows, orders of magnitude faster, `previous_frame` default measures per-step motion — divide by your frame interval for velocity; `fixed_frame`/external reference for deformation vs a rest state (TFM bead images). What bites: the window ladder trims itself on small crops (may quietly run single-pass — check `piv_invalid_points` and the effective ladder); window averaging attenuates structure finer than ~4 windows/wavelength (`sinc(π·w/λ)`: a window the size of the wavelength sees NOTHING); the default universal median test flags genuinely sharp gradients — set the median test `off` for discontinuous fields. Validated against openpiv's own suite + analytic fields (`scripts/piv_synthetic_bench.py`); driver bit-identical to upstream `windef.simple_multipass` |
+| PIV (OpenPIV) | `analysis.piv` | reference `previous_frame/fixed_frame/ensemble` + optional external `reference` Dataset, correlation `circular/linear`, `window_size` px + `passes` + `overlap`, subpixel fit, validation (`max_disp`, S/N, median test `universal/classic/off`, std), `replace`, `smooth`, `velocity` (+ `frame_interval` s), optional `roi` mask | 2D Point displacement field per frame **pair** (µm; +y down) with per-vector correlation S/N (`qfactor`) and a `replaced` flag; `velocity` adds `vy`/`vx`/`speed` µm/s from the file's `dt_s` (refused, never /1.0, when no interval exists; refused for cumulative pairings) *(dep: openpiv, GPLv3)*. The FLOW sibling of DIC: independent windows, orders of magnitude faster; `previous_frame` measures per-step motion, `fixed_frame`/external reference deformation vs a rest state (TFM beads), `ensemble` averages every pair's CORRELATION PLANES into one t=0 field — the micro-PIV move for sparse seeding (bench: 2.8 → 0.65 px at ~3 particles/window over 12 pairs; assumes steady flow). What bites: the window ladder trims itself on small crops (may quietly run single-pass — check `piv_invalid_points` and the effective ladder); window averaging attenuates structure finer than ~4 windows/wavelength (`sinc(π·w/λ)`: a window the size of the wavelength sees NOTHING); the default universal median test flags genuinely sharp gradients — set the median test `off` for discontinuous fields. Validated against openpiv's own suite + analytic fields (`scripts/piv_synthetic_bench.py`); driver bit-identical to upstream `windef.simple_multipass`. See §16-D2 for the fluorescence preprocessing chain |
 | Track Linking | `track.link` | target `label/point`, `max_distance` µm, `iou_threshold` | Track membership (IoU overlap / nearest neighbour) |
 | **Reduce → Scalar** | `analysis.reduce_scalar` | `domain` (voxel…track), `source` column/layer, `table` (only when a name is ambiguous), `reducer` `count/mean/sum/max/min/median`, `name` | ONE number on the **Global** domain — the score an Iterate node's `best` mode compares ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)), and the only node in the catalog that writes Global. An empty domain is a result (`count` → 0), not an error; a wrong column name still is |
 | Track Objects | `track.objects` | target `label/point`, method `centroid/serialtrack/topology/fingerprint/overlap` + per-method params | Track table **+ `track_id` write-back**; *(dep: numba/pandas)*. `serialtrack` is 1–2 orders of magnitude slower than the rest |
@@ -2236,6 +2236,50 @@ io.load ─→ analysis.dvc_field (previous_frame) ─→ analysis.accumulate_fi
 
   `python scripts/dic_synthetic_bench.py` re-runs the ground-truth accuracy suite (pyALDIC's
   own synthetic cases plus sub-pixel/noise/resolution probes) against the live code.
+
+### D2. Flow fields on fluorescence time-lapse (PIV)
+
+The flow sibling of D: `analysis.piv` cross-correlates independent windows per frame pair —
+microfluidics, cytoplasmic streaming, collective migration, TFM bead fields. On fluorescence
+the preprocessing chain matters as much as the correlation, because fluorescence signal is
+~1000× weaker than scattering-mode PIV imagery and everything static (autofluorescence,
+debris, uneven illumination) correlates *against* you at zero displacement:
+
+```
+io.load ─ch0→ enhance.subtract_background ─→ enhance.clahe ─→ analysis.piv (previous_frame,
+              (temporal estimator)                             velocity on) ─→ transform.rasterize_field
+```
+
+* **Subtract the static background first.** Anything that does not move pulls every vector
+  toward zero. A temporal estimator in `enhance.subtract_background` removes exactly the
+  static part while the moving tracers survive; `enhance.temporal_gain` handles bleaching
+  decay if intensities fade over the series (a slow global fade otherwise weakens
+  correlation between the two frames of a pair — or just use `correlation = linear`, whose
+  per-window normalization is insensitive to it).
+* **CLAHE evens out local contrast** so dim tracers in dark corners contribute windows as
+  usable as the bright centre's. PIVlab ships it default-on for the same reason.
+* **`velocity` on** emits `vy`/`vx`/`speed` in µm/s from the file's own `dt_s` (ND2
+  timestamps carry it); the node refuses rather than divide by a placeholder if the file
+  has no timing — set `frame_interval` manually then.
+* **Sparse tracers? Switch `reference_mode` to `ensemble`.** It averages the correlation
+  planes of every pair before peak-finding and emits ONE time-averaged field at t=0 —
+  measured on the bench: at ~3 particles per window, single pairs are broken (2.8 px RMSE)
+  where the 12-pair ensemble reads 0.65 px. The trade: the flow must be statistically
+  steady over the series (or use a fixed external reference for a static deformation
+  measured many times, e.g. TFM).
+* **What bites:** the window ladder trims itself on small crops (check the
+  `piv_invalid_points` metadata and effective ladder); structure finer than ~4 windows per
+  wavelength is attenuated (sinc law — a window the size of the feature sees nothing); the
+  default universal median test flags genuinely sharp gradients, so set `median_test = off`
+  across real discontinuities (channel walls, tissue interfaces); and `qfactor` (per-vector
+  correlation S/N) stays deceptively high on sparse noisy data — filter on `replaced` and
+  raise `s2n_threshold` rather than trusting raw S/N there.
+* `analysis.piv` and `analysis.dic_correlate` answer the same question with different
+  physics (independent windows vs a globally regularized FE solve). On a pair where both
+  apply, running both is the cheapest ground truth there is.
+
+`python scripts/piv_synthetic_bench.py` re-runs the PIV accuracy suite (openpiv's own
+fixtures, analytic fields, the windef parity pin, and the low-seeding ensemble comparison).
 
 ### E. Point cloud → mesh → label volume
 

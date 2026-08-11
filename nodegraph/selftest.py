@@ -6497,7 +6497,7 @@ def test_catalog_piv() -> None:
     assert {"data", "reference", "reference_frame", "window_size", "passes", "overlap",
             "median_test", "roi", "name"} <= {i.name for i in s.inputs}
     _modes = {mm.name: set(mm.choices) for mm in s.modes}
-    assert _modes.get("reference_mode") == {"previous_frame", "fixed_frame"}
+    assert _modes.get("reference_mode") == {"previous_frame", "fixed_frame", "ensemble"}
     assert _modes.get("correlation") == {"circular", "linear"}, _modes
 
     # a 3-frame 2D graph: frames carry k*(+1 y, +3 x) px of planted shift per step.
@@ -6585,11 +6585,63 @@ def test_catalog_piv() -> None:
     assert int(o_roi.metadata.get("piv_invalid_points", -1)) > 0, \
         "dropped out-of-ROI vectors must be counted in provenance"
 
+    # ensemble (V3 W5-P2 step 1) → ONE correlation-averaged field per (m, z) at t=0.
+    # The steady per-step (1, 3) px fixture is exactly the mode's assumption.
+    e_ens = _piv(modes={"reference_mode": "ensemble"})
+    o_ens = e_ens.pull("V")
+    t_ens = set(o_ens.get(D.POINT, "t", layer="piv").values.astype(int).tolist())
+    assert t_ens == {0}, t_ens
+    assert abs(_med(o_ens, "disp_y", 0) - 1.0 * px) < 0.12, _med(o_ens, "disp_y", 0)
+    assert abs(_med(o_ens, "disp_x", 0) - 3.0 * px) < 0.12, _med(o_ens, "disp_x", 0)
+    assert o_ens.metadata.get("piv_reference_mode") == "ensemble"
+    assert e_ens.entry("V").recipe_hash != e.entry("V").recipe_hash, \
+        "ensemble mode must fold into the recipe hash"
+
+    # velocity (step 3): µm/s columns from the file's dt_s, refused without a per-step
+    # pairing or without any interval — never a silent /1.0
+    meta_dt = {"pixel_size_um": px, "dt_s": 2.0}
+    ds_dt = Dataset(axes=ax, metadata=meta_dt).with_image(ArrayProvider(img))
+    g_v = Graph()
+    g_v.add(NodeInstance("S", "io.pivseed"))
+    g_v.add(NodeInstance("V", "analysis.piv", params={**P, "velocity": True}))
+    g_v.connect("S", "V", dst_socket="data")
+    e_vel = Engine(g_v, computes=COMPUTES, seeds={"S": ds_dt},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta_dt)})
+    o_vel = e_vel.pull("V")
+    vnames = {a.name for a in o_vel.layers_on(D.POINT) if a.layer == "piv"}
+    assert {"vy", "vx", "speed"} <= vnames, sorted(vnames)   # object_metrics' names
+    assert abs(_med(o_vel, "vx", 1) - 3.0 * px / 2.0) < 0.06, _med(o_vel, "vx", 1)
+    assert abs(_med(o_vel, "speed", 1) -
+               float(np.hypot(1.0, 3.0)) * px / 2.0) < 0.06, _med(o_vel, "speed", 1)
+    assert any(k == "dt_s" for k, _ in e_vel.entry("V").reads), "dt_s must be fenced"
+    assert abs(float(o_vel.metadata.get("piv_dt_s", 0)) - 2.0) < 1e-9
+    assert not any(k == "dt_s" for k, _ in e.entry("V").reads), \
+        "velocity OFF must not fence dt_s (R1)"
+    for bad_params, bad_modes, why in (
+            ({"velocity": True}, {"reference_mode": "fixed_frame"}, "cumulative"),
+            ({"velocity": True}, None, "no dt_s")):
+        gb = Graph()
+        gb.add(NodeInstance("S", "io.pivseed"))
+        gb.add(NodeInstance("V", "analysis.piv", params={**P, **bad_params},
+                            modes=bad_modes or {}))
+        gb.connect("S", "V", dst_socket="data")
+        seed_b = ds_dt if why == "cumulative" else ds        # ds has no dt_s
+        env_b = MetaEnvelope(axes=ax, metadata=(meta_dt if why == "cumulative" else meta))
+        raised = ""
+        try:
+            Engine(gb, computes=COMPUTES, seeds={"S": seed_b},
+                   meta_seeds={"S": env_b}).pull("V")
+        except ValueError as ex:
+            raised = str(ex)
+        assert "velocity" in raised.lower(), (why, raised)
+
     _ok("catalog (PIV OpenPIV): wired 2D PIV (reference + correlation levers, ROI, Point "
         "output, WHOLE_SERIES) ran end-to-end — previous_frame recovers a planted (1,3) "
         "px/step shift at t=1,2 in µm with S/N>1 per vector, fixed_frame accumulates with "
-        "self-pair~0, linear correlation agrees + rehashes, ROI confines + counts drops, "
-        "calib fenced")
+        "self-pair~0, ENSEMBLE averages correlation planes to one t=0 field and rehashes, "
+        "velocity emits vy/vx/speed µm/s from dt_s (fenced only when on; refused for "
+        "cumulative pairing and for a Dataset with no interval), linear correlation "
+        "agrees + rehashes, ROI confines + counts drops, calib fenced")
 
 
 def test_channel_derive() -> None:

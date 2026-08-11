@@ -25,7 +25,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from nodegraph.kernels.piv_field import openpiv_available, run_piv_pair  # noqa: E402
+from nodegraph.kernels.piv_field import (  # noqa: E402
+    openpiv_available, run_piv_ensemble, run_piv_pair)
 
 H = W = 256
 MARGIN = 32                       # interior margin, px (windows near edges excluded)
@@ -185,6 +186,48 @@ def main() -> int:
         FAILS.append("windef parity")
     print(f"[{status:>4}] {'windef.simple_multipass parity':<34} max |delta| "
           f"{max(du, dv):8.2e} px  (tol 1e-9; y-flip/v-negation undone)")
+
+    # ── 11. ensemble correlation in the Meinhart low-seeding regime ─────────────
+    # ~3 particles per final 32 px window, FRESH camera noise per frame (the noise must
+    # not advect with the particles, or empty windows correlate perfectly), steady
+    # (2.5, -1.25) px/step flow rendered by sub-pixel bilinear splatting with wrapped
+    # positions (statistically steady seeding). Single-pair PIV breaks here; averaging
+    # the correlation planes over the 12 pairs recovers the field — the point of the
+    # method (Meinhart, Wereley & Santiago 2000).
+    from scipy.ndimage import gaussian_filter as _gf
+
+    rng = np.random.default_rng(11)
+    n_pairs, n_part, noise_sd = 12, 50, 4.0
+
+    def _render(pos):
+        img = np.zeros((H, W))
+        for py, px_ in pos:
+            iy, ix = int(np.floor(py)) % H, int(np.floor(px_)) % W
+            fy, fx = py - np.floor(py), px_ - np.floor(px_)
+            for dy_, wy in ((0, 1 - fy), (1, fy)):
+                for dx_, wx in ((0, 1 - fx), (1, fx)):
+                    img[(iy + dy_) % H, (ix + dx_) % W] += 200.0 * wy * wx
+        return _gf(img, 1.2)
+
+    pos0 = rng.uniform(0, 1, (n_part, 2)) * np.array([H, W])
+    flow = [_render((pos0 + k * np.array([2.5, -1.25])) % np.array([H, W]))
+            + rng.normal(0, noise_sd, (H, W)) for k in range(n_pairs + 1)]
+
+    def _err11(d):
+        return float(np.sqrt(np.nanmean((d[..., 0] - 2.5) ** 2
+                                        + (d[..., 1] + 1.25) ** 2)))
+
+    single = [_err11(run_piv_pair(flow[k], flow[k + 1], vox, PARAMS).displacement_field)
+              for k in range(n_pairs)]
+    r_ens = run_piv_ensemble(flow, PARAMS, vox, pairing="previous")
+    e_single, e_ens = float(np.mean(single)), _err11(r_ens.displacement_field)
+    gain = e_single / max(e_ens, 1e-9)
+    status = "ok" if (e_ens < 0.85 and gain > 3.0) else "FAIL"
+    if status == "FAIL":
+        FAILS.append("ensemble low-seeding")
+    print(f"[{status:>4}] {'ensemble @ ~3 particles/window':<34} single-pair mean "
+          f"{e_single:6.3f} px -> ensemble {e_ens:6.3f} px ({gain:.1f}x; "
+          f"tol: <0.85 px and >3x)")
 
     print(f"\n{len(FAILS)} failures in {time.time() - t0:.1f} s")
     if FAILS:

@@ -308,11 +308,19 @@ def _piv_one_pair(frame_a, frame_b, params, voxel_size_um, roi_mask,
             if not final and s.smoothn:
                 u, v = _smooth(u, v, excluded)
 
-    # ── package ───────────────────────────────────────────────────────────────
-    # Contract: the final field carries only vectors that PASSED validation or were
-    # inpainted. If replacement did not run (turned off, or every vector failed and
-    # there was nothing to inpaint from), flagged vectors come back NaN, and `flags`
-    # on the survivors means "this value was filled from its neighbours".
+    return _package_result(x, y, u, v, s2n, flags, excluded, replaced_final,
+                           eff_ws, eff_ov, trimmed, s, voxel_size_um)
+
+
+def _package_result(x, y, u, v, s2n, flags, excluded, replaced_final,
+                    eff_ws, eff_ov, trimmed, s, voxel_size_um,
+                    extra_diag: Optional[Dict[str, Any]] = None) -> PIVResult:
+    """Shared final packaging (pair and ensemble paths — one copy so they cannot drift).
+
+    Contract: the final field carries only vectors that PASSED validation or were
+    inpainted. If replacement did not run (turned off, or every vector failed and
+    there was nothing to inpaint from), flagged vectors come back NaN, and `flags`
+    on the survivors means "this value was filled from its neighbours"."""
     dy = np.ma.filled(np.ma.masked_array(v, mask=excluded), np.nan)
     dx = np.ma.filled(np.ma.masked_array(u, mask=excluded), np.nan)
     if not replaced_final and flags.any():
@@ -322,6 +330,16 @@ def _piv_one_pair(frame_a, frame_b, params, voxel_size_um, roi_mask,
     disp = np.stack([dy, dx], axis=-1)        # [dy, dx], +dy = down rows (probed)
     grid = np.stack([np.asarray(y, float), np.asarray(x, float)], axis=-1)
     flags = np.asarray(flags, dtype=bool)
+    diag: Dict[str, Any] = {
+        "windowsizes": tuple(eff_ws), "overlaps": tuple(eff_ov),
+        "n_passes": len(eff_ws), "ladder_trimmed": bool(trimmed),
+        "correlation": s.correlation_method,
+        "normalized_correlation": bool(s.normalized_correlation),
+        "subpixel": s.subpixel_method, "deformation": s.deformation_method,
+        "n_flagged": int(flags.sum()), "n_excluded": int(excluded.sum()),
+    }
+    if extra_diag:
+        diag.update(extra_diag)
     return PIVResult(
         dim=2,
         grid_coords=grid,
@@ -331,14 +349,7 @@ def _piv_one_pair(frame_a, frame_b, params, voxel_size_um, roi_mask,
         voxel_size_um=(float(voxel_size_um[0]), float(voxel_size_um[1])),
         flags=flags,
         excluded=excluded,
-        diagnostics={
-            "windowsizes": tuple(eff_ws), "overlaps": tuple(eff_ov),
-            "n_passes": n_passes, "ladder_trimmed": bool(trimmed),
-            "correlation": s.correlation_method,
-            "normalized_correlation": bool(s.normalized_correlation),
-            "subpixel": s.subpixel_method, "deformation": s.deformation_method,
-            "n_flagged": int(flags.sum()), "n_excluded": int(excluded.sum()),
-        },
+        diagnostics=diag,
     )
 
 
@@ -392,3 +403,168 @@ def run_piv_series(
         if progress_cb is not None:
             progress_cb(int(round(100.0 * i / (n - 1))))
     return out
+
+
+def run_piv_ensemble(
+    images: Sequence[np.ndarray],
+    params: Dict[str, Any],
+    voxel_size_um: Tuple[float, float],
+    *,
+    pairing: str = "previous",
+    roi_mask: Optional[np.ndarray] = None,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    cancelled_cb: Optional[Callable[[], bool]] = None,
+) -> PIVResult:
+    """Ensemble (correlation-averaged) PIV: ONE time-averaged field for the whole series.
+
+    The micro-PIV method of Meinhart, Wereley & Santiago (2000): at every pass, the
+    CORRELATION PLANES of all frame pairs are summed before peak-finding — signal at the
+    true displacement accumulates over pairs while random cross-particle peaks average
+    out, so a field is recoverable from seeding far too sparse for any single pair
+    (upstream's measured case: <1% bad vectors at ~2.5 particles per window over 8 pairs,
+    where image- or vector-averaging leave 5–12%). Assumes the flow is statistically
+    STEADY over the series (or the deformation static, for a `fixed_head` bead series);
+    real temporal variation is averaged away, not detected.
+
+    Multipass window deformation composes with the averaging exactly as in PIVlab's
+    ensemble mode: each pass deforms EVERY pair by the ensemble predictor (deformation
+    is always symmetric here — `deformation_method` is ignored), re-correlates, and
+    averages again. `qfactor` is the signal-to-noise of the AVERAGED plane — the growth
+    of this number with series length is the method working. Frames are re-read lazily
+    once per pass (`n_passes × (len(images) - 1)` pair reads); peak memory is ~two
+    planes plus one correlation stack. A truthy ``cancelled_cb`` raises RuntimeError."""
+    n = len(images)
+    if n < 2:
+        raise ValueError("PIV ensemble needs at least 2 images (>= 1 pair)")
+    if pairing not in ("previous", "fixed_head"):
+        raise ValueError(f"unknown pairing {pairing!r}")
+    pyprocess, windef, validation, filters, smoothn_mod, PIVSettings = _require_openpiv()
+    from scipy.interpolate import RectBivariateSpline
+    from scipy.ndimage import map_coordinates
+
+    head = _as_frame(images[0], "frame 0")
+    shape = head.shape
+    if roi_mask is not None and np.asarray(roi_mask).shape != shape:
+        raise ValueError(
+            f"PIV roi_mask shape {np.asarray(roi_mask).shape} != frame {shape}")
+    overlap_frac = float(params.get("overlap", 0.5))
+    eff_ws, eff_ov, trimmed = _ladder(
+        shape, params.get("windowsizes", (64, 32, 16)), overlap_frac,
+        pyprocess.get_field_shape)
+    s = _build_settings(params, eff_ws, eff_ov, PIVSettings)
+    n_passes = s.num_iterations
+    n_pairs = n - 1
+    total_units = n_passes * n_pairs
+    done = 0
+
+    def _pairs():
+        first = _as_frame(images[0], "frame 0")
+        prev = first
+        for i in range(1, n):
+            if cancelled_cb is not None and cancelled_cb():
+                raise RuntimeError("PIV ensemble cancelled")
+            cur = _as_frame(images[i], f"frame {i}")
+            if cur.shape != shape:
+                raise ValueError(
+                    f"frame {i} shape {cur.shape} != frame 0 shape {shape}")
+            yield (first, cur) if pairing == "fixed_head" else (prev, cur)
+            prev = cur
+
+    def _mean_corr(window_size, overlap, deform_coords):
+        """Sum correlation planes over all pairs (optionally pre-deformed) → mean."""
+        nonlocal done
+        ws2 = (window_size, window_size)
+        ov2 = (overlap, overlap)
+        corr_sum = None
+        for fa, fb in _pairs():
+            if deform_coords is not None:
+                ca, cb = deform_coords
+                fa = map_coordinates(fa, ca, order=s.interpolation_order, mode="nearest")
+                fb = map_coordinates(fb, cb, order=s.interpolation_order, mode="nearest")
+            aa = pyprocess.sliding_window_array(fa, ws2, ov2)
+            bb = pyprocess.sliding_window_array(fb, ws2, ov2)
+            c = pyprocess.fft_correlate_images(
+                aa, bb, correlation_method=s.correlation_method,
+                normalized_correlation=s.normalized_correlation)
+            corr_sum = c if corr_sum is None else corr_sum + c
+            done += 1
+            if progress_cb is not None:
+                progress_cb(int(round(100.0 * done / total_units)))
+        return corr_sum / n_pairs
+
+    def _peaks(corr_mean, n_rows, n_cols):
+        u, v = pyprocess.correlation_to_displacement(
+            corr_mean, n_rows, n_cols, subpixel_method=s.subpixel_method)
+        s2n = pyprocess.sig2noise_ratio(
+            corr_mean, sig2noise_method=s.sig2noise_method,
+            width=s.sig2noise_mask).reshape(n_rows, n_cols)
+        return u, v, s2n
+
+    def _smooth(u, v, excluded):
+        u, *_ = smoothn_mod.smoothn(u, s=s.smoothn_p)
+        v, *_ = smoothn_mod.smoothn(v, s=s.smoothn_p)
+        return (np.ma.masked_array(u, mask=excluded),
+                np.ma.masked_array(v, mask=excluded))
+
+    def _replace(u, v, flags):
+        return filters.replace_outliers(
+            u, v, flags, method=s.filter_method,
+            max_iter=s.max_filter_iteration, kernel_size=s.filter_kernel_size)
+
+    # ── pass 0: plain windows, planes averaged over pairs ─────────────────────
+    window_size, overlap = eff_ws[0], eff_ov[0]
+    x, y = pyprocess.get_rect_coordinates(shape, window_size, overlap)
+    n_rows, n_cols = pyprocess.get_field_shape(shape, window_size, overlap)
+    u, v, s2n = _peaks(_mean_corr(window_size, overlap, None), n_rows, n_cols)
+    excluded = _roi_on_grid(roi_mask, x, y)
+    u = np.ma.masked_array(u, mask=excluded)
+    v = np.ma.masked_array(v, mask=excluded)
+    flags = validation.typical_validation(u, v, s2n, s)
+    replaced_final = False
+
+    if n_passes == 1:
+        if s.replace_vectors and flags.any() and not flags.all():
+            u, v = _replace(u, v, flags)
+            replaced_final = True
+        if s.smoothn:
+            u, v = _smooth(u, v, excluded)
+    else:
+        if flags.any() and not flags.all():
+            u, v = _replace(u, v, flags)
+        if s.smoothn:
+            u, v = _smooth(u, v, excluded)
+        for i in range(1, n_passes):
+            window_size, overlap = s.windowsizes[i], s.overlap[i]
+            x_new, y_new = pyprocess.get_rect_coordinates(shape, window_size, overlap)
+            ip_u = RectBivariateSpline(y[:, 0], x[0, :], np.ma.filled(u, 0.0))
+            ip_v = RectBivariateSpline(y[:, 0], x[0, :], np.ma.filled(v, 0.0))
+            u_pre = ip_u(y_new[:, 0], x_new[0, :])
+            v_pre = ip_v(y_new[:, 0], x_new[0, :])
+            # the deformation coordinates depend only on the ENSEMBLE predictor, so
+            # they are built once per pass and re-used for every pair (symmetric split)
+            xg, yg, ut, vt = windef.create_deformation_field(
+                head, x_new, y_new, u_pre, v_pre,
+                interpolation_order=s.interpolation_order)
+            coords = ((yg - vt / 2, xg - ut / 2), (yg + vt / 2, xg + ut / 2))
+            n_rows, n_cols = pyprocess.get_field_shape(shape, window_size, overlap)
+            du, dv, s2n = _peaks(_mean_corr(window_size, overlap, coords),
+                                 n_rows, n_cols)
+            u = du + u_pre
+            v = dv + v_pre
+            x, y = x_new, y_new
+            excluded = _roi_on_grid(roi_mask, x, y)
+            u = np.ma.masked_array(u, mask=excluded)
+            v = np.ma.masked_array(v, mask=excluded)
+            flags = validation.typical_validation(u, v, s2n, s)
+            final = i == n_passes - 1
+            if (not final or s.replace_vectors) and flags.any() and not flags.all():
+                u, v = _replace(u, v, flags)
+                if final:
+                    replaced_final = True
+            if not final and s.smoothn:
+                u, v = _smooth(u, v, excluded)
+
+    return _package_result(x, y, u, v, s2n, flags, excluded, replaced_final,
+                           eff_ws, eff_ov, trimmed, s, voxel_size_um,
+                           extra_diag={"ensemble_pairs": n_pairs,
+                                       "pairing": pairing})

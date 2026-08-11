@@ -50,8 +50,29 @@ run_piv_series(
     cancelled_cb: Optional[Callable[[], bool]] = None,
 ) -> List[PIVResult]                    # len == len(images) - 1
 
+run_piv_ensemble(
+    images: Sequence[np.ndarray],
+    params: Dict[str, Any],
+    voxel_size_um: Tuple[float, float],
+    *,
+    pairing: str = "previous",         # "previous" | "fixed_head"
+    roi_mask: Optional[np.ndarray] = None,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    cancelled_cb: Optional[Callable[[], bool]] = None,
+) -> PIVResult                          # ONE time-averaged field for the whole series
+
 openpiv_available() -> bool             # find_spec probe, no import side effects
 ```
+
+`run_piv_ensemble` is **ensemble (correlation-averaged) PIV** — Meinhart, Wereley &
+Santiago (2000): at every pass the correlation planes of ALL pairs are summed before
+peak-finding, so true signal accumulates while random cross-particle peaks cancel — the
+micro-PIV method for seeding too sparse for any single pair. Assumes statistically
+STEADY flow (or, with `fixed_head`, a static deformation measured many times). Multipass
+deformation composes as in PIVlab's ensemble mode: every pair is deformed by the
+ENSEMBLE predictor each pass (always symmetric — `deformation_method` is ignored here);
+`qfactor` is the S/N of the averaged plane. Frames are re-read lazily once per pass;
+a truthy `cancelled_cb` raises RuntimeError. Diagnostics add `ensemble_pairs`/`pairing`.
 
 `pairing="previous"` correlates `(images[i-1], images[i])` — one velocity field per step.
 `pairing="fixed_head"` correlates `(images[0], images[i])` — displacement from a fixed
@@ -236,6 +257,7 @@ margin), default `(64, 32)` ladder at 50% overlap unless noted, worst of RMSE_y/
 | sub-pixel + 5% gaussian noise | 0.0520 | 0.15 | |
 | upstream `create_pair` replica | 0.1463 | 0.25 | upstream's own THRESHOLD, their dense-noise fixture |
 | `windef.simple_multipass` parity | **0.00e+00** | 1e-9 | bit-identical after undoing their y-flip/v-negation |
+| ensemble @ ~3 particles/window, 12 pairs | 0.646 (single-pair mean 2.761) | <0.85 and >3× | the Meinhart regime: fresh per-frame noise, advected sub-pixel splatted particles; single-pair PIV is broken here, the ensemble is 4.3× better. NOTE: `qfactor` (peak2mean) stays deceptively high on the broken single-pair vectors in this regime — S/N is not a sufficient validator at sparse seeding |
 
 Upstream's shipped tolerances are loose (0.25 px, best-of-N-trials logic in
 `test_process.py`); the bounds above were set from the measured floor instead, per this

@@ -23,6 +23,7 @@ from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dvc import _dvc_rows
+from nodegraph.catalog._shared.objects import _frame_interval_s
 from nodegraph.catalog._shared.progress import _UnitBar
 
 # ── PIV (OpenPIV) — the FLOW sibling of DIC/DVC ─────────────────────────────────
@@ -83,17 +84,27 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     px deliberately: interrogation windows are texture-statistics units (features per
     window), not physical lengths, so a µm derive would mislead more than help.
 
-    ``reference_mode`` defaults to ``previous_frame`` (flow: one field per frame step —
-    divide ``disp_*`` µm by your frame interval for velocity; no frame-interval calibration
-    key exists in the envelope, so the node stores displacement, not velocity).
-    ``fixed_frame`` measures total displacement since a chosen frame, like DIC. Per pair
-    the kernel runs a coarse-to-fine window ladder (each pass 2× the next, ending at
-    ``window_size``) with symmetric image deformation between passes; each pass validates
-    (global limit / global std / median test / signal-to-noise) and inpaints failures —
-    mandatory between passes (holes poison the predictor), governed by ``replace`` on the
-    final field. Vectors that end non-finite (outside the ROI, or failed with replacement
-    off/impossible) are DROPPED, not emitted as NaN rows; the count lands in provenance
-    metadata as ``piv_invalid_points``.
+    ``reference_mode`` defaults to ``previous_frame`` (flow: one field per frame step).
+    ``fixed_frame`` measures total displacement since a chosen frame, like DIC.
+    ``ensemble`` (V3 W5-P2 step 1; Meinhart–Wereley–Santiago 2000) averages the
+    CORRELATION PLANES of every consecutive pair before peak-finding and emits ONE
+    time-averaged field per (m, z) line, stamped ``t = 0`` — the micro-PIV method for
+    seeding too sparse for any single pair (kernel bench: 2.63 → 0.41 px RMSE at ~3
+    particles/window over 16 pairs); it assumes the flow is statistically steady, and
+    with an external reference wired it averages (ref → t) pairs instead (static
+    deformation, e.g. a TFM bead series). ``velocity`` (step 3) divides the µm
+    displacement by the frame interval — the ``frame_interval`` socket if set, else the
+    file's ``dt_s`` via the shared :func:`_frame_interval_s` resolver, which REFUSES
+    when neither exists rather than mislabel µm/frame as µm/s — and emits ``vy``/``vx``/
+    ``speed`` columns (µm/s, names matching ``analysis.object_metrics``). Velocity is
+    refused for ``fixed_frame`` or an external reference (cumulative displacement has no
+    per-row rate). Per pair the kernel runs a coarse-to-fine window ladder (each pass 2×
+    the next, ending at ``window_size``) with symmetric image deformation between passes;
+    each pass validates (global limit / global std / median test / signal-to-noise) and
+    inpaints failures — mandatory between passes (holes poison the predictor), governed
+    by ``replace`` on the final field. Vectors that end non-finite (outside the ROI, or
+    failed with replacement off/impossible) are DROPPED, not emitted as NaN rows; the
+    count lands in provenance metadata as ``piv_invalid_points``.
 
     Output: a Point layer, one row per interrogation-window centre — ``disp_y``/``disp_x``/
     ``disp_mag_um`` in µm (grid px × ``pixel_size_um``), ``qfactor`` = the final pass's
@@ -102,7 +113,7 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     COARSER than the image (pitch = window × (1 − overlap)) — feed it to
     ``transform.rasterize_field`` for a dense map. Reuses the shared :func:`_dvc_rows`
     flattener, so columns align with the DVC/DIC siblings."""
-    from nodegraph.kernels.piv_field import run_piv_series
+    from nodegraph.kernels.piv_field import run_piv_ensemble, run_piv_series
 
     ds = ctx.inputs[0]
     prov = ds.image
@@ -138,6 +149,27 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
         "smoothn": bool(ctx.params.get("smooth", False)),
         "smoothn_p": max(0.0, float(ctx.params.get("smooth_strength", 0.05))),
     }
+    # velocity: only per-step pairings have a per-row rate. The shared resolver reads the
+    # `frame_interval` socket override, else the file's dt_s (memo-fenced), else REFUSES —
+    # never a silent 1.0 that would mislabel µm/frame as µm/s.
+    want_vel = bool(ctx.params.get("velocity", False))
+    if want_vel and (ref_mode == "fixed_frame" or ref_prov is not None):
+        raise ValueError(
+            "PIV velocity needs per-step pairing: fixed_frame (or an external reference) "
+            "reports CUMULATIVE displacement since the reference, so µm/s is not defined "
+            "per row — use previous_frame or ensemble, or divide the disp columns "
+            "downstream yourself")
+    try:
+        dt_s = _frame_interval_s(ctx, needed=want_vel, wanted=("velocity",),
+                                 node="analysis.piv")
+    except ValueError:
+        raise ValueError(
+            "analysis.piv: velocity columns (vy/vx/speed) are µm/s RATES, and this "
+            "Dataset declares no frame interval — set the `frame_interval` socket to the "
+            "seconds between timepoints, or re-open the source if it should carry timing "
+            "(an ND2's per-frame timestamps become `dt_s` at ingest; a plain TIFF has "
+            "none). The displacement columns need no interval — turn Velocity off to "
+            "proceed without one.") from None
     layer = ctx.layer("name")
     # optional ROI: a Voxel mask layer restricts where vectors are computed; the mask is
     # STATIC per (m, z) line — a time-varying layer contributes its t=0 plane
@@ -154,11 +186,12 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     def _plan(m: int, z: int) -> Tuple[List[Tuple[Any, int, int, int, int]], List[int], str]:
         """(plane plan, the t each RESULT belongs to, kernel pairing).
 
-        previous_frame feeds the T stack in order; result i is the step t-1 → t.
-        fixed_frame (or an external reference, always fixed) prepends the reference
-        plane so every t correlates against it — including t == the reference, which
-        self-pairs to ~0 exactly as the DIC sibling does."""
-        if ref_mode == "previous_frame" and ref_prov is None:
+        previous_frame — and ensemble without an external reference — feed the T stack
+        in order (consecutive pairs; ensemble averages their correlation planes).
+        fixed_frame (or an external reference, always fixed — ensemble included)
+        prepends the reference plane so every t correlates against it — including
+        t == the reference, which self-pairs to ~0 exactly as the DIC sibling does."""
+        if ref_mode in ("previous_frame", "ensemble") and ref_prov is None:
             return ([(prov, m, t, z, c) for t in range(ax.t)],
                     list(range(1, ax.t)), "previous")
         if ref_prov is not None:                          # external reference (fixed)
@@ -172,6 +205,23 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
 
     rows: list = []
     n_dropped = 0
+
+    def _emit(res, m: int, t: int, z: int) -> None:
+        """One PIVResult → filtered Point rows (+ velocity columns when asked)."""
+        nonlocal n_dropped
+        row = _dvc_rows(res, vox, m=m, t=t, c=c, z_plane=z)
+        row["replaced"] = res.flags.reshape(-1).astype(np.int64)
+        if want_vel:                                      # µm / s — one frame step per pair
+            row["vy"] = row["disp_y"] / dt_s
+            row["vx"] = row["disp_x"] / dt_s
+            row["speed"] = row["disp_mag_um"] / dt_s
+        keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
+        if not keep.all():
+            n_dropped += int((~keep).sum())
+            row = {k: v[keep] for k, v in row.items()}
+        if row["m"].size:
+            rows.append(row)
+
     bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=1, note="correlating")
     for m in range(ax.m):
         for z in range(ax.z):
@@ -179,28 +229,30 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
             if len(plan) < 2:                             # a 1-frame series has no pair
                 bar.finish_unit(note=f"m={m} z={z}")
                 continue
-            series = run_piv_series(
-                _PIVPlaneSeq(plan), params, vox, pairing=pairing,
-                roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
-            for i, t in enumerate(result_t):
-                if i >= len(series):
-                    break
-                res = series[i]
-                row = _dvc_rows(res, vox, m=m, t=t, c=c, z_plane=z)
-                row["replaced"] = res.flags.reshape(-1).astype(np.int64)
-                keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
-                if not keep.all():
-                    n_dropped += int((~keep).sum())
-                    row = {k: v[keep] for k, v in row.items()}
-                if row["m"].size:
-                    rows.append(row)
+            if ref_mode == "ensemble":
+                # ONE time-averaged field per (m, z), stamped t=0
+                res = run_piv_ensemble(
+                    _PIVPlaneSeq(plan), params, vox, pairing=pairing,
+                    roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
+                _emit(res, m, 0, z)
+            else:
+                series = run_piv_series(
+                    _PIVPlaneSeq(plan), params, vox, pairing=pairing,
+                    roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
+                for i, t in enumerate(result_t):
+                    if i >= len(series):
+                        break
+                    _emit(series[i], m, t, z)
             bar.finish_unit(note=f"m={m} z={z}")
 
     # Provenance (§7b): PIV-specific keys (NOT the dvc_* keys accumulate_field consumes —
     # a PIV per-step field is Eulerian flow, not an ALDVC volume increment).
-    prov_md = {"piv_reference_mode": (ref_mode if ref_prov is None else "fixed_frame"),
+    prov_md = {"piv_reference_mode": (ref_mode if ref_prov is None or
+                                      ref_mode == "ensemble" else "fixed_frame"),
                "piv_reference_frame": ref_frame, "piv_correlation": corr,
                "piv_invalid_points": n_dropped}
+    if want_vel:
+        prov_md["piv_dt_s"] = float(dt_s)
     if not rows:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
         return ds.with_structure(empty).with_metadata(**prov_md)
@@ -343,6 +395,20 @@ register_node(
                 "a reasonable tightening for smooth flows. Beware genuinely bimodal fields "
                 "(a jet through still fluid) where a tight value flags the minority "
                 "population wholesale."),
+        InBool("velocity", "Velocity", field=False, default=False,
+               description=
+               "Also emit `vy`, `vx` and `speed` columns in µm/s — the µm displacement "
+               "divided by the frame interval (the socket below if set, else the file's "
+               "own `dt_s`; with NEITHER available the node refuses rather than mislabel "
+               "µm/frame as µm/s). Column names match Object Metrics, so downstream "
+               "tables compare directly. Only defined for per-step pairing: refused under "
+               "`fixed_frame` or an external Reference, whose displacement is cumulative."),
+        InFloat("frame_interval", "Frame interval", unit="s", field=False, default=0.0,
+                description=
+                "Seconds between consecutive frames, used by Velocity. 0 = read the "
+                "file's own `dt_s` (ND2 timestamps supply it); set it only to OVERRIDE "
+                "the file — e.g. a series exported without timing metadata. Only read "
+                "when Velocity is on; a wrong value scales every velocity linearly."),
         InBool("replace", "Replace outliers", field=False, default=True,
                description=
                "Fill vectors that failed validation from their valid neighbours "
@@ -383,26 +449,37 @@ register_node(
                  "by this name."),
     ],
     outputs=[OutDataset()],
-    modes=[Mode("reference_mode", ["previous_frame", "fixed_frame"],
+    modes=[Mode("reference_mode", ["previous_frame", "fixed_frame", "ensemble"],
                 default="previous_frame", label="Reference",
                 description=
-                "Which image each frame is correlated AGAINST. It decides whether the "
-                "field is per-step motion (flow) or total displacement since a chosen "
-                "state (deformation), and how error behaves over a long series. Ignored "
-                "when an external Reference Dataset is wired — that is always fixed.",
+                "Which image each frame is correlated AGAINST, and whether pairs are "
+                "reported individually or pooled. It decides if the field is per-step "
+                "motion (flow), total displacement since a chosen state (deformation), "
+                "or one time-averaged field for the whole series. With an external "
+                "Reference Dataset wired, pairing is always against it (fixed).",
                 choice_docs={
                     "previous_frame":
                         "Correlate each frame against the one before it (t=0 emits "
                         "nothing). The natural mode for FLOW: every pair spans one frame "
                         "interval, so displacements stay small and correlation stays "
                         "reliable no matter how far material travels over the series. "
-                        "Divide the µm displacement by your frame interval for velocity.",
+                        "Turn on Velocity for µm/s directly.",
                     "fixed_frame":
                         "Correlate every frame against one chosen frame of the same "
                         "series (the self-pair reports ~0). Displacement is TOTAL motion "
                         "since that state — the right mode for deformation against a rest "
                         "state, e.g. substrate bead fields — until motion grows beyond "
                         "what the window ladder can span.",
+                    "ensemble":
+                        "Average the CORRELATION PLANES of all consecutive pairs before "
+                        "peak-finding and emit ONE time-averaged field per position/plane "
+                        "at t=0 — the micro-PIV method for seeding too sparse for any "
+                        "single pair (true signal accumulates over pairs, random peaks "
+                        "cancel; measured 2.6 → 0.4 px at ~3 particles/window over 16 "
+                        "pairs). Assumes statistically STEADY flow — real temporal change "
+                        "is averaged away, not detected. With an external Reference it "
+                        "averages (reference → t) pairs: a static deformation measured "
+                        "many times.",
                 }),
            Mode("correlation", ["circular", "linear"],
                 default="circular", label="Correlation",
@@ -427,8 +504,10 @@ register_node(
     granularity=Granularity.WHOLE_SERIES, kernel_axes=frozenset({"t", "y", "x"}),
     description="2D particle image velocimetry (OpenPIV: multipass FFT correlation with "
                 "window deformation, universal outlier detection, per-vector S/N) → a "
-                "Point displacement field per frame pair; previous/fixed self-reference "
-                "or an external reference Dataset + optional ROI mask. The FLOW sibling "
-                "of DIC — independent windows, far faster, per-vector confidence. Wired "
-                "to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError "
-                "at run time until installed).")
+                "Point displacement field per frame pair; previous/fixed self-reference, "
+                "ENSEMBLE correlation averaging (one time-averaged field — the micro-PIV "
+                "method for sparse seeding), or an external reference Dataset + optional "
+                "ROI mask; optional vy/vx/speed µm/s via the file's dt_s. The FLOW "
+                "sibling of DIC — independent windows, far faster, per-vector "
+                "confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: "
+                "friendly ImportError at run time until installed).")
