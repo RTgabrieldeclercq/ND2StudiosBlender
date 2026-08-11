@@ -6475,6 +6475,123 @@ def test_catalog_dic() -> None:
         "rehashes, compute_strain adds a zero strain tensor, calib fenced")
 
 
+def test_catalog_piv() -> None:
+    """PIV (OpenPIV, ``analysis.piv``) — the FLOW sibling of DIC, WIRED to the piv_field
+    kernel driver. ``openpiv`` is an optional dep: when absent the node is fully wired but
+    its compute raises a friendly ImportError at run time (it reaches ``run_piv_series`` —
+    not a bare stub). Asserts the structural spec + the gated-run behavior (and, if openpiv
+    is installed, a real Point-field pull with both pairing modes, ROI, and per-vector S/N)."""
+    if not _HAVE_SKIMAGE:
+        _ok("catalog (PIV OpenPIV): SKIPPED (scipy/skimage absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.piv_field import openpiv_available
+
+    # structural spec — Point output, reference + correlation levers, ROI, WHOLE_SERIES
+    s = NODES.get("analysis.piv")
+    assert s.category == "analysis"
+    assert D.POINT in s.adds_domains and D.VOXEL in s.reads_domains
+    assert s.granularity is Granularity.WHOLE_SERIES
+    assert {"data", "reference", "reference_frame", "window_size", "passes", "overlap",
+            "median_test", "roi", "name"} <= {i.name for i in s.inputs}
+    _modes = {mm.name: set(mm.choices) for mm in s.modes}
+    assert _modes.get("reference_mode") == {"previous_frame", "fixed_frame"}
+    assert _modes.get("correlation") == {"circular", "linear"}, _modes
+
+    # a 3-frame 2D graph: frames carry k*(+1 y, +3 x) px of planted shift per step.
+    # previous_frame (the default — PIV measures flow) sees (1, 3) px at BOTH t=1 and t=2.
+    define_node("io.pivseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(7)
+    patt = gaussian_filter(rng.random((256, 256)), 1.5)      # texture with ~2-4 px features
+    img = np.zeros((1, 3, 1, 1, 256, 256))
+    for _t in range(3):
+        img[0, _t, 0, 0] = (patt if _t == 0 else
+                            ndshift(patt, (1.0 * _t, 3.0 * _t), order=3, mode="nearest"))
+    px = 0.5
+    ax = AxisSizes(m=1, t=3, z=1, c=1, y=256, x=256)
+    meta = {"pixel_size_um": px}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+    P = {"window_size": 16, "passes": 2}                     # ladder (32, 16), fast
+
+    def _piv(params=None, modes=None, seed=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.pivseed"))
+        g.add(NodeInstance("V", "analysis.piv",
+                           params={**P, **(params or {})}, modes=modes or {}))
+        g.connect("S", "V", dst_socket="data")
+        return Engine(g, computes=COMPUTES, seeds={"S": seed if seed is not None else ds},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)})
+
+    e = _piv()
+    if not openpiv_available():
+        raised = ""                                          # dep-gated env: friendly error
+        try:
+            e.pull("V")
+        except ImportError as ex:
+            raised = str(ex)
+        assert "openpiv" in raised.lower(), f"expected a friendly openpiv ImportError, got {raised!r}"
+        _ok("catalog (PIV OpenPIV): wired 2D PIV node (reference + correlation levers, ROI, "
+            "Point output, WHOLE_SERIES); dep-gated — reaches run_piv_series, friendly "
+            "openpiv ImportError when the package is absent")
+        return
+
+    # openpiv present → recover the planted per-step shift (µm) + the Point schema
+    out = e.pull("V")
+    names = {a.name for a in out.layers_on(D.POINT) if a.layer == "piv"}
+    assert {"id", "m", "t", "c", "z", "y", "x", "disp_x", "disp_y", "disp_mag_um",
+            "qfactor", "replaced"} <= names, sorted(names)
+    assert "disp_z" not in names, "PIV is 2D"
+
+    def _med(o, col, t, layer="piv"):
+        v = o.get(D.POINT, col, layer=layer).values
+        return float(np.median(v[o.get(D.POINT, "t", layer=layer).values == t]))
+
+    t_vals = set(out.get(D.POINT, "t", layer="piv").values.astype(int).tolist())
+    assert t_vals == {1, 2}, t_vals                          # previous_frame: t0 emits nothing
+    for _t in (1, 2):                                        # per-STEP motion, not cumulative
+        assert abs(_med(out, "disp_y", _t) - 1.0 * px) < 0.12, (_t, _med(out, "disp_y", _t))
+        assert abs(_med(out, "disp_x", _t) - 3.0 * px) < 0.12, (_t, _med(out, "disp_x", _t))
+    qmed = _med(out, "qfactor", 1)
+    assert np.isfinite(qmed) and qmed > 1.0, f"S/N should exceed 1 on clean texture: {qmed}"
+    assert any(k == "pixel_size_um" for k, _ in e.entry("V").reads)   # calib fenced
+    assert out.metadata.get("piv_reference_mode") == "previous_frame"
+
+    # fixed_frame → cumulative displacement, self-pair ~0 at the reference
+    e_fix = _piv(modes={"reference_mode": "fixed_frame"})
+    o_fix = e_fix.pull("V")
+    t_fix = set(o_fix.get(D.POINT, "t", layer="piv").values.astype(int).tolist())
+    assert t_fix == {0, 1, 2}, t_fix
+    assert _med(o_fix, "disp_mag_um", 0) < 0.1, "self-pair at the reference must be ~0"
+    assert abs(_med(o_fix, "disp_x", 2) - 6.0 * px) < 0.15, _med(o_fix, "disp_x", 2)
+    assert e_fix.entry("V").recipe_hash != e.entry("V").recipe_hash, \
+        "reference mode must fold into the recipe hash"
+
+    # linear (normalized) correlation agrees on the same field and rehashes the memo
+    e_lin = _piv(modes={"correlation": "linear"})
+    o_lin = e_lin.pull("V")
+    assert abs(_med(o_lin, "disp_x", 1) - 3.0 * px) < 0.12, _med(o_lin, "disp_x", 1)
+    assert e_lin.entry("V").recipe_hash != e.entry("V").recipe_hash, \
+        "correlation mode must fold into the recipe hash"
+
+    # ROI mask layer → vectors only inside; everything outside is dropped, not NaN rows
+    roi6 = np.zeros((1, 3, 1, 1, 256, 256))
+    roi6[..., :, :128] = 1.0                                 # left half only
+    ds_roi = ds.with_layer(D.VOXEL, "roi_mask", roi6)
+    o_roi = _piv(seed=ds_roi).pull("V")
+    xs = o_roi.get(D.POINT, "x", layer="piv").values
+    assert xs.size > 0 and xs.max() <= 132.0, f"ROI must confine vectors: max x={xs.max()}"
+    assert int(o_roi.metadata.get("piv_invalid_points", -1)) > 0, \
+        "dropped out-of-ROI vectors must be counted in provenance"
+
+    _ok("catalog (PIV OpenPIV): wired 2D PIV (reference + correlation levers, ROI, Point "
+        "output, WHOLE_SERIES) ran end-to-end — previous_frame recovers a planted (1,3) "
+        "px/step shift at t=1,2 in µm with S/N>1 per vector, fixed_frame accumulates with "
+        "self-pair~0, linear correlation agrees + rehashes, ROI confines + counts drops, "
+        "calib fenced")
+
+
 def test_channel_derive() -> None:
     """C8 / H12 — per-channel derive resolution (``ctx.channel``). A c-iterating node's
     metadata-intelligent param DERIVES from *that channel's* emission λ (distinct λ →
@@ -11770,6 +11887,8 @@ _LAYER_RESOLVE_EXEMPT = {
     # `roi6 = None` and correlates the whole frame. Inferring the only Voxel layer on the
     # wire (a segmentation, an EDT field) would silently mask the correlation instead.
     ("analysis.dic_correlate", "roi"),
+    # Same contract as dic_correlate's roi, same reason: absent layer = whole frame.
+    ("analysis.piv", "roi"),
     # Not a layer name at all on 3 of its 5 domains: `source` names an attribute COLUMN, and
     # on a structure domain every invariant coordinate (id/m/t/c/z/y/x) is a "candidate", so
     # "the only one on the wire" is never the question being asked. It also must keep
@@ -18474,6 +18593,7 @@ def main() -> int:
     test_catalog_kernels()
     test_catalog_dvc()
     test_catalog_dic()
+    test_catalog_piv()
     test_channel_derive()
     test_cluster_points()
     test_mesh_domain()

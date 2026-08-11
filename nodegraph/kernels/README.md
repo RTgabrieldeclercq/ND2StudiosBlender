@@ -1,10 +1,11 @@
 # `pure_analysis/` — portable analysis math-kernels
 
-Fifteen self-contained analysis **math-kernels**. Fourteen were vendored (byte-verbatim)
+Sixteen self-contained analysis **math-kernels**. Fourteen were vendored (byte-verbatim)
 out of the ND2Studios app (branch `Version-1.45`) so they can be ported into a *different*
 software's new node system without dragging along the ND2Studios GUI, its plugin
-registry, or its pipeline runtime; the fifteenth (`cellsam_segment`, V2.12) is a new
-adapter of the same shape around a third-party package that has no v1 counterpart.
+registry, or its pipeline runtime; the other two (`cellsam_segment`, V2.12, and
+`piv_field`, V3 W5-P2) are new adapters of the same shape around third-party packages
+that have no v1 counterpart.
 (`mesh_raster.py`, V2.08, is new in-repo code rather than a kernel of this kind and is
 deliberately not indexed here — its contract lives in its module docstring.)
 
@@ -64,6 +65,7 @@ it returns a numpy result. That is the whole contract.
 | [`stardist_segment`](stardist_segment.md) | Segmentation (method=stardist) | `segment_frame(image, ...)` (+ `get_stardist_model`, `filter_and_relabel`) | **external** (stardist CNN + NMS) | numpy, tensorflow*, stardist*, csbdeep* |
 | [`cellsam_segment`](cellsam_segment.md) | Segmentation (method=cellsam) | `segment_plane(image, ...)` (+ `get_cellsam_model`, `relabel_contiguous`, `cellsam_available`) | **external** (SAM ViT + CellFinder Anchor-DETR) | numpy, cellSAM*, torch*, dask-image* |
 | [`dic_correlate`](dic_correlate.md) | DIC (pyALDIC) | `run_pyaldic_pair(...)`, `run_pyaldic_series(...)` | **external** (al-dic IC-GN + ADMM) | numpy, scipy, scikit-image, al-dic* |
+| [`piv_field`](piv_field.md) | PIV (OpenPIV) | `run_piv_pair(frame_a, frame_b, voxel_size_um, params, ...)`, `run_piv_series(images, params, ...)` | **external** (openpiv multipass window-deformation FFT correlation) | numpy, scipy, openpiv* |
 | [`checkpoint`](checkpoint.md) | Checkpoint | `save_checkpoints(...)`, `load_checkpoints(...)`, `checkpoints_dir_for(...)` | **none — serialization only** | numpy |
 
 `*` = lazy / optional dependency (see matrix). "in-repo" = the algorithm is native
@@ -213,6 +215,7 @@ degrades gracefully / falls back if absent). Blank = not used.
 | stardist_segment | IT | | | | | | | L | L | L | | |
 | cellsam_segment | IT | | | | | | L·opt | | | | | |
 | dic_correlate | IT | L | L | | | | | | | | | L·opt |
+| piv_field | IT | L | | | | | | | | | | |
 | checkpoint | IT | | | | | | | | | | | |
 
 Notes:
@@ -223,6 +226,10 @@ Notes:
   kernels decorate at module load, **`import track_objects` needs numba + pandas present**,
   even though the app imported those helpers lazily. sklearn stays lazy (POD-GPR warm start).
 - `dic_correlate`'s `al-dic` transitively pulls `numba` and `PySide6` when actually run.
+- `piv_field`'s real math dep is **`openpiv`** (GPLv3 — the reason it is a lazy adapter,
+  not a vendor; no column above since it is this kernel's alone). Lazy: module import
+  needs only numpy; `run_piv_*` raises a friendly ImportError until `pip install openpiv`
+  (which transitively pulls scikit-image, imageio, matplotlib, natsort, tqdm).
 - `checkpoint` also uses stdlib `json`; `dic_mesh_refinement` added stdlib `importlib`.
 
 ---
@@ -258,6 +265,7 @@ Each kernel was smoke-tested: `import` check plus a synthetic call where all dep
 | stardist_segment | ok | ran | 64×64 two-blob frame end-to-end (TF/stardist/csbdeep present) |
 | cellsam_segment | ok | **partial** | glue ran against a stubbed `cellSAM` (singleton reuse, kwarg forwarding, the `(3,H,W)` no-cells quirk, contiguous relabel); the real SAM+CellFinder net **not run** (package not installed, weights need a DeepCell token) |
 | dic_correlate | ok | **partial** | in-repo adapters ran (axis swap verified); external al-dic solver **not run** (not installed) |
+| piv_field | ok | ran | full known-answer bench (`scripts/piv_synthetic_bench.py`, openpiv 0.25.4 installed): planted shifts/rotation/shear to 0.03–0.05 px, driver bit-identical to `windef.simple_multipass` |
 | checkpoint | ok | ran | save/load round-trip; store rebuild verified |
 
 The two **partial** rows are dependency-availability gaps, not extraction defects: both the

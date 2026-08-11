@@ -180,16 +180,16 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "2c6d2d2aca1dc65918154e85b65f80d7"
+   "file:nodegraph/kernels/README.md": "00ddcb1c919c1de44638ac4d24824977"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-08-10",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "2c6d2d2aca1dc65918154e85b65f80d7"
+   "file:nodegraph/kernels/README.md": "00ddcb1c919c1de44638ac4d24824977"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-08-10",
   "file": "codemap/invariants.md"
  },
  "INV-12": {

@@ -125,6 +125,9 @@ MODULES: Tuple[str, ...] = (
     # the link-drag search menu's order, so a mid-list insert shifts every node after it and
     # re-keys nothing useful.
     "enhance.subtract_background",
+    # Appended last for the same reason, not slotted beside `analysis.dic_correlate` /
+    # `analysis.dvc_field` whose correlation sibling it is (V3.00 roadmap W5-P2).
+    "analysis.piv",
 )
 
 
