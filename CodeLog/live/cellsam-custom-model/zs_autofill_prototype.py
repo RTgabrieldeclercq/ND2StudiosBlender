@@ -17,6 +17,14 @@ The formula (see evidence-log entry for derivations and sources):
   (learning_rate 5e-5, batch 4, patch 128, denoise_weight 0.5, hess_weight 0.02,
   upsample True, damping 0/1, alpha 1.0).
 
+EDF / PROCESSED-INPUT BRANCH (e037/e039): EDF composites and other processed
+products carry almost no Poisson-Gaussian camera noise - the default noise model
+injects shot noise the image does not have and the network learns a stipple
+texture. Detect via 'EDF' in the filename or a photon-transfer slope << 1, then
+switch to: beta1 0.65, beta2 0.0, hess_weight 0.08, iterations <= 6000. Validated
+on the 2025 HK field: stipple energy -40%, best-in-class boundaries, ~1-cell
+detection cost. Prefer multi-plane training material whenever it exists.
+
 NOT wired into the node yet - that lands via build-node-v2 as metadata-aware
 defaults (same mechanism emission_nm already documents).
 """

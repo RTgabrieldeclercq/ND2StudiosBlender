@@ -1,0 +1,53 @@
+{
+ "tiles": [
+  {
+   "id": "packed",
+   "file": "img/packed.png",
+   "w": 720,
+   "h": 620,
+   "um_per_px": 0.09506512279203631,
+   "what": "ZS-DeconvNet 23k AF647 (red) + DAPI (blue), 2x grid; origin y=500 x=600 in the 1500x1700 frame",
+   "y0": 500,
+   "x0": 600
+  },
+  {
+   "id": "cell22",
+   "file": "img/cell22.png",
+   "w": 720,
+   "h": 620,
+   "um_per_px": 0.09506512279203631,
+   "what": "ZS-DeconvNet 23k AF647 (red) + DAPI (blue), 2x grid; origin y=262 x=210 in the 1500x1700 frame",
+   "y0": 262,
+   "x0": 210
+  }
+ ],
+ "classes": [
+  {
+   "key": "C",
+   "label": "cell",
+   "hint": "outline the cell edge as YOU see it here",
+   "color": "#34d399",
+   "shape": "polygon",
+   "ch": "r",
+   "hotkey": "1"
+  },
+  {
+   "key": "?",
+   "label": "cannot tell",
+   "hint": "boundary not decidable",
+   "color": "#fbbf24",
+   "shape": "polygon",
+   "fallback": true,
+   "hotkey": "2"
+  },
+  {
+   "key": "x",
+   "label": "not a cell",
+   "hint": "debris / artifact",
+   "color": "#a78bfa",
+   "shape": "polygon",
+   "hotkey": "3"
+  }
+ ],
+ "ambig_margin": 0.25
+}
