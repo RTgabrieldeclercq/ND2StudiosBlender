@@ -237,11 +237,15 @@ def read(path: str, *, manifest: Optional[str] = None) -> Dict[str, TileTruth]:
 
 
 def rasterize(truth: TileTruth, *, shape: Optional[Tuple[int, int]] = None,
-              classes: Sequence[str] = ("F", "I", "?"), fill_holes: bool = False):
+              classes: Optional[Sequence[str]] = None, fill_holes: bool = False):
     """``(labels, {label_id: class_key})`` — the polygons as an integer label image.
 
     Later polygons overwrite earlier ones where they overlap, which matches how they were
     drawn: a granule outlined on top of another was seen on top of it.
+
+    ``classes=None`` keeps every polygon. Pass an explicit tuple to filter — the old
+    default of ``("F", "I", "?")`` was the granule project's vocabulary and silently
+    returned an EMPTY raster for any page built with different class keys.
     """
     import numpy as np
     from skimage.draw import polygon as _poly
@@ -252,7 +256,7 @@ def rasterize(truth: TileTruth, *, shape: Optional[Tuple[int, int]] = None,
     cls: Dict[int, str] = {}
     n = 0
     for pts, ck in zip(truth.polys, truth.poly_cls):
-        if ck not in classes:
+        if classes is not None and ck not in classes:
             continue
         n += 1
         rr, cc = _poly(pts[:, 0], pts[:, 1], shape=hw)
@@ -413,7 +417,7 @@ const POLYCLS = CLS.filter(c => c.shape === 'polygon');
 const CIRCCLS = CLS.filter(c => c.shape === 'circle');
 const FALLBACK = (CLS.find(c => c.fallback) || POLYCLS[POLYCLS.length - 1]).key;
 const KEY = '_gt3_' + location.pathname + '_';
-const SNAP_PX = 7;                 // screen px within which a corner grabs a neighbour's
+const SNAP_PX = 5;                 // screen px within which a corner grabs a neighbour's
 const S = {
   ti: 0, tool: 'poly', cls: POLYCLS[0].key, pin: null, sel: null, draft: null, drag: null,
   z: 1, ox: 0, oy: 0, pan: null, space: false,
@@ -532,6 +536,10 @@ function draw() {
   const lw = 1.6 / S.z;
   for (const s of shapes()) drawShape(s, lw, s === S.sel);
   if (S.draft) drawDraft(lw);
+  if (S.snapTgt) {   // the ring = "your next click lands HERE, not under the crosshair"
+    ctx.lineWidth = 1.4 / S.z; ctx.strokeStyle = '#ffffff'; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(S.snapTgt[0], S.snapTgt[1], 6 / S.z, 0, 6.2832); ctx.stroke();
+  }
   ctx.restore();
   scalebar(); hud();
 }
@@ -610,7 +618,8 @@ function hud() {
       ` — by design</span>` : '');
   document.getElementById('hint').textContent = {
     poly: 'click each corner · click the first corner again (or enter / double-click) to close · '
-      + 'corners snap to a neighbour\'s · backspace undoes a corner · esc cancels',
+      + 'corners snap to a neighbour\'s (ring shows the grab; hold Alt to place exactly) · '
+      + 'backspace undoes a corner · esc cancels',
     circ: 'press at the centre of a cell and drag out · esc cancels',
     rect: 'drag a box around the area where you outlined EVERY granule',
     sel: 'click a shape · drag it or its corners · 1-5 retypes · delete removes',
@@ -671,7 +680,7 @@ function bboxOf(p) {
    them is a sliver of no-man's-land that is neither granule, which then shows up as
    boundary error that the annotator invented rather than the algorithm. Snapping makes a
    shared edge exactly shared. */
-function snapVertex(x, y) {
+function snapCandidate(x, y) {
   const e = SNAP_PX / S.z;
   let best = null, bd = e;
   for (const s of shapes()) {
@@ -681,6 +690,14 @@ function snapVertex(x, y) {
       if (d < bd) { bd = d; best = p; }
     }
   }
+  return best;
+}
+// A snapped point lands AWAY from the crosshair, so the grab must be visible before the
+// click (the ring drawn in draw()) and escapable (Alt places exactly at the cursor).
+// Invisible snapping read as a broken crosshair to the first real user.
+function snapVertex(x, y, alt) {
+  if (alt) return [x, y];
+  const best = snapCandidate(x, y);
   return best ? [best[0], best[1]] : [x, y];
 }
 function commitPoly(p) {
@@ -757,7 +774,7 @@ cv.addEventListener('pointerdown', e => {
     if (d.p.length >= 3 && Math.hypot(d.p[0][0] - x, d.p[0][1] - y) < e2) {
       commitPoly(d.p); S.draft = null; syncUI(); return;
     }
-    d.p.push(snapVertex(x, y)); d.cur = [x, y]; draw(); return;
+    d.p.push(snapVertex(x, y, e.altKey)); d.cur = [x, y]; draw(); return;
   }
   if (e.button === 2) return;
   if (S.tool === 'circ') { S.draft = { k: 'circ', cx: x, cy: y, r: 0 }; return; }
@@ -777,6 +794,13 @@ cv.addEventListener('pointermove', e => {
     S.ox = S.pan[2] + (e.clientX - S.pan[0]); S.oy = S.pan[3] + (e.clientY - S.pan[1]);
     draw(); return;
   }
+  // show where the NEXT click will land before it happens (Alt suppresses the snap)
+  if (S.tool === 'poly' && !S.drag) {
+    const tgt = e.altKey ? null : snapCandidate(x, y);
+    const changed = JSON.stringify(tgt) !== JSON.stringify(S.snapTgt);
+    S.snapTgt = tgt;
+    if (changed && !S.draft) draw();
+  } else if (S.snapTgt) { S.snapTgt = null; draw(); }
   if (S.draft) {
     const d = S.draft;
     if (d.k === 'poly') d.cur = [x, y];

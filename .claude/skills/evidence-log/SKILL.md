@@ -374,7 +374,7 @@ blindness, stratification and CSV round-trip, in a temp directory that never tou
 Run it after touching `devlog.py` or `labelsheet.py`, and after taking an upstream update.
 
 **Local fixes carried on top of upstream** — re-apply these if the skill is updated again,
-because as of 2026-08-06 upstream still ships all four:
+because as of 2026-08-09 upstream still ships all five:
 1. `devlog._cells` — `table` accepts `cols`/`headers` and `kv` accepts `rows`/`items` on
    BOTH surfaces. Upstream, a `kv` block logged the way SKILL.md documents renders blank in
    `index.html`, and a table logged with `headers` vanishes from the markdown.
@@ -384,6 +384,14 @@ because as of 2026-08-06 upstream still ships all four:
    silently rendered as an empty box.
 4. `labelsheet._spread` — bands are visited by bisection, so a short prefix straddles the
    score range instead of being monotonic in it.
+5. `groundtruth` corner snap is visible and escapable — a white ring previews the grab
+   before the click, Alt places exactly at the cursor, and `SNAP_PX` dropped 7 → 5.
+   Upstream snaps silently, which the first real user reported as "the crosshair is not
+   on the points" — an invisible snap is indistinguishable from a broken pointer.
+6. `groundtruth.rasterize` defaults to `classes=None` (keep every polygon). Upstream's
+   default filter is the granule project's own vocabulary `("F", "I", "?")`, which
+   silently returns an EMPTY raster for any page built with different class keys — it
+   cost a real scoring pass before it was caught.
 
 **Feed it back into the durable documents.** When a measurement here sets a default, a
 threshold or a size prior, cite the entry id where it lands — in the node's docstring, in
