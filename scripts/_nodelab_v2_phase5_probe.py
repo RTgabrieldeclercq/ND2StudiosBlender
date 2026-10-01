@@ -87,6 +87,206 @@ class _FakeRelease:
         pass
 
 
+def _probe_movie_editor(win, app) -> None:
+    """The Movie Editor dock (2026-09-30), driven the way the mouse would drive it.
+
+    One graph: a synthetic source ``S``, a threshold ``Th`` whose Voxel mask stands in for a
+    label raster, and an Export Movie ``M`` with ``S`` on ``data`` and ``Th`` — through a
+    Reroute — on ``source_b``. Checks, in order: selecting ``M`` raises and binds the dock;
+    the sources resolve THROUGH the reroute; *Compute sources* fetches without retargeting
+    the Viewer or evicting its held views; *Convert to timeline* switches the Mode and starts
+    from the flat movie; the loop template is the user's interleave (A's max-Z, then B's
+    labelled z sweep, alternating); the monitor's frames equal the EXPORTED frames bit for
+    bit; a settled Viewer LUT is stamped into the linked channels; undo/redo round-trip; and
+    deleting the only segment is refused."""
+    import glob as _glob
+    import json as _json
+    from PIL import Image as _Image
+    from nodegraph.catalog._shared import movie_timeline as MT
+    from nodelab_v2.node_item import NodeItem
+
+    def wait(pred, timeout=120.0):
+        t0 = time.time()
+        while not pred() and time.time() - t0 < timeout:
+            app.processEvents()
+            time.sleep(0.01)
+        return pred()
+
+    from nodegraph.dataset import AxisSizes
+    from nodegraph.metadata import MetaEnvelope
+    from nodelab_v2 import runner as _RN
+
+    win.file_new()
+    app.processEvents()
+    # A known synthetic stack. The runner caches the synthetic provider by path, so an
+    # earlier section's geometry would otherwise leak in (a Z=1 stack makes the z sweep one
+    # plane long and every frame count below wrong).
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner._raw_src.clear()
+    win.runner.invalidate()
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=2, z=4, c=2, y=96, x=128)
+    doc = win.doc
+    doc.add_node("io.load", node_id="S", x=0, y=0)
+    doc.set_meta_seed("S", MetaEnvelope(axes=_RN._SYNTH_AXES,
+                                        metadata=dict(_RN._SYNTH_META)))
+    doc.add_node("analysis.threshold", node_id="Th", x=260, y=180)
+    doc.add_node("rr.reroute", node_id="R", x=420, y=200)
+    doc.add_node("io.write_movie", node_id="M", x=560, y=40)
+    doc.connect("S", "image", "Th", "data")
+    doc.connect("Th", "out", "R", "data")
+    doc.connect("S", "image", "M", "data")
+    doc.connect("R", "out", "M", "source_b")
+    app.processEvents()
+    ed = win.movie_editor
+
+    # selecting the node raises and binds the dock — WITHOUT growing the main window. It
+    # used to: the dock spanned the full width under the tall side column and raised the
+    # window's minimum height past a 1080p screen, so its buttons sat off the bottom edge
+    # and "nothing in the movie editor could be clicked" (reported 2026-09-30).
+    min_before, size_before = win.minimumSizeHint(), win.size()
+    items = {i.node_id: i for i in win.scene.items() if isinstance(i, NodeItem)}
+    win.scene.clearSelection()
+    items["M"].setSelected(True)
+    wait(lambda: False, 0.3)
+    assert win._movie_dock.isVisible() and ed.bound() == "M", (ed.bound(),)
+    assert win.minimumSizeHint().height() <= max(min_before.height(), size_before.height()) \
+        and win.minimumSizeHint().width() <= max(min_before.width(), size_before.width()) \
+        and win.size() == size_before, (min_before, win.minimumSizeHint(), win.size())
+    assert ed._flat, "a new Export Movie plays its flat settings until converted"
+    assert all(b.isEnabled() for b in ed._op_btns), "a flat node locks the editor's buttons"
+    srcs = win._movie_sources("M")
+    assert srcs["A"]["node"] == "S" and srcs["B"]["node"] == "Th" and srcs["C"]["node"] is None
+    assert doc.real_source("M", "source_b") == "Th", "real_source did not walk the reroute"
+
+    # Compute sources: a payload-only fetch — the Viewer is not retargeted
+    shown = []
+    win.runner.finished.connect(lambda nid, *a: shown.append(nid))
+    viewed, held = win._viewed, set(win.runner._views)
+    ed.compute_sources()
+    assert wait(lambda: ed._payloads.get("A") is not None), "source A never arrived"
+    assert win._viewed == viewed and set(win.runner._views) == held and "S" not in shown, (
+        "a Movie Editor fetch reached the Viewer", win._viewed, shown)
+    assert wait(lambda: ed.frame_count() > 0), ed._status.text()
+
+    # Convert to timeline: Sweep flips, the flat movie becomes clip 1, auto channels link
+    ed.convert_to_timeline()
+    app.processEvents()
+    rec = doc.nodes["M"]
+    assert rec.modes.get("sweep") == "timeline" and not ed._flat
+    spec = MT.normalize_spec(rec.params["timeline"])
+    assert len(spec["segments"]) == 1 and spec["segments"][0]["kind"] == "clip"
+    assert all(d["link"] == "viewer"
+               for d in spec["segments"][0]["panels"][0]["display"].values())
+    assert rec.params["timeline"] == MT.canonical_json(spec), "not stored canonically"
+
+    # the loop template: A's max-Z at t, then B's labelled z sweep at t
+    ed.select(("seg", 0))
+    ed.add("loop")
+    app.processEvents()
+    spec = MT.normalize_spec(rec.params["timeline"])
+    loop = spec["segments"][1]
+    assert loop["kind"] == "loop" and loop["source"] == "A", loop
+    still, sweep = loop["body"]
+    assert still["play"]["axis"] == "none" and still["panels"][0]["z"] == "max"
+    assert sweep["play"] == dict(sweep["play"], axis="z", source="B", direction="alternate")
+    assert sweep["panels"][0]["render"] == "labels_over_image" and \
+        sweep["panels"][0]["layer"] == "mask", sweep["panels"][0]
+    ed.compute_sources()
+    assert wait(lambda: ed._payloads.get("B") is not None), "source B never arrived"
+    a_ax, b_ax = ed._payloads["A"].axes, ed._payloads["B"].axes
+    assert (a_ax.t, b_ax.z) == (2, 4), (a_ax, b_ax)
+    n_want = a_ax.t + a_ax.t * (1 + b_ax.z)       # clip 1 plays t, then the loop
+    assert wait(lambda: ed.frame_count() == n_want), (ed.frame_count(), n_want,
+                                                      ed._status.text())
+
+    # a settled Viewer LUT on S is stamped into A's linked channels
+    win.viewer._clim[("S", 0)] = (100.0, 900.0)
+    win.viewer._clim_user.add(("S", 0))        # a window the user SET, not an auto one
+    win.viewer._gammas[("S", 0)] = 1.5
+    win._on_viewer_display("S")
+    app.processEvents()
+    spec = MT.normalize_spec(rec.params["timeline"])
+    d0 = spec["segments"][0]["panels"][0]["display"]["0"]
+    assert (d0["lo"], d0["hi"], d0["gamma"]) == (100.0, 900.0, 1.5), d0
+    assert spec["segments"][1]["body"][0]["panels"][0]["display"]["0"]["lo"] == 100.0
+
+    # the monitor IS the export: write a PNG sequence and compare every frame
+    tmp = tempfile.mkdtemp(prefix="nd2sb_movie_editor_")
+    rec.params["path"] = os.path.join(tmp, "m.png")
+    rec.modes["format"] = "png"
+    doc.touch("M")
+    app.processEvents()
+    done = {}
+    win.runner.finished.connect(lambda nid, *a: done.setdefault(nid, True))
+    win.runner.failed.connect(lambda nid, tr: done.setdefault("err", tr))
+    win.export_movie("M")
+    assert wait(lambda: "M" in done or "err" in done), "the export never finished"
+    assert "err" not in done, done.get("err")
+    shots = sorted(_glob.glob(os.path.join(tmp, "m_*.png")))
+    assert wait(lambda: ed.frame_count() == n_want)
+    assert len(shots) == n_want, (len(shots), n_want)
+    for k, f in enumerate(shots):
+        assert np.array_equal(np.asarray(_Image.open(f)), ed.render_now(k)), (
+            f"monitor frame {k} differs from the exported frame")
+
+    # undo / redo, and the one refusal
+    n_before = len(MT.normalize_spec(rec.params["timeline"])["segments"])
+    ed.undo()
+    assert len(MT.normalize_spec(rec.params["timeline"])["segments"]) == n_before - 1
+    ed.redo()
+    assert len(MT.normalize_spec(rec.params["timeline"])["segments"]) == n_before
+    ed.select(("seg", 1))
+    ed.delete()
+    ed.select(("seg", 0))
+    ed.delete()
+    assert len(MT.normalize_spec(rec.params["timeline"])["segments"]) == 1
+    assert "cannot delete the only segment" in ed._status.text(), ed._status.text()
+
+    # REAL clicks, not the editor's API: outline rows and property checkboxes rebuild parts
+    # of the editor, which must never happen inside the clicked widget's own signal (that
+    # deleted the widget under a press Qt was still handling). Afterwards the op buttons
+    # must still answer.
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QCheckBox
+    tree = ed._tree
+    for _round in range(2):
+        for i in range(tree.topLevelItemCount()):
+            it = tree.topLevelItem(i)
+            QTest.mouseClick(tree.viewport(), _Qt.LeftButton,
+                             pos=tree.visualItemRect(it).center())
+            wait(lambda: False, 0.05)
+    ed.select(("seg", 0))
+    wait(lambda: False, 0.1)
+    for b in [b for b in ed._props.widget().findChildren(QCheckBox) if b.isVisible()][:3]:
+        QTest.mouseClick(b, _Qt.LeftButton)
+        wait(lambda: False, 0.05)
+    n_seg = len(MT.normalize_spec(rec.params["timeline"])["segments"])
+    QTest.mouseClick(ed._op_btns[0], _Qt.LeftButton)          # +Clip, clicked
+    wait(lambda: False, 0.1)
+    assert len(MT.normalize_spec(rec.params["timeline"])["segments"]) == n_seg + 1
+    QTest.mouseClick(ed._undo_btn, _Qt.LeftButton)            # Undo, clicked
+    wait(lambda: False, 0.1)
+    assert len(MT.normalize_spec(rec.params["timeline"])["segments"]) == n_seg
+
+    # the render thread must be idle before the probe's os._exit: a thread still inside
+    # OpenCV when the process tears down crashes it (exit 139, a false failure)
+    assert wait(lambda: not ed._renderer.busy, 60), "the render thread never went idle"
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
+    _ok("Movie Editor (2026-09-30): selecting an Export Movie raises the dock bound to it "
+        "without growing the main window (the dock sits under the canvas and scrolls), and "
+        "every control is live on a flat node; its sources resolve through a Reroute; "
+        "REAL clicks on outline rows and property checkboxes leave the op buttons "
+        "answering; Compute sources fetches payload-only "
+        "(Viewer target and held views untouched); Convert to timeline flips Sweep and "
+        "starts from the flat movie with auto channels linked to the Viewer; the loop "
+        f"template is A's max-Z then B's labelled z sweep, alternating ({n_want} frames on "
+        "a T=2, Z=4 stack); a settled Viewer LUT is stamped into the linked channels; every "
+        "monitor frame equals the exported PNG bit for bit; undo/redo round-trip; deleting "
+        "the only segment is refused")
+
+
 def main(argv) -> int:
     out = argv[1] if len(argv) > 1 else "nodelab_v2_phase5.png"
     app = QApplication(sys.argv[:1])
@@ -769,6 +969,36 @@ def main(argv) -> int:
     assert "nX" in fresh and fresh["nX"].axes.z == 9, "re-seed did not re-announce"
     _ok("R2: source re-seed re-announces on a changed source key (not once-only)")
 
+    # ── source calibration override: the typed value must reach BOTH halves ───
+    #
+    # Regression, found on real data 2026-09-15: the override was applied in
+    # `_resolve_source`, but `_all_sources` builds the worker's cfg as an explicit
+    # WHITELIST (`path`, access, bundle paths) — so the typed number never left the GUI
+    # thread. The edit-time header showed the Z step while the pulled payload still carried
+    # None, and `track.objects` refused quoting a value the card claimed to have. Drift
+    # between the envelope and the payload is the exact failure an axis-changing node's
+    # meta_transform exists to prevent; a SOURCE can drift the same way.
+    from nodelab_v2.ops import CALIB_OVERRIDE_KEYS as _CK, LOAD_OP as _LOAD
+    _cdoc = GraphDocument()
+    _crec = _cdoc.add_node(_LOAD, x=0, y=0, params={"path": "C:/nonexistent/vol.ome.tif"})
+    class _CR: document = _cdoc
+    assert not any(k in _ER._all_sources(_CR())[_crec.id] for k in _CK), \
+        "an untouched card must override nothing (0/absent = whatever the file says)"
+    _crec.params["z_step_um"] = 1.0                    # the user types it (inspector path)
+    _ccfg = _ER._all_sources(_CR())[_crec.id]
+    assert _ccfg.get("z_step_um") == 1.0, \
+        "the typed Z step must reach the worker thread's cfg, or the pull cannot see it"
+    from nodelab_v2.runner import _with_card_calib as _wcc
+    assert _wcc(MetaEnvelope(metadata={"pixel_size_um": 1.0}), _ccfg).metadata["z_step_um"] \
+        == 1.0, "…and be applied to the envelope the payload and meta-seed both come from"
+    _cdoc.propagate()
+    assert _cdoc.envs[_crec.id].metadata.get("z_step_um") == 1.0, \
+        "…while the EDIT-TIME envelope agrees, so derived defaults re-seed as you type"
+    _ok("source calibration override (2026-09-15): a Z step typed on the Load card reaches "
+        "the worker cfg, the resolved envelope AND the edit-time pass — the three that must "
+        "agree, since a plain TIFF records no z_step_um and nothing downstream can infer "
+        "one; an untouched card still overrides nothing")
+
     # ── G5 spreadsheet + Point overlay (Phase-6 inspection) ───────────────────
     from nodegraph.dataset import Dataset as _DS2
     from nodegraph.domains import Domain as _Dom
@@ -1196,6 +1426,10 @@ def main(argv) -> int:
     except ImportError:
         _ok("Export: Parquet SKIPPED (pyarrow absent)")
 
+    # (the file-bundle export column is covered by nodegraph.selftest's
+    # test_bundle_source_file_column — tables/export are Qt-free, so they belong on the
+    # Qt-free gate rather than in the middle of a GUI timing sequence.)
+
     # E2: splice-on-wire inserts a node into an existing link
     sdoc = _GD()
     sdoc.add_node("io.load", node_id="a", x=0, y=0)
@@ -1569,6 +1803,47 @@ def main(argv) -> int:
         "time in its tooltip), eager fractions, flowing wires, one shared timer, "
         "status-bar determinate bar (ingest fraction; hidden when indeterminate/ended)")
 
+    # Console: the FULL trace, selectable and copyable (restored 2026-09-15) ───
+    #
+    # Asked for by name ("errors should be in a console that can be copy/pasted into").
+    # The failure above is what opened it: the status bar TRUNCATES to the window width
+    # and a tooltip cannot be selected, so this panel is the only place the text a user
+    # needs to send someone can actually be got at.
+    from PySide6.QtGui import QGuiApplication
+    assert win._console_dock.isVisible(), "the first failure of a session must raise it"
+    assert win._console_act.isChecked(), "…and the View ▸ Console tick must follow the dock"
+    shown = win.console._out.toPlainText()
+    assert "n3 FAILED" in shown and "Boom" in shown, shown
+    assert win.console._out.isReadOnly(), "a log you can edit is a log you cannot trust"
+    assert win.console._out.textInteractionFlags() & Qt.TextSelectableByMouse, \
+        "the whole point is that it can be selected"
+    win.console.copy_all()
+    assert "Boom" in QGuiApplication.clipboard().text(), "Copy all must reach the clipboard"
+    # Whitespace is preserved verbatim — the reason the panel formats with
+    # QTextCharFormat rather than HTML, since a traceback whose indentation collapsed is
+    # not the traceback you were asked to paste.
+    win.console.error("outer\n    indented 4")
+    assert "\n    indented 4" in win.console._out.toPlainText()
+    # A console the USER closed stays closed — someone working through a chain of errors
+    # must not have to dismiss it after every one — while still RECORDING every failure.
+    win._console_act.setChecked(False)
+    assert not win._console_dock.isVisible()
+    win._on_run_failed("n3", "Traceback…\nAgain")
+    assert not win._console_dock.isVisible(), \
+        "a console the user closed must not re-open on each later failure"
+    assert "Again" in win.console._out.toPlainText(), "…but it still records them"
+    win.scene.clear_run_states()
+    win._set_progress(None)
+    # Hand the window back exactly as it was found: showing/hiding a bottom dock resizes
+    # the CENTRAL splitter, and the maximize/restore check below captures those sizes.
+    app.processEvents()
+    _ok("Console (asked 2026-09-15): a failed pull's FULL traceback lands in a selectable "
+        "monospace log with Copy all — the status bar truncates to the window width and a "
+        "tooltip cannot be selected, so this is the only copyable surface; it raises itself "
+        "on the first failure of a session, the View ▸ Console tick tracks the dock both "
+        "ways, indentation survives to the clipboard verbatim (QTextCharFormat, not HTML), "
+        "and a console the user closed keeps recording without re-opening itself")
+
     # E9: maximized canvas + mini-map Viewer + click-to-preview ────────────────
     docked_sizes = win._center.sizes()
     assert win._center.count() == 2 and win._center.widget(0) is win.viewer
@@ -1825,6 +2100,44 @@ def main(argv) -> int:
         "and so must a MODE the chosen method never reads (V2.12 ModeSpec.available_in)"
     _prec.modes["method"] = "watershed"
     assert "mask" in _sock_names() and "level" in _mode_names(), "gating is reversible"
+
+    # THE CONDITION COLUMN PICKER (V2.28). The layer picker above is an EDITABLE combo
+    # because a couple of producers name layers the edit-time pass cannot predict. The
+    # COLUMN picker is the opposite: every structure-producing node declares `adds_columns`
+    # (selftest::test_column_catalog_complete), so the columns a table carries really are
+    # determined by the nodes upstream and the control is a CLOSED dropdown. That is the
+    # whole feature — "which statistics do I have?" answered in the menu instead of by
+    # pulling and reading the error — so the closed-ness is asserted here, on the widget.
+    pdoc.add_node("analysis.if_else", node_id="PIE",
+                  params={"labels": "regions", "column1": "area"},
+                  modes={"target": "label"})
+    pdoc.connect("PL", "out", "PIE", "data")
+    _col_sock = pdoc.nodes["PIE"].spec().input("column1")
+    _cols = pdoc.column_choices("PIE", _col_sock)
+    assert "area" in _cols and "mean_intensity" not in _cols,         f"a segmentation alone offers its own geometry and nothing measured: {_cols}"
+    pdoc.add_node("analysis.measure", node_id="PM2",
+                  params={"labels": "regions", "stats": "mean", "shape": "solidity"},
+                  modes={"target": "label"})
+    pdoc.connect("PL", "out", "PM2", "data")
+    pdoc.connect("PM2", "out", "PIE", "data")          # re-wire through Measure
+    _cols2 = pdoc.column_choices("PIE", _col_sock)
+    assert {"mean_intensity", "solidity"} <= set(_cols2),         f"the palette must GROW when a Measure is inserted upstream: {_cols2}"
+
+    _pie_item = _PItem(pdoc.nodes["PIE"], pdoc)
+    _cbox = _PInsp()._column_box(_pie_item, _col_sock)
+    assert not _cbox.isEditable(),         "the column control must be a CLOSED dropdown, not a text box with suggestions "         "(nodelab_v2.inspector._names_box editable=False)"
+    assert [_cbox.itemText(i) for i in range(_cbox.count())] == list(_cols2),         "the dropdown must list exactly what the edit-time column catalog offers"
+    assert _cbox.currentText() == "area", "and start on the value the node actually holds"
+
+    # A value nothing upstream writes must SURVIVE. A closed combo can only emit items in
+    # its list, so an orphaned column would otherwise be silently rewritten to index 0 the
+    # moment the panel rebuilds — a value the user never chose, on a node that decides
+    # which objects survive.
+    pdoc.nodes["PIE"].params["column1"] = "ghost_col"
+    _cbox2 = _PInsp()._column_box(_PItem(pdoc.nodes["PIE"], pdoc), _col_sock)
+    assert _cbox2.currentText() == "ghost_col",         "a column no producer writes must be KEPT, not silently replaced by the first entry"
+    assert "NOT on this wire" in _cbox2.toolTip(),         "...and the panel has to say why it is there, or it reads as a working setting"
+    pdoc.nodes["PIE"].params["column1"] = "area"
 
     pinsp = _PInsp()
     pitem = _PItem(pdoc.nodes["PW"], pdoc)
@@ -2763,6 +3076,12 @@ def main(argv) -> int:
             time.sleep(0.005)
         assert len(win.viewer._planes) == n, sorted(win.viewer._planes)
 
+    # every channel is shown by default (2026-09-30), and a rebuild that switches one on
+    # asks for its plane — so both arrive without a click. Off and on again through the
+    # real toggle, so the fast path is still what is under test.
+    _await_planes(2)
+    win.viewer._on_channel_toggle(1)
+    _await_planes(1)
     win.viewer._on_channel_toggle(1)
     _await_planes(2)
     _both = win.viewer._hover_text((_cx, _cy))
@@ -4071,22 +4390,28 @@ def main(argv) -> int:
     win.viewer._ensure_geometry()
     _mk = win.viewer._geo_points
     _rend = win.viewer._renderer
-    _seen = {}
+    # NOT `_seen`: that name is still captured by the `plane_ready` lambda connected far
+    # above (the cold/warm decode probe), which appends to it. Rebinding it to a dict here
+    # made every later plane_ready raise AttributeError inside the handler — printed as a
+    # traceback that reads like a failed probe while every assertion still passed. Whether
+    # it fires at all is a timing accident, so it surfaces and vanishes with unrelated edits.
+    _colours = {}
     for _mode in ("single", "per_z", "per_point", "per_layer"):
         win.viewer.overlays.points.color_mode = _mode
-        _seen[_mode] = len({_rend._point_color(win.viewer.overlays.points, k).name()
-                            for k in _mk})
+        _colours[_mode] = len({_rend._point_color(win.viewer.overlays.points, k).name()
+                               for k in _mk})
     assert len({mk.layer for mk in _mk}) == 2, "the fixture must carry TWO Point layers"
-    assert _seen["single"] == 1, _seen
-    assert _seen["per_point"] == 6, (
-        f"per_point must give one colour PER POINT, got {_seen} — 4 for 6 marks was the "
+    assert _colours["single"] == 1, _colours
+    assert _colours["per_point"] == 6, (
+        f"per_point must give one colour PER POINT, got {_colours} — 4 for 6 marks was the "
         f"cross-layer id collision: every layer numbers ids from 0 and the neighbour graph "
         f"is per layer, so two layers' objects preferred (and kept) the same palette slots")
-    assert _seen["per_layer"] == 2, f"per_layer must be one colour per layer, got {_seen}"
+    assert _colours["per_layer"] == 2, \
+        f"per_layer must be one colour per layer, got {_colours}"
     # per_z: one colour per PLANE, over the 5 planes these 6 marks occupy — the cloud rounds
     # onto 3/4/5/5 and the per-plane layer sits on 1 and 6
     assert sorted({mk.zplane for mk in _mk}) == [1, 3, 4, 5, 6],         sorted({m.zplane for m in _mk})
-    assert _seen["per_z"] == 5, f"per_z must give one colour per Z plane, got {_seen}"
+    assert _colours["per_z"] == 5, f"per_z must give one colour per Z plane, got {_colours}"
     # …and with projection OFF every drawn mark is on the viewed plane, so per_z is ONE
     # colour. That is correct, not a repeat of the per_layer confusion — but it is a trap
     # worth pinning, because "colour by Z" showing one colour reads exactly like a bug.
@@ -4502,6 +4827,341 @@ def main(argv) -> int:
         "unwound without finishing and the branch queued behind it ran and delivered; "
         "run-graph clone ids (`n#it@i`, `body%inst`) map back to their document card so "
         "a delete also cancels runs computing a card's Iterate clones or group body")
+
+    # ── V5: a stale channel request against a per-channel tap (2026-08-15) ────
+    # The user's session: view a multi-channel node with only a HIGH channel toggled
+    # on, then click a node fed from a per-channel `chK` output (its tap output has
+    # c=1). The pull is made with the viewer's PREVIOUS active set (window.pull_node
+    # sends viewer.channels()), every index in it is at/above the payload's channel
+    # count, and `_plane_addrs` dropped them all — zero planes, "no image on this
+    # output", a black viewer — while the very same click a SECOND time displayed
+    # fine, because the strip is corrected on delivery, one click too late. The
+    # request now degrades to the clamped cursor channel instead of to nothing.
+    # (Found live: an ND2's per-channel output into ZS-DeconvNet; node-independent.)
+    _pulls.clear()
+    win.pull_node("cl")                        # view the 2-channel source
+    _await_pull(limit=60.0)
+    if 1 not in win.viewer._active_channels:   # leave ONLY channel index 1 active,
+        win.viewer._on_channel_toggle(1)       # through the real toggle path
+    if 0 in win.viewer._active_channels:
+        win.viewer._on_channel_toggle(0)
+    _t0 = time.time()
+    while time.time() - _t0 < 1.0:             # let the toggles' re-requests land
+        app.processEvents()
+        time.sleep(0.005)
+    assert win.viewer._active_channels == [1], win.viewer._active_channels
+    cdoc.add_node("enhance.gamma", node_id="cg2", x=380, y=400, params={"gamma": 0.9})
+    cdoc.connect("cs", "ch1", "cg2", "data")
+    win.scene.sync()
+    app.processEvents()
+    _pulls.clear()
+    win.pull_node("cg2")                       # FIRST view of the tap-fed node
+    _await_pull(limit=60.0)
+    _st = win.viewer._status.text()
+    assert "no image on this output" not in _st, _st
+    assert win.viewer._planes, "first view of a tap-fed node must deliver planes"
+    assert "px" in _st, _st
+    _ok("V5 stale-channel request vs a per-channel tap (2026-08-15): viewing only a "
+        "high channel index and then clicking a node fed from a `chK` output (tap "
+        "payload c=1) shows the image on the FIRST click — a request whose every "
+        "channel is stale degrades to the cursor channel instead of delivering zero "
+        "planes and reading 'no image on this output'")
+
+    # ── V6: channels never switch themselves off (2026-09-30) ──────────────────────
+    # Reported: "loading files or going from node to node deactivates one or more
+    # channels". The strip used to switch a channel on only the FIRST time its name was
+    # seen, so 2-channel -> 1-channel tap -> 2-channel came back with a channel OFF (seen,
+    # never re-enabled), and the pull that delivered the rebuild carried only the old
+    # strip's channels. Now: every channel is on unless the user switched it off, and the
+    # missing planes are fetched. V5 left channel 0 user-off; switch it back on first.
+    win.pull_node("cl")
+    _await_pull(limit=60.0)
+    if 0 not in win.viewer._active_channels:
+        win.viewer._on_channel_toggle(0)
+    _await_planes(2)
+    win.pull_node("cg2")                       # the 1-channel tap
+    _await_pull(limit=60.0)
+    assert win.viewer._active_channels == [0], win.viewer._active_channels
+    win.pull_node("cl")                        # ...and back
+    _await_pull(limit=60.0)
+    assert win.viewer._active_channels == [0, 1], win.viewer._active_channels
+    _await_planes(2)
+    assert all(win.viewer._chan_btns[_c].isChecked() for _c in (0, 1))
+    # a channel the USER switched off stays off through the same round trip
+    win.viewer._on_channel_toggle(1)
+    _await_planes(1)
+    win.pull_node("cg2")
+    _await_pull(limit=60.0)
+    win.pull_node("cl")
+    _await_pull(limit=60.0)
+    assert win.viewer._active_channels == [0], win.viewer._active_channels
+    win.viewer._on_channel_toggle(1)           # leave the probe as it found it
+    _await_planes(2)
+    # a node whose DATA changed under the same id re-auto-contrasts: a stale window
+    # from another file is a channel that looks switched off
+    win.viewer._clim[("cl", 0)] = (1e9, 2e9)
+    win.viewer._lut_ident["cl"] = ((2, ("other",), ()), set())
+    win.pull_node("cl")
+    _await_pull(limit=60.0)
+    assert win.viewer._clim.get(("cl", 0), (0.0, 0.0))[0] < 1e9, win.viewer._clim.get(("cl", 0))
+    _ok("V6 channels never switch themselves off (2026-09-30): 2-channel -> 1-channel "
+        "tap -> 2-channel returns with BOTH channels on and both planes delivered "
+        "without a click; a channel the user switched off stays off through the same "
+        "round trip; a node whose channel identity changed under the same id drops its "
+        "cached LUT and auto-contrasts afresh")
+
+    # ── B1 the golden point (V3.01) ──────────────────────────────────────────────
+    # The batch axis' canvas half: Batch and Unbatch render as GOLD CIRCLES rather than
+    # cards, the Unbatch grows one output per FILE, and each wired one materializes into a
+    # real `util.select_batch` tap. Probed here rather than in the headless selftest
+    # because every one of those is a property of the GUI's own layer — the document's
+    # socket synthesis, the node item's geometry, and the run-graph rewrite between them.
+    from nodelab_v2 import theme as _TB
+    from nodelab_v2.ops import materialize_batch_taps as _mbt
+    from nodelab_v2.scene import GraphScene as _GSb
+    bdoc = GraphDocument()
+    bdoc.add_node("util.batch", node_id="bba", x=300, y=0)
+    bdoc.add_node("enhance.gaussian", node_id="bg", x=460, y=0)
+    bdoc.add_node("util.unbatch", node_id="bun", x=700, y=0)
+    for _i in range(3):
+        bdoc.add_node("io.load", node_id=f"bf{_i}", x=0, y=_i * 90,
+                      params={"path": rf"C:\d\F{_i}.nd2"})
+        bdoc.connect(f"bf{_i}", "image", "bba", "data")
+    bdoc.connect("bba", "out", "bg", "data")
+    bdoc.connect("bg", "out", "bun", "data")
+    app.processEvents()
+
+    # (a) the Unbatch grows one output per file, NAMED after it — the only thing on the
+    #     canvas that says which wire is which specimen
+    _bnames = bdoc.batch_member_names("bun")
+    assert _bnames == ["F0.nd2", "F1.nd2", "F2.nd2"], _bnames
+    _bsocks = [s.name for s in bdoc.output_specs("bun")]
+    assert _bsocks == ["out", "bat0", "bat1", "bat2"], _bsocks
+    # ...and the Batch point does NOT: it collects into one multi socket
+    assert [s.name for s in bdoc.output_specs("bba")] == ["out"]
+
+    # (b) both render as circles, not cards, and the Unbatch's member sockets are SPREAD
+    #     far enough apart to tell one file's wire from another's
+    bscene = _GSb(bdoc)
+    _bitems = {i.node_id: i for i in bscene.items() if hasattr(i, "node_id")}
+    for _nid in ("bba", "bun"):
+        _it = _bitems[_nid]
+        assert getattr(_it, "_is_dot", False), _nid
+        assert _it.card_rect().width() == _it.card_rect().height(), _nid
+    assert not getattr(_bitems["bg"], "_is_dot", False), "a filter is still a card"
+    _bys = sorted(s.pos().y() for (io, nm), s in _bitems["bun"]._sockets.items()
+                  if io == "out" and nm.startswith("bat"))
+    _bgaps = [_bys[i + 1] - _bys[i] for i in range(len(_bys) - 1)]
+    assert _bgaps and min(_bgaps) >= _TB.SOCKET_PITCH - 0.01, _bgaps
+
+    # (c) a wired member socket becomes a REAL tap carrying the file's NAME, never its
+    #     index — the rewire-safety rule the group taps already follow
+    bdoc.add_node("view.viewer", node_id="bv", x=900, y=0)
+    bdoc.connect("bun", "bat1", "bv", "data")
+    _brun = _mbt(bdoc.to_graph())
+    _btaps = [n for n in _brun.nodes.values() if n.op_key == "util.select_batch"]
+    assert len(_btaps) == 1, _btaps
+    assert _btaps[0].params.get("member") == "F1.nd2", _btaps[0].params
+    assert not any(e.src_socket.startswith("bat") for e in _brun.edges), "a batK survived"
+    _ok("B1 the golden point (V3.01): Batch and Unbatch render as CIRCLES rather than "
+        "cards (a batch is not a processing step), the Unbatch grows one output per FILE "
+        "named after it while the Batch collects into one multi socket, the member "
+        "sockets stay at least SOCKET_PITCH apart so a wire is traceable to its file, and "
+        "a wired one materializes into a real util.select_batch tap carrying the file's "
+        "NAME — an index would slide onto a different specimen after a rewire with every "
+        "hash still agreeing")
+
+    # ── B2 per-file tabs in the measurement table (V3.01) ────────────────────────
+    # When several files share one pipeline every row belongs to one of them and the
+    # `file` column says which — but reading "the measurements for WellA3" out of a
+    # 6000-row table means finding where one name stops. These are that column as tabs.
+    from nodegraph.structure import StructureTable as _SB
+    from nodegraph.domains import Domain as _DomB
+    from nodegraph.dataset import Dataset as _DsB
+    from nodegraph.metadata import SOURCE_FILE_KEY as _SFK2
+    from nodelab_v2.spreadsheet import SpreadsheetPanel as _SP2
+    _tax = AxisSizes(m=3, t=1, z=1, c=1, y=16, x=16)
+    _ttbl = _SB(_DomB.LABEL, {
+        "id": np.arange(6), "m": np.array([0, 0, 1, 1, 2, 2]),
+        "t": np.zeros(6, int), "c": np.zeros(6, int), "z": np.zeros(6, int),
+        "y": np.linspace(1, 9, 6), "x": np.linspace(2, 8, 6),
+        "area": np.array([10.0, 11.0, 20.0, 21.0, 30.0, 31.0]),
+    }, layer="CELLS", z_kind="plane_index")
+    _tds = (_DsB(axes=_tax, metadata={"pixel_size_um": 0.5})
+            .with_metadata(**{_SFK2: ["A.nd2", "B.nd2", "C.nd2"]})
+            .with_structure(_ttbl))
+    _panel = _SP2()
+    _panel.show_dataset("measure", _tds)
+    _ttabs = [_panel._files.tabText(i) for i in range(_panel._files.count())]
+    assert _ttabs == ["All (3 files)", "A.nd2", "B.nd2", "C.nd2"], _ttabs
+
+    def _areas():
+        _c = [n for n in range(_panel._table.columnCount())
+              if _panel._table.horizontalHeaderItem(n).text() == "area"][0]
+        return [_panel._table.item(r, _c).text()
+                for r in range(_panel._table.rowCount())]
+
+    assert len(_areas()) == 6, _areas()                       # All
+    for _i, _want in ((1, ["10", "11"]), (2, ["20", "21"]), (3, ["30", "31"])):
+        _panel._files.setCurrentIndex(_i)
+        assert _areas() == _want, (_i, _areas())
+        # the row header keeps the ORIGINAL row number, so a filtered row is still
+        # findable in the unfiltered CSV the export writes
+        assert _panel._table.verticalHeaderItem(0).text() == str((_i - 1) * 2)
+    _panel._files.setCurrentIndex(0)
+    assert len(_areas()) == 6, _areas()
+    # a SINGLE-file table grows no tabs — one tab beside `All` would offer the same rows
+    # under two names, the floor the channel and member sockets already use
+    _one = (_DsB(axes=AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16),
+                    metadata={"pixel_size_um": 0.5})
+            .with_metadata(**{_SFK2: ["only.nd2"]})
+            .with_structure(_SB(_DomB.LABEL, {
+                "id": np.arange(2), "m": np.zeros(2, int), "t": np.zeros(2, int),
+                "c": np.zeros(2, int), "z": np.zeros(2, int),
+                "y": np.zeros(2), "x": np.zeros(2), "area": np.array([1.0, 2.0]),
+            }, layer="CELLS", z_kind="plane_index")))
+    _panel.show_dataset("measure1", _one)
+    assert _panel._files.count() == 0, [_panel._files.tabText(i)
+                                        for i in range(_panel._files.count())]
+    _ok("B2 per-file tabs (V3.01): a measurement table whose rows come from several "
+        "files grows one tab per file plus `All`, in WIRING order (not sorted — tab 2 "
+        "must mean the same file as output 2), each filtering to that file's rows while "
+        "the row header keeps the original row number so a row stays findable in the "
+        "unfiltered CSV; a single-file table grows none")
+
+    # -- O11 the experiment overlay (2026-09-30): Play all, the source strip, pins, LUTs --
+    #
+    # The engine and runner halves are proved headlessly (test_overlay_experiment,
+    # test_overlay_subtick_cache). What only a real widget can prove: the source strip
+    # shows each overlaid file by label with what it is showing; its steppers and Pin
+    # buttons emit exactly what the window writes; Play all holds each primary frame for
+    # n ticks (the slider moves once per n); the window turns a pin into canonical JSON on
+    # the Overlay through the ordinary edit path; a LUT drag keeps an overlay channel's
+    # blend; and an overlay channel's LUT is keyed by its SOURCE, not its chain position.
+    vw = win.viewer
+    if vw._playing_axis is not None:
+        vw._stop_play()
+    # The widget half runs DETACHED from the window: every emit would otherwise reach the
+    # real runner, re-request the viewed node (which overlays nothing) and have the window
+    # hand the strip an empty readout mid-assertion. The window half (pin -> params) is
+    # driven directly below.
+    vw.request_changed.disconnect(win._on_view_request)
+    vw.overlay_step.disconnect(win._on_overlay_step)
+    vw.overlay_pin.disconnect(win._on_overlay_pin)
+    vw._sliders["t"].blockSignals(True)
+    vw._sliders["t"].setRange(0, 2)
+    vw._sliders["t"].setValue(0)
+    vw._sliders["t"].blockSignals(False)
+    vw._sliders["z"].blockSignals(True)
+    vw._sliders["z"].setRange(0, 4)
+    vw._sliders["z"].setValue(2)
+    vw._sliders["z"].blockSignals(False)
+    rows = [{"ovl_id": "OVA", "sec_id": "SRC", "label": "GFP 20x", "t": 4, "n_t": 12,
+             "z": 1, "n_z": 3, "t_pinned": False, "z_pinned": False, "offset": (0, 0),
+             "sub_ticks": 3}]
+    vw.set_overlay_frames(rows, 3)
+    app.processEvents()
+    assert "OVA" in vw._src_rows and vw._n_sub == 3
+    row = vw._src_rows["OVA"]
+    assert row["name"].text() == "GFP 20x", row["name"].text()
+    assert "t 4/11" in row["info"].text() and "z 1/2" in row["info"].text() \
+        and "3x rate" in row["info"].text(), row["info"].text()
+    assert "Play all" in vw._play_btns["t"].toolTip()
+    got_step, got_pin, reqs = [], [], []
+    vw.overlay_step.connect(lambda *a: got_step.append(a))
+    vw.overlay_pin.connect(lambda *a: got_pin.append(a))
+    vw.request_changed.connect(lambda: reqs.append(vw.sub()))
+    vw._step_source("OVA", 0, +1)
+    vw._step_source("OVA", 1, -1)
+    assert got_step == [("OVA", 1, 0), ("OVA", 0, -1)], got_step
+    vw._pin_source("OVA", "t")
+    vw._pin_source("OVA", "z")
+    assert got_pin == [("OVA", "t", 0, 4), ("OVA", "z", 2, 1)], got_pin
+
+    # Play all: three ticks per primary frame -- the slider moves on the third
+    vw._playing_axis = "t"             # what `_on_play` sets, minus the timer and preload
+    vw._sync_pin_enabled()
+    vw._play_paced = False
+    vw._sub_step = 1
+    seen = []
+    for _ in range(6):
+        vw._tick_play()
+        seen.append((vw._sliders["t"].value(), vw.sub()))
+    assert seen == [(0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0)], seen
+    assert all(r["t_pin"].isEnabled() is False for r in vw._src_rows.values()), \
+        "no pinning mid-playback: a pin is an edit, and an edit cancels the preload"
+    vw._t_sub = 1
+    vw._stop_play()
+    assert vw.sub() == 0 and vw._src_rows["OVA"]["t_pin"].isEnabled()
+    # the tick rate: n_sub x the fps, capped, with several sub-ticks per tick past the cap
+    vw._fps_spins["t"].setValue(8.0)
+    assert vw._interval_ms("t") == int(1000.0 / 24.0) and vw._sub_step == 1
+    vw.set_overlay_frames(rows, 16)
+    vw._fps_spins["t"].setValue(30.0)
+    vw._interval_ms("t")
+    assert vw._sub_step == 8, vw._sub_step            # 480 ticks/s -> 8 per 60 Hz tick
+    vw.set_overlay_frames(rows, 3)
+    vw.request_changed.connect(win._on_view_request)
+    vw.overlay_step.connect(win._on_overlay_step)
+    vw.overlay_pin.connect(win._on_overlay_pin)
+
+    # the window writes a pin as canonical JSON, pinned, through the edit path
+    ovl = doc.add_node("view.overlay", x=1400, y=900)
+    win._viewed = win._viewed or "n3"
+    win._on_overlay_pin(ovl.id, "t", 5, 20)
+    win._on_overlay_pin(ovl.id, "t", 1, 4)
+    win._on_overlay_pin(ovl.id, "t", 5, 21)            # re-pinning a frame replaces it
+    assert doc.nodes[ovl.id].params["t_pins"] == "[[1,4],[5,21]]", \
+        doc.nodes[ovl.id].params["t_pins"]
+    assert "t_pins" in doc.nodes[ovl.id].locked
+    # ...and the inspector lists them, one remove button each
+    win.scene.clearSelection()
+    win.scene.node_items[ovl.id].setSelected(True)
+    app.processEvents()
+    from PySide6.QtWidgets import QToolButton as _QTB
+    xs = [b for b in win.inspector.findChildren(_QTB) if b.text() == "✕"]
+    assert len(xs) >= 2, "each T pin gets its own remove button"
+    xs[0].click()
+    app.processEvents()
+    app.processEvents()
+    assert doc.nodes[ovl.id].params["t_pins"] == "[[5,21]]", doc.nodes[ovl.id].params
+    doc.remove_node(ovl.id)
+
+    # an overlay channel's LUT is keyed by its SOURCE, and a LUT drag keeps its blend
+    vw._overlay_src = {1: {"node": "SRC", "ch": 0}}
+    assert vw._lut_key("n3", 1) == ("ovl", "SRC", 0) and vw._lut_key("n3", 0) == ("n3", 0)
+    calls = []
+
+    class _GLStub:
+        def set_channel(self, *a, **k):
+            calls.append(k)
+
+        def refresh(self):
+            pass
+
+    real_gl, real_style, real_planes = vw._gl, vw._overlay_style, vw._planes
+    try:
+        vw._gl = _GLStub()
+        vw._overlay_style = {1: (1, 0.35, 8.0)}             # `over` at 0.35
+        vw._planes = {0: np.zeros((4, 4)), 1: np.zeros((4, 4))}
+        vw._apply_lut(1)
+    finally:
+        vw._gl, vw._overlay_style, vw._planes = real_gl, real_style, real_planes
+    assert calls and calls[-1].get("blend") == 1 and abs(calls[-1]["opacity"] - 0.35) < 1e-9, \
+        calls
+    vw.set_overlay_frames([], 1)
+    assert not vw._src_box.isVisible() and vw._n_sub == 1
+    _ok("O11 experiment overlay (2026-09-30): the source strip shows each overlaid file by "
+        "its label with the frame/plane it is showing and its rate; the ◀▶ steppers emit an "
+        "absolute display-only offset and Pin T / Pin Z emit (primary, source-on-screen); "
+        "Play all holds each primary frame for n ticks (slider 0,0,1,1,1,2 over six ticks) "
+        "at n x the fps, several sub-ticks per tick past 60 Hz, pins are disabled while "
+        "playing and stopping parks on sub-tick 0; the window writes pins as canonical "
+        "sorted later-wins JSON through the pinning edit path and the inspector removes "
+        "one with its ✕; an overlay LUT is keyed by source, and a LUT drag no longer resets "
+        "an overlay channel to additive at full opacity")
+
+    _probe_movie_editor(win, app)
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

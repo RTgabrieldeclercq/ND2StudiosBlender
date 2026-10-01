@@ -13,6 +13,7 @@ import warnings
 import numpy as np
 
 from nodegraph.domains import (
+    LATTICE_DOMAINS,
     Domain, axes_of, comparable, dropped_axes, is_finer, is_lattice,
     is_structure, join, meet,
 )
@@ -127,23 +128,43 @@ def test_domains() -> None:
     assert is_lattice(D.VOXEL) and is_lattice(D.GLOBAL)
     assert is_lattice(D.CHANNEL) and axes_of(D.CHANNEL) == frozenset({"c"})  # V2.01 §H
     assert not is_lattice(D.LABEL) and is_structure(D.TRACK)
-    assert axes_of(D.VOXEL) == frozenset({"m", "t", "z", "c", "y", "x"})
-    assert axes_of(D.FRAME) == frozenset({"m", "t"})
+    assert axes_of(D.VOXEL) == frozenset({"b", "m", "t", "z", "c", "y", "x"})
+    assert axes_of(D.FRAME) == frozenset({"b", "m", "t"})
     assert axes_of(D.GLOBAL) == frozenset()
+    # V3.01 batch axis: `b` joins every place-or-time domain, because a position index
+    # and a frame index only mean anything WITHIN one file of a batch.
+    assert is_lattice(D.BATCH) and axes_of(D.BATCH) == frozenset({"b"})
+    assert axes_of(D.MULTIPOINT) == frozenset({"b", "m"})
+    assert axes_of(D.TIMEPOINT) == frozenset({"b", "t"})
+    assert axes_of(D.CHANNEL) == frozenset({"c"})         # a stain is not per-file
     # order
     assert is_finer(D.VOXEL, D.FRAME) and not is_finer(D.FRAME, D.VOXEL)
     assert is_finer(D.VOXEL, D.CHANNEL)                   # Channel ⊆ Voxel
     assert comparable(D.VOXEL, D.GLOBAL)
     assert not comparable(D.MULTIPOINT, D.TIMEPOINT)      # the two branches
     assert not comparable(D.CHANNEL, D.FRAME)             # Channel is orthogonal
-    # lattice: M∪T = Frame, M∩T = Global; meet total, join partial across c
+    assert is_finer(D.MULTIPOINT, D.BATCH) and is_finer(D.TIMEPOINT, D.BATCH)
+    assert is_finer(D.BATCH, D.GLOBAL)                    # Batch → Global closes the chain
+    # lattice: M∪T = Frame, M∩T = Batch; meet total, join partial across c
     assert join(D.MULTIPOINT, D.TIMEPOINT) is D.FRAME
-    assert meet(D.MULTIPOINT, D.TIMEPOINT) is D.GLOBAL
+    # THE reason Domain.BATCH has to exist: before `b`, this intersection was empty and
+    # named Global. Now it is {b}, and `meet` indexes _AXES_TO_DOMAIN directly — so
+    # without a name for {b} this line is a KeyError, not a wrong answer.
+    assert meet(D.MULTIPOINT, D.TIMEPOINT) is D.BATCH
+    assert meet(D.BATCH, D.CHANNEL) is D.GLOBAL           # {b} ∩ {c} = {} — still total
     assert join(D.PLANE, D.TIMEPOINT) is D.PLANE
     assert meet(D.CHANNEL, D.VOXEL) is D.CHANNEL
-    assert join(D.CHANNEL, D.FRAME) is None               # {m,t,c} unnamed → partial
+    assert join(D.CHANNEL, D.FRAME) is None               # {b,m,t,c} unnamed → partial
     assert dropped_axes(D.VOXEL, D.FRAME) == frozenset({"z", "c", "y", "x"})
-    _ok("domains: 10 domains (7 lattice incl. Channel), order, meet total / join partial")
+    assert dropped_axes(D.MULTIPOINT, D.BATCH) == frozenset({"m"})
+    # meet is TOTAL over the lattice — the property that makes generated transfers safe,
+    # and the one a new axis is most likely to break. Check it exhaustively rather than
+    # at the handful of pairs above.
+    for _a in LATTICE_DOMAINS:
+        for _b in LATTICE_DOMAINS:
+            assert meet(_a, _b) is not None
+    _ok("domains: 12 domains (8 lattice incl. Channel + the V3.01 batch axis), order, "
+        "meet total over every lattice pair / join partial")
 
 
 # ── reducers ─────────────────────────────────────────────────────────────────
@@ -231,10 +252,14 @@ def test_revision_and_immutability() -> None:
 # ── dataset / attribute layers ───────────────────────────────────────────────
 
 def test_dataset() -> None:
-    assert AX.shape_for(D.VOXEL) == (2, 3, 4, 2, 5, 6)   # (m,t,z,c,y,x)
+    # V3.01: the batch axis is ELIDED at b == 1, so a one-member Dataset has exactly the
+    # shapes it always had. This is what makes the axis a no-op for every existing compute.
+    assert AX.shape_for(D.VOXEL) == (2, 3, 4, 2, 5, 6)   # (m,t,z,c,y,x) — no b at b==1
     assert AX.shape_for(D.FRAME) == (2, 3)
-    assert AX.shape_for(D.CHANNEL) == (2,)               # (c,)
+    assert AX.shape_for(D.BATCH) == ()                  # a one-member batch IS a scalar
+    assert AX.shape_for(D.CHANNEL) == (2,)              # (c,) — never per-file
     assert AX.shape_for(D.GLOBAL) == ()
+    assert AX.axis_list(D.FRAME) == ("m", "t")
     ds = Dataset(axes=AX, metadata={"pixel_size_um": 1.7})
     frame = AttributeLayer(D.FRAME, "count", np.ones((2, 3)))
     ds2 = ds.with_attribute(frame)
@@ -246,6 +271,23 @@ def test_dataset() -> None:
         raise AssertionError("expected shape error")
     except ValueError:
         pass
+    # A REAL batch (b > 1) is where the axis materializes: the same domains now carry a
+    # leading b, and shape_for/axis_list say so.
+    axb = AxisSizes(b=2, m=2, t=3, z=4, c=2, y=5, x=6)
+    assert axb.axis_list(D.FRAME) == ("b", "m", "t")
+    assert axb.shape_for(D.FRAME) == (2, 2, 3)
+    assert axb.shape_for(D.BATCH) == (2,)
+    assert axb.shape_for(D.CHANNEL) == (2,)          # still not per-file
+    dsb = Dataset(axes=axb, metadata={})
+    assert dsb.with_attribute(
+        AttributeLayer(D.FRAME, "ok", np.ones((2, 2, 3)))).get(D.FRAME, "ok") is not None
+    # ...and a one-member array handed to a real batch is refused by NAME, because the
+    # failure it stands for is "the pipeline did 1 of K files and said nothing".
+    try:
+        dsb.with_attribute(AttributeLayer(D.FRAME, "bad", np.ones((2, 3))))
+        raise AssertionError("expected a refusal on a multi-member batch")
+    except ValueError as e:
+        assert "missing its leading batch axis" in str(e), e
     # §7b: with_structure preserves each table's z_kind into __struct_zkind__ provenance
     # (keyed by domain+layer), readable via structure_zkind — the generic dimensionality
     # inheritance mechanism. Two layers on the same domain keep independent z_kinds.
@@ -276,8 +318,19 @@ def test_plans() -> None:
     # Channel is a lattice domain now → Voxel↔Channel are GENERATED (V2.01 §H)
     pc = plan_transfer(D.VOXEL, D.CHANNEL)
     assert pc.generated and pc.steps[0].kind == "reduce"
-    assert pc.steps[0].axes == frozenset({"m", "t", "z", "y", "x"})
+    assert pc.steps[0].axes == frozenset({"b", "m", "t", "z", "y", "x"})
     assert plan_transfer(D.CHANNEL, D.VOXEL).steps[0].kind == "broadcast"
+
+    # V3.01: Batch is an ordinary lattice domain, so the per-FILE statistic needs no new
+    # machinery — Voxel→Batch is a generated reduce over everything but b, and the
+    # round trip back is a broadcast. This is what "a threshold per file" is made of.
+    pb = plan_transfer(D.VOXEL, D.BATCH)
+    assert pb.generated and pb.steps[0].kind == "reduce"
+    assert pb.steps[0].axes == frozenset({"m", "t", "z", "c", "y", "x"})
+    assert plan_transfer(D.BATCH, D.VOXEL).steps[0].kind == "broadcast"
+    # Batch vs Global is the distinction the axis exists to draw: one reduces to a number
+    # per file, the other to a number for the whole batch.
+    assert plan_transfer(D.BATCH, D.GLOBAL).steps[0].axes == frozenset({"b"})
 
     # incomparable lattice → reduce then broadcast, still generated
     mt = plan_transfer(D.MULTIPOINT, D.TIMEPOINT)
@@ -3068,7 +3121,7 @@ def test_zproject_over_stitch() -> None:
             super().__init__(*a, **k)
             self.reads = 0
 
-        def read_region(self, level, m, t, z, c, y0, y1, x0, x1):
+        def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0):
             self.reads += 1
             return super().read_region(level, m, t, z, c, y0, y1, x0, x1)
 
@@ -3676,11 +3729,13 @@ def test_track_objects() -> None:
     assert "max_distance" not in vis({"method": "overlap"})
     assert "max_size_diff_frac" in vis({"method": "centroid", "target": "label"})
     assert "max_size_diff_frac" not in vis({"method": "centroid", "target": "point"})
-    # `serialtrack` is Point-only, so the Label-raster picker must not be offered with it —
-    # the combination refuses at compute time, and a picker that leads only to a refusal is
-    # the same dead control the charter forbids.
+    # `serialtrack` was Point-only until 2026-09-17; the Label picker is now offered with
+    # it too, because it reads centroids and a Label table's centroid is a centroid. The
+    # picker is live for every method under target='label' — only `overlap` is still
+    # exclusive, and in the other direction (it needs a raster, so Points are refused).
     assert "labels" in vis({"target": "label", "method": "centroid"})
-    assert "labels" not in vis({"target": "label", "method": "serialtrack"})
+    assert "labels" in vis({"target": "label", "method": "serialtrack"})
+    assert "labels" not in vis({"target": "point", "method": "serialtrack"})
     assert "points" in vis({"target": "point", "method": "serialtrack"})
     # ── serialtrack's own 2D/3D lever (V2.24) ─────────────────────────────────
     # NOT the canonical DimMode: `spec.dim_lever()` is what the GUI header renders and it
@@ -3692,6 +3747,7 @@ def test_track_objects() -> None:
     assert mode_of["st_dim"].choices == ("2D", "3D") and mode_of["st_dim"].default == "2D"
     amodes = lambda st: {m.name for m in s.active_modes(st)}
     assert "st_dim" in amodes({"target": "point", "method": "serialtrack"})
+    assert "st_dim" in amodes({"target": "label", "method": "serialtrack"})
     for other in ("centroid", "topology", "fingerprint", "overlap"):
         assert "st_dim" not in amodes({"target": "label", "method": other}), other
 
@@ -3750,8 +3806,8 @@ def test_track_objects() -> None:
         return set(zip(get("track_id"), get("t"), get("member_id")))
 
     # ── the four Label-capable methods: 3 objects → 3 tracks spanning all 4 frames ──
-    # `serialtrack` is absent by design — it is Point-only (see the refusals below), the
-    # mirror image of `overlap` being Label-only.
+    # `serialtrack` is checked separately below, not excluded: its Label refusal was lifted
+    # 2026-09-17 and it now runs on either target.
     hashes = {}
     for meth in ("centroid", "topology", "fingerprint", "overlap"):
         out, e = pull(*build("label"), method=meth)
@@ -3821,11 +3877,15 @@ def test_track_objects() -> None:
     refuses(lambda: pull(*build("label"), method="bogus"), "unknown method")
     refuses(lambda: pull(*build("point"), target="point", method="overlap"),
             "unavailable for Point members")
-    # `serialtrack` is Point-only. A Label table DOES carry the (y,x) centroids it reads,
-    # so this combination would run — and that is why it must refuse: under target='label'
-    # the node declares reads={LABEL,VOXEL} and offers a raster picker, for a linker that
-    # opens no raster and consumes no shape or size.
-    refuses(lambda: pull(*build("label"), method="serialtrack"), "particle tracker")
+    # `serialtrack` on LABEL members: refused until 2026-09-17, now the ordinary way to
+    # track segmented objects (or a voxel raster's regions, via analysis.label) with the
+    # one linker here built for a dense field of them. It reads the centroids the Label
+    # table already carries and ignores its shape and size.
+    out_stl, _ = pull(*build("label"), method="serialtrack")
+    rows_stl = trows(out_stl)
+    assert len(rows_stl) == 12 and sorted({r[0] for r in rows_stl}) == [1, 2, 3], rows_stl
+    back_stl = out_stl.get(D.LABEL, "track_id", layer="labels").values
+    assert int((back_stl > 0).sum()) == 12, back_stl
     refuses(lambda: pull(*build("point"), target="point", max_size_diff_frac=0.1),
             "silently inert")                       # arealess members ⇒ gate does nothing
     refuses(lambda: pull(*build("label"), method="overlap", ct_max_gap=0),
@@ -3973,6 +4033,274 @@ def test_track_objects() -> None:
         "permutation; track.link membership conventions; distinct per-mode recipes; "
         "unconsumed sockets hidden per method; <2-frame groups survive "
         "min_track_length=1; 12 silent-degradation refusals")
+
+
+# ── analysis.track_field — SerialTrack's post-processing half ────────────────
+
+def test_track_field() -> None:
+    """``analysis.track_field`` — a TRACKED object field → displacement / velocity /
+    strain / stress as a Point field.
+
+    The fixture is an EXACT affine deformation (a uniform stretch along x) applied to a
+    scattered particle cloud with a hand-made, perfect ``track_id``. That is the point: an
+    affine field has a constant, analytically known gradient, so every number this node
+    produces has a closed form to be checked against rather than a plausible-looking one
+    to be eyeballed. The correspondence is hand-made so that a tracker regression cannot
+    masquerade as a kinematics regression here — ``test_track_objects`` owns the linkers.
+
+    Covers: the closed-form displacement, velocity, gradient and stress; the
+    **reference-configuration** fit, which is what makes the three FINITE strain measures
+    right (fitting at the deformed positions leaves ``infinitesimal`` right to first order
+    and all three others quietly wrong, so only the finite measures can catch it); 2-D vs
+    3-D inherited from ``z_kind`` rather than a lever; the two reference modes; the plane
+    assumptions; per-mode recipe distinctness and the calibration memo fence; and every
+    refusal."""
+    from nodegraph.structure import StructureTable
+    from nodegraph.nodes import COMPUTES
+
+    define_node("io.trkfield", "S", outputs=[OutDataset()])
+    PX, ZS, DT = 0.5, 2.0, 10.0          # µm/px lateral, µm/plane axial, s/frame
+    T, EXX, N = 4, 0.02, 240             # 4 frames, +2% stretch per frame
+
+    def build(is_3d=True, with_track=True, target="point"):
+        """N particles on a deterministic irrational-stride scatter, stretched about x=32
+        by ``EXX*t``. Never a regular grid — a perfectly periodic cloud has a degenerate
+        MLS neighbourhood and would make this test about conditioning instead."""
+        Y = X = 64
+        NZ = 9 if is_3d else 1
+        i = np.arange(N, dtype=float)
+        # deterministic, irrational-stride scatter: no RNG, no lattice periodicity
+        yy0 = 6.0 + 52.0 * ((i * 0.6180339887) % 1.0)
+        xx0 = 6.0 + 52.0 * ((i * 0.4142135624) % 1.0)
+        zz0 = (1.0 + 6.0 * ((i * 0.3027756377) % 1.0)) if is_3d else np.zeros(N)
+        ax = AxisSizes(m=1, t=T, z=NZ, c=1, y=Y, x=X)
+        cols: dict = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x", "track_id")}
+        nid = 1
+        for t in range(T):
+            xt = 32.0 + (xx0 - 32.0) * (1.0 + EXX * t)
+            for k in range(N):
+                cols["id"].append(nid); cols["m"].append(0); cols["t"].append(t)
+                cols["c"].append(0); cols["z"].append(float(zz0[k]))
+                cols["y"].append(float(yy0[k])); cols["x"].append(float(xt[k]))
+                cols["track_id"].append(k + 1)
+                nid += 1
+        arrs = {k: np.asarray(v) for k, v in cols.items()}
+        if not with_track:
+            arrs.pop("track_id")
+        zk = "subpixel" if is_3d else "plane_index"
+        ds = Dataset(axes=ax)
+        if target == "label":
+            # Label members carry a raster under the same layer name; this node reads only
+            # the TABLE, but the `labels` socket is layer_in=VOXEL so the picker needs one.
+            arrs["area"] = np.full(len(arrs["id"]), 25.0)
+            ds = ds.with_layer(D.VOXEL, "labels", np.zeros((1, T, NZ, 1, Y, X), np.int64))
+            return ds.with_structure(
+                StructureTable(D.LABEL, arrs, layer="labels", z_kind=zk)), ax
+        return ds.with_structure(
+            StructureTable(D.POINT, arrs, layer="spots", z_kind=zk)), ax
+
+    META = {"pixel_size_um": PX, "z_step_um": ZS, "dt_s": DT}
+
+    def pull(ds, ax, meta=None, modes=None, **params):
+        g = Graph(); g.add(NodeInstance("S", "io.trkfield"))
+        g.add(NodeInstance("F", "analysis.track_field",
+                           params={"strain_radius": 16.0, "strain_neighbors": 26,
+                                   **params},
+                           modes={"target": "point", **(modes or {})}))
+        g.connect("S", "F")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax,
+                                                 metadata=dict(META if meta is None
+                                                               else meta))})
+        return e.pull("F"), e
+
+    col = lambda out, n: (lambda a: None if a is None else np.asarray(a.values))(
+        out.get(D.POINT, n, layer="track_field"))
+
+    # ── 3D: the gradient is fitted in the REFERENCE config, so eps_xx == EXX*t exactly ──
+    ds3, ax3 = build(True)
+    out, e = pull(ds3, ax3)
+    t = col(out, "t"); exx = col(out, "strain_xx")
+    assert len(t) == T * N, (len(t), T * N)
+    fitted = np.isfinite(exx)
+    assert fitted.mean() > 0.95, fitted.mean()
+    for tv in range(T):
+        m = (t == tv) & fitted
+        assert m.sum(), tv
+        assert abs(float(np.median(exx[m])) - EXX * tv) < 1e-9, (tv, np.median(exx[m]))
+    # a pure x-stretch has no transverse and no shear component, to machine precision
+    for other in ("strain_yy", "strain_zz", "strain_xy", "strain_yx", "strain_xz",
+                  "strain_zx", "strain_yz", "strain_zy"):
+        v = col(out, other)
+        assert float(np.nanmax(np.abs(v))) < 1e-9, (other, np.nanmax(np.abs(v)))
+    # displacement closed form: u = X0*a µm, with X0 the REFERENCE offset from x=32
+    x, dx = col(out, "x"), col(out, "disp_x")
+    m3 = t == T - 1
+    a = EXX * (T - 1)
+    assert float(np.max(np.abs(dx[m3] - (x[m3] - 32.0) / (1 + a) * a * PX))) < 1e-9
+    assert float(np.nanmax(np.abs(col(out, "disp_y")))) < 1e-9
+    assert float(np.nanmax(np.abs(col(out, "strain_vol") - col(out, "strain_xx")))) < 1e-9
+    # z_kind is INHERITED and re-stamped, which is what transform.rasterize_field reads
+    assert out.structure_zkind(D.POINT, "track_field") == "subpixel"
+
+    # ── the finite strain measures: the ONLY check that catches a deformed-config fit ──
+    # At F_xx = 1 + a these are analytic, and a spatial-gradient fit would return the
+    # Almansi value under every one of the four names.
+    want = {"infinitesimal": a, "green-lagrange": 0.5 * ((1 + a) ** 2 - 1),
+            "hencky": float(np.log(1 + a)), "almansi": 0.5 * (1 - 1 / (1 + a) ** 2)}
+    assert len(set(round(v, 9) for v in want.values())) == 4, "the fixture must separate them"
+    for st, w in want.items():
+        o, _ = pull(ds3, ax3, modes={"strain_type": st})
+        tv = col(o, "t"); ee = col(o, "strain_xx"); mm = (tv == T - 1) & np.isfinite(ee)
+        assert abs(float(np.median(ee[mm])) - w) < 1e-9, (st, np.median(ee[mm]), w)
+
+    # ── 2D (plane_index): fewer columns, same exactness, no lever involved ──────
+    ds2, ax2 = build(False)
+    out2, _ = pull(ds2, ax2)
+    names2 = {a_.name for a_ in out2.layers_on(D.POINT) if a_.layer == "track_field"}
+    assert "strain_zz" not in names2 and "disp_z" not in names2, sorted(names2)
+    assert "strain_xx" in names2 and "disp_x" in names2
+    t2, e2 = col(out2, "t"), col(out2, "strain_xx")
+    for tv in range(T):
+        m = (t2 == tv) & np.isfinite(e2)
+        assert abs(float(np.median(e2[m])) - EXX * tv) < 1e-9, (tv, np.median(e2[m]))
+    assert out2.structure_zkind(D.POINT, "track_field") == "plane_index"
+
+    # ── reference modes: cumulative keeps every row, incremental drops each first ──
+    outp, _ = pull(ds3, ax3, modes={"reference": "previous_frame"})
+    tp, ep = col(outp, "t"), col(outp, "strain_xx")
+    assert (tp == 0).sum() == 0 and len(tp) == (T - 1) * N, (len(tp), (T - 1) * N)
+    for tv in range(1, T):
+        m = (tp == tv) & np.isfinite(ep)
+        # one step measured from the t-1 configuration: a / (1 + a_{t-1})
+        assert abs(float(np.median(ep[m])) - EXX / (1 + EXX * (tv - 1))) < 1e-9, tv
+
+    # ── velocity: instantaneous, so it is the SAME under either reference mode ──
+    outv, _ = pull(ds3, ax3, velocity=True)
+    tv_, vx = col(outv, "t"), col(outv, "vx")
+    assert np.isnan(vx[tv_ == 0]).all(), "a track's first row has no predecessor"
+    m = tv_ == 2
+    xv = col(outv, "x")[m]
+    assert float(np.max(np.abs(vx[m] - (xv - 32.0) / 1.04 * EXX * PX / DT))) < 1e-9
+    assert float(np.nanmax(np.abs(col(outv, "vy")))) < 1e-9
+    outv2, _ = pull(ds3, ax3, velocity=True, modes={"reference": "previous_frame"})
+    assert float(np.nanmax(np.abs(np.nan_to_num(col(outv2, "vx"))
+                                  - np.nan_to_num(vx[tv_ > 0])))) < 1e-12
+
+    # ── stress: a pure eps_xx state, so sigma_xx = (lambda + 2 mu) eps_xx exactly ──
+    E, NU = 3000.0, 0.45
+    mu = E / (2 * (1 + NU)); lam = E * NU / ((1 + NU) * (1 - 2 * NU))
+    outs, _ = pull(ds3, ax3, modes={"constitutive": "linear_elastic"},
+                   youngs_modulus=E, poisson_ratio=NU)
+    sxx, exs = col(outs, "stress_xx"), col(outs, "strain_xx")
+    ok = np.isfinite(sxx)
+    assert float(np.max(np.abs(sxx[ok] - (lam + 2 * mu) * exs[ok]))) < 1e-8 * E
+    syy = col(outs, "stress_yy")
+    assert float(np.max(np.abs(syy[ok] - lam * exs[ok]))) < 1e-8 * E
+    # von Mises of a uniaxial-strain state: |sigma_xx - sigma_yy| = 2 mu eps
+    vm = col(outs, "von_mises")
+    assert float(np.max(np.abs(vm[ok] - 2 * mu * np.abs(exs[ok])))) < 1e-7 * E
+    assert float(np.max(np.abs(col(outs, "pressure")[ok]
+                               + (lam + 2 * mu / 3) * exs[ok]))) < 1e-7 * E
+
+    # 2D plane assumptions: plane STRAIN reproduces the 3D law with eps_zz = 0, plane
+    # STRESS zeroes sigma_zz. Both write a full 3x3, so von Mises stays reproducible.
+    o_ps, _ = pull(ds2, ax2, modes={"constitutive": "linear_elastic", "plane": "strain"},
+                   youngs_modulus=E, poisson_ratio=NU)
+    o_pz, _ = pull(ds2, ax2, modes={"constitutive": "linear_elastic", "plane": "stress"},
+                   youngs_modulus=E, poisson_ratio=NU)
+    e2d = col(o_ps, "strain_xx"); ok2 = np.isfinite(e2d)
+    assert float(np.max(np.abs(col(o_ps, "stress_xx")[ok2]
+                               - (lam + 2 * mu) * e2d[ok2]))) < 1e-8 * E
+    assert float(np.max(np.abs(col(o_ps, "stress_zz")[ok2] - lam * e2d[ok2]))) < 1e-8 * E
+    assert float(np.nanmax(np.abs(col(o_pz, "stress_zz")))) == 0.0
+    assert float(np.max(np.abs(col(o_pz, "stress_xx")[ok2]
+                               - E / (1 - NU ** 2) * e2d[ok2]))) < 1e-8 * E
+    # a 2D field has no shear onto z, so those six components are not written at all
+    n_ps = {a_.name for a_ in o_ps.layers_on(D.POINT) if a_.layer == "track_field"}
+    assert "stress_zz" in n_ps and "stress_xz" not in n_ps and "stress_zx" not in n_ps
+
+    # ── LABEL members: centroids are centroids, so the answer must be IDENTICAL ──
+    # This is the other half of the 2026-09-17 change that let `serialtrack` read a Label
+    # table: a segmented-object field has to reach the same kinematics as a point field.
+    dsl, axl = build(True, target="label")
+    outl, el = pull(dsl, axl, modes={"target": "label"})
+    el_xx = col(outl, "strain_xx"); okl = np.isfinite(el_xx)
+    tl = col(outl, "t")
+    for tv in range(T):
+        m = (tl == tv) & okl
+        assert abs(float(np.median(el_xx[m])) - EXX * tv) < 1e-9, (tv, np.median(el_xx[m]))
+    assert np.allclose(np.sort(col(outl, "disp_x")), np.sort(dx), atol=1e-12)
+
+    # ── min_track_length prunes, and an all-pruned graph still ships the schema ──
+    out_cut, _ = pull(ds3, ax3, min_track_length=T + 1)
+    assert len(col(out_cut, "id")) == 0
+    n_cut = {a_.name for a_ in out_cut.layers_on(D.POINT) if a_.layer == "track_field"}
+    assert {"disp_x", "strain_xx", "strain_vol"} <= n_cut, sorted(n_cut)
+
+    # ── memo identity: every mode/param that changes the numbers changes the recipe ──
+    seen = {}
+    for key, md, pr in (("base", {}, {}),
+                        ("prev", {"reference": "previous_frame"}, {}),
+                        ("gl", {"strain_type": "green-lagrange"}, {}),
+                        ("hencky", {"strain_type": "hencky"}, {}),
+                        ("elastic", {"constitutive": "linear_elastic"}, {}),
+                        ("elastic_pz", {"constitutive": "linear_elastic",
+                                        "plane": "stress"}, {}),
+                        ("vel", {}, {"velocity": True}),
+                        ("radius", {}, {"strain_radius": 9.0}),
+                        ("E", {"constitutive": "linear_elastic"},
+                         {"youngs_modulus": 5000.0})):
+        _, ee = pull(ds3, ax3, modes=md, **pr)
+        seen[key] = ee.entry("F").recipe_hash
+    seen["label"] = el.entry("F").recipe_hash      # the `target` lever folds in too
+    assert len(set(seen.values())) == len(seen), seen
+    reads = dict(e.entry("F").reads)
+    assert "pixel_size_um" in reads and "z_step_um" in reads, sorted(reads)
+
+    # ── refusals (each is a number that would otherwise be silently wrong) ──────
+    def refuses(fn, needle):
+        try:
+            fn()
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc))
+            return
+        raise AssertionError(f"expected a refusal mentioning {needle!r}")
+
+    refuses(lambda: pull(*build(True, with_track=False)), "track_id")
+    refuses(lambda: pull(ds3, ax3, meta={"pixel_size_um": PX}), "z_step_um")
+    refuses(lambda: pull(ds2, ax2, meta={}), "pixel_size_um")
+    refuses(lambda: pull(ds3, ax3, modes={"constitutive": "linear_elastic"},
+                         poisson_ratio=0.5), "incompressible")
+    refuses(lambda: pull(ds3, ax3, modes={"constitutive": "linear_elastic"},
+                         youngs_modulus=0.0), "positive, finite stiffness")
+    refuses(lambda: pull(ds3, ax3, strain_radius=0.0), "positive distance")
+    refuses(lambda: pull(ds3, ax3, meta={"pixel_size_um": PX, "z_step_um": ZS},
+                         velocity=True), "frame interval")
+
+    # ── the vectorised gauge IS the funCompDefGrad3 loop it was derived from ───
+    from nodegraph.kernels.track_field import mls_displacement_gradient
+    from nodegraph.kernels.track_objects import compute_strain_mls
+    pts = np.column_stack([(np.arange(150) * 0.618) % 1.0 * 90.0,
+                           (np.arange(150) * 0.414) % 1.0 * 90.0,
+                           (np.arange(150) * 0.303) % 1.0 * 90.0])
+    u = 0.01 * pts[:, ::-1] / 90.0 + 0.004 * np.sin(pts[:, :1] / 7.0)
+    fos, K = 25.0, 24
+    _, g_loop, v_loop = compute_strain_mls(u, pts, f_o_s=fos, n_neighbors=K)
+    _, g_vec, v_vec = mls_displacement_gradient(
+        pts, u, radius=np.sqrt(3) * fos * (1 - 1e-12), n_neighbors=K)
+    both = v_loop & v_vec
+    assert both.sum() > 0.8 * len(pts), both.sum()
+    assert float(np.max(np.abs(g_vec[both] - g_loop[both]))) < 1e-8
+
+    _ok("analysis.track_field: SerialTrack post-processing — exact affine fixture pins "
+        "displacement/velocity/gradient/stress to closed form (residual <1e-9); the "
+        "REFERENCE-config fit verified through all four strain measures (the only check a "
+        "deformed-config gradient fails); 2D vs 3D inherited from z_kind, not a lever; "
+        "cumulative vs incremental reference; plane-strain/plane-stress vs the 3D law; "
+        "empty-but-schema-correct output when every track is pruned; 10 distinct recipes "
+        "+ calibration memo fence; 7 refusals; MLS gauge pinned to the funCompDefGrad3 "
+        "loop port")
 
 
 # ── save / load *.nd2graph.json (graph + zones + groups round-trip) ───────────
@@ -4694,7 +5022,7 @@ def test_streaming() -> None:
             self.axes, self.tile, self.levels = inner.axes, inner.tile, 1
             self.calls = []
 
-        def read_region(self, level, m, t, z, c, y0, y1, x0, x1):
+        def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0):
             self.calls.append((z, y0, y1, x0, x1))
             return self._i.read_region(level, m, t, z, c, y0, y1, x0, x1)
 
@@ -5465,7 +5793,7 @@ def test_streaming_slivers() -> None:
             super().__init__(*a, **k)
             self.reads = 0
 
-        def read_region(self, level, m, t, z, c, y0, y1, x0, x1):
+        def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0):
             self.reads += 1
             return super().read_region(level, m, t, z, c, y0, y1, x0, x1)
 
@@ -6093,12 +6421,18 @@ def test_catalog_kernels() -> None:
 
 
 def test_catalog_dvc() -> None:
-    """DVC/ALDVC displacement + strain field (``analysis.dvc_field``) → a Point field,
-    and its Voxel rasterizer (``transform.rasterize_field``). V2.06. Asserts: 2D/3D
-    recover a known shift (µm), the invariant Point schema + disp/strain/qfactor columns,
-    2D≠3D recipe hash, calibration fenced (pixel_size_um / z_step_um), the reference-mode
-    lever (previous_frame skips t0) + the optional external-reference input socket, and
-    the rasterizer reproducing a planted linear field at grid points. Needs scipy/skimage."""
+    """3D DVC displacement + strain field (``analysis.dvc_field``) → a Point field, and its
+    Voxel rasterizer (``transform.rasterize_field``). V2.06; **rewritten 2026-09-25** when the
+    in-repo ALDVC port was replaced by the official pyALDVC (``al-dvc``) solver and the node
+    lost its 2D lever — pyALDVC cannot correlate a single plane, so 2D is ``analysis.dic_correlate``.
+
+    Asserts: a known 3D shift is recovered in µm on all three axes, the invariant Point schema
+    + the 3D disp/strain/qfactor columns, calibration fenced (pixel_size_um AND z_step_um), a
+    solver mode re-keys the recipe hash, the reference-mode lever (previous_frame skips t0) +
+    the optional external-reference input socket (whose calibration must NOT win over the
+    primary's), accumulation of an increment series, the retired-param refusal that keeps a
+    saved graph from silently running on a different correlation, and the rasterizer
+    reproducing a planted linear field. Needs scipy/skimage + al-dvc."""
     if not _HAVE_SKIMAGE:
         _ok("catalog (DVC + field rasterize): SKIPPED (scipy/skimage absent)")
         return
@@ -6117,141 +6451,196 @@ def test_catalog_dvc() -> None:
             g.connect(e[0], e[1], dst_socket=(e[2] if len(e) > 2 else "data"))
         return Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=envs)
 
-    rng = np.random.default_rng(3)
-    patt = gaussian_filter(rng.random((64, 64)).astype(float), 1.5)
-    px = 0.2
-    P = {"subset_size": 16, "subset_spacing": 12, "admm_iterations": 1, "seed_levels": 1}
+    # ── the dependency is optional and lazily imported, exactly like al-dic ───────
+    # The catalog must LOAD without al-dvc; only a pull may fail, and it must name the
+    # package. Everything after this point needs the real solver.
+    from nodegraph.kernels.aldvc_field import al_dvc_available
+    if not al_dvc_available():
+        axk = AxisSizes(m=1, t=2, z=28, c=1, y=44, x=44)
+        dsk = (Dataset(axes=axk, metadata={"pixel_size_um": 0.2, "z_step_um": 0.5})
+               .with_image(ArrayProvider(np.zeros((1, 2, 28, 1, 44, 44)))))
+        caught = 0
+        try:
+            eng({"S": dsk}, {"S": MetaEnvelope(axes=axk, metadata={})},
+                [("S", "io.dvcseed", {}), ("G", "analysis.dvc_field", {})],
+                [("S", "G")]).pull("G")
+        except RuntimeError as exk:
+            caught = int("al-dvc" in str(exk))
+        assert caught == 1, "dvc_field did not raise a clear al-dvc install error"
+        _ok("catalog (DVC + field rasterize): dep-gated (al-dvc absent → friendly error)")
+        return
 
-    # ── 2D fixed_frame, T=2: frame0=ref (self-pair→~0), frame1=shift (dy,dx) ──────
-    img = np.zeros((1, 2, 1, 1, 64, 64))
-    img[0, 0, 0, 0] = patt
-    img[0, 1, 0, 0] = ndshift(patt, (1.5, -2.0), order=3, mode="nearest")
-    ax = AxisSizes(m=1, t=2, z=1, c=1, y=64, x=64)
-    meta = {"pixel_size_um": px}
+    # ── fixture ──────────────────────────────────────────────────────────────────
+    # pyALDVC has two hard geometry rules (al_dvc.utils.validation): every axis >= 16
+    # voxels, and winsize + 11 <= the axis extent; the node grid then additionally needs
+    # >= 2 nodes per axis. (28, 44, 44) with subset 12 / axial 8 and step 10 / axial 4 is
+    # the smallest fixture that satisfies all three and still gives a 3x3x3 grid.
+    rng = np.random.default_rng(3)
+    vol = gaussian_filter(rng.random((28, 44, 44)).astype(float), 1.2)
+    px, zs = 0.2, 0.5
+    meta = {"pixel_size_um": px, "z_step_um": zs}
+    P = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10,
+         "subset_spacing_z": 4, "admm_iterations": 1, "init_guess": "ncc",
+         "search_radius": 3, "n_threads": 2}
+    SHIFT = (1.0, 1.0, 1.5)                       # (dz, dy, dx) in voxels
+
+    def _stack(n_t, per_t):
+        img = np.zeros((1, n_t, 28, 1, 44, 44))
+        for tt in range(n_t):
+            img[0, tt, :, 0] = per_t(tt)
+        return img
+
+    # ── 3D fixed_frame, T=2: frame0 = ref (self-pair → ~0), frame1 = known shift ──
+    img = _stack(2, lambda tt: vol if tt == 0 else ndshift(vol, SHIFT, order=3, mode="nearest"))
+    ax = AxisSizes(m=1, t=2, z=28, c=1, y=44, x=44)
     ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
     env = MetaEnvelope(axes=ax, metadata=meta)
-    e2 = eng({"S": ds}, {"S": env},
+    e3 = eng({"S": ds}, {"S": env},
              [("S", "io.dvcseed", {}),
-              ("D", "analysis.dvc_field", {"modes": {"dim": "2D"}, "params": dict(P)})],
-             [("S", "D")])
-    o2 = e2.pull("D")
-    names2 = {a.name for a in o2.layers_on(D.POINT) if a.layer == "dvc"}
-    assert {"id", "m", "t", "c", "z", "y", "x", "disp_x", "disp_y", "disp_mag_um",
-            "qfactor", "strain_yx"} <= names2, sorted(names2)
-    assert "disp_z" not in names2, "2D field must not carry disp_z"
-    tc = o2.get(D.POINT, "t", layer="dvc").values
-    dy = o2.get(D.POINT, "disp_y", layer="dvc").values
-    dx = o2.get(D.POINT, "disp_x", layer="dvc").values
-    s1 = tc == 1
-    assert abs(float(np.median(dy[s1])) - 1.5 * px) < 0.06, float(np.median(dy[s1]))
-    assert abs(float(np.median(dx[s1])) + 2.0 * px) < 0.06, float(np.median(dx[s1]))
-    assert float(np.median(o2.get(D.POINT, "disp_mag_um", layer="dvc").values[tc == 0])) < 0.02
-    assert any(k == "pixel_size_um" for k, _ in e2.entry("D").reads)
-
-    # ── 3D fixed_frame, T=2: disp_z present, recovers (z,y,x), z_step fenced ──────
-    vol = gaussian_filter(rng.random((16, 40, 40)).astype(float), 1.2)
-    img3 = np.zeros((1, 2, 16, 1, 40, 40))
-    img3[0, 0, :, 0] = vol
-    img3[0, 1, :, 0] = ndshift(vol, (1.0, 1.0, 1.5), order=3, mode="nearest")
-    ax3 = AxisSizes(m=1, t=2, z=16, c=1, y=40, x=40)
-    meta3 = {"pixel_size_um": px, "z_step_um": 0.5}
-    ds3 = Dataset(axes=ax3, metadata=meta3).with_image(ArrayProvider(img3))
-    e3 = eng({"S": ds3}, {"S": MetaEnvelope(axes=ax3, metadata=meta3)},
-             [("S", "io.dvcseed", {}),
-              ("D", "analysis.dvc_field",
-               {"modes": {"dim": "3D"},
-                "params": {"subset_size": 8, "subset_spacing": 10,
-                           "admm_iterations": 1, "seed_levels": 1}})],
+              ("D", "analysis.dvc_field", {"params": dict(P)})],
              [("S", "D")])
     o3 = e3.pull("D")
-    t3 = o3.get(D.POINT, "t", layer="dvc").values == 1
-    dz = o3.get(D.POINT, "disp_z", layer="dvc").values[t3]
-    assert o3.get(D.POINT, "disp_z", layer="dvc") is not None
-    assert abs(float(np.median(dz)) - 1.0 * 0.5) < 0.08, float(np.median(dz))
-    assert abs(float(np.median(o3.get(D.POINT, "disp_x", layer="dvc").values[t3])) - 1.5 * px) < 0.08
+    names = {a.name for a in o3.layers_on(D.POINT) if a.layer == "dvc"}
+    assert {"id", "m", "t", "c", "z", "y", "x", "disp_z", "disp_y", "disp_x",
+            "disp_mag_um", "qfactor", "strain_zz", "strain_yx", "strain_xx"} <= names, sorted(names)
+    tc = o3.get(D.POINT, "t", layer="dvc").values
+    s1 = tc == 1
+    dz = o3.get(D.POINT, "disp_z", layer="dvc").values
+    dy = o3.get(D.POINT, "disp_y", layer="dvc").values
+    dx = o3.get(D.POINT, "disp_x", layer="dvc").values
+    # µm = voxels x voxel_size, per axis: dz uses z_step, dy/dx use pixel_size
+    assert abs(float(np.median(dz[s1])) - SHIFT[0] * zs) < 0.06, float(np.median(dz[s1]))
+    assert abs(float(np.median(dy[s1])) - SHIFT[1] * px) < 0.04, float(np.median(dy[s1]))
+    assert abs(float(np.median(dx[s1])) - SHIFT[2] * px) < 0.04, float(np.median(dx[s1]))
+    # the self-pair (t == reference_frame) is a zero field, not a missing row
+    assert float(np.median(o3.get(D.POINT, "disp_mag_um", layer="dvc").values[tc == 0])) < 0.02
+    # BOTH calibration keys are fenced: an anisotropic z-step changes the strain, so a
+    # z_step edit must invalidate the memo just as a pixel-size edit does.
     assert {"pixel_size_um", "z_step_um"} <= {k for k, _ in e3.entry("D").reads}
-    assert e2.entry("D").recipe_hash != e3.entry("D").recipe_hash, "2D/3D lever must re-key"
-    # 3D mode on a single-plane series is a hard error (kernel gotcha 6)
-    axf = AxisSizes(m=1, t=1, z=1, c=1, y=32, x=32)
-    dsf = Dataset(axes=axf, metadata=meta).with_image(ArrayProvider(np.zeros((1, 1, 1, 1, 32, 32))))
+    # the solver's own grid, in voxels, not the image grid
+    zc = o3.get(D.POINT, "z", layer="dvc").values
+    assert 0.0 < float(zc.min()) and float(zc.max()) < 27.0, (zc.min(), zc.max())
+
+    # ── a solver mode re-keys the recipe hash (the 2D/3D lever used to do this) ───
+    eg = eng({"S": ds}, {"S": env},
+             [("S", "io.dvcseed", {}),
+              ("D", "analysis.dvc_field",
+               {"modes": {"strain_type": "green_lagrange"}, "params": dict(P)})],
+             [("S", "D")])
+    assert e3.entry("D").recipe_hash != eg.entry("D").recipe_hash, \
+        "a strain-measure change must re-key the recipe"
+
+    # ── 3D-only: a single-plane series is a hard error that names the 2D node ────
+    axf = AxisSizes(m=1, t=2, z=1, c=1, y=44, x=44)
+    dsf = (Dataset(axes=axf, metadata=meta)
+           .with_image(ArrayProvider(np.zeros((1, 2, 1, 1, 44, 44)))))
     try:
         eng({"S": dsf}, {"S": MetaEnvelope(axes=axf, metadata=meta)},
             [("S", "io.dvcseed", {}),
-             ("D", "analysis.dvc_field", {"modes": {"dim": "3D"}})], [("S", "D")]).pull("D")
-        raise SystemExit("3D DVC on a single plane should raise")
+             ("D", "analysis.dvc_field", {"params": dict(P)})], [("S", "D")]).pull("D")
+        raise SystemExit("DVC on a single plane should raise")
     except ValueError as ex:
-        assert "z>1" in str(ex)
+        assert "z>1" in str(ex) and "dic_correlate" in str(ex), str(ex)
+
+    # ── retired params: a saved graph that SET one is refused, not silently re-run ─
+    # The solver swap changed what these meant; running them as no-ops would report a
+    # different correlation under the same node. At their OLD DEFAULT they are not a
+    # choice, so they pass.
+    for bad, val in (("cc_thresh", 0.5), ("repair_zncc", 0.9), ("seed_levels", 4)):
+        try:
+            eng({"S": ds}, {"S": env},
+                [("S", "io.dvcseed", {}),
+                 ("D", "analysis.dvc_field", {"params": dict(P, **{bad: val})})],
+                [("S", "D")]).pull("D")
+            raise SystemExit(f"a user-set `{bad}` should be refused")
+        except ValueError as exr:
+            assert bad in str(exr) and "pyALDVC" in str(exr), str(exr)
+    # ...and the old default sails through (the GUI serializes defaults)
+    ok_old = eng({"S": ds}, {"S": env},
+                 [("S", "io.dvcseed", {}),
+                  ("D", "analysis.dvc_field",
+                   {"params": dict(P, cc_thresh=0.0, repair_zncc=0.6, seed_levels=3)})],
+                 [("S", "D")]).pull("D")
+    assert ok_old.get(D.POINT, "disp_x", layer="dvc") is not None
+    # a retired MODE is refused by name too, and points at the 2D node
+    try:
+        eng({"S": ds}, {"S": env},
+            [("S", "io.dvcseed", {}),
+             ("D", "analysis.dvc_field", {"modes": {"dim": "2D"}, "params": dict(P)})],
+            [("S", "D")]).pull("D")
+        raise SystemExit("mode dim=2D should be refused")
+    except ValueError as exd:
+        assert "dic_correlate" in str(exd), str(exd)
 
     # ── optional external reference input socket (a second file as the reference) ─
-    imgp = np.zeros((1, 1, 1, 1, 64, 64)); imgp[0, 0, 0, 0] = ndshift(patt, (2.0, 0.0), order=3, mode="nearest")
-    imgr = np.zeros((1, 1, 1, 1, 64, 64)); imgr[0, 0, 0, 0] = patt
-    axp = AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64)
+    imgp = _stack(1, lambda tt: ndshift(vol, SHIFT, order=3, mode="nearest"))
+    imgr = _stack(1, lambda tt: vol)
+    axp = AxisSizes(m=1, t=1, z=28, c=1, y=44, x=44)
     ep = MetaEnvelope(axes=axp, metadata=meta)
-    ex = eng({"S": Dataset(axes=axp, metadata=meta).with_image(ArrayProvider(imgp)),
-              "Sr": Dataset(axes=axp, metadata=meta).with_image(ArrayProvider(imgr))},
-             {"S": ep, "Sr": ep},
-             [("S", "io.dvcseed", {}), ("Sr", "io.dvcseed", {}),
-              ("D", "analysis.dvc_field", {"modes": {"dim": "2D"}, "params": dict(P)})],
-             [("S", "D", "data"), ("Sr", "D", "reference")])
-    dyx = ex.pull("D").get(D.POINT, "disp_y", layer="dvc").values
-    assert abs(float(np.median(dyx)) - 2.0 * px) < 0.06, float(np.median(dyx))
+    ex_ = eng({"S": Dataset(axes=axp, metadata=meta).with_image(ArrayProvider(imgp)),
+               "Sr": Dataset(axes=axp, metadata=meta).with_image(ArrayProvider(imgr))},
+              {"S": ep, "Sr": ep},
+              [("S", "io.dvcseed", {}), ("Sr", "io.dvcseed", {}),
+               ("D", "analysis.dvc_field", {"params": dict(P)})],
+              [("S", "D", "data"), ("Sr", "D", "reference")])
+    dxx = ex_.pull("D").get(D.POINT, "disp_x", layer="dvc").values
+    assert abs(float(np.median(dxx)) - SHIFT[2] * px) < 0.04, float(np.median(dxx))
     # regression: the compute's calibration env is the PRIMARY (data) input's, even when
     # the reference is wired FIRST and carries a different pixel size — propagate_meta
     # must seed from the first-declared dataset socket, not edge-insertion order.
-    metaR = {"pixel_size_um": 0.9}                              # a wrong scale if picked
+    metaR = {"pixel_size_um": 0.9, "z_step_um": 0.5}            # a wrong scale if picked
     exr = eng({"S": Dataset(axes=axp, metadata=meta).with_image(ArrayProvider(imgp)),
                "Sr": Dataset(axes=axp, metadata=metaR).with_image(ArrayProvider(imgr))},
               {"S": ep, "Sr": MetaEnvelope(axes=axp, metadata=metaR)},
               [("S", "io.dvcseed", {}), ("Sr", "io.dvcseed", {}),
-               ("D", "analysis.dvc_field", {"modes": {"dim": "2D"}, "params": dict(P)})],
+               ("D", "analysis.dvc_field", {"params": dict(P)})],
               [("Sr", "D", "reference"), ("S", "D", "data")])   # reference wired FIRST
-    dyr = exr.pull("D").get(D.POINT, "disp_y", layer="dvc").values
-    # µm scale ⇒ primary px=0.2 (≈0.4 µm), NOT the reference px=0.9 (≈1.8 µm)
-    assert abs(float(np.median(dyr)) - 2.0 * px) < 0.06, \
-        f"DVC used the reference's calibration ({float(np.median(dyr)):.3f} µm ⇒ px≈0.9)"
+    dxr = exr.pull("D").get(D.POINT, "disp_x", layer="dvc").values
+    # µm scale ⇒ primary px=0.2 (≈0.3 µm), NOT the reference px=0.9 (≈1.35 µm)
+    assert abs(float(np.median(dxr)) - SHIFT[2] * px) < 0.04, \
+        f"DVC used the reference's calibration ({float(np.median(dxr)):.3f} µm ⇒ px≈0.9)"
     assert any(k == "pixel_size_um" for k, _ in exr.entry("D").reads)
 
     # ── previous_frame self-reference skips t0 (no increment into the first frame) ─
-    imgt = np.zeros((1, 3, 1, 1, 64, 64))
-    for tt in range(3):
-        imgt[0, tt, 0, 0] = ndshift(patt, (1.0 * tt, 0.0), order=3, mode="nearest")
-    axt = AxisSizes(m=1, t=3, z=1, c=1, y=64, x=64)
-    ept = eng({"S": Dataset(axes=axt, metadata=meta).with_image(ArrayProvider(imgt))},
-              {"S": MetaEnvelope(axes=axt, metadata=meta)},
+    # +1 voxel in x per frame, so each increment is 1·px and the composed field is t·px.
+    imgt = _stack(3, lambda tt: ndshift(vol, (0.0, 0.0, 1.0 * tt), order=3, mode="nearest"))
+    axt = AxisSizes(m=1, t=3, z=28, c=1, y=44, x=44)
+    envt = MetaEnvelope(axes=axt, metadata=meta)
+    dst = Dataset(axes=axt, metadata=meta).with_image(ArrayProvider(imgt))
+    ept = eng({"S": dst}, {"S": envt},
               [("S", "io.dvcseed", {}),
                ("D", "analysis.dvc_field",
-                {"modes": {"dim": "2D", "reference_mode": "previous_frame"},
-                 "params": dict(P)})], [("S", "D")])
-    tp = ept.pull("D").get(D.POINT, "t", layer="dvc").values
+                {"modes": {"reference_mode": "previous_frame"}, "params": dict(P)})],
+              [("S", "D")])
+    op_ = ept.pull("D")
+    tp = op_.get(D.POINT, "t", layer="dvc").values
     assert 0 not in set(tp.tolist()) and {1, 2} <= set(tp.tolist()), sorted(set(tp.tolist()))
+    dxp = op_.get(D.POINT, "disp_x", layer="dvc").values
+    assert abs(float(np.median(dxp[tp == 1])) - px) < 0.04, float(np.median(dxp[tp == 1]))
+    assert abs(float(np.median(dxp[tp == 2])) - px) < 0.04, float(np.median(dxp[tp == 2]))
 
-    # ── accumulate: previous_frame increments → cumulative Lagrangian field ────────
-    # imgt shifts +1 voxel/frame, so each increment ≈ 1·px and the cumulative field is
-    # 1·px at t=1, 2·px at t=2 (composition, not a fixed-frame re-correlation).
-    ea = eng({"S": Dataset(axes=axt, metadata=meta).with_image(ArrayProvider(imgt))},
-             {"S": MetaEnvelope(axes=axt, metadata=meta)},
+    # ── accumulate: previous_frame increments → cumulative Lagrangian field ───────
+    ea = eng({"S": dst}, {"S": envt},
              [("S", "io.dvcseed", {}),
               ("D", "analysis.dvc_field",
-               {"modes": {"dim": "2D", "reference_mode": "previous_frame"},
-                "params": dict(P)}),
+               {"modes": {"reference_mode": "previous_frame"}, "params": dict(P)}),
               ("A", "analysis.accumulate_field", {})],
              [("S", "D"), ("D", "A")])
     oa = ea.pull("A")
     na = {a.name for a in oa.layers_on(D.POINT) if a.layer == "dvc_cumulative"}
-    assert {"id", "m", "t", "c", "z", "y", "x", "disp_x", "disp_y", "disp_mag_um",
-            "qfactor", "strain_yx"} <= na, sorted(na)
+    assert {"id", "m", "t", "c", "z", "y", "x", "disp_z", "disp_y", "disp_x",
+            "disp_mag_um", "qfactor", "strain_xx"} <= na, sorted(na)
     ta = oa.get(D.POINT, "t", layer="dvc_cumulative").values
-    dya = oa.get(D.POINT, "disp_y", layer="dvc_cumulative").values
+    dxa = oa.get(D.POINT, "disp_x", layer="dvc_cumulative").values
     assert {1, 2} == set(ta.tolist()), sorted(set(ta.tolist()))
-    assert abs(float(np.median(dya[ta == 1])) - 1.0 * px) < 0.06, float(np.median(dya[ta == 1]))
-    assert abs(float(np.median(dya[ta == 2])) - 2.0 * px) < 0.08, float(np.median(dya[ta == 2]))
+    assert abs(float(np.median(dxa[ta == 1])) - 1.0 * px) < 0.04, float(np.median(dxa[ta == 1]))
+    assert abs(float(np.median(dxa[ta == 2])) - 2.0 * px) < 0.06, float(np.median(dxa[ta == 2]))
     assert any(k == "pixel_size_um" for k, _ in ea.entry("A").reads)   # calib fenced
     # guard: a fixed_frame (already cumulative) field is refused
     try:
-        eng({"S": Dataset(axes=axt, metadata=meta).with_image(ArrayProvider(imgt))},
-            {"S": MetaEnvelope(axes=axt, metadata=meta)},
+        eng({"S": dst}, {"S": envt},
             [("S", "io.dvcseed", {}),
-             ("D", "analysis.dvc_field", {"modes": {"dim": "2D"}, "params": dict(P)}),
+             ("D", "analysis.dvc_field", {"params": dict(P)}),
              ("A", "analysis.accumulate_field", {})], [("S", "D"), ("D", "A")]).pull("A")
         raise SystemExit("accumulate on a fixed_frame field should raise")
     except ValueError as exa:
@@ -6277,6 +6666,7 @@ def test_catalog_dvc() -> None:
     # ── rasterize a planted linear Point field → Voxel layer reproduces it ────────
     # Dimensionality is INHERITED from the table's z_kind (§7b): plane_index → 2D per-plane,
     # no dim lever passed. `with_structure` preserved z_kind into `__struct_zkind__`.
+    # Planted tables, independent of the solver — unchanged by the pyALDVC swap.
     axi = AxisSizes(m=1, t=1, z=1, c=1, y=20, x=20)
     yy, xx = np.meshgrid([4.0, 9.0, 14.0], [4.0, 9.0, 14.0], indexing="ij")
     yy, xx = yy.ravel(), xx.ravel()
@@ -6326,8 +6716,10 @@ def test_catalog_dvc() -> None:
         # ZERO candidates: `_resolve_layer` has nothing to infer from (2026-08-04 sweep)
         assert "no Point table" in str(ex2), str(ex2)
 
-    _ok("catalog (DVC + field rasterize): 2D/3D recover known shift (µm), Point schema "
-        "+ disp/strain/qfactor; 2D≠3D hash; pixel/z-step fenced; external-ref socket + "
+    _ok("catalog (DVC pyALDVC + field rasterize): 3D recovers a known (z,y,x) shift in µm, "
+        "Point schema + disp/strain/qfactor; strain-measure re-keys; pixel AND z-step "
+        "fenced; 3D-only guard names dic_correlate; retired params/modes refused by name "
+        "(old defaults pass); external-ref socket keeps the PRIMARY calibration; "
         "previous-frame skips t0; accumulate composes increments → cumulative (t·px, "
         "provenance-inherited, refuses fixed_frame/no-provenance); rasterizer reproduces "
         "a linear field + inherits z_kind (§7b: 2D field on z>1 not misread as 3D); "
@@ -10080,6 +10472,148 @@ def test_measure_points() -> None:
         "NOT read at z==1 (R1); a NaN coordinate and a missing table both handled")
 
 
+def test_measure_stage_position() -> None:
+    """``analysis.measure`` — absolute stage position (V2.29, 2026-09-08).
+
+    Both branches now also report ``stage_x_um``/``stage_y_um``/``stage_z_um`` — the row's
+    LOCAL physical position plus its multipoint's absolute placement
+    (:func:`nodegraph.placement.field_box` for X/Y, :func:`nodegraph.placement.z_um_of_slice`
+    for Z), so objects from different fields of a multi-position acquisition land in one
+    comparable physical frame rather than each in its own field's coordinates.
+
+    Two multipoints with DIFFERENT stage positions and a 3-plane stack (so the
+    ``z_home_index``/``z_step_um`` anchoring is actually exercised, not just the
+    single-plane early-out):
+
+    1. **POINT** — ``stage_x_um``/``stage_y_um`` is the row's own local ``x_um``/``y_um``
+       plus the field's absolute corner; ``stage_z_um`` is the row's OWN z-index correctly
+       anchored. Two rows share one multipoint but differ in z, proving the Z sample is
+       keyed per-ROW, not broadcast per-field.
+    2. **LABEL** — same three columns, PLUS the local ``x_um``/``y_um``/``z_um`` this branch
+       never had before, recovered from the region centroid the label producer already
+       wrote (looked up by id, not recomputed here).
+    3. **No placement metadata at all** → NaN throughout, never a guessed 0.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+
+    define_node("io.stageseed", "S", outputs=[OutDataset()])
+    M, Z, Y, X = 2, 3, 10, 12
+    ax = AxisSizes(m=M, t=1, z=Z, c=1, y=Y, x=X)
+    meta = {
+        "pixel_size_um": 0.5, "z_step_um": 2.0, "bit_depth": 16,
+        "stage_xy_um": [[100.0, 200.0], [300.0, 400.0]],   # [x, y] field CENTRE per m
+        "stage_z_um": [500.0, 600.0],                      # nominal focus per m
+        "z_home_index": 0, "z_bottom_to_top": True,
+    }
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    img = np.zeros((M, 1, Z, 1, Y, X), dtype=float)
+
+    def run(nodes, edges, sink, seed, seed_env=env):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b in edges:
+            g.connect(a, b)
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": seed_env})
+        return e, e.pull(sink)
+
+    # Expected field boxes and z-anchor, computed the same way field_box/z_um_of_slice are
+    # documented to: ext = (Y*px, X*px); corner = centre - half extent; z is affine in k.
+    ext_h, ext_w = Y * 0.5, X * 0.5
+    box_x0 = np.array([100.0 - 0.5 * ext_w, 300.0 - 0.5 * ext_w])
+    box_y0 = np.array([200.0 - 0.5 * ext_h, 400.0 - 0.5 * ext_h])
+
+    def stage_z(m: int, k: float) -> float:
+        return meta["stage_z_um"][m] + (k - meta["z_home_index"]) * meta["z_step_um"]
+
+    # ── 1. POINT branch ──────────────────────────────────────────────────────────
+    rows = [(0, 0.0, 4.0, 6.0), (0, 2.0, 4.0, 6.0), (1, 1.0, 5.0, 8.0)]
+    n = len(rows)
+    mm = np.array([r[0] for r in rows], np.int64)
+    zz = np.array([r[1] for r in rows], float)
+    yy = np.array([r[2] for r in rows], float)
+    xx = np.array([r[3] for r in rows], float)
+    ptab = _ST(D.POINT, {"id": np.arange(1, n + 1, dtype=np.int64),
+                         "m": mm, "t": np.zeros(n, np.int64),
+                         "c": np.zeros(n, np.int64), "z": zz, "y": yy, "x": xx},
+               layer="blobs", z_kind="plane_index")
+    ds_pt = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+             .with_structure(ptab))
+    PT = {"modes": {"target": "point"}}
+    _, out_pt = run([("S", "io.stageseed", {}), ("Q", "analysis.measure", PT)],
+                    [("S", "Q")], "Q", seed=ds_pt)
+
+    def col_pt(name):
+        a = out_pt.get(D.POINT, name, layer="blobs")
+        assert a is not None, f"missing Point column {name!r}"
+        return np.asarray(a.values, dtype=float)
+
+    want_sx = box_x0[mm] + xx * 0.5
+    want_sy = box_y0[mm] + yy * 0.5
+    want_sz = np.array([stage_z(int(mm[i]), zz[i]) for i in range(n)])
+    assert np.allclose(col_pt("stage_x_um"), want_sx), (col_pt("stage_x_um"), want_sx)
+    assert np.allclose(col_pt("stage_y_um"), want_sy), (col_pt("stage_y_um"), want_sy)
+    assert np.allclose(col_pt("stage_z_um"), want_sz), (col_pt("stage_z_um"), want_sz)
+    # rows 0 and 1 share m=0 but differ in z — proves the affine z sample is keyed on the
+    # ROW's own z, not broadcast once per field
+    assert col_pt("stage_z_um")[0] != col_pt("stage_z_um")[1]
+    assert col_pt("stage_x_um")[0] == col_pt("stage_x_um")[1]
+
+    # ── 2. LABEL branch: local x_um/y_um/z_um (new) + stage_* ───────────────────
+    raster6 = np.zeros((M, 1, Z, 1, Y, X), dtype=np.int64)
+    raster6[0, 0, 1, 0, 4, 6] = 1              # m=0, z-plane 1, single-pixel region
+    raster6[1, 0, 2, 0, 5, 8] = 2              # m=1, z-plane 2, single-pixel region
+    lab_cols = {
+        "id": np.array([1, 2], np.int64), "m": np.array([0, 1], np.int64),
+        "t": np.zeros(2, np.int64), "c": np.zeros(2, np.int64),
+        "area": np.array([1, 1], np.int64),
+        "z": np.array([1.0, 2.0]), "y": np.array([4.0, 5.0]), "x": np.array([6.0, 8.0]),
+    }
+    ltab = _ST(D.LABEL, lab_cols, layer="labels", z_kind="plane_index")
+    ds_lab = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+              .with_layer(D.VOXEL, "labels", raster6).with_structure(ltab))
+    _, out_lab = run([("S", "io.stageseed", {}), ("Q", "analysis.measure", {})],
+                     [("S", "Q")], "Q", seed=ds_lab)
+
+    def col_lab(name):
+        a = out_lab.get(D.LABEL, name, layer="labels")
+        assert a is not None, f"missing Label column {name!r}"
+        return np.asarray(a.values, dtype=float)
+
+    assert np.allclose(col_lab("x_um"), lab_cols["x"] * 0.5), col_lab("x_um")
+    assert np.allclose(col_lab("y_um"), lab_cols["y"] * 0.5), col_lab("y_um")
+    assert np.allclose(col_lab("z_um"), lab_cols["z"] * 2.0), col_lab("z_um")
+    lab_sx = np.array([box_x0[0] + 6.0 * 0.5, box_x0[1] + 8.0 * 0.5])
+    lab_sy = np.array([box_y0[0] + 4.0 * 0.5, box_y0[1] + 5.0 * 0.5])
+    lab_sz = np.array([stage_z(0, 1.0), stage_z(1, 2.0)])
+    assert np.allclose(col_lab("stage_x_um"), lab_sx), (col_lab("stage_x_um"), lab_sx)
+    assert np.allclose(col_lab("stage_y_um"), lab_sy), (col_lab("stage_y_um"), lab_sy)
+    assert np.allclose(col_lab("stage_z_um"), lab_sz), (col_lab("stage_z_um"), lab_sz)
+
+    # ── 3. no placement metadata at all → NaN, never a guessed 0 ────────────────
+    bare_meta = {"pixel_size_um": 0.5, "z_step_um": 2.0, "bit_depth": 16}
+    ds_bare = (Dataset(axes=ax, metadata=bare_meta).with_image(ArrayProvider(img))
+               .with_structure(ptab))
+    _, out_bare = run([("S", "io.stageseed", {}), ("Q", "analysis.measure", PT)],
+                      [("S", "Q")], "Q", seed=ds_bare,
+                      seed_env=MetaEnvelope(axes=ax, metadata=bare_meta))
+    for name in ("stage_x_um", "stage_y_um", "stage_z_um"):
+        a = out_bare.get(D.POINT, name, layer="blobs")
+        assert np.isnan(np.asarray(a.values, dtype=float)).all(), \
+            f"{name} must be NaN with no stage log, not a guessed 0"
+
+    _ok("measure stage position (V2.29): both branches report stage_x_um/stage_y_um/"
+        "stage_z_um — local position plus the row's OWN multipoint's absolute placement "
+        "(field_box for X/Y, the z_home_index/z_bottom_to_top-anchored z_um_of_slice for "
+        "Z, sampled twice per DISTINCT m rather than reimplementing the anchor math); two "
+        "positions with different stage logs and two z-planes prove the anchoring is keyed "
+        "per-row, not per-field; LABEL also gains its own local x_um/y_um/z_um from the "
+        "producer's centroid, looked up by id; and with no placement metadata at all every "
+        "stage_* column is NaN, never a guessed 0")
+
+
 def test_grow_points() -> None:
     """``transform.grow_points`` (2026-08-04) — Points → grown Label regions.
 
@@ -10847,6 +11381,331 @@ def test_filter_labels() -> None:
         "neither set the cut nor survive it; keep=below inverts; 56 mode states hash apart; "
         "no calibration key fenced; 5 refusals")
 
+
+
+def test_if_else() -> None:
+    """``analysis.if_else`` — split objects into a PASS set and a FAIL set by up to four
+    conditions on the table's own columns, and the edit-time COLUMN CATALOG that fills the
+    condition dropdown.
+
+    1. **Two results on one payload.** The engine is one-payload-per-node, so the branches
+       are two named instances rather than two sockets. They must be DISJOINT and their union
+       must be the input — an object silently counted twice, or lost, is the whole failure
+       mode of splitting into two tables instead of one.
+    2. **Ids are PRESERVED on both sides**, in the raster and the table, so a measurement or
+       track made upstream still joins; the input instance stays on the wire.
+    3. **`match` really combines**: `all` narrows, `any` widens, over the same two conditions.
+    4. **NaN is not a small number.** An unmeasured object satisfies no relational operator
+       and lands on FAIL; `is_nan` selects exactly those, and `!=` — the one operator numpy
+       would otherwise pass them through — does not.
+    5. **The TRACK join.** `track_length` lives on the Track table, not on the labels, so a
+       condition on "frames tracked" is only askable because `_track_joined` projects it by
+       `member_id`. An untracked object gets NaN, not 0, and so fails `>=`.
+    6. **The column catalog GROWS with the graph** (V2.28): the same socket offers geometry
+       after a segmentation, adds the intensity and shape columns after Measure, and adds
+       `track_length` after Track Objects — while never offering the Track table's join key,
+       which the compute refuses.
+    7. A blank row is skipped, not refused; mode states hash apart; no calibration fenced;
+       the point branch splits a Point table with no raster; 5 refusals."""
+    if not _HAVE_SKIMAGE:
+        _ok("if/else: skipped (no skimage in this environment)")
+        return
+    define_node("io.ieseed", "S", outputs=[OutDataset()])
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16)
+    lab6 = np.zeros(ax.shape_for(D.VOXEL), np.int64)
+    img6 = np.zeros(ax.shape_for(D.VOXEL))
+    for k in range(4):
+        lab6[0, 0, 0, 0][2 + 3 * k:5 + 3 * k, 2:5] = k + 1
+    cols = _pl_table([1, 2, 3, 4], area=9.0,
+                     mean_intensity=[10.0, 20.0, 130.0, 140.0],
+                     eccentricity=[0.1, 0.9, 0.2, np.nan])
+    seed, env = _pl_seed(img6, lab6, ax, zk="plane_index", cols=cols)
+    # ids 1,2 tracked for 12 frames; id 3 for 3; id 4 never linked (absent from membership)
+    seed = seed.with_structure(_ST(D.TRACK, {
+        "track_id": np.array([7, 7, 8], np.int64),
+        "t": np.zeros(3, np.int64),
+        "member_id": np.array([1, 2, 3], np.int64),
+        "track_length": np.array([12, 12, 3], np.int64),
+    }, layer="tracks", z_kind="plane_index"))
+
+    def run(**kw):
+        return _pl_run("analysis.if_else", seed, env, **kw)
+
+    def sides(payload):
+        return (_pl_cols(payload, "objects_pass")["id"].tolist(),
+                _pl_cols(payload, "objects_fail")["id"].tolist())
+
+    one = {"target": "label", "match": "all", "terms": "1"}
+
+    # ── 1/2. both sides, ids preserved, disjoint, union == input ───────────────
+    _e, o1 = run(modes=one, params={"column1": "mean_intensity", "op1": ">",
+                                    "value1": 100.0})
+    assert sides(o1) == ([3, 4], [1, 2]), f"the split is wrong: {sides(o1)}"
+    assert _pl_cols(o1, "labels")["id"].tolist() == [1, 2, 3, 4], \
+        "the input instance must stay on the wire unchanged"
+    assert sorted(_pl_cols(o1, "objects_pass")) == sorted(cols), \
+        "each side carries every column of the table it was split from"
+    pr = np.asarray(o1.get(D.VOXEL, "objects_pass").values)
+    fr = np.asarray(o1.get(D.VOXEL, "objects_fail").values)
+    assert sorted(set(pr.ravel().tolist()) - {0}) == [3, 4], \
+        "ids are PRESERVED in the raster, never renumbered — an upstream join depends on it"
+    assert not np.any((pr != 0) & (fr != 0)), "the two sides must be disjoint"
+    assert int(np.count_nonzero((pr != 0) | (fr != 0))) == int(np.count_nonzero(lab6)), \
+        "their union must be the input — an object may be neither counted twice nor lost"
+
+    # ── 3. match combines ──────────────────────────────────────────────────────
+    two = {"column1": "mean_intensity", "op1": ">", "value1": 100.0,
+           "column2": "eccentricity", "op2": "<", "value2": 0.5}
+    _e, oA = run(modes={"target": "label", "match": "all", "terms": "2"}, params=two)
+    _e, oO = run(modes={"target": "label", "match": "any", "terms": "2"}, params=two)
+    assert sides(oA)[0] == [3], f"all = bright AND round, got {sides(oA)[0]}"
+    assert sides(oO)[0] == [1, 3, 4], f"any = bright OR round, got {sides(oO)[0]}"
+
+    # ── 4. NaN fails, and is selectable ────────────────────────────────────────
+    _e, oN = run(modes=one, params={"column1": "eccentricity", "op1": ">",
+                                    "value1": -1.0})
+    assert sides(oN)[1] == [4], \
+        "an unmeasured object satisfies no relational test, so it FAILS — it must not be " \
+        "treated as though its eccentricity were small"
+    _e, oI = run(modes=one, params={"column1": "eccentricity", "op1": "is_nan"})
+    assert sides(oI)[0] == [4], "is_nan selects exactly the unmeasured objects"
+    _e, oQ = run(modes=one, params={"column1": "eccentricity", "op1": "!=",
+                                    "value1": 0.1})
+    assert 4 not in sides(oQ)[0], \
+        "`nan != x` is True in numpy, so != must exclude non-finite rows explicitly or it " \
+        "becomes the one operator that passes unmeasured objects"
+
+    # ── 5. the TRACK join ──────────────────────────────────────────────────────
+    _e, oT = run(modes=one, params={"column1": "track_length", "op1": ">=",
+                                    "value1": 10.0})
+    assert sides(oT) == ([1, 2], [3, 4]), \
+        f"track_length lives on the Track table and must reach the labels by member_id, " \
+        f"got {sides(oT)}"
+    assert 4 in sides(oT)[1], \
+        "an UNTRACKED object has no track length — NaN, not 0, or it would satisfy `< n`"
+
+    # ── 6. the edit-time column catalog grows with the graph ───────────────────
+    try:
+        import nodelab_v2.ops as _ops
+        from nodelab_v2.document import GraphDocument as _Doc
+        _ops.ensure_ops()
+    except Exception:                      # noqa: BLE001 — the pull half is still gated
+        _Doc = None
+    if _Doc is not None:
+        def offered(measure: bool, track: bool):
+            d = _Doc()
+            d.add_node("io.load", node_id="S")
+            d.meta_seeds["S"] = MetaEnvelope(axes=ax)
+            d.add_node("analysis.threshold", node_id="T", params={"name": "mask"})
+            d.add_node("analysis.label", node_id="L",
+                       params={"name": "CELLS", "mask": "mask"})
+            d.connect("S", "image", "T", "data"); d.connect("T", "out", "L", "data")
+            prev = "L"
+            if measure:
+                d.add_node("analysis.measure", node_id="M",
+                           params={"labels": "CELLS", "stats": "mean", "shape": "solidity"},
+                           modes={"target": "label"})
+                d.connect(prev, "out", "M", "data"); prev = "M"
+            if track:
+                d.add_node("track.objects", node_id="K",
+                           params={"labels": "CELLS", "name": "tracks"},
+                           modes={"target": "label"})
+                d.connect(prev, "out", "K", "data"); prev = "K"
+            d.add_node("analysis.if_else", node_id="F", params={"labels": "CELLS"},
+                       modes={"target": "label"})
+            d.connect(prev, "out", "F", "data")
+            return d.column_choices("F", d.nodes["F"].spec().input("column1"))
+
+        bare, measured, tracked = offered(False, False), offered(True, False), \
+            offered(True, True)
+        assert "area" in bare and "mean_intensity" not in bare, \
+            f"a segmentation alone offers its own geometry and nothing measured: {bare}"
+        assert {"mean_intensity", "solidity"} <= set(measured), \
+            f"Measure's stats and shape metrics must join the palette: {measured}"
+        assert set(bare) <= set(measured) <= set(tracked), \
+            "the catalog only GROWS along a chain — a node that adds columns must not " \
+            "drop the ones it inherited"
+        assert "track_length" in tracked, \
+            f"Track Objects' track_length must be offered on the LABEL rows: {tracked}"
+        assert "member_id" not in tracked, \
+            "the Track table's join KEY must not be offered — `_track_joined` skips it, so " \
+            "picking it would be a control the pull then refuses"
+
+    # ── 7. blank row, point branch, hashes, calibration, refusals ──────────────
+    _e, oS = run(modes={"target": "label", "match": "all", "terms": "2"},
+                 params={"column1": "mean_intensity", "op1": ">", "value1": 100.0,
+                         "column2": ""})
+    assert sides(oS)[0] == [3, 4], "a blank condition row is skipped, not refused"
+
+    h = set()
+    for st in ({"match": "all"}, {"match": "any"}, {"terms": "2"}):
+        e_, _o = run(modes={**{"target": "label", "match": "all", "terms": "1"}, **st},
+                     params=two)
+        h.add(e_.entry("N").recipe_hash)
+    assert len(h) == 3, "each mode state must hash apart, or a memo hit serves the other one"
+    e1, _o = run(modes=one, params={"column1": "area", "op1": ">", "value1": 1.0})
+    assert not [k for k, _v in e1.entry("N").reads if "pixel" in k or "z_step" in k], \
+        "the column is already in its own unit and this node converts nothing, so the memo " \
+        "must fence on no calibration key"
+
+    pax = AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16)
+    pcols = _pl_table([1, 2, 3], area=1.0, speed=[0.1, 5.0, 9.0])
+    pseed = (Dataset(axes=pax, metadata={"pixel_size_um": 0.5})
+             .with_image(ArrayProvider(np.zeros(pax.shape_for(D.VOXEL))))
+             .with_structure(_ST(D.POINT, pcols, layer="spots", z_kind="plane_index")))
+    _e, oP = _pl_run("analysis.if_else", pseed, MetaEnvelope(axes=pax),
+                     modes={"target": "point", "match": "all", "terms": "1"},
+                     params={"points": "spots", "column1": "speed", "op1": ">",
+                             "value1": 1.0})
+    assert [a.name for a in oP.layers_on(D.VOXEL) if a.name == "objects_pass"] == [], \
+        "the point branch writes no raster — a detection has no extent to rewrite"
+    assert ({a.layer for a in oP.layers_on(D.POINT)}
+            == {"spots", "objects_pass", "objects_fail"}), \
+        "the point branch splits the table into two new Point instances"
+
+    for bad, frag in (
+            ({"column1": "nope", "op1": ">"}, "does not carry"),
+            ({"column1": ""}, "no condition is filled in"),
+            ({"column1": "area", "op1": "~="}, "unknown operator"),
+            ({"column1": "area", "pass_name": "same", "fail_name": "same"},
+             "both sides are named"),
+            ({"column1": "area", "pass_name": "labels"}, "would overwrite")):
+        try:
+            run(modes=one, params={"op1": ">", "value1": 1.0, **bad})
+        except ValueError as ex:
+            assert frag in str(ex), f"wrong refusal for {bad}: {ex}"
+        else:
+            raise AssertionError(f"if/else accepted {bad} — expected a refusal")
+
+    _ok("if/else: objects split into PASS and FAIL sets by up to four column conditions - "
+        "two named instances on ONE payload (the engine is one-payload-per-node), proven "
+        "DISJOINT with their union equal to the input, ids PRESERVED in raster and table so "
+        "upstream joins hold, and the input instance left on the wire; `all` narrows and "
+        "`any` widens the same pair; an unmeasured object fails every relational test "
+        "(including `!=`, which numpy would otherwise pass) and `is_nan` selects exactly "
+        "those; track_length reaches the LABEL rows by the member_id join and an untracked "
+        "object gets NaN rather than 0; the edit-time column catalog GROWS along the chain "
+        "(geometry, then Measure's stats and shape, then track_length) and never offers the "
+        "join key the compute refuses; a blank row is skipped; 3 mode states hash apart; no "
+        "calibration key fenced; the point branch writes no raster; 5 refusals")
+
+
+def test_column_catalog_complete() -> None:
+    """The edit-time COLUMN catalog is CLOSED, so it has to be complete (V2.28).
+
+    `column_in` sockets render as a non-editable dropdown (``inspector._names_box`` with
+    ``editable=False``, ``node_item._open_name_menu`` with ``free_text=False``). That is only
+    defensible while the catalog names every column a graph can carry: with no free-text
+    escape, a producer that declares nothing makes its columns **unpickable**, and the user's
+    only symptom is a condition they cannot express. A layer picker can stay open because a
+    couple of producers name layers this pass cannot predict; a column picker cannot, because
+    the whole point of it is that the answer IS predetermined by the nodes upstream.
+
+    So this gate holds the line the dropdown depends on:
+
+    1. **Every node that adds a structure domain declares `adds_columns`.** This is the one
+       that fails when someone adds a producer and forgets — the failure the closed dropdown
+       would otherwise express as a missing menu entry three nodes away.
+    2. **Every declaration is TOTAL.** It runs inside ``propagate_meta``, on every keystroke,
+       whose caller catches only ``ValueError`` — so it is exercised with empty params, empty
+       modes, junk types and a half-typed vocabulary selector, and may not raise at any of
+       them. A picker that takes the window down is worse than no picker.
+    3. **Every declaration is well-formed** — `(Domain, str, str)` triples with no blank
+       layer or column, so nothing lands in the catalog keyed on `""`.
+    4. **A `column_in` socket's own default is a column something declares.** The factory
+       default is what a freshly-dropped node shows, and in a closed list an undeclared one
+       would appear as the orphan "not on this wire" entry on every new node.
+    5. **`document._JOIN_KEYS` names real columns**, or the filter that hides a join key from
+       the menu is dead code silently protecting nothing."""
+    from nodegraph.domains import Domain as _D
+    STRUCT = frozenset({_D.LABEL, _D.POINT, _D.TRACK, _D.MESH})
+
+    producers = [sp for sp in NODES.all()
+                 if (frozenset(sp.adds_domains) & STRUCT) and _is_catalog_op(sp.op_key)]
+    assert len(producers) >= 20, \
+        f"only {len(producers)} structure producers found — the discriminator broke"
+
+    missing = sorted(sp.op_key for sp in producers if sp.adds_columns is None)
+    assert not missing, (
+        "structure-producing node(s) with no `adds_columns` declaration: %s — the column "
+        "picker is a CLOSED dropdown, so every column these write is unreachable from it. "
+        "Declare them (nodegraph/catalog/_shared/columns.py has the invariant schemas), or "
+        "the user cannot condition on what this node measures." % missing)
+
+    # ── 2/3. total, and well-formed, under everything propagate_meta can hand them ──
+    declared: set = set()
+    for sp in producers:
+        state = sp.default_state()
+        params = {s.name: (s.default if s.default is not None else "") for s in sp.inputs}
+        hostile = [
+            (params, state),
+            ({}, {}),                                  # a node fresh off the search menu
+            ({}, dict(state)),
+            (dict(params), {}),
+            ({k: None for k in params}, dict(state)),   # cleared boxes
+            ({k: 0 for k in params}, {k: None for k in state}),   # wrong types throughout
+            ({**params, "stats": "mea", "shape": "ecc", "metrics": "vel",
+              "fields": "dens"}, dict(state)),          # every vocabulary mid-keystroke
+        ]
+        for i, (pp, mm) in enumerate(hostile):
+            try:
+                got = sp.adds_columns(pp, mm, ())
+            except Exception as ex:                     # noqa: BLE001 — that IS the defect
+                raise AssertionError(
+                    f"{sp.op_key}.adds_columns raised {ex!r} on case {i} — it runs inside "
+                    f"propagate_meta on every keystroke, whose caller catches only "
+                    f"ValueError, so this takes the window down") from ex
+            for entry in got or ():
+                assert (isinstance(entry, tuple) and len(entry) == 3), \
+                    f"{sp.op_key}.adds_columns yielded {entry!r}, want (Domain, layer, column)"
+                dom, lyr, col = entry
+                assert isinstance(dom, _D), f"{sp.op_key}: {dom!r} is not a Domain"
+                assert isinstance(lyr, str) and lyr, \
+                    f"{sp.op_key}: blank layer name — it would key the catalog on ''"
+                assert isinstance(col, str) and col, f"{sp.op_key}: blank column name"
+                if i == 0:
+                    declared.add(col)
+
+    # ── 4. a closed dropdown must be able to show its own factory default ─────────
+    orphan_defaults = []
+    for sp in NODES.all():
+        if not _is_catalog_op(sp.op_key):
+            continue
+        for so in sp.inputs:
+            if not (getattr(so, "column_in", None) or getattr(so, "column_in_mode", "")):
+                continue
+            dflt = str(so.default or "").strip()
+            if dflt and dflt not in declared:
+                orphan_defaults.append(f"{sp.op_key}.{so.name}={dflt!r}")
+    assert not orphan_defaults, (
+        "a `column_in` socket defaults to a column no producer declares: %s — in a closed "
+        "dropdown that shows as the 'not on this wire' orphan entry on every freshly dropped "
+        "node" % orphan_defaults)
+
+    # ── 5. the join-key filter guards something real ──────────────────────────────
+    try:
+        from nodelab_v2.document import _JOIN_KEYS
+    except Exception:                          # noqa: BLE001 — engine half still gated
+        _JOIN_KEYS = frozenset()
+    if _JOIN_KEYS:
+        assert _JOIN_KEYS <= declared, (
+            f"document._JOIN_KEYS names {sorted(_JOIN_KEYS - declared)}, which no producer "
+            f"declares — the filter that keeps a join key out of the condition menu is "
+            f"guarding nothing, and will stop guarding the real key silently")
+
+    _ok(f"column catalog is CLOSED and complete: all {len(producers)} structure-producing "
+        f"catalog nodes declare `adds_columns` ({len(declared)} distinct columns), which is "
+        f"what lets the condition picker be a non-editable dropdown instead of a text box - "
+        f"an undeclared producer would make its columns unpickable rather than merely "
+        f"unsuggested; every declaration survives 7 hostile (params, modes) shapes including "
+        f"empty dicts, None values, wrong types and four half-typed vocabulary selectors, "
+        f"since it runs inside propagate_meta on every keystroke; every triple is "
+        f"(Domain, non-blank layer, non-blank column); every `column_in` socket's factory "
+        f"default is a column something actually writes; and document._JOIN_KEYS still names "
+        f"a real column")
 
 def test_scope_facility() -> None:
     """The shared statistics-POPULATION facility (V2.27) — one vocabulary, and a footprint
@@ -12042,6 +12901,12 @@ _PARAM_NO_SOCKET_OK = {
     # read only as the fallback INSIDE `scale_xy`'s lookup — a back-compat alias for
     # graphs written before the axis-split, not a control of its own.
     ("util.resample", "scale"),
+    # RETIRED (2026-09-15): the bool became the three-way `split` Mode when per-GROUP export
+    # arrived. The compute reads it only to REFUSE a graph that still carries it, naming the
+    # mode to set instead — the `transform.transfer_domain` pattern. Giving it a socket back
+    # would put a live-looking control beside the mode that replaced it; dropping the read
+    # would let a saved graph that ticked the box silently export one file instead of 54.
+    ("io.write_tiff", "split_positions"),
 }
 #: Sockets no compute reads. Empty, and it should stay that way: a declared socket the
 #: kernel ignores is the "live-looking GUI control" the node charter forbids.
@@ -13640,6 +14505,271 @@ def test_nd2_zstack_home_index_guard() -> None:
         "stack and on upstream's other branches")
 
 
+def test_nd2_picture_meta_key_guard() -> None:
+    """The ``nd2`` SDK shim for picture metadata keyed at a frame other than 0 (2026-09-30).
+
+    Half the files of one JOBS run (``Spheroid_ELISA/20260916_180247_607``, the R-PE,Cy5
+    sequences 0004/0006/0008/0010/0012) could not be opened:
+    ``KeyError: Chunk key b'ImageMetadataSeqLV|0!' not found in chunkmap``. The metadata was
+    there, keyed ``|353!`` in a 706-frame file (always half the frame count across that run),
+    but ``ModernReader._cached_raw_metadata`` hard-codes ``|0!`` and ``attributes()``
+    depends on it, so ``ND2File.sizes`` died.
+
+    Pinned on a stub reader with the real files' key shapes, so no ND2 file is needed:
+
+    * ``|0!`` present → upstream's own answer, unchanged (the shim delegates first);
+    * only ``|353!`` (and a later ``|700!``) → the LOWEST one, decoded and unwrapped exactly
+      as upstream would have treated ``|0!``, and cached on ``_raw_image_metadata``;
+    * no picture-metadata chunk at all → the original ``KeyError`` still surfaces;
+    * the pre-v3 spelling (``ImageMetadataSeq|N!``) is matched only for pre-v3 files.
+    """
+    try:
+        from nd2._readers._modern.modern_reader import ModernReader
+    except ImportError:
+        _ok("nd2 picture meta key guard: SKIPPED (nd2 absent)")
+        return
+    from nodelab_v2.nd2_compat import import_nd2, _SHIM_TAG
+
+    import_nd2()
+    fn = ModernReader._cached_raw_metadata
+    assert getattr(fn, _SHIM_TAG, False), "import_nd2 did not install the picture-meta shim"
+    import_nd2()
+    assert ModernReader._cached_raw_metadata is fn, "the picture-meta shim double-wrapped"
+
+    class _Stub:
+        def __init__(self, keys, ver=(3, 0)):
+            self.chunkmap = {k: (0, 0) for k in keys}
+            self._ver = ver
+            self._raw_image_metadata = None
+
+        def version(self):
+            return self._ver
+
+        def _decode_chunk(self, name, strip_prefix=True):
+            if name not in self.chunkmap:          # what `_load_chunk` does upstream
+                raise KeyError(f"Chunk key {name!r} not found in chunkmap")
+            return {"SLxPictureMetadata": {"from": name}}
+
+    img = [b"ImageDataSeq|%d!" % i for i in range(4)] + [b"ImageAttributesLV!"]
+    ok = _Stub(img + [b"ImageMetadataSeqLV|0!"])
+    assert fn(ok) == {"from": b"ImageMetadataSeqLV|0!"}
+    assert fn.__wrapped__(_Stub(img + [b"ImageMetadataSeqLV|0!"])) == fn(ok)
+
+    shifted = _Stub(img + [b"ImageMetadataSeqLV|700!", b"ImageMetadataSeqLV|353!",
+                           b"ImageCalibrationLV|353!"])
+    try:
+        fn.__wrapped__(_Stub(list(shifted.chunkmap)))
+        premise = True
+    except KeyError:
+        premise = False
+    assert fn(shifted) == {"from": b"ImageMetadataSeqLV|353!"}, fn(shifted)
+    assert shifted._raw_image_metadata == {"from": b"ImageMetadataSeqLV|353!"}
+
+    try:
+        fn(_Stub(img))
+        raise AssertionError("a file with no picture metadata must still raise KeyError")
+    except KeyError:
+        pass
+    # pre-v3 spelling only for pre-v3 files; a v3 file must not pick up a v2-style key
+    assert fn(_Stub(img + [b"ImageMetadataSeq|12!"], ver=(2, 1))) == \
+        {"from": b"ImageMetadataSeq|12!"}
+    try:
+        fn(_Stub(img + [b"ImageMetadataSeq|12!"]))
+        raise AssertionError("a v3 file must not fall back to a pre-v3 metadata key")
+    except KeyError:
+        pass
+    if premise:                         # a fixed nd2 — the shim is now a no-op, as designed
+        _ok("nd2 picture meta key guard: nd2 now finds a non-zero ImageMetadataSeqLV key "
+            "itself — the shim is inert and can be retired (nodelab_v2/nd2_compat.py)")
+        return
+    _ok("nd2 picture meta key guard: a file whose only picture metadata is "
+        "ImageMetadataSeqLV|353! opens (lowest |N! used, cached like |0!), |0! files are "
+        "untouched, and a file with none still raises KeyError")
+
+
+def test_nd2_direct_access() -> None:
+    """``io.load``'s ``access=direct`` path (the DEFAULT) — reading an ND2 in place, with
+    no ingest.
+
+    The motivating file is 453 GB (54 positions × 74 timepoints × 54 z, 1024², uint16,
+    uncompressed). Ingesting it to a ``.b2nd`` store means writing a ~280 GB second copy
+    over many hours before a pixel can be seen, and the attempt that prompted this left a
+    torn 48.9 GB store behind. :class:`~nodelab_v2.nd2_direct.Nd2DirectProvider` skips the
+    copy: a modern uncompressed ND2's frames are a flat mmap, so a random 1024² plane
+    measured **6.2 ms** here and a whole 54-plane z-volume ~60 ms — already interactive.
+
+    That fast path bypasses the sanctioned reader (``ND2File.to_dask()``), so it re-derives
+    two things itself, and BOTH are pinned here because both are silent when wrong:
+
+    * **the channel axis.** ``ND2File.read_frame`` ends in
+      ``transpose((2, 0, 1, 3)).squeeze()``, so a 3-channel file arrives ``(C, Y, X)``
+      while a one-channel RGB camera arrives ``(Y, X, 3)`` — channel FIRST in one and LAST
+      in the other. The obvious guess (last, as a TIFF would be) was written first and was
+      wrong; it returned a correctly-shaped plane of the wrong channel, which no shape
+      assertion catches. The resolver matches against the declared geometry instead.
+    * **the sequence index.** ``_coord_shape`` is in the file's own EXPERIMENT order, which
+      is not the canonical ``(m,t,z)``: the real 640 series is
+      ``(TimeLoop, XYPosLoop, ZStackLoop)``. Reading it as ``(m,t,z)`` addresses the right
+      frame only on the diagonal — every other coordinate silently returns a different
+      timepoint's pixels.
+
+    No ND2 file is needed: both are pure arithmetic over the geometry, exercised here on
+    the real file's layout. The live cross-check against the SDK on actual pixels is
+    :meth:`~nodelab_v2.nd2_direct.Nd2DirectProvider.verify`, which runs on every open."""
+    import os
+
+    from nodegraph.provider import _plane_mean_2x
+    from nodegraph.registry import NODES
+    from nodelab_v2.nd2_direct import (Nd2DirectError, Nd2DirectProvider,
+                                       _estimate_ingest_bytes, _fits_on_disk, _GIB)
+    from nodelab_v2.ops import (ACCESS_AUTO, ACCESS_DEFAULT, ACCESS_DIRECT, ACCESS_INGEST,
+                                ACCESS_MODE, LOAD_OP, ensure_ops, source_access_of)
+    from nodelab_v2.runner import bundle_key, source_key
+
+    def _bare(m=1, t=1, z=1, c=1, y=64, x=48):
+        """A provider instance with geometry only — no file, no handles."""
+        p = object.__new__(Nd2DirectProvider)
+        p.axes = AxisSizes(m=m, t=t, z=z, c=c, y=y, x=x)
+        p.levels, p.tile = 3, 512
+        return p
+
+    # ── the channel axis ──────────────────────────────────────────────────────
+    one = _bare(c=1)
+    assert one._resolve_channel_axis((64, 48)) is None
+    three = _bare(c=3)
+    assert three._resolve_channel_axis((3, 64, 48)) == 0, "3-channel ND2 is (C,Y,X)"
+    rgb = _bare(c=3, y=64, x=48)
+    assert rgb._resolve_channel_axis((64, 48, 3)) == 2, "an RGB camera squeezes to (Y,X,3)"
+    # a bare (Y,X) frame from a file that claims channels is unaddressable, not "channel 0"
+    for bad in ((64, 48), (64, 48, 5), (2, 64, 48), (64, 48, 64)):
+        try:
+            three._resolve_channel_axis(bad)
+        except Nd2DirectError:
+            pass
+        else:
+            raise AssertionError(f"frame layout {bad} accepted for a 3-channel 64x48 image")
+    # the ambiguous square case still resolves to the declared layout rather than guessing
+    sq = _bare(c=2, y=2, x=2)
+    assert sq._resolve_channel_axis((2, 2, 2)) == 0, "ties must take the (C,Y,X) reading"
+
+    # ── the sequence index, on the real 640 series' loop order ────────────────
+    p = _bare(m=54, t=74, z=54)
+    p._order, p._cshape = ("t", "m", "z"), (74, 54, 54)
+    assert p._seq(0, 0, 0) == 0
+    # the tell: advancing m must step by 54 (one z-run), NOT by 54*54
+    assert p._seq(1, 0, 0) == 54, p._seq(1, 0, 0)
+    assert p._seq(0, 1, 0) == 54 * 54, p._seq(0, 1, 0)
+    assert p._seq(0, 0, 1) == 1
+    assert p._seq(53, 73, 53) == 74 * 54 * 54 - 1
+    seen = {p._seq(m, t, z) for m in range(54) for t in range(74) for z in range(54)}
+    assert len(seen) == 74 * 54 * 54 and max(seen) == len(seen) - 1, "index is not a bijection"
+    # a canonical-order file must NOT get the same answer — proves the order is really read
+    q = _bare(m=54, t=74, z=54)
+    q._order, q._cshape = ("m", "t", "z"), (54, 74, 54)
+    assert q._seq(1, 0, 0) == 74 * 54 != p._seq(1, 0, 0)
+    # a file with no loops at all (a single frame) is index 0, not an error
+    s = _bare()
+    s._order, s._cshape = (), ()
+    assert s._seq(0, 0, 0) == 0
+
+    # ── pyramid levels are the STORE's arithmetic, read off the mmap ──────────
+    rng = np.random.default_rng(4)
+    plane = rng.integers(0, 4096, size=(65, 49), dtype=np.uint16)   # odd on both axes
+    lp = _bare(y=65, x=49)
+    lp._frame = lambda m, t, z, c: plane                             # stub the file read
+    for lvl in range(3):
+        la = lp.level_axes(lvl)
+        got = lp.read_region(lvl, 0, 0, 0, 0, 0, la.y, 0, la.x)
+        assert got.shape == (la.y, la.x), (lvl, got.shape, (la.y, la.x))
+        want = plane
+        for _ in range(lvl):
+            want = _plane_mean_2x(want)
+        assert np.array_equal(got, want), f"level {lvl} is not the stored pyramid's pixels"
+        assert got.dtype == plane.dtype, "a level must not promote dtype"
+    # a window is the same pixels as the matching slice of the whole level
+    full1 = lp.read_region(1, 0, 0, 0, 0, 0, 32, 0, 24)
+    assert np.array_equal(lp.read_region(1, 0, 0, 0, 0, 4, 12, 6, 18), full1[4:12, 6:18])
+
+    # ── the cache key: `ingest` unchanged, `direct` distinct, `auto` refused ──
+    f = os.path.join(os.sep, "data", "big.nd2")
+    assert source_key(f) == source_key(f, ACCESS_INGEST) == ("image", os.path.abspath(f)), \
+        "the default key changed shape — every saved graph and store on disk means ingest"
+    assert source_key(f, ACCESS_DIRECT) == ("image", os.path.abspath(f), "direct")
+    assert source_key(f) != source_key(f, ACCESS_DIRECT), \
+        "both modes share one provider-cache slot; the mode would look like a no-op"
+    assert source_key("") == ("synthetic",)
+    assert bundle_key([f]) == ("bundle", (os.path.abspath(f),))
+    assert bundle_key([f], ACCESS_DIRECT) == ("bundle", (os.path.abspath(f),), "direct")
+    try:
+        source_key(f, ACCESS_AUTO)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(
+            "source_key() accepted 'auto' — a caller skipped EngineRunner."
+            "_effective_access() and the cache key would name a decision, not a provider")
+
+    # ── the access mode: `direct` is the default, both for a NEW card and for
+    #    every graph saved before this mode existed ───────────────────────────
+    ensure_ops()   # idempotent AND self-healing — re-registers a stale (pre-`auto`,
+    #                pre-default-flip) spec left behind by an earlier import in-process
+    spec = NODES.get(LOAD_OP)
+    access_mode = next(m for m in spec.modes if m.name == ACCESS_MODE)
+    assert set(access_mode.choices) == {ACCESS_DIRECT, ACCESS_AUTO, ACCESS_INGEST}, \
+        access_mode.choices
+    assert access_mode.resolved_default() == ACCESS_DEFAULT == ACCESS_DIRECT
+    assert spec.default_state()[ACCESS_MODE] == ACCESS_DIRECT, \
+        "a freshly placed io.load card must carry 'direct', not 'auto' or 'ingest'"
+
+    class _Rec:
+        op_key, modes = LOAD_OP, {}
+    assert source_access_of(_Rec()) == ACCESS_DIRECT, (
+        "an io.load record with no 'access' key at all — every graph saved before this "
+        "mode existed — must read as direct, not as a frozen 'always ingest' (or 'auto')")
+    _Rec.modes = {"access": ACCESS_AUTO}
+    assert source_access_of(_Rec()) == ACCESS_AUTO
+    _Rec.modes = {"access": ACCESS_INGEST}
+    assert source_access_of(_Rec()) == ACCESS_INGEST
+    _Rec.op_key = "io.dock"
+    assert source_access_of(_Rec()) == "", "only an io.load card has an access mode"
+
+    # ── the space estimate and the go/no-go arithmetic behind `auto` ──────────
+    # a 1000x1000 uint16 plane: raw = 2,000,000 bytes; 3 pyramid levels sum to
+    # 1 + 1/4 + 1/16 = 1.3125x of level 0 (no compression credited, by design)
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=1000, x=1000)
+    raw = 1000 * 1000 * 2
+    assert _estimate_ingest_bytes(ax, 2, levels=3) == int(raw * 1.3125)
+    assert _estimate_ingest_bytes(ax, 2, levels=1) == raw, "levels=1 must have no tail"
+    # a second channel and a second timepoint both multiply the estimate linearly
+    ax2 = AxisSizes(m=1, t=5, z=1, c=2, y=1000, x=1000)
+    assert _estimate_ingest_bytes(ax2, 2, levels=1) == raw * 10
+
+    # the margin is max(25% of the estimate, 5 GiB) — exact boundary, both regimes
+    big_needed = 100 * _GIB                    # 25% (25 GiB) dominates the 5 GiB floor
+    assert _fits_on_disk(big_needed, big_needed + 25 * _GIB + 1)
+    assert not _fits_on_disk(big_needed, big_needed + 25 * _GIB - 1)
+    small_needed = 1 * _GIB                    # the 5 GiB floor dominates 25%
+    assert _fits_on_disk(small_needed, small_needed + 5 * _GIB + 1)
+    assert not _fits_on_disk(small_needed, small_needed + 5 * _GIB - 1)
+
+    _ok("nd2 direct access (io.load access=direct/auto/ingest): direct is the default "
+        "for a NEW card and for every graph saved before this mode existed alike — every "
+        "file opens in place with no copy unless a card is explicitly told to build one "
+        "(ingest) or to decide for itself (auto). Auto resolves per file — an existing "
+        "store always wins outright, otherwise a pessimistic (no compression credited) "
+        "size estimate against the destination drive's free space decides, with a "
+        "25%-or-5 GiB margin so 'just barely fits' still reads as 'does not'; verified "
+        "end to end on the lab's two real files in scripts/_probe_nd2_direct.py (the "
+        "453 GB series -> direct, its ingested sibling -> its existing store, reused "
+        "without re-checking space it no longer needs). The 453 GB series opens with no "
+        "ingest and no store — channel axis resolved from the declared geometry "
+        "((C,Y,X) vs an RGB camera's (Y,X,3), the bug this caught), the sequence index "
+        "read from the file's own loop order (the real T,P,Z one, not canonical m,t,z), "
+        "levels bit-identical to the stored pyramid on an odd-sized plane, and the "
+        "ingest/direct cache keys left exactly as they were so every existing graph and "
+        "store still hits")
+
+
 def test_transfer_structure() -> None:
     """``transform.transfer_structure`` — the node surface for the structure bridges.
 
@@ -14445,6 +15575,331 @@ def test_crop_frames() -> None:
         st = tuple(eng(p).pull("K").metadata.get(SAMPLING_KEY, ()))
         assert len(st) == 1 and _stamp_axes(st[0]) == want, (p, st)
     _ok("util.crop frames mode (subset M/T/Z, metadata + rows follow, memo keys apart)")
+
+
+def test_position_groups() -> None:
+    """Position GROUPS: recovering which multipoints are one specimen, and selecting one.
+
+    A multipoint axis is often not one flat list of fields. The lab's CRC file records 54
+    positions that are six separate 3x3 mosaics a millimetre apart, and every consumer that
+    reads M as flat gets it wrong the same way \u2014 Stitch fuses all 54 into one canvas with
+    four holes in it, a dataset-scoped statistic pools six unrelated samples. This covers the
+    three layers that fix it:
+
+    * the DETECTOR (:func:`nodegraph.placement.position_groups`) \u2014 single linkage at one
+      field width, the grid/scan-order inference, the margin that says how much the answer
+      depended on the threshold, and the refusal to group data it cannot place;
+    * the NODE (``util.select_group``) \u2014 the payload's axes equal the ``select_group``
+      meta_transform's PREDICTION for every selection (build-node-v2 \u00a72), everything indexed
+      by M follows, and each selection keys the memo apart;
+    * the SIDECAR (:mod:`nodelab_v2.position_groups`) \u2014 a hand-written grouping WINS over
+      detection, and one that is not a partition of the positions is rejected whole rather
+      than half-applied.
+
+    The fixture's gaps sit far from the threshold on purpose. A 2x2 mosaic on a 2 um pitch
+    inside a 4 um field, with 40 um between mosaics, puts the decision at 2.83 um (the
+    in-group diagonal) against 38 um (the separation) with the cut at 4.0 um \u2014 so a rounding
+    difference cannot flip the grouping and turn this test into a coin flip.
+    """
+    from nodegraph.metadata import (POSITION_GROUP_KEY, group_picks, position_group_plan,
+                                    select_group as _meta_select_group)
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import GroupPlan, position_groups
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+
+    # Two 2x2 mosaics, acquired serpentine: (0,0) (0,2) (2,2) (2,0).
+    corners = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)]
+    origin = [[0.0, y, x + dx] for dx in (0.0, 40.0) for (y, x) in corners]
+    ax = AxisSizes(m=8, t=3, z=2, c=1, y=8, x=8)
+    img = np.arange(8 * 3 * 2 * 1 * 8 * 8, dtype=np.uint16).reshape(8, 3, 2, 1, 8, 8)
+    md = {"pixel_size_um": 0.5, "z_step_um": 0.4, "dt_s": 2.0, "bit_depth": 12,
+          "origin_um": origin,
+          "stage_xy_um": [[o[2] + 2.0, o[1] + 2.0] for o in origin],
+          "frame_time_jd": [2461249.0 + i for i in range(3)]}
+
+    # \u2500\u2500 the detector \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    plan = position_groups(md, ax)
+    assert plan.placed and len(plan) == 2, plan
+    assert [g.members for g in plan.groups] == [(0, 1, 2, 3), (4, 5, 6, 7)]
+    assert [g.key for g in plan.groups] == ["G1", "G2"], "keys are 1-based, acquisition order"
+    assert all((g.rows, g.cols) == (2, 2) for g in plan.groups), plan.groups
+    assert all(g.order == "serpentine" for g in plan.groups), \
+        "row 0 runs left-to-right and row 1 back again \u2014 that is a boustrophedon scan"
+    assert all(abs(g.pitch_um[0] - 2.0) < 1e-9 for g in plan.groups), plan.groups
+    assert abs(plan.margin - 19.0) < 1e-6, \
+        f"38 um between groups over a 2 um in-group bottleneck, got {plan.margin}"
+    assert plan.labels() == ("G1",) * 4 + ("G2",) * 4
+    assert plan.of_member(5).key == "G2" and plan.of_member(99) is None
+
+    # the threshold is a statement about mosaics, not a fitted number: widening it past the
+    # separation merges, narrowing it below the in-group diagonal shatters.
+    assert len(position_groups(md, ax, 12.0)) == 1, "one field width x12 > the 38 um gap"
+    assert len(position_groups(md, ax, 0.4)) == 8,         "0.4 x 4 um = 1.6 um, clear of the 2.0 um pitch rather than sitting on it — a "         "threshold placed exactly ON a fixture distance makes the test a float coin flip"
+
+    # a RASTER scan and an IRREGULAR one are told apart from a serpentine
+    raster = [[0.0, y, x] for y in (0.0, 2.0) for x in (0.0, 2.0)]
+    rax = AxisSizes(m=4, t=1, z=1, c=1, y=8, x=8)
+    rmd = {"pixel_size_um": 0.5, "origin_um": raster}
+    assert position_groups(rmd, rax).groups[0].order == "raster"
+    scatter = [[0.0, 0.0, 0.0], [0.0, 0.3, 1.9], [0.0, 2.1, 0.7], [0.0, 1.1, 2.4]]
+    got = position_groups({"pixel_size_um": 0.5, "origin_um": scatter}, rax).groups[0]
+    assert got.order == "irregular" and got.members == (0, 1, 2, 3), got
+
+    # UNEQUAL group sizes are the case a fixed "16 per group" would get wrong
+    uneven = [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0], [0.0, 2.0, 0.0],
+              [0.0, 0.0, 40.0], [0.0, 0.0, 42.0]]
+    uax = AxisSizes(m=5, t=1, z=1, c=1, y=8, x=8)
+    up = position_groups({"pixel_size_um": 0.5, "origin_um": uneven}, uax)
+    assert [g.members for g in up.groups] == [(0, 1, 2), (3, 4)], up.groups
+
+    # data that cannot be PLACED is not one group \u2014 it is no answer, and says so
+    assert not position_groups({"pixel_size_um": 0.5}, ax).placed
+    assert not position_groups({"origin_um": origin}, ax).placed, "no pixel size, no field"
+    short = {"pixel_size_um": 0.5, "origin_um": origin[:3]}
+    assert not position_groups(short, ax).placed, \
+        "a partial position log is refused whole, never used for the positions it has"
+    assert GroupPlan().labels() == (), "an unplaced plan contributes no per-M list"
+
+    # \u2500\u2500 a STAMPED grouping wins over the geometry \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    stamped = dict(md, **{POSITION_GROUP_KEY: ["a"] * 5 + ["b"] * 3})
+    sp = position_group_plan(stamped, ax)
+    assert [(g.key, g.members) for g in sp.groups] == [("a", (0, 1, 2, 3, 4)),
+                                                       ("b", (5, 6, 7))], sp.groups
+    assert group_picks(stamped, ax, "b") == (5, 6, 7)
+    assert group_picks(stamped, ax, "1") == (0, 1, 2, 3, 4), \
+        "the ordinal follows the STAMPED order, not the detector's"
+
+    # \u2500\u2500 the spelling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    assert group_picks(md, ax, "G1") == (0, 1, 2, 3)
+    assert group_picks(md, ax, "g1") == (0, 1, 2, 3), "case is not a thing to remember"
+    assert group_picks(md, ax, "2") == (4, 5, 6, 7), "a bare ordinal is 1-based"
+    assert group_picks(md, ax, "G2,G1") == tuple(range(8)), "ascending, never selection order"
+    assert group_picks(md, ax, "") is None and group_picks(md, ax, None) is None
+    assert group_picks(md, ax, "G9") == (), "named-but-matched-nothing stays distinguishable"
+    assert group_picks({"pixel_size_um": 0.5}, ax, "G1") == (), "unplaceable also refuses"
+
+    # \u2500\u2500 the node \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    pts = StructureTable(Domain.POINT, {
+        "id": np.arange(1, 9, dtype=np.int64), "m": np.arange(8, dtype=np.int64),
+        "t": np.zeros(8, dtype=np.int64), "c": np.zeros(8, dtype=np.int64),
+        "z": np.zeros(8), "y": np.arange(8, dtype=float), "x": np.arange(8, dtype=float),
+    }, layer="dots")
+    mask = (img % 5 == 0)
+    focus = np.arange(8 * 3 * 2, dtype=float).reshape(8, 3, 2)
+    src = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+           .with_layer(Domain.VOXEL, "mask", mask)
+           .with_layer(Domain.PLANE, "focus", focus).with_structure(pts))
+    define_node("io.groupseed", "S", outputs=[OutDataset()])
+
+    def eng(group, seed=None, meta=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.groupseed"))
+        g.add(NodeInstance("K", "util.select_group", params={"group": group}))
+        g.connect("S", "K")
+        return Engine(g, computes=COMPUTES, seeds={"S": seed if seed is not None else src},
+                      meta_seeds={"S": MetaEnvelope(axes=(seed.axes if seed is not None
+                                                          else ax),
+                                                    metadata=dict(meta or md))})
+
+    # THE gate: the header's prediction equals the payload, for every selection
+    for sel, want in (("G1", 4), ("G2", 4), ("1", 4), ("G1,G2", 8), ("", 8)):
+        e = eng(sel)
+        out, env = e.pull("K"), e.env("K")
+        assert out.axes.m == env.axes.m == want, (sel, out.axes.m, env.axes.m, want)
+        assert (out.axes.t, out.axes.z, out.axes.c) == (3, 2, 1), (sel, out.axes)
+
+    e = eng("G2")
+    out, env = e.pull("K"), e.env("K")
+    assert out.metadata["origin_um"] == env.metadata["origin_um"] == origin[4:]
+    assert out.metadata["stage_xy_um"] == md["stage_xy_um"][4:]
+    assert out.metadata["frame_time_jd"] == md["frame_time_jd"], "T is not touched"
+    assert out.metadata["dt_s"] == 2.0 and out.metadata["z_step_um"] == 0.4, \
+        "nothing is re-spaced: only positions were dropped"
+    assert np.array_equal(out.image.read_region(0, 0, 0, 0, 0, 0, 8, 0, 8), img[4, 0, 0, 0])
+    assert np.array_equal(out.image.read_region(0, 3, 2, 1, 0, 0, 8, 0, 8), img[7, 2, 1, 0])
+    assert np.array_equal(out.get(Domain.VOXEL, "mask").values, mask[4:]), \
+        "a lattice layer is SUBSET, not dropped for no longer fitting"
+    assert np.array_equal(out.get(Domain.PLANE, "focus").values, focus[4:])
+    rows = {n: out.get(Domain.POINT, n, "dots").values.tolist() for n in ("id", "m")}
+    assert rows == {"id": [5, 6, 7, 8], "m": [0, 1, 2, 3]}, \
+        f"rows on dropped positions go and the survivors are renumbered: {rows}"
+    assert out.metadata.get(SAMPLING_KEY) == ("m:select_group[4-7]",), \
+        out.metadata.get(SAMPLING_KEY)
+    # selecting a group leaves every survivor carrying that one key, so a second Select
+    # Group downstream is a no-op rather than a puzzle
+    assert position_group_plan(out.metadata, out.axes).placed
+
+    # an unconfigured node is a TRUE no-op, and so is asking for everything
+    assert eng("").pull("K") is src, "an empty selection must not even wrap the input"
+    assert eng("G1,G2").pull("K") is src, "selecting every position changes nothing"
+
+    # every selection keys the memo apart
+    hashes = [eng(sel).entry("K").recipe_hash for sel in ("G1", "G2", "G1,G2")]
+    assert len(set(hashes)) == 3, hashes
+
+    # the two refusals name different fixes, because the fixes ARE different
+    try:
+        eng("G9").pull("K")
+    except ValueError as exc:
+        assert "matches no position group" in str(exc) and "G1" in str(exc), exc
+    else:
+        raise AssertionError("a group that does not exist must be refused")
+    bare = AxisSizes(m=4, t=1, z=1, c=1, y=4, x=4)
+    bmd = {"pixel_size_um": 0.5}
+    bsrc = Dataset(axes=bare, metadata=bmd).with_image(
+        ArrayProvider(np.zeros((4, 1, 1, 1, 4, 4), np.uint16)))
+    be = eng("G1", seed=bsrc, meta=bmd)
+    assert be.env("K").axes.m == 4, \
+        "the advisory transform HOLDS when the fields cannot be placed \u2014 it does not mark " \
+        "m unknown, which would blank every prediction downstream while the user types"
+    try:
+        be.pull("K")
+    except ValueError as exc:
+        assert "no usable field geometry" in str(exc), exc
+    else:
+        raise AssertionError("ungroupable data must be refused, not guessed at")
+
+    # the transform is TOTAL: it runs on every keystroke and may never raise
+    for junk in ("", None, "G", "G1", "g", "9", "G1,", ",,", "treated"):
+        assert _meta_select_group(MetaEnvelope(axes=ax, metadata=md),
+                                  {"group": junk}, {}) is not None
+
+    # \u2500\u2500 the sidecar \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    import json
+    import os
+    import tempfile
+    from nodelab_v2.position_groups import (group_metadata, names_agree, read_sidecar,
+                                            resolve_plan, sidecar_path, write_sidecar)
+    with tempfile.TemporaryDirectory() as tmp:
+        f = os.path.join(tmp, "fake.nd2")
+        open(f, "wb").close()
+        got, note = resolve_plan(f, md, ax)
+        assert len(got) == 2 and "detected" in note, note
+        write_sidecar(f, got, detected=True)
+        got, note = resolve_plan(f, md, ax)
+        assert len(got) == 2 and "read from" in note, note
+
+        # a HAND EDIT wins over the geometry \u2014 merge, rename, and it sticks
+        doc = json.load(open(sidecar_path(f), encoding="utf-8"))
+        doc["groups"] = [{"key": "treated", "members": [0, 1, 2, 3, 4]},
+                         {"key": "control", "members": [5, 6, 7]}]
+        with open(sidecar_path(f), "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        got, _ = resolve_plan(f, md, ax)
+        assert [(g.key, g.members) for g in got.groups] == [
+            ("treated", (0, 1, 2, 3, 4)), ("control", (5, 6, 7))], got.groups
+        edited = dict(md, **group_metadata(got))
+        assert group_picks(edited, ax, "control") == (5, 6, 7)
+        assert eng("control", meta=edited).env("K").axes.m == 3
+
+        # anything that is not a PARTITION of the positions is rejected whole
+        for bad in ([{"key": "A", "members": [0, 1, 2]}],                    # incomplete
+                    [{"key": "A", "members": list(range(8))},
+                     {"key": "B", "members": [0]}],                          # overlapping
+                    [{"key": "A", "members": list(range(9))}],               # out of range
+                    [{"key": "A", "members": []}]):                          # empty
+            doc["groups"] = bad
+            with open(sidecar_path(f), "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            plan_b, why = read_sidecar(f, 8)
+            assert plan_b is None and why, bad
+            assert len(resolve_plan(f, md, ax)[0]) == 2, "and detection runs instead"
+
+    # the acquisition's own point names are an independent witness, not a tie-breaker
+    assert names_agree(plan, ["#1", "#2", "#3", "#4"] * 2) is True
+    assert names_agree(plan, ["p%d" % i for i in range(8)]) is None, \
+        "all-unique names say nothing about grouping and must not vote"
+    assert names_agree(plan, ["#1", "#1", "#2", "#3", "#1", "#2", "#3", "#4"]) is False
+    assert names_agree(plan, None) is None
+
+    # \u2500\u2500 the SOURCE CARD's per-group outputs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # The chK pattern applied to M: the card grows one output per specimen and wiring from
+    # one materializes a real `util.select_group` tap at graph-build. Tested through the
+    # DOCUMENT rather than by calling the helpers, because the thing that can break is the
+    # agreement between what the card offers and what the run graph does with it.
+    from nodelab_v2.document import GraphDocument, GROUPING_MODE, GROUPS_KEY
+    from nodelab_v2.ops import ensure_ops, headless_engine, materialize_group_taps
+    from nodelab_v2.tables import POSITION_GROUP_COLUMN, all_tables
+
+    ensure_ops()
+    descs = [{"key": "G1", "size": 4, "shape": "2x2 serpentine"},
+             {"key": "G2", "size": 4, "shape": "2x2 serpentine"}]
+    doc = GraphDocument()
+    # Grouping is OFF by default, so a card that has not opted in offers only `image` —
+    # asserted first, because "the lever does nothing" is the failure this guards.
+    plain = doc.add_node("io.load", x=0, y=-200,
+                         params={"path": "fake.nd2", GROUPS_KEY: descs})
+    assert [o.name for o in doc.output_specs(plain.id)] == ["image"], \
+        "a source card must not grow group outputs until asked"
+    card = doc.add_node("io.load", x=0, y=0,
+                        params={"path": "fake.nd2", GROUPS_KEY: descs},
+                        modes={GROUPING_MODE: "auto"})
+    doc.set_meta_seed(card.id, MetaEnvelope(axes=ax, metadata=md))
+    # `none` is Z-Project's documented pass-through, so each branch hands the tap's own
+    # pixels straight out — which is what lets the assertions below compare them to the
+    # source array rather than to a projection of it.
+    PASS = {"method": "none"}
+    b1 = doc.add_node("util.zproject", x=300, y=0, modes=dict(PASS))
+    b2 = doc.add_node("util.zproject", x=300, y=200, modes=dict(PASS))
+
+    socks = [o.name for o in doc.output_specs(card.id)]
+    assert socks == ["image", "grp0", "grp1"], socks
+    labels = {o.name: o.label for o in doc.output_specs(card.id)}
+    assert labels["grp1"].startswith("G2 \u00b7 4 pos"), labels
+    # the lever is the whole control: it EMPTIES the descriptor list rather than being
+    # re-tested at each call site, so nothing can offer a socket it disagrees with
+    doc.nodes[card.id].modes[GROUPING_MODE] = "off"
+    assert [o.name for o in doc.output_specs(card.id)] == ["image"]
+    doc.nodes[card.id].modes[GROUPING_MODE] = "auto"
+
+    doc.connect(card.id, "grp0", b1.id, "data")
+    doc.connect(card.id, "grp1", b2.id, "data")
+    run = doc.to_graph(for_run=True)
+    taps = {n.params.get("group")
+            for nid, n in materialize_group_taps(run).nodes.items()
+            if nid.startswith("__tap__")}
+    assert taps == {"G1", "G2"}, \
+        f"a tap carries the group KEY, never its index (a re-detect must not repoint): {taps}"
+
+    eng = headless_engine(run, seeds={card.id: src},
+                          meta_seeds={card.id: MetaEnvelope(axes=ax, metadata=md)})
+    for nid, first_m in ((b1.id, 0), (b2.id, 4)):
+        got = eng.pull(nid)
+        assert got.axes.m == 4, (nid, got.axes)
+        assert np.array_equal(got.image.read_region(0, 0, 0, 0, 0, 0, 8, 0, 8),
+                              img[first_m, 0, 0, 0]), nid
+
+    # several branches off ONE group share a single tap \u2014 so they share a memo entry
+    # instead of each recomputing the identical subset
+    b3 = doc.add_node("util.zproject", x=300, y=400, modes=dict(PASS))
+    doc.connect(card.id, "grp0", b3.id, "data")
+    shared = materialize_group_taps(doc.to_graph(for_run=True))
+    assert len([n for n in shared.nodes if n.startswith("__tap__")]) == 2
+
+    # a socket whose group no longer resolves is LEFT ALONE, never silently repointed
+    doc.nodes[card.id].params[GROUPS_KEY] = [descs[0]]
+    left = materialize_group_taps(doc.to_graph(for_run=True))
+    assert any(e.src_socket == "grp1" for e in left.edges), \
+        "an unresolvable grpK edge must survive to be reported, not be rewired"
+
+    # \u2500\u2500 the group reaches the SPREADSHEET \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    tagged = Dataset(axes=ax, metadata=dict(md, position_group=["G1"] * 4 + ["G2"] * 4))
+    tagged = tagged.with_image(ArrayProvider(img)).with_structure(pts)
+    cols = all_tables(tagged)[(Domain.POINT.value, "dots")]
+    assert list(cols[POSITION_GROUP_COLUMN]) == ["G1"] * 4 + ["G2"] * 4, \
+        "every row names the specimen its position belongs to"
+    # a list that does not cover the rows says NOTHING rather than mislabelling them \u2014
+    # a specimen name beside a measurement is exactly what a reader trusts unchecked
+    short = Dataset(axes=ax, metadata=dict(md, position_group=["G1", "G1"]))
+    short = short.with_image(ArrayProvider(img)).with_structure(pts)
+    assert POSITION_GROUP_COLUMN not in all_tables(short)[(Domain.POINT.value, "dots")]
+
+    _ok("position groups (detect 2x2 mosaics, sidecar overrides, util.select_group "
+        "header == payload, per-M metadata + rows follow; the source card grows one "
+        "output per specimen and materializes select_group taps by KEY; the group "
+        "reaches the spreadsheet)")
 
 
 def _mode_states(spec):
@@ -15357,6 +16812,37 @@ def test_overlay_placement() -> None:
     off_end = plan_placement(pri_md, pri_ax, sec_md, sec_ax, t_shift=2)
     assert any("no secondary frame" in w for w in off_end.warnings), off_end.warnings
 
+    # ── a STILL secondary is HELD across T, not unpaired after frame 0 ────────────
+    #
+    # Reported 2026-09-14: "overlay only appears on the first frame". Index pairing sent
+    # every t>0 of a single-frame secondary to None, `paired_t` returned None, and the
+    # compositor skipped the source — so a reference snapshot over a timelapse drew once
+    # and vanished. This is the T twin of `secondary_z_index`'s single-plane rule, which
+    # keeps a 2D context view visible while you scroll a 210-slice stack.
+    still_md = dict(sec_md, frame_time_jd=[sec_md["frame_time_jd"][0]])
+    still_ax = AxisSizes(m=49, t=1, z=1, c=1, y=1024, x=1024)
+    held = pair_timepoints(pri_md, 16, still_md, 1)
+    assert [j for _, j, _ in held] == [0] * 16, held
+    # the readout still says how far the primary has travelled from the still
+    assert abs(held[0][2] - 2414.6) < 2.0, held[0]
+    assert abs(held[15][2] - (2414.6 - 15 * 1421.9)) < 5.0, held[15]
+    # a still ignores t_shift rather than being shifted off its only frame
+    assert [j for _, j, _ in pair_timepoints(pri_md, 16, still_md, 1, shift=5)] == [0] * 16
+    # a SHORT secondary is NOT broadcast — three frames is a genuine mismatch
+    short = pair_timepoints(pri_md, 16, sec_md, 3)
+    assert [j for _, j, _ in short][:4] == [0, 1, 2, None], short[:4]
+    # ...and a secondary with no timepoints at all stays unpaired
+    assert all(j is None for _, j, _ in pair_timepoints(pri_md, 4, sec_md, 0))
+    # the plan says the still is held, so a frozen-looking overlay is not a mystery
+    still_plan = plan_placement(pri_md, pri_ax, still_md, still_ax)
+    assert still_plan.ok, still_plan.refusals
+    assert any("HELD across all 16" in w for w in still_plan.warnings), still_plan.warnings
+    assert not any("no secondary frame" in w for w in still_plan.warnings), still_plan.warnings
+    shift_plan = plan_placement(pri_md, pri_ax, still_md, still_ax, t_shift=3)
+    assert any("t_shift=3 is inapplicable" in w for w in shift_plan.warnings), shift_plan.warnings
+    # a 16-frame pair must NOT pick the note up
+    assert not any("HELD across" in w for w in plan.warnings), plan.warnings
+
     # ── Z: the stack anchoring is what places a plane inside a stack ──────────────
     box0 = field_box(pri_md, pri_ax, 0)
     assert abs(box0.z0 - 5971.96) < 1e-6 and abs(box0.z1 - (5971.96 + 209 * 0.288)) < 1e-6
@@ -15594,7 +17080,13 @@ def test_overlay_placement() -> None:
         "and the two `reference` sockets (a second version of the SAME pixels) composite "
         "nothing; and the entry is SYNTHESIZED — placed field-for-field at scale 1 with no "
         "stage log and no mirror default, because the node already proved the two branches "
-        "address the same voxels")
+        "address the same voxels. A SINGLE-timepoint secondary is HELD across every primary "
+        "frame rather than pairing with frame 0 and leaving the rest unpaired (reported "
+        "2026-09-14 as \"overlay only appears on the first frame\") — the T twin of the "
+        "single-plane rule that keeps a 2D context view up while you scroll a 210-slice "
+        "stack; t_shift goes inert, the plan SAYS the still is held so a legitimately "
+        "motionless overlay is not mistaken for a broken one, and a secondary with several "
+        "but too few timepoints is still honestly unpaired past its end")
 
 
 def test_overlay_renderers() -> None:
@@ -15887,12 +17379,15 @@ def test_overlay_override_and_presentation() -> None:
     for look in ("opacity", "wipe_pos", "flicker_hz"):
         assert rh(**{look: 0.77})[0] == base, f"{look} must not re-key the memo"
         assert look not in entry0, f"{look} must not reach the payload"
+    # the per-source LABEL (2026-09-30) is presentation too: renaming a source repaints
+    assert rh(label="GFP 20x")[0] == base, "label must not re-key the memo"
+    assert "label" not in entry0
     assert rh(t_shift=1)[0] != base, "a DATA param must still re-key"
     assert rh(offset_x=3.0)[0] != base
     # the flag is declared where the GUI and the engine both read it
     spec = NODES.get("view.overlay")
     assert {i.name for i in spec.inputs if i.presentation} == {
-        "opacity", "wipe_pos", "flicker_hz"}
+        "opacity", "wipe_pos", "flicker_hz", "label"}
 
     _ok("overlay override + presentation (V2.19): `align_by_index` lets a user place two "
         "files the FILES cannot prove line up — a TIFF, a cropped source — and stays loud "
@@ -15903,6 +17398,290 @@ def test_overlay_override_and_presentation() -> None:
         "flicker_hz are memo-NEUTRAL (proved against a shared memo, so upstream revisions "
         "hold still) and absent from the payload, which together are what let the GUI "
         "restyle without re-running a resample bake")
+
+
+def test_overlay_experiment() -> None:
+    """The experiment overlay (2026-09-30): rates, pins, Z interpolation, centre placement.
+
+    Four things a real multi-file experiment needs that "one secondary file" did not:
+
+    * a source recorded at n× the primary's frame rate has to advance n frames per primary
+      frame (``t_pairing=rate``), and Play all has to be told to split each primary frame
+      into n sub-ticks — without a 0.3% loop drift turning into a split;
+    * the user must be able to PIN "these frames go together", as JSON that is canonical
+      (INV-12) and refused when malformed or when it runs backwards — and a clock-anchored
+      pin must survive an upstream crop re-numbering the frames;
+    * ``z_sampling=linear`` must blend the two bracketing planes in the bake exactly as the
+      compositor does, while ``nearest`` stays bit-identical to the old slice choice;
+    * files whose fields do not overlap must be placeable centre-on-centre at true size,
+      and a two-click nudge must be flip-independent (and µm must mean µm under an index
+      placement, where it used to move the secondary whole fields)."""
+    from nodegraph.nodes import COMPUTES, OVERLAY_KEY
+    from nodegraph.placement import (
+        compose_secondary_plane, nudge_delta_um, paired_t_frac, parse_pins, pins_json,
+        plan_placement, plan_time, secondary_z_index, secondary_z_weights, snap_rate)
+    from nodegraph.catalog._shared.placement_entry import overlay_settings
+    from nodegraph.provider import ArrayProvider
+
+    # ── rates ─────────────────────────────────────────────────────────────────────
+    assert snap_rate(1421.9 / 1417.8) == 1.0, "the WellA3 loop drift is the SAME rate"
+    assert snap_rate(4.05) == 4.0 and snap_rate(0.251) == 0.25 and snap_rate(2.5) == 2.5
+    fast = plan_time({"dt_s": 20.0}, 5, {"dt_s": 5.0}, 20, pairing="rate")
+    assert fast["sub_ticks"] == 4 and not fast["refusals"]
+    assert [j for _t, j, _e in fast["t_pairs"]] == [0, 4, 8, 12, 16]
+    ent = {"t_pairs": [list(r) for r in fast["t_pairs"]], "t_map": fast["t_map"]}
+    assert [paired_t_frac(ent, 1, k, 4) for k in range(4)] == [4, 5, 6, 7]
+    # a slower source HOLDS: every sub-tick of a same-rate source stays on its paired frame
+    same = {"t_pairs": [[t, t, None] for t in range(5)],
+            "t_map": {"knots": [[0.0, 0.0]], "rate": 1.0, "n_src": 5}}
+    assert [paired_t_frac(same, 2, k, 4) for k in range(4)] == [2, 2, 2, 2]
+    # a recipe with no t_map (every pre-existing one) is plain `paired_t` on every sub-tick
+    assert [paired_t_frac({"t_pairs": [[0, 3, None]]}, 0, k, 4) for k in range(4)] == [3] * 4
+    slow = plan_time({"dt_s": 5.0}, 8, {"dt_s": 20.0}, 2, pairing="rate")
+    assert [j for _t, j, _e in slow["t_pairs"]] == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert slow["sub_ticks"] == 1
+    no_clock = plan_time({}, 4, {}, 4, pairing="rate")
+    assert no_clock["refusals"] and "frame interval" in no_clock["refusals"][0]
+    assert not plan_time({}, 4, {}, 16, pairing="rate", rate=4.0)["refusals"]
+    # index pairing with no pins is the historical pairing, and stamps no t_map
+    plain = plan_time({}, 3, {}, 5, shift=1)
+    assert plain["t_map"] is None and [j for _t, j, _e in plain["t_pairs"]] == [1, 2, 3]
+
+    # ── pins ──────────────────────────────────────────────────────────────────────
+    rows = parse_pins("[[10, 40], [0, 0], [3, 7], [3, 8]]", axis="t")
+    assert [r[:2] for r in rows] == [(0, 0), (3, 8), (10, 40)], "sorted, later row wins"
+    assert pins_json(rows) == "[[0,0],[3,8],[10,40]]"
+    assert pins_json(parse_pins(pins_json(rows), axis="t")) == pins_json(rows), "canonical"
+    assert parse_pins("", axis="t") == () and pins_json(()) == ""
+    for bad in ("[[1,", '{"a": 1}', "[[1]]", "[[1.5, 2]]", "[[-1, 2]]"):
+        try:
+            parse_pins(bad, axis="t")
+            raise AssertionError(f"{bad!r} must be refused")
+        except ValueError as exc:
+            assert "t_pins" in str(exc), exc
+    pinned = plan_time({}, 12, {}, 48, pins=rows)
+    got = [j for _t, j, _e in pinned["t_pairs"]]
+    assert got[0] == 0 and got[3] == 8 and got[10] == 40, got
+    assert pinned["sub_ticks"] >= 4, pinned["sub_ticks"]        # 32 frames over 7 = 4.6x
+    crossed = plan_time({}, 12, {}, 48, pins=parse_pins("[[0, 5], [3, 2]]", axis="t"))
+    assert crossed["refusals"] and "cross" in crossed["refusals"][0]
+
+    # a CLOCK-anchored pin re-finds its moment after the primary lost its first 2 frames
+    day = 1.0 / 86400.0
+    dst_jd = [100.0 + 10 * k * day for k in range(2, 10)]      # frames 2..9 survive
+    src_jd = [100.0 + 10 * k * day for k in range(10)]
+    anchored = parse_pins(f"[[6, 6, {100.0 + 60 * day!r}, {100.0 + 60 * day!r}]]", axis="t")
+    re_found = plan_time({"frame_time_jd": dst_jd}, 8, {"frame_time_jd": src_jd}, 10,
+                         pins=anchored)
+    assert [j for _t, j, _e in re_found["t_pairs"]][4] == 6, re_found["t_pairs"]
+
+    # ── Z weights ─────────────────────────────────────────────────────────────────
+    zax = AxisSizes(m=1, t=1, z=5, c=1, y=4, x=4)
+    zmd = {"stage_z_um": [100.0], "z_home_index": 0, "z_step_um": 2.0}
+    for z in (98.0, 100.0, 101.0, 102.9, 103.0, 107.0, 120.0, None):
+        near = secondary_z_weights(zmd, zax, 0, z)
+        assert len(near) == 1 and near[0][0] == secondary_z_index(zmd, zax, 0, z), z
+    assert secondary_z_weights(zmd, zax, 0, 101.0, linear=True) == [(0, 0.5), (1, 0.5)]
+    assert secondary_z_weights(zmd, zax, 0, 120.0, linear=True) == [(4, 1.0)], "clamped"
+    # one µm pin = an offset; the pinned primary focus lands on the pinned secondary plane
+    zp = parse_pins("[[3, 1, 55.0, 102.0]]", axis="z")
+    assert secondary_z_weights(zmd, zax, 0, 55.0, z_pins=zp) == [(1, 1.0)]
+    assert secondary_z_weights(zmd, zax, 0, 57.0, z_pins=zp) == [(2, 1.0)]
+    # index pins when the primary has no focus log
+    zi = parse_pins("[[0, 4]]", axis="z")
+    assert secondary_z_weights(zmd, zax, 0, None, z_pins=zi, pri_k=0) == [(4, 1.0)]
+
+    # ── the linear bake equals the blended display compose ───────────────────────
+    pmd = {"pixel_size_um": 1.0, "stage_xy_um": [(4.0, 4.0)], "stage_z_um": [101.0],
+           "z_home_index": 0, "z_step_um": 1.0, "channel_names": ["P"]}
+    pax = AxisSizes(m=1, t=1, z=3, c=1, y=8, x=8)
+    smd = {"pixel_size_um": 1.0, "stage_xy_um": [(4.0, 4.0)], "stage_z_um": [100.0],
+           "z_home_index": 0, "z_step_um": 2.0, "channel_names": ["S"]}
+    sax = AxisSizes(m=1, t=1, z=3, c=1, y=8, x=8)
+    svol = np.stack([np.full((8, 8), 10.0 * (k + 1), np.float32) for k in range(3)])
+    pri = Dataset(axes=pax, metadata=pmd).with_image(
+        ArrayProvider(np.zeros((1, 1, 3, 1, 8, 8), np.uint16)))
+    sec = Dataset(axes=sax, metadata=smd).with_image(
+        ArrayProvider(svol.reshape(1, 1, 3, 1, 8, 8).astype(np.uint16)))
+
+    def pull(**kw):
+        g = Graph()
+        g.add(NodeInstance("A", "io.load")); g.add(NodeInstance("B", "io.load"))
+        g.add(NodeInstance("O", "view.overlay", modes=kw.pop("modes", {}), params=kw))
+        g.connect("A", "O"); g.connect("B", "O", dst_socket="secondary")
+        eng = Engine(g, computes=COMPUTES, seeds={"A": pri, "B": sec},
+                     meta_seeds={"A": MetaEnvelope(axes=pax, metadata=dict(pmd))})
+        return eng, eng.pull("O")
+
+    _e, near = pull(flip_x=False, modes={"output": "resample"})
+    _e, lin = pull(flip_x=False, modes={"output": "resample", "z_sampling": "linear"})
+    # primary planes at 101/102/103 µm; secondary planes at 100/102/104 µm = 10/20/30
+    assert [float(lin.image.get_region(0, 0, 0, z, 1, 0, 8, 0, 8).mean()) for z in range(3)] \
+        == [15.0, 20.0, 25.0]
+    near_v = [float(near.image.get_region(0, 0, 0, z, 1, 0, 8, 0, 8).mean()) for z in range(3)]
+    assert near_v == [10.0, 20.0, 30.0], near_v    # midpoints 0.5 -> 0 and 1.5 -> 2 (banker's)
+    ent_lin = lin.metadata[OVERLAY_KEY][-1]
+    assert ent_lin["z_sampling"] == "linear"
+    assert "z_sampling" not in near.metadata[OVERLAY_KEY][-1], "defaults stamp nothing new"
+    # recipe hashes: the new modes/params re-key, the defaults stay one key
+    e1, _ = pull(); e2, _ = pull(t_pins="[[0,0]]"); e3, _ = pull(modes={"z_sampling": "linear"})
+    assert len({e1.entry("O").recipe_hash, e2.entry("O").recipe_hash,
+                e3.entry("O").recipe_hash}) == 3
+    # malformed pins reach the node card as a clear refusal
+    try:
+        pull(t_pins="[[0, 0")
+        raise AssertionError("malformed t_pins must refuse")
+    except Exception as exc:              # noqa: BLE001 — the engine may wrap it
+        assert "t_pins" in str(exc), exc
+    # the edit-time pass never sees pins, so it stays total whatever they hold (INV-06)
+    _e, _o = pull(modes={"output": "display"})
+    assert _e.env("O").axes == pax
+
+    # ── the shared settings reader: both callers see the same thing ──────────────
+    class _Rec:                                             # the document's node record
+        params = {"t_pins": "[[3,7]]", "rate": 2.0, "offset_x": 1.5}
+    s = overlay_settings(_Rec(), {"t_pairing": "rate", "z_sampling": "linear"})
+    assert s["t_pins"] == ((3, 7, None, None),) and s["rate"] == 2.0
+    assert s["offset_um"] == (0.0, 0.0, 1.5) and s["z_sampling"] == "linear"
+
+    # ── centre placement: files whose fields never overlap ───────────────────────
+    a_md = {"pixel_size_um": 1.0, "stage_xy_um": [(0.0, 0.0)]}
+    b_md = {"pixel_size_um": 0.5, "stage_xy_um": [(5000.0, 5000.0)]}   # another well
+    ax8 = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    apart = plan_placement(a_md, ax8, b_md, ax8)
+    assert apart.ok and apart.coverage[0] == 0.0 and apart.placed_by == "stage"
+    centred = plan_placement(a_md, ax8, b_md, ax8, on_unplaceable="align_centres")
+    assert centred.ok and centred.placed_by == "centre" and centred.tiles == {0: [(0, 1.0)]}
+    assert abs(centred.coverage[0] - 0.25) < 1e-9, centred.coverage   # 4 µm inside 8 µm
+    assert "CENTRE-ON-CENTRE" in centred.describe(0)
+    assert any("NOT verified" in w for w in centred.warnings)
+    # ...stageless files take the same route, and stay loud about the override
+    bare = plan_placement({"pixel_size_um": 1.0}, ax8, {"pixel_size_um": 0.5}, ax8,
+                          on_unplaceable="align_centres")
+    assert bare.placed_by == "centre" and any(w.startswith("OVERRIDDEN") for w in bare.warnings)
+    # overlapping files are NOT re-centred by the mode — stage placement wins
+    near_md = {"pixel_size_um": 1.0, "stage_xy_um": [(2.0, 2.0)]}
+    assert plan_placement(a_md, ax8, near_md, ax8,
+                          on_unplaceable="align_centres").placed_by == "stage"
+    # the compositor draws a centred 4 µm secondary in the middle 4x4 of the 8x8 primary
+    c_ent = {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 0.0], "flip_x": False,
+             "flip_y": False, "placed_by": "centre", "t_pairs": [[0, 0, None]]}
+    drawn = compose_secondary_plane(c_ent, (8, 8), a_md, ax8, 0, b_md, ax8,
+                                    lambda j, _w=None: np.ones((8, 8)), fill=0.0)
+    assert drawn is not None and drawn[2:6, 2:6].min() == 1.0 and drawn.sum() == 16.0
+    # a µm nudge moves it by µm (1 µm = 1 primary px here)
+    moved = compose_secondary_plane({**c_ent, "offset_um": [0.0, 0.0, 1.0]}, (8, 8), a_md,
+                                    ax8, 0, b_md, ax8, lambda j, _w=None: np.ones((8, 8)))
+    assert moved[2:6, 3:7].min() == 1.0 and moved.sum() == 16.0
+
+    # ── the nudge: flip-independent, and µm mean µm under an INDEX placement ─────
+    assert nudge_delta_um({"pixel_size_um": 0.5}, ax8, (10.0, 4.0), (6.0, 8.0)) == (2.0, -2.0)
+    assert nudge_delta_um({}, ax8, (1, 1), (0, 0)) is None
+    stageless = {"pixel_size_um": 1.0}
+    i_ent = {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 2.0], "flip_x": True,
+             "flip_y": False, "placed_by": "index", "t_pairs": [[0, 0, None]]}
+    src = np.ones((8, 8))
+    shifted = compose_secondary_plane(i_ent, (8, 8), stageless, ax8, 0, stageless, ax8,
+                                      lambda j, _w=None: src, fill=0.0)
+    assert shifted is not None and shifted[:, :2].sum() == 0 and shifted[:, 2:].min() == 1.0, \
+        "a 2 µm nudge moves an index placement 2 px, not two whole fields"
+    # ...and the two-click Nudge PICK commits the current nudge PLUS that delta, as a bound
+    # (offset_y, offset_x) group declared on the node
+    from dataclasses import replace as _dc_replace
+    from nodelab_v2.picker import Calibration, PickSession, request_for
+    ospec = NODES.get("view.overlay")
+    assert ospec.input("offset_y").pick_kind == ospec.input("offset_x").pick_kind == "nudge_xy"
+    req = _dc_replace(request_for("O", ospec.input("offset_y")),
+                      base=(("offset_y", 1.0), ("offset_x", -2.0)))
+    assert req.bounds == ("offset_y", "offset_x") and req.surface == "canvas"
+    sess = PickSession(req, Calibration(um_px=0.5))
+    for x, y in ((10.0, 20.0), (14.0, 16.0)):          # primary feature, then as drawn
+        sess.press(x, y); sess.release(x, y)
+    assert sess.done and sess.values() == {"offset_y": 3.0, "offset_x": -4.0}, sess.values()
+
+    _ok("overlay experiment (2026-09-30): a 4x-faster source pairs 4 frames per primary frame "
+        "and asks Play all for 4 sub-ticks (4,5,6,7 inside frame 1) while the WellA3 1.003 "
+        "loop drift snaps to the same rate; a slower source holds; no clock refuses unless "
+        "the rate is stated; pins are canonical JSON (sorted, later-wins), malformed or "
+        "backwards pins refuse, and a clock-anchored pin re-finds its moment after a crop; "
+        "nearest Z is bit-identical to the old slice while linear blends and clamps, and µm/"
+        "index Z pins steer it; the linear bake equals the blended planes and the defaults "
+        "stamp nothing new; the shared settings reader serves both callers; non-overlapping "
+        "files place centre-on-centre at true size (and overlapping ones stay stage-placed); "
+        "the two-click nudge is flip-independent and µm mean µm under an index placement")
+
+
+def test_overlay_frozen_in_z() -> None:
+    """Two stacks that cannot overlap in Z must SAY so, with the nudge that fixes it.
+
+    Reported 2026-08-25 as "overlay is not updating in Z, only in T", and that pairing of
+    symptoms is the whole diagnosis: T is paired by INDEX so it tracks regardless, while Z
+    is paired by absolute µm — so when the two stacks do not intersect, every primary plane
+    resolves to the same clamped end plane of the secondary and Z looks dead. Nothing was
+    broken in the Z code; there was simply nothing to place against, and no way to tell.
+
+    Two objectives rarely focus at the same stage Z (the reporting pair: a 10× at 6231–6531
+    µm and a 20× at 7166–7266 µm, 934 µm apart) and no ND2 records the difference, so this
+    is a normal state rather than a corrupt one — which is exactly why it needs a message
+    instead of a refusal.
+
+    The suggested nudge must carry the right SIGN, and the sign flips with the wiring
+    because ``offset_z`` moves the SECONDARY. Getting that backwards pushes the stacks
+    further apart and looks identical to doing nothing, which is how the report arose.
+    """
+    from nodegraph.placement import plan_placement
+    import re
+
+    def md_for(z0, nz, step, ps=1.0):
+        return {"pixel_size_um": ps, "z_step_um": step, "stage_xy_um": [(8.0, 8.0)],
+                "stage_z_um": [z0], "z_home_index": 0, "z_bottom_to_top": True,
+                "origin_um": [[z0, 0.0, 0.0]]}
+
+    ax_a = AxisSizes(m=1, t=1, z=16, c=1, y=16, x=16)      # coarse, 6231..6531
+    ax_b = AxisSizes(m=1, t=1, z=349, c=1, y=16, x=16)     # fine,   7166..7266
+    a, b = md_for(6231.4, 16, 20.0), md_for(7165.8, 349, 0.288)
+
+    def warn_of(dst, dax, src, sax, dz):
+        p = plan_placement(dst, dax, src, sax, offset_um=(dz, 0.0, 0.0))
+        return p, [w for w in p.warnings if "do not overlap in Z" in w]
+
+    for label, (dst, dax, src, sax) in (("coarse primary", (a, ax_a, b, ax_b)),
+                                        ("fine primary", (b, ax_b, a, ax_a))):
+        plan, w = warn_of(dst, dax, src, sax, 0.0)
+        assert plan.ok, label                 # a normal state, NOT a refusal
+        assert w, f"{label}: no frozen-in-Z warning"
+        assert "will not move as you scroll Z" in w[0]
+        assert "still follows T" in w[0], "the T/Z asymmetry is the diagnosis — say it"
+        dz = float(re.search(r"Nudge Z to ([-+0-9.]+)", w[0]).group(1))
+        # the SIGN is the thing: it must move the secondary TOWARD the primary
+        expect_sign = 1.0 if label == "fine primary" else -1.0
+        assert dz * expect_sign > 0, (label, dz)
+        # applying the suggestion clears it, and the stacks then really do intersect
+        _p2, w2 = warn_of(dst, dax, src, sax, dz)
+        assert not w2, (label, "the suggested nudge did not fix it")
+        # ...and the WRONG sign does not, which is the mistake being guarded against
+        _p3, w3 = warn_of(dst, dax, src, sax, -dz)
+        assert w3, (label, "the wrong sign must still warn")
+
+    # overlapping stacks say nothing at all
+    c = md_for(6231.4, 16, 20.0)
+    _p, w = warn_of(a, ax_a, c, ax_a, 0.0)
+    assert not w, w
+    # ...and a secondary with no focus log is silent here rather than guessing
+    flat = {"pixel_size_um": 1.0, "stage_xy_um": [(8.0, 8.0)],
+            "origin_um": [[0.0, 0.0, 0.0]]}
+    _p, w = warn_of(a, ax_a, flat, AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16), 0.0)
+    assert not w, w
+
+    _ok("overlay frozen in Z (V2.19, reported 2026-08-25): two stacks that cannot overlap "
+        "axially — a 10x at 6231-6531 µm and a 20x at 7166-7266 µm, which is normal, since "
+        "no ND2 records objective parfocality — now SAY so instead of silently clamping the "
+        "secondary to an end plane; the message names the T/Z asymmetry that IS the "
+        "diagnosis (T pairs by index so it tracks regardless, Z pairs by absolute µm so it "
+        "freezes) and carries the exact Nudge Z that fixes it, with the sign taken from "
+        "primary-centre minus secondary-centre so it flips with the wiring the way "
+        "offset_z itself does; applying the suggestion clears the warning, the WRONG sign "
+        "still warns, and overlapping stacks or a secondary with no focus log say nothing")
 
 
 def test_overlay_after_geometry_change() -> None:
@@ -16052,9 +17831,11 @@ def test_overlay_after_geometry_change() -> None:
         "original fields covered; an unresolvable re-plan keeps the stamped record")
 
 
-def test_channel_merge() -> None:
-    """``channel.merge`` must put two files on ONE channel axis by metadata — lazily, with each
-    channel keeping its own Z planes.
+def test_util_merge() -> None:
+    """``util.merge`` (retired ``channel.merge``'s successor) must put two files on ONE channel
+    axis by metadata — lazily, with each channel keeping its own Z planes — under
+    ``merge_axis="C"``, and must lay inputs end to end with NO resampling under
+    ``merge_axis="T"/"M"/"Z"``, refusing whenever another axis or a physical scale disagrees.
 
     Asked for 2026-08-05: "no need of an overlay, but instead a true metadata/image overlay …
     each channel can go through their individual Z frames since they are overlaid based on
@@ -16104,8 +17885,8 @@ def test_channel_merge() -> None:
 
     g = Graph()
     g.add(NodeInstance("A", "io.load")); g.add(NodeInstance("B", "io.load"))
-    g.add(NodeInstance("M", "channel.merge"))
-    g.connect("A", "M"); g.connect("B", "M", dst_socket="secondary")
+    g.add(NodeInstance("M", "util.merge"))
+    g.connect("A", "M"); g.connect("B", "M")
     eng = Engine(g, computes=COMPUTES, seeds={"A": pri, "B": sec},
                  meta_seeds={"A": MetaEnvelope(axes=p_ax, metadata=dict(p_md))})
     out = eng.pull("M")
@@ -16173,8 +17954,8 @@ def test_channel_merge() -> None:
     # ── Z grid = primary keeps this input's own planes, and says what it drops ───
     g2 = Graph()
     g2.add(NodeInstance("A", "io.load")); g2.add(NodeInstance("B", "io.load"))
-    g2.add(NodeInstance("M", "channel.merge", modes={"z_grid": "primary"}))
-    g2.connect("A", "M"); g2.connect("B", "M", dst_socket="secondary")
+    g2.add(NodeInstance("M", "util.merge", modes={"z_grid": "primary"}))
+    g2.connect("A", "M"); g2.connect("B", "M")
     eng2 = Engine(g2, computes=COMPUTES, seeds={"A": pri, "B": sec},
                   meta_seeds={"A": MetaEnvelope(axes=p_ax, metadata=dict(p_md))})
     kept = eng2.pull("M")
@@ -16261,13 +18042,13 @@ def test_channel_merge() -> None:
 
     # ── refusals ────────────────────────────────────────────────────────────────
     g3 = Graph()
-    g3.add(NodeInstance("A", "io.load")); g3.add(NodeInstance("M", "channel.merge"))
+    g3.add(NodeInstance("A", "io.load")); g3.add(NodeInstance("M", "util.merge"))
     g3.connect("A", "M")
     try:
         Engine(g3, computes=COMPUTES, seeds={"A": pri}).pull("M")
-        raise AssertionError("a merge with no secondary must refuse")
+        raise AssertionError("a merge with only one input must refuse")
     except ValueError as exc:
-        assert "secondary" in str(exc)
+        assert "at least two" in str(exc), str(exc)
     # two specimens focused 5 mm apart: the union would be thousands of planes of which almost
     # none carry both files, and every one of them would still READ
     far = dict(s_md); far["stage_z_um"] = [5000.0]; far["origin_um"] = [[5000.0, 0.0, 0.0]]
@@ -16278,7 +18059,187 @@ def test_channel_merge() -> None:
     _grid, warn, _r = merge_z_grid(bare, p_ax, bare, s_ax, {0: [(0, 1.0)]})
     assert any("paired by INDEX" in w for w in warn), warn
 
-    _ok("channel.merge (V2.23, asked 2026-08-05): two acquisitions on ONE channel axis, placed "
+    # ── a STILL secondary is HELD across the primary's T (reported 2026-09-14) ───
+    #
+    # The overlay report ("only appears on the first frame") is a `pair_timepoints` fault, so
+    # it lands here too: `ChannelMergeProvider` asks `paired_t` for the source frame and
+    # returns ZEROS when the answer is None. A snapshot merged into a timelapse therefore
+    # delivered its channels on t=0 and an empty channel on every later frame — a silent
+    # measurement of nothing, which is worse than the missing picture. A still has one frame
+    # and it is held; there is no neighbour to repeat and no wrong frame to hand over.
+    p_ax_t = AxisSizes(m=1, t=4, z=3, c=1, y=8, x=8)
+    p_vox_t = np.zeros((1, 4, 3, 1, 8, 8), np.uint16)
+    for ti in range(4):
+        for k in range(3):
+            p_vox_t[0, ti, k, 0] = 100 + 10 * ti + k
+    pri_t = Dataset(axes=p_ax_t, metadata={
+        **p_md, "frame_time_jd": [2461249.0 + i * (60.0 / 86400.0) for i in range(4)],
+    }).with_image(ArrayProvider(p_vox_t))
+    eng_t = Engine(g, computes=COMPUTES, seeds={"A": pri_t, "B": sec},
+                   meta_seeds={"A": MetaEnvelope(axes=p_ax_t, metadata=dict(p_md))})
+    out_t = eng_t.pull("M")
+    assert out_t.axes.t == 4 and out_t.axes.c == 3, out_t.axes
+    # plane 4 of the union grid (104 µm) is where the secondary's first plane sits, so both
+    # of its channels must read there — on EVERY primary frame, not just the first
+    for ti in range(4):
+        for c, want in ((1, 200.0), (2, 210.0)):
+            got = np.asarray(out_t.image.get_region(0, 0, ti, 4, c, 0, 8, 0, 8))
+            assert np.allclose(got, want), (ti, c, float(got.mean()), want)
+        # ...and the primary's own channel still advances with T, so this is not a frame
+        # stuck upstream masquerading as a held still
+        p0 = np.asarray(out_t.image.get_region(0, 0, ti, 0, 0, 0, 8, 0, 8))
+        assert np.allclose(p0, 100 + 10 * ti), (ti, float(p0.mean()))
+
+    # ── N-ARY (2026-09-15): a third input chains onto the running C-merge result ─
+    s2_md = {"pixel_size_um": 1.0, "bit_depth": 12,
+             "stage_xy_um": [(4.0, 4.0)], "stage_z_um": [105.0],
+             "origin_um": [[105.0, 0.0, 0.0]], "channel_names": ["Cy5"],
+             "frame_time_jd": [2461249.0]}
+    s2_ax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    sec2 = Dataset(axes=s2_ax, metadata=dict(s2_md)).with_image(
+        ArrayProvider(np.full((1, 1, 1, 1, 8, 8), 300, np.uint16)))
+    g4 = Graph()
+    g4.add(NodeInstance("A", "io.load")); g4.add(NodeInstance("B", "io.load"))
+    g4.add(NodeInstance("C2", "io.load")); g4.add(NodeInstance("M", "util.merge"))
+    g4.connect("A", "M"); g4.connect("B", "M"); g4.connect("C2", "M")
+    eng4 = Engine(g4, computes=COMPUTES, seeds={"A": pri, "B": sec, "C2": sec2},
+                  meta_seeds={"A": MetaEnvelope(axes=p_ax, metadata=dict(p_md))})
+    out4 = eng4.pull("M")
+    assert out4.axes.c == 4, out4.axes                    # DAPI + GFP + RFP + Cy5
+    note4 = out4.metadata["__merge__"]
+    assert note4["added_channels"] == 3, note4
+    assert "input 1" in note4["note"] and "input 2" in note4["note"], note4["note"]
+    got_cy5 = np.asarray(out4.image.get_region(0, 0, 0, 0, 3, 0, 8, 0, 8))
+    assert np.all(got_cy5 == 300), got_cy5[0, 0]           # the SECOND chained merge's data
+
+    # ── merge_axis="T"/"M"/"Z" (2026-09-15): literal concatenation, no resampling ─
+    #
+    # The before/after 3D-indentation SerialTrack use case this node was generalised for:
+    # two separately-ingested volumes becoming two frames of one series with NOTHING
+    # resampled, refusing outright the moment another axis or a physical scale disagrees.
+    from nodegraph.metadata import SOURCE_FILE_KEY
+    t_ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    before_md = {"pixel_size_um": 2.0, "bit_depth": 12, "frame_time_jd": [100.0]}
+    after_md = {"pixel_size_um": 2.0, "bit_depth": 12, "frame_time_jd": [200.0]}
+    before = Dataset(axes=t_ax, metadata=dict(before_md)).with_image(
+        ArrayProvider(np.full((1, 1, 1, 1, 4, 4), 10, np.uint16)))
+    after = Dataset(axes=t_ax, metadata=dict(after_md)).with_image(
+        ArrayProvider(np.full((1, 1, 1, 1, 4, 4), 20, np.uint16)))
+
+    gt = Graph()
+    gt.add(NodeInstance("A", "io.load")); gt.add(NodeInstance("B", "io.load"))
+    gt.add(NodeInstance("M", "util.merge", modes={"merge_axis": "T"}))
+    gt.connect("A", "M"); gt.connect("B", "M")
+    engt = Engine(gt, computes=COMPUTES, seeds={"A": before, "B": after},
+                  meta_seeds={"A": MetaEnvelope(axes=t_ax, metadata=dict(before_md))})
+    outt = engt.pull("M")
+    assert outt.axes.t == 2 and outt.axes.m == 1 and outt.axes.z == 1, outt.axes
+    got0 = np.asarray(outt.image.get_region(0, 0, 0, 0, 0, 0, 4, 0, 4))
+    got1 = np.asarray(outt.image.get_region(0, 0, 1, 0, 0, 0, 4, 0, 4))
+    assert np.all(got0 == 10) and np.all(got1 == 20), (got0[0, 0], got1[0, 0])
+    assert outt.metadata.get("frame_time_jd") == [100.0, 200.0], \
+        outt.metadata.get("frame_time_jd")
+    note_t = outt.metadata["__merge__"]["note"]
+    assert "input 0: t 0" in note_t and "input 1: t 1" in note_t, note_t
+    env_t = engt.env("M")
+    assert "t" in env_t.unknown_axes and "m" not in env_t.unknown_axes, env_t.unknown_axes
+
+    # mismatch on a non-merged axis refuses BY NAME, even though it is the same shape count
+    bad_y = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=5, x=4),
+                    metadata=dict(after_md)).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 5, 4), np.uint16)))
+    gt2 = Graph()
+    gt2.add(NodeInstance("A", "io.load")); gt2.add(NodeInstance("B", "io.load"))
+    gt2.add(NodeInstance("M", "util.merge", modes={"merge_axis": "T"}))
+    gt2.connect("A", "M"); gt2.connect("B", "M")
+    try:
+        Engine(gt2, computes=COMPUTES, seeds={"A": before, "B": bad_y}).pull("M")
+        raise AssertionError("mismatched y must refuse under merge_axis=T")
+    except ValueError as exc:
+        assert "Merge (T)" in str(exc) and "y" in str(exc), str(exc)
+
+    # mismatch on a physical scale refuses too, even though every axis COUNT agrees
+    bad_px = Dataset(axes=t_ax, metadata={**after_md, "pixel_size_um": 3.0}).with_image(
+        ArrayProvider(np.full((1, 1, 1, 1, 4, 4), 20, np.uint16)))
+    gt3 = Graph()
+    gt3.add(NodeInstance("A", "io.load")); gt3.add(NodeInstance("B", "io.load"))
+    gt3.add(NodeInstance("M", "util.merge", modes={"merge_axis": "T"}))
+    gt3.connect("A", "M"); gt3.connect("B", "M")
+    try:
+        Engine(gt3, computes=COMPUTES, seeds={"A": before, "B": bad_px}).pull("M")
+        raise AssertionError("mismatched pixel_size_um must refuse under merge_axis=T")
+    except ValueError as exc:
+        assert "pixel_size_um" in str(exc), str(exc)
+
+    # merge_axis="M": the same pair, concatenated onto M instead — source_file is stamped
+    gm = Graph()
+    gm.add(NodeInstance("A", "io.load")); gm.add(NodeInstance("B", "io.load"))
+    gm.add(NodeInstance("M", "util.merge", modes={"merge_axis": "M"}))
+    gm.connect("A", "M"); gm.connect("B", "M")
+    engm = Engine(gm, computes=COMPUTES, seeds={"A": before, "B": after},
+                  meta_seeds={"A": MetaEnvelope(axes=t_ax, metadata=dict(before_md))})
+    outm = engm.pull("M")
+    assert outm.axes.m == 2 and outm.axes.t == 1, outm.axes
+    got_m0 = np.asarray(outm.image.get_region(0, 0, 0, 0, 0, 0, 4, 0, 4))
+    got_m1 = np.asarray(outm.image.get_region(0, 1, 0, 0, 0, 0, 4, 0, 4))
+    assert np.all(got_m0 == 10) and np.all(got_m1 == 20), (got_m0[0, 0], got_m1[0, 0])
+    assert outm.metadata.get(SOURCE_FILE_KEY) == ["input0", "input1"], \
+        outm.metadata.get(SOURCE_FILE_KEY)
+
+    # the mode folds into the memo key: same wiring, different merge_axis, never collide
+    assert engt.entry("M").recipe_hash != engm.entry("M").recipe_hash
+
+    # merge_axis="Z": literal plane concatenation — NOT the focus-based reconciliation "C" does
+    z_ax = AxisSizes(m=1, t=1, z=2, c=1, y=4, x=4)
+    z1 = Dataset(axes=z_ax, metadata={"pixel_size_um": 2.0, "z_step_um": 1.0,
+                                      "bit_depth": 12}).with_image(
+        ArrayProvider(np.full((1, 1, 2, 1, 4, 4), 1, np.uint16)))
+    z2 = Dataset(axes=z_ax, metadata={"pixel_size_um": 2.0, "z_step_um": 1.0,
+                                      "bit_depth": 12}).with_image(
+        ArrayProvider(np.full((1, 1, 2, 1, 4, 4), 2, np.uint16)))
+    gz = Graph()
+    gz.add(NodeInstance("A", "io.load")); gz.add(NodeInstance("B", "io.load"))
+    gz.add(NodeInstance("M", "util.merge", modes={"merge_axis": "Z"}))
+    gz.connect("A", "M"); gz.connect("B", "M")
+    engz = Engine(gz, computes=COMPUTES, seeds={"A": z1, "B": z2},
+                  meta_seeds={"A": MetaEnvelope(axes=z_ax,
+                                                metadata=dict(z1.metadata))})
+    outz = engz.pull("M")
+    assert outz.axes.z == 4, outz.axes
+    gz_lo = np.asarray(outz.image.get_region(0, 0, 0, 0, 0, 0, 4, 0, 4))
+    gz_hi = np.asarray(outz.image.get_region(0, 0, 0, 2, 0, 0, 4, 0, 4))
+    assert np.all(gz_lo == 1) and np.all(gz_hi == 2), (gz_lo[0, 0], gz_hi[0, 0])
+
+    # disagreeing z_step_um refuses even though the Z PLANE COUNTS match — this schema has
+    # only one spacing, so two stacks at different steps cannot be laid end to end honestly
+    z2_bad = Dataset(axes=z_ax, metadata={"pixel_size_um": 2.0, "z_step_um": 3.0,
+                                          "bit_depth": 12}).with_image(
+        ArrayProvider(np.full((1, 1, 2, 1, 4, 4), 2, np.uint16)))
+    gz2 = Graph()
+    gz2.add(NodeInstance("A", "io.load")); gz2.add(NodeInstance("B", "io.load"))
+    gz2.add(NodeInstance("M", "util.merge", modes={"merge_axis": "Z"}))
+    gz2.connect("A", "M"); gz2.connect("B", "M")
+    try:
+        Engine(gz2, computes=COMPUTES, seeds={"A": z1, "B": z2_bad}).pull("M")
+        raise AssertionError("disagreeing z_step_um must refuse under merge_axis=Z")
+    except ValueError as exc:
+        assert "z_step_um" in str(exc), str(exc)
+
+    # a lone input still refuses under every axis choice, not just the default C
+    g5 = Graph()
+    g5.add(NodeInstance("A", "io.load"))
+    g5.add(NodeInstance("M", "util.merge", modes={"merge_axis": "T"}))
+    g5.connect("A", "M")
+    try:
+        Engine(g5, computes=COMPUTES, seeds={"A": before}).pull("M")
+        raise AssertionError("a merge with only one input must refuse under every axis")
+    except ValueError as exc:
+        assert "at least two" in str(exc), str(exc)
+
+    _ok("util.merge (2026-09-15, retires channel.merge): merge_axis=\"C\" is channel.merge's own "
+        "placement-based compositing, generalised from one secondary to N (a third input chains "
+        "onto the running result — 3-input C-merge sums channels correctly and the order note "
+        "names every input) — two acquisitions on ONE channel axis, placed "
         "by absolute stage position and focus — a real merged Dataset every downstream node can "
         "measure across, where `view.overlay` records a placement the Viewer composites and "
         "nothing else ever sees. LAZY through a two-source ChannelMergeProvider (a plane costs a "
@@ -16306,7 +18267,20 @@ def test_channel_merge() -> None:
         "coordinates and flipping it again mirrored the mosaic inside its own footprint, "
         "measured 784 µm (456 px) out in x on the WellA3 pair, which is what had the live graph "
         "carrying a hand-set flip_x=False; a GRID-layout stitch makes no stage claim and keeps "
-        "the camera flip")
+        "the camera flip. A SINGLE-timepoint secondary is HELD across the primary's whole T "
+        "rather than paired only with frame 0 (reported 2026-09-14 as \"overlay only appears on "
+        "the first frame\") — here a snapshot merged into a 4-frame timelapse reads 200/210 on "
+        "every frame instead of zeros after the first, while the primary's own channel still "
+        "advances, so the held still is not a frame stuck upstream. merge_axis=\"T\"/\"M\"/\"Z\" "
+        "are the new operation this node adds — literal concatenation via AxisConcatProvider, no "
+        "resampling: T/M lay two 1-frame/1-position Datasets end to end (values, frame_time_jd/ "
+        "source_file, and the order note all verified), refusing by NAME the moment a non-grown "
+        "axis (a planted mismatched Y) or a physical scale (pixel_size_um) disagrees even though "
+        "every axis COUNT still matches; Z refuses a disagreeing z_step_um even though the plane "
+        "counts match, since this schema has only one spacing; the meta_transform marks ONLY the "
+        "grown axis unknown (not also z, unlike \"C\"); merge_axis folds into the recipe hash so "
+        "T and M on the same wiring never collide; and a lone input refuses under every axis "
+        "choice, not just the default C")
 
 
 def test_display_resolution_policy() -> None:
@@ -16359,24 +18333,36 @@ def test_display_resolution_policy() -> None:
     #    prepare, so the per-frame cost is paid once — a computed frame is capped by
     #    AFFORDABILITY alone, exactly like a store's. The parameter is gone with the branch,
     #    so a revert cannot happen silently:
-    #  * the uploader packs planes into RGBA8, so a frame costs 4 bytes/px of VRAM plus two
-    #    transient CPU copies of the same size. `GL_MAX_TEXTURE_SIZE` (32768 here) would permit
-    #    a 4 GB texture, and the upload path has no `glGetError` — so overrunning VRAM does not
-    #    raise, it leaves the previous texture bound. That IS a frame with part of the picture
-    #    missing. This ceiling stays, and it is what still (correctly) declines a 13106²
-    #    canvas at the default TEXTURE_BYTES.
+    #  * the uploader is GL_R16 (2 bytes/px per shown channel; it packed RGBA8 at 4 until
+    #    2026-08-10). `GL_MAX_TEXTURE_SIZE` (32768 here) would permit a 4 GB texture, and the
+    #    upload path has no `glGetError` — so overrunning VRAM does not raise, it leaves the
+    #    previous texture bound. That IS a frame with part of the picture missing. This
+    #    ceiling stays — but it must charge the uploader's REAL texel cost: budgeting the
+    #    retired packing's 4 bytes/px refused a single-channel 13106² whole-well canvas that
+    #    actually costs 343 MB ("stitch is still pixelated", 2026-08-25). Two shown channels
+    #    of that canvas genuinely exceed the default and still decline.
     import inspect as _inspect
     assert "streaming" not in _inspect.signature(display_cap).parameters, \
         "cost-to-produce is no longer a display ceiling — a computed frame is shown at " \
         "native resolution whenever it is affordable, same as a baked one"
-    # the texture-BYTES ceiling counts every shown channel: 7168² is 205 MB of RGBA8 each
-    per_mb = 7168 * 7168 * 4
+    # the texture-BYTES ceiling counts every shown channel: 7168² is 103 MB of R16 each
+    per_mb = 7168 * 7168 * 2
     n_tex = max(1, TEXTURE_BYTES // per_mb)
     assert display_cap(big, texture_limit=32768, bytes_per_px=2, planes=int(n_tex)) == 7168
     assert display_cap(big, texture_limit=32768, bytes_per_px=2,
                        planes=int(n_tex) + 1) == MAX_DISPLAY_DIM, \
         "one channel too many must drop the whole frame to the pyramid rather than attempt " \
         "an upload that fails silently"
+    # …at the uploader's REAL cost. The 49-tile whole-well stitch (13106², one channel) is
+    # 343 MB of R16 — affordable at the default budget, and the frame the stale RGBA8
+    # accounting wrongly refused ("stitch is still pixelated", 2026-08-25). A second shown
+    # channel doubles it past the default and must still decline.
+    mosaic = AxisSizes(m=1, t=1, z=1, c=1, y=13106, x=13106)
+    assert display_cap(mosaic, texture_limit=32768, bytes_per_px=2) == 13106, \
+        "a single-channel 13106² mosaic costs 343 MB of R16 and must show NATIVE at the " \
+        "default TEXTURE_BYTES — charging the retired RGBA8 packing's 4 bytes/px refused it"
+    assert display_cap(mosaic, texture_limit=32768, bytes_per_px=2,
+                       planes=2) == MAX_DISPLAY_DIM
     # the RAM budget is the third ceiling and is checked against the narrowed size
     assert display_cap(big, texture_limit=32768, bytes_per_px=10 ** 6) == MAX_DISPLAY_DIM
 
@@ -16441,6 +18427,14 @@ def test_display_resolution_policy() -> None:
         r.frames_are_reads = lambda nid: EngineRunner.frames_are_reads(r, nid)
         r.preload_finished = SimpleNamespace(emit=lambda *a: None)
         r.preload_progress = SimpleNamespace(emit=lambda *a: None)
+        # `prefetch` asks which channels an overlay contributes so it can warm those too
+        # (they live ABOVE axes.c and used to be clamped away, which is why a playback with
+        # an overlay re-composed every frame). This fake has no overlay.
+        r.overlay_channels = lambda _nid: {}
+        # Play all (2026-09-30): no overlay here, so one sub-tick and no composed bytes
+        r._src_override, r._ovr_gen = {}, 0
+        r.overlay_sub_ticks = lambda _nid: 1
+        r._overlay_frame_bytes = lambda *a, **k: 0
         return r
 
     r = _fake_runner(prov.axes)
@@ -16562,8 +18556,8 @@ def test_display_resolution_policy() -> None:
         "budget that would let it evict its own head. V2.23c (reported 2026-08-05, \"it needs "
         "to update immediately … part of the stitch does not appear on some frames\"): fitting "
         "is not affording, and the first cut asked only whether it fit. Full resolution is "
-        "gated on TEXTURE BYTES, because the uploader packs to "
-        "RGBA8 at 4 bytes/px plus two transient copies and has no glGetError — so exceeding VRAM "
+        "gated on TEXTURE BYTES, charged at the uploader's real texel cost (RGBA8's 4 bytes/px "
+        "then; GL_R16's 2 since 2026-08-10), because a texture upload has no glGetError — so exceeding VRAM "
         "does not raise, it leaves the previous texture bound, which is exactly a frame with "
         "part of the picture missing. V2.23b's second gate — COST, which pinned every live "
         "(computed) mosaic to the pyramid because level 0 is 1.0 s a frame against level 1's "
@@ -16802,11 +18796,15 @@ def test_overlay_zoom_detail() -> None:
     # `_overlay_ctxs` is keyed per NODE (V2.28) for the same reason `_views` is: with two
     # Viewer panes a single slot held only the node pulled LAST, so the OTHER pane's
     # composed overlay channels silently dropped out of `_plane_addrs` on its next scrub.
-    fake = SimpleNamespace(_overlay_ctxs={"O": ctx}, _texture_limit=8192, _views={})
+    fake = SimpleNamespace(_overlay_ctxs={"O": ctx}, _texture_limit=8192, _views={},
+                           _src_override={}, _ovr_gen=0)
     fake._view_of = fake._views.get
     fake._payload_coords = lambda coords, pin: coords
     fake._clamp_coords = lambda coords, axes: EngineRunner._clamp_coords(fake, coords, axes)
     fake._compose_overlay = lambda *a, **k: EngineRunner._compose_overlay(fake, *a, **k)
+    # the Play-all sub-tick resolution (2026-09-30) the compositor now routes through
+    fake.overlay_sub_ticks = lambda nid: EngineRunner.overlay_sub_ticks(fake, nid)
+    fake._source_frame = lambda *a, **k: EngineRunner._source_frame(fake, *a, **k)
     fake.display_dim = lambda axes, **k: EngineRunner.display_dim(fake, axes, **k)
 
     # zoomed onto the top-left quarter, exactly one channel of primary shown plus the overlay
@@ -16911,6 +18909,119 @@ def test_overlay_zoom_detail() -> None:
         "comparators are computed in IMAGE "
         "space in a patch (CPU here, `u_rect` in the shader), so the divider stays on the "
         "feature you were judging instead of jumping to the middle of the zoom")
+
+
+def test_overlay_subtick_cache() -> None:
+    """Play all's sub-ticks through the runner's plane cache (2026-09-30).
+
+    A source recorded at 4x the primary's rate shows a DIFFERENT frame on each of four ticks
+    of one primary frame. The cache has to key those apart — or the first sub-tick's plane is
+    served for all four and the fast source plays at the primary's rate — while the PRIMARY's
+    plane, which is the same pixels on every sub-tick, must keep its old key so it is decoded
+    once, not four times. The prefetcher and the preload must warm every sub-tick, and the
+    preload must keep overlay channels at all: it used to clamp them into the primary's range,
+    so pressing Play never preloaded the overlay. The Viewer's ◀▶ stepper override is
+    display-only and keys apart, so it can never be served for the un-overridden frame."""
+    from collections import OrderedDict
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.runner import EngineRunner, PlaneCache, _HeldView, _key_sub, _plane_key
+    from types import SimpleNamespace
+
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=16, x=16)
+    sax = AxisSizes(m=1, t=8, z=1, c=1, y=16, x=16)
+    md = {"pixel_size_um": 1.0, "stage_xy_um": [(8.0, 8.0)]}
+    pri = ArrayProvider(np.zeros((1, 2, 1, 1, 16, 16), np.uint16))
+    # secondary frame k is the constant 10*(k+1), so a composed plane NAMES its frame
+    sec = ArrayProvider(np.stack([np.full((16, 16), 10 * (k + 1), np.uint16)
+                                  for k in range(8)]).reshape(1, 8, 1, 1, 16, 16))
+    entry = {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 0.0], "flip_x": False,
+             "flip_y": False, "placed_by": "stage", "t_pairs": [[0, 0, None], [1, 4, None]],
+             "t_map": {"knots": [[0.0, 0.0]], "rate": 4.0, "n_src": 8}, "sub_ticks": 4}
+    ctx = {"node": "O", "dropped": 0, "pri_md": dict(md), "pri_axes": ax, "sources": [
+        {"entry": entry, "ovl_id": "O", "sec_id": "B", "as_channel": False, "prefix": "",
+         "sec_md": dict(md), "sec_axes": sax, "sec_provider": sec, "base_c": 1, "n": 1}]}
+    queued: List[Any] = []
+    r = SimpleNamespace(
+        _overlay_ctxs={"O": ctx}, _texture_limit=8192, _src_override={}, _ovr_gen=0,
+        _views=OrderedDict(O=_HeldView(pri, ax, 0, None, np.uint16)), _planes=PlaneCache(),
+        _prefetch_gen=0, _preload_gen=0, _preload_node=None, _preload_total=0,
+        _preload_done=0, PRELOAD_JOBS=EngineRunner.PRELOAD_JOBS,
+        _pool=SimpleNamespace(start=queued.append, maxThreadCount=lambda: 8),
+        document=SimpleNamespace(nodes={}, edges=[]))
+    for name in ("_plane_addrs", "_cached_planes", "_decode_planes", "_compose_overlay",
+                 "_source_frame", "_warm_overlay", "overlay_sub_ticks", "overlay_channels",
+                 "source_label", "_source_label_of", "display_dim", "_clamp_coords",
+                 "_frame_bytes", "_overlay_frame_bytes", "cancel_preload",
+                 "frames_are_reads", "set_source_override", "overlay_frame_readout",
+                 "_pins_of"):
+        setattr(r, name, (lambda f: lambda *a, **k: f(r, *a, **k))(getattr(EngineRunner, name)))
+    r._view_of = r._views.get
+    r._payload_coords = lambda coords, pin: coords
+    r._prefetch_span = EngineRunner._prefetch_span
+    r._preload_jobs = EngineRunner._preload_jobs
+    r.preload_finished = r.preload_progress = SimpleNamespace(emit=lambda *a: None)
+
+    assert r.overlay_sub_ticks("O") == 4
+    # ── keys: primary unchanged, overlay carries the sub-tick ───────────────────
+    assert _plane_key("O", None, 0, 1, 0, 0, 64) == ("O", None, 0, 1, 0, 0, 64)
+    assert _plane_key("O", None, 0, 1, 0, 1, 64, 2) == ("O", None, 0, 1, 0, 1, 64, (2, 0))
+    addrs = r._plane_addrs("O", (0, 1, 0, 0), (0, 1), ax, sub=2)
+    by_ch = {ch: key for key, _m, _t, _z, ch in addrs}
+    assert _key_sub(by_ch[0]) == (0, 0) and _key_sub(by_ch[1]) == (2, 0), by_ch
+
+    # ── every sub-tick composes ITS frame; the primary is decoded once ──────────
+    seen = []
+    for sb in range(4):
+        planes = r._decode_planes(pri, "O", (0, 1, 0, 0), (0, 1), ax, sub=sb,
+                                  as_dtype=np.uint16)
+        seen.append(float(planes[1].mean()))
+    assert seen == [50.0, 60.0, 70.0, 80.0], seen        # secondary frames 4, 5, 6, 7
+    for sb in range(4):
+        warm = r._cached_planes("O", (0, 1, 0, 0), (0, 1), ax, sub=sb, provider=pri,
+                                dtype=np.uint16)
+        assert warm is not None and float(warm[1].mean()) == seen[sb], sb
+        assert warm[0] is r._cached_planes("O", (0, 1, 0, 0), (0,), ax, provider=pri,
+                                           dtype=np.uint16)[0], "ONE primary plane"
+
+    # ── the readout is the frame on screen ───────────────────────────────────────
+    ro = r.overlay_frame_readout("O", 0, 1, 3, 0)
+    assert ro and ro[0]["t"] == 7 and ro[0]["n_t"] == 8 and ro[0]["label"] == "ovl1", ro
+
+    # ── prefetch warms every sub-tick ahead (and this frame's later ones) ────────
+    EngineRunner.prefetch(r, "O", (0, 0, 0, 0), (0, 1), pin=None)
+    jobs = [j for q in queued for j in q._jobs]
+    ovl_subs = {(t, _key_sub(k)[0]) for k, _m, t, _z, ch in jobs if ch == 1}
+    assert {(0, 1), (0, 2), (0, 3)} <= ovl_subs, ovl_subs
+    queued.clear()
+    # ── the preload keeps overlay channels, every sub-tick of every frame ───────
+    r._planes = PlaneCache()
+    EngineRunner.preload_series(r, "O", (0, 0, 0, 0), (0, 1), pin=None)
+    pj = [j for q in queued for j in q._jobs]
+    assert {(t, _key_sub(k)[0]) for k, _m, t, _z, ch in pj if ch == 1} == \
+        {(t, s) for t in range(2) for s in range(4)}, "overlay preloaded, all sub-ticks"
+    queued.clear()
+
+    # ── the stepper override is display-only and keys apart ──────────────────────
+    r.set_source_override("O", dt=1)
+    assert r._ovr_gen == 1
+    stepped = r._decode_planes(pri, "O", (0, 1, 0, 0), (0, 1), ax, as_dtype=np.uint16)
+    assert float(stepped[1].mean()) == 60.0, "frame 4 stepped +1 = frame 5"
+    k_ovr = {ch: key for key, _m, _t, _z, ch in r._plane_addrs("O", (0, 1, 0, 0), (1,), ax)}
+    assert _key_sub(k_ovr[1]) == (0, 1), k_ovr
+    r.set_source_override("O")              # cleared: back to the plain key and frame
+    k_back = {ch: key for key, _m, _t, _z, ch in r._plane_addrs("O", (0, 1, 0, 0), (1,), ax)}
+    assert _key_sub(k_back[1]) == (0, 0)
+    back = r._decode_planes(pri, "O", (0, 1, 0, 0), (0, 1), ax, as_dtype=np.uint16)
+    assert float(back[1].mean()) == 50.0
+
+    _ok("overlay sub-tick cache (2026-09-30): a 4x-rate source composes secondary frames "
+        "4,5,6,7 on the four Play-all sub-ticks of primary frame 1, each under its own cache "
+        "key, while the primary plane keeps its old 7-tuple key and is ONE object across all "
+        "four; the readout names the frame on screen; prefetch warms this frame's later "
+        "sub-ticks and every sub-tick ahead, the preload now keeps overlay channels (it used "
+        "to clamp them away, so Play never preloaded the overlay) for every sub-tick of every "
+        "frame; and the display-only stepper override keys apart and clears back to the "
+        "plain key")
 
 
 def test_align_to() -> None:
@@ -18608,9 +20719,9 @@ def test_write_tiff() -> None:
         _export(changed, p4, modes={"existing": "overwrite"})
         assert os.stat(p4).st_mtime_ns != marked, "existing='overwrite' did not rewrite"
 
-        # 7. split_positions: one file per multipoint, sorted, right pixels
+        # 7. Split = position: one file per multipoint, sorted, right pixels
         p5 = os.path.join(tmp, "split.ome.tif")
-        _export(base, p5, params={"split_positions": True})
+        _export(base, p5, modes={"split": "position"})
         parts = sorted(glob.glob(os.path.join(tmp, "split_m*.ome.tif")))
         assert len(parts) == M and not os.path.exists(p5), parts
         assert os.path.basename(parts[1]) == "split_m1.ome.tif", parts
@@ -18620,8 +20731,8 @@ def test_write_tiff() -> None:
                 assert np.array_equal(tf.series[0].asarray(), base[m]), part
 
         # 8. the ImageJ model: Fiji's own calibration, and an honest refusal
-        _export(base, os.path.join(tmp, "ij.tif"), modes={"model": "imagej"},
-                params={"split_positions": True})
+        _export(base, os.path.join(tmp, "ij.tif"),
+                modes={"model": "imagej", "split": "position"})
         with tifffile.TiffFile(os.path.join(tmp, "ij_m0.tif")) as tf:
             assert tf.is_imagej and not tf.is_ome
             ij = tf.imagej_metadata
@@ -18638,7 +20749,8 @@ def test_write_tiff() -> None:
         # 9. exporting a Voxel LAYER instead of the image, at its own dtype
         mask = ((base % 3) == 0).astype(np.uint8)
         p7 = os.path.join(tmp, "mask.ome.tif")
-        _export(base, p7, params={"layer": "mask", "split_positions": True}, extra=mask)
+        _export(base, p7, params={"layer": "mask"}, modes={"split": "position"},
+                extra=mask)
         with tifffile.TiffFile(os.path.join(tmp, "mask_m0.ome.tif")) as tf:
             got = tf.series[0].asarray()
             assert got.dtype == np.uint8, got.dtype
@@ -18677,11 +20789,11 @@ def test_write_tiff() -> None:
         hashes = {}
         for tag, modes_, params_ in (
                 ("base", {}, {}),
-                ("imagej", {"model": "imagej"}, {"split_positions": True}),
-                ("plain", {"model": "plain"}, {"split_positions": True}),
+                ("imagej", {"model": "imagej", "split": "position"}, {}),
+                ("plain", {"model": "plain", "split": "position"}, {}),
                 ("lzma", {"compression": "lzma"}, {}),
                 ("level", {}, {"level": 6}),
-                ("split", {}, {"split_positions": True}),
+                ("split", {"split": "position"}, {}),
                 ("layer", {}, {"layer": "mask"})):
             ph = os.path.join(tmp, "h_" + tag + ".ome.tif")
             _, _, e = _export(base, ph, modes=modes_, params=params_, extra=mask)
@@ -18700,10 +20812,2095 @@ def test_write_tiff() -> None:
         "(corner moved by the cut, sampling unchanged); every calibration read is "
         "memo-fenced; the export stamp makes existing='skip' content-verified, so an "
         "identical re-run does no I/O, a deleted file comes back, and CHANGED content is "
-        "never served stale; split_positions writes one sorted file per multipoint; the "
+        "never served stale; Split writes one sorted file per multipoint or per group; the "
         "imagej model carries Fiji's own spacing/finterval and refuses a multi-position "
         "file; a Voxel layer exports at its own dtype; an empty path and an unusable codec "
         "are refused up front; no .part survives and every mode/param re-keys the memo")
+
+
+def test_movie_timeline() -> None:
+    """Export Movie's TIMELINE compositor (``_shared/movie_timeline.py``): several sources,
+    several clips, grids and labelled z sweeps drawn onto one fixed canvas.
+
+    Checked against the renderer directly (no engine), because every claim here is about
+    what a frame shows and what it read to show it:
+
+    * **the user's example plays in the right order**: a loop over source A's t whose body is
+      "A's max-Z still, then source B's labelled z sweep", with ``alternate`` direction, gives
+      T x (1 + Z) frames, z running up on even steps and down on odd ones, each step bound to
+      the loop's t;
+    * **one canvas**: every frame is the same size, which an MP4 requires;
+    * **one window per channel for a whole grid**: an M-tiled grid measures each channel ONCE
+      across every position (so a dim well stays dim), and its reads are exactly the
+      pre-pass plus one z-column per tile per frame; a held frame reads nothing more and
+      only its counter advances;
+    * **labels**: the movie paints the Viewer's own per-id colour on a region's outline, and
+      burns in ids only where a region is big enough to carry one;
+    * **the spec**: canonical JSON survives a round trip unchanged (it is what the memo
+      hashes), and every refusal names the spec path of the bad value.
+    """
+    import json as _json
+    from nodegraph.catalog._shared import movie_timeline as MT
+    from nodegraph.catalog._shared.label_paint import label_palette
+    from nodegraph.domains import Domain
+    from nodegraph.provider import ArrayProvider
+
+    try:
+        import cv2  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except Exception:  # noqa: BLE001
+        _ok("movie timeline: SKIPPED (cv2/Pillow unavailable)")
+        return
+
+    class _Counting(ArrayProvider):
+        def __init__(self, arr):
+            super().__init__(arr)
+            self.reads = 0
+
+        def get_region(self, *a, **k):
+            self.reads += 1
+            return super().get_region(*a, **k)
+
+    M, T, Z, C, Y, X = 2, 4, 3, 2, 32, 40
+    img = np.zeros((M, T, Z, C, Y, X), np.uint16)
+    for m in range(M):
+        for t in range(T):
+            for z in range(Z):
+                for c in range(C):
+                    img[m, t, z, c] = ((np.arange(Y * X).reshape(Y, X) % 53) * (1 + t)
+                                       + 30 * z + 50 * m)
+    lab = np.zeros((M, T, Z, C, Y, X), np.uint16)
+    for z in range(Z):
+        r = 3 + 2 * z                       # cells grow through the stack: 3, 5, 7 px
+        lab[:, :, z, :, 4:4 + r, 4:4 + r] = 7
+        lab[:, :, z, :, 16:16 + r, 20:20 + r] = 12
+    md = {"pixel_size_um": 0.5, "z_step_um": 1.5, "dt_s": 60.0, "bit_depth": 12,
+          "channel_emission_nm": [519.0, 610.0], "channel_names": ["GFP", "RFP"],
+          "position_name": ["P0", "P1"]}
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+
+    def _sources():
+        pa, pb = _Counting(img), _Counting(img)
+        a = Dataset(axes=ax, metadata=dict(md)).with_image(pa)
+        b = Dataset(axes=ax, metadata=dict(md)).with_image(pb).with_layer(
+            Domain.VOXEL, "labels", lab)
+        return ({"A": MT.MovieSource("A", a, calib=md.get, meta=md.get),
+                 "B": MT.MovieSource("B", b, calib=md.get, meta=md.get)}, pa)
+
+    style = MT.MovieStyle(max_px=0, corner="top_left", font_px=0,
+                          text_rgb=(255, 255, 255), interval_s=60.0)
+
+    # 1. the user's example: A's max-Z at t, then B's labelled z sweep at t
+    spec = {"segments": [{"kind": "loop", "source": "A", "body": [
+        {"play": {"axis": "none"}, "panels": [{"source": "A", "z": "max"}],
+         "annotations": {"title": "max-Z"}},
+        {"play": {"axis": "z", "source": "B", "direction": "alternate"},
+         "panels": [{"source": "B", "render": "labels_over_image", "layer": "labels",
+                     "labels": {"id_px": 6}}],
+         "annotations": {"title": "Z stack"}}]}]}
+    srcs, _ = _sources()
+    tl = MT.Timeline(spec, srcs, style)
+    assert tl.n_frames == T * (1 + Z), tl.n_frames
+    zs = [tl.frame_info(k)["z"] for k in range(tl.n_frames)]
+    assert zs == [None, 0, 1, 2, None, 2, 1, 0] * (T // 2), zs
+    assert [tl.frame_info(k)["loop_t"] for k in range(tl.n_frames)] == \
+        [t for t in range(T) for _ in range(1 + Z)]
+    shapes = {tl.render(k).shape for k in range(tl.n_frames)}
+    assert len(shapes) == 1, shapes
+
+    # labels: ids appear only on a cell big enough to carry one, outlines are the Viewer's
+    quiet = _json.loads(_json.dumps(spec))
+    quiet["segments"][0]["body"][1]["panels"][0]["labels"] = {"show_ids": False, "id_px": 6}
+    tq = MT.Timeline(quiet, _sources()[0], style)
+    assert not np.array_equal(tl.render(3), tq.render(3)), "ids drew nothing on 7 px cells"
+    assert np.array_equal(tl.render(1), tq.render(1)), "a 3 px cell got a 6 px number"
+    pal = label_palette(np.arange(1, 13))
+    assert tq.render(1)[4, 4].tolist() == pal[7].tolist(), "outline is not the id's colour"
+    try:
+        from nodelab_v2 import overlays as _OV
+        q = _OV.distinct_color(7)
+        assert tuple(int(v) for v in pal[7]) == (q.red(), q.green(), q.blue()), (
+            "the movie's label colour drifted from the Viewer's")
+    except ImportError:
+        pass
+
+    # 2. pingpong is a full there-and-back that does not repeat the turning point
+    tp = MT.Timeline({"segments": [{"play": {"axis": "z", "direction": "pingpong"},
+                                    "panels": [{"t": 1}]}]}, _sources()[0], style)
+    assert [tp.frame_info(k)["z"] for k in range(tp.n_frames)] == [0, 1, 2, 1, 0]
+
+    # 3. an M-grid: ONE window per channel across the tiles, reads = pre-pass + render
+    srcs, pa = _sources()
+    tg = MT.Timeline({"segments": [{"play": {"axis": "t"},
+                                    "panels": [{"tile": {"axis": "m"}}]}]}, srcs, style)
+    for k in range(tg.n_frames):
+        tg.render(k)
+    assert pa.reads == min(M * T, 24) * C * Z + T * M * C * Z, pa.reads
+    assert len(tg._windows) == C, tg._windows
+    # 4. a hold re-reads nothing, and only its counter moves
+    srcs, pa = _sources()
+    th = MT.Timeline({"segments": [{"play": {"axis": "t"}, "hold": 3,
+                                    "panels": [{"m": 1}]}]}, srcs, style)
+    frames = [th.render(k) for k in range(th.n_frames)]
+    assert th.n_frames == 3 * T and pa.reads == min(T, 24) * C * Z + T * C * Z, pa.reads
+    assert not np.array_equal(frames[0], frames[1]), "a held frame's counter did not move"
+    # 5. a contact sheet is one frame of several timepoints; a channel tile takes its tint
+    tc = MT.Timeline({"segments": [{"play": {"axis": "none"}, "panels": [
+        {"tile": {"axis": "t", "indices": [0, 3]}}]}]}, _sources()[0], style)
+    assert tc.n_frames == 1 and tc.render(0).shape[1] >= 2 * X
+    tt = MT.Timeline({"segments": [{"panels": [
+        {"tile": {"axis": "c"}, "display": {"1": {"rgb": [255, 0, 255]}}}]}]},
+        _sources()[0], style)
+    assert [v.tints for v in tt._clips[0].views] == [[(255, 255, 255)], [(255, 0, 255)]]
+
+    # 6. the canonical spelling is a fixed point — it is what the memo hashes
+    canon = MT.canonical_json(spec)
+    assert MT.canonical_json(_json.loads(canon)) == canon == MT.canonical_json(canon)
+
+    # 7. every refusal names where in the spec it is
+    for bad, needle in (
+            ({"segments": [{"panels": [{"chanels": [0]}]}]},
+             "timeline.segments[0].panels[0]: unknown key(s) ['chanels']"),
+            ({"segments": [{"panels": [{"source": "C"}]}]}, "source C is not wired"),
+            ({"segments": [{"panels": [{"render": "labels", "layer": "nope"}]}]},
+             "timeline.segments[0].panels[0].layer: no Voxel layer 'nope'"),
+            ({"segments": [{"play": {"axis": "z"}, "panels": [{"tile": {"axis": "z"}}]}]},
+             "cannot tile on 'z' while the clip plays 'z'"),
+            ({"segments": [{"play": {"to": 9}, "panels": [{}]}]},
+             "timeline.segments[0].play.to: 9 is outside 0..3"),
+            ({"segments": [{"panels": [{"channels": [5]}]}]}, "channel 5 does not exist"),
+            ("{not json", "not valid JSON"),
+            ("", "timeline: empty")):
+        try:
+            MT.Timeline(bad, _sources()[0], style)
+            raise AssertionError(f"not refused: {needle}")
+        except MT.TimelineError as exc:
+            assert needle in str(exc), (needle, str(exc))
+
+    # 8. END TO END through the Engine: Sweep = 'timeline', a segmentation on `source_b`
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from nodegraph.nodes import COMPUTES
+
+    tmp = _tempfile.mkdtemp(prefix="nd2sb_timeline_")
+    try:
+        def _pull(spec_obj, path, *, wire_b=True, modes=None):
+            a_ds = Dataset(axes=ax, metadata=dict(md)).with_image(_Counting(img))
+            b_ds = Dataset(axes=ax, metadata=dict(md)).with_image(_Counting(img)).with_layer(
+                Domain.VOXEL, "labels", lab)
+            g = Graph()
+            g.add(NodeInstance("A", "io.load"))
+            g.add(NodeInstance("B", "io.load"))
+            g.add(NodeInstance("W", "io.write_movie",
+                               params={"path": path, "max_px": 0,
+                                       "timeline": MT.canonical_json(spec_obj)},
+                               modes=dict(modes or {"sweep": "timeline"})))
+            g.connect("A", "W")
+            if wire_b:
+                g.connect("B", "W", dst_socket="source_b")
+            eng = Engine(g, computes=COMPUTES, seeds={"A": a_ds, "B": b_ds},
+                         meta_seeds={"A": MetaEnvelope(axes=ax, metadata=dict(md)),
+                                     "B": MetaEnvelope(axes=ax, metadata=dict(md))
+                                     .with_domains(frozenset({Domain.VOXEL,
+                                                              Domain.LABEL}))})
+            return eng.pull("W"), eng, a_ds
+
+        # A PNG sequence, not an MP4: this fixture's 40x32 canvas is below the smallest frame
+        # Media Foundation's H.264 encoder accepts (it refuses under ~64x48), and the MP4
+        # writer itself is test_write_movie's to cover. What is checked here is the timeline
+        # reaching the writers: every frame lands, and at one size.
+        p8 = _os.path.join(tmp, "interleave.png")
+        out, eng, a_ds = _pull(spec, p8, modes={"sweep": "timeline", "format": "png"})
+        import glob as _glob
+        from PIL import Image as _Image
+        shots = sorted(_glob.glob(_os.path.join(tmp, "interleave_*.png")))
+        sizes = {_Image.open(f).size for f in shots}
+        assert len(shots) == T * (1 + Z) and len(sizes) == 1, (len(shots), sizes)
+        assert out.axes == ax and out.image is not None, "the tap did not pass `data` through"
+        # a read-only input's domains do not reach the output: B carries Label rows, A does
+        # not. (Not Voxel: once the GUI's io.load is registered the image itself sits on the
+        # Voxel domain, so A has it too.)
+        assert Domain.LABEL in eng.env("B").domains, eng.env("B").domains
+        assert Domain.LABEL not in eng.env("W").domains, eng.env("W").domains
+        h_alt = eng.entry("W").recipe_hash
+        up = _json.loads(_json.dumps(spec))
+        up["segments"][0]["body"][1]["play"]["direction"] = "up"
+        _, eng_up, _ = _pull(up, _os.path.join(tmp, "up.png"),
+                             modes={"sweep": "timeline", "format": "png"})
+        assert eng_up.entry("W").recipe_hash != h_alt, "a timeline edit did not re-key the memo"
+        # a timeline naming B with nothing wired into `source_b` is refused, by name
+        try:
+            _pull(spec, _os.path.join(tmp, "nob.png"), wire_b=False,
+                  modes={"sweep": "timeline", "format": "png"})
+            raise AssertionError("a timeline using an unwired source B was accepted")
+        except ValueError as exc:
+            assert "source B is not wired" in str(exc), exc
+        # ...and the flat sweeps still work with B wired (it is simply not read there)
+        _pull(spec, _os.path.join(tmp, "flat.png"),
+              modes={"sweep": "time", "split": "position", "format": "png"})
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+    _ok("movie timeline: the user's 'max-Z at t, then a labelled z sweep at t' loop plays "
+        "T x (1+Z) frames with z alternating up/down and bound to the loop's t, on one "
+        "canvas size; pingpong is a there-and-back; an M-grid measures ONE window per "
+        "channel across its tiles and reads exactly pre-pass + one z-column per tile per "
+        "frame; a hold re-reads nothing while its counter advances; a contact sheet is one "
+        "frame of several timepoints; label outlines are the Viewer's own per-id colour and "
+        "ids are burned in only where a cell can carry one; the canonical spec is a fixed "
+        "point; 8 refusals each name their spec path; END TO END through the Engine with a "
+        "segmentation wired into `source_b`, the MP4 decodes to T x (1+Z) same-size frames, "
+        "`data` passes through, B's Voxel domain does not leak into the output envelope "
+        "(passes_domains=False), a timeline edit re-keys the memo, an unwired source is "
+        "refused by name, and the flat sweeps still run with B wired")
+
+
+def test_write_movie() -> None:
+    """``io.write_movie`` — the pipeline's PRESENTATION write end: render a Dataset to an
+    MP4 / GIF / image sequence with the acquisition's own clock burned in, and hand the
+    Dataset through untouched.
+
+    An exporter whose product is a picture can fail in a way ``io.write_tiff`` cannot: the
+    file is written, it opens, and what it SHOWS is wrong. So the assertions are grouped by
+    the three claims the node actually makes, and only the first is about the container:
+
+    * **the file** — it exists, no ``.part`` survives, and the frames READ BACK: an encoder
+      that silently wrote nothing still leaves a plausible non-empty MP4, so the round trip
+      through ``VideoCapture`` is the only honest check (this is also what pins the H.264
+      fallback in ``_open_writer``, which prints two scary FFmpeg errors on this machine and
+      succeeds anyway — the day that stops being true, this is the test that says so);
+    * **the picture** — the burn-ins are the ENVELOPE, not decoration: the clock is
+      ``dt_s``-derived and auto-fills on a headless pull, the scale bar is a round 1-2-5
+      value at the real pixel size, the window is ONE decision for the whole movie, and the
+      channel tints are the Viewer's own emission map. The window one is the subtle one: a
+      per-frame auto-contrast normalizes away the change a timelapse exists to show, and
+      produces a perfectly valid file that is scientifically wrong;
+    * **the side effect / the engine contract** — it streams (never asks for a volume,
+      never holds more than one plane), it passes the Dataset through byte-identical, every
+      mode re-keys the memo, and the calibration it reads is fenced so a changed frame
+      interval cannot serve a movie with a stale clock.
+    """
+    import glob
+    import os
+    import shutil
+    import tempfile
+    from nodegraph.catalog.io.write_movie import (_emission_rgb, _micro, _part_path,
+                                                  _scalebar, _time_text)
+    from nodegraph.domains import Domain
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+
+    try:
+        import cv2
+        from PIL import Image
+    except Exception:  # noqa: BLE001
+        _ok("io.write_movie: SKIPPED (cv2/Pillow unavailable)")
+        return
+
+    # ── pure helpers first: they are where the *meaning* of the overlay lives ──
+    # The clock's unit is picked from the run's DURATION and then holds, so the readout
+    # never changes shape mid-video. Four regimes, at the boundaries.
+    assert _time_text(0, 1.0, 10) == "0.0 s", _time_text(0, 1.0, 10)
+    assert _time_text(9, 1.0, 10) == "9.0 s", _time_text(9, 1.0, 10)
+    assert _time_text(2, 60.0, 10) == "02:00", _time_text(2, 60.0, 10)   # 9 min run -> mm:ss
+    # the lab's 6-hour WellA3 timelapse at its real 900 s interval -> hh:mm:ss
+    assert _time_text(23, 900.0, 24) == "05:45:00", _time_text(23, 900.0, 24)
+    assert _time_text(0, 900.0, 24) == "00:00:00", _time_text(0, 900.0, 24)
+    assert _time_text(100, 3600.0, 200) == "4d 04:00:00", _time_text(100, 3600.0, 200)
+
+    # A scale bar is a round 1-2-5 number or it is not drawn. NEVER an arbitrary length,
+    # and never anything at all without a pixel size — a bar with no calibration behind it
+    # is a fabrication that a reader will measure off.
+    assert _scalebar(640, None) is None
+    assert _scalebar(640, 0.0) is None
+    got = _scalebar(640, 0.65)
+    assert got is not None and got[1].endswith(("um", "µm")), got
+    assert got[1].split()[0] == "50", got            # 640 px * 0.65 = 416 µm -> 50, not 74.9
+    assert abs(got[0] - 50.0 / 0.65) < 1.0, got
+    # the lab's 10x plate at 1.7183 µm/px: a much coarser image still gets a round bar
+    coarse = _scalebar(640, 1.7183)
+    assert coarse is not None and coarse[1].split()[0] in ("100", "200"), coarse
+    # a frame too small for even the finest step drops the bar rather than drawing a stub
+    assert _scalebar(8, 0.0001) is None, _scalebar(8, 0.0001)
+
+    # The tints ARE the Viewer's, which is the node's whole "looks like what you saw" claim.
+    from nodelab_v2 import theme as _T
+    for nm in (None, 405.0, 488.0, 519.0, 610.0, 700.0, 850.0, 1064.0):
+        q = _T.emission_qcolor(nm)
+        assert _emission_rgb(nm) == (q.red(), q.green(), q.blue()), nm
+
+    # `.part` keeps the real extension last, or cv2/PIL sniff ".part" as the container and
+    # the writer refuses to open. This cost a debugging session; it is cheap to pin.
+    assert _part_path("a/b.mp4") == os.path.join("a", "b.part.mp4").replace("\\", "/") \
+        or _part_path("a/b.mp4").endswith("b.part.mp4"), _part_path("a/b.mp4")
+    assert _part_path("x.ome.tif").endswith(".part.tif"), _part_path("x.ome.tif")
+
+    # 64 px wide is the floor, not an arbitrary size: `_scalebar` drops a bar shorter
+    # than 4 px rather than drawing a stub, so a narrower fixture would render no bar
+    # and make the `show_scalebar` toggle below look dead when it is working.
+    M, T, Z, C, Y, X = 1, 6, 2, 2, 48, 64
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+    # A deterministic ramp that GROWS with t: the fixture the fixed-window assertion needs,
+    # since a constant-brightness series cannot tell a fixed window from a per-frame one.
+    base = np.zeros((M, T, Z, C, Y, X), np.uint16)
+    for t in range(T):
+        for z in range(Z):
+            for c in range(C):
+                base[0, t, z, c] = (np.arange(Y * X).reshape(Y, X) % 97) * (2 + t) + 40 * c
+    md = {"pixel_size_um": 0.65, "z_step_um": 2.0, "dt_s": 900.0, "bit_depth": 12,
+          "channel_emission_nm": [519.0, 610.0], "channel_names": ["GFP", "mCherry"],
+          "position_name": ["WellA3"]}
+
+    class _CountingProvider(ArrayProvider):
+        """Records how the export actually READ the data — the footprint claim, checked."""
+
+        def __init__(self, arr):
+            super().__init__(arr)
+            self.plane_reads = 0
+            self.volume_reads = 0
+            self.max_bytes = 0
+
+        def get_region(self, *a, **k):
+            out = super().get_region(*a, **k)
+            self.plane_reads += 1
+            self.max_bytes = max(self.max_bytes, int(np.asarray(out).nbytes))
+            return out
+
+        def get_region_volume(self, *a, **k):
+            self.volume_reads += 1
+            return super().get_region_volume(*a, **k)
+
+    tmp = tempfile.mkdtemp(prefix="nd2sb_movie_")
+    try:
+        def _export(path, *, modes=None, params=None, axes=None, arr=None, meta=None,
+                    layer=None):
+            """Pull one export graph; return (payload, provider, engine)."""
+            a = axes or ax
+            prov = _CountingProvider(base if arr is None else arr)
+            seed = Dataset(axes=a, metadata=dict(meta or md)).with_image(prov)
+            if layer is not None:
+                seed = seed.with_layer(Domain.VOXEL, "mask", layer)
+            g = Graph()
+            g.add(NodeInstance("S", "io.load"))
+            g.add(NodeInstance("W", "io.write_movie",
+                               params={"path": path, **(params or {})},
+                               modes=dict(modes or {})))
+            g.connect("S", "W")
+            eng = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                         meta_seeds={"S": MetaEnvelope(axes=a, metadata=dict(meta or md))})
+            return eng.pull("W"), prov, eng
+
+        def _frames(path):
+            """Every frame of an MP4, decoded back out of the container."""
+            cap = cv2.VideoCapture(path)
+            out = []
+            while True:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                out.append(fr[:, :, ::-1].copy())       # BGR -> RGB
+            cap.release()
+            return out
+
+        # 1. the MP4 exists, holds every frame, and the read pattern IS the declared
+        #    footprint. The readback is the point: a writer that encoded nothing still
+        #    leaves a non-empty file.
+        p1 = os.path.join(tmp, "one.mp4")
+        out, prov, eng = _export(p1, params={"max_px": 0})
+        assert os.path.exists(p1) and not os.path.exists(_part_path(p1))
+        got = _frames(p1)
+        assert len(got) == T, (len(got), T)
+        assert got[0].shape == (Y, X, 3), got[0].shape
+        # WHOLE_VOLUME on the `time` branch is honest: planes only, never a volume, and the
+        # largest single read is one Y*X plane — the streaming guarantee, asserted.
+        assert prov.volume_reads == 0, prov.volume_reads
+        assert prov.max_bytes == Y * X * 2, prov.max_bytes
+        # contrast pre-pass (min(T, 24) frames) + the render, each a full (z, c) fan-out
+        assert prov.plane_reads == 2 * T * Z * C, prov.plane_reads
+
+        # 1b. THE MP4 IS REALLY H.264, not the MPEG-4 Part 2 fallback. Both wear `.mp4`,
+        #     both decode in `_frames` above, and only one of them plays in a browser, in
+        #     PowerPoint or in Keynote — so "the file opened" does not distinguish the movie
+        #     that works in a talk from the one that is a black rectangle. The container's
+        #     sample-entry box is what actually says which, so read it.
+        #
+        #     This also pins the BACKEND ORDER. OpenCV's auto-chain tries FFmpeg first, whose
+        #     only H.264 encoder here is libopenh264 (`openh264-2.5.0-win64.dll`, not
+        #     installed) — it failed loudly on stderr and fell through to Media Foundation on
+        #     every single export. `_writer_backends` names the working backend instead, which
+        #     is byte-identical and silent; if that ordering is ever lost the export still
+        #     succeeds, and this assertion is the only thing that would notice.
+        raw = open(p1, "rb").read()
+        assert b"avc1" in raw and b"avcC" in raw, (
+            "the exported MP4 is not H.264 — it fell back to MPEG-4 Part 2 (mp4v), which "
+            "Chrome, Firefox, PowerPoint and Keynote will not play. Check that "
+            "`_writer_backends` still offers a backend encoding avc1 on this machine.")
+
+        # 2. identity pass-through — nothing downstream can tell an export happened
+        assert out.axes == ax and dict(out.metadata) == md, out.metadata
+        assert out.image is prov and out.image.fingerprint() == prov.fingerprint()
+
+        # 3. THE WINDOW IS ONE DECISION FOR THE WHOLE MOVIE. The fixture's brightness grows
+        #    with t, so a per-frame auto-contrast would make every frame's mean equal — the
+        #    failure that produces a valid file showing the opposite of the truth.
+        means = [float(f.mean()) for f in got]
+        assert means[-1] > means[0] * 1.25, means
+        assert sorted(means) == means, means            # monotone, like the data
+
+        # 4. the burn-ins are the ENVELOPE. Rendered at full size into a PNG so the pixels
+        #    can be inspected; compared against the SAME frame with the overlays off, so the
+        #    assertion is about what the overlay drew and not about the image under it.
+        def _png(name, **params):
+            p = os.path.join(tmp, name)
+            _export(p, modes={"format": "png"}, params={"max_px": 0, **params})
+            return np.asarray(Image.open(_seq(p, 0)))
+
+        def _seq(path, i):
+            stem = path[:-4] if path.lower().endswith(".png") else path
+            return f"{stem}_{i}.png"
+
+        bare = _png("bare.png", show_frame=False, show_time=False, show_scalebar=False,
+                    show_channels=False, show_position=False)
+        full = _png("full.png", show_position=True)
+        assert bare.shape == (Y, X, 3), bare.shape
+        assert not np.array_equal(bare, full), "the burn-ins drew nothing at all"
+        # Each overlay is independently reachable: turning exactly one on must change the
+        # frame, or it is a live-looking control the renderer ignores.
+        for only in ("show_frame", "show_time", "show_scalebar", "show_channels",
+                     "show_position"):
+            off = dict.fromkeys(("show_frame", "show_time", "show_scalebar",
+                                 "show_channels", "show_position"), False)
+            off[only] = True
+            one = _png(f"only_{only}.png", **off)
+            assert not np.array_equal(one, bare), f"{only}=True changed nothing"
+
+        # The clock AUTO-FILLS from the file's own dt_s on a headless pull — nobody typed
+        # 900 s. This is the derive actually firing, and it is the reason the param is read
+        # through `ctx.channel(0).param` rather than `ctx.params.get`.
+        no_dt = dict(md)
+        no_dt.pop("dt_s")
+        p_dt = os.path.join(tmp, "dt.png")
+        _export(p_dt, modes={"format": "png"},
+                params={"max_px": 0, "show_frame": False, "show_scalebar": False,
+                        "show_channels": False})
+        with_clock = np.asarray(Image.open(_seq(p_dt, 0)))
+        p_no = os.path.join(tmp, "nodt.png")
+        _export(p_no, modes={"format": "png"}, meta=no_dt,
+                params={"max_px": 0, "show_frame": False, "show_scalebar": False,
+                        "show_channels": False})
+        without = np.asarray(Image.open(_seq(p_no, 0)))
+        assert not np.array_equal(with_clock, without), (
+            "the clock did not auto-fill from dt_s — the `derive` is not reaching the "
+            "compute, so every headless export would be silently clocked at 0 s")
+        # ...and ABSENT dt_s draws no clock rather than inventing 0-second timestamps.
+        bare_no = _png("barenodt.png", show_frame=False, show_time=False,
+                       show_scalebar=False, show_channels=False)
+        assert np.array_equal(without, bare_no), (
+            "a Dataset with no frame interval still drew a clock — a fabricated time")
+
+        # 5. every format lands, and each one really holds T frames
+        pg = os.path.join(tmp, "a.gif")
+        _export(pg, modes={"format": "gif"})
+        with Image.open(pg) as im:
+            assert im.n_frames == T, (im.n_frames, T)
+
+        # THE FORMAT MODE OWNS THE EXTENSION, not the path. Reported 2026-09-29: choosing
+        # GIF while the File socket still said `.mp4` wrote a real GIF named `movie.mp4`,
+        # so every player refused it as a corrupt video. Nothing errored — the bytes were
+        # right and the name lied — which is why this asserts the FILENAME the node chose
+        # and then re-opens it to prove the content agrees with the new name.
+        stale = os.path.join(tmp, "stale_name.mp4")
+        _export(stale, modes={"format": "gif"})
+        landed = os.path.join(tmp, "stale_name.gif")
+        assert os.path.exists(landed), (
+            "Format = 'gif' did not rewrite a stale `.mp4` path: wrote "
+            + str(sorted(os.path.basename(f) for f in glob.glob(os.path.join(tmp, "stale*")))))
+        assert not os.path.exists(stale), "a GIF was left wearing the .mp4 name"
+        with Image.open(landed) as im:
+            assert im.format == "GIF" and im.n_frames == T, (im.format, im.n_frames)
+        # ...and the reverse, so the rule is the Mode's and not a special case for GIF
+        stale2 = os.path.join(tmp, "stale2.gif")
+        _export(stale2, modes={"format": "mp4"})
+        assert os.path.exists(os.path.join(tmp, "stale2.mp4"))
+        assert not os.path.exists(stale2)
+        # a dotted name that is NOT an extension keeps every one of its dots
+        dotted = os.path.join(tmp, "WellA3_1.7183um")
+        _export(dotted, modes={"format": "mp4"})
+        assert os.path.exists(dotted + ".mp4"), sorted(
+            os.path.basename(f) for f in glob.glob(os.path.join(tmp, "WellA3*")))
+        for fmt, ext in (("png", ".png"), ("jpeg", ".jpg")):
+            ps = os.path.join(tmp, f"seq_{fmt}{ext}")
+            _export(ps, modes={"format": fmt})
+            files = sorted(glob.glob(os.path.join(tmp, f"seq_{fmt}_*{ext}")))
+            assert len(files) == T, (fmt, len(files))
+        assert not glob.glob(os.path.join(tmp, "*.part*")), "a .part survived"
+
+        # 5b. THE COLOUR SURVIVES THE CODEC. OpenCV wants BGR and everything upstream of
+        #     the writer is RGB, so there is exactly one flip in `_write_mp4` — and getting
+        #     it backwards is invisible to every other assertion here: the file still
+        #     decodes, still has T frames, and the PNG path (which never flips) still looks
+        #     right. Only a fixture whose channels are SPATIALLY SEPARATED and differently
+        #     tinted can see it, because a grey or a symmetric composite is its own mirror.
+        sep = np.zeros((1, 2, 1, 2, Y, X), np.uint16)
+        sep[0, :, 0, 0, :, :X // 2] = 3000       # ch0 @ 519 nm -> green, left half
+        sep[0, :, 0, 1, :, X // 2:] = 3000       # ch1 @ 610 nm -> red,   right half
+        ax_sep = AxisSizes(m=1, t=2, z=1, c=2, y=Y, x=X)
+        flat = dict(no_overlay := {"max_px": 0, "show_frame": False, "show_time": False,
+                                   "show_scalebar": False, "show_channels": False})
+        p_png = os.path.join(tmp, "sep.png")
+        _export(p_png, modes={"format": "png"}, axes=ax_sep, arr=sep, params=flat)
+        p_mp4 = os.path.join(tmp, "sep.mp4")
+        _export(p_mp4, axes=ax_sep, arr=sep, params=dict(no_overlay))
+        as_png = np.asarray(Image.open(_seq(p_png, 0)))
+        as_mp4 = _frames(p_mp4)[0]
+        left, right = (Y // 2, X // 4), (Y // 2, 3 * X // 4)
+        for tag, img in (("PNG", as_png), ("MP4", as_mp4)):
+            lo, hi = img[left], img[right]
+            assert lo[1] > lo[0] + 20 and lo[1] > lo[2] + 20, (
+                f"{tag}: the 519 nm channel did not render GREEN ({tuple(lo)}) — on the MP4 "
+                f"this is the RGB/BGR flip in `_write_mp4`, which every other assertion in "
+                f"this test passes straight through")
+            assert hi[0] > hi[1] + 20 and hi[0] > hi[2] + 20, (
+                f"{tag}: the 610 nm channel did not render RED ({tuple(hi)})")
+        # ...and the two agree to within what a lossy codec explains, which is the stronger
+        # statement: the movie is the same picture as the lossless frame, not merely a
+        # picture with the right hues somewhere in it.
+        assert float(np.abs(as_png.astype(int) - as_mp4.astype(int)).mean()) < 12.0
+
+        # 5c. THE PREVIEW IS THE EXPORT. `MoviePlan` exists so the dialog and the writer
+        #     cannot drift, and this is the assertion that keeps it true: render a frame the
+        #     way the PREVIEW does (plan.render) and compare it BIT-FOR-BIT with the frame
+        #     the export just wrote. A preview that merely looks similar is worthless for the
+        #     one judgement it supports, and "similar" is what a second implementation decays
+        #     into within a couple of changes.
+        #
+        #     Also checks that `resolve_params` reproduces the ENGINE's resolution, which is
+        #     the subtle half: `interval_s` carries `derive="dt_s or 0.0"`, so a GUI resolver
+        #     that skipped derives would preview every movie with no clock and then export
+        #     one with a clock — the two disagreeing about the thing the user was
+        #     checking.
+        try:
+            from nodelab_v2.movie_preview import build_plan, resolve_params
+            _have_preview = True
+        except Exception:      # noqa: BLE001 — no Qt on this box; the engine half still ran
+            _have_preview = False
+        if _have_preview:
+            pv_params = {"max_px": 0, "show_position": True, "brightness": 150.0}
+            pv_modes = {"format": "png", "sweep": "time"}
+            pv_env = MetaEnvelope(axes=ax, metadata=dict(md))
+            pv_spec = NODES.get("io.write_movie")
+
+            resolved = resolve_params(pv_spec, pv_params, pv_env)
+            assert resolved.param("interval_s") == md["dt_s"], (
+                "the GUI param resolver did not fire the `interval_s` derive — the "
+                "preview would show no clock on data whose export has one")
+            assert resolved.param("fps") == 10.0, resolved.param("fps")           # socket default
+            assert resolved.param("brightness") == 150.0                    # explicit override
+
+            pv_path = os.path.join(tmp, "pv.png")
+            pv_payload = Dataset(axes=ax, metadata=dict(md)).with_image(
+                _CountingProvider(base))
+            _export(pv_path, modes=pv_modes, params=pv_params)
+            pv_plan, _note = build_plan(pv_payload, pv_spec, pv_params, pv_modes, pv_env)
+            assert pv_plan.n_frames == T, (pv_plan.n_frames, T)
+            for i in (0, T // 2, T - 1):
+                shot = np.asarray(Image.open(_seq(pv_path, i)))
+                assert np.array_equal(shot, pv_plan.render(0, i)), (
+                    f"preview frame {i} differs from the frame the export wrote — the "
+                    f"two renderers have drifted apart, which is the exact failure "
+                    f"`MoviePlan` exists to make impossible")
+
+        # 5d. BRIGHTNESS IS A LINEAR GAIN, and it is not gamma. Measured on the midtones
+        #     only, because the top of the range clips by design and would drag the ratio
+        #     down; the point of the control is that 200% means exactly twice, so a reader
+        #     can still compare two objects' brightness after it has been used.
+        def _lum(bright):
+            p = os.path.join(tmp, f"b{int(bright)}.png")
+            _export(p, modes={"format": "png"},
+                    params={"max_px": 0, "brightness": bright, "show_frame": False,
+                            "show_time": False, "show_scalebar": False,
+                            "show_channels": False})
+            return np.asarray(Image.open(_seq(p, 0))).astype(float)
+
+        at100 = _lum(100.0)
+        mid = (at100 > 8) & (at100 < 80)          # away from black and from the clip
+        assert mid.any(), "fixture has no midtones to measure the gain on"
+        for pct, want in ((150.0, 1.5), (200.0, 2.0), (300.0, 3.0)):
+            got = _lum(pct)[mid].mean() / at100[mid].mean()
+            assert abs(got - want) < 0.06, (pct, got, want)
+        # ...and 100% really is the identity, not merely close to it
+        assert np.array_equal(_lum(100.0), at100)
+
+        # 6. the Z axis can be what plays, and then it is Z frames — with the elapsed-time
+        #    overlay off, because a Z position is not a time.
+        ax1 = AxisSizes(m=M, t=1, z=Z, c=C, y=Y, x=X)
+        pz = os.path.join(tmp, "z.mp4")
+        _export(pz, modes={"sweep": "z"}, axes=ax1, arr=base[:, :1], params={"max_px": 0})
+        assert len(_frames(pz)) == Z, len(_frames(pz))
+
+        # 7. Split writes one sorted file per multipoint
+        ax3 = AxisSizes(m=3, t=T, z=Z, c=C, y=Y, x=X)
+        arr3 = np.repeat(base, 3, axis=0)
+        md3 = dict(md, position_name=["WellA3", "WellB1", "WellC7"])
+        pm = os.path.join(tmp, "multi.mp4")
+        _export(pm, modes={"split": "position"}, axes=ax3, arr=arr3, meta=md3,
+                params={"show_position": True})
+        assert sorted(os.path.basename(f)
+                      for f in glob.glob(os.path.join(tmp, "multi_m*.mp4"))) == \
+            ["multi_m0.mp4", "multi_m1.mp4", "multi_m2.mp4"]
+
+        # 8. the refusals — each one a case where guessing would ship a confident wrong file
+        for label, kw in (
+            ("multipoint with Split=none", dict(axes=ax3, arr=arr3, meta=md3)),
+            ("Sweep=z on a multi-timepoint Dataset", dict(modes={"sweep": "z"})),
+            ("a channel index that does not exist", dict(params={"channels": "7"})),
+            ("a Voxel layer that is not there", dict(params={"layer": "nope"})),
+        ):
+            try:
+                _export(os.path.join(tmp, "refuse.mp4"), **kw)
+                raise AssertionError(f"{label} was not refused")
+            except ValueError:
+                pass
+        try:
+            _export("")
+            raise AssertionError("an empty path was not refused")
+        except ValueError:
+            pass
+        # a GIF at full size would be built in RAM frame by frame — refused UP FRONT with
+        # the number to set, not discovered as a MemoryError partway through
+        try:
+            _export(os.path.join(tmp, "big.gif"), modes={"format": "gif"},
+                    params={"max_px": 0})
+            raise AssertionError("a full-size GIF was not refused")
+        except ValueError:
+            pass
+        # Existing='refuse' does not touch a file that is already there
+        pex = os.path.join(tmp, "ex.mp4")
+        _export(pex)
+        before = os.path.getsize(pex)
+        try:
+            _export(pex, modes={"existing": "refuse"})
+            raise AssertionError("Existing='refuse' overwrote a file")
+        except ValueError:
+            pass
+        assert os.path.getsize(pex) == before
+
+        # 9. a Voxel layer renders instead of the image, and differs from it
+        mask = ((base % 7) == 0).astype(np.uint8) * 255
+        pl = os.path.join(tmp, "mask.png")
+        _export(pl, modes={"format": "png"}, params={"layer": "mask", "max_px": 0},
+                layer=mask)
+        assert not np.array_equal(np.asarray(Image.open(_seq(pl, 0))), bare)
+
+        # 10. every mode and param re-keys the memo, so no combination can serve another's
+        #     file. `sweep` is the load-bearing one — it also switches the FOOTPRINT.
+        hashes = {}
+        for tag, modes_, params_ in (
+            ("base", {}, {}),
+            ("gif", {"format": "gif"}, {}),
+            ("midz", {"z_reduce": "mid"}, {}),
+            ("meanz", {"z_reduce": "mean"}, {}),
+            ("full", {"contrast": "full"}, {}),
+            ("absolute", {"contrast": "absolute"}, {}),
+            ("gamma", {}, {"gamma": 2.0}),
+            ("corner", {}, {"corner": "bottom_right"}),
+            ("noclock", {}, {"show_time": False}),
+        ):
+            _, _, e = _export(os.path.join(tmp, f"h_{tag}.mp4"), modes=modes_,
+                              params=params_)
+            hashes[tag] = e.entry("W").recipe_hash
+        assert len(set(hashes.values())) == len(hashes), hashes
+        assert (NODES.get("io.write_movie").resolve_granularity({"sweep": "time"})
+                is not NODES.get("io.write_movie").resolve_granularity({"sweep": "z"}))
+
+        # 11. the calibration is MEMO-FENCED: a changed frame interval must invalidate, or
+        #     a re-export serves a movie whose burned-in clock is a stale claim.
+        _, _, e = _export(os.path.join(tmp, "fence.mp4"))
+        reads = dict(e.entry("W").reads)
+        for key in ("pixel_size_um", "dt_s", "bit_depth", "channel_emission_nm"):
+            assert key in reads, (key, sorted(reads))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    _ok("io.write_movie: renders a Dataset to MP4/GIF/PNG/JPEG and hands it through "
+        "byte-identical; frames READ BACK out of the container, because an encoder that wrote "
+        "nothing still leaves a plausible file; streams plane-at-a-time, never "
+        "a volume, peak read = one Y*X plane; the display window is ONE decision for the "
+        "whole movie, so a brightening series stays brightening instead of being normalized "
+        "flat; the burn-ins are the ENVELOPE — the clock auto-fills from dt_s via the derive "
+        "and is OMITTED rather than fabricated when absent, the scale bar is a round 1-2-5 "
+        "value at the real pixel size, the tints are the Viewer's own emission map; each "
+        "overlay toggle independently changes the frame; a spatially-separated 519/610 nm "
+        "fixture pins the RGB->BGR flip, so green stays green through the codec and the MP4 "
+        "matches the lossless frame; the Format Mode OWNS the extension, so choosing GIF "
+        "against a stale `.mp4` path writes a real `.gif` and leaves no lying name "
+        "(the 2026-09-29 report), while a dotted filename keeps its dots; "
+        "the PREVIEW dialog renders through the export's own "
+        "MoviePlan and its frames are bit-identical to the written ones (and its param "
+        "resolver fires the same derives); Brightness is a LINEAR gain measured at "
+        "1.5/2/3x on the midtones with 100% the exact identity; "
+        "the container is verified H.264 (avc1/avcC), not the "
+        "mp4v fallback no browser plays, which pins the explicit backend order that also "
+        "stopped every export printing an OpenH264 failure; Sweep plays T or Z and re-keys the "
+        "footprint; Split writes one sorted file per multipoint; a multipoint, a Z sweep "
+        "over several timepoints, a bad channel/layer, an empty path, a full-size GIF and "
+        "Existing='refuse' are all refused; no .part survives and every mode re-keys the "
+        "memo")
+
+
+def test_file_bundle_provider() -> None:
+    """A **file bundle** lays K files end to end on the multipoint axis.
+
+    ``MultiSourceProvider`` is a pure index remap — position ``m`` of the bundle is a
+    position of exactly one member file, read from that file's own store — so a bundled
+    pull sees the same pixels an un-bundled one would. What is pinned here is the part
+    that can go wrong silently: the address arithmetic at the seams between files, the
+    refusal when the members do not share a grid, and the identity that keeps a changed
+    member from being served out of the memo as the bundle it used to be."""
+    from nodegraph.provider import ArrayProvider, MultiSourceProvider
+
+    def vol(m, val, c=2):
+        return np.full((m, 1, 1, c, 8, 8), val, dtype=np.uint16)
+
+    a, b = ArrayProvider(vol(2, 10)), ArrayProvider(vol(3, 20))
+    bundle = MultiSourceProvider([a, b], labels=["A.nd2", "B.nd2"])
+
+    # M concatenates; every other axis passes through untouched
+    assert bundle.axes.m == 5, bundle.axes
+    assert (bundle.axes.t, bundle.axes.z, bundle.axes.c,
+            bundle.axes.y, bundle.axes.x) == (1, 1, 2, 8, 8), bundle.axes
+    assert bundle.level_axes(0).m == 5
+    assert bundle.spans == (("A.nd2", 0, 2), ("B.nd2", 2, 3)), bundle.spans
+
+    # the seam: each position resolves to its OWN file, and locate() round-trips
+    assert [bundle.locate(m) for m in range(5)] == \
+        [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)]
+    got = [int(bundle.read_region(0, m, 0, 0, 0, 0, 8, 0, 8)[0, 0]) for m in range(5)]
+    assert got == [10, 10, 20, 20, 20], got
+    # an out-of-range read clamps into the bundle rather than escaping into a neighbour
+    assert int(bundle.read_region(0, 99, 0, 0, 0, 0, 8, 0, 8)[0, 0]) == 20
+
+    # a member that does not share the grid is refused, and the message names the axis
+    try:
+        MultiSourceProvider([a, ArrayProvider(vol(1, 30, c=3))])
+        raise AssertionError("a mismatched channel count must be refused")
+    except ValueError as exc:
+        assert "c" in str(exc) and "same channels" in str(exc), exc
+
+    # identity: two identical bundles alias (a memo HIT), a changed member does not
+    assert MultiSourceProvider([a, b], labels=["A.nd2", "B.nd2"]).version == bundle.version
+    assert MultiSourceProvider([a, ArrayProvider(vol(3, 21))]).version != bundle.version
+    # ordering is part of the identity — the same files bundled the other way round
+    # address different positions, so they must never share a cached result
+    assert MultiSourceProvider([b, a]).version != bundle.version
+
+    # the shared pyramid is the SHALLOWEST member's: a level the bundle advertises has
+    # to exist in every source, or a display read falls off the short one's pyramid
+    class _Deep(ArrayProvider):
+        levels = 4
+    assert MultiSourceProvider([_Deep(vol(1, 1)), ArrayProvider(vol(1, 2))]).levels == 1
+
+    _ok("file bundle: MultiSourceProvider concatenates K sources on M (pure index remap "
+        "— each position reads its own file), refuses a mismatched grid by axis name, "
+        "clamps an out-of-range read, folds every member's version (order included) so a "
+        "changed or reordered bundle cannot alias a cached one, and advertises only the "
+        "shallowest member's pyramid")
+
+
+def test_batch_axis() -> None:
+    """A **batch** stacks K files on ``b`` so ONE drawn pipeline runs over all of them.
+
+    The point of the axis is the thing a file bundle cannot do: keep the files apart. So
+    what is pinned here is that a member's pixels stay that member's pixels through a
+    whole pipeline and back out — the failure mode being not a crash but every file
+    quietly getting file 0's answer — plus the refusals that stop a batch being formed
+    where it would be meaningless."""
+    from dataclasses import replace
+    from nodegraph.provider import ArrayProvider, BatchProvider, BatchSliceProvider
+    from nodegraph.metadata import BATCH_FILE_KEY
+    from nodegraph.nodes import COMPUTES
+
+    def src(val, m=1, c=1):
+        return ArrayProvider(np.full((m, 1, 1, c, 8, 8), val, dtype=np.uint16))
+
+    a, b = src(10), src(20)
+    batch = BatchProvider([a, b], labels=["A.nd2", "B.nd2"])
+
+    # b grows; every other axis passes through untouched
+    assert batch.axes.b == 2, batch.axes
+    assert (batch.axes.m, batch.axes.t, batch.axes.z, batch.axes.c,
+            batch.axes.y, batch.axes.x) == (1, 1, 1, 1, 8, 8), batch.axes
+    assert batch.level_axes(0).b == 2
+    assert batch.spans == (("A.nd2", 0), ("B.nd2", 1)), batch.spans
+
+    # each member reads its OWN file, and b is consumed here rather than forwarded
+    got = [int(batch.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8, b=k)[0, 0]) for k in (0, 1)]
+    assert got == [10, 20], got
+
+    # the slice is the exact inverse: b collapses to 1 and the pixels are that member's
+    sl = BatchSliceProvider(batch, 1)
+    assert sl.axes.b == 1
+    assert int(sl.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8)[0, 0]) == 20
+    # ...and the caller's own b addresses the SLICE (one member), never the base again
+    assert int(sl.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8, b=0)[0, 0]) == 20
+    for bad in (-1, 2):
+        try:
+            BatchSliceProvider(batch, bad)
+            raise AssertionError(f"member {bad} must be refused")
+        except ValueError as exc:
+            assert "out of range" in str(exc), exc
+
+    # a member that does not share the grid is refused BY AXIS NAME — a batch axis is
+    # rectangular, so padding a short file would invent frames nobody acquired
+    try:
+        BatchProvider([a, src(30, m=2)])
+        raise AssertionError("a mismatched m must be refused")
+    except ValueError as exc:
+        assert "m" in str(exc) and "share the batch's grid" in str(exc), exc
+    # nesting is refused rather than silently flattened: two b axes do not fit on one
+    try:
+        BatchProvider([batch, a])
+        raise AssertionError("a nested batch must be refused")
+    except ValueError as exc:
+        assert "nested batches" in str(exc), exc
+
+    # identity: order is part of it, so the same files batched the other way round can
+    # never be served from the other's memo entry
+    assert BatchProvider([a, b], labels=["A.nd2", "B.nd2"]).version == batch.version
+    assert BatchProvider([b, a]).version != batch.version
+    assert BatchProvider([a, src(21)]).version != batch.version
+
+    # ── through a real graph: one pipeline node, two files, split back ────────────
+    AXB = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    from nodegraph.metadata import SOURCE_FILE_KEY
+
+    def seed(val, name):
+        return (Dataset(axes=AXB, metadata={"pixel_size_um": 1.0})
+                .with_image(src(val))
+                .with_metadata(**{SOURCE_FILE_KEY: [name]}))
+
+    g = Graph(
+        nodes={
+            "A": NodeInstance("A", "io.load"), "B": NodeInstance("B", "io.load"),
+            "BA": NodeInstance("BA", "util.batch"),
+            "G": NodeInstance("G", "enhance.gamma", params={"gamma": 1.0}),
+            "U": NodeInstance("U", "util.unbatch"),
+            "S0": NodeInstance("S0", "util.select_batch", params={"member": "A.nd2"}),
+            "S1": NodeInstance("S1", "util.select_batch", params={"member": "B.nd2"}),
+        },
+        edges=[Edge("A", "BA", "image", "data", "forward"),
+               Edge("B", "BA", "image", "data", "forward"),
+               Edge("BA", "G", "out", "data", "forward"),
+               Edge("G", "U", "out", "data", "forward"),
+               Edge("U", "S0", "out", "data", "forward"),
+               Edge("U", "S1", "out", "data", "forward")])
+    eng = Engine(g, computes=COMPUTES,
+                 seeds={"A": seed(10, "A.nd2"), "B": seed(20, "B.nd2")})
+
+    stacked = eng.pull("U")
+    assert stacked.axes.b == 2, stacked.axes
+    # the member list is stamped from the DATA, which is what lets Unbatch name its
+    # outputs without the count travelling as a param that could contradict the wiring
+    assert stacked.metadata.get(BATCH_FILE_KEY) == ["A.nd2", "B.nd2"], stacked.metadata
+
+    def pixel(ds):
+        return float(ds.image.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8)[0, 0])
+
+    r0, r1 = eng.pull("S0"), eng.pull("S1")
+    assert (r0.axes.b, r1.axes.b) == (1, 1), (r0.axes, r1.axes)
+    # THE assertion this whole feature exists for: after a shared pipeline, each file is
+    # still its own file. Both reading 10.0 is the silent failure a batch must not have.
+    assert (pixel(r0), pixel(r1)) == (10.0, 20.0), (pixel(r0), pixel(r1))
+    assert r0.metadata.get(BATCH_FILE_KEY) == ["A.nd2"], r0.metadata
+
+    # naming a member that is not in the batch REFUSES, listing the real ones, rather
+    # than falling back to an index that would hand back some other specimen's pixels
+    gbad = Graph(nodes=dict(g.nodes, SX=NodeInstance(
+        "SX", "util.select_batch", params={"member": "C.nd2"})),
+        edges=list(g.edges) + [Edge("U", "SX", "out", "data", "forward")])
+    try:
+        Engine(gbad, computes=COMPUTES,
+               seeds={"A": seed(10, "A.nd2"), "B": seed(20, "B.nd2")}).pull("SX")
+        raise AssertionError("an unknown member must be refused")
+    except ValueError as exc:
+        assert "A.nd2" in str(exc) and "B.nd2" in str(exc), exc
+
+    # an empty member is a true no-op, so an unconfigured tap changes nothing
+    gnoop = Graph(nodes=dict(g.nodes, SN=NodeInstance(
+        "SN", "util.select_batch", params={"member": ""})),
+        edges=list(g.edges) + [Edge("U", "SN", "out", "data", "forward")])
+    assert Engine(gnoop, computes=COMPUTES,
+                  seeds={"A": seed(10, "A.nd2"),
+                         "B": seed(20, "B.nd2")}).pull("SN").axes.b == 2
+
+    # A structure table on a batch must say WHICH FILE each row came from, or two
+    # specimens' objects are indistinguishable rows in one table. Without the column it
+    # is refused; with it, accepted — so "absent" always means "there is no batch"
+    # rather than "nobody filled it".
+    from nodegraph.structure import StructureTable as _ST
+    from nodegraph.domains import BATCH_COLUMN as _BCOL
+    _bcols = {"id": np.arange(2), "y": np.zeros(2), "x": np.zeros(2)}
+    try:
+        Dataset(axes=replace(AXB, b=2)).with_structure(
+            _ST(D.POINT, dict(_bcols), layer="p"))
+        raise AssertionError("a structure table without its batch column must be refused")
+    except ValueError as exc:
+        assert "without a 'b' column" in str(exc), exc
+    _withb = Dataset(axes=replace(AXB, b=2)).with_structure(
+        _ST(D.POINT, dict(_bcols, **{_BCOL: np.array([0, 1])}), layer="p"))
+    assert _withb.get(D.POINT, _BCOL, "p") is not None
+    # ...and an UNBATCHED Dataset still takes a table with no batch column at all
+    assert Dataset(axes=AXB).with_structure(
+        _ST(D.POINT, dict(_bcols), layer="p")).get(D.POINT, "id", "p") is not None
+
+    _ok("batch axis: BatchProvider stacks K files on b (pure re-address — each member "
+        "reads its own file), BatchSliceProvider is its exact inverse, a mismatched or "
+        "nested member is refused by name, order is part of the identity; end to end a "
+        "shared pipeline hands each file back its OWN pixels, Unbatch names its members "
+        "from the stamped batch_file list, an unknown member refuses with the real ones "
+        "listed, an empty one is a no-op, and a structure table on a batch is refused "
+        "unless it carries the batch column that says which file each row came from")
+
+
+def test_analysis_inside_a_batch() -> None:
+    """Segmentation and measurement run INSIDE a batch, and every row knows its file.
+
+    The whole point of the golden point: draw ``threshold → label → measure`` once and get
+    per-file results, rather than K copies of the pipeline. What is pinned is that the two
+    files stay apart all the way to the table — the row counts, the ids, and above all the
+    ``file`` column, because a filename beside a measurement is the one value a reader
+    trusts without checking.
+    """
+    from nodegraph.nodes import COMPUTES as _CM
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodegraph.domains import BATCH_COLUMN as _BC
+    from nodegraph.metadata import BATCH_FILE_KEY as _BFK, SOURCE_FILE_KEY as _SFK
+    from nodelab_v2.tables import all_tables as _all_tables
+
+    _ax = AxisSizes(m=1, t=1, z=1, c=1, y=32, x=32)
+
+    def _file(name, nblobs, level):
+        """One file with ``nblobs`` separated bright squares."""
+        a = np.full((1, 1, 1, 1, 32, 32), 10, dtype=np.uint16)
+        for i in range(nblobs):
+            r, c = 3 + (i // 4) * 8, 3 + (i % 4) * 8
+            a[0, 0, 0, 0, r:r + 4, c:c + 4] = level
+        return (Dataset(axes=_ax, metadata={"pixel_size_um": 0.5, "bit_depth": 16})
+                .with_image(_AP(a)).with_metadata(**{_SFK: [name]}))
+
+    # different object COUNTS, so a result that pooled the files or served one of them
+    # twice cannot accidentally look right
+    g = Graph(
+        nodes={"A": NodeInstance("A", "io.load"), "B": NodeInstance("B", "io.load"),
+               "BA": NodeInstance("BA", "util.batch"),
+               # modes go on NodeInstance.modes — the engine REBUILDS params["__modes__"]
+               # from node.state(spec), so a mode passed in params is overwritten and the
+               # test would silently exercise the default instead of what it names
+               "TH": NodeInstance("TH", "analysis.threshold",
+                                  params={"threshold": 100.0},
+                                  modes={"method": "fixed"}),
+               "LB": NodeInstance("LB", "analysis.label"),
+               "MS": NodeInstance("MS", "analysis.measure")},
+        edges=[Edge("A", "BA", "image", "data", "forward"),
+               Edge("B", "BA", "image", "data", "forward"),
+               Edge("BA", "TH", "out", "data", "forward"),
+               Edge("TH", "LB", "out", "data", "forward"),
+               Edge("LB", "MS", "out", "data", "forward")])
+    out = Engine(g, computes=_CM,
+                 seeds={"A": _file("A.nd2", 2, 200),
+                        "B": _file("B.nd2", 5, 900)}).pull("MS")
+
+    assert int(out.axes.b) == 2, out.axes
+    assert out.metadata.get(_BFK) == ["A.nd2", "B.nd2"], out.metadata.get(_BFK)
+
+    bcol = out.get(D.LABEL, _BC, "labels")
+    assert bcol is not None, "a Label table on a batch must carry its batch column"
+    b = np.asarray(bcol.values)
+    assert [int((b == k).sum()) for k in (0, 1)] == [2, 5], b.tolist()
+    # ids are offset per member: two files each numbering from 1 would collide, and a
+    # downstream join by id would silently pair one file's cell with another's
+    ids = np.asarray(out.get(D.LABEL, "id", "labels").values)
+    assert len(set(ids.tolist())) == ids.size, ids.tolist()
+
+    # ...and the table NAMES each row's file. Derived from the per-B batch list via the
+    # batch column — NOT from the per-M bundle list, which on a batch belongs to one
+    # member and would put the first file's name on all seven rows.
+    cols = _all_tables(out)[("label", "labels")]
+    assert [str(v) for v in cols["file"]] == ["A.nd2"] * 2 + ["B.nd2"] * 5, cols["file"]
+
+    _ok("analysis inside a batch: threshold → label → measure runs ONCE over a 2-file "
+        "batch and keeps the files apart to the last column — 2 and 5 objects landing on "
+        "their own members, ids offset so no two files share one, and the `file` column "
+        "resolved through the batch list rather than the per-M bundle list (which on a "
+        "batch names one member and would label every row with the first file)")
+
+
+def test_batch_ragged_files() -> None:
+    """Files that do not share a grid: refused by name, or trimmed on request.
+
+    Real files are ragged. Two scans of one plate came back with 748 and 754 positions
+    (2026-09-29), which a rectangular batch axis cannot hold — so the node has to say
+    something useful rather than just fail. Pinned here: the refusal NAMES the axis and
+    the counts and points at the way out, ``trim`` actually runs, and what it dropped is
+    stamped, because a per-file count over 748 fields against one over 754 is not
+    comparable and nothing downstream would ever mention it.
+    """
+    from nodegraph.nodes import COMPUTES as _CM
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodegraph.metadata import BATCH_FILE_KEY as _BFK, SOURCE_FILE_KEY as _SFK
+    from nodegraph.catalog.util.batch import BATCH_KEY as _BK
+
+    def _f(name, m, t=1, z=1):
+        a = np.full((m, t, z, 1, 8, 8), 7, dtype=np.uint16)
+        a[:, :, :, 0, 2:5, 2:5] = 400
+        return (Dataset(axes=AxisSizes(m=m, t=t, z=z, c=1, y=8, x=8),
+                        metadata={"pixel_size_um": 0.5})
+                .with_image(_AP(a)).with_metadata(**{_SFK: [name] * m}))
+
+    def _run(a, b, align):
+        g = Graph(nodes={"A": NodeInstance("A", "io.load"),
+                         "B": NodeInstance("B", "io.load"),
+                         "BA": NodeInstance("BA", "util.batch",
+                                            modes={"align": align})},
+                  edges=[Edge("A", "BA", "image", "data", "forward"),
+                         Edge("B", "BA", "image", "data", "forward")])
+        return Engine(g, computes=_CM, seeds={"A": a, "B": b}).pull("BA")
+
+    # (a) refuse is the default, and says which axis, what the values are, and the fix
+    try:
+        _run(_f("A.nd2", 748), _f("B.nd2", 754), "refuse")
+        raise AssertionError("a ragged batch must be refused by default")
+    except ValueError as exc:
+        msg = str(exc)
+        assert "748" in msg and "754" in msg and "m:" in msg, msg
+        assert "trim" in msg, msg          # the refusal has to name the way out
+
+    # (b) trim runs, keeps the SMALLEST extent, and stamps what went
+    out = _run(_f("A.nd2", 748), _f("B.nd2", 754), "trim")
+    assert (int(out.axes.b), int(out.axes.m)) == (2, 748), out.axes
+    assert out.metadata.get(_BFK) == ["A.nd2", "B.nd2"]
+    note = (out.metadata.get(_BK) or {}).get("note", "")
+    assert "dropped" in note and "748" in note, note
+    # each member still reads its OWN pixels inside the kept extent — trimming is a view,
+    # not a resample, so nothing moved
+    got = [float(out.image.get_region(0, 747, 0, 0, 0, 2, 3, 2, 3, b=k)[0, 0])
+           for k in (0, 1)]
+    assert got == [400.0, 400.0], got
+
+    # (c) trim is a no-op on files that already agree — it must not re-wrap or re-stamp
+    same = _run(_f("A.nd2", 4), _f("B.nd2", 4), "trim")
+    assert int(same.axes.m) == 4 and _BK not in same.metadata, same.metadata
+
+    # (d) an axis that CANNOT be trimmed is refused under trim too, and says why: a
+    # different stack depth is a different acquisition, not a longer run of the same one
+    try:
+        _run(_f("A.nd2", 4, z=3), _f("B.nd2", 4, z=5), "trim")
+        raise AssertionError("a z mismatch must be refused even under trim")
+    except ValueError as exc:
+        assert "z" in str(exc), exc
+
+    _ok("ragged batch: files that disagree on position/time count are REFUSED by default "
+        "with the axis, both counts and the fix named; Align='trim' crops to the common "
+        "extent, stamps exactly what it dropped from which file (a per-file count over "
+        "different extents is not comparable and nothing else would say so), leaves "
+        "already-matching files untouched, and still refuses a z/c/y/x mismatch — a "
+        "different stack depth is a different acquisition, not a longer run of one")
+
+
+def test_batch_drop_guard() -> None:
+    """The engine's own guard: a compute that drops the batch is refused.
+
+    The catalog-wide test next door proves no SHIPPED node drops a batch today. It cannot
+    prove the guard works, because every node it reaches is caught earlier by the layer
+    shape check in ``with_attribute`` — a node that adds a Voxel mask fails on the mask's
+    shape before the engine ever compares the batch extents. So the guard's own case is an
+    **image-only** eager compute, and none ships today.
+
+    This writes one. ``_bad`` is precisely the bug INV-14 describes: allocate a plain
+    ``(m,t,z,c,y,x)`` raster, fill it from ``get_region`` without passing ``b``, hand it
+    back. It adds no layer, so nothing else can catch it. That is the whole point — the
+    guard is the only thing standing between this shape of mistake and an export that
+    silently contains file 1.
+    """
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodegraph.nodes import COMPUTES as _CM, register_node as _reg
+
+    def _bad(ctx):
+        """The INV-14 bug, on purpose: reads member 0 and calls it the whole batch."""
+        ds = ctx.inputs[0]
+        ax = ds.image.axes
+        out = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=float)
+        for m in range(ax.m):
+            for t in range(ax.t):
+                for z in range(ax.z):
+                    for c in range(ax.c):
+                        # the defect: no `b=`, so this is always the FIRST file
+                        out[m, t, z, c] = ds.image.get_region(
+                            0, m, t, z, c, 0, ax.y, 0, ax.x)
+        return ds.with_image(_AP(out)).reshaped_axes(_AP(out).axes)
+
+    def _good(ctx):
+        """The same node written correctly — carries every member through."""
+        ds = ctx.inputs[0]
+        ax = ds.image.axes
+        nb = int(ax.b)
+        out = np.zeros((nb, ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=float)
+        for b in range(nb):
+            for m in range(ax.m):
+                for t in range(ax.t):
+                    for z in range(ax.z):
+                        for c in range(ax.c):
+                            out[b, m, t, z, c] = ds.image.get_region(
+                                0, m, t, z, c, 0, ax.y, 0, ax.x, b=b)
+        return ds.with_image(_AP(out)).reshaped_axes(_AP(out).axes)
+
+    for op, fn in (("test.batch_dropper", _bad), ("test.batch_keeper", _good)):
+        _reg(fn, op_key=op, label=op, category="general",
+             inputs=[InDataset()], outputs=[OutDataset()],
+             granularity=Granularity.WHOLE_SERIES)
+
+    ax1 = AxisSizes(m=1, t=1, z=1, c=1, y=6, x=6)
+
+    def _bseed(v):
+        return Dataset(axes=ax1, metadata={"pixel_size_um": 1.0}).with_image(
+            _AP(np.full((1, 1, 1, 1, 6, 6), float(v))))
+
+    def _graph(op):
+        return Graph(
+            nodes={"A": NodeInstance("A", "io.load"), "B": NodeInstance("B", "io.load"),
+                   "BA": NodeInstance("BA", "util.batch"), "N": NodeInstance("N", op)},
+            edges=[Edge("A", "BA", "image", "data", "forward"),
+                   Edge("B", "BA", "image", "data", "forward"),
+                   Edge("BA", "N", "out", "data", "forward")])
+
+    seeds = {"A": _bseed(10), "B": _bseed(20)}
+    computes = dict(_CM)
+    computes["test.batch_dropper"] = _bad
+    computes["test.batch_keeper"] = _good
+
+    # the buggy one is REFUSED — by the engine, naming the node and both extents
+    try:
+        Engine(_graph("test.batch_dropper"), computes=computes, seeds=seeds).pull("N")
+        raise AssertionError("an image-only compute that drops the batch must be refused")
+    except ValueError as exc:
+        msg = str(exc)
+        assert "narrows the batch" in msg, msg          # the ENGINE guard, not the shape check
+        assert "test.batch_dropper" in msg and "2-file batch" in msg, msg
+
+    # ...and the correct one passes, with each member still its own file. Without this
+    # half the guard could be a blanket refusal of every batch and still look green.
+    out = Engine(_graph("test.batch_keeper"), computes=computes, seeds=seeds).pull("N")
+    assert int(out.axes.b) == 2, out.axes
+    got = [float(out.image.get_region(0, 0, 0, 0, 0, 0, 6, 0, 6, b=k)[0, 0])
+           for k in (0, 1)]
+    assert got == [10.0, 20.0], got
+
+    _ok("batch drop guard: an IMAGE-ONLY eager compute that fills a (m,t,z,c,y,x) raster "
+        "without passing b — the INV-14 bug, which adds no layer and so escapes the "
+        "shape check — is refused by the engine, naming the node and both file counts; "
+        "the same node written with b in its loop carries both members through with each "
+        "one's own pixels, so the guard is not a blanket refusal of batches")
+
+
+def test_batch_never_silently_dropped() -> None:
+    """No catalog node may take a 2-file batch and hand back one file.
+
+    **The failure this stands against has no other witness.** ~25 realizing nodes in the
+    catalog allocate a plain ``(m,t,z,c,y,x)`` raster; read at the default ``b=0`` that is
+    the FIRST file, returned as though it were the whole batch. The pixels are real, the
+    axes are self-consistent, the row count is plausible — the only sign anything happened
+    is that two files went in and one came out. So the invariant is checked over the whole
+    catalog rather than at the handful of nodes anyone thought to look at.
+
+    Three outcomes are acceptable and one is not: keep both files (the lazy nodes),
+    refuse loudly, or need an input this fixture cannot provide. Silently returning fewer files is
+    the only verdict this test fails on.
+    """
+    from nodegraph.nodes import COMPUTES as _CM
+    from nodegraph.provider import ArrayProvider as _AP
+    from nodegraph.registry import NODES as _NODES
+    from nodegraph.sockets import SocketType as _ST
+    from nodegraph.metadata import SOURCE_FILE_KEY as _SFK
+
+    _bax = AxisSizes(m=1, t=2, z=3, c=1, y=24, x=24)
+
+    def _bseed(v, name):
+        rng = np.random.default_rng(v)
+        a = (rng.random((1, 2, 3, 1, 24, 24)) * 40 + v).astype(np.uint16)
+        a[0, :, :, 0, 8:16, 8:16] += v * 4
+        return (Dataset(axes=_bax,
+                        metadata={"pixel_size_um": 0.5, "z_step_um": 1.0,
+                                  "dt_s": 1.0, "bit_depth": 16})
+                .with_image(_AP(a))
+                .with_metadata(**{_SFK: [name]}))
+
+    # the batch nodes themselves are the mechanism, not a consumer of it; the rest are
+    # boundary/fixture ops with no pixels to speak of
+    _skip = ("io.load", "io.dock", "view.viewer", "util.batch", "util.unbatch",
+             "util.select_batch", "flow.", "zone.", "group.", "rr.", "test.", "eng.",
+             "io.seed")
+    kept, refused, dropped, na = [], [], [], []
+    for _spec in _NODES.all():
+        _op = _spec.op_key
+        if _op.startswith(_skip):
+            continue
+        _din = next((s for s in _spec.inputs if s.type is _ST.DATASET), None)
+        if _din is None:
+            continue
+        _g = Graph(
+            nodes={"A": NodeInstance("A", "io.load"), "B": NodeInstance("B", "io.load"),
+                   "BA": NodeInstance("BA", "util.batch"),
+                   "N": NodeInstance("N", _op)},
+            edges=[Edge("A", "BA", "image", "data", "forward"),
+                   Edge("B", "BA", "image", "data", "forward"),
+                   Edge("BA", "N", "out", _din.name, "forward")])
+        try:
+            _out = Engine(_g, computes=_CM,
+                          seeds={"A": _bseed(10, "A.nd2"),
+                                 "B": _bseed(20, "B.nd2")}).pull("N")
+            _b = int(getattr(_out.axes, "b", 1)) if isinstance(_out, Dataset) else -1
+            (kept if _b == 2 else dropped).append((_op, _b))
+        except ValueError as _exc:
+            _m = str(_exc)
+            if ("narrows the batch" in _m or "leading batch axis" in _m
+                    or "without a 'b' column" in _m):
+                refused.append(_op)
+            else:
+                na.append(_op)
+        except Exception:                          # noqa: BLE001 — an unrelated input need
+            na.append(_op)
+
+    assert not dropped, (
+        "these nodes took a 2-file batch and returned fewer files, with no error — the "
+        "exact silent-wrong-data failure the batch axis exists to prevent: "
+        f"{dropped}")
+    # A catalog where NOTHING keeps both files would pass `not dropped` vacuously — every
+    # node could be refusing — so the pass count is asserted too. That the guard itself
+    # still fires is `test_batch_drop_guard`'s job, on a fixture written to trip it, since
+    # no shipped node does any more.
+    assert len(kept) >= 35, (len(kept), sorted(op for op, _ in kept))
+    assert not refused, (
+        "a shipped node refuses a batch — wrap its compute in "
+        f"`_shared.batch.batch_aware` and it will run per member: {refused}")
+    _ok(f"batch is never silently dropped: across the catalog {len(kept)} nodes carry "
+        f"both files through a 2-file batch, {len(refused)} refuse it and {len(na)} need "
+        f"an input this fixture cannot wire. ZERO return fewer files than they were "
+        f"given — the failure with no other witness, since one file's pixels under the "
+        f"whole batch's name look entirely valid")
+
+
+def test_bundle_source_file_column() -> None:
+    """A bundled export names the file every row came from.
+
+    After a bundle, ``m`` is the only thing separating one file's rows from another's —
+    and it means "the 7th position of the concatenation", which is not something the user
+    chose. The per-M ``source_file`` list turns it back into a filename, injected as a
+    column by :func:`nodelab_v2.tables.with_source_file`.
+
+    Two behaviours matter more than the happy path. It rides
+    :data:`~nodegraph.metadata.PER_POSITION_KEYS`, so a node that narrows or collapses M
+    reindexes/retires it with no knowledge that bundles exist; and a list that does not
+    cover the rows is dropped WHOLE, because a wrong filename beside a measurement is the
+    one error a reader has no way to notice.
+
+    (`nodelab_v2.tables`/`export` are Qt-free — this is the sanctioned reach across the
+    GUI seam, same as the `nodelab_v2.ops` and `nodelab_v2.ingest` tests above.)"""
+    import csv as _csv
+    import os as _os
+    import tempfile as _tf
+    from nodegraph.metadata import (SOURCE_FILE_KEY, PER_POSITION_KEYS,
+                                    position_subset, drop_position_keys)
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.tables import SOURCE_FILE_COLUMN, all_tables, _ordered_columns
+    from nodelab_v2.export import export_dataset
+
+    assert SOURCE_FILE_KEY in PER_POSITION_KEYS, \
+        "source_file must be a per-M key or a crop will leave it describing the wrong file"
+
+    ax = AxisSizes(m=2, t=1, z=1, c=1, y=16, x=16)
+    ds = Dataset(axes=ax, metadata={"pixel_size_um": 0.1}).with_image(
+        ArrayProvider(np.zeros((2, 1, 1, 1, 16, 16))))
+    for name, vals in {"id": [1, 2, 3], "m": [0, 1, 1], "t": [0, 0, 0], "c": [0, 0, 0],
+                       "z": [0.0, 0.0, 0.0], "y": [1.0, 2.0, 3.0],
+                       "x": [4.0, 5.0, 6.0], "area": [7.0, 8.0, 9.0]}.items():
+        ds = ds.with_layer(Domain.POINT, name, np.array(vals), layer="spots")
+    bundled = ds.with_metadata(**{SOURCE_FILE_KEY: ["plateA.nd2", "plateB.nd2"]})
+
+    tabs = all_tables(bundled)
+    cols = tabs[("point", "spots")]
+    assert list(cols[SOURCE_FILE_COLUMN]) == ["plateA.nd2", "plateB.nd2", "plateB.nd2"], \
+        list(cols[SOURCE_FILE_COLUMN])
+    # `file` reads immediately before the `m` it explains
+    order = _ordered_columns(cols)
+    assert order.index(SOURCE_FILE_COLUMN) == order.index("m") - 1, order
+
+    # a non-bundle Dataset is completely unchanged — no new column, no header churn for
+    # every export that already exists
+    assert all(SOURCE_FILE_COLUMN not in c for c in all_tables(ds).values())
+
+    # a list that does not cover the rows is dropped whole rather than part-applied
+    short = all_tables(ds.with_metadata(**{SOURCE_FILE_KEY: ["only-one.nd2"]}))
+    assert all(SOURCE_FILE_COLUMN not in c for c in short.values())
+
+    # it reaches the CSV, with the filename on the right rows
+    path = _os.path.join(_tf.mkdtemp(prefix="nd2bundle_"), "b.csv")
+    export_dataset(bundled, path)
+    with open(path, encoding="utf-8", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert SOURCE_FILE_COLUMN in rows[0], list(rows[0])
+    assert [r[SOURCE_FILE_COLUMN] for r in rows] == \
+        ["plateA.nd2", "plateB.nd2", "plateB.nd2"], rows
+
+    # the per-M machinery carries it: a crop reindexes, a collapse retires
+    md = dict(bundled.metadata)
+    assert position_subset(md, [1])[SOURCE_FILE_KEY] == ["plateB.nd2"]
+    assert drop_position_keys(md)[SOURCE_FILE_KEY] is None
+
+    _ok("bundle provenance: the per-M source_file list becomes a `file` column on every "
+        "table with an `m`, ordered before it, and reaches the CSV on the right rows; a "
+        "non-bundle Dataset is untouched, a list too short is dropped whole rather than "
+        "mislabelling a row, and a crop/collapse reindexes/retires it via PER_POSITION_KEYS")
+
+
+def test_crop_to_field() -> None:
+    """``util.crop_to``: crop a Dataset to where ANOTHER file sits, in absolute stage µm.
+
+    ``util.crop`` takes a window in pixels, and a pixel window means nothing across two
+    files: the WellA3 pair are both 1024² and describe a 294 µm and a 1760 µm field. So
+    this node derives the window from the microscope frame the two share, and what it has
+    to get right is everything that turns a µm box into the right pixels:
+
+    * the window is the pixels the reference's field COVERS, checked by value rather than
+      by shape — a placement error and a correct crop produce arrays of the same size;
+    * handedness MIRRORS the source columns without moving the µm box, which is the
+      failure mode that yields plausible data from the wrong place;
+    * the corner really moves: ``origin_um`` comes out as the delivered box, so the crop
+      can be placed again afterwards (a Merge downstream reads exactly that);
+    * a region straddling several positions takes the best one and SAYS SO, a region
+      hanging off an edge is clamped and says so, and a region that misses entirely is
+      refused with both files' extents in the message;
+    * the payload's axes and the ``crop_to_field`` meta_transform's prediction agree where
+      the prediction is possible (``m``) and the prediction says UNKNOWN where it is not
+      (``y``/``x``, and ``z`` under the lever) rather than guessing — the ``util.stitch``
+      rule (build-node-v2 §2);
+    * 2D, 3D and each ``extent`` key the memo apart.
+
+    The fixture is exact on purpose. A 40 µm data field at 1.0 µm/px and a 4 µm reference
+    at 0.5 µm/px put every box edge on a whole pixel of the data, so each assertion is an
+    index identity rather than a tolerance — and the node snaps inside a nanopixel before
+    rounding precisely so that landing on a boundary is not a float coin flip.
+    """
+    from nodegraph.catalog.util.crop_to import CROP_TO_KEY
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    from nodegraph.metadata import crop_to_field as _meta_crop_to
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # ── the data: one 40x40 µm field at 1 µm/px, corner at the stage origin ───
+    d_ax = AxisSizes(m=1, t=2, z=1, c=1, y=40, x=40)
+    d_img = np.zeros((1, 2, 1, 1, 40, 40), np.uint16)
+    for y in range(40):
+        for x in range(40):
+            d_img[0, :, 0, 0, y, x] = y * 100 + x      # every pixel names its own address
+    d_md = {"pixel_size_um": 1.0, "bit_depth": 12, "dt_s": 5.0,
+            "origin_um": [[0.0, 0.0, 0.0]], "stage_xy_um": [[20.0, 20.0]],
+            "source_file": ["overview.nd2"], "frame_time_jd": [2461249.0, 2461249.1]}
+    d_focus = np.array([[[1.0], [2.0]]])                   # a PLANE layer: (m, t, z)
+    data = (Dataset(axes=d_ax, metadata=dict(d_md)).with_image(ArrayProvider(d_img))
+            .with_layer(D.VOXEL, "mask", (d_img % 3 == 0))
+            .with_layer(D.PLANE, "focus", d_focus))
+
+    # ── the reference: an 8x8 field at 0.5 µm/px = 4 µm, at y 10..14, x 20..24 ─
+    r_ax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    r_md = {"pixel_size_um": 0.5, "bit_depth": 12,
+            "origin_um": [[0.0, 10.0, 20.0]], "stage_xy_um": [[22.0, 12.0]]}
+    ref = Dataset(axes=r_ax, metadata=dict(r_md)).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8), np.uint16)))
+
+    def eng(dataset=data, reference=ref, params=None, modes=None, ax=None, md=None):
+        g = Graph()
+        g.add(NodeInstance("A", "io.load"))
+        g.add(NodeInstance("B", "io.load"))
+        g.add(NodeInstance("K", "util.crop_to",
+                           params=dict(params or {"flip_x": False}),
+                           modes=dict(modes or {"dim": "2D", "extent": "union"})))
+        g.connect("A", "K")
+        g.connect("B", "K", dst_socket="region")
+        return Engine(g, computes=COMPUTES, seeds={"A": dataset, "B": reference},
+                      meta_seeds={"A": MetaEnvelope(axes=ax or dataset.axes,
+                                                    metadata=dict(md or dataset.metadata))})
+
+    # ── the window is the pixels the reference COVERS, by value ───────────────
+    e = eng()
+    out, env = e.pull("K"), e.env("K")
+    assert (out.axes.m, out.axes.t, out.axes.z, out.axes.y, out.axes.x) == (1, 2, 1, 4, 4), \
+        out.axes
+    got = out.image.read_region(0, 0, 0, 0, 0, 0, 4, 0, 4)
+    assert np.array_equal(got, d_img[0, 0, 0, 0, 10:14, 20:24]), got
+    assert out.metadata["origin_um"] == [[0.0, 10.0, 20.0]], out.metadata["origin_um"]
+    assert out.metadata["pixel_size_um"] == 1.0, "a crop resamples nothing"
+    assert out.metadata["dt_s"] == 5.0 and out.metadata["bit_depth"] == 12
+    assert out.metadata["frame_time_jd"] == d_md["frame_time_jd"], "T is untouched"
+    assert "stage_xy_um" not in out.metadata, \
+        "the stage CENTRE stops describing the data the moment the field is cut"
+    assert out.get(D.VOXEL, "mask") is None, (
+        "a Y/X window DROPS a lattice layer that no longer fits, which is util.crop's "
+        "own rule (reshaped_axes(drop_stale=True)) and not a divergence introduced here")
+    assert np.array_equal(out.get(D.PLANE, "focus").values, d_focus), (
+        "...while a lattice layer with no Y/X survives it")
+    assert any(str(s).startswith("crop_to[") for s in out.metadata[SAMPLING_KEY]), \
+        out.metadata[SAMPLING_KEY]
+    note = out.metadata[CROP_TO_KEY]
+    assert note["position"] == 0 and note["coverage"] == 1.0, note
+    assert note["window_px"] == [0, 1, 10, 14, 20, 24], note["window_px"]
+    assert note["delivered_um"][:4] == [10.0, 14.0, 20.0, 24.0], note["delivered_um"]
+    assert note["source_file"] == "overview.nd2", \
+        "the retired per-M lists leave their one surviving value in the note"
+    assert not note["warnings"], note["warnings"]
+
+    # ── the envelope: exact where it can be, UNKNOWN where it cannot ──────────
+    assert env.axes.m == 1, "the position count IS predictable — it is always one"
+    assert {"y", "x"} <= env.unknown_axes, env.unknown_axes
+    assert "z" not in env.unknown_axes, "2D cuts no plane, so z stays predicted"
+    assert "origin_um" not in env.metadata, \
+        "the cut corner needs the OTHER input, which this pass cannot see — so it says so"
+    assert env.metadata["pixel_size_um"] == 1.0, "nothing is resampled"
+    z3 = _meta_crop_to(MetaEnvelope(axes=d_ax, metadata=dict(d_md)), {}, {"dim": "3D"})
+    assert {"y", "x", "z"} <= z3.unknown_axes, z3.unknown_axes
+
+    # ── handedness mirrors the SOURCE columns, never the µm box ───────────────
+    flipped = eng(params={"flip_x": True}).pull("K")
+    assert np.array_equal(flipped.image.read_region(0, 0, 0, 0, 0, 0, 4, 0, 4),
+                          d_img[0, 0, 0, 0, 10:14, 16:20]), "flip_x reads the mirror column"
+    assert flipped.metadata["origin_um"] == [[0.0, 10.0, 20.0]], \
+        "...and the delivered µm box is the SAME one — a flip moves the read, not the place"
+
+    # ── margin, in microns, both ways ─────────────────────────────────────────
+    wide = eng(params={"flip_x": False, "margin": 3.0}).pull("K")
+    assert (wide.axes.y, wide.axes.x) == (10, 10), wide.axes
+    assert np.array_equal(wide.image.read_region(0, 0, 0, 0, 0, 0, 10, 0, 10),
+                          d_img[0, 0, 0, 0, 7:17, 17:27])
+    assert wide.metadata["origin_um"] == [[0.0, 7.0, 17.0]]
+    tight = eng(params={"flip_x": False, "margin": -1.0}).pull("K")
+    assert (tight.axes.y, tight.axes.x) == (2, 2), "a negative margin shrinks"
+    try:
+        eng(params={"flip_x": False, "margin": -2.0}).pull("K")
+    except ValueError as exc:
+        assert "shrunk the region to nothing" in str(exc) and "-2 " in str(exc), exc
+    else:
+        raise AssertionError("a margin that collapses the box must be refused")
+
+    # ── a nudge moves the window, not the pixels ──────────────────────────────
+    nudged = eng(params={"flip_x": False, "offset_y": 5.0, "offset_x": -4.0}).pull("K")
+    assert np.array_equal(nudged.image.read_region(0, 0, 0, 0, 0, 0, 4, 0, 4),
+                          d_img[0, 0, 0, 0, 15:19, 16:20])
+    assert nudged.metadata["origin_um"] == [[0.0, 15.0, 16.0]]
+
+    # ── clamped at the edge, and SAID so ──────────────────────────────────────
+    edge = Dataset(axes=r_ax, metadata=dict(
+        r_md, origin_um=[[0.0, 38.0, 20.0]], stage_xy_um=[[22.0, 40.0]])).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8), np.uint16)))
+    clamped = eng(reference=edge).pull("K")
+    assert (clamped.axes.y, clamped.axes.x) == (2, 4), clamped.axes
+    assert clamped.metadata["origin_um"] == [[0.0, 38.0, 20.0]]
+    cnote = clamped.metadata[CROP_TO_KEY]
+    assert abs(cnote["coverage"] - 0.5) < 1e-9, cnote["coverage"]
+    assert cnote["requested_um"][:2] == [38.0, 42.0] and cnote["delivered_um"][:2] == [38.0, 40.0]
+    assert any("clamped" in w for w in cnote["warnings"]), cnote["warnings"]
+
+    # ── a MISS is refused, with both extents in the message ───────────────────
+    far = Dataset(axes=r_ax, metadata=dict(
+        r_md, origin_um=[[0.0, 900.0, 900.0]], stage_xy_um=[[902.0, 902.0]])).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8), np.uint16)))
+    try:
+        eng(reference=far).pull("K")
+    except ValueError as exc:
+        assert "does not touch the data" in str(exc) and "Flip X" in str(exc), exc
+    else:
+        raise AssertionError("a region disjoint from the data must be refused, not clamped")
+
+    # ── a STRADDLE takes the best position and names what it left ─────────────
+    #
+    # Two 40 µm tiles side by side in x (0..40 and 40..80) and a 4 µm region at x 38..42,
+    # so tile 0 holds half of it and tile 1 the other half. The 50/50 split is decided by
+    # the sort's stability rather than by arithmetic, which is exactly what the note has to
+    # make visible — so the fixture is deliberately asymmetric instead: x 37..41 puts 75%
+    # on tile 0 and 25% on tile 1, far from any tie.
+    t_ax = AxisSizes(m=2, t=1, z=1, c=1, y=40, x=40)
+    t_img = np.zeros((2, 1, 1, 1, 40, 40), np.uint16)
+    t_img[0] = 1
+    t_img[1] = 2
+    t_md = {"pixel_size_um": 1.0, "bit_depth": 12,
+            "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 40.0]],
+            "stage_xy_um": [[20.0, 20.0], [60.0, 20.0]],
+            "source_file": ["tile0.nd2", "tile1.nd2"]}
+    tiles = Dataset(axes=t_ax, metadata=dict(t_md)).with_image(ArrayProvider(t_img))
+    rows = StructureTable(D.POINT, {
+        "id": np.array([1, 2, 3], dtype=np.int64),
+        "m": np.array([0, 1, 1], dtype=np.int64),
+        "t": np.zeros(3, dtype=np.int64), "c": np.zeros(3, dtype=np.int64),
+        "z": np.zeros(3), "y": np.array([1.0, 2.0, 3.0]), "x": np.array([1.0, 2.0, 3.0]),
+    }, layer="dots")
+    tiles = tiles.with_structure(rows)
+    straddle = Dataset(axes=r_ax, metadata=dict(
+        r_md, origin_um=[[0.0, 10.0, 37.0]], stage_xy_um=[[39.0, 12.0]])).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8), np.uint16)))
+    st = eng(dataset=tiles, reference=straddle).pull("K")
+    assert st.axes.m == 1, "a crop is ONE window, so it comes from one position"
+    assert np.all(st.image.read_region(0, 0, 0, 0, 0, 0, st.axes.y, 0, st.axes.x) == 1), \
+        "the best-covering tile, not tile 0 by luck"
+    snote = st.metadata[CROP_TO_KEY]
+    assert snote["position"] == 0 and abs(snote["coverage"] - 0.75) < 1e-9, snote
+    assert snote["other_positions"] == [[1, 0.25]], snote["other_positions"]
+    assert any("straddles 2 positions" in w and "util.stitch" in w
+               for w in snote["warnings"]), snote["warnings"]
+    assert "also overlap" in snote["note"], snote["note"]
+    assert st.get(D.POINT, "id", "dots").values.tolist() == [1], \
+        "rows on a dropped position go, and the survivors are renumbered"
+    assert st.get(D.POINT, "m", "dots").values.tolist() == [0]
+
+    # ── extent: union over a multi-site reference vs one of its sites ─────────
+    multi_ax = AxisSizes(m=2, t=1, z=1, c=1, y=8, x=8)
+    multi = Dataset(axes=multi_ax, metadata=dict(
+        r_md, origin_um=[[0.0, 10.0, 20.0], [0.0, 30.0, 20.0]],
+        stage_xy_um=[[22.0, 12.0], [22.0, 32.0]])).with_image(
+        ArrayProvider(np.zeros((2, 1, 1, 1, 8, 8), np.uint16)))
+    u = eng(reference=multi).pull("K")
+    assert (u.axes.y, u.axes.x) == (24, 4), "union spans both sites AND the gap between"
+    assert u.metadata["origin_um"] == [[0.0, 10.0, 20.0]]
+    one = eng(reference=multi, params={"flip_x": False, "ref_position": 1},
+              modes={"dim": "2D", "extent": "position"}).pull("K")
+    assert (one.axes.y, one.axes.x) == (4, 4) and one.metadata["origin_um"] == [[0.0, 30.0, 20.0]]
+    assert one.metadata[CROP_TO_KEY]["ref_positions"] == [1]
+    try:
+        eng(reference=multi, params={"flip_x": False, "ref_position": 5},
+            modes={"dim": "2D", "extent": "position"}).pull("K")
+    except ValueError as exc:
+        assert "out of range" in str(exc) and "0..1" in str(exc), exc
+    else:
+        raise AssertionError("an out-of-range reference position must be refused")
+
+    # ── 3D: the lever also cuts Z to the reference's focus span ───────────────
+    v_ax = AxisSizes(m=1, t=1, z=9, c=1, y=40, x=40)
+    v_img = np.zeros((1, 1, 9, 1, 40, 40), np.uint16)
+    for k in range(9):
+        v_img[0, 0, k] = 500 + k
+    # planes at 100, 102 … 116 µm (home 0, bottom-to-top, 2 µm steps)
+    v_md = dict(d_md, z_step_um=2.0, z_home_index=0, z_bottom_to_top=True,
+                stage_z_um=[100.0], origin_um=[[100.0, 0.0, 0.0]], dt_s=None)
+    vol = Dataset(axes=v_ax, metadata={k: v for k, v in v_md.items() if v is not None}
+                  ).with_image(ArrayProvider(v_img))
+    # a reference stack spanning 105..109 µm: planes 3 (106) and 4 (108) sit inside it, and
+    # the half-step slack reaches plane 2 (104) and plane 5 (110) — 1 µm each side of a
+    # 1 µm slack, so the fixture is pinned at the boundary on purpose and the snap is what
+    # keeps it from being a coin flip. Kept span: planes 2..5.
+    rv_ax = AxisSizes(m=1, t=1, z=3, c=1, y=8, x=8)
+    rv_md = dict(r_md, z_step_um=2.0, z_home_index=0, z_bottom_to_top=True,
+                 stage_z_um=[105.0], origin_um=[[105.0, 10.0, 20.0]])
+    rvol = Dataset(axes=rv_ax, metadata=dict(rv_md)).with_image(
+        ArrayProvider(np.zeros((1, 1, 3, 1, 8, 8), np.uint16)))
+    e3 = eng(dataset=vol, reference=rvol, modes={"dim": "3D", "extent": "union"})
+    o3, v3 = e3.pull("K"), e3.env("K")
+    assert (o3.axes.z, o3.axes.y, o3.axes.x) == (4, 4, 4), o3.axes
+    assert np.all(o3.image.read_region(0, 0, 0, 0, 0, 0, 4, 0, 4) == 502), \
+        "plane 0 of the crop is plane 2 of the source"
+    assert o3.metadata["origin_um"] == [[104.0, 10.0, 20.0]], o3.metadata["origin_um"]
+    assert o3.metadata["z_step_um"] == 2.0, "no plane is re-spaced, only dropped"
+    assert {"y", "x", "z"} <= v3.unknown_axes, v3.unknown_axes
+    assert "z_step_um" in dict(e3.entry("K").reads), \
+        "the axial slack is a CALIBRATION read and must be memo-fenced"
+    assert any("kept Z planes 2:4" in w or "kept Z planes 2:6" in w
+               for w in o3.metadata[CROP_TO_KEY]["warnings"]), \
+        o3.metadata[CROP_TO_KEY]["warnings"]
+    # margin_z widens it in whole planes, and is inert in 2D
+    e3w = eng(dataset=vol, reference=rvol, params={"flip_x": False, "margin_z": 4.0},
+              modes={"dim": "3D", "extent": "union"})
+    assert e3w.pull("K").axes.z == 8, e3w.pull("K").axes
+    # a reference with no focus log places laterally and keeps every plane, with a note
+    flat = Dataset(axes=r_ax, metadata=dict(r_md)).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8), np.uint16)))
+    e3f = eng(dataset=vol, reference=flat, modes={"dim": "3D", "extent": "union"})
+    o3f = e3f.pull("K")
+    assert o3f.axes.z == 9, "no focus log on the reference: cut nothing in Z, say why"
+    assert any("no focus log" in w for w in o3f.metadata[CROP_TO_KEY]["warnings"])
+
+    # ── refusals that are about the WIRING, not the geometry ──────────────────
+    g = Graph()
+    g.add(NodeInstance("A", "io.load"))
+    g.add(NodeInstance("K", "util.crop_to"))
+    g.connect("A", "K")
+    lone = Engine(g, computes=COMPUTES, seeds={"A": data},
+                  meta_seeds={"A": MetaEnvelope(axes=d_ax, metadata=dict(d_md))})
+    try:
+        lone.pull("K")
+    except ValueError as exc:
+        assert "nothing is wired into `region`" in str(exc) and "util.crop" in str(exc), exc
+    else:
+        raise AssertionError("an unwired `region` must be refused, naming the alternative")
+    bare = Dataset(axes=r_ax, metadata={"bit_depth": 12}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 8, 8), np.uint16)))
+    try:
+        eng(reference=bare).pull("K")
+    except ValueError as exc:
+        assert "pixel_size_um" in str(exc) and "cannot place" in str(exc), exc
+    else:
+        raise AssertionError("a reference with no stage record must be refused")
+
+    # ── the memo keys every distinct question apart ───────────────────────────
+    hashes = {
+        "2D": eng().entry("K").recipe_hash,
+        "3D": eng(modes={"dim": "3D", "extent": "union"}).entry("K").recipe_hash,
+        "pos": eng(params={"flip_x": False, "ref_position": 0},
+                   modes={"dim": "2D", "extent": "position"}).entry("K").recipe_hash,
+        "margin": eng(params={"flip_x": False, "margin": 3.0}).entry("K").recipe_hash,
+        "flip": eng(params={"flip_x": True}).entry("K").recipe_hash,
+        "nudge": eng(params={"flip_x": False, "offset_x": 1.0}).entry("K").recipe_hash,
+    }
+    assert len(set(hashes.values())) == len(hashes), hashes
+
+    _ok("util.crop_to: a µm box from another file's stage position and field size becomes "
+        "the right PIXELS of this one (value-checked, both handednesses); the corner moves "
+        "so the crop can be placed again; a straddle takes the best position and names what "
+        "it left, an overhang is clamped and a miss refused; 3D cuts Z to the reference's "
+        "focus span with a half-step slack and degrades with a note when either focus log "
+        "is missing; and the envelope says UNKNOWN where it cannot see the other input "
+        "instead of guessing")
+
+def test_chain_files() -> None:
+    """``util.chain`` lays a set of source FILES onto one axis — the shape a folder of
+    one-frame-per-file exports needs before anything temporal will work.
+
+    The failure this node exists to stop is silent on both halves, so both are pinned
+    here. Files reach the canvas on the POSITION axis whatever route they took — a
+    multi-file card stacks them there, separate cards are separate Datasets — so every
+    temporal node downstream reads a 1-frame series and answers a different question
+    without erroring. And the file ORDER comes from filenames whose last number is very
+    often not their counter, so ordering by the obvious shortcut plays the frames out of
+    sequence while everything still runs. Neither shows up as a crash.
+
+    The node takes ONE multi-input socket, so the three shapes it must serve — one bundle,
+    N separate cards, and a mixture — are all exercised against the same assertions.
+    """
+    from dataclasses import replace
+    from nodegraph import file_sequence as FS
+    from nodegraph.domains import Domain
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, chain_grow,
+                                    chain_members, source_file_runs, stamp_source_file)
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider, AxisRespreadProvider, MultiSourceProvider
+
+    # ── the counting field is DERIVED, not positional ────────────────────────────
+    names = ["WellA3_t001_z002.nd2", "WellA3_t002_z002.nd2", "WellA3_t010_z002.nd2"]
+    spec = FS.detect(names)
+    assert spec is not None and spec.pattern() == "WellA3_t{}_z002.nd2", spec
+    # THE assertion the detector exists for: the last number in these names is `z002`,
+    # which never moves. Taking it -- the obvious shortcut -- orders a timelapse by a
+    # constant, which plays the frames in load order while reporting success.
+    assert FS.order([names[2], names[0], names[1]]) == [1, 2, 0], FS.order(names)
+    # ...and a digit run is compared as a NUMBER, so the first rollover does not reorder
+    # the series (`t10` sorting before `t9` is what an ASCII sort does here).
+    assert FS.order(["i_t10.tif", "i_t9.tif"]) == [1, 0]
+    # two varying fields have no right answer, so they are REPORTED rather than resolved
+    amb = FS.detect(["p1_t1.tif", "p1_t2.tif", "p2_t1.tif"])
+    assert amb is not None and len(amb.ambiguous) == 2, amb
+    # a typed pattern whose token is glued to literal digits would match `t99` as readily
+    # as `t00099` -- refused, rather than honoured as something narrower than it looks
+    assert FS.compile_pattern("t00{}.tif") is None
+    assert FS.compile_pattern("a_t{}.tif").index_of("a_t7.tif") == 7
+    # a constant field written two ways is still ONE series (`z002` vs `z2`)
+    assert FS.compile_pattern("a_t{}_z002.tif").index_of("a_t4_z2.tif") == 4
+    # a series stored one file per NUMBERED FOLDER has identical basenames, and a bundle
+    # labels exactly that case with its parent segments -- so the counter is read out of
+    # the path rather than lost. The basename rule is not weakened to get it: a constant
+    # numeric parent dir must still not look like a counting field.
+    lab = ["t010/img.nd2", "t002/img.nd2", "t001/img.nd2"]
+    assert [lab[i] for i in FS.order(lab)] == \
+        ["t001/img.nd2", "t002/img.nd2", "t010/img.nd2"], FS.order(lab)
+    par = ["run7/a_t2.nd2", "run7/a_t10.nd2", "run7/a_t1.nd2"]
+    assert [par[i] for i in FS.order(par)] == \
+        ["run7/a_t1.nd2", "run7/a_t2.nd2", "run7/a_t10.nd2"], FS.order(par)
+    _ok("file_sequence: counter derived not positional, 9<10, ambiguity reported")
+
+    # ── file boundaries are recovered from the labels the loader stamped ─────────
+    assert source_file_runs({SOURCE_FILE_KEY: ["a", "a", "b"]}, 3) == \
+        [("a", 0, 2), ("b", 2, 1)]
+    # a list that does not describe THIS many positions names the wrong file rather than
+    # admitting it does not know, so it is refused whole (the `position_subset` rule)
+    assert source_file_runs({SOURCE_FILE_KEY: ["a", "b"]}, 3) is None
+    assert source_file_runs({}, 3) is None
+    # every source card names itself now, not only a bundle's members (V3.02) -- without
+    # it a separately loaded file carries its name nowhere a compute can reach
+    env1 = stamp_source_file(MetaEnvelope(axes=AxisSizes(m=2)), "/data/A3/run_t007.nd2")
+    assert env1.metadata[SOURCE_FILE_KEY] == ["run_t007.nd2"] * 2, env1.metadata
+
+    def src(vals, t=1):
+        """One file: ``len(vals)`` positions, ``t`` frames, value ``v + 100*frame``."""
+        a = np.zeros((len(vals), t, 1, 1, 4, 4), dtype=np.uint16)
+        for i, v in enumerate(vals):
+            for k in range(t):
+                a[i, k] = v + 100 * k
+        return ArrayProvider(a)
+
+    def one(vals, name, t=1, z=1, **md):
+        """A separately loaded card: one file, its own provider."""
+        a = np.zeros((len(vals), t, z, 1, 4, 4), dtype=np.uint16)
+        for i, v in enumerate(vals):
+            for k in range(t):
+                a[i, k] = v + 100 * k
+        p = ArrayProvider(a)
+        meta = {"pixel_size_um": 0.5, SOURCE_FILE_KEY: [str(name)] * len(vals)}
+        meta.update(md)
+        return Dataset(axes=p.axes, metadata=meta).with_image(p)
+
+    def bundle(files, names, t=1, **md):
+        """A multi-file card: K files end to end on m, one provider."""
+        p = MultiSourceProvider([src(v, t) for v in files], labels=names)
+        labels = [n for n, v in zip(names, files) for _ in range(len(v))]
+        meta = {"pixel_size_um": 0.5, "z_step_um": 1.0,
+                "stage_xy_um": [[7.0, 8.0]] * int(p.axes.m), SOURCE_FILE_KEY: labels}
+        meta.update(md)
+        return p, Dataset(axes=p.axes, metadata=meta).with_image(p)
+
+    def run(seeds, axis="T", order="sequence"):
+        seeds = list(seeds)
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
+        nodes["C"] = NodeInstance("C", "util.chain",
+                                  modes={"chain_axis": axis, "chain_order": order})
+        g = Graph(nodes=nodes,
+                  edges=[Edge(f"L{i}", "C", "image", "data", "forward")
+                         for i in range(len(seeds))])
+        eng = Engine(g, computes=COMPUTES,
+                     seeds={f"L{i}": d for i, d in enumerate(seeds)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(seeds)})
+        return eng, eng.pull("C")
+
+    def px(ds, m=0, t=0, z=0, c=0):
+        return float(ds.image.get_region(0, m, t, z, c, 0, 4, 0, 4)[0, 0])
+
+    # ── shape 1: ONE multi-file card, its files listed out of sequence order ─────
+    scrambled = ["w_t010.nd2", "w_t002.nd2", "w_t001.nd2"]
+    prov, ds = bundle([[10], [2], [1]], scrambled)
+    assert (prov.axes.m, prov.axes.t) == (3, 1), prov.axes
+    eng, out = run([ds], "T")
+    assert (out.axes.m, out.axes.t) == (1, 3), out.axes
+    # THE assertion: frame k is the file whose NAME counts k, not the file listed k-th
+    assert [px(out, t=k) for k in range(3)] == [1.0, 2.0, 10.0], \
+        [px(out, t=k) for k in range(3)]
+    # the edit-time envelope predicts the pulled axes EXACTLY -- not "unknown". The
+    # transform opts into every input's envelope (`chain_grow.wants_inputs`), so the file
+    # count is visible to it and the card shows a real T while you are still wiring.
+    assert eng.env("C").axes == out.axes, (eng.env("C").axes, out.axes)
+    assert not eng.env("C").unknown_axes, eng.env("C").unknown_axes
+    note = out.metadata.get("__chain__")
+    assert note["files"] == sorted(scrambled) and note["order"] == "sequence", note
+
+    # ── shape 2: N SEPARATELY loaded cards, wired out of sequence order ──────────
+    seps = [one([10], "w_t010.nd2"), one([2], "w_t002.nd2"), one([1], "w_t001.nd2")]
+    eng_s, out_s = run(seps, "T")
+    assert (out_s.axes.m, out_s.axes.t) == (1, 3), out_s.axes
+    # the same answer as the bundle: the node reads FILES, not the shape they arrived in
+    assert [px(out_s, t=k) for k in range(3)] == [1.0, 2.0, 10.0]
+    assert eng_s.env("C").axes == out_s.axes and not eng_s.env("C").unknown_axes
+    # `loaded` keeps wiring order -- the escape for names that do not count
+    _e, out_l = run(seps, "T", order="loaded")
+    assert [px(out_l, t=k) for k in range(3)] == [10.0, 2.0, 1.0], out_l
+    assert _e.entry("C").recipe_hash != eng_s.entry("C").recipe_hash
+    # ...and a file with NO name falls back to wiring order rather than half-sorting:
+    # sorting a partly-named set puts the named files in sequence and leaves the rest
+    # where they fell, which reads as working.
+    anon = [one([10], "w_t010.nd2"), one([2], ""), one([1], "w_t001.nd2")]
+    _ea, out_a = run(anon, "T")
+    assert [px(out_a, t=k) for k in range(3)] == [10.0, 2.0, 1.0], out_a
+    assert out_a.metadata["__chain__"]["order"] == "wired", out_a.metadata["__chain__"]
+
+    # ── shape 3: MIXED — a 2-file card plus a separate card, interleaved by name ─
+    _pm, b2 = bundle([[1], [3]], ["m_t001.nd2", "m_t003.nd2"])
+    eng_m, out_m = run([b2, one([2], "m_t002.nd2")], "T")
+    assert (out_m.axes.m, out_m.axes.t) == (1, 3), out_m.axes
+    # the single card lands BETWEEN the bundle's two files -- the node splits inputs into
+    # files and orders globally, which neither util.merge nor a bundle can do
+    assert [px(out_m, t=k) for k in range(3)] == [1.0, 2.0, 3.0]
+    assert eng_m.env("C").axes == out_m.axes, (eng_m.env("C").axes, out_m.axes)
+
+    # ── metadata moves in lockstep with the axes ─────────────────────────────────
+    # every position now comes from all 3 files, so per-position keys survive only where
+    # the files already agreed. `source_file` never agrees -- it drops out by itself.
+    assert out.metadata.get(SOURCE_FILE_KEY) is None, out.metadata
+    assert out.metadata.get("stage_xy_um") == [[7.0, 8.0]], out.metadata
+    _p2, ds2 = bundle([[1], [2]], ["a_t1.nd2", "a_t2.nd2"])
+    ds2 = ds2.with_metadata(stage_xy_um=[[0.0, 0.0], [99.0, 99.0]])
+    _e2, out2 = run([ds2], "T")
+    # ...and where they disagree it is DROPPED, not taken from the first file: a chained
+    # position really did come from two places, and naming one is a coordinate on a voxel
+    # that was not acquired there.
+    assert out2.metadata.get("stage_xy_um") is None, out2.metadata
+    # ...and the note says by how much, which is what lets a downstream Stitch blame the
+    # chain rather than the file format
+    assert out2.metadata["__chain__"]["stage_spread_um"] == round(99.0 * 2 ** 0.5, 3), \
+        out2.metadata["__chain__"]
+    # A stage that REVISITS a point never reads back the same micron twice, so exact
+    # equality dropped the log on every real ND2 timelapse-per-file series and left Stitch
+    # with "carries 0". Within a tenth of a field (4 px * 0.5 um -> 0.2 um here) it is one
+    # field and the FIRST file's reading is kept -- tuples against lists too, since a
+    # sidecar round trip turns one into the other.
+    jit = {"stage_xy_um": [(0.0, 0.0), (2.0, 0.0), [0.05, -0.03], [2.02, 0.01]],
+           "stage_z_um": [5.0, 5.0, 5.4, 4.7]}
+    _pj, dsj = bundle([[1, 2], [3, 4]], ["j_t1.nd2", "j_t2.nd2"], **jit)
+    _ej, outj = run([dsj], "T")
+    assert (outj.axes.m, outj.axes.t) == (2, 2), outj.axes
+    assert outj.metadata.get("stage_xy_um") == [(0.0, 0.0), (2.0, 0.0)], outj.metadata
+    # axial tolerance is one z_step (1.0 um): 0.4 and 0.3 um of refocus is the same planes
+    assert outj.metadata.get("stage_z_um") == [5.0, 5.0], outj.metadata
+    assert _ej.env("C").metadata.get("stage_xy_um") == outj.metadata["stage_xy_um"]
+    assert 0 < outj.metadata["__chain__"]["stage_spread_um"] <= 0.2, outj.metadata
+    # one micron is five tolerances: two different places, still dropped -- and z too
+    far = dict(jit, stage_xy_um=[(0.0, 0.0), (2.0, 0.0), (1.0, 0.0), (3.0, 0.0)],
+               stage_z_um=[5.0, 5.0, 7.0, 5.0])
+    _pf, dsf = bundle([[1, 2], [3, 4]], ["f_t1.nd2", "f_t2.nd2"], **far)
+    _ef, outf = run([dsf], "T")
+    assert outf.metadata.get("stage_xy_um") is None, outf.metadata
+    assert outf.metadata.get("stage_z_um") is None, outf.metadata
+    # THE user path: chain a per-timepoint series onto T, then stitch by stage. Before the
+    # tolerance this raised "needs a per-position stage log ... carries 0".
+    def stitched(seed):
+        g = Graph(nodes={"L": NodeInstance("L", "io.load"),
+                         "C": NodeInstance("C", "util.chain", modes={"chain_axis": "T"}),
+                         "S": NodeInstance("S", "util.stitch", modes={"layout": "stage"})},
+                  edges=[Edge("L", "C", "image", "data", "forward"),
+                         Edge("C", "S", "out", "data", "forward")])
+        return Engine(g, computes=COMPUTES, seeds={"L": seed},
+                      meta_seeds={"L": MetaEnvelope(axes=seed.axes,
+                                                    metadata=seed.metadata)}).pull("S")
+    st = stitched(dsj)
+    assert (st.axes.m, st.axes.t, st.axes.y, st.axes.x) == (1, 2, 4, 8), st.axes
+    try:
+        stitched(dsf)
+        raise AssertionError("stitch placed tiles the chain could not locate")
+    except ValueError as exc:
+        # the refusal names the chain and its numbers, not "TIFFs never have one" alone
+        assert "Chain Files upstream dropped it" in str(exc), exc
+
+    # ── every axis: the payload and the prediction agree on all four branches ────
+    for axis, attr in (("T", "t"), ("Z", "z"), ("C", "c")):
+        e, o = run([ds], axis)
+        assert getattr(o.axes, attr) == 3 and o.axes.m == 1, (axis, o.axes)
+        assert e.env("C").axes == o.axes, (axis, e.env("C").axes, o.axes)
+    # "M" lays the files onto POSITIONS: for one card that is the same SIZE it already
+    # had, but the files are re-sorted by name, and the per-M lists concatenate so every
+    # position keeps naming its own file (unlike the other axes, where they merge).
+    e_m, om = run([ds], "M")
+    assert om.axes == prov.axes, om.axes
+    assert [px(om, m=k) for k in range(3)] == [1.0, 2.0, 10.0], om
+    assert om.metadata.get(SOURCE_FILE_KEY) == sorted(scrambled), om.metadata
+    assert e_m.env("C").axes == om.axes
+    # separate cards joined onto M really do grow it
+    _e3, om2 = run(seps, "M")
+    assert (om2.axes.m, om2.axes.t) == (3, 1), om2.axes
+    # the four axes are four distinct recipes
+    hashes = {a: run([ds], a)[0].entry("C").recipe_hash for a in ("T", "M", "C", "Z")}
+    assert len(set(hashes.values())) == 4, hashes
+
+    # per-channel lists TILE within one card when chaining onto C -- exact, not invented,
+    # because the loader refuses to bundle files whose channel names differ
+    _e4, out_c = run([ds.with_metadata(channel_names=["DAPI"])], "C")
+    assert out_c.metadata.get("channel_names") == ["DAPI"] * 3, out_c.metadata
+    # ...but SEPARATE cards each carry their own, so those concatenate exactly
+    _e5, out_c2 = run([one([1], "c_t1.nd2", channel_names=["DAPI"]),
+                       one([2], "c_t2.nd2", channel_names=["GFP"])], "C")
+    assert out_c2.metadata.get("channel_names") == ["DAPI", "GFP"], out_c2.metadata
+    # the per-T clock is DROPPED for one card's files: the bundle only ever carried file
+    # 0's, so tiling it would claim every file was acquired at the same instants
+    _e6, out_t = run([ds.with_metadata(frame_time_jd=[2451545.0])], "T")
+    assert out_t.metadata.get("frame_time_jd") is None, out_t.metadata
+    # ...while separate cards each carry their own clock, so those concatenate
+    _e7, out_t2 = run([one([1], "k_t1.nd2", frame_time_jd=[1.0]),
+                       one([2], "k_t2.nd2", frame_time_jd=[2.0])], "T")
+    assert out_t2.metadata.get("frame_time_jd") == [1.0, 2.0], out_t2.metadata
+
+    # ── files with DIFFERENT frame counts — the case the first cut refused ──────
+    # A series exported in unequal chunks (5 frames, then 3) is still one series. The
+    # chained axis is the SUM of what each file brings, not a multiple of the first
+    # file's, and requiring them to match refused an ordinary acquisition.
+    u5, u3 = one([1], "u_t001.nd2", t=5), one([9], "u_t002.nd2", t=3)
+    eu, outu = run([u5, u3], "T")
+    assert (outu.axes.m, outu.axes.t) == (1, 8), outu.axes
+    assert [px(outu, t=k) for k in range(8)] == \
+        [1.0, 101.0, 201.0, 301.0, 401.0, 9.0, 109.0, 209.0], \
+        [px(outu, t=k) for k in range(8)]
+    # the card predicts the SUM at edit time, not a product and not "unknown"
+    assert eu.env("C").axes == outu.axes, (eu.env("C").axes, outu.axes)
+    assert not eu.env("C").unknown_axes, eu.env("C").unknown_axes
+    assert outu.metadata["__chain__"]["per_file"] == [5, 3], outu.metadata["__chain__"]
+    # three unequal chunks, wired out of order, still land in filename order
+    _eu3, outu3 = run([one([3], "v_t003.nd2", t=2), one([1], "v_t001.nd2", t=5),
+                       one([2], "v_t002.nd2", t=3)], "T")
+    assert outu3.axes.t == 10, outu3.axes
+    assert [px(outu3, t=k) for k in (0, 5, 8)] == [1.0, 2.0, 3.0], outu3
+    # per-T clocks of different lengths concatenate, each contributing its own
+    _euc, outuc = run([one([1], "w_t001.nd2", t=2, frame_time_jd=[1.0, 2.0]),
+                       one([9], "w_t002.nd2", t=3, frame_time_jd=[5.0, 6.0, 7.0])], "T")
+    assert outuc.metadata.get("frame_time_jd") == [1.0, 2.0, 5.0, 6.0, 7.0], outuc.metadata
+    # ...but a mismatch on an axis that is NOT being chained is still refused, by name
+    try:
+        run([one([1], "y_t001.nd2", t=2), one([9], "y_t002.nd2", t=2, z=3)], "T")
+        raise AssertionError("a z mismatch must still be refused when chaining T")
+    except ValueError as exc:
+        assert "on z" in str(exc) and "every OTHER axis" in str(exc), exc
+
+    # ── files that hold several positions: blocks, never an interleave ───────────
+    _p5, ds5 = bundle([[1, 2, 3], [11, 12, 13]], ["s_t1.nd2", "s_t2.nd2"])
+    e5, out5 = run([ds5], "T")
+    assert (out5.axes.m, out5.axes.t) == (3, 2), out5.axes
+    assert e5.env("C").axes == out5.axes
+    # position j keeps its identity across the chain; it gains a frame from each file
+    assert [[px(out5, m=m, t=t) for t in range(2)] for m in range(3)] == \
+        [[1.0, 11.0], [2.0, 12.0], [3.0, 13.0]]
+    # a file that already held frames keeps them CONTIGUOUS -- file i owns [i*t0,(i+1)*t0)
+    _p6, ds6 = bundle([[1], [2]], ["q_t1.nd2", "q_t2.nd2"], t=2)
+    e6, out6 = run([ds6], "T")
+    assert (out6.axes.m, out6.axes.t) == (1, 4), out6.axes
+    assert [px(out6, t=k) for k in range(4)] == [1.0, 101.0, 2.0, 102.0], out6
+    assert e6.env("C").axes == out6.axes
+
+    # ── refusals ────────────────────────────────────────────────────────────────
+    _p7, ragged = bundle([[1, 2], [9]], ["r_t1.nd2", "r_t2.nd2"])
+    try:
+        run([ragged], "T")
+        raise AssertionError("files with different POSITION counts must be refused onto T")
+    except ValueError as exc:
+        # names every file and its count -- which ones are "the odd ones" is the user's
+        # judgement, and the fix differs depending on which way the majority runs -- and
+        # points at the axis that DOES take them, rather than only saying no
+        assert "POSITIONS" in str(exc) and "r_t1.nd2 holds 2" in str(exc) \
+            and "r_t2.nd2 holds 1" in str(exc) \
+            and "Chain onto M instead" in str(exc), exc
+    # ...and the prediction stays UNKNOWN for it, rather than greying the refusal out
+    # behind a plausible-looking card
+    env_r = chain_grow(MetaEnvelope(axes=ragged.axes, metadata=ragged.metadata),
+                       {}, {"chain_axis": "T"})
+    assert {"m", "t"} <= set(env_r.unknown_axes), env_r.unknown_axes
+    # a ragged set spread across SEPARATE cards is caught the same way
+    try:
+        run([one([1], "x_t1.nd2"), one([2, 3], "x_t2.nd2")], "T")
+        raise AssertionError("separate cards with different position counts must refuse")
+    except ValueError as exc:
+        assert "POSITIONS" in str(exc), exc
+    # ...but the same pair goes onto M, which is the axis that HAS room for them
+    _ex, out_x = run([one([1], "x_t1.nd2"), one([2, 3], "x_t2.nd2")], "M")
+    assert out_x.axes.m == 3, out_x.axes
+
+    # inputs that disagree on scale are refused BY KEY: chaining resamples nothing, so the
+    # result would carry one file's pixel size over another's pixels
+    try:
+        run([one([1], "b_t1.nd2"),
+             one([2], "b_t2.nd2").with_metadata(pixel_size_um=1.7)], "T")
+        raise AssertionError("a pixel-size mismatch must be refused")
+    except ValueError as exc:
+        assert "pixel_size_um" in str(exc) and "0.5" in str(exc), exc
+
+    masked = ds.with_layer(Domain.VOXEL, "mask",
+                           np.ones(ds.axes.shape_for(Domain.VOXEL), bool))
+    try:
+        run([masked], "T")
+        raise AssertionError("an input carrying layers must be refused")
+    except ValueError as exc:
+        assert "directly after the loaders" in str(exc), exc
+
+    # ── no-ops, so an unconfigured or single-file card costs and stamps nothing ──
+    _p8, solo = bundle([[7]], ["only.nd2"])
+    _e8, out8 = run([solo], "T")
+    assert out8.axes == solo.axes and out8.metadata.get("__chain__") is None, out8.axes
+    # an input with no `source_file` at all is one unnamed file -- the same pass-through
+    _e9, out9 = run([ds.with_metadata(**{SOURCE_FILE_KEY: None})], "T")
+    assert out9.axes == ds.axes, out9.axes
+
+    # ── member building, shared by the compute and the meta_transform ────────────
+    A4 = AxisSizes(m=4)
+    mem, n, prob = chain_members([({SOURCE_FILE_KEY: ["a", "a", "b", "b"]}, A4)], "t")
+    # one member per FILE, not per position: two files of two positions each
+    assert prob is None and n == 2 and [m.name for m in mem] == ["a", "b"], mem
+    assert [m.source for m in mem] == [0, 0] and [m.start for m in mem] == [0, 2]
+    # ...and two cards contribute one member each, from different `source` indices
+    A1 = AxisSizes(m=1)
+    mem2, n2, prob2 = chain_members([({SOURCE_FILE_KEY: ["b"]}, A1),
+                                     ({SOURCE_FILE_KEY: ["a"]}, A1)], "t")
+    assert prob2 is None and n2 == 1 and [m.source for m in mem2] == [1, 0], mem2
+    # each member knows its own extent along the chained axis, which is what lets files
+    # with different frame counts be summed rather than multiplied
+    m5, m3 = AxisSizes(m=1, t=5), AxisSizes(m=1, t=3)
+    memu, _nu, probu = chain_members([({SOURCE_FILE_KEY: ["u1"]}, m5),
+                                      ({SOURCE_FILE_KEY: ["u2"]}, m3)], "t")
+    assert probu is None and [mm.extent("t") for mm in memu] == [5, 3], memu
+    _m, _n, prob3 = chain_members([({SOURCE_FILE_KEY: ["a", "b", "b"]}, AxisSizes(m=3))],
+                                  "t")
+    assert prob3 is not None and "POSITIONS" in prob3, prob3
+    # ...and that same set is FINE onto m, where each file keeps its own count
+    _m4, _n4, prob4 = chain_members([({SOURCE_FILE_KEY: ["a", "b", "b"]}, AxisSizes(m=3))],
+                                    "m")
+    assert prob4 is None, prob4
+
+    # ── the provider's own contract ─────────────────────────────────────────────
+    base = src([1, 2, 3, 4])
+    # one source, two files of 2 positions each, taken in reverse order
+    rp = AxisRespreadProvider([(base, 2, 2), (base, 0, 2)], "t")
+    assert (rp.axes.m, rp.axes.t) == (2, 2), rp.axes
+    assert rp.locate(1) == (1, 0) and rp.spans[1] == ("file1", 1, 1), rp.spans
+    assert float(rp.read_region(0, 0, 0, 0, 0, 0, 4, 0, 4)[0, 0]) == 3.0
+    assert float(rp.read_region(0, 0, 1, 0, 0, 0, 4, 0, 4)[0, 0]) == 1.0
+    # ...and K DISTINCT sources are the same object to it, which is what lets one node
+    # serve a bundle and a pile of separate cards without branching
+    sep = AxisRespreadProvider([(src([9]), 0, 1), (src([8]), 0, 1)], "t")
+    assert (sep.axes.m, sep.axes.t) == (1, 2), sep.axes
+    assert [float(sep.read_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0]) for t in (0, 1)] \
+        == [9.0, 8.0]
+    # THE relaxation the reported traceback asked for: members may differ on the axis
+    # being chained, and the result is their SUM. Requiring them to match would refuse a
+    # series exported in unequal chunks, which is an ordinary way to acquire one.
+    une = AxisRespreadProvider([(src([1], t=5), 0, 1), (src([9], t=3), 0, 1)], "t")
+    assert une.axes.t == 8, une.axes
+    assert une.spans == (("file0", 0, 5), ("file1", 5, 3)), une.spans
+    assert [float(une.read_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0]) for t in range(8)] \
+        == [1.0, 101.0, 201.0, 301.0, 401.0, 9.0, 109.0, 209.0]
+    # onto m the members line up as positions instead, and may hold different counts
+    onm = AxisRespreadProvider([(base, 2, 2), (base, 0, 2)], "m")
+    assert onm.axes.m == 4 and onm.axes.t == 1, onm.axes
+    assert [float(onm.read_region(0, m, 0, 0, 0, 0, 4, 0, 4)[0, 0]) for m in range(4)] \
+        == [3.0, 4.0, 1.0, 2.0]
+    mixed = AxisRespreadProvider([(base, 0, 3), (base, 3, 1)], "m")
+    assert mixed.axes.m == 4, mixed.axes
+    # the spatial pyramid is a member's; the re-addressed axes are this provider's own
+    assert rp.level_axes(0).m == 2 and rp.level_axes(0).t == 2
+    # identity folds the ORDER, so the same files chained the other way round can never
+    # be served from the other's memo entry
+    assert AxisRespreadProvider([(base, 0, 2), (base, 2, 2)], "t").version != rp.version
+    for bad_axis in ("y", "b", "q"):
+        try:
+            AxisRespreadProvider([(base, 0, 4)], bad_axis)
+            raise AssertionError(f"axis {bad_axis!r} must be refused")
+        except ValueError as exc:
+            assert "axis must be one of" in str(exc), exc
+    try:
+        AxisRespreadProvider([(base, 0, 2), (base, 3, 2)], "t")   # 3..5 runs off m=4
+        raise AssertionError("a run past the end of m must be refused")
+    except ValueError as exc:
+        assert "source_file labels disagree with the image" in str(exc), exc
+    try:
+        AxisRespreadProvider([(src([1]), 0, 1), (src([1], t=2), 0, 1)], "z")
+        raise AssertionError("members disagreeing on a NON-chained axis must be refused")
+    except ValueError as exc:
+        assert "does not match member 0 on t" in str(exc), exc
+    try:
+        AxisRespreadProvider([(src([1, 2]), 0, 2), (src([1]), 0, 1)], "t")
+        raise AssertionError("differing position counts must be refused onto t")
+    except ValueError as exc:
+        assert "same number of positions" in str(exc), exc
+
+    _ok("util.chain: files laid onto T/Z/C/M in filename order from one card, N cards or "
+        "a mixture; payload == meta_transform on every branch; ragged/mismatched/layered "
+        "inputs refused")
 
 
 def main() -> int:
@@ -18742,6 +22939,8 @@ def main() -> int:
     test_catalog_ported()
     test_catalog_ported2()
     test_crop_frames()
+    test_crop_to_field()
+    test_position_groups()
     test_normalize_absolute_window()
     test_channel_split()
     test_two_channel_branches()
@@ -18757,6 +22956,7 @@ def main() -> int:
     test_groups()
     test_tracking()
     test_track_objects()
+    test_track_field()
     test_serialize()
     test_engine_hardening()
     test_review_regressions()
@@ -18779,6 +22979,7 @@ def main() -> int:
     test_celltracker_parity()
     test_subtract_background()
     test_measure_points()
+    test_measure_stage_position()
     test_grow_points()
     test_grow_labels()
     test_scope_facility()
@@ -18786,6 +22987,8 @@ def main() -> int:
     test_histogram_threshold_scopes()
     test_histogram_threshold_units()
     test_filter_labels()
+    test_if_else()
+    test_column_catalog_complete()
     test_socket_docs()
     test_option_docs()
     test_codemap()
@@ -18796,6 +22999,8 @@ def main() -> int:
     test_nd2_audit_repairs()
     test_nd2_ingest_calibration()
     test_nd2_zstack_home_index_guard()
+    test_nd2_picture_meta_key_guard()
+    test_nd2_direct_access()
     test_group_reduce_repairs()
     test_transfer_structure()
     test_checkpoint_dock()
@@ -18803,11 +23008,14 @@ def main() -> int:
     test_overlay_renderers()
     test_overlay_resample()
     test_overlay_override_and_presentation()
+    test_overlay_experiment()
+    test_overlay_frozen_in_z()
     test_overlay_after_geometry_change()
-    test_channel_merge()
+    test_util_merge()
     test_display_resolution_policy()
     test_held_views()
     test_overlay_zoom_detail()
+    test_overlay_subtick_cache()
     test_align_to()
     test_origin_um_maintenance()
     test_transform()
@@ -18815,6 +23023,16 @@ def main() -> int:
     test_zs_deconvnet()
     test_trained_params()
     test_write_tiff()
+    test_write_movie()
+    test_movie_timeline()
+    test_file_bundle_provider()
+    test_batch_axis()
+    test_analysis_inside_a_batch()
+    test_batch_ragged_files()
+    test_batch_drop_guard()
+    test_batch_never_silently_dropped()
+    test_bundle_source_file_column()
+    test_chain_files()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

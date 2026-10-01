@@ -57,9 +57,13 @@ def _fmt(sec: float) -> str:
 # ── load a real (or synthetic) 6554² uint16 plane ──────────────────────────────
 
 def _read_nd2_plane(nd2_path: str) -> np.ndarray:
-    """Materialize channel-0's 2D uint16 plane via the dask interface (``read_frame``
-    segfaults on some files; ``to_dask`` is the safe path). Computed while the file
-    is open (nd2 dask arrays reference the open handle)."""
+    """Materialize channel-0's 2D uint16 plane via the dask interface. Computed while the
+    file is open (nd2 dask arrays reference the open handle).
+
+    The old reason given here — "``read_frame`` segfaults on some files; ``to_dask`` is the
+    safe path" — does not hold against the vendored nd2 0.11.3: ``to_dask``'s blocks are
+    built by ``_dask_block``, which calls ``read_frame`` itself. See the note in
+    :mod:`nodelab_v2.ingest`."""
     from nodelab_v2.nd2_compat import import_nd2
     with import_nd2().ND2File(nd2_path) as f:
         sub = f.to_dask()
