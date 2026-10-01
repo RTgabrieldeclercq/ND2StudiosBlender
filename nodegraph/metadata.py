@@ -25,6 +25,7 @@ from typing import (Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Seq
                     Tuple)
 
 from nodegraph.dataset import AxisSizes, LayerKey
+from nodegraph.file_sequence import order as _seq_order
 from nodegraph.domains import AXIS_ORDER, Domain, axes_of, is_lattice
 from nodegraph.graph import Graph
 from nodegraph.registry import layer_value
@@ -63,6 +64,29 @@ class MetaEnvelope:
     #: ``(VOXEL, None)`` and offer nothing. This field stores the user-facing name per
     #: domain directly, so the projection never arises.
     layer_names: Tuple[Tuple[Domain, str], ...] = ()
+    #: The **column catalog** (V2.28): the ``(domain, layer, column)`` triples a Dataset on
+    #: this edge is expected to carry on its STRUCTURE tables, in first-appearance order.
+    #: Drives the GUI's column picker — a ``column_in`` socket offers the columns actually
+    #: measured upstream instead of making the user retype ``mean_intensity`` and discover
+    #: at pull time that nothing wrote it.
+    #:
+    #: Distinct from :attr:`layer_names`, which stops at the layer. A layer name says a
+    #: Label table called ``CELLS`` exists; it cannot say whether anyone has measured its
+    #: eccentricity yet, and that is exactly the question a per-object condition asks.
+    #:
+    #: **CLOSED, and therefore complete.** Every node that adds a structure domain
+    #: declares ``adds_columns``, enforced by
+    #: ``selftest::test_column_catalog_complete`` — so what a table carries is fully
+    #: determined by the nodes upstream, and a ``column_in`` socket can render as a
+    #: non-editable dropdown rather than a text box with hints. That is the whole point:
+    #: the user picks from what the graph measured instead of recalling a name and
+    #: learning at pull time that nothing wrote it.
+    #:
+    #: The obligation runs the other way from the layer catalog's. Because there is no
+    #: free-text escape, a producer that declares nothing makes its columns
+    #: **unpickable**, not merely unsuggested — which is why the completeness gate
+    #: exists and why a new structure producer fails the build until it declares.
+    column_names: Tuple[Tuple[Domain, str, str], ...] = ()
 
     @property
     def is_volumetric(self) -> bool:
@@ -78,6 +102,23 @@ class MetaEnvelope:
         """The layer names present on this edge for *domain*, in first-appearance
         order (the GUI picker's suggestion list)."""
         return tuple(n for d, n in self.layer_names if d is domain)
+
+    def with_column_names(
+            self, names: Sequence[Tuple[Domain, str, str]]) -> "MetaEnvelope":
+        return replace(self, column_names=tuple(names))
+
+    def columns_in(self, domain: Domain,
+                   layer: Optional[str] = None) -> Tuple[str, ...]:
+        """The column names known to be on this edge for *domain*, in first-appearance
+        order (the GUI column picker's suggestion list).
+
+        ``layer=None`` unions every layer in the domain, which is what a socket whose
+        layer is inferred (§4g) has to offer; naming one narrows to it. De-duplicated,
+        because two producers writing the same column onto one table (``analysis.measure``
+        run twice with different stats) is ordinary, not a conflict."""
+        return tuple(dict.fromkeys(
+            c for d, lyr, c in self.column_names
+            if d is domain and (layer is None or lyr == layer)))
 
     def with_axes(self, axes: AxisSizes, *,
                   unknown: Optional[FrozenSet[str]] = None) -> "MetaEnvelope":
@@ -246,10 +287,60 @@ def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
 #:   ``align_to_ncc`` — the per-field correction ``registration.align_to`` measured, one row
 #:   per M (``catalog/registration/align_to.py:137-141``), applied inside ``field_box``.
 #:
+#: * ``source_file`` (2026-09-08) — WHICH FILE position ``m`` came from, one name per M.
+#:   A single-file load leaves it absent; a **file bundle** stamps it, because a bundle
+#:   concatenates K files along M (:class:`~nodegraph.provider.MultiSourceProvider`) and
+#:   from that point on ``m`` is the only thing distinguishing one file's data from
+#:   another's. It belongs in this family rather than beside the calibration because it is
+#:   provenance, not geometry — nothing computes from it — but it is read POSITIONALLY like
+#:   every other member, so it fails the same way: a stale list does not report "unknown
+#:   file", it reports the WRONG file, onto a spreadsheet row that looks authoritative.
+#:   Membership here is what makes it survive a crop correctly and retire on a stitch,
+#:   without ``analysis.measure`` or the exporter knowing bundles exist.
+#:
+#: * ``position_group`` / ``position_name`` (2026-09-15) — WHICH SPECIMEN position ``m``
+#:   belongs to, and what the acquisition called it. A multipoint axis is very often not one
+#:   flat list of fields but several mosaics with a millimetre between them
+#:   (:func:`~nodegraph.placement.position_groups`), and these two keys are where that
+#:   recovered structure rides. Both are provenance rather than geometry — nothing computes
+#:   a coordinate from them — but they are read POSITIONALLY like every other member here,
+#:   and a stale one is the sharpest failure in the family: it does not report "unknown
+#:   group", it assigns a field to the WRONG SPECIMEN, which is a conclusion about an
+#:   experiment rather than a pixel. Membership here is what makes ``util.select_group``'s
+#:   output describe the positions it actually kept.
+#:
 #: ``frame_time_jd`` is deliberately ABSENT: it is indexed by T, not M.
 PER_POSITION_KEYS: Tuple[str, ...] = (
     "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc",
+    "source_file", "position_group", "position_name",
 )
+
+#: The per-M metadata key naming each position's GROUP — the specimen/mosaic it belongs to
+#: (see :data:`PER_POSITION_KEYS`). Named once here so the detector, the node, the GUI loader
+#: and the sidecar cannot disagree about the spelling.
+#:
+#: Values are group KEYS (``"G1"``, or whatever the user renamed the group to), not indices.
+#: A key survives a crop that drops whole groups; an index would silently renumber, so
+#: "group 2" would mean a different specimen before and after — and nothing downstream could
+#: tell. The keys are also what a measurement table carries out to a spreadsheet, where
+#: ``G3`` is legible and ``2`` is not.
+POSITION_GROUP_KEY = "position_group"
+
+#: The per-M metadata key naming each position as the ACQUISITION named it — NIS's point
+#: names (``"#1"``…``"#9"``), or whatever the user typed into the point list.
+#:
+#: Worth carrying because it is a second, independent witness to the grouping: on the CRC
+#: file the names restart at ``#1`` six times, which is the microscope's own record of where
+#: one specimen ended and the next began. :func:`~nodegraph.placement.position_groups`
+#: recovers the same six boundaries from geometry alone, so the two can be checked against
+#: each other — and when they disagree, that is a fact about the acquisition worth surfacing
+#: rather than a tie to break silently.
+POSITION_NAME_KEY = "position_name"
+
+#: The per-M metadata key naming each position's source file — the file bundle's identity
+#: (see :data:`PER_POSITION_KEYS`). Named once here so the engine, the exporter and the GUI
+#: cannot disagree about the spelling.
+SOURCE_FILE_KEY = "source_file"
 
 
 def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
@@ -273,6 +364,64 @@ def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[st
         changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
                         else None)
     return changes
+
+
+def source_file_runs(metadata: Mapping[str, Any], m: int) -> Optional[List[Tuple[str, int, int]]]:
+    """The per-M :data:`SOURCE_FILE_KEY` list collapsed into ``(name, start, count)`` runs
+    — one per source FILE — or ``None`` when the list cannot be trusted to say.
+
+    A **file bundle** lays K files end to end on ``m``
+    (:class:`~nodegraph.provider.MultiSourceProvider`), so a file contributing ``n``
+    positions appears as ``n`` consecutive identical labels. Collapsing them recovers the
+    file boundaries that the flat ``m`` axis erased — which is the whole input
+    ``util.chain`` re-addresses, and the reason that node needs no "how many files?" param.
+
+    ``None`` (rather than a one-run guess) when the key is absent, is not a list, or is not
+    exactly ``m`` long: the same rule :func:`position_subset` and :func:`read_origin_um`
+    follow. A positional list of the wrong length does not report "unknown file", it
+    reports the WRONG file, and a chain built on it would interleave two acquisitions.
+
+    Runs are **consecutive only** — two non-adjacent runs of one name stay two runs. They
+    cannot arise from a bundle (each file is contiguous by construction), and merging them
+    would silently reorder positions to make them so.
+    """
+    vals = metadata.get(SOURCE_FILE_KEY)
+    if not isinstance(vals, (list, tuple)) or len(vals) != int(m):
+        return None
+    out: List[Tuple[str, int, int]] = []
+    for i, raw in enumerate(vals):
+        name = str(raw)
+        if out and out[-1][0] == name and out[-1][1] + out[-1][2] == i:
+            name0, start, count = out[-1]
+            out[-1] = (name0, start, count + 1)
+        else:
+            out.append((name, i, 1))
+    return out
+
+
+def stamp_source_file(env: "MetaEnvelope", path: str) -> "MetaEnvelope":
+    """``env`` with :data:`SOURCE_FILE_KEY` naming ``path`` for every one of its positions.
+
+    The single-file twin of :func:`nodelab_v2.runner.bundle_envelope`'s own stamp, and the
+    reason it exists: until V3.02 only a BUNDLE said which file a position came from, so a
+    Dataset loaded from its own card carried its filename nowhere at all — the path lived
+    in the node's params, which no compute can see. ``util.chain`` orders files by the
+    counting number in their names, and with separately wired cards it had nothing to read.
+
+    Stamped in one place, called from both the pull-time envelope and the GUI's edit-time
+    seed, because the two disagreeing about a positional list is the whole failure mode
+    :data:`PER_POSITION_KEYS` documents.
+
+    The visible consequence, accepted deliberately: a measurement table from a single-file
+    graph now carries a ``file`` column too, where before only a bundle's did. It names the
+    file the rows came from, which was never wrong to say — it was only ever absent.
+    """
+    import os
+
+    name = os.path.basename(str(path)) or str(path)
+    if not name:
+        return env
+    return env.with_metadata(**{SOURCE_FILE_KEY: [name] * max(1, int(env.axes.m))})
 
 
 #: EVERY metadata key that is a **list indexed by timepoint**. The per-T member of the same
@@ -309,6 +458,77 @@ def time_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, A
         changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
                         else None)
     return changes
+
+
+#: The per-B metadata key naming each batch member's file — the batch's identity, and the
+#: exact twin of :data:`SOURCE_FILE_KEY` one axis out (V3.01). ``util.batch`` stamps it and
+#: nothing else writes it, which is what lets ``util.unbatch`` know how many members it has
+#: and what to CALL them without the member count having to travel as a param.
+#:
+#: It is deliberately a separate key from ``source_file`` rather than a reuse: a batched
+#: bundle has both, and they answer different questions — ``source_file`` says which file
+#: position ``m`` came from (within one member), ``batch_file`` says which file member
+#: ``b`` IS. Collapsing them would make a batch of bundles unreadable.
+BATCH_FILE_KEY = "batch_file"
+
+#: Metadata indexed POSITIONALLY by the batch axis — the per-B family, mirroring
+#: :data:`PER_POSITION_KEYS` and :data:`PER_TIME_KEYS`, and failing the same way if left
+#: stale: a wrong-length list reports the WRONG file's name rather than admitting it does
+#: not know. One member today.
+PER_BATCH_KEYS: Tuple[str, ...] = (BATCH_FILE_KEY,)
+
+
+def batch_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
+    """The ``{key: subset}`` changes that reindex every :data:`PER_BATCH_KEYS` list onto
+    the batch members ``keep`` — what ``util.select_batch`` applies when it narrows ``b``.
+
+    The per-B twin of :func:`position_subset` / :func:`time_subset`, with the same two
+    rules: absent or non-list is left alone rather than invented, and a list too short to
+    cover ``keep`` is dropped whole rather than shortened, because a partial positional
+    list names some other file instead of admitting it does not know.
+    """
+    changes: Dict[str, Any] = {}
+    for key in PER_BATCH_KEYS:
+        vals = metadata.get(key)
+        if not isinstance(vals, (list, tuple)):
+            continue
+        changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
+                        else None)
+    return changes
+
+
+def batch_grow(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.batch``: stacks its inputs on a NEW batch axis (V3.01).
+
+    Handed only INPUT 0's envelope (``propagate_meta`` reads ``dataset_preds[0]``), exactly
+    like :func:`merge_grow`, so the member COUNT is not visible here — ``b`` is marked
+    UNKNOWN rather than guessed, and the GUI shows ``?`` until a pull resolves it. Every
+    other axis is already correct for the result, because the node refuses a member whose
+    grid differs (:class:`~nodegraph.provider.BatchProvider`), so nothing else changes.
+
+    The per-member ``batch_file`` list is likewise a pull-time stamp, not a prediction: it
+    names files this envelope cannot see.
+    """
+    return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({"b"}))
+
+
+def batch_select(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.select_batch``: narrows ``b`` to one member, or leaves it alone.
+
+    An EMPTY ``member`` is the no-op the compute performs, so the envelope must say so too
+    — predicting ``b == 1`` for an unconfigured node would grey out controls and mis-size
+    the viewer for a Dataset the pull hands back untouched.
+
+    Which member is selected does not change the geometry, so the name is not read here:
+    every member of a batch shares (m,t,z,c,y,x) by the batch node's own refuse-on-mismatch
+    contract. Only the extent of ``b`` changes, and it becomes exactly 1.
+    """
+    want = str((params or {}).get("member") or "").strip()
+    if not want:
+        return env
+    ax = env.axes
+    return env.with_axes(replace(ax, b=1),
+                         unknown=env.unknown_axes - frozenset({"b"}))
 
 
 def respaced(value: Any, keep: Sequence[int]) -> Any:
@@ -622,6 +842,95 @@ def frame_spec_picks(raw, m: int, t: int, z: int
             for a in FRAME_SPEC_AXES}
 
 
+def position_group_plan(metadata: Mapping[str, Any], axes: Any,
+                        gap_factor: Optional[float] = None):
+    """The :class:`~nodegraph.placement.GroupPlan` for ``metadata``/``axes``.
+
+    Two sources, and the order between them is the whole point:
+
+    1. a **stamped** :data:`POSITION_GROUP_KEY` list, if it covers every multipoint. That is
+       the answer the GUI resolved at load — from the file's sidecar if the user has edited
+       one, else from the detector — and it WINS, because an edit the user made by hand must
+       not be re-derived away by a node that looked at the coordinates again.
+    2. otherwise the detector, run here on the geometry
+       (:func:`~nodegraph.placement.position_groups`).
+
+    So a Dataset that never went through the GUI — a headless fixture, a checkpoint, a raw
+    ND2 opened by a script — still groups correctly, and one that did carries the user's
+    corrections. Both paths return the same type, so no caller has to know which it got.
+
+    Imported lazily: :mod:`nodegraph.placement` is first-party and dependency-free, but this
+    module is imported by the graph layer on every edit and the detector is only needed by
+    the one node that groups.
+    """
+    from nodegraph.placement import (GROUP_GAP_FACTOR, GroupPlan, PositionGroup,
+                                     position_groups)
+
+    n = int(getattr(axes, "m", 0) or 0)
+    stamped = metadata.get(POSITION_GROUP_KEY)
+    if isinstance(stamped, (list, tuple)) and len(stamped) >= n > 0:
+        keys = [str(k) for k in stamped[:n]]
+        if all(keys):
+            order: List[str] = []
+            for k in keys:
+                if k not in order:
+                    order.append(k)
+            groups = tuple(
+                PositionGroup(key=k,
+                              members=tuple(i for i, v in enumerate(keys) if v == k))
+                for k in order)
+            # `margin`/`gap_um` stay at their "nothing was measured" defaults: these groups
+            # were READ, not clustered, so there is no threshold the answer turned on and
+            # reporting one would invent a confidence this path never computed.
+            return GroupPlan(groups=groups, placed=True)
+    return position_groups(metadata, axes,
+                           GROUP_GAP_FACTOR if gap_factor is None else gap_factor)
+
+
+def group_picks(metadata: Mapping[str, Any], axes: Any, raw: Any,
+                gap_factor: Optional[float] = None) -> Optional[Tuple[int, ...]]:
+    """A group selection resolved against a Dataset: the multipoint indices it keeps.
+
+    The per-M twin of :func:`frame_spec_picks`, with the same three-valued answer and for
+    exactly the same reason — ``None`` = nothing selected (keep every position), a non-empty
+    tuple = these positions, and ``()`` = something WAS selected and matched nothing, which
+    the compute refuses while the advisory ``meta_transform`` holds the pre-edit envelope
+    (it re-runs on every keystroke, and ``"G1"`` is seen while somebody types ``"G12"``).
+
+    The spelling is deliberately forgiving, because there is nothing to be gained from
+    making somebody remember it: ``"G3"``, ``"g3"`` and bare ``"3"`` all name the third
+    group, a comma list (``"G1,G4"``) keeps several, and any name a user gave a group in the
+    sidecar works in place of the generated key. Indices in the result are in ascending
+    order, never selection order — the output's ``m`` axis is the input's with positions
+    removed, and re-ordering it would break every per-M list that rides alongside.
+
+    Shared by ``util.select_group``'s compute and :func:`select_group`, so the predicted
+    extent and the produced extent cannot drift (build-node-v2 §2).
+    """
+    text = "" if raw is None else str(raw).strip()
+    if not text:
+        return None
+    plan = position_group_plan(metadata, axes, gap_factor)
+    if not plan.placed:
+        return ()
+    by_key = {g.key.casefold(): g for g in plan.groups}
+    # The ordinal spelling is resolved against POSITION in the plan, not against the key
+    # text, so "3" means the third group even for a sidecar that renamed them all.
+    keep: List[int] = []
+    for token in text.replace(";", ",").split(","):
+        tok = token.strip()
+        if not tok:
+            continue
+        got = by_key.get(tok.casefold())
+        if got is None and tok.isdigit():
+            i = int(tok) - 1
+            got = plan.groups[i] if 0 <= i < len(plan.groups) else None
+        if got is not None:
+            keep.extend(got.members)
+    n = int(getattr(axes, "m", 0) or 0)
+    return tuple(sorted({int(m) for m in keep if 0 <= int(m) < n}))
+
+
 #: EVERY metadata key that is a **list indexed by channel**. A node that narrows or
 #: reorders the channel axis must subset all of them together or the survivors stop
 #: describing the channels that are left — and because they are read POSITIONALLY
@@ -788,6 +1097,86 @@ def crop_frames(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvel
     return out
 
 
+def crop_to_field(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.crop_to``: crop to where ANOTHER file sits in absolute stage µm. M→1, Y/X
+    (and, in 3D, Z) shrink by an amount this pass cannot see.
+
+    The one thing to understand about this transform is what it deliberately does **not**
+    claim. It is handed only input 0's envelope — ``propagate_meta`` reads
+    ``dataset_preds[0]`` — so the reference file's placement, which is the entire input to
+    the window calculation, is invisible here. Every published option would be a lie:
+
+    * guessing the extent would put a confident wrong number on the wire and into every
+      derived spinbox downstream;
+    * holding the input's extent would claim a crop did nothing;
+    * so Y/X are marked **UNKNOWN**, which is the same answer :func:`stitch` gives for the
+      same reason (V2.03 §2 A3) and the only one a consumer can act on. Z joins them under
+      the 3D lever, where the node also cuts planes to the reference's focus span.
+
+    ``m`` is **not** unknown: it is exactly 1: the node always resolves to the single
+    position that best covers the region, however many were in the input. So the axis is
+    predicted, and only its size — not which position survived — is knowable here.
+
+    ``origin_um`` is DROPPED rather than shifted, and that is the second half of the same
+    admission: the cut corner is the intersection of two files' fields, and this pass can
+    see one of them. Absent is the honest signal (:func:`overlay` drops ``bit_depth`` on
+    the same reasoning). The payload restamps the true corner it measured, so placement
+    downstream — which reads the Dataset, not the envelope — stays exact; what degrades is
+    only the edit-time prediction, and it degrades to "unknown" rather than to "wrong".
+
+    Everything else is untouched on purpose. Nothing is resampled, so ``pixel_size_um``
+    survives; no axis is re-spaced, so ``dt_s`` and ``z_step_um`` survive; no value is
+    rewritten, so ``bit_depth`` survives. The remaining per-M lists retire through
+    :func:`drop_position_keys` exactly as they do for a stitch, because after this there is
+    one field whose stage CENTRE is no longer its field centre — a survivor left at full
+    length would report another position's coordinate, and a length-1 one would report the
+    uncropped field's.
+    """
+    ax = env.axes
+    unknown = set(env.unknown_axes) | {"y", "x"}
+    if (modes or {}).get("dim") == "3D":
+        unknown.add("z")
+    changes: Dict[str, Any] = dict(drop_position_keys(env.metadata))
+    if env.metadata.get("origin_um") is not None:
+        changes["origin_um"] = None
+    return (env.with_axes(replace(ax, m=1), unknown=frozenset(unknown))
+               .with_metadata(**changes))
+
+
+def select_group(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.select_group``: narrow M to the positions of the chosen specimen group.
+
+    A strict subset of what :func:`crop_frames` does — M only, and the picks come from
+    :func:`group_picks` instead of a typed index list. It is a separate transform rather
+    than a mode of that one because the two answer different questions and fail differently:
+    a frame spec is resolved against an axis LENGTH and cannot be wrong about the data,
+    while a group is resolved against the stage GEOMETRY and may legitimately come back
+    "these fields cannot be placed".
+
+    That case is the one to get right. When the fields cannot be located, the picks are
+    ``()`` and this holds the pre-edit envelope — it does NOT mark ``m`` unknown. The
+    difference matters: an unknown axis propagates down the whole graph as "nothing
+    downstream can be predicted", which is a heavy thing to do on a node the user is still
+    typing into, and the payload will refuse with a message naming the missing stage log
+    anyway. Holding is also what ``crop_frames`` does for an unparseable spec.
+
+    Only M moves, so — unlike a frame crop — there is no re-spacing and no origin shift to
+    apply: ``dt_s``, ``z_step_um``, ``z_home_index`` and every per-T list describe axes this
+    node does not touch, and each surviving position keeps the ``origin_um`` it always had.
+    What does move is every per-M list (:func:`position_subset`), and that includes
+    :data:`POSITION_GROUP_KEY` itself — after selecting one group the survivors all carry
+    that one key, which is correct and is what makes a second Select Group downstream a
+    no-op rather than a puzzle.
+    """
+    ax = env.axes
+    keep = group_picks(env.metadata, ax, params.get("group"),
+                       params.get("gap_factor"))
+    if keep is None or keep == ():
+        return env
+    return (env.with_axes(replace(ax, m=len(keep)))
+               .with_metadata(**position_subset(env.metadata, keep)))
+
+
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """Tile stitch: M→1, Y/X grow. The output extent is UNKNOWN unless supplied
     (it depends on estimated registration) — never a silent guess (V2.03 §2 A3)."""
@@ -847,28 +1236,28 @@ def overlay(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
                .with_metadata(bit_depth=None, channel_names=names))
 
 
-def merge_channels(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
-    """``channel.merge``: C and Z both grow, and both are UNKNOWN.
+def _merge_channels_grow(env: MetaEnvelope) -> MetaEnvelope:
+    """The ``merge_axis="C"`` branch of :func:`merge_grow`: C and Z both grow, both UNKNOWN.
 
-    This pass is handed only the PRIMARY edge's envelope (``propagate_meta`` reads
-    ``dataset_preds[0]``), so it cannot see the second file at all — and both changed axes are
-    functions of it:
+    This pass is handed only INPUT 0's envelope (``propagate_meta`` reads
+    ``dataset_preds[0]``), so it cannot see any of the other inputs at all — and both
+    changed axes are functions of them:
 
-    * ``c`` grows by however many channels the secondary has;
-    * ``z`` becomes the merged grid, whose plane count depends on the secondary's focus range
-      and step (:func:`nodegraph.placement.merge_z_grid`).
+    * ``c`` grows by however many channels the other inputs have, combined;
+    * ``z`` becomes the merged grid, whose plane count depends on their focus ranges and
+      steps (:func:`nodegraph.placement.merge_z_grid`).
 
-    ``view.overlay``'s ``resample`` mode solves the same blindness by baking exactly ONE channel,
-    which keeps its prediction exact. That is the right trade for an overlay you are going to
-    *measure one channel of*, and the wrong one here: this node exists to put both files on one
-    axis, so the honest answer is ``stitch``'s — mark the axes unknown rather than guess
-    (V2.03 §2 A3). The GUI shows "?" for them until the first pull, which is true.
+    ``view.overlay``'s ``resample`` mode solves the same blindness by baking exactly ONE
+    channel, which keeps its prediction exact. That is the right trade for an overlay you are
+    going to *measure one channel of*, and the wrong one here: this node exists to put every
+    input on one axis, so the honest answer is ``stitch``'s — mark the axes unknown rather
+    than guess (V2.03 §2 A3). The GUI shows "?" for them until the first pull, which is true.
 
-    ``bit_depth`` is dropped for the same reason it is under ``resample``: the output stacks two
-    files' intensity scales and this pass has never seen the second one.
+    ``bit_depth`` is dropped for the same reason it is under ``resample``: the output stacks
+    several files' intensity scales and this pass has never seen the others.
 
-    ``z_step_um`` is dropped too, and that one matters more than it looks. The merged grid's step
-    is the finer of the two files', which this pass cannot compute — and leaving the primary's
+    ``z_step_um`` is dropped too, and that one matters more than it looks. The merged grid's
+    step is the finest of the inputs', which this pass cannot compute — and leaving input 0's
     step standing would have every downstream µm→plane conversion silently using the wrong
     spacing. Absent is the signal that it must be re-read from the payload.
     """
@@ -879,6 +1268,368 @@ def merge_channels(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEn
     return (env.with_axes(replace(ax, c=ax.c + 1), unknown=frozenset({"c", "z"}))
                .with_metadata(bit_depth=None, z_step_um=None,
                               channel_names=names + ["merged"]))
+
+
+def merge_grow(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.merge``: grows exactly one axis — C, T, M or Z — picked by the ``merge_axis``
+    Mode (the node that absorbed and retired ``channel.merge``, 2026-09-15).
+
+    Handed only INPUT 0's envelope (``propagate_meta`` reads ``dataset_preds[0]``), so every
+    other input's contribution to the grown axis is invisible here — the prediction marks
+    that ONE axis UNKNOWN rather than guess, the same rule ``z_project``/the old
+    ``channel.merge`` already follow (V2.03 §2 A3).
+
+    * ``merge_axis="C"`` — placement-based channel merge: see :func:`_merge_channels_grow`.
+      Z becomes unknown too (the merged Z grid depends on the other inputs' focus ranges),
+      and ``bit_depth``/``z_step_um`` are dropped.
+    * ``merge_axis="T"/"M"/"Z"`` — literal concatenation: the node's refuse-on-mismatch
+      contract (:mod:`nodegraph.catalog.util.merge`) means every OTHER axis and every other
+      calibration key on input 0 is already correct for the merged result, so only the grown
+      axis itself needs marking unknown — nothing else changes.
+    """
+    axis = str((modes or {}).get("merge_axis", "C"))
+    if axis == "C":
+        return _merge_channels_grow(env)
+    ax_name = axis.lower()
+    if ax_name not in ("t", "m", "z"):
+        return env
+    return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({ax_name}))
+@dataclass(frozen=True)
+class ChainMember:
+    """One source FILE of a ``util.chain`` — the unit that node lays onto an axis.
+
+    A member is a file wherever it came from, which is what lets one node serve the two
+    shapes its input arrives in: a **file bundle** contributes several members that share
+    one ``source`` and one ``metadata`` and differ in ``start``, while **separately wired
+    files** contribute one member each, from different ``source`` indices, all starting at
+    0. Everything downstream — the provider, the metadata lockstep, the resolved-order
+    note — reads this and never asks which shape it was.
+    """
+
+    #: Index of the wired input this file came from, in the engine's canonical socket
+    #: order. Two members sharing it came out of ONE bundle, which is the difference that
+    #: decides whether a per-axis list can be concatenated (see :func:`chained_metadata`).
+    source: int
+    #: That input's whole metadata dict — shared between members of one bundle.
+    metadata: Mapping[str, Any]
+    #: That input's own axes, so a positional list can be checked before it is sliced and
+    #: the member's extent along the CHAINED axis is knowable. Shared within a bundle: the
+    #: files of one card necessarily have the same T/Z/C as the card.
+    input_axes: AxisSizes
+    #: Where this file's positions begin inside its input's ``m``.
+    start: int
+    #: How many positions this file contributes.
+    count: int
+    #: The file's name, from :data:`SOURCE_FILE_KEY`; ``""`` when the input carries none.
+    name: str = ""
+
+    def extent(self, axis: str) -> int:
+        """How much of the CHAINED axis this file contributes."""
+        return self.count if axis == "m" else max(1, int(getattr(self.input_axes, axis)))
+
+
+def chain_members(inputs: Sequence[Tuple[Mapping[str, Any], AxisSizes]], axis: str, *,
+                  sequence_order: bool = True
+                  ) -> Tuple[List[ChainMember], int, Optional[str]]:
+    """``util.chain``'s file members, in OUTPUT order — shared by the compute and
+    :func:`chain_grow` so the card and the pull cannot disagree about the result.
+
+    ``inputs`` is ``(metadata, axes)`` per wired Dataset, in wiring order. Each input is
+    split into its files by :func:`source_file_runs`; an input carrying no usable
+    :data:`SOURCE_FILE_KEY` is one unnamed member covering its whole ``m``, which is what
+    makes a plain single-file card work without a special case.
+
+    Returns ``(members, positions_per_file, problem)``. ``problem`` is a sentence naming
+    what is wrong and how to fix it, and is non-``None`` exactly when the chain cannot be
+    built — the compute raises it, and the envelope goes UNKNOWN rather than predicting a
+    shape the pull is going to refuse.
+
+    **What has to agree, and what deliberately does not.** Every axis EXCEPT ``m`` and the
+    one being chained must already match: the result is rectangular in those. The chained
+    axis is exempt because laying files end to end along it is the whole operation — a
+    series exported in unequal chunks (5 frames, then 3) is still one series, and refusing
+    it would refuse the ordinary case. ``m`` is exempt because each file is read through its
+    own window; instead, when chaining onto anything but ``m``, every file must hold the
+    same number of POSITIONS, since the result has one position axis and a file with more
+    has nowhere to put them.
+
+    **Ordering.** With ``sequence_order`` the members are sorted by the counting field in
+    their names (:func:`nodegraph.file_sequence.order`), but only when EVERY member has a
+    name: a half-named list has no coherent order, and sorting it would put the named files
+    in sequence and the rest wherever they fell, which reads as working. Otherwise the
+    order is the wiring order — inputs in socket order, each input's own files in bundle
+    order — which is the only information that exists in that case.
+    """
+    axis = str(axis).lower()
+    members: List[ChainMember] = []
+    for i, (md, ax) in enumerate(inputs):
+        runs = source_file_runs(md, int(ax.m)) or [("", 0, int(ax.m))]
+        for name, start, count in runs:
+            members.append(ChainMember(source=i, metadata=md, input_axes=ax,
+                                       start=start, count=count, name=name))
+    if not members:
+        return [], 0, "Chain has no input wired to it."
+
+    others = [a for a in ("b", "t", "z", "c", "y", "x") if a != axis]
+    first = members[0].input_axes
+    for mm in members[1:]:
+        bad = [a for a in others
+               if int(getattr(mm.input_axes, a)) != int(getattr(first, a))]
+        if bad:
+            want = tuple(int(getattr(first, a)) for a in others)
+            got = tuple(int(getattr(mm.input_axes, a)) for a in others)
+            return [], 0, (
+                f"Chain cannot lay these files onto {axis.upper()}: "
+                f"{mm.name or f'input {mm.source}'} does not match "
+                f"{members[0].name or f'input {members[0].source}'} on "
+                f"{', '.join(bad)} — ({', '.join(others)}) is {got} against {want}. "
+                f"Chaining lays files end to end on {axis.upper()} alone, so every OTHER "
+                f"axis has to already agree; resample or crop upstream so they match, or "
+                f"chain onto a different axis.")
+
+    counts = sorted({mm.count for mm in members})
+    if axis != "m" and len(counts) != 1:
+        # Name every file and its count, not just the minority: which files are "the odd
+        # ones" is the user's judgement, and the fix differs depending which way it runs.
+        shown = ", ".join(f"{mm.name or f'input {mm.source}'} holds {mm.count}"
+                          for mm in members[:6])
+        more = f", and {len(members) - 6} more" if len(members) > 6 else ""
+        return [], 0, (
+            f"Chain cannot lay these {len(members)} files onto {axis.upper()}: they hold "
+            f"different numbers of POSITIONS ({counts[0]} to {counts[-1]}) — {shown}{more}. "
+            f"The result has one position axis, so a file with more has nowhere to put "
+            f"them. Chain onto M instead to keep them as separate positions, or use "
+            f"util.select_group to cut every file down to the same positions first. "
+            f"(Files may differ freely on {axis.upper()} itself — that is what is being "
+            f"chained.)")
+    n = counts[0] if axis != "m" else 0
+    if sequence_order and all(mm.name for mm in members):
+        members = [members[j] for j in _seq_order([mm.name for mm in members])]
+    return members, n, None
+
+
+#: How far one position's recorded LATERAL location may wander across chained files and
+#: still be one field, as a fraction of the field's smaller side. A timelapse exported one
+#: file per frame revisits each point, and the stage reads back a slightly different
+#: coordinate every visit (encoder repeatability, thermal drift of the plate) — so exact
+#: equality never holds on real ND2s, and requiring it dropped the log that ``util.stitch``
+#: needs. A tenth of a field is the ordinary tile overlap: a disagreement smaller than it
+#: still places every tile against its real neighbours, and ``stage+refine`` measures the
+#: rest. It is also far below the spacing of two DIFFERENT positions of a mosaic, so it
+#: cannot mistake a neighbour for the same field.
+CHAIN_SAME_FIELD_FRACTION = 0.1
+
+#: The per-M keys that are coordinates, and how to read ``(x, y)`` / ``z`` out of one
+#: entry. Only these are compared with a tolerance; the rest (names, groups, alignment
+#: rows) must agree exactly, because "nearly the same name" is not the same name.
+_CHAIN_GEOMETRY: Dict[str, Tuple[Optional[Callable[[Any], Tuple[float, float]]],
+                                 Optional[Callable[[Any], float]]]] = {
+    "stage_xy_um": (lambda v: (float(v[0]), float(v[1])), None),
+    "stage_z_um": (None, lambda v: float(v)),
+    "origin_um": (lambda v: (float(v[2]), float(v[1])), lambda v: float(v[0])),
+}
+
+
+def _chain_slices(members: Sequence[ChainMember], key: str) -> Optional[List[List[Any]]]:
+    """Each member's own slice of a per-M list, or ``None`` if any member cannot say."""
+    got: List[List[Any]] = []
+    for mm in members:
+        vals = mm.metadata.get(key)
+        if not isinstance(vals, (list, tuple)) or len(vals) != int(mm.input_axes.m):
+            return None
+        got.append(list(vals[mm.start:mm.start + mm.count]))
+    return got
+
+
+def chain_position_spread(members: Sequence[ChainMember], key: str
+                          ) -> Optional[Tuple[float, float]]:
+    """``(lateral_um, axial_um)``: the furthest any file puts a position from where the
+    FIRST file puts it, for a coordinate key in :data:`_CHAIN_GEOMETRY` — or ``None`` when
+    the key is not one, or is missing, short or non-numeric in any file.
+
+    Measured against the first member rather than a centroid because the first is the
+    value that is kept (:func:`chained_metadata`), so this is exactly the error the kept
+    value carries for the worst frame. Shared with ``util.chain``'s note so the number the
+    card reports is the number the keep/drop decision was made on.
+    """
+    lat_of, ax_of = _CHAIN_GEOMETRY.get(key, (None, None))
+    if lat_of is None and ax_of is None:
+        return None
+    slices = _chain_slices(members, key)
+    if not slices:
+        return None
+    lat = ax = 0.0
+    try:
+        for sl in slices[1:]:
+            for ref, v in zip(slices[0], sl):
+                if lat_of is not None:
+                    (x0, y0), (x1, y1) = lat_of(ref), lat_of(v)
+                    lat = max(lat, math.hypot(x1 - x0, y1 - y0))
+                if ax_of is not None:
+                    ax = max(ax, abs(ax_of(v) - ax_of(ref)))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (math.isfinite(lat) and math.isfinite(ax)):
+        return None
+    return lat, ax
+
+
+def chain_position_tolerance(members: Sequence[ChainMember]) -> Tuple[float, float]:
+    """``(lateral_um, axial_um)`` a position may wander across files and stay one field.
+
+    Lateral is :data:`CHAIN_SAME_FIELD_FRACTION` of the field's smaller side; axial is one
+    ``z_step_um`` — a nominal focus that moved by less than one plane still addresses the
+    same planes. Either is ``0.0`` (exact agreement only) when the calibration that scales
+    it is missing, because a tolerance in pixels means nothing without the pixel size."""
+    md = members[0].metadata
+    ax = members[0].input_axes
+    try:
+        px = float(md.get("pixel_size_um") or 0.0)
+        dz = float(md.get("z_step_um") or 0.0)
+    except (TypeError, ValueError):
+        px = dz = 0.0
+    lat = CHAIN_SAME_FIELD_FRACTION * px * min(int(ax.y), int(ax.x)) if px > 0 else 0.0
+    return lat, (dz if dz > 0 else 0.0)
+
+
+def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[str, Any]:
+    """The metadata changes ``chain_grow`` and ``util.chain``'s compute BOTH apply.
+
+    One function because the two must agree exactly — the standing lockstep rule for an
+    axis-changing node (`wire-node-v2` Section 8) — and because each family below fails
+    differently if it is left stale.
+
+    **Per-M** (:data:`PER_POSITION_KEYS`). Onto ``m`` the members line up as positions, so
+    the lists CONCATENATE and every value keeps the position it described. Onto any other
+    axis the result has ``n`` positions, each now assembled from all K files, so a value
+    survives only where every file already agreed — the timelapse case this node exists
+    for, where K files of one field at different times share one ``stage_xy_um``.
+    "Agreed" means exactly for names and alignment rows, but for the COORDINATE keys
+    (:data:`_CHAIN_GEOMETRY`) it means "within :func:`chain_position_tolerance`": a stage
+    that revisits a point never reads back the same micron twice, so exact equality
+    dropped the log on every real ND2 series and left ``util.stitch`` nothing to place by.
+    Within tolerance the FIRST file's value is kept. Beyond it the key is DROPPED, not
+    taken from the first: a chained position really did come from K different places,
+    and naming one puts a coordinate on a voxel that was not acquired there.
+    :data:`SOURCE_FILE_KEY` falls out of this by itself — the names never agree — which is
+    correct and needs no special case.
+
+    **The chained axis's own family** (:data:`PER_TIME_KEYS` onto T,
+    :data:`PER_CHANNEL_KEYS` onto C) is concatenated per member, each contributing its OWN
+    length — which is what lets files with different frame counts chain — but only when the
+    members come from DISTINCT inputs, so that each carries its own list. Members of one
+    bundle share a single list that describes only the FIRST file (``bundle_envelope`` takes
+    the non-positional keys from member 0), so:
+
+    * onto **T** it is dropped. Repeating it would say every file was acquired at the same
+      instants, which is the one thing a timelapse-per-file series is guaranteed not to be.
+    * onto **C** it is tiled anyway. That is not a guess: the loader refuses to bundle
+      files whose channel names differ, so block ``i``'s channels genuinely are the same
+      stains in the same order.
+
+    ``dt_s``/``z_step_um`` are deliberately left alone. They describe the spacing WITHIN a
+    file, which the chain does not change; the gap BETWEEN two files is unknown and this
+    schema has nowhere to put an irregular one. See ``util.chain``'s description.
+    """
+    out: Dict[str, Any] = {}
+    k = len(members)
+    tol_lat, tol_ax = chain_position_tolerance(members)
+
+    for key in PER_POSITION_KEYS:
+        if not any(key in mm.metadata for mm in members):
+            continue
+        slices = _chain_slices(members, key)
+        if slices is None:
+            # Present somewhere but not readable everywhere. Dropped rather than carried
+            # forward: a positional list that outlives the axis it indexed does not look
+            # stale, it looks like the wrong position.
+            out[key] = None
+        elif axis == "m":
+            out[key] = [v for sl in slices for v in sl]
+        elif all(sl == slices[0] for sl in slices):
+            out[key] = slices[0]
+        else:
+            # A coordinate that differs by stage jitter is still ONE field -- the first
+            # file's reading is kept, the same one-value-per-position a native multi-T
+            # ND2 carries (read at T=0). Anything further apart is K different places.
+            spread = chain_position_spread(members, key)
+            same = spread is not None and spread[0] <= tol_lat + 1e-9 \
+                and spread[1] <= tol_ax + 1e-9
+            out[key] = slices[0] if same else None
+
+    if axis == "m":
+        return out
+
+    distinct = len({mm.source for mm in members}) == k
+    family = PER_TIME_KEYS if axis == "t" else PER_CHANNEL_KEYS if axis == "c" else ()
+    for key in family:
+        if not isinstance(members[0].metadata.get(key), (list, tuple)):
+            continue
+        if distinct:
+            # Each member contributes its OWN length, so unequal chunks concatenate
+            # correctly; a list that does not match its own file's extent is not a chunk
+            # this can place, so the whole key goes rather than half of it.
+            lists = [mm.metadata.get(key) for mm in members]
+            if all(isinstance(v, (list, tuple)) and len(v) == mm.extent(axis)
+                   for v, mm in zip(lists, members)):
+                out[key] = [v for one in lists for v in one]
+            else:
+                out[key] = None
+        elif axis == "c":
+            out[key] = list(members[0].metadata[key]) * k
+        else:
+            out[key] = None
+    return out
+
+
+def chain_grow(env: MetaEnvelope, params: Mapping, modes: Mapping,
+               inputs: Optional[Sequence[MetaEnvelope]] = None) -> MetaEnvelope:
+    """``util.chain``: lay every wired input's FILES onto one axis — T, M, C or Z (V3.02).
+
+    **Predicted exactly, not marked unknown** — the thing that separates this from
+    :func:`merge_grow`. That transform sees only input 0 and so cannot know how much the
+    other inputs add; this one opts into the whole list (``chain_grow.wants_inputs``, read
+    by :func:`propagate_meta`), and every input's per-position :data:`SOURCE_FILE_KEY`
+    already names its files. So the node card shows a real ``T=120`` while you are still
+    wiring, rather than a ``?`` only a pull could resolve — and it shows the right number
+    when the files hold DIFFERENT frame counts, which is a sum rather than a multiple.
+
+    It degrades to the input, unchanged, in the cases where the compute is also a no-op: a
+    single file with nothing to chain, or an axis it does not recognise. It marks ``m`` and
+    the target axis UNKNOWN only where the compute REFUSES, because predicting the shape of
+    a pull that is going to raise would grey the refusal out behind a plausible-looking card.
+    """
+    axis = str((modes or {}).get("chain_axis", "T")).lower()
+    if axis not in ("t", "z", "c", "m"):
+        return env
+    envs = list(inputs) if inputs else [env]
+    # An input whose own m is a guess cannot be split into files -- its `source_file` would
+    # be measured against a length that is not real. Stay unknown rather than compound it.
+    if any({"m", axis} & set(e.unknown_axes) for e in envs):
+        return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({axis, "m"}))
+    members, n, problem = chain_members(
+        [(e.metadata, e.axes) for e in envs], axis,
+        sequence_order=str((modes or {}).get("chain_order", "sequence")) == "sequence")
+    if problem is not None:
+        return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({axis, "m"}))
+    if len(members) < 2:
+        return env
+    ax = env.axes
+    total = sum(mm.extent(axis) for mm in members)
+    changes = chained_metadata(members, axis, n)
+    new_axes = replace(ax, m=total) if axis == "m" else \
+        replace(ax, m=n, **{axis: total})
+    return env.with_axes(new_axes,
+                         unknown=env.unknown_axes - frozenset({axis, "m"})) \
+              .with_metadata(**changes)
+
+
+#: :func:`propagate_meta` hands this transform EVERY dataset input's envelope, not just
+#: input 0's. Opt-in per transform (and absent on all the others) so the protocol stays
+#: what it was: a node that only ever reads its primary input cannot accidentally start
+#: depending on a second one's envelope, and adding this cost no edit to the other
+#: fourteen transforms.
+chain_grow.wants_inputs = True
 
 
 def zs_deconvnet(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
@@ -930,10 +1681,12 @@ def zs_deconvnet(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnve
 
 
 META_TRANSFORMS: Dict[str, MetaTransform] = {
-    "overlay": overlay, "merge_channels": merge_channels,
+    "overlay": overlay, "merge_grow": merge_grow,
+    "chain_grow": chain_grow,
     "identity": identity, "resample": resample, "z_project": z_project,
     "stack_time": stack_time, "frame_slice": frame_slice,
     "channel_select": channel_select, "crop": crop, "stitch": stitch,
+    "select_group": select_group,
     "value_rescaled": value_rescaled, "flatten_field": flatten_field,
     "zs_deconvnet": zs_deconvnet, "subtract_background": subtract_background,
 }
@@ -962,21 +1715,37 @@ def propagate_meta(graph: Graph,
         env_in = out.get(dpreds[0].src, MetaEnvelope()) if dpreds \
             else seeds.get(nid, MetaEnvelope())
         transform = spec.meta_transform if spec is not None else None
-        env_out = env_in if transform is None else transform(
-            env_in, node.params, node.state(spec))
+        if transform is None:
+            env_out = env_in
+        elif getattr(transform, "wants_inputs", False):
+            # A transform that must see EVERY dataset input opts in by name (today only
+            # `chain_grow`). Without it the protocol hands over input 0's envelope alone,
+            # so an N-input node can do no better than marking the axis it grows unknown
+            # -- which is exactly what `merge_grow` settles for.
+            env_out = transform(env_in, node.params, node.state(spec),
+                                [out.get(e.src, MetaEnvelope()) for e in dpreds])
+        else:
+            env_out = transform(env_in, node.params, node.state(spec))
         # Domain accumulation: union EVERY Dataset predecessor's domain-set (a merge
         # node combines them), then add what this node produces. A root seeds from its
         # own envelope's domain-set. The meta_transform never touches domains, so this
         # is layered on afterward. (V2.06: the socket domain-rail + wire-tint source.)
+        # An input declared `passes_domains=False` is read, not merged: its domains do not
+        # reach this node's output (`io.write_movie`'s `source_b`/`source_c`).
         if dpreds:
+            readonly = ({s.name for s in spec.inputs if not getattr(s, "passes_domains", True)}
+                        if spec is not None else set())
             dom_in: FrozenSet[Domain] = frozenset().union(
-                *(out.get(e.src, MetaEnvelope()).domains for e in dpreds))
+                *(out.get(e.src, MetaEnvelope()).domains for e in dpreds
+                  if e.dst_socket not in readonly or e is dpreds[0]))
         else:
             dom_in = env_in.domains
         adds = spec.adds_domains if spec is not None else frozenset()
         env_out = env_out.with_domains(dom_in | adds)
-        out[nid] = env_out.with_layer_names(
+        env_out = env_out.with_layer_names(
             _layer_names_out(spec, node, env_in, env_out))
+        out[nid] = env_out.with_column_names(
+            _column_names_out(spec, node, env_in, env_out))
     return out
 
 
@@ -1040,6 +1809,46 @@ def _layer_names_out(spec, node, env_in: MetaEnvelope,
         except Exception:                                # pragma: no cover - defensive
             pass
     return tuple(dict.fromkeys(names))                   # de-dup, keep first appearance
+
+
+def _column_names_out(spec, node, env_in: MetaEnvelope,
+                      env_out: MetaEnvelope) -> Tuple[Tuple[Domain, str, str], ...]:
+    """This node's outgoing STRUCTURE-column catalog: the input's, minus what its layer
+    catalog dropped, plus what its ``adds_columns`` declares (V2.28).
+
+    **Total by contract**, for the same reason as :func:`_layer_names_out` and enforced the
+    same way: this runs inside ``propagate_meta`` on every keystroke, whose caller catches
+    only ``ValueError`` — anything else takes the window down, and even a caught error
+    blanks every node's envelope graph-wide. So a producer whose declaration raises
+    contributes nothing and the pass continues; it can never be the reason an edit fails.
+
+    **The drop rule is inherited, not restated.** A column cannot outlive the layer it sits
+    on, so anything whose ``(domain, layer)`` pair is no longer in ``env_out.layer_names``
+    goes with it. In practice structure domains are never reshaped and this is a no-op —
+    but deriving it from the layer catalog rather than asserting that keeps the two from
+    drifting if a future node does drop a structure layer.
+    """
+    surviving = {(d, n) for d, n in env_out.layer_names}
+    cols: List[Tuple[Domain, str, str]] = [
+        (d, lyr, c) for d, lyr, c in env_in.column_names if (d, lyr) in surviving]
+    if spec is None:
+        return tuple(dict.fromkeys(cols))
+    adds = getattr(spec, "adds_columns", None)
+    if adds is None:
+        return tuple(dict.fromkeys(cols))
+    try:
+        state = node.state(spec)
+    except Exception:                                    # pragma: no cover - defensive
+        state = {}
+    params = getattr(node, "params", {}) or {}
+    try:
+        for entry in adds(params, state, tuple(cols)) or ():
+            dom, lyr, col = entry
+            if isinstance(lyr, str) and isinstance(col, str) and lyr and col:
+                cols.append((dom, lyr, col))
+    except Exception:                                    # pragma: no cover - defensive
+        pass
+    return tuple(dict.fromkeys(cols))                    # de-dup, keep first appearance
 
 
 # ── derive-symbol source + the metadata-intelligent lever default ─────────────
@@ -1112,7 +1921,11 @@ __all__ = [
     "parse_indices", "format_indices", "crop_frames",
     "FRAME_SPEC_AXES", "parse_frame_spec", "format_frame_spec", "frame_spec_picks",
     "PER_CHANNEL_KEYS", "channel_subset",
-    "PER_POSITION_KEYS", "position_subset", "drop_position_keys",
+    "select_group", "group_picks", "position_group_plan",
+    "POSITION_GROUP_KEY", "POSITION_NAME_KEY",
+    "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
+    "source_file_runs", "chain_grow", "chained_metadata",
+    "ChainMember", "chain_members", "stamp_source_file",
     "PER_TIME_KEYS", "time_subset", "respaced", "z_home_after",
     "eval_derive", "resolve_dim_default",
 ]

@@ -40,6 +40,7 @@ from typing import Dict, FrozenSet, Iterator, Mapping, Optional, Sequence, Tuple
 
 from nodegraph.domains import Domain
 from nodegraph.registry import Granularity, Mode, ModeSpec
+from nodegraph.structure import BATCH_COLUMN
 
 #: Every population, finest → coarsest, lattice before structure. The first four are the
 #: historical vocabulary (``analysis.threshold``, ``enhance.normalize``); the last two are the
@@ -206,8 +207,20 @@ def scope_declarations(choices: Sequence[str], *, per_plane: bool = False
     return gran, ({"scope": per_value} if per_value else {})
 
 
-def scope_key(scope: str, unit: Tuple[int, int, int, int]) -> tuple:
+def scope_key(scope: str, unit: Tuple[int, int, int, int],
+              b: Optional[int] = None) -> tuple:
     """The statistics-group key a ``(m,t,z,c)`` unit belongs to, for a LATTICE scope.
+
+    **``b`` is what makes a batch a batch (V3.01).** Passing the member index prefixes
+    every key with it, so a population NEVER pools across files — most visibly under
+    ``dataset``, whose key is ``(c,)`` alone and would otherwise compute ONE level over
+    every file in the batch and threshold each of them partly by the others. That is the
+    exact trap a file bundle has (``MultiSourceProvider`` names it, and
+    ``scripts/_probe_m_batch_independence.py`` pins it), and avoiding it is the reason the
+    batch axis exists rather than reusing ``m``.
+
+    ``None`` means "not a batch" and leaves every key exactly as it was, so an ordinary
+    single-file graph groups identically and its memo entries do not move.
 
     Channel is never pooled over at any scope: two channels are two different stains with
     different dynamic ranges, and one shared cut would threshold the dim one into nothing. That
@@ -223,14 +236,15 @@ def scope_key(scope: str, unit: Tuple[int, int, int, int]) -> tuple:
             f"scope_key: {scope!r} is a per-object population, so it has no unit group key — "
             f"enumerate it with unit_populations() inside each unit instead.")
     m, t, z, c = unit
+    pre = () if b is None else (int(b),)
     if scope == "plane":
-        return (m, t, z, c)
+        return pre + (m, t, z, c)
     if scope == "volume":
-        return (m, t, c)
+        return pre + (m, t, c)
     if scope == "series":
-        return (m, c)
+        return pre + (m, c)
     if scope == "dataset":
-        return (c,)
+        return pre + (c,)
     raise ValueError(f"unknown scope {scope!r} — one of {list(SCOPES)}")
 
 
@@ -239,6 +253,15 @@ _ROW_COLS: Dict[str, Tuple[str, ...]] = {
     "plane": ("m", "t", "z", "c"), "volume": ("m", "t", "c"),
     "series": ("m", "c"), "dataset": ("c",),
 }
+
+
+def _row_cols_for(scope: str, cols: Mapping[str, np.ndarray]) -> Tuple[str, ...]:
+    """The columns :func:`scope_row_key` groups by, with the batch column included when the
+    table carries one. The row path and the unit path MUST agree about what a population
+    is: if one pooled across files and the other did not, a level derived from a table
+    would silently differ from the identical level derived from the raster."""
+    base = _ROW_COLS[scope]
+    return (BATCH_COLUMN,) + base if BATCH_COLUMN in cols else base
 
 
 def scope_row_key(scope: str, cols: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -254,9 +277,9 @@ def scope_row_key(scope: str, cols: Mapping[str, np.ndarray]) -> np.ndarray:
             f"scope_row_key: {scope!r} is a per-object population. On a table whose rows ARE "
             f"the objects it would give every row a population of one, so a level derived from "
             f"it would be that row's own value — offer only the lattice scopes here.")
-    names = _ROW_COLS.get(scope)
-    if names is None:
+    if scope not in _ROW_COLS:
         raise ValueError(f"unknown scope {scope!r} — one of {list(SCOPES)}")
+    names = _row_cols_for(scope, cols)
     missing = [n for n in names if n not in cols]
     if missing:
         raise ValueError(f"scope_row_key: scope={scope} groups by {list(names)}, but the table "

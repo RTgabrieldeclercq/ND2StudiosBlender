@@ -77,6 +77,9 @@ PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 #:                    for an axis with nothing ticked) as one ``"m0-2,t3"`` spec
 #: * ``percentile`` — adopt the contrast window the histogram handles are sitting on
 #: * ``gamma``      — adopt the histogram's gamma dot
+#: * ``nudge_xy``   — two clicks, a feature in the primary then the same feature in an
+#:                    overlaid secondary; commits the µm nudge that lines them up (see
+#:                    ``pick_bounds``) — ``view.overlay``'s ``offset_y``/``offset_x``
 #:
 #: Validated at registration for the same reason as ``path_kind``: an unrecognized value
 #: fails SILENTLY (the GUI just wouldn't draw the Pick button), which is indistinguishable
@@ -84,6 +87,7 @@ PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 PICK_KINDS: FrozenSet[str] = frozenset({
     "shapes", "area", "level", "radius", "distance", "grid", "rect",
     "channel", "channels", "frame", "zrange", "frames", "percentile", "gamma",
+    "nudge_xy",
 })
 
 #: Pick kinds that write a whole GROUP of sockets from one gesture and therefore require
@@ -94,7 +98,7 @@ PICK_KINDS: FrozenSet[str] = frozenset({
 #: ``frames`` is deliberately NOT here: a selection across three axes is one VALUE (``util.crop``'s
 #: ``"m0-2,t3"`` spec) rather than three sockets written together, so there is no group to
 #: declare — which is the simpler shape wherever the picked thing is one thing.
-BOUND_PICK_KINDS: FrozenSet[str] = frozenset({"rect", "zrange"})
+BOUND_PICK_KINDS: FrozenSet[str] = frozenset({"rect", "zrange", "nudge_xy"})
 
 #: Which SocketTypes each pick kind may annotate. A gesture produces a particular KIND of
 #: number — a ruler produces a physical length, an eyedropper an intensity — so putting
@@ -119,6 +123,8 @@ _PICK_SOCKET_TYPES: Dict[str, Tuple[SocketType, ...]] = {
     "distance": (SocketType.FLOAT,),
     "percentile": (SocketType.FLOAT,),
     "gamma": (SocketType.FLOAT,),
+    # a µm offset pair, written together from one two-click gesture
+    "nudge_xy": (SocketType.FLOAT,),
 }
 
 
@@ -183,6 +189,40 @@ class SocketSpec:
     #: Falls back to the primary when the named input is UNWIRED, which is what keeps the
     #: single-wire graphs that predate the second input working unchanged.
     layer_from: str = ""
+    #: ── column-name sockets (V2.28) ───────────────────────────────────────────
+    #: A STRING socket carrying the name of a COLUMN on a structure table, rather than a
+    #: layer name or free text. ``column_in`` = the domain whose table the column must be
+    #: on — the GUI then offers the columns ``propagate_meta`` knows were measured
+    #: upstream (``MetaEnvelope.columns_in``), instead of a bare text box in which
+    #: ``mean_intensity`` is a guess the user only learns is wrong at pull time.
+    #:
+    #: ``column_in_mode`` names a Mode whose VALUE is the domain instead, for a node whose
+    #: member domain is a lever (a per-object condition tests Label rows or Point rows
+    #: depending on its ``target``) — the ``layer_in_mode`` arrangement, one level down.
+    #:
+    #: ``column_from`` names the LAYER-name socket on this same node that says which
+    #: layer's columns to offer; empty unions every layer in the domain, which is what a
+    #: socket whose layer is inferred (§4g) must do.
+    #:
+    #: The offered list is CLOSED and the combo is not editable, which is the whole
+    #: point: every structure-producing node declares ``adds_columns``
+    #: (``selftest::test_column_catalog_complete``), so a name absent from the list is a
+    #: column no node on this wire writes, and typing it would only defer the refusal to
+    #: the pull. Contrast ``layer_in``, whose combo MUST stay editable because a couple
+    #: of producers name layers the edit-time pass cannot predict.
+    #:
+    #: Presentation-only and memo-neutral all the same — the value is an ordinary
+    #: string param, and the compute still validates it against the real table.
+    column_in: Optional[Domain] = None
+    column_in_mode: str = ""
+    column_from: str = ""
+    #: EXTRA domains whose columns this socket also offers, beyond ``column_in``. A
+    #: per-object condition on Label rows can legitimately test ``track_length``, which
+    #: lives on the TRACK table and reaches the label rows by the ``member_id`` join the
+    #: compute performs — so the picker has to offer it even though it is not a Label
+    #: column. Without this the tracking half of the condition palette would be invisible
+    #: to the exact user who asked for it, and reachable only by typing.
+    column_join: Tuple[Domain, ...] = ()
     #: On an AUXILIARY Dataset input: its image is a viewer SOURCE, composited under the
     #: primary's when this node is viewed (V2.22, reported 2026-08-04).
     #:
@@ -199,6 +239,15 @@ class SocketSpec:
     #: different channel, segmented independently — which is exactly the case where the node
     #: reads a DOMAIN off the wire rather than intensities.
     view_source: bool = False
+    #: On an AUXILIARY Dataset input: whether the domains arriving on this wire are part of
+    #: what the node's OUTPUT carries (2026-09-30). ``propagate_meta`` unions the domain
+    #: sets of every Dataset input, which is right for a node that merges its inputs and
+    #: wrong for one that only READS a second input and passes its primary through.
+    #: ``io.write_movie`` is that case: it draws a segmentation wired into ``source_b``, but
+    #: what leaves the node is ``data`` byte-for-byte, so without this flag the edit-time
+    #: envelope would promise B's Label and Voxel layers to everything downstream, and the
+    #: pull would then fail to deliver them.
+    passes_domains: bool = True
     #: ── filesystem-path sockets (V2.15) ──────────────────────────────────────
     #: A STRING socket whose value is a PATH on the machine that runs the graph, not free
     #: text. ``path_kind`` says what the user is choosing — ``"open_file"`` (must exist),
@@ -447,6 +496,32 @@ class NodeSpec:
     #: their READ socket names (``analysis.measure`` adds Label columns to the raster it
     #: measures). MUST be total — see ``propagate_meta``, which runs on every keystroke.
     extra_layers: Optional[Callable[..., Any]] = None
+    #: STRUCTURE COLUMNS this node writes (V2.28): ``(params, modes, incoming) ->
+    #: [(Domain, layer_name, column_name), ...]``, feeding ``propagate_meta``'s edit-time
+    #: column catalog so a downstream ``column_in`` socket can OFFER them.
+    #:
+    #: ``incoming`` is the caller's accumulated catalog — the same triples, as they stand
+    #: on this node's input edge. It takes a third argument where its sibling
+    #: ``extra_layers`` takes two because columns FLOW in a way layer names do not: a node
+    #: that re-emits a table under a new name (``analysis.filter_labels`` → ``labels_kept``)
+    #: carries every column with it, and could not name one of them without being told what
+    #: is already there. Declaring only the columns it invents would silently amputate the
+    #: catalog at exactly the node a user filters with.
+    #:
+    #: The layer half of this question is already answered by ``layer_out``/``extra_layers``;
+    #: this is the half below it. "A Label table called CELLS exists" is what the layer
+    #: catalog knows, and it is not enough to populate a menu of conditions — whether
+    #: anyone has measured its eccentricity yet is a different fact, and the one the user
+    #: is actually choosing between.
+    #:
+    #: Same total-function obligation as ``extra_layers``, for the same reason: it runs
+    #: inside ``propagate_meta`` on every keystroke. It is **NOT optional**: the column
+    #: picker is a closed dropdown with no free-text escape, so a producer that declares
+    #: nothing makes every column it writes **unpickable** — not merely unsuggested.
+    #: ``selftest::test_column_catalog_complete`` fails the build for any node that adds
+    #: a structure domain without one, which is the only thing keeping the dropdown
+    #: honest as the catalog grows.
+    adds_columns: Optional[Callable[..., Any]] = None
     #: Socket values this node's LOADED MODEL was trained with (V2.23):
     #: ``(params, modes) -> {socket_name: value}``, read from the JSON beside the weights
     #: (``nodegraph.trained``). Same shape and the same total-function obligation as
@@ -613,15 +688,17 @@ class NodeSpec:
 
 def InDataset(name: str = "data", *, multi: bool = False, label: str = "",
               view_source: bool = False, description: str = "",
-              available_in: Optional[Mapping[str, FrozenSet[str]]] = None) -> SocketSpec:
+              available_in: Optional[Mapping[str, FrozenSet[str]]] = None,
+              passes_domains: bool = True) -> SocketSpec:
     """A Dataset input. ``description`` is the hover text, and it earns its place on a node
     with SEVERAL Dataset inputs: the domain rail is a node-level answer painted identically
     beside each one, so the card cannot say which wire wants what. A value socket has carried
     prose since V2.13; a Dataset socket could not, which is why `areas`, `raw`, `secondary`
-    and `reference` all hovered as bare names."""
+    and `reference` all hovered as bare names. ``passes_domains=False`` marks an input the
+    node only reads (see :attr:`SocketSpec.passes_domains`)."""
     return SocketSpec(name, SocketType.DATASET, Direction.IN, label=label,
                       multi=multi, view_source=view_source, description=description,
-                      available_in=available_in)
+                      available_in=available_in, passes_domains=passes_domains)
 
 
 def OutDataset(name: str = "out", *, label: str = "",
@@ -658,6 +735,8 @@ def _in_value(t: SocketType):
              available_in: Optional[Mapping[str, FrozenSet[str]]] = None,
              layer_in: Optional[Domain] = None, layer_in_mode: str = "",
              layer_out: Tuple[Domain, ...] = (), layer_from: str = "",
+             column_in: Optional[Domain] = None, column_in_mode: str = "",
+             column_from: str = "", column_join: Tuple[Domain, ...] = (),
              kernel_param: bool = False, description: str = "",
              path_kind: str = "", path_filter: str = "",
              path_hint: str = "", pick_kind: str = "", pick_peer: str = "",
@@ -670,6 +749,8 @@ def _in_value(t: SocketType):
                           multi=multi, dims=dims, available_in=available_in,
                           layer_in=layer_in, layer_in_mode=layer_in_mode,
                           layer_out=tuple(layer_out), layer_from=layer_from,
+                          column_in=column_in, column_in_mode=column_in_mode,
+                          column_from=column_from, column_join=tuple(column_join),
                           kernel_param=kernel_param,
                           description=description, path_kind=path_kind,
                           path_filter=path_filter, path_hint=path_hint,
@@ -1179,6 +1260,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                     Mapping[str, Mapping[str, FrozenSet[Domain]]]] = None,
                 adds_domains: FrozenSet[Domain] = frozenset(),
                 extra_layers: Optional[Callable[..., Any]] = None,
+                adds_columns: Optional[Callable[..., Any]] = None,
                 trained_params: Optional[Callable[..., Any]] = None,
                 trained_note: Optional[Callable[..., Any]] = None) -> NodeSpec:
     """Build and register a :class:`NodeSpec`."""
@@ -1194,6 +1276,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                                for m, per in (reads_domains_by_mode or {}).items()},
         adds_domains=frozenset(adds_domains),
         extra_layers=extra_layers,
+        adds_columns=adds_columns,
         trained_params=trained_params,
         trained_note=trained_note,
     ))

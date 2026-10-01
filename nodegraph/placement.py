@@ -53,6 +53,10 @@ __all__ = [
     "PlacementPlan", "plan_placement", "compose_secondary_plane", "paired_t",
     "context_extent", "sub_field_box", "source_window",
     "secondary_z_index", "ZGrid", "merge_z_grid", "Z_GRID_BLOWUP",
+    "paired_t_frac", "map_t", "secondary_z_weights", "plan_time", "frame_interval_s",
+    "snap_rate", "parse_pins", "pins_json", "nudge_delta_um", "RATE_SNAP_TOL",
+    "SUB_TICK_CAP",
+    "PositionGroup", "GroupPlan", "position_groups", "group_key", "GROUP_GAP_FACTOR",
 ]
 
 #: Julian day → seconds. ``frame_time_jd`` is the only clock two files share, and it is in
@@ -391,6 +395,142 @@ def paired_t(entry: Dict[str, Any], t: int) -> Optional[int]:
     return None
 
 
+#: Nudges a mapped frame position up past float noise before it is floored, so a map that
+#: lands EXACTLY on a frame (every index pairing, every integer rate) cannot round down to the
+#: frame before it.
+_FRAME_EPS = 1e-6
+
+
+def paired_t_frac(entry: Dict[str, Any], t: int, k: int = 0, n: int = 1) -> Optional[int]:
+    """The secondary timepoint on SUB-TICK ``k`` of ``n`` inside primary frame ``t``.
+
+    "Play all" holds each primary frame for ``n`` ticks so a faster source can show every one
+    of its own frames: a source recorded at 4x the primary's rate advances one frame per tick,
+    while a source at the primary's rate stays on its paired frame for all four. So the map is
+    sampled at the fractional primary time ``t + k/n``.
+
+    Sub-tick 0 (and any entry with no ``t_map``, i.e. every recipe stamped before rates
+    existed, and every synthesized ``view_source`` entry) is exactly :func:`paired_t`, so the
+    picture at rest never disagrees with the node card's pairing.
+    """
+    tm = entry.get("t_map")
+    if not tm or int(n) <= 1 or int(k) <= 0:
+        return paired_t(entry, t)
+    n_src = int(tm.get("n_src", 0) or 0)
+    if n_src <= 1:
+        return paired_t(entry, t)                      # a still is HELD, sub-tick or not
+    j = int(np.floor(map_t(tm, float(t) + float(k) / float(n)) + _FRAME_EPS))
+    return j if 0 <= j < n_src else None
+
+
+def _pw_linear(knots: Sequence[Tuple[float, float]], x: float, slope: float) -> float:
+    """Evaluate the piecewise-linear map through ``knots`` at ``x``.
+
+    The ONE interpolation rule every pin uses, in T and in Z: straight lines between
+    consecutive knots, and a line of gradient ``slope`` beyond the outermost ones. So one pin
+    is a pure offset at the natural rate, two pins fix the rate between them, and a third
+    lets the rate change part-way (a stage that stalled, a dropped cycle).
+    """
+    if not knots:
+        return float(x)
+    x = float(x)
+    u0, s0 = knots[0]
+    if x <= u0 or len(knots) == 1:
+        return float(s0) + float(slope) * (x - float(u0))
+    u_last, s_last = knots[-1]
+    if x >= u_last:
+        return float(s_last) + float(slope) * (x - float(u_last))
+    for (ua, sa), (ub, sb) in zip(knots, knots[1:]):
+        if ua <= x <= ub:
+            if ub == ua:
+                return float(sb)
+            return float(sa) + (float(sb) - float(sa)) * (x - float(ua)) / (float(ub) - float(ua))
+    return float(s_last)
+
+
+def map_t(t_map: Mapping[str, Any], u: float) -> float:
+    """The secondary's (fractional) frame position at primary time ``u`` under ``t_map``."""
+    knots = [(float(a), float(b)) for a, b in (t_map.get("knots") or ((0.0, 0.0),))]
+    return _pw_linear(knots, u, float(t_map.get("rate", 1.0) or 1.0))
+
+
+def secondary_z_weights(sec_md: Mapping[str, Any], sec_axes: Any, sec_m: int,
+                        z_um: Optional[float], *, dz: float = 0.0, linear: bool = False,
+                        z_pins: Sequence[Sequence[Any]] = (),
+                        pri_k: Optional[int] = None,
+                        pri_step_um: Optional[float] = None) -> List[Tuple[int, float]]:
+    """Which secondary slice(s) to draw for a primary plane at ``z_um`` → ``[(k, weight)]``.
+
+    ``linear=False`` (the ``nearest`` Z sampling) returns ONE slice at weight 1 — the slice
+    nearest in absolute µm, clamped into range — and is bit-identical to what the overlay has
+    always drawn (:func:`secondary_z_index` is now this function's first answer). A channel
+    shown that way is always a plane its microscope actually acquired.
+
+    ``linear=True`` blends the two bracketing slices by distance, so two stacks taken at
+    different Z steps can be scrolled together without the coarser one jumping a whole step
+    at a time. Off either end it clamps to the end plane (weight 1) rather than extrapolate
+    a plane that was never imaged.
+
+    ``z_pins`` are the user's "this plane goes with that plane" rows,
+    ``(k_pri, k_sec, um_pri | None, um_sec | None)``. When every pin carries its µm and both
+    files have a focus log, the pins define a µm → µm map (one pin = an offset, two = the
+    axial scale a refractive-index mismatch introduces) — that form survives an upstream Z
+    crop, since absolute focus does not re-index. Otherwise they map slice index to slice
+    index, with the files' own step ratio (or 1) beyond the outermost pin. Pins REPLACE the
+    Nudge Z: they are the more specific statement.
+
+    A single-plane secondary has one answer and takes it, pinned or not — the WellA3 case,
+    and the reason a 2D context view stays visible while you scroll a 210-slice stack rather
+    than appearing on one slice and vanishing.
+    """
+    nz = int(getattr(sec_axes, "z", 1) or 1)
+    if nz <= 1:
+        return [(0, 1.0)]
+    frac: Optional[float] = None
+    if z_pins:
+        frac = _pinned_z_frac(sec_md, sec_axes, sec_m, z_um, z_pins, pri_k, pri_step_um)
+    if frac is None:
+        if z_um is None:
+            return [(0, 1.0)]
+        z0 = z_um_of_slice(sec_md, sec_axes, sec_m, 0)
+        z1 = z_um_of_slice(sec_md, sec_axes, sec_m, nz - 1)
+        if z0 is None or z1 is None or z1 == z0:
+            return [(0, 1.0)]
+        frac = ((z_um - dz) - z0) / ((z1 - z0) / (nz - 1))
+    if not linear:
+        return [(int(min(max(0, round(frac)), nz - 1)), 1.0)]
+    f = min(max(float(frac), 0.0), float(nz - 1))
+    k0 = int(np.floor(f))
+    w = f - k0
+    if k0 >= nz - 1 or w < _FRAME_EPS:
+        return [(min(k0, nz - 1), 1.0)]
+    if w > 1.0 - _FRAME_EPS:
+        return [(k0 + 1, 1.0)]
+    return [(k0, 1.0 - w), (k0 + 1, w)]
+
+
+def _pinned_z_frac(sec_md: Mapping[str, Any], sec_axes: Any, sec_m: int,
+                   z_um: Optional[float], z_pins: Sequence[Sequence[Any]],
+                   pri_k: Optional[int], pri_step_um: Optional[float]) -> Optional[float]:
+    """The secondary's fractional slice under the user's Z pins, or ``None`` (not applicable).
+
+    µm form first (crop-proof), index form as the fallback — see :func:`secondary_z_weights`.
+    """
+    nz = int(getattr(sec_axes, "z", 1) or 1)
+    rows = [tuple(r) + (None,) * (4 - len(r)) for r in z_pins]
+    if z_um is not None and all(r[2] is not None and r[3] is not None for r in rows):
+        z0 = z_um_of_slice(sec_md, sec_axes, sec_m, 0)
+        z1 = z_um_of_slice(sec_md, sec_axes, sec_m, nz - 1)
+        if z0 is not None and z1 is not None and z1 != z0:
+            target = _pw_linear([(float(r[2]), float(r[3])) for r in rows], float(z_um), 1.0)
+            return (target - z0) / ((z1 - z0) / (nz - 1))
+    if pri_k is None:
+        return None
+    s_step = _z_step(sec_md, sec_axes)
+    slope = (float(pri_step_um) / s_step) if (pri_step_um and s_step) else 1.0
+    return _pw_linear([(float(r[0]), float(r[1])) for r in rows], float(pri_k), slope)
+
+
 def secondary_z_index(sec_md: Dict[str, Any], sec_axes: Any, sec_m: int,
                       z_um: Optional[float], *, dz: float = 0.0) -> int:
     """Which secondary slice to draw for a primary plane sitting at ``z_um``.
@@ -399,17 +539,12 @@ def secondary_z_index(sec_md: Dict[str, Any], sec_axes: Any, sec_m: int,
     is why a 2D context view stays visible while you scroll a 210-slice stack rather than
     appearing on one slice and vanishing. A volumetric secondary picks the slice NEAREST in
     absolute µm, clamped into range, so scrolling the primary's Z walks the secondary's too.
+
+    The ``nearest`` answer of :func:`secondary_z_weights`, kept by this name because
+    ``util.merge``'s channel branch and the resample bake's older callers ask for exactly one
+    slice.
     """
-    nz = int(getattr(sec_axes, "z", 1) or 1)
-    if nz <= 1 or z_um is None:
-        return 0
-    from nodegraph.placement import z_um_of_slice
-    z0 = z_um_of_slice(sec_md, sec_axes, sec_m, 0)
-    z1 = z_um_of_slice(sec_md, sec_axes, sec_m, nz - 1)
-    if z0 is None or z1 is None or nz < 2 or z1 == z0:
-        return 0
-    frac = ((z_um - dz) - z0) / ((z1 - z0) / (nz - 1))
-    return int(min(max(0, round(frac)), nz - 1))
+    return secondary_z_weights(sec_md, sec_axes, sec_m, z_um, dz=dz)[0][0]
 
 
 @dataclass(frozen=True)
@@ -601,15 +736,30 @@ def compose_secondary_plane(entry: Dict[str, Any],
     # anything is, which is the truthful statement in that state. Unit extents give that
     # for free through the same axis_map, so there is no second sampling path to keep in
     # step with this one.
-    by_index = str(entry.get("placed_by", "stage")) == "index"
-    pri_box = (FieldBox(0.0, 1.0, 0.0, 1.0) if by_index
-               else field_box(pri_md, pri_axes, pri_m))
+    placed_by = str(entry.get("placed_by", "stage"))
+    by_index = placed_by == "index"
+    # CENTRE placement (`unplaceable=align_centres`): both fields at their true µm size,
+    # centre on centre — for files the stage cannot relate (another well, no stage log).
+    centred = placed_by == "centre"
+    if by_index:
+        pri_box = FieldBox(0.0, 1.0, 0.0, 1.0)
+    elif centred:
+        pri_box = _centred_box(pri_md, pri_axes)
+    else:
+        pri_box = field_box(pri_md, pri_axes, pri_m)
     if pri_box is None:
         return None
     # The µm box the OUTPUT covers — the whole field, or the zoomed rect of it.
     out_box = pri_box if region is None else sub_field_box(pri_box, region)
 
     dz, dy, dx = (float(v) for v in (entry.get("offset_um") or (0.0, 0.0, 0.0)))
+    if by_index:
+        # The index layout is in FIELD fractions, and the nudge is in µm. Added raw, a 10 µm
+        # nudge moved the secondary ten whole fields. Scaled by the primary's own extent, a
+        # µm means a µm here too — and a two-click nudge (`nudge_delta_um`) lands on target.
+        ext = lateral_extent_um(pri_md, pri_axes)
+        if ext is not None and ext[0] > 0 and ext[1] > 0:
+            dy, dx = dy / ext[0], dx / ext[1]
     flip_x = bool(entry.get("flip_x", True))
     flip_y = bool(entry.get("flip_y", False))
     h, w = int(out_shape[0]), int(out_shape[1])
@@ -620,8 +770,12 @@ def compose_secondary_plane(entry: Dict[str, Any],
     # tiles that abut to a fraction of a micron, the alternative is a one-pixel seam drawn
     # from whichever tile happened to be painted last.
     for sec_m, _frac in sorted(hits, key=lambda p: p[1]):
-        sec_box = (FieldBox(0.0, 1.0, 0.0, 1.0) if by_index
-                   else field_box(sec_md, sec_axes, int(sec_m)))
+        if by_index:
+            sec_box = FieldBox(0.0, 1.0, 0.0, 1.0)
+        elif centred:
+            sec_box = _centred_box(sec_md, sec_axes)
+        else:
+            sec_box = field_box(sec_md, sec_axes, int(sec_m))
         if sec_box is None:
             continue
         # The nudge moves the SECONDARY, so it is added to the tile's box once, here, and
@@ -757,7 +911,8 @@ def tiles_covering(dst_md: Mapping[str, Any], dst_axes: Any, m: int,
 
 def pair_timepoints(dst_md: Mapping[str, Any], n_dst_t: int,
                     src_md: Mapping[str, Any], n_src_t: int,
-                    *, shift: int = 0) -> List[Tuple[int, Optional[int], Optional[float]]]:
+                    *, shift: int = 0, t_map: Optional[Mapping[str, Any]] = None
+                    ) -> List[Tuple[int, Optional[int], Optional[float]]]:
     """Pair each destination timepoint with a source one → ``[(t_dst, t_src, error_s)]``.
 
     Pairing is by **index** plus an integer ``shift``, which is the decision this node
@@ -774,12 +929,35 @@ def pair_timepoints(dst_md: Mapping[str, Any], n_dst_t: int,
     defensible policy and a terrible default — it changes which frames you are comparing
     based on rounding, and it disagrees with index pairing by two full cycles here. So the
     clock informs the readout and never drives the choice.
+
+    **A single-frame secondary is HELD, not unpaired** (reported 2026-09-14: "overlay only
+    appears on the first frame"). A still — a reference snapshot, a mask, a brightfield
+    context shot — has exactly one answer for every primary timepoint, so it takes it, and
+    ``shift`` is inapplicable rather than merely unsatisfiable. This is the T twin of the
+    rule :func:`secondary_z_index` already applies on the other axis, for the same reason
+    and in the same words: a single-plane secondary stays visible while you scroll a
+    210-slice stack "rather than appearing on one slice and vanishing". Index pairing
+    without this special case sent ``t=1..N-1`` to ``None`` and the overlay vanished after
+    frame 0 — a still being magnified into a timelapse is the commonest overlay there is,
+    and it was the one shape of input the pairing could not express. ``error_s`` is still
+    computed against that one frame, so the readout says how far the primary has travelled
+    from the moment the still was taken.
+
+    ``t_map`` (from :func:`plan_time`) replaces ``t + shift`` with the user's pins and/or a
+    frame-RATE ratio: secondary frame ``floor(map(t))`` pairs with primary frame ``t``. Still
+    an explicit, reported choice — never a nearest-in-time search.
     """
     dst_jd = _seq(dst_md, "frame_time_jd")
     src_jd = _seq(src_md, "frame_time_jd")
+    still = int(n_src_t) <= 1
     out: List[Tuple[int, Optional[int], Optional[float]]] = []
     for t in range(int(n_dst_t)):
-        j = t + int(shift)
+        if still:
+            j = 0
+        elif t_map is not None:
+            j = int(np.floor(map_t(t_map, float(t)) + _FRAME_EPS))
+        else:
+            j = t + int(shift)
         if not (0 <= j < int(n_src_t)):
             out.append((t, None, None))
             continue
@@ -791,6 +969,324 @@ def pair_timepoints(dst_md: Mapping[str, Any], n_dst_t: int,
                 err = None
         out.append((t, j, err))
     return out
+
+
+#: A measured frame-rate ratio within this fraction of a whole number IS that whole number.
+#:
+#: Two acquisition loops never run at exactly the rate they were programmed for: the WellA3
+#: pair cycles at 1421.9 s and 1417.8 s, a ratio of 1.003. Taken literally that is "the
+#: secondary runs 0.3% fast", which drifts the pairing a full frame every ~350 frames — the
+#: nearest-in-time policy :func:`pair_timepoints` rejects, re-entering through the side door —
+#: and would split every primary frame into two sub-ticks for a source that is not faster at
+#: all. What the user programmed was "the same rate" (or "4x"), and that is what is snapped
+#: to. Set the Rate by hand to state anything else exactly.
+RATE_SNAP_TOL = 0.02
+
+#: The most sub-ticks "Play all" will split one primary frame into. A 100x-faster source
+#: would otherwise ask the Viewer for 100 composes per primary frame; past this it plays the
+#: fast source by skipping frames instead, which the readout shows.
+SUB_TICK_CAP = 16
+
+
+def frame_interval_s(md: Mapping[str, Any]) -> Optional[float]:
+    """A file's frame interval in seconds, or ``None`` when it cannot be read.
+
+    ``dt_s`` first (the calibration key the ingest derives from the frame timestamps), then
+    the median step of the per-frame ``frame_time_jd`` clock — median, because one dropped or
+    delayed frame must not change what the whole series' rate is taken to be.
+    """
+    try:
+        dt = float(md.get("dt_s"))
+        if dt > 0 and np.isfinite(dt):
+            return dt
+    except (TypeError, ValueError):
+        pass
+    jd = _seq(md, "frame_time_jd")
+    if len(jd) >= 2:
+        try:
+            steps = np.diff(np.asarray([float(v) for v in jd], dtype=float)) * SECONDS_PER_DAY
+        except (TypeError, ValueError):
+            return None
+        steps = steps[np.isfinite(steps) & (steps > 0)]
+        if steps.size:
+            return float(np.median(steps))
+    return None
+
+
+def snap_rate(r: float) -> float:
+    """``r`` snapped to a whole ratio (``n`` or ``1/n``) when within :data:`RATE_SNAP_TOL`."""
+    r = float(r)
+    if not (r > 0):
+        return r
+    if r >= 1.0:
+        n = round(r)
+        return float(n) if n >= 1 and abs(r - n) <= RATE_SNAP_TOL * n else r
+    inv = 1.0 / r
+    n = round(inv)
+    return 1.0 / n if n >= 1 and abs(inv - n) <= RATE_SNAP_TOL * n else r
+
+
+def parse_pins(raw: Any, *, axis: str) -> Tuple[Tuple[Any, ...], ...]:
+    """A ``t_pins`` / ``z_pins`` value → canonical rows ``(pri, sec, anchor_pri, anchor_sec)``.
+
+    The value is JSON in a STRING socket (the ``roi_mask.shapes`` precedent: structured data
+    with no SocketType of its own), a list of ``[primary, secondary]`` frame-index pairs,
+    optionally ``[primary, secondary, anchor_primary, anchor_secondary]`` where the anchors
+    are the absolute clock (T, Julian days) or focus (Z, µm) the Viewer recorded when the pin
+    was made. ``""`` is no pins.
+
+    Canonical = sorted by the primary index, ONE pin per primary index (the later row wins —
+    re-pinning a frame replaces its pin), anchors as floats or ``None``. The canonical form is
+    what makes the recipe hash repeat-stable (INV-12): two spellings of the same pins must not
+    be two memo keys.
+
+    Malformed input is REFUSED with the parse error rather than read as "no pins": silently
+    dropping a user's pairing is the one outcome worse than an error.
+    """
+    if raw is None:
+        return ()
+    rows: Any = raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return ()
+        import json as _json
+        try:
+            rows = _json.loads(s)
+        except ValueError as exc:
+            raise ValueError(
+                f"`{axis}_pins` is not valid JSON ({exc}). Expected a list of "
+                f"[primary {axis}, secondary {axis}] pairs, e.g. [[0, 0], [12, 48]].") from None
+    if not isinstance(rows, (list, tuple)):
+        raise ValueError(f"`{axis}_pins` must be a JSON list of [primary, secondary] pairs, "
+                         f"not {type(rows).__name__}")
+    by_pri: Dict[int, Tuple[Any, ...]] = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) not in (2, 4):
+            raise ValueError(
+                f"`{axis}_pins` row {i} is {row!r}: each pin is [primary, secondary] or "
+                f"[primary, secondary, anchor_primary, anchor_secondary]")
+        try:
+            a, b = int(row[0]), int(row[1])
+            if a != float(row[0]) or b != float(row[1]):
+                raise ValueError
+            anchors = tuple(None if v is None else float(v) for v in row[2:4]) \
+                if len(row) == 4 else (None, None)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"`{axis}_pins` row {i} is {row!r}: frame indices must be whole numbers and "
+                f"anchors numbers or null") from None
+        if a < 0 or b < 0:
+            raise ValueError(f"`{axis}_pins` row {i} is {row!r}: frame indices start at 0")
+        by_pri[a] = (a, b) + anchors
+    return tuple(by_pri[k] for k in sorted(by_pri))
+
+
+def pins_json(rows: Sequence[Sequence[Any]]) -> str:
+    """Canonical rows → the canonical JSON string (``""`` for none). Anchors ride only when
+    present, so a hand-typed ``[[3, 7]]`` round-trips as itself."""
+    if not rows:
+        return ""
+    import json as _json
+    out = []
+    for r in parse_pins(list(list(x) for x in rows), axis="pin"):
+        out.append(list(r[:2]) if r[2] is None and r[3] is None else list(r))
+    return _json.dumps(out, separators=(",", ":"))
+
+
+def _nearest_frame(clock: Sequence[Any], anchor: float, fallback: int) -> Tuple[int, bool]:
+    """``(index, found)``: the frame of ``clock`` at ``anchor``, or ``fallback`` if no frame is
+    within half an interval of it (the pinned frame was cropped away, or it is another file)."""
+    try:
+        vals = np.asarray([float(v) for v in clock], dtype=float)
+    except (TypeError, ValueError):
+        return int(fallback), False
+    if vals.size == 0:
+        return int(fallback), False
+    d = np.abs(vals - float(anchor))
+    i = int(np.argmin(d))
+    if vals.size == 1:
+        return i, bool(d[i] < 1e-9)
+    steps = np.diff(np.sort(vals))
+    steps = steps[steps > 0]
+    half = 0.5 * float(np.median(steps)) if steps.size else 0.0
+    return (i, True) if d[i] <= half else (int(fallback), False)
+
+
+def plan_time(dst_md: Mapping[str, Any], n_dst_t: int,
+              src_md: Mapping[str, Any], n_src_t: int,
+              *, shift: int = 0, pairing: str = "index", rate: float = 0.0,
+              pins: Sequence[Sequence[Any]] = ()) -> Dict[str, Any]:
+    """Resolve the T pairing → ``{t_map, t_pairs, sub_ticks, rate, warnings, refusals}``.
+
+    ``pairing="index"`` with no pins is exactly the historical ``t + shift`` pairing and
+    returns ``t_map=None``, so a recipe that uses none of this is byte-identical to one
+    stamped before it existed.
+
+    ``pairing="rate"``: the secondary advances ``r = dt_primary / dt_secondary`` frames per
+    primary frame — 4 for a 5 s series against a 20 s one, 0.25 the other way round, which
+    then HOLDS each secondary frame for four primary ones. ``rate > 0`` states ``r`` exactly;
+    ``0`` measures it from the two files' clocks (:func:`frame_interval_s`) and snaps it to a
+    whole ratio (:data:`RATE_SNAP_TOL`). No clock on either file refuses: a rate this node
+    guessed would be a pairing it invented.
+
+    ``pins`` (canonical, :func:`parse_pins`) are "primary frame ``a`` goes with secondary
+    frame ``b``": the map runs straight through them, at the rate beyond the outermost. One
+    pin re-anchors, two or more also fix the rate between them. A pin that recorded both
+    files' clocks is re-found BY CLOCK, so an upstream T crop — which re-indexes — does not
+    silently move it onto different frames. Pins that run backwards are refused: a map that
+    goes back in time pairs one secondary frame with two unrelated moments.
+
+    ``sub_ticks`` is how many ticks "Play all" should split each primary frame into for this
+    source to show every one of its frames — ``ceil`` of the steepest part of the map, capped
+    at :data:`SUB_TICK_CAP`.
+    """
+    warnings: List[str] = []
+    refusals: List[str] = []
+    n_dst_t, n_src_t = int(n_dst_t), int(n_src_t)
+    still = n_src_t <= 1
+    if still or (pairing != "rate" and not pins):
+        if still and (pins or pairing == "rate"):
+            warnings.append("the secondary is a single frame, so T pins and the rate are "
+                            "inert — that frame is held across every primary timepoint")
+        return {"t_map": None, "sub_ticks": 1, "rate": 1.0, "warnings": warnings,
+                "refusals": refusals,
+                "t_pairs": pair_timepoints(dst_md, n_dst_t, src_md, n_src_t, shift=shift)}
+
+    r = 1.0
+    if pairing == "rate":
+        if rate and float(rate) > 0:
+            r = float(rate)
+        else:
+            dp, ds = frame_interval_s(dst_md), frame_interval_s(src_md)
+            if dp is None or ds is None:
+                missing = " and ".join(
+                    n for n, v in (("primary", dp), ("secondary", ds)) if v is None)
+                refusals.append(
+                    f"T pairing = rate needs each file's frame interval, and the {missing} "
+                    f"carries neither dt_s nor a frame clock — set Rate to the number of "
+                    f"secondary frames per primary frame (e.g. 4), or pair by index")
+                return {"t_map": None, "sub_ticks": 1, "rate": 1.0, "warnings": warnings,
+                        "refusals": refusals, "t_pairs": []}
+            raw_r = dp / ds
+            r = snap_rate(raw_r)
+            warnings.append(
+                f"rate pairing: the secondary runs {r:g}x the primary's frame rate "
+                f"(primary every {dp:g} s, secondary every {ds:g} s"
+                + (f", measured {raw_r:.4g}x and snapped" if r != raw_r else "") + ")")
+
+    knots: List[Tuple[float, float]] = []
+    if pins:
+        dst_jd, src_jd = _seq(dst_md, "frame_time_jd"), _seq(src_md, "frame_time_jd")
+        lost: List[int] = []
+        for row in pins:
+            a, b = int(row[0]), int(row[1])
+            ja = row[2] if len(row) > 2 else None
+            jb = row[3] if len(row) > 3 else None
+            if ja is not None and dst_jd:
+                a2, ok = _nearest_frame(dst_jd, float(ja), a)
+                a = a2 if ok else a
+                if not ok:
+                    lost.append(int(row[0]))
+            if jb is not None and src_jd:
+                b2, ok = _nearest_frame(src_jd, float(jb), b)
+                b = b2 if ok else b
+            knots.append((float(a), float(b)))
+        if lost:
+            warnings.append(
+                f"T pin(s) at primary frame(s) {_brief(lost)} no longer find their pinned "
+                f"moment on the clock (was that frame cropped away?) — used by index")
+        knots.sort()
+        for (ua, sa), (ub, sb) in zip(knots, knots[1:]):
+            if ub == ua or sb < sa:
+                refusals.append(
+                    f"T pins cross: primary t={ua:g} -> secondary t={sa:g} but primary "
+                    f"t={ub:g} -> secondary t={sb:g}, which runs backwards in time. Remove one "
+                    f"of them.")
+        out_of_range = [int(u) for u, s in knots
+                        if not (0 <= u < n_dst_t) or not (0 <= s < n_src_t)]
+        if out_of_range:
+            warnings.append(f"T pin(s) at primary frame(s) {_brief(out_of_range)} point "
+                            f"outside the data they pair — they still steer the map")
+        if shift:
+            warnings.append(f"t_shift={shift} is inert: T pins decide the pairing")
+    else:
+        knots = [(0.0, float(shift))]
+    if refusals:
+        return {"t_map": None, "sub_ticks": 1, "rate": r, "warnings": warnings,
+                "refusals": refusals, "t_pairs": []}
+
+    t_map = {"knots": [[u, s] for u, s in knots], "rate": r, "n_src": n_src_t}
+    slopes = [abs(r)] + [abs((sb - sa) / (ub - ua))
+                         for (ua, sa), (ub, sb) in zip(knots, knots[1:]) if ub > ua]
+    steep = max(slopes)
+    sub = int(min(SUB_TICK_CAP, max(1, int(np.ceil(steep * (1.0 - RATE_SNAP_TOL))))))
+    if steep > SUB_TICK_CAP:
+        warnings.append(f"the secondary runs {steep:.3g}x faster than the primary; Play all "
+                        f"shows {SUB_TICK_CAP} of its frames per primary frame and skips the "
+                        f"rest")
+    return {"t_map": t_map, "sub_ticks": sub, "rate": r, "warnings": warnings,
+            "refusals": refusals,
+            "t_pairs": pair_timepoints(dst_md, n_dst_t, src_md, n_src_t, t_map=t_map)}
+
+
+def nudge_delta_um(pri_md: Mapping[str, Any], pri_axes: Any,
+                   p_pri: Tuple[float, float], p_sec: Tuple[float, float],
+                   *, placed_by: str = "stage") -> Optional[Tuple[float, float]]:
+    """The ``(dy, dx)`` µm nudge that moves a feature drawn at ``p_sec`` onto ``p_pri``.
+
+    Both points are ``(row, col)`` in the PRIMARY's native image pixels: where a feature sits
+    in the primary, and where the same feature is currently drawn in the overlaid secondary.
+    The compositor lays the primary's image out along increasing µm on both axes and moves the
+    secondary by adding the nudge to its box, so the answer is the pixel delta times the
+    primary's pixel size — and it is **flip-independent**: a flip mirrors which source pixel
+    a box samples, never where the box sits, so the sign cannot depend on handedness.
+
+    An INDEX placement lays the fields out on the primary's own extent too
+    (:func:`compose_secondary_plane` scales the nudge by it), so the same rule holds there.
+    ``None`` without a pixel size — a delta that cannot be expressed in µm.
+    """
+    del placed_by, pri_axes          # the rule is the same for every placement — see above
+    try:
+        ps = float(pri_md.get("pixel_size_um"))
+    except (TypeError, ValueError):
+        return None
+    if not (ps > 0):
+        return None
+    return ((float(p_pri[0]) - float(p_sec[0])) * ps,
+            (float(p_pri[1]) - float(p_sec[1])) * ps)
+
+
+def _centred_box(md: Mapping[str, Any], axes: Any) -> Optional[FieldBox]:
+    """The field as a box of its TRUE µm size centred on the origin — CENTRE placement.
+
+    For two files whose stage positions do not overlap (another well, another dish, a file
+    with no stage log at all) but which the user wants seen together: centre on centre at each
+    file's real pixel size, so a 60x field sits at its true size inside a 20x one rather than
+    being stretched onto it as an index placement does."""
+    ext = lateral_extent_um(md, axes)
+    if ext is None:
+        return None
+    h, w = ext
+    return FieldBox(-0.5 * h, 0.5 * h, -0.5 * w, 0.5 * w)
+
+
+def _held_still_note(dst_axes: Any, src_axes: Any, t_shift: int) -> List[str]:
+    """The "single-frame secondary" note, or ``[]`` — one builder, two callers.
+
+    A still is drawn on every primary frame (:func:`pair_timepoints`), which is what the
+    user wants and also looks exactly like an overlay that has stopped updating, so it says
+    which it is unprompted. The ``t_shift`` half matters more than it looks: a shift
+    silently doing nothing is the state where someone reaches for that spinner to fix the
+    alignment and concludes the node is broken."""
+    n_src_t = int(getattr(src_axes, "t", 1) or 1)
+    n_dst_t = int(getattr(dst_axes, "t", 1) or 1)
+    if not (n_src_t <= 1 < n_dst_t):
+        return []
+    return [f"the secondary has a single timepoint, so that one frame is HELD across all "
+            f"{n_dst_t} primary timepoints — the overlay is not frozen, there is nothing "
+            f"for it to advance to" +
+            (f"; t_shift={t_shift} is inapplicable and was ignored" if t_shift else "")]
 
 
 @dataclass(frozen=True)
@@ -816,10 +1312,16 @@ class PlacementPlan:
     z_offset_um: Dict[int, Optional[float]]
     refusals: Tuple[str, ...] = ()
     warnings: Tuple[str, ...] = ()
-    #: ``"stage"`` (the real thing) or ``"index"`` (the user overrode a refusal). Carried
-    #: rather than inferred so every readout can say WHICH it is — a picture placed by
-    #: index looks exactly like one placed by stage, and that is the whole hazard.
+    #: ``"stage"`` (the real thing), ``"index"`` (the user overrode a refusal) or
+    #: ``"centre"`` (centre-on-centre at true size, `align_centres`). Carried rather than
+    #: inferred so every readout can say WHICH it is — a picture placed by index looks
+    #: exactly like one placed by stage, and that is the whole hazard.
     placed_by: str = "stage"
+    #: The T map (:func:`plan_time`) when pins or a rate decide the pairing, else ``None``
+    #: (plain ``t + shift``) — and how many "Play all" sub-ticks this source wants per
+    #: primary frame.
+    t_map: Optional[Dict[str, Any]] = None
+    sub_ticks: int = 1
 
     @property
     def ok(self) -> bool:
@@ -833,8 +1335,12 @@ class PlacementPlan:
             return f"m{m}: no secondary tile covers this field"
         names = ", ".join(f"m{j:02d}" for j, _ in tiles)
         parts = [f"m{m} <- {names}"]
-        if self.placed_by != "stage":
+        if self.placed_by == "centre":
+            parts.append("CENTRE-ON-CENTRE (override)")
+        elif self.placed_by != "stage":
             parts.append("BY INDEX (override)")
+        if self.t_map is not None and float(self.t_map.get("rate", 1.0)) != 1.0:
+            parts.append(f"{float(self.t_map['rate']):g}x rate")
         parts.append(f"{100.0 * self.coverage.get(m, 0.0):.0f}% covered")
         if self.scale:
             parts.append(f"{self.scale:.3g}x px")
@@ -854,9 +1360,26 @@ def plan_placement(dst_md: Mapping[str, Any], dst_axes: Any,
                    src_sampling: Sequence[str] = (),
                    offset_um: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                    min_coverage: float = 0.0,
-                   on_unplaceable: str = "refuse") -> PlacementPlan:
+                   on_unplaceable: str = "refuse",
+                   t_pairing: str = "index", rate: float = 0.0,
+                   t_pins: Sequence[Sequence[Any]] = (),
+                   z_pins: Sequence[Sequence[Any]] = ()) -> PlacementPlan:
     """Resolve the full placement of ``src`` into ``dst``'s field, with the tiered
     refuse/degrade verdict attached.
+
+    ``t_pairing`` / ``rate`` / ``t_pins`` decide the T pairing (:func:`plan_time`). Their
+    refusals — no clock for a measured rate, pins that run backwards — are NOT walked past by
+    an ``unplaceable`` override: that override is about where the secondary goes in space,
+    and it says nothing about which frame it is.
+
+    ``on_unplaceable="align_centres"`` places centre-on-centre at each file's true pixel size
+    — both when the files cannot prove a placement (as ``align_by_index`` does) AND when they
+    can but no field overlaps at all (two wells, two dishes), which would otherwise draw
+    nothing. Partly-overlapping files keep their stage placement: mixing the two in one
+    overlay would put some fields where they are and others where they are not.
+
+    ``z_pins`` only silence the FROZEN-IN-Z warning here (the pins are the user's own answer
+    to it); the compositor applies them (:func:`secondary_z_weights`).
 
     ``dst_sampling`` / ``src_sampling`` are the two Datasets' ``_sampling_of`` provenance
     tuples. They are compared because **size equality is not geometry equality**: a
@@ -868,6 +1391,15 @@ def plan_placement(dst_md: Mapping[str, Any], dst_axes: Any,
     """
     refusals: List[str] = []
     warnings: List[str] = []
+
+    # ── TIME first: its refusals stand whatever the spatial override says ─────────
+    tp = plan_time(dst_md, int(getattr(dst_axes, "t", 1) or 1),
+                   src_md, int(getattr(src_axes, "t", 1) or 1),
+                   shift=t_shift, pairing=t_pairing, rate=rate, pins=t_pins)
+    if tp["refusals"]:
+        return PlacementPlan(tiles={}, coverage={}, scale=None, t_pairs=[],
+                             z_offset_um={}, refusals=tuple(tp["refusals"]))
+    t_extra = dict(t_map=tp["t_map"], sub_ticks=int(tp["sub_ticks"]))
 
     # ── DEGRADE: the two chains diverged, but both can still be PLACED ───────────
     #
@@ -951,25 +1483,9 @@ def plan_placement(dst_md: Mapping[str, Any], dst_axes: Any,
     # is honest about what it is doing — it does not fabricate a stage position and then
     # present the result as physically placed.
     if refusals:
-        n_src_m = int(getattr(src_axes, "m", 1) or 1)
         warnings.extend(f"OVERRIDDEN — {r}" for r in refusals)
-        warnings.append(
-            "placement is by INDEX, not by stage position: field m is paired with the "
-            "secondary's field m (clamped to its last). Physical alignment is NOT "
-            "verified — check it by eye and correct it with the µm nudge")
-        n_dst_m = int(getattr(dst_axes, "m", 1) or 1)
-        idx_tiles = {m: [(min(m, n_src_m - 1), 1.0)] for m in range(n_dst_m)}
-        try:
-            idx_scale = float(src_md["pixel_size_um"]) / float(dst_md["pixel_size_um"])
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
-            idx_scale = None
-        return PlacementPlan(
-            tiles=idx_tiles, coverage={m: 1.0 for m in idx_tiles}, scale=idx_scale,
-            t_pairs=pair_timepoints(dst_md, int(getattr(dst_axes, "t", 1) or 1),
-                                    src_md, int(getattr(src_axes, "t", 1) or 1),
-                                    shift=t_shift),
-            z_offset_um={m: None for m in idx_tiles},
-            refusals=(), warnings=tuple(warnings), placed_by="index")
+        return _override_plan(dst_md, dst_axes, src_md, src_axes, tp, warnings,
+                              t_shift=t_shift, on_unplaceable=on_unplaceable, t_extra=t_extra)
 
     # ── resolve ──────────────────────────────────────────────────────────────────
     dst_ps = float(dst_md["pixel_size_um"])
@@ -991,11 +1507,21 @@ def plan_placement(dst_md: Mapping[str, Any], dst_axes: Any,
         z_offset[m] = _z_offset(dst_md, dst_axes, m, src_md, src_axes, hits,
                                 dz=float(offset_um[0]))
 
-    t_pairs = pair_timepoints(dst_md, int(getattr(dst_axes, "t", 1) or 1),
-                              src_md, int(getattr(src_axes, "t", 1) or 1),
-                              shift=t_shift)
+    t_pairs = tp["t_pairs"]
+
+    # ── no field overlaps at all: the stage cannot relate these two files ─────────
+    # (two wells, two dishes). `align_centres` is the user saying "show them together
+    # anyway"; everything else keeps the honest blank-plus-warning below.
+    if (on_unplaceable == "align_centres" and coverage
+            and all(c <= 0.0 for c in coverage.values())):
+        warnings.append(
+            "no secondary field overlaps any primary field on the stage — the two files were "
+            "imaged at different positions")
+        return _override_plan(dst_md, dst_axes, src_md, src_axes, tp, warnings,
+                              t_shift=t_shift, on_unplaceable=on_unplaceable, t_extra=t_extra)
 
     # ── DEGRADE: states you can see on screen ────────────────────────────────────
+    warnings.extend(tp["warnings"])
     blank = [m for m, c in coverage.items() if c <= 0.0]
     if blank:
         warnings.append(
@@ -1015,9 +1541,49 @@ def plan_placement(dst_md: Mapping[str, Any], dst_axes: Any,
                 f"coverage floor")
     unpaired = [t for t, j, _ in t_pairs if j is None]
     if unpaired:
+        why = "the T pins / rate" if tp["t_map"] is not None else f"t_shift={t_shift}"
         warnings.append(
-            f"t_shift={t_shift} leaves timepoint(s) {_brief(unpaired)} with no secondary "
+            f"{why} leaves timepoint(s) {_brief(unpaired)} with no secondary "
             f"frame — the overlay is empty there")
+    warnings.extend(_held_still_note(dst_axes, src_axes, t_shift))
+    if z_pins and float(offset_um[0]):
+        warnings.append(f"Nudge Z ({float(offset_um[0]):+g} µm) is inert: Z pins decide "
+                        f"which secondary plane goes with each primary plane")
+    # ── the FROZEN-IN-Z warning (reported 2026-08-25) ────────────────────────────
+    #
+    # T is paired by INDEX and Z by absolute µm, so when two stacks do not overlap axially
+    # the overlay still tracks T perfectly while Z looks completely dead: every plane of the
+    # primary resolves to the same clamped end plane of the secondary. "Updating in T but
+    # not in Z" is therefore not a hint that something is broken in the Z code — it is the
+    # exact signature of a Z placement that has nothing to place against, and it is
+    # invisible unless something says so.
+    #
+    # It is computable, so it gets computed, including the nudge that fixes it. The sign
+    # falls out of `primary centre - secondary centre` because `offset_z` moves the
+    # SECONDARY — which is also the sign users get wrong, since it flips when the same two
+    # files are wired the other way round.
+    for m, hits in tiles.items():
+        if not hits or z_pins:
+            # Z pins ARE the user's answer to "these stacks do not share a focus": the
+            # pinned planes are paired whatever their stage Z says, so the warning (and its
+            # Nudge Z advice, now inert) would be describing a state that no longer exists.
+            break
+        p_span = _z_span(dst_md, dst_axes, m)
+        s_span = _z_span(src_md, src_axes, int(hits[0][0]))
+        if p_span is None or s_span is None:
+            continue
+        s_lo, s_hi = s_span[0] + float(offset_um[0]), s_span[1] + float(offset_um[0])
+        if s_lo <= p_span[1] and s_hi >= p_span[0]:
+            break                       # they overlap somewhere: nothing to warn about
+        gap = ((p_span[0] + p_span[1]) - (s_lo + s_hi)) / 2.0
+        warnings.append(
+            f"the two stacks do not overlap in Z (primary {p_span[0]:.0f}–{p_span[1]:.0f} µm, "
+            f"secondary {s_lo:.0f}–{s_hi:.0f} µm), so the overlay is CLAMPED to one end plane "
+            f"and will not move as you scroll Z — it still follows T, which is paired by "
+            f"index. Set Nudge Z to {float(offset_um[0]) + gap:+.1f} µm to centre them. Two "
+            f"objectives rarely focus at the same stage Z, and no file records the difference")
+        break
+
     if dst_md.get("z_collapsed"):
         warnings.append(
             "the primary's Z is collapsed (a projection), so no depth relationship is "
@@ -1034,7 +1600,64 @@ def plan_placement(dst_md: Mapping[str, Any], dst_axes: Any,
             f"{'magnified' if scale > 1 else 'minified'} into its grid")
 
     return PlacementPlan(tiles=tiles, coverage=coverage, scale=scale, t_pairs=t_pairs,
-                         z_offset_um=z_offset, refusals=(), warnings=tuple(warnings))
+                         z_offset_um=z_offset, refusals=(), warnings=tuple(warnings),
+                         **t_extra)
+
+
+def _override_plan(dst_md: Mapping[str, Any], dst_axes: Any,
+                   src_md: Mapping[str, Any], src_axes: Any, tp: Dict[str, Any],
+                   warnings: List[str], *, t_shift: int, on_unplaceable: str,
+                   t_extra: Dict[str, Any]) -> PlacementPlan:
+    """The plan when the user has taken the SPATIAL decision back — by index, or centre on
+    centre. One builder for both the refusal override and the no-overlap fallback, so the two
+    routes into ``align_centres`` cannot disagree about what it means.
+
+    Centre placement needs a pixel size on both sides (it places at TRUE size); without one it
+    degrades to index placement and says so, rather than inventing a size."""
+    n_src_m = int(getattr(src_axes, "m", 1) or 1)
+    n_dst_m = int(getattr(dst_axes, "m", 1) or 1)
+    placed_by = "index"
+    if on_unplaceable == "align_centres":
+        if (lateral_extent_um(dst_md, dst_axes) is not None
+                and lateral_extent_um(src_md, src_axes) is not None):
+            placed_by = "centre"
+            warnings.append(
+                "placement is CENTRE-ON-CENTRE at each file's true pixel size, not by stage "
+                "position: field m is paired with the secondary's field m (clamped to its "
+                "last). Physical alignment is NOT verified — anchor it by eye with the µm "
+                "nudge or the two-click Nudge pick")
+        else:
+            warnings.append("centre placement needs a pixel size on both files — placed by "
+                            "INDEX instead")
+    if placed_by == "index":
+        warnings.append(
+            "placement is by INDEX, not by stage position: field m is paired with the "
+            "secondary's field m (clamped to its last). Physical alignment is NOT "
+            "verified — check it by eye and correct it with the µm nudge")
+    warnings.extend(tp["warnings"])
+    # A still is the commonest thing to reach the override at all — a snapshot TIFF
+    # carries no stage log — so the held-T note belongs on this path too.
+    warnings.extend(_held_still_note(dst_axes, src_axes, t_shift))
+    idx_tiles = {m: [(min(m, n_src_m - 1), 1.0)] for m in range(n_dst_m)}
+    try:
+        idx_scale = float(src_md["pixel_size_um"]) / float(dst_md["pixel_size_um"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        idx_scale = None
+    if placed_by == "centre" and idx_scale is not None:
+        coverage = {m: _centred_coverage(dst_md, dst_axes, src_md, src_axes) for m in idx_tiles}
+    else:
+        coverage = {m: 1.0 for m in idx_tiles}
+    return PlacementPlan(
+        tiles=idx_tiles, coverage=coverage, scale=idx_scale, t_pairs=tp["t_pairs"],
+        z_offset_um={m: None for m in idx_tiles},
+        refusals=(), warnings=tuple(warnings), placed_by=placed_by, **t_extra)
+
+
+def _centred_coverage(dst_md: Mapping[str, Any], dst_axes: Any,
+                      src_md: Mapping[str, Any], src_axes: Any) -> float:
+    """Fraction of the primary field a centred secondary covers (a 60x inside a 20x: <1)."""
+    a, b = _centred_box(dst_md, dst_axes), _centred_box(src_md, src_axes)
+    return overlap_fraction(a, b) if (a is not None and b is not None) else 1.0
 
 
 def _z_offset(dst_md: Mapping[str, Any], dst_axes: Any, m: int,
@@ -1074,3 +1697,341 @@ def _brief(items: Sequence[int], limit: int = 6) -> str:
         return ", ".join(str(v) for v in vals)
     head = ", ".join(str(v) for v in vals[:limit])
     return f"{head}, … (+{len(vals) - limit} more)"
+
+
+# ── position GROUPS: which multipoints belong to the same specimen ─────────────
+#
+# A multipoint acquisition is very often not one flat list of fields. The lab's
+# `9.1.26_CRC_Gradient/Channel640_Seq0001.nd2` holds 54 positions that are really SIX 3x3
+# mosaics — nine tiles at a 147 µm pitch across a 293 µm field (50 % overlap), and then a
+# jump of a millimetre to the next specimen. Every consumer that treats `m` as a flat axis
+# gets that wrong in the same way: Stitch fuses all 54 into one canvas with four huge holes
+# in it, a `scope="dataset"` statistic pools six unrelated specimens, and a per-position
+# table gives you 54 rows when the experiment had six samples.
+#
+# The grouping is not recorded anywhere in the file as such — NIS writes the point list flat
+# — so it has to be RECOVERED from the geometry, which is what this section does.
+
+#: Default gap threshold, as a multiple of the field of view: two fields whose centres are
+#: further apart than this start different groups.
+#:
+#: One FOV is the honest place to put it, and the reason is not tuning. Tiles of one mosaic
+#: must OVERLAP (or at worst abut) to be stitchable at all, so their centres are always
+#: closer than one field; anything further apart is not a neighbouring tile of the same
+#: mosaic, whatever else it is. That makes the threshold a statement about what a mosaic IS
+#: rather than a number fitted to one plate — and :attr:`GroupPlan.margin` reports how much
+#: room the answer actually had, so a layout where the choice mattered says so instead of
+#: quietly returning one of several defensible answers.
+GROUP_GAP_FACTOR = 1.0
+
+#: How far two coordinates may differ and still count as the same row/column of a grid,
+#: as a fraction of the inferred pitch. A stage repeats a nominal position to well under a
+#: micron (the CRC file's nine tiles sit within 0.2 µm of three clean x levels), so this is
+#: loose by two orders of magnitude on purpose: it is here to absorb a stage that settles
+#: differently per row, not to make a decision.
+_GRID_TOL = 0.25
+
+
+@dataclass(frozen=True)
+class PositionGroup:
+    """One cluster of multipoints — the fields of a single specimen.
+
+    ``members`` are multipoint indices in ACQUISITION order, which is the order Stitch and
+    every table already address them in; the grid description below is derived from their
+    coordinates and is advisory. ``rows``/``cols`` are the inferred mosaic shape and
+    ``order`` says how the scan walked it, so a caller can present "3x3 serpentine" rather
+    than nine numbers. A group whose fields do not lie on a grid at all still has valid
+    ``members`` — it reports ``rows=cols=0`` and ``order="irregular"`` instead of forcing a
+    shape onto it.
+    """
+
+    key: str
+    members: Tuple[int, ...]
+    #: ``(y, x)`` µm centre of the group's bounding box, or ``None`` when the group was READ
+    #: rather than measured (a sidecar names members, not coordinates). ``None`` instead of
+    #: ``(0, 0)`` deliberately: an origin is a real place on the stage, and a caller that
+    #: drew a group there would be drawing a measurement nobody made.
+    center_um: Optional[Tuple[float, float]] = None
+    rows: int = 0
+    cols: int = 0
+    pitch_um: Tuple[float, float] = (0.0, 0.0)   # (y, x); 0 on an axis with one level
+    order: str = "irregular"                # serpentine | raster | single | irregular
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+    def brief(self) -> str:
+        """One line for a menu or an error: ``"G2 — 9 positions, 3x3 serpentine"``."""
+        shape = (f", {self.rows}x{self.cols} {self.order}"
+                 if self.rows and self.cols else "")
+        noun = "position" if self.size == 1 else "positions"
+        return f"{self.key} — {self.size} {noun}{shape}"
+
+
+@dataclass(frozen=True)
+class GroupPlan:
+    """The whole grouping of one Dataset's multipoint axis, plus how sure it is.
+
+    ``placed`` is the honest failure: a Dataset whose fields cannot be located at all (no
+    ``origin_um``, no ``stage_xy_um``, no pixel size) gets an EMPTY plan rather than one
+    group containing everything. The two are very different answers and a caller must be
+    able to tell them apart — "they are all one specimen" is a claim, "I cannot see where
+    they are" is not.
+
+    ``margin`` is the ratio between the narrowest gap SEPARATING two groups and the widest
+    gap INSIDE any of them (formally: the smallest inter-cluster distance over the largest
+    single-linkage edge, i.e. the MST bottleneck). Any threshold between those two numbers
+    produces this exact grouping, so the margin says how much the answer depended on
+    :data:`GROUP_GAP_FACTOR`:
+
+    * ``margin`` well above 1 — the layout separates cleanly and the threshold is not doing
+      the work. The CRC file measures **7.1** (147 µm inside a mosaic, 1039 µm between).
+    * ``margin`` near 1 — the gap the grouping turns on is barely wider than the gaps it is
+      ignoring, and a different threshold would give a different answer. Say so; do not
+      present the result as discovered fact.
+    * ``inf`` — one group (or none), so nothing was separated and no threshold mattered.
+    """
+
+    groups: Tuple[PositionGroup, ...] = ()
+    gap_um: float = 0.0
+    margin: float = float("inf")
+    placed: bool = False
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def of_member(self, m: int) -> Optional[PositionGroup]:
+        """The group multipoint ``m`` belongs to, or ``None``."""
+        for g in self.groups:
+            if int(m) in g.members:
+                return g
+        return None
+
+    def labels(self) -> Tuple[str, ...]:
+        """One group key per multipoint — the per-M list :data:`POSITION_GROUP_KEY` holds.
+
+        Empty when the plan is unplaced, because a list of the wrong length read
+        positionally is the failure this module refuses everywhere else.
+        """
+        if not self.placed or not self.groups:
+            return ()
+        n = 1 + max(max(g.members) for g in self.groups)
+        out: List[str] = [""] * n
+        for g in self.groups:
+            for m in g.members:
+                out[m] = g.key
+        return tuple(out)
+
+
+def _group_centers(md: Mapping[str, Any], axes: Any
+                   ) -> Optional[Tuple[np.ndarray, float]]:
+    """Every multipoint's field CENTRE in µm as an ``(M, 2)`` ``[y, x]`` array, plus the
+    field size to measure gaps against — or ``None`` when any field cannot be placed.
+
+    Routed through :func:`field_box` rather than reading a stage key directly, so this
+    inherits the preference order the rest of the module already agreed on: the
+    transform-maintained ``origin_um`` first, the raw stage log as the fallback, and any
+    correction ``registration.align_to`` measured folded in. A grouping computed off a
+    different coordinate than the one Stitch will place the tiles with would be a grouping
+    that disagrees with the picture it produces.
+
+    All-or-nothing on purpose (the :func:`~nodegraph.nodes._stitch_stage_xy` rule): a log
+    covering some positions would cluster the ones it has and silently drop the rest, and
+    the result looks exactly like a complete answer.
+    """
+    n = int(getattr(axes, "m", 0) or 0)
+    if n <= 0:
+        return None
+    ext = lateral_extent_um(md, axes)
+    if ext is None:
+        return None
+    pts = np.empty((n, 2), dtype=float)
+    for m in range(n):
+        box = field_box(md, axes, m)
+        if box is None:
+            return None
+        pts[m] = (0.5 * (box.y0 + box.y1), 0.5 * (box.x0 + box.x1))
+    return pts, float(max(ext))
+
+
+def _single_linkage(pts: np.ndarray, gap: float) -> Tuple[List[List[int]], float, float]:
+    """Cluster ``pts`` by single linkage at ``gap``; also return the two margin numbers.
+
+    Union-find over the full pair list. That is O(M^2) and deliberately not a KD-tree: M is
+    the number of stage positions, which is tens — 54 on the file this was written for,
+    1536 on a pathological plate — so the pair matrix is at most a few megabytes and the
+    tree would cost more to build than the scan saves. It also keeps this module dependency
+    free (numpy only), which is what lets it run inside an edit-time ``meta_transform`` on
+    every keystroke.
+
+    Returned margins are ``(bottleneck, separation)``: the widest edge single linkage had to
+    ACCEPT to build these clusters, and the narrowest distance between two of them.
+    """
+    n = len(pts)
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    iu = np.triu_indices(n, k=1)
+    near = np.asarray(d[iu] <= gap).nonzero()[0]
+    for e in near:
+        i, j = int(iu[0][e]), int(iu[1][e])
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    buckets: Dict[int, List[int]] = {}
+    for i in range(n):
+        buckets.setdefault(find(i), []).append(i)
+    clusters = sorted((sorted(v) for v in buckets.values()), key=lambda v: v[0])
+
+    # The bottleneck is the widest edge of each cluster's minimum spanning tree. Computed
+    # as the widest step of a Prim walk, which for a cluster of this size is one small dense
+    # scan and avoids pulling in scipy for a number that only ever gets REPORTED.
+    bottleneck = 0.0
+    for c in clusters:
+        if len(c) < 2:
+            continue
+        idx = np.asarray(c)
+        sub = d[np.ix_(idx, idx)]
+        seen = [0]
+        rest = set(range(1, len(idx)))
+        while rest:
+            best = min(((sub[a, b], b) for a in seen for b in rest), key=lambda t: t[0])
+            bottleneck = max(bottleneck, float(best[0]))
+            seen.append(best[1])
+            rest.discard(best[1])
+
+    separation = float("inf")
+    for a in range(len(clusters)):
+        for b in range(a + 1, len(clusters)):
+            ia, ib = np.asarray(clusters[a]), np.asarray(clusters[b])
+            separation = min(separation, float(d[np.ix_(ia, ib)].min()))
+    return clusters, bottleneck, separation
+
+
+def _levels(vals: np.ndarray, tol_frac: float = _GRID_TOL) -> Tuple[List[float], float]:
+    """Collapse 1-D coordinates onto the distinct grid LEVELS they sample, and the pitch.
+
+    Sorted-and-split rather than rounded to a bin: a fixed bin boundary falling between two
+    readings of the same nominal position splits one row in two, and which readings land
+    either side of it depends on where the stage happened to settle — the dead-band failure
+    that makes a layout parse differently on two files from the same protocol. Splitting at
+    the LARGEST gaps instead means the answer depends on the spacing of the data, not on the
+    phase of a grid this function chose.
+    """
+    v = np.sort(np.asarray(vals, dtype=float))
+    if len(v) <= 1:
+        return ([float(v[0])] if len(v) else []), 0.0
+    steps = np.diff(v)
+    real = steps[steps > 0]
+    if not len(real):
+        return [float(v[0])], 0.0
+    # The pitch is the smallest step that is not stage jitter: take the median of the steps
+    # in the upper half, which is the spacing between ADJACENT levels rather than within one.
+    pitch = float(np.median(real[real >= 0.5 * float(real.max())]))
+    tol = max(tol_frac * pitch, 1e-9)
+    levels = [float(v[0])]
+    for prev, cur, step in zip(v[:-1], v[1:], steps):
+        if step > tol:
+            levels.append(float(cur))
+    return levels, (pitch if len(levels) > 1 else 0.0)
+
+
+def _grid_of(pts: np.ndarray, members: Sequence[int]
+             ) -> Tuple[int, int, Tuple[float, float], str]:
+    """Infer ``(rows, cols, (pitch_y, pitch_x), order)`` for one group's fields."""
+    sub = pts[np.asarray(members)]
+    ys, py = _levels(sub[:, 0])
+    xs, px = _levels(sub[:, 1])
+    rows, cols = len(ys), len(xs)
+    if rows * cols != len(members):
+        # Not a filled rectangle — a partial mosaic, a hand-picked scatter, or a stage that
+        # moved diagonally. Report the levels honestly and refuse to name a scan order for a
+        # walk that is not on a grid.
+        return rows, cols, (py, px), "irregular"
+    if rows == 1 and cols == 1:
+        return rows, cols, (py, px), "single"
+
+    def level_of(v: float, levels: Sequence[float]) -> int:
+        return int(np.argmin([abs(v - L) for L in levels]))
+
+    walk = [(level_of(sub[i, 0], ys), level_of(sub[i, 1], xs))
+            for i in range(len(members))]
+    if len({w for w in walk}) != len(members):
+        return rows, cols, (py, px), "irregular"
+    # A raster scan visits every row left-to-right; a serpentine (boustrophedon) one
+    # alternates. Read the direction each row was actually walked in rather than assuming:
+    # the CRC file's mosaics run RIGHT-to-left first, so "the first row ascends" is not a
+    # property a scan order may be tested on.
+    per_row: Dict[int, List[int]] = {}
+    for r, c in walk:
+        per_row.setdefault(r, []).append(c)
+    if any(len(v) != cols for v in per_row.values()):
+        return rows, cols, (py, px), "irregular"
+    dirs = []
+    for r in sorted(per_row):
+        seq = per_row[r]
+        if seq == sorted(seq):
+            dirs.append(1)
+        elif seq == sorted(seq, reverse=True):
+            dirs.append(-1)
+        else:
+            return rows, cols, (py, px), "irregular"
+    if rows == 1 or len(set(dirs)) == 1:
+        return rows, cols, (py, px), "raster"
+    if all(dirs[i] != dirs[i + 1] for i in range(len(dirs) - 1)):
+        return rows, cols, (py, px), "serpentine"
+    return rows, cols, (py, px), "irregular"
+
+
+def group_key(i: int) -> str:
+    """The default key of the ``i``-th group (0-based) — ``G1``, ``G2``, …
+
+    1-based in the TEXT because the thing it names is a specimen the user picked on the
+    microscope, and NIS numbers those from 1. The index stays 0-based everywhere in code.
+    """
+    return f"G{int(i) + 1}"
+
+
+def position_groups(md: Mapping[str, Any], axes: Any,
+                    gap_factor: float = GROUP_GAP_FACTOR) -> GroupPlan:
+    """Recover which multipoints of ``md``/``axes`` belong to the same specimen.
+
+    Single-linkage clustering of the field centres, cutting any link longer than
+    ``gap_factor`` field widths (:data:`GROUP_GAP_FACTOR`). Single linkage — not k-means,
+    not a fixed group size — because the question is genuinely "is there a gap here?", and
+    the shape of a mosaic is not known in advance: the CRC file is six 3x3s, but the same
+    protocol run with one position skipped is six groups of 8 and 9, and any method told how
+    many groups or how big to expect them would return a confident wrong answer for it.
+
+    Deterministic and dependency-free (numpy only), so the edit-time
+    ``meta_transform`` behind ``util.select_group`` can call it on every keystroke and get
+    the same answer the pull will.
+
+    Returns an unplaced (empty) :class:`GroupPlan` when the fields cannot be located — see
+    :attr:`GroupPlan.placed`, and note that this is NOT the same as finding one group.
+    """
+    got = _group_centers(md, axes)
+    if got is None:
+        return GroupPlan()
+    pts, fov = got
+    gap = float(gap_factor) * fov
+    clusters, bottleneck, separation = _single_linkage(pts, gap)
+    groups = []
+    for i, members in enumerate(clusters):
+        sub = pts[np.asarray(members)]
+        rows, cols, pitch, order = _grid_of(pts, members)
+        groups.append(PositionGroup(
+            key=group_key(i), members=tuple(int(m) for m in members),
+            center_um=(float(0.5 * (sub[:, 0].min() + sub[:, 0].max())),
+                       float(0.5 * (sub[:, 1].min() + sub[:, 1].max()))),
+            rows=rows, cols=cols, pitch_um=pitch, order=order))
+    margin = (separation / bottleneck) if bottleneck > 0 else float("inf")
+    return GroupPlan(groups=tuple(groups), gap_um=gap, margin=margin, placed=True)

@@ -567,6 +567,50 @@ Compute = Callable[[EvalContext], Any]
 
 # ── the engine ────────────────────────────────────────────────────────────────
 
+#: Ops allowed to shrink the batch axis — the one node whose whole job is to.
+_BATCH_NARROWING_OPS = frozenset({"util.select_batch"})
+
+
+def _check_batch_kept(node: Any, ctx: Any, payload: Any) -> None:
+    """Refuse a compute that silently DROPPED the batch axis (V3.01).
+
+    A ``b == K`` Dataset in, a ``b == 1`` Dataset out, from a node that never claimed to
+    narrow the batch. That is not a shape quibble — it is the signature of an **eager**
+    compute that allocated ``(m,t,z,c,y,x)`` and read it at the default ``b=0``: it
+    processed the first file, returned that as the whole result, and every later file
+    silently vanished. Roughly 25 realizing nodes in the catalog allocate exactly that
+    shape (``analysis.threshold``, ``analysis.segment``, ``enhance.deconvolve``,
+    ``align.drift``, …), so this is a live path, not a hypothetical.
+
+    Nothing about the wrong answer looks wrong: the pixels are real, the axes are
+    self-consistent, the table has a plausible row count. The only witness is that the
+    batch went in and did not come out, which is exactly what this checks.
+
+    The lazy/tileable nodes are unaffected — they return a provider over the batched base
+    and never allocate — so this fires precisely on the ones that need lifting, and names
+    the node so the message says which. It is a REFUSAL rather than an auto-fix because
+    the correct per-member result is something the node has to compute, not something the
+    engine can reconstruct from one member's output.
+    """
+    op = getattr(node, "op_key", "")
+    if op in _BATCH_NARROWING_OPS:
+        return
+    ins = getattr(ctx, "inputs", None) or ()
+    in_b = max((int(getattr(getattr(d, "axes", None), "b", 1))
+                for d in ins if isinstance(d, Dataset)), default=1)
+    if in_b <= 1 or not isinstance(payload, Dataset):
+        return
+    if int(getattr(payload.axes, "b", 1)) >= in_b:
+        return
+    raise ValueError(
+        f"{op!r} was given a {in_b}-file batch and returned a "
+        f"{int(payload.axes.b)}-file result, without being a node that narrows the "
+        f"batch. This is what an eager compute does when it allocates a plain "
+        f"(m,t,z,c,y,x) raster and reads it at b=0: it processes the FIRST file and "
+        f"returns that as the whole batch, so every other file is silently dropped. "
+        f"Move this node after Unbatch, or give its unit loop the batch axis.")
+
+
 class Engine:
     """Lazy pull scheduler over a :class:`~nodegraph.graph.Graph`.
 
@@ -843,6 +887,8 @@ class Engine:
         if (self.strict_reads and isinstance(payload, Dataset)
                 and isinstance(payload.metadata, _StrictCalibMetadata)):
             payload = replace(payload, metadata=dict(payload.metadata))
+
+        _check_batch_kept(node, ctx, payload)
 
         header = OutputHeader(
             axes=env.axes, metadata_digest=digest("md", dict(env.metadata)),

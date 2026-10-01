@@ -378,6 +378,23 @@ class StreamProvider(TileProvider):
 MapFn = Callable[..., np.ndarray]
 
 
+
+# ── the batch axis and the unit caches (V3.01) ────────────────────────────────
+#
+# Every compute provider below memoizes its computed unit under a key that now begins
+# with `b`. That is not bookkeeping: the key was `(m,t,z,c)`, which was total while `b`
+# did not exist and is NOT total once a batch is on the wire — member 1 would be served
+# member 0's cached unit, the right shape and plausible pixels under the wrong file's
+# address. Every `_tile`/`_plane`/`_unit` helper therefore takes `b` as its first index
+# and forwards it to the base read.
+#
+# The per-file semantics then fall out of the geometry rather than any special case:
+# `_AxisReduceProvider` only ever reduces `z` or `t`, so a projection folds inside one
+# member; `MultiViewProvider` collapses `m`, so it stitches one member's positions into
+# that member's canvas and a batch of K files is K canvases. Nothing here folds across
+# `b`, which is exactly why a batch is not the pooled-statistics trap a file bundle is
+# (see `MultiSourceProvider`, and `scripts/_probe_m_batch_independence.py`).
+
 class MapComputeProvider(StreamProvider):
     """The TILEABLE / WHOLE_PLANE lazy unit (V2.04 §1). ``unit="tile"`` computes
     canonical tiles from tile+halo base windows (overlap-recompute, halo clipped at
@@ -400,16 +417,17 @@ class MapComputeProvider(StreamProvider):
             self.cum_halo = 0
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         if level != 0:
             raise ValueError("streaming providers have no pyramid (level 0 only)")
         if self._plane_unit:
-            return self._window_of(self._plane(m, t, z, c), y0, y1, x0, x1)
+            return self._window_of(self._plane(b, m, t, z, c), y0, y1, x0, x1)
         return self._assemble(y0, y1, x0, x1,
-                              lambda iy, ix: self._tile(m, t, z, c, iy, ix))
+                              lambda iy, ix: self._tile(b, m, t, z, c, iy, ix))
 
-    def _tile(self, m: int, t: int, z: int, c: int, iy: int, ix: int) -> np.ndarray:
-        key = ("t", self._fp, m, t, z, c, iy, ix)
+    def _tile(self, b: int, m: int, t: int, z: int, c: int,
+              iy: int, ix: int) -> np.ndarray:
+        key = ("t", self._fp, b, m, t, z, c, iy, ix)
         a = self._cache.get(key)
         if a is not None:
             return a
@@ -419,20 +437,20 @@ class MapComputeProvider(StreamProvider):
         ty1, tx1 = min(ty0 + T, ay), min(tx0 + T, ax_)
         gy0, gx0 = max(0, ty0 - h), max(0, tx0 - h)
         gy1, gx1 = min(ay, ty1 + h), min(ax_, tx1 + h)
-        win = self._base.get_region(0, m, t, z, c, gy0, gy1, gx0, gx1)
+        win = self._base.get_region(0, m, t, z, c, gy0, gy1, gx0, gx1, b=b)
         res = np.asarray(
             self._fn(np.asarray(win, dtype=_F), m, t, z, c, gy0, gy1, gx0, gx1),
             dtype=_F)
         res = res[ty0 - gy0:ty1 - gy0, tx0 - gx0:tx1 - gx0]
         return self._cache.put(key, res)
 
-    def _plane(self, m: int, t: int, z: int, c: int) -> np.ndarray:
-        key = ("p", self._fp, m, t, z, c)
+    def _plane(self, b: int, m: int, t: int, z: int, c: int) -> np.ndarray:
+        key = ("p", self._fp, b, m, t, z, c)
         a = self._cache.get(key)
         if a is not None:
             return a
         ay, ax_ = self.axes.y, self.axes.x
-        win = self._base.get_region(0, m, t, z, c, 0, ay, 0, ax_)
+        win = self._base.get_region(0, m, t, z, c, 0, ay, 0, ax_, b=b)
         res = np.asarray(self._fn(np.asarray(win, dtype=_F), m, t, z, c,
                                   0, ay, 0, ax_), dtype=_F)
         return self._cache.put(key, res)
@@ -458,24 +476,25 @@ class VolumeComputeProvider(StreamProvider):
         self.cum_halo = 0        # a realized-unit level is a window-growth cut point
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         if level != 0:
             raise ValueError("streaming providers have no pyramid (level 0 only)")
         if not (0 <= z < self.axes.z):
             raise IndexError(f"z={z} out of range [0, {self.axes.z}) — an out-of-range "
                              f"read must not trigger a whole-volume compute")
-        key = ("p", self._fp, m, t, z, c)
+        key = ("p", self._fp, b, m, t, z, c)
         plane = self._cache.get(key)
         if plane is None:
             ax = self.axes
-            vol = self._base.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x)
+            vol = self._base.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x,
+                                               b=b)
             res = np.asarray(self._vfn(np.asarray(vol, dtype=_F), m, t, c),
                              dtype=_F)
             if res.shape != (ax.z, ax.y, ax.x):
                 raise ValueError(
                     f"volume kernel returned {res.shape}, expected {(ax.z, ax.y, ax.x)}")
             for zi in range(ax.z):               # per-z planar slabs (best-effort cache)
-                stored = self._cache.put(("p", self._fp, m, t, zi, c), res[zi])
+                stored = self._cache.put(("p", self._fp, b, m, t, zi, c), res[zi])
                 if zi == z:
                     plane = stored
         return self._window_of(plane, y0, y1, x0, x1)
@@ -549,16 +568,16 @@ class _AxisReduceProvider(StreamProvider):
         return replace(self._base.level_axes(level), **{self._axis: 1})
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         if not (0 <= level < self.levels):
             raise ValueError(f"level {level} out of range [0, {self.levels})")
         # A coarse level always folds whole planes: it is 1/4**L of level 0, so it caches
         # comfortably (level 3 of a 13106² canvas is 21 MB) and tiling it would only put the
         # plane_unit trap back for anything downstream that reads it a window at a time.
         if level or self.plane_unit:
-            return self._window_of(self._plane(level, m, t, z, c), y0, y1, x0, x1)
+            return self._window_of(self._plane(level, b, m, t, z, c), y0, y1, x0, x1)
         return self._assemble(y0, y1, x0, x1,
-                              lambda iy, ix: self._tile(m, t, z, c, iy, ix))
+                              lambda iy, ix: self._tile(b, m, t, z, c, iy, ix))
 
     def _fold(self, slab: Callable[[int], np.ndarray]) -> np.ndarray:
         """Reduce ``self._base.axes[_axis]`` slices returned by ``slab(i)`` — the one
@@ -577,25 +596,31 @@ class _AxisReduceProvider(StreamProvider):
         col = np.stack([np.asarray(slab(i), dtype=_F) for i in range(n)], axis=0)
         return np.asarray(_reduce_whole(col, (0,), self._reducer), dtype=_F)
 
-    def _slab_reader(self, level: int, m: int, t: int, z: int, c: int,
+    def _slab_reader(self, level: int, b: int, m: int, t: int, z: int, c: int,
                      y0: int, y1: int, x0: int, x1: int) -> Callable[[int], np.ndarray]:
         """``slab(i)`` → window ``[y0:y1, x0:x1]`` of the base at ``level`` and reduced-axis
         index ``i``. The caller's coordinate for the reduced axis is always 0 (it is size-1
-        on the output), so it is the one this overwrites."""
+        on the output), so it is the one this overwrites.
+
+        ``b`` is held FIXED across the fold, and that is the per-file semantics falling out
+        of the geometry rather than being special-cased: ``_axis`` is only ever ``z`` or
+        ``t``, so a projection folds within one batch member and never across files.
+        """
         coords = {"m": m, "t": t, "z": z, "c": c}
 
         def slab(i: int) -> np.ndarray:
             coords[self._axis] = i                # vary only the reduced axis
             return self._base.get_region(level, coords["m"], coords["t"], coords["z"],
-                                         coords["c"], y0, y1, x0, x1)
+                                         coords["c"], y0, y1, x0, x1, b=b)
 
         return slab
 
-    def _tile(self, m: int, t: int, z: int, c: int, iy: int, ix: int) -> np.ndarray:
+    def _tile(self, b: int, m: int, t: int, z: int, c: int,
+              iy: int, ix: int) -> np.ndarray:
         # the reduced axis is size-1 in the output, so the caller's coordinate for it is
         # 0 (z-reduce) / 0 (t-reduce); it is included in the key harmlessly and the base
         # reader overwrites it with the real slice index.
-        key = ("t", self._fp, m, t, z, c, iy, ix)
+        key = ("t", self._fp, b, m, t, z, c, iy, ix)
         a = self._cache.get(key)
         if a is not None:
             return a
@@ -603,16 +628,16 @@ class _AxisReduceProvider(StreamProvider):
         ty0, tx0 = iy * T, ix * T
         ty1, tx1 = min(ty0 + T, self.axes.y), min(tx0 + T, self.axes.x)
         return self._cache.put(
-            key, self._fold(self._slab_reader(0, m, t, z, c, ty0, ty1, tx0, tx1)))
+            key, self._fold(self._slab_reader(0, b, m, t, z, c, ty0, ty1, tx0, tx1)))
 
-    def _plane(self, level: int, m: int, t: int, z: int, c: int) -> np.ndarray:
-        key = ("p", self._fp, level, m, t, z, c)
+    def _plane(self, level: int, b: int, m: int, t: int, z: int, c: int) -> np.ndarray:
+        key = ("p", self._fp, level, b, m, t, z, c)
         a = self._cache.get(key)
         if a is not None:
             return a
         ax = self.level_axes(level)
         return self._cache.put(
-            key, self._fold(self._slab_reader(level, m, t, z, c, 0, ax.y, 0, ax.x)))
+            key, self._fold(self._slab_reader(level, b, m, t, z, c, 0, ax.y, 0, ax.x)))
 
 
 class ZReduceProvider(_AxisReduceProvider):
@@ -664,22 +689,23 @@ class PlaneRealizeProvider(StreamProvider):
             raise ValueError("PlaneRealizeProvider needs a plane_fn")
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         if level != 0:
             raise ValueError("streaming providers have no pyramid (level 0 only)")
         if not (0 <= z < self.axes.z):
             raise IndexError(f"z={z} out of range [0, {self.axes.z}) — an out-of-range "
                              f"read must not trigger a whole-unit compute")
-        key = ("p", self._fp, m, t, z, c)
+        key = ("p", self._fp, b, m, t, z, c)
         plane = self._cache.get(key)
         if plane is None:
-            plane = self._unit(m, t, z, c)
+            plane = self._unit(b, m, t, z, c)
         return self._window_of(plane, y0, y1, x0, x1)
 
-    def _unit(self, m: int, t: int, z: int, c: int) -> np.ndarray:
+    def _unit(self, b: int, m: int, t: int, z: int, c: int) -> np.ndarray:
         out, bax = self.axes, self._base.axes
         if self._is_volume:
-            vin = self._base.get_region_volume(0, m, t, c, 0, bax.z, 0, bax.y, 0, bax.x)
+            vin = self._base.get_region_volume(0, m, t, c, 0, bax.z, 0, bax.y, 0, bax.x,
+                                               b=b)
             res = np.asarray(self._volume_fn(np.asarray(vin, dtype=_F), m, t, c),
                              dtype=_F)
             if res.shape != (out.z, out.y, out.x):
@@ -687,18 +713,18 @@ class PlaneRealizeProvider(StreamProvider):
                                  f"{(out.z, out.y, out.x)}")
             plane = None
             for zi in range(out.z):                # cache per-z planar slabs
-                stored = self._cache.put(("p", self._fp, m, t, zi, c), res[zi])
+                stored = self._cache.put(("p", self._fp, b, m, t, zi, c), res[zi])
                 if zi == z:
                     plane = stored
             return plane
         # 2D: the output plane at (m,t,z,c) is a function of the whole input plane at the
         # SAME (m,t,z,c) — z is unchanged in a 2D op (resample keeps z; normalize/drift too).
-        pin = self._base.get_region(0, m, t, z, c, 0, bax.y, 0, bax.x)
+        pin = self._base.get_region(0, m, t, z, c, 0, bax.y, 0, bax.x, b=b)
         res = np.asarray(self._plane_fn(np.asarray(pin, dtype=_F), m, t, z, c),
                          dtype=_F)
         if res.shape != (out.y, out.x):
             raise ValueError(f"plane op returned {res.shape}, expected {(out.y, out.x)}")
-        return self._cache.put(("p", self._fp, m, t, z, c), res)
+        return self._cache.put(("p", self._fp, b, m, t, z, c), res)
 
 
 #: M→1 fusion kernel — ``(read_tile, offsets, canvas_h, canvas_w, tile_h, tile_w) -> (H, W)``.
@@ -789,7 +815,7 @@ class MultiViewProvider(StreamProvider):
         return self._plan[level][0]
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         if level not in self._plan:
             raise ValueError(f"level {level} out of range [0, {self.levels})")
         axes, offs = self._plan[level]
@@ -799,7 +825,10 @@ class MultiViewProvider(StreamProvider):
         if m != 0:
             raise IndexError(f"m={m} out of range [0, 1) — this provider fused every "
                              f"multipoint into a single view")
-        key = ("p", self._fp, level, t, z, c)
+        # `b` is in the key and NOT in the fuse: this provider collapses `m`, so it
+        # stitches one member's positions into that member's canvas. A batch of K files
+        # is K canvases, never one — fusing across `b` would composite two specimens.
+        key = ("p", self._fp, level, b, t, z, c)
         plane = self._cache.get(key)
         if plane is not None:
             return self._window_of(plane, y0, y1, x0, x1)
@@ -809,7 +838,8 @@ class MultiViewProvider(StreamProvider):
         def read_tile_at(offsets):
             def read_tile(mi: int) -> np.ndarray:
                 return np.asarray(
-                    self._base.get_region(level, mi, t, z, c, 0, bl.y, 0, bl.x), dtype=_F)
+                    self._base.get_region(level, mi, t, z, c, 0, bl.y, 0, bl.x, b=b),
+                    dtype=_F)
             return read_tile, offsets
 
         y0c, y1c = max(0, y0), min(y1, axes.y)
@@ -873,7 +903,7 @@ class WindowView(TileProvider):
             raise ValueError("WindowView has no pyramid (level 0 only)")
         return self.axes
 
-    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
         if level != 0:
             raise ValueError("WindowView has no pyramid (level 0 only)")
         if not (0 <= z < self.axes.z):
@@ -881,7 +911,7 @@ class WindowView(TileProvider):
                              f"— translating it would serve pixels OUTSIDE the crop")
         return self._base.read_region(
             0, m, t, z + self._z0, c,
-            y0 + self._y0, y1 + self._y0, x0 + self._x0, x1 + self._x0)
+            y0 + self._y0, y1 + self._y0, x0 + self._x0, x1 + self._x0, b=b)
 
 
 # ── realization (sinks: export, debug-verify, oversize fallback) ────────────────
@@ -907,23 +937,41 @@ def realize(payload: Any) -> Any:
     if isinstance(prov, ArrayProvider):
         return payload
     ax = prov.axes
+    # V3.01: the batch axis joins the ALLOCATION and the unit tuple. Before it did, this
+    # read every unit at the default b=0 and returned member 0's pixels shaped as the
+    # whole Dataset — and the ArrayProvider built from that reported b=1, so a K-file
+    # batch silently became one file on its way to an export. Nothing errored; the TIFF
+    # was simply the first file, K times smaller than asked for.
+    nb = int(getattr(ax, "b", 1))
+    batched = nb > 1
     with recursion_headroom(8 * (getattr(prov, "depth", 0) + 2)):
         probe = prov.get_region(0, 0, 0, 0, 0, 0, min(1, ax.y), 0, min(1, ax.x))
-        out = np.empty((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=probe.dtype)
+        shape = ((nb,) if batched else ()) + (ax.m, ax.t, ax.z, ax.c, ax.y, ax.x)
+        out = np.empty(shape, dtype=probe.dtype)
         if getattr(prov, "volume_unit", False):
             def read_volume(unit):
-                m, t, c = unit
+                b, m, t, c = unit
                 for z in range(ax.z):
-                    out[m, t, z, c] = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x)
+                    plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x, b=b)
+                    if batched:
+                        out[b, m, t, z, c] = plane
+                    else:
+                        out[m, t, z, c] = plane
 
-            map_units(read_volume, [(m, t, c) for m in range(ax.m)
+            map_units(read_volume, [(b, m, t, c) for b in range(nb)
+                                    for m in range(ax.m)
                                     for t in range(ax.t) for c in range(ax.c)])
         else:
             def read_plane(unit):
-                m, t, z, c = unit
-                out[m, t, z, c] = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x)
+                b, m, t, z, c = unit
+                plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x, b=b)
+                if batched:
+                    out[b, m, t, z, c] = plane
+                else:
+                    out[m, t, z, c] = plane
 
-            map_units(read_plane, [(m, t, z, c) for m in range(ax.m)
+            map_units(read_plane, [(b, m, t, z, c) for b in range(nb)
+                                   for m in range(ax.m)
                                    for t in range(ax.t) for z in range(ax.z)
                                    for c in range(ax.c)])
     return payload.with_image(ArrayProvider(out, tile=prov.tile))

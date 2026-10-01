@@ -17,6 +17,37 @@ from nodegraph.catalog._shared.labels import (
     _resolve_layer,
 )
 
+def _object_velocity_nd(track: np.ndarray, tt: np.ndarray, coords_um: np.ndarray,
+                        dt_s: float) -> np.ndarray:
+    """Per-object velocity in µm/s, for a coordinate array of ANY dimensionality.
+
+    ``coords_um`` is ``(N, D)`` slowest-first — ``(y, x)`` in 2D, ``(z, y, x)`` in 3D —
+    and the return is ``(N, D)`` aligned with the input rows. :func:`_object_velocity` is
+    the 2D wrapper the two Cell-Tracker-derived nodes use; ``analysis.track_field`` needs
+    the 3D form, and they share this so a `vz` can never be defined differently from the
+    `vy` beside it. The definition (gap-aware differencing against the track's own
+    previous detection, NaN at a track's first row and for untracked rows) is stated in
+    full on that wrapper.
+    """
+    coords_um = np.asarray(coords_um, dtype=float)
+    n, d = coords_um.shape
+    vel = np.full((n, d), np.nan, dtype=float)
+    live = np.flatnonzero(np.asarray(track) > 0)
+    if live.size < 2:
+        return vel
+    order = live[np.lexsort((tt[live], track[live]))]       # by track, then time
+    tid = np.asarray(track)[order]
+    edge = np.concatenate(([True], tid[1:] != tid[:-1]))    # first row of each track
+    step = np.concatenate(([np.nan], np.diff(tt[order]).astype(float)))
+    step = np.where(edge, np.nan, step)                     # a track's first row has none
+    span = step * float(dt_s)
+    good = np.isfinite(span) & (span > 0)
+    for k in range(d):
+        dk = np.concatenate(([np.nan], np.diff(coords_um[order, k])))
+        vel[order[good], k] = dk[good] / span[good]
+    return vel
+
+
 def _object_velocity(track: np.ndarray, tt: np.ndarray, y_um: np.ndarray,
                      x_um: np.ndarray, dt_s: float):
     """Per-object velocity ``(vy, vx)`` in µm/s from consecutive detections of the same
@@ -33,26 +64,14 @@ def _object_velocity(track: np.ndarray, tt: np.ndarray, y_um: np.ndarray,
 
     A track's FIRST detection has no predecessor, so its velocity is **NaN** — not 0,
     which would read as a stationary object and drag every mean toward zero. Untracked
-    rows (``track_id <= 0``, the write-back's background value) are NaN throughout."""
-    n = len(track)
-    vy = np.full(n, np.nan, dtype=float)
-    vx = np.full(n, np.nan, dtype=float)
-    live = np.flatnonzero(np.asarray(track) > 0)
-    if live.size < 2:
-        return vy, vx
-    order = live[np.lexsort((tt[live], track[live]))]       # by track, then time
-    tid = np.asarray(track)[order]
-    edge = np.concatenate(([True], tid[1:] != tid[:-1]))    # first row of each track
-    dt_frames = np.diff(tt[order]).astype(float)
-    step = np.concatenate(([np.nan], dt_frames))            # gap to the previous row
-    step = np.where(edge, np.nan, step)                     # a track's first row has none
-    span = step * float(dt_s)
-    dy = np.concatenate(([np.nan], np.diff(y_um[order])))
-    dx = np.concatenate(([np.nan], np.diff(x_um[order])))
-    good = np.isfinite(span) & (span > 0)
-    vy[order[good]] = dy[good] / span[good]
-    vx[order[good]] = dx[good] / span[good]
-    return vy, vx
+    rows (``track_id <= 0``, the write-back's background value) are NaN throughout.
+
+    The arithmetic lives in :func:`_object_velocity_nd`; this is the ``(y, x)`` face of
+    it, kept so the two 2-D callers read the way they always did."""
+    vel = _object_velocity_nd(
+        track, tt, np.column_stack([np.asarray(y_um, dtype=float),
+                                    np.asarray(x_um, dtype=float)]), dt_s)
+    return vel[:, 0], vel[:, 1]
 def _InFrameInterval() -> Tuple[SocketSpec, ...]:
     """The shared ``frame_interval`` escape hatch for the two per-object motion nodes.
 
@@ -105,16 +124,21 @@ def _frame_interval_s(ctx: EvalContext, *, needed: bool, wanted, node: str) -> f
         f"become `dt_s` at ingest; a plain TIFF has none). Metrics that are not rates "
         f"('neighbors', 'density', 'mean_area', 'intensity', 'frame_fold') need no "
         f"interval and work as they are.")
-def _object_table(ctx: EvalContext, ds: Dataset, *, node: str):
+def _object_table(ctx: EvalContext, ds: Dataset, *, node: str, allow_3d: bool = False):
     """Pull and validate the Label/Point member table an object-analysis node reads.
 
     Returns ``(domain, layer, columns, z_kind)`` with ``columns`` holding at least the
-    invariant ``id,m,t,c,z,y,x``. Shared by ``analysis.object_metrics`` and
-    ``analysis.object_field`` so their refusals are identical, and shaped after
-    ``track.objects``' own validation — including the **2D-only** rule: both of these port
-    2-D estimators (a 2-D curl is a scalar, a 3-D one is a vector; the neighbourhood
-    gradient is fitted in-plane), so a ``subpixel`` table is refused rather than measured
-    in a geometry the maths does not describe."""
+    invariant ``id,m,t,c,z,y,x``. Shared by ``analysis.object_metrics``,
+    ``analysis.object_field`` and ``analysis.track_field`` so their refusals are
+    identical, and shaped after ``track.objects``' own validation.
+
+    ``allow_3d`` is the one thing that differs between them. The first two port 2-D
+    estimators (a 2-D curl is a scalar, a 3-D one is a vector; the neighbourhood gradient
+    is fitted in-plane), so for them a ``subpixel`` table is refused rather than measured
+    in a geometry the maths does not describe. ``analysis.track_field`` fits a full
+    ``(z,y,x)`` gradient tensor and wants exactly that table, so it passes ``True`` and
+    branches on the returned ``z_kind`` itself. The flag is opt-IN because the refusal is
+    the safe direction: a node that has not thought about depth gets it for free."""
     target = ctx.params.get("__modes__", {}).get("target", "label")
     domain = Domain.LABEL if target == "label" else Domain.POINT
     # the one member table on the wire, whatever it is called (`_resolve_layer`) — both of
@@ -145,7 +169,7 @@ def _object_table(ctx: EvalContext, ds: Dataset, *, node: str):
             f"{node}: column(s) {ragged} on layer {layer!r} disagree in length with 'id' "
             f"({n}) — every metric would be built from misaligned rows.")
     zk = ds.structure_zkind(domain, layer) or "plane_index"
-    if zk == "subpixel":
+    if zk == "subpixel" and not allow_3d:
         raise ValueError(
             f"{node} is 2D-only: it ports Cell-Tracker's in-plane neighbourhood "
             f"estimators, and neither a 2-D curl nor a 2-D velocity gradient is defined on "

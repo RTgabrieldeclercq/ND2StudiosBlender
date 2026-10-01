@@ -23,7 +23,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from nodegraph.domains import AXIS_ORDER, Domain, axes_of, is_lattice
+from nodegraph.domains import (
+    AXIS_ORDER, BATCH_COLUMN, Domain, axes_of, is_lattice)
 from nodegraph.revision import next_revision
 
 
@@ -37,8 +38,21 @@ def _zkind_key(domain: Domain, layer: Optional[str]) -> str:
 @dataclass(frozen=True)
 class AxisSizes:
     """Sizes of the acquisition axes for one dataset (order per ``AXIS_ORDER``:
-    ``m,t,z,c,y,x`` — ``c`` is a first-class store/tile/memo axis, V2.01 §H)."""
+    ``b,m,t,z,c,y,x`` — ``c`` is a first-class store/tile/memo axis, V2.01 §H; ``b`` is
+    the outermost **batch** axis, V3.01).
 
+    ``b`` is declared FIRST so the field order matches ``AXIS_ORDER``, which is safe
+    because every one of the 237 construction sites in this repo passes keywords — the
+    two that build from a dict do so over an explicit key tuple
+    (``nodegraph.checkpoint``, ``nodelab_v2.ingest``) and are updated with it. A
+    positional ``AxisSizes(1, 2, …)`` anywhere would have silently re-read ``m`` as ``b``;
+    there are none, and there should stay none.
+
+    ``b == 1`` is an ordinary single-file dataset, which is why every existing caller
+    that never mentions ``b`` keeps meaning exactly what it meant.
+    """
+
+    b: int = 1
     m: int = 1
     t: int = 1
     z: int = 1
@@ -58,18 +72,40 @@ class AxisSizes:
 
     def shape_for(self, domain: Domain) -> Tuple[int, ...]:
         """Canonical array shape for a **lattice** domain's attribute (the sizes
-        of the axes it has, in :data:`AXIS_ORDER`). Global → ``()`` (scalar)."""
-        ax = axes_of(domain)
-        if ax is None:
-            raise ValueError(f"{domain} is not a lattice domain")
-        return tuple(self.size(a) for a in AXIS_ORDER if a in ax)
+        of the axes it has, in :data:`AXIS_ORDER`). Global → ``()`` (scalar).
+
+        **The batch axis is elided at ``b == 1`` (V3.01)** — see :meth:`axis_list`.
+        """
+        return tuple(self.size(a) for a in self.axis_list(domain))
 
     def axis_list(self, domain: Domain) -> Tuple[str, ...]:
-        """The lattice domain's axes present, in canonical order."""
+        """The lattice domain's axes present, in canonical order.
+
+        **``b`` is omitted when ``self.b == 1``, and only then.** This is the rule that
+        keeps a batch axis from rewriting every array in the engine, and it is a statement
+        about what a batch IS rather than a convenience.
+
+        ``m``/``t``/``z``/``c`` are axes of one acquisition, and the engine carries them
+        explicitly even at size 1 — a single plane really is ``(1,1,1,1,Y,X)`` — because a
+        compute may legitimately reach across them. ``b`` is not like that. A batch is a
+        bundle of SEPARATE acquisitions, and the engine's standing contract is that a
+        compute operates on one acquisition: a batch runs as a per-member unroll
+        (:mod:`nodegraph.zones`), so inside any chain ``b`` is always 1 and always
+        uninformative. Carrying a singleton ``b`` through every array would buy nothing and
+        cost the rank every compute infers its dimensionality from — ``analysis.label``
+        reading a 7-D array as 3-D and rejecting ``connectivity=8`` is what that looks
+        like.
+
+        So ``b`` materializes exactly where it means something: a genuine ``b > 1``
+        Dataset at the batch boundary (unbatch, the results tables, the viewer's batch
+        slider). Everywhere else it is present in :class:`AxisSizes`, in the domain
+        lattice and in provenance, but not in the array.
+        """
         ax = axes_of(domain)
         if ax is None:
             raise ValueError(f"{domain} is not a lattice domain")
-        return tuple(a for a in AXIS_ORDER if a in ax)
+        return tuple(a for a in AXIS_ORDER if a in ax
+                     and not (a == "b" and int(self.b) == 1))
 
 
 # store key: (domain, layer-or-None, name)
@@ -198,13 +234,27 @@ class Dataset:
 
     # ── derive (structural sharing) ───────────────────────────────────────────
     def with_attribute(self, attr: AttributeLayer) -> "Dataset":
-        """A new Dataset with ``attr`` added/replaced (upstream store shared)."""
+        """A new Dataset with ``attr`` added/replaced (upstream store shared).
+
+        The expected shape comes from :meth:`AxisSizes.shape_for`, which elides the batch
+        axis at ``b == 1`` — so a one-member Dataset validates exactly the shapes it
+        always did, and a real ``b > 1`` batch requires the leading axis.
+        """
         if is_lattice(attr.domain):
             expected = self.axes.shape_for(attr.domain)
-            if tuple(attr.values.shape) != expected:
+            got = tuple(attr.values.shape)
+            if got != expected:
+                extra = ""
+                # The one wrong guess worth naming: a compute that produced ONE member's
+                # array and handed it to a real batch. Without this the message reads as
+                # an ordinary size mismatch and hides that the pipeline did 1 of K files.
+                if int(self.axes.b) > 1 and got == expected[1:]:
+                    extra = (f" — this is a {self.axes.b}-member batch and the array is "
+                             f"missing its leading batch axis, i.e. it describes one "
+                             f"member and cannot say which. Run the compute per member.")
                 raise ValueError(
                     f"{attr.domain.value} attribute {attr.name!r} has shape "
-                    f"{tuple(attr.values.shape)}, expected {expected}")
+                    f"{got}, expected {expected}{extra}")
         new = dict(self.attributes)
         new[attr.key] = attr
         return replace(self, attributes=new)
@@ -271,7 +321,27 @@ class Dataset:
         (`wire-node-v2` §7b): a structure-producing node self-describes its dimensionality,
         so a downstream node can **inherit** it (see :meth:`structure_zkind`) instead of
         guessing from an independent 2D/3D lever that could silently disagree with the data.
+
+        **On a batch the table must carry its batch column (V3.01).** A structure table is
+        addressed by ``(m, t, z)``; on a ``b > 1`` Dataset that is not enough to say which
+        FILE a row came from, so without
+        :data:`~nodegraph.structure.BATCH_COLUMN` two specimens' cells land in one table as
+        indistinguishable rows — a measurement silently averaging two samples, with a
+        plausible row count and no error anywhere.
+
+        Producers get the column for free by running per member
+        (:func:`nodegraph.catalog._shared.batch.batch_aware`, which stamps it on the join),
+        so reaching this refusal means a node built a table on a batch by some other route
+        and has to say which member each row belongs to.
         """
+        if int(self.axes.b) > 1 and BATCH_COLUMN not in getattr(table, "columns", {}):
+            dom = getattr(getattr(table, "domain", None), "value", "structure")
+            raise ValueError(
+                f"cannot put a {dom} table without a {BATCH_COLUMN!r} column on a "
+                f"{self.axes.b}-member batch: its rows are addressed by (m,t,z), which on "
+                f"a batch cannot say which FILE a row came from, so every member's rows "
+                f"would be indistinguishable from every other member's. Run the producer "
+                f"per member (wrap its compute in `batch_aware`), or stamp the column.")
         ds = self
         layer = getattr(table, "layer", None)
         for name, values in table.columns.items():

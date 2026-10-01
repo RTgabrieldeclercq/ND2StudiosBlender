@@ -104,22 +104,39 @@ def _map_image(ctx: EvalContext, ds: Dataset,
         # kernels are pure, so this is a pure scheduling change — byte-identical output.
         # Threads, not processes: `plane_fn`/`volume_fn` are closures built by the caller
         # and cannot be pickled, and the scipy filters underneath release the GIL.
-        out = np.zeros((ax.m, ax.t, ax.z, ax.c, ax.y, ax.x), dtype=float)
+        # V3.01: `b` joins the unit tuple rather than the allocation's leading shape,
+        # because `shape_for` elides the batch axis at b == 1 — so an ordinary one-member
+        # pull allocates and indexes exactly what it always did, and only a real batch
+        # grows the array. The batch index is also what makes this fan out K times wider:
+        # `map_units` already runs units in parallel, so K files' planes are K× the units
+        # to spread over the same cores, with no scheduler change.
+        nb = int(getattr(ax, "b", 1))
+        batched = nb > 1
+        shape = ((nb,) if batched else ()) + (ax.m, ax.t, ax.z, ax.c, ax.y, ax.x)
+        out = np.zeros(shape, dtype=float)
         if volumetric:
             def do_volume(unit):
-                m, t, c = unit
-                vol = prov.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x)
-                out[m, t, :, c] = volume_fn(vol.astype(float))
+                b, m, t, c = unit
+                vol = prov.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x, b=b)
+                res = volume_fn(vol.astype(float))
+                if batched:
+                    out[b, m, t, :, c] = res
+                else:
+                    out[m, t, :, c] = res
 
-            map_units(do_volume, [(m, t, c) for m in range(ax.m)
+            map_units(do_volume, [(b, m, t, c) for b in range(nb) for m in range(ax.m)
                                   for t in range(ax.t) for c in range(ax.c)])
         else:
             def do_plane(unit):
-                m, t, z, c = unit
-                plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x)
-                out[m, t, z, c] = plane_fn(plane.astype(float))
+                b, m, t, z, c = unit
+                plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x, b=b)
+                res = plane_fn(plane.astype(float))
+                if batched:
+                    out[b, m, t, z, c] = res
+                else:
+                    out[m, t, z, c] = res
 
-            map_units(do_plane, [(m, t, z, c) for m in range(ax.m)
+            map_units(do_plane, [(b, m, t, z, c) for b in range(nb) for m in range(ax.m)
                                  for t in range(ax.t) for z in range(ax.z)
                                  for c in range(ax.c)])
         return ds.with_image(ArrayProvider(out))

@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from nodegraph.domains import Domain
+from nodegraph.domains import BATCH_COLUMN, Domain
 from nodegraph.memo import digest
 
 
@@ -37,6 +37,19 @@ from nodegraph.memo import digest
 
 # The invariant coordinate columns every structure table carries (V2.03 §4 C3).
 COORD_COLUMNS: Tuple[str, ...] = ("id", "m", "t", "c", "z", "y", "x")
+
+#: Re-exported from :mod:`nodegraph.domains` (which owns it, to keep ``dataset`` able to
+#: check it without a cycle). **Deliberately NOT a member of** :data:`COORD_COLUMNS`, the
+#: same call ``nodelab_v2.tables.SOURCE_FILE_COLUMN`` makes: that tuple is the contract
+#: that *every* structure table carries those columns, checked as a hard requirement by
+#: ``analysis.measure`` and ``transform.grow_points``, and a batch column exists only when
+#: there IS a batch.
+#:
+#: Optional, but not optional to get right: on a ``b > 1`` Dataset a table without it
+#: cannot say which file a row came from, so two specimens' objects become indistinguishable
+#: rows — a measurement silently averaging two samples with a plausible row count.
+#: :meth:`nodegraph.dataset.Dataset.with_structure` refuses exactly that, so "absent"
+#: always means "there is no batch" rather than "nobody filled it".
 
 
 @dataclass(frozen=True)
@@ -129,8 +142,14 @@ def _canonical_relabel(raw: np.ndarray, num: int) -> Tuple[np.ndarray, int]:
 
 def _label_table(labels: np.ndarray, k: int, areas: np.ndarray, cz: np.ndarray,
                  cy: np.ndarray, cx: np.ndarray, *, ndim: int, m: int, t: int, c: int,
-                 layer: Optional[str]) -> StructureTable:
-    """Assemble the invariant ``id,m,t,c,area,z,y,x`` Label table (review #6)."""
+                 layer: Optional[str], b: Optional[int] = None) -> StructureTable:
+    """Assemble the invariant ``id,m,t,c,area,z,y,x`` Label table (review #6).
+
+    ``b`` adds the optional :data:`BATCH_COLUMN` when the producer is walking a batch.
+    ``None`` omits it entirely rather than writing a column of zeros: on an unbatched
+    Dataset a ``b`` of 0 would be a coordinate that looks answered and means nothing,
+    and every consumer would then have to know that 0 sometimes means "member 0" and
+    sometimes "there is no batch" (V3.01)."""
     cols = {
         "id": np.arange(1, k + 1, dtype=np.int64),
         "m": np.full(k, m, dtype=np.int64),
@@ -141,12 +160,15 @@ def _label_table(labels: np.ndarray, k: int, areas: np.ndarray, cz: np.ndarray,
         "y": np.asarray(cy, dtype=float),
         "x": np.asarray(cx, dtype=float),
     }
+    if b is not None:
+        cols[BATCH_COLUMN] = np.full(k, int(b), dtype=np.int64)
     return StructureTable(Domain.LABEL, cols, layer=layer,
                           z_kind=("plane_index" if ndim == 2 else "subpixel"))
 
 
 def label_components(mask: np.ndarray, connectivity: int, *, m: int = 0, t: int = 0,
-                     c: int = 0, z_index: int = 0, layer: Optional[str] = None
+                     c: int = 0, z_index: int = 0, layer: Optional[str] = None,
+                     b: Optional[int] = None
                      ) -> Tuple[np.ndarray, StructureTable]:
     """Label a 2D plane or 3D volume ``mask`` (nonzero = foreground) into connected
     regions and return ``(label_raster, table)``. Ids are **raster-canonical**
@@ -170,7 +192,7 @@ def label_components(mask: np.ndarray, connectivity: int, *, m: int = 0, t: int 
         from scipy import ndimage as ndi
     except ImportError:                                   # no scipy → the reference flood-fill
         return _label_components_flood(fg, connectivity, m=m, t=t, c=c,
-                                       z_index=z_index, layer=layer)
+                                       z_index=z_index, layer=layer, b=b)
     raw, num = ndi.label(fg, structure=ndi.generate_binary_structure(fg.ndim, rank))
     labels, k = _canonical_relabel(raw, num)
     areas = np.bincount(labels.ravel(), minlength=k + 1)[1:k + 1].astype(np.int64)
@@ -185,12 +207,13 @@ def label_components(mask: np.ndarray, connectivity: int, *, m: int = 0, t: int 
     else:
         cz, cy, cx = com[:, 0], com[:, 1], com[:, 2]     # 3D: true subpixel centroid z
     table = _label_table(labels, k, areas, cz, cy, cx, ndim=fg.ndim, m=m, t=t, c=c,
-                         layer=layer)
+                         layer=layer, b=b)
     return labels, table
 
 
 def _label_components_flood(fg: np.ndarray, connectivity: int, *, m: int, t: int, c: int,
-                            z_index: int, layer: Optional[str]
+                            z_index: int, layer: Optional[str],
+                            b: Optional[int] = None
                             ) -> Tuple[np.ndarray, StructureTable]:
     """Pure-numpy flood-fill CCL — the **reference** implementation (and the scipy-absent
     fallback) for :func:`label_components`, producing identical raster-canonical output.
@@ -235,7 +258,7 @@ def _label_components_flood(fg: np.ndarray, connectivity: int, *, m: int, t: int
         cx.append(sx / n)
     table = _label_table(labels, cur, np.asarray(areas, dtype=np.int64),
                          np.asarray(cz, float), np.asarray(cy, float), np.asarray(cx, float),
-                         ndim=fg.ndim, m=m, t=t, c=c, layer=layer)
+                         ndim=fg.ndim, m=m, t=t, c=c, layer=layer, b=b)
     return labels, table
 
 
@@ -260,7 +283,8 @@ def seeded_watershed(fg_mask: np.ndarray, markers: np.ndarray, *,
 def point_table(positions: np.ndarray, *, z: Any = None, m: int = 0, t: int = 0,
                 c: int = 0, ids: Optional[np.ndarray] = None,
                 z_kind: Optional[str] = None, channel_kind: str = "single",
-                layer: Optional[str] = None) -> StructureTable:
+                layer: Optional[str] = None,
+                b: Optional[int] = None) -> StructureTable:
     """A Point table with the invariant ``id,m,t,c,z,y,x`` schema. ``positions`` is
     ``(N,3)`` ``(z,y,x)`` (3D-mode, ``z_kind="subpixel"``) or ``(N,2)`` ``(y,x)``
     (2D-mode — ``z`` is the integer plane index, ``z_kind="plane_index"``, never NaN)."""
@@ -286,6 +310,8 @@ def point_table(positions: np.ndarray, *, z: Any = None, m: int = 0, t: int = 0,
         "y": np.asarray(yc, dtype=float),
         "x": np.asarray(xc, dtype=float),
     }
+    if b is not None:
+        cols[BATCH_COLUMN] = np.full(n, int(b), dtype=np.int64)
     return StructureTable(Domain.POINT, cols, layer=layer, z_kind=zk,
                           channel_kind=channel_kind)
 
@@ -331,6 +357,6 @@ class TrackMembership:
 
 
 __all__ = [
-    "COORD_COLUMNS", "StructureTable", "connectivity_offsets",
+    "COORD_COLUMNS", "BATCH_COLUMN", "StructureTable", "connectivity_offsets",
     "label_components", "seeded_watershed", "point_table", "TrackMembership",
 ]

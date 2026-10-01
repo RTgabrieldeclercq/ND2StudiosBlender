@@ -1,13 +1,22 @@
-"""The eleven attribute domains and the acquisition lattice (nodegraph v2).
+"""The twelve attribute domains and the acquisition lattice (nodegraph v2).
 
 Two families (see ``CodeLog/ClaudesPlan/V2.00_nodegraph_blender_revamp.md`` §3.2):
 
 * **(a) Acquisition lattice** — coarsenings of the image hypercube over the axes
-  ``{m,t,z,y,x}``. Each domain is the finer one with an axis-group aggregated
+  ``{b,m,t,z,y,x}``. Each domain is the finer one with an axis-group aggregated
   away, forming a lattice closed under join (∪ of axes) and meet (∩ of axes)::
 
-      Voxel (m,t,z,y,x) → Plane (m,t,z) → Frame (m,t) ─┬─ Multipoint (m) ─┐
-                                                       └─ Timepoint (t) ──┴─ Global ()
+      Voxel (b,m,t,z,y,x) → Plane (b,m,t,z) → Frame (b,m,t) ─┬─ Multipoint (b,m) ─┐
+                                                             └─ Timepoint (b,t) ──┴─ Batch (b) → Global ()
+
+  ``b`` is the **batch** axis (V3.01): one index per file run through a shared
+  pipeline. It joins every place-or-time domain, because "position 3" and
+  "timepoint 7" only mean anything within one file — which is what makes
+  ``Batch (b)`` a *required* member rather than a convenience: it is the name of
+  ``meet(Multipoint, Timepoint)``, without which that intersection is unnamed and
+  :func:`meet` raises. ``Batch`` is the per-FILE answer and ``Global`` the
+  across-the-whole-batch one; the two were indistinguishable while a batch was
+  folded onto ``m``.
 
   Because it is a lattice, the transfer between any two of these is **generated**
   (coarsen = reduce, refine = broadcast) rather than hand-written — see
@@ -41,13 +50,32 @@ from enum import Enum
 from typing import Dict, FrozenSet, Iterable, Optional, Tuple
 
 # Canonical ordering of the acquisition axes (V2.01 §H: ``c`` is a first-class
-# store/tile/memo axis). A lattice domain's attribute array is shaped by the axes
-# it *has*, in this order (see :mod:`nodegraph.dataset`).
-AXIS_ORDER: Tuple[str, ...] = ("m", "t", "z", "c", "y", "x")
+# store/tile/memo axis; V3.01: ``b`` is the outermost **batch** axis). A lattice domain's
+# attribute array is shaped by the axes it *has*, in this order (see
+# :mod:`nodegraph.dataset`).
+#
+# ``b`` is the batch axis — one index per FILE run through a shared pipeline, and the
+# outermost axis because a batch member is the coarsest thing there is: it contains whole
+# positions, whole time courses, whole stacks. It is deliberately NOT ``m``. A multipoint is
+# one acquisition's several stage positions, which share a timebase, a calibration and a
+# focus range; a batch member is a separate acquisition that shares none of those. Folding
+# files onto ``m`` (what a file bundle does) is why a series-scoped statistic pools across
+# files — see :mod:`nodegraph.catalog._shared.scope`.
+AXIS_ORDER: Tuple[str, ...] = ("b", "m", "t", "z", "c", "y", "x")
+
+#: The name of the batch coordinate COLUMN on a structure table — the same letter as the
+#: axis, because they are the same coordinate seen from the two sides of the spine.
+#:
+#: It lives here rather than beside ``COORD_COLUMNS`` in :mod:`nodegraph.structure` for a
+#: layering reason: :mod:`nodegraph.dataset` must check it (``with_structure`` refuses a
+#: table that cannot say which file its rows came from) and ``structure`` imports ``memo``
+#: which imports ``dataset`` — so naming it there makes a cycle. ``structure`` re-exports
+#: it, which is where callers should read it from.
+BATCH_COLUMN: str = "b"
 
 
 class Domain(Enum):
-    """The eleven attribute domains. ``value`` is the stable serialization key."""
+    """The twelve attribute domains. ``value`` is the stable serialization key."""
 
     # (a) acquisition lattice
     VOXEL = "voxel"
@@ -55,6 +83,7 @@ class Domain(Enum):
     FRAME = "frame"
     TIMEPOINT = "timepoint"
     MULTIPOINT = "multipoint"
+    BATCH = "batch"
     GLOBAL = "global"
     # orthogonal axis-domain
     CHANNEL = "channel"
@@ -77,6 +106,10 @@ DOMAIN_COLOR: Dict[Domain, str] = {
     Domain.FRAME: "#4bb8c0",       # per (m,t)
     Domain.TIMEPOINT: "#4a90d8",   # per t
     Domain.MULTIPOINT: "#6a7bd8",  # per m
+    # Next-to-coarsest lattice domain, so it sits one step along the ramp from MULTIPOINT
+    # toward GLOBAL's grey: same blue-violet hue, desaturated and lightened. Adjacent
+    # domains reading as adjacent colors is the point of the ramp, not a collision.
+    Domain.BATCH: "#7b85c0",       # per b (one file of a batch)
     Domain.GLOBAL: "#8a93a1",      # one scalar
     Domain.CHANNEL: "#e8d44a",     # per c (orthogonal axis)
     Domain.LABEL: "#e08a3a",       # segmented regions
@@ -91,7 +124,8 @@ DOMAIN_COLOR: Dict[Domain, str] = {
 
 DOMAIN_ABBR: Dict[Domain, str] = {
     Domain.VOXEL: "VOX", Domain.PLANE: "PLN", Domain.FRAME: "FRM",
-    Domain.TIMEPOINT: "TIM", Domain.MULTIPOINT: "MPT", Domain.GLOBAL: "GLB",
+    Domain.TIMEPOINT: "TIM", Domain.MULTIPOINT: "MPT", Domain.BATCH: "BCH",
+    Domain.GLOBAL: "GLB",
     Domain.CHANNEL: "CHN", Domain.LABEL: "LBL", Domain.POINT: "PT",
     Domain.TRACK: "TRK", Domain.MESH: "MSH",
 }
@@ -101,12 +135,12 @@ DOMAIN_ABBR: Dict[Domain, str] = {
 #: :data:`DOMAIN_COLOR` for the same reason that does: a domain's identity is a property of
 #: the data model, not of any node, and four nodes offer a domain dropdown
 #: (``analysis.reduce_scalar``, both ``transform.transfer_*``, and any future one). Written
-#: once here, they cannot drift into four descriptions of the same eleven things — and the
+#: once here, they cannot drift into four descriptions of the same twelve things — and the
 #: honest phrasing is direction-neutral, so the same text serves a "from" and a "to" menu.
 #: Consumers pass the option names they actually offer through :func:`domain_docs`.
 DOMAIN_DOC: Dict[Domain, str] = {
     Domain.VOXEL:
-        "Per voxel — one value for every (m,t,z,c,y,x) position, i.e. an image-shaped "
+        "Per voxel — one value for every (b,m,t,z,c,y,x) position, i.e. an image-shaped "
         "layer. The finest domain there is: masks, intensity images and rasterized fields "
         "all live here, and everything else is a coarsening of it.",
     Domain.PLANE:
@@ -122,9 +156,16 @@ DOMAIN_DOC: Dict[Domain, str] = {
     Domain.MULTIPOINT:
         "Per position — one value for each m, pooling time. One number per well, tile or "
         "stage point, which is what a per-position summary or calibration belongs on.",
+    Domain.BATCH:
+        "Per file — one value for each b, pooling every position and timepoint WITHIN that "
+        "file but never across files. The domain of a per-file answer: this file's "
+        "threshold, its cell count, its QC verdict. Use it rather than Global whenever the "
+        "number is a property of one acquisition; Global pools the whole batch together.",
     Domain.GLOBAL:
-        "One single number for the entire dataset. The score an Iterate sweep compares, and "
-        "the coarsest possible domain — every axis has been reduced away.",
+        "One single number for the entire dataset — across every file of a batch, not one "
+        "of them. The score an Iterate sweep compares, and the coarsest possible domain: "
+        "every axis, batch included, has been reduced away. For a per-file number use "
+        "Batch instead.",
     Domain.CHANNEL:
         "Per channel — one value for each c. Orthogonal to the spatial/temporal chain, so "
         "use it for anything that is a property of the STAIN (a per-channel gain, "
@@ -175,12 +216,27 @@ def domain_abbr(domain: Domain) -> str:
 # this map are non-lattice (the detected structures Label/Point/Track/Mesh) — the
 # OMISSION is the declaration, which is why ``is_lattice``/``axes_of``/``_require_lattice``/
 # ``shape_for``/``axis_list`` all give the right answer (or a clean raise) for free.
+# **Why BATCH must exist (V3.01).** ``b`` joins every domain that was already addressed by
+# a place or a time, because "position 3" and "timepoint 7" are only meaningful WITHIN one
+# file of a batch. That makes ``{b}`` itself reachable as an intersection —
+# ``meet(Multipoint, Timepoint)`` is ``{b,m} & {b,t} == {b}`` — and :func:`meet` indexes
+# :data:`_AXES_TO_DOMAIN` directly, so an unnamed set is a ``KeyError``, not a soft failure.
+# ``Domain.BATCH`` is that name. It is not decoration: it is what keeps the lattice closed
+# under intersection, which is the property :func:`meet` is allowed to assume.
+#
+# ``CHANNEL`` and ``GLOBAL`` deliberately do NOT gain ``b``. A batch shares its channel
+# identities (a batch whose files disagree about which stain is channel 0 is refused at the
+# door, the rule the file bundle already enforces), so a per-channel value is a property of
+# the stain and not of any one file. ``GLOBAL`` keeps meaning "one number for everything" —
+# the per-FILE number is ``BATCH``, which is precisely the distinction that was impossible
+# to draw while files were folded onto ``m``.
 _LATTICE_AXES: Dict[Domain, FrozenSet[str]] = {
-    Domain.VOXEL: frozenset({"m", "t", "z", "c", "y", "x"}),
-    Domain.PLANE: frozenset({"m", "t", "z"}),
-    Domain.FRAME: frozenset({"m", "t"}),
-    Domain.TIMEPOINT: frozenset({"t"}),
-    Domain.MULTIPOINT: frozenset({"m"}),
+    Domain.VOXEL: frozenset({"b", "m", "t", "z", "c", "y", "x"}),
+    Domain.PLANE: frozenset({"b", "m", "t", "z"}),
+    Domain.FRAME: frozenset({"b", "m", "t"}),
+    Domain.TIMEPOINT: frozenset({"b", "t"}),
+    Domain.MULTIPOINT: frozenset({"b", "m"}),
+    Domain.BATCH: frozenset({"b"}),     # V3.01: one index per file of a batch
     Domain.CHANNEL: frozenset({"c"}),   # V2.01 §H: Channel is now a lattice axis-domain
     Domain.GLOBAL: frozenset(),
 }
@@ -209,7 +265,7 @@ MULTI_INSTANCE_DOMAINS: FrozenSet[Domain] = STRUCTURE_DOMAINS
 # ── predicates ───────────────────────────────────────────────────────────────
 
 def is_lattice(domain: Domain) -> bool:
-    """True for the seven acquisition-lattice domains (transfers are generated)."""
+    """True for the eight acquisition-lattice domains (transfers are generated)."""
     # NOTE: no MESH branch needed — it is absent from ``_LATTICE_AXES`` by design.
     return domain in _LATTICE_AXES
 

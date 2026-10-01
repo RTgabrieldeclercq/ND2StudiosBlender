@@ -54,8 +54,17 @@ class TileProvider(ABC):
     # ── the one primitive concrete providers implement ────────────────────────
     @abstractmethod
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
-        """A single-z 2D window ``[y0:y1, x0:x1]`` at ``level`` for ``(m,t,z,c)``."""
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
+        """A single-z 2D window ``[y0:y1, x0:x1]`` at ``level`` for ``(b,m,t,z,c)``.
+
+        **``b`` is keyword-only with a default (V3.01), deliberately.** The batch axis
+        was added to a repo with 206 positional call sites of this contract; threading it
+        positionally would have been 206 edits in which a single mis-ordered argument
+        reads ``m`` as ``b`` and returns the wrong position's pixels — plausible data, no
+        error. Keyword-only makes every existing call keep meaning exactly what it meant
+        (member 0 of a one-member batch), and makes every batch-aware read say ``b=`` at
+        the call site, where it can be read.
+        """
 
     # ── multiscale geometry ────────────────────────────────────────────────────
     def level_axes(self, level: int) -> AxisSizes:
@@ -93,13 +102,13 @@ class TileProvider(ABC):
 
     # ── derived reads (V2.03 §5 D1) ────────────────────────────────────────────
     def get_region(self, level: int, m: int, t: int, z: int, c: int,
-                   y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                   y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         ax = self.level_axes(level)
         return self.read_region(level, m, t, z, c,
-                                max(0, y0), min(y1, ax.y), max(0, x0), min(x1, ax.x))
+                                max(0, y0), min(y1, ax.y), max(0, x0), min(x1, ax.x), b=b)
 
     def get_tile(self, level: int, m: int, t: int, z: int, c: int,
-                 iy: int, ix: int) -> np.ndarray:
+                 iy: int, ix: int, *, b: int = 0) -> np.ndarray:
         """One block at grid position ``(iy, ix)`` — clipped at the plane edge."""
         ax = self.level_axes(level)
         y0, x0 = iy * self.tile, ix * self.tile
@@ -107,28 +116,28 @@ class TileProvider(ABC):
             raise IndexError(f"tile ({iy},{ix}) out of range for level {level} "
                              f"{(ax.y, ax.x)} tile={self.tile}")
         return self.read_region(level, m, t, z, c, y0, min(y0 + self.tile, ax.y),
-                                x0, min(x0 + self.tile, ax.x))
+                                x0, min(x0 + self.tile, ax.x), b=b)
 
     def get_subvolume(self, level: int, m: int, t: int, c: int,
-                      z0: int, z1: int, iy: int, ix: int) -> np.ndarray:
+                      z0: int, z1: int, iy: int, ix: int, *, b: int = 0) -> np.ndarray:
         """A ``(z1-z0, block_y, block_x)`` brick — planar blocks gathered across the
         z-range (the benchmark-preferred path; not a MIP). An empty range returns a
         ``(0, block_y, block_x)`` array (review #12: ``np.stack([])`` would crash)."""
         if z1 <= z0:
-            probe = self.get_tile(level, m, t, 0, c, iy, ix)   # z=0 always in range
+            probe = self.get_tile(level, m, t, 0, c, iy, ix, b=b)   # z=0 always in range
             return np.empty((0,) + probe.shape, dtype=probe.dtype)
-        return np.stack([self.get_tile(level, m, t, z, c, iy, ix)
+        return np.stack([self.get_tile(level, m, t, z, c, iy, ix, b=b)
                          for z in range(z0, z1)], axis=0)
 
     def get_region_volume(self, level: int, m: int, t: int, c: int,
-                          z0: int, z1: int, y0: int, y1: int, x0: int, x1: int
-                          ) -> np.ndarray:
+                          z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
+                          *, b: int = 0) -> np.ndarray:
         """An arbitrary ``(Z,Y,X)`` ROI (composes single-z region reads); an empty
         range returns a ``(0, ...)`` array (review #12)."""
         if z1 <= z0:
-            probe = self.get_region(level, m, t, 0, c, y0, y1, x0, x1)
+            probe = self.get_region(level, m, t, 0, c, y0, y1, x0, x1, b=b)
             return np.empty((0,) + probe.shape, dtype=probe.dtype)
-        return np.stack([self.get_region(level, m, t, z, c, y0, y1, x0, x1)
+        return np.stack([self.get_region(level, m, t, z, c, y0, y1, x0, x1, b=b)
                          for z in range(z0, z1)], axis=0)
 
 
@@ -144,7 +153,7 @@ class SyntheticProvider(TileProvider):
         self.tile = tile
         self.levels = levels
 
-    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
         s = 1 << level
         yy = (np.arange(y0, y1, dtype=np.int64) * s)[:, None]
         xx = (np.arange(x0, x1, dtype=np.int64) * s)[None, :]
@@ -273,7 +282,7 @@ class B2ndProvider(TileProvider):
         m, t, z, c, y, x = self._arrays[level].shape       # exact stored geometry
         return AxisSizes(m=m, t=t, z=z, c=c, y=y, x=x)
 
-    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
         return np.asarray(self._arrays[level][m, t, z, c, y0:y1, x0:x1])
 
     def fingerprint(self) -> tuple:
@@ -579,28 +588,43 @@ class B2ndProvider(TileProvider):
                 progress(min(1.0, done / total))
 
         kw = cls._store_kwargs(shapes[0], np.dtype(vol6d.dtype).itemsize, tile=tile,
-                               cparams=cparams, urlpath=urlpath, level=0)
+                               cparams=cparams, urlpath=urlpath, level=0,
+                               batch_thin_z=True)
         m, t, z, c = vol6d.shape[:4]
-        cz = int(kw["chunks"][2])
-        # A determinate bar needs sub-level granularity, and a chunk spans `cz` planes and
-        # never crosses (M,T,C) — so filling ONE z-slab at a time is exactly chunk-aligned
-        # (the same on-disk bytes as `blosc2.asarray`) and reports honestly. It also holds
-        # one slab contiguous at a time instead of a whole second copy of the volume, which
-        # is what made a >50 GB ingest thrash.
+        ct, cz = int(kw["chunks"][1]), int(kw["chunks"][2])
+        # A determinate bar needs sub-level granularity, and a chunk spans `ct` timepoints x
+        # `cz` planes and never crosses (M,C) — so filling ONE such block at a time is exactly
+        # chunk-aligned (the same on-disk bytes as `blosc2.asarray`) and reports honestly. It
+        # also holds one block contiguous at a time instead of a whole second copy of the
+        # volume, which is what made a >50 GB ingest thrash.
+        #
+        # `batch_thin_z=True` (V2.26) is what lets `ct` exceed 1, and it was measured before
+        # being turned on here rather than after. `cz` is capped by Z, so a 2D or thin-Z
+        # acquisition used to pin one 8 MiB chunk per plane and write at 50 MB/s — against
+        # 182 MB/s for the same data through the Dock's writer, which got the fix first. What
+        # held it back was that this store's READ profile serves every live chain and had
+        # never been measured under T-batching. It has now, on a 2048² thin-Z store: full-plane
+        # scrub 7.7 -> 7.9 ms and a 1024² window 4.75 -> 4.19 ms going ct=1 -> ct=4, at
+        # byte-identical size. Flat, because `blocks` — the decompression granularity a reader
+        # actually pays for — is untouched; the framing is a write-side concern only.
         arr0 = blosc2.empty(vol6d.shape, dtype=vol6d.dtype, **kw)
         cls._mark(arr0, 0, False)                    # declared, not yet written
-        for im, it, ic in np.ndindex(m, t, c):
-            for z0 in range(0, z, cz):
-                z1 = min(z0 + cz, z)
-                arr0[im:im + 1, it:it + 1, z0:z1, ic:ic + 1, :, :] = \
-                    np.ascontiguousarray(vol6d[im:im + 1, it:it + 1, z0:z1, ic:ic + 1])
-                bump(z1 - z0)
+        for im, ic in np.ndindex(m, c):
+            for t0 in range(0, t, ct):
+                t1 = min(t0 + ct, t)
+                for z0 in range(0, z, cz):
+                    z1 = min(z0 + cz, z)
+                    arr0[im:im + 1, t0:t1, z0:z1, ic:ic + 1, :, :] = \
+                        np.ascontiguousarray(
+                            vol6d[im:im + 1, t0:t1, z0:z1, ic:ic + 1])
+                    bump((t1 - t0) * (z1 - z0))
         cls._mark(arr0, 0, True)
 
         arrays = [arr0]
         for lvl in range(1, len(shapes)):
             nxt = cls._append_level(arrays[-1], lvl, tile=tile, cparams=cparams,
-                                    urlpath=urlpath, bump=bump)
+                                    urlpath=urlpath, bump=bump,
+                                    batch_thin_z=True)
             if nxt is None:
                 break
             arrays.append(nxt)
@@ -777,7 +801,9 @@ def subset_index(picks: Sequence[int], value: int) -> int:
 
 class ChannelMergeProvider(TileProvider):
     """Two acquisitions on one channel axis, placed by absolute stage position and focus —
-    ``channel.merge``'s image, and the only provider that reads from two sources.
+    ``channel.merge``'s image, and the only provider that reads from two sources and
+    RE-ADDRESSES them (:class:`MultiSourceProvider` also spans several files, but by pure
+    index arithmetic on ``m``: nothing there is resampled, paired in time, or placed).
 
     A channel index below ``pri_c`` is served from the PRIMARY and one at or above it from the
     SECONDARY. Both are addressed the same way: the output plane has an absolute µm focus (the
@@ -844,7 +870,7 @@ class ChannelMergeProvider(TileProvider):
         return secondary_z_index(md, axes, int(m), z_um, dz=dz)
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
-                    y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
         from nodegraph.placement import compose_secondary_plane, paired_t
         lax = self.level_axes(level)
         z_um = self._grid.plane_um(m, z)
@@ -854,7 +880,8 @@ class ChannelMergeProvider(TileProvider):
             # index space anyway, so pass the index straight through.
             pz = int(z) if z_um is None else self._z_of(self._pri_md, self._pri_axes, m, z_um)
             pz = min(max(0, pz), int(self._pri_axes.z) - 1)
-            return np.asarray(self._p.get_region(level, m, t, pz, int(c), y0, y1, x0, x1))
+            return np.asarray(
+                self._p.get_region(level, m, t, pz, int(c), y0, y1, x0, x1, b=b))
 
         k = int(c) - self._pri_c
         h, w = max(0, y1 - y0), max(0, x1 - x0)
@@ -991,7 +1018,7 @@ class FrameSubsetProvider(TileProvider):
         return replace(lax, m=len(self._ms), t=len(self._ts),
                        z=lax.z if self._zs is None else len(self._zs))
 
-    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
         # m/t/z are CLAMPED into the subset rather than trusted: this view has only the
         # picked indices, a consumer's own clamping already sends an in-range one, and
         # resolving through the pick means a hand-built read cannot escape the scope.
@@ -999,7 +1026,7 @@ class FrameSubsetProvider(TileProvider):
         bt = self._ts[min(max(0, int(t)), len(self._ts) - 1)]
         bz = z if self._zs is None else \
             self._zs[min(max(0, int(z)), len(self._zs) - 1)]
-        return self._base.read_region(level, bm, bt, bz, c, y0, y1, x0, x1)
+        return self._base.read_region(level, bm, bt, bz, c, y0, y1, x0, x1, b=b)
 
     def fingerprint(self) -> tuple:
         fp = (self._TAG, self._base.fingerprint(), self._ms, self._ts)
@@ -1027,17 +1054,30 @@ class FrameSliceProvider(FrameSubsetProvider):
 
 
 class ArrayProvider(TileProvider):
-    """A provider backed by an in-memory ``(M,T,Z,C,Y,X)`` array — how a *realizing*
+    """A provider backed by an in-memory ``(B,M,T,Z,C,Y,X)`` array — how a *realizing*
     node (e.g. deconvolve) wraps its computed volume back into ``Dataset.image``.
-    Single-level (no pyramid); numpy only."""
+    Single-level (no pyramid); numpy only.
+
+    **6-D is one batch member (V3.01).** A realizing compute runs per member (a batch is
+    a per-member unroll), so the array it hands back is ``(M,T,Z,C,Y,X)`` and ``b`` is
+    elided exactly as :meth:`nodegraph.dataset.AxisSizes.axis_list` describes. A 7-D array
+    is accepted too, for the ``b > 1`` case at the batch boundary.
+    """
 
     def __init__(self, array: np.ndarray, *, tile: int = 512) -> None:
         a = np.asarray(array)
-        if a.ndim != 6:
-            raise ValueError(f"expected a 6-D (M,T,Z,C,Y,X) array, got {a.shape}")
+        if a.ndim == 6:
+            b, (m, t, z, c, y, x) = 1, a.shape
+        elif a.ndim == 7:
+            b, m, t, z, c, y, x = a.shape
+            a = a if b > 1 else a[0]       # keep the stored form canonical: b elided at 1
+        else:
+            raise ValueError(
+                f"expected a 6-D (M,T,Z,C,Y,X) array for one batch member, or a 7-D "
+                f"(B,M,T,Z,C,Y,X) one for a batch, got {a.shape}")
         self._a = a
-        m, t, z, c, y, x = a.shape
-        self.axes = AxisSizes(m=m, t=t, z=z, c=c, y=y, x=x)
+        self._batched = b > 1
+        self.axes = AxisSizes(b=b, m=m, t=t, z=z, c=c, y=y, x=x)
         self.tile = tile
         self.levels = 1
 
@@ -1047,10 +1087,11 @@ class ArrayProvider(TileProvider):
         holding this provider actually frees (Memo GC sizing, :func:`~nodegraph.memo.payload_bytes`)."""
         return int(self._a.nbytes)
 
-    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
         if level != 0:
             raise ValueError("ArrayProvider has no pyramid (level 0 only)")
-        return np.asarray(self._a[m, t, z, c, y0:y1, x0:x1])
+        a = self._a[b] if self._batched else self._a
+        return np.asarray(a[m, t, z, c, y0:y1, x0:x1])
 
     def fingerprint(self) -> tuple:
         """Content fingerprint — the realized array's bytes (this provider IS its
@@ -1070,6 +1111,551 @@ class ArrayProvider(TileProvider):
         return self._fp
 
 
+class MultiSourceProvider(TileProvider):
+    """K files laid end to end on the multipoint axis — a **file bundle**'s image.
+
+    Position ``m`` of the bundle is position ``m - offset[i]`` of source ``i``. Nothing is
+    resampled, blended or copied: this is a pure index remap, so a bundled pull reads
+    exactly the bytes an un-bundled one would, from each file's own store.
+
+    **Why ``m`` and not a new axis.** ``m`` already means "one acquisition site" — a well,
+    a tile, a stage point — and every domain, every table row (``COORD_COLUMNS`` carries
+    ``m``) and the viewer's M strip already address it. Only three nodes in the catalog
+    read across ``m`` at all (the ``MULTI_VIEW`` three), so for everything else a position
+    is an independent unit of work and a bundle runs one pipeline over N files for free.
+    That independence is a *measured* property, not an assumption:
+    ``scripts/_probe_m_batch_independence.py`` pins it, and names the one documented
+    exception — a histogram ``scope="dataset"`` pools its level over the whole (m,t,z,c)
+    population, so under a bundle it pools **across files**. That is the same widening the
+    2026-07-30 scope fix made opt-in for positions; a bundle does not change its meaning,
+    it enlarges what it reaches.
+
+    **The grid must agree.** Sources are required to match on ``t``/``z``/``c``/``y``/``x``.
+    A bundle is a claim that one pipeline is meaningful over all of it, and a chain that
+    silently re-addressed a different pixel size or channel count per position would break
+    that claim somewhere far downstream — where it reads as a bad result rather than a bad
+    grouping. Refusing here is the cheap end of that trade.
+
+    **Identity.** :meth:`version` folds each source's own ``version`` (not its
+    ``fingerprint``): ``B2ndProvider`` overrides ``version`` to carry the store's mtime, so
+    editing one file of a bundle in place invalidates the bundle — folding fingerprints
+    would have silently served the stale pixels.
+    """
+
+    def __init__(self, sources: Sequence[TileProvider],
+                 labels: Optional[Sequence[str]] = None) -> None:
+        srcs = list(sources)
+        if not srcs:
+            raise ValueError("a file bundle needs at least one source")
+        first = srcs[0].axes
+        for i, s in enumerate(srcs[1:], start=1):
+            a = s.axes
+            bad = [n for n in ("t", "z", "c", "y", "x")
+                   if int(getattr(a, n)) != int(getattr(first, n))]
+            if bad:
+                want = tuple(int(getattr(first, n)) for n in ("t", "z", "c", "y", "x"))
+                got = tuple(int(getattr(a, n)) for n in ("t", "z", "c", "y", "x"))
+                raise ValueError(
+                    f"file {i} does not share the bundle's grid on {', '.join(bad)}: "
+                    f"(t,z,c,y,x) is {got}, the bundle's is {want}. Group only files with "
+                    f"the same channels and frame geometry, or load them separately.")
+        self._srcs = tuple(srcs)
+        counts = [max(0, int(s.axes.m)) for s in srcs]
+        # exclusive prefix sums: source i owns bundle positions [_off[i], _off[i+1])
+        off, run = [0], 0
+        for n in counts:
+            run += n
+            off.append(run)
+        self._off = tuple(off)
+        self.axes = replace(first, m=run)
+        self.labels = tuple(labels) if labels is not None else \
+            tuple(f"file{i}" for i in range(len(srcs)))
+        # The shared pyramid is only as deep as the SHALLOWEST member: a level the bundle
+        # advertises must exist in every source, or a read into the short one would fall
+        # off its own pyramid at display time rather than at construction.
+        self.levels = max(1, min(int(getattr(s, "levels", 1)) for s in srcs))
+        self.tile = min(int(getattr(s, "tile", 512)) for s in srcs)
+        # A bundle costs what its most expensive member costs: these flags fence real
+        # read-amplification cliffs (see FrameSubsetProvider), and taking `any`/`max`
+        # keeps the fence up for every position, not just the ones in a cheap file.
+        self.depth = max((int(getattr(s, "depth", 0)) for s in srcs), default=0)
+        self.cum_halo = max((int(getattr(s, "cum_halo", 0)) for s in srcs), default=0)
+        self.plane_unit = any(bool(getattr(s, "plane_unit", False)) for s in srcs)
+        self.volume_unit = any(bool(getattr(s, "volume_unit", False)) for s in srcs)
+
+    @property
+    def sources(self) -> tuple:
+        return self._srcs
+
+    @property
+    def spans(self) -> tuple:
+        """``(label, m_start, m_count)`` per source — the file identity of every position."""
+        return tuple((self.labels[i], self._off[i], self._off[i + 1] - self._off[i])
+                     for i in range(len(self._srcs)))
+
+    def locate(self, m: int) -> Tuple[int, int]:
+        """Bundle position ``m`` → ``(source index, that source's own m)``."""
+        mm = min(max(0, int(m)), max(0, int(self.axes.m) - 1))
+        i = bisect_left(self._off, mm + 1) - 1
+        i = min(max(0, i), len(self._srcs) - 1)
+        return i, mm - self._off[i]
+
+    def level_axes(self, level: int) -> AxisSizes:
+        # Delegate the spatial halving to a real member so the bundle's pyramid geometry
+        # is the members' own, then restore the concatenated m.
+        return replace(self._srcs[0].level_axes(level), m=int(self.axes.m))
+
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
+        i, local_m = self.locate(m)
+        return np.asarray(self._srcs[i].read_region(
+            level, local_m, t, z, c, y0, y1, x0, x1, b=b))
+
+    def fingerprint(self) -> tuple:
+        return ("bundle", tuple(s.fingerprint() for s in self._srcs), self._off)
+
+    @property
+    def version(self) -> Any:
+        # `version`, not `fingerprint`: a disk-backed member folds its mtime into version
+        # only, so this is what makes an in-place edit of one file invalidate the bundle.
+        return ("bundle", tuple(s.version for s in self._srcs), self._off)
+
+
+class BatchProvider(TileProvider):
+    """K acquisitions stacked on the **batch** axis — one file per ``b`` (V3.01).
+
+    Member ``b`` of the batch is source ``b``, read at its own ``(m,t,z,c)`` unchanged.
+    Like :class:`MultiSourceProvider` this is a pure re-addressing — nothing is resampled,
+    blended or copied — but it grows a *new* axis rather than lengthening ``m``, and that
+    difference is the entire point of the class.
+
+    **Why not just use** :class:`MultiSourceProvider`. Laying files end to end on ``m``
+    makes them positions of one acquisition, and the engine then cannot tell "position 3 of
+    file 1" from "position 3 of the run". That is not a naming quibble: it is exactly why a
+    ``scope="dataset"`` statistic pools its level **across files** under a file bundle — the
+    caveat :class:`MultiSourceProvider`'s own docstring names, pinned by
+    ``scripts/_probe_m_batch_independence.py``. On ``b`` the population a scope pools over
+    stops at the file boundary, so a per-file threshold is a per-file threshold.
+
+    **The grid must agree on every other axis.** Sources must match on ``m``/``t``/``z``/
+    ``c``/``y``/``x``, and the refusal names the axis. An array axis is rectangular, so a
+    ragged batch is not representable at all — files with different frame counts have to be
+    run as separate graphs, not silently padded or truncated to the shortest.
+
+    **Identity** folds each member's ``version``, not its ``fingerprint``, for the reason
+    :class:`MultiSourceProvider` gives: a disk-backed member carries its store's mtime in
+    ``version`` alone, so folding fingerprints would serve a batch whose file changed
+    underneath it.
+    """
+
+    #: Axes every member must already agree on — everything except ``b`` itself.
+    MUST_MATCH: Tuple[str, ...] = ("m", "t", "z", "c", "y", "x")
+
+    def __init__(self, sources: Sequence[TileProvider],
+                 labels: Optional[Sequence[str]] = None) -> None:
+        srcs = list(sources)
+        if not srcs:
+            raise ValueError("a batch needs at least one source")
+        for i, s in enumerate(srcs):
+            if int(getattr(s.axes, "b", 1)) != 1:
+                raise ValueError(
+                    f"batch member {i} is itself a {s.axes.b}-member batch; nested "
+                    f"batches are not representable on one b axis. Unbatch it first.")
+        first = srcs[0].axes
+        for i, s in enumerate(srcs[1:], start=1):
+            a = s.axes
+            bad = [n for n in self.MUST_MATCH
+                   if int(getattr(a, n)) != int(getattr(first, n))]
+            if bad:
+                want = tuple(int(getattr(first, n)) for n in self.MUST_MATCH)
+                got = tuple(int(getattr(a, n)) for n in self.MUST_MATCH)
+                raise ValueError(
+                    f"batch member {i} does not share the batch's grid on "
+                    f"{', '.join(bad)}: (m,t,z,c,y,x) is {got}, the batch's is {want}. "
+                    f"A batch runs ONE pipeline over every member, so the members have to "
+                    f"share a grid; run the odd one out as its own graph.")
+        self._srcs = tuple(srcs)
+        self.axes = replace(first, b=len(srcs))
+        self.labels = tuple(labels) if labels is not None else \
+            tuple(f"file{i}" for i in range(len(srcs)))
+        # Same reasoning as MultiSourceProvider for every one of these: a batch advertises
+        # only the shallowest member's pyramid, costs what its most expensive member costs,
+        # and keeps a read-amplification fence up for every member rather than the cheap ones.
+        self.levels = max(1, min(int(getattr(s, "levels", 1)) for s in srcs))
+        self.tile = min(int(getattr(s, "tile", 512)) for s in srcs)
+        self.depth = max((int(getattr(s, "depth", 0)) for s in srcs), default=0)
+        self.cum_halo = max((int(getattr(s, "cum_halo", 0)) for s in srcs), default=0)
+        self.plane_unit = any(bool(getattr(s, "plane_unit", False)) for s in srcs)
+        self.volume_unit = any(bool(getattr(s, "volume_unit", False)) for s in srcs)
+
+    @property
+    def sources(self) -> tuple:
+        return self._srcs
+
+    @property
+    def spans(self) -> tuple:
+        """``(label, b_index)`` per member — the file identity of every batch index."""
+        return tuple((self.labels[i], i) for i in range(len(self._srcs)))
+
+    def member(self, b: int) -> TileProvider:
+        """The source backing batch index ``b``, clamped into range."""
+        return self._srcs[min(max(0, int(b)), len(self._srcs) - 1)]
+
+    def level_axes(self, level: int) -> AxisSizes:
+        # Delegate spatial halving to a real member so the pyramid geometry is the
+        # members' own, then restore the batch extent.
+        return replace(self._srcs[0].level_axes(level), b=int(self.axes.b))
+
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
+        # b addresses the MEMBER here and is consumed, not forwarded: the member is an
+        # ordinary single-acquisition provider and reads at its own b=0.
+        return np.asarray(self.member(b).read_region(
+            level, m, t, z, c, y0, y1, x0, x1))
+
+    def fingerprint(self) -> tuple:
+        return ("batch", tuple(s.fingerprint() for s in self._srcs))
+
+    @property
+    def version(self) -> Any:
+        return ("batch", tuple(s.version for s in self._srcs))
+
+
+class BatchSliceProvider(TileProvider):
+    """One member of a batch, as a ``b == 1`` provider — what ``util.select_batch`` puts on
+    the wire, and the exact inverse of :class:`BatchProvider` (V3.01).
+
+    A pure re-address, like :class:`FrameSliceProvider` one axis out: every read is
+    forwarded to the base at the pinned member, so member ``k``'s pixels are byte-for-byte
+    what an unbatched graph would have read. It wraps ANY provider rather than only a
+    :class:`BatchProvider`, which is the point — by the time an unbatch runs, the batch has
+    a whole pipeline stacked on it and the thing on the wire is a compute provider, not the
+    original stack.
+
+    The unbatch is therefore free: splitting K results apart costs no compute and no copy,
+    because each member's chain was always addressed by ``b`` and this only fixes it.
+    """
+
+    def __init__(self, base: TileProvider, b: int) -> None:
+        nb = int(getattr(base.axes, "b", 1))
+        k = int(b)
+        if not (0 <= k < nb):
+            raise ValueError(
+                f"batch member {k} is out of range for a {nb}-member batch [0, {nb}).")
+        self._base = base
+        self._b = k
+        self.axes = replace(base.axes, b=1)
+        self.levels = int(getattr(base, "levels", 1))
+        self.tile = int(getattr(base, "tile", 512))
+        # the member costs exactly what the batch charged for it — inherit every fence
+        self.depth = int(getattr(base, "depth", 0))
+        self.cum_halo = int(getattr(base, "cum_halo", 0))
+        self.plane_unit = bool(getattr(base, "plane_unit", False))
+        self.volume_unit = bool(getattr(base, "volume_unit", False))
+
+    @property
+    def member_index(self) -> int:
+        return self._b
+
+    def level_axes(self, level: int) -> AxisSizes:
+        return replace(self._base.level_axes(level), b=1)
+
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
+        # The caller's `b` addresses THIS view, which has one member, so it is discarded
+        # and the pinned index used instead. Forwarding the caller's would re-index into
+        # the base and hand back a different file.
+        return np.asarray(self._base.read_region(
+            level, m, t, z, c, y0, y1, x0, x1, b=self._b))
+
+    def fingerprint(self) -> tuple:
+        return ("batchslice", self._base.fingerprint(), self._b)
+
+    @property
+    def version(self) -> Any:
+        return ("batchslice", self._base.version, self._b)
+
+
+#: The axes :class:`AxisConcatProvider` can grow — never ``c``: a channel merge needs
+#: :class:`ChannelMergeProvider`'s placement/resampling, not a pure index remap (two files
+#: at different pixel sizes cannot be laid end to end on Y/X the way two timepoints can be
+#: laid end to end on T).
+CONCAT_AXES: Tuple[str, ...] = ("t", "m", "z")
+
+
+class AxisConcatProvider(TileProvider):
+    """N sources laid end to end on ONE axis — ``t``, ``m`` or ``z`` — ``util.merge``'s
+    literal-concatenation branch (:data:`CONCAT_AXES`; ``c`` goes through
+    :class:`ChannelMergeProvider` instead, see above).
+
+    This is :class:`MultiSourceProvider` generalised from "always ``m``" to "whichever axis
+    the node picked" — the exclusive-prefix-sum index remap is identical, just applied to a
+    different axis of ``read_region``'s signature. **Nothing is resampled, blended or
+    interpolated**: source ``i`` owns concat-axis positions ``[_off[i], _off[i+1])``, and a
+    read at index ``k`` of the merged axis is index ``k - _off[i]`` of source ``i``, on
+    whichever of its own ``(m,t,z)`` the other two indices already name. A read still costs
+    exactly what it would cost un-merged.
+
+    **The grid must agree on every OTHER axis** (mirrors :class:`MultiSourceProvider`'s own
+    contract exactly, generalised the same way): growing ``t`` requires every input to
+    already match on ``m,z,c,y,x``; growing ``m`` requires ``t,z,c,y,x``; growing ``z``
+    requires ``m,t,c,y,x``. A caller with mismatched inputs resamples/crops upstream
+    (``util.resample``, ``util.crop``) rather than this provider silently reconciling a
+    difference it cannot see the physical meaning of — the same trade
+    :class:`MultiSourceProvider`'s docstring argues for M.
+    """
+
+    def __init__(self, sources: Sequence[TileProvider], axis: str,
+                 labels: Optional[Sequence[str]] = None) -> None:
+        axis = str(axis).lower()
+        if axis not in CONCAT_AXES:
+            raise ValueError(f"AxisConcatProvider: axis must be one of {CONCAT_AXES}, "
+                             f"got {axis!r}")
+        srcs = list(sources)
+        if len(srcs) < 2:
+            raise ValueError("a merge needs at least two sources")
+        other = [n for n in ("m", "t", "z", "c", "y", "x") if n != axis]
+        first = srcs[0].axes
+        for i, s in enumerate(srcs[1:], start=1):
+            a = s.axes
+            bad = [n for n in other if int(getattr(a, n)) != int(getattr(first, n))]
+            if bad:
+                want = tuple(int(getattr(first, n)) for n in other)
+                got = tuple(int(getattr(a, n)) for n in other)
+                raise ValueError(
+                    f"input {i} does not match input 0 on {', '.join(bad)}: "
+                    f"({', '.join(other)}) is {got}, input 0's is {want}. Growing "
+                    f"{axis!r} requires every other axis to already agree — resample or "
+                    f"crop upstream so they match, or merge onto a different axis.")
+        self._srcs = tuple(srcs)
+        self._axis = axis
+        counts = [max(0, int(getattr(s.axes, axis))) for s in srcs]
+        # exclusive prefix sums: source i owns merged-axis positions [_off[i], _off[i+1])
+        off, run = [0], 0
+        for n in counts:
+            run += n
+            off.append(run)
+        self._off = tuple(off)
+        self.axes = replace(first, **{axis: run})
+        self.labels = tuple(labels) if labels is not None else \
+            tuple(f"input{i}" for i in range(len(srcs)))
+        # Same reasoning as MultiSourceProvider: the shared pyramid/tile/cost model is the
+        # worst (shallowest/most expensive) of the members, so no read past what a bundle
+        # advertises falls off a shorter member's own pyramid.
+        self.levels = max(1, min(int(getattr(s, "levels", 1)) for s in srcs))
+        self.tile = min(int(getattr(s, "tile", 512)) for s in srcs)
+        self.depth = max((int(getattr(s, "depth", 0)) for s in srcs), default=0)
+        self.cum_halo = max((int(getattr(s, "cum_halo", 0)) for s in srcs), default=0)
+        self.plane_unit = any(bool(getattr(s, "plane_unit", False)) for s in srcs)
+        self.volume_unit = any(bool(getattr(s, "volume_unit", False)) for s in srcs)
+
+    @property
+    def sources(self) -> tuple:
+        return self._srcs
+
+    @property
+    def spans(self) -> tuple:
+        """``(label, start, count)`` per source along the merged axis — the input
+        identity of every index, the same shape as :attr:`MultiSourceProvider.spans`."""
+        return tuple((self.labels[i], self._off[i], self._off[i + 1] - self._off[i])
+                     for i in range(len(self._srcs)))
+
+    def locate(self, i: int) -> Tuple[int, int]:
+        """Merged-axis index ``i`` → ``(source index, that source's own index)``."""
+        ii = min(max(0, int(i)), max(0, int(getattr(self.axes, self._axis)) - 1))
+        j = bisect_left(self._off, ii + 1) - 1
+        j = min(max(0, j), len(self._srcs) - 1)
+        return j, ii - self._off[j]
+
+    def level_axes(self, level: int) -> AxisSizes:
+        # Delegate the spatial halving to a real member (its pyramid geometry), then
+        # restore the concatenated axis to its own full extent.
+        base = self._srcs[0].level_axes(level)
+        return replace(base, **{self._axis: int(getattr(self.axes, self._axis))})
+
+    def read_region(self, level: int, m: int, t: int, z: int, c: int,
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
+        idx = {"m": m, "t": t, "z": z}
+        src_i, local = self.locate(idx[self._axis])
+        idx[self._axis] = local
+        return np.asarray(self._srcs[src_i].read_region(
+            level, idx["m"], idx["t"], idx["z"], c, y0, y1, x0, x1, b=b))
+
+    def fingerprint(self) -> tuple:
+        return ("axis_concat", self._axis, tuple(s.fingerprint() for s in self._srcs),
+                self._off)
+
+    @property
+    def version(self) -> Any:
+        return ("axis_concat", self._axis, tuple(s.version for s in self._srcs), self._off)
+
+#: Axes a chain's file members can be laid onto (:class:`AxisRespreadProvider`). ``y``/``x``
+#: are absent because a file boundary is not a spatial one: laying two files side by side in
+#: the field of view is a stitch (``util.stitch``), which needs overlap and blending rather
+#: than an index remap. ``m`` IS here — laying members onto positions is an ordinary chain,
+#: and for one already-ordered source it is the identity.
+RESPREAD_AXES: Tuple[str, ...] = ("t", "z", "c", "m")
+
+
+class AxisRespreadProvider(TileProvider):
+    """K file **members** laid end to end on one axis — ``util.chain``.
+
+    A member is one source file: a provider, the ``m`` offset at which that file's positions
+    begin inside it, and how many positions it holds. Two shapes of input collapse to the
+    same thing here, which is the point of taking triples rather than either one alone:
+
+    * a **file bundle** (:class:`MultiSourceProvider`) is ONE provider whose ``m`` already
+      holds K files end to end, so its members share a provider and differ in ``start``;
+    * **separately loaded files** are K providers each holding one file, so its members
+      differ in provider and all start at 0.
+
+    Either way member ``i`` owns ``m`` in ``[start_i, start_i + count_i)``, and::
+
+        in :  m = start_i + j        axis = a
+        out:  m = j                  axis = off_i + a          (axis != "m")
+        out:  m = off_i + j                                    (axis == "m")
+
+    where ``off`` is the exclusive prefix sum of the members' own extents along the chained
+    axis. So 120 single-position files each holding one frame become ``t = 0..119``; three
+    files holding 50, 30 and 50 frames become ``t = 0..129`` with each file's own frames
+    contiguous; and onto ``m`` the members simply line up as positions.
+
+    **Members may differ on the axis being chained — that is the whole point.** A series
+    exported in unequal chunks (5 frames, then 3) is still one series, and requiring the
+    chunks to match would refuse the ordinary case. Every OTHER axis must agree, because the
+    result is rectangular in those; ``m`` is exempt from that check too, since each member is
+    read through its own ``[start, start+count)`` window rather than whole.
+
+    **Nothing is resampled, blended or copied** — one output voxel is one input voxel, so a
+    read costs exactly what the un-chained read costs. That is why ``util.chain`` declares
+    ``TILEABLE`` despite changing two axes.
+
+    Members are in OUTPUT order, so the ordering decision — by the counting field in the
+    filenames (:mod:`nodegraph.file_sequence`) rather than by wiring order — is expressed
+    here and nowhere else, and folds into :meth:`version`: the same files chained the other
+    way round can never be served from each other's memo entry.
+    """
+
+    def __init__(self, members: Sequence[Tuple[TileProvider, int, int]], axis: str,
+                 labels: Optional[Sequence[str]] = None) -> None:
+        axis = str(axis).lower()
+        if axis not in RESPREAD_AXES:
+            raise ValueError(f"AxisRespreadProvider: axis must be one of {RESPREAD_AXES}, "
+                             f"got {axis!r}")
+        mem = [(p, int(s), int(n)) for p, s, n in members]
+        if not mem:
+            raise ValueError("a chain needs at least one file member")
+        first = mem[0][0].axes
+        # Every axis but `m` and the chained one. `m` is exempt because each member is read
+        # through its own window; the chained axis is exempt because laying files end to end
+        # along it is exactly what this provider does.
+        others = [a for a in ("b", "t", "z", "c", "y", "x") if a != axis]
+        for i, (prov, start, count) in enumerate(mem):
+            a = prov.axes
+            bad = [nm for nm in others
+                   if int(getattr(a, nm)) != int(getattr(first, nm))]
+            if bad:
+                want = tuple(int(getattr(first, nm)) for nm in others)
+                got = tuple(int(getattr(a, nm)) for nm in others)
+                raise ValueError(
+                    f"member {i} does not match member 0 on {', '.join(bad)}: "
+                    f"({', '.join(others)}) is {got}, member 0's is {want}. Chaining lays "
+                    f"files end to end on {axis.upper()} alone, so every OTHER axis has to "
+                    f"already agree — resample or crop upstream so they match, or chain "
+                    f"onto a different axis.")
+            if count < 1:
+                raise ValueError(
+                    f"member {i} holds {count} positions; every file must hold at least one.")
+            if start < 0 or start + count > int(a.m):
+                raise ValueError(
+                    f"member {i} occupies positions [{start}, {start + count}) but its "
+                    f"source has only {int(a.m)} — the source_file labels disagree with "
+                    f"the image.")
+        if axis != "m":
+            counts = {n for _, _, n in mem}
+            if len(counts) != 1:
+                raise ValueError(
+                    f"chaining onto {axis.upper()} needs every file to hold the same number "
+                    f"of positions (got {sorted(counts)}) — the result has ONE position "
+                    f"axis, so a file with more has nowhere to put them. Chain onto M "
+                    f"instead to keep them as separate positions.")
+        self._mem = tuple(mem)
+        self._axis = axis
+        self._n = mem[0][2]
+        # Each member's own extent along the chained axis — its position count onto `m`,
+        # otherwise its provider's own size on that axis. These are what differ.
+        self._ext = tuple(n if axis == "m" else max(1, int(getattr(p.axes, axis)))
+                          for p, _s, n in mem)
+        off, run = [0], 0
+        for e in self._ext:
+            run += e
+            off.append(run)
+        self._off = tuple(off)                      # exclusive prefix sums
+        self.axes = replace(first, m=run) if axis == "m" else \
+            replace(first, m=self._n, **{axis: run})
+        self.labels = tuple(labels) if labels is not None else \
+            tuple(f"file{i}" for i in range(len(mem)))
+        # Geometry and cost model are the members': this is a pure re-address, so it
+        # neither deepens the pyramid nor changes what a tile costs. The SHALLOWEST member
+        # bounds the shared pyramid (the `MultiSourceProvider` rule) so no read into a
+        # level this provider advertises falls off a shorter member's own.
+        self.levels = max(1, min(int(getattr(p, "levels", 1)) for p, _s, _n in mem))
+        self.tile = min(int(getattr(p, "tile", 512)) for p, _s, _n in mem)
+        self.depth = max((int(getattr(p, "depth", 0)) for p, _s, _n in mem), default=0)
+        self.cum_halo = max((int(getattr(p, "cum_halo", 0)) for p, _s, _n in mem), default=0)
+        self.plane_unit = any(bool(getattr(p, "plane_unit", False)) for p, _s, _n in mem)
+        self.volume_unit = any(bool(getattr(p, "volume_unit", False)) for p, _s, _n in mem)
+
+    @property
+    def members(self) -> tuple:
+        """``(provider, m start, position count)`` per file member, in output order."""
+        return self._mem
+
+    @property
+    def spans(self) -> tuple:
+        """``(label, start, count)`` per file along the chained axis — the same shape as
+        :attr:`AxisConcatProvider.spans`, so a caller reporting which file an index came
+        from does not care which of the two it is reading through."""
+        return tuple((self.labels[i], self._off[i], self._ext[i])
+                     for i in range(len(self._mem)))
+
+    def locate(self, i: int) -> Tuple[int, int]:
+        """Chained-axis index ``i`` -> ``(member index, that member's own index)``."""
+        ii = min(max(0, int(i)), max(0, int(getattr(self.axes, self._axis)) - 1))
+        j = bisect_left(self._off, ii + 1) - 1
+        j = min(max(0, j), len(self._mem) - 1)
+        return j, ii - self._off[j]
+
+    def level_axes(self, level: int) -> AxisSizes:
+        # A member owns the spatial pyramid; the re-addressed axes are this provider's own
+        # and never halve.
+        base = self._mem[0][0].level_axes(level)
+        run = int(getattr(self.axes, self._axis))
+        return replace(base, m=run) if self._axis == "m" else \
+            replace(base, m=self._n, **{self._axis: run})
+
+    def read_region(self, level: int, m: int, t: int, z: int, c: int,
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
+        idx = {"t": t, "z": z, "c": c}
+        if self._axis == "m":
+            member_i, local = self.locate(m)
+            m_in = self._mem[member_i][1] + local
+        else:
+            member_i, local = self.locate(idx[self._axis])
+            idx[self._axis] = local
+            m_in = self._mem[member_i][1] + int(m)
+        return np.asarray(self._mem[member_i][0].read_region(
+            level, m_in, idx["t"], idx["z"], idx["c"], y0, y1, x0, x1, b=b))
+
+    def fingerprint(self) -> tuple:
+        return ("axis_respread", self._axis,
+                tuple((p.fingerprint(), s, n) for p, s, n in self._mem))
+
+    @property
+    def version(self) -> Any:
+        return ("axis_respread", self._axis,
+                tuple((p.version, s, n) for p, s, n in self._mem))
+
+
 __all__ = ["TileProvider", "SyntheticProvider", "B2ndProvider", "ArrayProvider",
            "ChannelMergeProvider", "FrameSubsetProvider", "FrameSliceProvider",
+           "MultiSourceProvider", "AxisConcatProvider", "AxisRespreadProvider",
+           "BatchProvider", "BatchSliceProvider", "CONCAT_AXES", "RESPREAD_AXES",
            "subset_index"]

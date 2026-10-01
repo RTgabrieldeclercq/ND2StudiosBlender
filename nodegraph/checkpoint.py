@@ -40,7 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from nodegraph.dataset import AttributeLayer, AxisSizes, Dataset
-from nodegraph.domains import Domain
+from nodegraph.domains import AXIS_ORDER, Domain
 from nodegraph.metadata import MetaEnvelope
 from nodegraph.provider import B2ndProvider
 
@@ -745,8 +745,14 @@ def _domain(value: Any) -> Optional[Domain]:
 
 
 def _axes_of(man: Dict[str, Any]) -> AxisSizes:
+    """Axis sizes from a checkpoint manifest, driven off :data:`AXIS_ORDER` rather than a
+    literal key tuple so a new axis cannot be silently dropped here (V3.01 added ``b``).
+
+    A manifest written before an axis existed simply does not carry it, and the ``1``
+    default is then exactly right: a pre-batch checkpoint IS a one-member batch. That is
+    what makes this forward-compatible without a schema version bump."""
     a = man.get("axes", {}) or {}
-    return AxisSizes(**{k: int(a.get(k, 1) or 1) for k in ("m", "t", "z", "c", "y", "x")})
+    return AxisSizes(**{k: int(a.get(k, 1) or 1) for k in AXIS_ORDER})
 
 
 def open_checkpoint(dirpath: str) -> Dataset:
