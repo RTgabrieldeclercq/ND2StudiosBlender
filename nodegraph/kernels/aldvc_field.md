@@ -1,403 +1,353 @@
-# `aldvc_field` — DVC (ALDVC) kernel integration contract
+# `aldvc_field` — DVC (pyALDVC) integration contract
 
-Interface contract for wiring the vendored Augmented Lagrangian Digital
-Volume/Image Correlation kernel into a node system. Read this before calling
-`run_aldvc`.
-
----
+> **3D ONLY.** pyALDVC cannot correlate a single plane. 2D image correlation is
+> [`dic_correlate`](dic_correlate.md) (the pyALDIC sibling package), exposed as
+> `analysis.dic_correlate`.
 
 ## 1. Purpose + where the real math lives
 
-Given **two same-shape volumes** — a *reference* and a *deformed* one — the
-kernel computes a **dense displacement field** (in voxels) on a regular subset
-grid plus a **strain tensor field**. Works for 2D images `(H, W)` (DIC, 6-DOF
-affine subset warp) and 3D volumes `(Z, H, W)` (DVC, 12-DOF); dimensionality is
-inferred from `ndim`.
+Runs the **official pyALDVC** Augmented-Lagrangian Digital Volume Correlation solver
+over an ordered stack of 3D volumes and packages each frame pair as a `DVCResult` on
+a regular subset grid: dense displacement (voxels) + a strain tensor + a per-subset
+ZNCC.
 
-**The real math is IN-REPO**, not in a third-party package. `aldvc_field.py` is
-a clean-room numpy/scipy/scikit-image port of FranckLab's MATLAB ALDVC (Yang,
-Hazlett, Landauer & Franck, *Exp. Mech.* 2020), implemented natively in
-ND2Studios' `nd2studios/backend/dvc/` package and vendored here verbatim.
-Optional CuPy accelerates only the seed FFT (lazy import, CPU fallback).
+**All of the correlation math is EXTERNAL**, in the `al-dvc` package
+(`al_dvc.core.pipeline.run_aldvc`), imported **lazily**:
 
-Pipeline stages inside `run_aldvc`: **Stage 0** normalize + spline-prefilter →
-**Stage 1** FFT integer seed (multigrid) → **Stage 2** outlier clean + inpaint →
-**Stages 3–6** local IC-GN + ADMM global-compatibility loop → **Stage 7** strain.
+| | |
+|---|---|
+| package | `al-dvc` on PyPI, import name `al_dvc` |
+| source | <https://github.com/zachtong/pyALDVC> |
+| docs | <https://zachtong.github.io/pyALDVC/> |
+| DOI | 10.5281/zenodo.22883767 |
+| verified against | al-dvc **1.2.0**, numpy 2.4.6, scipy 1.18.0, numba 0.66.0 |
 
----
+It implements MATLAB `main_ALDVC.m` Sections 2–8: node grid → pyramid-NCC initial
+guess → 12-DOF local IC-GN (subproblem 1) → global compatibility solve (subproblem 2)
+with L-curve β auto-tuning → ADMM outer loop → strain. Same author as pyALDIC.
 
-## 2. Entry point
+**The in-repo math is ONLY the adapter:**
 
-Primary:
+* *input* — node params → an `al_dvc` `DVCPara` with the `(z,y,x)`→`(x,y,z)` reversal
+  and even/≥4 subset snapping (`build_dvcpara`); a lazy `VolumeProvider` over a
+  caller-supplied frame getter (`LazyVolumeProvider`).
+* *output* — the **load-bearing `[x,y,z]`→`[z,y,x]` reversal** of node coordinates,
+  displacement and the strain tensor, reshaped from pyALDVC's flat `(N, …)` node
+  arrays onto the `(Gz,Gy,Gx, …)` grid this repo's Point flattener expects
+  (`frame_to_dvcresult`, `_strain_tensor_zyx`).
+
+### What this replaced (2026-09-25)
+
+This module used to be a **2998-line clean-room numpy/scipy port** of FranckLab's
+MATLAB ALDVC. It was replaced wholesale: pyALDVC is the maintained implementation,
+it is numba/CUDA accelerated, and it carries its own validation against the same
+MATLAB reference. The port's dimension-agnostic leftovers that other nodes depend on
+(`DVCResult`, the subset `Grid`, the strain-measure stack, Lagrangian accumulation)
+moved to [`field_math`](field_math.md); nothing else survived.
+
+## 2. Entry points
 
 ```python
-def run_aldvc(
-    ref_vol: np.ndarray,
-    def_vol: np.ndarray,
-    voxel_size_um: tuple[float, ...],
-    params: dict,
-    progress_cb: Callable[[int], None] | None = None,
-    cancelled_cb: Callable[[], bool] | None = None,
-    u0_seed: np.ndarray | None = None,
-    use_fft_seed: bool = True,
-) -> DVCResult
+run_aldvc_series(get_volume, n_frames, shape, *, voxel_size_um, params=None,
+                 ref_indices=None, compute_strain=True, cumulative=False,
+                 progress_cb=None, stop_cb=None) -> list[DVCResult]
 ```
 
-Thin OO wrapper (identical behavior; forwards `**kwargs` such as `u0_seed`/
-`use_fft_seed`):
+The one you want. Correlates the whole ordered stack in **one** `al_dvc.run_aldvc`
+call and returns `n_frames - 1` results, for frames `1 … n_frames-1`.
+
+One call rather than N pair calls matters: pyALDVC builds the node grid once, caches
+each reference frame's bundle (normalized volume + its three gradient volumes) across
+every frame that references it, and auto-tunes β once per reference rather than once
+per pair. On an accumulative schedule that is a single reference bundle for the
+entire series.
 
 ```python
-ALDVCMethod().run(ref_vol, def_vol, voxel_size_um, params,
-                  progress_cb=None, cancelled_cb=None, **kwargs) -> DVCResult
+run_aldvc(ref_vol, def_vol, *, voxel_size_um=(1,1,1), params=None,
+          compute_strain=True, progress_cb=None) -> DVCResult
 ```
 
-Lower-level entry points also vendored (call these only if you are re-implementing
-the orchestration; **they do NOT do Stage-0 prep** — see gotchas):
+Convenience for a single pair. Raises if either volume is not 3-D, naming
+`dic_correlate` as the 2D route.
 
-- `run_admm(ref, defm_pref, grid, u0, subset_size, *, mu, admm_iterations, ...) -> ADMMResult`
-- `local_icgn(ref, defm_pref, grid, u0, subset_size, ...) -> (u_grid, F_grid, zncc_grid, iters_grid)`
-- `build_grid(shape, subset_size, subset_spacing) -> Grid`
-- `accumulate_incremental(grid, increments) -> [(t, u_accum_grid), ...]`
-- `build_accumulated_results(grid, increment_results, voxel_size_um, *, strain_type, strain_smooth) -> {t: DVCResult}`
-
----
+```python
+al_dvc_available() -> bool        # is the optional dep importable?
+build_dvcpara(params, voxel_size_um, *, n_frames=2, ref_indices=None) -> DVCPara
+frame_to_dvcresult(mesh, frame, strain, voxel_size_um, *, ...) -> DVCResult
+normalize_strain_type(name) -> str        # 'green-lagrange' -> 'green_lagrange'
+LazyVolumeProvider(get_volume, n_frames, shape, *, voi=None, cache_size=3)
+```
 
 ## 3. Inputs
 
-| name | Python type | array shape | dtype | axis order | units | required? / default | meaning & constraints |
-|---|---|---|---|---|---|---|---|
-| `ref_vol` | `np.ndarray` | `(H,W)` or `(Z,H,W)` | any real (cast internally to f32) | `(y,x)` / `(z,y,x)`, slowest-first | intensity | required | Reference (undeformed) image/volume. Pass **RAW** — `run_aldvc` normalizes it. |
-| `def_vol` | `np.ndarray` | same as `ref_vol` | any real | same as `ref_vol` | intensity | required | Deformed image/volume; **must match `ref_vol.shape` exactly**. Pass RAW. |
-| `voxel_size_um` | `tuple[float,...]` | len = `ndim` | float | `(y,x)` / `(z,y,x)` | µm/voxel | required (falls back to all-1.0 if `len != ndim`) | Physical voxel size; used only for the strain cross-axis rescaling and stored on the result. Displacements stay in **voxels** regardless. |
-| `params` | `dict` | — | — | — | — | required (may be `{}`; all keys defaulted) | Tunables — see §4. Unknown keys ignored. |
-| `progress_cb` | `Callable[[int],None]` | — | — | — | 0–100 | optional | Progress ticks. |
-| `cancelled_cb` | `Callable[[],bool]` | — | — | — | — | optional | Return `True` to abort → raises `InterruptedError`. |
-| `u0_seed` | `np.ndarray` | `(ndim, *grid_shape)` | float | mesh order, component-first | voxels | optional / `None` | Warm-start displacement (a prior frame's field). Used **only** when `use_fft_seed=False` **and** its shape equals `(ndim, *grid)`; otherwise silently ignored and the FFT seed runs. |
-| `use_fft_seed` | `bool` | — | — | — | — | optional / `True` | `True` = always run the FFT multigrid seed. `False` = warm-start from `u0_seed` (skips the FFT search). |
+| arg | shape / type | notes |
+|---|---|---|
+| `get_volume(i)` | `(nz, ny, nx)` array | any dtype; **every frame must have the same shape**. Frame 0 is the first reference. |
+| `n_frames` | int ≥ 2 | |
+| `shape` | `(nz, ny, nx)` | asserted against each fetched volume |
+| `voxel_size_um` | `(z, y, x)` floats | **slowest-first**, this repo's order. Positive and finite. |
+| `ref_indices` | `(n_frames-1,)` ints or None | `ref_indices[i]` is the reference for deformed frame `i+1`; must satisfy `0 <= ref_indices[i] <= i`. `None` falls back to `params["reference_mode"]`. |
 
----
+The caller owns all preparation: no file I/O, no m/t looping beyond the stack you
+hand it, no crop/downsample/registration/exclusion. Normalization IS done for you —
+pyALDVC's own `normalize_volume` (z-score over the VOI), so the numbers the solver
+sees match what it would compute from a plain list of volumes.
 
-## 4. Parameters (`params` dict keys)
+**Masks are not wired.** `LazyVolumeProvider.get_mask` returns `None`. pyALDVC's mask
+path also drives `subset_split` and the VOI, which the node does not expose; crop
+before you call.
 
-| name | type | default | valid range / choices | semantics |
-|---|---|---|---|---|
-| `subset_size` | int | 16 | 4–128 (even) | Edge length (voxels) of each correlation subset window. Larger = smoother/more robust, less local. Reduced **per axis** on an axis too short to hold it (shallow-Z stacks) — see `subset_shape_for`. |
-| `subset_spacing` | int | 10 | ≥1 | Spacing (voxels) between subset centers → sets grid density (measurement resolution). |
-| `search_radius` | int | 0 | ≥0 | Max residual seed displacement per axis for the FFT integer search. `0` → auto `max(4, subset_size)`. |
-| `border_margin` | int | auto | ≥0 | Extra inset (voxels) of the subset-center grid beyond `subset_size//2`, so the deformed **search window fits symmetrically** around every node. Auto = `min(search_radius, min(shape)//4 − subset_size//2)`. `0` reproduces the old flush-to-edge grid, where the outermost ring's seed cannot represent displacement of the clipped sign. ALDVC insets by `1 + round(winsize)` for the same reason. |
-| `seed_levels` | int | 3 | ≥1 | Coarse-to-fine multigrid pyramid levels for the integer seed. Higher brackets larger motion; `1` = single-scale. |
-| `correlation` | str | `"zncc"` | `"zncc"`, `"phase"` | Seed correlation metric. ZNCC = FFT normalized cross-correlation (robust to brightness/contrast); `phase` = phase cross-correlation. |
-| `mu` | float | 1e-3 | 1e-6–1.0 | ADMM `u`-coupling penalty. Weighted against the **ZNSSD-normalized** image Hessian (`2·H/f_norm²`), so it is a scale-free ratio — the paper's "O(10⁻³)∼O(10⁻¹) times the diagonal terms of a′_ip" — and is invariant to intensity units and subset size. |
-| `admm_iterations` | int | 4 | ≥0 | Outer ADMM iterations. `0` ⇒ pass-0 only = conventional local DVC + one global solve. |
-| `repair_zncc` | float | 0.6 | [-1,1] | ZNCC floor below which a subset is retried from each converged neighbour's affine warp, first-order-extrapolated (reliability-guided propagation). Nodes still below it afterwards are rejected and interpolated. `≤ -1` disables. **This is what makes large rotation/stretch work** — the seed is translation-only, so a 20–25° rotation otherwise leaves several voxels of error. |
-| `strain_type` | str | `"infinitesimal"` | `infinitesimal`, `green-lagrange`, `almansi`, `hencky` | Strain measure derived from the displacement gradient. |
-| `strain_smooth` | float | 0.0 | ≥0 | Gaussian σ applied to `û` before `∂u/∂x`. `0` (default) means strain comes from the ADMM's own compatible gradient `F̂ = Dû` (what ALDVC reports); `>0` re-differentiates a smoothed `û` instead. |
-| `f_smooth_passes` | int | 3 | ≥0 | Passes of a 3³ median filter applied to the locally measured `F` before it enters the augmented-Lagrangian RHS (ALDVC's `funSmoothStrain3`, which is **not** a no-op at its default sizes). `0` = off. |
-| `use_gpu` | bool | False | — | Route the **seed FFT** through CuPy if importable (CPU fallback). IC-GN always runs on CPU. Mutually exclusive with the multi-process seed (the GPU path keeps the volumes device-resident). |
-| `n_workers` | int | 0 | ≥0 | Process-pool workers for **both** the seed and the IC-GN sweeps. `0` = auto (`min(cores-1, 32)`); `1` = serial. Forced to `1` when `grid.n_nodes < 64`. |
-| `icgn_tol` | float | 1e-2 | >0 | IC-GN convergence tol (radius-weighted parameter step). The paper's own benchmarks used `1e-4`. |
-| `icgn_max_iter` | int | 100 | ≥1 | Max IC-GN iterations per subset. Hitting it marks the subset unconverged → rejected → interpolated. |
-| `admm_tol` | float | 1e-2 | >0 | ADMM stop: `‖Δû‖₂/√(ndim·N) < admm_tol` (all displacement DOFs, matching MATLAB's `norm(dU)/sqrt(numel(U))`). |
-| `cc_thresh` | float | 0.0 | [-1,1] | Absolute ZNCC floor for the seed/local field. **Off by default**, matching the reference run (`qDICOrNot = 0`). Prefer `repair_zncc`, which only rejects what propagation could not rescue. |
-| `median_thresh` | float | 0.0 | ≥0 | Normalized-median-test threshold (Westerweel–Scarano). **Off by default**, matching `main_ALDVC.m`'s cumulative branch (`medianFilterThreshold = 0`); the incremental branch uses `2.0`. An always-on test at 2.0 rejected up to 40 % of nodes on a valid large-strain field. |
+## 4. Parameters (`params` dict — pyALDVC defaults in parentheses)
 
-> `DVCParams` also carries `tracking_mode` and `newFFTSearch`, but `run_aldvc`
-> itself does **not** read them — they are series-level knobs handled by the
-> caller (cumulative-vs-incremental accumulation via `build_accumulated_results`,
-> and per-frame warm-start via the `u0_seed`/`use_fft_seed` arguments).
+Every key is optional; an empty dict reproduces `dvcpara_default()`. Names are this
+repo's; the `DVCPara` field each maps to is given.
 
----
+| key | → `DVCPara` | default | meaning |
+|---|---|---|---|
+| `subset_size` | `winsize[x,y]` | 32 | subset edge, **voxels**. Snapped UP to even ≥4 — `DVCPara` refuses anything else. Upstream's rule: ≥ 4–5× the speckle/pore diameter. |
+| `subset_size_z` | `winsize[z]` | 0 = same as lateral | axial subset edge; set it for anisotropic stacks (upstream's own advice, e.g. 32/32/16) |
+| `subset_spacing` | `winstepsize[x,y]` | 16 | node spacing, voxels. Half the subset for smooth fields, a quarter when chasing gradients. |
+| `subset_spacing_z` | `winstepsize[z]` | 0 = same as lateral | |
+| `search_radius` | `search_radius` | 0 = **leave to solver** (8) | NCC half-width at the coarsest pyramid level; auto-expands on clipped peaks |
+| `init_guess` | `init_guess_method` | `pyramid` | `pyramid` / `ncc` / `zero` / `previous` |
+| `global_shift` | `global_shift` | True | rigid whole-volume pre-shift by phase correlation |
+| `init_coarse_factor` | `init_coarse_factor` | 1 | >1: seed on every k-th node, interpolate U **and** F to the rest |
+| `prefilter_sigma` | `prefilter_sigma` | 0.0 | Gaussian pre-smoothing, voxels (0.6–1.0 for SNR < 5) |
+| `interp_method` | `interp_method` | `cubic` | `cubic` (Keys = MATLAB `ba_interp3`) / `bspline` / `linear` |
+| `icgn_max_iter` | `icgn_max_iter` | 100 | per-subset iteration cap |
+| `subset_stride` | `subset_stride` | 1 | sample every k-th subset voxel; **clamped** so ≥5 samples per axis remain |
+| `use_global_step` | `use_global_step` | True | False = plain local subset DVC |
+| `admm_iterations` | `admm_max_iter` | 4 | ≥1. Published guidance: 3–5 suffice. |
+| `mu` | `mu` | 1e-3 | ADMM penalty; upstream says it rarely needs changing |
+| `beta` | `beta` | 0.0 = **auto** | >0 pins it; 0 → `None` → L-curve sweep per reference frame |
+| `disp_smoothing` | `disp_smoothing` | 0.0 | Gaussian σ in **node** units |
+| `strain_smooth` | `strain_smoothing` | 0.0 | Gaussian σ in **node** units |
+| `strain_method` | `strain_method` | `plane_fit` | `plane_fit` / `fem` / `fd` / `direct` |
+| `strain_type` | `strain_type` | `infinitesimal` | `infinitesimal` / `green_lagrange` / `euler_almansi` / `hencky`; hyphenated and legacy spellings accepted via `normalize_strain_type` |
+| `strain_halfwidth` | `strain_plane_fit_halfwidth` | 1 | plane-fit window half-width in nodes (1 = 3×3×3) |
+| `backend` | `backend` | `auto` | `auto` / `numba` / `numpy` / `cuda` |
+| `n_threads` | `n_threads` | 0 = all cores | numba thread count (in-process; **no** spawn hazard) |
+| `tile_local` | `tile_local` | 0 = off | solve in boxes of this edge, in voxels, to bound memory |
+| `reference_mode` | `reference_mode` | `accumulative` | only read when `ref_indices` is None |
+
+`voxel_size_um` is passed through to `DVCPara.voxel_size` (reversed to `(x,y,z)`) and
+`units` is set to `"um"` — upstream warns if a scaled voxel size is still labelled
+`"voxel"`.
 
 ## 5. Output — `DVCResult` (dataclass)
 
-`d = ndim` (2 or 3); `grid = (Gy,Gx)` 2D or `(Gz,Gy,Gx)` 3D.
+`d = 3` always. `(Gz, Gy, Gx)` is the solver's node grid, **not** the image grid.
 
-| field | type | shape | dtype | axis order | units | meaning |
-|---|---|---|---|---|---|---|
-| `dim` | int | — | — | — | — | 2 or 3. |
-| `grid_coords` | ndarray | `(*grid, d)` | f64 | mesh order; last axis = component | voxels | Subset-center coordinates. `[...,0]` = slowest axis (y in 2D, z in 3D). |
-| `displacement_field` | ndarray | `(*grid, d)` | f64 | mesh order; last axis = component | **voxels** | Dense displacement. `[...,0]`=y/z, `[...,1]`=x/y, `[...,2]`=x. |
-| `voxel_size_um` | tuple | len `d` | float | `(y,x)`/`(z,y,x)` | µm | Stored voxel size (as passed / defaulted). |
-| `strain_field` | ndarray | `(*grid, d, d)` | f64 | mesh order; last two axes = tensor `[i,j]` | dimensionless | Strain tensor of the requested measure. |
-| `strain_type` | str | — | — | — | — | Echo of the `strain_type` used. |
-| `qfactor` | ndarray | `(*grid,)` | f64 | mesh order | — | Per-subset final ZNCC correlation confidence in `[-1,1]` (NaN = failed subset). |
-| `converged` | bool | — | — | — | — | ADMM convergence flag. |
-| `iterations` | int | — | — | — | — | ADMM iterations actually run. |
-| `mu`, `beta` | float | — | — | — | — | Penalty `mu` used and the L-curve-selected `beta`. |
-| `method`, `notes` | str | — | — | — | — | Human-readable provenance/summary. |
-| `diagnostics` | dict | — | — | — | — | `grid_shape`, `n_subsets`, `beta`, `admm_residuals`, `median_zncc`, `search_radius`, `n_workers`, `use_gpu`, `border_margin`, `n_repaired` (subsets rescued by reliability-guided propagation — a nonzero count means the translation-only seed was struggling, i.e. large rotation/stretch or weak texture). |
+| field | shape | meaning |
+|---|---|---|
+| `dim` | — | always 3 |
+| `grid_coords` | `(Gz,Gy,Gx,3)` | subset-centre coordinates in **voxels**, `[..., 0] = z` |
+| `displacement_field` | `(Gz,Gy,Gx,3)` | displacement in **voxels**, `[..., 0] = dz` |
+| `strain_field` | `(Gz,Gy,Gx,3,3)` | **symmetric** strain tensor, `[i,j]` over axes `(z,y,x)`, in **physical** units |
+| `strain_type` | str | the resolved `DVCPara.strain_type` |
+| `qfactor` | `(Gz,Gy,Gx)` | per-subset ZNCC |
+| `converged` | bool | True only if EVERY node's final status is `converged` |
+| `iterations` | int | ADMM steps actually run |
+| `mu`, `beta` | float | the values used (β is the auto-tuned one when auto) |
+| `method` | str | `"pyALDVC (al-dvc)"` |
+| `diagnostics` | dict | `engine`, `ref_frame`, `n_nodes`, `grid_shape`, `n_converged`, `n_nodes_bad`, `n_outlier`, `median_zncc` |
 
-Convenience methods: `.magnitude` (voxels), `.displacement_um()` (per-axis
-`× voxel_size_um`), `.magnitude_um()`.
-
----
+`DVCResult.displacement_um()` applies `voxel_size_um`; the node's Point flattener
+(`catalog/_shared/dvc.py::_dvc_rows`) does the same multiply.
 
 ## 6. Conventions & GOTCHAS (the real integration risk)
 
-1. **Axis order is slowest-axis-first, matching numpy array axes.** 2D = `(y,x)`,
-   3D = `(z,y,x)`. Every grid coordinate and displacement **component** uses this
-   same order: component `0` is `y` (2D) / `z` (3D). Do **not** feed `(x,y,...)`
-   ordered data or you will silently transpose the field.
-2. **`F[i,j] = ∂u_i/∂x_j`** (component `i`, derivative axis `j`), mesh order.
-   Strain last-two-axes are `[i,j]` in the same convention.
-3. **DOF pack/unpack layout is load-bearing.** `pack_u`/`unpack_u`
-   (`u_vec[ndim*p + c]`) and `pack_F`/`unpack_F`
-   (`F_vec[ndim²*p + (j*ndim + i)]`, component `i` fastest, then derivative axis
-   `j`, node `p` in C-order) **must** match the sparse finite-difference operator
-   `D` built in `_build_fd_operator` so that `D @ u_vec ≈ F_vec`. Do not reorder
-   either side independently — they are a matched pair.
-4. **Displacements come out in VOXELS**, always — never µm — regardless of
-   `voxel_size_um`. To get µm, use `.displacement_um()` (multiplies each component
-   by `voxel_size_um[c]`).
-5. **Voxel ↔ µm contract under downsampling (CALLER'S JOB).** If the caller
-   downsampled the volumes by factor `s` before calling, the returned voxels are
-   *downsampled* voxels. Scale `voxel_size_um` by `s` (`voxel_size_um_effective =
-   original_um_per_voxel * s`) so `.displacement_um()` / strain stay physically
-   correct. The kernel has no knowledge of any caller-side downsample.
-6. **2D vs 3D is inferred from `ndim`.** A volume with a singleton Z (`(1,H,W)`)
-   is treated as **3D** and will misbehave — the **caller must `np.squeeze` a
-   singleton-Z volume to 2D** before calling.
-7. **Stage-0 prep is internal to `run_aldvc` ONLY.** `run_aldvc` normalizes both
-   volumes (min/max → [0,1] f32) and spline-prefilters the deformed one. So pass
-   `run_aldvc` **RAW** arrays. But `run_admm` / `local_icgn` expect
-   `defm_pref` = the deformed volume **already** normalized AND
-   `scipy.ndimage.spline_filter`ed (order 3); their per-iteration sampling is
-   `map_coordinates(order=3, prefilter=False)`. Do not pass a raw deformed volume
-   to those lower-level functions.
-8. **Strain non-cubic-voxel rescaling** multiplies each `G[i,j]` by
-   `voxel_i/voxel_j` — this is applied inside `compute_strain` when
-   `voxel_size_um` is given; strain is therefore dimensionless and physically
-   correct for anisotropic (confocal z-step ≠ xy) voxels.
-9. **`n_workers > 1` uses a `ProcessPoolExecutor` (spawn on Windows)** with
-   volumes in `multiprocessing.shared_memory`. The worker function
-   (`_icgn_block`) is pickled by qualified name, so **the module must be
-   importable in the child** — i.e. the caller's `sys.path` (and any wrapper
-   `__main__` guard) must let a spawned process `import aldvc_field`. The
-   `n_workers = 1` path is a plain in-process loop with no such requirement and is
-   the safe default when embedding.
-10. **Failed/low-confidence subsets are NaN'd then inpainted** by a discrete
-    **harmonic (Laplace) fill** — exact for a locally linear field, which is the
-    regime a displacement field is in over one grid step. (The earlier
-    nearest-finite-value EDT fill produced piecewise-constant blocks whose interior
-    gradient is zero and whose edge is a step, and those blocks fed straight into
-    `D` and the strain gradient.) `qfactor` still marks the originally-failed
-    subsets. A subset is rejected if it is non-finite, hit `icgn_max_iter`, or is
-    still below `repair_zncc` after the propagation pass.
-11. **Grid insetting & minimum size.** Centers are inset by
-    `subset_size//2 + border_margin`; the margin shrinks before the half-window
-    does. Tiny axes fall back to a midpoint, and an axis that could hold ≥2 centers
-    is forced to ≥2 (the FD operator and `np.gradient` need ≥2 nodes). An axis too
-    short for the isotropic window gets a **reduced window on that axis only**
-    (`subset_shape_for`) rather than centers whose window hangs off the end.
-12. **The global solve does not overwrite the grid's outer node shell.** ALDVC's
-    Neumann bookkeeping (`notNeumannBCInd_U`/`_F`) keeps boundary nodes at their
-    local IC-GN values for both `û` and `F̂`, because `D`'s one-sided border
-    stencil is a different operator from its central-difference interior. Pass
-    `restrict_boundary=False` to `AugLagGlobalStep.solve` to opt out.
-13. **Subpb1 inside the ADMM loop solves only the `ndim` translation DOFs**, with
-    the affine part frozen at the compatible `F̂ = Dû`, and then takes `F₁ := F̂`.
-    That is the paper's own simplification (p. 1209) and `funICGN_Subpb13`'s
-    behaviour; re-fitting all 12 DOF from `G = 0` each iteration threw away the
-    global step's regularized affine field and made the loop oscillate.
-14. **Out-of-volume subset voxels are masked out of the correlation**, not
-    edge-replicated into it: the means, norms, residual, Hessian and RHS are all
-    recomputed on the surviving voxels (`min_valid` = 0.5 of the window). The
-    reference rejects the whole subset on the first out-of-bounds voxel; accepting
-    up to 20 % fabricated voxels (the earlier behaviour) is worse than either.
-15. **The reference-subset cache is byte-budgeted.** A cached `_RefSubset` is
-    ~0.89 MB for a 21³ 3-D subset, so caching every node of a reference-sized grid
-    (39 k nodes) would want ~35 GB *per process*. `RefCache` caps it and simply
-    recomputes beyond the cap.
+### 6a. THE AXIS REVERSAL — the single load-bearing adapter
 
----
+pyALDVC and this repo order axes **oppositely**. Everything in `frame_to_dvcresult`
+exists to bridge it.
 
-## 6b. Measured accuracy (what "works" means here)
-
-Run by `scripts/_aldvc_validate.py`. Three independent kinds of truth, because a
-port can be self-consistent and uniformly wrong:
-
-**A — exact truth.** The paper's own homogeneous benchmark (Fig. 2) on
-Appendix-D Gaussian-PSF bead volumes (96³, ws=20, st=10, 4 ADMM iterations),
-with the deformed volume built by re-placing every bead at its *analytically*
-deformed centre, so no interpolation enters the ground truth. RMS displacement
-error over the interior nodes, paper Eq. (13), in voxels:
-
-| case | range | RMS \|u\| | strain RMS | measured vs exact e_xx |
-|---|---|---|---|---|
-| x-translation | 0 → 1 vox | 0.0001 – 0.0020 | ≤1.3e-5 | 0 / 0 |
-| uniaxial stretch | λ = 1.00 → 1.30 | 0.0001 – 0.0025 | ≤1.2e-4 | +0.30014 / +0.30000 (λ=1.3) |
-| z-rotation | 0° → 25° | 0.0001 – 0.0016 | ≤1.7e-4 | −0.09368 / −0.09369 (25°) |
-
-Sub-voxel translations sit at ~2e-3 rather than ~1e-4 — that is the cubic
-interpolation bias (Bornert 2017, O(10⁻³) voxels), i.e. the floor, not the method.
-Re-running with `--warp` (the paper's own resample-based generation) gives
-0.0003 – 0.0012 across the same sweep.
-
-**B — MATLAB parity.** FranckLab's distributed SEM-Challenge Sample 14 volumes
-(`vol_Sample14_1001/1002`, 192×192×2048) at the reference's own ws=20/st=10,
-compared node-for-node against the `results_S14_ws20_st10.mat` that MATLAB
-produced from the same inputs (39 004 nodes, 150 s at 20 workers):
-
-- **β selected = 0.031623, MATLAB β = 0.031623** — the L-curve now picks the
-  reference's value exactly.
-- field agreement vs MATLAB ALDVC: **0.0115 vox** (x), 0.0089 (y), 0.0089 (z).
-  For scale, the paper's Table 1 quotes ALDVC's own x-displacement RMS error on
-  this case as 0.0128 vox — the two implementations agree to within the
-  reference's published error.
-
-**C — invariant.** The same deformation is imposed along x only, so u_y ≡ u_z ≡ 0
-is truth with no reference at all: **RMS 0.0050 vox** on Sample 14. On the
-distributed uniaxial-stretch volumes (`vol_stretch_1001/1002`, 192×512×512,
-ws=30/st=10, 20 339 nodes, 318 s), whose deformation an independent robust affine
-probe measures as `∂u_x/∂x = 0.05000` with every other gradient ≤1e-4: measured
-**e_xx = 0.049996 ± 0.00019** and u_y/u_z RMS 0.0030/0.0031 vox.
-
-(The `results_uniaxial_stretch_ws30_st10.mat` shipped alongside those volumes was
-produced from frames **1001 vs 1006**, not 1001 vs 1002, so its recorded
-β = 3.16e-4 is not a parity target for this pair — a different deformation
-magnitude legitimately selects a different β. Sample 14 is the β parity test, and
-there the match is exact.)
-
-**D — real experimental data.** ALDVC's own polyacrylamide indentation dataset
-(`hydrogel_indentation_20190504_cut_01/02`, 306×1024×1024 uint16 — `cut_01` is
-the stress-free reference, `cut_02` the indented state), on the paper's own VOI
-and DVC settings (MATLAB `[320,728]×[320,728]×[20,164]`, ws=32, st=8, voxel
-0.42/0.42/0.425 µm) — 15 876 nodes, 800 s at 20 workers. There is no ground
-truth, so what is checkable is sign, scale, shape and smoothness:
-
-| quantity | measured | paper (Fig. 7/8) |
+| quantity | pyALDVC native | what this kernel returns |
 |---|---|---|
-| u_x range | −1.03 … +2.00 µm | −2 … +3 µm |
-| u_y range | −1.77 … +1.25 µm | −2 … +2 µm |
-| u_z range | −1.95 … +1.31 µm | −2 … 0 µm |
-| u_z sign under the indenter | median −0.267 µm, 98 % of nodes negative | compression |
-| e_zz median | −0.019 | −0.08 … 0 |
-| e_xz range | −0.105 … +0.113 | ±0.06 |
-| median ZNCC | 0.924 | — |
-| mean node-to-node jump | 0.051 µm (1.6 % of the field's range) | — |
+| volume array | `(nz, ny, nx)` | same — no change |
+| `DVCPara` triples | `(x, y, z)` | caller passes `(z, y, x)` |
+| node coordinates | `(N,3)` `[x, y, z]` | `(Gz,Gy,Gx,3)` `[z, y, x]` |
+| displacement `U` | `(N,3)` `[u, v, w]` | `(Gz,Gy,Gx,3)` `[dz, dy, dx]` |
+| gradient `F[i,j]` | `du_i/dx_j`, `i,j ∈ xyz` | strain `[i,j]`, `i,j ∈ zyx` |
 
-Swapping reference and deformed returns very nearly the negated field (u_z median
-+0.280 vs −0.267 µm; e_zz +0.019 vs −0.019), i.e. the solve is self-inverse to
-~5 % — the residual is the genuine finite-strain asymmetry, and this is a useful
-consistency check on any real dataset where no truth exists.
+The reversal is a full `[::-1]` on the component axis — and on **both** tensor axes
+for strain. **Reversing one and not the other transposes the strain tensor, which is
+invisible on any symmetric fixture.** That is why `scripts/_aldvc_validate.py`
+group B uses an *asymmetric* gradient (`du_x/dy = 0.030`, `du_y/dx = 0.010`).
 
-The ADMM did **not** reach `admm_tol` in 4 iterations on this dataset — which is
-consistent with the paper, whose own indentation run "converged after 6 ADMM
-iterations". Raise `admm_iterations` for experimental data; 4 is tuned to the
-synthetic cases.
+`mesh.grid_shape` is already `(nz, ny, nx)` node counts with node
+`n = iz*ny*nx + iy*nx + ix`, so a plain C-order reshape lands on the right grid — the
+**component** axis is the only thing that needs reversing, never a transpose of the
+grid itself.
 
-Regression to watch: the pre-fix kernel scored RMS 1.74 vox at λ=1.2 and 6.23 vox
-at 25° rotation, with e_xx reading 0.080 against 0.200 exact — while median ZNCC
-stayed at 0.99, i.e. **the correlation quality metric did not reveal the error.**
-Do not treat a healthy `qfactor` as evidence the field is right; run suite A.
+### 6b. pyALDVC is NOT pyALDIC on signs — do not "fix" it
 
----
+`dic_correlate` has to **negate** pyALDIC's two 2D strain cross-terms. **pyALDVC does
+not need this**, and adding it by analogy with the sibling package would introduce a
+bug. Measured 2026-09-25 against analytic truth on a 72³ bead volume:
 
-## 7. Dependencies (pip names)
-
-| package | why | import-time or lazy |
+| fixture | truth | pyALDVC returns |
 |---|---|---|
-| `numpy` | arrays throughout | **import-time** (module top) |
-| `scipy` | `ndimage` (spline_filter, map_coordinates, gradient/median filters, EDT), `sparse` + `sparse.linalg` (FD operator + factorized solve), `interpolate` (RegularGridInterpolator), `signal` (fftconvolve NCC) | **import-time** |
-| `scikit-image` (`skimage`) | `registration.phase_cross_correlation` (the `correlation="phase"` seed) | **import-time** |
-| `cupy` (+ `cupyx`) | GPU seed FFT when `use_gpu=True` | **lazy / optional** — imported inside `_get_backends`/`_to_host`, guarded by `importlib.util.find_spec`; absent → CPU. Not required to import or run. |
+| translation `t=(+2,+1,-1.5)` in `(x,y,z)` | — | `U` median `[+1.9999, +1.0000, -1.5001]` |
+| simple shear `du/dy=+0.02` | `F[0,1]=+0.02`, `F[1,0]=0` | `+0.0202`, `+1e-5` |
+| **antisymmetric** `du/dy=+0.02, dv/dx=-0.02` | `+0.02`, `-0.02` | `+0.0202`, `-0.0202` |
 
-Standard-library only otherwise (`multiprocessing.shared_memory`, `concurrent.futures`,
-`dataclasses`, `typing`, `os`, `contextlib`, `importlib`).
+The antisymmetric fixture is the one that would expose a negation or a transpose, and
+it exposes neither. Its rigid-rotation reading is the standing regression: a rotation
+must give **zero** infinitesimal shear strain, so a single negated cross-term would
+read `±g` instead of `~0`.
 
----
+### 6c. Tensor shear, not engineering shear
+
+`StrainResult.exy/exz/eyz` are **tensor** shear (½ the engineering shear): the
+`du/dy = +0.02` fixture reports `exy = +0.0101`. That matches
+`field_math.strain_from_gradient`'s `½(G+Gᵀ)`, so the two are interchangeable and the
+Point columns mean what they always did.
+
+### 6d. Displacement is voxels, strain is physical — deliberately
+
+`displacement_field` comes from `FrameResult.U`, which stays in **voxels** whatever
+`voxel_size` is. `strain_field` comes from `StrainResult`, which pyALDVC computes in
+**physical** units (`scale_to_physical(U, F, para.voxel_size)`).
+
+This split is load-bearing for anisotropic voxels. A confocal z-step of 0.5 µm against
+a 0.1 µm xy pixel makes every off-diagonal strain term wrong by the 5× anisotropy
+ratio unless the solver is told the voxel size — so `voxel_size_um` **is** passed
+through, and strain comes back dimensionless-correct. Validated: with
+`voxel_size_um=(0.5,0.2,0.2)`, `strain[x,z]` scales by exactly `v_x/v_z = 0.400`
+while `strain[x,y]` (both axes lateral) is unchanged, and displacement does not move
+at all.
+
+### 6e. Geometry constraints that reject a volume outright
+
+Three separate rules, each raising from a different place upstream:
+
+1. `al_dvc.utils.validation` — **every axis must be ≥ 16 voxels**.
+2. same — **`winsize[axis] + 11 ≤ extent[axis]`** (subset half-width plus a 5-voxel
+   margin each side).
+3. `al_dvc.mesh.grid_mesh.build_grid_axes` — **≥ 2 nodes per axis**, i.e.
+   `extent - winsize - 10 ≥ winstepsize`, where the border is
+   `GRADIENT_BORDER + INTERP_MARGIN = 5`.
+
+A shallow confocal stack hits (1) and (3) first. The fix is `subset_size_z` /
+`subset_spacing_z`, which is why those sockets exist. The smallest fixture that
+satisfies all three and still yields a 3×3×3 grid is `(28, 44, 44)` with subset
+12 / axial 8 and step 10 / axial 4 — that is exactly the selftest's fixture.
+
+### 6f. `beta = 0` means auto, and `search_radius = 0` means "solver's default"
+
+`DVCPara` refuses a non-positive `beta` and treats `None` as "auto-tune by L-curve",
+so this repo spells auto as `0`. Likewise `search_radius = 0` would make the NCC seed
+a single-point lookup, so `0` is mapped to "omit the key" and upstream's 8 applies.
+Neither can be passed through literally.
+
+### 6g. Threads, not processes
+
+The old port forced `n_workers=1` because it used a process pool and embedding it
+risked a spawn/import hazard. pyALDVC uses **numba's in-process thread pool**, so
+`n_threads=0` (all cores) is safe inside the engine and is the default. There is no
+spawn hazard to avoid any more.
+
+### 6h. First call in a process is slow
+
+Numba compiles on first use. Measured on the selftest fixture: **2.30 s** cold,
+**0.02 s** warm — the JIT cache is on disk, so it is a per-machine one-off, not a
+per-process one. `al_dvc.warmup()` exists if you want to pay it at start-up.
+
+## 7. Dependencies
+
+| pip name | import | required? |
+|---|---|---|
+| `al-dvc` | `al_dvc` | **optional, lazily imported** |
+| `numpy` | `numpy` | yes (top-level) |
+
+Importing this module never imports `al_dvc`: the catalog loads on a machine without
+it and only a *pull* fails, with `INSTALL_HINT`. Install with `pip install al-dvc`,
+or `pip install "al-dvc[gpu]"` for the CUDA local solver. `al-dvc` itself pulls
+numba, scipy, h5py, tifffile, pyyaml, matplotlib and — for its own desktop app, not
+for this kernel — pyvista/pyvistaqt/vtk.
 
 ## 8. Failure modes / edge cases
 
-- **Shape mismatch** `ref_vol.shape != def_vol.shape` → `ValueError`.
-- **Wrong ndim** (`ndim not in {2,3}`) → `ValueError`.
-- **Constant/degenerate volume** → normalized to all-zeros; featureless subsets
-  are skipped (their `qfactor` stays NaN, displacement inpainted from neighbors).
-- **Singleton-Z `(1,H,W)`** → treated as 3D, will produce a degenerate z-grid;
-  squeeze to 2D first (gotcha 6).
-- **`cancelled_cb()` returns True** → raises `InterruptedError("DVC cancelled")`.
-- **Missing CuPy with `use_gpu=True`** → silent CPU fallback (no error).
-- **Empty/too-small grid** (`n_nodes < 64`) → forces `n_workers=1`.
-- **All-NaN local field** (every subset failed) → `inpaint_nans` returns zeros;
-  result is finite but zero displacement.
-- **Spawned-worker import failure** (`n_workers>1`, module not importable in
-  child) → a `ProcessPoolExecutor` error; use `n_workers=1` if the embedding host
-  cannot make `aldvc_field` importable in child processes.
-
----
+| situation | behaviour |
+|---|---|
+| `al_dvc` not installed | `RuntimeError(INSTALL_HINT)` naming the package and the install line |
+| 2-D input to `run_aldvc` | `ValueError` pointing at `dic_correlate` |
+| ref/def shapes differ | `ValueError` naming both shapes |
+| any axis < 16 voxels | upstream `ValueError` (see 6e) |
+| subset too large for the axis | upstream `ValueError` naming the needed extent |
+| fewer than 2 nodes on an axis | upstream `ValueError` suggesting smaller winsize/step |
+| `voxel_size_um` not length 3, or ≤ 0 | `ValueError` from `build_dvcpara` |
+| `ref_indices[i] > i` | upstream `ValueError` — no frame may reference a future one |
+| unknown `strain_type` | `ValueError` listing the four valid measures |
+| a frame's shape ≠ `shape` | `ValueError` from `LazyVolumeProvider` naming the frame index |
+| no usable CUDA device with `backend="auto"` | logs one line and falls back to CPU; `backend="cuda"` raises instead |
 
 ## 9. Minimal runnable example
 
 ```python
-import sys; sys.path.insert(0, "pure_analysis")
 import numpy as np
-from scipy.ndimage import gaussian_filter, shift as ndshift
-import aldvc_field as A
+from al_dvc import synthetic as syn
+from nodegraph.kernels.aldvc_field import run_aldvc
 
-rng = np.random.default_rng(0)
-ref = gaussian_filter(rng.random((72, 72)).astype(np.float32), 1.5)   # (y, x)
-defm = ndshift(ref, shift=(1.0, 2.0), order=3, mode="nearest")        # dy=1, dx=2
+ref = syn.generate_bead_volume((72, 72, 72), n_beads=9000, radius=1.8, seed=0)
+dfm = syn.warp_volume_lagrangian(ref, syn.affine_displacement(t=(2.5, 0.0, 0.0)))
 
-res = A.run_aldvc(
-    ref, defm, voxel_size_um=(1.0, 1.0),
-    params=dict(subset_size=16, subset_spacing=12,
-                admm_iterations=2, seed_levels=1, n_workers=1),
-)
+r = run_aldvc(ref, dfm, voxel_size_um=(0.5, 0.2, 0.2),
+              params=dict(subset_size=24, subset_spacing=12, admm_iterations=3))
 
-print(res.displacement_field.shape)   # (5, 5, 2)   -> (*grid, ndim)
-print(res.strain_field.shape)         # (5, 5, 2, 2)
-d = res.displacement_field
-print(np.nanmedian(d[..., 0]), np.nanmedian(d[..., 1]))  # ~0.999 (y), ~1.998 (x)
+print(r.displacement_field.shape)          # (Gz, Gy, Gx, 3)
+print(np.median(r.displacement_field[..., 2]))   # ~2.5 voxels along x
+print(np.nanmedian(r.qfactor))             # ~1.0 on synthetic data
+print(r.strain_field.shape, r.strain_type) # (Gz, Gy, Gx, 3, 3) infinitesimal
 ```
 
-3D is identical with `(Z,H,W)` inputs and `voxel_size_um=(z,y,x)`; output
-displacement is `(*grid, 3)` with component order `(z, y, x)`.
+## 10. Pipeline wiring (nodegraph)
 
----
+`analysis.dvc_field` (label **DVC (pyALDVC)**) calls `run_aldvc_series` **once per
+m-position** over the whole T stack, then flattens each frame with
+`catalog/_shared/dvc.py::_dvc_rows` into Point rows carrying `disp_*` in µm, nine
+`strain_*` columns and `qfactor`.
 
-## 10. Pipeline wiring (in the original ND2Studios pipeline)
-
-**Upstream (caller owns all of it — NOT vendored):**
-the DVC node handler / plane_runner selects a reference frame and a deformed
-frame from an ND2 multipoint/timeseries, applies any crop / downsample /
-registration / exclusion mask, and squeezes singleton-Z. It then calls the kernel
-**once per reference→deformed pair**. Voxel size is taken from `ND2Metadata`
-(scaled by any downsample factor per gotcha 5).
-
-**This kernel** = the `DVC (ALDVC)` node body: two prepared volumes in → one
-`DVCResult` (dense voxel displacement + strain) out.
-
-**Downstream:** for **incremental** tracking mode the per-step `DVCResult`s are
-composed into cumulative fields by `build_accumulated_results` (Lagrangian
-point-tracking through the increments) — also vendored here. The `DVCResult`
-(displacement/strain/qfactor grids) then feeds visualization (voxel/surface
-render, quiver, strain heatmaps) and the `.nd2dvc` export bundle. None of that
-downstream rendering/export code is vendored — only the accumulation helper.
-
----
+* Footprint `Granularity.WHOLE_SERIES`, `kernel_axes={t,z,y,x}` — it crosses T.
+* `reference_mode` `fixed_frame` → the reference volume is **prepended** as frame 0
+  and `ref_indices` is all-zero. That keeps pyALDVC's DAG rule (`ref[i] <= i`)
+  satisfied for **any** `reference_frame`, including one later in the series than the
+  frame being correlated. `previous_frame` → `ref_indices = (0,1,…,T-2)` and t=0
+  yields no row.
+* The optional `reference` Dataset input takes the same prepended-frame-0 path, so a
+  separate undeformed stack becomes the reference.
+* Downstream: `analysis.accumulate_field` composes a `previous_frame` increment
+  series into a cumulative field (via [`field_math`](field_math.md)), and
+  `transform.rasterize_field` interpolates the sparse Point grid onto voxels.
 
 ## 11. Provenance
 
-Branch **`Version-1.45`**. Byte-copied (deps-first) from:
+* **Solver** — external, `al-dvc` 1.2.0 (pyALDVC), Zach Tong.
+  <https://github.com/zachtong/pyALDVC>, DOI 10.5281/zenodo.22883767.
+* **Method** — Yang, Hazlett, Landauer & Franck, *Augmented Lagrangian Digital Volume
+  Correlation*, Exp. Mech. 60 (2020), DOI 10.1007/s11340-020-00607-3;
+  <https://github.com/FranckLab/ALDVC>.
+* **Adapter** — in-repo, written 2026-09-25, replacing the in-repo clean-room port
+  that had held this filename since the v1 vendoring pass.
 
-```
-nd2studios/compute/parallel/shared_array.py   (shared_ndarray, attach_shared)
-nd2studios/core/dvc_registry.py               (DVCResult, DVCParams)
-nd2studios/backend/dvc/mesh.py
-nd2studios/backend/dvc/outliers.py
-nd2studios/backend/dvc/strain.py
-nd2studios/backend/dvc/integer_search.py
-nd2studios/backend/dvc/global_step.py
-nd2studios/backend/dvc/icgn.py
-nd2studios/backend/dvc/parallel.py
-nd2studios/backend/dvc/admm.py
-nd2studios/backend/dvc/engine.py
-nd2studios/backend/dvc/tracking.py
-nd2studios/backend/dvc/method.py
-```
+## 12. Validation (2026-09-25, al-dvc 1.2.0 — `scripts/_aldvc_validate.py`)
 
-Dropped (UI/registry-only, not on the compute path): the `DVCMethod` ABC registry
-base + `@register` decorator + `get_methods`/`get_method`, `ALDVCMethod.get_params()`
-(ParamSpec UI list), and the `ParamSpec` import. No compute-path code altered; no
-helper renamed (no cross-module collisions).
-```
+Upstream validates the **solver** against the MATLAB reference; re-running the
+paper's benchmark here would measure upstream's code. This repo validates the
+**adapter**, whose failure modes all produce a correctly-shaped field of finite
+numbers that is transposed, negated or mis-scaled. Five groups, 18 checks, all
+passing:
+
+| group | what it pins | representative result |
+|---|---|---|
+| A axis isolation | the `[x,y,z]`→`[z,y,x]` reversal | `+2.5` vox on x → `[0.0001, -0.0001, 2.5001]` |
+| B strain relabelling | `_strain_tensor_zyx`, via an **asymmetric** gradient | `strain[x,y] = 0.02024` for mean(0.030, 0.010) = 0.020; `[x,y] == [y,x]`; a +4% x-stretch lands on `[x,x]`, not `[z,z]` |
+| C sign | pyALDVC does **not** negate (pyALDIC does) | rigid rotation → `strain[x,y] = −1e-5`, not `+0.020`; `u_y = −g·(x−cx)` to 0.0044 vox |
+| D anisotropic voxels | `voxel_size` pass-through and its `(x,y,z)` order | `strain[x,z]` ratio **0.400** = `v_x/v_z` exactly; `strain[x,y]` unchanged; displacement unchanged |
+| E frame schedule | `ref_indices` pairing and grid reuse | accumulative `[0.894, 1.792, 2.693]` vs truth `[0.9, 1.8, 2.7]`; incremental `[0.894]×3`; one shared grid |
+
+Run it with `PYTHONUTF8=1 python scripts/_aldvc_validate.py` (add `--quick` for
+groups A and C only). It is **not** part of `nodegraph.selftest` — it runs a real
+solver a dozen times. The selftest's own DVC group covers the wiring, the schema, the
+calibration fence and the retired-param refusal.
