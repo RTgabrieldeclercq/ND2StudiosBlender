@@ -19,14 +19,16 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import nodegraph.nodes  # noqa: F401 — registers the node catalog into NODES
 from nodegraph import hotreload
+from collections import OrderedDict
+
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QApplication, QDialog, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QMainWindow, QMessageBox, QProgressBar, QSplitter, QToolButton, QVBoxLayout,
     QWidget,
 )
@@ -34,13 +36,14 @@ from PySide6.QtWidgets import (
 from nodegraph.iterate import (
     ITERATE_OP, SWEEP_KEY, SWEEP_OWNER_KEY, SWEEP_ROWS_KEY, plan as iterate_plan)
 from nodelab_v2 import theme as T
+from nodelab_v2.console import ConsolePanel
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
 from nodelab_v2.minimap import MiniMapOverlay
 from nodelab_v2.node_item import NodeItem
-from nodelab_v2.ops import DOCK_OP, LOAD_OP, PRECISION_UNSET
+from nodelab_v2.ops import MOVIE_OP, CALIB_OVERRIDE_KEYS, DOCK_OP, LOAD_OP, PRECISION_UNSET
 from nodelab_v2.palette import PalettePanel
 from nodelab_v2.picker import Calibration
 from nodelab_v2.runner import EngineRunner, ensure_gui_ops
@@ -72,6 +75,16 @@ PROGRESS_BAR_H = 5     # one of the two stacked bars (frame above, within-frame 
 #: in a column rather than on top of each other; this is wide enough that they read as
 #: separate sources and leave room to drop a first processing node beside each.
 SOURCE_STACK_GAP = 34
+
+#: horizontal offset of the ``util.chain`` card the sequence loader drops beside its bundle
+#: (scene px). Wide enough that the wire between them is visibly a wire rather than two
+#: touching cards — a source card is ~214 px, so this leaves a clear ~90 px span.
+SEQUENCE_CHAIN_GAP = 306
+
+#: What the axis a sequence was chained onto is CALLED, for the status line. The keys are
+#: ``util.chain``'s own ``chain_axis`` values; "M" is absent because the loader never drops
+#: a chain card for it (re-addressing onto M is the identity the bundle already performed).
+_AXIS_NOUN = {"T": "timepoints", "Z": "focal planes", "C": "channels"}
 PROGRESS_BAR_GAP = 2
 
 #: The longest a pressed ▶ may hold playback while its frames prepare (seconds) — applied
@@ -189,6 +202,55 @@ class _CompareBox(QWidget):
         self.panel.restyle()
 
 
+class _MovieHost:
+    """The Movie Editor's view of the window — everything it may ask for, and nothing else.
+
+    :class:`nodelab_v2.movie_editor.MovieEditorPanel` holds widgets and a working copy of one
+    timeline; the window holds the runner (to compute its sources without moving the
+    Viewer), the document (to commit the timeline) and the Viewer (whose LUTs it links to).
+    An adapter rather than the window itself, so the panel's dependencies are this list and
+    a probe can see them."""
+
+    def __init__(self, win: "MainWindow") -> None:
+        self._w = win
+
+    def movie_state(self, node_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        rec = self._w.doc.nodes.get(node_id) if node_id else None
+        if rec is None or rec.op_key != MOVIE_OP:
+            return None
+        spec = rec.spec()
+        try:
+            env = self._w.doc.env(node_id)
+        except Exception:                  # noqa: BLE001 — an un-propagated node
+            env = None
+        return {"spec": spec, "params": dict(rec.params), "modes": dict(rec.modes),
+                "env": env, "label": f"{spec.label if spec else rec.op_key} ({node_id})"}
+
+    def movie_sources(self, node_id: str) -> Dict[str, Dict[str, Any]]:
+        return self._w._movie_sources(node_id)
+
+    def source_payload(self, node_id: str) -> Any:
+        return self._w.runner.finished_result(node_id)
+
+    def fetch(self, node_id: str) -> None:
+        self._w.runner.fetch(node_id)
+
+    def commit_timeline(self, node_id: str, text: str) -> None:
+        self._w.write_movie_timeline(node_id, text)
+
+    def set_sweep(self, node_id: str, value: str) -> None:
+        self._w.set_movie_sweep(node_id, value)
+
+    def live_display(self, node_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+        return self._w.live_display(node_id, spec)
+
+    def capture(self, node_id: str) -> None:
+        self._w.stamp_movie_links(node_id)
+
+    def export(self, node_id: str) -> None:
+        self._w.export_movie(node_id)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -286,9 +348,66 @@ class MainWindow(QMainWindow):
         self.lablink.send.load_into_graph.connect(self.lablink_load_result)
         idock.raise_()
 
-        # Console removed — the reclaimed bottom-dock space goes to the central splitter
-        # (Viewer + node canvas). Run/error messages surface in the status bar, and a
-        # failed pull shows its trace in the Viewer (status line + tooltip).
+        # Console (restored 2026-09-15, asked for by name: "errors should be in a console
+        # that can be copy/pasted into"). It had been removed for the bottom-dock space,
+        # leaving a failure as a status-bar line TRUNCATED to the terminal's width and a
+        # Viewer tooltip — and a tooltip cannot be selected, so the one text a user actually
+        # needs to send someone was the one text they could not copy.
+        #
+        # Starts HIDDEN so the reclaimed centre space is still the default layout, and
+        # raises itself on the first failure (`_on_run_failed`) — the moment it is worth the
+        # room. View ▸ Console toggles it by hand.
+        self.console = ConsolePanel()
+        cdock = QDockWidget("Console", self)
+        cdock.setObjectName("console_dock")
+        cdock.setWidget(self.console)
+        cdock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.BottomDockWidgetArea, cdock)
+        cdock.hide()
+        self._console_dock = cdock
+        self._console_shown = False
+
+        # The Movie Editor (2026-09-30): a bottom dock tabbed with the Console that binds to
+        # an Export Movie node when one is selected — asked for as "a movie editor when on
+        # the node, rather than just a parameter list". Floatable, so it can live on a second
+        # screen while the Viewer keeps the centre. It talks to the window only through the
+        # `_MovieHost` adapter; the window owns the runner and the document.
+        from nodelab_v2.movie_editor import MovieEditorPanel
+        self.movie_editor = MovieEditorPanel(_MovieHost(self))
+        mdock = QDockWidget("Movie Editor", self)
+        mdock.setObjectName("movie_editor_dock")
+        # Inside a scroll area, so the editor's own minimum size can never become the MAIN
+        # WINDOW's: a dock that cannot shrink below its content grows the window instead,
+        # and a maximized window then runs off the screen. Too small a dock scrolls.
+        from PySide6.QtWidgets import QFrame, QScrollArea
+        mscroll = QScrollArea()
+        mscroll.setWidgetResizable(True)
+        mscroll.setFrameShape(QFrame.NoFrame)
+        mscroll.setWidget(self.movie_editor)
+        mdock.setWidget(mscroll)
+        mdock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea
+                              | Qt.RightDockWidgetArea)
+        mdock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
+                          | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                          | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        # NOT tabbed with the Console: a tabbed dock takes the tab group's size and ignores
+        # `resizeDocks`, so it opened at the Console's sliver of height with a monitor
+        # 200 px tall. Both visible at once simply share the bottom edge.
+        #
+        # The side columns own the bottom corners, so a bottom dock sits under the CANVAS
+        # rather than under the full-height Properties/LabLink column. Spanning the width,
+        # its height stacked on top of that column's minimum: showing the editor raised the
+        # window's minimum height from 756 to 1023 px, which on a maximized 1080p window put
+        # the dock — and every button in it — below the bottom of the screen.
+        self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
+        self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.BottomDockWidgetArea, mdock)
+        mdock.hide()
+        self._movie_dock = mdock
+        # Keep the View ▸ Console tick honest when the dock is closed by its own ✕ or
+        # raised by a failure — a menu tick that disagrees with what is on screen is the
+        # same defect as a control that does nothing.
+        cdock.visibilityChanged.connect(self._sync_console_action)
 
         # Live node reload. `prime()` must run here — after the catalog and the GUI ops are
         # imported, before the user can edit anything — because it baselines the source
@@ -355,6 +474,7 @@ class MainWindow(QMainWindow):
         self.scene.selectionChanged.connect(self._on_selection)
         self.scene.node_activated.connect(self.pull_node)
         self.view.op_dropped.connect(self._on_op_dropped)
+        self.view.files_dropped.connect(self._on_files_dropped)
         self.doc.on_change(self._on_doc_changed)
         self.doc.on_change(self.inspector.refresh_derived)   # G8 live ƒmd re-seed
         self.scene.pull_requested.connect(self.pull_node)
@@ -365,6 +485,13 @@ class MainWindow(QMainWindow):
                          [p.show_running(nid) for p in self._panes_showing(nid)],
                          self._set_led("busy"),
                          self.minimap.set_state("busy")))
+        # The Movie Editor's sources arrive on their own signal (a payload-only fetch never
+        # reaches a pane), and the Viewer's settled LUT edits feed its linked channels.
+        self.runner.fetched.connect(self._on_movie_fetched)
+        self.runner.fetch_started.connect(
+            lambda nid: self.statusBar().showMessage(
+                f"computing {nid} for the Movie Editor…"))
+        self.viewer.display_changed.connect(self._on_viewer_display)
         self.runner.finished.connect(self._on_run_finished)
         self.runner.plane_ready.connect(self._on_plane_ready)
         self.runner.failed.connect(self._on_run_failed)
@@ -390,6 +517,10 @@ class MainWindow(QMainWindow):
         self.viewer.request_changed.connect(self._on_view_request)
         self.viewer.selection_changed.connect(self._on_frame_selection)
         self.viewer.iteration_changed.connect(self._on_iteration_changed)
+        # the overlay SOURCE strip (2026-09-30): a stepper is a display-only runner setting,
+        # a pin is a graph edit — the viewer does neither itself
+        self.viewer.overlay_step.connect(self._on_overlay_step)
+        self.viewer.overlay_pin.connect(self._on_overlay_pin)
         # What the live surface can hold decides whether a big frame is shown WHOLE at full
         # resolution or off the pyramid (V2.23). The surface knows the number, the runner makes
         # the decision, and neither should know about the other.
@@ -410,6 +541,7 @@ class MainWindow(QMainWindow):
         self.inspector.dock_action.connect(self._on_dock_action)
         self.scene.dock_action.connect(self._on_dock_action)
         self.inspector.iterate_action.connect(self._on_iterate_action)
+        self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
         self.runner.baked.connect(self._on_baked)
         self.viewer.pick_committed.connect(self._on_pick_committed)
@@ -447,6 +579,13 @@ class MainWindow(QMainWindow):
         load.setShortcut("Ctrl+L")
         load.triggered.connect(self.file_load_source)
         m_file.addAction(load)
+
+        seq = QAction("Load file &sequence…", self)
+        seq.setShortcut("Ctrl+Shift+L")
+        seq.setStatusTip("Pick one file of a numbered series; load the whole series as "
+                         "one source and chain it onto Time, Z or Channels")
+        seq.triggered.connect(self.file_load_sequence)
+        m_file.addAction(seq)
 
         m_file.addSeparator()
         exp = QAction("&Export table…", self)
@@ -661,6 +800,14 @@ class MainWindow(QMainWindow):
         self._follow_act.setToolTip("Pull and show a node as soon as you click it "
                                     "(always on while the canvas is maximized)")
         m_view.addAction(self._follow_act)
+        self._console_act = QAction("&Console", self)
+        self._console_act.setCheckable(True)
+        self._console_act.setShortcut("Ctrl+`")
+        self._console_act.setToolTip("A selectable log of run activity and the FULL text of "
+                                     "any node failure, with Copy all — the status line is "
+                                     "truncated and a tooltip cannot be copied")
+        self._console_act.toggled.connect(self._toggle_console)
+        m_view.addAction(self._console_act)
         m_view.addSeparator()
         ovl = QAction("&Overlays…", self)
         ovl.setShortcut("Ctrl+Shift+O")
@@ -760,7 +907,7 @@ class MainWindow(QMainWindow):
             "  • Thresholding (global / local / multi-Otsu / histogram methods), "
             "connected components, EDT, boundaries\n"
             "  • Detection: spots, particles\n"
-            "  • Correlation: DIC (pyALDIC) and DVC (ALDVC) + cumulative "
+            "  • Correlation: DIC (pyALDIC, 2D) and DVC (pyALDVC, 3D) + cumulative "
             "accumulation and field rasterization\n"
             "  • Structure: point clustering, tessellation / mesh, measurements, "
             "domain transfer\n"
@@ -781,7 +928,8 @@ class MainWindow(QMainWindow):
         T.apply(mode)
         self.setStyleSheet(_window_qss())
         for panel in (self.palette, self.inspector, self.viewer, self.sheet,
-                      self.minimap, self.welcome, self.view, self.lablink):
+                      self.minimap, self.welcome, self.view, self.lablink,
+                      self.console, self.movie_editor):
             panel.restyle()
         if self._compare_box is not None:
             self._compare_box.restyle()   # restyles viewer2 with it
@@ -900,6 +1048,7 @@ class MainWindow(QMainWindow):
         if self._viewed2 is not None and self._viewed2 not in self.doc.nodes:
             self.close_compare()          # its node was deleted — an empty pane lies
         self._sync_solo(self._viewed)     # a rewired source changes the frame count
+        self.movie_editor.on_doc_changed(touched, self.doc.downstream_of)
         name = self.doc.path or "untitled"
         self.statusBar().showMessage(f"{name} — rev {self.doc.revision}")
 
@@ -909,6 +1058,9 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             return          # scene torn down (app closing) — the C++ object is gone
         self.inspector.set_node(sel[0] if sel else None)
+        # an Export Movie node brings up its editor; any other selection leaves it bound
+        if len(sel) == 1 and sel[0].rec.op_key == MOVIE_OP:
+            self.open_movie_editor(sel[0].node_id)
         # click-to-preview (always on while maximized): debounce, so dragging a marquee
         # across a chain queues ONE pull — the node the selection settled on.
         if sel and self._follow_act.isChecked():
@@ -933,6 +1085,13 @@ class MainWindow(QMainWindow):
             md = dict(self.doc.env(req.node_id).metadata or {})
         except Exception:                     # noqa: BLE001 — an un-propagated node
             md = {}
+        if req.kind == "nudge_xy":
+            # a two-click nudge commits a CHANGE — the session needs the nudge already set
+            from dataclasses import replace as _dc_replace
+            rec = self.doc.nodes.get(req.node_id)
+            prm = rec.params if rec is not None else {}
+            req = _dc_replace(req, base=tuple(
+                (n, float(prm.get(n, 0.0) or 0.0)) for n in req.bounds))
         self._open_viewer()
         self.viewer.arm_pick(req, Calibration.from_metadata(md))
 
@@ -941,6 +1100,66 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Picking — Esc cancels, Enter applies")
         else:
             self.statusBar().clearMessage()
+
+    def _sync_overlay_frames(self, pane, node_id: str) -> None:
+        """Hand ``pane`` what each overlaid source is showing at its cursor, and how many
+        Play-all ticks one primary frame is split into. Cheap (metadata arithmetic), and run
+        on every delivery so the strip reads the frame actually on screen."""
+        try:
+            m, t, z, _c = pane.coords()
+            sub = pane.sub() if hasattr(pane, "sub") else 0
+            rows = self.runner.overlay_frame_readout(node_id, m, t, sub, z)
+            pane.set_overlay_frames(rows, self.runner.overlay_sub_ticks(node_id))
+        except Exception:  # noqa: BLE001 — a readout must never cost the frame
+            pass
+
+    def _on_overlay_step(self, ovl_id: str, dt: int, dz: int) -> None:
+        """A source's ◀▶ stepper: move that source's DISPLAYED frame by ``(dt, dz)`` from
+        its mapped one. A runner setting, not an edit — nothing re-runs, nothing is saved —
+        so the user can hunt for the frame that goes with this one before pinning it."""
+        self.runner.set_source_override(ovl_id, int(dt), int(dz))
+        self._on_view_request()
+
+    def _on_overlay_pin(self, ovl_id: str, axis: str, pri: int, sec: int) -> None:
+        """Pin T / Pin Z: "the primary's current frame goes with THIS frame of the source".
+
+        Written into the Overlay's ``t_pins`` / ``z_pins`` through the same lines a typed edit
+        runs (the value plus its sticky pin), so it serializes, diffs and keys the memo like
+        any param. The row records each file's clock (T) or absolute focus (Z) beside the
+        indices, which is what lets it survive an upstream crop re-numbering the frames. A
+        pin at a primary frame that already had one replaces it; the source's stepped offset
+        is dropped, since the pin now makes the mapping land where the stepper was."""
+        from nodegraph.placement import parse_pins, pins_json
+        rec = self.doc.nodes.get(ovl_id)
+        if rec is None or axis not in ("t", "z") or self._viewed is None:
+            return
+        name = f"{axis}_pins"
+        try:
+            rows = list(parse_pins(rec.params.get(name, ""), axis=axis))
+        except ValueError as exc:
+            self.statusBar().showMessage(f"{ovl_id}: cannot add a pin — {exc}", 6000)
+            return
+        m = self.viewer.coords()[0]
+        a_pri, a_sec = self.runner.overlay_pin_anchors(self._viewed, ovl_id, axis, m,
+                                                       int(pri), int(sec))
+        rows = [r for r in rows if int(r[0]) != int(pri)]
+        rows.append((int(pri), int(sec), a_pri, a_sec))
+        try:
+            text = pins_json(rows)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"{ovl_id}: pin refused — {exc}", 6000)
+            return
+        rec.params[name] = text
+        rec.set_locked(rec.locked | {name})
+        self.runner.set_source_override(ovl_id, 0, 0)
+        self.doc.touch(ovl_id)
+        item = self.scene.node_items.get(ovl_id)
+        if item is not None:
+            item.refresh()
+            item.changed.emit(item)
+        self.statusBar().showMessage(
+            f"{ovl_id}: pinned primary {axis}={pri} to source {axis}={sec}"
+            + ("" if a_pri is not None else " (by index — no clock/focus to anchor it)"), 5000)
 
     def _on_pick_committed(self, node_id: str, values: dict) -> None:
         """Write a finished pick into the document.
@@ -1039,6 +1258,47 @@ class MainWindow(QMainWindow):
         rec = self.doc.add_node(op_key, x=pos.x() - 20, y=pos.y() - 20)
         if edge_tuple is not None:
             self.scene.splice_onto(rec.id, edge_tuple)
+
+    def _on_files_dropped(self, paths: list, pos: QPointF, target: str) -> None:
+        """Image files dragged from the desktop onto the canvas (V3.01).
+
+        Two gestures, told apart by WHERE they land:
+
+        * **on a Batch point** — one source card per file, each wired straight into that
+          point. This is the gesture the golden point exists for: drop four files on it
+          and the pipeline already drawn downstream now runs over four files.
+        * **anywhere else** — one source card per file, unwired, exactly as
+          File -> Load would have made them.
+
+        Dropping several files on empty canvas does NOT silently build a batch. The cards
+        are what the user asked for; wiring them into something they did not place would be
+        inventing a pipeline. Making the batch is one more drag onto the point, and that
+        drag is the decision.
+        """
+        from PySide6.QtWidgets import QMessageBox
+        made, failed = [], []
+        x, y = pos.x(), pos.y()
+        for i, p in enumerate(paths):
+            try:
+                rec, _axes = self._add_source_node(p, x, y + i * 96.0)
+                made.append(rec)
+            except Exception as exc:                      # noqa: BLE001 - reported below
+                failed.append((p, exc))
+        if target and made:
+            # newest first would reverse the batch's member order, and member order is
+            # the order Unbatch hands results back in — so wire in the order dropped
+            for rec in made:
+                self.doc.connect(rec.id, "image", target, "data")
+        if failed:
+            import os
+            lines = "\n".join(f"{os.path.basename(p)} — {exc}" for p, exc in failed)
+            QMessageBox.warning(
+                self, "Some files could not be loaded",
+                f"{len(made)} of {len(paths)} loaded.\n\n{lines}")
+        if made:
+            self.statusBar().showMessage(
+                f"loaded {len(made)} file(s)"
+                + (" into the batch point" if target else ""), 6000)
 
     # ── run (G7) ─────────────────────────────────────────────────────────────
     def pull_selected(self) -> None:
@@ -1407,6 +1667,10 @@ class MainWindow(QMainWindow):
         """
         try:
             self.lablink.shutdown()
+        except Exception:                                    # noqa: BLE001 — see above
+            pass
+        try:
+            self.movie_editor.shutdown()     # its render thread, for the same reason
         except Exception:                                    # noqa: BLE001 — see above
             pass
         super().closeEvent(event)
@@ -1807,6 +2071,204 @@ class MainWindow(QMainWindow):
         # about it.
         self.pull_node(self._viewed or owner)
 
+    def _on_movie_action(self, node_id: str, action: str) -> None:
+        """The inspector's *Open Movie Editor*: raise the dock on ``node_id``."""
+        if action not in ("edit", "preview"):
+            return
+        rec = self.doc.nodes.get(node_id)
+        if rec is None or rec.op_key != MOVIE_OP:
+            return
+        self.open_movie_editor(node_id)
+
+    def open_movie_editor(self, node_id: str) -> None:
+        """Show the Movie Editor dock bound to Export Movie node ``node_id``.
+
+        The editor previews the node's SOURCES, never the node: pulling ``io.write_movie``
+        runs its compute, and that compute WRITES THE FILE, so a preview that exported the
+        movie in order to show it would be the opposite of the feature."""
+        first = self._movie_dock.isHidden() and not getattr(self, "_movie_dock_sized", False)
+        self._movie_dock.show()
+        self._movie_dock.raise_()
+        if first:
+            # the first time only: room for a monitor. After that the user's size stands.
+            self._movie_dock_sized = True
+            # `resizeDocks` on a dock that has just been shown is discarded, and the dock
+            # area otherwise opens it at its MINIMUM height (a 120 px monitor). So hold a
+            # minimum for one layout pass — the separator settles there — then release it,
+            # which leaves the size in place and lets the user drag it smaller again.
+            # Clamped to what the centre can actually give up: a minimum larger than that
+            # would GROW the main window, and a maximized one would then run off the screen.
+            spare = (self.centralWidget().height()
+                     - self.centralWidget().minimumSizeHint().height())
+            want = min(int(self.height() * 0.42),
+                       self._movie_dock.height() + max(0, spare - 8))
+            if want > self._movie_dock.height():
+                self._movie_dock.setMinimumHeight(want)
+                QTimer.singleShot(0, lambda: self._movie_dock.setMinimumHeight(0))
+        self.movie_editor.bind(node_id)
+
+    def _on_movie_fetched(self, node_id: str, payload, _seconds: float) -> None:
+        self.scene.finish_run(node_id)
+        self._set_led("idle")
+        self.movie_editor.on_fetched(node_id, payload)
+        self.statusBar().showMessage(f"{node_id} ready for the Movie Editor")
+
+    def _on_viewer_display(self, node_id: str) -> None:
+        """The Viewer's look of ``node_id`` settled: stamp it into every Export Movie whose
+        linked panels read that node, then let the editor re-render."""
+        for mid in self._movie_nodes():
+            if self._movie_links_to(mid, node_id):
+                self.stamp_movie_links(mid)
+        self.movie_editor.on_display_changed()
+
+    # ── Export Movie ↔ Viewer LUT link ────────────────────────────────────────────
+    def _movie_nodes(self) -> List[str]:
+        return [n for n, r in self.doc.nodes.items() if r.op_key == MOVIE_OP]
+
+    def _movie_sources(self, movie_id: str) -> Dict[str, Dict[str, Any]]:
+        """``{letter: {"node", "label", "env"}}`` for an Export Movie's three inputs, each
+        the REAL node feeding it (through reroutes and muted nodes)."""
+        from nodegraph.catalog._shared.movie_timeline import SOURCE_SOCKETS
+        out: Dict[str, Dict[str, Any]] = {}
+        for letter, socket in SOURCE_SOCKETS.items():
+            src = self.doc.real_source(movie_id, socket)
+            if src is None:
+                out[letter] = {"node": None}
+                continue
+            rec = self.doc.nodes.get(src)
+            spec = rec.spec() if rec is not None else None
+            label = f"{spec.label if spec is not None else rec.op_key} ({src})"
+            try:
+                env = self.doc.env(src)
+            except Exception:              # noqa: BLE001 — an un-propagated node
+                env = None
+            out[letter] = {"node": src, "label": label, "env": env}
+        return out
+
+    def _movie_links_to(self, movie_id: str, node_id: str) -> bool:
+        rec = self.doc.nodes.get(movie_id)
+        if rec is None or str(rec.modes.get("sweep", "time")) != "timeline":
+            return False
+        srcs = self._movie_sources(movie_id)
+        return any((i or {}).get("node") == node_id for i in srcs.values()) \
+            or node_id == movie_id
+
+    def live_display(self, movie_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """``spec`` with every Viewer-linked channel filled in from the Viewer, NOT written.
+
+        Each linked channel takes its panel source's node's LUT; a channel the Viewer holds
+        nothing for on that node falls back to the movie node itself (a tap: viewing it
+        shows source A), and past that keeps whatever values it already had — the stamp from
+        last time, or none, which renders as auto contrast."""
+        import copy as _copy
+        out = _copy.deepcopy(spec)
+        srcs = self._movie_sources(movie_id)
+        states: Dict[str, Dict[int, Dict[str, Any]]] = {}
+
+        def state_of(node: Optional[str], letter: str) -> Dict[int, Dict[str, Any]]:
+            key = f"{letter}:{node}"
+            if key not in states:
+                env = (srcs.get(letter) or {}).get("env")
+                names = list((getattr(env, "metadata", {}) or {}).get("channel_names")
+                             or [])
+                got = self.viewer.display_state(node, names) if node else {}
+                if letter == "A":
+                    for c, d in self.viewer.display_state(movie_id, names).items():
+                        got.setdefault(c, d)
+                states[key] = got
+            return states[key]
+
+        def panels():
+            for seg in out.get("segments", []):
+                clips = seg.get("body", []) if seg.get("kind") == "loop" else [seg]
+                for clip in clips:
+                    for p in clip.get("panels", []):
+                        yield p
+
+        for p in panels():
+            letter = p.get("source", "A")
+            node = (srcs.get(letter) or {}).get("node")
+            for c, d in (p.get("display") or {}).items():
+                if d.get("link") != "viewer":
+                    continue
+                got = state_of(node, letter).get(int(c))
+                if not got:
+                    continue
+                for k in ("lo", "hi", "gamma", "rgb"):
+                    if k in got:
+                        d[k] = got[k]
+        return out
+
+    def stamp_movie_links(self, movie_id: str) -> bool:
+        """Write the Viewer's current look into ``movie_id``'s linked channels. ``True`` if
+        the node's timeline changed.
+
+        The COMMIT half of the live link: the values land in the saved graph, so a headless
+        or LabLink run of this movie wears the LUTs the user tuned here. Deferred while the
+        movie node itself is being computed, because an edit inside a running export's cone
+        would cancel it; it is retried a moment later."""
+        from nodegraph.catalog._shared.movie_timeline import canonical_json, try_normalize
+        rec = self.doc.nodes.get(movie_id)
+        if rec is None or str(rec.modes.get("sweep", "time")) != "timeline":
+            return False
+        spec, _err = try_normalize(rec.params.get("timeline", "") or "")
+        if spec is None:
+            return False
+        text = canonical_json(self.live_display(movie_id, spec))
+        if text == rec.params.get("timeline"):
+            return False
+        if self.runner.in_flight(movie_id):
+            QTimer.singleShot(1500, lambda m=movie_id: self.stamp_movie_links(m))
+            return False
+        self.write_movie_timeline(movie_id, text)
+        return True
+
+    def write_movie_timeline(self, movie_id: str, text: str) -> None:
+        """The one write path for an Export Movie's ``timeline``: the value, the lock that
+        tells a re-seed the user owns it, and the narrowed touch — the same three steps an
+        inspector edit takes (``node_item._write_param``)."""
+        rec = self.doc.nodes.get(movie_id)
+        if rec is None:
+            return
+        rec.params["timeline"] = text
+        rec.set_locked(rec.locked | {"timeline"})
+        self.doc.touch(movie_id)
+
+    def set_movie_sweep(self, movie_id: str, value: str) -> None:
+        rec = self.doc.nodes.get(movie_id)
+        if rec is None or rec.modes.get("sweep") == value:
+            return
+        item = self._node_item(movie_id)
+        if item is not None:
+            item._write_mode("sweep", value)     # THE mode-write path: re-gates the card
+        else:
+            rec.modes["sweep"] = value
+            self.doc.touch(movie_id)
+
+    def export_movie(self, movie_id: str) -> None:
+        """Stamp the linked LUTs, make sure there is a file to write, and pull the node."""
+        rec = self.doc.nodes.get(movie_id)
+        if rec is None:
+            return
+        self.stamp_movie_links(movie_id)
+        if not str(rec.params.get("path", "") or "").strip():
+            path, _f = QFileDialog.getSaveFileName(
+                self, "Export movie to", "movie.mp4",
+                "MP4 video (*.mp4);;Animated GIF (*.gif);;PNG sequence (*.png);;"
+                "JPEG sequence (*.jpg)")
+            if not path:
+                return
+            rec.params["path"] = path
+            rec.set_locked(rec.locked | {"path"})
+            self.doc.touch(movie_id)
+        self.pull_node(movie_id)
+
+    def _node_item(self, node_id: str):
+        for it in self.scene.items():
+            if isinstance(it, NodeItem) and it.node_id == node_id:
+                return it
+        return None
+
     def _on_iterate_action(self, node_id: str, action: str) -> None:
         """Run sweep / stop sweeping, from the Iterate panel."""
         rec = self.doc.nodes.get(node_id)
@@ -2124,7 +2586,7 @@ class MainWindow(QMainWindow):
             # follow the cursor either way.
             self._sync_solo_chip()
             self.runner.request_plane(self._viewed, self.viewer.coords(),
-                                      self.viewer.channels())
+                                      self.viewer.channels(), self.viewer.sub())
         # LINKED compare: the primary's strips are the one cursor, so its move carries
         # the other pane with it — mirror silently, then ask for that pane's planes.
         if self._compare_linked and self._viewed2 is not None and self.viewer2 is not None:
@@ -2259,6 +2721,14 @@ class MainWindow(QMainWindow):
             self.viewer.set_play_gate(False)
 
     def _on_run_finished(self, node_id, payload, plane, axes, seconds) -> None:
+        # A source the Movie Editor is waiting on may have just been computed by an
+        # ordinary pull; it takes the payload the same way it takes a fetched one. Only the
+        # runner's UNPINNED result: a solo-scoped payload holds a few frames, and a movie
+        # built from it would silently be a truncated one.
+        if payload is not None and getattr(self, "movie_editor", None) is not None:
+            full = self.runner.finished_result(node_id)
+            if full is not None:
+                self.movie_editor.on_fetched(node_id, full)
         if plane:
             self._open_viewer()       # there is something to see now — unfold the pane
         panes = self._panes_showing(node_id)
@@ -2266,10 +2736,12 @@ class MainWindow(QMainWindow):
             pane.show_result(node_id, plane, axes, seconds, dataset=payload,
                              overlay=self.runner.overlay_channels(node_id),
                              overlay_note=self.runner.overlay_note(node_id),
-                             overlay_style=self.runner.overlay_style(node_id))
+                             overlay_style=self.runner.overlay_style(node_id),
+                                overlay_src=self.runner.overlay_sources(node_id))
             # flicker is a property of TIME, not of the composite, so it is driven here
             # rather than folded into the style map the shader reads
             pane.set_overlay_flicker(self.runner.overlay_flicker_hz(node_id))
+            self._sync_overlay_frames(pane, node_id)
         if self._maximized:
             # a new axes shape rebuilds the channel/LUT controls, and fresh widgets are
             # visible — re-fold them so the mini-map keeps its compact strip
@@ -2400,6 +2872,7 @@ class MainWindow(QMainWindow):
         # refresh — only the showing pane's frame changes.
         for pane in self._panes_showing(node_id):
             pane.show_planes(node_id, planes, axes, seconds)
+            self._sync_overlay_frames(pane, node_id)
         # A COLD frame is decoded off the GUI thread and announces itself as "reading
         # planes" while it runs (EngineRunner._serve_from_cache); the frame landing is the
         # end of that, so the rail goes back to idle. A warm frame never raised it.
@@ -2417,10 +2890,28 @@ class MainWindow(QMainWindow):
         from nodelab_v2.runner import MAX_DISPLAY_DIM
         self.runner.request_detail(node_id, coords, channels, rect01, MAX_DISPLAY_DIM)
 
+    def _sync_console_action(self, visible: bool) -> None:
+        act = getattr(self, "_console_act", None)   # the dock is built before the menu
+        if act is None or act.isChecked() == bool(visible):
+            return
+        act.blockSignals(True)                      # reflect, don't re-drive
+        act.setChecked(bool(visible))
+        act.blockSignals(False)
+
+    def _toggle_console(self, on: bool) -> None:
+        """View ▸ Console. Opening it by hand counts as "shown", so the first failure does
+        not then re-raise a dock the user already has open."""
+        self._console_shown = self._console_shown or bool(on)
+        self._console_dock.setVisible(bool(on))
+        if on:
+            self._console_dock.raise_()
+
     def _on_run_failed(self, node_id, trace) -> None:
-        # console removed: the Viewer shows the failing line (status) + full trace (tooltip)
-        # …and the card that raised keeps its red 'error' state (the engine's error event
-        # named it, which is more precise than the pulled node).
+        # The Viewer shows the failing line (status) + full trace (tooltip), and the card
+        # that raised keeps its red 'error' state (the engine's error event named it, which
+        # is more precise than the pulled node). The CONSOLE gets the whole trace,
+        # selectable, because the other three are all uncopyable: a status line is truncated
+        # to the window width, a tooltip cannot be selected, and a red card is not text.
         self.scene.finish_run(node_id, failed=True)
         for pane in self._panes_showing(node_id):
             pane.show_error(node_id, trace)
@@ -2428,11 +2919,28 @@ class MainWindow(QMainWindow):
         self._set_progress(None)              # a failed run must not leave a stale bar
         self.minimap.set_state("error")
         last = [ln for ln in trace.strip().splitlines() if ln.strip()]
-        self.statusBar().showMessage(f"{node_id} FAILED — {last[-1] if last else 'see Viewer'}")
+        self.console.error(f"{node_id} FAILED\n{trace.rstrip()}")
+        # Raise it on the FIRST failure of a session rather than every time: a user who has
+        # deliberately closed it while working through a chain of errors should not have to
+        # close it again after each one.
+        if not self._console_shown:
+            self._console_shown = True
+            self._console_dock.show()
+            self._console_dock.raise_()
+        self.statusBar().showMessage(
+            f"{node_id} FAILED — {last[-1] if last else 'see Console'}")
 
     # ── file (G6) ────────────────────────────────────────────────────────────
+    def _forget_display_state(self) -> None:
+        """A new or newly opened graph reuses node ids, so the Viewer's per-node LUTs and
+        switched-off channels from the last graph must not carry over to it."""
+        for pane in (self.viewer, self.viewer2):
+            if pane is not None:
+                pane.forget_display_state()
+
     def file_new(self) -> None:
         self.doc.clear()          # → _on_doc_changed closes the compare pane too
+        self._forget_display_state()
         self._viewed = None
         self.scene.set_viewed(None)
         self.minimap.set_state("idle")
@@ -2449,7 +2957,7 @@ class MainWindow(QMainWindow):
         interruptions, and the caller is the one that knows which it is."""
         import os
         from nodelab_v2.document import CHANNELS_KEY, TITLE_KEY
-        from nodegraph.metadata import MetaEnvelope
+        from nodegraph.metadata import MetaEnvelope, stamp_source_file
         from nodelab_v2.ingest import read_meta_only
 
         axes, calib, disp = read_meta_only(path)
@@ -2473,11 +2981,113 @@ class MainWindow(QMainWindow):
             "color": _native(i),
         } for i in range(axes.c)]
 
+        # Pre-fill the calibration boxes from the file's own header, so the card SHOWS the
+        # spacing the pipeline is about to use instead of hiding it behind a 0 that means
+        # "ask the file". A key the file does not carry stays 0 — and a plain TIFF carries
+        # no Z spacing at all, so that empty box IS the prompt to type one (2026-09-15).
+        # Writing the detected value as a param is deliberate: it is then visible, editable
+        # and SAVED, so the graph records the spacing its measurements assumed rather than
+        # depending on a header that may not survive a re-export.
+        prefill = {k: float(calib[k]) for k in CALIB_OVERRIDE_KEYS
+                   if isinstance(calib.get(k), (int, float)) and float(calib[k]) > 0.0}
+        # NO grouping work here (2026-09-28). Grouping is off by default, so detecting at
+        # file-pick time would be work nobody asked for on every file that is ever opened
+        # — and this is the one path where an extra read is least affordable, because it
+        # runs inside the File menu before anything is on the canvas. The lever turns it
+        # on, and `GraphDocument.to_graph` resolves the groups then
+        # (`group_descriptors`, which falls back to the envelope), so nothing has to be
+        # captured in advance.
         rec = self.doc.add_node(
             LOAD_OP, x=x, y=y,
             params={"path": path, TITLE_KEY: os.path.basename(path),
+                    CHANNELS_KEY: chans, **prefill})
+        # `source_file` rides the seed for the same reason the bundle card's does: the
+        # edit-time envelope and the pulled payload must agree about a positional list, and
+        # `EngineRunner._resolve_source` stamps the identical value on the pull side. It is
+        # what lets `util.chain` order separately loaded files by their names.
+        self.doc.set_meta_seed(rec.id, stamp_source_file(
+            MetaEnvelope(axes=axes, metadata=dict(calib)), path))
+        return rec, axes
+
+    def _add_bundle_node(self, paths: list, x: float, y: float):
+        """Read every path's metadata (**no pixels**) and drop ONE ``io.load`` card that
+        carries all of them — a **file bundle**. Returns ``(rec, axes)`` with ``axes.m``
+        summed over the members.
+
+        The members must share ``(t, z, c, y, x)``. That is not a stylistic rule: a bundle
+        lays the files end to end on the multipoint axis, and an axis cannot be ragged, so
+        :class:`~nodegraph.provider.MultiSourceProvider` refuses a mismatch outright. Doing
+        the same check HERE, against the headers, is what turns that into a sentence at
+        load time naming the file and the axis, instead of a traceback on the first pull —
+        by which point the user has wired a pipeline onto a card that could never run.
+
+        Channel NAMES are compared too, not just the count. Two files with two channels
+        each but ``[DAPI, GFP]`` against ``[GFP, DAPI]`` would stack without complaint and
+        put two different stains in one column of the results.
+        """
+        import os
+        from nodelab_v2.document import CHANNELS_KEY, TITLE_KEY
+        from nodegraph.metadata import MetaEnvelope, SOURCE_FILE_KEY
+        from nodegraph.dataset import AxisSizes
+        from nodelab_v2.ingest import read_meta_only
+        from nodelab_v2.runner import BUNDLE_PATHS_KEY, _unique_labels
+
+        heads = [(p,) + tuple(read_meta_only(p)) for p in paths]
+        (p0, ax0, calib0, disp0) = heads[0]
+
+        def _names(disp, axes):
+            got = disp.get("channel_names") or []
+            return [str(got[i]) if i < len(got) else f"Ch{i}" for i in range(axes.c)]
+
+        base_names = _names(disp0, ax0)
+        for (p, ax, _cal, disp) in heads[1:]:
+            bad = [n for n in ("t", "z", "c", "y", "x")
+                   if int(getattr(ax, n)) != int(getattr(ax0, n))]
+            if bad:
+                raise ValueError(
+                    f"{os.path.basename(p)} does not match {os.path.basename(p0)} on "
+                    f"{', '.join(bad)} — "
+                    f"(t,z,c,y,x) is {(ax.t, ax.z, ax.c, ax.y, ax.x)} against "
+                    f"{(ax0.t, ax0.z, ax0.c, ax0.y, ax0.x)}. Grouped files share one "
+                    f"pipeline, so they have to share those axes; load them separately "
+                    f"instead.")
+            if _names(disp, ax) != base_names:
+                raise ValueError(
+                    f"{os.path.basename(p)} has channels {_names(disp, ax)} but "
+                    f"{os.path.basename(p0)} has {base_names}. Grouping them would put "
+                    f"different stains in the same result column; load them separately, "
+                    f"or reorder the channels first.")
+
+        emis = disp0.get("channel_emission_nm")
+        colors = disp0.get("channel_colors")
+
+        def _native(i):
+            if isinstance(colors, (list, tuple)) and i < len(colors):
+                col = colors[i]
+                if isinstance(col, (list, tuple)) and len(col) == 3:
+                    return [int(v) for v in col]
+            return None
+
+        chans = [{"name": base_names[i],
+                  "emission_nm": (emis[i] if isinstance(emis, (list, tuple))
+                                  and i < len(emis) else None),
+                  "color": _native(i)} for i in range(ax0.c)]
+
+        labels = _unique_labels(list(paths))
+        total_m = sum(int(h[1].m) for h in heads)
+        axes = AxisSizes(m=total_m, t=ax0.t, z=ax0.z, c=ax0.c, y=ax0.y, x=ax0.x)
+        rec = self.doc.add_node(
+            LOAD_OP, x=x, y=y,
+            params={"path": paths[0], BUNDLE_PATHS_KEY: list(paths),
+                    TITLE_KEY: f"{len(paths)} files",
                     CHANNELS_KEY: chans})
-        self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=dict(calib)))
+        # The seed envelope must say the same thing the pull will (the edit-time envelope
+        # and the payload agreeing is the standing rule for anything that changes axes):
+        # M is the sum, and `source_file` names the file each position came from.
+        md = dict(calib0)
+        md[SOURCE_FILE_KEY] = [labels[i] for i, h in enumerate(heads)
+                               for _ in range(int(h[1].m))]
+        self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))
         return rec, axes
 
     def file_load_source(self) -> None:
@@ -2509,7 +3119,78 @@ class MainWindow(QMainWindow):
             "TIFF (*.tif *.tiff);;All files (*)")
         if not paths:
             return
-        self._load_source_paths(paths)
+        self._load_source_paths(paths, group=self._ask_group(paths))
+
+    def file_load_sequence(self) -> None:
+        """File → Load file sequence…: pick ONE file of a numbered series, get all of it.
+
+        The gap this fills. :meth:`file_load_source` can already multi-select a folder's
+        worth of files into one bundle card — but that means ctrl-clicking 120 entries in a
+        file dialog, and the bundle stacks them on POSITIONS, because that is the only axis
+        a loader can grow without being told what the files mean. For a timelapse exported
+        one frame per file that is the wrong axis, and wrongly in a way nothing errors on:
+        the result is 120 fields of a 1-frame series, so ``util.stack`` fuses nothing and
+        ``track.link`` has no frames to link (see :mod:`nodegraph.catalog.util.chain`).
+
+        So this action does the three things that turn one click into that series: it
+        derives the sequence from the picked file's name and scans its folder
+        (:func:`nodegraph.file_sequence.scan`), it shows what it found and lets the pattern
+        be corrected before anything is built
+        (:class:`~nodelab_v2.sequence_dialog.SequenceScanDialog`), and it drops the bundle
+        card with a ``util.chain`` already wired to it and preset to the chosen axis.
+
+        Everything after the dialog is :meth:`_load_source_paths`, so a series whose files
+        do not share a grid is refused with the same message, and the same "load as separate
+        cards" fallback, as any other bundle.
+        """
+        path, _f = QFileDialog.getOpenFileName(
+            self, "Pick one file of the sequence", "",
+            "Microscopy images (*.nd2 *.tif *.tiff);;ND2 (*.nd2);;"
+            "TIFF (*.tif *.tiff);;All files (*)")
+        if not path:
+            return
+        from nodelab_v2.sequence_dialog import SequenceScanDialog
+
+        dlg = SequenceScanDialog(path, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        paths, axis = dlg.result_paths(), dlg.chain_axis()
+        if len(paths) < 2:
+            # One file is a correct answer, not an error — but chaining it is a no-op, so
+            # it loads as the ordinary single source card it is rather than arriving with
+            # an inert Chain node attached that the user would have to work out and delete.
+            self._load_source_paths(paths)
+            return
+        self._load_source_paths(paths, group=True, chain_axis=axis)
+
+    def _ask_group(self, paths: list) -> bool:
+        """For a multi-file pick: one **bundle** card, or one card per file?
+
+        Asked rather than inferred, because both answers are ordinary and the graph you
+        build next is different for each. Grouping is for replicates — the same acquisition
+        of several wells or dishes that you want to treat identically and compare, which is
+        one pipeline whose spreadsheet gains a ``file`` column. Separate cards are for files
+        with different ROLES (a reference and a sample, two channels to merge), which is
+        several wired inputs.
+
+        One file, or a cancelled dialog, never asks."""
+        if len(paths) < 2:
+            return False
+        box = QMessageBox(self)
+        box.setWindowTitle("Load as a group?")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Load {len(paths)} files as one bundle, or as separate cards?")
+        box.setInformativeText(
+            "A bundle is ONE card carrying all the files. They run through one pipeline "
+            "and every exported table gains a 'file' column naming the row's source. The "
+            "files must share their channels and frame geometry.\n\n"
+            "Separate cards are independent sources you wire up yourself — the right "
+            "choice when the files play different roles.")
+        grp = box.addButton("Group into one bundle", QMessageBox.AcceptRole)
+        box.addButton("Separate cards", QMessageBox.RejectRole)
+        box.setDefaultButton(grp)
+        box.exec()
+        return box.clickedButton() is grp
 
     def publish_recipe(self) -> None:
         """Graph → Publish as a LabLink recipe…
@@ -2551,18 +3232,77 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"loaded {os.path.basename(path)} from the hub — it is a source node now")
 
-    def _load_source_paths(self, paths: list) -> None:
-        """Drop one ``io.load`` card per path, stacked, selected, and scrolled into view.
+    def _load_source_paths(self, paths: list, group: bool = False,
+                           chain_axis: str = "") -> None:
+        """Drop one ``io.load`` card per path, stacked, selected, and scrolled into view —
+        or, with ``group``, ONE bundle card carrying all of them.
 
         Split out of :meth:`file_load_source` so the File menu and a returned LabLink result
         take the identical path — including the per-file failure collection, which is what
-        keeps one unreadable file from costing the others."""
+        keeps one unreadable file from costing the others.
+
+        A bundle is all-or-nothing and says so: its members have to share a grid, so
+        "5 of 6 grouped" is not a thing that can be built. A refused group reports why and
+        offers the fallback that always works — separate cards — rather than silently
+        loading something the user did not ask for.
+
+        ``chain_axis`` (:meth:`file_load_sequence`) additionally wires a ``util.chain`` card
+        onto the bundle, preset to that axis. It rides HERE rather than in the caller so the
+        sequence loader inherits this method's grid-mismatch handling unchanged — and it is
+        deliberately dropped by the "separate cards" fallback, since there is no bundle left
+        for a chain to re-address."""
         import os
 
         c = self.view.mapToScene(self.view.viewport().rect().center())
         x, y = c.x() - 107, c.y() - 40
         added: list = []
         failed: list = []
+
+        if group and len(paths) >= 2:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                rec, axes = self._add_bundle_node(list(paths), x, y)
+            except Exception as exc:  # noqa: BLE001 — a reader failure or a grid mismatch
+                QApplication.restoreOverrideCursor()
+                box = QMessageBox(self)
+                box.setWindowTitle("Cannot group these files")
+                box.setIcon(QMessageBox.Warning)
+                box.setText("These files cannot share one bundle.")
+                box.setInformativeText(f"{exc}")
+                sep = box.addButton("Load as separate cards",
+                                    QMessageBox.AcceptRole)
+                box.addButton("Cancel", QMessageBox.RejectRole)
+                box.setDefaultButton(sep)
+                box.exec()
+                if box.clickedButton() is sep:
+                    self._load_source_paths(paths, group=False)
+                return
+            QApplication.restoreOverrideCursor()
+            chain = None
+            if chain_axis and chain_axis != "M":
+                chain = self.doc.add_node("util.chain", x=x + SEQUENCE_CHAIN_GAP, y=y,
+                                          modes={"chain_axis": chain_axis})
+                self.doc.connect(rec.id, "image", chain.id, "data")
+            ids = [rec.id] + ([chain.id] if chain is not None else [])
+            items = [self.scene.node_items[i] for i in ids if i in self.scene.node_items]
+            if items:
+                self.scene.clearSelection()
+                span = QRectF()
+                for it in items:
+                    it.setSelected(True)
+                    span = span.united(it.card_rect().translated(it.pos()))
+                self.view.ensureVisible(span, 60, 60)
+            if chain is not None:
+                self.statusBar().showMessage(
+                    f"{len(paths)} files loaded as one source and chained onto "
+                    f"{chain_axis} — they are {_AXIS_NOUN.get(chain_axis, chain_axis)} of "
+                    f"one series now, not {axes.m} separate positions")
+            else:
+                self.statusBar().showMessage(
+                    f"bundled {len(paths)} files into one source — {axes.m} positions, "
+                    f"{axes.c} channel(s); exported tables will carry a 'file' column")
+            return
+
         # Reading N files' metadata is N ND2 header parses — fast per file, but visibly not
         # instant for a folder's worth, and it all happens before the first card appears.
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -2622,6 +3362,7 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Open failed", str(exc))
             return
+        self._forget_display_state()
         self.view.fit_all()
         if self.doc.has_unedited_structure:
             QMessageBox.information(
@@ -2630,10 +3371,17 @@ class MainWindow(QMainWindow):
                 "yet. They are shown as their member nodes and preserved unchanged on "
                 "save — editing/creating them in the GUI is a later phase.")
 
+    def _stamp_all_movies(self) -> None:
+        """Before a save: write the Viewer's current LUTs into every linked movie channel,
+        so the file on disk reproduces the movies the user was looking at."""
+        for mid in self._movie_nodes():
+            self.stamp_movie_links(mid)
+
     def file_save(self) -> None:
         if not self.doc.path:
             self.file_save_as()
             return
+        self._stamp_all_movies()
         self.doc.save_file(self.doc.path)
         self.statusBar().showMessage(f"saved {self.doc.path}")
 
@@ -2642,6 +3390,7 @@ class MainWindow(QMainWindow):
                                                FILE_FILTER)
         if not path:
             return
+        self._stamp_all_movies()
         self.doc.save_file(path)
         self.statusBar().showMessage(f"saved {path}")
 
