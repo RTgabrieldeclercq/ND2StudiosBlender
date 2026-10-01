@@ -6,10 +6,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
-
 from nodegraph.dataset import Dataset
-from nodegraph.domains import Domain, is_lattice
 from nodegraph.engine import EvalContext
 from nodegraph.metadata import (crop as _meta_crop, format_indices, frame_spec_picks,
                                 position_subset, respaced, shift_origin_um, time_subset,
@@ -20,11 +17,11 @@ from nodegraph.streaming import WindowView
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_GRAN
+from nodegraph.catalog._shared.frame_subset import (AXIS_NOUN, FRAME_AXES,
+                                                    subset_lattice_layers,
+                                                    subset_structure_rows)
 from nodegraph.catalog._shared.sampling import Z_STAMP, _sampled
 
-#: The frame axes the ``frames`` mode subsets, in the order :data:`_CROP_FRAMES` names their
-#: sockets — the pick group is written positionally against that tuple, so the two must agree.
-_FRAME_AXES: Tuple[str, ...] = ("m", "t", "z")
 
 # ── Crop (axis-changing: shrink Y,X and, in 3D, Z — or narrow M/T/Z by index) ────
 
@@ -83,8 +80,6 @@ def _compute_crop(ctx: EvalContext) -> Dataset:
     return out.with_metadata(origin_um=origin) if origin is not None else out
 
 
-#: What each frame-spec axis is called in a message, and where its length comes from.
-_AXIS_NOUN: Dict[str, str] = {"m": "position", "t": "timepoint", "z": "plane"}
 
 
 def _check_frame_picks(picks: Dict[str, Optional[Tuple[int, ...]]], raw: Any,
@@ -99,7 +94,7 @@ def _check_frame_picks(picks: Dict[str, Optional[Tuple[int, ...]]], raw: Any,
     for axis, kept in picks.items():
         if kept != ():
             continue
-        n, noun = sizes[axis], _AXIS_NOUN[axis]
+        n, noun = sizes[axis], AXIS_NOUN[axis]
         raise ValueError(
             f"util.crop: `frames` = {raw!r} keeps no {noun} — this Dataset has {n}, so the "
             f"only valid {axis} indices are {'0' if n == 1 else f'0..{n - 1}'}. Ranges are "
@@ -148,8 +143,8 @@ def _crop_frames(ctx: EvalContext, ds: Dataset, prov: Any, raw: Any) -> Dataset:
     # entirely and keeps the fingerprint it would have had without a z pick.
     view = FrameSubsetProvider(prov, keep_m, keep_t, zs if zs is not None else None)
 
-    out = _subset_lattice_layers(ds.with_image(view), new_axes, keep)
-    out = _subset_structure_rows(out, keep)
+    out = subset_lattice_layers(ds.with_image(view), new_axes, keep)
+    out = subset_structure_rows(out, keep)
 
     # ── the metadata that is indexed BY one of these axes ─────────────────────
     md = ds.metadata
@@ -192,7 +187,7 @@ def _crop_frames(ctx: EvalContext, ds: Dataset, prov: Any, raw: Any) -> Dataset:
     # z subset is the `z:` case the spatial z-crop already stamps — but neither is dropped
     # by a consumer unless that axis is singleton on BOTH branches, and `m`/`t` never are
     # (see `_require_same_grid`: "frame 3" and "frame 7" are not one grid).
-    touched = "".join(a for a in _FRAME_AXES if keep[a] is not None)
+    touched = "".join(a for a in FRAME_AXES if keep[a] is not None)
     return _sampled(out, f"{touched}:crop.frames"
                          f"[m{_picks_text(ms)},t{_picks_text(ts)},z{_picks_text(zs)}]")
 
@@ -205,101 +200,6 @@ def _picks_text(picks: Optional[Tuple[int, ...]]) -> str:
     — which ``format_indices`` over an already sorted, de-duplicated tuple guarantees — while
     still being short enough to read in an error message about a grid mismatch."""
     return "*" if picks is None else format_indices(picks)
-
-
-def _subset_lattice_layers(ds: Dataset, new_axes: Any,
-                           keep: Dict[str, Optional[Tuple[int, ...]]]) -> Dataset:
-    """Move ``ds`` onto ``new_axes``, reindexing every lattice layer onto the kept indices.
-
-    Generic over the domain: :meth:`AxisSizes.axis_list` says which axes the layer's array
-    has and in what order, so a Voxel mask (m,t,z,c,y,x), a Plane statistic (m,t,z) and a
-    Timepoint series (t) are all handled by the same two lines with no per-domain table —
-    and a domain added later is handled for free.
-
-    The arrays are all cut BEFORE the axis change and written back after it, which is the
-    only order that works: ``with_attribute`` validates a lattice layer's shape against the
-    Dataset's CURRENT axes, so a subset written too early is rejected and the original left
-    in place is dropped by ``reshaped_axes`` a line later. A layer that already disagrees
-    with the input axes is not touched at all — it was stale before this node ran, and
-    ``reshaped_axes`` is the right place for it to go."""
-    subset = []
-    for attr in ds.attributes.values():
-        if not is_lattice(attr.domain):
-            continue
-        arr = np.asarray(attr.values)
-        if tuple(arr.shape) != ds.axes.shape_for(attr.domain):
-            continue
-        for pos, axis in enumerate(ds.axes.axis_list(attr.domain)):
-            idx = keep.get(axis)
-            if idx is not None:
-                arr = np.take(arr, list(idx), axis=pos)
-        subset.append((attr, arr))
-    out = ds.reshaped_axes(new_axes)
-    for attr, arr in subset:
-        out = out.with_layer(attr.domain, attr.name, arr, attr.layer)
-    return out
-
-
-def _subset_structure_rows(ds: Dataset, keep: Dict[str, Optional[Tuple[int, ...]]]
-                           ) -> Dataset:
-    """Filter and renumber structure rows onto the kept m/t/z indices.
-
-    A structure table lives on the Dataset as one attribute layer per COLUMN, keyed by
-    ``(domain, layer)``, so a group is reassembled here, masked as a unit, and written back.
-    A row is kept when its address survives on every subset axis, and its address is then
-    the POSITION of that index within the picks — the same remap the image view performs
-    (:func:`~nodegraph.provider.subset_index` is its inverse). A sub-pixel ``z`` keeps its
-    fractional offset within its plane; which plane it is in is decided by rounding, because
-    that is the plane the voxel data itself was subset by.
-
-    **Mesh is different and is dropped instead**, unless nothing about it moves. Its three
-    buckets (element / vertex / face) are joined by CSR ranges and dense per-frame ids that
-    ``nodegraph.mesh`` validates strictly, so filtering the element bucket alone would leave
-    every vertex pointing at the wrong element — a corrupted mesh that raises somewhere else
-    later. When no element row is dropped and Z is untouched, there is nothing to rebuild and
-    only the frame ADDRESSES are remapped, which covers the ordinary "crop the positions I
-    do not care about" case; anything more is a rebuild this node has no business doing
-    silently, so the mesh layers go and the user re-runs the meshing after the crop."""
-    if all(v is None for v in keep.values()):
-        return ds
-    groups: Dict[Tuple[Domain, Optional[str]], Dict[str, Any]] = {}
-    for attr in ds.attributes.values():
-        if not is_lattice(attr.domain):
-            groups.setdefault((attr.domain, attr.layer), {})[attr.name] = attr
-    out = ds
-    for (domain, layer), cols in groups.items():
-        shapes = {np.asarray(a.values).shape for a in cols.values()}
-        if len(shapes) != 1 or len(shapes.copy().pop()) != 1:
-            continue           # not one row per element (a mesh CSR bucket, a 2-D column):
-                               # there is no row to filter, so leave it exactly as it is
-        n = int(shapes.pop()[0])
-        mask = np.ones(n, dtype=bool)
-        moves = []
-        for axis in _FRAME_AXES:
-            idx, col = keep.get(axis), cols.get(axis)
-            if idx is None or col is None:
-                continue
-            vals = np.asarray(col.values)
-            plane = np.rint(vals.astype(float)).astype(np.int64)
-            order = {int(v): i for i, v in enumerate(idx)}
-            inside = np.array([int(p) in order for p in plane], dtype=bool)
-            mask &= inside
-            moves.append((axis, col, vals, plane, order))
-        if domain is Domain.MESH and (not mask.all() or keep.get("z") is not None):
-            for name in cols:
-                out = out.without(domain, name, layer)
-            continue
-        for _axis, col, vals, plane, order in moves:
-            moved = (np.array([order[int(p)] for p in plane[mask]], dtype=float)
-                     + (vals[mask].astype(float) - plane[mask].astype(float)))
-            out = out.with_layer(domain, col.name, moved.astype(vals.dtype), layer)
-        readdressed = {col.name for _a, col, _v, _p, _o in moves}
-        if not mask.all():
-            for name, col in cols.items():
-                if name not in readdressed:
-                    out = out.with_layer(domain, name,
-                                         np.asarray(col.values)[mask], layer)
-    return out
 
 
 #: Shared hover text for the six crop bounds. One template rather than six near-identical

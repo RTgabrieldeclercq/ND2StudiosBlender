@@ -50,6 +50,7 @@ MODULES: Tuple[str, ...] = (
     "detect.spots",
     "util.zproject",
     "util.crop",
+    "util.select_group",
     "enhance.morphological_gradient",
     "enhance.bilateral",
     "enhance.nlm",
@@ -97,8 +98,10 @@ MODULES: Tuple[str, ...] = (
     # shift every node after it and re-key nothing usefully. Last is also where
     # `module_order()` would put it on its own.
     "transform.grow_points",
-    # Appended for the same reason (see above), not slotted beside `channel.split`/`select`.
-    "channel.merge",
+    # `channel.merge` sat here until 2026-09-15 and was RETIRED, not renamed: its op_key is
+    # deregistered outright (a saved graph using it silently stops merging on its next pull —
+    # see `nodegraph/catalog/util/merge.py`'s module docstring). Its full behaviour, plus
+    # T/M/Z concatenation it never had, lives on as `util.merge`'s `merge_axis="C"` branch.
     # Appended for the same reason, not slotted beside `enhance.deconvolve` whose learned
     # counterpart it is: the two share the PSF derivation but nothing else, and moving
     # `enhance.deconvolve` off position 4 would shift every node after it in the link-drag
@@ -115,6 +118,7 @@ MODULES: Tuple[str, ...] = (
     # `parent_id` join, the per-parent level/n_above/frac_above/n_sub columns, `min_pixels`), so
     # keeping the node as well would have been a third way to do one thing.
     "analysis.filter_labels",
+    "analysis.if_else",
     # Appended last, like everything since V2.20 — the list's order is the link-drag search
     # menu's order, so a mid-list insert shifts every node after it for no gain. Last is also
     # where this one BELONGS: it is the write end of the pipeline, and the first catalog node
@@ -130,6 +134,36 @@ MODULES: Tuple[str, ...] = (
     "analysis.piv",
     # Appended last for the same reason — analysis.piv's dense per-pixel sibling.
     "analysis.optical_flow",
+    # Appended last for the same reason: this list's order is the link-drag search menu's
+    # order, so a mid-list insert (beside `channel.merge`'s old slot, or beside
+    # `util.stack`/`util.stitch`) would shift every node after it for no gain.
+    "util.merge",
+    # Appended last for the same reason, not slotted beside `track.objects` whose
+    # post-processing half it is nor beside `analysis.dvc_field` whose output schema it
+    # shares: this list's order is the link-drag search menu's order.
+    "analysis.track_field",
+    # Appended last for the same reason, not slotted beside `util.crop` whose sibling it
+    # plainly is: this list's order is the link-drag search menu's order, and moving every
+    # node after `util.crop` one place down to put the two together would cost more than
+    # the adjacency is worth.
+    "util.crop_to",
+    # Appended last for the same reason, not slotted beside `io.write_tiff` whose sibling it
+    # is: this list's order is the link-drag search menu's order. The two are the pipeline's
+    # write end read two ways — `write_tiff` exports the pixels for measuring, this one
+    # exports a picture of them for showing.
+    "io.write_movie",
+    # The batch axis's three nodes (V3.01), appended in the order you meet them: stack the
+    # files, split them again, and the tap the split materializes into. Appended rather than
+    # slotted next to `util.merge` — whose Multipoint branch they deliberately are NOT, see
+    # `util/batch.py` — because this list's order is the link-drag search menu's order.
+    "util.batch",
+    "util.unbatch",
+    "util.select_batch",
+    # Appended last for the same reason, not slotted beside `util.merge` whose one-input
+    # counterpart it is: this list's order is the link-drag search menu's order. Merge lays
+    # N WIRED Datasets onto an axis; this splits ONE multi-file source card's M axis onto
+    # one, which is the same arithmetic reached from the other end.
+    "util.chain",
 )
 
 

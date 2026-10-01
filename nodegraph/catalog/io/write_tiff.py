@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from nodegraph.dataset import Dataset
+from nodegraph.metadata import position_group_plan
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.memo import value_digest
@@ -117,7 +118,7 @@ def _compute_write_tiff(ctx: EvalContext) -> Dataset:
       ``WHOLE_SERIES``, which is what materializing the whole 6-D array first would have
       required — and what makes the lab's 49-position 6554² files unexportable.
     * **Sockets** ``path`` (``save_file``), ``layer`` (Voxel, empty = the image), ``level``
-      (gated to the codecs that accept one), ``split_positions``. Modes: ``model``
+      (gated to the codecs that accept one). Modes: ``split``, ``model``
       (ome/imagej/plain), ``compression``, ``existing``.
     * **Backend** tifffile 2026.5.15, already a dependency. Re-verified in-env: an iterator
       of planes with ``shape``/``dtype`` streams; one ``write`` per multipoint gives one OME
@@ -161,7 +162,14 @@ def _compute_write_tiff(ctx: EvalContext) -> Dataset:
     model = str(modes.get("model", "ome"))
     comp_name = str(modes.get("compression", "zlib"))
     existing = str(modes.get("existing", "skip"))
-    split = bool(ctx.params.get("split_positions", False))
+    split = str(modes.get("split", "none"))
+    if ctx.params.get("split_positions"):
+        raise ValueError(
+            "Export TIFF: `split_positions` has been replaced by the Split mode, which can "
+            "also write one file per GROUP. Set Split to 'position' for what the tick box "
+            "did, then clear the old value. Refused rather than translated because the two "
+            "are not the same control: a graph saved with the box ticked would otherwise "
+            "keep exporting per position while the header said 'none'.")
     level = int(ctx.params.get("level", 1))
 
     codec, takes_level, _enum = _CODECS[comp_name]
@@ -228,12 +236,22 @@ def _compute_write_tiff(ctx: EvalContext) -> Dataset:
                   for m in range(ax.m)]
 
     # ── target files ──────────────────────────────────────────────────────────
-    if split or (model != "ome" and ax.m > 1):
-        if not split:
+    if split == "group":
+        plan = position_group_plan(ds.metadata, ax)
+        if not plan.placed:
+            raise ValueError(
+                f"Export TIFF: Split = 'group' needs to know which positions belong "
+                f"together, and this Dataset carries no usable field geometry for its "
+                f"{ax.m} positions (it needs `pixel_size_um` plus a per-position "
+                f"`origin_um` or `stage_xy_um`). Use Split = 'position' for one file each, "
+                f"or 'none' for one file holding all of them.")
+        targets = [(_group_path(path, g.key), list(g.members)) for g in plan.groups]
+    elif split == "position" or (model != "ome" and ax.m > 1):
+        if split == "none":
             raise ValueError(
                 f"the {model!r} metadata model cannot hold {ax.m} positions in one file — "
-                f"only OME-TIFF has multiple images per file. Tick `split_positions` to "
-                f"write one file per position, or switch Model to 'ome'.")
+                f"only OME-TIFF has multiple images per file. Set Split to 'position' (or "
+                f"'group') to write more than one file, or switch Model to 'ome'.")
         targets = [(_split_path(path, m, ax.m), [m]) for m in range(ax.m)]
     else:
         targets = [(path, list(range(ax.m)))]
@@ -272,8 +290,8 @@ def _compute_write_tiff(ctx: EvalContext) -> Dataset:
             raise ValueError(
                 f"an ImageJ hyperstack cannot exceed 4 GB and this would be "
                 f"~{per_file[target] * plane_bytes / 1e9:.1f} GB. Switch Model to 'ome' "
-                f"(BigTIFF, and Fiji reads it through Bio-Formats), or tick "
-                f"`split_positions`, or crop first.")
+                f"(BigTIFF, and Fiji reads it through Bio-Formats), or set Split to "
+                f"'position'/'group', or crop first.")
         opts: Dict[str, Any] = {"bigtiff": big} if kw != "imagej" else {}
         if kw:
             opts[kw] = True
@@ -350,6 +368,26 @@ def _split_path(path: str, m: int, n: int) -> str:
     else:
         stem, ext = path, ""
     return f"{stem}_m{m:0{len(str(max(0, n - 1)))}d}{ext}"
+
+
+def _group_path(path: str, key: str) -> str:
+    """``out.ome.tif`` → ``out_G3.ome.tif`` — the per-GROUP filename.
+
+    The group's own key rather than an index, because the key is what the user typed into
+    ``util.select_group`` and what a renamed group in a ``.groups.json`` sidecar is called:
+    an export named ``_g02`` while everything else calls it ``treated`` would be one more
+    thing to map by hand. Sanitised to what every filesystem accepts, since a sidecar key is
+    free text.
+    """
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(key)).strip("_")
+    lower = path.lower()
+    for suffix in (".ome.tif", ".ome.tiff", ".tif", ".tiff"):
+        if lower.endswith(suffix):
+            stem, ext = path[: -len(suffix)], path[-len(suffix):]
+            break
+    else:
+        stem, ext = path, ""
+    return f"{stem}_{safe or 'group'}{ext}"
 
 
 def _stamp(ds: Dataset, arr: Optional[np.ndarray], layer: str, ms: List[int], *,
@@ -530,10 +568,10 @@ register_node(
                  "Where the file is written, on the machine that runs the graph. There is no "
                  "default and an empty value is refused rather than guessed — this node is "
                  "the one thing in the graph that puts bytes somewhere permanent, and it "
-                 "must be somewhere you picked. With `split_positions` on, this is the "
-                 "template: position 3 of 49 becomes `<name>_m03.<ext>`, the index padded so "
-                 "the files sort in position order. A `.ome.tif` suffix is kept whole when "
-                 "the index is inserted."),
+                 "must be somewhere you picked. With Split on, this is the TEMPLATE: "
+                 "position 3 of 49 becomes `<name>_m03.<ext>` (the index padded so the "
+                 "files sort in position order), and group G3 becomes `<name>_G3.<ext>`. "
+                 "A `.ome.tif` suffix is kept whole when the suffix is inserted."),
         InString("layer", "Layer", field=False, default="", layer_in=Domain.VOXEL,
                  description=
                  "Export a Voxel raster — a mask, a label image, a distance field — instead "
@@ -552,18 +590,35 @@ register_node(
               "file is going somewhere slow — an archive, a share — and the write is not the "
               "thing you are waiting on. Only read for the codecs that accept a level; lzma "
               "has no level in tifffile's encoder, so this field is hidden there."),
-        InBool("split_positions", "One file per position", field=False, default=False,
-               description=
-               "Write one file per multipoint instead of one file holding all of them. OFF "
-               "gives a single OME-TIFF with one OME Image per position — tidy, and the form "
-               "a viewer reopens as one experiment. Turn it ON when the positions are going "
-               "to be handled separately downstream, when a single file would be "
-               "uncomfortably large, or when Model is 'imagej'/'plain', which have no way to "
-               "hold more than one position and refuse a multi-position export without it. "
-               "No effect on a single-position dataset."),
     ],
     outputs=[OutDataset()],
     modes=[
+        Mode("split", ["none", "position", "group"], default="none", label="Split",
+             description=
+             "Whether this writes ONE file or several. A multipoint export is the only "
+             "place the answer is not obvious: the positions can be one experiment or "
+             "several specimens, and only you know which.",
+             choice_docs={
+                 "none":
+                     "One file holding every position — a single OME-TIFF with one OME "
+                     "Image per multipoint. Tidy, and the form a viewer reopens as one "
+                     "experiment. Refused by the 'imagej' and 'plain' models when there is "
+                     "more than one position, because neither can hold them.",
+                 "position":
+                     "One file per multipoint, named `<name>_m03.<ext>` with the index "
+                     "zero-padded so the files sort in position order. What you want when "
+                     "the positions are handled separately downstream, or when a single "
+                     "file would be uncomfortably large. On a 54-position series this "
+                     "writes 54 files.",
+                 "group":
+                     "One file per position GROUP — the 3x3 mosaic, the plate well — named "
+                     "`<name>_G3.<ext>` after the group's own key, so a group renamed in a "
+                     "`.groups.json` sidecar exports under that name. This is the one that "
+                     "matches how a multi-specimen acquisition is actually analysed: a "
+                     "54-position file of six mosaics writes six files of nine positions, "
+                     "each reopening as one specimen. Needs the stage geometry, and refuses "
+                     "rather than guessing when it is missing.",
+             }),
         Mode("model", ["ome", "imagej", "plain"], default="ome", label="Model",
              description=
              "Which metadata container the calibration is written into — i.e. which reader "
