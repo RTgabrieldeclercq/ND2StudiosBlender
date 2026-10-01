@@ -66,13 +66,21 @@ from nodegraph.dataset import AxisSizes, Dataset
 from nodegraph.engine import Engine, PullCancelled
 from nodegraph.graph import Graph
 from nodegraph.memo import Memo
-from nodegraph.metadata import MetaEnvelope, position_subset
+from nodegraph.metadata import (
+    MetaEnvelope, PER_POSITION_KEYS, SOURCE_FILE_KEY, position_subset,
+    stamp_source_file)
 from nodegraph.parallel import (
     cpu_budget, memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
 from nodegraph.provider import (
-    FrameSliceProvider, FrameSubsetProvider, SyntheticProvider, _picked, subset_index)
+    FrameSliceProvider, FrameSubsetProvider, MultiSourceProvider, SyntheticProvider,
+    _picked, subset_index)
 from nodegraph.streaming import StreamProvider, TileCache
-from nodelab_v2.ops import LOAD_OP, dock_seeds, dock_store_of
+from nodelab_v2.document import BUNDLE_PATHS_KEY
+from nodelab_v2.ops import (ACCESS_AUTO, ACCESS_DIRECT, ACCESS_INGEST, ACCESS_MODE,
+                            CALIB_OVERRIDE_KEYS, GROUPING_AUTO, GROUPING_DEFAULT,
+                            GROUPING_MODE, LOAD_OP,
+                            calib_overrides, dock_seeds, dock_store_of,
+                            source_access_of)
 
 #: byte-budget LRU cap for the persistent Memo (Memo GC). The persistent memo is the
 #: V2.04-flagged hazard: an eager full-raster node in a high-T zone would otherwise
@@ -116,10 +124,195 @@ def _clean_source_path(path: Any) -> str:
     return path.strip().strip('"').strip("'").strip()
 
 
-def source_key(path: str) -> Any:
+def source_key(path: str, access: str = ACCESS_INGEST) -> Any:
     """The provider-cache key for a source path — the identity a store, a provider and an
-    in-flight ingest are all shared under. An empty path is the synthetic demo source."""
-    return ("image", os.path.abspath(path)) if path else ("synthetic",)
+    in-flight ingest are all shared under. An empty path is the synthetic demo source.
+
+    ``access`` (``io.load``'s mode) is part of the identity because the two modes build
+    genuinely different providers over the same bytes — a
+    :class:`~nodegraph.provider.B2ndProvider` over a store versus a
+    :class:`~nodelab_v2.nd2_direct.Nd2DirectProvider` over the file — and they carry
+    different fingerprints. Sharing one cache slot would serve whichever was resolved
+    first and make the mode look like it had done nothing.
+
+    The ingest key is left **byte-identical** to the pre-mode tuple rather than growing a
+    uniform ``(…, access)`` tail. Every saved graph and every store on disk means
+    ``ingest``, so the default must not become a different key than it was.
+
+    For a REAL path, ``access`` must already be a CONCRETE choice — never
+    :data:`ACCESS_AUTO` itself. ``"auto"`` names a decision, not a provider, so keying on
+    the literal word would open a third cache slot belonging to neither real provider type
+    and sharable by nothing. :meth:`EngineRunner._effective_access` is where ``auto`` gets
+    resolved before it ever reaches here; this function's own ``access=ACCESS_INGEST``
+    default is an implementation fallback for a caller with no opinion — it is NOT
+    :data:`~nodelab_v2.ops.ACCESS_DEFAULT` (``"direct"``, the mode's actual default), which
+    a caller with a real ``io.load`` record should read via :func:`source_access_of`
+    instead of relying on this function's default to guess it. An EMPTY path is exempt —
+    the synthetic source has no file to decide anything about, so ``io.load``'s default
+    access (``"direct"``, unresolved) reaching here for the demo source is not a caller's
+    mistake."""
+    if not path:
+        return ("synthetic",)
+    assert access != ACCESS_AUTO, "source_key() needs a RESOLVED access, not 'auto'"
+    key = ("image", os.path.abspath(path))
+    return key if access == ACCESS_INGEST else key + (str(access),)
+
+
+def bundle_key(paths: Sequence[str], access: str = ACCESS_INGEST) -> Any:
+    """The provider-cache key for a file BUNDLE. Order is part of the identity because it
+    decides which file each multipoint index addresses, so the same files bundled the other
+    way round must not share a cached provider.
+
+    ``access`` joins it for the reason :func:`source_key` gives, and is appended the same
+    way — only when it is not the default — so an existing bundle keeps its key.
+
+    Unlike :func:`source_key`, ``access`` here is the card's own RAW setting and MAY be
+    ``"auto"`` — this key only has to be stable and distinct for the bundle's own
+    :class:`~nodegraph.provider.MultiSourceProvider` cache slot, never mind what each
+    member resolves to underneath; each member's own key (built by
+    :meth:`EngineRunner._resolve_one`, one call per file) is what actually distinguishes
+    ingest from direct, and members can resolve differently from each other."""
+    key = ("bundle", tuple(os.path.abspath(p) for p in paths))
+    return key if access == ACCESS_INGEST else key + (str(access),)
+
+
+def _with_card_calib(env: MetaEnvelope, cfg: Mapping[str, Any]) -> MetaEnvelope:
+    """``env`` with the source card's own calibration override applied (V2.29).
+
+    Applied HERE — after :meth:`EngineRunner._resolve_one`, never inside it — because that
+    cache is keyed on ``(path, access)`` and shared: two cards opening the SAME file with
+    different Z steps must not serve each other's calibration, and the provider (the pixels)
+    is genuinely identical for both. So the bytes stay shared and only the envelope forks.
+
+    This is also the ONE place the payload and the engine's meta-seed both come from
+    (:meth:`EngineRunner._ensure_engine` builds the seed ``Dataset`` from ``env.metadata``
+    and passes the same ``env`` as ``meta_seeds``), which is what keeps the pulled result and
+    the edit-time header from disagreeing about the spacing — the lockstep rule an
+    axis-changing node's ``meta_transform`` follows, applied to a source.
+    """
+    over = calib_overrides(cfg)
+    return env.with_metadata(**over) if over else env
+
+
+def _with_position_groups(env: MetaEnvelope, path: str, display: Mapping[str, Any],
+                          grouping: str = GROUPING_DEFAULT) -> Tuple[MetaEnvelope, str]:
+    """``env`` with the per-M grouping stamped on, plus the note the card shows.
+
+    Resolved HERE, once per source, rather than inside the node that selects a group. Three
+    reasons, and the last is the one that decides it:
+
+    * the sidecar is a property of the FILE, so the file's reader is where it belongs;
+    * every consumer benefits, not just ``util.select_group`` — a measurement table can
+      carry which specimen a row came from without anything else knowing how groups are
+      found;
+    * and this is applied on the same path as :func:`_with_card_calib`, which is the one
+      place the payload and the engine's meta-seed both come from. Stamping anywhere else
+      would put the grouping in one of them and not the other, and the two disagreeing about
+      how many positions a group has is precisely the edit-time/pull-time split an
+      axis-changing node's ``meta_transform`` exists to prevent.
+
+    Never fails a load: a file that cannot be grouped simply is not stamped, and
+    ``util.select_group`` reports that when (and only when) somebody asks for a group.
+    """
+    # OFF is the default, and off means NOTHING happens \u2014 no sidecar read, no clustering,
+    # no stamp. The lever is checked here rather than inside the detector so that a card
+    # nobody has opted in does not pay for, or fail on, work it will not use: this runs on
+    # every source of every pull, and a file whose header the SDK struggles with must not
+    # be made less openable by a feature that was not asked for.
+    if str(grouping or GROUPING_DEFAULT) != GROUPING_AUTO:
+        return env, ""
+    from nodelab_v2.position_groups import group_metadata, names_agree, resolve_plan
+    if int(getattr(env.axes, "m", 0) or 0) <= 0:
+        return env, ""
+    try:
+        plan, note = resolve_plan(path, env.metadata, env.axes)
+    except Exception:                    # noqa: BLE001 — grouping is never load-fatal
+        return env, ""
+    stamped = group_metadata(plan, display.get("position_name"))
+    if not stamped:
+        return env, note
+    agree = names_agree(plan, display.get("position_name"))
+    if agree is False:
+        note = (note + " — but the acquisition's own point names do NOT restart at these "
+                       "boundaries, so the geometry and the point list disagree about where "
+                       "one specimen ends. Worth checking before you rely on it.").strip()
+    return env.with_metadata(**stamped), note
+
+
+def _clean_source_paths(cfg: Dict[str, Any]) -> List[str]:
+    """A source cfg's member paths, cleaned. Returns 2+ entries only for a real bundle;
+    a single-file card (or a bundle someone reduced to one member) returns at most one, so
+    every caller can treat ``len(...) >= 2`` as "this is a bundle" without a second flag
+    that could disagree with the list."""
+    raw = cfg.get(BUNDLE_PATHS_KEY)
+    out: List[str] = []
+    if isinstance(raw, (list, tuple)):
+        out = [p for p in (_clean_source_path(p) for p in raw) if p]
+    if len(out) >= 2:
+        return out
+    fallback = _clean_source_path(cfg.get("path", ""))
+    return out or ([fallback] if fallback else [])
+
+
+def _unique_labels(paths: Sequence[str]) -> List[str]:
+    """A short, DISTINCT display name per bundle member — the basename where that is
+    already unique, otherwise enough trailing path segments to tell the duplicates apart.
+
+    Two wells exported as ``.../A3/data.nd2`` and ``.../B7/data.nd2`` is the ordinary case,
+    not a corner: bare basenames would put the identical name on both files' rows, which is
+    worse than a long name because the spreadsheet still looks answerable."""
+    names = [os.path.basename(p) or p for p in paths]
+    if len(set(names)) == len(names):
+        return names
+    out: List[str] = []
+    for p, name in zip(paths, names):
+        if names.count(name) == 1:
+            out.append(name)
+            continue
+        parts = os.path.normpath(os.path.abspath(p)).replace("\\", "/").split("/")
+        out.append("/".join(parts[-2:]) if len(parts) >= 2 else name)
+    if len(set(out)) == len(out):
+        return out
+    # still colliding (same parent AND same basename cannot happen, but a UNC/drive edge
+    # could) — fall back to the full path, which is always distinct
+    return [os.path.abspath(p) for p in paths]
+
+
+def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
+                    labels: Sequence[str]) -> MetaEnvelope:
+    """One envelope for a bundle of K files: the FIRST file's calibration, its multipoint
+    lists concatenated across the members, and a ``source_file`` name per position.
+
+    The first file's calibration is the bundle's because the members are required to share
+    a grid (:class:`~nodegraph.provider.MultiSourceProvider` refuses otherwise), so pixel
+    size, z step and channel optics already agree — taking one is not a choice between
+    disagreeing values.
+
+    The per-M lists are the part that can go quietly wrong. ``origin_um`` /
+    ``stage_xy_um`` and friends are read POSITIONALLY, so a bundle whose ``m`` runs 0..K·n
+    needs a list of that length or every read past the first file lands on another file's
+    coordinate. A key that is missing from ANY member, or the wrong length on one, is
+    dropped for the whole bundle rather than padded: a partial positional list reports the
+    wrong position instead of admitting it does not know (the same rule
+    :func:`nodegraph.metadata.position_subset` follows)."""
+    md: Dict[str, Any] = dict(envs[0].metadata) if envs else {}
+    counts = [int(e.axes.m) for e in envs]
+    for key in PER_POSITION_KEYS:
+        if key == SOURCE_FILE_KEY:
+            continue
+        vals: List[Any] = []
+        for env, n in zip(envs, counts):
+            got = env.metadata.get(key)
+            if not isinstance(got, (list, tuple)) or len(got) != n:
+                vals = []
+                break
+            vals.extend(got)
+        if vals:
+            md[key] = vals
+        else:
+            md.pop(key, None)
+    md[SOURCE_FILE_KEY] = [labels[i] for i, n in enumerate(counts) for _ in range(n)]
+    return MetaEnvelope(axes=axes, metadata=md)
 
 #: demo calibration for the synthetic fallback source (drives the ƒmd derive pills)
 _SYNTH_META = {
@@ -202,10 +395,12 @@ def display_ram_bytes() -> int:
 DEFAULT_TEXTURE_LIMIT = 8192
 
 
-#: Bytes of GPU texture the shown channels may occupy at once. The uploader packs each plane
-#: into **RGBA8** (:meth:`nodelab_v2.glview.GLImageView._upload` — 16-bit split across R and G),
-#: so one frame costs ``4 * y * x`` of VRAM *and* two transient CPU copies of the same size:
-#: a 7168² plane is 205 MB three times over, per channel. ``NODELAB_TEXTURE_BYTES`` overrides.
+#: Bytes of GPU texture the shown channels may occupy at once. The uploader is **GL_R16**
+#: (:meth:`nodelab_v2.glview.GLImageView._upload` — one normalized 16-bit channel per texture;
+#: it packed RGBA8 at 4 bytes/px until 2026-08-10, when the repack itself was measured as the
+#: playback cost), so one frame costs ``2 * y * x`` of VRAM plus transient CPU copies of the
+#: same size (``pack_u16`` + ``tobytes``): a 7168² plane is 103 MB per channel, a 13106² mosaic
+#: 344 MB. ``NODELAB_TEXTURE_BYTES`` overrides.
 #:
 #: This exists because ``GL_MAX_TEXTURE_SIZE`` is the wrong ceiling to trust — this GPU reports
 #: 32768, which would permit a 4 GB texture. Uploads are not error-checked (there is no
@@ -237,8 +432,12 @@ def display_cap(axes: Any, *, texture_limit: int, bytes_per_px: int = 8,
     that was the pyramid's zoomed-in alibi. A cold scrub does pay the level-0 read, on the
     worker, with the card showing "reading planes" — slower and honest, like every other
     lazy read in this app. The affordability ceilings above still refuse what the surface
-    or the budget genuinely cannot hold (a 13106² canvas is 687 MB of RGBA8 — past the
-    default :data:`TEXTURE_BYTES`; raise ``NODELAB_TEXTURE_BYTES`` if the GPU has room).
+    or the budget genuinely cannot hold. The budget charges the uploader's REAL texel cost
+    — 2 bytes/px since the R16 upload (2026-08-10) — and keeping the retired RGBA8 packing's
+    4 here was a live bug: it refused a single-channel 13106² whole-well canvas (687 MB
+    budgeted, 343 MB actual — "stitch is still pixelated", 2026-08-25). Two shown channels
+    of that canvas DO exceed the default; ``NODELAB_TEXTURE_BYTES`` is the knob, VRAM
+    permitting.
 
     ``bytes_per_px`` is deliberately pessimistic by default (8 — float64, what a stitch canvas
     serves): budgeting may be conservative, and over-committing is the failure that matters.
@@ -250,7 +449,7 @@ def display_cap(axes: Any, *, texture_limit: int, bytes_per_px: int = 8,
         return MAX_DISPLAY_DIM                # nothing to decide; it fits either way
     px = int(axes.y) * int(axes.x) * max(1, int(planes))
     if (long_edge <= int(texture_limit)
-            and px * 4 <= TEXTURE_BYTES
+            and px * 2 <= TEXTURE_BYTES
             and px * int(max(1, bytes_per_px)) <= display_ram_bytes()):
         return long_edge
     return MAX_DISPLAY_DIM
@@ -461,7 +660,7 @@ def _fit_plane(plane: np.ndarray, max_dim: int, *, as_dtype: Any = None) -> np.n
 
 
 def _plane_key(node_id: str, pin: Optional[Any], m: int, t: int, z: int, ch: int,
-               cap: int) -> tuple:
+               cap: int, sub: int = 0, ovr: int = 0) -> tuple:
     """The one spelling of a :class:`PlaneCache` address.
 
     It exists because there were two. `_plane_addrs` built a 7-tuple ending in the display
@@ -472,8 +671,21 @@ def _plane_key(node_id: str, pin: Optional[Any], m: int, t: int, z: int, ch: int
     re-composed) on every scrub. Worse, the fallback also omitted `max_dim=cap` on the read,
     so with a cap above :data:`MAX_DISPLAY_DIM` — every docked mosaic that fits the texture
     and RAM budgets — the shape-reference plane came back decimated to 4096 and the overlay
-    was composed onto a grid the primary channels do not share."""
-    return (node_id, pin, int(m), int(t), int(z), int(ch), int(cap))
+    was composed onto a grid the primary channels do not share.
+
+    ``sub`` / ``ovr`` exist only for COMPOSED overlay channels (2026-09-30): the Play-all
+    sub-tick inside primary frame ``t`` (a 4x-faster source shows a different frame on each of
+    four ticks of one primary frame), and the generation of the Viewer's per-source frame
+    override (its ◀▶ steppers — display-only, and so must never be served for the un-overridden
+    frame). Both are appended only when non-zero, so every primary key — and every overlay key
+    at rest — is the 7-tuple it always was, and the primary plane is shared by every sub-tick."""
+    base = (node_id, pin, int(m), int(t), int(z), int(ch), int(cap))
+    return base + ((int(sub), int(ovr)),) if (sub or ovr) else base
+
+
+def _key_sub(key: tuple) -> Tuple[int, int]:
+    """``(sub, ovr)`` of a :func:`_plane_key` (``(0, 0)`` for a 7-tuple)."""
+    return tuple(key[7]) if len(key) > 7 else (0, 0)
 
 
 def render_plane(provider: Any, m: int, t: int, z: int, c: int,
@@ -801,8 +1013,10 @@ class _Worker(QRunnable):
             # An overlay node's picture needs a SECOND chain evaluated. Resolved here, on
             # the worker, because pulling the secondary is real work (and normally a memo
             # hit); the compose itself happens per displayed plane in `_decode_planes`.
-            r._overlay_ctxs[job.node_id] = r._resolve_overlay(
-                engine, job.graph, job.pull_id, payload)
+            # A payload-only fetch (`EngineRunner.fetch`) is never displayed, so it skips it.
+            if job.epoch not in r._fetches:
+                r._overlay_ctxs[job.node_id] = r._resolve_overlay(
+                    engine, job.graph, job.pull_id, payload)
             plane = None                    # dict {channel_index: 2-D native plane}
             axes = None
             if isinstance(payload, Dataset) and payload.image is not None:
@@ -858,12 +1072,21 @@ class _IngestJob(QRunnable):
     wants a file already being ingested WAITS for it and then takes the cached provider,
     where a second writer would have torn the store the first was still filling."""
 
-    def __init__(self, runner: "EngineRunner", node_id: str, path: str, key: Any) -> None:
+    def __init__(self, runner: "EngineRunner", node_id: str,
+                 paths: Sequence[str], key: Any,
+                 access: str = ACCESS_INGEST) -> None:
         super().__init__()
         self._r = runner
         self._node_id = node_id
-        self._path = path
+        # a LIST, not a path: a file-bundle card names several files and all of them have
+        # to reach disk, or its first pull pays for the rest inside the pull slot — the
+        # exact cost this job exists to keep out of it
+        self._paths = list(paths)
         self._key = key
+        # The card's access mode, carried so the cfg this job hands `_resolve_source`
+        # matches the one a pull would build. A `direct` card resolves here too — it just
+        # finishes in milliseconds instead of minutes, since there is nothing to write.
+        self._access = access
 
     def run(self) -> None:  # ingest-pool thread
         r = self._r
@@ -873,8 +1096,11 @@ class _IngestJob(QRunnable):
             # An un-epoched observer: an ingest is not part of any pull, so it must not be
             # silenced when the epoch moves on (an edit, or another node being pulled while
             # this runs). Its card reports for as long as it takes.
-            r._resolve_source(self._node_id, {"path": self._path},
-                              observe=r._make_observer(None))
+            cfg: Dict[str, Any] = {"path": self._paths[0] if self._paths else "",
+                                   ACCESS_MODE: self._access}
+            if len(self._paths) >= 2:
+                cfg[BUNDLE_PATHS_KEY] = list(self._paths)
+            r._resolve_source(self._node_id, cfg, observe=r._make_observer(None))
         except Exception:  # noqa: BLE001 — full trace to the GUI, never a dead thread
             err = traceback.format_exc()
         r._ingest_done.emit((self._node_id, self._key, time.perf_counter() - t0, err))
@@ -902,9 +1128,10 @@ class _DecodeJob(QRunnable):
 
     def __init__(self, runner: "EngineRunner", gen: int, epoch: int, provider: Any,
                  node_id: str, coords, channels, axes, pin: Optional[Pin],
-                 dtype: Any = None) -> None:
+                 dtype: Any = None, sub: int = 0) -> None:
         super().__init__()
         self._r = runner
+        self._sub = int(sub)       # the Play-all sub-tick, captured with the coords
         self._gen = gen
         self._epoch = epoch
         self._prov = provider
@@ -919,13 +1146,13 @@ class _DecodeJob(QRunnable):
         r = self._r
         t0 = time.perf_counter()
         packet = (self._gen, self._epoch, self._node_id, self._coords, self._channels,
-                  self._pin)
+                  self._pin, self._sub)
         planes = axes = err = None
         try:
             if self._gen == r._decode_gen:        # else: superseded before it ever started
                 planes = r._decode_planes(self._prov, self._node_id, self._coords,
                                           self._channels, self._axes, pin=self._pin,
-                                          as_dtype=self._dtype)
+                                          as_dtype=self._dtype, sub=self._sub)
                 axes = self._axes
         except Exception:  # noqa: BLE001 — full trace to the GUI, never a dead thread
             err = traceback.format_exc()
@@ -966,6 +1193,12 @@ class _PrefetchJob(QRunnable):
             if r._planes.get(key) is not None:
                 continue
             try:
+                if ch >= int(getattr(getattr(prov, "axes", None), "c", ch + 1)):
+                    # An overlay channel is COMPOSED, not read — the provider has no such
+                    # index. Warmed through the same call the displayed frame uses, so the
+                    # cache entry it writes is byte-identical to the one it saves.
+                    r._warm_overlay(key, m, t, z, ch)
+                    continue
                 # No decode lock (V2.14). It used to serialize every provider read because
                 # the engine's TileCache was unsynchronized; the cache carries its own lock
                 # now, so holding one here only forced the prefetch pool to decode one frame
@@ -973,7 +1206,7 @@ class _PrefetchJob(QRunnable):
                 # The cap rides in the key (V2.23) — it must, because this writes planes the
                 # displayed-frame path then reads, and a prefetcher decimating to a different
                 # size would have it serve frames of the wrong shape.
-                arr, _lv = render_plane_native(prov, m, t, z, ch, max_dim=int(key[-1]),
+                arr, _lv = render_plane_native(prov, m, t, z, ch, max_dim=int(key[6]),
                                                as_dtype=self._dtype)
                 r._planes.put(key, arr)
             except Exception:                # noqa: BLE001 — prefetch is best-effort
@@ -1017,10 +1250,15 @@ class _PreloadJob(QRunnable):
                 return                       # cancelled: an edit, a stop, or a newer preload
             if r._planes.get(key) is None:
                 try:
-                    arr, _lv = render_plane_native(prov, m, t, z, ch,
-                                                   max_dim=int(key[-1]),
-                                                   as_dtype=self._dtype)
-                    r._planes.put(key, arr)
+                    if ch >= int(getattr(getattr(prov, "axes", None), "c", ch + 1)):
+                        # a COMPOSED overlay plane - the same warm call the prefetcher uses,
+                        # so a preloaded plane is byte-identical to a displayed one
+                        r._warm_overlay(key, m, t, z, ch)
+                    else:
+                        arr, _lv = render_plane_native(prov, m, t, z, ch,
+                                                       max_dim=int(key[6]),
+                                                       as_dtype=self._dtype)
+                        r._planes.put(key, arr)
                 except Exception:            # noqa: BLE001 — one unreadable frame must not
                     pass                     # abandon the rest of the series
             try:
@@ -1100,6 +1338,14 @@ class EngineRunner(QObject):
     #: a pull result — **never dropped as stale**, because the checkpoint is already on
     #: disk and the document has to record it or the bake is orphaned.
     baked = Signal(str, object)
+    #: a PAYLOAD-ONLY pull finished (:meth:`fetch`): ``(node_id, payload, seconds)``. Unlike
+    #: ``finished`` it never reaches a Viewer pane, holds no view and decodes no planes — it
+    #: is how the Movie Editor gets a source's Dataset without retargeting what is on screen.
+    fetched = Signal(str, object, float)
+    #: a fetch was submitted to the pull slot: ``(node_id)``. The counterpart to ``started``,
+    #: kept separate because ``started`` marks every pane showing that node as running, and
+    #: a fetch never delivers the ``finished`` that would clear it.
+    fetch_started = Signal(str)
     #: a viewport detail patch is ready: ``(node_id, {channel: plane}, (x0,y0,x1,y1))``
     #: with the rect in NORMALIZED image coordinates, so it is independent of both the
     #: patch's own resolution and the overview's.
@@ -1159,6 +1405,12 @@ class EngineRunner(QObject):
         self._engine_rev = -1
         self._providers: Dict[Any, Tuple[Any, MetaEnvelope]] = {}
         self._channel_display: Dict[Any, Dict[str, Any]] = {}   # source key → Viewer meta
+        #: path → the concrete access (`"ingest"`/`"direct"`) an `access=auto` card
+        #: resolved to, decided once per path and never revisited this session
+        #: (:meth:`_effective_access`) — plus the human-readable reason, for
+        #: :meth:`auto_access_reason`.
+        self._auto_access: Dict[str, str] = {}
+        self._auto_access_reason: Dict[str, str] = {}
         # ── per-source ingest, concurrent and outside the pull slot (V2.21) ───────
         self._ingest_pool = QThreadPool()
         self._ingest_pool.setMaxThreadCount(ingest_workers())
@@ -1243,6 +1495,16 @@ class EngineRunner(QObject):
         #: The worker only ever assigns one key (an atomic dict store); the GUI thread does
         #: the bounded trim in :meth:`_deliver`, so no reader can see a half-evicted map.
         self._overlay_ctxs: Dict[str, Optional[Dict[str, Any]]] = {}
+        #: source node id → {channel: {"clim", "bit_depth"}} for overlay channels. One
+        #: plane read of the SOURCE, cached because it never changes for that source.
+        self._src_lut_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        #: overlay node id → ``(dt, dz)``: the Viewer's per-source ◀▶ steppers, a DISPLAY-ONLY
+        #: move of that source's frame away from its mapped one, so the user can find the frame
+        #: that goes with this one before pinning it. Never written to the document; composed
+        #: planes made under it are keyed by ``_ovr_gen`` (:func:`_plane_key`), which advances on
+        #: every change, so they can never be served for the un-overridden frame.
+        self._src_override: Dict[str, Tuple[int, int]] = {}
+        self._ovr_gen: int = 0
         #: what one texture axis may be, from the live surface (:meth:`set_display_limits`).
         self._texture_limit: int = DEFAULT_TEXTURE_LIMIT
         self._prefetch_gen = 0
@@ -1257,12 +1519,16 @@ class EngineRunner(QObject):
         # plane never reaches this — it is served inline from the PlaneCache.
         self._decode_gen = 0
         self._decode_busy = False
-        self._decode_pending: Optional[Tuple[str, Any, Any]] = None
+        self._decode_pending: Optional[Tuple[Any, ...]] = None
         # ── viewport detail-on-demand (see :class:`_DetailJob`) ───────────────────
         #: bumped on every new request AND on every pull/scrub, so a patch that arrives
         #: for a rect (or a frame) the user has already left is dropped instead of being
         #: painted over the wrong place.
         self._detail_gen = 0
+        #: per source node, what the grouping resolution decided — read by the card so a
+        #: detected split and one a person wrote are not shown as the same claim.
+        self._group_note: Dict[str, str] = {}
+
         # ── solo-frame (troubleshooting) scope ────────────────────────────────────
         self._solo = False
         # the Viewer's M/T/Z picks. Empty on M or T → that axis follows the cursor; empty
@@ -1279,6 +1545,11 @@ class EngineRunner(QObject):
         # ── per-node progress bookkeeping ─────────────────────────────────────────
         #: epoch → the in-flight bake request (see :meth:`bake`), consumed by `_deliver`
         self._bakes: Dict[int, Dict[str, Any]] = {}
+        #: epochs of the in-flight payload-only pulls (:meth:`fetch`), and the node ids
+        #: waiting for one. Fetches queue BEHIND every pull the user asked for: they feed an
+        #: editor's preview, which must never delay the result someone is waiting to see.
+        self._fetches: set = set()
+        self._fetch_queue: "OrderedDict[str, None]" = OrderedDict()
         #: node_id → the Dataset a ``held`` dock is serving, and its envelope. Modelled on
         #: :attr:`_providers` (keyed by source path): a payload cache that must OUTLIVE every
         #: engine rebuild, because `_ensure_engine` builds a new Engine per document revision
@@ -1326,12 +1597,36 @@ class EngineRunner(QObject):
             return "not-a-source"
         if node_id in self._ingesting:
             return "running"
-        path = _clean_source_path(rec.params.get("path", ""))
-        if not path:
+        paths = _clean_source_paths(dict(rec.params))
+        if not paths:
             return "synthetic"
-        if source_key(path) in self._providers:
+        if self._source_key_of(paths, source_access_of(rec)) in self._providers:
             return "ready"
-        return "cold" if os.path.isfile(path) else "missing"
+        # a bundle is only as ready as its coldest member, and only as loadable as its
+        # most missing one — reporting "cold" for a bundle with a deleted member would
+        # start a job that can only fail
+        if any(not os.path.isfile(p) for p in paths):
+            return "missing"
+        return "cold"
+
+    def _source_key_of(self, paths: Sequence[str], access: str = ACCESS_INGEST) -> Any:
+        """The provider-cache key a source card's paths resolve under — one place, so the
+        state check, the ingest job and the pull cannot disagree about a card's identity.
+
+        ``access`` has to come along for exactly that reason: it is part of the key
+        (:func:`source_key`), so omitting it here would have :meth:`source_state` probing
+        the ingest slot for a card set to direct and reporting ``"cold"`` for a file that
+        is already open.
+
+        A single file's key is RESOLVED (:meth:`_effective_access`) the same way
+        :meth:`_resolve_one` resolves it, for the same reason — the key has to name the
+        provider that is actually cached, not the word ``"auto"``. A bundle's key is left
+        literal, matching :meth:`_resolve_bundle`: it only has to be stable and distinct,
+        and each member resolves independently underneath it anyway."""
+        if len(paths) >= 2:
+            return bundle_key(paths, access)
+        path = paths[0] if paths else ""
+        return source_key(path, self._effective_access(path, access) if path else access)
 
     def ingest_source(self, node_id: str) -> str:
         """Ingest the file an ``io.load`` card names — **now, concurrently, and without
@@ -1353,14 +1648,15 @@ class EngineRunner(QObject):
         if state != "cold":
             return state
         rec = self.document.nodes[node_id]
-        path = _clean_source_path(rec.params.get("path", ""))
-        key = source_key(path)
+        paths = _clean_source_paths(dict(rec.params))
+        access = source_access_of(rec)
+        key = self._source_key_of(paths, access)
         joined = key in set(self._ingesting.values())
         self._ingesting[node_id] = key
         self.ingest_started.emit(node_id)
         if joined:
             return "joined"
-        self._ingest_pool.start(_IngestJob(self, node_id, path, key))
+        self._ingest_pool.start(_IngestJob(self, node_id, list(paths), key, access))
         return "started"
 
     def ingest_all_sources(self) -> Dict[str, str]:
@@ -1538,7 +1834,10 @@ class EngineRunner(QObject):
                 _z_um_of(octx["pri_md"], octx["pri_axes"], m, z),
                 # the SNAPPED rect, in the (fy0, fy1, fx0, fx1) order placement uses: the
                 # patch's pixels cover that box and not the one that was requested
-                region=(ly0 / lax.y, ly1 / lax.y, lx0 / lax.x, lx1 / lax.x))
+                region=(ly0 / lax.y, ly1 / lax.y, lx0 / lax.x, lx1 / lax.x),
+                # detail is requested at REST (playback holds it off), so sub-tick 0 — but
+                # the stepper override and Z index must match the overview underneath it
+                z_index=z, override=dict(self._src_override))
             # the caller asked for a channel set; an overlay channel whose toggle is off is
             # not in it, and the patch must not put back what the overview leaves out
             want = {int(ch) for ch in (channels or ()) if int(ch) >= int(axes.c)}
@@ -1623,6 +1922,43 @@ class EngineRunner(QObject):
         """How many pulls are waiting behind the running one (0 when nothing is queued)."""
         return len(self._queue)
 
+    def in_flight(self, node_id: str) -> bool:
+        """Whether a live run (the one on the worker or one waiting behind it) reads
+        ``node_id`` — i.e. whether an edit to it now would cancel work in progress."""
+        return (any(node_id in cone for cone in self._run_cones.values())
+                or node_id in self._queue)
+
+    def finished_result(self, node_id: str) -> Any:
+        """``node_id``'s finished, UNPINNED payload at the current document revision, or
+        ``None``. A frame-scoped (solo) payload is never returned: it holds only the frames
+        it was scoped to, and handing it out as the node's answer would play a truncated
+        series."""
+        entry = self._results.get((node_id, self.document.revision))
+        return entry[0] if entry is not None else None
+
+    def fetch(self, node_id: str) -> None:
+        """Compute ``node_id``'s whole Dataset and deliver it on :attr:`fetched` ONLY.
+
+        The pull a normal :meth:`pull` makes goes to the Viewer: it holds a view, decodes
+        planes, retargets the primary pane and evicts the held views of whatever was being
+        compared. An editor that needs another node's payload in order to preview it must do
+        none of that, so a fetch is its own job kind, modelled on the Dock bake: it shares
+        the one pull thread and the engine's memo (an already computed chain is a memo hit),
+        and is resolved in :meth:`_deliver` before the view-holding path. Never frame-scoped.
+
+        Served at once when the answer is already in hand; otherwise queued behind every
+        user-requested pull, and a repeat request while one is waiting is a no-op."""
+        if node_id not in self.document.nodes:
+            return
+        have = self.finished_result(node_id)
+        if have is not None:
+            self.fetched.emit(node_id, have, 0.0)
+            return
+        if self._busy:
+            self._fetch_queue[node_id] = None
+            return
+        self._submit(node_id, None, None, fetch=True)
+
     def queued_nodes(self) -> Tuple[str, ...]:
         """The node ids waiting to be pulled, in the order they will run."""
         return tuple(self._queue)
@@ -1664,7 +2000,7 @@ class EngineRunner(QObject):
 
     def request_plane(self, node_id: str,
                       coords: Optional[Tuple[int, int, int, int]] = None,
-                      channels: Optional[Tuple[int, ...]] = None) -> None:
+                      channels: Optional[Tuple[int, ...]] = None, sub: int = 0) -> None:
         """Coords-only request. When ``node_id`` has a held view at the current document
         revision (only the M/T/Z cursor or the active-channel set moved), bypass the
         graph snapshot + ``engine.pull`` entirely and serve the plane straight from the
@@ -1688,7 +2024,9 @@ class EngineRunner(QObject):
             if (view is not None and view.provider is not None
                     and self.document.revision == view.rev
                     and self._pin_for(coords) == view.pin):
-                self._serve_from_cache(node_id, coords, channels)
+                # `sub` is the Play-all sub-tick (overlay planes only). A full pull below
+                # draws sub-tick 0: it happens at a document change, never mid-playback.
+                self._serve_from_cache(node_id, coords, channels, sub)
                 return
         self.pull(node_id, coords, channels)
 
@@ -1783,6 +2121,9 @@ class EngineRunner(QObject):
         # the composed overlay belongs to the graph that produced it — an edit can change
         # the placement, the pairing or the secondary chain entirely
         self._overlay_ctxs.clear()
+        # ...and the per-source LUT with them: it is keyed by SOURCE NODE, so editing that
+        # node's path would otherwise leave the previous file's window on the overlay.
+        self._src_lut_cache.clear()
         self._planes.clear()
 
     # ── the solo-frame (troubleshooting) scope ─────────────────────────────────
@@ -1892,7 +2233,7 @@ class EngineRunner(QObject):
 
     def _plane_addrs(self, node_id, coords, channels, axes,
                      *, pin: Optional[Pin] = None, provider: Any = None,
-                     dtype: Any = _UNSET) -> List[Tuple[tuple, int, int, int, int]]:
+                     dtype: Any = _UNSET, sub: int = 0) -> List[Tuple[tuple, int, int, int, int]]:
         """``(key, m, t, z, ch)`` per requested channel — the :class:`PlaneCache` addresses
         one display update needs, de-duplicated. Shared by the cache probe and the decode so
         the two can never disagree about a key.
@@ -1929,8 +2270,10 @@ class EngineRunner(QObject):
                                dtype=dtype)
         out: List[Tuple[tuple, int, int, int, int]] = []
         seen: set = set()
+        ovr = self._ovr_gen if self._src_override else 0
         for ch in wanted:
-            if ch >= int(axes.c):
+            is_ovl = ch >= int(axes.c)
+            if is_ovl:
                 if ch not in ovl:
                     continue          # a stale index from a node that no longer overlays
             else:
@@ -1938,19 +2281,32 @@ class EngineRunner(QObject):
             if ch in seen:
                 continue
             seen.add(ch)
-            out.append((_plane_key(node_id, pin, m, t, z, ch, cap), m, t, z, ch))
+            # the Play-all sub-tick and the stepper override address OVERLAY planes only —
+            # the primary plane is the same pixels on every sub-tick of its frame
+            out.append((_plane_key(node_id, pin, m, t, z, ch, cap,
+                                   sub if is_ovl else 0, ovr if is_ovl else 0),
+                        m, t, z, ch))
+        if not out:
+            # Every requested index was stale for THIS payload — the Viewer's active set
+            # is state from the PREVIOUSLY viewed node, and a payload with fewer channels
+            # (a per-channel `chK` tap materializes to c=1) can invalidate all of it at
+            # once. Degrade to the clamped cursor channel, exactly as an empty request
+            # does above: a payload that HAS an image must never deliver zero planes and
+            # read "no image on this output" (2026-08-15; the Viewer corrects its active
+            # set only on delivery, one click too late to save this pull).
+            out.append((_plane_key(node_id, pin, m, t, z, c, cap), m, t, z, c))
         return out
 
     def _cached_planes(self, node_id, coords, channels, axes,
                        *, pin: Optional[Pin] = None, provider: Any = None,
-                       dtype: Any = _UNSET) -> Optional[Dict[int, np.ndarray]]:
+                       dtype: Any = _UNSET, sub: int = 0) -> Optional[Dict[int, np.ndarray]]:
         """The requested planes if EVERY one of them is already decoded, else ``None`` —
         a read-only probe, so the GUI thread can decide whether serving this frame is free
         before it commits to doing it there (:meth:`_serve_from_cache`)."""
         out: Dict[int, np.ndarray] = {}
         for key, _m, _t, _z, ch in self._plane_addrs(node_id, coords, channels, axes,
                                                     pin=pin, provider=provider,
-                                                    dtype=dtype):
+                                                    dtype=dtype, sub=sub):
             arr = self._planes.get(key)
             if arr is None:
                 return None
@@ -2069,11 +2425,13 @@ class EngineRunner(QObject):
             # secondary from another acquisition and wrong for a sibling branch of one file.
             if not synthetic:
                 entry = self._replan(ovl_id, entry, payload, sec)
+            src_lut = self._source_lut(sec_id, sec)
             n = min(int(sec.axes.c), MAX_OVERLAY_CHANNELS)
             if n <= 0 or n > budget:
                 dropped += 1
                 continue
-            sources.append({"entry": entry, "ovl_id": ovl_id,
+            sources.append({"entry": entry, "ovl_id": ovl_id, "sec_id": sec_id,
+                            "src_lut": src_lut,
                             # A `view_source` wire is not an OVERLAY, it is another CHANNEL of
                             # the same acquisition — "I don't want an overlay, I want the
                             # channel to be active" (2026-08-04). So it takes the socket's name
@@ -2094,7 +2452,9 @@ class EngineRunner(QObject):
                 "pri_md": dict(payload.metadata), "pri_axes": payload.axes}
 
     def _compose_overlay(self, node_id: str, out_shape, m: int, t: int, z_um,
-                         *, region=None) -> Dict[int, np.ndarray]:
+                         *, region=None, t_sub: int = 0, z_index: Optional[int] = None,
+                         override: Optional[Dict[str, Tuple[int, int]]] = None
+                         ) -> Dict[int, np.ndarray]:
         """``{channel_index: composed plane}`` for the overlay on ``node_id``, or ``{}``.
 
         ``region`` is a fractional ``(fy0, fy1, fx0, fx1)`` sub-rect of the primary's image
@@ -2111,15 +2471,25 @@ class EngineRunner(QObject):
         the secondary rather than more of the blur.
 
         Never raises: an overlay that cannot be drawn must cost the user their overlay, not
-        their image."""
-        from nodelab_v2.overlay_compose import (
-            compose_secondary_plane, paired_t, secondary_z_index)
+        their image.
+
+        ``t_sub`` is the Play-all sub-tick inside primary frame ``t`` (of
+        :meth:`overlay_sub_ticks`); each source reads the frame its OWN map puts there
+        (:func:`~nodegraph.placement.paired_t_frac`), so a 4x-faster source advances on every
+        tick and a same-rate one holds. ``z_index`` is the primary's plane index, which Z pins
+        in index form need. ``override`` is the Viewer's display-only per-source ``(dt, dz)``
+        stepper offset. Z is sampled through the node's own :func:`z_pick` — the same slice
+        choice and weights the ``resample`` bake uses — so ``linear`` blends here exactly as it
+        does there."""
+        from nodelab_v2.overlay_compose import compose_secondary_plane
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return {}
         # The composite is sampled onto `out_shape`, so reading the window any finer than that
         # would be thrown away by the nearest-neighbour map — and any coarser is the blur.
         budget = max(1, int(max(out_shape[0], out_shape[1])))
+        n_sub = self.overlay_sub_ticks(node_id)
+        pri_k = int(z_index) if z_index is not None else 0
         out: Dict[int, np.ndarray] = {}
         for src in ctx.get("sources", ()):
             # Per SOURCE, so one source that cannot be placed at this frame (an unpaired
@@ -2127,33 +2497,66 @@ class EngineRunner(QObject):
             # chain still draws.
             try:
                 entry = src["entry"]
-                t_sec = paired_t(entry, t)
-                if t_sec is None:
-                    continue
                 sec_ax = src["sec_axes"]
+                frame = self._source_frame(src, ctx, t, int(t_sub), n_sub, pri_k, z_um,
+                                           m, override)
+                if frame is None:
+                    continue
+                t_sec, z_weights = frame
                 tiles = dict((int(a), b) for a, b in (entry.get("tiles") or ()))
                 hits = tiles.get(int(m)) or ()
                 if not hits:
                     continue
-                dz = float((entry.get("offset_um") or (0.0, 0.0, 0.0))[0])
-                z_sec = secondary_z_index(src["sec_md"], sec_ax, int(hits[0][0]),
-                                          z_um, dz=dz)
                 prov = src["sec_provider"]
                 for k in range(int(src["n"])):
-                    def read_tile(j, want, _k=k, _p=prov, _t=t_sec, _z=z_sec):
-                        try:
-                            return _window_read(_p, int(j), int(_t), int(_z), _k,
-                                                want, budget)
-                        except Exception:  # noqa: BLE001 — one bad tile, not a crash
-                            return None
-                    composed = compose_secondary_plane(
-                        entry, out_shape, ctx["pri_md"], ctx["pri_axes"], int(m),
-                        src["sec_md"], sec_ax, read_tile, region=region)
-                    if composed is not None:
-                        out[int(src["base_c"]) + k] = composed
+                    blended = None
+                    for z_sec, w in z_weights:
+                        def read_tile(j, want, _k=k, _p=prov, _t=t_sec, _z=z_sec):
+                            try:
+                                return _window_read(_p, int(j), int(_t), int(_z), _k,
+                                                    want, budget)
+                            except Exception:  # noqa: BLE001 — one bad tile, not a crash
+                                return None
+                        composed = compose_secondary_plane(
+                            entry, out_shape, ctx["pri_md"], ctx["pri_axes"], int(m),
+                            src["sec_md"], sec_ax, read_tile, region=region)
+                        if composed is not None:
+                            part = composed if w == 1.0 else composed * np.float32(w)
+                            blended = part if blended is None else blended + part
+                    if blended is not None:
+                        out[int(src["base_c"]) + k] = blended
             except Exception:  # noqa: BLE001 — the image must survive a bad overlay
                 continue
         return out
+
+    def _source_frame(self, src: Dict[str, Any], ctx: Dict[str, Any], t: int, t_sub: int,
+                      n_sub: int, pri_k: int, z_um, m: int,
+                      override: Optional[Dict[str, Tuple[int, int]]] = None):
+        """``(t_sec, [(z_sec, weight)])`` this source shows at primary ``(t, sub, z)``, or
+        ``None`` where it has no frame. The ONE resolution the compositor and the Play-all
+        readout share, so the numbers under the strip are the frame on screen."""
+        from nodegraph.catalog._shared.placement_entry import z_pick
+        from nodegraph.placement import paired_t_frac
+        entry = src["entry"]
+        sec_ax = src["sec_axes"]
+        t_sec = paired_t_frac(entry, int(t), int(t_sub), int(n_sub))
+        if t_sec is None:
+            return None
+        tiles = dict((int(a), b) for a, b in (entry.get("tiles") or ()))
+        hits = tiles.get(int(m)) or ()
+        sec_m = int(hits[0][0]) if hits else 0
+        z_weights = z_pick(entry, src["sec_md"], sec_ax, sec_m, ctx["pri_md"],
+                           ctx["pri_axes"], pri_k, z_um)
+        dt, dz = (override or {}).get(str(src.get("ovl_id")), (0, 0))
+        if dt:
+            t_sec = min(max(0, int(t_sec) + int(dt)), int(getattr(sec_ax, "t", 1) or 1) - 1)
+        if dz:
+            nz = int(getattr(sec_ax, "z", 1) or 1)
+            # a stepped Z is a real acquired plane: the user is looking for the ONE that goes
+            # with this one, which an interpolated blend could not show them
+            z0 = int(max(z_weights, key=lambda p: p[1])[0])
+            z_weights = [(min(max(0, z0 + int(dz)), nz - 1), 1.0)]
+        return int(t_sec), z_weights
 
     def overlay_flicker_hz(self, node_id: str) -> float:
         """Blink rate for the overlay's flicker mode, or ``0`` when no source uses it.
@@ -2199,12 +2602,12 @@ class EngineRunner(QObject):
             names = src["sec_md"].get("channel_names") or []
             for k in range(int(src["n"])):
                 label = str(names[k]) if k < len(names) and names[k] else str(k)
-                # the source's ordinal is in the label, so three overlaid files are
-                # tellable apart on the channel strip without opening the graph. A
+                # the SOURCE's name is in the label — the Overlay's own `label`, else the
+                # card title or file it came from (`source_label`) — so five overlaid files
+                # are tellable apart on the channel strip without opening the graph. A
                 # `view_source` wire is named by its SOCKET instead — it is a channel of this
-                # graph, not the nth overlaid file, and `ovl1:` misdescribes it.
-                pre = str(src.get("prefix") or "")
-                out[int(src["base_c"]) + k] = f"{pre}:{label}" if pre else f"ovl{i + 1}:{label}"
+                # graph, not the nth overlaid file.
+                out[int(src["base_c"]) + k] = f"{EngineRunner.source_label(self, src, i)}:{label}"
         return out
 
     #: `blend` Mode value → the shader's mode number. Kept here, next to the only reader,
@@ -2302,33 +2705,34 @@ class EngineRunner(QObject):
         record cannot drift. Falls back to the stamped entry if anything is missing, which
         is the pre-existing behaviour and correct whenever nothing downstream moved."""
         try:
+            from nodegraph.catalog._shared.placement_entry import (
+                handedness_for, overlay_settings, plan_kwargs)
             from nodegraph.catalog.view.overlay import overlay_entry
             from nodegraph.placement import plan_placement
             from nodegraph.nodes import SAMPLING_KEY
             node = self.document.nodes.get(ovl_id)
             if node is None or payload is None or sec is None:
                 return stamped
-            prm, mds = dict(node.params or {}), dict(node.modes or {})
-            offset = (float(prm.get("offset_z", 0.0)), float(prm.get("offset_y", 0.0)),
-                      float(prm.get("offset_x", 0.0)))
+            # The node's OWN settings reader, not a list kept here: a list here is how every
+            # new Overlay setting used to be honoured by the record and ignored by the picture.
+            s = overlay_settings(node, dict(node.modes or {}))
             plan = plan_placement(
                 payload.metadata, payload.axes, sec.metadata, sec.axes,
-                t_shift=int(prm.get("t_shift", 0)), offset_um=offset,
                 dst_sampling=tuple(payload.metadata.get(SAMPLING_KEY, ())),
                 src_sampling=tuple(sec.metadata.get(SAMPLING_KEY, ())),
-                min_coverage=float(prm.get("min_coverage", 0.0)),
-                on_unplaceable=mds.get("unplaceable", "refuse"))
+                **plan_kwargs(s))
             if not plan.ok:
                 return stamped        # keep the record; the pull itself already refused
             # The SAME handedness derivation the compute makes — an already-stitched secondary
             # is in stage coordinates, and a display path that flipped it while the compute did
             # not would draw the overlay 456 px from where a bake put it.
-            from nodegraph.catalog._shared.placement_entry import handedness_for
-            fx, fy, _w = handedness_for(sec, prm.get("flip_x", True),
-                                        prm.get("flip_y", False))
-            return overlay_entry(ovl_id, plan, {
-                "blend": mds.get("blend", "add"), "flip_x": fx, "flip_y": fy,
-                "t_shift": int(prm.get("t_shift", 0)), "offset_um": offset})
+            fx, fy, _w = handedness_for(sec, s["flip_x"], s["flip_y"])
+            # `context` is carried over from the stamped entry: the context boxes are the
+            # compute's to build (they need the canvas mode against the stamped geometry),
+            # and a re-plan that dropped them silently narrowed a context canvas back to the
+            # primary's field.
+            return overlay_entry(ovl_id, plan, {**s, "flip_x": fx, "flip_y": fy},
+                                 context=stamped.get("context") or [])
         except Exception:      # noqa: BLE001 — a re-plan failure must not cost the image
             return stamped
 
@@ -2345,6 +2749,243 @@ class EngineRunner(QObject):
             return float((node.params if node is not None else {}).get(name, default))
         except (TypeError, ValueError):
             return float(default)
+
+    def _source_lut(self, sec_id: str, sec) -> Dict[int, Dict[str, Any]]:
+        """The secondary's OWN display terms, per channel — worker thread, cached per source.
+
+        An overlay channel is a second FILE, not a second view of this one, so its contrast
+        has to come from that file: its own significant bit depth for the histogram extent,
+        and a window taken from one of ITS OWN whole planes. Two things it deliberately is
+        not. Not the composed crop, which is a sliver of a different-sized field and gave a
+        (300, 301) window on the WellA3 pair — noise. And not the secondary NODE's live
+        clim: reading that would tie the two together, so tuning the overlay would move the
+        source view and vice versa, when what the two datasets share is the OVERLAP (a
+        placement, which is metadata) and nothing about how either is displayed.
+        """
+        out = self._src_lut_cache.get(sec_id)
+        if out is not None:
+            return out
+        out = {}
+        prov = getattr(sec, "image", None)
+        ax = getattr(prov, "axes", None)
+        depth = (sec.metadata or {}).get("bit_depth") if hasattr(sec, "metadata") else None
+        for k in range(min(int(getattr(ax, "c", 1) or 1), MAX_OVERLAY_CHANNELS)):
+            lohi = None
+            try:
+                plane, _lv = render_plane_native(
+                    prov, 0, 0, int(getattr(ax, "z", 1) or 1) // 2, k, max_dim=1024)
+                finite = np.asarray(plane, dtype=float)
+                finite = finite[np.isfinite(finite)]
+                if finite.size:
+                    lo = float(np.percentile(finite, 1.0))
+                    hi = float(np.percentile(finite, 99.5))
+                    lohi = (lo, hi if hi > lo else lo + 1.0)
+            except Exception:      # noqa: BLE001 — no window is better than a wrong one
+                lohi = None
+            out[k] = {"clim": lohi, "bit_depth": int(depth) if depth else None}
+        self._src_lut_cache[sec_id] = out
+        return out
+
+    def _warm_overlay(self, key: tuple, m: int, t: int, z: int, ch: int) -> None:
+        """Compose ONE overlay plane into the cache ahead of the cursor (worker thread).
+
+        Goes through `_compose_overlay` so a prefetched plane and a displayed one are the
+        same pixels; a prefetcher that composed differently would be worse than none.
+
+        The Play-all sub-tick (and stepper generation) come from the KEY itself
+        (:func:`_key_sub`), so a job list can warm every sub-tick of a frame without a second
+        job shape. One compose yields every overlay channel of the chain, so every one of them
+        is cached — keeping only ``ch`` threw the rest away and composed them again for each
+        of their own jobs, n_sub times over under Play all."""
+        node_id = str(key[0])
+        try:
+            ctx = self._overlay_ctxs.get(node_id) if hasattr(self, "_overlay_ctxs")                 else self._overlay_ctx
+            if not ctx:
+                return
+            shape = ctx.get("display_shape")
+            if not shape:
+                return
+            sub, ovr = _key_sub(key)
+            if ovr and ovr != self._ovr_gen:
+                return             # a stepper moved since this was queued: stale on arrival
+            z_um = _z_um_of(ctx["pri_md"], ctx["pri_axes"], m, z)
+            got = self._compose_overlay(node_id, tuple(shape), m, t, z_um, t_sub=sub,
+                                        z_index=z,
+                                        override=dict(self._src_override) if ovr else {})
+            for c_k, arr in got.items():
+                if arr is not None:
+                    self._planes.put(key[:5] + (int(c_k),) + key[6:], arr)
+        except Exception:      # noqa: BLE001 — a warm miss costs latency, never the frame
+            return
+
+    def overlay_sources(self, node_id: str) -> Dict[int, Dict[str, Any]]:
+        """``{display channel: (secondary node id, that source's channel)}``.
+
+        What the Viewer needs to give an overlay channel the LUT of the FILE it came from
+        rather than one invented from the crop. A composed overlay plane is the part of the
+        secondary that happens to fall inside the primary's field — on the WellA3 pair a
+        294 µm sliver of a 1760 µm frame — so percentiles taken from it describe a different
+        image than the one the user tuned while looking at that file, which is what made the
+        overlay "rewrite the LUT" and look nothing like its source."""
+        ctx = self._overlay_ctxs.get(node_id) if hasattr(self, "_overlay_ctxs")             else self._overlay_ctx
+        if not ctx or (ctx.get("node") not in (None, node_id)):
+            return {}
+        out: Dict[int, Dict[str, Any]] = {}
+        for src in ctx.get("sources", ()):
+            sid = str(src.get("sec_id") or src.get("ovl_id") or "")
+            lut = src.get("src_lut") or {}
+            for k in range(int(src.get("n", 1))):
+                info = dict(lut.get(k) or {})
+                info.update({"node": sid, "ch": k})
+                out[int(src["base_c"]) + k] = info
+        return out
+
+    def overlay_sub_ticks(self, node_id: str) -> int:
+        """How many ticks Play all splits each primary frame into for ``node_id``'s overlay:
+        the most any source asked for (its entry's ``sub_ticks``), else 1. A same-rate chain
+        is 1 — playback is exactly what it always was."""
+        ctx = self._overlay_ctxs.get(node_id) if hasattr(self, "_overlay_ctxs") else None
+        if not ctx or ctx.get("node") != node_id:
+            return 1
+        return max([1] + [int(s["entry"].get("sub_ticks", 1) or 1)
+                          for s in ctx.get("sources", ())])
+
+    def overlay_frame_readout(self, node_id: str, m: int, t: int, sub: int,
+                              z: int) -> List[Dict[str, Any]]:
+        """Per source, what it is showing at primary ``(m, t, sub, z)`` — the Play-all strip.
+
+        ``{ovl_id, sec_id, label, t, n_t, z, n_z, t_pinned, z_pinned, offset}``; ``t``/``z``
+        are ``None`` where the source has no frame (the pairing ran off its end). ``z`` is the
+        dominant plane of a linear blend. Resolved through the compositor's own
+        :meth:`_source_frame`, so the readout IS the frame on screen."""
+        ctx = self._overlay_ctxs.get(node_id)
+        if not ctx or ctx.get("node") != node_id:
+            return []
+        n_sub = self.overlay_sub_ticks(node_id)
+        z_um = _z_um_of(ctx["pri_md"], ctx["pri_axes"], int(m), z)
+        out: List[Dict[str, Any]] = []
+        for i, src in enumerate(ctx.get("sources", ())):
+            if src.get("as_channel"):
+                continue           # a `view_source` channel of this graph, not an overlaid file
+            entry, sax = src["entry"], src["sec_axes"]
+            try:
+                fr = self._source_frame(src, ctx, t, sub, n_sub, int(z), z_um, int(m),
+                                        dict(self._src_override))
+            except Exception:  # noqa: BLE001 — a readout must never cost the view
+                fr = None
+            tz = (None, None) if fr is None else (
+                fr[0], int(max(fr[1], key=lambda p: p[1])[0]))
+            pins_t = {int(r[0]) for r in (self._pins_of(src["ovl_id"], "t_pins"))}
+            pins_z = {int(r[0]) for r in (self._pins_of(src["ovl_id"], "z_pins"))}
+            out.append({
+                "ovl_id": src["ovl_id"], "sec_id": src["sec_id"],
+                "label": self.source_label(src, i),
+                "t": tz[0], "n_t": int(getattr(sax, "t", 1) or 1),
+                "z": tz[1], "n_z": int(getattr(sax, "z", 1) or 1),
+                "t_pinned": int(t) in pins_t, "z_pinned": int(z) in pins_z,
+                "offset": tuple(self._src_override.get(str(src["ovl_id"]), (0, 0))),
+                "sub_ticks": int(entry.get("sub_ticks", 1) or 1)})
+        return out
+
+    def _pins_of(self, ovl_id: str, name: str) -> tuple:
+        """The overlay node's live pins (canonical rows), ``()`` when absent or malformed."""
+        from nodegraph.placement import parse_pins
+        node = self.document.nodes.get(ovl_id)
+        try:
+            return parse_pins((node.params if node is not None else {}).get(name, ""),
+                              axis=name[0])
+        except ValueError:
+            return ()
+
+    def source_label(self, src: Dict[str, Any], index: int) -> str:
+        """The name a source goes by on the channel strip, its LUTs and the Play-all strip.
+
+        The Overlay's own ``label`` (presentation, read live), else the secondary card's
+        title, else the base name of the file at the root of the secondary's chain, else
+        ``ovl{n}`` — never blank, because five overlaid files must be tellable apart."""
+        pre = str(src.get("prefix") or "")
+        if pre:
+            return pre                          # a `view_source` channel: its socket name
+        try:
+            return self._source_label_of(src) or f"ovl{index + 1}"
+        except Exception:  # noqa: BLE001 — a name is cosmetic; it must never cost the strip
+            return f"ovl{index + 1}"
+
+    def _source_label_of(self, src: Dict[str, Any]) -> str:
+        from nodelab_v2.document import TITLE_KEY
+        from nodelab_v2.ops import batch_member_identity
+        doc = self.document
+        node = doc.nodes.get(str(src.get("ovl_id")))
+        own = str((node.params if node is not None else {}).get("label") or "").strip()
+        if own:
+            return own
+        sid = str(src.get("sec_id") or "")
+        sec = doc.nodes.get(sid)
+        title = str((sec.params if sec is not None else {}).get(TITLE_KEY) or "").strip()
+        if title:
+            return title
+        # the root of the secondary's primary spine — the file it came from
+        cur, seen = sid, set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            preds = [e[0] for e in doc.edges if e[2] == cur and e[3] == "data"]
+            if not preds:
+                break
+            cur = preds[0]
+        root = doc.nodes.get(cur)
+        if root is not None and root.params.get("path"):
+            name = batch_member_identity(root, cur)
+            if name and name != cur:
+                return name
+        return ""
+
+    def overlay_pin_anchors(self, node_id: str, ovl_id: str, axis: str, m: int,
+                            pri: int, sec: int) -> Tuple[Optional[float], Optional[float]]:
+        """The ABSOLUTE anchors a new pin records beside its two indices, so it keeps
+        meaning the same frames after an upstream crop re-numbers them: each file's frame
+        clock (``frame_time_jd``) for a T pin, each plane's absolute focus (µm) for a Z pin.
+        ``(None, None)`` where either file lacks it — the pin then pairs by index."""
+        ctx = self._overlay_ctxs.get(node_id)
+        src = next((s for s in (ctx or {}).get("sources", ())
+                    if str(s.get("ovl_id")) == str(ovl_id)), None)
+        if src is None:
+            return (None, None)
+        pmd, smd = ctx["pri_md"], src["sec_md"]
+        try:
+            if axis == "t":
+                pj, sj = pmd.get("frame_time_jd") or (), smd.get("frame_time_jd") or ()
+                if 0 <= pri < len(pj) and 0 <= sec < len(sj):
+                    return (float(pj[pri]), float(sj[sec]))
+                return (None, None)
+            from nodegraph.placement import z_um_of_slice
+            tiles = dict((int(a), b) for a, b in (src["entry"].get("tiles") or ()))
+            hits = tiles.get(int(m)) or ()
+            sec_m = int(hits[0][0]) if hits else 0
+            zp = z_um_of_slice(pmd, ctx["pri_axes"], int(m), int(pri))
+            zs = z_um_of_slice(smd, src["sec_axes"], sec_m, int(sec))
+            return (None, None) if (zp is None or zs is None) else (float(zp), float(zs))
+        except (TypeError, ValueError):
+            return (None, None)
+
+    def set_source_override(self, ovl_id: str, dt: int = 0, dz: int = 0) -> None:
+        """Move one overlay source's DISPLAYED frame by ``(dt, dz)`` from its mapped frame
+        (``(0, 0)`` clears it) — the Viewer's ◀▶ steppers. Display-only: the document is not
+        touched, nothing re-runs, and the planes composed under it are keyed apart."""
+        key = str(ovl_id)
+        now = self._src_override.get(key, (0, 0))
+        new = (int(dt), int(dz))
+        if new == now:
+            return
+        if new == (0, 0):
+            self._src_override.pop(key, None)
+        else:
+            self._src_override[key] = new
+        self._ovr_gen += 1
+
+    def clear_source_overrides(self) -> None:
+        if self._src_override:
+            self._src_override.clear()
+            self._ovr_gen += 1
 
     def overlay_style(self, node_id: str) -> Dict[int, Tuple[int, float, float]]:
         """``{channel index: (blend mode, opacity, checker cells)}`` for the overlay's
@@ -2374,7 +3015,7 @@ class EngineRunner(QObject):
 
     def _decode_planes(self, provider, node_id, coords, channels, axes,
                        *, pin: Optional[Pin] = None, overlay_all: bool = False,
-                       as_dtype: Any = _UNSET) -> Dict[int, np.ndarray]:
+                       as_dtype: Any = _UNSET, sub: int = 0) -> Dict[int, np.ndarray]:
         """Native per-channel planes at ``coords`` (a GLOBAL display cursor), cache-first
         (used by the pull worker and by :class:`_DecodeJob`). Misses decode and are cached.
 
@@ -2395,11 +3036,11 @@ class EngineRunner(QObject):
             view = self._view_of(node_id)
             as_dtype = view.dtype if view is not None else None
         addrs = self._plane_addrs(node_id, coords, channels, axes, pin=pin,
-                                  provider=provider, dtype=as_dtype)
+                                  provider=provider, dtype=as_dtype, sub=sub)
         if not addrs:
             return out
         nc = int(axes.c)
-        cap = addrs[0][0][-1]          # the cap the keys were built with — never re-derived
+        cap = addrs[0][0][6]           # the cap the keys were built with — never re-derived
         dt = as_dtype
         ovl_addrs = [a for a in addrs if a[4] >= nc]
         ref: Optional[np.ndarray] = None
@@ -2433,14 +3074,22 @@ class EngineRunner(QObject):
         # placed by µm, so the display decimation costs it nothing and no caller has to
         # track a scale factor.
         z_um = _z_um_of(octx["pri_md"], octx["pri_axes"], m, z)
-        composed = self._compose_overlay(node_id, ref.shape[:2], m, t, z_um)
+        # Recorded so the PREFETCHER composes at exactly this size. A warmed plane of a
+        # different shape would be worse than no warming: the displayed-frame path would
+        # find a cache entry it cannot use, or worse, use one of the wrong shape.
+        octx["display_shape"] = tuple(ref.shape[:2])
+        # The override snapshot is taken ONCE, with the keys: a stepper moved while this runs
+        # must not compose one frame's pixels under another generation's key.
+        ovr = self._ovr_gen if self._src_override else 0
+        composed = self._compose_overlay(node_id, ref.shape[:2], m, t, z_um, t_sub=sub,
+                                         z_index=z, override=dict(self._src_override))
         keys = {a[4]: a[0] for a in ovl_addrs}
         for ch, plane in composed.items():
             key = keys.get(ch)
             if key is None:
                 if not overlay_all:
                     continue                   # not asked for: its toggle is off
-                key = _plane_key(node_id, pin, m, t, z, int(ch), cap)
+                key = _plane_key(node_id, pin, m, t, z, int(ch), cap, sub, ovr)
             self._planes.put(key, plane)
             out[int(ch)] = plane
         return out
@@ -2537,7 +3186,7 @@ class EngineRunner(QObject):
             self._planes.put(key, arr)
         return arr
 
-    def _serve_from_cache(self, node_id, coords, channels) -> None:  # GUI thread
+    def _serve_from_cache(self, node_id, coords, channels, sub: int = 0) -> None:  # GUI thread
         """Display the plane(s) at ``coords`` without going through the engine.
 
         A **warm** frame is served right here: the pixels are already decoded, so emitting
@@ -2551,15 +3200,19 @@ class EngineRunner(QObject):
             return
         axes, pin = view.axes, view.pin
         warm = self._cached_planes(node_id, coords, channels, axes, pin=pin,
-                                   provider=view.provider, dtype=view.dtype)
+                                   provider=view.provider, dtype=view.dtype, sub=sub)
         if warm is not None:
             self.plane_ready.emit(node_id, warm, axes, time.perf_counter() - t0)
-            self.prefetch(node_id,
-                          self._clamp_coords(self._payload_coords(coords, pin), axes),
-                          tuple(channels) if channels else None, pin=pin)
+            # Only on sub-tick 0: one prefetch warms every sub-tick of the frames ahead, and
+            # each call supersedes the last (`_prefetch_gen`) — calling it on every Play-all
+            # tick would cancel the warm after one compose, and it would never get ahead.
+            if not sub:
+                self.prefetch(node_id,
+                              self._clamp_coords(self._payload_coords(coords, pin), axes),
+                              tuple(channels) if channels else None, pin=pin)
             return
         if self._decode_busy:
-            self._decode_pending = (node_id, coords, channels)   # latest-wins
+            self._decode_pending = (node_id, coords, channels, sub)   # latest-wins
             return
         self._decode_gen += 1
         self._decode_busy = True
@@ -2569,7 +3222,7 @@ class EngineRunner(QObject):
         self._progress.emit(("decode", node_id, {"epoch": self._epoch, "op_key": ""}))
         self._pool.start(_DecodeJob(self, self._decode_gen, self._epoch,
                                     view.provider, node_id, coords, channels,
-                                    axes, pin, view.dtype))
+                                    axes, pin, view.dtype, sub))
 
     def _deliver_planes(self, packet) -> None:   # GUI thread (queued)
         """Land a :class:`_DecodeJob`'s planes, then run whatever the cursor did meanwhile.
@@ -2578,7 +3231,7 @@ class EngineRunner(QObject):
         or a real pull happened): either way the pixels describe a frame nobody is looking at
         any more, so they are dropped — they are still in the PlaneCache, so nothing is
         wasted if the cursor comes back."""
-        (gen, epoch, node_id, coords, channels, pin, planes, axes, dt, err) = packet
+        (gen, epoch, node_id, coords, channels, pin, sub, planes, axes, dt, err) = packet
         self._decode_busy = False
         pending, self._decode_pending = self._decode_pending, None
         fresh = gen == self._decode_gen and epoch == self._epoch
@@ -2587,9 +3240,10 @@ class EngineRunner(QObject):
         elif fresh and planes:
             self._progress.emit(("done", node_id, {"epoch": epoch, "seconds": dt}))
             self.plane_ready.emit(node_id, planes, axes, dt)
-            self.prefetch(node_id,
-                          self._clamp_coords(self._payload_coords(coords, pin), axes),
-                          tuple(channels) if channels else None, pin=pin)
+            if not sub:
+                self.prefetch(node_id,
+                              self._clamp_coords(self._payload_coords(coords, pin), axes),
+                              tuple(channels) if channels else None, pin=pin)
         if pending is not None:
             # back through request_plane, not straight to the decode: the node, the document
             # revision and the pin all have to be re-checked, and a cursor that wandered
@@ -2622,18 +3276,36 @@ class EngineRunner(QObject):
             return
         m, t, z, _c = center
         nt = axes.t
-        chans = tuple(min(max(0, int(ch)), axes.c - 1)
+        # Overlay channels live ABOVE `axes.c` and must survive the clamp. They used not
+        # to, so prefetch warmed only the primary's channels and every frame of a playback
+        # paid the overlay compose on the critical path — the "does not play fast" report.
+        # The composed planes are cached under the same keys, so warming them is the whole
+        # fix; they just have to be asked for.
+        ovl_ch = tuple(sorted(self.overlay_channels(node_id)))
+        chans = tuple(ch if ch in ovl_ch else min(max(0, int(ch)), axes.c - 1)
                       for ch in (channels if channels else
                                  (min(max(0, center[3]), axes.c - 1),)))
+        chans = tuple(dict.fromkeys(chans + ovl_ch))
         cap = self.display_dim(axes, planes=max(1, len(set(chans))),
                                provider=prov, dtype=view.dtype)
+        # Play all: every sub-tick of each frame ahead, for OVERLAY channels only - the
+        # primary plane is shared by all of them. The frame UNDER the cursor is warmed too,
+        # since its later sub-ticks are exactly what the next few ticks show.
+        n_sub = self.overlay_sub_ticks(node_id)
+        ovr = self._ovr_gen if self._src_override else 0
         self._prefetch_gen += 1
         gen = self._prefetch_gen
         jobs: List[Tuple[tuple, int, int, int, int]] = []
-        for d in range(1, span + 1):
-            for tt in ((t + d) % nt, (t - d) % nt):
-                for ch in chans:
-                    key = (node_id, pin, m, tt, z, ch, cap)
+        order = ([t] if n_sub > 1 else []) + [tt for d in range(1, span + 1)
+                                              for tt in ((t + d) % nt, (t - d) % nt)]
+        for tt in order:
+            for ch in chans:
+                is_ovl = ch in ovl_ch
+                for sb in (range(n_sub) if is_ovl else (0,)):
+                    if tt == t and not (is_ovl and sb):
+                        continue               # the displayed frame itself is already here
+                    key = _plane_key(node_id, pin, m, tt, z, ch, cap,
+                                     sb if is_ovl else 0, ovr if is_ovl else 0)
                     if self._planes.get(key) is None:
                         jobs.append((key, m, tt, z, ch))
         if jobs:
@@ -2655,6 +3327,20 @@ class EngineRunner(QObject):
         cap = self.display_dim(axes, planes=max(1, chans), provider=provider, dtype=dtype)
         return (min(cap, int(axes.y)) * min(cap, int(axes.x))
                 * (2 if dtype is not None else 8) * max(1, chans))
+
+    def _overlay_frame_bytes(self, node_id: str, axes: Any, *, provider: Any = None,
+                             dtype: Any = None) -> int:
+        """Extra bytes one frame's COMPOSED overlay planes cost in the plane cache: float32,
+        one per overlay channel per Play-all sub-tick. `_frame_bytes` alone assumed every
+        plane was a 2-byte read, which under-counts a composed overlay by 2x and a 4x-rate
+        source by 8x - the preload would then size itself past the cache and evict its own
+        head."""
+        n_ovl = len(self.overlay_channels(node_id))
+        if not n_ovl:
+            return 0
+        cap = self.display_dim(axes, planes=1, provider=provider, dtype=dtype)
+        return (min(cap, int(axes.y)) * min(cap, int(axes.x)) * 4
+                * n_ovl * self.overlay_sub_ticks(node_id))
 
     def preload_series(self, node_id: str, center, channels, *,
                        pin: Optional[Pin] = None) -> int:
@@ -2696,22 +3382,35 @@ class EngineRunner(QObject):
             self.cancel_preload()
             return 0
         m, t0, z, _c = center
-        chans = tuple(sorted({min(max(0, int(ch)), axes.c - 1)
+        # Overlay channels (indices above the primary's own) are KEPT, not clamped into the
+        # primary's range: the clamp is why Play never preloaded the overlay at all, so every
+        # frame of a playback composed it on the critical path.
+        ovl_ch = set(self.overlay_channels(node_id))
+        chans = tuple(sorted({int(ch) if int(ch) in ovl_ch else min(max(0, int(ch)), axes.c - 1)
                               for ch in (channels or (center[3],))}))
+        prim = [ch for ch in chans if ch not in ovl_ch]
         cap = self.display_dim(axes, planes=max(1, len(chans)),
                                provider=prov, dtype=view.dtype)
         nt = max(1, int(axes.t))
-        room = max(1, min(self._planes.budget, display_ram_bytes())
-                   // max(1, self._frame_bytes(axes, len(chans),
-                                               provider=prov, dtype=view.dtype)))
+        n_sub = self.overlay_sub_ticks(node_id)
+        ovr = self._ovr_gen if self._src_override else 0
+        per_frame = (self._frame_bytes(axes, max(1, len(prim)), provider=prov,
+                                       dtype=view.dtype)
+                     + (self._overlay_frame_bytes(node_id, axes, provider=prov,
+                                                  dtype=view.dtype)
+                        if ovl_ch & set(chans) else 0))
+        room = max(1, min(self._planes.budget, display_ram_bytes()) // max(1, per_frame))
         start = min(max(0, int(t0)), nt - 1)
         want: List[Tuple[tuple, int, int, int, int]] = []
         for i in range(min(nt, int(room))):
             tt = (start + i) % nt
             for ch in chans:
-                key = (node_id, pin, m, tt, z, ch, cap)
-                if self._planes.get(key) is None:
-                    want.append((key, m, tt, z, ch))
+                is_ovl = ch in ovl_ch
+                for sb in (range(n_sub) if is_ovl else (0,)):
+                    key = _plane_key(node_id, pin, m, tt, z, ch, cap,
+                                     sb if is_ovl else 0, ovr if is_ovl else 0)
+                    if self._planes.get(key) is None:
+                        want.append((key, m, tt, z, ch))
         self._preload_gen += 1
         self._preload_node = node_id
         self._preload_total = len(want)
@@ -2766,10 +3465,14 @@ class EngineRunner(QObject):
         if axes is None:
             return False
         ceiling = min(self._planes.budget, display_ram_bytes())
-        return (self._frame_bytes(axes, planes,
-                                  provider=view.provider if view else None,
-                                  dtype=view.dtype if view else None)
-                * max(1, int(axes.t)) <= ceiling)
+        prov, dt = (view.provider, view.dtype) if view else (None, None)
+        # composed overlay planes are float32 and one per Play-all sub-tick — counted, or a
+        # 4x-rate overlay reports "fits" for a series that is 8x the budget in overlay alone
+        n_ovl = len(self.overlay_channels(node_id)) if node_id is not None else 0
+        extra = (self._overlay_frame_bytes(node_id, axes, provider=prov, dtype=dt)
+                 if n_ovl else 0)
+        return ((self._frame_bytes(axes, max(1, planes - n_ovl), provider=prov, dtype=dt)
+                 + extra) * max(1, int(axes.t)) <= ceiling)
 
     def frames_are_reads(self, node_id: str) -> bool:
         """Whether one frame of ``node_id``'s held result is BYTES — a decompress off a store
@@ -3143,8 +3846,43 @@ class EngineRunner(QObject):
 
     # ── internals ─────────────────────────────────────────────────────────────
     def _all_sources(self) -> Dict[str, Dict[str, Any]]:
-        return {rec.id: {"path": str(rec.params.get("path", "") or "")}
-                for rec in self.document.nodes.values() if rec.op_key == LOAD_OP}
+        # `paths` rides alongside `path` rather than replacing it: a bundle card keeps a
+        # usable single `path` (its first member), so every reader that predates bundles —
+        # a saved graph opened by an older build, the LabLink protocol — still names a real
+        # file instead of an empty one.
+        out: Dict[str, Dict[str, Any]] = {}
+        for rec in self.document.nodes.values():
+            if rec.op_key != LOAD_OP:
+                continue
+            cfg: Dict[str, Any] = {"path": str(rec.params.get("path", "") or ""),
+                                   # the card's access mode rides in the cfg beside its
+                                   # path because that cfg is the whole of what the worker
+                                   # thread is given about a source (`_resolve_source`);
+                                   # reading `rec.modes` down there would mean touching the
+                                   # document off the GUI thread.
+                                   ACCESS_MODE: source_access_of(rec),
+                                   # ...and so does the grouping lever, for the same reason
+                                   # and with the same unset-means-default rule the document
+                                   # applies (`group_descriptors`). The worker must not reach
+                                   # into `rec.modes` off the GUI thread.
+                                   GROUPING_MODE: str(
+                                       rec.modes.get(GROUPING_MODE, GROUPING_DEFAULT)
+                                       or GROUPING_DEFAULT)}
+            # The card's own calibration ride along for the same reason the access mode
+            # does: this cfg is the WHOLE of what the worker thread is told about a source,
+            # and `_resolve_source` applies the override to the envelope that becomes both
+            # the payload's metadata and the engine's meta-seed. Leaving them out is not a
+            # missing feature but a DRIFT: the edit-time header (document.propagate reads
+            # the params directly) would show the typed Z step while the pulled payload
+            # still carried None, so the graph refused with a number the card said it had.
+            for key in CALIB_OVERRIDE_KEYS:
+                if key in rec.params:
+                    cfg[key] = rec.params[key]
+            members = rec.params.get(BUNDLE_PATHS_KEY)
+            if isinstance(members, (list, tuple)) and len(members) >= 2:
+                cfg[BUNDLE_PATHS_KEY] = [str(p or "") for p in members]
+            out[rec.id] = cfg
+        return out
 
     def _sources_for(self, node_id: str, graph: Graph
                      ) -> Tuple[Dict[str, Dict[str, Any]], frozenset]:
@@ -3165,7 +3903,7 @@ class EngineRunner(QObject):
         return ({nid: cfg for nid, cfg in every.items() if nid in needed},
                 frozenset(every))
 
-    def _submit(self, node_id: str, coords, channels=None) -> None:
+    def _submit(self, node_id: str, coords, channels=None, *, fetch: bool = False) -> None:
         self._epoch += 1
         self._last_progress.clear()
         self._last_frame.clear()
@@ -3176,7 +3914,10 @@ class EngineRunner(QObject):
         sources, every = self._sources_for(pull_id, graph)
         job = _Job(self._epoch, graph,
                    self.document.revision, node_id, coords, channels, sources,
-                   pin=self._pin_for(coords), all_sources=every, pull_id=pull_id)
+                   pin=None if fetch else self._pin_for(coords), all_sources=every,
+                   pull_id=pull_id)
+        if fetch:
+            self._fetches.add(self._epoch)
         self._busy = True
         self._active = job          # the job on the worker — `invalidate` latches its
         #                             cancel flag so the engine can abort mid-run
@@ -3191,7 +3932,7 @@ class EngineRunner(QObject):
         self._run_cones[self._epoch] = frozenset(
             _doc_id_of(c) for c in self.planned_nodes(pull_id, graph))
         self.plan.emit(node_id, self.planned_nodes(pull_id, graph))
-        self.started.emit(node_id)
+        (self.fetch_started if fetch else self.started).emit(node_id)
         self._pull_thread.start(_Worker(self, job))
 
     def _start_next(self) -> None:
@@ -3207,6 +3948,17 @@ class EngineRunner(QObject):
                 self._submit(*req)
                 return
             self.cancelled.emit(req[0])      # the node was deleted while it waited
+        # only once no pull the user asked for is waiting: an editor's source fetch
+        while self._fetch_queue:
+            nid, _ = self._fetch_queue.popitem(last=False)
+            if nid not in self.document.nodes:
+                continue
+            have = self.finished_result(nid)
+            if have is not None:              # a user pull computed it while it waited
+                self.fetched.emit(nid, have, 0.0)
+                continue
+            self._submit(nid, None, None, fetch=True)
+            return
 
     def _pull_id(self, node_id: str, graph: Graph) -> str:
         """Which id in the RUN graph serves ``node_id``.
@@ -3261,13 +4013,29 @@ class EngineRunner(QObject):
         # view of the node the user is looking at (a moved cursor, a changed channel set),
         # and showing the older one first would be a visible flicker backwards. A queued
         # request for a DIFFERENT node is simply the next branch and retires nothing.
-        if node_id in self._queue:
+        # A FETCH is exempt from that rule: a queued view of the same node does not make a
+        # payload-only answer any less true — only a cancellation (an edit in its cone) does.
+        fetch = epoch in self._fetches
+        self._fetches.discard(epoch)
+        if node_id in self._queue and not fetch:
             stale = True
         self._start_next()
         if stale:
             return
         if err is not None:
             self.failed.emit(node_id, err)
+            return
+        if fetch:
+            # A payload-only pull: remembered like any finished branch (so a later click on
+            # the node is served instantly), and handed to whoever asked. No view is held, no
+            # plane decoded, no `finished` — so no pane is retargeted and none is left
+            # showing a run that never delivers.
+            if isinstance(payload, Dataset):
+                self._results[(node_id, self.document.revision)] = (payload, axes)
+                self._results.move_to_end((node_id, self.document.revision))
+                while len(self._results) > _FINISHED_RESULTS:
+                    self._results.popitem(last=False)
+            self.fetched.emit(node_id, payload, dt)
             return
         # Hold the image provider so subsequent coords-only requests skip the engine
         # (the fast path). Tied to the CURRENT document revision — not the job's: the
@@ -3445,6 +4213,75 @@ class EngineRunner(QObject):
                 lock = self._src_locks[key] = threading.Lock()
             return lock
 
+    def _store_path_for(self, path: str) -> str:
+        """Where ``path``'s ``.b2nd`` store lives — beside the file, or under
+        ``NODEGRAPH_STORE_DIR`` with a path-digest tag when the store is relocated (see
+        :func:`~nodegraph.parallel.store_dir`). The one place this is computed, so an
+        auto-access decision and an actual ingest cannot disagree about a file's store
+        identity."""
+        base = os.path.splitext(path)[0] + ".b2nd_store"
+        target_dir = store_dir(os.path.dirname(base))
+        if os.path.abspath(target_dir) == os.path.abspath(os.path.dirname(base)):
+            return base
+        tag = hashlib.blake2b(os.path.abspath(path).lower().encode("utf-8"),
+                              digest_size=6).hexdigest()
+        return os.path.join(
+            target_dir, f"{os.path.splitext(os.path.basename(path))[0]}.{tag}.b2nd_store")
+
+    def _effective_access(self, path: str, access: str) -> str:
+        """``access`` unchanged unless it is :data:`ACCESS_AUTO`, in which case the
+        concrete choice ``path`` resolves to — decided once and cached for the runner's
+        lifetime.
+
+        Caching matters here specifically: :meth:`source_state` is polled continuously by
+        the canvas to paint each source card's status, and the decision below opens the
+        file and stats a drive — cheap once, wasteful on every tick. A later free-space
+        change or a store built by another means within the same session will not move an
+        already-cached decision; that trade mirrors :attr:`_providers` itself, which is
+        just as sticky for the same reason (a session-lifetime resolve, not a live poll).
+
+        **A store that already exists and opens cleanly always wins**, without even
+        asking :func:`~nodelab_v2.nd2_direct.decide_access` — a copy already sitting on
+        disk has nothing left to protect against by reading around it, and "auto reads
+        the file in place because the drive filled up with something unrelated after the
+        ingest finished" would silently stop using a store the user already paid for.
+        Only when there is nothing usable on disk does the decision turn on whether a
+        FRESH ingest would fit."""
+        if access != ACCESS_AUTO:
+            return access
+        cached = self._auto_access.get(path)
+        if cached is not None:
+            return cached
+        from nodelab_v2.ingest import open_store
+        store = self._store_path_for(path)
+        resolved, reason = ACCESS_INGEST, "an existing store already covers this file"
+        valid_store = False
+        if os.path.isdir(store):
+            try:
+                open_store(store)
+                valid_store = True
+            except Exception:                      # noqa: BLE001 — torn/short store
+                valid_store = False
+        if not valid_store:
+            from nodelab_v2.nd2_direct import decide_access
+            resolved, reason = decide_access(path, os.path.dirname(store))
+        self._auto_access[path] = resolved
+        self._auto_access_reason[path] = reason
+        return resolved
+
+    def auto_access_reason(self, node_id: str) -> str:
+        """Why this card's ``access=auto`` resolved the way it did — empty when the card
+        is not set to auto, names a bundle (each member decides independently; there is
+        no single reason for the card), or has not been decided yet (nothing has pulled
+        or ingested it this session)."""
+        rec = self.document.nodes.get(node_id)
+        if rec is None or source_access_of(rec) != ACCESS_AUTO:
+            return ""
+        paths = _clean_source_paths(dict(rec.params))
+        if len(paths) != 1:
+            return ""
+        return self._auto_access_reason.get(paths[0], "")
+
     def _resolve_source(self, node_id: str, cfg: Dict[str, Any],
                         epoch: Optional[int] = None, observe=None
                         ) -> Tuple[Any, MetaEnvelope]:   # worker thread
@@ -3456,15 +4293,89 @@ class EngineRunner(QObject):
         and a caller that arrives mid-ingest waits and takes the result rather than starting
         a second writer on the same store.
 
+        A card carrying 2+ ``paths`` is a **file bundle** and resolves through
+        :meth:`_resolve_bundle` instead.
+
         ``observe`` overrides the progress sink (the ingest pool passes an un-epoched one);
         by default it reports under ``epoch``, or the current one."""
-        path = _clean_source_path(cfg.get("path", ""))
+        paths = _clean_source_paths(cfg)
+        access = str(cfg.get(ACCESS_MODE) or ACCESS_INGEST)
+        if len(paths) >= 2:
+            prov, env = self._resolve_bundle(node_id, paths, epoch, observe, access)
+            # A bundle has no sidecar of its own — it is K files, and the grouping question
+            # is about the concatenated M axis — so it detects from the joined geometry.
+            env, note = _with_position_groups(_with_card_calib(env, cfg), "", {},
+                                              cfg.get(GROUPING_MODE, GROUPING_DEFAULT))
+            self._group_note[node_id] = note
+            return prov, env
+        path = paths[0] if paths else ""
+        key, res = self._resolve_one(node_id, path, epoch, observe, access)
+        self._node_source_key[node_id] = key
+        prov, env = res
+        # A single file names itself too (V3.02), the way a bundle's members always have.
+        # Stamped HERE rather than inside `_resolve_one` only for symmetry with the bundle
+        # branch above -- it is derived from the path, which that cache is keyed on, so
+        # either side would be correct. `util.chain` needs it to order separately loaded
+        # files by the counting number in their names; without it the filename lives only
+        # in the node's params, where no compute can reach it.
+        env = stamp_source_file(env, path)
+        env, note = _with_position_groups(_with_card_calib(env, cfg), path,
+                                          self._channel_display.get(key, {}),
+                                          cfg.get(GROUPING_MODE, GROUPING_DEFAULT))
+        self._group_note[node_id] = note
+        return prov, env
+
+    def _resolve_one(self, node_id: str, path: str, epoch: Optional[int], observe,
+                     access: str = ACCESS_INGEST
+                     ) -> Tuple[Any, Tuple[Any, MetaEnvelope]]:   # worker thread
+        """``(cache key, (provider, envelope))`` for ONE file — the cache/lock/ingest core.
+
+        Split out of :meth:`_resolve_source` so a bundle's members go through exactly this
+        path: each file keeps its own store, its own lock and its own cache entry, so a file
+        that appears both on its own card and inside a bundle is ingested once and shared.
+        It deliberately does NOT stamp :attr:`_node_source_key` — for a bundle the node's
+        key is the bundle's, and stamping per member would leave it naming the last file.
+
+        ``access`` is resolved (:meth:`_effective_access`) BEFORE the key is built — a
+        bundle's members can resolve differently from each other (one may already have a
+        store, another may not fit the drive), which is exactly why this lives here and
+        not in :meth:`_resolve_bundle`: one call per file, one decision per file."""
         if path and not os.path.isfile(path):
             raise FileNotFoundError(
                 f"No such ND2/TIFF file:\n  {path!r}\n"
                 f"Reload it via File → Load ND2/TIFF file… (or fix the node's 'path' "
                 f"field). Leave it empty for the synthetic demo source.")
-        key = source_key(path)
+        # There is nothing for `access` to mean for the synthetic source — no file, no
+        # store, no drive to check — so it is normalized to a concrete value rather than
+        # resolved: ACCESS_INGEST reads correctly either way, and it keeps the invariant
+        # every OTHER caller of `source_key`/`_ingest_locked` relies on (never literal
+        # "auto") true here too, instead of adding a second empty-path exemption.
+        resolved = self._effective_access(path, access) if path else ACCESS_INGEST
+        key = source_key(path, resolved)
+        hit = self._providers.get(key)
+        if hit is not None:
+            return key, hit
+        with self._source_lock(key):
+            hit = self._providers.get(key)
+            if hit is not None:
+                return key, hit  # someone else ingested it while we waited on the lock
+            return key, self._ingest_locked(node_id, path, key, epoch, observe, resolved)
+
+    def _resolve_bundle(self, node_id: str, paths: Sequence[str],
+                        epoch: Optional[int], observe,
+                        access: str = ACCESS_INGEST
+                        ) -> Tuple[Any, MetaEnvelope]:   # worker thread
+        """Resolve a **file bundle** — K files laid end to end on the multipoint axis.
+
+        Every member resolves through :meth:`_resolve_one`, so the bundle costs nothing
+        beyond the files themselves and shares their stores with any other card using them.
+        The bundle's own cache entry is keyed on the ordered member paths, so re-pulling it
+        is a hit and a re-ordered bundle is not.
+
+        The member locks are taken one at a time INSIDE the bundle's own lock; the keys are
+        disjoint by construction (``("bundle", …)`` vs ``("image", …)``), so this cannot
+        deadlock against a concurrent single-file pull of the same file."""
+        key = bundle_key(paths, access)
         self._node_source_key[node_id] = key
         hit = self._providers.get(key)
         if hit is not None:
@@ -3472,12 +4383,55 @@ class EngineRunner(QObject):
         with self._source_lock(key):
             hit = self._providers.get(key)
             if hit is not None:
-                return hit      # someone else ingested it while we waited on the lock
-            return self._ingest_locked(node_id, path, key, epoch, observe)
+                return hit
+            provs: List[Any] = []
+            envs: List[MetaEnvelope] = []
+            member_keys: List[Any] = []
+            for p in paths:
+                mkey, (mprov, menv) = self._resolve_one(node_id, p, epoch, observe,
+                                                        access)
+                provs.append(mprov)
+                envs.append(menv)
+                member_keys.append(mkey)
+            labels = _unique_labels(paths)
+            prov = MultiSourceProvider(provs, labels=labels)
+            env = bundle_envelope(prov.axes, envs, labels)
+            self._providers[key] = (prov, env)
+            # The members share a grid, so they share their channel display; taking the
+            # first is not a choice between disagreeing values.
+            self._channel_display[key] = dict(
+                self._channel_display.get(member_keys[0], {}))
+            return prov, env
+
+    @staticmethod
+    def _open_direct(path: str) -> Tuple[Any, MetaEnvelope]:
+        """Open ``path`` as a no-ingest :class:`~nodelab_v2.nd2_direct.Nd2DirectProvider`.
+
+        A failure here **raises** rather than falling back to the ingest. ``direct`` is an
+        explicit per-card choice, and the thing it is chosen to avoid is a copy that can
+        run for hours on a series too big to duplicate — so silently doing that copy
+        anyway, because the file turned out to be compressed or oddly shaped, is the one
+        outcome the user most needs not to get by surprise. The provider's messages all end
+        by naming the way out ("Load it normally instead"), and the card shows them."""
+        from nodelab_v2.ingest import _is_tiff, read_calibration
+        from nodelab_v2.nd2_direct import Nd2DirectError, Nd2DirectProvider
+        if _is_tiff(path):
+            raise Nd2DirectError(
+                f"{os.path.basename(path)} is a TIFF; direct reading is ND2-only "
+                f"(tifffile has no memory-mapped frame path here). Set this card's "
+                f"Access back to 'ingest'.")
+        prov = Nd2DirectProvider(path)
+        env = MetaEnvelope(axes=prov.axes, metadata=read_calibration(path))
+        return prov, env
 
     def _ingest_locked(self, node_id: str, path: str, key: Any,
-                       epoch: Optional[int], observe
+                       epoch: Optional[int], observe,
+                       access: str = ACCESS_INGEST
                        ) -> Tuple[Any, MetaEnvelope]:   # worker thread, holding the key lock
+        # `access` must already be resolved — `_resolve_one` is this method's only caller
+        # and calls `_effective_access` before building `key`, so an `auto` reaching here
+        # would mean two callers disagreeing about what `key` even means.
+        assert access != ACCESS_AUTO, "_ingest_locked() needs a RESOLVED access"
         if not path:
             prov = SyntheticProvider(_SYNTH_AXES, tile=128)
             env = MetaEnvelope(axes=_SYNTH_AXES, metadata=dict(_SYNTH_META))
@@ -3487,24 +4441,24 @@ class EngineRunner(QObject):
             from nodelab_v2.ingest import (
                 PYRAMID_LEVELS, ensure_store_levels, ingest_image, open_store,
                 read_calibration, read_channel_display)
+            if access == ACCESS_DIRECT:
+                # No store, no ingest, nothing written beside the file: the provider
+                # memory-maps the ND2's frames where they are. Deliberately BEFORE the
+                # store probe below — a card switched to direct must not be held up by a
+                # torn store left behind by an ingest that was abandoned precisely because
+                # the file was too big to copy.
+                prov, env = self._open_direct(path)
+                self._providers[key] = (prov, env)
+                self._channel_display[key] = read_channel_display(path)
+                return prov, env
             # Beside the source file by default. `NODEGRAPH_STORE_DIR` moves every store to
             # one directory instead, which matters when the data lives on slow media: a USB
             # SSD here measured 27 MB/s of store write against 56 MB/s on the internal
             # NVMe, and 55 MB/s of raw sequential write against 952 MB/s. The store is a
             # derived cache, so relocating it costs nothing but has to stay UNIQUE per
             # source — hence the path digest, or two files of the same basename in
-            # different folders would fight over one store.
-            base = os.path.splitext(path)[0] + ".b2nd_store"
-            target_dir = store_dir(os.path.dirname(base))
-            if os.path.abspath(target_dir) == os.path.abspath(os.path.dirname(base)):
-                store = base
-            else:
-                tag = hashlib.blake2b(
-                    os.path.abspath(path).lower().encode("utf-8"),
-                    digest_size=6).hexdigest()
-                store = os.path.join(
-                    target_dir,
-                    f"{os.path.splitext(os.path.basename(path))[0]}.{tag}.b2nd_store")
+            # different folders would fight over one store (:meth:`_store_path_for`).
+            store = self._store_path_for(path)
             # A store DIRECTORY existing is not proof the store is USABLE: write()
             # mkdir -p's it BEFORE writing any level, so an ingest killed partway
             # (crash, cancel, full disk) leaves an empty or torn store behind. Trusting
@@ -3568,4 +4522,5 @@ class EngineRunner(QObject):
 
 
 __all__ = ["EngineRunner", "ensure_gui_ops", "render_plane", "render_plane_native",
-           "PlaneCache", "ingest_workers", "source_key"]
+           "PlaneCache", "ingest_workers", "source_key", "bundle_key",
+           "bundle_envelope", "BUNDLE_PATHS_KEY"]

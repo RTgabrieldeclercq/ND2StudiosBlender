@@ -8,9 +8,19 @@
 * a source :class:`~nodegraph.metadata.MetaEnvelope` (canonical axes + the calibration
   dict that drives every metadata-intelligent param).
 
-The ND2 pixels are read via ``nd2.ND2File.to_dask()`` (the frame-wise ``read_frame``
-path **segfaults** on the sample, per V2.01) and transposed into the canonical
-``(M,T,Z,C,Y,X)`` order, inserting size-1 axes for absent dimensions. Calibration reuses
+The ND2 pixels are read via ``nd2.ND2File.to_dask()`` and transposed into the canonical
+``(M,T,Z,C,Y,X)`` order, inserting size-1 axes for absent dimensions.
+
+.. note:: **"``read_frame`` segfaults, ``to_dask`` is the safe path" is no longer true as
+   stated** (re-checked against the vendored ``nd2`` 0.11.3, 2026-09-14). ``to_dask`` builds
+   its blocks with ``ND2File._dask_block``, whose body *is* ``self.read_frame(int(idx))`` —
+   they are one code path, so ``to_dask`` cannot be avoiding a fault in ``read_frame``. What
+   it really adds is (a) ``self._lock`` around each block, making one shared handle
+   thread-safe, and (b) ``.copy()``, which turns the reader's memory-mapped view into an
+   owned array. The original V2.01 note predates this SDK version; keep using ``to_dask``
+   here, but for the reason above, not for a segfault. :mod:`nodelab_v2.nd2_direct` takes
+   ``read_frame`` deliberately — it *wants* the un-copied mmap view — and pays for the lock
+   with a handle per thread instead. Calibration reuses
 the proven ``read_nd2_metadata_extended`` (optics parsing is fiddly — don't re-derive it;
 vendored from the retired v1 backend into :mod:`nodelab_v2.nd2_meta`), filtered to the v2
 ``CALIBRATION_KEYS`` vocabulary. Qt-free.
@@ -272,7 +282,12 @@ STAGE_KEYS = ("stage_xy_um", "stage_z_um")
 #: Same status as :data:`STAGE_KEYS`: non-calibration provenance riding the payload
 #: (`wire-node-v2` §7b), read by consumers straight off ``ds.metadata``.
 PLACEMENT_KEYS = ("z_home_index", "z_bottom_to_top", "frame_time_jd",
-                  "stage_layout_source", "acquisition_start")
+                  "stage_layout_source", "acquisition_start",
+                  # per-M point names — the acquisition's own labels, and a second witness
+                  # to where one specimen ends and the next begins (the NIS counter restarts
+                  # per point group). Carried like the rest of the placement vocabulary:
+                  # best-effort, and dropped whole rather than padded when it is short.
+                  "position_name")
 
 
 def _nd2_bit_depth(path: str) -> Any:

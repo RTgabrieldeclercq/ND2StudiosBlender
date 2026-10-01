@@ -59,7 +59,8 @@ from nodegraph.metadata import envelope_symbols, eval_derive
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
-from nodelab_v2.document import GraphDocument, NodeRecord, TITLE_KEY
+from nodelab_v2.document import (
+    BATCH_OP, BUNDLE_PATHS_KEY, GraphDocument, NodeRecord, TITLE_KEY, UNBATCH_OP)
 from nodelab_v2.ops import DOCK_OP
 from nodelab_v2.picker import PICK_ACTION, PICK_GLYPH, request_for
 
@@ -645,6 +646,16 @@ class NodeItem(QGraphicsObject):
         self.rec = rec
         self.doc = doc
         self._is_reroute = rec.op_key == "rr.reroute"
+        # ── the dot family (V3.01) ───────────────────────────────────────────────
+        # Three ops render as a circle rather than a card, because none of them is a step
+        # in the pipeline the way a card is: a reroute is a bead on a wire, and the two
+        # batch nodes are the points where K files become one stream and become K again.
+        # Drawing them as cards would make "run these four files" look like four more
+        # processing stages. They share the layout and hit-testing; only the size and the
+        # paint differ, which is what `_dot_size` is for.
+        self._is_batch = rec.op_key in (BATCH_OP, UNBATCH_OP)
+        self._is_dot = self._is_reroute or self._is_batch
+        self._dot_size = float(T.BATCH_SIZE if self._is_batch else T.RR_SIZE)
         self._group_name = group_name_of(rec.op_key)   # a group instance? → its name
         self._is_group = self._group_name is not None
         self._sockets: Dict[Tuple[str, str], SocketItem] = {}
@@ -795,7 +806,7 @@ class NodeItem(QGraphicsObject):
         build whose engine half is older, and a hot-reloaded node must never be able to crash
         a paint."""
         spec = self.spec
-        if spec is None or self._is_group or self._is_reroute or self.rec.collapsed:
+        if spec is None or self._is_group or self._is_dot or self.rec.collapsed:
             return None
         fn = getattr(spec, "scope_mode", None)
         m = fn() if callable(fn) else None
@@ -964,7 +975,7 @@ class NodeItem(QGraphicsObject):
         self._rows = []
         self._width = float(T.NODE_W)
         self._place_close()
-        if self._is_reroute:
+        if self._is_dot:
             self._layout_reroute()
             return
         if self.rec.collapsed:
@@ -997,22 +1008,59 @@ class NodeItem(QGraphicsObject):
         self._apply_card_tip()
         self.update()
 
+    def _dot_size_for(self, n_side: int) -> float:
+        """The circle's diameter, GROWN so ``n_side`` sockets on one edge stay apart.
+
+        A fixed 44px point fits three members comfortably and ten not at all — at ten the
+        sockets are 3px apart and the user cannot tell which wire is which file, which is
+        the one thing the Unbatch exists to make visible. So the point grows with its
+        member count instead of the sockets crowding: the circle is the affordance, and
+        an affordance that stops working at the tenth file is not one.
+        """
+        base = float(T.BATCH_SIZE if self._is_batch else T.RR_SIZE)
+        if n_side <= 1:
+            return base
+        # the arc carries sockets across the middle 70%, so that span needs the pitch
+        needed = (T.SOCKET_PITCH * (n_side - 1)) / 0.7
+        return max(base, needed)
+
     def _layout_reroute(self) -> None:
-        """A reroute renders as a compact dot: one Dataset input on the left edge, one
-        output on the right, both at mid-height; no header/rows/switch."""
-        r = T.RR_SIZE / 2.0
-        for s in self._active_inputs():
-            sock = SocketItem(self, s, "in")
-            sock.setPos(0, r)
-            self._apply_domain_tip(sock, s, "in")
-            self._sockets[("in", s.name)] = sock
-        for s in self._active_outputs():
-            sock = SocketItem(self, s, "out")
-            sock.setPos(T.RR_SIZE, r)
-            self._apply_domain_tip(sock, s, "out")
-            self._sockets[("out", s.name)] = sock
-        self._width = float(T.RR_SIZE)
-        self._height = float(T.RR_SIZE)
+        """A dot-family node: sockets on the circle's left and right edges, no
+        header/rows/switch.
+
+        **Several sockets on a side are spread down the arc**, not stacked at mid-height.
+        A reroute has one each way and never notices, but an Unbatch has one output per
+        FILE — the whole point of the node — and K wires leaving a single point would be
+        indistinguishable from each other exactly where the user needs to see which file
+        is which. They are placed on the circle itself so each still reads as belonging to
+        the point, rather than drifting off it like a card's socket column.
+        """
+        ins, outs = list(self._active_inputs()), list(self._active_outputs())
+        self._dot_size = size = self._dot_size_for(max(len(ins), len(outs)))
+        r = size / 2.0
+
+        def place(specs, io: str, x: float) -> None:
+            items = list(specs)
+            n = len(items)
+            for i, s in enumerate(items):
+                sock = SocketItem(self, s, io)
+                if n <= 1:
+                    y = r
+                else:
+                    # spread across the middle 70% of the height: the arc's extremes are
+                    # where the circle is thinnest, so a socket there reads as off the edge
+                    span = size * 0.7
+                    y = (size - span) / 2.0 + span * i / (n - 1)
+                sock.setPos(x, y)
+                self._apply_domain_tip(sock, s, io)
+                if io == "out":
+                    self._tint_channel_socket(sock, s)
+                self._sockets[(io, s.name)] = sock
+
+        place(ins, "in", 0.0)
+        place(outs, "out", size)
+        self._width = size
+        self._height = size
         self.update()
 
     def _layout_collapsed(self) -> None:
@@ -1129,17 +1177,38 @@ class NodeItem(QGraphicsObject):
         repaint region) carries the glow margin."""
         return QRectF(0, 0, self._width, self._height)
 
+    #: Offset per card in a file bundle's stack, and how many are drawn (a count is what
+    #: the eyebrow is for; the stack only has to say "more than one file").
+    STACK_STEP = 4.0
+    STACK_MAX = 3
+
+    def stack_depth(self) -> int:
+        """How many cards to draw BEHIND this one — 0 for an ordinary node, up to
+        :attr:`STACK_MAX` for a **file bundle** (an ``io.load`` carrying several paths).
+
+        A bundle is one card that is really N acquisitions, and nothing else on the canvas
+        says so at a glance: the title reads like any other source and the wire leaving it
+        looks like one file's. The stack is the cheapest honest signal — it reads as depth
+        without claiming a number the eyebrow states exactly."""
+        members = self.rec.params.get(BUNDLE_PATHS_KEY)
+        if not isinstance(members, (list, tuple)) or len(members) < 2:
+            return 0
+        return min(self.STACK_MAX, len(members) - 1)
+
     def boundingRect(self) -> QRectF:
         # MUST cover every pixel paint() touches, glow included. Qt only repaints the
         # boundingRect it is told about, so anything painted outside it is left behind as
         # a smear when the card moves (the trailing outlines while dragging).
         m = self.GLOW_M
-        return self.card_rect().adjusted(-m, -m, m, m)
+        # The bundle stack extends down-and-right only, so the margin is ASYMMETRIC —
+        # raising GLOW_M instead would move the glow and the reroute ring with it.
+        s = self.stack_depth() * self.STACK_STEP
+        return self.card_rect().adjusted(-m, -m, m + s, m + s)
 
     def shape(self) -> QPainterPath:
         """Clicks and rubber-band selection follow the card, not its glow margin."""
         path = QPainterPath()
-        if self._is_reroute:
+        if self._is_dot:
             path.addEllipse(self.card_rect())
         else:
             path.addRoundedRect(self.card_rect(), T.RADIUS, T.RADIUS)
@@ -1153,13 +1222,59 @@ class NodeItem(QGraphicsObject):
         col = self._run_color()
         if self._run in ("running", "decoding"):
             col = T.alpha(col, 96 + int(159 * abs(1.0 - 2.0 * ((self._phase * 1.7) % 1.0))))
+        size = self._dot_size
         p.setBrush(Qt.NoBrush)
         for grow, a in ((2.0, 40),):
             p.setPen(QPen(T.alpha(col, a), 2))
-            p.drawEllipse(QRectF(1 - grow, 1 - grow, T.RR_SIZE - 2 + 2 * grow,
-                                 T.RR_SIZE - 2 + 2 * grow))
+            p.drawEllipse(QRectF(1 - grow, 1 - grow, size - 2 + 2 * grow,
+                                 size - 2 + 2 * grow))
         p.setPen(QPen(col, 2))
-        p.drawEllipse(QRectF(1, 1, T.RR_SIZE - 2, T.RR_SIZE - 2))
+        p.drawEllipse(QRectF(1, 1, size - 2, size - 2))
+
+    def _paint_batch(self, p: QPainter) -> None:
+        """The **golden point** — where K files become one stream (Batch) and become K
+        again (Unbatch).
+
+        Gold rather than a category colour because it is not a processing step and should
+        not read as one; it is the one mark on the canvas that means "several files travel
+        this wire". Batch is filled and Unbatch is a ring — the same object, opening —
+        so the two ends of a batched run are distinguishable at a glance without a label,
+        which matters because they are otherwise identical circles.
+        """
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if self.rec.muted:
+            p.setOpacity(0.45)
+        size = self._dot_size
+        r = size / 2.0
+        gold = T.BATCH_GOLD_DIM if (self.rec.muted or self.is_dormant()) else T.BATCH_GOLD
+        body = QRectF(1, 1, size - 2, size - 2)
+        p.setPen(QPen(T.ACCENT if self.isSelected() else T.BORDER,
+                      2 if self.isSelected() else 1))
+        p.setBrush(T.PANEL)
+        p.drawEllipse(body)
+        # The gold mark is a FRACTION of the point, so a grown Unbatch still reads as a
+        # golden point rather than a small ring adrift in a large dark disc.
+        ir = max(8.0, size * 0.25)
+        inner = QRectF(r - ir, r - ir, 2 * ir, 2 * ir)
+        p.setPen(Qt.NoPen)
+        if self.rec.op_key == BATCH_OP:
+            p.setBrush(gold)                       # closing: K files become one stream
+            p.drawEllipse(inner)
+        else:
+            p.setBrush(Qt.NoBrush)                 # opening: one stream becomes K files
+            p.setPen(QPen(gold, max(4.0, size * 0.09)))
+            p.drawEllipse(inner)
+        # the member count, when the wiring says one — the single fact worth reading off
+        # this node at a glance, and the one thing its shape cannot say
+        n = len(self.doc.batch_member_names(self.rec.id)) if self._is_batch else 0
+        if n >= 2:
+            p.setPen(QPen(T.INK))
+            f = p.font()
+            f.setPixelSize(11)
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(QRectF(0, size, size, 14), Qt.AlignHCenter | Qt.AlignTop,
+                       f"{n} files")
 
     def _paint_reroute(self, p: QPainter) -> None:
         """A small rounded dot in the Dataset-socket colour; the in/out SocketItems sit
@@ -1194,8 +1309,10 @@ class NodeItem(QGraphicsObject):
             return ""
 
     def paint(self, p: QPainter, *_a) -> None:
-        if self._is_reroute:
-            self._paint_reroute(p)
+        if self._is_dot:
+            # one progress ring for the whole family: a dot is too small for the card's
+            # rail, so its run state reads as a glowing ring either way
+            self._paint_batch(p) if self._is_batch else self._paint_reroute(p)
             self._paint_reroute_progress(p)
             return
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -1218,6 +1335,16 @@ class NodeItem(QGraphicsObject):
             T.ACCENT if self.isSelected() else
             (T.alpha(T.ACCENT, 170) if working else T.BORDER))
         body = rect.adjusted(0.5, 0.5, -0.5, -0.5)
+        # A file bundle draws as a STACK: offset cards behind the body, furthest first, so
+        # the front card's own fill covers their overlap and no clipping is needed. Painted
+        # BEFORE the glow, or the offsets would sit on top of the selection ring's corner.
+        depth = self.stack_depth()
+        if depth:
+            p.setBrush(T.mix(T.PANEL, T.BG, 0.45))
+            for k in range(depth, 0, -1):
+                d = k * self.STACK_STEP
+                p.setPen(QPen(T.alpha(T.BORDER, 150), 1))
+                p.drawRoundedRect(body.translated(d, d), T.RADIUS, T.RADIUS)
         if failed or working or self.isSelected():
             self._paint_card_glow(p, body, T.ERROR if failed else T.ACCENT)
         p.setPen(QPen(border, 2 if (self.isSelected() or self.dim_invalid() or failed)
@@ -1268,6 +1395,12 @@ class NodeItem(QGraphicsObject):
             flags.append("DORMANT")
         if dock in ("docked", "stale", "unbaked"):
             flags.append(dock.upper())
+        # The stack behind a bundle says "several"; this says how many. It is a property of
+        # the card rather than a volatile status, so it yields to a real status (MUTED,
+        # DORMANT, a dock state) on the one line they share.
+        members = self.rec.params.get(BUNDLE_PATHS_KEY)
+        if isinstance(members, (list, tuple)) and len(members) >= 2 and not flags:
+            flags.append(f"{len(members)} FILES")
         tag = ("● " if self._viewed else "") + ("  ·  ".join(flags) if flags else cat)
         if dock == "stale":
             p.setPen(T.DIM2D)
@@ -1462,7 +1595,7 @@ class NodeItem(QGraphicsObject):
         same rects, so a control can never be painted somewhere it cannot be clicked. A
         collapsed card, a reroute dot or an unrecognized op has none — there are no rows to
         put them on."""
-        if self._is_reroute or self.rec.collapsed or self.spec is None:
+        if self._is_dot or self.rec.collapsed or self.spec is None:
             return []
         out: List[Ctl] = []
         # the footprint band's population pill, ABOVE the rows (V2.27) — the rows start at
@@ -1912,6 +2045,9 @@ class NodeItem(QGraphicsObject):
                 self._open_menu(ctl, list(s.choices), str(self.resolved(s) or ""))
             elif s.type is SocketType.STRING and (s.layer_in or s.layer_in_mode):
                 self._open_layer_menu(ctl)
+            elif s.type is SocketType.STRING and (getattr(s, "column_in", None)
+                                                  or getattr(s, "column_in_mode", "")):
+                self._open_column_menu(ctl)
             elif s.type in (SocketType.INT, SocketType.FLOAT):
                 # Defer: this is a scrub only if the pointer actually travels. A press that
                 # doesn't move is a click, and opens the editor on release.
@@ -2093,8 +2229,57 @@ class NodeItem(QGraphicsObject):
             choices = list(self.doc.layer_choices(self.rec.id, s))
         except Exception:                     # never let a picker eat a click
             choices = []
+        dom = s.layer_in.value if s.layer_in else (s.layer_in_mode or "layer")
+        self._open_name_menu(
+            ctl, choices,
+            each=f"A {dom} layer present on `{s.layer_from or 'the input'}`.",
+            note="The list above is what the edit-time pass can predict for this wire; "
+                 "a few producers name layers it cannot. Type the name if yours is "
+                 "missing.")
+
+    def _open_column_menu(self, ctl: Ctl) -> None:
+        """A popup of the columns the graph has MEASURED onto this socket's wire (V2.28).
+
+        :meth:`_open_layer_menu`'s sibling, and it exists for the same reason: a
+        condition whose column can only be typed is a condition the user has to already
+        know the answer to. Here the list is the point of the node rather than a
+        convenience — "which statistics do I have?" is the question being asked, and
+        before this it could only be answered by pulling and reading the error.
+
+        Free text stays reachable for a STRONGER reason than on a layer pill: the column
+        catalog is built from voluntary ``adds_columns`` declarations, so an undeclared
+        producer writes real columns the menu cannot name."""
+        s = ctl.obj
+        try:
+            choices = list(self.doc.column_choices(self.rec.id, s))
+        except Exception:                     # never let a picker eat a click
+            choices = []
+        self._open_name_menu(
+            ctl, choices,
+            each="A column measured onto these objects upstream.",
+            note="No columns on this wire yet — add Measure, Object Metrics "
+                 "or Track Objects upstream",
+            free_text=False)
+
+    def _open_name_menu(self, ctl: Ctl, choices: list, *, each: str,
+                        note: str, free_text: bool = True) -> None:
+        """The shared name popup behind the layer and column pills — one menu rather
+        than two copies of the empty-list, tooltip and free-text handling.
+
+        ``free_text`` is the difference, and it tracks how complete the catalog behind the
+        list is. A LAYER list cannot be closed (a couple of producers name layers the
+        edit-time pass cannot predict), so it ends in "Type a name…". A COLUMN list can be:
+        every structure-producing node declares ``adds_columns``, gated by
+        ``selftest::test_column_catalog_complete``, so a name not in the list is one no node
+        on this wire writes — and typing it would only defer the refusal to the pull.
+
+        With no free-text escape, an EMPTY list can no longer fall through to the inline
+        editor: it opens a menu carrying one disabled line naming the nodes that would fill
+        it. Silently doing nothing on click reads as a broken pill, and dropping into a text
+        box invites typing a column the graph does not have."""
+        s = ctl.obj
         current = str(self.resolved(s) or "")
-        if not choices:
+        if not choices and free_text:
             self._open_inline_edit(ctl)       # nothing to offer — go straight to typing
             return
         view, r = self._view_and_rect(ctl)
@@ -2103,25 +2288,33 @@ class NodeItem(QGraphicsObject):
         menu = QMenu()
         menu.setStyleSheet(T.menu_qss())
         menu.setToolTipsVisible(True)
-        dom = s.layer_in.value if s.layer_in else (s.layer_in_mode or "layer")
-        src = s.layer_from or "the input"
-        for c in choices:
+        # The CURRENT value is always listed, offered or not: a closed menu that omits it
+        # gives the user no way to see what the pill is set to, and the pill may be showing a
+        # column whose producer has since been deleted.
+        listed = list(choices)
+        if current and current not in listed:
+            listed.insert(0, current)
+        for c in listed:
             act = menu.addAction(c)
             act.setCheckable(True)
             act.setChecked(c == current)
             act.setToolTip(option_hover_text(
-                c, f"A {dom} layer present on `{src}`."))
-        menu.addSeparator()
-        typed = menu.addAction("Type a name…")
-        typed.setToolTip(option_hover_text(
-            "Type a name…",
-            "The list above is what the edit-time pass can predict for this wire; a few "
-            "producers name layers it cannot. Type the name if yours is missing."))
+                c, each if c in choices else
+                "NOT on this wire — nothing upstream writes this column. Kept so the "
+                "setting is visible rather than silently replaced."))
+        if not listed:
+            menu.addAction(note).setEnabled(False)
+        if free_text:
+            menu.addSeparator()
+            typed = menu.addAction("Type a name…")
+            typed.setToolTip(option_hover_text("Type a name…", note))
+        else:
+            typed = None
         chosen = menu.exec(view.viewport().mapToGlobal(
             QPoint(int(r.left()), int(r.bottom() + 2))))
         if chosen is None:
             return
-        if chosen is typed:
+        if typed is not None and chosen is typed:
             self._open_inline_edit(ctl)
         elif chosen.text() != current:
             self._write_param(s.name, chosen.text())
@@ -2167,7 +2360,7 @@ class NodeItem(QGraphicsObject):
         """Pin the ✕ badge to the card's top-right corner — mostly inside it (so the
         pointer stays over the card on the way to the badge), just clear of the 2D/3D
         switch and the elided title."""
-        w = T.RR_SIZE if self._is_reroute else T.NODE_W
+        w = self._dot_size if self._is_dot else T.NODE_W
         self._close.setPos(w - T.CLOSE_BTN + 4, -4)
 
     def hide_close_if_away(self) -> None:

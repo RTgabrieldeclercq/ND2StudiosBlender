@@ -51,7 +51,7 @@ from nodegraph.iterate import (
     candidate_targets, plan as iterate_plan,
 )
 from nodelab_v2.document import is_driver_edge as _is_driver
-from nodelab_v2.ops import DOCK_OP, PRECISION_UNSET, bake_record
+from nodelab_v2.ops import DOCK_OP, MOVIE_OP, PRECISION_UNSET, bake_record
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 
 _UNIT = {"um": "µm", "um_axial": "µm↕", "um2": "µm²", "um3": "µm³",
@@ -271,6 +271,11 @@ class InspectorPanel(QScrollArea):
     #: ``sweep`` (mint and run every iteration) / ``stop_sweep`` (back to the cheap
     #: single-clone form). Same division of labour as the two above.
     iterate_action = Signal(str, str)
+    #: an Export Movie node's Preview button was pressed: ``(node_id, "preview")``.
+    #: Same division of labour as the two above — the panel only asks. The window
+    #: owns the runner, and a preview needs the node's INPUT payload, which only a
+    #: completed pull can supply.
+    movie_action = Signal(str, str)
     #: the ⟳ button beside the node title was pressed: ``op_key``. Re-read that node type's
     #: module from disk. Same division of labour as the signals above — the panel asks, the
     #: window owns the reloader, the runner (which must be idle) and the canvas that has to
@@ -560,6 +565,16 @@ class InspectorPanel(QScrollArea):
         # iterate (V2.19) — what this sweep resolves to, what it costs, and the results
         if spec.op_key == ITERATE_OP:
             self._v.addWidget(self._iterate_section(node))
+            self._v.addWidget(self._sep())
+
+        # export movie — look at the movie before writing it
+        if spec.op_key == MOVIE_OP:
+            self._v.addWidget(self._movie_section(node))
+            self._v.addWidget(self._sep())
+
+        # overlay (2026-09-30) — the frame pins the Viewer wrote, removable one by one
+        if spec.op_key == "view.overlay":
+            self._v.addWidget(self._overlay_section(node))
             self._v.addWidget(self._sep())
 
         # connections
@@ -877,6 +892,124 @@ class InspectorPanel(QScrollArea):
         "unbaked": "Set to docked, but there is nothing on disk to serve. Bake it, or "
                    "switch State back to live.",
     }
+
+    def _overlay_section(self, node: NodeItem) -> QWidget:
+        """The Overlay node's own panel: the frame PINS, each removable.
+
+        Pins are made in the Viewer (its source strip's Pin T / Pin Z) and stored as JSON in
+        ``t_pins`` / ``z_pins``, which is right for the record and hopeless to edit by hand —
+        and there is no undo. So they are listed here as rows, one ✕ each. (The resolved rate
+        and Play-all tick count live in the Viewer's source strip: they come from the stamped
+        recipe, which the edit-time envelope this panel reads does not carry.)"""
+        from nodegraph.placement import parse_pins
+        rec = node.rec
+        sec = self._section("Frame pins")
+        lay = sec._lay  # type: ignore[attr-defined]
+
+        def muted(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setProperty("role", "muted")
+            lbl.setWordWrap(True)
+            f = lbl.font(); f.setPointSize(9); lbl.setFont(f)
+            return lbl
+
+        any_pin = False
+        for axis in ("t", "z"):
+            name = f"{axis}_pins"
+            try:
+                rows = list(parse_pins(rec.params.get(name, ""), axis=axis))
+            except ValueError as exc:
+                lay.addWidget(muted(f"{axis.upper()} pins are malformed — {exc}"))
+                continue
+            if not rows:
+                continue
+            any_pin = True
+            head = QHBoxLayout()
+            head.addWidget(QLabel(f"{axis.upper()} pins"))
+            head.addStretch(1)
+            clear = QToolButton()
+            clear.setText("clear")
+            clear.setToolTip(f"Remove every {axis.upper()} pin — the pairing goes back to "
+                             + ("the Time shift / Rate" if axis == "t" else "the Nudge Z"))
+            clear.clicked.connect(
+                lambda _c=False, n=name: self._set_pins(node, n, []))
+            head.addWidget(clear)
+            lay.addLayout(head)
+            for r in rows:
+                line = QHBoxLayout()
+                anchor = "" if r[2] is None else (
+                    "  · clock-anchored" if axis == "t" else f"  · {r[2]:.1f}→{r[3]:.1f} µm")
+                line.addWidget(QLabel(f"primary {axis}={r[0]}  →  source {axis}={r[1]}"
+                                      + anchor))
+                line.addStretch(1)
+                rm = QToolButton()
+                rm.setText("✕")
+                rm.setToolTip("Remove this pin")
+                rm.clicked.connect(
+                    lambda _c=False, n=name, a=int(r[0]), rs=tuple(rows):
+                    self._set_pins(node, n, [x for x in rs if int(x[0]) != a]))
+                line.addWidget(rm)
+                lay.addLayout(line)
+        if not any_pin:
+            lay.addWidget(muted(
+                "No pins. In the Viewer, step an overlaid source with its ◀ ▶ buttons until "
+                "its frame matches the primary's, then press Pin T or Pin Z — the pairing "
+                "runs through every pin from then on."))
+        return sec
+
+    def _set_pins(self, node: NodeItem, name: str, rows) -> None:
+        """Write a pin list back — canonical, and through the ordinary edit path."""
+        from nodegraph.placement import pins_json
+        text = pins_json(list(rows))
+        rec = node.rec
+        if text:
+            self._set_param(node, name, text)
+        else:
+            rec.params.pop(name, None)
+            rec.set_locked(rec.locked - {name})
+            node.doc.touch(node.node_id)
+        QTimer.singleShot(0, self._rebuild)
+
+    def _movie_section(self, node: NodeItem) -> QWidget:
+        """The Export Movie node's own panel: what it plays, and the way into the editor.
+
+        The Movie Editor itself is a bottom dock (it opens when this node is selected),
+        because a timeline and a monitor do not fit in a 376 px column. This panel only says
+        what the node will make and raises the dock; every movie-wide setting is already a
+        socket above."""
+        from nodegraph.catalog._shared.movie_timeline import try_normalize
+        rec = node.rec
+        sec = self._section("Movie")
+        lay = sec._lay  # type: ignore[attr-defined]
+
+        if str(rec.modes.get("sweep", "time")) == "timeline":
+            spec, err = try_normalize(rec.params.get("timeline", "") or "")
+            if spec is None:
+                text = f"Timeline, not yet playable — {err}"
+            else:
+                segs = spec["segments"]
+                loops = sum(1 for s in segs if s["kind"] == "loop")
+                text = (f"Timeline: {len(segs)} segment{'s' if len(segs) != 1 else ''}"
+                        + (f", {loops} loop{'s' if loops != 1 else ''}" if loops else "")
+                        + ". Edit it in the Movie Editor.")
+        else:
+            text = (f"Plays one axis ({rec.modes.get('sweep', 'time')}) of the input with the "
+                    f"settings above. The Movie Editor previews it, and can turn it into a "
+                    f"timeline: grids, several sources, z sweeps between timepoints.")
+        blurb = QLabel(text)
+        blurb.setProperty("role", "muted")
+        blurb.setWordWrap(True)
+        bf = blurb.font(); bf.setPointSize(9); blurb.setFont(bf)
+        lay.addWidget(blurb)
+
+        btn = QPushButton("Open Movie Editor")
+        btn.setToolTip("Raise the Movie Editor dock on this node: a monitor that plays the "
+                       "frames it would export (nothing is written), a timeline of clips, "
+                       "and each clip's panels, channels, LUTs and labels.")
+        btn.clicked.connect(
+            lambda _=False, nid=node.node_id: self.movie_action.emit(nid, "edit"))
+        lay.addWidget(btn)
+        return sec
 
     def _dock_section(self, node: NodeItem) -> QWidget:
         """The Dock node's own panel: what state it is in, what is on disk, and the one
@@ -1218,6 +1351,10 @@ class InspectorPanel(QScrollArea):
         elif s.type is SocketType.STRING and (s.layer_in or s.layer_in_mode):
             lay.addWidget(self._layer_box(node, s))
             return row
+        elif s.type is SocketType.STRING and (getattr(s, "column_in", None)
+                                              or getattr(s, "column_in_mode", "")):
+            lay.addWidget(self._column_box(node, s))
+            return row
         elif s.type is SocketType.STRING:
             from PySide6.QtWidgets import QLineEdit
             # Any socket declaring `path_kind` is a filesystem path and gets a Browse…
@@ -1354,44 +1491,109 @@ class InspectorPanel(QScrollArea):
         while the list is being REPOPULATED and while the user types, so they would
         commit half-typed names and fight the rebuild. Only ``activated`` (a real user
         pick, never programmatic) and the line edit's ``editingFinished`` commit."""
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QCompleter
-
-        box = _NoWheelCombo()
-        box.setEditable(True)
-        box.setInsertPolicy(QComboBox.NoInsert)      # typing must not grow the list
-        box.setFocusPolicy(Qt.StrongFocus)
-        box.setDuplicatesEnabled(False)
-
         try:
             choices = list(node.doc.layer_choices(node.node_id, s))
         except Exception:                            # never let a picker break the panel
             choices = []
+        return self._names_box(
+            node, s, choices,
+            present="Layers on the incoming edge: ",
+            empty="No layers detected upstream yet — connect a producer, or type "
+                  "the name.",
+            note="\n(free text is allowed — some layer names cannot be predicted "
+                 "before the graph runs)")
+
+    def _column_box(self, node: NodeItem, s):
+        """A CLOSED dropdown for a ``column_in`` socket: the columns the edit-time pass
+        knows were MEASURED onto this wire, and nothing else (V2.28).
+
+        Same widget as :meth:`_layer_box`, but CLOSED (``editable=False``) where that one
+        is open, and the difference is not a style choice. Every structure-producing node
+        declares ``adds_columns`` (``selftest::test_column_catalog_complete``), so the
+        columns a table carries are fully determined by the nodes upstream — there is
+        nothing legitimate to type that is not already in the list, and typing anything
+        else only defers the refusal to the pull.
+
+        The empty state names the nodes that PRODUCE columns rather than reporting an empty
+        list, because "no columns" is almost always "no Measure in this graph yet", and that
+        is the one thing the user needs told."""
+        try:
+            choices = list(node.doc.column_choices(node.node_id, s))
+        except Exception:                            # never let a picker break the panel
+            choices = []
+        return self._names_box(
+            node, s, choices,
+            present="Columns measured upstream: ",
+            empty="No measured columns on this wire yet — add Measure (intensity, "
+                  "shape), Object Metrics (speed, neighbours) or Track Objects "
+                  "(track_length) upstream, and its columns appear here.",
+            note="\n(every node that produces columns declares them, so this list "
+                 "is what the graph actually carries)",
+            editable=False)
+
+    def _names_box(self, node: NodeItem, s, choices: list, *,
+                   present: str, empty: str, note: str, editable: bool = True):
+        """The shared name combo behind :meth:`_layer_box` and :meth:`_column_box`.
+
+        One widget rather than two near-copies: every clause below is a trap that was paid
+        for once, and a second copy is where the two would drift apart.
+
+        ``editable`` is the one real difference between the two callers, and it follows from
+        how complete their catalogs are. A LAYER catalog cannot be closed — a couple of
+        producers name layers the edit-time pass cannot predict. A COLUMN catalog can be, and
+        is: every node that adds a structure domain declares ``adds_columns``, enforced by
+        ``selftest::test_column_catalog_complete``, so what a table carries is determined by
+        the nodes upstream and a closed list cannot hide a real column.
+
+        **The current value is always an entry, offered or not.** A closed combo can only
+        emit values that are in its list, so a saved graph whose column has since gone (the
+        Measure feeding it deleted, a layer renamed) would otherwise have its setting
+        silently rewritten to whatever sits at index 0 the moment the panel rebuilds — a
+        value the user never chose, on a node that decides which objects survive."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QCompleter
+
         current = str(node.params.get(s.name, s.default or ""))
+        shown = list(choices)
+        orphan = bool(current) and current not in shown
+        if orphan:
+            shown.insert(0, current)
+
+        box = _NoWheelCombo()
+        box.setEditable(editable)
+        box.setFocusPolicy(Qt.StrongFocus)
+        box.setDuplicatesEnabled(False)
         box.blockSignals(True)
-        box.addItems(choices)
-        box.setEditText(current)
+        box.addItems(shown)
+        if editable:
+            box.setInsertPolicy(QComboBox.NoInsert)  # typing must not grow the list
+            box.setEditText(current)
+        else:
+            box.setCurrentIndex(shown.index(current) if current in shown else -1)
         box.blockSignals(False)
 
-        cp = QCompleter(choices, box)
-        cp.setCaseSensitivity(Qt.CaseInsensitive)
-        # PopupCompletion, not InlineCompletion: inline would type-ahead-fill the edit
-        # with a suggestion, so tabbing away would COMMIT a name the user never chose.
-        cp.setCompletionMode(QCompleter.PopupCompletion)
-        cp.popup().setStyleSheet(T.controls_qss())   # else the popup ignores the theme
-        box.setCompleter(cp)
+        if editable:
+            cp = QCompleter(shown, box)
+            cp.setCaseSensitivity(Qt.CaseInsensitive)
+            # PopupCompletion, not InlineCompletion: inline would type-ahead-fill the edit
+            # with a suggestion, so tabbing away would COMMIT a name the user never chose.
+            cp.setCompletionMode(QCompleter.PopupCompletion)
+            cp.popup().setStyleSheet(T.controls_qss())   # else the popup ignores the theme
+            box.setCompleter(cp)
 
-        if choices:
-            box.setToolTip("Layers on the incoming edge: " + ", ".join(choices)
-                           + "\n(free text is allowed — some layer names cannot be "
-                             "predicted before the graph runs)")
-        else:
-            box.setToolTip("No layers detected upstream yet — connect a producer, or "
-                           "type the name.")
+        tip = (present + ", ".join(choices) + note) if choices else empty
+        if orphan:
+            tip = (f"{current!r} is NOT on this wire — nothing upstream writes it. It is "
+                   f"kept so your setting is not silently changed; pick another entry, or "
+                   f"add the node that measures it.\n\n") + tip
+        box.setToolTip(tip)
+        if orphan:
+            box.setItemData(0, tip, Qt.ToolTipRole)
         box.activated.connect(
             lambda _i, nm=s.name, b=box: self._set_param(node, nm, b.currentText()))
-        box.lineEdit().editingFinished.connect(
-            lambda nm=s.name, b=box: self._set_param(node, nm, b.currentText()))
+        if editable:
+            box.lineEdit().editingFinished.connect(
+                lambda nm=s.name, b=box: self._set_param(node, nm, b.currentText()))
         return box
 
     def _mode_row(self, node: NodeItem, m) -> QWidget:

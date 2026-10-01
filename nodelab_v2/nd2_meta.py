@@ -53,6 +53,32 @@ def _safe(get, default=None):
         return default
 
 
+def _point_names(f, n_m):
+    """The acquisition's own name for each multipoint, or ``[]``.
+
+    NIS keeps a POINT LIST behind a multipoint experiment, and each entry carries the label
+    the user saw while setting it up. The default labels are a counter (``"#1"``, ``"#2"``,
+    …) — and NIS restarts that counter for each point GROUP, so on a file acquired as six
+    3x3 mosaics the list reads ``#1``..``#9`` six times over. That repetition is the
+    microscope's own record of where one specimen ended and the next began, which is worth
+    carrying even though nothing computes a coordinate from it
+    (:func:`nodelab_v2.position_groups.names_agree` checks it against the geometry).
+
+    ``[]`` unless the list covers EVERY multipoint — the rule the stage logs above already
+    follow, because these are read by index and a short list names the wrong position.
+    """
+    names = []
+    for loop in _safe(lambda: list(f.experiment), default=[]) or []:
+        pts = _safe(lambda lp=loop: list(lp.parameters.points), default=None)
+        if not pts:
+            continue
+        got = [_safe(lambda p=pt: str(p.name)) for pt in pts]
+        if len(got) == n_m and all(v for v in got):
+            names = got
+            break
+    return names
+
+
 def read_nd2_metadata_extended(filepath):
     """Return a dict of all the metadata fields ND2Studios surfaces.
 
@@ -300,6 +326,7 @@ def read_nd2_metadata_extended(filepath):
         out["stage_xy_um"] = stage_xy
         out["stage_z_um"] = stage_z
         out["stage_layout_source"] = stage_layout_source
+        out["position_name"] = _point_names(f, n_m)
 
         # 3) Z-stack anchoring. `stagePositionUm.z` is CONSTANT down a stack — it is the
         # position's nominal focus, not a per-slice reading — so on its own it cannot say

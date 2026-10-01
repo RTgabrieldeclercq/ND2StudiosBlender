@@ -131,6 +131,15 @@ def emission_qcolor(nm) -> QColor:
     # intensity roll-off at the spectrum edges
     if w < 420:
         f = 0.3 + 0.7 * (w - 380) / 40.0
+    elif w > 780:
+        # NEAR-IR (780-900). The 0.35 red set above is already this branch's attenuation —
+        # it is how a wavelength the eye cannot see is drawn at all. The visible tail's
+        # roll-off below is only defined up to 780 and goes NEGATIVE past it, which raised a
+        # negative base to a fractional power and returned a **complex number**: any channel
+        # in this range (Cy7, AlexaFluor 790 — ordinary in multiplexed imaging) crashed the
+        # tint with `TypeError: type complex doesn't define __round__`. Found 2026-09-25 by
+        # the `io.write_movie` parity check against this function.
+        f = 1.0
     elif w > 700:
         f = 0.3 + 0.7 * (780 - w) / 80.0
     else:
@@ -257,6 +266,18 @@ def alpha(col: QColor, a: int) -> QColor:
 # ── metrics ───────────────────────────────────────────────────────────────────
 NODE_W = 214
 RR_SIZE = 22          # a reroute node's compact dot (width == height)
+# The batch nodes' golden point (V3.01) — a dot like a reroute, but big enough to GRAB.
+# A reroute is 22px and is meant to be a bead on a wire; this one is a place you drop files
+# on and drag around, so it has to present a real target for the hand as well as for the
+# two sockets on its edges. 44px is the smallest that stays comfortably clickable at the
+# zoom levels the canvas actually gets used at without competing with a node card.
+BATCH_SIZE = 44
+# Minimum gap between two sockets stacked on a dot's edge. A socket dot is ~9px across, so
+# this leaves a clear gap rather than two touching circles — which is what decides whether
+# a user can tell member 6's wire from member 7's. The Unbatch point grows to honour it.
+SOCKET_PITCH = 14
+BATCH_GOLD = c("#d9a441")        # the point itself
+BATCH_GOLD_DIM = c("#8a6a2c")    # its ring when the node is muted/dormant
 HEADER_H = 36
 ROW_H = 26
 GRAN_H = 28

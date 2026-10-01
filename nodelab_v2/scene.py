@@ -43,7 +43,12 @@ from PySide6.QtWidgets import (
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType, can_connect as _sock_can_connect
 from nodelab_v2 import theme as T
-from nodelab_v2.document import GraphDocument
+from nodelab_v2.document import BATCH_OP, UNBATCH_OP, GraphDocument
+
+#: Extensions the canvas accepts as a DESKTOP file drop (V3.01). The same set the
+#: File -> Load dialog offers, kept here as a tuple because a drag has to be judged on
+#: every mouse move and a dialog filter string cannot be.
+FILE_DROP_SUFFIXES = (".nd2", ".tif", ".tiff")
 from nodelab_v2.edge_item import EdgeItem, wire_path
 from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.minimap import HudButton
@@ -791,6 +796,16 @@ class GraphScene(QGraphicsScene):
                            "source cards can ingest at the same time and the app stays "
                            "usable.")
             act.triggered.connect(lambda: self.ingest_requested.emit(nid))
+        if node.op_key == UNBATCH_OP:
+            n_un = len(self.doc.batch_member_names(nid))
+            act = menu.addAction(f"Fan out to {n_un} cards" if n_un >= 2
+                                 else "Fan out to cards")
+            act.setEnabled(n_un >= 2)
+            act.setToolTip(
+                "Give every file in the batch its own Viewer card, wired to that file's "
+                "output. Cards already wired to a member are left alone, so this is safe "
+                "to run again after adding files to the batch.")
+            act.triggered.connect(lambda: self.fan_out_batch(nid))
         mute = menu.addAction("Muted (pass through)\tM")
         mute.setCheckable(True)
         mute.setChecked(bool(rec.muted) if rec is not None else False)
@@ -859,6 +874,44 @@ class GraphScene(QGraphicsScene):
         menu.addSeparator()
         menu.addAction("Delete frame (keeps the nodes)\tDel").triggered.connect(
             lambda: self.doc.remove_frame(frame.frame_id))
+
+    def fan_out_batch(self, unbatch_id: str) -> list:
+        """Give every file of the batch its own card, wired to that file's output.
+
+        The closing gesture of the golden point: the pipeline ran once over K files and
+        this is where the K results become K things you can look at. Each card is a
+        ``view.viewer`` — an inspection tap — because what the user wants at the end of a
+        batch is to SEE each file's result, and a viewer is the card that shows one.
+
+        **Idempotent by wiring, not by a flag.** A member whose socket already feeds
+        something is skipped, so running it again after adding two files to the batch adds
+        two cards rather than duplicating the ones already there — and a card the user
+        deleted on purpose stays deleted until they ask again. That is also why this is an
+        explicit action instead of firing on every rewire: spawning cards nobody asked for,
+        repeatedly, is worse than one menu click.
+        """
+        names = self.doc.batch_member_names(unbatch_id)
+        if len(names) < 2:
+            return []
+        item = next((i for i in self.items()
+                     if isinstance(i, NodeItem) and i.node_id == unbatch_id), None)
+        base = item.scenePos() if item is not None else QPointF(0.0, 0.0)
+        wired = {ss for src, ss, _d, _ds in self.doc.edges if src == unbatch_id}
+        made = []
+        for i, _name in enumerate(names):
+            sock = f"bat{i}"
+            if sock in wired:
+                continue                       # this member already goes somewhere
+            rec = self.doc.add_node(
+                "view.viewer",
+                x=base.x() + 220.0, y=base.y() + (i - (len(names) - 1) / 2.0) * 150.0)
+            try:
+                self.doc.connect(unbatch_id, sock, rec.id, "data")
+            except ValueError:
+                self.doc.remove_node(rec.id)   # socket gone (the batch shrank) — no card
+                continue
+            made.append(rec.id)
+        return made
 
     def _reroute_on(self, edge: EdgeItem, pos: QPointF) -> None:
         r = T.RR_SIZE / 2.0
@@ -931,6 +984,10 @@ class GraphView(QGraphicsView):
 
     STEP = 26
     op_dropped = Signal(str, QPointF)
+    #: ``(paths, scene position, target node id or "")`` — image files dropped from the
+    #: DESKTOP onto the canvas (V3.01). The target is the id of the node the drop landed
+    #: on when that node is a Batch point, else ``""``; the window decides what to build.
+    files_dropped = Signal(list, QPointF, str)
     maximize_toggled = Signal(bool)
 
     #: troubleshooting frame: stroke width, and the inset its rounded rect sits at.
@@ -1240,15 +1297,54 @@ class GraphView(QGraphicsView):
             return
         self.fitInView(r.adjusted(-70, -70, 70, 70), Qt.KeepAspectRatio)
 
-    # palette drag-and-drop (G2)
+    # palette drag-and-drop (G2) + desktop file drop (V3.01)
+    def _dropped_image_paths(self, md) -> list:
+        """Local image files in a drag's mime data, in the order the OS listed them.
+
+        Filtered by extension rather than accepting any URL, so dragging a folder, a URL
+        from a browser or a stray text file is simply not our drop and falls through to
+        Qt — a drag that LOOKS accepted and then does nothing is worse than one the
+        cursor never offered to take.
+        """
+        if not md.hasUrls():
+            return []
+        out = []
+        for u in md.urls():
+            if not u.isLocalFile():
+                continue
+            p = u.toLocalFile()
+            if p.lower().endswith(FILE_DROP_SUFFIXES):
+                out.append(p)
+        return out
+
+    def _batch_node_at(self, view_pt) -> str:
+        """The id of the Batch point under ``view_pt``, or ``""``.
+
+        Only ``util.batch`` answers: dropping files onto the point that COLLECTS them is
+        the gesture with an obvious meaning, and there is none for dropping a file on an
+        Unbatch or on an ordinary card.
+        """
+        for it in self.items(view_pt):
+            nid = getattr(it, "node_id", None)
+            if nid is None and getattr(it, "parentItem", None) is not None:
+                nid = getattr(it.parentItem(), "node_id", None)
+            if nid is None:
+                continue
+            rec = self.scene().doc.nodes.get(nid) if self.scene() else None
+            if rec is not None and rec.op_key == BATCH_OP:
+                return str(nid)
+        return ""
+
     def dragEnterEvent(self, e) -> None:
-        if e.mimeData().hasFormat("application/x-nd2studios-op"):
+        if (e.mimeData().hasFormat("application/x-nd2studios-op")
+                or self._dropped_image_paths(e.mimeData())):
             e.acceptProposedAction()
         else:
             super().dragEnterEvent(e)
 
     def dragMoveEvent(self, e) -> None:
-        if e.mimeData().hasFormat("application/x-nd2studios-op"):
+        if (e.mimeData().hasFormat("application/x-nd2studios-op")
+                or self._dropped_image_paths(e.mimeData())):
             e.acceptProposedAction()
         else:
             super().dragMoveEvent(e)
@@ -1258,8 +1354,14 @@ class GraphView(QGraphicsView):
             op = bytes(e.mimeData().data("application/x-nd2studios-op")).decode("utf-8")
             self.op_dropped.emit(op, self.mapToScene(e.position().toPoint()))
             e.acceptProposedAction()
-        else:
-            super().dropEvent(e)
+            return
+        paths = self._dropped_image_paths(e.mimeData())
+        if paths:
+            pt = e.position().toPoint()
+            self.files_dropped.emit(paths, self.mapToScene(pt), self._batch_node_at(pt))
+            e.acceptProposedAction()
+            return
+        super().dropEvent(e)
 
 
 __all__ = ["GraphScene", "GraphView", "LinkSearchPopup", "compatible_ops",

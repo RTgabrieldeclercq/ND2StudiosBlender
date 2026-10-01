@@ -53,10 +53,39 @@ microscope PC wrote into the file, not a parse error, so it is left alone — ``
 is honest about what it read. The consequence is real but belongs to the data: this file
 cannot be placed on the cross-file clock ``view.overlay`` uses. Relative ``dt_s`` (299.99 s)
 is unaffected, so rates and tracking are fine.
+
+Shim 2 — **picture metadata keyed at a frame other than 0**
+----------------------------------------------------------
+Found 2026-09-30 on the ``Spheroid_ELISA/20260916_180247_607`` JOBS run: ten
+``ChannelR-PE,Cy5_Seq00NN.nd2`` files from one job, and every other one (0004, 0006, 0008,
+0010, 0012) could not be opened at all::
+
+    KeyError: Chunk key b'ImageMetadataSeqLV|0!' not found in chunkmap: {...}
+
+``ModernReader._cached_raw_metadata`` hard-codes the key ``ImageMetadataSeqLV|0!`` (the
+picture metadata: channels, calibration, planes), and ``attributes()`` reads it to count
+channels — so the failure fires from ``ND2File.sizes`` and nothing about the file is
+reachable. But the metadata is **not missing**. NIS-Elements wrote it under a different
+sequence index, and in every one of these files that index is exactly half the frame count::
+
+    Seq0002  748 frames  ImageMetadataSeqLV|0!     ImageCalibrationLV|0!      (loads)
+    Seq0004  706 frames  ImageMetadataSeqLV|353!   ImageCalibrationLV|353!    (failed)
+    Seq0006  726 frames  ImageMetadataSeqLV|363!   ImageCalibrationLV|363!    (failed)
+    Seq0008  712 frames  ImageMetadataSeqLV|356!   ImageCalibrationLV|356!    (failed)
+
+The ``|353!`` chunk is 47015 bytes, byte-for-byte the same size as ``|0!`` in the sibling
+that loads, and it is the only picture-metadata chunk in the file. The ``|N!`` suffix names
+the first frame a metadata record applies to, so a file whose lowest record is ``|353!``
+has no other record to describe frame 0 with. The shim uses **the lowest-indexed**
+``ImageMetadataSeqLV|N!`` present. That is what ``|0!`` is whenever it exists, and it is
+the same record the SDK would have read had the writer keyed it at 0.
+
+Same nd2 range as shim 1 (``<= 0.11.3``, current on PyPI as of 2026-09-30).
 """
 from __future__ import annotations
 
 import functools
+import re
 from typing import Any
 
 #: Attribute stamped on a wrapper so :func:`import_nd2` can tell an already-shimmed SDK from
@@ -102,6 +131,66 @@ def _patch_zstack_home_index() -> bool:
     return True
 
 
+#: ``ImageMetadataSeqLV|353!`` → 353 (and the pre-v3 ``ImageMetadataSeq|N!`` spelling).
+_PICTURE_META_KEY = re.compile(rb"^ImageMetadataSeq(LV)?\|(\d+)!$")
+
+
+def _lowest_picture_meta_key(chunkmap: Any, v3: bool) -> Any:
+    """The lowest-indexed picture-metadata chunk key in ``chunkmap`` for this file version,
+    or ``None`` if there is none at all (then the file really has no metadata and the
+    original ``KeyError`` stands)."""
+    best = None
+    for k in chunkmap:
+        m = _PICTURE_META_KEY.match(k)
+        if m is None or bool(m.group(1)) != v3:
+            continue
+        n = int(m.group(2))
+        if best is None or n < best[0]:
+            best = (n, k)
+    return None if best is None else best[1]
+
+
+def _patch_picture_meta_key() -> bool:
+    """Wrap ``ModernReader._cached_raw_metadata`` so a file whose picture metadata is keyed
+    ``ImageMetadataSeqLV|N!`` with ``N != 0`` reads that record instead of raising
+    ``KeyError`` (shim 2 in the module docstring).
+
+    Delegates first: the wrapper acts only when upstream raised ``KeyError`` **and** the
+    ``|0!`` key it wanted is genuinely absent. It then decodes the replacement the same
+    way upstream decodes ``|0!`` (``_decode_chunk(..., strip_prefix=False)``, then unwrap
+    ``SLxPictureMetadata``) and caches it on the same attribute, so every downstream
+    reader (``attributes``, ``metadata``, ``voxel_size``) sees an ordinary file."""
+    try:
+        from nd2._readers._modern.modern_reader import ModernReader
+    except Exception:            # noqa: BLE001 — private path; absence is not an error
+        return False
+    orig = getattr(ModernReader, "_cached_raw_metadata", None)
+    if orig is None or getattr(orig, _SHIM_TAG, False):
+        return False
+
+    @functools.wraps(orig)
+    def guarded(self: Any) -> Any:
+        try:
+            return orig(self)
+        except KeyError:
+            v3 = self.version() >= (3, 0)
+            want = b"ImageMetadataSeqLV|0!" if v3 else b"ImageMetadataSeq|0!"
+            cm = self.chunkmap
+            if want in cm:
+                raise                   # not the missing-key case this shim is for
+            alt = _lowest_picture_meta_key(cm, v3)
+            if alt is None:
+                raise
+            meta = self._decode_chunk(alt, strip_prefix=False)
+            meta = meta.get("SLxPictureMetadata", meta)
+            self._raw_image_metadata = meta
+            return meta
+
+    setattr(guarded, _SHIM_TAG, True)
+    ModernReader._cached_raw_metadata = guarded
+    return True
+
+
 def apply_shims() -> None:
     """Apply every shim in this module, once per process. Never raises — a shim that cannot
     find its target simply does not install (see :func:`_patch_zstack_home_index`), because
@@ -111,6 +200,7 @@ def apply_shims() -> None:
         return
     _applied = True
     _patch_zstack_home_index()
+    _patch_picture_meta_key()
 
 
 def import_nd2() -> Any:

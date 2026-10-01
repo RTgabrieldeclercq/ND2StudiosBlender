@@ -40,12 +40,99 @@ from nodegraph.metadata import propagate_meta
 from nodegraph.nodes import COMPUTES, register_node
 from nodegraph.domains import Domain
 from nodegraph.registry import (
-    Granularity, InDataset, InString, Mode, NODES, OutDataset, define_node)
+    Granularity, InDataset, InFloat, InString, Mode, NODES, OutDataset, define_node)
 from nodegraph.sockets import SocketType
 
 #: a synthetic per-channel output socket name — ``ch0``, ``ch1``, … (GUI-only; the
 #: materialization pass turns each wired one into a real ``channel.select`` tap).
 CH_SOCKET_RE = re.compile(r"^ch(\d+)$")
+
+#: An ``io.load`` card's resolved **position groups**: ``[{"key", "size", "shape"}, …]``,
+#: one per specimen the acquisition holds (:func:`nodegraph.placement.position_groups`).
+#: Drives the card's synthetic ``grpK`` outputs, and is read back here to put each group's
+#: KEY on the tap that materializes it.
+#:
+#: Lives in this module rather than beside the document's other params keys only because of
+#: the import direction — ``document`` imports ``ops``, never the reverse — and it is
+#: re-exported there so the GUI layer reads it from the place it belongs to.
+#:
+#: Deliberately NOT one of ``document._UI_PARAM_KEYS``, for the reason ``BUNDLE_PATHS_KEY``
+#: is not either: this is not an annotation, it decides WHICH PIXELS the ``grpK`` outputs
+#: produce. ``grp2`` means "the third group in this list", so a list that changed — a
+#: sidecar written, a threshold moved — has to re-key the memo, or a cached result computed
+#: for one specimen would be served for another.
+GROUPS_KEY = "__groups__"
+
+#: A synthetic per-GROUP output socket on a source card: ``grp0``, ``grp1``, … The index is
+#: a position in the card's :data:`~nodelab_v2.document.GROUPS_KEY` list, not a group key —
+#: socket names have to be plain identifiers, and a group renamed to "treated (2 mM)" in a
+#: sidecar could not be one. The KEY is resolved from that list at materialization and put
+#: on the tap, which is what the engine and the memo actually see.
+GRP_SOCKET_RE = re.compile(r"^grp(\d+)$")
+
+#: A synthetic per-MEMBER output socket on a ``util.unbatch`` card: ``bat0``, ``bat1``, …
+#: The index is a position in the batch's wiring order, not a file name — socket names have
+#: to be plain identifiers and a file called ``WellA3 (2 mM).nd2`` could not be one. The
+#: NAME is resolved at materialization and put on the ``util.select_batch`` tap, which is
+#: what the engine and the memo see, for the same reason :data:`GRP_SOCKET_RE` resolves a
+#: group KEY: an index would quietly point at a different file after a rewire with every
+#: hash still agreeing, while a name either still resolves or refuses.
+BAT_SOCKET_RE = re.compile(r"^bat(\d+)$")
+
+
+def batch_member_identity(node: Any, node_id: str) -> str:
+    """A batch member's identity: the base name of the file its source node carries.
+
+    **The single definition, used by both sides on purpose.** The document resolves it to
+    label and key the synthetic ``batK`` sockets; :func:`materialize_batch_taps` resolves it
+    again from the RUN graph to put on the tap. If those two disagreed the card would look
+    correct and the pull would refuse, so they call the same function over the same
+    param — ``path``, which is a real compute input and survives the strip that removes UI
+    annotations like ``__title__``.
+    """
+    import os
+    if node is None:
+        return str(node_id)
+    path = str((getattr(node, "params", None) or {}).get("path") or "").strip()
+    return os.path.basename(path) if path else str(node_id)
+
+
+def batch_member_names_of(graph: Graph, unbatch_id: str) -> List[str]:
+    """Member identities of the batch feeding ``unbatch_id``, in wiring order — the run
+    graph's copy of :meth:`nodelab_v2.document.GraphDocument.batch_member_names`.
+
+    Walks back to the nearest ``util.batch``, stopping at a ``util.select_batch`` because
+    past that tap the stream is one member and is not in a batch any more.
+    """
+    seen: set = set()
+    stack = [unbatch_id]
+    bid = None
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        node = graph.nodes.get(nid)
+        op = getattr(node, "op_key", "")
+        if op == "util.batch":
+            bid = nid
+            break
+        if op == "util.select_batch" and nid != unbatch_id:
+            continue
+        stack.extend(e.src for e in graph.edges
+                     if e.dst == nid and e.kind == "forward")
+    if bid is None:
+        return []
+    out: List[str] = []
+    seen_names: Dict[str, int] = {}
+    for e in graph.edges:
+        if e.dst != bid or e.kind != "forward":
+            continue
+        name = batch_member_identity(graph.nodes.get(e.src), e.src)
+        n = seen_names.get(name, 0)
+        seen_names[name] = n + 1
+        out.append(name if n == 0 else f"{name} ({n + 1})")
+    return out
 
 #: ``io.dock``'s op_key, and the params key holding its **bake record** — an opaque
 #: machine-set dict ``{"id", "sig", "precision", "at", "bytes"}`` written by the Bake
@@ -53,6 +140,11 @@ CH_SOCKET_RE = re.compile(r"^ch(\d+)$")
 #: bookkeeping rather than a user control, so the param↔socket contract exempts it
 #: (`wire-node-v2` §4b) and no socket may offer it for editing.
 DOCK_OP = "io.dock"
+
+#: ``io.write_movie``. Named here beside the other op keys the GUI special-cases so
+#: the inspector and the window agree on one spelling, rather than each carrying a
+#: literal that can drift.
+MOVIE_OP = "io.write_movie"
 BAKE_KEY = "__bake__"
 
 #: ``io.load``'s op_key — the pipeline source. Named because three layers now test for it
@@ -60,6 +152,49 @@ BAKE_KEY = "__bake__"
 #: entry, the window's double-click routing) and a bare string in each is how one of them
 #: ends up spelled differently.
 LOAD_OP = "io.load"
+
+#: ``io.load``'s access mode and its three choices — how a source card reaches its pixels.
+#:
+#: ``direct`` reads an uncompressed ND2's memory-mapped frames in place — no copy, no
+#: store, usable the instant the file is picked (:mod:`nodelab_v2.nd2_direct`). ``ingest``
+#: copies the file into a ``.b2nd`` store once and reads from there — compressed, with a
+#: display pyramid, at the cost of a one-time copy that can be the size of the file itself.
+#: ``auto`` decides between the two at resolve time instead of committing either way:
+#: reuse an existing store if one already covers the file
+#: (:meth:`~nodelab_v2.runner.EngineRunner._effective_access`), else ingest it if a fresh
+#: copy would fit the destination drive with room to spare, else read it in place
+#: (:func:`~nodelab_v2.nd2_direct.decide_access`).
+#:
+#: **``direct`` is the default** (:data:`ACCESS_DEFAULT`) — both for a freshly placed card,
+#: via :meth:`~nodegraph.registry.NodeSpec.default_state`, and for the unset mode on every
+#: graph saved before this mode existed, via :func:`source_access_of`'s fallback. Every
+#: file opens immediately with no copy unless something is explicitly asked to build one:
+#: ``auto`` and ``ingest`` are both there, but neither is what a card gets by just sitting
+#: on the canvas. The one case this costs something is a series with very large planes,
+#: which scrubs better off a stored pyramid than decimated live — set ``auto`` or
+#: ``ingest`` by hand for those (the crossover is the size of a PLANE, not of the file; see
+#: the choice docs and MANUAL.md §4).
+ACCESS_MODE = "access"
+
+#: ``io.load``'s grouping lever and its two choices — whether the card offers one output per
+#: POSITION GROUP (see :data:`GROUPS_KEY`).
+#:
+#: **Off is the default** (changed 2026-09-28). Detection is reliable on a clean multi-mosaic
+#: acquisition, but a card that silently grows six extra outputs is a card whose shape depends
+#: on a threshold, and the sockets are only useful to somebody who already wants to work one
+#: specimen at a time. Opting in is one dropdown; opting out of something the app decided for
+#: you means first working out why the card looks like that.
+GROUPING_MODE = "grouping"
+GROUPING_AUTO, GROUPING_OFF = "auto", "off"
+#: What an unset ``grouping`` mode means. Named rather than spelled at each site: the document
+#: reads it to decide whether to offer sockets, and a saved graph from before this mode existed
+#: carries no mode at all — both must land on the same answer as a freshly dropped card.
+GROUPING_DEFAULT = GROUPING_OFF
+ACCESS_AUTO, ACCESS_INGEST, ACCESS_DIRECT = "auto", "ingest", "direct"
+#: What an unset ``access`` mode means — named rather than spelled at each site, the same
+#: reason :data:`GROUPING_DEFAULT` is, and for the same requirement: a freshly placed card
+#: and a saved graph from before this mode existed must land on the same answer.
+ACCESS_DEFAULT = ACCESS_DIRECT
 
 #: the three dock states. ``live`` = an identity pass-through (the chain runs normally);
 #: ``held`` = the computed payload is pinned in memory as an engine seed and the in-edge is
@@ -83,12 +218,64 @@ DOCK_FROZEN = (DOCK_HELD, DOCK_DOCKED)
 PRECISION_UNSET = "unset"
 
 
+#: The calibration a SOURCE card may state for itself, overriding (or supplying) what the
+#: file carries. Named once here so the socket list, the edit-time envelope
+#: (:meth:`nodelab_v2.document.GraphDocument.propagate`) and the pulled payload
+#: (:meth:`nodelab_v2.runner.EngineRunner._resolve_source`) cannot drift about what is
+#: overridable — the same single-builder rule the placement entry follows.
+#:
+#: **Why the source and not a mid-graph node** (asked 2026-09-15): a plain TIFF records no
+#: Z spacing at all — every file in FranckLab's SerialTrack3D set is one — and `z_step_um`
+#: is read *before* anything downstream could restate it. `detect.particles`/`detect.spots`
+#: derive their AXIAL sigma from it, so a correction applied after detection would leave the
+#: detection itself scaled against the wrong spacing, and `track.objects` (SerialTrack 3D)
+#: refuses outright without it. Fixing it at the card that opens the file is the only place
+#: that is true for every reader.
+CALIB_OVERRIDE_KEYS: Tuple[str, ...] = ("pixel_size_um", "z_step_um")
+
+
+def calib_overrides(params: Mapping[str, Any]) -> Dict[str, float]:
+    """The calibration keys this source node states for itself — ``{}`` when it states none.
+
+    **Zero or blank means "whatever the file itself carries"**, which is what makes this
+    additive: a graph saved before these fields existed has neither param, resolves to ``{}``
+    and reads exactly as it always did. Only a POSITIVE value overrides, because zero is not
+    a physically meaningful pixel size or Z step — it is the empty box.
+    """
+    out: Dict[str, float] = {}
+    for key in CALIB_OVERRIDE_KEYS:
+        try:
+            value = float(params.get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue                          # a half-typed box is not an override
+        if value > 0.0:
+            out[key] = value
+    return out
+
+
+def with_calib_override(metadata: Mapping[str, Any],
+                        params: Mapping[str, Any]) -> Dict[str, Any]:
+    """``metadata`` with this source node's calibration overrides applied (copy-on-write)."""
+    over = calib_overrides(params)
+    md = dict(metadata)
+    md.update(over)
+    return md
+
+
 def ensure_ops() -> None:
     """Idempotently register ``io.load`` (source, no compute) + ``view.viewer``
     (pass-through). Safe to call repeatedly and from any thread (pure registry
     writes)."""
     spec = NODES.get("io.load")
-    if spec is None or spec.input("path") is None:
+    _access_mode = next((m for m in spec.modes if m.name == ACCESS_MODE), None) \
+        if spec is not None else None
+    _group_mode = next((m for m in spec.modes if m.name == GROUPING_MODE), None) \
+        if spec is not None else None
+    if (spec is None or spec.input("path") is None
+            or spec.input("z_step_um") is None
+            or _access_mode is None or ACCESS_AUTO not in _access_mode.choices
+            or _access_mode.resolved_default() != ACCESS_DEFAULT
+            or _group_mode is None):
         define_node(
             "io.load", "Load ND2/TIFF file", category="io",
             inputs=[InString("path", "Path", field=False, default="",
@@ -98,12 +285,108 @@ def ensure_ops() -> None:
                              path_hint="empty = synthetic demo · or Browse…",
                              description="The ND2 or TIFF to open. Browse… fills this in; "
                                          "an empty path runs the synthetic demo stack "
-                                         "instead, so the graph is testable with no file.")],
+                                         "instead, so the graph is testable with no file."),
+                    InFloat("pixel_size_um", "Pixel size", unit="um", field=False,
+                            default=0.0,
+                            description=
+                            "The lateral sampling this file was acquired at, in microns per "
+                            "pixel. Loading a file FILLS THIS IN from its own header, so "
+                            "what you see is what the pipeline is using — and you can type "
+                            "over it when the file is wrong or silent. **0 means \"whatever "
+                            "the file says\"**, which is what an older graph (and any file "
+                            "whose header is trustworthy) resolves to.\n\n"
+                            "It moves MEASUREMENTS, not just the ruler: every µm-denominated "
+                            "size in the graph — a spot radius, a minimum area, a search "
+                            "distance — converts through this number, and so does every area "
+                            "and length a table reports. An ND2 carries it; a plain TIFF "
+                            "often does not."),
+                    InFloat("z_step_um", "Z step", unit="um", field=False, default=0.0,
+                            description=
+                            "The spacing between Z planes, in microns. Filled in from the "
+                            "file when it records one (an ND2, or an ImageJ TIFF's "
+                            "`spacing`) and typed in by hand when it does not — **a plain "
+                            "OME-TIFF usually carries no Z spacing at all**, which is why "
+                            "this box exists. 0 means \"whatever the file says\".\n\n"
+                            "Nothing downstream can invent it: a 3D detection derives its "
+                            "AXIAL radius from this (a wrong value stretches or flattens "
+                            "every bead it finds), and SerialTrack 3D tracking REFUSES "
+                            "without it, because it rescales z by z_step ÷ pixel size before "
+                            "building its topology descriptor and anisotropic voxels would "
+                            "distort every neighbour distance. For a volume already expressed "
+                            "in isotropic voxel units, set it equal to the pixel size."),
+            ],
             outputs=[OutDataset("image")],
+            modes=[
+                Mode(GROUPING_MODE, [GROUPING_OFF, GROUPING_AUTO],
+                     default=GROUPING_DEFAULT, label="Grouping",
+                     description=
+                     "Whether this card offers one output per SPECIMEN. A multipoint file "
+                     "is often several samples rather than one flat list of fields \u2014 six "
+                     "3x3 mosaics a millimetre apart, one plate well per site \u2014 and the "
+                     "stage coordinates say which. No effect on a file with one group.",
+                     choice_docs={
+                         GROUPING_AUTO:
+                             "Work out the groups when the file is opened (from a "
+                             "`.groups.json` sidecar if you wrote one, otherwise by "
+                             "clustering the stage positions) and grow one extra output "
+                             "per group, beside the full-file output. Wiring from one of "
+                             "them is the same as inserting a Select Group node \u2014 it IS "
+                             "one, added for you at run time \u2014 so a six-mosaic file gives "
+                             "six pipelines off one card with nothing to configure. Inert "
+                             "on a file that turns out to hold a single group, so the only "
+                             "cost of turning it on is the sockets you asked for.",
+                         GROUPING_OFF:
+                             "One output, every position, no detection \u2014 the DEFAULT, so a "
+                             "card looks the same whatever the stage log happens to contain. "
+                             "Right whenever the positions are one experiment (a plate "
+                             "scanned as a single 7x7 mosaic), whenever you would rather "
+                             "place Select Group by hand, and whenever you simply have not "
+                             "thought about it yet. Switching to Auto later costs nothing "
+                             "and needs no reload. Turning it back off with group outputs "
+                             "already WIRED breaks those wires, so the card asks first.",
+                     }),
+                Mode("access", [ACCESS_DIRECT, ACCESS_AUTO, ACCESS_INGEST], label="Access",
+                     description=
+                     "How the pixels are reached. Direct is the default — every file "
+                     "opens immediately with no copy. Switch to Auto to let the app build "
+                     "a compressed store when that clearly pays off, or to Ingest to "
+                     "always build one.",
+                     choice_docs={
+                         ACCESS_DIRECT:
+                             "Read planes straight out of the .nd2 — no copy, no store, "
+                             "usable immediately. This is the DEFAULT. For an UNCOMPRESSED "
+                             "ND2 the frames are memory-mapped, so a random plane costs "
+                             "about a page fault (~6 ms for 1024² here) and a 453 GB "
+                             "series is interactive with no ingest at all. Refused, with "
+                             "the reason, for a compressed or legacy ND2 and for TIFFs — "
+                             "switch to Auto or Ingest for those. There is no stored "
+                             "pyramid, so a series with very large planes scrubs better "
+                             "off Auto or Ingest instead.",
+                         ACCESS_AUTO:
+                             "Decide automatically, the moment this file is actually "
+                             "opened: keep using an existing store if this file already "
+                             "has one; otherwise ingest it if a fresh copy would fit the "
+                             "destination drive with room to spare, or read it in place "
+                             "(Direct) if it would not. Picks up an already-ingested "
+                             "file's store for free — Direct on its own never looks for "
+                             "one — while still refusing to run the drive to zero bytes "
+                             "free on a series too big to copy.",
+                         ACCESS_INGEST:
+                             "Always copy the file once into a compressed .b2nd store "
+                             "beside it, then read every plane from there — even though "
+                             "Direct is the default. Costs a one-time ingest (roughly the "
+                             "size of the file, and minutes to hours) and buys compression "
+                             "plus a display pyramid, which is what keeps a large-plane "
+                             "series smooth to scrub. Force this when the planes are large "
+                             "and you know the copy fits.",
+                     }),
+            ],
             adds_domains=frozenset({Domain.VOXEL}),   # the source of the image domain
-            description="Open an ND2 or TIFF as the pipeline source (the GUI ingests it "
-                        "once to a b2nd store next to the file; empty path = synthetic "
-                        "demo). Exposes one output per channel + a combined 'All "
+            description="Open an ND2 or TIFF as the pipeline source. Access defaults to "
+                        "Direct — read the ND2 in place, no copy; switch to Auto to build "
+                        "a compressed b2nd store when it clearly pays off, or to Ingest to "
+                        "always build one. Empty path = synthetic demo. "
+                        "Exposes one output per channel + a combined 'All "
                         "channels' output.")
     if NODES.get("view.viewer") is None:
         register_node(
@@ -229,6 +512,28 @@ def dock_state_of(rec: Any) -> str:
     if getattr(rec, "op_key", "") != DOCK_OP:
         return ""
     return str((getattr(rec, "modes", None) or {}).get("state") or DOCK_LIVE)
+
+
+def source_access_of(rec: Any) -> str:
+    """The access mode of an ``io.load`` record — ``"direct"``/``"auto"``/``"ingest"``, or
+    ``""`` when ``rec`` is not a source card.
+
+    Duck-typed on ``.op_key``/``.modes`` for the same reason :func:`dock_state_of` is: it
+    has to read a GUI ``NodeRecord`` and a headless
+    :class:`~nodegraph.graph.NodeInstance` alike. An unset mode falls back to
+    :data:`ACCESS_DEFAULT` (``"direct"``) — which is also the FIRST declared choice, so
+    this matches what a freshly placed card actually carries via
+    ``NodeSpec.default_state()`` (:meth:`nodelab_v2.document.NodeRecord.state`).
+
+    This is a deliberate behaviour choice, not a backward-compatibility default: every
+    graph saved before this mode existed reads ``"direct"`` too, not a fixed "always
+    ingest". Nothing gets copied unless a card is explicitly told to (``ingest``) or told
+    to decide for itself (``auto``) — including graphs saved back when ingesting was the
+    only thing that happened, and including a card whose file already has a perfectly
+    good store sitting next to it (set Access to Auto, or Ingest, to use that store)."""
+    if getattr(rec, "op_key", "") != LOAD_OP:
+        return ""
+    return str((getattr(rec, "modes", None) or {}).get(ACCESS_MODE) or ACCESS_DEFAULT)
 
 
 def is_docked(rec: Any) -> bool:
@@ -391,7 +696,12 @@ def prepare_run_graph(graph: Graph) -> Graph:
     envelope pass too, where unrolling would delete the node ids the inspector looks up.
     :func:`nodelab_v2.document.GraphDocument.to_graph` unrolls first, under its own flag;
     :func:`headless_engine` does the same."""
-    return materialize_channel_taps(cut_docked_inputs(graph))
+    # Batch FIRST, then groups, then channels: each narrows a different axis (B, then M,
+    # then C) so they commute on the data, and running them outermost-axis-first keeps
+    # each tap closest to the node that asked for it — the order the card reads in.
+    return materialize_channel_taps(
+        materialize_group_taps(
+            materialize_batch_taps(cut_docked_inputs(graph))))
 
 
 def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -590,6 +900,54 @@ def _real_dataset_out(op_key: str) -> str:
     return "out"
 
 
+def _materialize_taps(graph: Graph, pattern, op_key: str, tag: str, params_for) -> Graph:
+    """Rewire every GUI-synthetic output edge matching ``pattern`` through a real tap node.
+
+    The shared engine behind :func:`materialize_channel_taps` and
+    :func:`materialize_group_taps`. One tap is inserted per ``(source_node, index)`` and
+    SHARED by every edge leaving that socket, so wiring one group into four downstream
+    branches costs one ``util.select_group``, not four — and, because the tap has one
+    identity, those branches hit one memo entry instead of computing the same subset
+    repeatedly.
+
+    ``params_for(src_node, index)`` returns the tap's params, or ``None`` to leave the edge
+    alone. Returning ``None`` is how a socket whose meaning can no longer be resolved — a
+    ``grp4`` edge on a card whose group list has shrunk to three — fails: the edge stays
+    pointed at a socket that is not there, which the document's own validation reports,
+    rather than being silently rewritten to some other specimen's positions.
+
+    Full-bundle edges (``image`` / ``out`` / value sockets) pass through unchanged; the
+    input graph is never mutated, and with no taps the same object is returned.
+    """
+    taps: dict = {}                              # (src, k) -> tap node id
+    extra_nodes: dict = {}
+    new_edges = []
+    for e in graph.edges:
+        m = pattern.match(e.src_socket) if e.kind == "forward" else None
+        if m is None:
+            new_edges.append(e)
+            continue
+        k = int(m.group(1))
+        params = params_for(graph.nodes.get(e.src), k)
+        if params is None:
+            new_edges.append(e)
+            continue
+        key = (e.src, k)
+        tap_id = taps.get(key)
+        if tap_id is None:
+            tap_id = f"__tap__{e.src}__{tag}{k}"
+            taps[key] = tap_id
+            extra_nodes[tap_id] = NodeInstance(tap_id, op_key, params=params)
+            real_out = _real_dataset_out(graph.nodes[e.src].op_key)
+            new_edges.append(Edge(e.src, tap_id, real_out, "data", "forward"))
+        new_edges.append(Edge(tap_id, e.dst, "out", e.dst_socket, e.kind))
+    if not extra_nodes:
+        return graph
+    nodes = dict(graph.nodes)
+    nodes.update(extra_nodes)
+    return Graph(nodes=nodes, edges=new_edges)
+
+
 def materialize_channel_taps(graph: Graph) -> Graph:
     """Return a runnable graph in which every GUI-synthetic per-channel output edge
     (``src_socket`` matching ``chK``) is rewired through a real ``channel.select`` tap.
@@ -599,30 +957,67 @@ def materialize_channel_taps(graph: Graph) -> Graph:
     sockets) pass through unchanged. The input graph is not mutated; if there are no
     channel taps the same graph object is returned.
     """
-    taps: dict = {}                              # (src, k) -> tap node id
-    extra_nodes: dict = {}
-    new_edges = []
-    for e in graph.edges:
-        m = CH_SOCKET_RE.match(e.src_socket) if e.kind == "forward" else None
-        if m is None:
-            new_edges.append(e)
-            continue
-        k = int(m.group(1))
-        key = (e.src, k)
-        tap_id = taps.get(key)
-        if tap_id is None:
-            tap_id = f"__tap__{e.src}__c{k}"
-            taps[key] = tap_id
-            extra_nodes[tap_id] = NodeInstance(
-                tap_id, "channel.select", params={"channels": [k]})
-            real_out = _real_dataset_out(graph.nodes[e.src].op_key)
-            new_edges.append(Edge(e.src, tap_id, real_out, "data", "forward"))
-        new_edges.append(Edge(tap_id, e.dst, "out", e.dst_socket, e.kind))
-    if not extra_nodes:
-        return graph
-    nodes = dict(graph.nodes)
-    nodes.update(extra_nodes)
-    return Graph(nodes=nodes, edges=new_edges)
+    return _materialize_taps(graph, CH_SOCKET_RE, "channel.select", "c",
+                             lambda node, k: {"channels": [k]})
+
+
+def materialize_group_taps(graph: Graph) -> Graph:
+    """Rewire every GUI-synthetic per-GROUP output edge (``grpK``) through a real
+    ``util.select_group`` tap — the multipoint twin of :func:`materialize_channel_taps`.
+
+    **The tap carries the group's KEY, never its index**, resolved here from the card's
+    :data:`~nodelab_v2.document.GROUPS_KEY` list. That is the whole reason this function
+    reads the source node's params at all, and it is what makes the arrangement survive a
+    re-detection: if a sidecar appears and renames or reorders the groups, an index would
+    quietly point ``grp2`` at a different specimen while every hash stayed put, whereas a
+    key either still names a group or refuses. It also means the run graph reads the way the
+    user thinks — ``group="treated"`` on the tap, not ``group="2"``.
+
+    A card with no resolved list leaves its edges untouched (see :func:`_materialize_taps`),
+    so nothing is invented for a file whose grouping could not be worked out.
+    """
+    def params_for(node, k):
+        got = (node.params.get(GROUPS_KEY) if node is not None else None) or []
+        if not isinstance(got, (list, tuple)) or not (0 <= k < len(got)):
+            return None
+        key = str((got[k] or {}).get("key") or "")
+        return {"group": key} if key else None
+
+    return _materialize_taps(graph, GRP_SOCKET_RE, "util.select_group", "g", params_for)
+
+
+def materialize_batch_taps(graph: Graph) -> Graph:
+    """Rewire every GUI-synthetic per-MEMBER output edge (``batK``) on a ``util.unbatch``
+    card through a real ``util.select_batch`` tap — the batch-axis twin of
+    :func:`materialize_channel_taps`.
+
+    **The tap carries the member's NAME, never its index**, for the reason
+    :func:`materialize_group_taps` gives and one more besides: a batch's whole purpose is
+    keeping files apart, so an index that silently slid onto a different file after a
+    rewire would defeat the feature rather than merely surprise someone. A name that no
+    longer resolves makes ``util.select_batch`` refuse with the real members listed.
+
+    ``_materialize_taps`` calls ``params_for`` with the SOURCE node of the edge — the
+    unbatch card — but a member's name lives on the batch node upstream of it, so the walk
+    is done here against the whole graph and keyed by the unbatch's id.
+    """
+    cache: Dict[str, List[str]] = {}
+
+    def params_for(node, k):
+        nid = getattr(node, "id", None)
+        if nid is None:
+            return None
+        names = cache.get(nid)
+        if names is None:
+            names = cache[nid] = batch_member_names_of(graph, nid)
+        if not (0 <= k < len(names)):
+            # the batch shrank under this card: leave the edge pointing at a socket that
+            # is not there, which the document's validation reports, rather than
+            # rewriting it onto whichever file now occupies that slot
+            return None
+        return {"member": names[k]}
+
+    return _materialize_taps(graph, BAT_SOCKET_RE, "util.select_batch", "b", params_for)
 
 
 def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
@@ -649,7 +1044,7 @@ def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
     from nodegraph.iterate import iterate_nodes, unroll as unroll_iterate
     ensure_ops()
     if iterate_nodes(graph):
-        pre = materialize_channel_taps(graph)
+        pre = materialize_channel_taps(materialize_group_taps(graph))
         try:
             envs = propagate_meta(pre, dict(meta_seeds or {}))
         except ValueError:                    # a malformed graph: the unroll reports it
@@ -667,8 +1062,13 @@ def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
 
 
 __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
+           "materialize_group_taps", "GRP_SOCKET_RE", "GROUPS_KEY",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",
            "dock_store_of", "bake_record", "is_docked", "is_frozen", "held_nodes",
            "CH_SOCKET_RE", "DOCK_OP", "BAKE_KEY", "DOCK_LIVE", "DOCK_HELD",
-           "DOCK_DOCKED", "DOCK_FROZEN", "PRECISION_UNSET"]
+           "DOCK_DOCKED", "DOCK_FROZEN", "PRECISION_UNSET",
+           "LOAD_OP", "ACCESS_MODE", "ACCESS_AUTO", "ACCESS_INGEST", "ACCESS_DIRECT",
+           "ACCESS_DEFAULT", "source_access_of",
+           "BAT_SOCKET_RE", "batch_member_identity", "batch_member_names_of",
+           "materialize_batch_taps"]

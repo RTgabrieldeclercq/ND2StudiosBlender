@@ -41,8 +41,11 @@ from nodegraph.sockets import (
     Direction, SocketType, can_connect as _can_connect, can_convert as _can_convert)
 from nodegraph.zones import Zone, unroll as _unroll
 from nodelab_v2.ops import (
-    BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP,
+    BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
+    GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
+    calib_overrides,
     dock_status as _dock_status,
+    batch_member_identity,
     dormant_nodes, is_docked, is_frozen, prepare_run_graph, upstream_signature)
 
 #: params key holding the sticky pinned-override list (serialized per V2.03; stripped
@@ -56,9 +59,54 @@ LOCKED_KEY = "__locked__"
 TITLE_KEY = "__title__"
 CHANNELS_KEY = "__channels__"
 
+#: An ``io.load`` card's **file bundle** members: a list of 2+ paths laid end to end on the
+#: multipoint axis by :class:`~nodegraph.provider.MultiSourceProvider`. Fewer than 2 entries
+#: (or absent) is the ordinary single-file card that ``path`` describes, and ``path`` stays
+#: populated with the first member either way, so a reader that predates bundles still names
+#: a real file.
+#:
+#: Deliberately NOT in :data:`_UI_PARAM_KEYS`: this is not a UI annotation, it decides which
+#: pixels the card produces, so it belongs in the params the memo keys on.
+BUNDLE_PATHS_KEY = "paths"
+
 #: op_keys whose GUI card grows one synthetic per-channel output socket (``ch0…``) per
 #: channel — materialized into ``channel.select`` taps at graph-build (see nodelab_v2.ops).
 CHANNEL_TAP_OPS = ("io.load", "channel.split")
+
+#: op_keys whose GUI card grows one synthetic per-GROUP output socket (``grp0…``) per
+#: position group — materialized into ``util.select_group`` taps at graph-build.
+#:
+#: Only the SOURCE, unlike :data:`CHANNEL_TAP_OPS`. A channel tap is meaningful anywhere a
+#: channel axis survives, but grouping is a property of the acquisition's stage log, and the
+#: place a user thinks about "which specimen" is where the file enters the graph. A node
+#: downstream that wants it has ``util.select_group`` to wire explicitly.
+GROUP_TAP_OPS = ("io.load",)
+
+#: The three op_keys of the batch axis (V3.01). ``util.unbatch``'s card grows one synthetic
+#: per-MEMBER output socket (``bat0…``) per file in the batch reaching it, materialized into
+#: ``util.select_batch`` taps at graph-build — the third member of the same family as
+#: :data:`CHANNEL_TAP_OPS` and :data:`GROUP_TAP_OPS`.
+#:
+#: Unlike those two the member list is NOT captured into params: it is resolved live from
+#: the wiring by :meth:`GraphDocument.batch_member_names`, because it describes the graph
+#: rather than a file, and a captured copy could disagree with the wires after a rewire.
+BATCH_OP = "util.batch"
+UNBATCH_OP = "util.unbatch"
+SELECT_BATCH_OP = "util.select_batch"
+
+#: op_keys whose GUI card grows one synthetic per-MEMBER output socket (``bat0…``).
+BATCH_TAP_OPS = (UNBATCH_OP,)
+
+
+
+#: Columns of a JOINED domain that a ``column_in`` picker must not offer, because the
+#: consuming compute uses them to perform the join rather than exposing them as a testable
+#: value. ``member_id`` is the Track—member key: ``analysis.if_else._track_joined``
+#: skips it (and ``t``, which the member table already carries), so offering it would put a
+#: name in the menu that the pull then refuses — the live-control-that-does-nothing
+#: defect, wearing a picker's clothes. Kept here rather than in the envelope because it is a
+#: fact about how a consumer joins, not about what a producer wrote.
+_JOIN_KEYS = frozenset({"member_id"})
 
 #: params keys that are UI-only and must be stripped before the graph runs. ``__sweep__``
 #: (an Iterate node's recorded results table) is here and NOT with ``io.dock``'s ``__bake__``
@@ -76,6 +124,25 @@ _UI_PARAM_KEYS = (LOCKED_KEY, TITLE_KEY, CHANNELS_KEY, _SWEEP_KEY)
 #: :meth:`GraphDocument.to_graph` needs to know, and it re-derives the kind here.
 _DRIVER_SOCKETS: frozenset = frozenset(
     n for k in range(4) for n in _var_out_names(k))
+
+
+def _group_socket_label(i: int, g) -> str:
+    """The text a ``grpK`` output socket shows: ``"G2 · 9 pos, 3x3"``.
+
+    The group's KEY leads, not the index, because the key is what the user types into
+    ``util.select_group`` and what a renamed group in a sidecar is called — a socket reading
+    ``2`` beside a node reading ``treated`` would be one more thing to map by hand. The size
+    is there because it is the one number that says at a glance whether the detection did
+    something sensible: six sockets all reading "9 pos" is a mosaic set, and one reading
+    "1 pos" is a stray position worth looking at.
+    """
+    key = str((g or {}).get("key") or f"G{i + 1}")
+    size = int((g or {}).get("size") or 0)
+    shape = str((g or {}).get("shape") or "")
+    bits = [f"{size} pos"] if size else []
+    if shape:
+        bits.append(shape.split(" ")[0])          # "3x3" — the order word does not fit
+    return f"{key} · {', '.join(bits)}" if bits else key
 
 
 def is_driver_edge(doc: "GraphDocument", edge: EdgeTuple) -> bool:
@@ -322,6 +389,34 @@ class GraphDocument:
                     stack.append(dst)
         return frozenset(seen)
 
+    def real_source(self, node_id: str, socket: str = "data") -> Optional[str]:
+        """The node whose output actually reaches ``node_id``'s input ``socket``.
+
+        The wire into the socket, followed back through every **Reroute** (a routing dot,
+        not a node anyone means) and every **muted** node (which passes its first connected
+        Dataset input through, exactly as :meth:`_bypass_muted` rewires it for a run). So the
+        answer is the node a pull of ``node_id`` really reads, which is what "the node feeding
+        this one" should mean to anything keyed by node: the Viewer's LUTs, a finished
+        payload. ``None`` when nothing real is wired (unwired, or a muted source)."""
+        def into(nid: str, names) -> Optional[EdgeTuple]:
+            return next((e for e in self.edges
+                         if e[2] == nid and (e[3] in names or (not e[3] and "data" in names))),
+                        None)
+
+        edge = into(node_id, {socket})
+        seen = set()
+        while edge is not None:
+            src = edge[0]
+            rec = self.nodes.get(src)
+            if rec is None or src in seen:
+                return None
+            seen.add(src)
+            if rec.op_key != "rr.reroute" and not rec.muted:
+                return src
+            edge = into(src, {s.name for s in self.input_specs(src)
+                              if s.type is SocketType.DATASET})
+        return None
+
     def _prune_frames(self, node_id: str) -> None:
         """Drop a removed node from every frame; a frame left with no members is
         removed (frames never persist empty). Does NOT notify (the caller does)."""
@@ -377,6 +472,21 @@ class GraphDocument:
                 for i, ch in enumerate(descs):
                     base.append(OutDataset(f"ch{i}",
                                            label=f"{i} · {ch.get('name') or f'Ch{i}'}"))
+        if rec.op_key in GROUP_TAP_OPS:
+            groups = self.group_descriptors(node_id)
+            # TWO or more, the same floor the channel taps use and for the same reason: a
+            # single group is the whole file, so a lone `grp0` socket would sit beside
+            # `image` offering the identical Dataset under a second name.
+            if len(groups) >= 2:
+                for i, g in enumerate(groups):
+                    base.append(OutDataset(f"grp{i}", label=_group_socket_label(i, g)))
+        if rec.op_key in BATCH_TAP_OPS:
+            # Same TWO-or-more floor, same reason: `util.batch` itself refuses a one-file
+            # batch, so a lone `bat0` could only ever duplicate `out`.
+            members = self.batch_member_names(node_id)
+            if len(members) >= 2:
+                for i, name in enumerate(members):
+                    base.append(OutDataset(f"bat{i}", label=f"{i} · {name}"))
         return base
 
     def input_specs(self, node_id: str) -> list:
@@ -448,6 +558,61 @@ class GraphDocument:
             return inherited
         return env_descs
 
+    def group_descriptors(self, node_id: str) -> list:
+        """The card's position groups — ``[{"key", "size", "shape"}, …]``, or ``[]``.
+
+        The captured :data:`GROUPS_KEY` first, exactly as
+        :meth:`channel_descriptors` prefers ``__channels__``: it is written when the file is
+        opened, from the sidecar or the detector, and it is what SAVES with the graph — so a
+        card reopened on a machine that cannot see the file still shows the specimen names
+        its wires refer to, instead of collapsing its outputs and dropping every edge.
+
+        The envelope is the fallback, and it can answer because the grouping rides there as
+        an ordinary per-M list (``position_group``, stamped by
+        :func:`nodelab_v2.runner._with_position_groups`). That covers a graph saved before
+        this existed: it regains its groups on the first resolve rather than needing a
+        migration.
+
+        ``[]`` unless the lever is explicitly ``auto`` — which is what makes the lever mean
+        anything, since the sockets are computed from this list, so a lever that is off has
+        to empty it rather than be tested again at every call site. Off is the DEFAULT
+        (:data:`~nodelab_v2.ops.GROUPING_DEFAULT`), and the test is written as "not auto"
+        rather than "is off" so that an unset mode and a saved graph from before this lever
+        existed both land on the same answer as a freshly dropped card.
+        """
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return []
+        if str(rec.modes.get(GROUPING_MODE, GROUPING_DEFAULT)) != GROUPING_AUTO:
+            return []
+        got = rec.params.get(GROUPS_KEY)
+        if isinstance(got, list) and got:
+            return got
+        return self._env_group_descriptors(self.env(node_id))
+
+    @staticmethod
+    def _env_group_descriptors(env: MetaEnvelope) -> list:
+        """Group descriptors read off an envelope's per-M ``position_group`` list.
+
+        First-appearance order, which is acquisition order — the same order
+        :func:`nodegraph.placement.position_groups` returns and the same order the ordinal
+        spelling (``"2"``) counts in. Sorting the keys here would silently renumber them.
+        """
+        labels = env.metadata.get("position_group")
+        if not isinstance(labels, (list, tuple)) or not labels:
+            return []
+        out: list = []
+        seen: dict = {}
+        for v in labels:
+            key = str(v)
+            if not key:
+                return []                    # a gap makes the whole list untrustworthy
+            if key not in seen:
+                seen[key] = len(out)
+                out.append({"key": key, "size": 0, "shape": ""})
+            out[seen[key]]["size"] += 1
+        return out
+
     def _inherited_channel_descriptors(self, node_id: str, _depth: int = 0) -> list:
         """The captured ``__channels__`` descriptors of the nearest upstream node that has
         them, following the first Dataset in-edge. ``[]`` if none does.
@@ -507,6 +672,88 @@ class GraphDocument:
                 return [descs[idx]] if 0 <= idx < len(descs) else []
             return descs
         return []
+
+    def batch_member_names(self, node_id: str) -> list:
+        """The member names of the batch reaching ``node_id`` — ``[]`` if none does.
+
+        Walks back along the Dataset chain to the nearest ``util.batch`` and reads the
+        display name of each source wired into it, in wiring order. That is the same list
+        ``util.batch`` stamps as ``batch_file`` at pull time, resolved here from the GRAPH
+        so an ``util.unbatch`` card can draw its per-member outputs **before anything has
+        been pulled** — the envelope cannot answer, because the member count is invisible
+        to a ``meta_transform`` (it is handed input 0 alone) and the names are a pull-time
+        stamp.
+
+        Resolved live rather than captured into params, unlike the channel and group
+        descriptors. Those describe a FILE, which a reopened graph may no longer be able to
+        see; this describes the WIRING, which the document always has in front of it — so
+        recomputing it cannot go stale, and rewiring the Batch node moves the sockets with
+        it instead of leaving a captured list to disagree.
+
+        Duplicate names are suffixed exactly as the compute does, because two members
+        sharing a label would make the unbatch's outputs indistinguishable on the canvas.
+        """
+        bid = self._batch_node_for(node_id)
+        if bid is None:
+            return []
+        out: list = []
+        seen: Dict[str, int] = {}
+        for src, _ssock, dst, _dsock in self.edges:
+            if dst != bid:
+                continue
+            name = self._source_display_name(src)
+            n = seen.get(name, 0)
+            seen[name] = n + 1
+            out.append(name if n == 0 else f"{name} ({n + 1})")
+        return out
+
+    def _batch_node_for(self, node_id: str) -> Optional[str]:
+        """The nearest ``util.batch`` upstream of ``node_id`` (or ``node_id`` itself).
+
+        Stops at the FIRST one found walking back, and stops entirely at a
+        ``util.select_batch`` — past that tap the batch is already one member, so anything
+        downstream of it is not in a batch any more and must not grow member sockets.
+        """
+        seen: set = set()
+        stack = [node_id]
+        while stack:
+            nid = stack.pop()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            rec = self.nodes.get(nid)
+            op = rec.op_key if rec else ""
+            if op == BATCH_OP:
+                return nid
+            if op == SELECT_BATCH_OP and nid != node_id:
+                continue                       # the batch ends here
+            stack.extend(e[0] for e in self.edges if e[2] == nid)
+        return None
+
+    def _source_display_name(self, node_id: str) -> str:
+        """A member's IDENTITY — the base name of the file the source card carries, else
+        the node id. Never blank, because this is what a ``util.select_batch`` tap is keyed
+        by and what it resolves against the batch at pull time.
+
+        **Deliberately not** :data:`TITLE_KEY`, tempting though it is to show the name the
+        user typed. A title is a UI annotation and :data:`_UI_PARAM_KEYS` strips it on the
+        way to the engine, so a tap keyed by it would be resolvable here and unresolvable
+        in the run graph — the card would look right and the pull would refuse. The label
+        beside the socket may still show a title (see :meth:`batch_member_label`); the
+        identity has to be something the engine can also see.
+        """
+        return batch_member_identity(self.nodes.get(node_id), node_id)
+
+    def batch_member_label(self, node_id: str, index: int, identity: str) -> str:
+        """What to WRITE beside a member's output socket — the user's title when there is
+        one, otherwise the identity. Cosmetic only; the wire is keyed by the identity."""
+        srcs = [e[0] for e in self.edges if e[2] == node_id]
+        if 0 <= index < len(srcs):
+            rec = self.nodes.get(srcs[index])
+            title = str(rec.params.get(TITLE_KEY) or "").strip() if rec else ""
+            if title:
+                return title
+        return identity
 
     def source_channel_total(self, node_id: str) -> int:
         """The total channel count of the source file(s) feeding ``node_id`` — used by
@@ -795,6 +1042,18 @@ class GraphDocument:
                 # downstream of the dock.
                 if rec.op_key == DOCK_OP and params.get("store"):
                     params["store"] = self.dock_store(rec.id)
+                # A source card's resolved GROUPS ride into the run graph, where
+                # `materialize_group_taps` turns a `grpK` edge into a `util.select_group`
+                # carrying that group's KEY. Written HERE rather than captured when the
+                # file was picked, so that a card nobody opted in never detects anything:
+                # `group_descriptors` returns [] unless the lever is `auto`, which both
+                # supplies the keys when it is and strips a stale list when it is not.
+                if rec.op_key == LOAD_OP:
+                    descs = self.group_descriptors(rec.id)
+                    if descs:
+                        params[GROUPS_KEY] = descs
+                    else:
+                        params.pop(GROUPS_KEY, None)
             modes = dict(rec.modes)
             # `live_docks` forces a dock to pass through for THIS graph only — what a
             # re-bake needs, since the node is currently docked and its in-edge would be
@@ -1053,6 +1312,20 @@ class GraphDocument:
             # rails. Seeded per propagate rather than cached because the user can
             # re-bake, repoint or delete a dock at any time; the read is one small JSON.
             seeds.update(self._dock_seed_envs())
+            # A source card may STATE its own calibration, overriding (or supplying) what
+            # the file carries — the only way to give a plain TIFF a Z spacing, which it
+            # never records. Applied to the seed here rather than only in the runner so the
+            # whole graph re-derives on the keystroke instead of on the next pull: every
+            # µm→px default downstream reads it, and the 3D lever's guard consults it. The
+            # runner applies the SAME override to the payload it resolves
+            # (`runner._with_card_calib`), so the header the user is typing against and the
+            # pixels that arrive never disagree.
+            for nid, rec in self.nodes.items():
+                if rec.op_key != LOAD_OP:
+                    continue
+                over = calib_overrides(rec.params)
+                if over:
+                    seeds[nid] = seeds.get(nid, MetaEnvelope()).with_metadata(**over)
             unknown = MetaEnvelope(unknown_axes=frozenset(AXIS_ORDER))
             for nid in g.roots():
                 seeds.setdefault(nid, unknown)
@@ -1340,6 +1613,78 @@ class GraphDocument:
         if edge is None:
             return []
         return list(self.env(edge[0]).layers_in(domain))
+
+    # ── column picker (V2.28) ──────────────────────────────────────────────────
+    def column_choices(self, node_id: str, sock) -> list:
+        """The column names a ``column_in`` socket should offer — those the edit-time pass
+        knows were MEASURED onto the incoming edge, in the domain the socket declares.
+
+        The layer picker's sibling, one level down, and it follows the same primary edge for
+        the same reason (``layer_choices``): a second Dataset input's columns are not on the
+        wire the payload flows down.
+
+        Two differences, both because a column is a narrower thing than a layer.
+        ``column_join`` adds domains beyond the socket's own — a condition on Label rows can
+        test ``track_length``, which lives on the Track table and reaches those rows by the
+        ``member_id`` join the compute performs, so the picker has to offer it or the
+        tracking half of the palette is reachable only by typing. And ``column_from`` names
+        the layer socket that says WHICH instance's columns to list; without it the domain's
+        layers are unioned, which is what a socket whose layer is inferred needs.
+
+        Unlike ``layer_choices`` this list is CLOSED — the combo it fills is not
+        editable. Every structure-producing node declares ``adds_columns``
+        (``selftest::test_column_catalog_complete``), so the columns a table carries are
+        determined by the nodes upstream and there is nothing legitimate to type that is
+        not here. A layer picker cannot make that promise, which is why that one stays
+        free text."""
+        if sock is None:
+            return []
+        domains = []
+        base = getattr(sock, "column_in", None)
+        if not base and getattr(sock, "column_in_mode", ""):
+            rec = self.nodes.get(node_id)
+            spec = rec.spec() if rec else None
+            value = rec.state().get(sock.column_in_mode) if (rec and spec) else None
+            try:
+                base = Domain(value) if value else None
+            except ValueError:                      # a mode value that is not a Domain
+                base = None
+        if base is not None:
+            domains.append(base)
+        domains.extend(getattr(sock, "column_join", ()) or ())
+        if not domains:
+            return []
+        rec = self.nodes.get(node_id)
+        spec = rec.spec() if rec else None
+        if spec is None:
+            return []
+        primary = next((s.name for s in spec.inputs
+                        if s.type is SocketType.DATASET), None)
+        if primary is None:
+            return []
+        edge = self.edge_into(node_id, primary)
+        if edge is None:
+            return []
+        env = self.env(edge[0])
+        # `column_from` names a LAYER socket on this node; its current value is the instance
+        # whose columns to list. Empty (or an unset socket) unions the domain, which is the
+        # only honest answer when the compute will resolve the layer by only-candidate.
+        layer = None
+        src = getattr(sock, "column_from", "")
+        if src and rec is not None:
+            layer = str(rec.params.get(src) or "") or None
+        out: list = []
+        for dom in domains:
+            # the join domains are separate TABLES, so a layer name from the member domain
+            # must not be used to filter them — it would match nothing and silently hide
+            # every joined column.
+            want = layer if dom is base else None
+            for c in env.columns_in(dom, want):
+                if dom is not base and c in _JOIN_KEYS:
+                    continue
+                if c not in out:
+                    out.append(c)
+        return out
 
     # ── domain interface (socket rail + wire tint + validation) ────────────────
     def input_domains(self, node_id: str) -> frozenset:
