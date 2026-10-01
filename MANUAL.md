@@ -235,8 +235,15 @@ conversion. Expect the first pull on a large file to be slower than the rest.
 ### Ingesting: double-click a source card
 
 You don't have to wait for a pull to discover that cost. **Double-click a source card** and
-it ingests that one file right away — on its own worker, showing its own progress on the
+it resolves that one file right away — on its own worker, showing its own progress on the
 card, with the rest of the app still usable. When it lands, that card opens in the Viewer.
+
+What "resolves" costs depends on the card's **Access** mode ([§4](#loading-a-file--the-access-mode)):
+on the default, **Direct**, this is near-instant (open + a quick pixel check, no copy) no
+matter how large the file is. Only **Auto** (when it decides to) or **Ingest** actually
+write a `.b2nd` store, which is where the rest of this section's "minutes for a big series"
+applies. The mechanism below — its own worker, one job per file, several at once, sharing
+across duplicate cards — is the same either way.
 
 **Several ingest at once.** Double-click each of the files you just loaded and they all go
 together (up to `NODELAB_INGEST_WORKERS`, by default 4 or fewer on a small machine; the rest
@@ -264,6 +271,60 @@ Notes:
 **A pull only ingests the files it actually needs** — the sources in the pulled node's
 upstream closure. Files sitting on the canvas that this chain doesn't touch cost nothing.
 
+### Loading a file — the `Access` mode
+
+Every source card has an **Access** mode in the Inspector, and it defaults to reading your
+file in place — no copy, nothing written, usable the instant you pick it:
+
+| | |
+|---|---|
+| **Direct** (default) | Read the `.nd2` in place. No copy, no store, usable immediately. |
+| **Auto** | Decide per file, the moment it is actually opened — see below. |
+| **Ingest** | Always copy the file into a `.b2nd` store, compressed, with a display pyramid. |
+
+Direct opens in seconds no matter how large the file is, because nothing is written. An
+uncompressed ND2 stores its frames as a flat block, so the app memory-maps them and a
+plane costs about one disk seek. Measured on the lab's 453 GB 640 series (54 positions ×
+74 timepoints × 54 z, 1024², 12-bit):
+
+| | |
+|---|---|
+| opening the file | **3.2 s** (versus hours, and 340+ GB, to ingest) |
+| scrubbing z or t | ~1 ms per plane (~950 fps) |
+| jumping between positions | ~5 ms per plane (~200 fps) |
+| written to disk | **nothing** |
+
+Everything downstream behaves exactly as it does for an ingested file — the same nodes, the
+same Viewer, the same 2D/3D lever, the same spreadsheet.
+
+**When to move off Direct.** Direct has no stored pyramid, so each zoomed-out view is
+reduced from full-resolution pixels on the fly. That is free on 1024² planes and not free
+on very large ones: a 6247×4506 plane costs ~275 ms direct against ~4 ms from a store. If
+your planes are huge, or a file already has a store sitting next to it from an earlier
+session, switch Access to **Auto** or **Ingest**. The rule of thumb is the size of one
+**plane**, not the size of the file.
+
+**If Direct is refused**, it is ND2-only, and only for uncompressed ND2s: a TIFF, or a
+compressed or legacy ND2, has to decode a whole frame per read, which is what a store does
+better anyway. The card tells you which case you hit and names the fix — switch that card's
+Access to Auto or Ingest.
+
+**What Auto does**, in order: if this file already has a store on disk, use it — full stop,
+no space check, because a copy that already exists has nothing left to protect against.
+Otherwise, estimate what a fresh ingest would need (pessimistically — no compression
+credited, so it only ever *overestimates*) and compare it against the free space on the
+destination drive, with a margin (25%, or 5 GB, whichever is larger) so "just barely fits"
+still reads as "does not". Room to spare → **Ingest**. Not enough room → **Direct**. Auto
+is the mode to reach for on a file you already ingested once, or whenever you would rather
+the app weigh the trade-off than do it yourself — it also decides once per file per
+session, so freeing up disk space or deleting a store mid-session does not move an
+already-resolved card; switch Access away and back to force a re-check, or reopen the file.
+
+**Getting the best of both** on a series too big to ever fully ingest: add a **Crop** node
+to keep just the positions and timepoints you are actually working on, and **Dock** that
+(§12b). The dock bakes only that subset to disk, so you get a compressed, pyramided, fully
+cached store of the part you care about without ever copying the file you don't.
+
 ### Several files in one graph
 
 A graph can hold as many source nodes as you like, and they're independent all the way
@@ -275,7 +336,26 @@ Where they come back together:
 
 * **`view.overlay`** composites a second file onto the one you're viewing, placed by stage
   coordinates and focus rather than by pixel index (it needs the placement metadata ND2
-  carries and TIFF doesn't — it says so rather than guessing).
+  carries and TIFF doesn't — it says so rather than guessing). **Every file of one
+  experiment** can be laid together this way (2026-09-30), one Overlay per added file,
+  chained primary → primary:
+  * **Different frame rates.** `T pairing = rate` pairs a series recorded at n× the
+    primary's rate (read from `dt_s` / the frame clock and snapped to a whole ratio, or
+    typed as `Rate`), and the Viewer's **Play all** then plays that source n frames per
+    primary frame.
+  * **Different Z steps.** `Z sampling = linear` blends the two bracketing planes of a
+    coarser stack, in the Viewer and in a `resample` bake alike; `nearest` (default) only
+    ever shows planes that were acquired.
+  * **Frames you know go together.** Step a source with its own ◀ ▶ buttons in the Viewer's
+    source strip, then **Pin T** / **Pin Z**: the pairing runs through every pin from then on
+    (one pin re-anchors, two or more also fix the rate or axial scale between them). Pins are
+    stored on the Overlay (`t_pins` / `z_pins`) and listed in its inspector, one ✕ each.
+  * **Files that don't overlap on the stage** (another well, no stage log): `If unplaceable =
+    align_centres` lays them centre-on-centre at true pixel size; anchor them with the
+    two-click **Nudge** pick (a feature in the primary, then the same feature in the
+    source).
+  * **Labels and LUTs.** Each source's `Label` names it on the channel strip, and each
+    source keeps its own independent LUT wherever the chain is viewed.
 * **Correlation / DVC reference inputs** take a separate file as the undeformed reference
   frame.
 * Otherwise the branches stay independent — the Viewer and Spreadsheet show whichever node
@@ -284,6 +364,45 @@ Where they come back together:
 
 The Viewer's hover readout deliberately withholds its "raw" column when a node has **two**
 sources upstream — there is no single raw file to attribute the value to.
+
+### Grouping files into one bundle
+
+Picking more than one file asks whether to load them as **separate cards** (the default
+described above) or **grouped into one bundle**. Both are ordinary; they build different
+graphs, which is why it asks rather than guesses.
+
+* **Separate** is for files with different *roles* — a reference and a sample, two channels
+  to merge. You wire them up yourself.
+* **A bundle** is for *replicates*: the same acquisition of several wells or dishes that you
+  want treated identically and compared. It is ONE card carrying every file, so you build
+  one pipeline instead of N copies, and it draws as a **stack of cards** with `5 FILES` on
+  its eyebrow so a bundle never reads like a single source.
+
+A bundle lays its files end to end on the **multipoint (M) axis**: three single-position
+files become one three-position series. Everything downstream then works unchanged, because
+`m` already means "one acquisition site" everywhere in the app — the Viewer's M strip walks
+between the files, and per-position nodes treat each one independently.
+
+**The members must share their channels and their `(t, z, y, x)` geometry.** An axis cannot
+be ragged, so this is checked against the file headers *when you group*, and a mismatch is
+refused with the file and the axis named, offering separate cards instead. Channel *names*
+are compared too, not just the count: two files with `[DAPI, GFP]` and `[GFP, DAPI]` would
+otherwise stack quietly and put two different stains in one results column.
+
+**Exports name the file.** Every table a bundle produces gains a **`file`** column, sitting
+immediately before `m`, naming the source of each row — so one CSV holds every replicate and
+stays sortable by file. (A single-file load is unchanged and gains no column.) Where two
+members share a basename, the label keeps enough of the folder to tell them apart.
+
+Two things to know:
+
+* A node that pools statistics over the whole dataset pools **across files** in a bundle —
+  `analysis.threshold` with `scope="dataset"` derives one level from every file's pixels.
+  That is the same widening `scope` has always meant for positions; the per-plane default is
+  unaffected. If you want each file thresholded on its own pixels, leave `scope` alone.
+* A node that *collapses* M — `util.stitch` — has no per-position identity left afterwards,
+  so the `file` column retires rather than naming an arbitrary member. Stitching a bundle
+  treats its files as tiles of one mosaic, which is almost certainly not what you want.
 
 ### Per-channel output sockets
 
@@ -535,7 +654,11 @@ stacks the same two bars the same way), so a busy canvas stays readable.
 
 ### The first pull of a file shows a determinate bar
 
-The **first** pull of an ND2/TIFF pays a one-time **ingest**: the volume is read, then
+This section describes what happens when a card's **Access** is **Auto** (and decides to
+ingest) or **Ingest**. On the default, **Direct** ([§4](#loading-a-file--the-access-mode)),
+the first pull just opens the file — seconds, not minutes, and nothing below is written.
+
+The **first** pull of an ND2/TIFF under Ingest pays a one-time **ingest**: the volume is read, then
 compressed into a planar-block `.b2nd` store (a `<file>.b2nd_store` directory beside it,
 with one `level_<l>.b2nd` per pyramid level). For a large series that is minutes, so the
 status bar shows a real **progress bar** with the phase and the source card's rail fills in
@@ -790,6 +913,19 @@ once, side by side — see [the compare pane](#two-results-side-by-side--the-com
   achieved rate beside the strip. On a series whose frames are **computed** rather than read
   it advances as each frame lands instead — the fps spinner is then a ceiling nothing reaches,
   and the strip reads `computing Ns` while a frame is being produced.
+* **Play all** (an Overlay chain whose sources run at different rates). When an overlaid
+  source was recorded at n× the primary's frame rate (`T pairing = rate`, or pins steeper
+  than 1:1), the T ▶ holds each primary frame for **n ticks** and the fast source advances
+  one of its own frames per tick — so it plays n times faster, and every one of its frames
+  is shown. The fps spinner stays the *primary's* rate; the readout reads `4/199 ·2/4` for
+  sub-tick 2 of 4. Above 60 ticks/s several sub-ticks go by per tick. Stopping parks on the
+  primary frame's first sub-tick.
+* **The source strip** (under the strips, only when something is overlaid): one row per
+  overlaid file — its label, the frame and plane it is showing, its rate, 📌 where a pin
+  applies. ◀ ▶ move *that source's* frame on its own (display-only: nothing re-runs, nothing
+  is saved, `⟲` resets); **Pin T** / **Pin Z** write "the primary's current frame goes with
+  this one" into the Overlay. Pinning is disabled while playing — a pin is a graph edit, and
+  an edit cancels the preload that keeps playback smooth.
 * **Ctrl+click a strip to *pick* boxes** (ctrl+drag paints a run, shift+click extends from
   the last one, right-click offers pick all / invert / clear). Picked boxes are outlined in
   the accent colour and counted in the `4/199 ·3` readout. Picks are the run scope for
@@ -1142,9 +1278,11 @@ be shown *whole*? A frame is drawn at full resolution when it clears three ceili
 * the surface's real `GL_MAX_TEXTURE_SIZE` (this machine reports 32768, so a 7168² mosaic is
   comfortable; the CPU fallback declines, because its QImage is the size of the frame);
 * the **texture byte budget** (512 MiB by default; `NODELAB_TEXTURE_BYTES` overrides): the
-  uploader packs each shown channel to RGBA8 at 4 bytes/px, so a 7168² frame is 205 MiB of
-  VRAM and a 13106² whole-well canvas is 687 MiB — past the default, so a canvas that big
-  stays progressive unless you raise the budget on a GPU with room for it;
+  uploader is a 16-bit single-channel texture (R16) at 2 bytes/px per shown channel, so a
+  7168² frame is 103 MiB of VRAM and a 13106² whole-well canvas is 343 MiB — under the
+  default, so even the whole-well stitch shows native with one channel on. Two shown
+  channels of a canvas that size (687 MiB) are past the default and stay progressive
+  unless you raise the budget on a GPU with room for it;
 * the **display memory budget**, 25% of RAM by default and counted over every channel you have
   switched on. `NODELAB_DISPLAY_RAM_PCT` changes the share, `NODELAB_DISPLAY_RAM_BYTES` sets it
   outright — the right answer is a property of the machine, and this runs on both a 256 GiB
@@ -1263,6 +1401,16 @@ Two limits worth knowing before you reach for it on a long series:
 * a resampled overlay has no single integer scale, so it reports no `bit_depth` and its frames
   stay `float32` — 411 MB per two-channel frame instead of 205. Still inside the default budget
   here, but it halves how many frames stay resident.
+* `Z sampling = linear` under `resample` **measures interpolated planes**: each baked value is
+  a distance-weighted mix of the two secondary planes around the primary's focus, which blurs
+  axially thin structure. Keep `nearest` when the number must come from one acquired plane.
+* **Play all** at n sub-ticks composes the overlay n times per primary frame, so a preload holds
+  n× the overlay planes (counted in the fit check). It is capped at 16 sub-ticks per primary
+  frame; a source faster than that skips frames and the node card says so. The compare pane
+  mirrors the primary's frame but not its sub-tick.
+* A pin made on a file with **no frame clock** (T) or **no focus log** (Z) is stored by index
+  alone, and re-points at different frames if an upstream crop re-numbers them; the Viewer says
+  "by index" when it writes one.
 
 ---
 
@@ -2008,15 +2156,15 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 
 | Node | `op_key` | What it does |
 |---|---|---|
-| Load (GUI source) | `io.load` | The pipeline source. Resolves `path` to a lazy provider (ND2/TIFF → planar-block `.b2nd`), or a synthetic fallback when empty. Grows per-channel output sockets. |
+| Load (GUI source) | `io.load` | The pipeline source. Resolves `path` to a lazy provider (ND2/TIFF → planar-block `.b2nd`), or a synthetic fallback when empty. Grows per-channel output sockets. **`Pixel size` / `Z step` (µm) state the file's calibration** — filled in from its own header on load, so the card shows what the pipeline is using, and editable when the header is wrong or silent. `0` means "whatever the file says", so a graph saved before these existed is unchanged. This is the only way to give a **plain TIFF a Z spacing**, which it almost never records (no ImageJ `spacing` tag ⇒ no `z_step_um`), and nothing downstream can invent one: a 3D detection derives its **axial** radius from it, and **SerialTrack 3D tracking refuses outright without it** (it rescales z by `z_step ÷ pixel size` before building its topology descriptor, so anisotropic voxels would distort every neighbour distance). For a volume already in isotropic voxel units — FranckLab's `SerialTrack3D_data` are, at 1.0 µm/px — set `Z step` equal to `Pixel size`. Both feed the **edit-time** envelope too, so every µm-denominated default downstream re-derives as you type, and the payload the runner resolves carries the same numbers. |
 | Select Channel | `channel.select` | Subset/reorder the channel axis; the per-channel emission list follows in lockstep. |
 | Split Channels | `channel.split` | Fan a multi-channel Dataset into per-channel outputs; `out` still carries the full bundle. |
-| **Merge Channels** | `channel.merge` | Put **two acquisitions on one channel axis**, placed by absolute stage position and focus — two files become a single multi-channel image every downstream node can measure across. Where **Overlay** records a placement for the Viewer and changes nothing a node reads, this returns real merged data, and it is **lazy**: a plane costs a plane (measured on the WellA3 pair — pull 0.025 s, +0 MiB, against `view.overlay`'s `resample` at 25 s and +12.4 GiB for the same co-registration). **Each channel shows its OWN plane nearest the viewed focus**, so scrolling Z walks acquired planes on both sides instead of interpolating one to fit the other. `Z grid` = `union` (default: span both focus ranges at the finer step, so which file you wired as primary cannot decide whether the other's stack is reachable) or `primary` (keep this input's grid exactly, naming the secondary planes it cannot address). Lateral placement is nearest-neighbour, so every value is a real sample of its source. `If unplaceable` = `refuse`/`align_by_index` as Overlay, and it matters more here because this output is measured. C and Z both show **?** until the first pull — the edit-time pass is shown only the primary's envelope, so both are honestly unknown. **Which input you make the primary decides the output grid**: wire the FINE-pixel file as the primary or its detail is minified away (a 0.287 µm/px stack into a 1.718 µm/px mosaic loses 6× linear — the node warns, and a minified secondary is area-averaged rather than point-sampled so at least the noise is not amplified). `Flip X`/`Flip Y` go **inert** when the secondary is an already-stitched canvas: the stitch answered that question to place its tiles, so flipping again would mirror the mosaic 456 px out of place. |
 | Dock Data | `io.dock` | Bake everything upstream to a disk checkpoint, then serve it as a new source — the chain behind it greys out and is released from memory. See [§12b](#12b-docking-bake-a-chain-to-disk-and-free-the-memory-v218). |
 | **Export TIFF** | `io.write_tiff` | Write the Dataset on this wire to a TIFF, and **hand it through unchanged** — so it is a tap, not a terminal: drop it mid-chain, keep wiring downstream, and a Viewer after it still shows what was written. **Streams one plane at a time** (`get_region` per `(m,t,z,c)`, never a volume), so peak memory is a single plane and a 49-position series exports without ever being materialized. `File` is a **save-file browse**; empty is refused rather than guessed. `Layer` (empty = the image) exports a Voxel raster instead — a mask or label image at its own dtype, which is how a segmentation reaches Fiji or QuPath as real ids. Model `ome` (default: OME-XML with physical XY/Z, frame interval, significant bits, channel names + emission wavelengths, and a per-plane stage position and time offset; the only model that holds several positions in one file, BigTIFF when needed) / `imagej` (Fiji's own `spacing`/`unit`/`finterval` — opens natively with no import dialog, but one position, no stage log, 4 GB ceiling) / `plain` (pixels + XY resolution only; **loses** Z spacing, interval, channel identity and position). Compression `none` (~1.4 GB/s here)/`zlib` (default; lossless, ~230 MB/s at Level 1 — how much smaller depends entirely on the data)/`lzma` (smallest, ~33 MB/s)/`zstd`, with `Level` for the two that take one — **`zstd` is refused up front on this installation**, which needs `imagecodecs` or Python 3.14. `One file per position` writes `<name>_m00.<ext>` per multipoint (required by `imagej`/`plain` for a multi-position export). **The calibration written is the envelope on THIS wire, not the source file's** — export after a crop and the file says where the *cropped* field is, at the sampling it actually has; a key the envelope does not hold is **omitted**, never defaulted to 1.0. `Existing` = `skip` (default) / `overwrite` / `refuse`. Full description, including what `skip` actually checks: [§11](#11-spreadsheet--export). |
+| **Export Movie** | `io.write_movie` | Render the Dataset on this wire to an **H.264 MP4**, an **animated GIF** or a **numbered PNG/JPEG sequence** — the presentation counterpart to Export TIFF, and like it a **tap, not a terminal** (the Dataset passes through byte-identical). Where Export TIFF writes the pixels for measuring, this writes a picture of them for showing: 8-bit RGB, channels composited by their **emission tints** (the Viewer's own colour map), single-channel rendered greyscale. **The display window is ONE decision for the whole movie** — measured up front from ~24 frames spread across the series and then held — because a per-frame auto-contrast normalizes away the very change a timelapse exists to show and makes the background pulse. **The burn-ins are the calibration envelope, not typed captions**: the frame counter (`12/240`), the **elapsed experiment time** interpolated from the file's own `dt_s` (auto-filled, overridable on `Frame interval`; the unit is picked once from the run's duration, so a 6-hour run reads `01:15:00` and a 90-second one `12.5 s`, and it is **omitted rather than fabricated** when the file carries no interval), a **scale bar** snapped to a round 1-2-5 micron value from `pixel_size_um` (dropped entirely when there is no pixel size), the **channel names** in their own tints, and optionally the **position name**. **`Brightness`** is a straight LINEAR gain in percent on the finished picture (100 = unchanged, 300 = three times), applied after the window and after gamma; unlike `Gamma` it preserves the ratio between a dim and a bright object, so the movie stays honest about which structure is brighter, and 300 is the practical ceiling because by then the brightest structure has clipped flat. **The Movie Editor** — a bottom dock that opens when the node is selected (or from *Open Movie Editor* in its inspector panel) — plays the movie before anything is written: the same frames, contrast and burn-ins, rendered through the export's own code path so what you watch is what lands. Its *Compute sources* computes the nodes feeding the movie in the background without moving the Viewer, and nothing is written until *Export*. `Corner` places the counter/clock block; the other three fill the remaining corners in a fixed order, so no two burn-ins can collide. Format `mp4` (default — H.264, the one that plays in a browser, PowerPoint and Slack; streams, no size ceiling; encoded through the platform backend that actually has an H.264 encoder — on Windows that is Media Foundation, since this OpenCV's FFmpeg has no usable one) / `gif` (loops and autoplays inline, 256 colours so a smooth ramp bands, every frame held in RAM — hence the `Max px` cap) / `png` / `jpeg` (numbered sequences, for a figure panel or your own ffmpeg). `Sweep` picks **which axis plays**: `time` (the timelapse; a Z-stack is flattened first by `Z projection` = `max`/`mid`/`mean`) or `z` (a flythrough of one stack — needs a single timepoint, and the clock switches off because a Z position is not a time). `Contrast` `auto` (percentiles; **not comparable between exports**) / `full` (the sensor's real range from `bit_depth` — 4095 on a 12-bit camera, not 65535) / `absolute` (typed black/white — **the option for a figure**, since two conditions exported with the same window are genuinely comparable). `Max px` defaults to **1200**, not full size: a 6554² movie is one nobody can send. `Split` = `position` writes `<name>_m03.<ext>` per multipoint, **each with its own auto window** (switch to `absolute` when they must match). **The extension follows Format, not the path**: choose GIF with a stale `.mp4` in the File box and a real `.gif` is written, because a GIF wearing an `.mp4` name is refused by every player while nothing reports an error. `Existing` = `overwrite` (default) / `refuse` — there is deliberately **no `skip`**, because neither MP4 nor GIF has anywhere to hold the export stamp that makes Export TIFF's `skip` safe. **`Sweep` = `timeline`** plays the **Movie Editor**'s layout instead (the dock that opens when the node is selected): **clips in sequence**, each showing one or more **panels** from `data` (**A**), **`source_b`** (**B**) or **`source_c`** (**C**); a panel **tiled** into an n×n **grid** by position (M, all playing in sync), channel, z slice or timepoint (a **contact sheet**); **loops** over t whose body clips bind to the loop's t — e.g. *A's max-Z at t, then B's labelled z sweep at t* (`up`/`down`/`pingpong`/`alternate`, where alternate reverses on every other step so the sweep never jumps back to the bottom); **label rasters** drawn over the image in the Viewer's own per-id colours with the **ids burned in** (a cell too small to carry its number gets none, and past 400 only the largest keep theirs); and **per-channel colour, black/white and gamma**, which the editor can capture from the Viewer's LUTs for that source. One display window per channel is shared by every tile, so a dim well in a grid stays dim. The per-clip controls on the card (Channels, Contrast, Gamma, Brightness, Layer, the burn-in toggles, Split) hide in this mode; frame rate, `Max px`, text and the file stay. B and C are only **read** — the node still hands `data` through, so their layers are not offered downstream — and a timeline naming an unwired source is refused by name. The spec is canonical JSON in the `timeline` socket; a bad entry is refused with its path (`segments[0].panels[1].layer`). The **scale bar** of a downscaled frame is measured in output pixels (before 2026-09-30 it was drawn in source pixels, i.e. too long by the downscale factor on any export larger than `Max px`). |
 | Reroute | `rr.reroute` | Identity pass-through for wire tidiness (created by double-clicking a wire; hidden from the palette). |
 | Viewer tap | `view.viewer` | Pure pass-through inspection tap. |
-| **Overlay** | `view.overlay` | Draw a **second Dataset inside this one's field**, placed by absolute stage position, pixel size and focus — so two files that ran through different graphs line up on the microscope's own coordinates. Controls: blend `add/over/difference/checkerboard/wipe/flicker`, `opacity`, a µm `offset_y`/`offset_x`/`offset_z` nudge, `t_shift`, `flip_x`/`flip_y` handedness, `min_coverage`, `secondary_channel`. Output `display` (default) records **where** the secondary goes and changes nothing a downstream node reads — the payload passes straight through, and `opacity`/`wipe_pos`/`flicker_hz` are outside the recipe hash, so dragging one repaints rather than re-runs; `resample` bakes the secondary onto the primary's grid as real pixels. Overlays **chain**: wiring one into another's primary appends a third source, so N-way needs no N-ary socket. `If unplaceable` = `refuse` (default) declines when the files cannot prove they line up; `align_by_index` overrides and stays loud about it — every refusal reappears as a warning. The pairing, the nudge and the time shift are decisions about the experiment, not the window, which is why this is a node and not a Viewer setting. See [§7](#7-the-viewer). |
+| **Overlay** | `view.overlay` | Draw a **second Dataset inside this one's field**, placed by absolute stage position, pixel size and focus — so two files that ran through different graphs line up on the microscope's own coordinates. Controls: blend `add/over/difference/checkerboard/wipe/flicker`, `opacity`, `label` (the source's name on the channel strip and its LUTs — presentation, like opacity), a µm `offset_y`/`offset_x`/`offset_z` nudge (Y/X also by a two-click **Nudge** pick), `t_shift`, `T pairing` `index`/`rate` + `rate`, `t_pins`/`z_pins` (written by the Viewer's Pin T / Pin Z; they override `t_shift` / `offset_z`), `Z sampling` `nearest`/`linear`, `flip_x`/`flip_y` handedness, `min_coverage`, `secondary_channel`. `If unplaceable = align_centres` places files the stage cannot relate — or whose fields never overlap — centre-on-centre at true pixel size. Output `display` (default) records **where** the secondary goes and changes nothing a downstream node reads — the payload passes straight through, and `opacity`/`wipe_pos`/`flicker_hz` are outside the recipe hash, so dragging one repaints rather than re-runs; `resample` bakes the secondary onto the primary's grid as real pixels. Overlays **chain**: wiring one into another's primary appends a third source, so N-way needs no N-ary socket. `If unplaceable` = `refuse` (default) declines when the files cannot prove they line up; `align_by_index` overrides and stays loud about it — every refusal reappears as a warning. The pairing, the nudge and the time shift are decisions about the experiment, not the window, which is why this is a node and not a Viewer setting. See [§7](#7-the-viewer). |
 
 ### Enhancement (20)
 
@@ -2043,7 +2191,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | **Remove Blobs** | `enhance.remove_blobs` | detector `log/dog`, action `zero/interpolate/median`, `min_radius`/`max_radius` µm (per channel), `threshold`, `expand`, `fill_radius` µm | per-plane, no lever (sensor/glass artifacts are per-plane). Ports Blob Subtract |
 | **Subtract Background** | `enhance.subtract_background` | **Estimator** `rolling_ball` (default) / `ellipsoid` / `opening` / `minimum` / `median` / `percentile` / `gaussian` / `polynomial` / `global_percentile`; **Polarity** `dark_background`/`light_background`; **Output** `corrected`/`background`; **Arithmetic** `subtract`/`subtract_signed`/`divide`; per-estimator: `radius`(+`_z`) µm, `sigma`(+`_z`) µm, `percentile`, `degree`, `height`, `shrink`, plus `presmooth` and `bg_floor` | lever, **true 3D** (the ball becomes an anisotropic ellipsoid; the box, Gaussian and polynomial all take a third axis). ImageJ's `Process > Subtract Background` under the name you'd search for, with its three checkboxes as Modes — "Light background" = `polarity`, "Create background" = `output`, "Disable smoothing" = `presmooth` off — generalized to the eight other popular estimators. **`shrink` is what makes it usable:** the rolling ball is polynomial in the radius with degree = dimensionality (measured here: 8.7 s per 2048² plane at r = 29 px, 105 s at 120 px), so `auto` follows ImageJ's own factor table (1/2/4/8) for 10–86× at under 3 % error, and stays off for the two estimators scipy already runs radius-independently. `subtract_signed` is the one to use before measuring intensities — the default clip at 0 folds the negative half of the background noise back and biases every mean upward. `divide` **drops `bit_depth`**. Distinct from its two neighbours: `enhance.tophat` *is* the `opening` estimator with the arithmetic fixed, and `enhance.flatten_field` is the Cell-Tracker port, which keeps the two things this node leaves out — a mean-restoring arithmetic, and a background **averaged over T** |
 
-### Segmentation & analysis (27)
+### Segmentation & analysis (29)
 
 | Node | `op_key` | Key controls | Produces |
 |---|---|---|---|
@@ -2053,9 +2201,10 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Connected Components | `analysis.label` | `mask`, `connectivity` (8 / 26 default), `name` | Voxel raster **+ Label table** |
 | **Segmentation** | `analysis.segment` | method **threshold** (`level` otsu/li/yen/triangle/mean/fixed, `connectivity`) · **watershed** (optional `mask` layer, `min_distance` µm) · **stardist** (`prob_thresh`, `nms_thresh`, `scale`, `model_name`) · **cellsam** (`bbox_threshold`, `cellsam_model`, `model_path`, `normalize`, `postprocess`, `remove_boundaries`, `tile`+`tile_size`/`tile_overlap` px, `fast`); shared: `name`, `fill_holes`, min/max **area µm²** (2D) or **volume µm³** (3D) | Voxel label raster **+ Label table**; lever: 2D = per-plane instances, 3D = z-connected *(the two learned methods refuse 3D)*. CellSAM `fast` = **~5× on a GPU** (batched mask decoder); not bit-identical, so it is off by default — see below |
 | Distance Transform | `analysis.edt` | `mask`, `name` | µm distance field (anisotropic in 3D) |
-| Measure | `analysis.measure` | **Members** `label` (`labels`, `stats`, `shape`) · `point` (`points`); optional **`raw`** Dataset in both | `label`: per-region stats on the Label table, and `shape` adds µm-aware regionprops geometry (`eccentricity`, `perimeter`, `solidity`, `extent`, `axis_major`, `axis_minor`, `orientation`) — the 2-D-only three are refused on a 3D Label table. `point`: each detection's physical position `x_um`/`y_um`/`z_um` **and** `mean_intensity`, the value of the voxel it sits on. `stats`/`shape` are hidden there — a point has no region to reduce over. The pixel `x`/`y`/`z` columns are left alone, so everything reading them as indices keeps working; leave `points` **empty** and the only Point table on the wire is used |
+| Measure | `analysis.measure` | **Members** `label` (`labels`, `stats`, `shape`) · `point` (`points`); optional **`raw`** Dataset in both | `label`: per-region stats on the Label table, and `shape` adds µm-aware regionprops geometry (`eccentricity`, `perimeter`, `solidity`, `extent`, `axis_major`, `axis_minor`, `orientation`) — the 2-D-only three are refused on a 3D Label table. `label` also writes its own `x_um`/`y_um`/`z_um` centroid (recovered from the region the label/segment node already computed, not re-measured). `point`: each detection's physical position `x_um`/`y_um`/`z_um` **and** `mean_intensity`, the value of the voxel it sits on. `stats`/`shape` are hidden there — a point has no region to reduce over. **Both branches** also write `stage_x_um`/`stage_y_um`/`stage_z_um` — the ABSOLUTE microscope position, i.e. the row's own field placement (stage log or the maintained `origin_um`) plus its local `x_um`/`y_um`/`z_um` — so objects from different multipoints of the same acquisition land in one comparable physical frame in the spreadsheet; NaN when the file carries no placement metadata at all. The pixel `x`/`y`/`z` columns are left alone, so everything reading them as indices keeps working; leave `points` **empty** and the only Point table on the wire is used |
 | Histogram Threshold | `analysis.histogram_threshold` | method `single/hysteresis/percentile/relative` × direction `below/above/between/outside`, **Scope** `plane/per_label/per_roi` + `regions`/`min_pixels`, `full_scale`, morphology cleanup, area filters µm², optional `raw` | mask + Label raster + region table (2D). **Scope = per_label runs this whole engine — morphology, area filters and all — once per REGION**, on that region's own bounding box, so each cell is cut at its own level and two touching cells can never merge their sub-objects. The children carry `parent_id` + `level` (so "puncta per cell" is a groupby) and the parents gain `level`/`n_above`/`frac_above`/`n_sub`, NaN where a region was skipped for want of `min_pixels` samples or of any spread. `single`/`hysteresis` are absolute raw counts and have no population, so pairing them with a per-object Scope is refused; a VOLUMETRIC Label instance is refused too (this engine is 2D — use Threshold's `per_label` for that). This replaced the separate Threshold Per Label node in V2.27. **Absolute cuts are FLOAT and read in the image's own units** (V2.28): raw counts while the file declares a bit depth, and the data's own scale once it does not — so on normalized [0,1] data a hysteresis of `strict` 0.7 / `permissive` 0.3 is exactly what you type, where the node used to refuse fractional input outright. `full_scale` pins the one case the Dataset cannot answer: a float image whose range is neither counts nor [0,1] |
 | **Filter Labels** | `analysis.filter_labels` | method `otsu/li/yen/triangle/mean/fixed/percentile` × keep `above/below` × **Scope** `plane/volume/series/dataset` (the shared vocabulary, editable from the card's footprint band), `labels`, `column`, `level`/`percentile`, `name` | **Keeps or drops whole labels** by cutting one per-label *column* — `mean_intensity`, `area`, `eccentricity`, `n_sub`, anything the table carries — with the cut derived from the population of label values (or given as a fixed level / percentile). Reads the table, never the pixels, so it filters whatever was measured upstream. Surviving **ids are preserved** with gaps, so a measurement or track made upstream still joins; the input layer stays on the wire. Every original column reaches the output plus `cut`. A non-finite value can neither set the cut nor survive it |
+| **If / Else** | `analysis.if_else` | **Members** `label/point` × **Match** `all/any` × **Conditions** `1..4`, `labels`/`points`, `column1..4`, `op1..4`, `value1..4`, `pass_name`, `fail_name` | **Splits objects into a pass set and a fail set** by up to four conditions on the table's own columns. The column control is a **closed dropdown**, not a text box: every node that writes columns declares them, so it offers exactly what THIS graph has measured, and it grows as you wire nodes — `area` and the centroid from segmentation, Measure's intensity stats and `eccentricity`/`solidity`, Object Metrics' `speed`, and Track Objects' `track_length` (joined onto the member rows by `member_id`, since it lives on the Track table). Both sides are written as new instances with **ids preserved**, so the "else" branch is wired onward by pointing a downstream layer picker at `fail_name`. **An object whose column was never measured fails** — NaN satisfies no comparison — and the count is reported on the progress rail; `is_finite`/`is_nan` select that split deliberately. Reads the table, never the pixels |
 | Spot Detection | `detect.spots` | `min/max_radius` µm (+ `_z`), method `log/dog`, polarity `bright/dark` | Point table; lever |
 | Particle Detection | `detect.particles` | `min_distance` µm, `threshold`, `min_intensity`, `min_size`, `subpixel`, mode `log/components` | Point table; lever. `min_size` (voxels — area in 2D, volume in 3D) defaults to 4 and is the main defence against single-voxel shot noise; lower it toward 1 if small spots are being missed. See [§15.1](#151-particle-detection-on-a-noisy-stack). |
 | Extract Boundary | `analysis.extract_boundary` | `labels`, `name` | boundary Points (2D contours / 3D surface verts) |
@@ -2066,14 +2215,15 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Tessellate | `analysis.tessellate` | boundary `convex_hull/alpha_shape/voronoi/label_surface`, `alpha_um` µm, `min_points`, `labels`, `iso_level`, `decimate` | **Mesh** (one closed surface per label + analytic volume/area/density); 3D |
 | **Voronoi Cells** | `analysis.voronoi` | `points` (the dots), `region` (the areas), bound `per_region/mask/frame`, `max_distance_um` µm, `name`; 3D-only `mesh` `build/skip` + `mesh_name`, `decimate` | **One territory per dot, clipped to the areas** → Voxel Label raster + table (`area`, `density` = 1/µm² or 1/µm³, `point_id`, `region`), plus a **Mesh** of the cell surfaces in 3D. Nearest-seed in **µm** space, so anisotropic z cannot stretch a cell; lever |
 | ROI Mask | `analysis.roi_mask` | `shapes` (**drawn** on the image — see [§8b](#8b-picking-parameters-off-the-image-v216)), `name` | boolean Voxel ROI mask; empty ⇒ whole frame |
-| DVC (ALDVC) | `analysis.dvc_field` | reference `fixed_frame/previous_frame` + optional external `reference` Dataset, `subset_size/spacing` px, `search_radius`, correlation `zncc/phase`, strain `infinitesimal/green-lagrange/almansi/hencky`, `newFFTSearch` | Point displacement+strain field (µm); lever |
+| **DVC (pyALDVC)** | `analysis.dvc_field` | reference `fixed_frame/previous_frame` + optional external `reference` Dataset; `subset_size`/`subset_spacing` (+ `_z` companions) voxels, `search_radius`, `init_guess` `pyramid/ncc/zero/previous`, `global_shift`, `prefilter_sigma`, `interp_method`, `subset_stride`, `use_global_step`, `admm_iterations`, `mu`, `beta` (0 = auto L-curve), `disp_smoothing`/`strain_smooth`, `strain_method` `plane_fit/fem/fd/direct`, strain `infinitesimal/green_lagrange/euler_almansi/hencky`, `backend` `auto/numba/numpy/cuda`, `n_threads`, `tile_local` | **3D ONLY** — the official pyALDVC solver (`pip install al-dvc`), which cannot correlate a single plane; use **DIC (pyALDIC)** for 2D. Emits a Point displacement+strain field (disp µm, dimensionless strain, per-subset ZNCC) on the solver's own subset grid, one `run_aldvc` call per m-position over the whole T stack. What bites: **three geometry rules reject a volume outright** — every axis ≥ 16 voxels, `subset + 11 ≤ axis extent`, and ≥ 2 nodes per axis — which a shallow confocal stack hits first, so set `subset_size_z`/`subset_spacing_z` rather than shrinking the lateral subset; the subset wants ≥ 4–5× your speckle diameter; `beta` is auto-tuned per reference frame and rarely worth pinning; the first solve in a session pays a one-off numba JIT (~2 s, then disk-cached). Params of the old in-repo port (`cc_thresh`, `repair_zncc`, `seed_levels`, `newFFTSearch`, the `zncc/phase` and 2D/3D levers) are **refused by name** if a saved graph set them |
 | Accumulate DVC Field | `analysis.accumulate_field` | `source`, `name` | cumulative Lagrangian disp+strain; **inherits** its config from the upstream DVC (refuses `fixed_frame`/no provenance) |
 | DIC (pyALDIC) | `analysis.dic_correlate` | reference lever + optional `reference` Dataset, solver `aldic/local`, `winsize/winstepsize/search_range` px, ICGN/ADMM iterations, smoothness, `compute_strain`, optional `roi` mask | 2D Point displacement (+ optional strain) field *(dep: al-dic)*. Solves the whole T stack in **one** solver call per (m, z) — 2.3–3.2× faster than the per-frame pairing it replaced, for bit-identical displacements. Validated against pyALDIC's own synthetic suite (`scripts/dic_synthetic_bench.py`) |
 | PIV (OpenPIV) | `analysis.piv` | reference `previous_frame/fixed_frame/ensemble` + optional external `reference` Dataset, correlation `circular/linear`, `window_size` px + `passes` + `overlap`, subpixel fit, validation (`max_disp`, S/N, median test `universal/classic/off`, std), `replace`, `smooth`, `velocity` (+ `frame_interval` s), `uncertainty`, optional `roi` mask | 2D Point displacement field per frame **pair** (µm; +y down) with per-vector correlation S/N (`qfactor`) and a `replaced` flag; `velocity` adds `vy`/`vx`/`speed` µm/s from the file's `dt_s` (refused, never /1.0, when no interval exists; refused for cumulative pairings); `uncertainty` adds per-vector `unc_y`/`unc_x` µm error bars by image-matching disparity (Sciacchitano 2013; NaN where <2 particles matched; refused for `ensemble`; *dep: pivuq*) *(dep: openpiv, GPLv3)*. The FLOW sibling of DIC: independent windows, orders of magnitude faster; `previous_frame` measures per-step motion, `fixed_frame`/external reference deformation vs a rest state (TFM beads), `ensemble` averages every pair's CORRELATION PLANES into one t=0 field — the micro-PIV move for sparse seeding (bench: 2.8 → 0.65 px at ~3 particles/window over 12 pairs; assumes steady flow). What bites: the window ladder trims itself on small crops (may quietly run single-pass — check `piv_invalid_points` and the effective ladder); window averaging attenuates structure finer than ~4 windows/wavelength (`sinc(π·w/λ)`: a window the size of the wavelength sees NOTHING); the default universal median test flags genuinely sharp gradients — set the median test `off` for discontinuous fields. Validated against openpiv's own suite + analytic fields (`scripts/piv_synthetic_bench.py`); driver bit-identical to upstream `windef.simple_multipass`. See §16-D2 for the fluorescence preprocessing chain |
 | Optical Flow | `analysis.optical_flow` | method `tvl1/ilk` (+ per-method params: attachment/tightness/iterations/tol vs window radius/gaussian), reference `previous_frame/fixed_frame`, `num_warp` (0 = method default), `prefilter`, `name` | DENSE per-pixel motion → Voxel layers `<name>_y`/`<name>_x`/`<name>_mag` in µm (+y down), on scikit-image's estimators — **no extra dependency**. The per-pixel sibling of PIV: use it on CONTINUOUS texture (confluent monolayers, cytoplasmic streaming) where windows would average boundaries away; use PIV on sparse tracers, where flow's brightness-constancy assumption starves. Timepoints without a pair (t=0) and un-analysed channels are NaN, not zero — feed the layers to Measure/Reduce or view directly. Assumes brightness constancy: correct bleaching upstream (`enhance.temporal_gain`); large per-pair motion wants PIV's window ladder instead |
 | Track Linking | `track.link` | target `label/point`, `max_distance` µm, `iou_threshold` | Track membership (IoU overlap / nearest neighbour) |
 | **Reduce → Scalar** | `analysis.reduce_scalar` | `domain` (voxel…track), `source` column/layer, `table` (only when a name is ambiguous), `reducer` `count/mean/sum/max/min/median`, `name` | ONE number on the **Global** domain — the score an Iterate node's `best` mode compares ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)), and the only node in the catalog that writes Global. An empty domain is a result (`count` → 0), not an error; a wrong column name still is |
-| Track Objects | `track.objects` | target `label/point`, method `centroid/serialtrack/topology/fingerprint/overlap` + per-method params | Track table **+ `track_id` write-back**; *(dep: numba/pandas)*. `serialtrack` is 1–2 orders of magnitude slower than the rest |
+| Track Objects | `track.objects` | target `label/point`, method `centroid/serialtrack/topology/fingerprint/overlap` + per-method params | Track table **+ `track_id` write-back**; *(dep: numba/pandas)*. `serialtrack` is 1–2 orders of magnitude slower than the rest. All five linkers now run on **either** target — `serialtrack`'s old Point-only refusal was lifted 2026-09-17, since it reads centroids and a Label table's centroid is a centroid; only `overlap` is still exclusive (Label-only, it intersects rasters) |
+| **Track Field** | `analysis.track_field` | target `label/point`, reference `first_frame/previous_frame`, strain `infinitesimal/green-lagrange/almansi/hencky`, `strain_radius` µm + `strain_neighbors`, `min_track_length`, `velocity` (+ `frame_interval` s), stress `none/linear_elastic` (+ `youngs_modulus` Pa, `poisson_ratio`, 2D `plane` `strain/stress`) | **SerialTrack's post-processing half** — the node that turns tracks into the maps. Reads any tracker's `track_id` column and emits a Point field with displacement (µm), the MLS deformation gradient and strain, optional velocity (µm/s) and optional isotropic linear-elastic stress + `von_mises`/`pressure`/`max_shear` (Pa). Same Point schema as `analysis.dvc_field`, so **`transform.rasterize_field` turns every column into a full-resolution Voxel map** — that is the whole point of the pair. 2D-per-plane vs full 3D is **inherited from the members' `z_kind`**, never a lever. What bites: the gradient is fitted in the **reference** configuration (`x−u`) while the row sits at its current position — get that backwards and only the three finite strain measures notice; `strain_radius` is the gauge length, so too large flattens exactly the concentrations you are looking for and too small leaves sparse particles NaN (not zero); stress needs a material model you state, and ν = 0.5 is refused, not clamped. Cheap to re-run — changing the strain measure or the modulus does not re-run the tracking |
 
 ### Registration (3)
 
@@ -2083,16 +2233,23 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Registration | `registration.stabilize` | model `translation/euclidean/affine/feature`, reference `first/previous/mean/template`, `ref_channel`, `upsample`, `highpass_sigma` px, `min_confidence` | **register once on a reference channel, apply to all** — preserves colocalisation |
 | **Align To** | `registration.align_to` | `reference` Dataset, `max_shift_um` µm, `min_ncc`, `highpass_um` µm, `ref_t`, `ref_c` | Measures how far this input's **stage log** sits from a reference's, per field, by phase-correlating their physical overlap in µm space — and **records** the correction rather than applying it to pixels. Pixels, axes, pixel size and `origin_um` pass through untouched and no sampling provenance is stamped, so an **Overlay** downstream still places (the engine's registration rule: registration stores its transform). No lever — one reference plane per field, lateral correction, exactly as `align.drift` and `util.stitch` do it. **Declines rather than guessing**, in all four ways that matter: a field that does not sit ≥50 % inside one reference field, a shift beyond `max_shift_um`, a correlation under `min_ncc`, or no `reference` wired each leave the stage log standing — an uncorrected log beats a confident wrong shift. Measured: a planted 6/−4 µm log error recovered to 0.3 µm, and an already-correct log measures zero at ncc 1.0 |
 
-### Transform & utility (11)
+### Transform & utility (12)
 
 | Node | `op_key` | Key controls | Notes |
 |---|---|---|---|
 | **Transform** | `transform.rigid` | `channels` (tick by name), `shift_x`/`shift_y` µm (+ `shift_z` µm-axial in 3D), `angle` degrees, interp `linear/nearest/cubic`, lever | Move **selected channels** inside a **fixed frame** — translate and rotate in-plane about the centre; what leaves the frame is cropped and what it vacates is zero. Channels not named pass through at their raw position **on the same wire**, so a corrected and an untouched channel arrive downstream addressable voxel-for-voxel — the reason this is one node rather than a split/transform/merge chain. Axes, pixel size and `origin_um` are unchanged (only content moves), but the move IS stamped as sampling provenance, so `analysis.measure`'s `raw` guard sees it. Positive: X right, Y down, angle clockwise as displayed (ImageJ's sign). Voxel layers ride along (integer rasters always nearest, so ids survive); a Label/Point/Track table on the wire is **refused** — put Transform before segmentation |
 | Z-Project | `util.zproject` | method `max/mean/sum/min/median/none` | Z→1; drops `z_step_um`, marks `z_collapsed`; `sum` widens `bit_depth`. **`none` is the reset** — the node becomes a pass-through and the full Z stack comes back with `z_step_um` intact, `z_collapsed` unstamped and the pixels untouched, so a downstream lever can go back to 3D without rewiring the graph (it also stamps no sampling provenance and costs nothing — the footprint drops to `tileable`). Streams as a tree-reduce (no plane is ever realized) and forwards the source's display pyramid, so it scrubs on a stitched mosaic; on screen a coarse level of `max`/`min`/`median` is very slightly smoothed (~1% of the display range, measured), while level 0 — everything a node reads, measures or exports — is exact |
 | **Crop** | `util.crop` | **What to crop `spatial/frames`**. `spatial`: `y0/y1/x0/x1` px — **drag one rectangle** ([§8b](#8b-picking-parameters-off-the-image-v216)) (+ `z0/z1` from the Z strip in 3D). `frames`: one `frames` selector — **use the selected frames** | Two questions, two modes. **`spatial`** cuts a window out of every image: fewer pixels per image, the same number of images, pixel size preserved and `origin_um` moved to the cut corner; lever (Z is cut only in 3D). **`frames`** keeps only the M / T / Z indices you name — full extent, fewer images — as **one** selection: `"m0-2,t3,z1-4"`. An axis you do not name is kept whole, so `"t3"` is timepoint 3 of every position and **`"m0,t3"` is a single frame**; each axis may be **sparse** (`"t0,3,7"`), which a start/end pair could not say; ranges are inclusive at both ends; a bare list with no letter is read as timepoints. Empty = keep everything; naming an axis and keeping nothing on it is refused rather than shipped as an empty axis. Lazy either way (a pure index view — no pixels are copied). Everything indexed by a cut axis follows the selection: per-position stage/origin/alignment records, per-frame acquisition times, lattice layers (a mask **survives** a frames crop instead of being dropped), and structure rows — a Point/Label/Track row on a dropped frame is removed and the rest renumbered, so the row COUNT downstream changes. The axis spacings answer honestly: keeping every Nth frame or plane multiplies `dt_s` / `z_step_um` by the stride, and an unevenly spaced selection **drops** the key rather than reporting an interval true of no pair; cutting planes off the bottom moves `origin_um` and re-addresses `z_home_index`. A **Mesh** is dropped rather than half-filtered (its element/vertex/face buckets are joined by CSR ranges) unless nothing about it moves |
+| **Crop To File** | `util.crop_to` | second Dataset on `region`; `What defines the region` `union/position` (+ `ref_position`); `margin` µm (+ `margin_z` µm-axial in 3D); µm `Nudge Y/X` (+ `Nudge Z` in 3D); `Flip X`/`Flip Y`; lever | **Crop an overview to where another acquisition was taken**, using the absolute stage coordinates the two files share — its recorded position plus its field-of-view size. This is the question a pixel window cannot answer: two files at 0.287 and 1.718 µm/px are *both* 1024² and describe a 294 µm and a 1760 µm field, so `y0:y1` means nothing across them. Wire the overview (or the stitched mosaic) into `data` and the high-mag file into `region`, and you get exactly its footprint back, lazily — no pixels are copied. `margin` adds context in microns; a **negative** margin trims the reference's own vignetted border instead. **`region` supplies placement only — no pixels are ever read from it**, so it can be the raw acquisition rather than any processed branch, and it is deliberately not drawn in the viewer. It needs `pixel_size_um` and a stage position (`origin_um`, or `stage_xy_um`); a TIFF usually has neither and is refused, naming which key is missing. **What will bite, in order.** (1) **`Flip X` is on by default** — it is the camera's mounting handedness, which no file records. Wrong, it does not shrink the crop, it *mirrors where the crop is taken from*: you get plausible data from the wrong place. The tell is a crop that misses by about one field width, or a "does not touch the data at all" refusal on two files you know overlap. It is ignored (with a note) when `data` is an already-stitched canvas, which is already in stage coordinates. (2) **M collapses to 1.** A crop is one window, so it can only come from one position; the node takes the one with the largest overlap and stamps a `__crop_to__` note naming the coverage and the positions it therefore left out — put **Stitch** upstream if the region straddles tiles and you want all of it. Structure rows on a dropped position go, and the survivors are renumbered. (3) A box hanging off the edge is **clamped**, not refused, and the note records requested-vs-delivered; only a complete miss raises. (4) Like **Crop**, a Y/X window **drops** any lattice layer that no longer fits (a Voxel mask), while layers with no Y/X (a Plane statistic) survive; structure rows keep their original Y/X. (5) `origin_um` is restamped to the cut corner so the result can still be placed, stitched or merged — but the *edit-time* envelope marks Y/X (and Z in 3D) **UNKNOWN** and drops the origin, because this pass is handed only the first input's metadata and cannot see the reference at all. The consequence: a **Crop** placed directly downstream leaves the origin unshifted. The per-position stage logs retire, as after a Stitch. (6) In **3D** the lever also trims planes to the reference's focus span, with half a Z step of slack; it keeps every plane, and says so in the note, when either file has no focus log — which is the normal widefield-montage state, and is also why a reference whose `origin_um` carries the ingest's filler `z = 0.0` is treated as axially unplaced rather than as "in focus at zero" |
+| **Select Group** | `util.select_group` | `Group` (which specimen — `G2`, `2`, `G1,G3`, or a name from the sidecar), `Group gap` (field widths) | Keeps only the multipoints of ONE specimen. A multipoint file is frequently not one flat list of fields: the lab's `Channel640_Seq0001.nd2` holds 54 positions that are really **six separate 3×3 mosaics** a millimetre apart, and every node that reads M as flat gets that wrong in the same quiet way — **Stitch** fuses all 54 into one canvas with four enormous holes in it, a `scope="dataset"` threshold pools six unrelated samples into one histogram, and a per-position table reports 54 rows for a six-sample experiment. This is the missing “which specimen?” selector, and the usual chain is **Select Group → Stitch**: nine tiles at 50 % overlap become one mosaic of one sample. The groups come from the acquisition if it stored them, otherwise they are **recovered from the stage coordinates** — single-linkage clustering that starts a new group wherever two fields are more than one field width apart, which is a statement about what a mosaic IS (tiles must overlap to be stitchable) rather than a tuned number. It infers each group's grid too, so the card says `G2 — 9 positions, 3×3 serpentine`. **Nothing is assumed about group SIZE**: six groups of nine and a run with one position skipped (8 + 9) both come out right, which a fixed “16 per group” could not. Lazy — a pure index view, no pixels copied, no re-spacing, and a kept position is bit-for-bit what it was — but the M axis really shrinks and everything indexed by it follows, exactly as **Crop**'s `frames` mode does: per-position stage/origin/alignment records, lattice layers, and structure rows (a row on a dropped position is removed and the survivors renumbered, so the row COUNT downstream changes). Empty = keep everything, so an unconfigured node is a true no-op. **Refuses rather than guessing** in both directions: a group name that does not exist is refused with the ones that do listed, and a Dataset with no usable stage geometry is refused outright — the plausible guess (“they are all one specimen”) produces a result indistinguishable from a correct one. To override the detection, write a `.groups.json` sidecar beside the file — see [§15.2](#152-position-groups-and-the-groupsjson-sidecar) |
 | Resample | `util.resample` | `scale_xy`, `scale_z` | pixel size scales inversely; lever |
 | Stack (T→1) | `util.stack` | method `mean/median/sigma_clip/trimmed_mean/max/sum` | SNR stacking; drops `dt_s`; `sum` widens `bit_depth` |
 | Stitch (M→1) | `util.stitch` | layout `stage/stage+refine/grid`, blend `feather/max/mean/overwrite`, `flip_x`/`flip_y`, `refine_*`, `grid_cols` | M→1 mosaic from the file's stage log; Y/X **grow to an extent the header reports UNKNOWN** (it depends on the position log, which rides the payload); one canvas plane streamed at a time; refuses a missing/short stage log, an M axis of repeat visits, and any Dataset carrying a structure table |
+| **Merge** | `util.merge` | `Axis` `C/T/M/Z`; C-only: `Z grid` `union/primary`, `If unplaceable` `refuse/align_by_index`, µm `Nudge Y/X/Z`, `Time shift`, `Coverage floor`, `Flip X/Y` | Merge **two or more** Datasets (one multi-input socket — wire as many as you like) by growing ONE axis. Replaces the retired **Merge Channels**: `Axis = C` is that node's exact behaviour, generalised to chain any number of inputs — each later one is placed against the running result by absolute stage position/focus (nearest-neighbour resampled, Z-reconciled), so files that disagree on pixel size or focus range still merge. `Axis = T/M/Z` is a different operation with no counterpart before this node: **literal concatenation**, no resampling at all — input 0's frames/positions/planes, then input 1's, and so on, refusing outright (naming the exact axis and values) unless every OTHER axis and physical scale (`pixel_size_um`, `z_step_um`, `bit_depth`) already match. `Axis = T` is the shape a **before/after pair** needs to become one 2-frame series for a frame-to-frame tracker (`Track Objects`' `serialtrack` method, or any node whose footprint is `WHOLE_SERIES` over `t`) — ingest each volume separately, process them however you like, then Merge them onto T immediately before tracking. **Order matters and is not otherwise visible**: input 0 is whichever Dataset you wired first, and for T/M that IS the result (frame 0 vs frame 1). The node stamps a resolved-order note on its card (`input 0: t 0 · input 1: t 1`, …) so a wrong order is something you see, not something you discover downstream. `Axis = Z` still requires a **shared `z_step_um`** — it stacks planes in wire order, it does **not** reconcile two different focus ranges the way `Axis = C` does. C is the slow, tolerant axis (a channel-plane read may touch several of a later input's tiles); T/M/Z are as cheap as a pass-through (a pure index remap — a read costs exactly what the un-merged read would) |
+| **Batch** | `util.batch` | `Files` (one multi-input socket — wire as many as you like), `Align` `refuse/trim` | Stack **two or more files on the batch axis** so one drawn pipeline runs over all of them at once. This is the node behind running a folder of files through the same analysis: wire each source in, build the pipeline once, and **Unbatch** hands the results back one per file. It draws as a **gold point** rather than a card, because it is not a processing step — it is where several files start sharing one wire. You can **drag .nd2/.tif files straight from the desktop onto the point**: each becomes a source card already wired in. (Dropping files on empty canvas just makes the cards, unwired — building a batch you did not ask for would be inventing a pipeline.) Drag the circle itself to move it. **It is deliberately not `Merge` with `Axis = M`.** Merging on M makes the files *positions of one acquisition*, and from that moment nothing can tell “position 3 of file 1” from “position 3 of the run” — so a `scope = dataset` threshold computes ONE level pooled across every file, and each file is thresholded partly by the others. That is the exact trap this node exists to avoid: on the batch axis every data-derived level stops at the file boundary, so a per-file threshold really is per-file, a Z-projection folds inside one file, and **Stitch** on a batch of K mosaics gives K canvases rather than one composite of two specimens. Nothing is resampled or copied — a batched pull reads exactly the bytes K separate graphs would — so the batch costs no memory of its own. Every file must share `(m,t,z,c,y,x)`, because the batch axis is rectangular. Real files often do not — two scans of one plate came back with 748 and 754 positions — so **`Align`** decides what happens. `refuse` (the default) stops and names the axis and both counts. `trim` crops every file to the smallest common **position and time** extent and states on the card exactly how many were dropped from which file. Trimming is opt-in because it is a real loss: a per-file object count over 748 fields is not comparable with one over 754, and nothing downstream would mention it. Only position and time can be trimmed — a different stack depth, channel count or frame size is a different acquisition rather than a longer run of the same one, and is refused either way. Order is the order you wired them, and it is the order Unbatch returns them in. Segmentation, measurement and tracking now run **inside** the batch: every producer runs once per file and its table carries a `b` column plus a `file` column, so the measurement table tabs by file |
+| **Unbatch** | `util.unbatch` | — (the per-file outputs appear on the card once a batch reaches it) | Split a batch back into **one output per file**, each a single-file Dataset named after its source. The card grows one output socket per member — drawn as a gold RING, the Batch point opening again — and the whole batch also passes through `out` for anything that genuinely wants all K at once (an export writing one file per member). Right-click it and choose **Fan out to N cards** to give every file its own Viewer card in one go; it skips members already wired somewhere, so it is safe to run again after adding files, and a card you deleted on purpose stays deleted. The point GROWS with its member count so the wires stay far enough apart to tell one file's from another's. Splitting is **free**: each member's chain was addressed by the batch axis all along, so a tap is a lazy pin — no copy, no recompute. The member names come from the files themselves, so rewiring the **Batch** node changes them and a tap left naming a file that is no longer there refuses rather than quietly selecting whichever file now sits at that index. **The one real restriction:** segmentation, measurement and tracking must go AFTER this node. Structure rows are addressed by `(m,t,z)` and carry no batch column, so inside a batch two files' cells would land in one table as indistinguishable rows — a measurement silently averaging two specimens, with a plausible row count and no error anywhere. Putting a structure table on a batch is refused outright and says so |
+| **Select Batch Member** | `util.select_batch` | `Member` (a file name from the batch, or a 0-based index; EMPTY = keep the batch whole) | Keep **one file** of a batch. This is the tap **Unbatch**'s per-file outputs turn into behind the scenes, and it is also usable on its own — to pull a single file out of a batch for a look without splitting the rest. Lazy: no pixels are copied, but the batch axis really narrows to one and everything indexed by it follows. Empty keeps everything, so an unconfigured node is a true no-op. Naming a member that is not in the batch is **refused with the real members listed** rather than falling back to an index — a batch exists to keep files apart, so handing back the wrong file would defeat the whole point |
+| **Chain Files** | `util.chain` | `Files` (one multi-input socket — wire as many as you like); `Onto axis` `T/M/C/Z`; `File order` `sequence/loaded` | Lay a set of source **files** onto ONE axis, so a numbered series becomes one series. A loader can only ever put files on **positions** — a multi-file card stacks them there, separate cards are just separate Datasets — because that is all it can know about them. So a timelapse exported one frame per file (`WellA3_t001.nd2` … `WellA3_t120.nd2`) arrives as 120 fields of a **1-frame** series, and `Stack (T→1)` fuses nothing, `Link Tracks` has no frames to link and `Optical Flow` has no second frame. Nothing errors; the graph just answers a different question. This node says which axis the files really vary along. **Wire it however your files arrive**: one multi-file card, a pile of separate loaders, or both at once — each input is split into its own files, so a card holding 60 plus two single cards is 62 files, and a single card can land *between* two of a bundle's files if that is where its name puts it. **The fastest way to get a long series is File → Load file sequence…** (`Ctrl+Shift+L`): pick any ONE file, and the pattern, the siblings, the order and the axis are all settled in one dialog before a card exists — it drops the source card with this node already wired and preset. **`File order = sequence` reads the counting number out of the filenames**, and specifically the numeric field that *varies* across them: in `WellA3_t003_z002.nd2` the last number is `z002`, which never moves, so ordering by it would play the frames in load order while reporting success. `t9` also sorts before `t10`, which an ASCII sort gets wrong at the first rollover. Where two numbers both vary the scan dialog **says so** and lets you move the `{}` in the pattern; where none does, the order falls back to a natural sort. If **any** file has no name at all the whole order falls back to the order you wired them — half-sorting would look like it worked — and the card's note reads `wired` when that happened. `loaded` forces wiring order. **Nothing is resampled or copied** — a pure index remap, so a chained read costs exactly what the un-chained read costs. **Put it directly after the loaders.** It refuses an input already carrying masks, labels, tracks or measurement rows, because every one of those is indexed by the position axis it re-addresses. **Files may hold different numbers of frames** — a series exported in unequal chunks (5 frames, then 3) chains to `t=8`, the sum, which is the whole point of laying files end to end; only the axes you are NOT chaining have to agree. It refuses a mismatch on any of those, naming the axis. It refuses files holding **different numbers of positions** when chaining onto anything but M — the result has one position axis, so a file with more has nowhere to put them, and the message says to chain onto M instead. It refuses inputs that disagree on `pixel_size_um`/`z_step_um`/`bit_depth` — chaining reconciles nothing, so the result would carry one file's scale over another's pixels. `Onto axis = M` keeps them as separate positions (it *joins* separate cards; for one card already in name order it is the identity) — but prefer **Batch** if you want per-file statistics, since M pools a `scope = dataset` threshold across every file. **The stage log survives onto T/Z/C**, so `Stitch (M→1)` with `Layout = stage` works on the chained series: a stage that revisits a point never reads back the same micron twice, so each position's coordinate is kept (the first file's reading) as long as every file puts it within a tenth of a field laterally and one `z_step_um` axially — the same one-position-per-field record a native multi-T ND2 carries. Further apart than that, the files are different places rather than one field revisited, and the log is dropped; the card's `__chain__` note records `stage_spread_um` against `stage_tolerance_um`, and Stitch's refusal names Chain and quotes both. **What it cannot recover:** the gap *between* two files. `dt_s` and `z_step_um` still describe spacing WITHIN a file. Per-file timestamps concatenate when the files came from separate cards (each carries its own clock) but are **dropped** when they came from one multi-file card, which only ever carried the first file's — so a Z-stack chained from irregularly spaced files will measure axial distances wrongly unless you set the spacing yourself. On `C`, separate cards' channel names concatenate, but one card's are repeated per file — select channels by index, not by name, downstream |
 | Transfer Domain | `transform.transfer_domain` | `from_domain`, `to_domain`, `reducer`, `attr` | lattice ↔ lattice only |
 | **Transfer Structure** | `transform.transfer_structure` | From `voxel/label/point/track` → To `voxel/label/point/track/frame`, `attr`, `source_layer`, `target_layer`, `via_label` (voxel↔track only), reducer `mean/sum/count/max/min/median`, `name` | The structure counterpart to Transfer Domain: moves an attribute across the **detected-structure spine** — the four-domain spine fully connected (12 ordered pairs) plus the three structure→Frame reductions, **15 pairs**. This is the surface for transfers the engine's bridges could always run but no node exposed, so a graph that segmented, detected or tracked could not move a value between those domains at all. Only what can actually run is offered, so no menu entry raises: `voxel→frame` is redirected to Transfer Domain (it is a lattice reduce, and it carries the fusion reducers this node's group vocabulary lacks) and From == To is refused. A pair whose route reads the Label **raster** needs one; the pure table joins (label↔track, label→frame) do not, so a Label table that outlived its raster still transfers |
 | **Label → Points** | `transform.label_to_points` | `labels`, position `centroid/inside/weighted`, `name` (empty ⇒ `<labels>_points`), optional **`raw`** Dataset | every region → **one dot** at its centre, keeping a `label` column back to the region. `inside` snaps to the nearest region voxel so a C-shaped or annular object still gets a point *inside* it; `weighted` is the intensity-weighted centre of mass. **No lever** — 2D vs 3D is inherited from the Label instance's own provenance |
@@ -2153,6 +2310,96 @@ see [§7 Which Z a point belongs to](#which-z-a-point-belongs-to). A 2-D run rep
 particle once per plane it appears on, which is why the same stack gives more rows in 2-D
 than in 3-D.
 
+### 15.2 Position groups and the `.groups.json` sidecar
+
+A multipoint acquisition often holds several **specimens**, not one flat list of fields.
+NIS writes the point list flat, so nothing in the file says where one sample ends and the
+next begins — it has to be recovered from where the stage went.
+
+**Grouping is opt-in.** A source card loads with **Grouping = off** and one `image`
+output, exactly as it always did — nothing about the card's shape depends on what the
+stage log happens to contain. Set **Grouping = auto** in the Inspector when you want to
+work one specimen at a time.
+
+**With it on**, the app clusters the field centres: any two fields more than one field
+width apart start different groups. That threshold is not tuned, it is what a mosaic means
+— tiles have to overlap (or at worst touch) to be stitchable, so neighbouring tiles are
+always closer than one field.
+
+**The card then grows one output per specimen**, beside its full-file `image` output — the
+same thing it already does per channel. A 54-position file of six mosaics gains six extra
+sockets reading `G1 · 9 pos, 3x3` … `G6 · 9 pos, 3x3`, so six pipelines come off one card
+with nothing else to configure:
+
+```
+Channel640_Seq0001.nd2
+  ● All positions ────► (the whole 54)
+  ● G1 · 9 pos, 3x3 ──► Stitch ──► Segment ──► Measure
+  ● G2 · 9 pos, 3x3 ──► Stitch ──► …
+  ● …
+```
+
+Wiring from a group socket **is** a Select Group node — one is inserted for you when the
+graph runs, carrying that group's key. So there is nothing extra to learn, nothing to keep
+in sync, and several branches off the same group share one tap (and therefore one cached
+result) rather than each recomputing the subset. Switching the lever back to `off` with
+group outputs already wired breaks those wires, so the card asks first. On a file that
+turns out to hold one group, `auto` adds no sockets at all.
+
+Turning the lever on buys two more things, both annotations rather than changes to the
+graph: the **M strip** in the Viewer bands itself by specimen, so scrubbing tells you which
+one you are in and hovering a box names it; and measurement tables carry a **`group`**
+column beside `m`, so a table taken over all 54 positions still says which sample each row
+came from — the join you need to compare specimens in a spreadsheet.
+
+**Nothing group-shaped happens while the lever is off** — no sidecar is read, no clustering
+is done, and no per-position group list is put on the data. That is deliberate: opening a
+file should cost the same whatever its stage log contains. A `util.select_group` you place
+by hand still works on an ungrouped card, because the node falls back to detecting from the
+geometry itself when the source did not stamp a list.
+
+**To see what the detector found without turning the lever on,** put a **Select Group**
+node on the source and type `?` into its `Group` field — any name that does not exist —
+and the refusal lists every group with its size and grid shape:
+
+> `util.select_group: `group` = '?' matches no position group. This Dataset has 6:`
+> `G1 — 9 positions, 3×3 serpentine; G2 — 9 positions, 3×3 serpentine; …`
+
+**When it is wrong.** Detection infers intent from geometry and there are real layouts it
+cannot get right: two specimens mounted a field apart, one mosaic acquired in two passes, a
+control site that belongs with the treatment it pairs with. Write a sidecar next to the
+file — `Channel640_Seq0001.nd2.groups.json` — and it **wins over detection** from the next
+open onwards:
+
+```json
+{
+  "version": 1,
+  "groups": [
+    { "key": "treated", "members": [0, 1, 2, 3, 4, 5, 6, 7, 8] },
+    { "key": "control", "members": [9, 10, 11, 12, 13, 14, 15, 16, 17] }
+  ]
+}
+```
+
+`key` is what you then type into **Select Group**, and it is what **Export TIFF** names the
+file after (`out_treated.ome.tif`), so renaming a group here renames it everywhere.
+
+Two rules worth knowing:
+
+* the members must be an exact **partition** of the positions — every position in one
+  group, none in two. A sidecar that is not is rejected **whole**, with the reason, and
+  detection runs instead. Half-applying it would put some positions in the wrong specimen
+  and leave others unassigned, which reads downstream as a result rather than a fault;
+* **nothing writes the sidecar for you.** Detection is re-run on every open instead, so a
+  file with no sidecar is one nobody has had an opinion about yet — and an improvement to
+  the detector reaches it, rather than being frozen out by a guess written the first time
+  the file was opened.
+
+If the file's own point names are informative they are carried too (`position_name`), and
+they act as a second witness: NIS restarts its `#1`, `#2`, … counter at each point group,
+so on a correctly grouped file the names restart exactly where the geometry says they
+should. When the two **disagree**, the card says so rather than picking a winner.
+
 ---
 
 ## 16. Worked workflows
@@ -2207,7 +2454,9 @@ io.load ─→ analysis.dvc_field (previous_frame) ─→ analysis.accumulate_fi
 ```
 
 * `dvc_field` returns a **Point** field at subset centres with displacement in µm plus
-  strain; 2D per-plane or 3D volumetric via the lever.
+  strain. It is **3D only** — it runs the official pyALDVC solver, which needs a real
+  volume (≥ 16 voxels on every axis). For a 2D series use `analysis.dic_correlate`
+  (pyALDIC), which emits the same Point schema and feeds the same two downstream nodes.
 * `accumulate_field` composes `previous_frame` increments into a **cumulative Lagrangian**
   series. It does not ask you to restate the reference mode — it **inherits** it from the
   upstream node's stamped provenance, and refuses a `fixed_frame` field (already cumulative)
@@ -2292,6 +2541,52 @@ io.load ─ch0→ enhance.subtract_background ─→ enhance.clahe ─→ analys
 
 `python scripts/piv_synthetic_bench.py` re-runs the PIV accuracy suite (openpiv's own
 fixtures, analytic fields, the windef parity pin, and the low-seeding ensemble comparison).
+
+### D3. Strain fields from TRACKED particles (SerialTrack / TFM)
+
+```
+io.load ─→ registration.stabilize ─→ enhance.deconvolve(3D)
+        ─→ detect.particles(3D) ─→ track.objects(method=serialtrack, st_dim=3D)
+        ─→ analysis.track_field ─→ transform.rasterize_field ─→ view.overlay
+```
+
+The third way to a strain field, and the one for **discrete fiducials** — beads embedded in
+a gel — where DVC's subsets have no texture to correlate and PIV's windows have too few
+particles each. Here the correspondence is solved per PARTICLE, and everything downstream
+comes from the trajectories.
+
+* **`track.objects` only produces track ids.** That is the whole of its job, and it is why a
+  graph that stops there has no displacement in it. `analysis.track_field` is the other half:
+  it reads any tracker's `track_id` column and emits displacement (µm), the deformation
+  gradient, strain, optional velocity (µm/s) and optional stress (Pa).
+* **It emits the same Point schema as `analysis.dvc_field`**, so `transform.rasterize_field`
+  interpolates every column — `disp_mag_um`, each `strain_ij`, `von_mises` — into
+  full-resolution Voxel layers with no adapter. That pair is how you get maps.
+* **Dimensionality is inherited, not chosen.** Run `detect.particles` with the 3D lever and
+  its points carry a measured depth (`z_kind='subpixel'`); `track.objects` then needs
+  `st_dim=3D` to link through depth, and `track_field` fits a full 3×3 gradient
+  automatically. A 2D (plane-index) detection gives a per-plane 2×2 instead. Nothing asks
+  you twice, and nothing can disagree with the data.
+* **Either member kind works.** Points are the usual input, but `serialtrack` reads
+  centroids, so a segmented field (`analysis.label` / `analysis.segment` → `track.objects`)
+  reaches the same kinematics — use that when the things that move ARE the cells.
+* **`strain_radius` is the gauge length.** It is the one knob that decides what the strain
+  map can resolve: too small and sparse particles come out NaN (not zero), too large and it
+  averages away exactly the concentrations you are measuring. Start at a few times the mean
+  bead spacing.
+* **`reference=first_frame` is what strain means.** Strain is deformation against an
+  undeformed state, so the cumulative reference is the one to use for a traction or stiffness
+  measurement; `previous_frame` gives per-interval increments. Velocity is instantaneous
+  either way.
+* **Stress asks you to state the material.** `constitutive=linear_elastic` adds Young's
+  modulus and Poisson's ratio and writes the stress tensor plus `von_mises`, `pressure` and
+  `max_shear`. It is off by default because SerialTrack itself computes no stress — stress is
+  a claim about your gel, not about your images. ν = 0.5 is refused (infinite bulk modulus);
+  use 0.49. In 2D you also pick plane strain (a thick specimen — the default, and what a TFM
+  gel is) or plane stress (a thin film). Surface **traction** is a different problem — a
+  half-space inversion, not a local law — and is not in this node.
+* Re-running `track_field` with another strain measure or another modulus **does not re-run
+  the tracking**, which is the expensive half by one to two orders of magnitude.
 
 ### E. Point cloud → mesh → label volume
 
@@ -2408,6 +2703,40 @@ Wrap the body in a **Sim zone**, put a `zone.frame` node inside it, and set iter
 Iteration *t* processes frame *t* while the `In`/`Out` feedback carries state across frames.
 Each iteration memoizes independently, so editing frame 40's parameters does not recompute
 frames 1–39.
+
+### I. One movie made of several — the Movie Editor
+
+**Goal: a max projection that shows the state of the sample, and between every two
+timepoints a labelled z sweep, bottom→top then top→bottom.**
+
+1. Wire the raw (or enhanced) image into an **Export Movie**'s `data` — that is source **A**.
+   Wire the segmentation into its **`source_b`** — source **B**. (A Reroute or a muted node
+   in between is fine; the editor follows the wire to the node that really feeds it.)
+2. Select the Export Movie. The **Movie Editor** opens under the canvas. Press
+   **Convert to timeline**: the node switches to `Sweep = timeline` and clip 1 is exactly the
+   movie it was already making.
+3. Press **Compute sources** (A and B are computed in the background — usually a memo hit —
+   and the Viewer stays where it was). Then **+Loop**: it adds a loop over A's t whose body
+   is *A's max-Z still* followed by *B's z sweep, labels over the image, direction
+   `alternate`* — the example itself. Delete clip 1 if the loop is all you want.
+4. In the Viewer, tune the look of the nodes feeding A and B. Every channel with **Viewer**
+   ticked follows: the values are stamped into the node a moment after you stop dragging, and
+   again before Export and before Save, so the saved graph (and a headless or LabLink run)
+   reproduces the movie you watched.
+5. **Export** (it asks for a file if the node has none).
+
+**A 7×7 plate in one movie, one or two channels:** **+Grid** tiles source A by position
+(`Tile by = position`), all 49 playing in sync; tick the one or two **Channels** you want and
+give each a colour. One display window per channel is shared by every tile, so a dim well
+stays dim — which is the comparison a plate movie exists for. `Tile by = timepoint` on a
+clip that plays nothing is a **contact sheet**; `channel` puts the channels side by side;
+`z slice` is a montage of the stack.
+
+What bites: a panel's `t = auto` inside a loop means *the loop's t*, so a source with fewer
+timepoints than the loop is refused by name; label ids are only burned into cells large
+enough to carry the number (`Id size px`); an MP4 needs one frame size, so every clip is
+fitted into one canvas (the largest), and `canvas.fit = center` keeps small clips at their
+true size instead of enlarging them.
 
 ---
 
@@ -2815,6 +3144,9 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | Symptom | Cause / fix |
 |---|---|
 | "install scikit-learn / al-dic / stardist / numba" | that node is dependency-gated; install the extra from [§1](#1-install--launch) |
+| **SerialTrack 3D: "needs a depth to track in … z_kind='plane_index'"** | the detection upstream is in **2D**, so its z is a plane NUMBER and every object on a plane shares one — a flat sheet to the topology descriptor. Set the detector's 2D/3D lever to **3D** (it then emits `z_kind='subpixel'`). For SerialTrack specifically prefer **Particle Detection** over Spot Detection: it wraps `kernels/bead_detect.py`, the validated port of SerialTrack's own TPT/radial-symmetry detector, where Spot Detection is a generic LoG/DoG blob finder |
+| **SerialTrack 3D: "needs both 'pixel_size_um' and 'z_step_um' … z_step_um=None"** | the file records no Z spacing — a plain OME-TIFF almost never does, including every volume in FranckLab's own `SerialTrack3D_data`. Type it into the source card's **`Z step`** box ([§15](#15-node-reference)). Nothing downstream can invent it, and the refusal is deliberate: SerialTrack rescales z by `z_step ÷ pixel size` before building its descriptor, so a guessed spacing distorts every neighbour distance it matches on. If the volume is already in isotropic voxel units, set `Z step` = `Pixel size`. **Note the asymmetry**: the 3D *detectors* do not refuse — they fall back to an assumed `0.5 µm` axial spacing — so a blank `Z step` gives you detections scaled against a number nobody chose |
+| **A node failed and I cannot copy the error** | the status bar truncates and a tooltip cannot be selected. The **Console** (View ▸ Console, `Ctrl+``) carries the full traceback as selectable text with *Copy all*; it opens itself on the first failure of a session |
 | A node shows a **red domain chip** | it requires a domain nothing upstream produced (e.g. Measure on `Members = label` needs `LABEL` — add Connected Components; on `Members = point` it needs `PT`, from Spot / Particle Detection or Label to Points) |
 | The **3D switch is greyed out** | the incoming `z` is known to be 1. Z-project or a `z==1` file will do that. If a Z-Project upstream is the cause, set its method to **`none`** — the stack (and the 3D switch) come back without deleting the node or rewiring |
 | Red validation badge on a card | the graph is locked to 3D but `z == 1` |
@@ -2829,7 +3161,11 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **Which order — Stitch→Z-Project, or Z-Project→Stitch?** | Both stream at the ideal cost (every source voxel read once) and both keep the pyramid, so this is a question about the *numbers*, not speed. With blend `overwrite` or `max` the two are **bit-identical**, always. With `feather`/`mean` they agree exactly as long as overlapping tiles differ only by a **z-independent** factor — vignetting, exposure, gain all cancel — and diverge when they disagree *as a function of z*: measured on a ±0.45-z-step per-tile focus offset, 8% of overlap pixels differ (peak 3% of range); on 5% independent per-tile noise, 41% differ (peak 1.6%). The direction is fixed by convexity — `Z-Project(Stitch) ≤ Stitch(Z-Project)` — so projecting **last** averages the tiles before taking the max and suppresses independent noise in the seams, while projecting **first** takes each tile's best focus and then averages, which is brighter there. Outside the overlaps they are identical either way. Prefer **Stitch → Z-Project** unless you specifically want per-tile best-focus |
 | **Z-Project on a Stitch hangs** (fixed in V2.20) | it did, and badly. The projection tiled the mosaic, and each of its tiles re-stitched the whole canvas from the source planes without caching — `n_output_tiles × Z × n_positions` full plane reads where `Z × n_positions` was needed, a **~350× multiplier** on a 26×26-tile mosaic. Two smaller faults rode along: a windowed stitch also read every tile lying *before* the window (only the far edge was checked), and the projection had no pyramid, so the Viewer could only read level 0. All three are fixed and the numbers are unchanged — level 0 is bit-identical. If you are on an older build, project **before** stitching (Z→1 per tile, then one mosaic) as the workaround |
 | Viewer went black after docking/undocking | the GL context was recreated; it rebuilds and replays automatically. `NODELAB_GL=0` forces the CPU path |
-| First pull on a big ND2 is slow | the one-time `.b2nd` planar-block ingest next to the file; later pulls reopen it lazily |
+| **An Overlay draws on the first frame and vanishes on every other one** | fixed 2026-09-14. The secondary has a **single timepoint** — a reference snapshot, a mask, a brightfield context shot — and T was paired strictly by index, so primary `t=0` matched it and `t=1…N-1` matched nothing; an unpaired frame draws nothing, by design. A still is now **held** across every primary frame, which is what the Z axis has always done with a single-plane secondary. The node card says so (`… HELD across all N primary timepoints`) so a still that legitimately does not move is not mistaken for a broken overlay, and `Time shift` goes inert — there is no second frame to shift to. **Merge Channels** had the same shape of bug (the merged channel read as zeros after frame 0) and is fixed with it. A secondary with *several* timepoints but fewer than the primary is still genuinely unpaired past its end, and still says so: that is a mismatch, not a still |
+| **Clicked a node fed from a per-channel output and the viewer went black** saying `no image on this output` — then showed fine on the second click | fixed 2026-08-15. The click pulled with the channel indices active on the *previously* viewed node; a per-channel `ChN` tap output has one channel, so with only a high channel toggled on every requested index was stale and the display request came back empty (the data itself was always fine). A request whose every channel is stale now falls back to the cursor channel, so the first click shows the image |
+| **Loading a file or clicking from node to node switched one or more channels off** (or left a channel button lit over a picture without it, or a channel at the wrong contrast) | fixed 2026-09-30. The strip switched a channel on only the *first* time its name was seen in the session, so 3-channel node → 1-channel tap → 3-channel node came back with two channels off, and a new file whose channels shared names with an earlier one arrived the same way. Now **every channel is shown unless you switched it off yourself** (that choice is remembered by channel name, across nodes); channels switched on by a node change have their planes fetched at once; and a node whose data changed under the same card (rewired onto another file, another Split branch) drops its cached LUT and auto-contrasts afresh. *File → New* / *Open* starts the Viewer clean. Export Movie's *link to Viewer* now captures only windows you **set** (drag or typed value); a channel you never tuned uses the movie's own auto contrast |
+| First pull on a big ND2 is slow | Access on that card is set to **Auto** or **Ingest**, either of which copies the file to a `.b2nd` store before serving it (later pulls reopen the store lazily). The default, **Direct**, skips this entirely — it opens in seconds regardless of file size ([§4](#loading-a-file--the-access-mode)). Switch the card's Access back to Direct if you would rather not pay for the copy |
+| **"The following file is too large to open"**, or an ingest that runs for hours and then fails | Access set to **Ingest** (or **Auto**, which decided to ingest) on a file that does not fit the drive. Auto checks free space before starting, so this means either the card was forced to Ingest by hand, or free space dropped after Auto already committed. Either way: an ingest writes a second copy — roughly 0.6–0.8× the source — and it has to fit. A 453 GB series needs ~340 GB of free space; on a 931 GB drive already holding the file, it cannot. The symptom of running out is a **torn store**: the next open refuses it ("was never finished writing") and starts the whole copy again. Set the card's **Access** to **Direct** — the default, and what a fresh card would already be using ([§4](#loading-a-file--the-access-mode)) — it reads the ND2 in place, needs no free space, and opens a 453 GB file in ~3 s. Delete the abandoned `<file>.b2nd_store` folder to get the space back |
 | Tuning a parameter on a long series is painfully slow | press `F9` — pulls then analyse only the frames you picked, or the one you are on ([§6](#troubleshooting-mode-analyse-the-frames-you-pick--f9)), typically T× faster |
 | Tracks/time reductions look empty or trivial, and the canvas has an amber frame / `TROUBLESHOOTING MODE` badge | troubleshooting mode is on and only one frame is scoped. Ctrl+click a few T boxes so the tracker has a series, or `F9` to leave the mode |
 | A tracker under `F9` links across the wrong gaps | the picked frames are the whole series as far as the graph is concerned — unpicked ones are absent, not empty. Pick a contiguous run (ctrl+drag), or leave the mode for real numbers |

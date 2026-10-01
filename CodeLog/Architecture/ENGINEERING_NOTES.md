@@ -1921,7 +1921,8 @@ name. Current pass counts live in [../../codemap/STATE.md](../../codemap/STATE.m
 
 Heavier, not in the fast gate: `scripts/_ingest_nd2_smoke.py` (real ND2),
 `_bench_provider_granularity.py` (the storage keystone), `_bench_ccl_watershed.py`,
-`_bench_aldvc_profile.py`, `_bench_nms_numba.py`, `_nodelab_v2_shot.py` (one render).
+`_aldvc_validate.py` (pyALDVC adapter conformance — 18 checks against analytic truth),
+`_bench_nms_numba.py`, `_nodelab_v2_shot.py` (one render).
 
 Offscreen GUI gotchas: register Windows TTFs (else tofu), `os._exit(0)` to bypass the exit-5
 teardown crash, `setParent(None)` before an offscreen grab.
@@ -2111,11 +2112,23 @@ Nothing is blocking; these are the honest edges.
     progress bar, so `display_cap` now caps computed frames by affordability alone (texture
     px, texture bytes, RAM — same three ceilings as a Flatten bake; the `streaming`
     parameter is deleted so a revert cannot happen silently). What did NOT come back is the
-    V2.23b bug the byte ceilings fixed: a 13106² canvas at 687 MiB of RGBA8 still exceeds
-    the default `TEXTURE_BYTES` and stays progressive — `NODELAB_TEXTURE_BYTES` is the
+    V2.23b bug the byte ceilings fixed: a 13106² canvas at 687 MiB of RGBA8 still exceeded
+    the default `TEXTURE_BYTES` and stayed progressive — `NODELAB_TEXTURE_BYTES` is the
     knob, VRAM permitting. Cold scrubs on a native-res mosaic pay ~1 s a frame where the
     pyramid paid 0.2 — the user chose that trade with eyes open, and Flatten remains the
     answer when it stings.
+    **Follow-up (2026-08-25, "stitch is still showing the data pixelated"): the budget has
+    to charge the uploader's real texel cost, and the uploader changed underneath it.** The
+    same 2026-08-10 batch replaced the RGBA8 byte-packing with a native `GL_R16` upload —
+    half the bytes — but `display_cap` kept charging 4 bytes/px, so the whole-well stitch
+    kept being refused native display on accounting that described a code path that no
+    longer existed (687 MiB budgeted vs 343 MiB actual, against the 512 MiB default). One
+    character (`px * 4` → `px * 2`) and the single-channel whole-well canvas shows native;
+    two shown channels of it genuinely exceed the default and still go progressive. The
+    lesson is the constant-pair trap: a budget and the cost it models live in different
+    files (`runner.display_cap` vs `glview._upload`), and nothing tied them together — the
+    selftest now pins the 13106²/one-channel case in `display_cap`'s own numbers so the
+    next uploader change breaks a test instead of a user.
 * **A live mosaic has a floor no display trick reaches** (V2.23). Full resolution was a display
   decision; *cheap* is not — a stitched canvas is recomputed per displayed frame. NIS-Elements
   does not keep one live either (its Large Image mode carries the pyramid in the file and

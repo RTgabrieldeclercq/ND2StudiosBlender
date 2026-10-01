@@ -4,17 +4,17 @@
 
 | | |
 |---|---|
-| catalog node types | **77** |
+| catalog node types | **86** |
 | GUI-layer ops (`io.load`, `view.viewer`, `io.dock`) | 3 |
-| sockets + mode selectors | 707 |
-| mapped Python modules | 247 |
-| indexed symbols | 3188 |
-| first-party import edges | 1141 |
-| LOC — `nodegraph/` | 77,113 |
-| LOC — `nodelab_v2/` | 33,775 |
-| LOC — `scripts/` | 14,709 |
-| map fingerprint | `a583ff9c38a041ad3059bdfecdae67bc` |
-| gates last verified green | **2026-08-11** |
+| sockets + mode selectors | 827 |
+| mapped Python modules | 272 |
+| indexed symbols | 3726 |
+| first-party import edges | 1352 |
+| LOC — `nodegraph/` | 90,369 |
+| LOC — `nodelab_v2/` | 40,084 |
+| LOC — `scripts/` | 15,397 |
+| map fingerprint | `6bf70b0183e04f651081f96adaf6dffb` |
+| gates last verified green | **2026-10-01** |
 
 `gates last verified green` moves only when a human or agent passes
 `--verified YYYY-MM-DD` to `scripts/_codemap.py write`, after actually running them. A plain

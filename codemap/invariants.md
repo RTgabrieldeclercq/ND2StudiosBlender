@@ -84,10 +84,14 @@ indexing, no assumption that an upstream layer exists.
 anchors: file:nodelab_v2/nd2_compat.py
 
 The SDK has bugs that make a *healthy* file unopenable, and they fire from `ND2File.sizes` —
-i.e. at file-pick time in the File menu, before a pixel is read. The shim wraps upstream and
-acts **only on the raised exception**; it never reimplements the calculation, which is what
-makes patching a third-party parser safe and lets the shim self-sunset when a fixed release
-stops raising. The import also stays lazy and in-function so `ingest.py` remains importable,
+i.e. at file-pick time in the File menu, before a pixel is read. Two so far: a zero-range
+Z-stack that divides by zero, and picture metadata keyed `ImageMetadataSeqLV|N!` with `N != 0`
+(upstream hard-codes `|0!`). Each shim wraps upstream and acts **only on the raised
+exception**, so a file that opens today opens bit-for-bit identically. That is what makes
+patching a third-party parser safe, and it lets each shim self-sunset once a fixed release
+stops raising. Where a shim has to redo upstream's work, it copies upstream's own
+lines (shim 2 decodes a different key exactly the way upstream decodes `|0!`) and does not
+derive anything new. The import also stays lazy and in-function so `ingest.py` remains importable,
 and its TIFF half usable, with no SDK installed.
 
 ---
@@ -119,10 +123,21 @@ The engine takes `dataset_preds[0]` as the calibration/envelope source and walks
 ### INV-10 — `voxel_size_um` is always `(dz, dy, dx)`, slowest-first
 anchors: file:nodegraph/kernels/README.md
 
-Every kernel in `nodegraph/kernels/` takes it that way: `(z_step_um, pixel_size_um,
-pixel_size_um)`. A `(dx, dy, dz)` swap corrupts anisotropy and every µm column downstream
-without raising anything. It is the single most-repeated warning across the per-kernel `.md`
-contracts, which is why it is here rather than only there.
+Every kernel in `nodegraph/kernels/` that takes a voxel size takes it that way:
+`(z_step_um, pixel_size_um, pixel_size_um)`. A `(dx, dy, dz)` swap corrupts anisotropy and
+every µm column downstream without raising anything. It is the single most-repeated warning
+across the per-kernel `.md` contracts, which is why it is here rather than only there.
+
+One kernel takes no voxel size at all: `track_field` requires its `coords` and `disp` to
+arrive in ONE physical length unit already, so its gradient is dimensionless with no
+anisotropy factor left to apply. That is the same invariant reached from the other side, and
+the caller (`analysis.track_field`) is where the `(dz, dy, dx)` scaling happens.
+
+The invariant is the KERNEL's boundary, not the upstream package's. `aldvc_field` wraps
+pyALDVC, whose `DVCPara` triples are `(x, y, z)`, and `dic_correlate` wraps pyALDIC, which
+works in `(x, y)` — both still take `voxel_size_um` slowest-first and reverse it *inside*.
+Passing `(x, y, z)` to match the upstream package's own order is the exact silent corruption
+this entry exists to prevent.
 
 Each kernel's own `.md` lists the rest of its conventions — 2D fallbacks that put z in
 column 0, threshold kernels that need integer input and a 2-tuple, registration shifts as
@@ -138,6 +153,24 @@ preference — "this default seems wrong" — is not a licence to edit a kernel;
 or exposes a param instead. Otherwise the kernel stops being comparable to the paper it
 implements, and the validation suites that score it against published results stop meaning
 anything.
+
+Not every kernel is vendored, and this rule says nothing about the ones that are not:
+`cellsam_segment`, `piv_field` and `aldvc_field` (rewritten 2026-09-25) are adapters around
+third-party packages, and `track_field` (2026-09-17) is new in-repo math. `field_math`
+(2026-09-25) is a third case: it is byte-verbatim code that was *lifted out of* a vendored
+kernel when the official pyALDVC package replaced the in-repo ALDVC port, so the verbatim
+rule still governs it — it just no longer lives where it was vendored to.
+
+An adapter is not exempt from the spirit of this entry. Its own risk is not editing the
+maths — it cannot, the maths is in the package — but silently reordering, negating or
+rescaling the answer on the way out. That is why `scripts/_aldvc_validate.py` scores the
+ADAPTER against analytic truth rather than re-running upstream's benchmark.
+
+Where new code is *derived* from a vendored kernel, the
+equivalent guarantee is an explicit equivalence test rather than byte-identity —
+`track_field.mls_displacement_gradient` is a vectorised re-derivation of
+`track_objects.compute_strain_mls` and `selftest::test_track_field` pins the two together on
+a fixture, so the derivation cannot silently drift from the code it came from.
 
 ---
 
@@ -172,3 +205,34 @@ holds, and a raster can hold ids the table never measured. A parent that was nev
 wherever its raster and its incoming table disagree. The viewer now clips a ragged layer to the
 rows every column agrees on and says so once, because a colour is never worth a crash — but that
 is a backstop, not a licence.
+
+---
+
+### INV-14 — a compute must never return fewer batch members than it was given
+anchors: sym:nodegraph.engine._check_batch_kept, sym:nodegraph.streaming.realize
+
+Roughly 25 realizing nodes allocate a plain `(m,t,z,c,y,x)` raster and fill it from
+`get_region(...)`. The batch index is **keyword-only with a default of 0**
+([CON-11](concepts.md)), so such a loop reads the FIRST file, writes it into an array
+shaped like the whole batch, and hands back a Dataset whose `b` has quietly become 1.
+Every other file is gone.
+
+Nothing about the result looks wrong. The pixels are real, the axes are self-consistent,
+the row count is plausible, no exception is raised — the single witness is that two files
+went in and one came out. `realize()` had exactly this bug (fixed 2026-09-27) and it sat on
+the export path, so a batched write-out produced file 1 under the batch's name.
+
+Two guards, deliberately independent, because each catches cases the other does not:
+
+* a node that adds a **lattice layer** is caught by the shape check in
+  `Dataset.with_attribute`, which names the missing batch axis;
+* a node that returns only an **image** is caught by `_check_batch_kept` in the engine,
+  the one place every compute passes through.
+
+Both **refuse** rather than repair: the correct per-member result is something the node has
+to compute, and one member's output carries nothing to reconstruct the others from.
+
+`nodegraph.selftest.test_batch_never_silently_dropped` runs the whole catalog against a
+two-file batch and fails if *any* node returns fewer files. As of 2026-09-27: 28 carry both
+through, 11 refuse loudly, 0 drop. Lifting one of the 11 means giving its unit loop the
+batch axis — never widening the guard.

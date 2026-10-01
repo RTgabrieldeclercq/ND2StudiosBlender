@@ -183,6 +183,43 @@ anchors: sym:nodelab_v2.runner.EngineRunner, file:nodelab_v2/ingest.py
    `nodegraph.provider.B2ndProvider` plus a `MetaEnvelope`. `nodelab_v2.nd2_meta` parses the
    optics and calibration — pixel size, z step, frame interval, emission per channel, NA,
    magnification — which is what makes every `unit`/`derive` socket downstream work (CON-05).
+2b. **There are two routes, chosen by `io.load`'s `access` mode**, and the store is only
+   one of them. Under `access="direct"` — **the default** (`ops.ACCESS_DEFAULT`), for a
+   freshly placed card and for every graph saved before this mode existed alike — the
+   runner skips the ingest entirely and builds a `nodelab_v2.nd2_direct.Nd2DirectProvider`
+   over the ND2's own memory-mapped frames: no store, nothing written, usable the instant
+   the file is picked. The calibration half is unchanged (same `read_calibration`), so
+   only the provider differs; everything downstream is identical. It exists because the
+   ingest's second copy is not always affordable: the lab's 453 GB series needs ~340+ GB of
+   store on a 931 GB drive that already holds it.
+
+   `access="auto"` resolves the choice instead of committing to it, via
+   `EngineRunner._effective_access`: an existing valid store on disk always wins outright
+   (no space check — it is already paid for); otherwise `nodelab_v2.nd2_direct.decide_access`
+   estimates a fresh ingest's size — pessimistically, no compression credited — against the
+   destination drive's free space (a 25%-or-5 GiB margin) and picks `ingest` if it fits,
+   `direct` if it does not. Reach for it on a file that already has a store from an earlier
+   session (`direct` on its own never looks for one), or whenever the size trade-off should
+   just be decided rather than defaulted. The resolution is decided once per path and
+   cached for the runner's session (`EngineRunner._auto_access`) — `source_state()` polls
+   it continuously and must not re-open the file or re-stat the drive on every tick.
+   `access="ingest"` forces the store unconditionally.
+
+   `access` (resolved, never the literal `"auto"`) is part of the provider-cache key
+   (`runner.source_key`), and the `ingest` key is deliberately byte-identical to the
+   pre-mode tuple so every saved graph and on-disk store still hits under `access="auto"`
+   or `access="ingest"`.
+2c. **The per-M grouping is resolved here too**, by `runner._with_position_groups`, and
+   stamped onto the envelope as `position_group` / `position_name`
+   (`metadata.PER_POSITION_KEYS`). A multipoint axis is often several specimens rather than
+   one flat list — the lab's CRC file is six 3×3 mosaics a millimetre apart — and
+   `nodelab_v2.position_groups.resolve_plan` decides which: a hand-written
+   `<file>.groups.json` sidecar if there is one, else
+   `nodegraph.placement.position_groups` clustering the field centres at one field width.
+   It is applied on the same path as `_with_card_calib`, which is the ONE place the payload
+   and the engine's meta-seed both come from — stamping anywhere else would put the
+   grouping in one of them and not the other, and `util.select_group`'s edit-time header
+   would disagree with its pull.
 3. An empty `io.load` path falls back to a synthetic stack, so a graph is always runnable.
 4. A value the *file* carries that looks wrong is passed through, not repaired: a microscope
    PC with a bad clock produces an absurd acquisition date, and a downstream node refusing to

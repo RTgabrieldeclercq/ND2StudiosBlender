@@ -2,17 +2,17 @@
  "CON-01": {
   "anchors": {
    "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
-   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+   "sym:nodegraph.registry.define_node": "abb7890380f8dffaf7e47934f93a7798"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-08",
   "file": "codemap/concepts.md"
  },
  "CON-02": {
   "anchors": {
-   "file:nodegraph/domains.py": "5e53fa24004661cdf8bc2938189a9a9f",
+   "file:nodegraph/domains.py": "169b3940597f271bbc4829679b9d5a77",
    "sym:nodegraph.domains.Domain": "9a3c5f1b642fd7e854ee86e10df4f05a"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-27",
   "file": "codemap/concepts.md"
  },
  "CON-03": {
@@ -52,7 +52,7 @@
    "op:util.crop": "c9d2bc8ba5f2f06917846d6c2c78d4b0",
    "sym:nodegraph.metadata.propagate_meta": "c29ab8f9379bc2225c97936b97ee242c"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-29",
   "file": "codemap/concepts.md"
  },
  "CON-08": {
@@ -80,18 +80,18 @@
  },
  "CON-11": {
   "anchors": {
-   "file:nodegraph/provider.py": "f681942e17542d691f8a5617328930f6",
+   "file:nodegraph/provider.py": "77b85c8efd5a19cd75bcda1570f66fe0",
    "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-30",
   "file": "codemap/concepts.md"
  },
  "CON-12": {
   "anchors": {
    "sym:nodegraph.registry.SocketSpec": "e2b4360003ef3d619631e8bd0a633d3f",
-   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+   "sym:nodegraph.registry.define_node": "abb7890380f8dffaf7e47934f93a7798"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-08",
   "file": "codemap/concepts.md"
  },
  "CON-13": {
@@ -109,6 +109,25 @@
   "blessed": "2026-08-05",
   "file": "codemap/concepts.md"
  },
+ "CON-15": {
+  "anchors": {
+   "sym:nodegraph.metadata.MetaEnvelope.columns_in": "e30410e7eeff5e3f69ac1f7d15782fc8",
+   "sym:nodegraph.metadata._column_names_out": "cdbc7bd310ed6634f38c3921c61def4e",
+   "sym:nodelab_v2.document.GraphDocument.column_choices": "37d23240dfceebb958265784159f510c"
+  },
+  "blessed": "2026-09-08",
+  "file": "codemap/concepts.md"
+ },
+ "CON-16": {
+  "anchors": {
+   "sym:nodegraph.catalog._shared.movie_timeline.Timeline": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.catalog._shared.movie_timeline.normalize_spec": "52e8ba7c3dfcaf05e156773825da3af1",
+   "sym:nodelab_v2.movie_editor.MovieEditorPanel": "f7711c370dbc77d6512023d1d9d5e16c",
+   "sym:nodelab_v2.runner.EngineRunner.fetch": "eaa6b7208c1b66696825e8c8485a631b"
+  },
+  "blessed": "2026-09-30",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
@@ -119,17 +138,17 @@
  },
  "INV-02": {
   "anchors": {
-   "file:nodegraph/streaming.py": "52ec2d69bd9b8f2a54aeb124957f0bb2",
+   "file:nodegraph/streaming.py": "1592cbc04a588a5fb5be0baeda454715",
    "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-27",
   "file": "codemap/invariants.md"
  },
  "INV-03": {
   "anchors": {
-   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+   "sym:nodegraph.registry.define_node": "abb7890380f8dffaf7e47934f93a7798"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-08",
   "file": "codemap/invariants.md"
  },
  "INV-04": {
@@ -157,9 +176,9 @@
  },
  "INV-07": {
   "anchors": {
-   "file:nodelab_v2/nd2_compat.py": "bbbb6d392c98f40560b209001db2b1cd"
+   "file:nodelab_v2/nd2_compat.py": "7c736a375e1e0da83a094c6cca917fbe"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-30",
   "file": "codemap/invariants.md"
  },
  "INV-08": {
@@ -180,16 +199,16 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "00ddcb1c919c1de44638ac4d24824977"
+   "file:nodegraph/kernels/README.md": "0ec6a239bc96ea8c8ee6b6a4741db54a"
   },
-  "blessed": "2026-08-10",
+  "blessed": "2026-09-25",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "00ddcb1c919c1de44638ac4d24824977"
+   "file:nodegraph/kernels/README.md": "0ec6a239bc96ea8c8ee6b6a4741db54a"
   },
-  "blessed": "2026-08-10",
+  "blessed": "2026-09-25",
   "file": "codemap/invariants.md"
  },
  "INV-12": {
@@ -204,6 +223,14 @@
    "sym:nodegraph.dataset.Dataset.with_structure": "b63b4c84283bbebd5b30bf2ab37535ac"
   },
   "blessed": "2026-08-06",
+  "file": "codemap/invariants.md"
+ },
+ "INV-14": {
+  "anchors": {
+   "sym:nodegraph.engine._check_batch_kept": "e9eecfb5cbb8b5db9b6eab2201cbc64d",
+   "sym:nodegraph.streaming.realize": "7611ff992d405155f0908c158d628226"
+  },
+  "blessed": "2026-09-27",
   "file": "codemap/invariants.md"
  },
  "WF-01": {
@@ -237,9 +264,9 @@
   "anchors": {
    "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
    "sym:nodegraph.catalog.module_order": "1ae7d144cb5031219d2c60724c714e67",
-   "sym:nodegraph.registry.define_node": "bd233b65be01e066d89e988a5ea8a48c"
+   "sym:nodegraph.registry.define_node": "abb7890380f8dffaf7e47934f93a7798"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-08",
   "file": "codemap/workflows.md"
  },
  "WF-05": {
@@ -261,10 +288,10 @@
  },
  "WF-07": {
   "anchors": {
-   "file:nodelab_v2/ingest.py": "dd5b2c38beee9532054282105d117fb0",
+   "file:nodelab_v2/ingest.py": "cc8fd6ff6b054a943ad34b68de1a4a60",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-09-15",
   "file": "codemap/workflows.md"
  }
 }

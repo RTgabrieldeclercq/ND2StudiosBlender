@@ -21,10 +21,16 @@ python scripts/_catalog_snapshot.py                                # "CATALOG ID
 python scripts/_codemap.py                                         # "CODEMAP CURRENT — …"
 ```
 
+**`python` here means `.venv\Scripts\python.exe`.** The interpreter on `PATH` has no numpy,
+so every gate above dies on `ModuleNotFoundError: No module named 'numpy'` at import — which
+looks like a broken checkout and is only a wrong interpreter.
+
 `PYTHONUTF8=1` on Windows only: some `[ok]` lines carry `µ`/`σ`/`↔` and a cp1252 console
 raises `UnicodeEncodeError` **inside the reporting line**, which reads like a failure and is
 not one. `-B` because a stale `.pyc` from a moved module fabricates failures in tests you
 never touched — the tell is a traceback whose source line does not match that line number.
+Add `-u` to anything you redirect to a file: the GUI probe ends in `os._exit(0)`, which
+skips the buffer flush and leaves you reading an empty log.
 
 ## How to find things
 
