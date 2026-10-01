@@ -21,6 +21,8 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
 from nodegraph.catalog._shared.units import to_pixels_v2
 
@@ -103,9 +105,17 @@ def _compute_particles(ctx: EvalContext) -> Dataset:
         cols["id"] = np.arange(len(cols["id"]), dtype=np.int64)   # global-unique ids
         merged = StructureTable(Domain.POINT, cols, layer=layer, z_kind=zk)
     return ds.with_structure(merged)
+
+def _columns_particles(params, modes, incoming):
+    """The invariant Point schema (``structure.point_table``) — coordinates only, as with
+    every detector. Total by contract (runs on every keystroke)."""
+    return on_layer(Domain.POINT, str((params or {}).get("name") or "particles"),
+                    POINT_INVARIANT)
+
 register_node(
-    _compute_particles, op_key="detect.particles", label="Particle Detection",
+    batch_aware(_compute_particles), op_key="detect.particles", label="Particle Detection",
     category="analysis",
+    adds_columns=_columns_particles,
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
     inputs=[
         InDataset(),

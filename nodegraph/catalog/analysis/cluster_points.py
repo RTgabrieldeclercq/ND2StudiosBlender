@@ -18,6 +18,7 @@ from nodegraph.registry import (
 )
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 
 # ── Cluster a point cloud → a per-point cluster-id label column ────────────────
@@ -83,8 +84,18 @@ def _compute_cluster_points(ctx: EvalContext) -> Dataset:
     # Add the label column to the SAME Point layer (with_layer, not with_structure — leaves
     # the source's z_kind provenance untouched, no clobber).
     return ds.with_layer(Domain.POINT, name, out, layer=source)
+
+def _columns_cluster_points(params, modes, incoming):
+    """One column, onto the SOURCE layer. This node writes its cluster id back onto the very
+    Point table it read (``with_layer``, so the source's z_kind provenance is untouched)
+    rather than emitting a new instance — so the name to declare is the READ socket's, which
+    is the ``analysis.measure`` / ``analysis.object_metrics`` shape."""
+    return on_layer(Domain.POINT, str((params or {}).get("source") or "particles"),
+                    (str((params or {}).get("name") or "cluster"),))
+
 register_node(
     _compute_cluster_points, op_key="analysis.cluster_points", label="Cluster Points",
+    adds_columns=_columns_cluster_points,
     category="analysis",
     reads_domains=frozenset({Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
     inputs=[InDataset(),

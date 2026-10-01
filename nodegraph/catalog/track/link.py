@@ -10,6 +10,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InFloat, InString, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import TRACK_MEMBERSHIP, on_layer
 from nodegraph.catalog._shared.labels import (
     _point_layers,
     _resolve_layer,
@@ -102,9 +103,19 @@ def _compute_track_link(ctx: EvalContext) -> Dataset:
     membership = TrackMembership(track_id=track_id, t=t_col, member_id=member_id,
                                  member_domain=member_domain)
     return ds.with_structure(membership.to_table(layer=out_layer))
+
+def _columns_track_link(params, modes, incoming):
+    """The three membership arrays ``TrackMembership.to_table`` emits, and ONLY those
+    (V2.28). Unlike ``track.objects`` this node writes no ``track_length`` and nothing back
+    onto the member layer — the table is the hard-coded 3-key literal, so declaring more
+    would offer a condition on a column that is never written. Total by contract."""
+    return on_layer(Domain.TRACK, str((params or {}).get("name") or "tracks"),
+                    TRACK_MEMBERSHIP)
+
 register_node(
     _compute_track_link,
     op_key="track.link", label="Track Linking", category="analysis",
+    adds_columns=_columns_track_link,
     adds_domains=frozenset({Domain.TRACK}),
     # reads Label OR Point, per the 'target' mode — stated per branch since V2.22. Unlike
     # track.objects the label branch reads the RASTER and nothing else (`attr.values` fed

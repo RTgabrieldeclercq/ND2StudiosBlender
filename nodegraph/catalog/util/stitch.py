@@ -315,13 +315,28 @@ def _stitch_layout(ctx: EvalContext, ds: Dataset, prov: Any, ax: AxisSizes):
 
     stage_xy = _stitch_stage_xy(ds, ax.m)
     if not stage_xy:
-        have = len(getattr(ds, "metadata", {}).get("stage_xy_um") or [])
+        md = getattr(ds, "metadata", {}) or {}
+        have = len(md.get("stage_xy_um") or [])
+        # When Chain Files is upstream it is the likelier culprit than the format, and it
+        # stamped how far apart the files put each field -- say so, with the numbers.
+        chain = md.get("__chain__") if isinstance(md.get("__chain__"), dict) else {}
+        why = ""
+        if "stage_spread_um" in chain:
+            why = (f" Chain Files upstream dropped it: its {len(chain.get('files') or [])} "
+                   f"files put the same position up to {chain['stage_spread_um']} µm apart, "
+                   f"beyond the {chain.get('stage_tolerance_um')} µm (a tenth of a field) "
+                   f"within which they still count as one field — so these are different "
+                   f"places, not one field revisited. Chain onto M to keep each file's "
+                   f"positions, or stitch each file before chaining.")
+        elif chain:
+            why = (" Chain Files is upstream, but its inputs carried no complete stage "
+                   "log to keep — check the loaders' metadata.")
         raise ValueError(
             f"layout='{layout}' needs a per-position stage log covering all {ax.m} "
-            f"multipoints, and this Dataset carries {have}. TIFFs never have one, and an "
-            f"ND2 whose SDK did not fill the XYPosLoop in has none either. Set the Layout "
-            f"mode to 'grid' for a contact-sheet montage instead — a guessed placement "
-            f"would look exactly like a measured one.")
+            f"multipoints, and this Dataset carries {have}.{why} TIFFs never have one, "
+            f"and an ND2 whose SDK did not fill the XYPosLoop in has none either. Set the "
+            f"Layout mode to 'grid' for a contact-sheet montage instead — a guessed "
+            f"placement would look exactly like a measured one.")
     px_um = float(ctx.calib("pixel_size_um") or 0.0)
     if px_um <= 0:
         raise ValueError(

@@ -34,8 +34,9 @@ class _FrameView(TileProvider):
     def level_axes(self, level: int) -> AxisSizes:
         return replace(self._base.level_axes(level), t=1)
 
-    def read_region(self, level, m, t, z, c, y0, y1, x0, x1) -> np.ndarray:
-        return self._base.read_region(level, m, self._t, z, c, y0, y1, x0, x1)
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
+        return self._base.read_region(
+            level, m, self._t, z, c, y0, y1, x0, x1, b=b)
 
     def fingerprint(self) -> tuple:
         return ("frameview", self._fp)

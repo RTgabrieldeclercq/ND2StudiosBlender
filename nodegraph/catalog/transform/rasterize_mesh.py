@@ -19,6 +19,7 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import on_layer
 from nodegraph.catalog._shared.labels import _resolve_layer, _structure_layers
 
 # ── Rasterize a MESH → a Voxel Label volume + geometry table (3D) ──────────────
@@ -129,8 +130,20 @@ def _compute_rasterize_mesh(ctx: EvalContext) -> Dataset:
               for k in rows[0]}
     return res.with_structure(StructureTable(Domain.LABEL, merged, layer=name,
                                              z_kind="subpixel"))
+
+def _columns_rasterize_mesh(params, modes, incoming):
+    """The Label table the rasterized mesh carries: the invariant schema plus the analytic
+    per-element measurements the MESH already held (``volume_um3``, ``surface_area_um2``,
+    ``density``, ``n_points``) and the ``voxel_count`` this node measured while filling them.
+    Those analytic figures are the reason to rasterize a mesh rather than re-segment, so they
+    must stay conditionable on the far side of the hop."""
+    return on_layer(Domain.LABEL, str((params or {}).get("name") or "labels"),
+                    ("id", "m", "t", "c", "z", "y", "x", "n_points", "voxel_count",
+                     "volume_um3", "surface_area_um2", "density"))
+
 register_node(
     _compute_rasterize_mesh, op_key="transform.rasterize_mesh", label="Rasterize Mesh",
+    adds_columns=_columns_rasterize_mesh,
     category="transform",
     reads_domains=frozenset({Domain.MESH, Domain.VOXEL}),
     adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),

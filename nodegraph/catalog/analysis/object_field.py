@@ -13,6 +13,7 @@ from nodegraph.registry import Granularity, InDataset, InFloat, InString, Mode, 
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import on_layer
 from nodegraph.catalog._shared.objects import (
     _InFrameInterval,
     _frame_interval_s,
@@ -252,8 +253,30 @@ def _compute_object_field(ctx: EvalContext) -> Dataset:
     # left to be re-derived by differencing coordinates.
     return ds.with_structure(table).with_metadata(
         object_field_source=layer, object_field_step_um=float(step_px * px))
+
+def _columns_object_field(params, modes, incoming):
+    """The gridded Eulerian field this node writes: the node coordinates plus the column(s)
+    each selected ``fields`` entry produces, read from the same ``_OBJECT_FIELDS`` map the
+    compute writes through — so ``velocity`` correctly offers ``velocity_y``/``velocity_x``
+    rather than a column called ``velocity`` that no table carries.
+
+    ``_object_field_names`` refuses an unknown name; called defensively here because a
+    selector mid-edit must not blank the envelope (``analysis.measure``'s reason)."""
+    try:
+        try:
+            names = _object_field_names(params.get("fields", ""))
+        except Exception:
+            return ()                        # a selector mid-edit offers nothing new
+        cols = ["id", "m", "t", "c", "z", "y", "x"]
+        cols += [c for n in names for c in _OBJECT_FIELDS.get(n, ())]
+        return on_layer(Domain.POINT, str((params or {}).get("name") or "object_field"),
+                        dict.fromkeys(cols))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
     _compute_object_field, op_key="analysis.object_field", label="Object Field",
+    adds_columns=_columns_object_field,
     category="analysis",
     # ONE of the two, never both — `_object_table` reads the Label table under
     # `target=label` and the Point table under `target=point`. The shipped static union

@@ -16,6 +16,7 @@ from nodegraph.spill import dense_output
 from nodegraph.structure import StructureTable, label_components
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import LABEL_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _resolve_layer, _voxel_layers
 from nodegraph.catalog._shared.progress import _parallel_progress
 
@@ -59,26 +60,43 @@ def _compute_label(ctx: EvalContext) -> Dataset:
     # is pure per unit; `take` is not — it advances the global id `offset` and appends the
     # Label rows, so its order defines the ids. `fold_units` keeps that order exactly, so
     # the raster and the table are byte-identical to the serial loop.
-    units = ([(m, t, None, c) for m in range(ax.m) for t in range(ax.t)
-              for c in range(ax.c)] if is_3d else
-             [(m, t, z, c) for m in range(ax.m) for t in range(ax.t)
-              for z in range(ax.z) for c in range(ax.c)])
+    # V3.01: the batch axis joins the unit tuple. `mask6` is already the right rank —
+    # a Voxel layer on a batch carries a leading `b` and `raster_out` is sized from its
+    # own shape — so the only thing needed is to ADDRESS it, which `pre` does. Without
+    # this the loop would read member 0 and write it into every member's slot.
+    nb = int(getattr(ax, "b", 1))
+    batched = nb > 1
+
+    def _pre(b):
+        return (b,) if batched else ()
+
+    units = ([(b, m, t, None, c) for b in range(nb) for m in range(ax.m)
+              for t in range(ax.t) for c in range(ax.c)] if is_3d else
+             [(b, m, t, z, c) for b in range(nb) for m in range(ax.m)
+              for t in range(ax.t) for z in range(ax.z) for c in range(ax.c)])
     tick = _parallel_progress(ctx, len(units), "labelling", frames=ax.t)
 
+    # the member index is stamped onto every Label row only when there IS a batch, so an
+    # ordinary table keeps exactly the columns it always had (see structure.BATCH_COLUMN)
+    def _bcol(b):
+        return b if batched else None
+
     def _label_one(unit):
-        m, t, z, c = unit
+        b, m, t, z, c = unit
         if z is None:
-            return label_components(mask6[m, t, :, c], conn, m=m, t=t, c=c)
-        return label_components(mask6[m, t, z, c], conn, m=m, t=t, c=c, z_index=z)
+            return label_components(mask6[_pre(b) + (m, t, slice(None), c)], conn,
+                                    m=m, t=t, c=c, b=_bcol(b))
+        return label_components(mask6[_pre(b) + (m, t, z, c)], conn,
+                                m=m, t=t, c=c, z_index=z, b=_bcol(b))
 
     def _fold(_i, unit, res):
         nonlocal offset
-        m, t, z, c = unit
+        b, m, t, z, c = unit
         lab, tbl = res
         if z is None:
-            raster[m, t, :, c], offset = take(lab, tbl)
+            raster[_pre(b) + (m, t, slice(None), c)], offset = take(lab, tbl)
         else:
-            raster[m, t, z, c], offset = take(lab, tbl)
+            raster[_pre(b) + (m, t, z, c)], offset = take(lab, tbl)
         tick()
 
     fold_units(_label_one, units, _fold)
@@ -90,8 +108,17 @@ def _compute_label(ctx: EvalContext) -> Dataset:
             layer=layer, z_kind=("subpixel" if is_3d else "plane_index"))
         out = out.with_structure(merged)
     return out
+def _columns_label(params, modes, incoming):
+    """The invariant Label schema this node writes (V2.28 ``adds_columns``), so a
+    downstream condition can offer `area` / the centroid columns without a Measure in
+    between. Total by contract (runs on every keystroke)."""
+    return on_layer(Domain.LABEL, str((params or {}).get("name") or "labels"),
+                    LABEL_INVARIANT)
+
+
 register_node(
-    _compute_label, op_key="analysis.label", label="Connected Components",
+    _compute_label, op_key="analysis.label",
+    adds_columns=_columns_label, label="Connected Components",
     reads_domains=frozenset({Domain.VOXEL}),
     adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),   # emits a label RASTER too
     category="analysis",

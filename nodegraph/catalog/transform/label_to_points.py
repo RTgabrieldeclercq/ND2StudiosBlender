@@ -14,6 +14,8 @@ from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDatase
 from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import (
     _label_centroids,
     _label_raster,
@@ -171,9 +173,27 @@ def _compute_label_to_points(ctx: EvalContext) -> Dataset:
         cols["id"] = np.arange(len(cols["label"]), dtype=np.int64)   # global-unique
         merged = StructureTable(Domain.POINT, cols, layer=out_layer, z_kind=zk_out)
     return ds.with_structure(merged)
+
+def _columns_label_to_points(params, modes, incoming):
+    """The invariant Point schema plus **``label``** — the join back to the region each dot
+    came from, which is what makes a centroid condition composable with the region's own
+    measurements (V2.28).
+
+    Mirrors :func:`_layers_label_to_points`'s name resolution exactly, including the
+    auto-derived ``<labels>_points`` case: a catalog keyed on a name the layer catalog does
+    not also carry would offer columns under a layer the picker never lists."""
+    try:
+        name = str((params or {}).get("name") or "").strip()
+        if not name:
+            name = f"{str((params or {}).get('labels') or '') or 'labels'}_points"
+        return on_layer(Domain.POINT, name, POINT_INVARIANT + ("label",))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
-    _compute_label_to_points, op_key="transform.label_to_points",
+    batch_aware(_compute_label_to_points), op_key="transform.label_to_points",
     label="Label → Points", category="transform",
+    adds_columns=_columns_label_to_points,
     extra_layers=_layers_label_to_points,
     reads_domains=frozenset({Domain.VOXEL, Domain.LABEL}),
     adds_domains=frozenset({Domain.POINT}),

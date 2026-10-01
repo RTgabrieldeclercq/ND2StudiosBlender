@@ -22,6 +22,8 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import MESH_ELEMENT, on_layer
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
 from nodegraph.catalog._shared.labels import (
     _label_centroids,
@@ -488,8 +490,32 @@ def _compute_voronoi(ctx: EvalContext) -> Dataset:
                                     "src_layer": str(pts_layer), "bound": str(bound),
                                     "voxel_size_um": [float(v) for v in vox]})
     return out
+
+def _columns_voronoi(params, modes, incoming):
+    """All THREE tables this node writes, because they answer different questions.
+
+    The territory **Label** table carries ``point_id`` (back to the seed that won it),
+    ``region`` (the arena it was clipped to) and ``density``; the ``<name>_seeds`` **Point**
+    table is the seeds that actually won one, carrying ``cell_id`` forward; and the optional
+    **MESH** carries the element schema. Declaring only the Label half would leave the seed
+    filter — the node's whole point, since the surviving dots are a different set from the
+    input cloud — with an empty condition menu."""
+    try:
+        name = str((params or {}).get("name") or "voronoi")
+        base = ("id", "m", "t", "c", "area", "z", "y", "x")
+        out = on_layer(Domain.LABEL, name, base + ("point_id", "region", "density"))
+        out += on_layer(Domain.POINT, "%s_seeds" % name,
+                        ("id", "m", "t", "c", "z", "y", "x", "cell_id"))
+        out += on_layer(Domain.MESH,
+                        str((params or {}).get("mesh_name") or "voronoi_mesh"),
+                        MESH_ELEMENT)
+        return out
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
-    _compute_voronoi, op_key="analysis.voronoi", label="Voronoi Cells",
+    batch_aware(_compute_voronoi), op_key="analysis.voronoi", label="Voronoi Cells",
+    adds_columns=_columns_voronoi,
     category="analysis",
     extra_layers=_layers_voronoi,
     # POINT is required in every mode — they are the seeds. The AREA is conditional, and

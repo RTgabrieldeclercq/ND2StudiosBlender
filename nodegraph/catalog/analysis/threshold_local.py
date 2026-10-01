@@ -12,6 +12,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InFloat, InString, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
 from nodegraph.catalog._shared.planes import _each_plane_p
 
 def _compute_threshold_local(ctx: EvalContext) -> Dataset:
@@ -37,7 +38,7 @@ def _odd_leq(shape: Tuple[int, ...]) -> int:
     m = max(3, min(shape))
     return m if m % 2 else m - 1
 register_node(
-    _compute_threshold_local, op_key="analysis.threshold_local", label="Local Threshold",
+    batch_aware(_compute_threshold_local), op_key="analysis.threshold_local", label="Local Threshold",
     category="analysis",
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.VOXEL}),
     inputs=[InDataset(),

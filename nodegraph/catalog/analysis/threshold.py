@@ -15,6 +15,7 @@ from nodegraph.registry import InDataset, InFloat, InString, Mode, OutDataset
 from nodegraph.spill import dense_output, spill_budget
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
 from nodegraph.catalog._shared.map_image import _FIELD_TYPES
 from nodegraph.catalog._shared.planes import _each_plane
 from nodegraph.catalog._shared.progress import _parallel_progress
@@ -551,7 +552,7 @@ def _compute_threshold(ctx: EvalContext) -> Dataset:
     map_units(_one_reporting, list(enumerate(units)))
     return ds.with_layer(Domain.VOXEL, ctx.layer("name"), out.seal())
 register_node(
-    _compute_threshold, op_key="analysis.threshold", label="Threshold",
+    batch_aware(_compute_threshold), op_key="analysis.threshold", label="Threshold",
     category="analysis",
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.VOXEL}),
     inputs=[InDataset(),

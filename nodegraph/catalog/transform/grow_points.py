@@ -22,6 +22,8 @@ from nodegraph.registry import (
 from nodegraph.structure import COORD_COLUMNS, StructureTable, label_components
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import on_layer
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
 from nodegraph.catalog._shared.labels import (
     _label_centroids,
@@ -713,8 +715,26 @@ def _compute_grow_points(ctx: EvalContext) -> Dataset:
     zk = "subpixel" if volumetric else "plane_index"
     return (ds.with_layer(Domain.VOXEL, name, raster)
             .with_structure(StructureTable(Domain.LABEL, table, layer=name, z_kind=zk)))
+
+def _columns_grow_points(params, modes, incoming):
+    """The grown-region Label table. Its schema depends on which SOURCE was grown, exactly as
+    the compute's ``keys`` tuple does: growing points counts how many fell in each region
+    (``n_points``, with the seed ``radius_um``), growing labels counts how many regions merged
+    (``n_regions``, with the geometry column the ``grow`` lever names). Both are declared —
+    the branch is decided by which layer socket is wired, which is not a param this pass can
+    read, and under-declaring one would make a real column unpickable."""
+    try:
+        name = str((params or {}).get("name") or "grown")
+        base = ("id", "m", "t", "c", "area", "z", "y", "x")
+        return on_layer(Domain.LABEL, name,
+                        base + ("n_points", "radius_um", "n_regions", "distance_um",
+                                "scale"))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
-    _compute_grow_points, op_key="transform.grow_points", label="Grow",
+    batch_aware(_compute_grow_points), op_key="transform.grow_points", label="Grow",
+    adds_columns=_columns_grow_points,
     category="transform",
     # Nothing is required unconditionally: the point branch reads no pixels at all (just
     # `ds.axes`, to size the raster it writes) while the three label branches read a whole

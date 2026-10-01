@@ -10,6 +10,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InInt, InString, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
 from nodegraph.catalog._shared.planes import _each_volume_p
 
 def _compute_multiotsu(ctx: EvalContext) -> Dataset:
@@ -31,7 +32,7 @@ def _compute_multiotsu(ctx: EvalContext) -> Dataset:
         out[m, t, :, c] = np.digitize(vol, th)
     return ds.with_layer(Domain.VOXEL, ctx.layer("name"), out)
 register_node(
-    _compute_multiotsu, op_key="analysis.multiotsu", label="Multi-Otsu",
+    batch_aware(_compute_multiotsu), op_key="analysis.multiotsu", label="Multi-Otsu",
     category="analysis",
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.VOXEL}),
     inputs=[InDataset(), InInt("classes", "Classes", default=3, field=False,

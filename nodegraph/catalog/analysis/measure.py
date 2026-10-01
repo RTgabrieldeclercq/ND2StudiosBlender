@@ -1,4 +1,4 @@
-"""Measure (``analysis.measure``) — Per-label statistics of the image (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops; or, on Point members, each detection's µm position and the intensity of the voxel it sits on."""
+"""Measure (``analysis.measure``) — Per-label statistics of the image (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops; or, on Point members, each detection's µm position and the intensity of the voxel it sits on. Both branches also report each row's absolute stage position (`stage_x_um`/`stage_y_um`/`stage_z_um`), for comparing objects across a multi-position acquisition."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDatase
 from nodegraph.structure import COORD_COLUMNS, StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import on_layer, resolved_layer
 from nodegraph.catalog._shared.labels import (
     _label_raster,
     _point_layers,
@@ -125,6 +127,78 @@ def _measure_shape_columns(raster6: np.ndarray, names: Sequence[str], *,
                         for lid, val in zip(tbl["label"], tbl[p]):
                             out[p][int(lid)] = float(val)
     return out
+def _stage_position_columns(ds: Dataset, m: np.ndarray, x_um: np.ndarray, y_um: np.ndarray,
+                            z_index: np.ndarray) -> Dict[str, np.ndarray]:
+    """``stage_x_um``/``stage_y_um``/``stage_z_um`` — each row's LOCAL ``x_um``/``y_um``
+    (this field's own physical position) plus its multipoint's absolute corner
+    (:func:`nodegraph.placement.field_box`), and its absolute focus
+    (:func:`nodegraph.placement.z_um_of_slice`) at its own z-index ``z_index`` (a Point or
+    Label row's ``z`` column — an integer plane index or a subpixel centroid, whichever
+    ``z_um_of_slice`` was written to take; the two ``z_kind`` provenances are one code path
+    there exactly as they are for the local ``z_um`` above).
+
+    One :func:`field_box` call and two :func:`z_um_of_slice` samples per DISTINCT
+    multipoint, never per row — ``z_um_of_slice`` is affine in ``k``
+    (``z_nom + dir*(k-home)*step``), so sampling ``k=0`` and ``k=1`` recovers the intercept
+    and slope without a second copy of the ``z_home_index``/``z_bottom_to_top`` anchor math,
+    which must never drift from the one copy :mod:`nodegraph.placement` already owns.
+
+    NaN wherever the field cannot be placed (no ``pixel_size_um``, no stage log at all, or —
+    for Z only — no focus-log anchoring on a multi-slice stack): never a guessed 0, which is
+    a legal position, matching the rule :mod:`nodegraph.placement` itself follows."""
+    from nodegraph.placement import field_box, z_um_of_slice
+    md, axes = ds.metadata, ds.axes
+    mi = np.asarray(m, dtype=np.int64)
+    zk = np.asarray(z_index, dtype=float)
+    n = mi.shape[0]
+    sx = np.full(n, np.nan)
+    sy = np.full(n, np.nan)
+    sz = np.full(n, np.nan)
+    for mv in np.unique(mi):
+        mv = int(mv)
+        if not (0 <= mv < axes.m):
+            continue
+        mask = mi == mv
+        box = field_box(md, axes, mv)
+        if box is not None:
+            sx[mask] = box.x0 + x_um[mask]
+            sy[mask] = box.y0 + y_um[mask]
+        z0 = z_um_of_slice(md, axes, mv, 0.0)
+        if z0 is None:
+            continue
+        if axes.z <= 1:
+            sz[mask] = z0
+            continue
+        z1 = z_um_of_slice(md, axes, mv, 1.0)
+        if z1 is not None:
+            sz[mask] = z0 + (z1 - z0) * zk[mask]
+    return {"stage_x_um": sx, "stage_y_um": sy, "stage_z_um": sz}
+def _label_position_columns(ds: Dataset, layer: str, row_ids: np.ndarray, *,
+                            px: float, zs: float) -> Dict[str, np.ndarray]:
+    """Local ``x_um``/``y_um``/``z_um`` and absolute ``stage_x_um``/``stage_y_um``/
+    ``stage_z_um`` for ``row_ids`` (measure's own ``id`` order), from the region centroid
+    columns the label/segment node already wrote (invariant ``m``/``z``/``y``/``x``,
+    :mod:`nodegraph.structure`). Measure never recomputes a centroid — it looks the
+    original one up **by id**, the same way the ``shape`` columns above look up regionprops
+    output — because :meth:`Dataset.with_structure` only replaces the columns THIS node's
+    own table carries, so the producer's ``m``/``z``/``y``/``x`` survive untouched on the
+    same ``(LABEL, layer)`` attributes for measure to read back."""
+    ids_attr = ds.get(Domain.LABEL, "id", layer=layer)
+    orig_ids = ids_attr.values
+
+    def _by_id(name: str) -> Dict[int, float]:
+        attr = ds.get(Domain.LABEL, name, layer=layer)
+        return {int(i): float(v) for i, v in zip(orig_ids, attr.values)}
+
+    m_by_id, z_by_id = _by_id("m"), _by_id("z")
+    y_by_id, x_by_id = _by_id("y"), _by_id("x")
+    m = np.array([m_by_id.get(int(i), -1) for i in row_ids], dtype=np.int64)
+    z_px = np.array([z_by_id.get(int(i), np.nan) for i in row_ids], dtype=float)
+    y_px = np.array([y_by_id.get(int(i), np.nan) for i in row_ids], dtype=float)
+    x_px = np.array([x_by_id.get(int(i), np.nan) for i in row_ids], dtype=float)
+    out = {"z_um": z_px * zs, "y_um": y_px * px, "x_um": x_px * px}
+    out.update(_stage_position_columns(ds, m, out["x_um"], out["y_um"], z_px))
+    return out
 def _compute_measure(ctx: EvalContext) -> Dataset:
     """Measure the image over the members of a structure table → columns on that table.
 
@@ -137,6 +211,11 @@ def _compute_measure(ctx: EvalContext) -> Dataset:
     * **``point``** (:func:`_measure_points`) — a detection is dimensionless, so it has a
       *position* and one *sample*: ``x_um``/``y_um``/``z_um`` and the intensity of the voxel
       it sits on, via the Voxel→Point bridge's nearest-voxel rule.
+
+    Both branches also report each row's ABSOLUTE stage position — ``stage_x_um``/
+    ``stage_y_um``/``stage_z_um``, via :func:`_stage_position_columns` — so objects from
+    different multipoints of the same acquisition land in one comparable physical frame in
+    the spreadsheet, not just their own field's local coordinates.
 
     The optional **``raw``** Dataset input serves both: it redirects *which pixels are
     measured* while the structure keeps coming from the main input — the "segment on
@@ -158,13 +237,17 @@ def _measure_points(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
     **voxel it sits on**, as columns on its own Point table.
 
     A Point row is dimensionless: there is no region to reduce over, so `stats` and `shape`
-    are `available_in`-gated away and this branch writes a fixed set of four columns:
+    are `available_in`-gated away and this branch writes a fixed set of columns:
 
-    ==================  ==========================================================
-    ``x_um``/``y_um``   the row's own ``x``/``y`` scaled by ``pixel_size_um``
-    ``z_um``            ``z`` scaled by ``z_step_um`` (0 on a single-plane Dataset)
-    ``mean_intensity``  the value of the nearest voxel to ``(z, y, x)``
-    ==================  ==========================================================
+    ========================================  ==================================================
+    ``x_um``/``y_um``                         the row's own ``x``/``y`` scaled by ``pixel_size_um``
+    ``z_um``                                  ``z`` scaled by ``z_step_um`` (0 on a single-plane Dataset)
+    ``mean_intensity``                        the value of the nearest voxel to ``(z, y, x)``
+    ``stage_x_um``/``stage_y_um``/``stage_z_um``  the ABSOLUTE microscope position — ``x_um``/
+                                               ``y_um``/``z_um`` plus this row's multipoint's
+                                               stage position (:func:`_stage_position_columns`);
+                                               NaN when the file carries no placement metadata
+    ========================================  ==================================================
 
     **Why µm columns rather than just re-emitting z/y/x.** The invariant schema already
     carries ``z``,``y``,``x`` — in **voxel index** units — so those are not something this
@@ -279,6 +362,7 @@ def _measure_points(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
         "z_um": zf * zs, "y_um": yf * px, "x_um": xf * px,
         "mean_intensity": vals,
     }
+    out.update(_stage_position_columns(ds, mm, out["x_um"], out["y_um"], zf))
     # Re-emits the SAME Point layer with the new columns, so its z_kind provenance (§7b)
     # must be carried forward rather than clobbered with the StructureTable default
     # ("subpixel"), which would tell every downstream node this 2D cloud was volumetric.
@@ -296,7 +380,13 @@ def _measure_labels(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
     measurement from the intensity stats above: they read only the label raster, never the
     image, so ``raw`` does not affect them, and lengths are reported in **µm** via the
     voxel ``spacing``. Off by default (they cost a second walk), and the 2D-only ones are
-    refused on a 3D Label table rather than failing inside skimage."""
+    refused on a 3D Label table rather than failing inside skimage.
+
+    **Position (unconditional, like ``mean``).** ``x_um``/``y_um``/``z_um`` — the region's
+    own centroid (already computed by the label producer, looked up by id) scaled to
+    physical units — and ``stage_x_um``/``stage_y_um``/``stage_z_um``, its ABSOLUTE
+    microscope position (:func:`_label_position_columns`, :func:`_stage_position_columns`).
+    NaN wherever the file carries no placement metadata, never a guessed 0."""
     ax = ds.axes
     # the ONE Label instance on the wire, whatever it is called (`_resolve_layer`) — the
     # literal default agreed only with `analysis.segment`'s own default name.
@@ -366,9 +456,50 @@ def _measure_labels(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
             # perfect circle), so a missing region must not read as a round one.
             cols[name] = np.array([lookup.get(int(i), np.nan) for i in row_ids],
                                   dtype=float)
+    # ── position (V2.29): local centroid + absolute stage position ───────────────────
+    # Uses the SAME px/z_step_um the shape pass above would (a fresh ctx.calib read here
+    # rather than sharing that block's locals, since `shape_names` may be empty and this
+    # runs unconditionally).
+    px = ctx.calib("pixel_size_um") or 0.1
+    zs = (ctx.calib("z_step_um") or 0.5) if ax.z > 1 else 0.0
+    cols.update(_label_position_columns(ds, layer, cols["id"], px=px, zs=zs))
     return ds.with_structure(StructureTable(Domain.LABEL, cols, layer=layer, z_kind=zk))
+
+def _columns_measure(params, modes, incoming):
+    """The columns each branch writes, resolved through the SAME selectors the compute
+    parses (V2.28) — so a stat the user has not ticked is not offered as a condition.
+
+    ``_measure_stats``/``_measure_shape`` REFUSE an unknown name, which is right at pull
+    time and wrong here: a half-typed selector is the normal state of a text box mid-edit,
+    and raising would blank every node's envelope graph-wide. So both are called
+    defensively and a selector that does not parse yet contributes nothing.
+
+    ``mean`` is forced by the compute, so ``mean_intensity`` is declared unconditionally on
+    the label branch — it stays a stable downstream key however the selector is edited."""
+    try:
+        if (modes or {}).get("target") == "point":
+            layer = resolved_layer(params, "points", incoming, Domain.POINT)
+            return on_layer(Domain.POINT, layer,
+                            ("z_um", "y_um", "x_um", "mean_intensity",
+                             "stage_x_um", "stage_y_um", "stage_z_um"))
+        layer = str((params or {}).get("labels") or "labels")
+        names = ["mean_intensity", "x_um", "y_um", "z_um",
+                 "stage_x_um", "stage_y_um", "stage_z_um"]
+        try:
+            names += [_MEASURE_COLUMNS[s] for s in _measure_stats(params.get("stats", ""))]
+        except Exception:
+            pass                             # a selector mid-edit offers only the forced one
+        try:
+            names += list(_measure_shape(params.get("shape", "") or ""))
+        except Exception:
+            pass
+        return on_layer(Domain.LABEL, layer, dict.fromkeys(names))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
-    _compute_measure, op_key="analysis.measure", label="Measure", category="analysis",
+    batch_aware(_compute_measure), op_key="analysis.measure", label="Measure", category="analysis",
+    adds_columns=_columns_measure,
     extra_layers=_layers_measure,
     # VOXEL is unconditional because it is the IMAGE domain — both branches measure pixels,
     # and §4f is explicit that the image is not a per-branch layer requirement. What DOES
@@ -394,15 +525,18 @@ register_node(
                     "label":
                         "Measure the regions of a Label table (Segmentation / Connected "
                         "Components): per-region intensity statistics over every voxel the "
-                        "region owns, plus optional µm regionprops geometry. This is the "
+                        "region owns, plus optional µm regionprops geometry, plus each "
+                        "region's `x_um`/`y_um`/`z_um` centroid and absolute "
+                        "`stage_x_um`/`stage_y_um`/`stage_z_um` position. This is the "
                         "branch `stats` and `shape` belong to; it needs a raster whose ids "
                         "divide the foreground into objects, not a bare mask.",
                     "point":
                         "Measure the detections of a Point table (Spot / Particle Detection, "
                         "Label to Points): writes `x_um`/`y_um`/`z_um` — the physical "
                         "position, which the invariant pixel `x`/`y`/`z` columns are not — "
-                        "and `mean_intensity`, the value of the single voxel each detection "
-                        "sits on. `stats` and `shape` are hidden here: there is no region to "
+                        "`mean_intensity`, the value of the single voxel each detection "
+                        "sits on, and absolute `stage_x_um`/`stage_y_um`/`stage_z_um`. "
+                        "`stats` and `shape` are hidden here: there is no region to "
                         "reduce over or fit an ellipse to.",
                 })],
     inputs=[InDataset(), _InRaw(),
@@ -533,7 +667,10 @@ register_node(
                 "optional µm-aware `shape` geometry columns (eccentricity, perimeter, "
                 "solidity, …) from regionprops. On POINT members: each detection's physical "
                 "position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the "
-                "voxel it sits on. Optional `raw` input measures THOSE pixels instead "
+                "voxel it sits on. Both branches also report each row's absolute "
+                "`stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing "
+                "objects across a multi-position acquisition (NaN when the file carries no "
+                "placement metadata). Optional `raw` input measures THOSE pixels instead "
                 "(segment on enhanced, measure on raw); the structure, the labels and the "
                 "shape metrics always come from the main input.",
 )

@@ -23,6 +23,8 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import on_layer
 from nodegraph.catalog._shared.labels import (
     _label_raster,
     _resolve_label_instance,
@@ -750,8 +752,33 @@ def _compute_histogram_threshold(ctx: EvalContext) -> Dataset:
         out = out.with_structure(StructureTable(Domain.LABEL, cols_out, layer=pop_layer,
                                                 z_kind="plane_index"))
     return out
+
+def _columns_histogram_threshold(params, modes, incoming):
+    """The sub-object Label table this node writes, plus the per-PARENT columns it writes
+    back onto the population it thresholded within (V2.28).
+
+    ``parent_id`` is what makes a sub-object joinable to the parent it was found in, and
+    ``n_sub`` / ``frac_above`` are the parent-side summary of that same pass — two different
+    tables, so both are declared or half the result would be unconditionable.
+
+    The parent half is declared only when the ``regions`` socket names the layer explicitly:
+    the compute resolves it through ``_resolve_populations`` against the wire, which an
+    edit-time pass cannot do, and guessing would offer columns on a layer that may not be the
+    one written to."""
+    try:
+        cols = ("id", "m", "t", "c", "area", "z", "y", "x", "mean_intensity", "level",
+                "parent_id")
+        out = on_layer(Domain.LABEL, str((params or {}).get("name") or "labels"), cols)
+        parent = str((params or {}).get("regions") or "").strip()
+        if parent:
+            out += on_layer(Domain.LABEL, parent, ("n_sub", "frac_above"))
+        return out
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
-    _compute_histogram_threshold, op_key="analysis.histogram_threshold",
+    batch_aware(_compute_histogram_threshold), op_key="analysis.histogram_threshold",
+    adds_columns=_columns_histogram_threshold,
     label="Histogram Threshold", category="analysis",
     reads_domains=frozenset({Domain.VOXEL}),
     adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),

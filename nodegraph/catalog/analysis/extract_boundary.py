@@ -11,6 +11,7 @@ from nodegraph.registry import DimMode, Granularity, InDataset, InString, OutDat
 from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.dim_footprint import _DIM_KAX
 from nodegraph.catalog._shared.labels import _resolve_layer, _voxel_layers
 
@@ -98,8 +99,26 @@ def _compute_extract_boundary(ctx: EvalContext) -> Dataset:
         cols["id"] = np.arange(len(cols["id"]), dtype=np.int64)   # global-unique ids
         merged = StructureTable(Domain.POINT, cols, layer=out_layer, z_kind=zk)
     return ds.with_structure(merged)
+
+def _columns_extract_boundary(params, modes, incoming):
+    """The contour Point table: the invariant schema plus ``contour_id``, which says WHICH
+    closed loop each vertex belongs to (``nodegraph.boundary.extract_boundary``). Without it
+    a condition could test single vertices but never a whole outline.
+
+    Mirrors :func:`_layers_extract_boundary`'s derived-name rule exactly — a catalog keyed on
+    a name the layer catalog does not also carry would offer columns under a layer the picker
+    never lists."""
+    try:
+        src = str((params or {}).get("labels") or "") or "labels"
+        return on_layer(Domain.POINT,
+                        str((params or {}).get("name") or "") or "%s_boundary" % src,
+                        POINT_INVARIANT + ("contour_id",))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
     _compute_extract_boundary, op_key="analysis.extract_boundary",
+    adds_columns=_columns_extract_boundary,
     label="Extract Boundary", category="analysis",
     extra_layers=_layers_extract_boundary,
     # identical contract to detect.spots / detect.particles: a Voxel raster in, Points out

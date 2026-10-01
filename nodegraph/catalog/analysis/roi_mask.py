@@ -10,6 +10,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InString, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
 
 # ── ROI mask (serializable shape list → boolean Voxel mask, 2D) ────────────────
 
@@ -60,7 +61,7 @@ def _compute_roi_mask(ctx: EvalContext) -> Dataset:
     mask6 = np.broadcast_to(m2d, (ax.m, ax.t, ax.z, ax.c, ax.y, ax.x)).copy()
     return ds.with_layer(Domain.VOXEL, ctx.layer("name"), mask6)
 register_node(
-    _compute_roi_mask, op_key="analysis.roi_mask", label="ROI Mask",
+    batch_aware(_compute_roi_mask), op_key="analysis.roi_mask", label="ROI Mask",
     category="analysis",
     # reads only the image EXTENT (pure pixel geometry), so nothing is required of the
     # input beyond a provider; it adds the ROI raster.

@@ -14,6 +14,7 @@ from nodegraph.registry import Granularity, InDataset, InFloat, InInt, Mode, Out
 from nodegraph.streaming import MapComputeProvider, stream_fp
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
 from nodegraph.catalog._shared.drift_layers import _layers_drift
 from nodegraph.catalog._shared.sampling import _sampled
 
@@ -118,7 +119,7 @@ def _compute_stabilize(ctx: EvalContext) -> Dataset:
     res = res.with_layer(Domain.FRAME, "drift_y", dy)
     return res.with_layer(Domain.FRAME, "drift_x", dx)
 register_node(
-    _compute_stabilize, op_key="registration.stabilize", label="Registration",
+    batch_aware(_compute_stabilize), op_key="registration.stabilize", label="Registration",
     extra_layers=_layers_drift,
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.FRAME}),
     category="registration",

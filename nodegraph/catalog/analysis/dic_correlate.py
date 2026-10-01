@@ -22,6 +22,7 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
 from nodegraph.catalog._shared.progress import _UnitBar
 
@@ -217,8 +218,25 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
     return (ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
         .with_metadata(**prov_md))
+
+def _columns_dic_correlate(params, modes, incoming):
+    """The correlation grid this node writes, as ``_shared.dvc._dvc_rows`` builds it.
+
+    Derived from :func:`dvc_field_columns` rather than transcribed, so the declaration and the
+    flattener cannot drift on the axis-dependent ``disp_``/``strain_`` names. The strain block
+    is declared unconditionally: it is present whenever the solver was asked for it, and the
+    only cost of naming it on a strain-free run is a menu entry the compute then refuses by
+    name — whereas omitting it would make a real column unpickable, which is the direction
+    this catalog must not err in."""
+    try:
+        return on_layer(Domain.POINT, str((params or {}).get("name") or "dic"),
+                        list(dvc_field_columns(is_3d=False)) + ["qfactor"])
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
     _compute_dic_correlate, op_key="analysis.dic_correlate", label="DIC (pyALDIC)",
+    adds_columns=_columns_dic_correlate,
     category="analysis",
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
     inputs=[

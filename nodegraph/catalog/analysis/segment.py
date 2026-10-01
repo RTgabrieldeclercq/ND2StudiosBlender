@@ -28,6 +28,8 @@ from nodegraph.trained import (stardist_config, stardist_model_dir,
                               stardist_note, stardist_trained)
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import LABEL_INVARIANT, on_layer
 from nodegraph.catalog._shared.dim_footprint import _DIM_GRAN_GLOBAL, _DIM_KAX
 from nodegraph.catalog._shared.progress import _UnitBar
 from nodegraph.catalog._shared.units import to_pixels_v2
@@ -883,9 +885,18 @@ _STARDIST_2D_MODELS: Tuple[str, ...] = (
     "2D_versatile_fluo", "2D_versatile_he", "2D_paper_dsb2018", "2D_demo")
 _STARDIST_3D_MODELS: Tuple[str, ...] = ("3D_demo",)
 _CELLSAM_MODELS: Tuple[str, ...] = ("cellsam_general", "cellsam_extra")
+
+def _columns_segment(params, modes, incoming):
+    """The invariant Label schema every segmentation backend emits (V2.28). Independent of
+    the `method` lever: the table is assembled by `structure._label_table` whichever
+    detector found the regions. Total by contract (runs on every keystroke)."""
+    return on_layer(Domain.LABEL, str((params or {}).get("name") or "labels"),
+                    LABEL_INVARIANT)
+
 register_node(
-    _compute_segment, op_key="analysis.segment", label="Segmentation",
+    batch_aware(_compute_segment), op_key="analysis.segment", label="Segmentation",
     category="analysis",
+    adds_columns=_columns_segment,
     # STATIC on purpose, and left alone by the V2.22 per-mode sweep: this is the image
     # domain every source already supplies (`io.load` adds VOXEL), not a layer requirement
     # that varies by method. The only method-specific Voxel layer is watershed's `mask`,

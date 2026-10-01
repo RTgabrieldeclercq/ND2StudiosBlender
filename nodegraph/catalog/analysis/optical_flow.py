@@ -19,6 +19,7 @@ from nodegraph.registry import (
 )
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
 from nodegraph.catalog._shared.progress import _UnitBar
 
 # ── Optical Flow — the DENSE motion sibling of analysis.piv ─────────────────────
@@ -147,7 +148,7 @@ def _compute_optical_flow(ctx: EvalContext) -> Dataset:
 
 
 register_node(
-    _compute_optical_flow, op_key="analysis.optical_flow", label="Optical Flow",
+    batch_aware(_compute_optical_flow), op_key="analysis.optical_flow", label="Optical Flow",
     category="analysis",
     extra_layers=_layers_optical_flow,
     reads_domains=frozenset(), adds_domains=frozenset({Domain.VOXEL}),

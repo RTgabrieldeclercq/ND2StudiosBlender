@@ -20,6 +20,7 @@ from nodegraph.registry import (
 )
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import MESH_ELEMENT, on_layer
 from nodegraph.catalog._shared.labels import (
     _point_layers,
     _resolve_layer,
@@ -209,8 +210,16 @@ def _compute_tessellate(ctx: EvalContext) -> Dataset:
     return with_mesh(ds, tables, provenance={
         "boundary": mode, "source": src_kind, "src_layer": str(src_layer),
         "voxel_size_um": [float(v) for v in vox]})
+
+def _columns_tessellate(params, modes, incoming):
+    """The MESH element table (``nodegraph.mesh.build_mesh_tables``): one row per closed
+    surface, with ``src_label`` joining it back to the region or cluster it was built from and
+    the vertex/face spans that locate its geometry."""
+    return on_layer(Domain.MESH, str((params or {}).get("name") or "mesh"), MESH_ELEMENT)
+
 register_node(
     _compute_tessellate, op_key="analysis.tessellate", label="Tessellate",
+    adds_columns=_columns_tessellate,
     category="analysis",
     # POINT in three modes, VOXEL in the fourth — the split that used to be inexpressible
     # and shipped as `frozenset()` (V2.22). `label_surface` wants only the RASTER, not a

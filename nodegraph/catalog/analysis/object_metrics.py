@@ -12,6 +12,8 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, InInt, InString, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import member_layer, on_layer
 from nodegraph.catalog._shared.objects import (
     _InFrameInterval,
     _frame_interval_s,
@@ -261,9 +263,30 @@ def _compute_object_metrics(ctx: EvalContext) -> Dataset:
     for name, values in out.items():
         res = res.with_layer(domain, name, np.asarray(values, dtype=float), layer=layer)
     return res
+
+def _columns_object_metrics(params, modes, incoming):
+    """The column(s) each selected metric writes onto the member layer (V2.28), read from
+    the same ``_OBJECT_METRIC_COLUMNS`` map the compute writes through — so ``velocity``
+    correctly offers ``vy``/``vx`` rather than a column called ``velocity`` that no table
+    ever carries.
+
+    ``_object_metric_names`` refuses an unknown name; called defensively here for
+    ``analysis.measure``'s reason — a selector mid-edit must not blank the envelope."""
+    try:
+        dom, lyr = member_layer(params, modes)
+        try:
+            names = _object_metric_names(params.get("metrics", ""))
+        except Exception:
+            return ()                        # a selector mid-edit offers nothing new
+        cols = [c for n in names for c in _OBJECT_METRIC_COLUMNS.get(n, ())]
+        return on_layer(dom, lyr, dict.fromkeys(cols))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
-    _compute_object_metrics, op_key="analysis.object_metrics", label="Object Metrics",
+    batch_aware(_compute_object_metrics), op_key="analysis.object_metrics", label="Object Metrics",
     category="analysis",
+    adds_columns=_columns_object_metrics,
     extra_layers=_layers_object_metrics,
     # ONE of the two, never both — the `analysis.object_field` note applies verbatim:
     # `_object_table` is shared, so the two nodes' requirements are the same function of

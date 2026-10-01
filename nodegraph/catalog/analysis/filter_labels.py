@@ -21,6 +21,8 @@ from nodegraph.spill import dense_output
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.batch import batch_aware
+from nodegraph.catalog._shared.columns import carried_over
 from nodegraph.catalog._shared.labels import _label_raster, _resolve_label_instance
 from nodegraph.catalog._shared.planes import _each_plane
 from nodegraph.catalog._shared.scope import LATTICE_SCOPES, ScopeMode, scope_row_key
@@ -272,9 +274,25 @@ def _compute_filter_labels(ctx: EvalContext) -> Dataset:
                                              z_kind=zk))
 
 
+
+def _columns_filter_labels(params, modes, incoming):
+    """Every column of the filtered table, re-offered under the OUTPUT layer, plus ``cut``
+    (V2.28) — matching the compute, which keeps "the surviving rows of EVERY column, plus
+    the cut each was judged against".
+
+    Carried rather than invented: this node measures nothing, so its whole catalog is the
+    incoming one under a new key. Declaring only ``cut`` would amputate the column list at
+    exactly the node a user filters with, and a condition downstream of a filter is the
+    ordinary case rather than an exotic one. Total by contract."""
+    return carried_over(incoming, Domain.LABEL,
+                        str((params or {}).get("labels") or "labels"),
+                        str((params or {}).get("name") or "labels_kept"),
+                        extra=("cut",))
+
 register_node(
-    _compute_filter_labels, op_key="analysis.filter_labels", label="Filter Labels",
+    batch_aware(_compute_filter_labels), op_key="analysis.filter_labels", label="Filter Labels",
     category="analysis",
+    adds_columns=_columns_filter_labels,
     reads_domains=frozenset({Domain.VOXEL, Domain.LABEL}),
     adds_domains=frozenset({Domain.VOXEL, Domain.LABEL}),
     inputs=[
@@ -290,6 +308,7 @@ register_node(
                  "the wire; the survivors go to the output layer below, so both are available "
                  "downstream and the viewer can show what was dropped."),
         InString("column", "Column", field=False, default="mean_intensity",
+                 column_in=Domain.LABEL, column_from="labels",
                  description=
                  "Which per-label column supplies the one number each label is judged by. Any "
                  "column on the table works, which is the point — `mean_intensity` / "
@@ -297,8 +316,8 @@ register_node(
                  "`eccentricity` / `solidity` / `perimeter` from its `shape` selector, the "
                  "physical µm areas from Object Metrics, or `n_sub` / `frac_above` from "
                  "Threshold Per Label. Naming a column the table does not carry is refused "
-                 "with the list it does carry. Deliberately NOT a closed dropdown: a table can "
-                 "hold columns no node in this catalog knows about."),
+                 "with the list it does carry. A dropdown, not free text: every producer declares "
+                 "the columns it writes, so this offers what the graph actually measured."),
         InString("name", "Output layer", field=False, default="labels_kept",
                  layer_out=(Domain.VOXEL, Domain.LABEL),
                  description=
