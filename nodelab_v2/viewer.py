@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
+from nodegraph.metadata import POSITION_GROUP_KEY, SOURCE_FILE_KEY
 from nodegraph.domains import Domain
 from nodegraph.mesh import mesh_part as MESH_PART
 from nodegraph.provider import subset_index
@@ -938,6 +939,11 @@ class ViewerPanel(QWidget):
     on*, an unpicked Z means *the whole volume*, because a 3D node needs one."""
 
     request_changed = Signal()
+    #: the look of node ``node_id`` settled after a change — a LUT window, a gamma, a channel
+    #: colour (2026-09-30). Debounced, so a slider drag emits once when the hand stops rather
+    #: than on every tick: the Movie Editor stamps these values into a timeline, and every
+    #: stamp is a document edit.
+    display_changed = Signal(str)
     #: the M/T/Z picks changed — the window re-scopes the runner and re-pulls.
     selection_changed = Signal()
     #: the ITERATION strip moved: which of an Iterate node's results to show. The window
@@ -959,6 +965,14 @@ class ViewerPanel(QWidget):
     #: that EVERY frame is wanted in order, which is what licenses a whole-series preload —
     #: the scrub prefetcher deliberately will not do that from a cursor nudge.
     playing = Signal(bool, str)
+    #: an overlay source's ◀▶ stepper moved: ``(overlay node, dt, dz)`` — the ABSOLUTE
+    #: display-only offset of that source's frame from its mapped one (``0, 0`` resets). The
+    #: window hands it to the runner; nothing is written to the document.
+    overlay_step = Signal(str, int, int)
+    #: Pin T / Pin Z on an overlay source: ``(overlay node, "t"|"z", primary index, the
+    #: source's index on screen)`` — "these frames go together". The window writes it into
+    #: that Overlay's ``t_pins`` / ``z_pins`` — the viewer never touches the document.
+    overlay_pin = Signal(str, str, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1042,8 +1056,10 @@ class ViewerPanel(QWidget):
             sld = FrameStrip(ax)
             sld.setRange(0, 0)
             sld.unpicked_note = (
-                "nothing picked — troubleshooting runs the whole z range" if ax == "z"
-                else "nothing picked — troubleshooting runs the frame the cursor is on")
+                "nothing picked — troubleshooting runs the whole z range, "
+                "and play steps through every frame" if ax == "z"
+                else "nothing picked — troubleshooting runs the frame the cursor is on, "
+                "and play steps through every frame")
             sld.valueChanged.connect(lambda _v, a=ax: self._on_slider(a))
             sld.selectionChanged.connect(lambda a=ax: self._on_frame_pick(a))
             val = QLabel("0/0")
@@ -1053,7 +1069,8 @@ class ViewerPanel(QWidget):
             play.setText("▶")
             play.setCheckable(True)
             play.setAutoRaise(True)
-            play.setToolTip(f"Play / pause the {ax.upper()} axis")
+            play.setToolTip(f"Play / pause the {ax.upper()} axis"
+                             " (loops the picked frames when any are selected)")
             play.toggled.connect(lambda on, a=ax: self._on_play(a, on))
             fps = QDoubleSpinBox()
             fps.setRange(0.5, 60.0)
@@ -1078,6 +1095,24 @@ class ViewerPanel(QWidget):
         self._axes_box = QWidget()
         self._axes_box.setLayout(grid)
         cv.addWidget(self._axes_box)
+
+        # ── the overlay SOURCE strip (2026-09-30) ──────────────────────────────────
+        # One row per overlaid file: its label, the frame and plane it is showing right now,
+        # ◀▶ steppers that move THAT source's frame on its own (display-only — for finding
+        # the frame that goes with this one), and Pin T / Pin Z to say "these go together".
+        # Hidden when nothing is overlaid. Play all's sub-tick lives here too: a source
+        # recorded at n x the primary's rate asks for n ticks per primary frame.
+        self._t_sub = 0
+        self._n_sub = 1
+        self._sub_step = 1
+        self._ovl_frames: List[Dict[str, Any]] = []
+        self._src_rows: Dict[str, Dict[str, Any]] = {}
+        self._src_box = QWidget()
+        self._src_lay = QVBoxLayout(self._src_box)
+        self._src_lay.setContentsMargins(0, 0, 0, 0)
+        self._src_lay.setSpacing(0)
+        self._src_box.hide()
+        cv.addWidget(self._src_box)
 
         # ── the ITERATION strip (V2.19) ─────────────────────────────────────────
         # Deliberately NOT a fourth member of `_AXES`: iteration is not an acquisition
@@ -1161,9 +1196,13 @@ class ViewerPanel(QWidget):
         # NAME so the choice follows the channel across nodes/pulls rather than being
         # pinned to a position, and survives every _rebuild_channels.
         self._chan_color_user: Dict[str, Tuple[int, int, int]] = {}
-        #: colour keys of composed (overlay / merged) channels that have appeared before, so
-        #: each is auto-enabled ONCE rather than on every pull — see `_apply_axes`.
-        self._chan_seen: set = set()
+        #: colour keys (channel NAMES) the user switched OFF by hand. Every other channel is
+        #: shown — see `_rebuild_channels`. Only the toggle writes it.
+        self._chan_off: set = set()
+        #: node id → the channel identity and source files its cached LUTs were taken
+        #: from, so a node whose content changed under the same id re-auto-contrasts —
+        #: see `_retire_stale_luts`.
+        self._lut_ident: Dict[str, Tuple[tuple, set]] = {}
         self._active_channels: List[int] = [0]
         self._auto_on = False
         self._split = False
@@ -1211,6 +1250,9 @@ class ViewerPanel(QWidget):
         self._overlay_chans: Dict[int, str] = {}
         #: {channel index: (blend mode, opacity, checker cells)} for those same channels.
         self._overlay_style: Dict[int, Tuple[int, float, float]] = {}
+        #: {display channel: (secondary node id, its own channel)} — where an overlay
+        #: channel's pixels came FROM, so its LUT can follow that file instead of the crop.
+        self._overlay_src: Dict[int, Tuple[str, int]] = {}
         self._overlay_note: str = ""
         #: blink-comparator state: the timer that toggles `_overlay_blink`, and the phase.
         #: Flicker is deliberately NOT a shader mode — it is not a compositing rule, it is
@@ -1223,6 +1265,15 @@ class ViewerPanel(QWidget):
         self._clim: Dict[Tuple[str, int], Tuple[float, float]] = {}
         self._drange: Dict[Tuple[str, int], Tuple[float, float]] = {}   # LUT slider extent
         self._gammas: Dict[Tuple[str, int], float] = {}   # per-channel transfer gamma
+        #: the `_clim` keys whose window the USER set (a drag or a typed value). Every other
+        #: window is the Viewer's own auto-contrast — recomputed when the data changes — and
+        #: is not reported by `display_state`.
+        self._clim_user: set = set()
+        # `display_changed` debounce: restarted by every LUT/colour edit, fires once they stop
+        self._display_timer = QTimer(self)
+        self._display_timer.setSingleShot(True)
+        self._display_timer.setInterval(500)
+        self._display_timer.timeout.connect(self._emit_display_changed)
         self._bit_depth: Optional[int] = None     # significant bit depth (metadata)
         self._clim_node: Optional[str] = None
         self._node_id: Optional[str] = None
@@ -1416,6 +1467,151 @@ class ViewerPanel(QWidget):
     def channels(self) -> Tuple[int, ...]:
         return tuple(sorted(self._active_channels)) or (0,)
 
+    def sub(self) -> int:
+        """The Play-all sub-tick inside the current primary T frame (0 at rest)."""
+        return int(self._t_sub)
+
+    def set_overlay_frames(self, rows: Sequence[Dict[str, Any]], n_sub: int = 1) -> None:
+        """The window's per-source readout (:meth:`EngineRunner.overlay_frame_readout`) and
+        how many Play-all ticks one primary frame is split into. Rebuilds the source strip only
+        when the SET of sources changes; otherwise it just rewrites the numbers, which is what
+        happens on every tick of a playback."""
+        self._n_sub = max(1, int(n_sub or 1))
+        if self._t_sub >= self._n_sub:
+            self._t_sub = 0
+        self._ovl_frames = [dict(r) for r in rows or ()]
+        ids = [str(r["ovl_id"]) for r in self._ovl_frames]
+        if ids != list(self._src_rows):
+            self._rebuild_source_strip()
+        for r in self._ovl_frames:
+            row = self._src_rows.get(str(r["ovl_id"]))
+            if row is None:
+                continue
+            t = "-" if r.get("t") is None else str(r["t"])
+            z = "-" if r.get("z") is None else str(r["z"])
+            dt, dz = (tuple(r.get("offset") or (0, 0)) + (0, 0))[:2]
+            info = f"t {t}/{max(0, int(r.get('n_t', 1)) - 1)}"
+            if int(r.get("n_z", 1)) > 1:
+                info += f" · z {z}/{int(r['n_z']) - 1}"
+            if r.get("t_pinned") or r.get("z_pinned"):
+                info += "  📌" + ("T" if r.get("t_pinned") else "") + \
+                        ("Z" if r.get("z_pinned") else "")
+            if dt or dz:
+                info += f"  (stepped {dt:+d}t {dz:+d}z — pin to keep)"
+            if int(r.get("sub_ticks", 1)) > 1:
+                info += f"  · {int(r['sub_ticks'])}x rate"
+            row["name"].setText(str(r.get("label") or r["ovl_id"]))
+            row["info"].setText(info)
+            row["z_box"].setVisible(int(r.get("n_z", 1)) > 1)
+            row["t_box"].setVisible(int(r.get("n_t", 1)) > 1)
+            row["reset"].setVisible(bool(dt or dz))
+        self._src_box.setVisible(bool(self._ovl_frames) and not self._compact)
+        self._sync_play_tip()
+
+    def _rebuild_source_strip(self) -> None:
+        while self._src_lay.count():
+            item = self._src_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._src_rows = {}
+        for r in self._ovl_frames:
+            oid = str(r["ovl_id"])
+            box = QWidget()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            name = QLabel(str(r.get("label") or oid))
+            name.setProperty("role", "axis")
+            name.setToolTip("This overlaid source's label — set it on its Overlay node")
+            info = QLabel("")
+            info.setProperty("role", "muted")
+
+            def _btn(text: str, tip: str, fn) -> QToolButton:
+                b = QToolButton()
+                b.setText(text)
+                b.setAutoRaise(True)
+                b.setToolTip(tip)
+                b.clicked.connect(fn)
+                return b
+
+            def _pair(axis: str, oid=oid) -> Tuple[QWidget, QToolButton]:
+                w = QWidget()
+                lay = QHBoxLayout(w)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(0)
+                i = 0 if axis == "t" else 1
+                lay.addWidget(_btn("◀", f"Show this source's previous {axis.upper()} "
+                                        f"(display only)",
+                                   lambda _c=False, a=i: self._step_source(oid, a, -1)))
+                lay.addWidget(_btn("▶", f"Show this source's next {axis.upper()} "
+                                        f"(display only)",
+                                   lambda _c=False, a=i: self._step_source(oid, a, +1)))
+                pin = _btn(f"Pin {axis.upper()}",
+                           f"Pin: this source's {axis.upper()} on screen goes with the "
+                           f"primary's current {axis.upper()}. Written to the Overlay's "
+                           f"{axis}_pins, so the pairing runs through it from now on.",
+                           lambda _c=False, a=axis: self._pin_source(oid, a))
+                lay.addWidget(pin)
+                return w, pin
+
+            t_box, t_pin = _pair("t")
+            z_box, z_pin = _pair("z")
+            reset = _btn("⟲", "Back to the mapped frame (drop the stepped offset)",
+                         lambda _c=False, o=oid: self.overlay_step.emit(o, 0, 0))
+            h.addWidget(name)
+            h.addWidget(info, 1)
+            h.addWidget(t_box)
+            h.addWidget(z_box)
+            h.addWidget(reset)
+            self._src_lay.addWidget(box)
+            self._src_rows[oid] = {"box": box, "name": name, "info": info, "t_box": t_box,
+                                   "z_box": z_box, "t_pin": t_pin, "z_pin": z_pin,
+                                   "reset": reset}
+        self._sync_pin_enabled()
+
+    def _row_of(self, oid: str) -> Optional[Dict[str, Any]]:
+        return next((r for r in self._ovl_frames if str(r["ovl_id"]) == oid), None)
+
+    def _step_source(self, oid: str, axis: int, delta: int) -> None:
+        r = self._row_of(oid)
+        if r is None:
+            return
+        dt, dz = (tuple(r.get("offset") or (0, 0)) + (0, 0))[:2]
+        if axis == 0:
+            dt += int(delta)
+        else:
+            dz += int(delta)
+        self.overlay_step.emit(oid, int(dt), int(dz))
+
+    def _pin_source(self, oid: str, axis: str) -> None:
+        r = self._row_of(oid)
+        if r is None or r.get(axis) is None:
+            self._set_status(f"nothing to pin: this source has no {axis.upper()} frame here")
+            return
+        pri = self._sliders["t" if axis == "t" else "z"].value()
+        self.overlay_pin.emit(oid, axis, int(pri), int(r[axis]))
+
+    def _sync_pin_enabled(self) -> None:
+        """Pins are disabled while PLAYING: a pin is a graph edit, and an edit cancels the
+        preload that is making playback smooth."""
+        on = self._playing_axis is None
+        for row in self._src_rows.values():
+            row["t_pin"].setEnabled(on)
+            row["z_pin"].setEnabled(on)
+
+    def _sync_play_tip(self) -> None:
+        btn = self._play_btns.get("t")
+        if btn is None:
+            return
+        if self._n_sub > 1:
+            btn.setToolTip(f"Play all — each primary frame is held for {self._n_sub} ticks so "
+                           f"the fastest overlaid source shows every one of its frames "
+                           f"(loops the picked frames when any are selected)")
+        else:
+            btn.setToolTip("Play / pause the T axis"
+                           " (loops the picked frames when any are selected)")
+
     def axes(self):
         """The axes of the last delivered payload, or ``None`` before the first pull —
         what the window compares to decide whether two panes' cursors can be linked."""
@@ -1535,7 +1731,7 @@ class ViewerPanel(QWidget):
     # ── result / error ─────────────────────────────────────────────────────────
     def show_result(self, node_id: str, planes, axes, seconds: float,
                     dataset=None, overlay=None, overlay_note: str = "",
-                    overlay_style=None) -> None:
+                    overlay_style=None, overlay_src=None) -> None:
         """Full-pull delivery: refresh dataset/axes/channels, then display. Contrast is
         (re)computed once for a new node/volume and cached across all subsequent frames.
 
@@ -1549,6 +1745,7 @@ class ViewerPanel(QWidget):
             self._axes_key = None          # the channel strip must rebuild for the new set
         self._overlay_chans = ovl
         self._overlay_style = dict(overlay_style or {})
+        self._overlay_src = dict(overlay_src or {})
         self._overlay_note = str(overlay_note or "")
         self._dataset = dataset
         # Contrast is keyed ``(node_id, channel)`` and is now KEPT across a node switch
@@ -1560,9 +1757,13 @@ class ViewerPanel(QWidget):
         self._node_id = node_id
         key = ((axes.m, axes.t, axes.z, axes.c) + self._channel_key(axes, dataset)
                if axes is not None else None)
+        rebuilt = False
+        if axes is not None:
+            self._retire_stale_luts(node_id, axes, dataset)
         if axes is not None and key != self._axes_key:
             self._apply_axes(axes, dataset)
             self._axes_key = key
+            rebuilt = True
         self._axes = axes if axes is not None else self._axes
         # `bit_depth` is refreshed UNCONDITIONALLY, not only inside `_rebuild_channels`.
         # That rebuild is gated on the key above — axis sizes plus channel names/emissions —
@@ -1597,6 +1798,13 @@ class ViewerPanel(QWidget):
                              f"pulled in {seconds:.2f}s")
             return
         self._display(node_id, planes, self._axes)
+        # The pull that produced these planes was made with the PREVIOUS strip's channel set
+        # (`window.pull_node` sends `channels()` before the payload is known), so a rebuild
+        # that switches channels on leaves their buttons lit over a picture without them.
+        # Ask once for the missing planes — the decoded-plane fast path, not a re-pull. Only
+        # on a rebuild: the next delivery carries the same key, so this cannot loop.
+        if rebuilt and any(c not in self._planes for c in self._active_channels):
+            QTimer.singleShot(0, self.request_changed.emit)
         h, w = self._ref_plane.shape[:2]
         npts, nframe = self._point_tally()
         # Report the count whenever the frame carries ANY point, not only when some land on
@@ -1611,10 +1819,11 @@ class ViewerPanel(QWidget):
         note = getattr(self, "_overlay_note", "")
         # The GL composite has a fixed sampler bank (`glview._MAX_CH`) and simply TRUNCATES
         # past it — `active = list(chans)[:_MAX_CH]`, with no error check on the path. A
-        # 4+5 channel merge is enough to reach it (`channel.merge` puts no ceiling on the
-        # channel axis), and the failure is invisible: the extra channel keeps its button,
-        # its LUT and its own split-view pane, and is missing only from the composite. So
-        # say it here rather than leaving the user to notice a colour that never appears.
+        # 4+5 channel merge is enough to reach it (`util.merge`'s merge_axis="C" puts no
+        # ceiling on the channel axis), and the failure is invisible: the extra channel
+        # keeps its button, its LUT and its own split-view pane, and is missing only from
+        # the composite. So say it here rather than leaving the user to notice a colour
+        # that never appears.
         over = len(shown) - _GL_MAX_CH
         self._set_status(
             f"{node_id} · {w}×{h} px · {chans}{extra}{self._solo_note()} · "
@@ -1638,10 +1847,56 @@ class ViewerPanel(QWidget):
         self._display(node_id, planes, self._axes)
         self._measure_fps()
 
+    def _retire_stale_luts(self, node_id: str, axes, dataset) -> None:
+        """Drop ``node_id``'s cached LUTs when the data under that id is no longer the data
+        they were taken from, so every channel auto-contrasts afresh.
+
+        The cache is keyed ``(node, channel)`` and kept across node switches on purpose
+        (a hand-set window is the one thing that cannot be recomputed). But a node id does
+        not name its data: rewire a Gaussian onto a newly loaded file, or switch a Split
+        branch, and channel 0 is a different image under the same key. It then kept the
+        old file's window, which on a dimmer or brighter file reads as a channel that is
+        not displayed at all. A different channel identity (count, names, emissions) or
+        a source-file set disjoint from every file this node has shown means "new data".
+        Disjoint, not unequal: the solo-frame scope and `util.select_group` hand a bundle's
+        node a SUBSET of its files, and that is the same data, not new data.
+
+        Overlay channels are keyed by their source (:meth:`_lut_key`) and are untouched."""
+        md = getattr(dataset, "metadata", {}) or {}
+        files = md.get(SOURCE_FILE_KEY)
+        files = ({str(f) for f in files if f}
+                 if isinstance(files, (list, tuple)) else set())
+        ident = (int(getattr(axes, "c", 1) or 1),) + self._channel_key(axes, dataset)
+        prev = self._lut_ident.get(node_id)
+        if prev is not None:
+            p_ident, p_files = prev
+            if ident != p_ident or (files and p_files and not (files & p_files)):
+                for store in (self._clim, self._drange, self._gammas):
+                    for k in [k for k in store if len(k) == 2 and k[0] == node_id]:
+                        store.pop(k, None)
+                self._clim_user = {k for k in self._clim_user
+                                   if not (len(k) == 2 and k[0] == node_id)}
+                p_files = set()
+            files = files | p_files
+        self._lut_ident[node_id] = (ident, files)
+
+    def forget_display_state(self) -> None:
+        """Forget every per-node LUT and every channel the user switched off — for a new or
+        newly opened graph, whose node ids reuse the last graph's (``n1`` is ``n1`` again)
+        and would otherwise inherit its windows. User-picked channel COLOURS are kept: they
+        are keyed by channel name and mean the same thing in any graph."""
+        self._clim.clear()
+        self._clim_user.clear()
+        self._drange.clear()
+        self._gammas.clear()
+        self._lut_ident.clear()
+        self._chan_off.clear()
+        self._axes_key = None
+
     def _clim_for(self, node_id: str, ch: int, plane: np.ndarray) -> Tuple[float, float]:
         """Percentile contrast bounds for a channel, computed once (native units) and
         cached — this is what keeps ``np.percentile`` off the per-frame hot path."""
-        ckey = (node_id, ch)
+        ckey = self._lut_key(node_id, ch)
         lohi = self._clim.get(ckey)
         if lohi is None:
             a = np.asarray(plane, dtype=float)
@@ -1658,6 +1913,21 @@ class ViewerPanel(QWidget):
                 self._drange[ckey] = self._display_range(plane)
             self._clim[ckey] = lohi
         return lohi
+
+    def _range_for_depth(self, bit_depth, plane: np.ndarray):
+        """The LUT slider extent for a plane whose file declares ``bit_depth``.
+
+        The overlay counterpart to :meth:`_display_range`, which reads ``self._bit_depth``
+        — the VIEWED file's depth. An overlay channel comes from a different file and must
+        be sized by that file's own declaration, or a 12-bit overlay under a 16-bit primary
+        gets a slider four times too long and looks black at the bottom of its range."""
+        try:
+            bits = int(bit_depth) if bit_depth else 0
+        except (TypeError, ValueError):
+            bits = 0
+        if bits and np.issubdtype(np.asarray(plane).dtype, np.integer):
+            return 0.0, float((1 << bits) - 1)
+        return self._display_range(plane)
 
     def _display_range(self, plane: np.ndarray) -> Tuple[float, float]:
         """The LUT histogram extent. Prefer the **significant bit depth** carried on the
@@ -1712,16 +1982,45 @@ class ViewerPanel(QWidget):
             self._detail_rect = None
             if self._detail_timer is not None:
                 self._detail_timer.start()
-        if self._auto_on:
-            clims = {}
-            for ch, pl in self._planes.items():
+        clims = {}
+        for ch, pl in self._planes.items():
+            src = self._overlay_src.get(ch)
+            if src is not None:
+                # An OVERLAY channel is a second FILE and gets its OWN independent LUT.
+                #
+                # Independent in both directions, and both matter. Not the composed crop:
+                # that is a sliver of a differently-sized field, and percentiles from it
+                # gave a (300, 301) window on the WellA3 pair — noise. And not the source
+                # NODE's live clim either, which is what this first tried: reading that ties
+                # the two views together, so tuning the overlay would move the source view
+                # and vice versa. What the two datasets share is the OVERLAP — a placement,
+                # which is metadata — and nothing at all about how either is displayed.
+                #
+                # So: whatever the user has set on THIS channel wins (it is theirs to tune,
+                # in the overlay's own channel strip), else a window taken once from one of
+                # the source file's OWN whole planes. Never recomputed per frame, so it
+                # cannot pulse while scrubbing.
+                seed = src.get("clim")
+                clims[ch] = (self._clim.get(self._lut_key(node_id, ch))
+                             or (tuple(seed) if seed else None)
+                             or self._clim_for(node_id, ch, pl))
+                self._clim.setdefault(self._lut_key(node_id, ch), clims[ch])
+                # The histogram extent comes from the SOURCE's significant depth, not the
+                # primary's: `self._bit_depth` describes the viewed file, and an overlay
+                # channel is not from it. A 12-bit overlay under a 16-bit primary would
+                # otherwise get a slider spanning 65535 for data that stops at 4095.
+                self._drange.setdefault(self._lut_key(node_id, ch),
+                                        self._range_for_depth(src.get("bit_depth"), pl))
+                continue
+            if self._auto_on:
                 lohi = self._auto_clim(pl)
-                self._clim[(node_id, ch)] = lohi           # reflect on the histogram
-                self._drange.setdefault((node_id, ch), self._display_range(pl))
+                self._clim[self._lut_key(node_id, ch)] = lohi           # reflect on the histogram
+                self._clim_user.discard(self._lut_key(node_id, ch))
+                self._drange.setdefault(self._lut_key(node_id, ch), self._display_range(pl))
                 clims[ch] = lohi
-        else:
-            clims = {ch: self._clim_for(node_id, ch, pl) for ch, pl in self._planes.items()}
-        gammas = {ch: self._gammas.get((node_id, ch), 1.0) for ch in self._planes}
+            else:
+                clims[ch] = self._clim_for(node_id, ch, pl)
+        gammas = {ch: self._gammas.get(self._lut_key(node_id, ch), 1.0) for ch in self._planes}
         # Not while playing: the histograms re-sample the plane and repaint their strip on
         # every call — measured 51 ms of a 125 ms frame budget at 8 fps, for a readout
         # nobody can follow frame-by-frame. They freeze for the run and `_stop_play` syncs
@@ -1826,9 +2125,9 @@ class ViewerPanel(QWidget):
         # CPU path: composite the patch with the SAME clim/gamma/blend the overview uses, or
         # it would sit on the image as a differently-contrasted rectangle — and, once the
         # patch carries the overlay's channels too, as a differently-BLENDED one.
-        clims = {ch: self._clim.get((node_id, ch)) or self._clim_for(node_id, ch, pl)
+        clims = {ch: self._clim.get(self._lut_key(node_id, ch)) or self._clim_for(node_id, ch, pl)
                  for ch, pl in planes.items()}
-        gammas = {ch: self._gammas.get((node_id, ch), 1.0) for ch in planes}
+        gammas = {ch: self._gammas.get(self._lut_key(node_id, ch), 1.0) for ch in planes}
         x0, y0, x1, y1 = (float(v) for v in rect01)
         img = composite_with_clim(planes, self._chan_colors, clims, gammas,
                                   self._blend_map(planes), region=(y0, y1, x0, x1))
@@ -1935,7 +2234,7 @@ class ViewerPanel(QWidget):
         return (lo, hi if hi > lo else lo + 1.0)
 
     def _hist_tip(self, ch: int) -> str:
-        ckey = (self._node_id, ch)
+        ckey = self._lut_key(self._node_id, ch)
         lo, hi = self._clim.get(ckey, (0.0, 1.0))
         name = self._chan_names[ch] if ch < len(self._chan_names) else f"Ch{ch}"
         return (f"{name}: {lo:.0f}–{hi:.0f}  γ={self._gammas.get(ckey, 1.0):.2f}\n"
@@ -1956,7 +2255,7 @@ class ViewerPanel(QWidget):
         edits = self._lut_edits.get(ch)
         if edits is None:
             return
-        lo, hi = self._clim.get((self._node_id, ch), (0.0, 1.0))
+        lo, hi = self._clim.get(self._lut_key(self._node_id, ch), (0.0, 1.0))
         for e, val in zip(edits, (lo, hi)):
             if force or not e.hasFocus():
                 e.blockSignals(True)
@@ -1978,15 +2277,16 @@ class ViewerPanel(QWidget):
             hi = lo + 1.0
         # No change (e.g. blur right after a drag already set this window) → nothing to do,
         # and in particular don't re-fit the view.
-        cur = self._clim.get((self._node_id, ch))
+        cur = self._clim.get(self._lut_key(self._node_id, ch))
         if cur is not None and abs(cur[0] - lo) < 1e-9 and abs(cur[1] - hi) < 1e-9:
             return
         if self._lut_auto.isChecked():
             self._lut_auto.setChecked(False)  # a manual value leaves per-frame Auto
-        self._clim[(self._node_id, ch)] = (lo, hi)
+        self._clim[self._lut_key(self._node_id, ch)] = (lo, hi)
+        self._clim_user.add(self._lut_key(self._node_id, ch))
         # widen the histogram's data range if the typed value exceeds it, so the handle
         # can actually sit there, then fit the view to the new window.
-        ckey = (self._node_id, ch)
+        ckey = self._lut_key(self._node_id, ch)
         dmin, dmax = self._drange.get(ckey, (lo, hi))
         self._drange[ckey] = (min(dmin, lo), max(dmax, hi))
         hst = self._hists.get(ch)
@@ -1995,6 +2295,7 @@ class ViewerPanel(QWidget):
             hst.set_window(lo, hi)
             hst.fit_view_to_window()          # auto-fit the new manual value
         self._apply_lut(ch)
+        self._display_timer.start()
 
     def _sync_luts(self) -> None:
         """Refresh EVERY channel's histogram — range, window, gamma, tint, and the
@@ -2002,7 +2303,7 @@ class ViewerPanel(QWidget):
         if self._node_id is None:
             return
         for ch, hst in self._hists.items():
-            ckey = (self._node_id, ch)
+            ckey = self._lut_key(self._node_id, ch)
             pl = self._planes.get(ch)
             if ckey not in self._drange and pl is not None:
                 self._drange[ckey] = self._display_range(pl)
@@ -2025,15 +2326,60 @@ class ViewerPanel(QWidget):
             return
         if self._lut_auto.isChecked():
             self._lut_auto.setChecked(False)      # a manual edit leaves per-frame Auto
-        self._clim[(self._node_id, ch)] = (float(lo), float(hi))
+        self._clim[self._lut_key(self._node_id, ch)] = (float(lo), float(hi))
+        self._clim_user.add(self._lut_key(self._node_id, ch))
         self._apply_lut(ch)
+        self._display_timer.start()
 
     def _on_lut_gamma(self, ch: int, gamma: float) -> None:
         """A drag on channel ``ch``'s midpoint dot → update its gamma (instant)."""
         if self._node_id is None:
             return
-        self._gammas[(self._node_id, ch)] = float(gamma)
+        self._gammas[self._lut_key(self._node_id, ch)] = float(gamma)
         self._apply_lut(ch)
+        self._display_timer.start()
+
+    def _emit_display_changed(self) -> None:
+        if self._node_id is not None:
+            self.display_changed.emit(str(self._node_id))
+
+    def display_state(self, node_id: str,
+                      names: Sequence[str] = ()) -> Dict[int, Dict[str, Any]]:
+        """How this Viewer shows node ``node_id``'s channels: ``{channel: {"lo", "hi",
+        "gamma", "rgb"}}``, each key present only where the Viewer holds a value.
+
+        What the Movie Editor links a panel to (2026-09-30). ``lo``/``hi`` are the black and
+        white points in the image's own units and ``gamma`` the transfer gamma, both keyed by
+        ``(node, channel)`` exactly as the Viewer keeps them, so they exist only for a node
+        that has been shown here — and ``lo``/``hi`` only where the USER set the window. The
+        Viewer's own auto-contrast is not reported: it is recomputed whenever the data under
+        a node changes, and it appears whenever a channel is first DISPLAYED, including by
+        the export's own result landing here — after the export stamped its links, so the
+        monitor drifted off the file just written (2026-09-30). An unset channel renders as
+        the movie's own auto contrast instead. ``rgb`` is a colour the user PICKED for that channel,
+        remembered by channel name (``names``); a channel still on its emission colour
+        reports none, so the movie keeps its own default (emission tints, a lone channel in
+        grey) exactly as the Viewer does. An overlay channel's LUT is keyed by its source and
+        is not reported here."""
+        chans = {k[1] for k in list(self._clim) + list(self._gammas)
+                 if len(k) == 2 and k[0] == node_id}
+        n = max(len(names), (max(chans) + 1) if chans else 0)
+        out: Dict[int, Dict[str, Any]] = {}
+        for c in range(n):
+            d: Dict[str, Any] = {}
+            lohi = self._clim.get((node_id, c))
+            if lohi is not None and (node_id, c) in self._clim_user:
+                d["lo"], d["hi"] = float(lohi[0]), float(lohi[1])
+            g = self._gammas.get((node_id, c))
+            if g is not None:
+                d["gamma"] = float(g)
+            key = names[c] if c < len(names) and names[c] else f"#{c}"
+            rgb = self._chan_color_user.get(key)
+            if rgb is not None:
+                d["rgb"] = [int(v) for v in rgb]
+            if d:
+                out[c] = d
+        return out
 
     def _on_auto_toggled(self, on: bool) -> None:
         """Auto is a TOGGLE: while on, contrast is recomputed for every frame. Flipping it
@@ -2049,8 +2395,8 @@ class ViewerPanel(QWidget):
     def _apply_lut(self, ch: int) -> None:
         """Push the current window + gamma for ``ch`` to the display. On GPU this is a
         uniform change + repaint — no decode, no re-upload — so it is instantaneous."""
-        lo, hi = self._clim.get((self._node_id, ch), (0.0, 1.0))
-        gm = self._gammas.get((self._node_id, ch), 1.0)
+        lo, hi = self._clim.get(self._lut_key(self._node_id, ch), (0.0, 1.0))
+        gm = self._gammas.get(self._lut_key(self._node_id, ch), 1.0)
         hst = self._hists.get(ch)
         if hst is not None:
             hst.setToolTip(self._hist_tip(ch))
@@ -2058,14 +2404,20 @@ class ViewerPanel(QWidget):
         # the field must follow a drag even while it (still) holds keyboard focus.
         self._update_lut_edits(ch, force=True)
         if self._gl is not None:
+            # The channel's BLEND rides along. `set_channel` defaults to additive at full
+            # opacity, so pushing only the window here silently reset an overlay channel to
+            # `add` @ 1.0 on every LUT drag, until the next frame's `_display` put it back.
+            mode, opacity, cells = self._blend_map().get(ch, (0, 1.0, 8.0))
             self._gl.set_channel(ch, lo, hi,
-                                 self._chan_colors.get(ch, (255, 255, 255)), gm)
+                                 self._chan_colors.get(ch, (255, 255, 255)), gm,
+                                 blend=int(mode), opacity=float(opacity),
+                                 checker=float(cells))
             self._gl.refresh()
         elif self._planes:
-            clims = {c: self._clim.get((self._node_id, c),
+            clims = {c: self._clim.get(self._lut_key(self._node_id, c),
                                        self._clim_for(self._node_id, c, pl))
                      for c, pl in self._planes.items()}
-            gammas = {c: self._gammas.get((self._node_id, c), 1.0) for c in self._planes}
+            gammas = {c: self._gammas.get(self._lut_key(self._node_id, c), 1.0) for c in self._planes}
             self._base_pix = QPixmap.fromImage(self._compose_cpu(clims, gammas))
             self._repaint()
 
@@ -2128,15 +2480,34 @@ class ViewerPanel(QWidget):
 
     def _apply_axes(self, axes, dataset) -> None:
         self._apply_cursor_ranges(axes)
+        self._apply_position_groups(dataset)
         self._rebuild_channels(axes, dataset)
+
+    def _apply_position_groups(self, dataset) -> None:
+        """Band the M strip by specimen, from the payload's per-position group list.
+
+        AFTER :meth:`_apply_cursor_ranges`, never before: the strip refuses a label list
+        that does not cover its axis (a half-banded strip would claim some positions are
+        grouped and others are not), so the range has to be right first or every band is
+        dropped on the pull that re-ranges M.
+
+        Read off the payload rather than the envelope because it has to describe the data
+        ON SCREEN. A ``util.select_group`` upstream leaves nine positions all carrying one
+        key, which correctly draws no bands — there is only one specimen left to be in.
+        """
+        md = getattr(dataset, "metadata", {}) or {}
+        self._sliders["m"].setGroups(md.get(POSITION_GROUP_KEY))
 
     def _sync_axis_label(self, ax: str, suffix: str = "") -> None:
         """The ``value/max`` readout beside a strip, with ``·N`` when N frames are picked
         — the picks scope the run, so their count belongs where the axis is read."""
         sld = self._sliders[ax]
         picked = len(sld.selection())
+        sub = (f" ·{self._t_sub + 1}/{self._n_sub}"
+               if ax == "t" and getattr(self, "_n_sub", 1) > 1 and
+               (self._t_sub or self._playing_axis == "t") else "")
         self._val_lbls[ax].setText(f"{sld.value()}/{sld.maximum()}"
-                                   + (f" ·{picked}" if picked else "") + suffix)
+                                   + (f" ·{picked}" if picked else "") + sub + suffix)
 
     def _apply_cursor_ranges(self, axes) -> None:
         """Range/enable the M/T/Z strips for ``axes``. Under the solo-frame scope every
@@ -2186,46 +2557,47 @@ class ViewerPanel(QWidget):
         # and magenta-on-green is the convention for a two-source overlay.
         ovl = dict(getattr(self, "_overlay_chans", {}) or {})
         ovl_idx = sorted(i for i in ovl if i >= nc)
+        # one tint per SOURCE, cycling OVERLAY_TINTS in chain order, so three overlaid files
+        # are three colours rather than three magentas
+        src_of = dict(getattr(self, "_overlay_src", {}) or {})
+        order: List[str] = []
+        for i in ovl_idx:
+            sid = str((src_of.get(i) or {}).get("node") or i)
+            if sid not in order:
+                order.append(sid)
         for i in ovl_idx:
             while len(self._chan_names) <= i:
                 self._chan_names.append(f"Ch{len(self._chan_names) + 1}")
             self._chan_names[i] = str(ovl[i])
-            self._chan_colors[i] = self._chan_color_user.get(
-                self._color_key(i), (255, 64, 200))
+            sid = str((src_of.get(i) or {}).get("node") or i)
+            tint = self.OVERLAY_TINTS[order.index(sid) % len(self.OVERLAY_TINTS)]
+            self._chan_colors[i] = self._chan_color_user.get(self._color_key(i), tint)
         n_total = nc + len(ovl_idx)
 
-        # keep only still-valid active channels; default to channel 0 if none. An overlay
-        # channel is switched ON the moment it FIRST appears — an overlay you have to go and
-        # enable is an overlay that looks broken — but only the first time: one the user
-        # switched off stays off, where before every pull switched it back on and its toggle
-        # button looked broken instead (2026-08-05, "each channel should be its state from
-        # before"). `_chan_seen` is keyed the same way the colour override is, so it survives a
-        # node switch and a re-pull for the same reason.
-        # The first-appearance rule applies to the payload's OWN channels too, not just to
-        # overlay ones. It used to run over `ovl_idx` alone — indices >= nc — and
-        # `channel.merge` grows the real channel axis (`merge.py`: `replace(ax, c=ax.c +
-        # sax.c, …)`), so its new channels are INSIDE nc and were only ever filtered by the
-        # line above, never appended. The result was the merge's own headline symptom: the
-        # buttons appear with the right names and the picture does not change, because the
-        # channels the node was added to combine arrive switched off.
+        # EVERY channel is shown unless the user switched it off by hand (2026-09-30: "all
+        # channels need to be auto LUT and displayed"). `_chan_off` is keyed by channel NAME
+        # (`_color_key`), like the colour override, so a channel switched off stays off
+        # through a node switch and a re-pull (2026-08-05, "each channel should be its state
+        # from before") — and nothing else ever turns one off.
         #
-        # `_chan_seen` is keyed by channel NAME (`_color_key`), so "first appearance" means
-        # first time that named channel is seen in this session — a channel the user switched
-        # off stays off through a node switch and a re-pull, which is the property the
-        # overlay version was written for and the reason this can be widened safely.
-        self._active_channels = [c for c in self._active_channels
-                                 if c < nc or c in ovl] or [0]
-        # Auto-enable stops at the sampler bank, so the DEFAULT state is always one the
+        # This replaced a "switch on at FIRST appearance" rule (`_chan_seen`), which turned
+        # channels off on its own. Its memory was "seen this session", not "chosen by the
+        # user", so a channel was enabled once and then left to the filter that drops indices
+        # a payload does not have: view a 3-channel node, then a 1-channel tap, then the
+        # 3-channel node again, and channels 2 and 3 came back OFF — already seen, so never
+        # re-enabled. A second file sharing channel names with the first arrived the same
+        # way. A rule that only records the user's own clicks cannot do that.
+        #
+        # Overlay channels (indices >= nc) and `channel.merge`'s grown channels (inside nc)
+        # take the same rule, so an overlay or merge never arrives looking broken.
+        #
+        # The default stops at the sampler bank, so the DEFAULT state is always one the
         # composite can actually render. Past that the user can still switch more on and the
-        # status line says what the composite dropped — but arriving in a state that silently
-        # hides a channel would be the same defect this loop is here to fix.
-        for i in list(range(nc)) + ovl_idx:
-            key = self._color_key(i)
-            if key not in self._chan_seen:
-                self._chan_seen.add(key)
-                if (i not in self._active_channels
-                        and len(self._active_channels) < _GL_MAX_CH):
-                    self._active_channels.append(i)
+        # status line says what the composite dropped.
+        self._active_channels = [i for i in list(range(nc)) + ovl_idx
+                                 if self._color_key(i) not in self._chan_off][:_GL_MAX_CH]
+        if not self._active_channels:        # every channel here switched off → never zero
+            self._active_channels = [0]
 
         # rebuild the per-channel LUT columns: [channel toggle] over [its histogram]
         for col in self._lut_cols:
@@ -2284,6 +2656,28 @@ class ViewerPanel(QWidget):
             self._chan_btns[i] = btn
             self._hists[i] = hst
             self._lut_edits[i] = (lo_e, hi_e)
+
+    def _lut_key(self, node_id: Any, ch: int) -> tuple:
+        """The key a channel's LUT (window, gamma, histogram range) is remembered under.
+
+        A primary channel is ``(node, index)``, as it always was. An OVERLAY channel is keyed
+        by its SOURCE instead — ``("ovl", secondary node, that file's channel)`` — because its
+        display index is only its position in the chain (the primary's channel count plus the
+        sources before it): adding, removing or reordering an Overlay shifted every later
+        source onto another source's LUT, and viewing the chain at a downstream node gave
+        every source a fresh one. Keyed by source, each overlaid file keeps its own labelled,
+        independent LUT wherever it is viewed."""
+        src = (getattr(self, "_overlay_src", None) or {}).get(ch)
+        if src is not None and src.get("node"):
+            return ("ovl", str(src["node"]), int(src.get("ch", 0)))
+        return (node_id, ch)
+
+    #: Default tints for overlaid SOURCES, in chain order: magenta first (the two-source
+    #: convention against a green primary), then colours that stay distinguishable from it
+    #: and from each other. A source's channels share its tint; a user's pick (right-click)
+    #: still wins, remembered by the channel's name.
+    OVERLAY_TINTS = ((255, 64, 200), (0, 200, 255), (255, 200, 0), (255, 120, 40),
+                     (150, 255, 60), (170, 120, 255))
 
     # ── per-channel colour (right-click a channel button) ───────────────────────
     def _color_key(self, idx: int) -> str:
@@ -2363,6 +2757,7 @@ class ViewerPanel(QWidget):
             self._apply_lut(idx)                     # pushes colour + window to the display
         else:
             self._repaint()
+        self._display_timer.start()
 
     def _style_channel_btn(self, btn: QPushButton, idx: int) -> None:
         r, g, b = self._chan_colors.get(idx, (196, 200, 208))
@@ -2413,24 +2808,42 @@ class ViewerPanel(QWidget):
 
     # ── interaction ────────────────────────────────────────────────────────────
     def _on_slider(self, ax: str) -> None:
+        if ax == "t":
+            self._t_sub = 0         # a new primary frame always starts at its first sub-tick
         self._sync_axis_label(ax)
         self.request_changed.emit()
 
     def _on_channel_toggle(self, idx: int) -> None:
         active = set(self._active_channels)
+        key = self._color_key(idx)
         if idx in active:
             active.discard(idx)
+            self._chan_off.add(key)          # the user's own choice — the only writer
         else:
             active.add(idx)
+            self._chan_off.discard(key)
         if not active:                       # never leave zero channels shown
             active = {idx}
+            self._chan_off.discard(key)
             self._chan_btns[idx].setChecked(True)
         self._active_channels = sorted(active)
         self.request_changed.emit()          # re-pull → _display re-syncs the histograms
 
     # ── playback (wall-clock timer, frame-dropping) ─────────────────────────────
+    #: The fastest the Play-all tick may run. Past it, each tick advances several sub-ticks
+    #: instead: a 16x source at 8 fps would otherwise ask for a compose every 8 ms.
+    MAX_TICK_HZ = 60.0
+
     def _interval_ms(self, ax: str) -> int:
-        return int(max(1.0, 1000.0 / max(0.5, self._fps_spins[ax].value())))
+        fps = max(0.5, self._fps_spins[ax].value())
+        if ax == "t" and self._n_sub > 1:
+            # Play all: the fps spinner stays the PRIMARY's rate; the tick runs n_sub times
+            # faster so the fastest source shows each of its own frames
+            rate = fps * self._n_sub
+            self._sub_step = max(1, int(np.ceil(rate / self.MAX_TICK_HZ)))
+            return int(max(1.0, 1000.0 * self._sub_step / rate))
+        self._sub_step = 1
+        return int(max(1.0, 1000.0 / fps))
 
     def _on_play(self, ax: str, on: bool) -> None:
         if on:
@@ -2445,6 +2858,7 @@ class ViewerPanel(QWidget):
                     self._play_btns[other].setText("▶")
                     self._play_btns[other].blockSignals(False)
             self._playing_axis = ax
+            self._sync_pin_enabled()
             self._play_btns[ax].setText("⏸")
             self._last_frame_t = None
             self._fps_ema = None
@@ -2512,6 +2926,12 @@ class ViewerPanel(QWidget):
         self._gated = False
         self._awaiting_frame = False
         self._play_timer.stop()
+        self._sync_pin_enabled()
+        if self._t_sub:
+            # park on sub-tick 0: it is what the detail patch composes and what a pin pairs,
+            # so stopping mid-frame must not leave the overview on a sub-tick of its own
+            self._t_sub = 0
+            self.request_changed.emit()
         if ax is not None:
             btn = self._play_btns[ax]
             btn.blockSignals(True)
@@ -2537,6 +2957,11 @@ class ViewerPanel(QWidget):
         arrives while the previous is still working, Qt coalesces the timeout — i.e. the
         frame is dropped — so playback keeps real-time rather than lagging behind.
 
+        If the axis has a frame **selection** (:meth:`FrameStrip.selection`), playback loops
+        over exactly those picked frames instead of the whole axis — the same picks that
+        scope a troubleshooting pull now scope what plays, so isolating three frames and
+        hitting play does not run everything in between.
+
         Under :meth:`set_play_pacing` the tick does not advance while the last frame is still
         being computed: dropping frames is the right answer only when the next one is a read.
         The wait rides on the axis label, so a computed series looks like slow honest
@@ -2548,10 +2973,26 @@ class ViewerPanel(QWidget):
             self._sync_axis_label(
                 ax, f" · computing {time.perf_counter() - self._awaiting_since:.0f}s")
             return
+        if ax == "t" and self._n_sub > 1 and self._t_sub + self._sub_step < self._n_sub:
+            # Play all: stay on this primary frame and advance the sub-tick, so a faster
+            # overlaid source shows its next frame. The slider does not move, so the request
+            # is emitted here (`_on_slider` will not fire).
+            self._t_sub += self._sub_step
+            self._awaiting_frame = True
+            self._awaiting_since = time.perf_counter()
+            self._sync_axis_label(ax)
+            self.request_changed.emit()
+            return
+        self._t_sub = 0
         sld = self._sliders[ax]
-        nxt = sld.value() + 1
-        if nxt > sld.maximum():
-            nxt = 0
+        picks = sld.selection()
+        if picks:
+            cur = sld.value()
+            nxt = next((i for i in picks if i > cur), picks[0])
+        else:
+            nxt = sld.value() + 1
+            if nxt > sld.maximum():
+                nxt = 0
         # armed BEFORE the move, so a frame served warm inside `setValue` clears it again on
         # the way out and paced playback runs at full speed over the part that is resident
         self._awaiting_frame = True
@@ -2566,6 +3007,9 @@ class ViewerPanel(QWidget):
             dt = now - self._last_frame_t
             if dt > 0:
                 inst = 1.0 / dt
+                if self._playing_axis == "t" and self._n_sub > 1:
+                    # a delivery per TICK; the readout is the primary's frame rate
+                    inst *= self._sub_step / float(self._n_sub)
                 self._fps_ema = inst if self._fps_ema is None else \
                     0.6 * self._fps_ema + 0.4 * inst
         self._last_frame_t = now
@@ -2751,11 +3195,11 @@ class ViewerPanel(QWidget):
         ch = self._lut_channel()
         node = self._node_id or ""
         plane = self._planes.get(ch, self._ref_plane)
-        lo, hi = self._clim.get((node, ch), (0.0, 1.0))
+        lo, hi = self._clim.get(self._lut_key(node, ch), (0.0, 1.0))
         vmin, vmax = self._drange.get(
-            (node, ch), self._display_range(plane) if plane is not None else (0.0, 1.0))
+            self._lut_key(node, ch), self._display_range(plane) if plane is not None else (0.0, 1.0))
         return histogram_values(req, lo=lo, hi=hi, vmin=vmin, vmax=vmax,
-                                gamma=self._gammas.get((node, ch), 1.0))
+                                gamma=self._gammas.get(self._lut_key(node, ch), 1.0))
 
     def _set_pick_tool(self, tool: str) -> None:
         if self._pick is not None:
@@ -3256,7 +3700,7 @@ class ViewerPanel(QWidget):
             self._paint_crop_rect(p, s, W)
         elif kind == "grid" and len(pts) >= 2:
             self._paint_grid(p, s, W, sx)
-        elif kind == "distance":
+        elif kind in ("distance", "nudge_xy"):
             a = W(pts[0]) if pts else None
             b = (W(pts[1]) if len(pts) >= 2
                  else (W(s.hover_pt) if s.hover_pt is not None else None))

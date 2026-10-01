@@ -39,7 +39,8 @@ INSTANT_KINDS = frozenset({"channel", "frame", "channels", "zrange", "frames"})
 HISTOGRAM_KINDS = frozenset({"percentile", "gamma"})
 
 #: Kinds driven by a mouse gesture on the image surface.
-CANVAS_KINDS = frozenset({"shapes", "area", "level", "radius", "distance", "grid", "rect"})
+CANVAS_KINDS = frozenset({"shapes", "area", "level", "radius", "distance", "grid", "rect",
+                          "nudge_xy"})
 
 if INSTANT_KINDS | HISTOGRAM_KINDS | CANVAS_KINDS != PICK_KINDS:
     # Import-time, and a raise rather than an assert so ``-O`` cannot silence it. A kind
@@ -70,6 +71,8 @@ PICK_HELP: Dict[str, str] = {
               "nothing ticked, the frame you are looking at.",
     "percentile": "Set the histogram handles where you want them, then Apply.",
     "gamma": "Drag the histogram's gamma dot, then Apply.",
+    "nudge_xy": "Click a feature in the PRIMARY image, then click the same feature where the "
+                "overlaid source shows it — the nudge moves the source onto the primary.",
 }
 
 #: The marker that means "this parameter can be picked", used in the inspector's button
@@ -96,6 +99,7 @@ PICK_ACTION: Dict[str, str] = {
     "frames": "Use the selected frames",
     "percentile": "Take the histogram window",
     "gamma": "Take the histogram gamma",
+    "nudge_xy": "Align by two clicks",
 }
 
 #: What a BOUND group is, as a noun phrase, for the pick bar's title. A group gesture is not
@@ -104,6 +108,7 @@ PICK_ACTION: Dict[str, str] = {
 PICK_GROUP_LABEL: Dict[str, str] = {
     "rect": "the crop window",
     "zrange": "the Z range",
+    "nudge_xy": "the XY nudge",
 }
 
 #: Name fragments that mark a socket as the LOW or HIGH end of a co-picked pair. Checked as
@@ -212,6 +217,10 @@ class PickRequest:
     #: an int (a px subset size, a channel index) instead of a float.
     integral: bool = False
     peer_integral: bool = False
+    #: The bound members' CURRENT values, ``((name, value), ...)`` — for a gesture that commits
+    #: a CHANGE rather than a fresh value (``nudge_xy`` adds its delta to the nudge already
+    #: set). Filled by the window, which owns the document; ``()`` means "all zero".
+    base: Tuple[Tuple[str, float], ...] = ()
 
     @property
     def surface(self) -> str:
@@ -336,7 +345,7 @@ class PickSession:
         self._moved = False
         if probe is not None:
             self.probe = probe
-        if self.req.kind == "distance":
+        if self.req.kind in ("distance", "nudge_xy"):
             if len(self.pts) >= 2:
                 self.pts = []                   # a third click restarts the measurement
             self.pts.append((x, y))
@@ -356,7 +365,7 @@ class PickSession:
         self._moved = True
         self.hover_pt = (x, y)
         kind = self.req.kind
-        if kind == "distance":
+        if kind in ("distance", "nudge_xy"):
             return                              # two clicks, not a drag — see press()
         if kind == "shapes" and self.tool == "polygon":
             return                              # a polygon grows on clicks, not on drags
@@ -382,7 +391,7 @@ class PickSession:
         if kind == "shapes":
             self._end_shape(x, y)
             return
-        if kind == "distance":
+        if kind in ("distance", "nudge_xy"):
             if len(self.pts) >= 2:
                 self.done = True
             return
@@ -554,6 +563,26 @@ class PickSession:
         # spelt differently gets nothing rather than a wrong guess.
         return {n: by_name[n] for n in self.req.bounds if n in by_name}
 
+    # ── nudge_xy (two clicks → the µm offset pair that lines them up) ────────────
+    def _nudge_values(self) -> Dict[str, Any]:
+        """The two clicks → the new ``(offset_y, offset_x)``: the current nudge PLUS the move
+        that carries the second click (the feature as the overlay draws it) onto the first
+        (the same feature in the primary). Through the engine's own
+        :func:`nodegraph.placement.nudge_delta_um`, which is flip-independent — a flip
+        mirrors which source pixel the secondary's box samples, never where the box sits.
+        The bound group is ``(y name, x name)`` in that order."""
+        from nodegraph.placement import nudge_delta_um
+        if len(self.pts) < 2 or len(self.req.bounds) != 2:
+            return {}
+        (xa, ya), (xb, yb) = self.pts[0], self.pts[1]
+        got = nudge_delta_um({"pixel_size_um": self.calib.lateral}, None, (ya, xa), (yb, xb))
+        if got is None:
+            return {}
+        base = dict(self.req.base or ())
+        ny, nx = self.req.bounds
+        return {ny: round(float(base.get(ny, 0.0)) + got[0], 4),
+                nx: round(float(base.get(nx, 0.0)) + got[1], 4)}
+
     # ── radius / grid magnitudes ──────────────────────────────────────────────
     def _magnitude(self, x: float, y: float) -> float:
         """The gesture's extent in the socket's own unit."""
@@ -583,6 +612,8 @@ class PickSession:
             return {}
         if req.kind == "rect":
             return self._rect_values()
+        if req.kind == "nudge_xy":
+            return self._nudge_values()
         if req.kind == "distance":
             (x0, y0), (x1, y1) = self.pts[0], self.pts[1]
             d = math.hypot(x1 - x0, y1 - y0)
@@ -611,6 +642,16 @@ class PickSession:
             n = len(self.shapes)
             live = f", drawing {self.tool}" if self.pts else ""
             return f"{n} shape{'' if n == 1 else 's'}{live}"
+        if req.kind == "nudge_xy":
+            if len(self.pts) < 2:
+                return ("click the feature in the PRIMARY" if not self.pts
+                        else "now click the same feature in the overlaid source")
+            v = self._nudge_values()
+            base = dict(req.base or ())
+            parts = [f"{n} {float(base.get(n, 0.0)):+.2f} → {v[n]:+.2f} µm" for n in v]
+            tail = ("" if self.calib.calibrated
+                    else "  ⚠ uncalibrated file — values are in pixels")
+            return " · ".join(parts) + tail
         if req.kind == "rect":
             # The box reads as a window plus its size, which is what a crop is about: the
             # four raw bounds are in the pills already, and "512 × 384 px" is the number the

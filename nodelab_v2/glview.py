@@ -106,12 +106,11 @@ void main() {
 def _build_frag(n: int) -> str:
     # Sampler arrays MUST be indexed by a constant in GLSL 330 (dynamic indexing is
     # undefined pre-400 → links but samples black on many drivers), so unroll with a
-    # guard per channel instead of a `for i` loop over u_tex[i]. Contrast is baked into
-    # the 8-bit texture on the CPU (the float-texture upload path is broken in this
-    # PySide6 build); the shader keeps colour + gamma as free uniforms.
-    # The raw 16-bit value is packed into R (high byte) + G (low byte) of an RGBA8 texture
-    # (only RGBA8/ubyte uploads reliably in this PySide6 build). The unpack + LUT window
-    # are INLINED per channel with a constant sampler index — passing a sampler-array
+    # guard per channel instead of a `for i` loop over u_tex[i].
+    # Each channel is one GL_R16 texture (`_upload`, since 2026-08-10; it was 16 bits
+    # byte-packed into R+G of an RGBA8 until the repack was measured as the playback
+    # cost) — the sampler normalizes to u16/65535, read as `.r`. The LUT window is
+    # INLINED per channel with a constant sampler index — passing a sampler-array
     # element to a helper function returns a bad sampler on this driver. Windowing here in
     # the shader (u_vlo/u_vhi) makes contrast changes a free uniform update.
     # u_win[i] = vec2(vlo, vhi) — the LUT window is carried as a vec2 (set via QVector2D),

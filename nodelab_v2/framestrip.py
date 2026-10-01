@@ -78,6 +78,9 @@ class FrameStrip(QWidget):
         self._paint_to = True                   # what a select-drag writes
         self._last_paint: Optional[int] = None
         self._anchor = 0                        # Shift-range origin
+        #: contiguous ``(start, end, key)`` runs this axis is divided into, or ``[]``.
+        #: Set for M when the acquisition holds several specimens — see :meth:`setGroups`.
+        self._groups: List[Tuple[int, int, str]] = []
         self._sel_dirty = False
         self._compact = False
         self.setMouseTracking(True)
@@ -96,6 +99,49 @@ class FrameStrip(QWidget):
     def count(self) -> int:
         """How many frames the axis has (``maximum() + 1``)."""
         return self._max + 1
+
+    def groups(self) -> List[Tuple[int, int, str]]:
+        return list(self._groups)
+
+    def setGroups(self, labels: Optional[Sequence[str]]) -> None:
+        """Divide the axis into runs from a per-index label list (``["G1","G1","G2",…]``).
+
+        Written for M, where the labels are the per-position group keys
+        (:data:`nodegraph.metadata.POSITION_GROUP_KEY`): a 54-position file that is really
+        six 3x3 mosaics draws as six banded runs, so scrubbing tells you which specimen you
+        are in instead of presenting 54 interchangeable boxes.
+
+        **Contiguous runs only.** A label that reappears after a different one starts a NEW
+        run rather than joining the earlier one, because this is a strip of adjacent boxes
+        and a band that jumped a gap would be drawn as though it covered what is between.
+        Ordinary groupings are contiguous (positions are acquired a specimen at a time), and
+        one that is not still bands correctly — it just shows more bands than it has groups,
+        which is the truth about the axis order.
+
+        A list that does not cover the axis clears the banding rather than covering part of
+        it: a half-banded strip reads as "these positions are grouped and those are not",
+        which is a claim about the data nobody made.
+        """
+        runs: List[Tuple[int, int, str]] = []
+        vals = [str(v) for v in (labels or [])]
+        if len(vals) == self.count() and all(vals):
+            start = 0
+            for i in range(1, len(vals) + 1):
+                if i == len(vals) or vals[i] != vals[start]:
+                    runs.append((start, i - 1, vals[start]))
+                    start = i
+        if len(runs) < 2:
+            runs = []                 # one run is the whole axis: nothing to distinguish
+        if runs == self._groups:
+            return
+        self._groups = runs
+        self.update()
+
+    def _group_at(self, i: int) -> str:
+        for a, b, key in self._groups:
+            if a <= i <= b:
+                return key
+        return ""
 
     def setMaximum(self, hi: int) -> None:
         """Re-range the axis. Shrinking drops out-of-range picks — a selection that
@@ -193,6 +239,17 @@ class FrameStrip(QWidget):
 
         base = T.BODY if live else T.BG
         border = T.BORDER
+        # Alternate group bands get a slightly lifted fill. A TINT rather than a colour per
+        # group: the strip already spends its saturated colours on the cursor and the run
+        # selection, and six hues competing with those would make the thing it is trying to
+        # show (where you are) the hardest part to find.
+        band = T.PANEL_HI if live else T.BG
+
+        def band_of(i: int) -> QColor:
+            for k, (a, b, _key) in enumerate(self._groups):
+                if a <= i <= b:
+                    return band if (k % 2) else base
+            return base
         sel_fill = T.ACCENT_DIM
         cur = T.ACCENT if live else T.MUTED
 
@@ -211,6 +268,9 @@ class FrameStrip(QWidget):
             # ── dense: one rect per box would be thousands of sub-pixel draws ──────
             span = QRectF(self.PAD, y0, n * pitch, bh)
             fill(span, base, border)         # outlined: at this density the fill alone
+            for k, (a, b, _key) in enumerate(self._groups):
+                if k % 2:                    # the bands still read when boxes do not
+                    fill(QRectF(self._x_of(a), y0, (b - a + 1) * pitch, bh), band)
             for a, b in _runs(sorted(self._sel)):   # barely separates from the panel
                 fill(QRectF(self._x_of(a), y0, (b - a + 1) * pitch, bh), sel_fill)
             p.fillRect(QRectF(self._x_of(self._value), y0, max(2.0, bw), bh), cur)
@@ -227,12 +287,17 @@ class FrameStrip(QWidget):
             elif i == self._hover and live:
                 fill(r, T.PANEL_HI, T.BORDER_HI)
             else:
-                fill(r, base, border if bw >= 4.0 else None)
+                fill(r, band_of(i), border if bw >= 4.0 else None)
             if picked:
                 # a bar under every picked box: the cursor's own bright fill would
                 # otherwise hide whether the frame the user is on is in the run set
                 p.fillRect(QRectF(r.left(), r.bottom() - 2.0, r.width(), 2.0),
                            T.ACCENT if live else T.MUTED)
+        # A divider ON each group boundary, drawn last so no box fill covers it. The bands
+        # alone are ambiguous where a group happens to be one box wide; a hard edge is not.
+        for a, _b, _key in self._groups[1:]:
+            x = self._x_of(a) - (pitch - bw) * 0.5
+            p.fillRect(QRectF(x - 0.5, 0.0, 1.0, h), T.BORDER_HI if live else T.BORDER)
         p.end()
 
     # ── mouse ──────────────────────────────────────────────────────────────────
@@ -349,7 +414,12 @@ class FrameStrip(QWidget):
         sel = self.selection()
         pick = (f"<br>picked: {compact_list(sel)} ({len(sel)} of {n})" if sel
                 else f"<br>{self.unpicked_note or 'nothing picked'}")
-        return (f"<b>{ax} {i}</b> of {n}{pick}"
+        grp = self._group_at(i)
+        if grp:
+            a, b, _k = next(r for r in self._groups if r[0] <= i <= r[1])
+            grp = (f"<br>group <b>{grp}</b> &nbsp;— {ax} {a}-{b} "
+                   f"({b - a + 1} of {n})")
+        return (f"<b>{ax} {i}</b> of {n}{grp}{pick}"
                 f"<br><br>drag &nbsp;— scrub (keeps working outside the strip)"
                 f"<br>ctrl+click / drag &nbsp;— pick {ax} for the run scope"
                 f"<br>shift+click &nbsp;— pick the range from the last one"
