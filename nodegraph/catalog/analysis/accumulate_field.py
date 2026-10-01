@@ -13,6 +13,7 @@ from nodegraph.registry import Granularity, InDataset, InString, OutDataset
 from nodegraph.structure import StructureTable, point_table
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 
@@ -40,7 +41,7 @@ def _reconstruct_grid(coords: np.ndarray, ndim: int):
     ``(N, ndim)`` (voxels, one timepoint). The DVC grid is regular, so the per-axis
     unique sorted coordinates recover ``axes``/``grid_shape``/``step``; ``coords`` is the
     ``ij`` meshgrid. Requires a full grid (``N == prod(grid_shape)``)."""
-    from nodegraph.kernels.aldvc_field import Grid
+    from nodegraph.kernels.field_math import Grid
     axes = [np.unique(coords[:, a]).astype(np.float64) for a in range(ndim)]
     grid_shape = tuple(int(len(a)) for a in axes)
     if int(np.prod(grid_shape)) != coords.shape[0]:
@@ -80,9 +81,9 @@ def _compute_accumulate_field(ctx: EvalContext) -> Dataset:
     so there is no redundant reference control and an already-cumulative field (fixed_frame
     or external reference) is refused. Displacement voxels↔µm via ``ctx.calib`` (the DVC
     output carries the same series calibration). Kernel:
-    :func:`nodegraph.kernels.aldvc_field.accumulate_incremental` / ``compute_strain``."""
+    :func:`nodegraph.kernels.field_math.accumulate_incremental` / ``compute_strain``."""
     from types import SimpleNamespace
-    from nodegraph.kernels.aldvc_field import accumulate_incremental, compute_strain
+    from nodegraph.kernels.field_math import accumulate_incremental, compute_strain
     ds = ctx.inputs[0]
     # the one Point field on the wire, whatever it is called (`_resolve_layer`) — the literal
     # default agreed only with `analysis.dvc_field`'s own default name
@@ -193,8 +194,26 @@ def _compute_accumulate_field(ctx: EvalContext) -> Dataset:
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)
     return (ds.with_structure(StructureTable(Domain.POINT, merged, layer=out_layer, z_kind=zk))
             .with_metadata(**prov_md))
+
+def _columns_accumulate_field(params, modes, incoming):
+    """The correlation grid this node writes, as ``_shared.dvc._dvc_rows`` builds it.
+
+    Derived from :func:`dvc_field_columns` rather than transcribed, so the declaration and the
+    flattener cannot drift on the axis-dependent ``disp_``/``strain_`` names. The strain block
+    is declared unconditionally: it is present whenever the solver was asked for it, and the
+    only cost of naming it on a strain-free run is a menu entry the compute then refuses by
+    name — whereas omitting it would make a real column unpickable, which is the direction
+    this catalog must not err in."""
+    try:
+        is_3d = (modes or {}).get("dim", "3D") == "3D"
+        return on_layer(Domain.POINT, str((params or {}).get("name") or "dvc_cumulative"),
+                        list(dvc_field_columns(is_3d=is_3d)) + ["qfactor"])
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
     _compute_accumulate_field, op_key="analysis.accumulate_field",
+    adds_columns=_columns_accumulate_field,
     label="Accumulate DVC Field", category="analysis",
     extra_layers=_layers_accumulate_field,
     reads_domains=frozenset({Domain.POINT}), adds_domains=frozenset({Domain.POINT}),

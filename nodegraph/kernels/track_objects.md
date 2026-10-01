@@ -244,6 +244,17 @@ plain Python index lists/tuples; `compute_topology_features` returns an
     still records their `track_length`).
 12. **Logging collision (cosmetic).** All vendored modules share one rebound `log`
     logger — log records emit under a single logger name. No effect on results.
+13. **Never build a SerialTrack fixture on a REGULAR lattice** (observed 2026-09-17,
+    while writing `analysis.track_field`'s tests). The topology matcher identifies a
+    particle by the *arrangement* of its neighbours, so on a perfectly periodic cloud every
+    descriptor is identical and there is nothing to match on: a 9x9x5 grid under a 2%-per-
+    frame stretch linked so badly that `strain_xx` came back 0 at t=1 and had the wrong
+    sign by t=3, with the global step clamping 344/405 updates. Jittering the same lattice
+    by ±0.6 px fixed it outright — 100% correct links, strain exact to 1e-16. The tell is a
+    flood of `Clamping N/M global-step updates` on data you know is smooth. This is inherent
+    to topology-based PTV, not a port defect, and it is why upstream's own synthetic data is
+    Poisson-disc seeded rather than gridded. It is also why `serialtrack` is the wrong linker
+    for anything laid out on a grid — use `centroid` there.
 
 ---
 

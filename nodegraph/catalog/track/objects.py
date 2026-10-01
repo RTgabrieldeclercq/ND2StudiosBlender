@@ -21,6 +21,7 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.columns import TRACK_MEMBERSHIP, member_layer, on_layer
 from nodegraph.catalog._shared.labels import (
     _label_tables,
     _point_layers,
@@ -62,10 +63,14 @@ def _compute_track_objects(ctx: EvalContext) -> Dataset:
     mirroring ``track.link``) and adds the Track domain. *Members* keep their upstream
     layer; the tracker never re-derives geometry.
 
-    Two of the five methods are exclusive to one target, and both refuse the other rather
-    than running on evidence they cannot use: ``overlap`` intersects label rasters and is
-    **Label-only**; ``serialtrack`` is a particle tracker that reads centroids and nothing
-    else, so it is **Point-only** (2026-08-03).
+    One of the five methods is exclusive to a target: ``overlap`` intersects label rasters
+    and is **Label-only**, refusing Points rather than running on evidence it cannot use.
+    ``serialtrack`` was the mirror image of that (Point-only, 2026-08-03) until the refusal
+    was **lifted on 2026-09-17**: it reads centroids and nothing else, a Label table's
+    centroid is a centroid, and blocking it stopped the ordinary case of tracking segmented
+    objects — or a voxel raster's regions via ``analysis.label`` — with the one linker in
+    this node built for a dense field of them. See the comment at the lift for why the two
+    costs it was refused over are cosmetic.
 
     *Dimensionality* (2026-08-04). Four of the five linkers are two-column by
     construction, so this node is 2-D for them: a z-stack is tracked plane by plane, with
@@ -140,26 +145,28 @@ def _compute_track_objects(ctx: EvalContext) -> Dataset:
             f"(choose one of {sorted(_TRACK_OBJECT_METHODS)})")
     method = getattr(_tk, _TRACK_OBJECT_METHODS[method_key])
 
-    # SerialTrack is a PARTICLE tracker and is Point-only, the mirror image of `overlap`
-    # (Label-only, refused for Points below). `_link_group_serialtrack` builds its rows
-    # from `[[_cy(r), _cx(r)]]` and nothing else: no `area_px`, no raster. Its whole
-    # method is the topology of neighbouring POSITIONS.
+    # SerialTrack is a PARTICLE tracker: `_link_group_serialtrack` builds its rows from
+    # `[[_cy(r), _cx(r)]]` (plus `_cz` in 3-D) and nothing else — no `area_px`, no raster.
+    # Its whole method is the topology of neighbouring POSITIONS.
     #
-    # A Label table does carry those centroids, so this combination would run — which is
-    # exactly why it has to be refused rather than left to work by accident. Under
-    # `target='label'` the node declares `reads_domains = {LABEL, VOXEL}` and offers a
-    # Voxel-raster picker, because `reads_domains_by_mode` unions each mode's branch
-    # independently and so cannot say "VOXEL for the other four methods only". The node
-    # would therefore demand a raster this linker never opens, and present the shape/size
-    # criteria (the area gate) that come with Label members to the one linker that cannot
-    # consume them.
-    if method_key == "serialtrack" and target != "point":
-        raise ValueError(
-            "track objects: the 'serialtrack' method is a particle tracker — it identifies "
-            "each object by the ARRANGEMENT of its neighbouring positions and reads nothing "
-            "but (y, x) centroids, so it has no use for a label raster or for object shape "
-            "and size. Set Members to 'point' (a Spot / Particle Detection layer), or pick "
-            "centroid / topology / fingerprint / overlap to track Label regions.")
+    # That used to be enforced as "Point members only" (2026-08-03), on the grounds that
+    # offering the Label branch would present shape/size criteria to a linker that cannot
+    # consume them and declare a VOXEL requirement it never opens. Lifted 2026-09-17: a
+    # LABEL table's centroid is a centroid, the refusal blocked the ordinary case of
+    # tracking segmented objects — or a voxel raster's regions, via analysis.label — with
+    # the one linker in this node built for a dense field of them, and the two stated costs
+    # are both cosmetic rather than a correctness risk:
+    #
+    #   * the size gate. `max_size_diff_frac` is already `available_in`-gated to the
+    #     `centroid` method alone, so it is not offered here at all.
+    #   * the VOXEL declaration. `reads_domains_by_mode` unions each mode's branch
+    #     independently and so cannot say "VOXEL for the other four methods only" — but
+    #     every producer of a Label TABLE in this catalog emits the raster under the same
+    #     layer name, and the other three Label-capable linkers carry the identical
+    #     over-declaration and are unaffected by it.
+    #
+    # `overlap` stays Label-only (it intersects rasters; refused for Points below), so the
+    # exclusivity is now one-way rather than mirrored.
 
     member_domain = Domain.LABEL if target == "label" else Domain.POINT
     # The one member table on the wire, whatever it is called (`_resolve_layer`). Candidates
@@ -275,7 +282,11 @@ def _compute_track_objects(ctx: EvalContext) -> Dataset:
                 "to put z on the same scale as y/x — its topology descriptor is built from "
                 "Euclidean neighbour distances, so an unscaled plane index would distort "
                 f"every one of them (have pixel_size_um={px_um!r}, z_step_um={z_um!r}). "
-                "Ingest a calibrated file, or set the calibration explicitly.")
+                "Select the Load card that opened this file and type the missing value into "
+                "its 'z_step_um' / 'pixel_size_um' box (Parameters, in µm) — a plain TIFF "
+                "records no Z spacing at all, so an absent z_step_um is the normal case for "
+                "one and nothing downstream can infer it. If the volume is already in "
+                "isotropic voxel units, set z_step_um equal to pixel_size_um.")
         z_scale = float(z_um) / float(px_um)          # plane index → lateral px
         zc = vals["z"].astype(float) * z_scale
         rows = [{"segmentation_channel": f"c{int(cc[i])}",
@@ -478,9 +489,28 @@ def _compute_track_objects(ctx: EvalContext) -> Dataset:
               .with_structure(StructureTable(member_domain, {"track_id": back},
                                              layer=src, z_kind=zk))
               .with_metadata(**prov_md))
+
+def _columns_track_objects(params, modes, incoming):
+    """BOTH tables this node writes (V2.28), because they answer different questions and
+    only one of them is on the objects the user is filtering.
+
+    The **Track** table carries ``track_length`` — how many frames the object was followed
+    for — alongside the membership arrays. The **member** layer gets exactly one column
+    back, ``track_id``, which is the join key; declaring any more here would promise the
+    label rows a ``track_length`` that ``_compute_track_objects`` explicitly does not
+    re-emit onto them ("Only this one column is re-emitted"). Total by contract."""
+    try:
+        tracks = on_layer(Domain.TRACK, str((params or {}).get("name") or "tracks"),
+                          TRACK_MEMBERSHIP + ("track_length", "m", "c"))
+        dom, lyr = member_layer(params, modes)
+        return tracks + on_layer(dom, lyr, ("track_id",))
+    except Exception:                        # pragma: no cover - defensive
+        return ()
+
 register_node(
     _compute_track_objects,
     op_key="track.objects", label="Track Objects", category="analysis",
+    adds_columns=_columns_track_objects,
     adds_domains=frozenset({Domain.TRACK}),
     # reads Label OR Point, per the 'target' mode — stated per branch since V2.22 rather
     # than left empty. The member rows come from the LABEL table (`ds.get(member_domain,
@@ -495,19 +525,17 @@ register_node(
         InDataset(),
         InString("labels", "Label layer", field=False, default="labels",
                  layer_in=Domain.VOXEL,
-                 # Label members only, AND not for `serialtrack`, which is Point-only —
-                 # see the refusal in the compute. Without the second key this picker
-                 # would be offered for a combination that cannot run.
-                 available_in={"target": frozenset({"label"}),
-                               "method": frozenset({"centroid", "topology",
-                                                    "fingerprint", "overlap"})},
+                 # Label members only. Every one of the five linkers can run on a Label
+                 # table now that `serialtrack` accepts centroids from one (2026-09-17), so
+                 # the method key that used to narrow this picker is gone.
+                 available_in={"target": frozenset({"label"})},
                  description=
                  "Which label raster supplies the objects to track — a Connected Components or "
                  "Segmentation output. Tracking a label layer gives every linker access to "
                  "object SHAPE and SIZE as well as position, which is what the area and overlap "
                  "criteria need. A `track_id` column is written back onto this layer, so the "
-                 "result is reachable from the object rows themselves. Label target only, and "
-                 "not for `serialtrack`, which tracks Point members."),
+                 "result is reachable from the object rows themselves. Label target only; note "
+                 "`serialtrack` reads the centroids from it and ignores shape and size."),
         InString("points", "Point layer", field=False, default="spots",
                  layer_in=Domain.POINT,
                  available_in={"target": frozenset({"point"})},
@@ -515,7 +543,8 @@ register_node(
                  "Which Point table supplies the objects to track — a Spot or Particle Detection "
                  "output. Only positions are available, so size- and overlap-based criteria "
                  "cannot apply; a `track_id` column is written back onto this layer. Point "
-                 "target only, and the only input `serialtrack` accepts."),
+                 "target only, and the usual input for `serialtrack` — though that linker "
+                 "reads centroids, so it takes a Label layer just as happily."),
         InString("name", "Output layer", field=False, default="tracks",
                  layer_out=(Domain.TRACK,),
                  description=
@@ -638,24 +667,24 @@ register_node(
                 "What is being tracked: the regions of a Label raster or the detections of a "
                 "Point table. Labels carry shape and size, so every linker's criteria are "
                 "available; Points carry position only, which rules the mask-overlap linker "
-                "out entirely. Two methods are exclusive to one target — `overlap` needs "
-                "rasters to intersect and so is Label-only, `serialtrack` is a particle "
-                "tracker and so is Point-only — and each refuses the other target rather "
-                "than running on evidence it cannot use. Either way a `track_id` column is "
-                "written back onto the member layer, which is how the rest of the catalog "
-                "reads the result.",
+                "out entirely. One method is exclusive to a target — `overlap` needs rasters "
+                "to intersect and so is Label-only, refusing Points rather than running on "
+                "evidence it cannot use. The other four run on either. Whichever you pick, "
+                "a `track_id` column is written back onto the member layer, which is how the "
+                "rest of the catalog reads the result.",
                 choice_docs={
                     "label":
                         "Track the regions of a Voxel label raster (Segmentation / Connected "
                         "Components). The richest input — area gates, shape fingerprints and "
                         "mask IoU all become usable — and the only target the `overlap` method "
-                        "can run on, since it needs rasters to intersect. Refused by "
-                        "`serialtrack`, which reads centroids only.",
+                        "can run on, since it needs rasters to intersect. `serialtrack` runs "
+                        "here too, reading the region centroids and ignoring everything else.",
                     "point":
                         "Track the rows of a Point table (Spot / Particle Detection). Positions "
                         "only: the area column is absent, so size-based gates neutralize "
                         "themselves and `overlap` is refused rather than silently falling back "
-                        "to another linker. The only target `serialtrack` accepts.",
+                        "to another linker. The usual target for `serialtrack`, whose 3D lever "
+                        "needs the measured depth a 3D detection emits.",
                 }),
            # SerialTrack's own dimensionality. NOT the canonical `DimMode()`: a
            # `role="dim_lever"` Mode is drawn from `spec.dim_lever()`, which does not
@@ -710,11 +739,13 @@ register_node(
                         "SerialTrack): each object is described by the ARRANGEMENT of its "
                         "neighbours and matched on that descriptor, then the field is "
                         "regularized globally. Built for dense fields of near-identical "
-                        "particles — beads in a gel — where distance alone is hopeless. "
-                        "POINT MEMBERS ONLY: it reads (y, x) centroids and nothing else, so "
-                        "Label members are refused rather than silently ignoring the shape and "
-                        "size they carry. The most expensive option, and it wants many "
-                        "neighbours (25 by default) to be reliable.",
+                        "particles — beads in a gel — where distance alone is hopeless. It "
+                        "reads CENTROIDS and nothing else, so it runs on Point and Label "
+                        "members alike and ignores any shape or size they carry; it is also "
+                        "the only linker here that tracks in true 3D. The most expensive "
+                        "option by one to two orders of magnitude, and it wants many "
+                        "neighbours (25 by default) to be reliable. Pair it with Track Field "
+                        "to turn the result into displacement and strain maps.",
                     "topology":
                         "Cell-Tracker's topology linker: cost is `(1-w)·distance + w·topology`, "
                         "so neighbourhood pattern is blended with proximity by an explicit "

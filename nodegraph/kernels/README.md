@@ -1,11 +1,14 @@
 # `pure_analysis/` — portable analysis math-kernels
 
-Sixteen self-contained analysis **math-kernels**. Fourteen were vendored (byte-verbatim)
+Eighteen self-contained analysis **math-kernels**. Thirteen were vendored (byte-verbatim)
 out of the ND2Studios app (branch `Version-1.45`) so they can be ported into a *different*
 software's new node system without dragging along the ND2Studios GUI, its plugin
-registry, or its pipeline runtime; the other two (`cellsam_segment`, V2.12, and
-`piv_field`, V3 W5-P2) are new adapters of the same shape around third-party packages
-that have no v1 counterpart.
+registry, or its pipeline runtime; three (`cellsam_segment`, V2.12, `piv_field`, V3 W5-P2,
+and `aldvc_field`, rewritten 2026-09-25) are adapters of the same shape around third-party
+packages; and two are in-repo math — `track_field` (2026-09-17), the post-processing half of
+SerialTrack, derived from `track_objects`' own gauge and pinned to it by selftest, and
+`field_math` (2026-09-25), the dimension-agnostic strain/accumulation maths lifted out of the
+ALDVC port when the official pyALDVC package replaced it.
 (`mesh_raster.py`, V2.08, is new in-repo code rather than a kernel of this kind and is
 deliberately not indexed here — its contract lives in its module docstring.)
 
@@ -52,8 +55,10 @@ it returns a numpy result. That is the whole contract.
 | module | node name | entry point | real math | key deps |
 |--------|-----------|-------------|-----------|----------|
 | [`histogram_threshold`](histogram_threshold.md) | Histogram Threshold Segmenter | `HistogramThresholdSegmenter(cfg).run(image, reference_mask, voxel_size)` — `make_config(**kw)` helper | in-repo (on skimage/scipy) | numpy, scikit-image, scipy |
-| [`aldvc_field`](aldvc_field.md) | DVC / ALDVC | `run_aldvc(ref_vol, def_vol, voxel_size_um, params, ...)` | in-repo (clean-room ALDVC port) | numpy, scipy, scikit-image, cupy* |
+| [`aldvc_field`](aldvc_field.md) | DVC (pyALDVC) — **3D only** | `run_aldvc_series(get_volume, n_frames, shape, voxel_size_um, params, ...)`; `run_aldvc(ref_vol, def_vol, ...)` for one pair | **external** `al-dvc` (pyALDVC) | numpy, al-dvc* |
+| [`field_math`](field_math.md) | *(no node — shared maths)* | `build_grid(...)`, `compute_strain(...)`, `strain_from_gradient(...)`, `accumulate_incremental(...)`; owns `DVCResult` | in-repo (lifted from the ALDVC port) | numpy, scipy |
 | [`track_objects`](track_objects.md) | Track Objects | `link_objects(rows, ...)` — `link_objects_with_params(...)` µm-wrapper | in-repo (no tracking pkg) | numpy, scipy, numba, pandas, sklearn*, skimage* |
+| [`track_field`](track_field.md) | Track Field | `mls_displacement_gradient(coords, disp, ...)`, `linear_elastic_stress(strain, ...)`, `stress_invariants(...)` | in-repo (SerialTrack's `funCompDefGrad3` + isotropic linear elasticity) | numpy, scipy* |
 | [`registration`](registration.md) | Registration | `estimate_series(...)`, `apply_series(...)`, `apply_frame(...)` | in-repo (on scipy/skimage/cv2) | numpy, scikit-image, scipy, opencv-python |
 | [`bead_detect`](bead_detect.md) | Bead Detection | `detect_beads(volume_zhw, voxel_size_um, params)` | in-repo (ParticleDetector) | numpy, scipy, numba, scikit-image* |
 | [`granule_cluster`](granule_cluster.md) | Granule Clustering | `cluster_granules(points_zyx, voxel_size_um, params)` | in-repo (fits via sklearn) | numpy, scikit-learn* |
@@ -94,10 +99,15 @@ is no `(x, y)` array anywhere on the array side — `x` is always the **last** a
 
 Kernel-specific twists that bite:
 
-- **DVC / `aldvc_field`** — the displacement field is stored **slowest-axis-first**:
-  component `0` = `y` in 2-D, component `0` = `z` in 3-D. Strain uses
-  `F[i, j] = du_i / dx_j`. 2-D vs 3-D is inferred from `ndim`; a singleton-Z volume
-  must be **squeezed to 2-D** by the caller before calling.
+- **DVC / `aldvc_field`** — **3-D only** (pyALDVC cannot correlate a single plane; 2-D is
+  `dic_correlate`). pyALDVC works internally in **`(x, y, z)`**: node coords are `[x,y,z]`,
+  displacement is `[u,v,w]`, `DVCPara` triples are `(x,y,z)`. The adapter applies the
+  load-bearing **`[x,y,z]→[z,y,x]` reversal** on the component axis — and on **both** tensor
+  axes for strain, since reversing one and not the other transposes the tensor invisibly on
+  any symmetric fixture. Unlike pyALDIC, pyALDVC does **not** negate its cross-terms: do not
+  add a sign flip by analogy with `dic_correlate` (measured — `aldvc_field.md` §6b).
+  Displacement comes back in **voxels**; strain comes back in **physical** units, because
+  `voxel_size_um` is passed through so non-cubic voxels get the `voxel_i/voxel_j` rescale.
 - **`bead_detect`** — the internal `ParticleDetector` works in native `(x, y, z)`
   detector coordinates and flips to/from the wrapper's `(z, y, x)` inside
   `_detector_coords`. The wrapper's **input volume and output cloud are both `(z, y, x)`**;
@@ -167,8 +177,12 @@ is defined by the external package's version:
     prompted by CellFinder box detections). The in-repo glue is the model singleton, the
     device knob, four upstream-quirk normalizations and a contiguous relabel.
 - **Pure in-repo math** (native ND2Studios code; installs are just numpy/scipy-class):
-  `histogram_threshold`, `aldvc_field` (a clean-room numpy/scipy port of FranckLab ALDVC —
-  *not* the same thing as the `al-dic`-backed `dic_correlate`), `track_objects`,
+  `histogram_threshold`, `field_math` (the strain-measure and Lagrangian-accumulation maths
+  the correlation nodes share; it owns the `DVCResult` contract but does no correlation),
+  `track_objects`,
+  `track_field` (new 2026-09-17, not a vendor: SerialTrack's own scattered strain gauge
+  re-derived in vectorised form, plus isotropic linear elasticity, which SerialTrack has
+  no counterpart for),
   `registration`, `bead_detect`, `granule_cluster` (fits delegated to sklearn),
   `granule_tessellate`, `granule_volume_mask`, `granule_boundary`, `dic_mesh_region`.
 - **No analysis at all**: `checkpoint` is pure serialization (compressed NPZ + JSON
@@ -184,8 +198,9 @@ you must install just to load a kernel. See the matrix; the headline cases:
 - **Lazy / optional**: `cellSAM`/`torch` (cellsam_segment — `find_spec`-gated, and
   `resolve_device("cpu")` avoids the torch import entirely),
   `tensorflow`/`stardist`/`csbdeep` (stardist_segment), `al-dic`
-  (dic_correlate, dic_mesh_refinement), `cupy` (aldvc_field — GPU FFT seed only, CPU
-  fallback), `scikit-learn` (granule_cluster; track_objects warm-start).
+  (dic_correlate, dic_mesh_refinement), `al-dvc` (aldvc_field — the whole solver; the
+  module imports fine without it and only a call raises), `scikit-learn`
+  (granule_cluster; track_objects warm-start).
 - **Import-time (must be installed to `import`)**: `numpy` (all), `scipy` +
   `numba` (bead_detect; and via `track_objects`), `pandas` (track_objects — pulled in
   because CellTracker's tracking imports it at top level), `scikit-image` (histogram_threshold;
@@ -199,11 +214,13 @@ you must install just to load a kernel. See the matrix; the headline cases:
 imports fine; needed only when a specific path runs). `opt` = optional feature only (kernel
 degrades gracefully / falls back if absent). Blank = not used.
 
-| module | numpy | scipy | scikit-image | opencv | numba | pandas | scikit-learn | tensorflow | stardist | csbdeep | cupy | al-dic |
+| module | numpy | scipy | scikit-image | opencv | numba | pandas | scikit-learn | tensorflow | stardist | csbdeep | al-dvc | al-dic |
 |--------|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
 | histogram_threshold | IT | IT | IT | | | | | | | | | |
-| aldvc_field | IT | IT | IT | | | | | | | | L·opt | |
+| aldvc_field | IT | | | | | | | | | | L | |
+| field_math | IT | IT | | | | | | | | | | |
 | track_objects | IT | IT | L | | IT | IT | L | | | | | |
+| track_field | IT | L | | | | | | | | | | |
 | registration | IT | L | IT | L | | | | | | | | |
 | bead_detect | IT | IT | L·opt | | IT | | | | | | | |
 | granule_cluster | IT | | | | | | L | | | | | |
@@ -252,8 +269,10 @@ Each kernel was smoke-tested: `import` check plus a synthetic call where all dep
 | module | import | synthetic run | note |
 |--------|:------:|:-------------:|------|
 | histogram_threshold | ok | ran | all 4 threshold methods on a 64×64 uint16 frame |
-| aldvc_field | ok | ran | serial 2-D + 3-D with `n_workers=2` (process-pool / shared-memory) |
+| aldvc_field | ok | ran | 3-D pair + series against analytic truth; 18 adapter checks in `scripts/_aldvc_validate.py` (axis reversal, asymmetric-strain relabelling, no sign flip, anisotropic rescale, frame schedule) |
+| field_math | ok | ran | shear fixture: tensor shear symmetric at half the gradient; grid build on a 40³ volume |
 | track_objects | ok | ran | all 5 linking methods; in-place mutation confirmed |
+| track_field | ok | ran | closed-form suite: affine gradient exact to 1e-15, parity with the `compute_strain_mls` loop, and every elasticity case (uniaxial / shear / hydrostatic / plane stress / plane strain) against its analytic answer |
 | registration | ok | ran | every entry point; translation recovered injected drift exactly |
 | bead_detect | ok | ran | 3-D detection + 2-D fallback |
 | granule_cluster | ok | ran | 2-granule cloud; BIC sweep; empty-cloud early return |
