@@ -16,7 +16,7 @@ from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
 from nodegraph.metadata import subtract_background as _meta_subtract_background
 from nodegraph.registry import (DimMode, Granularity, InBool, InDataset, InFloat, InInt,
-                                Mode, OutDataset)
+                                InString, Mode, OutDataset)
 
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.kernel_radius import (
@@ -87,6 +87,93 @@ _POLY_SAMPLES = 200_000
 #: Default background scale, in microns. Comfortably above one adherent cell, which is the
 #: condition every estimator here needs to not subtract the objects themselves.
 _R_DEFAULT = 25.0
+
+#: ``approach`` -> the two things this node can mean by "subtract background" (2026-10-02).
+#: ``estimate_surface`` is everything above: fit a smooth surface, remove it arithmetically.
+#: ``zero_regions`` is the other request users make: DECIDE which pixels are background and
+#: set them to nothing, leaving every object pixel untouched.
+_APPROACHES: Tuple[str, ...] = ("estimate_surface", "zero_regions")
+_SURFACE = frozenset({"estimate_surface"})
+_ZERO = frozenset({"zero_regions"})
+#: ``detector`` -> how the ``zero_regions`` approach decides what is background.
+_DETECTORS: Tuple[str, ...] = ("sampled_region", "adaptive")
+_SAMPLED = frozenset({"sampled_region"})
+_ADAPTIVE = frozenset({"adaptive"})
+#: Fewest region pixels the sampled detector accepts: a standard deviation needs two, and a
+#: drawn region with one pixel in it is a mis-click, not a background sample.
+_MIN_SAMPLE = 2
+
+
+# ── the zero-regions detectors ─────────────────────────────────────────────────
+
+def _region_shapes(raw):
+    """The ``shapes`` param -> a list of shape dicts, or ``None`` when nothing is drawn.
+
+    The same two forms ``analysis.roi_mask`` accepts, for the same reason: the GUI's draw
+    tool writes JSON text into a STRING socket (``pick_kind="shapes"``), a headless caller
+    hands in the list. Malformed JSON is refused with the parse error. Kept here rather than
+    imported from the ROI node because a node module may not import another node's module."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    if not isinstance(raw, str):
+        return raw
+    import json as _json
+    try:
+        val = _json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"subtract background (sampled region): `shapes` is not valid JSON ({exc}). Draw "
+            "the background region with the Pick tool, or pass a list of shape objects.") from exc
+    if val in (None, [], {}):
+        return None
+    if not isinstance(val, list):
+        raise ValueError("subtract background (sampled region): `shapes` must be a JSON "
+                         f"list, got {type(val).__name__}")
+    return val
+
+
+def _sampled_background(s: np.ndarray, region2d: np.ndarray, tolerance: float) -> np.ndarray:
+    """Background = every voxel no brighter than the sampled region's own distribution.
+
+    ``s`` is the unit in SIGNAL space (positive-going, so the polarity algebra has already
+    run); ``region2d`` is the drawn ``(Y, X)`` mask, applied to every plane of a volume. The
+    sample's mean and standard deviation set one cut, ``mean + tolerance * sd``, and
+    everything at or below it is background — "similar to what you showed me, or darker".
+    Darker-than-sample is included deliberately: a camera-offset corner is still not an
+    object. Bright pixels inside the drawn region (a stray object the user swept over) widen
+    the sd and so loosen the cut a little; they do not break it."""
+    sample = s[..., region2d] if s.ndim == 3 else s[region2d]
+    mu, sd = float(sample.mean()), float(sample.std())
+    return s <= mu + tolerance * sd
+
+
+def _adaptive_background(s: np.ndarray, sigmas: Sequence[float], tolerance: float,
+                         low: float, high: float) -> np.ndarray:
+    """Background = every voxel at or below a LOCAL cut, clamped into ``[low, high]``.
+
+    ``cut = local_mean + tolerance * noise_sd``: the local mean under a Gaussian of the block
+    scale rides the shading the way the surface estimators do, and is then used as a
+    DECISION, not subtracted. The margin is ONE robust noise width for the whole unit —
+    ``1.4826 * median(|s - local_mean|)``, the MAD of the high-pass residual — rather than
+    Niblack's local standard deviation, on purpose: a local sd balloons next to any bright
+    object (measured here: a compact object whose core sat 3x above its local mean was still
+    zeroed at tolerance 3), so it ate exactly the pixels the approach exists to protect. The
+    median is immune to the objects' tails as long as they cover under half the field.
+
+    The clamp is the "within a user-defined range" half of the request, and it is what keeps
+    adaptive thresholding from its classic failure: inside an object wider than the block
+    the local mean rises to the object's own brightness, so its interior sits below its
+    local cut and would be zeroed. An upper limit set below object brightness makes that
+    impossible; a lower limit keeps the cut from collapsing onto a flat, noise-free field
+    and zeroing nothing. ``high <= 0`` means no upper limit, mirroring this node's
+    ``0 = auto`` convention elsewhere."""
+    from scipy import ndimage as ndi
+    mean = ndi.gaussian_filter(s, sigma=sigmas, mode="nearest")
+    resid = s - mean
+    noise = 1.4826 * float(np.median(np.abs(resid)))
+    cut = mean + tolerance * noise
+    cut = np.clip(cut, low, high if high > 0.0 else None)
+    return s <= cut
 
 
 # ── the estimators ─────────────────────────────────────────────────────────────
@@ -307,10 +394,43 @@ def _compute_subtract_background(ctx: EvalContext) -> Dataset:
     copy, the arithmetic is applied to the ORIGINAL pixels. skimage's docstring gives the
     reason directly — the rolling ball is sensitive to salt-and-pepper noise, because one dead
     pixel lets the ball reach the floor under it.
+
+    **The second approach — ``approach="zero_regions"`` (2026-10-02).** Instead of estimating
+    a surface and subtracting it from every pixel, DECIDE which pixels are background and set
+    them to nothing, leaving object pixels bit-for-bit untouched. ``detector`` picks the
+    decision rule:
+
+    * ``sampled_region`` — the user draws one or more regions of pure background (the
+      ``shapes`` socket, the same draw tool as ``analysis.roi_mask``); every voxel no brighter
+      than ``mean + tolerance * sd`` of the sampled pixels is background. The region is drawn
+      in (Y, X) and applies to every plane of a volume; the statistics pool over the whole
+      unit's region voxels. An empty region is REFUSED — "similar to nothing" is not a rule.
+    * ``adaptive`` — a local cut, ``local_mean + tolerance * noise_sd``: the mean under a
+      Gaussian of ``block_size`` (and ``block_size_z`` in 3D), plus a margin of one robust
+      noise width for the unit (MAD of the high-pass residual), clamped into
+      ``[range_low, range_high]``. The clamp is what stops the interior of an object wider
+      than the block from falling below its own local mean and being zeroed.
+
+    Both run in the same signal space as the estimators, so ``polarity`` means the same
+    thing: on a light background "nothing" is the white level, and background pixels are set
+    to white, not black. ``presmooth`` governs the DECISION only (the mask is computed on the
+    smoothed copy, applied to the original pixels), exactly as it governs the estimate above.
+    ``output="corrected"`` zeroes the background; ``output="background"`` zeroes everything
+    else, so the diagnostic shows precisely the pixels about to be removed, in their own
+    units. ``combine`` is not read on this path and is hidden. The intensity scale never
+    changes (a pixel is either itself or nothing), so ``bit_depth`` survives on every branch
+    of this approach, and the meta_transform says so. Footprint unchanged: both detectors
+    need the whole unit (the sample's statistics, the clamp over the unit).
     """
     from scipy import ndimage as ndi
     ds = ctx.inputs[0]
     modes = ctx.params.get("__modes__", {})
+    approach = str(modes.get("approach") or "estimate_surface")
+    if approach not in _APPROACHES:
+        raise ValueError(f"subtract background: unknown approach {approach!r} — one of "
+                         f"{list(_APPROACHES)}")
+    if approach == "zero_regions":
+        return _compute_zero_regions(ctx, ds, modes)
     method = str(modes.get("method") or "rolling_ball")
     if method not in _METHODS:
         raise ValueError(f"subtract background: unknown method {method!r} — one of "
@@ -432,6 +552,94 @@ def _compute_subtract_background(ctx: EvalContext) -> Dataset:
     return emit(_map_image(ctx, ds, plane_fn=unit, volume_fn=unit if vol else None))
 
 
+def _compute_zero_regions(ctx: EvalContext, ds: Dataset, modes) -> Dataset:
+    """The ``approach="zero_regions"`` half of :func:`_compute_subtract_background`: decide
+    which voxels are background, then set them to nothing. See that docstring for the spec;
+    this function is the branch, split out so each approach reads its own params only (R1:
+    a plain surface subtract must not be memo-fenced on a ``shapes`` string it never read)."""
+    from scipy import ndimage as ndi
+    detector = str(modes.get("detector") or "sampled_region")
+    if detector not in _DETECTORS:
+        raise ValueError(f"subtract background: unknown detector {detector!r} — one of "
+                         f"{list(_DETECTORS)}")
+    output = str(modes.get("output") or "corrected")
+    light = str(modes.get("polarity") or "dark_background") == "light_background"
+    vol = ctx.is_volume
+    tolerance = float(ctx.params.get("tolerance", 3.0))
+    if tolerance < 0.0:
+        raise ValueError(f"subtract background ({detector}): tolerance must be >= 0 standard "
+                         f"deviations, got {tolerance:g}.")
+    presmooth = bool(ctx.params.get("presmooth", True))
+    white = None
+    if light:
+        bd = ctx.calib("bit_depth")
+        white = float(2 ** int(bd) - 1) if bd else None
+
+    region2d = None
+    sigmas: Tuple[float, ...] = ()
+    low = high = 0.0
+    if detector == "sampled_region":
+        from nodegraph.kernels.dic_mesh_region import build_roi_mask, has_region
+        shapes = _region_shapes(ctx.params.get("shapes"))
+        if not has_region(shapes):
+            raise ValueError(
+                "subtract background (sampled region): no background region is drawn. Use the "
+                "Pick tool on the `Background sample` socket to outline one or more patches of "
+                "pure background — the node zeroes everything that looks like them. With "
+                "nothing drawn there is nothing to compare against, so refusing is the only "
+                "honest answer (the ROI Mask node's whole-frame default would mean 'everything "
+                "is background').")
+        ax = ds.image.axes
+        region2d = np.asarray(build_roi_mask(shapes, ax.y, ax.x), dtype=bool)
+        if int(region2d.sum()) < _MIN_SAMPLE:
+            raise ValueError(
+                f"subtract background (sampled region): the drawn region covers "
+                f"{int(region2d.sum())} pixel(s); at least {_MIN_SAMPLE} are needed to "
+                "estimate a spread. Draw a larger patch.")
+    else:
+        node = "subtract background (adaptive)"
+        degenerate = ("compares every pixel to itself, so the local cut equals the pixel and "
+                      "every pixel is zeroed")
+        ry = _radius_px(ctx, "block_size", _R_DEFAULT)
+        _require_window(ctx, _win(ry), ry, node=node, zero_is_identity=False,
+                        degenerate=degenerate, param="block_size")
+        if vol:
+            rz = _radius_z_px(ctx, "block_size", _R_DEFAULT)
+            _require_window(ctx, _win(rz), rz, node=node, param="block_size_z", axis="axial",
+                            zero_is_identity=False, degenerate=degenerate)
+            sigmas = (max(1e-6, rz / 2.0), ry / 2.0, ry / 2.0)
+        else:
+            sigmas = (ry / 2.0, ry / 2.0)
+        low = float(ctx.params.get("range_low", 0.0))
+        high = float(ctx.params.get("range_high", 0.0))
+        if low < 0.0 or (high > 0.0 and high < low):
+            raise ValueError(
+                f"subtract background (adaptive): the clamp range must satisfy 0 <= low <= "
+                f"high (or high = 0 for no upper limit), got low={low:g}, high={high:g}.")
+
+    def unit_fn(a: np.ndarray) -> np.ndarray:
+        a = np.asarray(a, dtype=float)
+        mx = max(white, float(a.max())) if white is not None else float(a.max())
+        s = (mx - a) if light else a
+        s_est = ndi.uniform_filter(s, size=3, mode="nearest") if presmooth else s
+        if detector == "sampled_region":
+            bg = _sampled_background(s_est, region2d, tolerance)
+        else:
+            # the clamp is typed in RECORDED units; in signal space a light-background
+            # range flips and reflects about the white level
+            if light:
+                s_low = (mx - high) if high > 0.0 else 0.0
+                s_high = mx - low
+            else:
+                s_low, s_high = low, high
+            bg = _adaptive_background(s_est, sigmas, tolerance, s_low, s_high)
+        keep = ~bg if output == "corrected" else bg
+        out_s = np.where(keep, s, 0.0)
+        return (mx - out_s) if light else out_s
+
+    return _map_image(ctx, ds, plane_fn=unit_fn, volume_fn=unit_fn if vol else None)
+
+
 register_node(
     _compute_subtract_background, op_key="enhance.subtract_background",
     label="Subtract Background", category="enhancement",
@@ -439,7 +647,7 @@ register_node(
         InDataset(),
         InFloat("radius", "Background radius", unit="um", field=False,
                 default=_R_DEFAULT, pick_kind="radius",
-                available_in={"method": _RADIUS_METHODS},
+                available_in={"approach": _SURFACE, "method": _RADIUS_METHODS},
                 description=
                 "The background scale in MICRONS — the one knob that decides what counts as "
                 "background. Structure LARGER than this survives in the estimate and is "
@@ -453,10 +661,12 @@ register_node(
                 "methods, which carry their own scale control or none at all."),
         InFloat("radius_z", "Background radius Z", unit="um_axial", field=False,
                 default=_R_DEFAULT,
-                available_in={"dim": frozenset({"3D"}), "method": _RADIUS_METHODS},
+                available_in={"approach": _SURFACE, "dim": frozenset({"3D"}),
+                              "method": _RADIUS_METHODS},
                 description=_AXIAL_TWIN_DOC.format(lateral="Background radius")),
         InFloat("sigma", "Background sigma", unit="um", field=False, default=20.0,
-                pick_kind="radius", available_in={"method": frozenset({"gaussian"})},
+                pick_kind="radius",
+                available_in={"approach": _SURFACE, "method": frozenset({"gaussian"})},
                 description=
                 "Width of the Gaussian background estimate, in microns. Plays the same role "
                 "as `Background radius` but for a smooth blur rather than a kernel, so the "
@@ -465,11 +675,11 @@ register_node(
                 "its value. Matches `enhance.flatten_field`'s default of 20 um, so the two "
                 "nodes agree when set the same. Only read by the `gaussian` method."),
         InFloat("sigma_z", "Background sigma Z", unit="um_axial", field=False, default=20.0,
-                available_in={"dim": frozenset({"3D"}),
+                available_in={"approach": _SURFACE, "dim": frozenset({"3D"}),
                               "method": frozenset({"gaussian"})},
                 description=_AXIAL_TWIN_DOC.format(lateral="Background sigma")),
         InFloat("percentile", "Percentile", unit="", field=False, default=10.0,
-                available_in={"method": _PCT_METHODS},
+                available_in={"approach": _SURFACE, "method": _PCT_METHODS},
                 description=
                 "Which point in the local intensity distribution is taken as the background, "
                 "0-100. LOWER is a darker, more conservative estimate that removes less and "
@@ -483,7 +693,7 @@ register_node(
                 "the latter, a low value here is the usual way to strip a flat camera "
                 "offset."),
         InInt("degree", "Polynomial degree", unit="", field=False, default=2,
-                available_in={"method": frozenset({"polynomial"})},
+                available_in={"approach": _SURFACE, "method": frozenset({"polynomial"})},
                 description=
                 "Total degree of the fitted surface. 0 subtracts a single mean level, 1 a "
                 "tilted plane, 2 the saddle/dome that models ordinary vignetting — 2 is the "
@@ -495,7 +705,7 @@ register_node(
                 "has no length scale at all, which is exactly why it cannot subtract a cell: "
                 "a low-degree surface has nowhere to put one. Only read by `polynomial`."),
         InFloat("height", "Ball height", unit="", field=False, default=0.0,
-                available_in={"method": frozenset({"ellipsoid"})},
+                available_in={"approach": _SURFACE, "method": frozenset({"ellipsoid"})},
                 description=
                 "How far the ball may curve in INTENSITY, in the image's own units — the "
                 "control `rolling_ball` does not expose. 0 means auto, which reproduces "
@@ -508,7 +718,7 @@ register_node(
                 "removes less. Start near the peak-to-trough range of the shading you can "
                 "see. Only read by `ellipsoid`."),
         InInt("shrink", "Shrink factor", unit="", field=False, default=0,
-                available_in={"method": _SHRINK_METHODS},
+                available_in={"approach": _SURFACE, "method": _SHRINK_METHODS},
                 description=
                 "Estimate the background on a coarsened copy, then interpolate it back up — "
                 "the speed control. 0 is auto (ImageJ's own table: 1 up to a 10 px radius, "
@@ -539,7 +749,7 @@ register_node(
                 "methods, which average over far more pixels than a 3x3 window."),
         InFloat("bg_floor", "Background floor", unit="", field=False, default=1.0,
                 derive="1.0 if bit_depth else 1e-06",
-                available_in={"combine": frozenset({"divide"}),
+                available_in={"approach": _SURFACE, "combine": frozenset({"divide"}),
                               "output": frozenset({"corrected"})},
                 description=
                 "Smallest value the background may take before it is used as a divisor — it "
@@ -551,11 +761,122 @@ register_node(
                 "image, so the division would quietly return the input unchanged. Raise it to "
                 "clamp harder in dark regions; it has no effect where the background is well "
                 "above it. Only read by the `divide` arithmetic."),
+        # ── the zero-regions approach's own sockets ──
+        InString("shapes", "Background sample", field=False, default="",
+                 pick_kind="shapes",
+                 available_in={"approach": _ZERO, "detector": _SAMPLED},
+                 description=
+                 "One or more patches of PURE background, drawn on the viewer with the Pick "
+                 "button (rectangle / ellipse / polygon / freehand, with Add and Cut). The "
+                 "node measures the intensity distribution under what you draw and zeroes "
+                 "every pixel in the frame that is no brighter than it — so the patch should "
+                 "be representative, not tiny: a few hundred pixels spanning the dim and the "
+                 "brighter parts of the empty field. Drawing over an object widens the "
+                 "spread and makes the cut more aggressive, eating dim objects. The region is "
+                 "drawn in (Y, X) and is applied to every Z plane of a volume, and the "
+                 "statistics are pooled over the whole plane or volume. EMPTY is REFUSED "
+                 "rather than defaulting to the whole frame: with no sample there is nothing "
+                 "to be similar to. Only read by the `sampled_region` detector."),
+        InFloat("tolerance", "Tolerance", unit="", field=False, default=3.0,
+                available_in={"approach": _ZERO},
+                description=
+                "How many noise widths above the background's mean still count as "
+                "background. For `sampled_region` the mean and spread are those of the pixels "
+                "you drew; for `adaptive` the mean is each pixel's local mean under the block "
+                "and the spread is one robust noise estimate for the whole plane or volume. "
+                "HIGHER zeroes more — it reaches into the dim tail of real objects and "
+                "lowers their reported areas — and LOWER leaves speckles of unzeroed noise in "
+                "the field. 3 is the natural starting point: on Gaussian noise it keeps "
+                "99.7 percent of genuine background pixels on the background side, so the "
+                "field comes out clean while anything a few noise widths above it survives. "
+                "Drop toward 2 when objects are faint; raise toward 4 to 5 on noisy cameras."),
+        InFloat("block_size", "Block size", unit="um", field=False, default=_R_DEFAULT,
+                pick_kind="radius",
+                available_in={"approach": _ZERO, "detector": _ADAPTIVE},
+                description=
+                "Radius in MICRONS of the neighbourhood whose local mean sets the cut at each "
+                "pixel (the Gaussian's sigma is half of it, so the window spans "
+                "about this far). The same rule as `Background radius`: keep it well above "
+                "object size, or a cell becomes its own neighbourhood, its local mean rises "
+                "to its own brightness, and its interior is zeroed from the inside out. The "
+                "`Upper limit` clamp exists for exactly that case, but the right block size "
+                "makes it unnecessary. Only read by the `adaptive` detector."),
+        InFloat("block_size_z", "Block size Z", unit="um_axial", field=False,
+                default=_R_DEFAULT,
+                available_in={"approach": _ZERO, "detector": _ADAPTIVE,
+                              "dim": frozenset({"3D"})},
+                description=_AXIAL_TWIN_DOC.format(lateral="Block size")),
+        InFloat("range_low", "Lower limit", unit="", field=False, default=0.0,
+                available_in={"approach": _ZERO, "detector": _ADAPTIVE},
+                description=
+                "Floor for the local cut, in the image's own intensity units — the local "
+                "threshold is never allowed below this. 0 (the default) imposes nothing. "
+                "Raise it to guarantee that everything under a known intensity is zeroed even "
+                "where the field is so flat and clean that the local spread collapses and the "
+                "adaptive cut would otherwise leave a faint pedestal in place. Typed in "
+                "recorded units in both polarities (for a light background, 'below the cut' "
+                "means closer to white). Only read by the `adaptive` detector."),
+        InFloat("range_high", "Upper limit", unit="", field=False, default=0.0,
+                available_in={"approach": _ZERO, "detector": _ADAPTIVE},
+                description=
+                "Ceiling for the local cut, in the image's own intensity units — the local "
+                "threshold is never allowed above this, so no pixel brighter than it can ever "
+                "be zeroed. 0 (the default) means no ceiling. This is the control that makes "
+                "adaptive thresholding safe on large bright objects: without it, a cell wider "
+                "than the block has a local mean near its own brightness and its interior falls "
+                "below the cut. Set it a little under the dimmest object you want to keep and "
+                "the object is protected whatever the block size does. Must be at or above "
+                "the lower limit when both are set. Only read by the `adaptive` detector."),
     ],
     outputs=[OutDataset()],
     modes=[
         DimMode(),
+        Mode("approach", list(_APPROACHES), default="estimate_surface", label="Approach",
+             description=
+             "What 'subtract background' means for this node. The two options are different "
+             "operations, not two settings of one: the first changes every pixel by a smooth "
+             "amount, the second changes a chosen set of pixels completely and leaves the rest "
+             "exactly as they were. Each shows only its own controls.",
+             choice_docs={
+                 "estimate_surface":
+                     "Fit a smooth background surface from the image's own pixels with the "
+                     "chosen `Estimator`, then remove it with the chosen `Arithmetic` — "
+                     "ImageJ's `Subtract Background`, and the default. Every pixel moves, by "
+                     "the local background amount; objects keep their shape and lose their "
+                     "pedestal. The right tool for photometry and for uneven illumination.",
+                 "zero_regions":
+                     "Decide which pixels ARE background and set them to nothing (0 on a dark "
+                     "background, the white level on a light one), touching no other pixel. "
+                     "Objects keep their exact recorded intensities, so a downstream mean over "
+                     "an object is unchanged, while the field becomes exactly empty. The right "
+                     "tool for cleaning a field before display, for a hard mask of 'not "
+                     "background', or when you can show the node what background looks like.",
+             }),
+        Mode("detector", list(_DETECTORS), default="sampled_region", label="Detector",
+             available_in={"approach": _ZERO},
+             description=
+             "How the `zero_regions` approach decides what is background. One rule is taught "
+             "by example, the other is computed from each pixel's own neighbourhood; both end "
+             "in a cut that `Tolerance` moves.",
+             choice_docs={
+                 "sampled_region":
+                     "You draw one or more patches of pure background (`Background sample`); "
+                     "every pixel in the frame no brighter than that sample's mean plus "
+                     "`Tolerance` spreads is zeroed. One global cut per plane or volume, so it "
+                     "assumes the background is roughly uniform across the field — under "
+                     "strong shading, flatten the image first or use `adaptive`. Needs the "
+                     "drawn region; nothing drawn is refused.",
+                 "adaptive":
+                     "A local cut at every pixel: its neighbourhood's mean under a Gaussian of "
+                     "`Block size`, plus `Tolerance` noise widths (one robust estimate per "
+                     "plane or volume), clamped between `Lower limit` and `Upper limit`. "
+                     "Follows uneven illumination without any "
+                     "drawing, at the cost of the classic adaptive failure inside objects "
+                     "wider than the block — which the upper limit is there to prevent. Needs "
+                     "no input from you beyond a block size above object size.",
+             }),
         Mode("method", list(_METHODS), default="rolling_ball", label="Estimator",
+             available_in={"approach": _SURFACE},
              description=
              "How the background surface is estimated. Every option answers the same "
              "question — what does this image look like with the objects taken out — and they "
@@ -663,20 +984,23 @@ register_node(
              "is small enough to be tracing your objects.",
              choice_docs={
                  "corrected":
-                     "The image with the background removed, by the `Arithmetic` below. What "
-                     "you want downstream, and the default.",
+                     "The image with the background removed — by the `Arithmetic` below under "
+                     "`estimate_surface`, or with the detected background pixels set to nothing "
+                     "under `zero_regions`. What you want downstream, and the default.",
                  "background":
-                     "The estimated background surface itself, in the input's own intensity "
-                     "units — the diagnostic. Objects visible in it are objects about to be "
-                     "subtracted from themselves, which means the radius is too small; that "
-                     "is the one check worth making before trusting any number downstream, "
-                     "and it is far easier to see here than in the corrected image. Wire it "
-                     "to a Viewer, or to `io.write_tiff` to keep it beside the run. The "
-                     "`Arithmetic` control is hidden on this output because nothing reads it, "
-                     "and the intensity scale is unchanged whatever it was set to.",
+                     "The background itself, in the input's own intensity units — the "
+                     "diagnostic. Under `estimate_surface` it is the estimated surface: objects "
+                     "visible in it are objects about to be subtracted from themselves, which "
+                     "means the radius is too small. Under `zero_regions` it is the complement "
+                     "of the corrected image — only the pixels about to be zeroed, everything "
+                     "else blank — so you can see exactly what the detector decided. Either way "
+                     "it is the one check worth making before trusting any number downstream. "
+                     "Wire it to a Viewer, or to `io.write_tiff` to keep it beside the run. "
+                     "The `Arithmetic` control is hidden on this output because nothing reads "
+                     "it, and the intensity scale is unchanged whatever it was set to.",
              }),
         Mode("combine", list(_COMBINES), default="subtract", label="Arithmetic",
-             available_in={"output": frozenset({"corrected"})},
+             available_in={"approach": _SURFACE, "output": frozenset({"corrected"})},
              description=
              "How the estimate is removed. The real question is whether your shading is an "
              "additive offset (stray light, camera bias, autofluorescent medium) or a "
@@ -715,4 +1039,7 @@ register_node(
                 "percentile, large-sigma Gaussian, least-squares polynomial surface, or one "
                 "whole-unit percentile. Dark or light background, subtract / signed subtract "
                 "/ divide, or output the estimate itself. Auto-shrinks the expensive "
-                "estimators (ImageJ's factor table); `divide` drops bit_depth.")
+                "estimators (ImageJ's factor table); `divide` drops bit_depth. Or, as a "
+                "second approach, DECIDE which pixels are background — by similarity to a "
+                "drawn sample, or by an adaptive local cut clamped to a range — and set "
+                "exactly those to nothing, leaving every object pixel untouched.")

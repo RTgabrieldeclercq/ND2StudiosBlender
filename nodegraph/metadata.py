@@ -214,8 +214,14 @@ def subtract_background(env: MetaEnvelope, params: Mapping,
     compute's own branch. Both defaults are spelled the way the compute spells them, since
     this runs on every keystroke against a state that may predate either Mode.
 
-    Axis-preserving either way — only the meaning of the numbers can change."""
+    Axis-preserving either way — only the meaning of the numbers can change.
+
+    ``approach="zero_regions"`` (2026-10-02) never changes the scale — a pixel is either
+    itself or nothing — so the key survives there whatever ``combine`` still holds behind
+    its hidden dropdown. Checked FIRST for that reason: a hidden Mode keeps its value."""
     m = modes or {}
+    if str(m.get("approach") or "estimate_surface") == "zero_regions":
+        return env
     dimensionless = (str(m.get("output") or "corrected") == "corrected"
                      and str(m.get("combine") or "subtract") == "divide")
     return env.with_metadata(bit_depth=None) if dimensionless else env
