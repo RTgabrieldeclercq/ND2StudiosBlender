@@ -590,6 +590,15 @@ class GLImageView(QOpenGLWidget):
         f.glTexParameteri(_GL_TEXTURE_2D, _GL_TEXTURE_WRAP_T, _GL_CLAMP_TO_EDGE)
         f.glTexImage2D(_GL_TEXTURE_2D, 0, _GL_R16, w, h, 0, _GL_RED,
                        _GL_UNSIGNED_SHORT, u16.tobytes())
+        # Put the alignment BACK. Pixel-store state belongs to the context, not to this
+        # call, and QPainter's text engine shares the context: it uploads each new glyph
+        # into its glyph-cache texture with 4-byte-aligned scanlines and never sets the
+        # alignment itself. Left at 1, every glyph rasterized after the first frame is
+        # read with the wrong stride and lands in the cache as a white block with black
+        # stripes — and stays that way for the life of the context, since the cache is
+        # never refilled (2026-10-02; glyphs cached before the first upload were fine,
+        # which is why it looked like only *some* labels were broken).
+        f.glPixelStorei(_GL_UNPACK_ALIGNMENT, 4)
         keymap[ch] = id(plane)
 
     def set_channel(self, ch: int, lo: float, hi: float,
