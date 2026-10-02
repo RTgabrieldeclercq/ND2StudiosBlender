@@ -19,10 +19,10 @@ import html
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QMimeData, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLineEdit, QSplitter, QTextBrowser, QToolButton,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHBoxLayout, QHeaderView, QLineEdit, QSplitter, QStyledItemDelegate, QTextBrowser,
+    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from nodegraph import roles as R
@@ -117,9 +117,37 @@ def _dots_icon(colors: Sequence[Tuple[QColor, str]], align_right: bool = False) 
 
 # ── the tree ──────────────────────────────────────────────────────────────────
 
+class _BandDelegate(QStyledItemDelegate):
+    """Paint the stage/role rows' background band.
+
+    The band is the item's own ``BackgroundRole`` brush, but it has to be painted here
+    rather than left to the view: the panel's stylesheet has a ``QTreeWidget::item`` rule
+    (padding, radius), and once such a rule exists Qt's stylesheet style draws the item
+    panel itself and ignores the model's background brush — so ``setBackground`` alone
+    produced no band at all. Filling the row rect before the default paint puts the band
+    under the text whatever the stylesheet does; the hover/selection rules still draw on
+    top of it, which is what you want.
+    """
+
+    def paint(self, painter: QPainter, option, index) -> None:  # noqa: D401
+        kind = index.data(_KIND)
+        if kind in ("stage", "role"):
+            brush = index.data(Qt.BackgroundRole)
+            if brush is not None:
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(brush)
+                r = option.rect.adjusted(0, 1, 0, -1)
+                painter.drawRoundedRect(r, 4.0, 4.0)
+                painter.restore()
+        super().paint(painter, option, index)
+
+
 class _PaletteTree(QTreeWidget):
     def __init__(self) -> None:
         super().__init__()
+        self.setItemDelegate(_BandDelegate(self))
         self.setHeaderHidden(True)
         self.setDragEnabled(True)
         self.setIndentation(12)
@@ -255,30 +283,43 @@ class PalettePanel(QWidget):
             if not roles:
                 continue
             smeta = R.stage_meta(sk)
-            head = QTreeWidgetItem(["", str(smeta.get("label", sk)).upper(), ""])
+            # The stage is a BAND, not a column entry: its text sits in column 0 and spans
+            # the row, so it starts at the panel's left edge instead of after the dots
+            # column, and it gets a filled background so the five stages read as sections
+            # at a glance. (The first cut put the label in the middle column in small muted
+            # caps, which left it both indented and the faintest thing on the panel.)
+            head = QTreeWidgetItem([str(smeta.get("label", sk)), "", ""])
             head.setFlags(Qt.ItemIsEnabled)
             head.setData(0, _KIND, "stage")
             head.setData(0, _KEY, sk)
-            head.setForeground(1, T.MUTED)
-            head.setToolTip(1, _squash(smeta.get("description")))
-            f = head.font(1)
+            head.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+            head.setBackground(0, QBrush(T.ACCENT_DIM))
+            head.setForeground(0, QBrush(T.INK))
+            head.setToolTip(0, _squash(smeta.get("description")))
+            f = head.font(0)
             f.setBold(True)
-            f.setPointSizeF(max(7.0, f.pointSizeF() - 1.0))
-            head.setFont(1, f)
+            head.setFont(0, f)
+            head.setSizeHint(0, QSize(0, 24))
             self._tree.addTopLevelItem(head)
+            head.setFirstColumnSpanned(True)      # only takes effect once it is in the tree
             role_order = [rk for rk, _ in R.roles_in(sk)] + [R.OTHER_ROLE]
             for rk in role_order:
                 group = roles.get(rk)
                 if not group:
                     continue
                 rmeta = R.role_meta(rk)
-                rrow = QTreeWidgetItem(["", str(rmeta.get("label", rk)), ""])
+                # a role is a sub-heading: spanned and left-justified like the stage, one
+                # indent step in, with a lighter tint so stage > role > node reads as depth
+                rrow = QTreeWidgetItem([str(rmeta.get("label", rk)), "", ""])
                 rrow.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 rrow.setData(0, _KIND, "role")
                 rrow.setData(0, _KEY, rk)
-                rrow.setForeground(1, T.ACCENT)
-                rrow.setToolTip(1, _squash(rmeta.get("description")))
+                rrow.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+                rrow.setBackground(0, QBrush(T.mix(T.PANEL, T.ACCENT_DIM, 0.45)))
+                rrow.setForeground(0, QBrush(T.ACCENT))
+                rrow.setToolTip(0, _squash(rmeta.get("description")))
                 head.addChild(rrow)
+                rrow.setFirstColumnSpanned(True)
                 for spec in sorted(group, key=lambda s: s.label):
                     row = QTreeWidgetItem(["", spec.label, ""])
                     row.setData(0, _OP, spec.op_key)

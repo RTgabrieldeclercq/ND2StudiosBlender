@@ -3039,25 +3039,27 @@
 {"doc":"Draw a small sample of ``tab``'s overlay inside ``rect`` using the REAL renderer, over a synthetic checker so opacity is readable. Reserved tabs get a plain note.","file":"nodelab_v2/overlays.py","id":"nodelab_v2.overlays.render_preview","k":"sym","kind":"func","line":1821,"sig":"(p: QPainter, rect: QRectF, s: OverlaySettings, tab: str, renderer: Optional[OverlayRenderer]=None) -> None"}
 {"doc":"Copy ``source``'s look onto every other tab **where the role applies**.","file":"nodelab_v2/overlays.py","id":"nodelab_v2.overlays.spread_settings","k":"sym","kind":"func","line":753,"sig":"(settings: OverlaySettings, source: str) -> List[str]"}
 {"doc":"","file":"nodelab_v2/overlays.py","id":"nodelab_v2.overlays.write_json","k":"sym","kind":"func","line":809,"sig":"(path: Path, settings: OverlaySettings) -> Path"}
-{"doc":"The dockable palette. ``on_add(op_key)`` fires on double-click/Enter.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel","k":"sym","kind":"class","line":147,"sig":"(QWidget)"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.__init__","k":"sym","kind":"method","line":155,"sig":"(self, on_add: Callable[[str], None]) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._add_current","k":"sym","kind":"method","line":309,"sig":"(self, item: Optional[QTreeWidgetItem]=None, _col: int=0) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._css","k":"sym","kind":"method","line":329,"sig":"(self) -> str"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._dot","k":"sym","kind":"method","line":326,"sig":"(col: QColor) -> str"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._on_current","k":"sym","kind":"method","line":298,"sig":"(self, item: Optional[QTreeWidgetItem], _prev=None) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_legend","k":"sym","kind":"method","line":338,"sig":"(self) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_node","k":"sym","kind":"method","line":376,"sig":"(self, op: str) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_role","k":"sym","kind":"method","line":365,"sig":"(self, rk: str) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_stage","k":"sym","kind":"method","line":353,"sig":"(self, sk: str) -> None"}
-{"doc":"The op the overview is showing, or ``None`` (a role/stage/legend).","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.current_op","k":"sym","kind":"method","line":316,"sig":"(self) -> Optional[str]"}
-{"doc":"Select the search box (the welcome card's 'Browse nodes' lands here).","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.focus_search","k":"sym","kind":"method","line":213,"sig":"(self) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.overview_html","k":"sym","kind":"method","line":320,"sig":"(self) -> str"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.refill","k":"sym","kind":"method","line":242,"sig":"(self, text: str='') -> None"}
-{"doc":"Rebuild the tree from the registry, keeping the user's search text.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.reload_catalog","k":"sym","kind":"method","line":203,"sig":"(self) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.restyle","k":"sym","kind":"method","line":218,"sig":"(self) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._PaletteTree","k":"sym","kind":"class","line":120,"sig":"(QTreeWidget)"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._PaletteTree.__init__","k":"sym","kind":"method","line":121,"sig":"(self) -> None"}
-{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._PaletteTree.startDrag","k":"sym","kind":"method","line":135,"sig":"(self, _actions) -> None"}
+{"doc":"The dockable palette. ``on_add(op_key)`` fires on double-click/Enter.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel","k":"sym","kind":"class","line":175,"sig":"(QWidget)"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.__init__","k":"sym","kind":"method","line":183,"sig":"(self, on_add: Callable[[str], None]) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._add_current","k":"sym","kind":"method","line":350,"sig":"(self, item: Optional[QTreeWidgetItem]=None, _col: int=0) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._css","k":"sym","kind":"method","line":370,"sig":"(self) -> str"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._dot","k":"sym","kind":"method","line":367,"sig":"(col: QColor) -> str"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._on_current","k":"sym","kind":"method","line":339,"sig":"(self, item: Optional[QTreeWidgetItem], _prev=None) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_legend","k":"sym","kind":"method","line":379,"sig":"(self) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_node","k":"sym","kind":"method","line":417,"sig":"(self, op: str) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_role","k":"sym","kind":"method","line":406,"sig":"(self, rk: str) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel._show_stage","k":"sym","kind":"method","line":394,"sig":"(self, sk: str) -> None"}
+{"doc":"The op the overview is showing, or ``None`` (a role/stage/legend).","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.current_op","k":"sym","kind":"method","line":357,"sig":"(self) -> Optional[str]"}
+{"doc":"Select the search box (the welcome card's 'Browse nodes' lands here).","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.focus_search","k":"sym","kind":"method","line":241,"sig":"(self) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.overview_html","k":"sym","kind":"method","line":361,"sig":"(self) -> str"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.refill","k":"sym","kind":"method","line":270,"sig":"(self, text: str='') -> None"}
+{"doc":"Rebuild the tree from the registry, keeping the user's search text.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.reload_catalog","k":"sym","kind":"method","line":231,"sig":"(self) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette.PalettePanel.restyle","k":"sym","kind":"method","line":246,"sig":"(self) -> None"}
+{"doc":"Paint the stage/role rows' background band.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._BandDelegate","k":"sym","kind":"class","line":120,"sig":"(QStyledItemDelegate)"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._BandDelegate.paint","k":"sym","kind":"method","line":132,"sig":"(self, painter: QPainter, option, index) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._PaletteTree","k":"sym","kind":"class","line":147,"sig":"(QTreeWidget)"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._PaletteTree.__init__","k":"sym","kind":"method","line":148,"sig":"(self) -> None"}
+{"doc":"","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._PaletteTree.startDrag","k":"sym","kind":"method","line":163,"sig":"(self, _actions) -> None"}
 {"doc":"What flows IN: one dot per domain the node reads, else the plain dataset green when it takes a Dataset but requires nothing of it; then one per value-socket type.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._dataset_in_colors","k":"sym","kind":"func","line":51,"sig":"(spec) -> List[Tuple[QColor, str]]"}
 {"doc":"What flows OUT: one dot per domain the node adds, else the plain dataset green when it passes a Dataset through; then one per value output type.","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._dataset_out_colors","k":"sym","kind":"func","line":72,"sig":"(spec) -> List[Tuple[QColor, str]]"}
 {"doc":"Render ``colors`` as a row of dots. A fixed width per icon column keeps rows aligned whatever the count (up to six dots; beyond that the last is a '+').","file":"nodelab_v2/palette.py","id":"nodelab_v2.palette._dots_icon","k":"sym","kind":"func","line":92,"sig":"(colors: Sequence[Tuple[QColor, str]], align_right: bool=False) -> QIcon"}

@@ -899,8 +899,15 @@ def main(argv) -> int:
         return out
 
     win.palette.refill("")
-    stage_labels = [h.text(1) for h in _rows("stage")]
-    assert stage_labels == [m["label"].upper() for _, m in _ROLES.stages()], stage_labels
+    # stage and role rows are spanned bands with their text in column 0 (left-justified,
+    # filled background); node rows keep the dots | label | dots columns
+    stage_labels = [h.text(0) for h in _rows("stage")]
+    assert stage_labels == [m["label"] for _, m in _ROLES.stages()], stage_labels
+    for h in _rows("stage"):
+        assert h.isFirstColumnSpanned() and h.background(0).color().isValid() \
+            and h.background(0).color() != h.background(1).color(), "stage band"
+    for r in _rows("role"):
+        assert r.isFirstColumnSpanned() and r.text(0) and not r.text(1), "role band"
     visible_ops = {s.op_key for s in visible_specs()}
     roles_with_visible = {rk for rk, r in _ROLES.load()["roles"].items()
                           if any(op in visible_ops for op in r["ops"])}
