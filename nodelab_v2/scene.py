@@ -53,15 +53,11 @@ from nodelab_v2.edge_item import EdgeItem, wire_path
 from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.minimap import HudButton
 from nodelab_v2.node_item import NodeItem, SocketItem
-from nodelab_v2.ops import DOCK_OP, LOAD_OP, PRECISION_UNSET, bake_record
+from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PRECISION_UNSET,
+                            bake_record)
 
-#: op prefixes hidden from the palette / link search (boundary + fixture ops, plus the
-#: source loader ``io.load`` — it is created from File → Load ND2/TIFF file…, never dragged)
-HIDDEN_OP_PREFIXES = ("zone.", "group.", "test.", "io.seed", "io.stream_seed",
-                      "rr.", "eng.", "io.nd2", "io.load",
-                      # minted by nodegraph.iterate's feedback rewrite between two clones,
-                      # never placed by hand — it exists only inside an unrolled graph
-                      "flow.advance")
+# ``HIDDEN_OP_PREFIXES`` moved to the Qt-free :mod:`nodelab_v2.ops` (2026-10-02) so the
+# readiness checker can rank suggested nodes without importing Qt; still exported here.
 
 
 def visible_specs():

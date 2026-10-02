@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 90,
+    "nodes": 91,
     "categories": 12,
     "roles": 19,
     "stages": 5,
-    "inputs": 600,
-    "outputs": 97,
+    "inputs": 604,
+    "outputs": 98,
     "gui_ops_included": true
   },
   "stages": {
@@ -152,6 +152,7 @@
       ],
       "ops": [
         "analysis.boundary_band",
+        "analysis.draw_regions",
         "analysis.edt",
         "analysis.extract_boundary",
         "analysis.histogram_threshold",
@@ -503,9 +504,14 @@
     "segmentation_and_labeling": {
       "label": "Segmentation & labeling",
       "stage": "find_structure",
-      "description": "From intensities to regions: global, local and multi-level thresholds, the unified Segmentation node (threshold, watershed, StarDist, CellSAM), connected-component labeling, ROI rasterization, and growing seed points into measurable label regions.",
-      "count": 8,
+      "description": "From intensities to regions: global, local and multi-level thresholds, the unified Segmentation node (threshold, watershed, StarDist, CellSAM), connected-component labeling, ROI rasterization, hand-drawn labelled regions pinned to a frame, and growing seed points into measurable label regions.",
+      "count": 9,
       "ops": [
+        {
+          "op": "analysis.draw_regions",
+          "label": "Draw Regions",
+          "summary": "Hand-drawn labelled regions (rect / circle / ellipse / polygon / freehand), each pinned to the frame (m, t, z) it was drawn on → a Label raster + Label table; Subtract Background's `Background regions` input samples them."
+        },
         {
           "op": "analysis.histogram_threshold",
           "label": "Histogram Threshold",
@@ -835,6 +841,7 @@
       "analysis.boundary_band",
       "analysis.cluster_points",
       "analysis.dic_correlate",
+      "analysis.draw_regions",
       "analysis.dvc_field",
       "analysis.edt",
       "analysis.extract_boundary",
@@ -1631,6 +1638,107 @@
         "winsize",
         "winsize_min",
         "winstepsize"
+      ]
+    },
+    "analysis.draw_regions": {
+      "op": "analysis.draw_regions",
+      "label": "Draw Regions",
+      "category": "analysis",
+      "role": "segmentation_and_labeling",
+      "stage": "find_structure",
+      "module": "nodegraph/catalog/analysis/draw_regions.py",
+      "gui_only": false,
+      "summary": "Hand-drawn labelled regions (rect / circle / ellipse / polygon / freehand), each pinned to the frame (m, t, z) it was drawn on → a Label raster + Label table; Subtract Background's `Background regions` input samples them.",
+      "overview": "Rasterize the drawn shapes into a Label raster per frame and emit the matching Label table (``id, m, t, c, area, z, y, x`` — the invariant schema, centroid in pixels), so the regions overlay draws them with ids, Measure can report on them, and Subtract Background can sample them. Under ``scope = drawn_frame`` a shape lands only on the frame it was drawn on (its ``frame`` stamp) and an unstamped shape on every frame; under ``all_frames`` every shape lands everywhere. Nothing drawn is not an error: the node emits an empty layer, which is what an unconfigured annotation is.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_plane",
+        "kernel_axes": [
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": [
+          "label",
+          "voxel"
+        ]
+      },
+      "modes": [
+        {
+          "name": "scope",
+          "label": "Scope",
+          "choices": [
+            "drawn_frame",
+            "all_frames"
+          ],
+          "default": "drawn_frame",
+          "description": "Whether a drawn shape belongs to the one frame it was drawn on or to the whole series. Folds into the memo key, so switching re-rasterizes.",
+          "choice_docs": {
+            "drawn_frame": "Each shape appears only on the frame (m, t, z) it was drawn on, which the viewer stamps onto it when the shape is finished. A frame you drew nothing on gets no regions. A shape with no stamp (typed in by hand) appears on every frame.",
+            "all_frames": "Every shape appears on every frame, whatever it was drawn on — the right choice when the background patch or the region of interest does not move and you want to draw it once."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The image the regions are drawn on. Only its extent and frame count are read; the pixels pass through untouched, with the regions added as a Label layer beside them."
+        },
+        {
+          "name": "shapes",
+          "label": "Regions",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "pick_kind": "shapes",
+          "description": "The drawn regions. DRAW them on the viewer with the Pick button: rectangle, ellipse, circle, closed polygon (double-click to close) or freehand, with Add and Cut; each finished shape is stamped with the frame (m, t, z) you were looking at, so under `scope = drawn_frame` it appears on that frame only — step to another frame and draw its regions there. The shapes are stored as a JSON list in full-frame pixel coordinates (a region drawn inside a troubleshooting window is shifted back into the full frame), so the list is scriptable and diffable. Each region shape becomes one labelled region, numbered in draw order; a Cut shape carves out of the regions before it. Empty draws nothing and the output layer is all zero."
+        },
+        {
+          "name": "name",
+          "label": "Output layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "regions",
+          "layer_out": [
+            "voxel",
+            "label"
+          ],
+          "description": "Name of the Label layer this node writes: an integer raster with one id per drawn region (0 outside), plus the matching Label table with each region's frame, area and centroid. Anything that takes a Label layer accepts it — Measure, Filter Labels, the Labels overlay — and Subtract Background's `Background regions` input samples it."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_draw_regions",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_mesh_region.md",
+      "params_read": [
+        "__modes__",
+        "name",
+        "shapes"
       ]
     },
     "analysis.dvc_field": {
@@ -8877,6 +8985,22 @@
           "type": "dataset",
           "role": "dataset",
           "description": ""
+        },
+        {
+          "name": "regions",
+          "label": "Background regions",
+          "type": "dataset",
+          "role": "dataset",
+          "available_in": {
+            "approach": [
+              "zero_regions"
+            ],
+            "detector": [
+              "sampled_region"
+            ]
+          },
+          "passes_domains": false,
+          "description": "OPTIONAL. A Dataset carrying the drawn background patches as a Label or mask layer — wire a Draw Regions node (analysis.draw_regions) here, fed from the same image as `data`, and draw the patches on it frame by frame. Every non-zero pixel is background sample; a frame with no patch of its own uses the union of every patch drawn on any frame. When this is wired the `Background sample` drawing below is ignored. Read only — its regions do not flow downstream of this node."
         },
         {
           "name": "radius",

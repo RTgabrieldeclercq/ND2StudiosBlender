@@ -124,6 +124,15 @@
 {"dst":"nodegraph.kernels.dic_correlate","k":"imp","lazy":true,"src":"nodegraph.catalog.analysis.dic_correlate"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dic_correlate"}
 {"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dic_correlate"}
+{"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.catalog._shared.batch","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.catalog._shared.columns","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.kernels.dic_mesh_region","k":"imp","lazy":true,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
+{"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.draw_regions"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_field"}
 {"dst":"nodegraph.catalog._shared.columns","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_field"}
 {"dst":"nodegraph.catalog._shared.dvc","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_field"}
@@ -473,9 +482,11 @@
 {"dst":"nodegraph.streaming","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.remove_blobs"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.catalog._shared.kernel_radius","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
+{"dst":"nodegraph.catalog._shared.labels","k":"imp","lazy":true,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.catalog._shared.map_image","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.catalog._shared.units","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.kernels.dic_mesh_region","k":"imp","lazy":true,"src":"nodegraph.catalog.enhance.subtract_background"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":false,"src":"nodegraph.catalog.enhance.subtract_background"}
@@ -879,6 +890,7 @@
 {"dst":"nodegraph.catalog._shared.psf","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared.sampling","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared.scope","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.catalog.analysis.draw_regions","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.analysis.multiotsu","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.analysis.segment","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.analysis.threshold","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -953,6 +965,7 @@
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.position_groups","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.readiness","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.region_box","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.runner","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.tables","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1022,6 +1035,7 @@
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
+{"dst":"nodelab_v2.readiness","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.lablink.protocol","k":"imp","lazy":false,"src":"nodelab_v2.lablink"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.lablink.artifacts"}
@@ -1134,6 +1148,10 @@
 {"dst":"nodegraph.sockets","k":"imp","lazy":true,"src":"nodelab_v2.picker"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":false,"src":"nodelab_v2.position_groups"}
 {"dst":"nodegraph.placement","k":"imp","lazy":false,"src":"nodelab_v2.position_groups"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.readiness"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.readiness"}
+{"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.readiness"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.readiness"}
 {"dst":"nodegraph.catalog._shared.placement_entry","k":"imp","lazy":true,"src":"nodelab_v2.runner"}
 {"dst":"nodegraph.catalog.view.overlay","k":"imp","lazy":true,"src":"nodelab_v2.runner"}
 {"dst":"nodegraph.checkpoint","k":"imp","lazy":false,"src":"nodelab_v2.runner"}
@@ -1204,6 +1222,7 @@
 {"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.nodes","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.window"}
+{"dst":"nodegraph.sockets","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.console","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.window"}

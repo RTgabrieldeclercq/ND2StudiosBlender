@@ -53,6 +53,7 @@ from nodegraph.iterate import (
 from nodelab_v2.document import is_driver_edge as _is_driver
 from nodelab_v2.ops import DOCK_OP, MOVIE_OP, PRECISION_UNSET, bake_record
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
+from nodelab_v2 import readiness as RD
 
 _UNIT = {"um": "µm", "um_axial": "µm↕", "um2": "µm²", "um3": "µm³",
          "nm": "nm", "s": "s", "px": "px"}
@@ -210,6 +211,11 @@ QToolButton[role="pick"] {{ color:{_h(T.ACCENT)}; border-color:{_h(T.ACCENT_DIM)
   background:{_h(T.mix(T.PANEL, T.ACCENT, 0.13))}; text-align:left; padding:4px 9px; }}
 QToolButton[role="pick"]:hover {{ border-color:{_h(T.ACCENT)};
   background:{_h(T.mix(T.PANEL, T.ACCENT, 0.26))}; }}
+/* a *Ready to run* suggestion: the node to add, in the problem's own red */
+QToolButton[role="add"] {{ color:{_h(T.INK)}; border-color:{_h(T.mix(T.PANEL, T.ERROR, 0.5))};
+  background:{_h(T.mix(T.PANEL, T.ERROR, 0.18))}; padding:3px 8px; }}
+QToolButton[role="add"]:hover {{ border-color:{_h(T.ERROR)};
+  background:{_h(T.mix(T.PANEL, T.ERROR, 0.32))}; }}
 QLabel[role="vocab"] {{ color:{_h(T.MUTED)}; }}
 """ + T.controls_qss()
 
@@ -281,10 +287,17 @@ class InspectorPanel(QScrollArea):
     #: window owns the reloader, the runner (which must be idle) and the canvas that has to
     #: be relaid out afterwards.
     reload_requested = Signal(str)
+    #: a *Ready to run* suggestion was taken: ``(node_id, op_key, wire_to)`` — add a node
+    #: of ``op_key`` and wire its output into this node's ``wire_to`` input. Same division
+    #: of labour as the signals above: the panel asks, the window owns the document and
+    #: the canvas, so it places the node, re-routes the wires and relays out the scene.
+    add_requested = Signal(str, str, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWidgetResizable(True)
+        self._problems: list = []          # readiness problems of the shown node
+        self._problem_sockets: dict = {}   # socket name -> Problem (what is painted red)
         # wide enough for the richest param row (label + spinbox + unit + ƒ-auto button)
         # PLUS the vertical scrollbar, so the right edge (the ƒ-auto buttons) never clips.
         self.setFixedWidth(376)
@@ -471,6 +484,18 @@ class InspectorPanel(QScrollArea):
         self._v.addWidget(hd)
         self._v.addWidget(self._sep())
 
+        # readiness (2026-10-02) — can it run as wired? Each problem names the input it is
+        # about, which the rows below paint red, and offers the nodes that would fix it.
+        # Computed once per rebuild and consulted by `_param_row` / `_conn_label`.
+        try:
+            self._problems = RD.problems(node.doc, node.node_id)
+        except Exception as exc:              # noqa: BLE001 — never let a check hide the panel
+            self._problems = [RD.Problem("validation", None,
+                                         f"readiness check failed: {exc}")]
+        self._problem_sockets = RD.socket_problems(self._problems)
+        self._v.addWidget(self._readiness_section(node, self._problems))
+        self._v.addWidget(self._sep())
+
         # footprint — the read COST (a fact), plus the statistics POPULATION (a control, V2.27)
         fp = self._section("Footprint")
         gname = node.granularity()
@@ -581,11 +606,67 @@ class InspectorPanel(QScrollArea):
         sec = self._section("Connections")
         for s in spec.inputs:
             if s.type is SocketType.DATASET:
-                sec._lay.addWidget(self._conn_label(f"in · {s.name}", T.SOCKET[s.type]))  # type: ignore[attr-defined]
+                prob = self._problem_sockets.get(s.name)
+                sec._lay.addWidget(self._conn_label(  # type: ignore[attr-defined]
+                    f"in · {s.name}", T.SOCKET[s.type],
+                    problem=prob.message if prob is not None else ""))
         for s in spec.outputs:
             sec._lay.addWidget(self._conn_label(f"out · {s.name}", T.SOCKET[s.type]))  # type: ignore[attr-defined]
         self._v.addWidget(sec)
         self._v.addStretch(1)
+
+    # ── readiness (2026-10-02) ──────────────────────────────────────────────
+    def _readiness_section(self, node: NodeItem, probs: list) -> QWidget:
+        """*Ready to run*: a green line when nothing is missing; otherwise one red block per
+        problem, each with *Add <node>* buttons for the nodes that would supply the gap.
+
+        The section sits directly under the title because it is the first question about
+        a node that is not running — before its parameters. The same problems colour the
+        param rows and connection labels below, so the eye lands on the input in question
+        without reading; this block is where the words are."""
+        sec = self._section("Ready to run", "" if probs else "✓")
+        if not probs:
+            lab = QLabel("✓  every input this node needs is present")
+            lab.setProperty("role", "muted"); lab.setWordWrap(True)
+            lf = lab.font(); lf.setPointSize(9); lab.setFont(lf)
+            lab.setStyleSheet(f"color:{_h(T.WIRE)};")
+            sec._lay.addWidget(lab)       # type: ignore[attr-defined]
+            return sec
+        for p in probs:
+            block = QFrame()
+            block.setObjectName("readyProblem")
+            block.setStyleSheet(
+                f"QFrame#readyProblem {{ border-left:3px solid {_h(T.ERROR)}; "
+                f"background:{_h(T.mix(T.PANEL, T.ERROR, 0.10))}; border-radius:4px; }}")
+            bl = QVBoxLayout(block); bl.setContentsMargins(9, 6, 8, 6); bl.setSpacing(5)
+            msg = QLabel("⚠  " + p.message)
+            msg.setWordWrap(True)
+            msg.setStyleSheet(f"color:{_h(T.ERROR)}; background:transparent;")
+            mf = msg.font(); mf.setPointSize(9); msg.setFont(mf)
+            bl.addWidget(msg)
+            if p.suggestions:
+                hint = QLabel("add to the graph, wired in:")
+                hint.setProperty("role", "muted")
+                hint.setStyleSheet(f"color:{_h(T.MUTED)}; background:transparent;")
+                hf = hint.font(); hf.setPointSize(8); hint.setFont(hf)
+                bl.addWidget(hint)
+                row = QHBoxLayout(); row.setSpacing(6)
+                for sgg in p.suggestions:
+                    btn = QToolButton()
+                    btn.setText(f"+ {sgg.label}")
+                    btn.setProperty("role", "add")
+                    btn.setCursor(Qt.PointingHandCursor)
+                    btn.setToolTip(f"{sgg.label} ({sgg.op_key})\n{sgg.reason}\n\n"
+                                   f"Adds the node and wires its output into "
+                                   f"`{sgg.wire_to}`.")
+                    btn.clicked.connect(
+                        lambda _c, nid=node.node_id, op=sgg.op_key, w=sgg.wire_to:
+                        self.add_requested.emit(nid, op, w))
+                    row.addWidget(btn)
+                row.addStretch(1)
+                bl.addLayout(row)
+            sec._lay.addWidget(block)     # type: ignore[attr-defined]
+        return sec
 
     # ── iterate section (V2.19) ─────────────────────────────────────────────
     def _iterate_section(self, node: NodeItem) -> QWidget:
@@ -1134,6 +1215,16 @@ class InspectorPanel(QScrollArea):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
         outer.addWidget(self._value_row(node, s))
+        prob = self._problem_sockets.get(s.name)
+        if prob is not None:
+            # the red highlight: the readiness block above says why; this says WHERE
+            block.setObjectName("needRow")
+            block.setAttribute(Qt.WA_StyledBackground, True)
+            block.setStyleSheet(
+                f"QWidget#needRow {{ border-left:3px solid {_h(T.ERROR)}; "
+                f"background:{_h(T.mix(T.PANEL, T.ERROR, 0.10))}; border-radius:4px; }}")
+            outer.setContentsMargins(6, 2, 2, 2)
+            block.setToolTip("⚠ " + prob.message)
         driver = self._driver_of(node, s.name)
         if driver is not None:
             # A driven param's editor is dead: the rewrite bakes the sweep's value over
@@ -1618,12 +1709,18 @@ class InspectorPanel(QScrollArea):
         lay.addWidget(combo)
         return row
 
-    def _conn_label(self, text: str, col) -> QWidget:
+    def _conn_label(self, text: str, col, problem: str = "") -> QWidget:
+        """One connection line. ``problem`` (a readiness message) paints the line red with a
+        ⚠ — the input in question, found by colour from the block above."""
         row = QWidget(); lay = QHBoxLayout(row); lay.setContentsMargins(0, 2, 0, 2); lay.setSpacing(8)
         dot = QLabel(); dot.setFixedSize(11, 11)
-        dot.setStyleSheet(f"background:{_h(col)}; border-radius:5px;")
+        dot.setStyleSheet(f"background:{_h(T.ERROR if problem else col)}; border-radius:5px;")
         lay.addWidget(dot)
-        lab = QLabel(text); lab.setProperty("role", "muted")
+        lab = QLabel(("⚠ " if problem else "") + text)
+        lab.setProperty("role", "muted")
+        if problem:
+            lab.setStyleSheet(f"color:{_h(T.ERROR)}; font-weight:600;")
+            row.setToolTip("⚠ " + problem)
         lf = lab.font(); lf.setPointSize(10); lab.setFont(lf)
         lay.addWidget(lab); lay.addStretch(1)
         return row

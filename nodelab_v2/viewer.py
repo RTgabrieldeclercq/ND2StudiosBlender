@@ -49,7 +49,7 @@ import numpy as np
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform)
+    QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform)
 from PySide6.QtWidgets import (
     QColorDialog, QDoubleSpinBox, QGraphicsPixmapItem, QGraphicsScene,
     QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu,
@@ -1248,6 +1248,10 @@ class ViewerPanel(QWidget):
         # scope is on, the chosen window in source pixels (None = whole frame), and the
         # in-flight drag — (handle, press point in source px, region at press, preview).
         self._region_extent: Optional[Tuple[int, int]] = None
+        #: the full field as it looked when the window was first narrowed — the picture
+        #: behind the locator map (``_paint_region_map``); None = schematic only
+        self._region_thumb = None
+        self._thumb_suppress = False       # True while grabbing the surface for the thumb
         self._region: Optional[Tuple[int, int, int, int]] = None
         self._region_drag: Optional[tuple] = None
         self._region_hover: Optional[str] = None
@@ -1707,6 +1711,7 @@ class ViewerPanel(QWidget):
             return
         self._region_extent = ext
         self._region_drag = None
+        self._region_thumb = None          # a different field: the old picture is wrong
         if ext is not None:
             self._region = region_box.clamp(self._region, ext)
         self._refresh_surface()
@@ -1727,6 +1732,12 @@ class ViewerPanel(QWidget):
         new = region_box.clamp(region, self._region_extent) if self._region_extent else None
         if new == self._region:
             return
+        if self._region is None and new is not None:
+            # the surface still shows the WHOLE field at this moment (the payload is the
+            # current window, which is the frame) — the one chance to keep its picture
+            self._capture_region_thumb()
+        elif new is None:
+            self._region_thumb = None
         self._region = new
         self._region_drag = None
         self._refresh_surface()
@@ -1834,6 +1845,107 @@ class ViewerPanel(QWidget):
         r = getattr(self._view, "refresh", None)
         if r is not None:
             r()
+
+    def _capture_region_thumb(self) -> None:
+        """Keep a small picture of the full field for the locator map.
+
+        Taken from the live surface — whichever backend is up — rather than from the
+        planes, so it is the composite the user is looking at (their LUTs, their channel
+        mix) and costs one grab. The overlays are suppressed for the grab so the amber
+        box and the pick do not end up baked into the map. A GL surface re-renders into
+        its framebuffer (``grabFramebuffer``), the CPU view is grabbed as a widget; both
+        are cropped to the image's own rect. Any failure leaves ``None``, and the map
+        falls back to a schematic — a locator that is wrong is worse than one that is
+        plain."""
+        self._region_thumb = None
+        mp = getattr(self._view, "plane_to_widget", None)
+        if mp is None or self._ref_plane is None:
+            return
+        H, W = self._ref_plane.shape[:2]
+        try:
+            tl, br = mp(0.0, 0.0), mp(float(W), float(H))
+            rect = QRectF(tl, br).normalized().toRect().intersected(self._view.rect())
+            if rect.width() < 8 or rect.height() < 8:
+                return
+            self._thumb_suppress = True
+            try:
+                grab_fb = getattr(self._view, "grabFramebuffer", None)
+                if callable(grab_fb):
+                    img = grab_fb()
+                    dpr = float(self._view.devicePixelRatioF() or 1.0)
+                    dev = QRectF(rect.x() * dpr, rect.y() * dpr,
+                                 rect.width() * dpr, rect.height() * dpr).toRect()
+                    img = img.copy(dev.intersected(img.rect()))
+                else:
+                    img = self._view.grab(rect).toImage()
+            finally:
+                self._thumb_suppress = False
+            if img.isNull():
+                return
+            self._region_thumb = img.scaled(
+                240, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        except Exception:                      # noqa: BLE001 — the map is a convenience
+            self._thumb_suppress = False
+            self._region_thumb = None
+
+    def _paint_region_map(self, p: QPainter) -> None:
+        """The LOCATOR MAP, top-left: the whole source field (its picture when one was
+        captured, else a plain panel) with the current window drawn on it in amber, and
+        the candidate window while a drag is in progress. Shown only once the window is
+        narrower than the frame — at rest the box already frames everything and a map
+        would say nothing. Sized to the field's aspect inside 150×110 px so a 2:1 field
+        reads as 2:1."""
+        if not self._region_active() or self._region is None or self._region_extent is None:
+            return
+        Yext, Xext = self._region_extent
+        reg = region_box.resolve(self._region, self._region_extent)
+        if reg is None:
+            return
+        maxw, maxh = 150.0, 110.0
+        k = min(maxw / max(1, Xext), maxh / max(1, Yext))
+        box = QRectF(14.0, 14.0, Xext * k, Yext * k)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(T.alpha(T.BG, 215))
+        p.drawRoundedRect(box.adjusted(-5, -5, 5, 5), 5.0, 5.0)
+        if self._region_thumb is not None and not self._region_thumb.isNull():
+            p.drawImage(box, self._region_thumb)
+        else:
+            p.fillRect(box, T.alpha(T.PANEL_HI, 235))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(T.alpha(T.INK, 110), 1.0))
+        p.drawRect(box)
+
+        def R(r) -> QRectF:                     # source window → map rect
+            return QRectF(box.left() + r[2] * k, box.top() + r[0] * k,
+                          max(1.0, (r[3] - r[2]) * k), max(1.0, (r[1] - r[0]) * k))
+        # dim everything outside the window so the window itself is the bright part
+        p.setPen(Qt.NoPen)
+        p.setBrush(T.alpha(T.BG, 120))
+        win = R(reg)
+        for shade in (QRectF(box.left(), box.top(), box.width(), win.top() - box.top()),
+                      QRectF(box.left(), win.bottom(), box.width(), box.bottom() - win.bottom()),
+                      QRectF(box.left(), win.top(), win.left() - box.left(), win.height()),
+                      QRectF(win.right(), win.top(), box.right() - win.right(), win.height())):
+            if shade.width() > 0 and shade.height() > 0:
+                p.drawRect(shade)
+        p.setBrush(T.alpha(T.DIM2D, 45))
+        p.setPen(QPen(T.DIM2D, 1.5))
+        p.drawRect(win)
+        if self._region_drag is not None:
+            p.setBrush(Qt.NoBrush)
+            pen = QPen(T.DIM2D, 1.0, Qt.DashLine)
+            p.setPen(pen)
+            p.drawRect(R(self._region_drag[3]))
+        # caption: the field's size, so the window label on the box has its reference
+        f = QFont(p.font()); f.setPointSizeF(max(7.0, f.pointSizeF() - 1.5))
+        p.setFont(f)
+        fm = p.fontMetrics()
+        cap = f"field {Xext}×{Yext} px"
+        p.setPen(T.alpha(T.INK, 200))
+        p.drawText(QPointF(box.left(), box.bottom() + fm.ascent() + 6.0), cap)
+        p.restore()
 
     def _paint_region(self, p: QPainter) -> None:
         """The amber box over the image, in widget pixels. At rest it frames the whole
@@ -3450,8 +3562,8 @@ class ViewerPanel(QWidget):
         the settings is a screen size, zooming moves the overlay with the image without
         changing how thick or how big it is.
         """
-        if self._ref_plane is None:
-            return
+        if self._ref_plane is None or self._thumb_suppress:
+            return                                # (suppressed: grabbing the bare image)
         mp = getattr(self._view, "plane_to_widget", None)
         if mp is None:                            # a surface without the overlay contract
             return
@@ -3474,6 +3586,7 @@ class ViewerPanel(QWidget):
         self._renderer.paint(p, self.overlays, frame)
         self._paint_scalebar(p)               # the Viewer node's bar, over the image
         self._paint_region(p)                 # the troubleshooting box, under the pick
+        self._paint_region_map(p)             # where that window sits in the full field
         self._paint_pick(p)                   # the armed gesture rides ON TOP of everything
 
     # ── parameter picking (V2.16) ─────────────────────────────────────────────
@@ -3547,11 +3660,54 @@ class ViewerPanel(QWidget):
             vals = self._histogram_pick_values(s.req)
         else:
             vals = s.values()
+            if s.req.kind == "shapes" and s.req.socket in vals:
+                vals[s.req.socket] = self._stamp_shapes(vals[s.req.socket])
         node_id = s.req.node_id
         self.cancel_pick(quiet=True)
         self.pick_armed.emit(False)
         if vals:
             self.pick_committed.emit(node_id, vals)
+
+    def _stamp_shapes(self, text: str) -> str:
+        """Finish a ``shapes`` pick: pin every newly drawn shape to the frame it was drawn
+        on and put it into FULL-FRAME pixel coordinates.
+
+        Two facts only the viewer knows at commit time, so this is where they are written:
+
+        * **The frame.** A shape gains ``"frame": [m, t, z]`` — the GLOBAL cursor the
+          strips name, not the index into a scoped payload — so Draw Regions can keep a
+          patch on the frame it belongs to. Shapes that already carry a stamp (drawn in an
+          earlier session on this socket) keep it; consumers that have no use for a frame
+          (ROI Mask, Subtract Background's own sample) ignore the key.
+        * **The window.** Under the troubleshooting region the displayed payload IS the
+          window, so the gesture's vertices are window-relative; they are shifted by the
+          window's origin so the stored shape addresses the source frame. Without this a
+          region drawn in a 64 px window at (y=32, x=96) would land at the frame's corner
+          the moment the scope came off.
+        """
+        import json as _json
+        try:
+            shapes = _json.loads(text) if text else []
+        except ValueError:
+            return text
+        if not isinstance(shapes, list):
+            return text
+        m, t, z, _c = self.coords()
+        reg = self._region_resolved() if self._solo is not None else None
+        oy, ox = (float(reg[0]), float(reg[2])) if reg is not None else (0.0, 0.0)
+        for sh in shapes:
+            if not isinstance(sh, dict) or str(sh.get("type", "")) in ("", "invert", "clear"):
+                continue
+            if "frame" not in sh:
+                sh["frame"] = [int(m), int(t), int(z)]
+                if oy or ox:
+                    if isinstance(sh.get("vertices"), list):
+                        sh["vertices"] = [[round(v[0] + oy, 2), round(v[1] + ox, 2)]
+                                          for v in sh["vertices"]]
+                    if isinstance(sh.get("center"), list) and len(sh["center"]) == 2:
+                        sh["center"] = [round(sh["center"][0] + oy, 2),
+                                        round(sh["center"][1] + ox, 2)]
+        return _json.dumps(shapes)
 
     def _histogram_pick_values(self, req: PickRequest) -> Dict[str, Any]:
         """Read the live LUT for a ``percentile`` / ``gamma`` pick: the window the handles

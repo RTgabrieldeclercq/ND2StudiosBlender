@@ -23457,6 +23457,224 @@ def test_viewer_node_inputs() -> None:
         "sockets are presentation-only; layout Mode merged/tiles/both; payload = primary")
 
 
+def test_draw_regions() -> None:
+    """``analysis.draw_regions`` (2026-10-02) + Subtract Background's ``regions`` input.
+
+    1. **Per-frame pinning**: under ``scope=drawn_frame`` a shape stamped ``frame=[m,t,z]``
+       lands on that frame only and an unstamped one on every frame; ids are global-unique
+       across frames and the Label table has one row per region per frame with the
+       invariant schema; ``all_frames`` puts every shape everywhere.
+    2. **Cut and clear** carve and reset; a ``cut`` never creates an id.
+    3. **Subtract Background samples the wired regions**: field zeroed and object cores
+       bit-exact on EVERY frame, including a frame with no patch of its own (it falls back
+       to the union of what was drawn anywhere); the wired input wins over the socket's own
+       drawing; a volume samples the patches drawn on any of its planes.
+    4. **Refusals**: nothing drawn on any frame; a regions raster of the wrong size; a
+       malformed shape list; an unknown scope.
+    5. **R1**: the socket's ``shapes`` string is not read when ``regions`` is wired, so a
+       stale drawing cannot re-key the memo; the two scopes hash apart.
+    """
+    if not _HAVE_SKIMAGE:
+        _ok("draw regions: SKIPPED (scikit-image absent)")
+        return
+    import json as _json
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.catalog.analysis.draw_regions import rasterize_regions
+
+    define_node("io.drseed", "S", outputs=[OutDataset()])
+    Y, X, T, Z = 48, 64, 3, 2
+    zz, tt, yy, xx = np.mgrid[0:Z, 0:T, 0:Y, 0:X].astype(float)
+    noise = 6.0 * np.sin(yy * 1.3 + xx * 0.7)
+    obj = 1200.0 * np.exp(-((yy - 24) ** 2 + (xx - 40) ** 2) / 20.0)
+    vol = 300.0 + 20.0 * tt + 5.0 * zz + noise + obj           # (Z, T, Y, X)
+    arr = np.transpose(vol, (1, 0, 2, 3)).reshape(1, T, Z, 1, Y, X)
+    ax = AxisSizes(m=1, t=T, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 1.0, "bit_depth": 12}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    empty, core = obj[0, 0] < 1.0, obj[0, 0] > 800.0
+
+    rect_t1 = {"type": "rect", "op": "add", "vertices": [[2, 2], [14, 14]], "frame": [0, 1, 0]}
+    circ_t1 = {"type": "circle", "op": "add", "center": [40.0, 10.0], "radius": 5.0,
+               "frame": [0, 1, 1]}
+    poly_all = {"type": "polygon", "op": "add", "vertices": [[30, 50], [44, 50], [44, 62]]}
+    shapes = [rect_t1, circ_t1, poly_all]
+
+    def graph(scope, shapes_list, *, wire=True, sock_shapes="", dim="2D"):
+        g = Graph()
+        g.add(NodeInstance("S", "io.drseed"))
+        g.add(NodeInstance("R", "analysis.draw_regions",
+                           params={"shapes": _json.dumps(shapes_list)}, modes={"scope": scope}))
+        bp = {"tolerance": 3.0}
+        if sock_shapes:
+            bp["shapes"] = sock_shapes
+        g.add(NodeInstance("B", "enhance.subtract_background", params=bp,
+                           modes={"approach": "zero_regions", "detector": "sampled_region",
+                                  "dim": dim}))
+        g.connect("S", "R")
+        g.connect("S", "B")
+        if wire:
+            g.connect("R", "B", dst_socket="regions")
+        return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)})
+
+    # 1. per-frame pinning + table
+    e = graph("drawn_frame", shapes)
+    r = e.pull("R")
+    lab = r.get(Domain.VOXEL, "regions").values
+    assert lab.shape == (1, T, Z, 1, Y, X), lab.shape
+    ids = lambda t, z: sorted(set(np.unique(lab[0, t, z, 0]).tolist()) - {0})
+    assert ids(0, 0) == [1] and ids(0, 1) == [2], (ids(0, 0), ids(0, 1))      # polygon only
+    assert ids(1, 0) == [3, 4] and ids(1, 1) == [5, 6], (ids(1, 0), ids(1, 1))  # + its own
+    assert ids(2, 0) == [7] and ids(2, 1) == [8]
+    assert lab[0, 1, 0, 0, 8, 8] == 3 and lab[0, 1, 1, 0, 40, 10] == 5, "stamped shapes"
+    assert lab[0, 0, 0, 0, 8, 8] == 0, "a frame-1 rect must not appear on frame 0"
+    tbl = r.get(Domain.LABEL, "id", layer="regions")
+    assert tbl is not None and len(tbl.values) == 8, tbl
+    cols = {k[2] for k in r.attributes if k[0] is Domain.LABEL and k[1] == "regions"}
+    assert cols >= {"id", "m", "t", "c", "area", "z", "y", "x"}, cols
+    rows = {int(i): (int(t), int(z), int(a)) for i, t, z, a in zip(
+        tbl.values, r.get(Domain.LABEL, "t", layer="regions").values,
+        r.get(Domain.LABEL, "z", layer="regions").values,
+        r.get(Domain.LABEL, "area", layer="regions").values)}
+    assert rows[3][:2] == (1, 0) and rows[3][2] == int((lab[0, 1, 0, 0] == 3).sum()), rows[3]
+    lab_all = graph("all_frames", shapes).pull("R").get(Domain.VOXEL, "regions").values
+    assert all(len(sorted(set(np.unique(lab_all[0, t, z, 0]).tolist()) - {0})) == 3
+               for t in range(T) for z in range(Z)), "all_frames: every shape everywhere"
+
+    # 2. cut and clear
+    cut = rasterize_regions([
+        {"type": "rect", "op": "add", "vertices": [[0, 0], [20, 20]]},
+        {"type": "rect", "op": "cut", "vertices": [[5, 5], [10, 10]]},
+        {"type": "rect", "op": "add", "vertices": [[30, 30], [40, 40]]}], Y, X)
+    assert cut[2, 2] == 1 and cut[7, 7] == 0 and cut[35, 35] == 2 and cut.max() == 2, \
+        "cut carves, never numbers"
+    clr = rasterize_regions([
+        {"type": "rect", "op": "add", "vertices": [[0, 0], [20, 20]]}, {"type": "clear"},
+        {"type": "rect", "op": "add", "vertices": [[30, 30], [40, 40]]}], Y, X)
+    assert clr[2, 2] == 0 and clr[35, 35] == 1, "clear starts over"
+
+    # 3. Subtract Background samples the wired regions, every frame, both dims
+    for dim in ("2D", "3D"):
+        out = graph("drawn_frame", shapes, dim=dim).pull("B")
+        for t in range(T):
+            for z in range(Z):
+                got = out.image.get_region(0, 0, t, z, 0, 0, Y, 0, X)
+                src = arr[0, t, z, 0]
+                assert float((got[empty] == 0.0).mean()) > 0.99, \
+                    f"{dim} t={t} z={z}: field not zeroed ({(got[empty] == 0).mean():.3f})"
+                assert np.array_equal(got[core], src[core]), f"{dim} t={t} z={z}: core changed"
+    # a frame with NO patch of its own: only frame 1 is drawn, frames 0 and 2 use the union
+    only_t1 = graph("drawn_frame", [rect_t1, circ_t1]).pull("B")
+    got0 = only_t1.image.get_region(0, 0, 0, 0, 0, 0, Y, 0, X)
+    assert float((got0[empty] == 0.0).mean()) > 0.99, "union fallback for an undrawn frame"
+    # the wired input wins over a socket drawing that would otherwise be refused (1 px)
+    tiny = _json.dumps([{"type": "rect", "op": "add", "vertices": [[0, 0], [1, 1]]}])
+    graph("drawn_frame", shapes, sock_shapes=tiny).pull("B").image.get_region(
+        0, 0, 0, 0, 0, 0, Y, 0, X)
+
+    # 4. refusals
+    def refuses(fn, needle):
+        try:
+            res = fn()
+            if hasattr(res, "image") and res.image is not None:
+                res.image.get_region(0, 0, 0, 0, 0, 0, Y, 0, X)
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc)[:200])
+            return
+        raise AssertionError(f"expected a refusal mentioning {needle!r}")
+    refuses(lambda: graph("drawn_frame", []).pull("B"), "nothing drawn on any frame")
+    refuses(lambda: graph("sideways", shapes).pull("R"), "unknown scope")
+    g_bad = Graph()
+    g_bad.add(NodeInstance("S", "io.drseed"))
+    g_bad.add(NodeInstance("R", "analysis.draw_regions", params={"shapes": "[1, 2"}))
+    g_bad.connect("S", "R")
+    refuses(lambda: Engine(g_bad, computes=COMPUTES, seeds={"S": ds},
+                           meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull("R"),
+            "not valid JSON")
+    small = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8), metadata=meta).with_layer(
+        Domain.VOXEL, "regions", np.ones((1, 1, 1, 1, 8, 8), dtype=np.int64))
+    from nodegraph.catalog.enhance.subtract_background import _regions_lookup
+    try:
+        _regions_lookup(small, ax, node="t")
+        raise AssertionError("a wrong-size regions raster must be refused")
+    except ValueError as exc:
+        assert "pixels but the data is" in str(exc), str(exc)
+
+    # 5. R1 — the socket string is not read when the input is wired; scopes hash apart
+    e_w = graph("drawn_frame", shapes, sock_shapes=tiny)
+    e_w.pull("B").image.get_region(0, 0, 0, 0, 0, 0, Y, 0, X)
+    assert "shapes" not in str(dict(e_w.entry("B").reads)), \
+        f"a wired `regions` must not memo-fence `shapes`: {dict(e_w.entry('B').reads)}"
+    e1, e2 = graph("drawn_frame", shapes), graph("all_frames", shapes)
+    e1.pull("R"); e2.pull("R")
+    assert e1.entry("R").recipe_hash != e2.entry("R").recipe_hash, "scopes must hash apart"
+    _ok("draw regions: shapes pinned to the (m,t,z) they were drawn on under drawn_frame "
+        "(unstamped = every frame), global-unique ids, a Label table row per region per "
+        "frame; cut carves and clear resets; Subtract Background's wired `regions` zeroes "
+        "the field and keeps cores bit-exact on every frame in 2D and 3D, an undrawn frame "
+        "falls back to the union, the wire wins over the socket drawing; refuses nothing "
+        "drawn / wrong size / bad JSON / unknown scope")
+
+
+def test_readiness() -> None:
+    """``nodelab_v2.readiness`` (2026-10-02) — the inspector's *Ready to run* block, through
+    the Qt-free document seam. An unwired primary input is the ONLY problem reported (and
+    offers Load when the graph has no source); a missing domain names the producers with
+    the usual one first; a shapes socket the node refuses empty points at its richer Dataset
+    alternative and is silent once that is wired; the 3D lever on one plane is a problem;
+    a ready node reports nothing; ``socket_problems`` keys the highlights."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import readiness as RD
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("analysis.measure", node_id="M")
+    p = RD.problems(doc, "M")
+    assert [x.kind for x in p] == ["unwired"] and p[0].socket == "data", p
+    assert [s.op_key for s in p[0].suggestions] == ["io.load"], "no source yet → offer Load"
+    doc.add_node("io.load", node_id="L")
+    doc.meta_seeds["L"] = MetaEnvelope(axes=AxisSizes(m=1, t=4, z=1, c=1, y=64, x=64),
+                                       metadata={"pixel_size_um": 0.5})
+    assert RD.problems(doc, "M")[0].suggestions == (), "a source exists → no Load offer"
+    doc.connect("L", "image", "M", "data")
+    p = RD.problems(doc, "M")
+    assert len(p) == 1 and p[0].kind == "domain" and "label" in p[0].message, p
+    assert p[0].suggestions[0].op_key == "analysis.label", [s.op_key for s in p[0].suggestions]
+    assert all(s.wire_to == "data" for s in p[0].suggestions)
+    assert RD.socket_problems(p) == {"data": p[0]}
+    doc.add_node("enhance.subtract_background", node_id="B", modes={"approach": "zero_regions"})
+    doc.connect("L", "image", "B", "data")
+    p = RD.problems(doc, "B")
+    assert len(p) == 1 and p[0].kind == "empty" and p[0].socket == "shapes", p
+    assert [(s.op_key, s.wire_to) for s in p[0].suggestions] == \
+        [("analysis.draw_regions", "regions")], p[0].suggestions
+    doc.nodes["B"].modes["detector"] = "adaptive"
+    assert RD.problems(doc, "B") == [], "the adaptive detector has no shapes socket to miss"
+    doc.nodes["B"].modes["detector"] = "sampled_region"
+    doc.add_node("analysis.draw_regions", node_id="R")
+    doc.connect("L", "image", "R", "data")
+    assert [x.kind for x in RD.problems(doc, "R")] == ["empty"], "nothing drawn yet"
+    doc.connect("R", "out", "B", "regions")
+    assert RD.problems(doc, "B") == [], "wired regions satisfy the sample"
+    doc.nodes["R"].params["shapes"] = '[{"type":"rect","op":"add","vertices":[[1,1],[5,5]]}]'
+    assert RD.problems(doc, "R") == [] and RD.ready(doc, "R")
+    doc.add_node("enhance.gaussian", node_id="G", modes={"dim": "3D"})
+    doc.connect("L", "image", "G", "data")
+    p = RD.problems(doc, "G")
+    assert [x.kind for x in p] == ["validation"] and p[0].socket is None, p
+    doc.nodes["G"].modes["dim"] = "2D"
+    assert RD.ready(doc, "G")
+    prods = [s.op_key for s in RD.producers_of(Domain.LABEL)]
+    assert prods[:2] == ["analysis.label", "analysis.segment"] and "analysis.draw_regions" in prods
+    assert not any(k.startswith(OPS.HIDDEN_OP_PREFIXES) for k in prods)
+    _ok("readiness: unwired primary → the one problem (+Load only when the graph has no "
+        "source); a missing Label names Connected Components first, wired to `data`; an "
+        "empty Background sample points at Draw Regions → `regions` and is silent once "
+        "wired or under the adaptive detector; 3D on z=1 is a validation problem; a ready "
+        "node reports nothing")
+
+
 def test_multiotsu_outputs() -> None:
     """``analysis.multiotsu`` ``output`` Mode (2026-10-02): ``merged`` (the class index, as
     before), ``per_class`` (one 0/1 mask per tier, a partition), ``selected`` (one mask of
@@ -23626,6 +23844,8 @@ def main() -> int:
     test_multiotsu_outputs()
     test_region_scope()
     test_viewer_node_inputs()
+    test_draw_regions()
+    test_readiness()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

@@ -544,6 +544,7 @@ class MainWindow(QMainWindow):
         self.inspector.iterate_action.connect(self._on_iterate_action)
         self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
+        self.inspector.add_requested.connect(self._on_add_requested)
         self.runner.baked.connect(self._on_baked)
         self.viewer.pick_committed.connect(self._on_pick_committed)
         self.viewer.pick_armed.connect(self._on_pick_armed)
@@ -1170,6 +1171,64 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{ovl_id}: pinned primary {axis}={pri} to source {axis}={sec}"
             + ("" if a_pri is not None else " (by index — no clock/focus to anchor it)"), 5000)
+
+    def _on_add_requested(self, node_id: str, op_key: str, wire_to: str) -> Optional[str]:
+        """A *Ready to run* suggestion was taken: add ``op_key`` and wire it into
+        ``node_id``'s ``wire_to`` input (2026-10-02). Returns the new node's id.
+
+        Two placements, decided by which input the suggestion feeds:
+
+        * the node's PRIMARY input (a missing domain, e.g. Measure wants Label) — the new
+          node is INSERTED on the wire: whatever fed ``data`` now feeds the new node, and
+          the new node feeds ``data``. That is what "add Connected Components before this"
+          means on a canvas.
+        * a SIDE input (Subtract Background's ``regions``) — the new node is fed from the
+          same source as this node's primary input, so it draws on the same image, and its
+          output goes into the side socket. The primary wire is untouched.
+
+        The new node lands left of the target, one row down for a side input so it does
+        not cover the primary's source. A refused wire (a cycle, a type mismatch) is
+        reported on the status bar and leaves the node placed but unwired — the user can
+        see what happened and finish it by hand."""
+        rec = self.doc.nodes.get(node_id)
+        spec = rec.spec() if rec is not None else None
+        if spec is None:
+            return None
+        from nodegraph.sockets import SocketType as _ST
+        ds_ins = [s for s in spec.inputs if s.type is _ST.DATASET
+                  and not getattr(s, "view_source", False)]
+        primary = ds_ins[0].name if ds_ins else wire_to
+        side = wire_to != primary
+        new = self.doc.add_node(op_key, x=float(rec.x) - 270.0,
+                                y=float(rec.y) + (120.0 if side else 0.0))
+        nspec = new.spec()
+        new_in = next((s.name for s in getattr(nspec, "inputs", ())
+                       if s.type is _ST.DATASET), None) if nspec is not None else None
+        new_out = next((s.name for s in getattr(nspec, "outputs", ())
+                        if s.type is _ST.DATASET), "out") if nspec is not None else "out"
+        feeders = [e for e in self.doc.edges if e[2] == node_id and e[3] == primary]
+        try:
+            if side:
+                if new_in is not None and feeders:
+                    self.doc.connect(feeders[0][0], feeders[0][1], new.id, new_in)
+            else:
+                for e in feeders:
+                    self.doc.disconnect(*e)
+                    if new_in is not None:
+                        self.doc.connect(e[0], e[1], new.id, new_in)
+            self.doc.connect(new.id, new_out, node_id, wire_to)
+            msg = f"added {nspec.label if nspec else op_key} → {node_id}.{wire_to}"
+        except ValueError as exc:
+            msg = f"added {op_key} but could not wire it: {exc}"
+        self.doc.touch()
+        if hasattr(self.scene, "sync"):
+            self.scene.sync()
+        item = self.scene.node_items.get(node_id)
+        if item is not None:
+            item.refresh()
+            item.changed.emit(item)        # the inspector rebuilds: the problem is gone
+        self.statusBar().showMessage(msg)
+        return new.id
 
     def _on_pick_committed(self, node_id: str, values: dict) -> None:
         """Write a finished pick into the document.

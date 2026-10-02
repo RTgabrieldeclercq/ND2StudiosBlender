@@ -75,8 +75,8 @@
     "segmentation_and_labeling": {
       "label": "Segmentation & labeling",
       "stage": "find_structure",
-      "description": "From intensities to regions: global, local and multi-level thresholds, the unified Segmentation node (threshold, watershed, StarDist, CellSAM), connected-component labeling, ROI rasterization, and growing seed points into measurable label regions.",
-      "ops": ["analysis.threshold", "analysis.threshold_local", "analysis.multiotsu", "analysis.histogram_threshold", "analysis.segment", "analysis.label", "analysis.roi_mask", "transform.grow_points"]
+      "description": "From intensities to regions: global, local and multi-level thresholds, the unified Segmentation node (threshold, watershed, StarDist, CellSAM), connected-component labeling, ROI rasterization, hand-drawn labelled regions pinned to a frame, and growing seed points into measurable label regions.",
+      "ops": ["analysis.threshold", "analysis.threshold_local", "analysis.multiotsu", "analysis.histogram_threshold", "analysis.segment", "analysis.label", "analysis.roi_mask", "analysis.draw_regions", "transform.grow_points"]
     },
     "object_detection": {
       "label": "Object detection (points)",

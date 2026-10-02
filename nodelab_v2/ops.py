@@ -154,6 +154,16 @@ BAKE_KEY = "__bake__"
 #: ends up spelled differently.
 LOAD_OP = "io.load"
 
+#: op prefixes hidden from the palette / link search / readiness suggestions (boundary +
+#: fixture ops, plus the source loader ``io.load`` — it is created from File → Load
+#: ND2/TIFF file…, never dragged). Lives here, Qt-free, so :mod:`nodelab_v2.readiness` can
+#: rank producers without importing the scene (moved from scene.py 2026-10-02).
+HIDDEN_OP_PREFIXES = ("zone.", "group.", "test.", "io.seed", "io.stream_seed",
+                      "rr.", "eng.", "io.nd2", "io.load",
+                      # minted by nodegraph.iterate's feedback rewrite between two clones,
+                      # never placed by hand — it exists only inside an unrolled graph
+                      "flow.advance")
+
 #: ``io.load``'s access mode and its three choices — how a source card reaches its pixels.
 #:
 #: ``direct`` reads an uncompressed ND2's memory-mapped frames in place — no copy, no

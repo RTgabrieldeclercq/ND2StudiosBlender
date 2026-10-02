@@ -13,6 +13,7 @@ import numpy as np
 from typing import Callable, Sequence, Tuple
 
 from nodegraph.dataset import Dataset
+from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.metadata import subtract_background as _meta_subtract_background
 from nodegraph.registry import (DimMode, Granularity, InBool, InDataset, InFloat, InInt,
@@ -130,6 +131,53 @@ def _region_shapes(raw):
         raise ValueError("subtract background (sampled region): `shapes` must be a JSON "
                          f"list, got {type(val).__name__}")
     return val
+
+
+def _regions_lookup(regions: Dataset, ax, *, node: str) -> Callable[[int, int, int], np.ndarray]:
+    """A ``(m, t, z) -> (Y, X) bool`` sampler over a wired ``Background regions`` Dataset.
+
+    The region is the non-zero part of the regions Dataset's raster: a Draw Regions node's
+    Label layer (one id per drawn patch — the ids do not matter here, every patch is
+    background), or any Voxel mask. When that Dataset carries a Label table, its layer is
+    the one sampled, so a node that also carries a threshold mask is not misread; otherwise
+    the first Voxel layer. A frame that has NO region of its own — the user drew on frame 3
+    and is correcting frame 7 — falls back to the UNION of everything drawn on any frame,
+    which is the only honest reading of "these patches are background" for a frame nobody
+    annotated. A Dataset with nothing drawn anywhere is refused. The regions raster must
+    share the data's (Y, X); its m/t/z are clamped so a single-frame annotation serves a
+    series."""
+    from nodegraph.catalog._shared.labels import _lattice_layers, _structure_layers
+    layers = _structure_layers(regions, Domain.LABEL) or _lattice_layers(regions, Domain.VOXEL)
+    if not layers:
+        raise ValueError(
+            f"{node}: the `Background regions` input carries no Label or Voxel layer. Wire "
+            f"a Draw Regions node (analysis.draw_regions) or any mask-producing node into it.")
+    attr = regions.get(Domain.VOXEL, layers[0])
+    if attr is None:
+        raise ValueError(f"{node}: the `Background regions` layer {layers[0]!r} has no raster")
+    arr = np.asarray(attr.values)
+    if arr.ndim == 7:                      # a batch — one member is as good as another here
+        arr = arr[0]
+    if arr.ndim != 6 or arr.shape[-2:] != (ax.y, ax.x):
+        raise ValueError(
+            f"{node}: `Background regions` is {arr.shape[-2:]} pixels but the data is "
+            f"({ax.y}, {ax.x}); draw the regions on this node's own input (or an image of "
+            f"the same size) — a region drawn on a cropped or resampled image does not "
+            f"place onto this one.")
+    any_c = arr.any(axis=3)                # (m, t, z, y, x)
+    union = any_c.any(axis=(0, 1, 2))
+    if not union.any():
+        raise ValueError(
+            f"{node}: the `Background regions` input has nothing drawn on any frame. Draw at "
+            f"least one patch of pure background on the Draw Regions node feeding it.")
+    M, Tn, Z = any_c.shape[:3]
+
+    def region_for(m: int, t: int, z) -> np.ndarray:
+        """``z=None`` is a whole volume: every plane's patch counts."""
+        frame = any_c[min(m, M - 1), min(t, Tn - 1)]
+        r = frame.any(axis=0) if z is None else frame[min(int(z), Z - 1)]
+        return r if r.any() else union
+    return region_for
 
 
 def _sampled_background(s: np.ndarray, region2d: np.ndarray, tolerance: float) -> np.ndarray:
@@ -576,26 +624,37 @@ def _compute_zero_regions(ctx: EvalContext, ds: Dataset, modes) -> Dataset:
         white = float(2 ** int(bd) - 1) if bd else None
 
     region2d = None
+    region_for = None                      # per-frame sampler from a wired regions Dataset
     sigmas: Tuple[float, ...] = ()
     low = high = 0.0
     if detector == "sampled_region":
         from nodegraph.kernels.dic_mesh_region import build_roi_mask, has_region
-        shapes = _region_shapes(ctx.params.get("shapes"))
-        if not has_region(shapes):
-            raise ValueError(
-                "subtract background (sampled region): no background region is drawn. Use the "
-                "Pick tool on the `Background sample` socket to outline one or more patches of "
-                "pure background — the node zeroes everything that looks like them. With "
-                "nothing drawn there is nothing to compare against, so refusing is the only "
-                "honest answer (the ROI Mask node's whole-frame default would mean 'everything "
-                "is background').")
         ax = ds.image.axes
-        region2d = np.asarray(build_roi_mask(shapes, ax.y, ax.x), dtype=bool)
-        if int(region2d.sum()) < _MIN_SAMPLE:
-            raise ValueError(
-                f"subtract background (sampled region): the drawn region covers "
-                f"{int(region2d.sum())} pixel(s); at least {_MIN_SAMPLE} are needed to "
-                "estimate a spread. Draw a larger patch.")
+        regions = ctx.input("regions")
+        if isinstance(regions, Dataset):
+            # A wired Draw Regions (or any mask) wins over the socket's own drawing: it is
+            # the richer form — per-frame, labelled, visible on its own node — and the
+            # socket stays as the quick single-patch route when nothing is wired.
+            region_for = _regions_lookup(regions, ax,
+                                         node="subtract background (sampled region)")
+        else:
+            shapes = _region_shapes(ctx.params.get("shapes"))
+            if not has_region(shapes):
+                raise ValueError(
+                    "subtract background (sampled region): no background region is drawn. "
+                    "Either wire a Draw Regions node (analysis.draw_regions) into "
+                    "`Background regions` — draw the patches there, pinned to the frames you "
+                    "draw them on — or use the Pick tool on the `Background sample` socket to "
+                    "outline one or more patches of pure background; the node zeroes "
+                    "everything that looks like them. With nothing drawn there is nothing to "
+                    "compare against, so refusing is the only honest answer (the ROI Mask "
+                    "node's whole-frame default would mean 'everything is background').")
+            region2d = np.asarray(build_roi_mask(shapes, ax.y, ax.x), dtype=bool)
+            if int(region2d.sum()) < _MIN_SAMPLE:
+                raise ValueError(
+                    f"subtract background (sampled region): the drawn region covers "
+                    f"{int(region2d.sum())} pixel(s); at least {_MIN_SAMPLE} are needed to "
+                    "estimate a spread. Draw a larger patch.")
     else:
         node = "subtract background (adaptive)"
         degenerate = ("compares every pixel to itself, so the local cut equals the pixel and "
@@ -617,13 +676,23 @@ def _compute_zero_regions(ctx: EvalContext, ds: Dataset, modes) -> Dataset:
                 f"subtract background (adaptive): the clamp range must satisfy 0 <= low <= "
                 f"high (or high = 0 for no upper limit), got low={low:g}, high={high:g}.")
 
-    def unit_fn(a: np.ndarray) -> np.ndarray:
+    def unit_fn(a: np.ndarray, m: int = 0, t: int = 0, *rest: int) -> np.ndarray:
+        # (a, m, t, z, c) for a plane, (a, m, t, c) for a volume — a volume samples the
+        # patches drawn on ANY of its planes (z=None), the way the socket's 2D drawing is
+        # applied to every plane
+        z = rest[0] if (len(rest) >= 2) else None
         a = np.asarray(a, dtype=float)
         mx = max(white, float(a.max())) if white is not None else float(a.max())
         s = (mx - a) if light else a
         s_est = ndi.uniform_filter(s, size=3, mode="nearest") if presmooth else s
         if detector == "sampled_region":
-            bg = _sampled_background(s_est, region2d, tolerance)
+            reg = region_for(m, t, z) if region_for is not None else region2d
+            if int(reg.sum()) < _MIN_SAMPLE:
+                raise ValueError(
+                    f"subtract background (sampled region): the background region on frame "
+                    f"m={m} t={t} z={z} covers {int(reg.sum())} pixel(s); at least "
+                    f"{_MIN_SAMPLE} are needed to estimate a spread. Draw a larger patch.")
+            bg = _sampled_background(s_est, reg, tolerance)
         else:
             # the clamp is typed in RECORDED units; in signal space a light-background
             # range flips and reflects about the white level
@@ -637,7 +706,8 @@ def _compute_zero_regions(ctx: EvalContext, ds: Dataset, modes) -> Dataset:
         out_s = np.where(keep, s, 0.0)
         return (mx - out_s) if light else out_s
 
-    return _map_image(ctx, ds, plane_fn=unit_fn, volume_fn=unit_fn if vol else None)
+    return _map_image(ctx, ds, plane_fn=unit_fn, volume_fn=unit_fn if vol else None,
+                      with_coords=True)
 
 
 register_node(
@@ -645,6 +715,16 @@ register_node(
     label="Subtract Background", category="enhancement",
     inputs=[
         InDataset(),
+        InDataset("regions", label="Background regions", passes_domains=False,
+                  available_in={"approach": _ZERO, "detector": _SAMPLED},
+                  description=
+                  "OPTIONAL. A Dataset carrying the drawn background patches as a Label or "
+                  "mask layer — wire a Draw Regions node (analysis.draw_regions) here, fed "
+                  "from the same image as `data`, and draw the patches on it frame by frame. "
+                  "Every non-zero pixel is background sample; a frame with no patch of its "
+                  "own uses the union of every patch drawn on any frame. When this is wired "
+                  "the `Background sample` drawing below is ignored. Read only — its "
+                  "regions do not flow downstream of this node."),
         InFloat("radius", "Background radius", unit="um", field=False,
                 default=_R_DEFAULT, pick_kind="radius",
                 available_in={"approach": _SURFACE, "method": _RADIUS_METHODS},

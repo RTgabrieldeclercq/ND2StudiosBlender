@@ -41,9 +41,9 @@ def _kernel_field_varies(ctx: EvalContext) -> bool:
             return True
     return False
 def _map_image(ctx: EvalContext, ds: Dataset,
-               plane_fn: Callable[[np.ndarray], np.ndarray],
-               volume_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-               halo: int = 0) -> Dataset:
+               plane_fn: Callable[..., np.ndarray],
+               volume_fn: Optional[Callable[..., np.ndarray]] = None,
+               halo: int = 0, *, with_coords: bool = False) -> Dataset:
     """Apply a spatial op across the image — **lazily** (C1 / V2.04): the returned
     Dataset carries a streaming compute provider instead of a realized array.
 
@@ -61,8 +61,22 @@ def _map_image(ctx: EvalContext, ds: Dataset,
     larger σ). Falls back to the pre-C1 eager whole-realize when there is no engine
     cache (a bare ``EvalContext``), an unsupported granularity, or an oversize unit
     (> half the cache budget — V2.04 §6b pin/bypass policy).
+
+    ``with_coords=True`` (2026-10-02) hands each call its unit's position as well:
+    ``plane_fn(plane, m, t, z, c)`` and ``volume_fn(volume, m, t, c)``. For an op whose
+    answer depends on WHICH frame it is on — Subtract Background sampling a background
+    region drawn on one frame and not another — and not only on the pixels. Both the lazy
+    providers underneath already pass these; the default form drops them so the dozens of
+    translation-invariant callers keep their one-argument closures.
     """
     prov = ds.image
+    if with_coords:
+        _pf, _vf = plane_fn, volume_fn
+        plane_at = _pf
+        volume_at = _vf
+    else:
+        plane_at = (lambda a, m, t, z, c: plane_fn(a))
+        volume_at = ((lambda v, m, t, c: volume_fn(v)) if volume_fn is not None else None)
     if prov is None:
         raise ValueError(f"{ctx.op_key} needs an image provider on its input Dataset")
     ax = prov.axes
@@ -118,7 +132,7 @@ def _map_image(ctx: EvalContext, ds: Dataset,
             def do_volume(unit):
                 b, m, t, c = unit
                 vol = prov.get_region_volume(0, m, t, c, 0, ax.z, 0, ax.y, 0, ax.x, b=b)
-                res = volume_fn(vol.astype(float))
+                res = volume_at(vol.astype(float), m, t, c)
                 if batched:
                     out[b, m, t, :, c] = res
                 else:
@@ -130,7 +144,7 @@ def _map_image(ctx: EvalContext, ds: Dataset,
             def do_plane(unit):
                 b, m, t, z, c = unit
                 plane = prov.get_region(0, m, t, z, c, 0, ax.y, 0, ax.x, b=b)
-                res = plane_fn(plane.astype(float))
+                res = plane_at(plane.astype(float), m, t, z, c)
                 if batched:
                     out[b, m, t, z, c] = res
                 else:
@@ -143,8 +157,8 @@ def _map_image(ctx: EvalContext, ds: Dataset,
     fp = stream_fp("map", ctx.op_key, ctx.params, ctx.reads.declared_reads(), (), prov)
     if volumetric:
         return ds.with_image(VolumeComputeProvider(
-            prov, lambda v, m, t, c: volume_fn(v), fp=fp, cache=cache))
+            prov, lambda v, m, t, c: volume_at(v, m, t, c), fp=fp, cache=cache))
     unit = "tile" if tileable else "plane"
     return ds.with_image(MapComputeProvider(
-        prov, lambda a, m, t, z, c, gy0, gy1, gx0, gx1: plane_fn(a),
+        prov, lambda a, m, t, z, c, gy0, gy1, gx0, gx1: plane_at(a, m, t, z, c),
         halo=halo, unit=unit, fp=fp, cache=cache))

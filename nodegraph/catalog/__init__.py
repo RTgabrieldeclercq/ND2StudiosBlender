@@ -75,6 +75,7 @@ MODULES: Tuple[str, ...] = (
     "transform.label_to_points",
     "analysis.voronoi",
     "analysis.roi_mask",
+    "analysis.draw_regions",
     "analysis.dvc_field",
     "transform.rasterize_field",
     "analysis.accumulate_field",

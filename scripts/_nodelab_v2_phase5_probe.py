@@ -2331,6 +2331,37 @@ def main(argv) -> int:
              f"{int((got[inner] != want[inner]).sum())} of {got[inner].size} differ")
         assert not np.array_equal(got, want), \
             f"the window's halo border should differ from the full run (c={c}) — it is clipped"
+    # the LOCATOR MAP (2026-10-02): once the window is narrower than the frame, the top-left
+    # of the surface carries the whole field with the window drawn on it in amber. Painted
+    # through the same overlay callback both surfaces call, onto a black canvas, so the
+    # check is on pixels: amber in the map's corner, none there with the window cleared.
+    from PySide6.QtGui import QImage as _QI, QPainter as _QP, QPixmap as _QPx
+    from PySide6.QtCore import Qt as _Qt2
+    _surf = win.viewer._pick_targets()[0]
+
+    def _corner_amber() -> int:
+        cv = _QPx(_surf.width(), _surf.height()); cv.fill(_Qt2.black)
+        pp = _QP(cv); win.viewer._paint_overlays(pp); pp.end()
+        im = cv.toImage().convertToFormat(_QI.Format_RGB32)
+        rows = np.frombuffer(bytes(im.constBits()), np.uint8).reshape(
+            im.height(), im.bytesPerLine() // 4, 4)[:, :im.width(), :3]
+        corner = rows[8:140, 8:180].astype(int)
+        # amber: red high, green mid, blue low (T.DIM2D is #e0a13a in the dark theme)
+        return int(((corner[..., 2] > 150) & (corner[..., 1] > 110) & (corner[..., 1] < 200)
+                    & (corner[..., 0] < 110)).sum())
+    assert win.viewer._region is not None
+    _amber = _corner_amber()
+    assert _amber > 40, f"the locator map must draw the window in amber top-left ({_amber} px)"
+    assert win.viewer._region_thumb is None or not win.viewer._region_thumb.isNull()
+    # a shapes pick committed under the window is shifted back into SOURCE coordinates and
+    # stamped with the viewed frame — what Draw Regions pins a shape to
+    _stamped = json.loads(win.viewer._stamp_shapes(json.dumps(
+        [{"type": "rect", "op": "add", "vertices": [[0, 0], [10, 10]]},
+         {"type": "circle", "op": "add", "center": [5.0, 5.0], "radius": 2.0}])))
+    assert _stamped[0]["vertices"] == [[32, 16], [42, 26]], _stamped[0]
+    assert _stamped[1]["center"] == [37.0, 21.0], _stamped[1]
+    _m, _t, _z, _c = win.viewer.coords()
+    assert _stamped[0]["frame"] == [_m, _t, _z] == _stamped[1]["frame"], (_stamped, _m, _t, _z)
     # the box hit-test + drag maths the Viewer's mouse handling is built on
     assert _RB.hit((32, 96, 16, 80), 16, 32, 3) == "nw" and \
         _RB.hit((32, 96, 16, 80), 48, 96, 3) == "s" and \
@@ -2349,6 +2380,8 @@ def main(argv) -> int:
     for c, plane in solo_pixels.items():
         assert np.array_equal(plane, np.asarray(win.viewer._planes[c])), \
             f"clearing the region must restore the full frame's pixels (c={c})"
+    assert win.viewer._region_thumb is None, "clearing the window drops the map's picture"
+    assert _corner_amber() == 0, "no window → no locator map"
     _ok("T1b region box: the box spans the 128² source; a 64×64 window pulls a 64×64 "
         "payload whose pixels are the full frame's slice, the chip and status name it, the "
         "hit/drag maths pin handles and edges, and clearing it restores the full frame")
@@ -5349,6 +5382,70 @@ def main(argv) -> int:
         "layout merged/tiles/both gives 0/2/3 panes that partition the channels; the scale "
         "bar is presentation (off by default), 10 um reads '10 µm' top-left inside the "
         "image at the calibrated length, and clears when switched off")
+
+    # ── RD1: the inspector's READY TO RUN block (2026-10-02) ───────────────────
+    # A node that cannot run as wired says so under its title, paints the input in question
+    # red, and offers the nodes that would fix it; pressing one adds the node AND wires it —
+    # on the primary wire for a missing domain, into the side input for a background sample.
+    from PySide6.QtWidgets import QLabel as _QL, QToolButton as _QTB
+    _rdoc = win.doc
+    _rl = _rdoc.add_node("io.load", node_id="RDL", x=0, y=900)
+    _rdoc.meta_seeds["RDL"] = MetaEnvelope(axes=AxisSizes(m=1, t=4, z=1, c=1, y=64, x=64),
+                                           metadata={"pixel_size_um": 0.5})
+    _rdoc.add_node("enhance.subtract_background", node_id="RDB", x=400, y=900,
+                   modes={"approach": "zero_regions"})
+    _rdoc.connect("RDL", "image", "RDB", "data")
+    win.scene.sync(); app.processEvents()
+
+    def _warns():
+        # the problem MESSAGES ("⚠  …", two spaces) — not the red connection line ("⚠ in · data")
+        return [l.text() for l in win.inspector.findChildren(_QL) if l.text().startswith("⚠  ")]
+
+    def _red_conns():
+        return [l.text() for l in win.inspector.findChildren(_QL) if l.text().startswith("⚠ in")]
+
+    def _adds():
+        return [b for b in win.inspector.findChildren(_QTB) if b.property("role") == "add"]
+    win.inspector.set_node(win.scene.node_items["RDB"]); app.processEvents()
+    assert any("Background sample" in w for w in _warns()), _warns()
+    assert "shapes" in win.inspector._problem_sockets, win.inspector._problem_sockets
+    assert [b.text() for b in _adds()] == ["+ Draw Regions"], [b.text() for b in _adds()]
+    _adds()[0].click(); app.processEvents()
+    _new = [nid for nid, r in _rdoc.nodes.items() if r.op_key == "analysis.draw_regions"]
+    assert len(_new) == 1, _new
+    assert ("RDL", "image", _new[0], "data") in _rdoc.edges, "fed from the same image"
+    assert (_new[0], "out", "RDB", "regions") in _rdoc.edges, "wired into the side input"
+    assert ("RDL", "image", "RDB", "data") in _rdoc.edges, "the primary wire is untouched"
+    assert _warns() == [] and not _adds(), "the problem is gone once the input is wired"
+    assert any(l.text().startswith("✓") for l in win.inspector.findChildren(_QL))
+    # a missing domain inserts ON the wire
+    _rdoc.add_node("analysis.measure", node_id="RDM", x=800, y=900)
+    _rdoc.connect("RDB", "out", "RDM", "data")
+    win.scene.sync(); app.processEvents()
+    win.inspector.set_node(win.scene.node_items["RDM"]); app.processEvents()
+    assert any("label" in w for w in _warns()), _warns()
+    assert [b.text() for b in _adds()][0] == "+ Connected Components", [b.text() for b in _adds()]
+    _before = set(_rdoc.nodes)
+    _adds()[0].click(); app.processEvents()
+    _lab = [nid for nid in _rdoc.nodes if nid not in _before]      # the one node it added
+    assert len(_lab) == 1 and _rdoc.nodes[_lab[0]].op_key == "analysis.label", _lab
+    assert ("RDB", "out", _lab[0], "data") in _rdoc.edges and \
+        (_lab[0], "out", "RDM", "data") in _rdoc.edges and \
+        ("RDB", "out", "RDM", "data") not in _rdoc.edges, "inserted on the wire"
+    assert _warns() == [], _warns()
+    # an unwired node: the one problem, and nothing else judged
+    _rdoc.add_node("enhance.gaussian", node_id="RDG", x=400, y=1100)
+    win.scene.sync(); app.processEvents()
+    win.inspector.set_node(win.scene.node_items["RDG"]); app.processEvents()
+    assert len(_warns()) == 1 and "nothing is wired" in _warns()[0], _warns()
+    assert _red_conns() == ["⚠ in · data"], _red_conns()      # the input itself painted red
+    for nid in ("RDG", "RDM", _lab[0], _new[0], "RDB", "RDL"):
+        _rdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("RD1 ready-to-run: an empty background sample is reported with its socket painted "
+        "red and `+ Draw Regions` adds the node fed from the same image and wired into "
+        "`regions`; a missing Label offers Connected Components first and inserts it on the "
+        "wire; an unwired node reports that alone; a satisfied node shows the green tick")
 
     _probe_movie_editor(win, app)
 
