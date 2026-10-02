@@ -1,21 +1,121 @@
-"""Registry-driven node palette (G2) — searchable, grouped by category; double-click
-adds at the view center, or drag a row onto the canvas (mime
-``application/x-nd2studios-op``, accepted by :class:`~nodelab_v2.scene.GraphView`)."""
+"""Registry-driven node palette (G2) — searchable, grouped by pipeline STAGE and functional
+ROLE (the taxonomy in ``codemap/node_roles.json``, read through :mod:`nodegraph.roles`);
+double-click adds at the view center, or drag a row onto the canvas (mime
+``application/x-nd2studios-op``, accepted by :class:`~nodelab_v2.scene.GraphView`).
+
+Each node row carries coloured DOTS: on the left, what flows IN — one dot per attribute
+domain the node reads off its Dataset input (voxel, label, point, …), plus one per value
+socket type (float, int, string, …); on the right, what flows OUT — one per domain the node
+adds, plus one per value output. The colours are the canvas's own socket and domain-rail
+colours (:data:`nodelab_v2.theme.SOCKET`, :data:`nodelab_v2.theme.DOMAIN`), so a dot here
+means the same thing as a wire there. The bottom third of the panel is the OVERVIEW: click
+any row and it explains the node — what it is for, its data contract, sockets with types and
+units, footprint, modes — read live from the registry, never from prose that could drift.
+(2026-10-02: previously grouped by the registry ``category``, with no dots and no overview.)
+"""
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Callable, Optional
+import html
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QMimeData, Qt, Signal
-from PySide6.QtGui import QDrag
+from PySide6.QtCore import QMimeData, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLineEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-    QWidget,
+    QHBoxLayout, QHeaderView, QLineEdit, QSplitter, QTextBrowser, QToolButton,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from nodegraph import roles as R
+from nodegraph.domains import Domain
+from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
 from nodelab_v2.scene import visible_specs
 
+#: item-data slots
+_OP = Qt.UserRole            # a node row: its op_key
+_KIND = Qt.UserRole + 1      # "stage" | "role" | "node"
+_KEY = Qt.UserRole + 2       # a stage/role row: its key
+
+#: dot geometry (device pixels; the icon is rendered at 2x for crisp HiDPI)
+_DOT = 9
+_GAP = 3
+_SCALE = 2
+
+
+def _squash(text: Optional[str]) -> str:
+    return " ".join(str(text or "").split())
+
+
+# ── the dots ──────────────────────────────────────────────────────────────────
+
+def _dataset_in_colors(spec) -> List[Tuple[QColor, str]]:
+    """What flows IN: one dot per domain the node reads, else the plain dataset green when
+    it takes a Dataset but requires nothing of it; then one per value-socket type."""
+    out: List[Tuple[QColor, str]] = []
+    state = spec.default_state()
+    has_ds = any(s.type is SocketType.DATASET for s in spec.inputs)
+    reads = sorted(spec.reads_domains, key=lambda d: d.value)
+    if has_ds and reads:
+        for d in reads:
+            out.append((T.domain_qcolor(d), f"reads {d.value}"))
+    elif has_ds:
+        out.append((T.SOCKET[SocketType.DATASET], "dataset in (no domain required)"))
+    seen = set()
+    for s in spec.active_inputs(state):
+        if s.type is SocketType.DATASET or s.type in seen:
+            continue
+        seen.add(s.type)
+        out.append((T.SOCKET[s.type], f"{s.type.value} parameter"))
+    return out
+
+
+def _dataset_out_colors(spec) -> List[Tuple[QColor, str]]:
+    """What flows OUT: one dot per domain the node adds, else the plain dataset green when it
+    passes a Dataset through; then one per value output type."""
+    out: List[Tuple[QColor, str]] = []
+    has_ds = any(s.type is SocketType.DATASET for s in spec.outputs)
+    adds = sorted(spec.adds_domains, key=lambda d: d.value)
+    if has_ds and adds:
+        for d in adds:
+            out.append((T.domain_qcolor(d), f"adds {d.value}"))
+    elif has_ds:
+        out.append((T.SOCKET[SocketType.DATASET], "dataset out (passes its input's layers)"))
+    seen = set()
+    for s in spec.outputs:
+        if s.type is SocketType.DATASET or s.type in seen:
+            continue
+        seen.add(s.type)
+        out.append((T.SOCKET[s.type], f"{s.type.value} output"))
+    return out
+
+
+def _dots_icon(colors: Sequence[Tuple[QColor, str]], align_right: bool = False) -> QIcon:
+    """Render ``colors`` as a row of dots. A fixed width per icon column keeps rows aligned
+    whatever the count (up to six dots; beyond that the last is a '+')."""
+    n = max(1, min(len(colors), 6))
+    w = (6 * _DOT + 5 * _GAP) * _SCALE
+    h = (_DOT + 4) * _SCALE
+    pm = QPixmap(w, h)
+    pm.setDevicePixelRatio(_SCALE)
+    pm.fill(Qt.transparent)
+    if not colors:
+        return QIcon(pm)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    total = n * _DOT + (n - 1) * _GAP
+    x = (6 * _DOT + 5 * _GAP) - total if align_right else 0
+    for i, (col, _why) in enumerate(colors[:6]):
+        p.setPen(QPen(T.alpha(T.INK, 60), 1.0))
+        p.setBrush(col)
+        p.drawEllipse(x + i * (_DOT + _GAP), 2, _DOT, _DOT)
+    if len(colors) > 6:
+        p.setPen(T.MUTED)
+        p.drawText(x + 5 * (_DOT + _GAP), 2 + _DOT - 1, "+")
+    p.end()
+    return QIcon(pm)
+
+
+# ── the tree ──────────────────────────────────────────────────────────────────
 
 class _PaletteTree(QTreeWidget):
     def __init__(self) -> None:
@@ -23,10 +123,18 @@ class _PaletteTree(QTreeWidget):
         self.setHeaderHidden(True)
         self.setDragEnabled(True)
         self.setIndentation(12)
+        self.setColumnCount(3)
+        self.setIconSize(QSize(6 * _DOT + 5 * _GAP, _DOT + 4))
+        hdr = self.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.setRootIsDecorated(False)
 
     def startDrag(self, _actions) -> None:
         it = self.currentItem()
-        op = it.data(0, Qt.UserRole) if it is not None else None
+        op = it.data(0, _OP) if it is not None else None
         if not op:
             return
         mime = QMimeData()
@@ -47,6 +155,7 @@ class PalettePanel(QWidget):
     def __init__(self, on_add: Callable[[str], None]) -> None:
         super().__init__()
         self._on_add = on_add
+        self._current_op: Optional[str] = None
         self.restyle()
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -71,18 +180,34 @@ class PalettePanel(QWidget):
         top.addWidget(self._search, 1)
         top.addWidget(self._refresh)
         self._tree = _PaletteTree()
+        # the OVERVIEW: the bottom third of the panel, a scrolling rich-text card
+        self._overview = QTextBrowser()
+        self._overview.setOpenExternalLinks(False)
+        self._overview.setOpenLinks(False)
+        self._overview.setFrameStyle(0)
+        self._split = QSplitter(Qt.Vertical)
+        self._split.addWidget(self._tree)
+        self._split.addWidget(self._overview)
+        self._split.setStretchFactor(0, 2)
+        self._split.setStretchFactor(1, 1)
+        self._split.setChildrenCollapsible(False)
+        self._split.setSizes([600, 300])
         lay.addLayout(top)
-        lay.addWidget(self._tree)
+        lay.addWidget(self._split, 1)
         self._search.textChanged.connect(self.refill)
         self._tree.itemDoubleClicked.connect(self._add_current)
+        self._tree.currentItemChanged.connect(self._on_current)
         self.refill("")
+        self._show_legend()
 
     def reload_catalog(self) -> None:
         """Rebuild the tree from the registry, keeping the user's search text.
 
         The palette is built once from ``NODES``, so a live node reload
         (:mod:`nodegraph.hotreload`) that added, removed, renamed or recategorized a node
-        type leaves it showing the catalog the window opened with."""
+        type leaves it showing the catalog the window opened with. The roles file is
+        re-read too, so a role written for a new node appears without a restart."""
+        R.reload()
         self.refill(self._search.text())
 
     def focus_search(self) -> None:
@@ -94,40 +219,238 @@ class PalettePanel(QWidget):
         self.setStyleSheet(f"""
             QWidget {{ background:{T.PANEL.name()}; color:{T.INK.name()}; }}
             QTreeWidget {{ background:{T.PANEL.name()}; border:0; outline:0; }}
-            QTreeWidget::item {{ padding:4px 4px; border-radius:5px; }}
+            QTreeWidget::item {{ padding:3px 2px; border-radius:5px; }}
             QTreeWidget::item:selected {{ background:{T.ACCENT_DIM.name()};
                 color:{T.INK.name()}; }}
             QTreeWidget::item:hover {{ background:{T.PANEL_HI.name()}; }}
+            QTextBrowser {{ background:{T.PANEL_HI.name()}; color:{T.INK.name()};
+                border:1px solid {T.BORDER.name()}; border-radius:6px; padding:6px; }}
+            QSplitter::handle {{ background:{T.BORDER.name()}; height:3px; }}
             QToolButton {{ color:{T.MUTED.name()}; background:transparent;
                 border:1px solid {T.BORDER.name()}; border-radius:5px; font-size:14px; }}
             QToolButton:hover {{ color:{T.INK.name()}; background:{T.PANEL_HI.name()}; }}
         """ + T.controls_qss())
+        if getattr(self, "_tree", None) is not None:
+            self.refill(self._search.text())      # dots are rendered in theme colours
+            if self._current_op:
+                self._show_node(self._current_op)
+            else:
+                self._show_legend()
+
+    # ── filling ───────────────────────────────────────────────────────────────
 
     def refill(self, text: str = "") -> None:
         t = (text or "").lower()
         self._tree.clear()
-        by_cat = defaultdict(list)
-        for spec in visible_specs():
-            if t and t not in spec.label.lower() and t not in spec.op_key.lower():
+        specs = {s.op_key: s for s in visible_specs()
+                 if not t or t in s.label.lower() or t in s.op_key.lower()}
+        # stage -> role -> [spec], in the taxonomy's own order; unclassified ops last
+        buckets: Dict[str, Dict[str, List]] = {}
+        for op, spec in specs.items():
+            rk, sk = R.role_of(op)
+            buckets.setdefault(sk, {}).setdefault(rk, []).append(spec)
+        order = [sk for sk, _ in R.stages()] + [R.OTHER_STAGE]
+        for sk in order:
+            roles = buckets.get(sk)
+            if not roles:
                 continue
-            by_cat[spec.category].append(spec)
-        for cat in sorted(by_cat):
-            head = QTreeWidgetItem([cat.upper()])
+            smeta = R.stage_meta(sk)
+            head = QTreeWidgetItem(["", str(smeta.get("label", sk)).upper(), ""])
             head.setFlags(Qt.ItemIsEnabled)
-            head.setForeground(0, T.MUTED)
+            head.setData(0, _KIND, "stage")
+            head.setData(0, _KEY, sk)
+            head.setForeground(1, T.MUTED)
+            head.setToolTip(1, _squash(smeta.get("description")))
+            f = head.font(1)
+            f.setBold(True)
+            f.setPointSizeF(max(7.0, f.pointSizeF() - 1.0))
+            head.setFont(1, f)
             self._tree.addTopLevelItem(head)
-            for spec in sorted(by_cat[cat], key=lambda s: s.label):
-                row = QTreeWidgetItem([spec.label])
-                row.setData(0, Qt.UserRole, spec.op_key)
-                row.setToolTip(0, f"{spec.op_key}\n{spec.description}")
-                head.addChild(row)
+            role_order = [rk for rk, _ in R.roles_in(sk)] + [R.OTHER_ROLE]
+            for rk in role_order:
+                group = roles.get(rk)
+                if not group:
+                    continue
+                rmeta = R.role_meta(rk)
+                rrow = QTreeWidgetItem(["", str(rmeta.get("label", rk)), ""])
+                rrow.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                rrow.setData(0, _KIND, "role")
+                rrow.setData(0, _KEY, rk)
+                rrow.setForeground(1, T.ACCENT)
+                rrow.setToolTip(1, _squash(rmeta.get("description")))
+                head.addChild(rrow)
+                for spec in sorted(group, key=lambda s: s.label):
+                    row = QTreeWidgetItem(["", spec.label, ""])
+                    row.setData(0, _OP, spec.op_key)
+                    row.setData(0, _KIND, "node")
+                    ins, outs = _dataset_in_colors(spec), _dataset_out_colors(spec)
+                    row.setIcon(0, _dots_icon(ins, align_right=True))
+                    row.setIcon(2, _dots_icon(outs))
+                    row.setToolTip(0, "IN: " + ", ".join(w for _, w in ins))
+                    row.setToolTip(2, "OUT: " + ", ".join(w for _, w in outs))
+                    row.setToolTip(1, f"{spec.op_key}\n{_squash(spec.description)}")
+                    rrow.addChild(row)
+                rrow.setExpanded(True)
             head.setExpanded(True)
+
+    # ── selection → overview ──────────────────────────────────────────────────
+
+    def _on_current(self, item: Optional[QTreeWidgetItem], _prev=None) -> None:
+        if item is None:
+            return
+        kind = item.data(0, _KIND)
+        if kind == "node":
+            self._show_node(item.data(0, _OP))
+        elif kind == "role":
+            self._show_role(item.data(0, _KEY))
+        elif kind == "stage":
+            self._show_stage(item.data(0, _KEY))
 
     def _add_current(self, item: Optional[QTreeWidgetItem] = None, _col: int = 0) -> None:
         it = item or self._tree.currentItem()
-        op = it.data(0, Qt.UserRole) if it is not None else None
+        op = it.data(0, _OP) if it is not None else None
         if op:
             self._on_add(op)
+
+    @property
+    def current_op(self) -> Optional[str]:
+        """The op the overview is showing, or ``None`` (a role/stage/legend)."""
+        return self._current_op
+
+    def overview_html(self) -> str:
+        return self._overview.toHtml()
+
+    # ── overview content ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _dot(col: QColor) -> str:
+        return (f'<span style="color:{col.name()}; font-size:13px;">&#9679;</span>')
+
+    def _css(self) -> str:
+        return (f"<style>body{{color:{T.INK.name()}; font-size:11px;}} "
+                f"h3{{margin:0 0 2px 0; font-size:13px;}} "
+                f".k{{color:{T.MUTED.name()};}} .op{{color:{T.MUTED.name()}; "
+                f"font-family:monospace; font-size:10px;}} "
+                f"table{{border-collapse:collapse;}} td{{padding:1px 6px 1px 0; "
+                f"vertical-align:top;}} .sec{{color:{T.ACCENT.name()}; font-weight:bold; "
+                f"margin-top:6px;}}</style>")
+
+    def _show_legend(self) -> None:
+        self._current_op = None
+        dom = " ".join(f"{self._dot(T.domain_qcolor(d))}&nbsp;{d.value}" for d in Domain)
+        typ = " ".join(f"{self._dot(T.SOCKET[t])}&nbsp;{t.value}" for t in SocketType)
+        self._overview.setHtml(
+            self._css() + "<h3>Nodes</h3>"
+            "<div class='k'>Grouped by pipeline stage, then by what the node does. Click a "
+            "node for its overview; double-click or drag to add it.</div>"
+            "<div class='sec'>Dots</div>"
+            "<div><b>Left</b> = what flows in: the attribute domains the node reads from "
+            "its Dataset, then its parameter types. <b>Right</b> = what flows out: the "
+            "domains it adds, then value outputs.</div>"
+            f"<div style='margin-top:4px'>{dom}</div>"
+            f"<div style='margin-top:2px'>{typ}</div>")
+
+    def _show_stage(self, sk: str) -> None:
+        self._current_op = None
+        meta = R.stage_meta(sk)
+        roles = "".join(
+            f"<li><b>{html.escape(str(r.get('label', rk)))}</b> — "
+            f"{html.escape(_squash(r.get('description')))}</li>"
+            for rk, r in R.roles_in(sk))
+        self._overview.setHtml(
+            self._css() + f"<h3>{html.escape(str(meta.get('label', sk)))}</h3>"
+            f"<div>{html.escape(_squash(meta.get('description')))}</div>"
+            f"<div class='sec'>Roles</div><ul>{roles}</ul>")
+
+    def _show_role(self, rk: str) -> None:
+        self._current_op = None
+        meta = R.role_meta(rk)
+        smeta = R.stage_meta(meta.get("stage", R.OTHER_STAGE))
+        ops = "".join(f"<li>{html.escape(op)}</li>" for op in sorted(meta.get("ops", ())))
+        self._overview.setHtml(
+            self._css() + f"<h3>{html.escape(str(meta.get('label', rk)))}</h3>"
+            f"<div class='k'>{html.escape(str(smeta.get('label', '')))}</div>"
+            f"<div>{html.escape(_squash(meta.get('description')))}</div>"
+            f"<div class='sec'>Nodes</div><ul>{ops}</ul>")
+
+    def _show_node(self, op: str) -> None:
+        from nodegraph.registry import NODES
+        spec = NODES.get(op)
+        if spec is None:
+            self._show_legend()
+            return
+        self._current_op = op
+        rk, sk = R.role_of(op)
+        rmeta, smeta = R.role_meta(rk), R.stage_meta(sk)
+        state = spec.default_state()
+        e = html.escape
+
+        def sock_row(s, direction: str) -> str:
+            if s.type is SocketType.DATASET:
+                doms = (sorted(d.value for d in spec.reads_domains) if direction == "in"
+                        else sorted(d.value for d in spec.adds_domains))
+                col = T.SOCKET[SocketType.DATASET]
+                what = "Dataset" + (f" · {'reads' if direction == 'in' else 'adds'} "
+                                    + ", ".join(doms) if doms else "")
+                return (f"<tr><td>{self._dot(col)}</td><td><b>{e(s.label or s.name)}</b></td>"
+                        f"<td class='k'>{e(what)}</td></tr>")
+            extra = []
+            if s.unit:
+                extra.append(e(s.unit))
+            if s.default is not None and direction == "in":
+                extra.append(f"default {e(str(s.default))}")
+            if getattr(s, "layer_in", None) is not None:
+                extra.append(f"picks a {s.layer_in.value} layer")
+            if getattr(s, "layer_out", ()):
+                extra.append("names a layer it writes")
+            return (f"<tr><td>{self._dot(T.SOCKET[s.type])}</td>"
+                    f"<td><b>{e(s.label or s.name)}</b> <span class='k'>{e(s.type.value)}"
+                    f"</span></td><td class='k'>{' · '.join(extra)}</td></tr>")
+
+        ins = "".join(sock_row(s, "in") for s in spec.active_inputs(state))
+        outs = "".join(sock_row(s, "out") for s in spec.outputs)
+        modes = "".join(
+            f"<li><b>{e(m.label or m.name)}</b>: {e(', '.join(m.choices))} "
+            f"<span class='k'>(default {e(m.resolved_default())})</span></li>"
+            for m in spec.modes if m.active_in(state))
+        gran = spec.granularity
+        if isinstance(gran, dict):
+            gran_s = ", ".join(f"{k}: {getattr(v, 'value', v)}" for k, v in gran.items())
+        else:
+            gran_s = getattr(gran, "value", str(gran)) if gran is not None else "—"
+        dims = []
+        if spec.supports_2d:
+            dims.append("2D")
+        if spec.supports_true_3d:
+            dims.append("true 3D")
+        elif spec.three_d_fallback:
+            dims.append(f"3D as {spec.three_d_fallback.replace('_', ' ')}")
+        # the long-form prose: the compute's docstring, else the owning module's (a shared
+        # forwarder compute or a node with no compute documents itself at module level —
+        # the same fallback scripts/_node_synopsis.py applies)
+        try:
+            import sys
+            from nodegraph.nodes import COMPUTES
+            long = _squash(getattr(COMPUTES.get(op), "__doc__", "") or "")
+            if not long:
+                owner = NODES.owner(op) or ""
+                long = _squash(getattr(sys.modules.get(owner), "__doc__", "") or "")
+        except Exception:                                   # pragma: no cover - defensive
+            long = ""
+        if len(long) > 1600:
+            long = long[:1600].rsplit(" ", 1)[0] + " …"
+        self._overview.setHtml(
+            self._css()
+            + f"<h3>{e(spec.label)}</h3><div class='op'>{e(op)}</div>"
+            f"<div class='k'>{e(str(smeta.get('label', '')))} › "
+            f"<b>{e(str(rmeta.get('label', rk)))}</b></div>"
+            f"<div style='margin-top:4px'>{e(_squash(spec.description))}</div>"
+            f"<div class='sec'>In</div><table>{ins or '<tr><td class=k>— (source)</td></tr>'}</table>"
+            f"<div class='sec'>Out</div><table>{outs}</table>"
+            + (f"<div class='sec'>Modes</div><ul>{modes}</ul>" if modes else "")
+            + f"<div class='sec'>Footprint</div><div class='k'>{e(gran_s)}"
+            + (f" · {e(' / '.join(dims))}" if dims else "") + "</div>"
+            + (f"<div class='sec'>How it works</div><div>{e(long)}</div>" if long else ""))
 
 
 __all__ = ["PalettePanel"]
