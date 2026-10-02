@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/_sync_check.py --hook 2>&1 || true",
+            "timeout": 90,
+            "statusMessage": "team-sync: fetching origin, checking PRs and incoming commits"
+          }
+        ]
+      }
+    ]
+  }
+}

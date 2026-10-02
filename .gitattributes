@@ -1,0 +1,22 @@
+# Both developers' clones must see byte-identical source, or every content fingerprint in
+# codemap/gen/*.jsonl differs between machines and each regeneration conflicts with the other.
+# Blobs in this repo are already LF; this pins the working copy to LF on Windows too, which
+# also silences git's "LF will be replaced by CRLF" warnings. Existing CRLF files in a
+# working copy stay CRLF until git next rewrites them; `git add --renormalize .` is safe
+# (blobs do not change) if you want it done at once.
+* text=auto eol=lf
+
+# Never normalise binaries.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.nd2 binary
+*.npy binary
+*.npz binary
+*.h5 binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.zip binary
+*.pdf binary

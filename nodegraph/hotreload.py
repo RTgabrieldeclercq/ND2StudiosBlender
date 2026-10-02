@@ -342,11 +342,20 @@ def dependency_closure(name: str) -> Tuple[str, ...]:
 
 
 def _digest_path(path: str) -> str:
+    """Content digest of one source file, line-ending-neutral.
+
+    CRLF is folded to LF before hashing. A clone with ``core.autocrlf=true`` checks out CRLF
+    while the blob (and a clone on another machine) is LF; hashing raw bytes made every
+    node's ``fp`` in ``codemap/gen/nodes.jsonl`` differ between the two developers' machines,
+    so each ``_codemap.py write`` rewrote 86 fingerprints the other side then rewrote back -
+    a conflict on every merge (found 2026-10-02). Reload detection is unaffected: it compares
+    digests of the same file over time on one machine."""
     try:
         with open(path, "rb") as fh:
-            return hashlib.blake2b(fh.read(), digest_size=16).hexdigest()
+            data = fh.read()
     except OSError:
         return ""
+    return hashlib.blake2b(data.replace(b"\r\n", b"\n"), digest_size=16).hexdigest()
 
 
 def closure_fingerprint(name: str) -> str:
