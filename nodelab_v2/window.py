@@ -516,6 +516,7 @@ class MainWindow(QMainWindow):
         self.runner.cancelled.connect(self._on_run_cancelled)
         self.viewer.request_changed.connect(self._on_view_request)
         self.viewer.selection_changed.connect(self._on_frame_selection)
+        self.viewer.region_changed.connect(self._on_region_changed)
         self.viewer.iteration_changed.connect(self._on_iteration_changed)
         # the overlay SOURCE strip (2026-09-30): a stepper is a display-only runner setting,
         # a pin is a graph edit — the viewer does neither itself
@@ -723,6 +724,13 @@ class MainWindow(QMainWindow):
                                "frame the Viewer's cursor is on, whole volume")
         clear_picks.triggered.connect(self.clear_frame_picks)
         m_run.addAction(clear_picks)
+        clear_region = QAction("Clear troubleshooting &region", self)
+        clear_region.setToolTip(
+            "Drop the amber region box back to the whole frame — scoped pulls run on the "
+            "full field again. The box itself is dragged on the Viewer while F9 is on: its "
+            "edges and corners resize the window, its interior moves it.")
+        clear_region.triggered.connect(self.clear_region)
+        m_run.addAction(clear_region)
 
         m_run.addSeparator()
         reload_act = QAction("&Reload node code", self)
@@ -2475,7 +2483,8 @@ class MainWindow(QMainWindow):
         self.runner.set_solo_frame(on)
         self.runner.set_frame_selection(*self.viewer.frame_selection())
         self.inspector.set_solo_frame(on)     # an Iterate panel warns when the scope is off
-        self._sync_solo(self._viewed)
+        self._sync_solo(self._viewed)         # ...which also ranges the region box
+        self.runner.set_region(self.viewer.region)
         if self._solo_act.isChecked() != on:      # keep a programmatic call in sync
             self._solo_act.blockSignals(True)
             self._solo_act.setChecked(on)
@@ -2500,6 +2509,11 @@ class MainWindow(QMainWindow):
         if zs:
             phrase += (f", cut to {len(zs)} of {totals[2]} z-planes "
                        f"(z={compact_list(zs)})")
+        reg = self.viewer.region
+        if reg is not None:
+            y0, y1, x0, x1 = reg
+            phrase += (f", inside the {x1 - x0}×{y1 - y0} px region at y={y0}, x={x0} "
+                       f"(drag the amber box on the Viewer to move it)")
         return phrase
 
     def clear_frame_picks(self) -> None:
@@ -2507,6 +2521,55 @@ class MainWindow(QMainWindow):
         whole volume. Reachable from the menu because a selection made on a strip that is
         currently scrolled out of the mini-map is otherwise invisible."""
         self.viewer.clear_frame_selection()
+
+    def clear_region(self) -> None:
+        """Run → *Clear troubleshooting region*: the amber box back to the whole frame."""
+        self.viewer.clear_region()
+
+    # ── the Viewer node's display settings (2026-10-02) ───────────────────────
+    def _viewer_layout(self, node_id: Optional[str]) -> str:
+        """The viewed node's ``layout`` Mode if it is a ``view.viewer``, else ``merged``."""
+        rec = self.doc.nodes.get(node_id) if node_id else None
+        if rec is None or rec.op_key != "view.viewer":
+            return "merged"
+        return str((rec.modes or {}).get("layout") or "merged")
+
+    def _viewer_scalebar(self, node_id: Optional[str]):
+        """The viewed node's scale-bar settings if it is a ``view.viewer`` with the bar on,
+        else ``None``. Presentation params: read from the document, never the payload."""
+        rec = self.doc.nodes.get(node_id) if node_id else None
+        if rec is None or rec.op_key != "view.viewer":
+            return None
+        spec = rec.spec()
+        params = rec.params or {}
+
+        def val(name):
+            if name in params:
+                return params[name]
+            s = spec.input(name) if spec is not None else None
+            return s.default if s is not None else None
+
+        if not bool(val("show_scalebar")):
+            return None
+        try:
+            um = float(val("scalebar_um") or 0.0)
+        except (TypeError, ValueError):
+            um = 0.0
+        return {"um": um, "corner": str(val("scalebar_corner") or "bottom_right"),
+                "color": str(val("scalebar_color") or "white")}
+
+    def _on_region_changed(self) -> None:
+        """The Viewer's region box was dragged or cleared — a change to WHAT a scoped pull
+        computes, laterally. Re-scope the runner and, under the scope, re-run the viewed
+        node; off the scope the window is remembered for when F9 is armed."""
+        self.runner.set_region(self.viewer.region)
+        self._sync_solo_chip()
+        if not self.runner.solo_frame:
+            return
+        self.statusBar().showMessage(f"troubleshooting: pulls analyse "
+                                     f"{self._scope_phrase()}")
+        if self._viewed is not None:
+            self.pull_node(self._viewed)
 
     def _on_frame_selection(self) -> None:
         """The Viewer's M/T/Z picks changed — that is a change to *what a pull computes*,
@@ -2536,6 +2599,12 @@ class MainWindow(QMainWindow):
         on = self.runner.solo_frame
         self.viewer.set_solo(self.doc.source_scope_totals(node_id)
                             if (on and node_id) else None)
+        # the region box spans the SOURCE frame for the same reason the strips span the
+        # source series; a remembered window is re-clamped, not dropped
+        self.viewer.set_region_extent(self.doc.source_scope_extent(node_id)
+                                      if (on and node_id) else None)
+        if on and self.runner.region != self.viewer.region:
+            self.runner.set_region(self.viewer.region)
         # the compare pane's chooser has to span ITS node's source extent for the same
         # reason — a linked cursor is expressed in global frame indices
         if self.viewer2 is not None and self._viewed2 is not None:
@@ -2551,7 +2620,11 @@ class MainWindow(QMainWindow):
         name = f"t{compact_list(ts)}" if len(ts) == 1 else f"{len(ts)}T[{compact_list(ts)}]"
         if totals[0] > 1:
             name = (f"m{ms[0]}" if len(ms) == 1 else f"{len(ms)}M") + "·" + name
-        return name + (f"·{len(zs)}Z" if zs else "")
+        name += f"·{len(zs)}Z" if zs else ""
+        reg = self.viewer.region
+        if reg is not None:
+            name += f"·{reg[3] - reg[2]}×{reg[1] - reg[0]}px"
+        return name
 
     def _sync_solo_chip(self) -> None:
         """Raise (or drop) every indicator of the scope: the amber frame + badge on the
@@ -2744,6 +2817,11 @@ class MainWindow(QMainWindow):
             # rather than folded into the style map the shader reads
             pane.set_overlay_flicker(self.runner.overlay_flicker_hz(node_id))
             self._sync_overlay_frames(pane, node_id)
+            # the Viewer NODE's own display settings (2026-10-02): its layout Mode and the
+            # presentation-only scale bar, read live from the document — "merged" and no
+            # bar for every other node, so viewing a filter never inherits them
+            pane.set_source_layout(self._viewer_layout(node_id))
+            pane.set_scalebar(self._viewer_scalebar(node_id))
         if self._maximized:
             # a new axes shape rebuilds the channel/LUT controls, and fresh widgets are
             # visible — re-fold them so the mini-map keeps its compact strip

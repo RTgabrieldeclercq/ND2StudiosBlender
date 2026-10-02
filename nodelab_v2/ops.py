@@ -40,7 +40,8 @@ from nodegraph.metadata import propagate_meta
 from nodegraph.nodes import COMPUTES, register_node
 from nodegraph.domains import Domain
 from nodegraph.registry import (
-    Granularity, InDataset, InFloat, InString, Mode, NODES, OutDataset, define_node)
+    Granularity, InBool, InDataset, InFloat, InString, Mode, NODES, OutDataset,
+    define_node)
 from nodegraph.sockets import SocketType
 
 #: a synthetic per-channel output socket name — ``ch0``, ``ch1``, … (GUI-only; the
@@ -262,6 +263,19 @@ def with_calib_override(metadata: Mapping[str, Any],
     return md
 
 
+def _compute_viewer(ctx: EvalContext):
+    """``view.viewer`` — the display sink. Returns the PRIMARY stream untouched: that is the
+    payload the Viewer panel shows and describes. The extra ``source_N`` streams are
+    ``view_source`` sockets, composited for display by the runner
+    (:meth:`nodelab_v2.runner.EngineRunner.overlay_chain` collects every wired one) and
+    never read here, so the memo key of the viewed result is the primary's alone. The
+    scale-bar sockets are ``presentation`` and are deliberately NOT read either — the window
+    reads them live from the document (:meth:`nodelab_v2.window.MainWindow._viewer_scalebar`),
+    so toggling the bar repaints instead of re-pulling. ``layout`` is a Mode, which folds
+    into the recipe hash; a change re-pulls, and the pull is a memo hit."""
+    return ctx.inputs[0]
+
+
 def ensure_ops() -> None:
     """Idempotently register ``io.load`` (source, no compute) + ``view.viewer``
     (pass-through). Safe to call repeatedly and from any thread (pure registry
@@ -388,13 +402,110 @@ def ensure_ops() -> None:
                         "always build one. Empty path = synthetic demo. "
                         "Exposes one output per channel + a combined 'All "
                         "channels' output.")
-    if NODES.get("view.viewer") is None:
+    _vspec = NODES.get("view.viewer")
+    if _vspec is None or _vspec.input("source_2") is None or _vspec.outputs:
+        _src_doc = (
+            "Another image stream to show alongside the primary. It is composited for "
+            "DISPLAY only — placed field-for-field onto the primary's frame as extra "
+            "channels named after this socket — and never reaches a node downstream, "
+            "because this node has no output. The next empty slot appears once this one "
+            "is wired, so there is always exactly one free input. For two files that must "
+            "line up by stage position, pixel size or focus, use an Overlay node upstream "
+            "instead; this slot pairs frame m with frame m at scale 1.")
         register_node(
-            lambda ctx: ctx.inputs[0],
+            _compute_viewer,
             op_key="view.viewer", label="Viewer", category="io",
-            inputs=[InDataset()], outputs=[OutDataset()],
-            description="Inspection tap — the Viewer panel renders whatever Dataset "
-                        "flows through it (V2.00 §10).")
+            inputs=[
+                InDataset("data", label="Image",
+                          description=
+                          "The image to display. This is the PAYLOAD of the node — the "
+                          "stream the channel strip, the hover readout and every overlay "
+                          "tab describe. Extra streams wired below are drawn over or "
+                          "beside it."),
+                *[InDataset(f"source_{i}", label=f"Source {i}", view_source=True,
+                            passes_domains=False, grow_group="sources",
+                            description=_src_doc) for i in range(2, 7)],
+                InBool("show_scalebar", "Scale bar", field=False, default=False,
+                       presentation=True,
+                       description=
+                       "Draw a scale bar over the image in the Viewer. Its length snaps to "
+                       "a round 1-2-5 value sized to the frame unless `Bar length` sets "
+                       "one, and it is drawn from the payload's `pixel_size_um` — with no "
+                       "calibration on the wire no bar is drawn, because a bar without one "
+                       "would be a fabrication. Display only: it is not part of any result "
+                       "and not saved into exports (Export Movie has its own)."),
+                InFloat("scalebar_um", "Bar length", unit="um", field=False, default=0.0,
+                        presentation=True,
+                        available_in=None,
+                        description=
+                        "The bar's length in MICRONS. 0 (the default) is auto: the largest "
+                        "1-2-5 value near a fifth of the frame width. Set it to pin the bar "
+                        "to a figure's convention (10, 20, 50 µm); a length wider than the "
+                        "visible image is shortened to fit rather than drawn off-screen. "
+                        "Only drawn while `Scale bar` is on."),
+                InString("scalebar_corner", "Bar corner", field=False,
+                         default="bottom_right", presentation=True,
+                         choices=["bottom_right", "bottom_left", "top_right", "top_left"],
+                         choice_docs={
+                             "bottom_right": "The figure convention and the default; the "
+                                             "label sits above the bar.",
+                             "bottom_left": "Bottom-left, label above — when the "
+                                            "bottom-right corner holds the structure "
+                                            "you are showing.",
+                             "top_right": "Top-right with the label below the bar — clear "
+                                          "of a status readout along the bottom edge.",
+                             "top_left": "Top-left, label below — away from a bottom "
+                                         "status readout or a frame counter.",
+                         },
+                         description=
+                         "Which corner of the VISIBLE image the bar sits in. It follows the "
+                         "corner as you zoom and pan, so it stays readable rather than "
+                         "scrolling off with the frame. Only drawn while `Scale bar` is on."),
+                InString("scalebar_color", "Bar colour", field=False, default="white",
+                         presentation=True,
+                         choices=["white", "black", "yellow", "cyan"],
+                         choice_docs={
+                             "white": "White with a dark shadow — reads on a dark "
+                                      "fluorescence field, the default.",
+                             "black": "Black — for a light-background (brightfield, phase) "
+                                      "image where white would vanish.",
+                             "yellow": "Yellow — high contrast on both a dark field and a "
+                                       "green or red channel.",
+                             "cyan": "Cyan — high contrast over a red or magenta channel, "
+                                     "where white and yellow both blend into the signal.",
+                         },
+                         description=
+                         "The bar and label colour. Pick the one that contrasts with the "
+                         "corner it sits in; the bar also carries a translucent dark "
+                         "shadow so white survives a bright field. Only drawn while `Scale "
+                         "bar` is on."),
+            ],
+            outputs=[],
+            modes=[
+                Mode("layout", ["merged", "tiles", "both"], default="merged", label="Layout",
+                     description=
+                     "How several image streams are laid out in the Viewer. With one "
+                     "stream wired the three are identical. A display choice: changing it "
+                     "re-lays out the picture from the planes already decoded.",
+                     choice_docs={
+                         "merged": "One picture: every stream's channels composited "
+                                   "together over the primary's frame, each stream named "
+                                   "on the channel strip so it can be toggled on its own.",
+                         "tiles": "One pane per stream, side by side — the primary's "
+                                  "channels in the first pane, then each extra source in "
+                                  "its own — with a shared cursor and contrast. The way to "
+                                  "compare a raw channel with a processed one, or two "
+                                  "files, without colours mixing.",
+                         "both": "The merged composite first, then the per-stream panes: "
+                                 "see the overlap and the parts at once, at the cost of "
+                                 "smaller panes.",
+                     }),
+            ],
+            description="Display sink — shows the primary image stream, and any extra "
+                        "streams wired into the slots that appear as you fill them, merged "
+                        "or tiled, with an optional scale bar. No output: what it shows "
+                        "goes nowhere downstream (V2.00 §10; sources, layout and scale bar "
+                        "2026-10-02).")
     if NODES.get(DOCK_OP) is None:
         register_node(
             _compute_dock,

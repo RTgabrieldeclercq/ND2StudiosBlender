@@ -61,6 +61,7 @@ from nodegraph.domains import Domain
 from nodegraph.mesh import mesh_part as MESH_PART
 from nodegraph.provider import subset_index
 from nodelab_v2 import overlays as OV
+from nodelab_v2 import region_box
 from nodelab_v2 import theme as T
 #: How many channels the GL composite can sample at once. Defined in
 #: :mod:`nodelab_v2.overlays` rather than imported from :mod:`nodelab_v2.glview` because
@@ -946,6 +947,9 @@ class ViewerPanel(QWidget):
     display_changed = Signal(str)
     #: the M/T/Z picks changed — the window re-scopes the runner and re-pulls.
     selection_changed = Signal()
+    #: the troubleshooting REGION box was dragged (or cleared): what a scoped pull runs
+    #: changed laterally — the window re-scopes the runner and re-pulls (2026-10-02)
+    region_changed = Signal()
     #: the ITERATION strip moved: which of an Iterate node's results to show. The window
     #: writes it as that node's ``index`` param and re-pulls — the viewer never touches the
     #: document, exactly like :attr:`pick_committed`.
@@ -1240,6 +1244,17 @@ class ViewerPanel(QWidget):
         # M/T strips keep spanning the real series even though a payload holds only the
         # frames that were scoped.
         self._solo: Optional[Tuple[int, int]] = None
+        # the troubleshooting REGION box (2026-10-02): the SOURCE frame's (Y, X) while the
+        # scope is on, the chosen window in source pixels (None = whole frame), and the
+        # in-flight drag — (handle, press point in source px, region at press, preview).
+        self._region_extent: Optional[Tuple[int, int]] = None
+        self._region: Optional[Tuple[int, int, int, int]] = None
+        self._region_drag: Optional[tuple] = None
+        self._region_hover: Optional[str] = None
+        # the Viewer NODE's display settings (2026-10-02), pushed by the window from the
+        # viewed node's own modes/params — "merged" and no bar for every other node
+        self._source_layout: str = "merged"
+        self._scalebar: Optional[Dict[str, Any]] = None
         self._planes: Dict[int, np.ndarray] = {}
         self._ref_plane: Optional[np.ndarray] = None
         self._dataset = None
@@ -1674,6 +1689,199 @@ class ViewerPanel(QWidget):
     def solo(self) -> Optional[Tuple[int, int, int]]:
         return self._solo
 
+    # ── the troubleshooting REGION box (2026-10-02) ───────────────────────────
+    #
+    # While the solo-frame scope is on, an amber rectangle sits over the image. At rest it
+    # frames the whole source; dragging its edges, corners or interior chooses the window
+    # of the SOURCE frame the next scoped pull evaluates (the runner seeds a WindowView, so
+    # every node downstream sees only that window). Because the delivered payload IS the
+    # window, the box always frames the whole displayed image — what the drag changes is
+    # the window's position and size in source pixels, and the payload follows.
+
+    def set_region_extent(self, extent: Optional[Tuple[int, int]]) -> None:
+        """The SOURCE frame's ``(Y, X)`` the box is dragged over, or ``None`` to hide the
+        box (the scope is off). A remembered window is re-clamped into a new extent rather
+        than dropped: viewing a different node must not throw the user's region away."""
+        ext = (max(1, int(extent[0])), max(1, int(extent[1]))) if extent else None
+        if ext == self._region_extent:
+            return
+        self._region_extent = ext
+        self._region_drag = None
+        if ext is not None:
+            self._region = region_box.clamp(self._region, ext)
+        self._refresh_surface()
+
+    @property
+    def region_extent(self) -> Optional[Tuple[int, int]]:
+        return self._region_extent
+
+    @property
+    def region(self) -> Optional[Tuple[int, int, int, int]]:
+        """The chosen ``(y0, y1, x0, x1)`` source window, or ``None`` for the whole frame."""
+        return self._region
+
+    def set_region(self, region: Optional[Tuple[int, int, int, int]]) -> None:
+        """Set the window programmatically — what a completed drag does. Clamped into the
+        source extent; a whole-frame window is stored as ``None``. Emits
+        :attr:`region_changed` when it actually changed."""
+        new = region_box.clamp(region, self._region_extent) if self._region_extent else None
+        if new == self._region:
+            return
+        self._region = new
+        self._region_drag = None
+        self._refresh_surface()
+        self.region_changed.emit()
+
+    def clear_region(self) -> None:
+        """Back to the whole source frame."""
+        self.set_region(None)
+
+    def _region_resolved(self) -> Optional[Tuple[int, int, int, int]]:
+        """The window a pull evaluates, spelled out — the whole frame when none is set."""
+        if self._region_extent is None:
+            return None
+        return region_box.resolve(self._region, self._region_extent)
+
+    def _region_active(self) -> bool:
+        return (self._solo is not None and self._region_extent is not None
+                and self._ref_plane is not None and self._pick is None)
+
+    def _source_pt(self, wpt: QPointF) -> Optional[Tuple[float, float]]:
+        """A widget point → ``(x, y)`` in SOURCE pixels, extrapolated past the image: the
+        box's edges are dragged OUTWARD into the margin to grow the window, which
+        :meth:`_pick_plane_pt` (correctly, for ROI shapes) refuses to map."""
+        mp = getattr(self._view, "plane_to_widget", None)
+        if mp is None or self._ref_plane is None:
+            return None
+        o, u = mp(0.0, 0.0), mp(1.0, 1.0)
+        kx, ky = (u.x() - o.x()), (u.y() - o.y())
+        if abs(kx) < 1e-9 or abs(ky) < 1e-9:
+            return None
+        sx, sy = self._disp_scale()
+        lx, ly = (wpt.x() - o.x()) / kx / (sx or 1.0), (wpt.y() - o.y()) / ky / (sy or 1.0)
+        reg = self._region_resolved()
+        y0, x0 = (reg[0], reg[2]) if reg else (0, 0)
+        return (lx + x0, ly + y0)
+
+    def _region_tol(self) -> float:
+        """The grab radius, in source pixels: ~8 screen pixels at the current zoom."""
+        mp = getattr(self._view, "plane_to_widget", None)
+        if mp is None:
+            return 4.0
+        o, u = mp(0.0, 0.0), mp(1.0, 1.0)
+        k = max(1e-6, min(abs(u.x() - o.x()), abs(u.y() - o.y())))
+        sx, sy = self._disp_scale()
+        return 8.0 / k / max(1e-6, min(sx or 1.0, sy or 1.0))
+
+    _REGION_CURSORS = {
+        "n": Qt.SizeVerCursor, "s": Qt.SizeVerCursor,
+        "e": Qt.SizeHorCursor, "w": Qt.SizeHorCursor,
+        "ne": Qt.SizeBDiagCursor, "sw": Qt.SizeBDiagCursor,
+        "nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor,
+        "move": Qt.SizeAllCursor,
+    }
+
+    def _region_event(self, obj, e) -> bool:
+        """Turn mouse events on the image surface into region-box gestures. Returns True
+        when the event was consumed. Only the box's own handles consume a press — a click
+        elsewhere still pans, and the wheel always zooms."""
+        et = e.type()
+        reg = self._region_resolved()
+        if reg is None:
+            return False
+        tol = self._region_tol()
+        if self._region_drag is None:
+            if et == QEvent.MouseMove:
+                pt = self._source_pt(e.position())
+                h = region_box.hit(reg, pt[0], pt[1], tol) if pt is not None else None
+                if h != self._region_hover:
+                    self._region_hover = h
+                    cur = self._REGION_CURSORS.get(h)
+                    for w in self._pick_targets():
+                        if w is None:
+                            continue
+                        if cur is not None:
+                            w.setCursor(cur)
+                        else:
+                            w.unsetCursor()
+                return False
+            if et == QEvent.MouseButtonPress and e.button() == Qt.LeftButton:
+                pt = self._source_pt(e.position())
+                h = region_box.hit(reg, pt[0], pt[1], tol) if pt is not None else None
+                if h is None:
+                    return False
+                self._region_drag = (h, pt, reg, reg)
+                return True
+            return False
+        handle, p0, start, _ = self._region_drag
+        if et == QEvent.MouseMove:
+            pt = self._source_pt(e.position())
+            if pt is not None:
+                cand = region_box.drag(start, handle, pt[0] - p0[0], pt[1] - p0[1],
+                                       self._region_extent)
+                self._region_drag = (handle, p0, start, cand)
+                self._refresh_surface()
+            return True
+        if et == QEvent.MouseButtonRelease and e.button() == Qt.LeftButton:
+            cand = self._region_drag[3]
+            self._region_drag = None
+            self.set_region(cand)          # emits region_changed when it moved
+            self._refresh_surface()
+            return True
+        return et in (QEvent.MouseButtonDblClick,)
+
+    def _refresh_surface(self) -> None:
+        r = getattr(self._view, "refresh", None)
+        if r is not None:
+            r()
+
+    def _paint_region(self, p: QPainter) -> None:
+        """The amber box over the image, in widget pixels. At rest it frames the whole
+        displayed payload (which IS the current window); mid-drag it shows the candidate
+        window relative to the current one, so growing the box draws it past the image's
+        edge into the margin — the pixels that will arrive on release."""
+        if not self._region_active():
+            return
+        mp = getattr(self._view, "plane_to_widget", None)
+        reg = self._region_resolved()
+        if mp is None or reg is None:
+            return
+        sx, sy = self._disp_scale()
+        y0, _y1, x0, _x1 = reg
+        show = self._region_drag[3] if self._region_drag is not None else reg
+
+        def W(x: float, y: float) -> QPointF:          # source px → widget px
+            return mp((x - x0) * sx, (y - y0) * sy)
+
+        rect = QRectF(W(show[2], show[0]), W(show[3], show[1])).normalized()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(T.alpha(T.DIM2D, 70), 6.0))
+        p.drawRect(rect)
+        p.setPen(QPen(T.DIM2D, 2.0))
+        p.drawRect(rect)
+        # eight handles, drawn in screen pixels so they stay grabbable at any zoom
+        p.setBrush(T.DIM2D)
+        p.setPen(QPen(T.alpha(T.BG, 200), 1.0))
+        h = 4.0
+        cx, cy = rect.center().x(), rect.center().y()
+        for hx, hy in ((rect.left(), rect.top()), (cx, rect.top()), (rect.right(), rect.top()),
+                       (rect.left(), cy), (rect.right(), cy),
+                       (rect.left(), rect.bottom()), (cx, rect.bottom()),
+                       (rect.right(), rect.bottom())):
+            p.drawRect(QRectF(hx - h, hy - h, 2 * h, 2 * h))
+        if self._region_drag is not None or self._region is not None:
+            lab = region_box.label(show, self._region_extent) or "whole frame"
+            p.setPen(T.DIM2D_INK)
+            p.setBrush(T.DIM2D)
+            fm = p.fontMetrics()
+            tw = fm.horizontalAdvance(lab) + 10
+            box = QRectF(rect.left(), rect.top() - fm.height() - 6, tw, fm.height() + 4)
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(box, 3, 3)
+            p.setPen(T.DIM2D_INK)
+            p.drawText(box, Qt.AlignCenter, lab)
+
     def frame_selection(self) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
         """The picked ``(ms, ts, zs)`` — what the troubleshooting scope should run.
 
@@ -1724,6 +1932,9 @@ class ViewerPanel(QWidget):
                 continue          # a degenerate axis says nothing; unpicked z is "all z"
             parts.append(f"{ax}{compact_list(picks)}" if len(picks) == 1
                          else f"{ax}[{compact_list(picks)}]")
+        reg = region_box.label(self._region, self._region_extent)
+        if reg:
+            parts.append(f"region {reg}")
         return f" · solo {'·'.join(parts)}" if parts else ""
 
     def _on_frame_pick(self, ax: str) -> None:
@@ -2155,6 +2366,9 @@ class ViewerPanel(QWidget):
         there is only one channel to split, where a split would show the same image twice.
         """
         chans = sorted(self._planes)
+        by_source = self._source_tiles(chans)
+        if by_source is not None:
+            return by_source
         if not self._split or len(chans) < 2:
             return []
         tiles = [("Composite", tuple(chans), (235, 240, 248))]
@@ -2162,6 +2376,149 @@ class ViewerPanel(QWidget):
             name = self._chan_names[ch] if ch < len(self._chan_names) else f"Ch{ch}"
             tiles.append((name, (ch,), self._chan_colors.get(ch, (235, 240, 248))))
         return tiles
+
+    # ── the Viewer node's source layout (2026-10-02) ──────────────────────────
+
+    def set_source_layout(self, mode: str) -> None:
+        """``merged`` (one composite — the default for every node), ``tiles`` (one pane per
+        SOURCE: the primary's channels, then each extra stream's), or ``both`` (the merged
+        composite first, then the per-source panes). A display mode like the channel split:
+        no re-pull, no re-decode."""
+        mode = str(mode or "merged")
+        if mode not in ("merged", "tiles", "both"):
+            mode = "merged"
+        if mode == self._source_layout:
+            return
+        self._source_layout = mode
+        if self._planes and self._node_id is not None:
+            self._display(self._node_id, self._planes, self._axes)
+        if self._gl is not None:
+            self._gl.fit()
+        elif self._base_pix is not None:
+            self._view.fit()
+
+    @property
+    def source_layout(self) -> str:
+        return self._source_layout
+
+    def _source_tiles(self, chans: Sequence[int]):
+        """The per-SOURCE panes for ``tiles`` / ``both``, or ``None`` when the layout is
+        ``merged`` or there is only one stream (nothing to tile).
+
+        A source is told from its channels' labels: the runner names every composed channel
+        ``<source>:<channel>`` (:meth:`~nodelab_v2.runner.EngineRunner.overlay_channels`),
+        so grouping by the part before the colon, in first-appearance order, recovers the
+        streams in the order they were wired."""
+        if self._source_layout == "merged" or not self._overlay_chans:
+            return None
+        primary = tuple(ch for ch in chans if ch not in self._overlay_chans)
+        groups: Dict[str, List[int]] = {}
+        for ch in chans:
+            lab = self._overlay_chans.get(ch)
+            if lab is None:
+                continue
+            groups.setdefault(str(lab).split(":", 1)[0], []).append(ch)
+        if not groups:
+            return None
+        neutral = (235, 240, 248)
+        tiles: List[Tuple[str, Tuple[int, ...], Tuple[int, int, int]]] = []
+        if self._source_layout == "both":
+            tiles.append(("Merged", tuple(chans), neutral))
+        if primary:
+            tiles.append((str(self._node_id or "primary"), primary, neutral))
+        for name, members in groups.items():
+            tiles.append((name, tuple(members), self._chan_colors.get(members[0], neutral)))
+        return tiles if len(tiles) >= 2 else None
+
+    # ── the Viewer node's scale bar (2026-10-02) ──────────────────────────────
+
+    def set_scalebar(self, settings: Optional[Dict[str, Any]]) -> None:
+        """``{"um": float (0 = auto), "corner": str, "color": str}`` to draw a bar, or
+        ``None`` for none. Presentation only: read live from the Viewer node's params by the
+        window, never from the payload, so changing it is a repaint and not a re-pull."""
+        s = dict(settings) if settings else None
+        if s == self._scalebar:
+            return
+        self._scalebar = s
+        self._refresh_surface()
+
+    @property
+    def scalebar(self) -> Optional[Dict[str, Any]]:
+        return self._scalebar
+
+    def _scalebar_geometry(self, device_rect: QRectF):
+        """``(bar rect, label, text above?)`` in widget pixels, or ``None`` when no bar can
+        honestly be drawn (no setting, no image, or no ``pixel_size_um`` on the payload —
+        a bar without a calibration would be a fabrication, the same rule Export Movie
+        applies)."""
+        from nodegraph.catalog._shared.movie_draw import _scalebar as _auto_bar
+        s = self._scalebar
+        if not s or self._ref_plane is None or self._axes is None:
+            return None
+        mp = getattr(self._view, "plane_to_widget", None)
+        if mp is None:
+            return None
+        md = getattr(self._dataset, "metadata", None) or {}
+        px_um = md.get("pixel_size_um")
+        try:
+            px_um = float(px_um) if px_um else 0.0
+        except (TypeError, ValueError):
+            px_um = 0.0
+        if px_um <= 0.0:
+            return None
+        um = float(s.get("um") or 0.0)
+        if um > 0.0:
+            length_axes_px = um / px_um
+            label = f"{um:g} µm" if um < 1000 else f"{um / 1000:g} mm"
+        else:
+            auto = _auto_bar(int(self._axes.x), px_um, micro="µm")
+            if auto is None:
+                return None
+            length_axes_px, label = float(auto[0]), auto[1]
+        sx, _sy = self._disp_scale()
+        o, u = mp(0.0, 0.0), mp(1.0, 0.0)
+        k = abs(u.x() - o.x())                              # widget px per displayed px
+        length_w = length_axes_px * (sx or 1.0) * k
+        H, W = self._ref_plane.shape[:2]
+        img = QRectF(mp(0.0, 0.0), mp(float(W), float(H))).normalized()
+        area = img.intersected(device_rect) if device_rect.isValid() else img
+        if area.isEmpty() or length_w < 4.0:
+            return None
+        length_w = min(length_w, area.width() * 0.9)
+        margin, thick = 14.0, 4.0
+        corner = str(s.get("corner") or "bottom_right")
+        x = area.left() + margin if "left" in corner else area.right() - margin - length_w
+        top = corner.startswith("top")
+        y = area.top() + margin + 16.0 if top else area.bottom() - margin - thick
+        return QRectF(x, y, length_w, thick), label, not top
+
+    def _paint_scalebar(self, p: QPainter) -> None:
+        geo = self._scalebar_geometry(QRectF(0, 0, p.device().width(), p.device().height()))
+        if geo is None:
+            return
+        bar, label, above = geo
+        from nodegraph.catalog._shared.movie_draw import _TEXT_RGB
+        rgb = _TEXT_RGB.get(str((self._scalebar or {}).get("color") or "white"),
+                            (255, 255, 255))
+        col = QColor(*rgb)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 110))
+        p.drawRect(bar.adjusted(-1.5, -1.5, 1.5, 1.5))
+        p.setBrush(col)
+        p.drawRect(bar)
+        f = p.font()
+        f.setPointSizeF(max(8.0, f.pointSizeF()))
+        f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(label)
+        tx = bar.center().x() - tw / 2.0
+        ty = (bar.top() - 4.0) if above else (bar.bottom() + fm.ascent() + 3.0)
+        p.setPen(QColor(0, 0, 0, 160))
+        p.drawText(QPointF(tx + 1.0, ty + 1.0), label)
+        p.setPen(col)
+        p.drawText(QPointF(tx, ty), label)
 
     def _compose_cpu(self, clims, gammas) -> QImage:
         """The CPU-path image for the current mode — the composite, or the labelled
@@ -3115,6 +3472,8 @@ class ViewerPanel(QWidget):
             current_t=self._payload_coords()[1],
         )
         self._renderer.paint(p, self.overlays, frame)
+        self._paint_scalebar(p)               # the Viewer node's bar, over the image
+        self._paint_region(p)                 # the troubleshooting box, under the pick
         self._paint_pick(p)                   # the armed gesture rides ON TOP of everything
 
     # ── parameter picking (V2.16) ─────────────────────────────────────────────
@@ -3299,6 +3658,11 @@ class ViewerPanel(QWidget):
         elif et in (QEvent.Leave, QEvent.WindowDeactivate):
             self._clear_hover()
         s = self._pick
+        if s is None and self._region_active() and et in (
+                QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
+                QEvent.MouseButtonDblClick):
+            if self._region_event(obj, e):
+                return True
         if s is None or s.req.surface != "canvas":
             return super().eventFilter(obj, e)
         if et == QEvent.MouseButtonPress and e.button() == Qt.LeftButton:

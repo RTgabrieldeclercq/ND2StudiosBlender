@@ -876,16 +876,65 @@ def main(argv) -> int:
     _ok(f"G7: re-pull hits the persistent memo ({repull*1000:.0f} ms)")
 
     # ── G2: palette content ─────────────────────────────────────────────────────
-    win.palette.refill("gauss")
+    # Stage → role → node (the taxonomy in codemap/node_roles.json), dots on both sides of
+    # every node row, and an overview card for whatever is clicked (2026-10-02).
+    from nodegraph import roles as _ROLES
+    from nodelab_v2.scene import visible_specs
+    from PySide6.QtCore import Qt as _Qt
     tree = win.palette._tree
-    found = []
-    for i in range(tree.topLevelItemCount()):
-        head = tree.topLevelItem(i)
-        for j in range(head.childCount()):
-            found.append(head.child(j).text(0))
-    assert any("Gaussian" in t for t in found), found
+
+    def _rows(kind):
+        out = []
+        for i in range(tree.topLevelItemCount()):
+            head = tree.topLevelItem(i)
+            if kind == "stage":
+                out.append(head)
+            for j in range(head.childCount()):
+                role = head.child(j)
+                if kind == "role":
+                    out.append(role)
+                for k in range(role.childCount()):
+                    if kind == "node":
+                        out.append(role.child(k))
+        return out
+
     win.palette.refill("")
-    _ok("G2: palette search filters the registry")
+    stage_labels = [h.text(1) for h in _rows("stage")]
+    assert stage_labels == [m["label"].upper() for _, m in _ROLES.stages()], stage_labels
+    visible_ops = {s.op_key for s in visible_specs()}
+    roles_with_visible = {rk for rk, r in _ROLES.load()["roles"].items()
+                          if any(op in visible_ops for op in r["ops"])}
+    assert len(_rows("role")) == len(roles_with_visible), \
+        (len(_rows("role")), len(roles_with_visible))   # graph-structure ops are hidden
+    nodes = _rows("node")
+    assert len(nodes) == len(visible_specs()), (len(nodes), len(visible_specs()))
+    gauss = next(r for r in nodes if r.data(0, _Qt.UserRole) == "enhance.gaussian")
+    label = next(r for r in nodes if r.data(0, _Qt.UserRole) == "analysis.label")
+    for r in (gauss, label):
+        assert not r.icon(0).isNull() and not r.icon(2).isNull(), "dots on both sides"
+    assert "reads voxel" in label.toolTip(0) and "adds label" in label.toolTip(2), \
+        (label.toolTip(0), label.toolTip(2))
+    assert "float parameter" in gauss.toolTip(0), gauss.toolTip(0)
+    # a single click fills the overview with THAT node, read live from the registry
+    tree.setCurrentItem(label)
+    app.processEvents()
+    assert win.palette.current_op == "analysis.label"
+    ov = win.palette.overview_html()
+    for needle in ("Connected Components", "analysis.label", "Find structure",
+                   "Segmentation", "Footprint", "How it works"):
+        assert needle in ov, f"overview lacks {needle!r}"
+    tree.setCurrentItem(_rows("role")[0])
+    app.processEvents()
+    assert win.palette.current_op is None and "Nodes" in win.palette.overview_html()
+    # search still filters, and keeps the stage/role scaffolding only where it has a hit
+    win.palette.refill("gauss")
+    found = [r.text(1) for r in _rows("node")]
+    assert any("Gaussian" in t for t in found), found
+    assert all(h.childCount() > 0 for h in _rows("stage")), "no empty stage under a filter"
+    win.palette.refill("")
+    _ok("G2: palette is stage → role → node with every visible op placed, in/out dots "
+        "with domain-aware tooltips, an overview that follows the click, and a search "
+        "that filters without leaving empty groups")
 
     # ── review regressions (Phase-5 impl review, 2026-07-22) ──────────────────
     from nodegraph.graph import Edge, Graph, NodeInstance
@@ -2240,6 +2289,62 @@ def main(argv) -> int:
     assert solo_t4.axes.t == 1
     assert win.viewer._sliders["t"].value() == 4 and win._solo_chip.text() == "SOLO t4"
     solo_pixels = {c: np.array(p) for c, p in win.viewer._planes.items()}
+
+    # ── T1b: the troubleshooting REGION box (2026-10-02) ─────────────────────
+    # While the scope is on, the Viewer carries an amber box spanning the SOURCE frame;
+    # dragging it (here: the programmatic call a completed drag makes) scopes the pull to
+    # that window of the source. The payload IS the window, its pixels are the full frame's
+    # slice, the chip names it, and clearing it restores the full frame as a memo identity.
+    from nodelab_v2 import region_box as _RB
+    assert win.viewer.region_extent == (128, 128), win.viewer.region_extent
+    assert win.viewer.region is None and win.runner.region is None, "at rest: whole frame"
+    assert _RB.clamp((0, 128, 0, 128), (128, 128)) is None, "full frame == no region"
+    win.viewer.set_region((32, 96, 16, 80))            # ← what releasing a drag does
+    windowed = _await_pull()
+    assert win.viewer.region == (32, 96, 16, 80) and win.runner.region == (32, 96, 16, 80)
+    assert (windowed.axes.y, windowed.axes.x) == (64, 64), \
+        f"a windowed pull must carry the window's extent, got {windowed.axes}"
+    assert windowed.axes.t == 1 and windowed.axes.z == 3 and windowed.axes.c == 2
+    assert win._solo_chip.text() == "SOLO t4·64×64px", win._solo_chip.text()
+    assert "region 64×64@y32,x16" in win.viewer._status.text(), win.viewer._status.text()
+    # n5 sits below a 3D Gaussian (n3), whose halo is clipped at the WINDOW's edge exactly
+    # as it would be below a Crop node — so the window's outermost halo of pixels differs
+    # from the full frame's slice and its interior is bit-identical. Both halves are the
+    # claim: the interior proves the window reads the right source pixels, the border
+    # proves the caveat the manual states is real rather than theoretical. The halo here is
+    # 20 px (sigma 0.5 um at the synthetic 0.1 um/px -> 5 px, int(4*sigma+0.5)).
+    HALO = 20
+    for c, plane in solo_pixels.items():
+        got = np.asarray(win.viewer._planes[c])
+        want = plane[32:96, 16:80]
+        assert got.shape == (64, 64), f"windowed plane shape {got.shape}, want (64, 64) (c={c})"
+        inner = (slice(HALO, -HALO), slice(HALO, -HALO))
+        assert np.array_equal(got[inner], want[inner]), \
+            (f"the window's interior must be the full frame's slice (c={c}): "
+             f"{int((got[inner] != want[inner]).sum())} of {got[inner].size} differ")
+        assert not np.array_equal(got, want), \
+            f"the window's halo border should differ from the full run (c={c}) — it is clipped"
+    # the box hit-test + drag maths the Viewer's mouse handling is built on
+    assert _RB.hit((32, 96, 16, 80), 16, 32, 3) == "nw" and \
+        _RB.hit((32, 96, 16, 80), 48, 96, 3) == "s" and \
+        _RB.hit((32, 96, 16, 80), 50, 60, 3) == "move" and \
+        _RB.hit((32, 96, 16, 80), 5, 5, 3) is None
+    assert _RB.drag((32, 96, 16, 80), "move", 100, 100, (128, 128)) == (64, 128, 64, 128), \
+        "a move stops at the frame edge"
+    assert _RB.drag((32, 96, 16, 80), "e", 500, 0, (128, 128)) == (32, 96, 16, 128)
+    assert _RB.drag((32, 96, 16, 80), "w", 500, 0, (128, 128))[2] == 80 - _RB.MIN_SIDE, \
+        "a side never crosses its opposite"
+    win.clear_region()                                 # Run → Clear troubleshooting region
+    unwindowed = _await_pull()
+    assert win.viewer.region is None and win.runner.region is None
+    assert (unwindowed.axes.y, unwindowed.axes.x) == (128, 128)
+    assert win._solo_chip.text() == "SOLO t4"
+    for c, plane in solo_pixels.items():
+        assert np.array_equal(plane, np.asarray(win.viewer._planes[c])), \
+            f"clearing the region must restore the full frame's pixels (c={c})"
+    _ok("T1b region box: the box spans the 128² source; a 64×64 window pulls a 64×64 "
+        "payload whose pixels are the full frame's slice, the chip and status name it, the "
+        "hit/drag maths pin handles and edges, and clearing it restores the full frame")
 
     # returning to a frame already run is a MEMO HIT — this is what makes flipping
     # between two frames instant, and it proves the pin re-keys rather than aliases
@@ -5160,6 +5265,83 @@ def main(argv) -> int:
         "sorted later-wins JSON through the pinning edit path and the inspector removes "
         "one with its ✕; an overlay LUT is keyed by source, and a LUT drag no longer resets "
         "an overlay channel to additive at full opacity")
+
+    # ── V1: the Viewer NODE — growable sources, layout modes, scale bar (2026-10-02) ──
+    # A display sink: the primary is the payload, every extra wired `source_N` is composited
+    # as display channels named after its socket, the card offers exactly one empty slot,
+    # `layout` lays the streams out as one picture / per-stream panes / both, and the scale
+    # bar is a presentation setting the window pushes to the panel from the document.
+    from PySide6.QtCore import QRectF as _QRectF
+    win.set_solo_frame(False)
+    win.build_demo()
+    app.processEvents()
+    vdoc = win.doc
+    vdoc.add_node("view.viewer", node_id="vv", x=1330, y=430)
+    assert [s.name for s in vdoc.input_specs("vv") if s.type.name == "DATASET"] == \
+        ["data", "source_2"], "at rest: the primary and ONE empty slot"
+    assert not list(vdoc.output_specs("vv")), "a sink has no output socket"
+    vdoc.connect("n3", "out", "vv", "data")                 # the blurred image
+    vdoc.connect("n2", "out", "vv", "source_2")             # the raw channel beside it
+    assert [s.name for s in vdoc.input_specs("vv") if s.type.name == "DATASET"] == \
+        ["data", "source_2", "source_3"], "wiring a slot reveals the next"
+    _pulls.clear()
+    win.pull_node("vv")
+    vpay = _await_pull()
+    assert vpay.axes.c == 2, f"the payload is the PRIMARY (its own channels), got {vpay.axes}"
+    labels = win.runner.overlay_channels("vv")
+    assert labels and all(str(l).startswith("source_2:") for l in labels.values()), labels
+    assert win.viewer._overlay_chans == labels
+    assert win.viewer.source_layout == "merged" and win.viewer._tiles() == [], \
+        "merged: one composite, no panes"
+    vrec = vdoc.nodes["vv"]
+    vrec.modes["layout"] = "tiles"
+    win.pull_node("vv")
+    _await_pull()
+    tiles = win.viewer._tiles()
+    assert win.viewer.source_layout == "tiles" and len(tiles) == 2, tiles
+    assert tiles[0][0] == "vv" and tiles[1][0] == "source_2", [t[0] for t in tiles]
+    assert set(tiles[0][1]) | set(tiles[1][1]) == set(win.viewer._planes), \
+        "the panes partition every shown channel"
+    vrec.modes["layout"] = "both"
+    win.pull_node("vv")
+    _await_pull()
+    tiles = win.viewer._tiles()
+    assert len(tiles) == 3 and tiles[0][0] == "Merged" and \
+        set(tiles[0][1]) == set(win.viewer._planes), [t[0] for t in tiles]
+    # the scale bar: presentation params, read from the document, drawn inside the image
+    assert win.viewer.scalebar is None, "off by default"
+    vrec.params["show_scalebar"] = True
+    vrec.params["scalebar_um"] = 10.0
+    vrec.params["scalebar_corner"] = "top_left"
+    win.pull_node("vv")
+    _await_pull()
+    assert win.viewer.scalebar == {"um": 10.0, "corner": "top_left", "color": "white"}, \
+        win.viewer.scalebar
+    _surf = win.viewer._pick_targets()[0]
+    geo = win.viewer._scalebar_geometry(_QRectF(0, 0, _surf.width(), _surf.height()))
+    assert geo is not None, "a calibrated payload must yield a bar"
+    bar, label, above = geo
+    assert label == "10 µm" and not above, (label, above)
+    _mp = win.viewer._view.plane_to_widget
+    _H, _W = win.viewer._ref_plane.shape[:2]
+    _img = _QRectF(_mp(0.0, 0.0), _mp(float(_W), float(_H))).normalized()
+    assert _img.contains(bar), f"the bar must sit inside the image: {bar} vs {_img}"
+    # 10 um at 0.1 um/px = 100 source px → the bar spans 100 axes px of the image width,
+    # or is capped at 90% of the visible image when the frame is narrower than that (the
+    # demo source here is 64 px wide, so the cap is what this exercises)
+    _want = min(100.0 / win.viewer._axes.x, 0.9)
+    assert abs(bar.width() / _img.width() - _want) < 0.02, \
+        (bar.width(), _img.width(), win.viewer._axes.x, _want)
+    vrec.params["show_scalebar"] = False
+    win.pull_node("vv")
+    _await_pull()
+    assert win.viewer.scalebar is None
+    vdoc.remove_node("vv")
+    _ok("VN1 viewer node: primary + one empty source slot that grows as wired, no output; "
+        "a second stream composites as `source_2:` display channels on the primary payload; "
+        "layout merged/tiles/both gives 0/2/3 panes that partition the channels; the scale "
+        "bar is presentation (off by default), 10 um reads '10 µm' top-left inside the "
+        "image at the calibrated length, and clears when switched off")
 
     _probe_movie_editor(win, app)
 

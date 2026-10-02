@@ -334,6 +334,15 @@ class SocketSpec:
     #: old value while the socket shows the new one. A presentation socket's only legitimate
     #: consumer is the GUI, reading it live from the document.
     presentation: bool = False
+    #: ── growable input groups (2026-10-02) ───────────────────────────────────
+    #: Dataset inputs that share a ``grow_group`` name reveal themselves ONE AT A TIME on
+    #: the card: the first is always shown, and each later one appears only once the one
+    #: before it is wired (or it is wired itself) — Blender's "virtual socket", so a node
+    #: that takes any number of streams (``view.viewer``) always offers exactly one empty
+    #: slot instead of a column of six. Engine-neutral: the specs all exist and an unwired
+    #: one is simply absent from ``ctx.inputs``; only :meth:`nodelab_v2.document
+    #: .GraphDocument.input_specs` reads it, and it is the one place that knows the wires.
+    grow_group: str = ""
     kernel_param: bool = False        # influences the spatial kernel (radius/σ): a
     #: NON-Const Field on this socket is spatially varying and breaks tile translation-
     #: invariance + halo sizing, so a consumer must stream at the plane unit, not tiled
@@ -689,7 +698,7 @@ class NodeSpec:
 def InDataset(name: str = "data", *, multi: bool = False, label: str = "",
               view_source: bool = False, description: str = "",
               available_in: Optional[Mapping[str, FrozenSet[str]]] = None,
-              passes_domains: bool = True) -> SocketSpec:
+              passes_domains: bool = True, grow_group: str = "") -> SocketSpec:
     """A Dataset input. ``description`` is the hover text, and it earns its place on a node
     with SEVERAL Dataset inputs: the domain rail is a node-level answer painted identically
     beside each one, so the card cannot say which wire wants what. A value socket has carried
@@ -698,7 +707,8 @@ def InDataset(name: str = "data", *, multi: bool = False, label: str = "",
     node only reads (see :attr:`SocketSpec.passes_domains`)."""
     return SocketSpec(name, SocketType.DATASET, Direction.IN, label=label,
                       multi=multi, view_source=view_source, description=description,
-                      available_in=available_in, passes_domains=passes_domains)
+                      available_in=available_in, passes_domains=passes_domains,
+                      grow_group=grow_group)
 
 
 def OutDataset(name: str = "out", *, label: str = "",

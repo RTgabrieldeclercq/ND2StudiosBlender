@@ -23132,6 +23132,421 @@ def test_chain_files() -> None:
         "inputs refused")
 
 
+def test_subtract_background_zero_regions() -> None:
+    """``enhance.subtract_background`` ``approach="zero_regions"`` (2026-10-02) — decide which
+    voxels are background and set them to nothing, by a drawn sample or an adaptive cut.
+
+    Asserted, against a fixture whose object cores and empty field are known exactly:
+
+    1. **Object pixels are untouched bit-for-bit** on every path, and the empty field is
+       zeroed completely at the default tolerance — the two halves of the approach's promise.
+    2. **``output="background"`` is the exact complement**: corrected + background == input,
+       so the diagnostic shows precisely the pixels about to be removed.
+    3. **The adaptive margin is a noise width, not a local sd**: a compact bright object must
+       SURVIVE with no upper limit set (Niblack's local sd ate it; the robust MAD margin must
+       not), and the upper limit must protect an object the block is too small for.
+    4. **Polarity**: on a light background the field goes to the WHITE level and dark objects
+       keep their values.
+    5. **``bit_depth`` survives** every state of this approach, envelope == payload (§7c),
+       including with ``combine="divide"`` left behind its hidden dropdown — the trap the
+       meta_transform's approach-first check exists for.
+    6. **R1**: a plain surface subtract does not record the ``shapes`` param it never read;
+       the three approach/detector states hash apart.
+    7. **Gating**: the estimator sockets, ``bg_floor``, ``method`` and ``combine`` are hidden
+       under ``zero_regions``; ``shapes`` only with ``sampled_region``; the block/range
+       sockets only with ``adaptive``; ``block_size_z`` only in 3D.
+    8. **Refusals**: no region drawn, malformed JSON, a sub-2-pixel region, a backwards clamp
+       range, a negative tolerance, a sub-voxel block, an unknown detector.
+    """
+    if not _HAVE_SKIMAGE:
+        _ok("subtract background (zero regions): SKIPPED (scikit-image absent)")
+        return
+    import json as _json
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+
+    define_node("io.zrseed", "S", outputs=[OutDataset()])
+    Y, X, Z = 64, 80, 3
+    zz, yy, xx = np.mgrid[0:Z, 0:Y, 0:X].astype(float)
+    noise = 8.0 * np.sin(yy * 1.7 + xx * 0.9)              # deterministic texture
+    objects = np.zeros_like(noise)
+    for cz, cy, cx in [(1, 16, 20), (1, 44, 56)]:
+        objects += 1500.0 * np.exp(-(((zz - cz) ** 2) / 2.0
+                                     + ((yy - cy) ** 2 + (xx - cx) ** 2) / 18.0))
+    # Two fixtures, one per claim. `flat` has a uniform field (plus texture and a small
+    # per-plane offset) so the sampled detector's ONE global cut is the right tool and the
+    # test measures "similar to the sample" and nothing else; `ramped` adds a 300-count
+    # illumination ramp the sampled detector cannot follow by design (its option doc says
+    # so) and the adaptive detector must. The sample patch sits in the bottom-left corner,
+    # far from both objects — a patch over an object tail would inflate the spread and let
+    # everything be zeroed for the wrong reason.
+    flat = 300.0 + 10.0 * zz + noise + objects
+    ramped = flat + 300.0 * (yy / Y)
+    fixture = {"sampled_region": flat, "adaptive": ramped}
+    empty, core = objects[1] < 1.0, objects[1] > 800.0
+    meta = {"pixel_size_um": 0.5, "z_step_um": 1.0, "bit_depth": 12}
+    ax = AxisSizes(m=1, t=1, z=Z, c=1, y=Y, x=X)
+    sample = _json.dumps([{"type": "rect", "op": "add", "vertices": [[50, 2], [62, 16]]}])
+    img = flat
+
+    def pull(params, modes, vol=None):
+        if vol is None:
+            vol = fixture.get(modes.get("detector", "sampled_region"), flat)
+        ds = (Dataset(axes=ax, metadata=meta)
+              .with_image(ArrayProvider(vol.reshape(1, 1, Z, 1, Y, X))))
+        g = Graph()
+        g.add(NodeInstance("S", "io.zrseed"))
+        g.add(NodeInstance("B", "enhance.subtract_background", params=params,
+                           modes=dict({"approach": "zero_regions"}, **modes)))
+        g.connect("S", "B")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)})
+        out = e.pull("B")
+        return e, out.image.get_region(0, 0, 0, 1, 0, 0, Y, 0, X), out
+
+    # 1 + 2. both detectors, both dims: field zeroed, objects exact, complement exact
+    for dim in ("2D", "3D"):
+        for detector, params in (("sampled_region", {"shapes": sample}),
+                                 ("adaptive", {"block_size": 6.0, "block_size_z": 2.0})):
+            modes = {"detector": detector, "dim": dim}
+            src = fixture[detector][1]
+            e, got, out = pull(params, modes)
+            assert np.all(np.isfinite(got)) and out.axes == ax, (dim, detector)
+            assert float((got[empty] == 0.0).mean()) > 0.99, \
+                f"{dim}/{detector}: the empty field must be zeroed, " \
+                f"{(got[empty] == 0).mean():.3f} was"
+            assert np.array_equal(got[core], src[core]), \
+                f"{dim}/{detector}: object pixels must be returned bit-for-bit"
+            _, bg, _ = pull(params, dict(modes, output="background"))
+            assert np.allclose(got + bg, src), \
+                f"{dim}/{detector}: output=background must be the exact complement"
+    # …and the sampled detector's documented limit: ONE global cut cannot follow a ramp. The
+    # sample must sit at the DIM end for this to show (a bright-end sample's cut covers the
+    # whole ramp, which is also correct behaviour, just not the one under test).
+    dim_sample = _json.dumps([{"type": "rect", "op": "add", "vertices": [[2, 40], [14, 60]]}])
+    _, on_ramp, _ = pull({"shapes": dim_sample},
+                         {"detector": "sampled_region", "dim": "2D"}, vol=ramped)
+    assert 0.1 < float((on_ramp[empty] == 0.0).mean()) < 0.9, \
+        ("a global cut from a dim-end sample must NOT appear to follow an illumination ramp: "
+         f"{(on_ramp[empty] == 0.0).mean():.3f} zeroed")
+    # 3. the adaptive margin: compact objects survive unclamped; the clamp rescues a wide one
+    _, unclamped, _ = pull({"block_size": 6.0}, {"detector": "adaptive", "dim": "2D"})
+    assert float((unclamped[core] == 0.0).mean()) == 0.0, \
+        "a compact bright object must survive the adaptive cut with no upper limit"
+    wide = 300.0 + 10.0 * zz + noise
+    wide[1][20:44, 24:60] += 1200.0                        # an object far wider than the block
+    _, eaten, _ = pull({"block_size": 2.0}, {"detector": "adaptive", "dim": "2D"}, vol=wide)
+    _, saved, _ = pull({"block_size": 2.0, "range_high": 900.0},
+                       {"detector": "adaptive", "dim": "2D"}, vol=wide)
+    interior = np.zeros((Y, X), dtype=bool)
+    interior[26:38, 32:52] = True
+    assert float((eaten[interior] == 0.0).mean()) > 0.5, \
+        "a block far smaller than the object must eat its interior — the failure the clamp is for"
+    assert float((saved[interior] == 0.0).mean()) == 0.0, \
+        "an upper limit under object brightness must protect the interior completely"
+    # 4. polarity: the field goes to WHITE, dark objects keep their values
+    white = 4095.0
+    _, lit, _ = pull({"shapes": sample}, {"detector": "sampled_region", "dim": "2D",
+                                          "polarity": "light_background"}, vol=white - img)
+    assert float((lit[empty] == white).mean()) > 0.99, "light field must go to the white level"
+    assert np.array_equal(lit[core], (white - img[1])[core]), "dark objects untouched"
+    # 5. bit_depth survives every state, envelope == payload
+    for modes in ({"detector": "sampled_region", "output": "corrected", "combine": "divide"},
+                  {"detector": "adaptive", "output": "background", "combine": "divide"}):
+        params = {"shapes": sample, "block_size": 6.0}
+        e, _, out = pull(params, dict(modes, dim="2D"))
+        assert e.env("B").metadata.get("bit_depth") == out.metadata.get("bit_depth") == 12, \
+            f"zero_regions never changes the scale: {modes}"
+    # 6. R1 + distinct hashes
+    hashes = set()
+    for modes in ({"approach": "estimate_surface", "method": "opening"},
+                  {"detector": "sampled_region"}, {"detector": "adaptive"}):
+        e, _, _ = pull({"shapes": sample, "radius": 12.0, "block_size": 6.0},
+                       dict(modes, dim="2D"))
+        hashes.add(e.entry("B").recipe_hash)
+        if modes.get("approach") == "estimate_surface":
+            assert "shapes" not in str(dict(e.entry("B").reads)), \
+                "a surface subtract must not be fenced on a sample it never read"
+    assert len(hashes) == 3, "approach/detector must re-key the memo"
+    # 7. gating
+    spec = NODES.get("enhance.subtract_background")
+    vis = lambda st: {i.name for i in spec.active_inputs(st)}
+    base = {"dim": "2D", "method": "rolling_ball", "output": "corrected", "combine": "divide"}
+    surf = vis(dict(base, approach="estimate_surface"))
+    assert "radius" in surf and "bg_floor" in surf and not ({"shapes", "tolerance"} & surf)
+    samp = vis(dict(base, approach="zero_regions", detector="sampled_region"))
+    assert {"shapes", "tolerance", "presmooth"} <= samp
+    assert not ({"radius", "sigma", "percentile", "degree", "height", "shrink", "bg_floor",
+                 "block_size", "block_size_z", "range_low", "range_high"} & samp), samp
+    adap2 = vis(dict(base, approach="zero_regions", detector="adaptive"))
+    adap3 = vis(dict(base, approach="zero_regions", detector="adaptive", dim="3D"))
+    assert {"block_size", "range_low", "range_high", "tolerance"} <= adap2
+    assert "shapes" not in adap2 and "block_size_z" not in adap2 and "block_size_z" in adap3
+    zstate = dict(base, approach="zero_regions", detector="sampled_region")
+    live_modes = {m.name for m in spec.modes if m.active_in(zstate)}
+    assert "detector" in live_modes and not ({"method", "combine"} & live_modes), live_modes
+    assert "detector" not in {m.name for m in spec.modes
+                              if m.active_in(dict(base, approach="estimate_surface"))}
+    # 8. refusals, each naming the fix
+    one_px = _json.dumps([{"type": "rect", "op": "add", "vertices": [[2, 2], [2, 2]]}])
+    for params, modes, needle in (
+            ({}, {"detector": "sampled_region"}, "no background region"),
+            ({"shapes": "[not json"}, {"detector": "sampled_region"}, "not valid JSON"),
+            ({"shapes": one_px}, {"detector": "sampled_region"}, "at least 2"),
+            ({"block_size": 6.0, "range_low": 500.0, "range_high": 100.0},
+             {"detector": "adaptive"}, "0 <= low <= high"),
+            ({"shapes": sample, "tolerance": -1.0}, {"detector": "sampled_region"},
+             "tolerance must be"),
+            ({"block_size": 0.05}, {"detector": "adaptive"}, "1-voxel"),
+            ({"shapes": sample}, {"detector": "nope"}, "unknown detector"),
+    ):
+        try:
+            pull(params, dict(modes, dim="2D"))
+        except ValueError as exc:
+            assert needle in str(exc), f"{modes}/{params}: {exc}"
+        else:
+            raise AssertionError(f"not refused: {modes} {params}")
+    _ok("subtract_background zero_regions: sampled-region and adaptive detectors zero the "
+        "field and return object pixels bit-for-bit in 2D and 3D; output=background is the "
+        "exact complement; the adaptive margin is a robust noise width (a compact object "
+        "survives unclamped) and the upper limit protects an object wider than the block; "
+        "light polarity sends the field to white; bit_depth survives with envelope == payload "
+        "even with a hidden divide; R1 holds for the surface path; 3 states hash apart; the "
+        "estimator/arithmetic controls hide and the sample/block/range sockets gate per "
+        "detector and dim; 7 refusals")
+
+
+def test_region_scope() -> None:
+    """The troubleshooting REGION box (2026-10-02): the Qt-free maths in
+    ``nodelab_v2.region_box`` and the seed-level window the runner builds from it.
+
+    The GUI half (the drag on the Viewer, the chip, the re-pull) is the phase-5 probe's
+    T1b; this pins what it is built on. (1) A full-frame region is ``None`` — the identity
+    the pre-region pin had, so an untouched box re-keys no memo entry. (2) Clamping keeps a
+    remembered window inside a shrunken source and above the minimum side. (3) Hit-testing
+    prefers corners over edges over the interior and misses outside the grab zone. (4) A
+    move slides without resizing and stops at the frame edge; an edge drag never crosses
+    its opposite side. (5) A ``WindowView`` over a ``FrameSubsetProvider`` — the seed the
+    runner builds — serves exactly the window's pixels of the picked frames, shrinks the
+    axes, and keys apart from both the unwindowed subset and a different window, while the
+    envelope's origin moves by the cut in µm."""
+    from dataclasses import replace
+    from nodelab_v2 import region_box as RB
+    from nodegraph.provider import FrameSubsetProvider
+    from nodegraph.streaming import WindowView
+    from nodegraph.metadata import shift_origin_um
+
+    ext = (120, 160)
+    assert RB.clamp(None, ext) is None and RB.clamp((0, 120, 0, 160), ext) is None
+    assert RB.clamp((-5, 500, 10, 50), ext) == (0, 120, 10, 50), "clipped into the frame"
+    assert RB.clamp((40, 42, 10, 50), ext) == (40, 48, 10, 50), "floored at MIN_SIDE"
+    assert RB.clamp((118, 119, 10, 50), ext) == (112, 120, 10, 50), "floor pushes back in"
+    assert RB.clamp((20, 60, 30, 90), (40, 40)) == (20, 40, 30, 40), "re-clamped to a smaller source"
+    assert RB.resolve(None, ext) == (0, 120, 0, 160) and RB.resolve((1, 9, 2, 12), ext) == (1, 9, 2, 12)
+    r = (20, 60, 30, 90)
+    assert RB.hit(r, 30, 20, 2) == "nw" and RB.hit(r, 90, 60, 2) == "se"
+    assert RB.hit(r, 60, 20, 2) == "n" and RB.hit(r, 30, 40, 2) == "w" and RB.hit(r, 90, 40, 2) == "e"
+    assert RB.hit(r, 60, 40, 2) == "move" and RB.hit(r, 10, 10, 2) is None
+    assert RB.hit(r, 30, 22, 1) == "w", "a point near one edge but not a corner is the edge"
+    assert RB.drag(r, "move", 10, -5, ext) == (15, 55, 40, 100)
+    assert RB.drag(r, "move", 1000, 1000, ext) == (80, 120, 100, 160), "stops at the edge"
+    assert RB.drag(r, "n", -100, -100, ext) == (0, 60, 30, 90), "only its own side moves"
+    assert RB.drag(r, "s", 0, -1000, ext) == (20, 20 + RB.MIN_SIDE, 30, 90), "never crosses"
+    assert RB.drag(r, "se", 5, 5, ext) == (20, 65, 30, 95)
+    assert RB.label(r) == "60×40@y20,x30" and RB.label(None) == "" \
+        and RB.label((0, 120, 0, 160), ext) == ""
+
+    base = SyntheticProvider(AxisSizes(m=2, t=4, z=3, c=1, y=120, x=160), tile=16, levels=2)
+    sub = FrameSubsetProvider(base, (1,), (0, 2))
+    y0, y1, x0, x1 = 20, 60, 30, 90
+    win = WindowView(sub, y0=y0, x0=x0, axes=replace(sub.axes, y=y1 - y0, x=x1 - x0))
+    assert (win.axes.m, win.axes.t, win.axes.z, win.axes.y, win.axes.x) == (1, 2, 3, 40, 60)
+    for ti, bt in enumerate((0, 2)):
+        for z in range(3):
+            assert np.array_equal(win.get_region(0, 0, ti, z, 0, 0, 40, 0, 60),
+                                  base.get_region(0, 1, bt, z, 0, y0, y1, x0, x1)), \
+                "the window must serve exactly its slice of each picked frame"
+    other = WindowView(sub, y0=y0 + 1, x0=x0, axes=win.axes)
+    assert len({sub.fingerprint(), win.fingerprint(), other.fingerprint()}) == 3, \
+        "no window, this window and a shifted window must key apart"
+    # origin_um is PER-M (one [z, y, x] corner per position) — the runner shifts it after
+    # `position_subset` has already narrowed it to the picked positions
+    env = MetaEnvelope(axes=base.axes, metadata={"pixel_size_um": 0.5,
+                                                 "origin_um": [[0.0, 0.0, 0.0], [0.0, 5.0, 5.0]]})
+    moved = shift_origin_um(env, 0.0, y0 * 0.5, x0 * 0.5)
+    assert moved and [o[1:] for o in moved["origin_um"]] == [[10.0, 15.0], [15.0, 20.0]], moved
+    assert shift_origin_um(MetaEnvelope(axes=base.axes, metadata={}), 0.0, 1.0, 1.0) == {}, \
+        "a file with no position log gains no origin"
+    _ok("region scope: full frame is None (pin identity kept); clamp clips/floors/re-fits; "
+        "hit prefers corner > edge > interior; move slides and stops, edges never cross; a "
+        "WindowView over a frame subset serves the exact window of each picked frame, "
+        "shrinks axes, keys apart from the subset and a shifted window; origin moves by the cut")
+
+
+def test_viewer_node_inputs() -> None:
+    """``view.viewer`` (2026-10-02): a sink with a GROWABLE column of Dataset inputs, no
+    output, a source layout Mode and presentation-only scale-bar sockets — checked through
+    the Qt-free document seam, which is the one place that knows the wires.
+
+    1. The spec: ``data`` plus ``source_2``…``source_6``, every extra one a ``view_source``
+       that passes no domains and shares the ``sources`` grow group; no outputs.
+    2. ``input_specs`` reveals the column one slot at a time: at rest ``data`` and ONE empty
+       extra; wire that extra and the next appears; wire a later slot directly and
+       everything up to it shows (a wire must never be hidden).
+    3. The scale-bar sockets are ``presentation`` (excluded from the recipe hash, so a
+       change repaints rather than re-pulls) and the compute does not read them.
+    4. The compute is the primary pass-through: with two sources wired, the payload is the
+       primary's, untouched."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    spec = NODES.get("view.viewer")
+    assert spec is not None and not spec.outputs, "a sink: no output socket"
+    names = [s.name for s in spec.inputs if s.type is SocketType.DATASET]
+    assert names == ["data", "source_2", "source_3", "source_4", "source_5", "source_6"], names
+    extras = [s for s in spec.inputs if s.name.startswith("source_")]
+    assert all(s.view_source and not s.passes_domains and s.grow_group == "sources"
+               for s in extras), "every extra stream is a display source of the primary"
+    assert not spec.inputs[0].grow_group and spec.inputs[0].view_source is False
+    bars = {s.name: s for s in spec.inputs if s.name.startswith("scalebar") or s.name == "show_scalebar"}
+    assert set(bars) == {"show_scalebar", "scalebar_um", "scalebar_corner", "scalebar_color"}
+    assert all(s.presentation for s in bars.values()), "scale bar = presentation only"
+    assert bars["scalebar_um"].unit == "um"
+    assert [m.name for m in spec.modes] == ["layout"] and \
+        list(spec.modes[0].choices) == ["merged", "tiles", "both"]
+
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="A")
+    doc.add_node("io.load", node_id="B")
+    doc.add_node("io.load", node_id="C")
+    doc.add_node("view.viewer", node_id="V")
+
+    def ds_inputs():
+        return [s.name for s in doc.input_specs("V") if s.type is SocketType.DATASET]
+
+    assert ds_inputs() == ["data", "source_2"], ds_inputs()
+    doc.connect("A", "image", "V", "data")
+    assert ds_inputs() == ["data", "source_2"], "wiring the primary reveals nothing new"
+    doc.connect("B", "image", "V", "source_2")
+    assert ds_inputs() == ["data", "source_2", "source_3"], ds_inputs()
+    doc.connect("C", "image", "V", "source_4")               # skipped a slot on purpose
+    assert ds_inputs() == ["data", "source_2", "source_3", "source_4", "source_5"], \
+        "a wired slot is always shown, with everything before it, plus one empty after"
+    assert doc.output_specs("V") == [] or not list(doc.output_specs("V")), "still a sink"
+
+    # the compute passes the primary through, whatever else is wired
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    define_node("io.seedviewer", "S", outputs=[OutDataset()])
+    g = Graph()
+    g.add(NodeInstance("A", "io.seedviewer"))
+    g.add(NodeInstance("B", "io.seedviewer"))
+    g.add(NodeInstance("V", "view.viewer"))
+    g.connect("A", "V", src_socket="out", dst_socket="data")
+    g.connect("B", "V", src_socket="out", dst_socket="source_2")
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    a = Dataset(axes=ax).with_image(ArrayProvider(np.full((1, 1, 1, 1, 8, 8), 3.0)))
+    b = Dataset(axes=ax).with_image(ArrayProvider(np.full((1, 1, 1, 1, 8, 8), 9.0)))
+    env = MetaEnvelope(axes=ax, metadata={})
+    out = Engine(g, computes=COMPUTES, seeds={"A": a, "B": b},
+                 meta_seeds={"A": env, "B": env}).pull("V")
+    assert float(out.image.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8).mean()) == 3.0, \
+        "the Viewer node's payload is its PRIMARY; extra streams are composited for display"
+    _ok("viewer node: data + source_2..6 (view_source, no domains, grow group), no output; "
+        "input_specs reveals one empty slot at a time and never hides a wire; scale-bar "
+        "sockets are presentation-only; layout Mode merged/tiles/both; payload = primary")
+
+
+def test_multiotsu_outputs() -> None:
+    """``analysis.multiotsu`` ``output`` Mode (2026-10-02): ``merged`` (the class index, as
+    before), ``per_class`` (one 0/1 mask per tier, a partition), ``selected`` (one mask of
+    the classes ``keep`` names). Asserts the partition property, the equivalence of
+    ``selected`` with the index test it stands for, the ``keep`` grammar and its refusals,
+    that ``per_class`` is announced to the edit-time layer catalog via ``extra_layers`` while
+    ``merged`` announces nothing extra, that ``keep`` is gated to ``selected``, and that the
+    three states hash apart."""
+    if not _HAVE_SKIMAGE:
+        _ok("multi-otsu outputs: SKIPPED (scikit-image absent)")
+        return
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.catalog.analysis.multiotsu import _parse_keep
+
+    define_node("io.moseed", "S", outputs=[OutDataset()])
+    Y, X = 48, 56
+    yy, xx = np.mgrid[0:Y, 0:X].astype(float)
+    img = 100.0 + 20.0 * np.sin(yy / 5.0) * np.cos(xx / 7.0)       # dim tier, textured
+    img[8:20, 8:24] = 900.0 + 15.0 * (yy[8:20, 8:24] - 8.0)       # middle tier
+    img[28:44, 30:52] = 2400.0 + 10.0 * (xx[28:44, 30:52] - 30.0)  # bright tier
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=Y, x=X)
+    env = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.5})
+
+    def pull(params, modes):
+        ds = Dataset(axes=ax, metadata={"pixel_size_um": 0.5}) \
+            .with_image(ArrayProvider(img.reshape(1, 1, 1, 1, Y, X)))
+        g = Graph()
+        g.add(NodeInstance("S", "io.moseed"))
+        g.add(NodeInstance("N", "analysis.multiotsu", params=params, modes=modes))
+        g.connect("S", "N")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull("N")
+
+    e_m, merged = pull({"classes": 3}, {"output": "merged"})
+    idx = merged.get(D.VOXEL, "classes").values
+    assert set(np.unique(idx).tolist()) == {0, 1, 2}, "three populations → three classes"
+    assert int(idx[0, 0, 0, 0, 34, 40]) == 2 and int(idx[0, 0, 0, 0, 12, 12]) == 1 \
+        and int(idx[0, 0, 0, 0, 2, 2]) == 0, "class index must rank by brightness"
+    e_p, per = pull({"classes": 3}, {"output": "per_class"})
+    assert np.array_equal(per.get(D.VOXEL, "classes").values, idx), \
+        "per_class keeps the merged index layer too"
+    masks = [per.get(D.VOXEL, f"classes_{i}").values for i in range(3)]
+    assert np.all(sum(masks) == 1), "per-class masks must partition the volume"
+    assert all(np.array_equal(masks[i], (idx == i).astype(np.int64)) for i in range(3))
+    assert per.get(D.VOXEL, "classes_3") is None, "no mask beyond K-1"
+    e_s, sel = pull({"classes": 3}, {"output": "selected"})
+    assert np.array_equal(sel.get(D.VOXEL, "classes").values, (idx >= 1).astype(np.int64)), \
+        "`1+` (the default) is everything above the dimmest class"
+    _, sel02 = pull({"classes": 3, "keep": "0, 2"}, {"output": "selected"})
+    assert np.array_equal(sel02.get(D.VOXEL, "classes").values,
+                          np.isin(idx, [0, 2]).astype(np.int64))
+    _, sel12 = pull({"classes": 3, "keep": "1-2"}, {"output": "selected"})
+    assert np.array_equal(sel12.get(D.VOXEL, "classes").values, (idx >= 1).astype(np.int64))
+    assert sel.get(D.VOXEL, "classes_0") is None, "selected writes ONE layer"
+    assert len({e_m.entry("N").recipe_hash, e_p.entry("N").recipe_hash,
+                e_s.entry("N").recipe_hash}) == 3, "the three outputs must hash apart"
+    # the keep grammar
+    assert _parse_keep("1-2", 3) == {1, 2} and _parse_keep("2+", 4) == {2, 3} \
+        and _parse_keep(" 0 , 2 ", 3) == {0, 2} and _parse_keep("0", 2) == {0}
+    for bad, needle in (("", "empty"), ("3", "outside"), ("2-1", "backwards"),
+                        ("x", "cannot read"), ("1,,5+", "outside")):
+        try:
+            _parse_keep(bad, 3)
+        except ValueError as exc:
+            assert needle in str(exc), (bad, exc)
+        else:
+            raise AssertionError(f"keep={bad!r} must be refused")
+    try:
+        pull({"classes": 3, "keep": "7"}, {"output": "selected"})
+    except ValueError as exc:
+        assert "outside" in str(exc)
+    else:
+        raise AssertionError("an out-of-range keep must refuse at the pull, not empty the mask")
+    # edit-time announcement + gating
+    spec = NODES.get("analysis.multiotsu")
+    announced = spec.extra_layers({"classes": 3, "name": "cls"}, {"output": "per_class"})
+    assert tuple(n for _, n in announced) == ("cls_0", "cls_1", "cls_2"), announced
+    assert spec.extra_layers({"classes": 3}, {"output": "merged"}) == ()
+    assert spec.extra_layers(None, None) == (), "total: never raises, even on garbage"
+    vis = lambda st: {i.name for i in spec.active_inputs(st)}
+    assert "keep" in vis({"output": "selected"}) and "keep" not in vis({"output": "merged"}) \
+        and "keep" not in vis({"output": "per_class"})
+    _ok("multiotsu outputs: merged index ranks by brightness; per_class adds a disjoint, "
+        "complete set of K masks beside the index and announces them via extra_layers; "
+        "selected writes one mask of the kept classes (`1+`, lists, ranges) and refuses an "
+        "empty, backwards or out-of-range keep at the pull; keep gated to selected; 3 "
+        "states hash apart")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -23207,6 +23622,10 @@ def main() -> int:
     test_segment()
     test_celltracker_parity()
     test_subtract_background()
+    test_subtract_background_zero_regions()
+    test_multiotsu_outputs()
+    test_region_scope()
+    test_viewer_node_inputs()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

@@ -68,13 +68,14 @@ from nodegraph.graph import Graph
 from nodegraph.memo import Memo
 from nodegraph.metadata import (
     MetaEnvelope, PER_POSITION_KEYS, SOURCE_FILE_KEY, position_subset,
-    stamp_source_file)
+    shift_origin_um, stamp_source_file)
 from nodegraph.parallel import (
     cpu_budget, memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
 from nodegraph.provider import (
     FrameSliceProvider, FrameSubsetProvider, MultiSourceProvider, SyntheticProvider,
     _picked, subset_index)
-from nodegraph.streaming import StreamProvider, TileCache
+from nodegraph.streaming import StreamProvider, TileCache, WindowView
+from nodelab_v2 import region_box
 from nodelab_v2.document import BUNDLE_PATHS_KEY
 from nodelab_v2.ops import (ACCESS_AUTO, ACCESS_DIRECT, ACCESS_INGEST, ACCESS_MODE,
                             CALIB_OVERRIDE_KEYS, GROUPING_AUTO, GROUPING_DEFAULT,
@@ -740,7 +741,12 @@ def render_plane_native(provider: Any, m: int, t: int, z: int, c: int,
 #: ``None`` for the whole series. ``ms``/``ts`` are sorted and never empty (they fall back
 #: to the display cursor); ``zs`` is ``None`` when the whole volume runs, which is the
 #: default because a 3D node needs one.
-Pin = Tuple[Tuple[int, ...], Tuple[int, ...], Optional[Tuple[int, ...]]]
+#: ``(ms, ts, zs, region)`` — the solo-frame scope a pull runs under. ``zs`` is ``None`` for
+#: the whole volume; ``region`` (2026-10-02) is the ``(y0, y1, x0, x1)`` source window the
+#: Viewer's troubleshooting box selects, or ``None`` for the whole frame. Both ``None``s are
+#: the identities the pre-region pin had, so an untouched box re-keys nothing.
+Pin = Tuple[Tuple[int, ...], Tuple[int, ...], Optional[Tuple[int, ...]],
+            Optional[Tuple[int, int, int, int]]]
 
 
 class _HeldView(NamedTuple):
@@ -808,14 +814,39 @@ def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEn
     The picks are clamped by the provider, so they are re-derived from the VIEW's own axes
     rather than from ``pin`` — a cursor past the end of a shrunken source names a real
     position after clamping, and the subset must use the position actually served.
+
+    **The region** (2026-10-02, the Viewer's draggable troubleshooting box) is applied LAST,
+    as a :class:`~nodegraph.streaming.WindowView` over the frame subset — the same lazy
+    translated view ``util.crop`` returns, so every node downstream reads only the window's
+    pixels and clips its halos at the window's edge exactly as it would below a Crop node.
+    The envelope shrinks to match and ``origin_um`` moves by the cut
+    (:func:`nodegraph.metadata.shift_origin_um`, the arithmetic :func:`nodegraph.metadata.crop`
+    performs), so a stage-placed Overlay or Export still knows where the window sits. The
+    window is clamped into the source's own frame (:func:`nodelab_v2.region_box.clamp`) and
+    a window covering the whole frame resolves to ``None`` BEFORE it reaches here, so the
+    full-frame box is the identity the pre-region pin had.
     """
-    ms, ts, zs = pin
+    ms, ts, zs = pin[0], pin[1], pin[2]
+    region = pin[3] if len(pin) > 3 else None
     view = (FrameSliceProvider(provider, ms[0], ts[0], zs) if len(ms) == len(ts) == 1
             else FrameSubsetProvider(provider, ms, ts, zs))
     out = env.with_axes(replace(env.axes, m=view.axes.m, t=view.axes.t, z=view.axes.z))
     kept = _picked(ms, int(env.axes.m))
     changes = position_subset(env.metadata, kept)
-    return view, (out.with_metadata(**changes) if changes else out)
+    if changes:
+        out = out.with_metadata(**changes)
+    region = region_box.clamp(region, (int(view.axes.y), int(view.axes.x)))
+    if region is not None:
+        y0, y1, x0, x1 = region
+        win_axes = replace(view.axes, y=y1 - y0, x=x1 - x0)
+        view = WindowView(view, y0=y0, x0=x0, axes=win_axes)
+        px = out.metadata.get("pixel_size_um")
+        moved = shift_origin_um(out, 0.0, y0 * float(px) if px else 0.0,
+                                x0 * float(px) if px else 0.0)
+        out = out.with_axes(replace(out.axes, y=win_axes.y, x=win_axes.x))
+        if moved:
+            out = out.with_metadata(**moved)
+    return view, out
 
 
 class PlaneCache:
@@ -1555,6 +1586,10 @@ class EngineRunner(QObject):
         self._sel_m: Tuple[int, ...] = ()
         self._sel_t: Tuple[int, ...] = ()
         self._sel_z: Tuple[int, ...] = ()
+        #: the Viewer's troubleshooting REGION box, ``(y0, y1, x0, x1)`` in source pixels, or
+        #: ``None`` for the whole frame (2026-10-02). Scopes the run LATERALLY the way the
+        #: picks scope it along M/T/Z; see :meth:`set_region`.
+        self._sel_region: Optional[Tuple[int, int, int, int]] = None
         self._seed_axes: Dict[str, AxisSizes] = {}   # what the live engine's meta was built on
         #: every meta seed the live engine has been given, ACCUMULATED across pulls at the
         #: same revision. A pull only resolves the sources its own closure reaches (V2.21),
@@ -2219,15 +2254,40 @@ class EngineRunner(QObject):
     def frame_selection(self) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
         return (self._sel_m, self._sel_t, self._sel_z)
 
+    def set_region(self, region: Optional[Tuple[int, int, int, int]]) -> None:
+        """The Viewer's troubleshooting REGION box (2026-10-02): the ``(y0, y1, x0, x1)``
+        window of the SOURCE frame a scoped pull evaluates, or ``None`` for the whole frame.
+
+        Scoped at the seed like the frame picks, and for the same reasons: nothing in the
+        catalog changes (every node sees a smaller frame, the eager computes allocate for
+        it), the graph is untouched, and the window rides in the seed provider's
+        fingerprint so a windowed result can never be served for a different window or for
+        the full frame — while an already-run window is a memo hit. A window covering the
+        whole frame is stored as ``None`` so that the box's resting state is the identity
+        the scope had before regions existed. Kernels clip their halos at the window's edge
+        (as below a Crop node), so a result's border pixels differ from a full run's by at
+        most one halo; that is what the box is for — checking parameters, not producing
+        results. Inert while the scope is off, like the picks."""
+        region = tuple(int(v) for v in region) if region else None
+        if region == self._sel_region:
+            return
+        self._sel_region = region
+        if self._solo:
+            self.invalidate()
+
+    @property
+    def region(self) -> Optional[Tuple[int, int, int, int]]:
+        return self._sel_region
+
     def _pin_for(self, coords: Optional[Tuple[int, int, int, int]]) -> Optional[Pin]:
-        """The ``(ms, ts, zs)`` a request scopes to — ``None`` when the whole series runs.
-        The picks where the user made them; the display cursor (exactly "the frame the
-        user is on") on whichever *frame* axis they did not; and the whole volume when z
-        is unpicked."""
+        """The ``(ms, ts, zs, region)`` a request scopes to — ``None`` when the whole series
+        runs. The picks where the user made them; the display cursor (exactly "the frame
+        the user is on") on whichever *frame* axis they did not; the whole volume when z
+        is unpicked; and the troubleshooting box's window, or the whole frame."""
         if not self._solo or coords is None:
             return None
         return (self._sel_m or (int(coords[0]),), self._sel_t or (int(coords[1]),),
-                self._sel_z or None)
+                self._sel_z or None, self._sel_region)
 
     @staticmethod
     def _payload_coords(coords, pin: Optional[Pin]):
@@ -2241,7 +2301,7 @@ class EngineRunner(QObject):
         payload — re-applying it to an already-mapped index would remap the index."""
         if pin is None or coords is None:
             return coords
-        ms, ts, zs = pin
+        ms, ts, zs = pin[0], pin[1], pin[2]       # the region does not re-address a cursor
         m, t, z, c = coords
         return (subset_index(ms, m), subset_index(ts, t), subset_index(zs or (), z), c)
 
@@ -2381,13 +2441,19 @@ class EngineRunner(QObject):
                 # synthesized in `_resolve_overlay`, since these nodes stamp no recipe.
                 from nodegraph.registry import NODES as _NODES
                 _spec = _NODES.get(node.op_key)
-                _vs = {s.name for s in getattr(_spec, "inputs", ())
-                       if getattr(s, "view_source", False)} if _spec else set()
+                _vs = [s.name for s in getattr(_spec, "inputs", ())
+                       if getattr(s, "view_source", False)] if _spec else []
                 if _vs:
-                    for e in graph.preds(cur):
-                        if e.dst_socket in _vs:
-                            out.append((cur, e.src))
-                            break        # one source per node, like `secondary`
+                    # EVERY wired view_source socket, in the spec's declaration order (so
+                    # `source_2` composites before `source_3` whatever order the wires were
+                    # made in). One per node used to be the rule, when `analysis.voronoi`'s
+                    # `areas` was the only such socket; `view.viewer` (2026-10-02) takes a
+                    # growable column of them.
+                    by_sock = {e.dst_socket: e.src for e in graph.preds(cur)
+                               if e.dst_socket in _vs}
+                    for name in _vs:
+                        if name in by_sock:
+                            out.append((cur, by_sock[name]))
             # Walk THROUGH a non-overlay node rather than stopping at it. The recipe rides
             # on `Dataset.metadata`, so it survives every node downstream of the overlay —
             # view an `Overlay -> Stitch` at the Stitch and the overlay is still logically
@@ -2466,7 +2532,7 @@ class EngineRunner(QObject):
                             # of an Overlay node's 0.5: at half strength a second channel reads
                             # as a wash over the first rather than as itself.
                             "as_channel": synthetic,
-                            "prefix": (self._view_source_socket(graph, ovl_id)
+                            "prefix": (self._view_source_socket(graph, ovl_id, sec_id)
                                        if synthetic else ""),
                             "sec_md": dict(sec.metadata),
                             "sec_axes": sec.axes, "sec_provider": sec.image,
@@ -2650,8 +2716,10 @@ class EngineRunner(QObject):
                    "wipe": 4, "flicker": 0}
 
     @staticmethod
-    def _view_source_socket(graph, node_id: str) -> str:
-        """The name of the wired ``view_source`` socket on ``node_id`` (``""`` if none)."""
+    def _view_source_socket(graph, node_id: str, sec_id: Optional[str] = None) -> str:
+        """The name of the wired ``view_source`` socket on ``node_id`` (``""`` if none) —
+        the one ``sec_id`` is wired into when given, since a node may now carry several
+        (``view.viewer``'s growable sources), and each needs its own name on the strip."""
         try:
             from nodegraph.registry import NODES
             node = graph.nodes.get(node_id)
@@ -2659,7 +2727,7 @@ class EngineRunner(QObject):
             names = {s.name for s in getattr(spec, "inputs", ())
                      if getattr(s, "view_source", False)}
             for e in graph.preds(node_id):
-                if e.dst_socket in names:
+                if e.dst_socket in names and (sec_id is None or e.src == sec_id):
                     return str(e.dst_socket)
         except Exception:  # noqa: BLE001
             pass

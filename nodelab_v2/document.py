@@ -499,7 +499,36 @@ class GraphDocument:
         spec = rec.spec() if rec else None
         if spec is None:
             return []
-        return list(spec.active_inputs(rec.state())) + self.mode_port_specs(node_id)
+        specs = self._grow_filter(node_id, list(spec.active_inputs(rec.state())))
+        return specs + self.mode_port_specs(node_id)
+
+    def _grow_filter(self, node_id: str, specs: list) -> list:
+        """Hide the not-yet-needed members of each ``grow_group``
+        (:attr:`~nodegraph.registry.SocketSpec.grow_group`, 2026-10-02).
+
+        Within a group, in declaration order: the first member always shows; every later
+        member shows if it is wired, if the member before it is wired, or if ANY later
+        member is wired (a wire must never be hidden, nor the slots leading up to it). So a
+        node always offers exactly one empty slot after its last wired stream — Blender's
+        virtual socket — and the engine never knows: the hidden specs still exist, they are
+        simply unwired."""
+        if not any(getattr(s, "grow_group", "") for s in specs):
+            return specs
+        wired = {e[3] for e in self.edges if e[2] == node_id}
+        groups: Dict[str, List] = {}
+        for s in specs:
+            g = getattr(s, "grow_group", "")
+            if g:
+                groups.setdefault(g, []).append(s)
+        hide: set = set()
+        for members in groups.values():
+            last_wired = max((i for i, s in enumerate(members) if s.name in wired),
+                             default=-1)
+            keep_upto = min(len(members) - 1, last_wired + 1)   # ...plus one empty slot
+            for i, s in enumerate(members):
+                if i > keep_upto:
+                    hide.add(s.name)
+        return [s for s in specs if s.name not in hide]
 
     def mode_port_specs(self, node_id: str) -> list:
         """Synthetic input ports for this node's Modes, so an Iterate variable can be wired
@@ -811,13 +840,45 @@ class GraphDocument:
             totals = [(ax.m, ax.t, ax.z)]
         return tuple(max(1, max(t[i] for t in totals)) for i in range(3))
 
+    def source_scope_extent(self, node_id: str) -> Tuple[int, int]:
+        """``(Y, X)`` of the source data feeding ``node_id`` — the frame the troubleshooting
+        REGION box (2026-10-02) is dragged over. Same root walk as
+        :meth:`source_scope_totals`, for the same reason: the region is applied at the
+        source seed, upstream of any crop, resample or stitch in the chain, so it has to be
+        expressed in the SOURCE's pixels even when the viewed node's frame is a different
+        size. The max over roots, so a graph fed by two files offers the larger frame."""
+        seen: set = set()
+        stack = [node_id]
+        extents: List[Tuple[int, int]] = []
+        while stack:
+            nid = stack.pop()
+            if nid in seen or nid not in self.nodes:
+                continue
+            seen.add(nid)
+            preds = [e for e in self.edges if e[2] == nid]
+            if preds:
+                stack.extend(e[0] for e in preds)
+            else:
+                ax = self.env(nid).axes
+                extents.append((ax.y, ax.x))
+        if not extents:
+            ax = self.env(node_id).axes
+            extents = [(ax.y, ax.x)]
+        return (max(1, max(e[0] for e in extents)), max(1, max(e[1] for e in extents)))
+
     # ── wiring (G1) ──────────────────────────────────────────────────────────
     def _socket_spec(self, node_id: str, io: str, name: str):
         rec = self.nodes.get(node_id)
         spec = rec.spec() if rec else None
         if spec is None:
             return None
-        pool = self.input_specs(node_id) if io == "in" else self.output_specs(node_id)
+        if io == "in":
+            # UNFILTERED by the grow groups: a slot the card is not showing yet is still a
+            # real socket, and a saved graph (or a script) may wire it directly — the
+            # filter then reveals it and everything before it.
+            pool = list(spec.active_inputs(rec.state())) + self.mode_port_specs(node_id)
+        else:
+            pool = self.output_specs(node_id)
         return next((s for s in pool if s.name == name), None)
 
     def can_connect(self, src: str, src_socket: str, dst: str, dst_socket: str
