@@ -164,6 +164,11 @@ MODULES: Tuple[str, ...] = (
     # N WIRED Datasets onto an axis; this splits ONE multi-file source card's M axis onto
     # one, which is the same arithmetic reached from the other end.
     "util.chain",
+    # Appended last, not slotted beside `view.overlay` whose primary it exists to be: this
+    # list's order is the link-drag search menu's order. Overlay places a file inside the
+    # primary's field; this makes a primary whose field is EVERY file's, so files that share
+    # no field can still be overlaid into one view.
+    "view.canvas",
 )
 
 

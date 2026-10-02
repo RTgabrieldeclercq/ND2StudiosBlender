@@ -336,19 +336,14 @@ def plan_movie(ds, *, ch, modes, calib, meta, layer: str = "") -> MoviePlan:
             f"Export Movie: `channels` selected nothing in range — this Dataset has "
             f"{ax.c} channel(s), indexed 0..{ax.c - 1}. Leave it empty for all of them.")
 
+    # ONE frame is a legitimate export — a still. T=1 (or Z=1) used to be refused here, before
+    # Format was even consulted, so the refusal's own advice ("set Format to 'png' for a
+    # still") could never be followed. A single-frame PNG/JPEG is written under the File name
+    # itself (no `_0` counter); a single-frame MP4 or GIF is a one-frame clip.
     if sweep == "time":
         n_frames = ax.t
-        if n_frames < 2:
-            raise ValueError(
-                "Export Movie: Sweep = 'time' needs more than one timepoint and this Dataset "
-                "has T=1. Set Sweep to 'z' to fly through the stack, or set Format to 'png' "
-                "for a still.")
     else:
         n_frames = ax.z
-        if n_frames < 2:
-            raise ValueError(
-                "Export Movie: Sweep = 'z' needs more than one Z slice and this Dataset has "
-                "Z=1. Set Sweep to 'time' to play the timelapse.")
         if ax.t > 1:
             raise ValueError(
                 f"Export Movie: Sweep = 'z' plays the Z axis, but this Dataset also has "
@@ -577,7 +572,13 @@ def _compute_write_movie(ctx: EvalContext) -> Dataset:
         note = f"rendering {os.path.basename(target)}"
         render = tl.render
 
-        if is_sequence:
+        if is_sequence and n_frames == 1:
+            # a still: the file is the name the user chose, not `<name>_0.png`
+            _write_image(target, render(0), fmt, quality)
+            done += 1
+            ctx.progress(done, total_work, note, frames=n_frames)
+            written.append(target)
+        elif is_sequence:
             for i in range(n_frames):
                 _write_image(_seq_path(target, i, n_frames, ext), render(i), fmt, quality)
                 done += 1
@@ -758,8 +759,9 @@ register_node(
                  "error. A name whose dots are not an extension (`WellA3_1.7183um`) keeps "
                  "all of them and simply gains the right suffix. With "
                  "Format = 'png'/'jpeg' this is the TEMPLATE for a numbered sequence — "
-                 "`<name>_0007.png`, zero-padded so the frames sort in playback order — and "
-                 "with Split = 'position' it also gains `_m03`."),
+                 "`<name>_0007.png`, zero-padded so the frames sort in playback order — "
+                 "except for a single frame (T=1), which is written under this name as it "
+                 "stands; with Split = 'position' it also gains `_m03`."),
         InString("layer", "Layer", field=False, default="", layer_in=Domain.VOXEL,
                  available_in={"sweep": _FLAT},
                  description=
@@ -988,12 +990,14 @@ register_node(
                      "Not a movie: this is the option for pulling individual frames into a "
                      "figure, for handing to Illustrator or Premiere, or for re-encoding "
                      "with your own ffmpeg settings. On a long series it writes a LOT of "
-                     "files.",
+                     "files; on a single timepoint it writes ONE still, `<name>.png`, with "
+                     "the scale bar and burn-ins — the figure-panel export.",
                  "jpeg":
                      "A numbered JPEG per frame, lossy and much smaller than the PNG "
-                     "sequence. For a contact sheet, a quick visual check of a long run, or "
-                     "a browse directory. Do not pick it for a figure panel — JPEG blocking "
-                     "on fine texture survives into print.",
+                     "sequence (one still, `<name>.jpg`, on a single timepoint). For a "
+                     "contact sheet, a quick visual check of a long run, or a browse "
+                     "directory. Do not pick it for a figure panel — JPEG blocking on fine "
+                     "texture survives into print.",
              }),
         Mode("sweep", ["time", "z", "timeline"], default="time", label="Sweep",
              description=

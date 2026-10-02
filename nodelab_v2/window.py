@@ -1090,8 +1090,10 @@ class MainWindow(QMainWindow):
             from dataclasses import replace as _dc_replace
             rec = self.doc.nodes.get(req.node_id)
             prm = rec.params if rec is not None else {}
+            from nodegraph.placement import canvas_flip
             req = _dc_replace(req, base=tuple(
-                (n, float(prm.get(n, 0.0) or 0.0)) for n in req.bounds))
+                (n, float(prm.get(n, 0.0) or 0.0)) for n in req.bounds),
+                mirror=canvas_flip(md) if md.get("canvas_flip") is not None else None)
         self._open_viewer()
         self.viewer.arm_pick(req, Calibration.from_metadata(md))
 

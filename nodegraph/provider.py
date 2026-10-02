@@ -141,6 +141,34 @@ class TileProvider(ABC):
                          for z in range(z0, z1)], axis=0)
 
 
+# ── constant provider (a blank backdrop: no pixels held) ──────────────────────
+
+class ConstantProvider(TileProvider):
+    """Every voxel is ``value`` — a backdrop that costs nothing however large it is.
+
+    ``view.canvas``'s image: an experiment canvas spanning several files' stage footprint
+    can be tens of thousands of pixels on a side (three adjacent 1760 µm grids at
+    1.718 µm/px are ~9000 x 13500), and nothing in it is data — the files are drawn onto it
+    by the Overlays downstream. Allocating it would be gigabytes of zeros; generating a
+    window on demand is O(window), at any pyramid level, exactly like
+    :class:`SyntheticProvider`. Structural fingerprint (type + geometry + value): two
+    canvases of one geometry ARE the same pixels."""
+
+    def __init__(self, axes: AxisSizes, *, value: float = 0.0, levels: int = 1,
+                 tile: int = 512, dtype: Any = np.uint16) -> None:
+        self.axes = axes
+        self.value = value
+        self.levels = max(1, int(levels))
+        self.tile = tile
+        self.dtype = np.dtype(dtype)
+
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
+        return np.full((max(0, y1 - y0), max(0, x1 - x0)), self.value, dtype=self.dtype)
+
+    def fingerprint(self) -> tuple:
+        return super().fingerprint() + (float(self.value), self.dtype.str)
+
+
 # ── synthetic provider (numpy only; deterministic — for tests) ────────────────
 
 class SyntheticProvider(TileProvider):

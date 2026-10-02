@@ -460,7 +460,13 @@ def display_cap(axes: Any, *, texture_limit: int, bytes_per_px: int = 8,
 #: primary's own channels — so this is deliberately small rather than "whatever the file
 #: has". A 2-channel primary plus a 2-channel secondary is 4 of the 8; letting a 6-channel
 #: secondary in would silently push the primary's own channels out of the shader.
-MAX_OVERLAY_CHANNELS = 2
+#:
+#: 3 since 2026-10-01: an Experiment Canvas primary (``view.canvas``) is ONE blank channel,
+#: and three overlaid files of a real well (2 + 2 + 3 channels — GFP / R-B / Nile Blue on the
+#: third) then fit the bank exactly, where a cap of 2 silently dropped Nile Blue. The
+#: primary's channels are still reserved first (`_resolve_overlay`'s budget), so this can
+#: crowd out a LATER source — announced, never silent — but never the primary.
+MAX_OVERLAY_CHANNELS = 3
 
 def _gl_channel_cap(default: int = 8) -> int:
     """The shader's sampler-bank size, taken from :mod:`nodelab_v2.glview` itself so the
@@ -681,6 +687,19 @@ def _plane_key(node_id: str, pin: Optional[Any], m: int, t: int, z: int, ch: int
     at rest — is the 7-tuple it always was, and the primary plane is shared by every sub-tick."""
     base = (node_id, pin, int(m), int(t), int(z), int(ch), int(cap))
     return base + ((int(sub), int(ovr)),) if (sub or ovr) else base
+
+
+def self_is_canvas_node(graph, node_id: str) -> bool:
+    """Whether ``node_id`` OUTPUTS an experiment canvas — a ``view.canvas``, or an Overlay
+    in ``canvas=union`` mode. A union Overlay on top of one grows that canvas rather than
+    drawing it as a picture of its own."""
+    node = graph.nodes.get(node_id) if graph is not None else None
+    if node is None:
+        return False
+    if node.op_key == "view.canvas":
+        return True
+    return (node.op_key == "view.overlay"
+            and dict(getattr(node, "modes", None) or {}).get("canvas") == "union")
 
 
 def _key_sub(key: tuple) -> Tuple[int, int]:
@@ -2345,6 +2364,14 @@ class EngineRunner(QObject):
                 sec = [e.src for e in graph.preds(cur) if e.dst_socket == "secondary"]
                 if sec:
                     out.append((cur, sec[0]))
+                # canvas=union (2026-10-01): the output is a BLANK canvas, so the primary is a
+                # source too — `<node>#primary`, stamped by the compute. Not when the primary
+                # is itself a canvas (an earlier union Overlay, or a `view.canvas`): its own
+                # sources are further down this spine and are collected there. Appended
+                # AFTER the secondary so the reverse below puts it first (drawn underneath).
+                if (dict(getattr(node, "modes", None) or {}).get("canvas") == "union"
+                        and pri and not self_is_canvas_node(graph, pri[0])):
+                    out.append((f"{cur}#primary", pri[0]))
             else:
                 # ANY node may declare an auxiliary Dataset input a viewer SOURCE
                 # (`SocketSpec.view_source`, 2026-08-04). `analysis.voronoi`'s `areas` is the
@@ -2710,12 +2737,20 @@ class EngineRunner(QObject):
             from nodegraph.catalog.view.overlay import overlay_entry
             from nodegraph.placement import plan_placement
             from nodegraph.nodes import SAMPLING_KEY
-            node = self.document.nodes.get(ovl_id)
+            base_id, _sep, role = str(ovl_id).partition("#")
+            node = self.document.nodes.get(base_id)
             if node is None or payload is None or sec is None:
                 return stamped
             # The node's OWN settings reader, not a list kept here: a list here is how every
             # new Overlay setting used to be honoured by the record and ignored by the picture.
             s = overlay_settings(node, dict(node.modes or {}))
+            if role == "primary":
+                # a union canvas's PRIMARY source (`<node>#primary`): placed by its own stage
+                # position with the node's handedness, and none of the secondary's nudge,
+                # pins or rate — exactly what the compute stamped
+                s = {**s, "blend": "add", "t_shift": 0, "offset_um": (0.0, 0.0, 0.0),
+                     "t_pairing": "index", "rate": 0.0, "t_pins": (), "z_pins": (),
+                     "min_coverage": 0.0}
             plan = plan_placement(
                 payload.metadata, payload.axes, sec.metadata, sec.axes,
                 dst_sampling=tuple(payload.metadata.get(SAMPLING_KEY, ())),
@@ -3006,7 +3041,9 @@ class EngineRunner(QObject):
             # A `view_source` channel composites at FULL strength: it has no opacity socket to
             # read, and an Overlay's 0.5 default would make a second channel of the same
             # acquisition read as a wash laid over the first instead of as a channel.
-            opacity = (1.0 if src.get("as_channel")
+            # A union canvas's own PRIMARY (`#primary`) is the base image, drawn onto a blank
+            # backdrop — at full strength, or the picture's main file would be a half wash.
+            opacity = (1.0 if (src.get("as_channel") or "#" in str(src["ovl_id"]))
                        else self._look(src["ovl_id"], "opacity", 0.5))
             style = (self.BLEND_MODES.get(name, 0), opacity, param)
             for k in range(int(src["n"])):

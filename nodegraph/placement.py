@@ -55,7 +55,8 @@ __all__ = [
     "secondary_z_index", "ZGrid", "merge_z_grid", "Z_GRID_BLOWUP",
     "paired_t_frac", "map_t", "secondary_z_weights", "plan_time", "frame_interval_s",
     "snap_rate", "parse_pins", "pins_json", "nudge_delta_um", "RATE_SNAP_TOL",
-    "SUB_TICK_CAP",
+    "SUB_TICK_CAP", "union_canvas", "CANVAS_MAX_PX", "CANVAS_MAX_Z", "canvas_flip",
+    "canvas_mapping",
     "PositionGroup", "GroupPlan", "position_groups", "group_key", "GROUP_GAP_FACTOR",
 ]
 
@@ -749,8 +750,23 @@ def compose_secondary_plane(entry: Dict[str, Any],
         pri_box = field_box(pri_md, pri_axes, pri_m)
     if pri_box is None:
         return None
+    # A FLIPPED CANVAS (`canvas_flip`) runs its own pixel grid toward stage −x / −y. Its
+    # zoomed sub-rect is a fraction of that mirrored grid, so it is mirrored back into µm
+    # here; the output axes are then walked from the far edge (`ox`/`oy` below). Each SOURCE
+    # tile still samples by its own handedness (`flip_x`/`flip_y`), so a canvas flip mirrors
+    # the whole layout and leaves every tile reading exactly as its camera recorded it.
+    cfx, cfy, inv_x, inv_y = canvas_mapping(pri_md)
+    if region is not None and (cfx or cfy):
+        fy0, fy1, fx0, fx1 = (float(v) for v in region)
+        if cfy:
+            fy0, fy1 = 1.0 - fy1, 1.0 - fy0
+        if cfx:
+            fx0, fx1 = 1.0 - fx1, 1.0 - fx0
+        region = (fy0, fy1, fx0, fx1)
     # The µm box the OUTPUT covers — the whole field, or the zoomed rect of it.
     out_box = pri_box if region is None else sub_field_box(pri_box, region)
+    oy = (out_box.y1, out_box.y0) if cfy else (out_box.y0, out_box.y1)
+    ox = (out_box.x1, out_box.x0) if cfx else (out_box.x0, out_box.x1)
 
     dz, dy, dx = (float(v) for v in (entry.get("offset_um") or (0.0, 0.0, 0.0)))
     if by_index:
@@ -760,8 +776,8 @@ def compose_secondary_plane(entry: Dict[str, Any],
         ext = lateral_extent_um(pri_md, pri_axes)
         if ext is not None and ext[0] > 0 and ext[1] > 0:
             dy, dx = dy / ext[0], dx / ext[1]
-    flip_x = bool(entry.get("flip_x", True))
-    flip_y = bool(entry.get("flip_y", False))
+    flip_x = bool(entry.get("flip_x", True)) != inv_x
+    flip_y = bool(entry.get("flip_y", False)) != inv_y
     h, w = int(out_shape[0]), int(out_shape[1])
     out = np.full((h, w), float(fill), dtype=np.float32)
     painted = False
@@ -799,8 +815,8 @@ def compose_secondary_plane(entry: Dict[str, Any],
         else:
             r_lo, r_hi = _window_extent(s_y0, s_y1, (cover[0], cover[1]), flip_y)
             c_lo, c_hi = _window_extent(s_x0, s_x1, (cover[2], cover[3]), flip_x)
-        rows = axis_map(h, out_box.y0, out_box.y1, n_sy, r_lo, r_hi, flip=flip_y)
-        cols = axis_map(w, out_box.x0, out_box.x1, n_sx, c_lo, c_hi, flip=flip_x)
+        rows = axis_map(h, oy[0], oy[1], n_sy, r_lo, r_hi, flip=flip_y)
+        cols = axis_map(w, ox[0], ox[1], n_sx, c_lo, c_hi, flip=flip_x)
         r_ok = np.flatnonzero(rows >= 0)
         c_ok = np.flatnonzero(cols >= 0)
         if r_ok.size == 0 or c_ok.size == 0:
@@ -811,8 +827,8 @@ def compose_secondary_plane(entry: Dict[str, Any],
         if (n_sy > _SHRINK_AT * r_ok.size) or (n_sx > _SHRINK_AT * c_ok.size):
             plane = _area_shrink(plane, r_ok.size, c_ok.size)
             n_sy, n_sx = plane.shape
-            rows = axis_map(h, out_box.y0, out_box.y1, n_sy, r_lo, r_hi, flip=flip_y)
-            cols = axis_map(w, out_box.x0, out_box.x1, n_sx, c_lo, c_hi, flip=flip_x)
+            rows = axis_map(h, oy[0], oy[1], n_sy, r_lo, r_hi, flip=flip_y)
+            cols = axis_map(w, ox[0], ox[1], n_sx, c_lo, c_hi, flip=flip_x)
             r_ok = np.flatnonzero(rows >= 0)
             c_ok = np.flatnonzero(cols >= 0)
             if r_ok.size == 0 or c_ok.size == 0:
@@ -1253,8 +1269,167 @@ def nudge_delta_um(pri_md: Mapping[str, Any], pri_axes: Any,
         return None
     if not (ps > 0):
         return None
-    return ((float(p_pri[0]) - float(p_sec[0])) * ps,
-            (float(p_pri[1]) - float(p_sec[1])) * ps)
+    # ...except on a FLIPPED canvas (`canvas_flip`), whose pixel grid runs toward stage −x /
+    # −y: there, moving the box +1 µm moves its picture one way and the pointer reads the other
+    rev_x, rev_y, _ix, _iy = canvas_mapping(pri_md)
+    return ((float(p_pri[0]) - float(p_sec[0])) * ps * (-1.0 if rev_y else 1.0),
+            (float(p_pri[1]) - float(p_sec[1])) * ps * (-1.0 if rev_x else 1.0))
+
+
+#: A canvas side past this many pixels is refused, naming the pixel size that would fit: the
+#: backdrop itself is free (:class:`~nodegraph.provider.ConstantProvider`), but the Viewer
+#: and every downstream node address it, and a typo'd pixel size of 0.001 µm would ask for a
+#: canvas larger than any texture or array.
+CANVAS_MAX_PX = 100_000
+#: Planes beyond this on the canvas Z grid widen the step instead (and say so).
+CANVAS_MAX_Z = 256
+
+
+def canvas_flip(md: Mapping[str, Any]) -> Tuple[bool, bool]:
+    """``(x, y)``: whether a canvas's image columns / rows run along stage −x / −y.
+
+    An experiment canvas (:func:`union_canvas`) is laid out in stage coordinates, and this is
+    its ORIENTATION — which way its own pixel grid runs over the stage. ``(True, False)``
+    matches a camera mounted like this lab's (the Stitch / Overlay ``flip_x`` default): the
+    canvas then looks like the camera saw it, every tile from that scope reads unmirrored, and
+    the tiles' POSITIONS are mirrored instead — which is the only thing a flip of a whole
+    picture can honestly change. ``(False, False)`` for any Dataset that is not a canvas, so
+    every non-canvas composite is exactly what it was."""
+    v = (md or {}).get("canvas_flip")
+    if not isinstance(v, (list, tuple)) or len(v) != 2:
+        return (False, False)
+    return (bool(v[0]), bool(v[1]))
+
+
+def canvas_mapping(md: Mapping[str, Any]) -> Tuple[bool, bool, bool, bool]:
+    """``(reverse_x, reverse_y, invert_x, invert_y)`` — how the compositor walks a canvas.
+
+    ``reverse_*``: the canvas's columns / rows run toward stage −x / −y (positions mirrored).
+    ``invert_*``: each source tile's sampling flip is inverted, so that when a reversal
+    mirrors POSITIONS the tiles' own pixels still read as acquired.
+
+    The rule (2026-10-01, settled on the Spheroid_TF-ELISA well): at the DEFAULT flips
+    (:data:`DEFAULT_FLIP` — this scope's handedness, the Stitch / Overlay default) the canvas
+    runs stage +X to the RIGHT and +Y down, each tile sampled with that handedness — the one
+    rendering in which the well wall runs unbroken across every tile seam. Toggling a flip
+    away from its default mirrors the WHOLE picture along that axis, positions and pixels
+    together (``reverse`` and ``invert`` move as one), so the seams stay intact either way —
+    which is what a flip of a picture has to mean. Two rejected rules, both visible on that
+    well: mirroring tiles in place (seams break) and mirroring positions while keeping the
+    pixels as acquired (seams break). A non-canvas primary (no ``canvas_flip``) is
+    ``(False,) * 4``, so every other composite is exactly what it was."""
+    v = (md or {}).get("canvas_flip")
+    if not isinstance(v, (list, tuple)) or len(v) != 2:
+        return (False, False, False, False)
+    rx = bool(v[0]) != DEFAULT_FLIP[0]
+    ry = bool(v[1]) != DEFAULT_FLIP[1]
+    return (rx, ry, rx, ry)
+
+
+#: The camera handedness the Flip X / Flip Y sockets default to (Stitch and Overlay alike) —
+#: the orientation a canvas takes when nobody has touched them.
+DEFAULT_FLIP = (True, False)
+
+
+def union_canvas(sources: Sequence[Tuple[Mapping[str, Any], Any]], *,
+                 pixel_size_um: float = 0.0, margin_um: float = 0.0,
+                 flip: Tuple[bool, bool] = (False, False)) -> Dict[str, Any]:
+    """The ONE field that holds every field of every source at its true stage position.
+
+    ``sources`` is ``[(metadata, axes), ...]``. Returns ``{"y", "x", "z", "t",
+    "metadata", "notes", "refusals"}``: the canvas extent in pixels, its Z plane count, its T
+    (the FIRST source's — the canvas keeps that file's clock, so Overlays onto it pair T the
+    way they would against that file), the calibration that places it (``origin_um`` at the
+    union's corner, ``pixel_size_um``, and a uniform focus grid ``stage_z_um`` /
+    ``z_home_index=0`` / ``z_step_um`` spanning every source's stack), and the reasons it
+    could not be built.
+
+    This is how files that share no field — three adjacent strips of one well, two wells of
+    one plate — end up in ONE view: an Overlay's primary defines the canvas, so a primary
+    whose field IS the union lets every source be stage-placed onto it at its true position,
+    with nothing invented. Pure arithmetic over :func:`field_box`; the compute and the
+    edit-time pass call it alike, so the predicted canvas and the built one cannot differ.
+
+    ``pixel_size_um`` 0 takes the FINEST source's, so nothing is minified on the canvas;
+    ``margin_um`` pads every side. ``flip`` is the canvas's ORIENTATION, stamped as
+    ``canvas_flip`` (:func:`canvas_flip`): it mirrors the whole layout, never one tile. Z: the finest Z step among the volumetric sources over the
+    union of every field's focus span (one plane when every source is a single plane).
+    """
+    refusals: List[str] = []
+    notes: List[str] = []
+    boxes: List[FieldBox] = []
+    steps: List[float] = []
+    ps_all: List[float] = []
+    for i, (md, axes) in enumerate(sources):
+        ext = lateral_extent_um(md, axes)
+        if ext is None:
+            refusals.append(f"input {i} has no pixel_size_um, so its fields have no size")
+            continue
+        ps_all.append(float(md["pixel_size_um"]))
+        n_m = int(getattr(axes, "m", 1) or 1)
+        got = [field_box(md, axes, m) for m in range(n_m)]
+        if any(b is None for b in got):
+            refusals.append(
+                f"input {i} cannot be placed on the stage — it carries no origin_um or "
+                f"stage position log for all {n_m} position(s) (a TIFF never does)")
+            continue
+        boxes.extend(got)
+        s = _z_step(md, axes)
+        if s:
+            steps.append(s)
+    if not sources:
+        refusals.append("Experiment Canvas needs at least one input")
+    if refusals or not boxes:
+        return {"y": 1, "x": 1, "z": 1, "t": 1, "metadata": {}, "notes": notes,
+                "refusals": refusals or ["no input could be placed"]}
+
+    ps = float(pixel_size_um) if pixel_size_um and pixel_size_um > 0 else min(ps_all)
+    mg = max(0.0, float(margin_um or 0.0))
+    y0 = min(b.y0 for b in boxes) - mg
+    y1 = max(b.y1 for b in boxes) + mg
+    x0 = min(b.x0 for b in boxes) - mg
+    x1 = max(b.x1 for b in boxes) + mg
+    ny = max(1, int(np.ceil((y1 - y0) / ps - 1e-9)))
+    nx = max(1, int(np.ceil((x1 - x0) / ps - 1e-9)))
+    if max(ny, nx) > CANVAS_MAX_PX:
+        need = max(y1 - y0, x1 - x0) / CANVAS_MAX_PX
+        refusals.append(
+            f"the canvas would be {ny} x {nx} px at {ps:g} µm/px — past the "
+            f"{CANVAS_MAX_PX}-px limit. Set Pixel size to {need:.3g} µm or more")
+        return {"y": 1, "x": 1, "z": 1, "t": 1, "metadata": {}, "notes": notes,
+                "refusals": refusals}
+
+    zs = [(b.z0, b.z1) for b in boxes if b.z0 is not None and b.z1 is not None]
+    md0, ax0 = sources[0]
+    md_out: Dict[str, Any] = {"pixel_size_um": ps, "stage_layout_source": "canvas",
+                              "channel_names": ["canvas"], "bit_depth": None,
+                              "canvas_flip": [bool(flip[0]), bool(flip[1])]}
+    nz = 1
+    if zs:
+        z_lo, z_hi = min(z for z, _ in zs), max(z for _, z in zs)
+        step = min(steps) if steps else None
+        if step and z_hi > z_lo:
+            nz = int(round((z_hi - z_lo) / step)) + 1
+            if nz > CANVAS_MAX_Z:
+                step = (z_hi - z_lo) / (CANVAS_MAX_Z - 1)
+                nz = CANVAS_MAX_Z
+                notes.append(f"the sources' focus spans {z_hi - z_lo:.0f} µm, so the canvas Z "
+                             f"step is widened to {step:.3g} µm ({CANVAS_MAX_Z} planes)")
+            md_out.update(z_step_um=float(step), z_home_index=0, z_bottom_to_top=True)
+        md_out.update(stage_z_um=[float(z_lo)])
+        md_out["origin_um"] = [[float(z_lo), float(y0), float(x0)]]
+    else:
+        md_out["origin_um"] = [[0.0, float(y0), float(x0)]]
+        notes.append("no source carries a focus log, so the canvas has one plane and Z is "
+                     "paired by index")
+    for key in ("dt_s", "frame_time_jd", "acquisition_start"):
+        if md0.get(key) is not None:
+            md_out[key] = md0[key]
+    notes.append(f"canvas {nx * ps / 1000:.2f} x {ny * ps / 1000:.2f} mm "
+                 f"({nx} x {ny} px at {ps:g} µm/px, {nz} plane(s)) holding "
+                 f"{len(boxes)} field(s) of {len(sources)} file(s)")
+    return {"y": ny, "x": nx, "z": nz, "t": int(getattr(ax0, "t", 1) or 1),
+            "metadata": md_out, "notes": notes, "refusals": []}
 
 
 def _centred_box(md: Mapping[str, Any], axes: Any) -> Optional[FieldBox]:

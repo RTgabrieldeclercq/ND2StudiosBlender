@@ -1557,6 +1557,11 @@ class ViewerPanel(QWidget):
 
             t_box, t_pin = _pair("t")
             z_box, z_pin = _pair("z")
+            if "#" in oid:
+                # a union canvas's own PRIMARY: it is the reference the others are pinned
+                # TO, and there is no Overlay node of its own to write a pin into
+                t_pin.hide()
+                z_pin.hide()
             reset = _btn("⟲", "Back to the mapped frame (drop the stepped offset)",
                          lambda _c=False, o=oid: self.overlay_step.emit(o, 0, 0))
             h.addWidget(name)

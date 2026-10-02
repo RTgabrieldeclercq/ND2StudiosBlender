@@ -1204,8 +1204,13 @@ def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     return env.with_axes(new_axes, unknown=frozenset(unknown)).with_metadata(**changes)
 
 
-def overlay(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
-    """``view.overlay``: identity in ``display`` mode, **C+1** in ``resample`` mode.
+def overlay(env: MetaEnvelope, params: Mapping, modes: Mapping,
+            inputs: Optional[Sequence[MetaEnvelope]] = None) -> MetaEnvelope:
+    """``view.overlay``: identity in ``display`` mode, **C+1** in ``resample`` mode, and the
+    UNION CANVAS under ``canvas=union`` — one blank field over the primary's and the
+    secondary's fields, predicted from BOTH envelopes (``wants_inputs``) with the very
+    :func:`canvas_union` ``view.canvas`` uses, so the card's size is the pull's.
+
 
     Exactly ONE channel, and that is a design consequence rather than a simplification. A
     ``meta_transform`` is handed only the PRIMARY edge's envelope (``propagate_meta`` reads
@@ -1225,6 +1230,17 @@ def overlay(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     secondary, and this pass supplies a placeholder of the right LENGTH — the count is what
     downstream logic indexes by.
     """
+    if (modes or {}).get("canvas") == "union" and (modes or {}).get("output") != "resample":
+        envs = [e for e in (list(inputs) if inputs else [env]) if e is not None]
+        # The canvas ORIENTATION: this node's Flip X/Y when it starts the canvas; the existing
+        # canvas's when it grows one, so a chain keeps the orientation its first Overlay chose.
+        from nodegraph.placement import canvas_flip
+        if str(env.metadata.get("stage_layout_source", "")) == "canvas":
+            fx, fy = canvas_flip(env.metadata)
+        else:
+            fx = bool((params or {}).get("flip_x", True))
+            fy = bool((params or {}).get("flip_y", False))
+        return canvas_union(env, {"flip_x": fx, "flip_y": fy}, {}, envs[:2] or [env])
     if (modes or {}).get("output") != "resample":
         return env
     ax = env.axes
@@ -1580,6 +1596,63 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[
         else:
             out[key] = None
     return out
+
+
+def canvas_changes(base: Mapping[str, Any], canvas: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ``with_metadata`` changes that turn input 0's metadata into an experiment
+    CANVAS's — shared by ``view.canvas``'s compute and :func:`canvas_union`, so the payload
+    and the edit-time prediction are the same dict (INV-04).
+
+    Every per-position key retires (the canvas is ONE field; its ``origin_um`` and its own
+    focus grid come from :func:`nodegraph.placement.union_canvas`), every per-channel key
+    retires (the canvas has one blank channel, not input 0's), and the Z anchoring is
+    replaced outright — a stale ``z_home_index`` from input 0 would place the canvas's planes
+    at another file's focus. The clock (``dt_s``, ``frame_time_jd``) is input 0's, on purpose:
+    Overlays onto the canvas pair T as they would against that file."""
+    changes: Dict[str, Any] = {k: None for k in PER_POSITION_KEYS if base.get(k) is not None}
+    changes.update({k: None for k in PER_CHANNEL_KEYS if base.get(k) is not None})
+    for k in ("z_step_um", "z_home_index", "z_bottom_to_top", "z_collapsed",
+              "bit_depth", "stage_layout_source"):
+        if base.get(k) is not None:
+            changes[k] = None
+    changes.update(dict(canvas.get("metadata") or {}))
+    return changes
+
+
+def canvas_union(env: MetaEnvelope, params: Mapping, modes: Mapping,
+                 inputs: Optional[Sequence[MetaEnvelope]] = None) -> MetaEnvelope:
+    """``view.canvas``: one blank field spanning every input's fields at their true stage
+    positions (:func:`nodegraph.placement.union_canvas`).
+
+    Opts into every input's envelope (``wants_inputs``), so the card shows the real canvas
+    size while you wire — the same function the compute calls, so it cannot differ. Total:
+    an input that cannot be placed yet (no envelope, no origin) marks Y/X/Z unknown instead
+    of raising, and the compute names the problem when it is pulled."""
+    from nodegraph.placement import union_canvas
+    envs = [e for e in (list(inputs) if inputs else [env]) if e is not None]
+    try:
+        uc = union_canvas([(e.metadata, e.axes) for e in envs],
+                          pixel_size_um=float(params.get("pixel_size_um", 0.0) or 0.0),
+                          margin_um=float(params.get("margin_um", 0.0) or 0.0),
+                          flip=(bool(params.get("flip_x", True)),
+                                bool(params.get("flip_y", False))))
+    except Exception:  # noqa: BLE001 — the edit-time pass must never raise (INV-06)
+        uc = {"refusals": ["unplaceable"]}
+    if uc.get("refusals"):
+        return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({"y", "x", "z",
+                                                                             "m", "c"}))
+    ax = env.axes
+    new_axes = replace(ax, m=1, t=int(uc["t"]), z=int(uc["z"]), c=1,
+                       y=int(uc["y"]), x=int(uc["x"]))
+    return env.with_axes(new_axes, unknown=env.unknown_axes - frozenset(
+        {"y", "x", "z", "m", "c"})).with_metadata(**canvas_changes(env.metadata, uc))
+
+
+canvas_union.wants_inputs = True
+# `overlay` is defined above `canvas_union` in this module but only CALLS it at edit time;
+# it opts into every input's envelope for the canvas=union branch (the secondary's fields
+# are half of the canvas), and ignores the extra inputs in every other mode.
+overlay.wants_inputs = True
 
 
 def chain_grow(env: MetaEnvelope, params: Mapping, modes: Mapping,

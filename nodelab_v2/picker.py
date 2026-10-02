@@ -221,6 +221,10 @@ class PickRequest:
     #: a CHANGE rather than a fresh value (``nudge_xy`` adds its delta to the nudge already
     #: set). Filled by the window, which owns the document; ``()`` means "all zero".
     base: Tuple[Tuple[str, float], ...] = ()
+    #: The viewed canvas's orientation (``canvas_flip``) for ``nudge_xy``, or ``None`` when
+    #: what is viewed is not a canvas: on a canvas that runs toward stage −x / −y a screen
+    #: delta runs against stage µm, so the nudge must reverse it. Filled by the window.
+    mirror: Optional[Tuple[bool, bool]] = None
 
     @property
     def surface(self) -> str:
@@ -575,7 +579,10 @@ class PickSession:
         if len(self.pts) < 2 or len(self.req.bounds) != 2:
             return {}
         (xa, ya), (xb, yb) = self.pts[0], self.pts[1]
-        got = nudge_delta_um({"pixel_size_um": self.calib.lateral}, None, (ya, xa), (yb, xb))
+        md = {"pixel_size_um": self.calib.lateral}
+        if self.req.mirror is not None:
+            md["canvas_flip"] = list(self.req.mirror)
+        got = nudge_delta_um(md, None, (ya, xa), (yb, xb))
         if got is None:
             return {}
         base = dict(self.req.base or ())

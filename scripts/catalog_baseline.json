@@ -22646,7 +22646,7 @@
      "column_join": [],
      "default": "",
      "derive": "",
-     "description": "Where the movie is written, on the machine that runs the graph. There is no default and an empty value is refused rather than guessed. **The extension is set by Format, not by what you type here** \u2014 pick GIF with `movie.mp4` still in this box and the node writes `movie.gif`, because a GIF named `.mp4` is a file every player refuses while nothing reports an error. A name whose dots are not an extension (`WellA3_1.7183um`) keeps all of them and simply gains the right suffix. With Format = 'png'/'jpeg' this is the TEMPLATE for a numbered sequence \u2014 `<name>_0007.png`, zero-padded so the frames sort in playback order \u2014 and with Split = 'position' it also gains `_m03`.",
+     "description": "Where the movie is written, on the machine that runs the graph. There is no default and an empty value is refused rather than guessed. **The extension is set by Format, not by what you type here** \u2014 pick GIF with `movie.mp4` still in this box and the node writes `movie.gif`, because a GIF named `.mp4` is a file every player refuses while nothing reports an error. A name whose dots are not an extension (`WellA3_1.7183um`) keeps all of them and simply gains the right suffix. With Format = 'png'/'jpeg' this is the TEMPLATE for a numbered sequence \u2014 `<name>_0007.png`, zero-padded so the frames sort in playback order \u2014 except for a single frame (T=1), which is written under this name as it stands; with Split = 'position' it also gains `_m03`.",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
@@ -23520,9 +23520,9 @@
      "available_in": null,
      "choice_docs": {
       "gif": "An animated GIF \u2014 loops forever, autoplays inline in GitHub, Slack and a wiki, and needs no player at all. In exchange it is limited to 256 colours (so a smooth fluorescence ramp bands visibly), it is several times larger than the same MP4, its frame delay is quantized to hundredths of a second, and every frame must be held in RAM at once, which is why `Max px` is capped here.",
-      "jpeg": "A numbered JPEG per frame, lossy and much smaller than the PNG sequence. For a contact sheet, a quick visual check of a long run, or a browse directory. Do not pick it for a figure panel \u2014 JPEG blocking on fine texture survives into print.",
+      "jpeg": "A numbered JPEG per frame, lossy and much smaller than the PNG sequence (one still, `<name>.jpg`, on a single timepoint). For a contact sheet, a quick visual check of a long run, or a browse directory. Do not pick it for a figure panel \u2014 JPEG blocking on fine texture survives into print.",
       "mp4": "H.264 video \u2014 the one that plays in a browser, in PowerPoint, in Keynote and in Slack without anyone installing anything, and by far the smallest of the four. Streams frame by frame, so there is no length or size ceiling. The default, and the right answer unless you need something else. Encoded by whichever backend on this machine genuinely has an H.264 encoder \u2014 Media Foundation on Windows, since this OpenCV build's FFmpeg has none.",
-      "png": "A numbered PNG per frame \u2014 `<name>_0007.png` \u2014 losslessly compressed. Not a movie: this is the option for pulling individual frames into a figure, for handing to Illustrator or Premiere, or for re-encoding with your own ffmpeg settings. On a long series it writes a LOT of files."
+      "png": "A numbered PNG per frame \u2014 `<name>_0007.png` \u2014 losslessly compressed. Not a movie: this is the option for pulling individual frames into a figure, for handing to Illustrator or Premiere, or for re-encoding with your own ffmpeg settings. On a long series it writes a LOT of files; on a single timepoint it writes ONE still, `<name>.png`, with the scale bar and burn-ins \u2014 the figure-panel export."
      },
      "choices": [
       "mp4",

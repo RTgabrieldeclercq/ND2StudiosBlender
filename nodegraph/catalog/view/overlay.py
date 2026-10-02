@@ -20,6 +20,8 @@ from nodegraph.catalog._shared.placement_entry import overlay_entry as _overlay_
 from nodegraph.catalog._shared.placement_entry import overlay_settings
 from nodegraph.catalog._shared.placement_entry import plan_kwargs as _plan_kwargs
 from nodegraph.catalog._shared.placement_entry import z_pick as _z_pick
+from nodegraph.catalog._shared.canvas import build_canvas as _build_canvas
+from nodegraph.catalog._shared.canvas import is_canvas as _is_canvas
 from nodegraph.catalog._shared.sampling import _sampling_of
 
 # ── Overlay (view — physical co-display of two Datasets) ───────────────────────
@@ -99,6 +101,15 @@ def _compute_overlay(ctx: EvalContext) -> Dataset:
       do not overlap. Stage placement still wins wherever any field overlaps.
     * **Label.** ``label`` names this source on the channel strip and its LUTs. Presentation:
       renaming repaints, it never re-keys the memo.
+    * **Canvas = union** (2026-10-01). For files that share NO field — adjacent regions of a
+      well, several wells — the primary's field cannot hold the secondary, so the output
+      becomes ONE blank field over both files' fields at their true stage positions (the
+      ``_shared/canvas.py`` builder ``view.canvas`` uses), and the primary is drawn onto it
+      as a source of its own (recipe entry ``<node>#primary``, full strength, its own LUT).
+      A union Overlay whose primary is ALREADY a canvas grows that canvas instead, so a chain
+      puts every file in one view. Axis-changing in this mode (one field, one blank channel,
+      the union extent), predicted from both inputs by the meta_transform. Display only —
+      refused under ``resample``, whose grid every downstream measurement is expressed on.
     """
     from nodegraph.placement import plan_placement
 
@@ -115,15 +126,32 @@ def _compute_overlay(ctx: EvalContext) -> Dataset:
     # the picture can never honour a setting the record ignored (or the other way round).
     s = overlay_settings(ctx, modes)
     offset = s["offset_um"]
+    union = modes.get("canvas") == "union"
+    if union and modes.get("output") == "resample":
+        raise ValueError(
+            "Overlay cannot bake a `union` canvas: `resample` writes a real Dataset on the "
+            "primary's grid, and a union canvas is a different grid. Use canvas=primary to "
+            "bake, or output=display to look at every file together.")
+    # The destination the secondary is placed INTO: the primary's own field, or — for
+    # canvas=union — one blank field over both files (grown, if the primary already is one).
+    base_is_canvas = _is_canvas(ds.metadata)
+    # The canvas ORIENTATION follows this node's Flip X/Y when it starts the canvas, and the
+    # existing canvas's when it grows one — so a chain keeps its first Overlay's orientation,
+    # and later Overlays' flips stay what they always were: their own file's handedness.
+    from nodegraph.placement import canvas_flip
+    c_flip = (canvas_flip(ds.metadata) if base_is_canvas
+              else (bool(s["flip_x"]), bool(s["flip_y"])))
+    dst = (_build_canvas([(ds.metadata, ds.axes), (sec.metadata, sec.axes)], ds, flip=c_flip)
+           if union else ds)
     plan = plan_placement(
-        ds.metadata, ds.axes, sec.metadata, sec.axes,
+        dst.metadata, dst.axes, sec.metadata, sec.axes,
         # channel-blind provenance (2026-08-03): an overlay places by PHYSICAL µm, and the
         # channel axis is not a spatial axis — a tap leaves every (z,y,x) address pointing at
         # the same place and leaves the stage log describing exactly these pixels. Comparing
         # the full provenance made "overlay channel 0 on channel 1", one file, two taps, both
         # warn about geometry that never diverged AND hit the stale-stage-log refusal
         # ("its geometry has changed since the source"), which for a channel tap is false.
-        dst_sampling=_sampling_of(ds, channel_axis=False),
+        dst_sampling=_sampling_of(dst, channel_axis=False),
         src_sampling=_sampling_of(sec, channel_axis=False),
         **_plan_kwargs(s))
 
@@ -144,8 +172,26 @@ def _compute_overlay(ctx: EvalContext) -> Dataset:
     if hand_warn:
         entry["warnings"] = list(entry.get("warnings") or ()) + list(hand_warn)
         entry["note"] = str(entry.get("note") or "") + "  ·  Flip inert (stitched secondary)"
-    recipe = _overlay_of(ds) or ({"node": "primary", "role": "base"},)
-    out = ds.with_metadata(**{OVERLAY_KEY: list(recipe) + [entry]})
+    recipe = list(_overlay_of(ds) or ({"node": "primary", "role": "base"},))
+    if union and not base_is_canvas:
+        # The canvas is blank, so the PRIMARY must be drawn onto it too — as a source of its
+        # own, placed by its stage position exactly as the secondary is, with this node's
+        # handedness (both files came off one scope) and none of the secondary's nudges,
+        # pins or rate: those describe how the SECONDARY relates to the primary.
+        p_plan = plan_placement(
+            dst.metadata, dst.axes, ds.metadata, ds.axes,
+            dst_sampling=_sampling_of(dst, channel_axis=False),
+            src_sampling=_sampling_of(ds, channel_axis=False),
+            on_unplaceable=s["on_unplaceable"])
+        if p_plan.refusals:
+            raise ValueError("Overlay cannot place the primary on the union canvas:\n  - "
+                             + "\n  - ".join(p_plan.refusals))
+        pfx, pfy, _pw = _handedness_for(ds, s["flip_x"], s["flip_y"])
+        recipe.append(overlay_entry(
+            f"{ctx.node_id}#primary", p_plan,
+            {"blend": "add", "flip_x": pfx, "flip_y": pfy,
+             "z_sampling": s["z_sampling"]}))
+    out = dst.with_metadata(**{OVERLAY_KEY: recipe + [entry]})
     if modes.get("output") == "resample":
         if modes.get("canvas") == "context":
             raise ValueError(
@@ -387,13 +433,20 @@ register_node(
                "camera is mounted, so this cannot be derived — it is a property of the "
                "scope. The default matches Stitch's, so a mosaic and an overlay of the "
                "same file can never disagree about which way is right. If a stitched "
-               "montage from this scope comes out mirrored, flip it here too."),
+               "montage from this scope comes out mirrored, flip it here too.\n\n"
+               "Under Canvas = union it ALSO sets the canvas's orientation (on the Overlay "
+               "that starts the canvas): on (the default) runs stage +X to the right, tiles "
+               "joining at their seams; toggling it mirrors the WHOLE picture — every file, "
+               "tile position and tile's pixels together, seams intact. On later union "
+               "Overlays it is that file's own handedness, as usual."),
         InBool("flip_y", "Flip Y", field=False, default=False,
                description=
                "Whether image +y runs along stage −y. As Flip X, and defaulted to match "
                "Stitch for the same reason. Handedness affects only which way the "
                "secondary's pixels are sampled — never which tiles are chosen, since a "
-               "mirrored field still occupies the same patch of stage."),
+               "mirrored field still occupies the same patch of stage. Under Canvas = union "
+               "it also sets the canvas's top-to-bottom orientation, as Flip X does "
+               "left-to-right."),
         InFloat("min_coverage", "Coverage floor", unit="", field=False, default=0.0,
                 description=
                 "Warn when the secondary supplies less than this fraction of a primary "
@@ -532,7 +585,7 @@ register_node(
            # a baked Dataset whose extent is the union rather than the primary's would
            # silently change the grid every downstream measurement is expressed on, which
            # is exactly what the primary-defines-the-canvas rule exists to prevent.
-           Mode("canvas", ["primary", "context"], default="primary", label="Canvas",
+           Mode("canvas", ["primary", "context", "union"], default="primary", label="Canvas",
                 available_in={"output": frozenset({"display"})},
                 description=
                 "How much of the world the Viewer shows: only the primary's own field, or enough "
@@ -550,6 +603,14 @@ register_node(
                         "sits inside a whole-well overview — the primary's pixels and every "
                         "measurement are unchanged, only the visible frame grows. Refused under "
                         "`resample`, which writes a real Dataset.",
+                    "union":
+                        "ONE canvas over BOTH files' fields, each at its true stage position — for "
+                        "files that share no field (adjacent regions of a well, other wells), "
+                        "which would otherwise draw nothing. The primary is drawn onto it as a "
+                        "source with its own LUT; chain further union Overlays and the canvas "
+                        "grows to hold every file. The output is that canvas (one blank field), "
+                        "not the primary, so measure on a branch before the Overlay. Display "
+                        "only — refused under `resample`.",
                 })],
     # Footprint keyed on `output`, not on a dim lever: `display` touches no voxel at all,
     # while `resample` reads every overlapping tile of the SECONDARY for each primary

@@ -17611,6 +17611,213 @@ def test_overlay_experiment() -> None:
         "the two-click nudge is flip-independent and µm mean µm under an index placement")
 
 
+def test_view_canvas() -> None:
+    """``view.canvas`` (2026-10-01): files that share no field, in ONE view.
+
+    Reported on the Spheroid_TF-ELISA well: two 32-position grids 8.84 mm apart and a 7-tile
+    column between them. An Overlay's primary defines the canvas, and no one of those files'
+    fields contains the others, so overlaying them drew nothing — the stage was right, there
+    was simply no canvas that held all three. The Experiment Canvas is that canvas: one blank
+    field over the union of every input's fields. The gates: the pulled canvas equals the
+    edit-time prediction (INV-04, from EVERY input via ``wants_inputs``); every Overlay onto it
+    paints its file at exactly its stage position; it reads and holds no pixels; it keeps
+    input 0's clock and spans every input's focus; and it refuses an unplaceable file and an
+    absurd pixel size by name."""
+    from nodegraph.nodes import COMPUTES, OVERLAY_KEY
+    from nodegraph.placement import compose_secondary_plane, union_canvas
+    from nodegraph.provider import ArrayProvider, ConstantProvider
+
+    ax2 = AxisSizes(m=2, t=3, z=2, c=1, y=8, x=8)
+    # file A: two 8 µm fields side by side at x 0..16; file B: the same layout 1000 µm away
+    a_md = {"pixel_size_um": 1.0, "stage_xy_um": [(4.0, 4.0), (12.0, 4.0)],
+            "stage_z_um": [50.0, 50.0], "z_home_index": 0, "z_step_um": 2.0, "dt_s": 10.0}
+    b_md = {"pixel_size_um": 1.0, "stage_xy_um": [(1004.0, 4.0), (1012.0, 4.0)],
+            "stage_z_um": [60.0, 60.0], "z_home_index": 0, "z_step_um": 2.0, "dt_s": 30.0}
+    # file C: one coarser 16 µm field between them, one plane
+    c_md = {"pixel_size_um": 2.0, "stage_xy_um": [(500.0, 8.0)], "stage_z_um": [55.0]}
+    ax1 = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    vals = {"A": 10, "B": 20, "C": 30}
+    seeds = {
+        "A": Dataset(axes=ax2, metadata=a_md).with_image(
+            ArrayProvider(np.full((2, 3, 2, 1, 8, 8), vals["A"], np.uint16))),
+        "B": Dataset(axes=ax2, metadata=b_md).with_image(
+            ArrayProvider(np.full((2, 3, 2, 1, 8, 8), vals["B"], np.uint16))),
+        "C": Dataset(axes=ax1, metadata=c_md).with_image(
+            ArrayProvider(np.full((1, 1, 1, 1, 8, 8), vals["C"], np.uint16)))}
+    metas = {k: MetaEnvelope(axes=d.axes, metadata=dict(d.metadata)) for k, d in seeds.items()}
+
+    def build(**params):
+        g = Graph()
+        for k in "ABC":
+            g.add(NodeInstance(k, "io.load"))
+        g.add(NodeInstance("K", "view.canvas", params=dict(params)))
+        for k in "ABC":
+            g.connect(k, "K")
+        prev = "K"
+        for i, k in enumerate("ABC"):
+            g.add(NodeInstance(f"O{i}", "view.overlay", params={"flip_x": False}))
+            g.connect(prev, f"O{i}")
+            g.connect(k, f"O{i}", dst_socket="secondary")
+            prev = f"O{i}"
+        return Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas), prev
+
+    # stage orientation (the default Flip X on: stage +x to the right), so canvas column =
+    # stage µm; the mirrored orientation is checked below
+    eng, last = build(flip_x=True)
+    canvas = eng.pull("K")
+    # the union: x 0..1016, y 0..16 (C is 16 µm tall), at the FINEST pixel size (1 µm)
+    assert canvas.axes.m == 1 and canvas.axes.c == 1, canvas.axes
+    assert (canvas.axes.y, canvas.axes.x) == (16, 1016), canvas.axes
+    assert canvas.axes == eng.env("K").axes, (canvas.axes, eng.env("K").axes)
+    assert canvas.metadata["origin_um"] == [[50.0, 0.0, 0.0]]
+    assert canvas.metadata["pixel_size_um"] == 1.0
+    # focus spans A's 50..52 and B's 60..62 at the finest step: 50..62 = 7 planes
+    assert canvas.axes.z == 7 and canvas.metadata["z_step_um"] == 2.0
+    # input 0's clock, not a later input's
+    assert canvas.axes.t == 3 and canvas.metadata["dt_s"] == 10.0
+    assert "stage_xy_um" not in canvas.metadata and "channel_names" in canvas.metadata
+    assert {k: eng.env("K").metadata.get(k) for k in ("origin_um", "pixel_size_um")} == \
+        {k: canvas.metadata.get(k) for k in ("origin_um", "pixel_size_um")}
+    # no pixels held: a constant provider, read as a window at any level
+    assert isinstance(canvas.image, ConstantProvider)
+    assert canvas.image.get_region(0, 0, 0, 0, 0, 0, 16, 0, 1016).sum() == 0
+
+    # every Overlay onto it places ITS file at its stage position
+    out = eng.pull(last)
+    recipe = out.metadata[OVERLAY_KEY]
+    assert [e["node"] for e in recipe[1:]] == ["O0", "O1", "O2"]
+    painted = {}
+    for e, k in zip(recipe[1:], "ABC"):
+        assert e["placed_by"] == "stage", e["placed_by"]
+        src = seeds[k]
+        plane = compose_secondary_plane(
+            e, (16, 1016), canvas.metadata, canvas.axes, 0, src.metadata, src.axes,
+            lambda j, _w=None, _s=src: _s.image.get_region(0, int(j), 0, 0, 0, 0, 8, 0, 8),
+            fill=0.0)
+        painted[k] = np.flatnonzero(plane.max(axis=0) == vals[k])
+    assert painted["A"].min() == 0 and painted["A"].max() == 15, painted["A"]
+    assert painted["B"].min() == 1000 and painted["B"].max() == 1015, painted["B"]
+    assert painted["C"].min() == 492 and painted["C"].max() == 507, painted["C"]
+    # edit-time stays total while the inputs are still unplaceable
+    unk = eng.env("K")
+    assert not ({"y", "x"} & set(unk.unknown_axes))
+
+    # refusals, by name
+    uc = union_canvas([({"pixel_size_um": 1.0}, ax1)])
+    assert uc["refusals"] and "TIFF" in uc["refusals"][0], uc
+    uc = union_canvas([(a_md, ax2), (b_md, ax2)], pixel_size_um=0.001)
+    assert uc["refusals"] and "Pixel size" in uc["refusals"][0], uc
+    eng2, _l = build(margin_um=5.0, flip_x=True)
+    padded = eng2.pull("K")
+    assert (padded.axes.y, padded.axes.x) == (26, 1026) and \
+        padded.metadata["origin_um"] == [[50.0, -5.0, -5.0]]
+
+    # ── the same canvas from the OVERLAY node: canvas=union, grown along a chain ────────
+    g = Graph()
+    for k in "ABC":
+        g.add(NodeInstance(k, "io.load"))
+    # Flip X on (the default): the union canvas runs stage +x to the right
+    g.add(NodeInstance("U0", "view.overlay", modes={"canvas": "union"},
+                       params={"flip_x": True}))
+    g.add(NodeInstance("U1", "view.overlay", modes={"canvas": "union"},
+                       params={"flip_x": True}))
+    g.connect("A", "U0"); g.connect("B", "U0", dst_socket="secondary")
+    g.connect("U0", "U1"); g.connect("C", "U1", dst_socket="secondary")
+    ueng = Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas)
+    u = ueng.pull("U1")
+    assert u.axes == canvas.axes == ueng.env("U1").axes, (u.axes, ueng.env("U1").axes)
+    assert u.metadata["origin_um"] == canvas.metadata["origin_um"]
+    assert isinstance(u.image, ConstantProvider)
+    # the PRIMARY is a source of its own (the canvas is blank), stamped once, by U0
+    urec = u.metadata[OVERLAY_KEY]
+    assert [e["node"] for e in urec[1:]] == ["U0#primary", "U0", "U1"], urec
+    for e, k in zip(urec[1:], "ABC"):
+        src = seeds[k]
+        plane = compose_secondary_plane(
+            e, (16, 1016), u.metadata, u.axes, 0, src.metadata, src.axes,
+            lambda j, _w=None, _s=src: _s.image.get_region(0, int(j), 0, 0, 0, 0, 8, 0, 8),
+            fill=0.0)
+        cols = np.flatnonzero(plane.max(axis=0) == vals[k])
+        assert (cols.min(), cols.max()) == {"A": (0, 15), "B": (1000, 1015),
+                                            "C": (492, 507)}[k], (k, cols.min(), cols.max())
+    # ...and the Viewer's chain walk finds all three, the primary first (drawn underneath)
+    from nodelab_v2.runner import EngineRunner
+    assert EngineRunner.overlay_chain(g, "U1") == [("U0#primary", "A"), ("U0", "B"),
+                                                    ("U1", "C")], \
+        EngineRunner.overlay_chain(g, "U1")
+    # ── FLIP on a canvas is its ORIENTATION: the whole layout mirrors, tiles stay intact ──
+    # (reported 2026-10-01: "flip x and flip y are not working on the union version" — the
+    # union canvas used to keep stage orientation and mirror each tile IN PLACE, so toggling
+    # it only broke every tile seam). Asymmetric content makes a mirror unmistakable.
+    from nodegraph.placement import canvas_flip, nudge_delta_um
+    ramp = np.tile(np.arange(8, dtype=np.uint16), (8, 1)).reshape(1, 1, 1, 1, 8, 8)
+    one = AxisSizes(m=1, t=1, z=1, c=1, y=8, x=8)
+    left = Dataset(axes=one, metadata={"pixel_size_um": 1.0, "stage_xy_um": [(4.0, 4.0)]}
+                   ).with_image(ArrayProvider(ramp))
+    right = Dataset(axes=one, metadata={"pixel_size_um": 1.0, "stage_xy_um": [(24.0, 4.0)]}
+                    ).with_image(ArrayProvider(ramp * 10))
+
+    def rows(fx):
+        gg = Graph()
+        gg.add(NodeInstance("L", "io.load")); gg.add(NodeInstance("R", "io.load"))
+        gg.add(NodeInstance("F", "view.overlay", modes={"canvas": "union"},
+                            params={"flip_x": fx}))
+        gg.connect("L", "F"); gg.connect("R", "F", dst_socket="secondary")
+        ee = Engine(gg, computes=COMPUTES, seeds={"L": left, "R": right},
+                    meta_seeds={k: MetaEnvelope(axes=one, metadata=dict(d.metadata))
+                                for k, d in (("L", left), ("R", right))})
+        o = ee.pull("F")
+        assert canvas_flip(o.metadata) == canvas_flip(ee.env("F").metadata) == (fx, False)
+        got = []
+        for e, src in zip(o.metadata[OVERLAY_KEY][1:], (left, right)):
+            pl = compose_secondary_plane(
+                e, (o.axes.y, o.axes.x), o.metadata, o.axes, 0, src.metadata, src.axes,
+                lambda j, _w=None, _s=src: _s.image.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8),
+                fill=-1)
+            got.append(pl[0].astype(int).tolist())
+        return o, got
+
+    o_on, (l_on, r_on) = rows(True)
+    o_off, (l_off, r_off) = rows(False)
+    blank = [-1] * 20
+    # Flip X on (the default): stage +x runs to the RIGHT, each tile sampled with the
+    # default handedness (image +x along stage -x, so the ramp reads 7..0); off mirrors the
+    # WHOLE picture — positions AND pixels together — so the left file lands right reading
+    # 0..7. Never one without the other: on the real well both half-measures broke every
+    # tile seam (the user's 2026-10-01 reports)
+    assert l_on == list(range(7, -1, -1)) + blank and \
+        r_on == blank + list(range(70, -1, -10)), (l_on, r_on)
+    assert l_off == blank + list(range(8)) and r_off == list(range(0, 80, 10)) + blank, \
+        (l_off, r_off)
+    assert l_off == l_on[::-1] and r_off == r_on[::-1], "off is the exact mirror of on"
+    # a zoomed patch of the reversed canvas is the matching part of the whole composite
+    e_l = o_off.metadata[OVERLAY_KEY][1]
+    patch = compose_secondary_plane(
+        e_l, (8, 8), o_off.metadata, o_off.axes, 0, left.metadata, left.axes,
+        lambda j, _w=None: left.image.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8), fill=-1,
+        region=(0.0, 1.0, 20 / 28, 1.0))
+    assert patch[0].astype(int).tolist() == list(range(8)), patch[0]
+    # the two-click nudge reverses wherever the canvas runs toward stage -x
+    assert nudge_delta_um(o_off.metadata, one, (0.0, 10.0), (0.0, 6.0)) == (0.0, -4.0)
+    assert nudge_delta_um(o_on.metadata, one, (0.0, 10.0), (0.0, 6.0)) == (0.0, 4.0)
+
+    # union is display-only: a bake would change the grid every measurement is expressed on
+    g.nodes["U1"].modes["output"] = "resample"
+    try:
+        Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas).pull("U1")
+        raise AssertionError("resample on a union canvas must refuse")
+    except Exception as exc:          # noqa: BLE001 — the engine may wrap it
+        assert "union" in str(exc), exc
+
+    _ok("view.canvas (2026-10-01): three files that share no field — two 8 µm grids 1000 µm "
+        "apart and a coarser field between them — get ONE blank 1016 x 16 px field over the "
+        "union at the finest pixel size, a 7-plane focus grid spanning every stack and input "
+        "0's clock; the pulled canvas equals the edit-time prediction made from every input; "
+        "it holds no pixels (a constant provider); each Overlay onto it paints its file at "
+        "exactly its stage columns (0-15, 1000-1015, 492-507); margin pads every side; and an "
+        "unplaceable file or an absurd pixel size is refused by name")
+
+
 def test_overlay_frozen_in_z() -> None:
     """Two stacks that cannot overlap in Z must SAY so, with the nudge that fixes it.
 
@@ -21439,6 +21646,28 @@ def test_write_movie() -> None:
         _export(pz, modes={"sweep": "z"}, axes=ax1, arr=base[:, :1], params={"max_px": 0})
         assert len(_frames(pz)) == Z, len(_frames(pz))
 
+        # 6b. ONE timepoint is an export, not a refusal (reported 2026-10-01: "export movie
+        #     should not need more than 1 T frame, especially for a png or jpeg"). A still
+        #     lands under the chosen name itself, with no `_0` counter; MP4 and GIF become
+        #     one-frame clips; a single plane can be what Sweep = z plays.
+        for fmt, ext in (("png", ".png"), ("jpeg", ".jpg")):
+            ps = os.path.join(tmp, f"still{ext}")
+            _export(ps, modes={"format": fmt}, axes=ax1, arr=base[:, :1])
+            assert os.path.exists(ps), sorted(os.listdir(tmp))
+            assert not glob.glob(os.path.join(tmp, f"still_*{ext}")), "a still got a counter"
+            assert np.asarray(Image.open(ps)).shape == (Y, X, 3)
+        p1m = os.path.join(tmp, "one_frame.mp4")
+        _export(p1m, axes=ax1, arr=base[:, :1], params={"max_px": 0})
+        assert len(_frames(p1m)) == 1, len(_frames(p1m))
+        p1g = os.path.join(tmp, "one_frame.gif")
+        _export(p1g, modes={"format": "gif"}, axes=ax1, arr=base[:, :1])
+        with Image.open(p1g) as im:
+            assert getattr(im, "n_frames", 1) == 1
+        ax11 = AxisSizes(m=M, t=1, z=1, c=C, y=Y, x=X)
+        pz1 = os.path.join(tmp, "z1.png")
+        _export(pz1, modes={"sweep": "z", "format": "png"}, axes=ax11, arr=base[:, :1, :1])
+        assert os.path.exists(pz1)
+
         # 7. Split writes one sorted file per multipoint
         ax3 = AxisSizes(m=3, t=T, z=Z, c=C, y=Y, x=X)
         arr3 = np.repeat(base, 3, axis=0)
@@ -23009,6 +23238,7 @@ def main() -> int:
     test_overlay_resample()
     test_overlay_override_and_presentation()
     test_overlay_experiment()
+    test_view_canvas()
     test_overlay_frozen_in_z()
     test_overlay_after_geometry_change()
     test_util_merge()

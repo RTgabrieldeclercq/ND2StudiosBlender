@@ -230,6 +230,12 @@ A composite folds each member's `version`, not its `fingerprint`, into its own: 
 disk-backed member carries its store's mtime in `version` alone, so folding fingerprints
 would serve a bundle whose file changed underneath it.
 
+A provider need not wrap anything at all: `ConstantProvider` (`view.canvas`, 2026-10-01)
+GENERATES a uniform window on demand at any pyramid level, so an experiment canvas tens of
+thousands of pixels a side — the blank primary that several files are overlaid onto — holds
+no pixels. Its fingerprint is structural (geometry + value): two canvases of one geometry
+are the same pixels.
+
 `AxisRespreadProvider` (`util.chain`, V3.02) is the one that erases the difference between
 the two shapes above. It takes **`(provider, m start, position count)` triples — one per
 source FILE** — and lays them end to end on `t`, `z`, `c` or `m`, by the same exclusive
