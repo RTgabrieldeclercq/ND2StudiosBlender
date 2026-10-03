@@ -278,10 +278,13 @@ STAGE_KEYS = ("stage_xy_um", "stage_z_um")
 #:   those origins differ by 1207.3 s).
 #: * ``stage_layout_source`` — how the position log was obtained, or ``"missing"``.
 #: * ``acquisition_start`` — the human date string, for readouts only.
+#: * ``frame_datetime`` — per-T ``YYYY-MM-DD HH:MM:SS.mmm`` wall-clock text, the readable
+#:   twin of ``frame_time_jd`` (2026-10-02): the Viewer's timestamp overlay and the
+#:   Timeseries Builder's order note show it, and it moves with T in lockstep.
 #:
 #: Same status as :data:`STAGE_KEYS`: non-calibration provenance riding the payload
 #: (`wire-node-v2` §7b), read by consumers straight off ``ds.metadata``.
-PLACEMENT_KEYS = ("z_home_index", "z_bottom_to_top", "frame_time_jd",
+PLACEMENT_KEYS = ("z_home_index", "z_bottom_to_top", "frame_time_jd", "frame_datetime",
                   "stage_layout_source", "acquisition_start",
                   # per-M point names — the acquisition's own labels, and a second witness
                   # to where one specimen ends and the next begins (the NIS counter restarts

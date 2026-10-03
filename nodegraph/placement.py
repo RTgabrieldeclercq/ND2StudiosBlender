@@ -64,6 +64,59 @@ __all__ = [
 #: days, so every time difference this module reports goes through here.
 SECONDS_PER_DAY = 86400.0
 
+#: The Julian day of the Unix epoch (1970-01-01 00:00:00). ``frame_time_jd`` is NIS's
+#: ``absoluteJulianDayNumber``: the microscope PC's wall clock, written as a Julian day with
+#: no time-zone marker, so it is converted back to a wall-clock reading and NOT shifted.
+JD_UNIX_EPOCH = 2440587.5
+
+
+def jd_to_datetime_text(jd: Any) -> str:
+    """A Julian day → ``YYYY-MM-DD HH:MM:SS.mmm`` (2026-10-02), the per-frame timestamp the
+    ND2 reader stores beside ``frame_time_jd`` as ``frame_datetime`` and the Viewer's
+    timestamp overlay shows in its ``clock`` mode. Milliseconds are kept because a fast
+    acquisition has several frames a second; the wall clock is reported as the microscope
+    wrote it (no time-zone conversion — there is nothing in the file to convert from).
+    ``""`` for anything that is not a finite number."""
+    import math
+    from datetime import datetime, timedelta
+    try:
+        v = float(jd)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(v):
+        return ""
+    secs = (v - JD_UNIX_EPOCH) * SECONDS_PER_DAY
+    try:
+        dt = datetime(1970, 1, 1) + timedelta(seconds=secs)
+    except (OverflowError, ValueError):
+        return ""
+    # round to the millisecond ourselves: timedelta carries microseconds
+    ms = int(round(dt.microsecond / 1000.0))
+    if ms >= 1000:
+        dt = dt.replace(microsecond=0) + timedelta(seconds=1)
+        ms = 0
+    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}:" \
+           f"{dt.second:02d}.{ms:03d}"
+
+
+def elapsed_text(seconds: float, span_seconds: float) -> str:
+    """Elapsed time ``seconds`` into a run of ``span_seconds``, at a unit picked ONCE from
+    the span so a readout never changes shape mid-series: ``12.5 s`` under 90 s,
+    ``mm:ss`` under 90 min, ``hh:mm:ss`` under a day, ``Nd hh:mm:ss`` beyond. Shared by
+    Export Movie's burned-in counter and the Viewer's timestamp overlay."""
+    t = float(seconds)
+    span = max(0.0, float(span_seconds))
+    sign = "-" if t < 0 else ""
+    t = abs(t)
+    if span < 90.0:
+        return f"{sign}{t:.1f} s"
+    if span < 5400.0:                                  # under 90 min -> mm:ss
+        return f"{sign}{int(t) // 60:02d}:{int(round(t)) % 60:02d}"
+    s = int(round(t))
+    if span < 86400.0:                                 # under a day -> hh:mm:ss
+        return f"{sign}{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+    return f"{sign}{s // 86400}d {(s % 86400) // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
 #: Two fields are treated as describing the same field of view when their physical extents
 #: agree to within this fraction. Deliberately loose: a resample by a non-integer factor
 #: lands the extent a fraction of a pixel off, and refusing over that would be pedantry.

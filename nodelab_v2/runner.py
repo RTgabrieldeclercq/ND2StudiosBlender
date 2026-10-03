@@ -4420,7 +4420,7 @@ class EngineRunner(QObject):
         # A single file names itself too (V3.02), the way a bundle's members always have.
         # Stamped HERE rather than inside `_resolve_one` only for symmetry with the bundle
         # branch above -- it is derived from the path, which that cache is keyed on, so
-        # either side would be correct. `util.chain` needs it to order separately loaded
+        # either side would be correct. `util.timeseries` needs it to order separately loaded
         # files by the counting number in their names; without it the filename lives only
         # in the node's params, where no compute can reach it.
         env = stamp_source_file(env, path)

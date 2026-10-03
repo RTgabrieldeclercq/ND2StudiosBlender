@@ -322,7 +322,7 @@ def _stitch_layout(ctx: EvalContext, ds: Dataset, prov: Any, ax: AxisSizes):
         chain = md.get("__chain__") if isinstance(md.get("__chain__"), dict) else {}
         why = ""
         if "stage_spread_um" in chain:
-            why = (f" Chain Files upstream dropped it: its {len(chain.get('files') or [])} "
+            why = (f" Timeseries Builder upstream dropped it: its {len(chain.get('files') or [])} "
                    f"files put the same position up to {chain['stage_spread_um']} µm apart, "
                    f"beyond the {chain.get('stage_tolerance_um')} µm (a tenth of a field) "
                    f"within which they still count as one field — so these are different "

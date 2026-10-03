@@ -323,6 +323,12 @@ def read_nd2_metadata_extended(filepath):
 
         out["frame_timestamps_s"] = frame_ts
         out["frame_time_jd"] = frame_jd
+        # The same clock, readable: one ``YYYY-MM-DD HH:MM:SS.mmm`` per timepoint
+        # (2026-10-02). Derived from the Julian day here, once, so every consumer — the
+        # Viewer's timestamp, a table export, a Timeseries Builder's resolved order — shows
+        # the identical text for a frame rather than each re-deriving it.
+        from nodegraph.placement import jd_to_datetime_text
+        out["frame_datetime"] = [jd_to_datetime_text(j) for j in frame_jd]
         out["stage_xy_um"] = stage_xy
         out["stage_z_um"] = stage_z
         out["stage_layout_source"] = stage_layout_source

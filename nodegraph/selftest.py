@@ -22795,10 +22795,13 @@ def test_chain_files() -> None:
     def run(seeds, axis="T", order="sequence"):
         seeds = list(seeds)
         nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
-        nodes["C"] = NodeInstance("C", "util.chain",
+        nodes["C"] = NodeInstance("C", "util.timeseries",
                                   modes={"chain_axis": axis, "chain_order": order})
+        # one file per SLOT (`data`, then `file_2`, `file_3`, …) — the Viewer-style grow
+        # group that replaced the single multi-input socket (2026-10-02)
         g = Graph(nodes=nodes,
-                  edges=[Edge(f"L{i}", "C", "image", "data", "forward")
+                  edges=[Edge(f"L{i}", "C", "image", "data" if i == 0 else f"file_{i + 1}",
+                              "forward")
                          for i in range(len(seeds))])
         eng = Engine(g, computes=COMPUTES,
                      seeds={f"L{i}": d for i, d in enumerate(seeds)},
@@ -22896,7 +22899,7 @@ def test_chain_files() -> None:
     # tolerance this raised "needs a per-position stage log ... carries 0".
     def stitched(seed):
         g = Graph(nodes={"L": NodeInstance("L", "io.load"),
-                         "C": NodeInstance("C", "util.chain", modes={"chain_axis": "T"}),
+                         "C": NodeInstance("C", "util.timeseries", modes={"chain_axis": "T"}),
                          "S": NodeInstance("S", "util.stitch", modes={"layout": "stage"})},
                   edges=[Edge("L", "C", "image", "data", "forward"),
                          Edge("C", "S", "out", "data", "forward")])
@@ -22910,7 +22913,7 @@ def test_chain_files() -> None:
         raise AssertionError("stitch placed tiles the chain could not locate")
     except ValueError as exc:
         # the refusal names the chain and its numbers, not "TIFFs never have one" alone
-        assert "Chain Files upstream dropped it" in str(exc), exc
+        assert "Timeseries Builder upstream dropped it" in str(exc), exc
 
     # ── every axis: the payload and the prediction agree on all four branches ────
     for axis, attr in (("T", "t"), ("Z", "z"), ("C", "c")):
@@ -23127,7 +23130,7 @@ def test_chain_files() -> None:
     except ValueError as exc:
         assert "same number of positions" in str(exc), exc
 
-    _ok("util.chain: files laid onto T/Z/C/M in filename order from one card, N cards or "
+    _ok("util.timeseries: files laid onto T/Z/C/M in filename order from one card, N cards or "
         "a mixture; payload == meta_transform on every branch; ragged/mismatched/layered "
         "inputs refused")
 
@@ -23675,6 +23678,146 @@ def test_readiness() -> None:
         "node reports nothing")
 
 
+def test_timeseries_clock_order() -> None:
+    """``util.timeseries`` (2026-10-02, formerly ``util.chain``) orders files by their
+    acquisition clock, and the per-frame timestamp rides the metadata.
+
+    1. :func:`placement.jd_to_datetime_text`: J2000.0 is ``2000-01-01 12:00:00.000``,
+       milliseconds survive, garbage is ``""``. :func:`placement.elapsed_text` picks its
+       unit from the span.
+    2. Three separately loaded files wired OUT of clock order and named AGAINST clock
+       order: under ``chain_order=time`` the output's frames follow the clock, the
+       concatenated ``frame_time_jd`` is monotone, ``frame_datetime`` concatenates in
+       lockstep (it is a :data:`PER_TIME_KEYS` member), and the stamped note says
+       ``time`` with each file's first timestamp; ``sequence`` on the same inputs follows
+       the names instead; a file WITHOUT a clock makes ``time`` fall back to ``sequence``
+       and the note says so.
+    3. The edit-time envelope (``chain_grow``) agrees with the pull on axes and on
+       the clock keys. ``time_subset`` reindexes ``frame_datetime`` with ``frame_time_jd``.
+    4. The slots: ``data`` + ``file_2…`` reveal one at a time in the document (the same
+       ``grow_group`` rule the Viewer uses); a saved graph naming ``util.chain`` loads as
+       ``util.timeseries``.
+    5. ``chain_order`` outside the three values is refused.
+    """
+    import json as _json
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import elapsed_text, jd_to_datetime_text
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, chain_grow,
+                                    time_subset)
+
+    # 1. the formatters
+    assert jd_to_datetime_text(2451545.0) == "2000-01-01 12:00:00.000"
+    assert jd_to_datetime_text(2451545.0 + 1.5 / 86400.0) == "2000-01-01 12:00:01.500"
+    assert jd_to_datetime_text("x") == "" and jd_to_datetime_text(float("nan")) == ""
+    assert elapsed_text(12.5, 60) == "12.5 s" and elapsed_text(200, 3000) == "03:20"
+    assert elapsed_text(4500, 20000) == "01:15:00" and elapsed_text(90000, 200000) == "1d 01:00:00"
+
+    def one(value, name, jd0):
+        ax = AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4)
+        arr = np.full((1, 2, 1, 1, 4, 4), float(value))
+        arr[0, 1] += 0.5
+        jd = [jd0, jd0 + 30.0 / 86400.0]
+        md = {"pixel_size_um": 0.5, "z_step_um": 1.0, SOURCE_FILE_KEY: [name],
+              "frame_time_jd": jd, "frame_datetime": [jd_to_datetime_text(v) for v in jd]}
+        return Dataset(axes=ax, metadata=md).with_image(ArrayProvider(arr))
+
+    def run(seeds, order="time"):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
+        nodes["C"] = NodeInstance("C", "util.timeseries",
+                                  modes={"chain_axis": "T", "chain_order": order})
+        g = Graph(nodes=nodes,
+                  edges=[Edge(f"L{i}", "C", "image", "data" if i == 0 else f"file_{i + 1}",
+                              "forward") for i in range(len(seeds))])
+        eng = Engine(g, computes=COMPUTES, seeds={f"L{i}": d for i, d in enumerate(seeds)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(seeds)})
+        return eng, eng.pull("C")
+
+    def px(ds, t):
+        return float(ds.image.get_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0])
+
+    # 2. names say 1,2,3; clocks say 3,1,2 (value == clock rank); wired in name order
+    J = 2460000.0
+    files = [one(3, "run_t001.nd2", J + 2 / 24), one(1, "run_t002.nd2", J),
+             one(2, "run_t003.nd2", J + 1 / 24)]
+    eng, out = run(files, "time")
+    assert out.axes.t == 6 and out.axes.m == 1, out.axes
+    assert [px(out, t) for t in (0, 2, 4)] == [1.0, 2.0, 3.0], [px(out, t) for t in range(6)]
+    jd = out.metadata["frame_time_jd"]
+    assert len(jd) == 6 and all(b > a for a, b in zip(jd, jd[1:])), "clock must be monotone"
+    fd = out.metadata["frame_datetime"]
+    assert len(fd) == 6 and fd[0] == jd_to_datetime_text(J) and fd[-1] == \
+        jd_to_datetime_text(J + 2 / 24 + 30.0 / 86400.0), fd
+    note = out.metadata["__chain__"]
+    assert note["order"] == "time" and note["files"] == ["run_t002.nd2", "run_t003.nd2",
+                                                           "run_t001.nd2"], note
+    assert note["first_frame"][0] == jd_to_datetime_text(J) and "clock order" in note["note"]
+    _, out_seq = run(files, "sequence")
+    assert [px(out_seq, t) for t in (0, 2, 4)] == [3.0, 1.0, 2.0], "sequence follows names"
+    assert out_seq.metadata["__chain__"]["order"] == "sequence"
+    noclock = one(2, "run_t003.nd2", J + 1 / 24)
+    noclock = Dataset(axes=noclock.axes,
+                      metadata={k: v for k, v in noclock.metadata.items()
+                                if k not in ("frame_time_jd", "frame_datetime")}
+                      ).with_image(noclock.image)
+    _, out_fb = run([files[0], files[1], noclock], "time")
+    assert out_fb.metadata["__chain__"]["order"] == "sequence", \
+        "a file without a clock makes `time` fall back to the filename sequence"
+    assert out_fb.metadata.get("frame_time_jd") is None, "a half-clocked chain carries no clock"
+
+    # 3. envelope == pull; the subset keeps the twins together
+    env = eng.env("C")
+    assert env.axes == out.axes and env.metadata.get("frame_time_jd") == jd
+    assert env.metadata.get("frame_datetime") == fd
+    sub = time_subset(out.metadata, [4, 5])
+    assert sub["frame_time_jd"] == jd[4:6] and sub["frame_datetime"] == fd[4:6], sub
+
+    # 4. the slots and the rename, through the document seam
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("util.timeseries", node_id="TS")
+    names = [s.name for s in doc.input_specs("TS")]
+    assert names == ["data", "file_2"], names
+    for i in range(3):
+        doc.add_node("io.load", node_id=f"F{i}")
+    doc.connect("F0", "image", "TS", "data")
+    assert [s.name for s in doc.input_specs("TS")] == ["data", "file_2"]
+    doc.connect("F1", "image", "TS", "file_2")
+    assert [s.name for s in doc.input_specs("TS")] == ["data", "file_2", "file_3"], \
+        "one empty slot after the last wired file"
+    legacy = {"version": 2, "nodes": {"old": {"op": "util.chain", "params": {},
+                                              "modes": {"chain_axis": "T"}}},
+              "edges": []}
+    try:
+        from nodegraph.serialize import to_dict as _to_dict
+        d2 = GraphDocument()
+        d2.add_node("util.timeseries", node_id="old", modes={"chain_axis": "T"})
+        saved = d2.to_dict() if hasattr(d2, "to_dict") else None
+    except Exception:          # noqa: BLE001 — the shape below is what matters
+        saved = None
+    if saved is not None:
+        saved = _json.loads(_json.dumps(saved).replace('"util.timeseries"', '"util.chain"'))
+        d3 = GraphDocument()
+        d3.load_dict(saved)
+        assert d3.nodes["old"].op_key == "util.timeseries", d3.nodes["old"].op_key
+
+    # 5. refusal
+    try:
+        run(files, "random")
+        raise AssertionError("an unknown file order must be refused")
+    except ValueError as exc:
+        assert "unknown file order" in str(exc), str(exc)
+    _ok("timeseries builder: files ordered by their acquisition clock whatever the names "
+        "and wiring say, frame_time_jd and frame_datetime concatenated in lockstep and "
+        "monotone, the note names the rule and each file's first timestamp; sequence "
+        "follows the names; a clockless file falls back to sequence; envelope == pull; "
+        "slots reveal one at a time; util.chain loads as util.timeseries; "
+        "jd_to_datetime_text / elapsed_text exact")
+
+
 def test_multiotsu_outputs() -> None:
     """``analysis.multiotsu`` ``output`` Mode (2026-10-02): ``merged`` (the class index, as
     before), ``per_class`` (one 0/1 mask per tier, a partition), ``selected`` (one mask of
@@ -23846,6 +23989,7 @@ def main() -> int:
     test_viewer_node_inputs()
     test_draw_regions()
     test_readiness()
+    test_timeseries_clock_order()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

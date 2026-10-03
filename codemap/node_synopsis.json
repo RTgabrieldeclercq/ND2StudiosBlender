@@ -70,7 +70,7 @@
     "categories": 12,
     "roles": 19,
     "stages": 5,
-    "inputs": 607,
+    "inputs": 622,
     "outputs": 98,
     "gui_ops_included": true
   },
@@ -90,10 +90,10 @@
         "io.write_movie",
         "io.write_tiff",
         "util.batch",
-        "util.chain",
         "util.merge",
         "util.select_batch",
         "util.select_group",
+        "util.timeseries",
         "util.unbatch"
       ]
     },
@@ -277,11 +277,6 @@
           "summary": "Stack two or more files on the batch axis so one pipeline runs over all of them independently — per-file statistics, not pooled. Unbatch splits the results back apart."
         },
         {
-          "op": "util.chain",
-          "label": "Chain Files",
-          "summary": "Lay a set of source FILES onto ONE axis — Time, Channels, Z or positions. Wire a multi-file card, several separate loaders, or both: each input is split into its own files, and they are ordered by the counting number in their filenames rather than by how you wired them. This is the shape a folder of one-frame-per-file exports needs before anything temporal will work, since a loader can only ever put files on positions. A pure index remap: nothing is resampled or copied. Put it directly after the loaders — it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses."
-        },
-        {
           "op": "util.merge",
           "label": "Merge",
           "summary": "Merge two or more Datasets by growing ONE chosen axis. 'C' places and resamples channels the way the retired Merge Channels did (handles mismatched pixel size/focus); 'T'/'M'/'Z' lay inputs end to end with no resampling, refusing unless every other axis already matches — the shape a 'before'/'after' pair needs to become one series for tracking."
@@ -295,6 +290,11 @@
           "op": "util.select_group",
           "label": "Select Group",
           "summary": "Keep only the multipoints of one specimen group — the 3x3 mosaic, the plate well — recovered from the stage coordinates or read from the acquisition. Lazy: no pixels move, and per-position metadata, layers and structure rows follow the selection."
+        },
+        {
+          "op": "util.timeseries",
+          "label": "Timeseries Builder",
+          "summary": "Build one series from many source FILES: wire each file (or multi-file card) into its own slot — a new empty slot appears as you fill the last — and the files are laid onto ONE axis (Time by default; or Channels, Z, positions) in the order their acquisition clocks say, so the series is right whatever order you dropped them in. Falls back to the counting number in the filenames, then to wiring order, and says which on the card. A pure index remap: nothing is resampled or copied. Put it directly after the loaders — it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses. (Formerly Chain Files, util.chain.)"
         },
         {
           "op": "util.unbatch",
@@ -928,7 +928,6 @@
     ],
     "utility": [
       "util.batch",
-      "util.chain",
       "util.crop",
       "util.crop_to",
       "util.merge",
@@ -937,6 +936,7 @@
       "util.select_group",
       "util.stack",
       "util.stitch",
+      "util.timeseries",
       "util.unbatch",
       "util.zproject"
     ],
@@ -14867,95 +14867,6 @@
         "__modes__"
       ]
     },
-    "util.chain": {
-      "op": "util.chain",
-      "label": "Chain Files",
-      "category": "utility",
-      "role": "dataset_and_channel_organization",
-      "stage": "acquire_and_organize",
-      "module": "nodegraph/catalog/util/chain.py",
-      "gui_only": false,
-      "summary": "Lay a set of source FILES onto ONE axis — Time, Channels, Z or positions. Wire a multi-file card, several separate loaders, or both: each input is split into its own files, and they are ordered by the counting number in their filenames rather than by how you wired them. This is the shape a folder of one-frame-per-file exports needs before anything temporal will work, since a loader can only ever put files on positions. A pure index remap: nothing is resampled or copied. Put it directly after the loaders — it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses.",
-      "overview": "Lay every wired input's FILES onto ``chain_axis``. Resolved spec (Section 0 grill, 2026-09-29; multi-input 2026-09-29) ------------------------------------------------------------------ * **Kind** utility, axis-changing -> ``op_key=\"util.chain\"``, category ``\"utility\"``. Sits beside ``util.merge`` and deliberately does not absorb it: Merge reconciles differently-placed acquisitions onto C (resampling, focus-matching), which this node never does, and this node sees INSIDE a bundle, which Merge never does. * **Data contract** image -> image, lazily. Onto T/C/Z, ``m`` shrinks to the per-file position count and the chained axis grows by the file count; onto M the files line up as positions and ``m`` becomes ``k*n``. Every other axis and every scalar calibration key is untouched — nothing is resampled, so no value is rewritten. The per-M/per-T/ per-C metadata families move in lockstep (:func:`~nodegraph.metadata.chained_metadata`, shared verbatim with the ``meta_transform`` so the two cannot drift). * **2D/3D** no lever. The node runs no kernel over voxels — only index re-addressing — so dimensionality is a property of the data, not an opinion this node could add (`wire-node-v2` Section 7b: derive, don't ask). The same call ``util.merge``, ``util.batch`` and ``util.unbatch`` all make. * **Footprint** ``TILEABLE``, no kernel axes, on every branch: one output unit reads EXACTLY the corresponding input unit, so a chained read costs what the un-chained read costs. A scalar rather than a Mode-keyed mapping (``util.merge`` needs the mapping because its ``C`` branch resamples; this node's ``C`` branch does not — every input is required to already share the grid). * **Backend** none — :class:`~nodegraph.provider.AxisRespreadProvider` is a lazy index remap, the same kind of object as :class:`~nodegraph.provider.AxisConcatProvider`. **The file order is derived, not wired** — when it can be. ``chain_order=\"sequence\"`` sorts by the numeric field that VARIES across the names, so ``t9`` lands before ``t10`` and a constant ``_z002`` elsewhere in the name is not mistaken for the counter. It applies only when EVERY file has a name: a half-named set has no coherent order, and sorting it would put the named files in sequence and leave the rest where they fell, which reads as working. Otherwise the order is the wiring order, and the stamped :data:`CHAIN_KEY` note says ``\"wired\"`` so a wrong result is visible rather than deduced. **A no-op rather than a refusal** wherever there is nothing to do: fewer than two files across every input, or an axis it does not recognise. The input comes back untouched, so an unconfigured node on a canvas costs and stamps nothing — the choice ``util.select_batch`` and ``util.crop`` both make.",
-      "overview_source": "compute",
-      "dimensionality": {
-        "supports_2d": true,
-        "supports_true_3d": true,
-        "three_d_fallback": null
-      },
-      "footprint": {
-        "granularity": "tileable",
-        "kernel_axes": [],
-        "footprint_mode": "dim"
-      },
-      "domains": {
-        "reads": [],
-        "reads_by_mode": {},
-        "adds": []
-      },
-      "modes": [
-        {
-          "name": "chain_axis",
-          "label": "Onto axis",
-          "choices": [
-            "T",
-            "M",
-            "C",
-            "Z"
-          ],
-          "default": "T",
-          "description": "Which axis the wired files actually vary along. A loader can only put files on POSITIONS, because that is all it can know about them; this says what they really were, and re-addresses them with no resampling and no copy.",
-          "choice_docs": {
-            "T": "Timepoints — the usual case: one file per frame of a timelapse. 120 files become t=0..119, and util.stack, track.link and analysis.optical_flow start seeing a series instead of 120 unrelated fields. Files need NOT hold the same number of frames: a series exported in unequal chunks (5 then 3) becomes t=0..7. Separately loaded files each contribute their own clock, so those concatenate; within one multi-file card the clock is DROPPED: the bundle only ever carried the first file's, so the others' timestamps were never read. dt_s is left alone and still describes spacing WITHIN a file, not the gap between two. The stage log is kept (first file's reading) wherever every file puts a position within a tenth of a field of the same place, so Stitch by stage still works on the result.",
-            "M": "Positions — the files stay separate fields of one acquisition, laid end to end on M. For a single multi-file card already in filename order this is the identity (it is what the card did); for several wired cards it is what joins them; for a card in the wrong order it re-sorts the positions by name. Use it when the files are wells or dishes rather than frames — but prefer Batch if you want per-file statistics, since M pools a dataset-scoped threshold across every file.",
-            "C": "Channels — one file per stain, acquired separately. Block i of the output is file i's channels, and the channel NAMES are tiled, which is exact rather than invented because the loader refuses to group files whose channel names differ. That also means the result has each name repeated once per file: use channel.select by index, not by name, downstream. Unlike util.merge's C branch nothing is placed or resampled here — grouped files already share a grid.",
-            "Z": "Focal planes — one file per plane of a stack. z_step_um is left alone and still describes spacing within a file; the gap between the last plane of one file and the first of the next is not recorded anywhere, so a stack chained from irregularly spaced files will measure axial distances wrongly. Check the spacing yourself, or set it on the source card."
-          }
-        },
-        {
-          "name": "chain_order",
-          "label": "File order",
-          "choices": [
-            "sequence",
-            "loaded"
-          ],
-          "default": "sequence",
-          "description": "Which file becomes frame 0. This is the one setting a wrong result here actually depends on, and nothing else in the GUI shows the answer — the node card's note reports the order that was used, including when it had to fall back to wiring order because a file carried no name.",
-          "choice_docs": {
-            "sequence": "By the counting number in the filenames: the numeric field that VARIES across them, so t9 sorts before t10 and a constant _z002 elsewhere in the name is not mistaken for the counter. Falls back to a plain natural sort when no single field varies (several do, or the names differ in shape).",
-            "loaded": "Wiring order: the inputs in the order you wired them, and each card's own files in the order it holds them. Use it when the names carry no usable number — dated exports, or a set assembled by hand in the order you want. This is also what the node falls back to on its own when any file has no name at all, and the card's note reads 'wired' when that happened."
-          }
-        }
-      ],
-      "inputs": [
-        {
-          "name": "data",
-          "label": "data",
-          "type": "dataset",
-          "role": "dataset",
-          "multi": true,
-          "description": ""
-        }
-      ],
-      "outputs": [
-        {
-          "name": "out",
-          "label": "out",
-          "type": "dataset",
-          "role": "dataset",
-          "description": ""
-        }
-      ],
-      "compute": "_compute_chain",
-      "meta_transform": "chain_grow",
-      "extra_layers": null,
-      "adds_columns": false,
-      "trained_params": false,
-      "kernel_doc": "",
-      "params_read": [
-        "__modes__"
-      ]
-    },
     "util.crop": {
       "op": "util.crop",
       "label": "Crop",
@@ -16144,6 +16055,184 @@
         "refine_min_ncc"
       ]
     },
+    "util.timeseries": {
+      "op": "util.timeseries",
+      "label": "Timeseries Builder",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "module": "nodegraph/catalog/util/timeseries.py",
+      "gui_only": false,
+      "summary": "Build one series from many source FILES: wire each file (or multi-file card) into its own slot — a new empty slot appears as you fill the last — and the files are laid onto ONE axis (Time by default; or Channels, Z, positions) in the order their acquisition clocks say, so the series is right whatever order you dropped them in. Falls back to the counting number in the filenames, then to wiring order, and says which on the card. A pure index remap: nothing is resampled or copied. Put it directly after the loaders — it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses. (Formerly Chain Files, util.chain.)",
+      "overview": "Lay every wired slot's FILES onto ``chain_axis``, ordered by ``chain_order``. Resolved spec (Section 0 grill, 2026-09-29; multi-input 2026-09-29; slots + clock order 2026-10-02) ------------------------------------------------------------------ * **Kind** utility, axis-changing -> ``op_key=\"util.timeseries\"``, category ``\"utility\"``. Sits beside ``util.merge`` and deliberately does not absorb it: Merge reconciles differently-placed acquisitions onto C (resampling, focus-matching), which this node never does, and this node sees INSIDE a bundle, which Merge never does. * **Data contract** image -> image, lazily. Onto T/C/Z, ``m`` shrinks to the per-file position count and the chained axis grows by the file count; onto M the files line up as positions and ``m`` becomes ``k*n``. Every other axis and every scalar calibration key is untouched — nothing is resampled, so no value is rewritten. The per-M/per-T/ per-C metadata families move in lockstep (:func:`~nodegraph.metadata.chained_metadata`, shared verbatim with the ``meta_transform`` so the two cannot drift). * **2D/3D** no lever. The node runs no kernel over voxels — only index re-addressing — so dimensionality is a property of the data, not an opinion this node could add (`wire-node-v2` Section 7b: derive, don't ask). * **Footprint** ``TILEABLE``, no kernel axes, on every branch: one output unit reads EXACTLY the corresponding input unit, so a chained read costs what the un-chained read costs. * **Backend** none — :class:`~nodegraph.provider.AxisRespreadProvider` is a lazy index remap, the same kind of object as :class:`~nodegraph.provider.AxisConcatProvider`. **The file order is derived, not wired.** ``chain_order=\"time\"`` sorts by each file's first-frame clock (:func:`~nodegraph.metadata.chain_member_clock`) when every file has one; ``\"sequence\"`` by the numeric field that VARIES across the names; either falls back toward wiring order where its information is missing, and the stamped :data:`CHAIN_KEY` note says which rule actually applied (``\"time\"`` / ``\"sequence\"`` / ``\"wired\"``) and lists the resolved order with each file's first timestamp. **A no-op rather than a refusal** wherever there is nothing to do: fewer than two files across every slot, or an axis it does not recognise. The input comes back untouched, so an unconfigured node on a canvas costs and stamps nothing — the choice ``util.select_batch`` and ``util.crop`` both make.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "chain_axis",
+          "label": "Onto axis",
+          "choices": [
+            "T",
+            "M",
+            "C",
+            "Z"
+          ],
+          "default": "T",
+          "description": "Which axis the wired files actually vary along. A loader can only put files on POSITIONS, because that is all it can know about them; this says what they really were, and re-addresses them with no resampling and no copy.",
+          "choice_docs": {
+            "T": "Timepoints — the usual case: one file per frame (or per chunk) of a timelapse. 120 files become t=0..119, and util.stack, track.link and analysis.optical_flow start seeing a series instead of 120 unrelated fields. Files need NOT hold the same number of frames: a series exported in unequal chunks (5 then 3) becomes t=0..7. Separately loaded files each contribute their own clock, which is concatenated so every frame of the result keeps its real acquisition time; within one multi-file card the clock is DROPPED: the bundle only ever carried the first file's. dt_s is left alone and still describes spacing WITHIN a file, not the gap between two. The stage log is kept (first file's reading) wherever every file puts a position within a tenth of a field of the same place, so Stitch by stage still works on the result.",
+            "M": "Positions — the files stay separate fields of one acquisition, laid end to end on M. For a single multi-file card already in filename order this is the identity (it is what the card did); for several wired cards it is what joins them; for a card in the wrong order it re-sorts the positions. Use it when the files are wells or dishes rather than frames — but prefer Batch if you want per-file statistics, since M pools a dataset-scoped threshold across every file.",
+            "C": "Channels — one file per stain, acquired separately. Block i of the output is file i's channels, and the channel NAMES are tiled, which is exact rather than invented because the loader refuses to group files whose channel names differ. That also means the result has each name repeated once per file: use channel.select by index, not by name, downstream. Unlike util.merge's C branch nothing is placed or resampled here — grouped files already share a grid.",
+            "Z": "Focal planes — one file per plane of a stack. z_step_um is left alone and still describes spacing within a file; the gap between the last plane of one file and the first of the next is not recorded anywhere, so a stack chained from irregularly spaced files will measure axial distances wrongly. Check the spacing yourself, or set it on the source card."
+          }
+        },
+        {
+          "name": "chain_order",
+          "label": "File order",
+          "choices": [
+            "time",
+            "sequence",
+            "loaded"
+          ],
+          "default": "time",
+          "description": "Which file becomes frame 0, and the rest after it. This is the one setting a wrong result here actually depends on, and nothing else in the GUI shows the answer — the node card's note reports the rule that was actually used and the resolved order, with each file's first timestamp.",
+          "choice_docs": {
+            "time": "By each file's acquisition clock — its first frame's absolute time as the microscope recorded it (frame_time_jd), so the series is correct whatever order the files were wired in and whatever their names say. Needs a clock on EVERY file; where one is missing the node falls back to the filename sequence and the card's note says so. The default.",
+            "sequence": "By the counting number in the filenames: the numeric field that VARIES across them, so t9 sorts before t10 and a constant _z002 elsewhere in the name is not mistaken for the counter. Falls back to a plain natural sort when no single field varies, and to wiring order when any file has no name. Use it for files whose clocks are wrong or missing.",
+            "loaded": "Wiring order: the slots in the order you wired them, and each card's own files in the order it holds them. Use it when both the clocks and the names are unusable and you have assembled the set by hand in the order you want. The card's note reads 'wired' whenever this order is in force, chosen or fallen back to."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "File 1",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The first source file (or multi-file card) of the series. Its calibration is the one every other file must match; its place in the built series is decided by its clock like every other file's."
+        },
+        {
+          "name": "file_2",
+          "label": "File 2",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_3",
+          "label": "File 3",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_4",
+          "label": "File 4",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_5",
+          "label": "File 5",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_6",
+          "label": "File 6",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_7",
+          "label": "File 7",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_8",
+          "label": "File 8",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_9",
+          "label": "File 9",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_10",
+          "label": "File 10",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_11",
+          "label": "File 11",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        },
+        {
+          "name": "file_12",
+          "label": "File 12",
+          "type": "dataset",
+          "role": "dataset",
+          "grow_group": "files",
+          "description": "Another source file (or multi-file card) for the series. Slots appear one at a time as you fill them, so there is always exactly one empty slot to drop the next file into. The order you wire them in does not matter under `File order = time`: the files are sorted by their first frame's acquisition clock."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_timeseries",
+      "meta_transform": "chain_grow",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__"
+      ]
+    },
     "util.unbatch": {
       "op": "util.unbatch",
       "label": "Unbatch",
@@ -16921,6 +17010,82 @@
           },
           "presentation": true,
           "description": "The bar and label colour. Pick the one that contrasts with the corner it sits in; the bar also carries a translucent dark shadow so white survives a bright field. Only drawn while `Scale bar` is on."
+        },
+        {
+          "name": "show_timestamp",
+          "label": "Timestamp",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "presentation": true,
+          "description": "Draw the viewed frame's time over the image. What it says is `Timestamp shows`: elapsed time since the first frame by default, from the file's own per-frame acquisition clock (frame_time_jd) — so a series built by Timeseries Builder shows real gaps, not a nominal interval — falling back to `dt_s × frame` and then to the frame number when no clock rides the payload. Display only: not part of any result and not saved into exports (Export Movie has its own counter)."
+        },
+        {
+          "name": "timestamp_mode",
+          "label": "Timestamp shows",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "elapsed",
+          "choices": [
+            "elapsed",
+            "clock",
+            "frame",
+            "elapsed_clock"
+          ],
+          "choice_docs": {
+            "clock": "The wall-clock time the frame was acquired, `YYYY-MM-DD HH:MM:SS.mmm`, as the microscope wrote it (frame_datetime). Blank when the payload carries no absolute clock — a synthetic or TIFF source.",
+            "elapsed": "Time since the first frame of the series — `12.5 s`, `03:20`, `01:15:00` or `2d 04:00:00`, at a unit chosen once from the whole span so the readout never changes shape while you scrub. The default.",
+            "elapsed_clock": "Both: the elapsed time, then the wall-clock time in brackets — for a figure that needs the experiment time and the real date.",
+            "frame": "The frame number and the series length, `t 7/120` (1-based for reading; the status bar keeps the 0-based index). Always available."
+          },
+          "presentation": true,
+          "description": "What the timestamp overlay displays for the viewed frame. All four read the payload's own metadata; nothing is re-run. Only drawn while `Timestamp` is on."
+        },
+        {
+          "name": "timestamp_corner",
+          "label": "Timestamp corner",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "top_left",
+          "choices": [
+            "top_left",
+            "top_right",
+            "bottom_left",
+            "bottom_right"
+          ],
+          "choice_docs": {
+            "bottom_left": "Bottom-left — beside, not over, a scale bar in the bottom-right corner, along the same bottom edge.",
+            "bottom_right": "Bottom-right — shares the corner with a scale bar there, so the text moves up a line to keep clear of the bar.",
+            "top_left": "Top-left, where video players put a clock — the default; clear of the bottom-right scale bar.",
+            "top_right": "Top-right — when the top-left corner holds the troubleshooting locator map or a structure you are showing."
+          },
+          "presentation": true,
+          "description": "Which corner of the VISIBLE image the timestamp sits in; it follows the corner under zoom and pan. Only drawn while `Timestamp` is on."
+        },
+        {
+          "name": "timestamp_color",
+          "label": "Timestamp colour",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "white",
+          "choices": [
+            "white",
+            "black",
+            "yellow",
+            "cyan"
+          ],
+          "choice_docs": {
+            "black": "Black — for a light-background (brightfield, phase) image where white would vanish.",
+            "cyan": "Cyan — high contrast over a red or magenta channel, where white and yellow both blend into the signal.",
+            "white": "White with a dark shadow — reads on a dark fluorescence field, the default.",
+            "yellow": "Yellow — high contrast on both a dark field and a green or red channel."
+          },
+          "presentation": true,
+          "description": "The timestamp's text colour; it also carries a translucent dark shadow so white survives a bright field. Only drawn while `Timestamp` is on."
         }
       ],
       "outputs": [],

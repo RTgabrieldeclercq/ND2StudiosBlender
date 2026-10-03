@@ -77,13 +77,13 @@ PROGRESS_BAR_H = 5     # one of the two stacked bars (frame above, within-frame 
 #: separate sources and leave room to drop a first processing node beside each.
 SOURCE_STACK_GAP = 34
 
-#: horizontal offset of the ``util.chain`` card the sequence loader drops beside its bundle
+#: horizontal offset of the ``util.timeseries`` card the sequence loader drops beside its bundle
 #: (scene px). Wide enough that the wire between them is visibly a wire rather than two
 #: touching cards — a source card is ~214 px, so this leaves a clear ~90 px span.
 SEQUENCE_CHAIN_GAP = 306
 
 #: What the axis a sequence was chained onto is CALLED, for the status line. The keys are
-#: ``util.chain``'s own ``chain_axis`` values; "M" is absent because the loader never drops
+#: ``util.timeseries``'s own ``chain_axis`` values; "M" is absent because the loader never drops
 #: a chain card for it (re-addressing onto M is the identity the bundle already performed).
 _AXIS_NOUN = {"T": "timepoints", "Z": "focal planes", "C": "channels"}
 PROGRESS_BAR_GAP = 2
@@ -2766,6 +2766,28 @@ class MainWindow(QMainWindow):
         return {"um": um, "corner": str(val("scalebar_corner") or "bottom_right"),
                 "color": str(val("scalebar_color") or "white")}
 
+    def _viewer_timestamp(self, node_id: Optional[str]):
+        """The viewed node's timestamp settings if it is a ``view.viewer`` with the
+        timestamp on, else ``None`` (2026-10-02). Presentation params, read from the
+        document like the scale bar's."""
+        rec = self.doc.nodes.get(node_id) if node_id else None
+        if rec is None or rec.op_key != "view.viewer":
+            return None
+        spec = rec.spec()
+        params = rec.params or {}
+
+        def val(name):
+            if name in params:
+                return params[name]
+            s = spec.input(name) if spec is not None else None
+            return s.default if s is not None else None
+
+        if not bool(val("show_timestamp")):
+            return None
+        return {"mode": str(val("timestamp_mode") or "elapsed"),
+                "corner": str(val("timestamp_corner") or "top_left"),
+                "color": str(val("timestamp_color") or "white")}
+
     def _on_region_changed(self) -> None:
         """The Viewer's region box was dragged or cleared — a change to WHAT a scoped pull
         computes, laterally. Re-scope the runner and, under the scope, re-run the viewed
@@ -3034,6 +3056,7 @@ class MainWindow(QMainWindow):
             # bar for every other node, so viewing a filter never inherits them
             pane.set_source_layout(self._viewer_layout(node_id))
             pane.set_scalebar(self._viewer_scalebar(node_id))
+            pane.set_timestamp(self._viewer_timestamp(node_id))
         if self._maximized:
             # a new axes shape rebuilds the channel/LUT controls, and fresh widgets are
             # visible — re-fold them so the mini-map keeps its compact strip
@@ -3296,7 +3319,7 @@ class MainWindow(QMainWindow):
         # `source_file` rides the seed for the same reason the bundle card's does: the
         # edit-time envelope and the pulled payload must agree about a positional list, and
         # `EngineRunner._resolve_source` stamps the identical value on the pull side. It is
-        # what lets `util.chain` order separately loaded files by their names.
+        # what lets `util.timeseries` order separately loaded files by their names.
         self.doc.set_meta_seed(rec.id, stamp_source_file(
             MetaEnvelope(axes=axes, metadata=dict(calib)), path))
         return rec, axes
@@ -3422,14 +3445,14 @@ class MainWindow(QMainWindow):
         a loader can grow without being told what the files mean. For a timelapse exported
         one frame per file that is the wrong axis, and wrongly in a way nothing errors on:
         the result is 120 fields of a 1-frame series, so ``util.stack`` fuses nothing and
-        ``track.link`` has no frames to link (see :mod:`nodegraph.catalog.util.chain`).
+        ``track.link`` has no frames to link (see :mod:`nodegraph.catalog.util.timeseries`).
 
         So this action does the three things that turn one click into that series: it
         derives the sequence from the picked file's name and scans its folder
         (:func:`nodegraph.file_sequence.scan`), it shows what it found and lets the pattern
         be corrected before anything is built
         (:class:`~nodelab_v2.sequence_dialog.SequenceScanDialog`), and it drops the bundle
-        card with a ``util.chain`` already wired to it and preset to the chosen axis.
+        card with a ``util.timeseries`` already wired to it and preset to the chosen axis.
 
         Everything after the dialog is :meth:`_load_source_paths`, so a series whose files
         do not share a grid is refused with the same message, and the same "load as separate
@@ -3538,7 +3561,7 @@ class MainWindow(QMainWindow):
         offers the fallback that always works — separate cards — rather than silently
         loading something the user did not ask for.
 
-        ``chain_axis`` (:meth:`file_load_sequence`) additionally wires a ``util.chain`` card
+        ``chain_axis`` (:meth:`file_load_sequence`) additionally wires a ``util.timeseries`` card
         onto the bundle, preset to that axis. It rides HERE rather than in the caller so the
         sequence loader inherits this method's grid-mismatch handling unchanged — and it is
         deliberately dropped by the "separate cards" fallback, since there is no bundle left
@@ -3572,7 +3595,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
             chain = None
             if chain_axis and chain_axis != "M":
-                chain = self.doc.add_node("util.chain", x=x + SEQUENCE_CHAIN_GAP, y=y,
+                chain = self.doc.add_node("util.timeseries", x=x + SEQUENCE_CHAIN_GAP, y=y,
                                           modes={"chain_axis": chain_axis})
                 self.doc.connect(rec.id, "image", chain.id, "data")
             ids = [rec.id] + ([chain.id] if chain is not None else [])

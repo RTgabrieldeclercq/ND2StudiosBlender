@@ -3,7 +3,7 @@
 A microscope that exports one file per frame leaves a folder of ``WellA3_t001.nd2`` ..
 ``WellA3_t120.nd2``. The ordinary loader can already multi-select all 120 into one bundle
 card, but that is a 120-item file dialog and it stacks them on POSITIONS, which is the
-wrong axis for a timelapse (see :mod:`nodegraph.catalog.util.chain`). This dialog is the
+wrong axis for a timelapse (see :mod:`nodegraph.catalog.util.timeseries`). This dialog is the
 one-gesture form: pick any member, and the pattern, the siblings, the order and the axis
 are all settled here before a card exists.
 
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from nodegraph import file_sequence as FS
 
 #: The chain axis choices, as ``(chain_axis mode value, what it means to a user)``. The
-#: mode values are ``util.chain``'s own, so this list cannot drift from the node's.
+#: mode values are ``util.timeseries``'s own, so this list cannot drift from the node's.
 AXIS_CHOICES: Tuple[Tuple[str, str], ...] = (
     ("T", "Timepoints — one file per frame of a timelapse"),
     ("Z", "Z planes — one file per focal plane of a stack"),
@@ -53,7 +53,7 @@ class SequenceScanDialog(QDialog):
     """Confirm the detected sequence and the axis to chain it onto.
 
     :meth:`result_paths` is the matched series in order; :meth:`chain_axis` is the
-    ``util.chain`` mode value the caller presets on the node it wires up. Both are only
+    ``util.timeseries`` mode value the caller presets on the node it wires up. Both are only
     meaningful after ``exec()`` returned :attr:`QDialog.Accepted`.
     """
 
@@ -120,7 +120,7 @@ class SequenceScanDialog(QDialog):
         return list(self._paths)
 
     def chain_axis(self) -> str:
-        """The ``util.chain`` ``chain_axis`` mode value the user picked."""
+        """The ``util.timeseries`` ``chain_axis`` mode value the user picked."""
         return str(self._axis.currentData() or "T")
 
     # ── live re-scan ─────────────────────────────────────────────────────────

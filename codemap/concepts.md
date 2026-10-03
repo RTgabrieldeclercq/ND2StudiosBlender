@@ -236,7 +236,7 @@ thousands of pixels a side — the blank primary that several files are overlaid
 no pixels. Its fingerprint is structural (geometry + value): two canvases of one geometry
 are the same pixels.
 
-`AxisRespreadProvider` (`util.chain`, V3.02) is the one that erases the difference between
+`AxisRespreadProvider` (`util.timeseries`, formerly `util.chain`, V3.02) is the one that erases the difference between
 the two shapes above. It takes **`(provider, m start, position count)` triples — one per
 source FILE** — and lays them end to end on `t`, `z`, `c` or `m`, by the same exclusive
 prefix sum `AxisConcatProvider` uses: `m = start_i + j, axis = a` becomes `m = j,

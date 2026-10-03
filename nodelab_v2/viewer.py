@@ -1262,6 +1262,8 @@ class ViewerPanel(QWidget):
         # viewed node's own modes/params — "merged" and no bar for every other node
         self._source_layout: str = "merged"
         self._scalebar: Optional[Dict[str, Any]] = None
+        #: the Viewer node's timestamp settings (``mode`` / ``corner`` / ``color``), or None
+        self._timestamp: Optional[Dict[str, Any]] = None
         self._planes: Dict[int, np.ndarray] = {}
         self._ref_plane: Optional[np.ndarray] = None
         self._dataset = None
@@ -2607,6 +2609,127 @@ class ViewerPanel(QWidget):
         y = area.top() + margin + 16.0 if top else area.bottom() - margin - thick
         return QRectF(x, y, length_w, thick), label, not top
 
+    # ── the Viewer node's TIMESTAMP (2026-10-02) ──────────────────────────────
+    def set_timestamp(self, settings: Optional[Dict[str, Any]]) -> None:
+        """``{"mode", "corner", "color"}`` from the viewed Viewer node, or ``None`` for
+        no timestamp. Presentation: a repaint, never a re-pull."""
+        s = dict(settings) if settings else None
+        if s == self._timestamp:
+            return
+        self._timestamp = s
+        self._refresh_surface()
+
+    @property
+    def timestamp(self) -> Optional[Dict[str, Any]]:
+        return self._timestamp
+
+    def timestamp_text(self) -> str:
+        """The text the timestamp overlay shows for the viewed frame, per ``mode``, read
+        from the PAYLOAD's metadata and indexed by the payload's own T (under the solo
+        scope the per-T lists are already subset to the scoped frames, so the two agree).
+
+        ``elapsed``: seconds since the series' first frame from ``frame_time_jd`` — real
+        gaps, which is what a Timeseries Builder's output carries — else ``dt_s × t``,
+        else the frame number; the unit is chosen once from the whole span
+        (:func:`nodegraph.placement.elapsed_text`). ``clock``: ``frame_datetime[t]``, or
+        the same text derived from ``frame_time_jd[t]``; ``""`` when the payload has no
+        absolute clock, because a made-up date is worse than none. ``frame``: ``t 7/120``
+        (1-based). ``elapsed_clock``: both."""
+        s = self._timestamp
+        if not s or self._axes is None:
+            return ""
+        from nodegraph.placement import SECONDS_PER_DAY, elapsed_text, jd_to_datetime_text
+        md = getattr(self._dataset, "metadata", None) or {}
+        _m, t, _z, _c = self._payload_coords()
+        total = max(1, int(self._axes.t))
+        t = max(0, min(int(t), total - 1))
+        mode = str(s.get("mode") or "elapsed")
+        jd = md.get("frame_time_jd")
+        jd = list(jd) if isinstance(jd, (list, tuple)) and len(jd) >= total else None
+
+        def clock_text() -> str:
+            fd = md.get("frame_datetime")
+            if isinstance(fd, (list, tuple)) and len(fd) > t and fd[t]:
+                return str(fd[t])
+            return jd_to_datetime_text(jd[t]) if jd is not None else ""
+
+        def elapsed() -> str:
+            if jd is not None:
+                try:
+                    secs = (float(jd[t]) - float(jd[0])) * SECONDS_PER_DAY
+                    span = (float(jd[total - 1]) - float(jd[0])) * SECONDS_PER_DAY
+                    return elapsed_text(secs, span)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                dt = float(md.get("dt_s") or 0.0)
+            except (TypeError, ValueError):
+                dt = 0.0
+            if dt > 0.0:
+                return elapsed_text(dt * t, dt * (total - 1))
+            return f"t {t + 1}/{total}"
+
+        if mode == "clock":
+            return clock_text()
+        if mode == "frame":
+            return f"t {t + 1}/{total}"
+        if mode == "elapsed_clock":
+            c = clock_text()
+            return f"{elapsed()}  [{c}]" if c else elapsed()
+        return elapsed()
+
+    def _timestamp_geometry(self, device_rect: QRectF, text: str, fm):
+        """``(baseline point, text width)`` in widget pixels for ``text``, in the chosen
+        corner of the VISIBLE image; the bottom-right corner lifts the text above a scale
+        bar sharing it. ``None`` when there is no image on screen."""
+        s = self._timestamp
+        if not s or self._ref_plane is None:
+            return None
+        mp = getattr(self._view, "plane_to_widget", None)
+        if mp is None:
+            return None
+        H, W = self._ref_plane.shape[:2]
+        img = QRectF(mp(0.0, 0.0), mp(float(W), float(H))).normalized()
+        area = img.intersected(device_rect) if device_rect.isValid() else img
+        if area.isEmpty():
+            return None
+        margin = 14.0
+        tw = fm.horizontalAdvance(text)
+        corner = str(s.get("corner") or "top_left")
+        x = area.left() + margin if "left" in corner else area.right() - margin - tw
+        if corner.startswith("top"):
+            y = area.top() + margin + fm.ascent()
+        else:
+            y = area.bottom() - margin
+            bar = self._scalebar
+            if bar and str(bar.get("corner") or "bottom_right") == corner:
+                y -= fm.height() + 12.0        # clear of the bar and its label
+        return QPointF(x, y), tw
+
+    def _paint_timestamp(self, p: QPainter) -> None:
+        if not self._timestamp:
+            return
+        text = self.timestamp_text()
+        if not text:
+            return
+        from nodegraph.catalog._shared.movie_draw import _TEXT_RGB
+        rgb = _TEXT_RGB.get(str(self._timestamp.get("color") or "white"), (255, 255, 255))
+        f = QFont(p.font())
+        f.setPointSizeF(max(9.0, f.pointSizeF() + 1.0))
+        f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        geo = self._timestamp_geometry(
+            QRectF(0, 0, p.device().width(), p.device().height()), text, fm)
+        if geo is None:
+            return
+        at, _tw = geo
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QColor(0, 0, 0, 170))
+        p.drawText(QPointF(at.x() + 1.0, at.y() + 1.0), text)
+        p.setPen(QColor(*rgb))
+        p.drawText(at, text)
+
     def _paint_scalebar(self, p: QPainter) -> None:
         geo = self._scalebar_geometry(QRectF(0, 0, p.device().width(), p.device().height()))
         if geo is None:
@@ -3588,6 +3711,7 @@ class ViewerPanel(QWidget):
         )
         self._renderer.paint(p, self.overlays, frame)
         self._paint_scalebar(p)               # the Viewer node's bar, over the image
+        self._paint_timestamp(p)              # …and its timestamp
         self._paint_region(p)                 # the troubleshooting box, under the pick
         self._paint_region_map(p)             # where that window sits in the full field
         self._paint_pick(p)                   # the armed gesture rides ON TOP of everything

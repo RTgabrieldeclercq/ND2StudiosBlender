@@ -5373,9 +5373,33 @@ def main(argv) -> int:
     assert abs(bar.width() / _img.width() - _want) < 0.02, \
         (bar.width(), _img.width(), win.viewer._axes.x, _want)
     vrec.params["show_scalebar"] = False
+    # the TIMESTAMP (2026-10-02): presentation like the bar; `frame` always reads, `clock`
+    # is honest about a payload with no absolute clock, `elapsed` falls back to the frame
+    # number on a synthetic source with neither clock nor interval
+    vrec.params["show_timestamp"] = True
+    vrec.params["timestamp_mode"] = "frame"
     win.pull_node("vv")
     _await_pull()
     assert win.viewer.scalebar is None
+    assert win.viewer.timestamp == {"mode": "frame", "corner": "top_left", "color": "white"}
+    _tt = win.viewer.timestamp_text()
+    assert _tt.startswith("t ") and f"/{win.viewer._axes.t}" in _tt, _tt
+    vrec.params["timestamp_mode"] = "clock"
+    win.pull_node("vv"); _await_pull()
+    _md = getattr(win.viewer._dataset, "metadata", {}) or {}
+    if not (_md.get("frame_time_jd") or _md.get("frame_datetime")):
+        assert win.viewer.timestamp_text() == "", "no clock on the payload → no fabricated date"
+    vrec.params["timestamp_mode"] = "elapsed"
+    win.pull_node("vv"); _await_pull()
+    assert win.viewer.timestamp_text(), "elapsed always says something"
+    from PySide6.QtGui import QFontMetrics as _QFM
+    _geo = win.viewer._timestamp_geometry(
+        _QRectF(0, 0, win.viewer._view.width(), win.viewer._view.height()), "t 1/4",
+        _QFM(win.viewer.font()))
+    assert _geo is not None and _geo[0].x() >= 0 and _geo[0].y() > 0, _geo
+    vrec.params["show_timestamp"] = False
+    win.pull_node("vv"); _await_pull()
+    assert win.viewer.timestamp is None
     vdoc.remove_node("vv")
     _ok("VN1 viewer node: primary + one empty source slot that grows as wired, no output; "
         "a second stream composites as `source_2:` display channels on the primary payload; "

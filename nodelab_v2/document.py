@@ -1880,7 +1880,8 @@ class GraphDocument:
         for nid, inst in graph.nodes.items():
             extra = ui_nodes.get(nid, {})
             self.nodes[nid] = NodeRecord(
-                nid, inst.op_key, params=dict(inst.params), modes=dict(inst.modes),
+                nid, self._OP_RENAMES.get(inst.op_key, inst.op_key),
+                params=dict(inst.params), modes=dict(inst.modes),
                 x=float(extra.get("x", 0.0)), y=float(extra.get("y", 0.0)),
                 muted=bool(extra.get("muted", False)),
                 collapsed=bool(extra.get("collapsed", False)))
@@ -1908,6 +1909,13 @@ class GraphDocument:
     #: became the segment's ``to`` in V2.22, and it means the same thing: the end of the
     #: series.
     _SOCKET_RENAMES: Dict[str, Dict[str, str]] = {ITERATE_OP: {"collect": _SEG_TO}}
+
+    #: Node types renamed after files had already been saved against them: ``{old op_key:
+    #: new}``. A record naming an op the registry no longer has would open as "unrecognized
+    #: node type" with its wires dead; the loader repoints it instead. ``util.chain`` (Chain
+    #: Files) became ``util.timeseries`` (Timeseries Builder) on 2026-10-02 — same sockets
+    #: for the first file (``data``) and the same Modes, with a wider default (``time``).
+    _OP_RENAMES: Dict[str, str] = {"util.chain": "util.timeseries"}
 
     def _migrate_socket(self, node_id: str, socket: str) -> str:
         rec = self.nodes.get(node_id)

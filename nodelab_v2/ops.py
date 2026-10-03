@@ -489,6 +489,79 @@ def ensure_ops() -> None:
                          "corner it sits in; the bar also carries a translucent dark "
                          "shadow so white survives a bright field. Only drawn while `Scale "
                          "bar` is on."),
+                # ── the timestamp (2026-10-02): presentation, like the bar ──
+                InBool("show_timestamp", "Timestamp", field=False, default=False,
+                       presentation=True,
+                       description=
+                       "Draw the viewed frame's time over the image. What it says is "
+                       "`Timestamp shows`: elapsed time since the first frame by default, "
+                       "from the file's own per-frame acquisition clock (frame_time_jd) — "
+                       "so a series built by Timeseries Builder shows real gaps, not a "
+                       "nominal interval — falling back to `dt_s × frame` and then to the "
+                       "frame number when no clock rides the payload. Display only: not "
+                       "part of any result and not saved into exports (Export Movie has "
+                       "its own counter)."),
+                InString("timestamp_mode", "Timestamp shows", field=False, default="elapsed",
+                         presentation=True,
+                         choices=["elapsed", "clock", "frame", "elapsed_clock"],
+                         choice_docs={
+                             "elapsed": "Time since the first frame of the series — "
+                                        "`12.5 s`, `03:20`, `01:15:00` or `2d 04:00:00`, "
+                                        "at a unit chosen once from the whole span so the "
+                                        "readout never changes shape while you scrub. The "
+                                        "default.",
+                             "clock": "The wall-clock time the frame was acquired, "
+                                      "`YYYY-MM-DD HH:MM:SS.mmm`, as the microscope wrote "
+                                      "it (frame_datetime). Blank when the payload carries "
+                                      "no absolute clock — a synthetic or TIFF source.",
+                             "frame": "The frame number and the series length, `t 7/120` "
+                                      "(1-based for reading; the status bar keeps the "
+                                      "0-based index). Always available.",
+                             "elapsed_clock": "Both: the elapsed time, then the wall-clock "
+                                              "time in brackets — for a figure that needs "
+                                              "the experiment time and the real date.",
+                         },
+                         description=
+                         "What the timestamp overlay displays for the viewed frame. All "
+                         "four read the payload's own metadata; nothing is re-run. Only "
+                         "drawn while `Timestamp` is on."),
+                InString("timestamp_corner", "Timestamp corner", field=False,
+                         default="top_left", presentation=True,
+                         choices=["top_left", "top_right", "bottom_left", "bottom_right"],
+                         choice_docs={
+                             "top_left": "Top-left, where video players put a clock — the "
+                                         "default; clear of the bottom-right scale bar.",
+                             "top_right": "Top-right — when the top-left corner holds the "
+                                          "troubleshooting locator map or a structure you "
+                                          "are showing.",
+                             "bottom_left": "Bottom-left — beside, not over, a scale bar "
+                                            "in the bottom-right corner, along the same "
+                                            "bottom edge.",
+                             "bottom_right": "Bottom-right — shares the corner with a "
+                                             "scale bar there, so the text moves up a line "
+                                             "to keep clear of the bar.",
+                         },
+                         description=
+                         "Which corner of the VISIBLE image the timestamp sits in; it "
+                         "follows the corner under zoom and pan. Only drawn while "
+                         "`Timestamp` is on."),
+                InString("timestamp_color", "Timestamp colour", field=False, default="white",
+                         presentation=True,
+                         choices=["white", "black", "yellow", "cyan"],
+                         choice_docs={
+                             "white": "White with a dark shadow — reads on a dark "
+                                      "fluorescence field, the default.",
+                             "black": "Black — for a light-background (brightfield, phase) "
+                                      "image where white would vanish.",
+                             "yellow": "Yellow — high contrast on both a dark field and a "
+                                       "green or red channel.",
+                             "cyan": "Cyan — high contrast over a red or magenta channel, "
+                                     "where white and yellow both blend into the signal.",
+                         },
+                         description=
+                         "The timestamp's text colour; it also carries a translucent dark "
+                         "shadow so white survives a bright field. Only drawn while "
+                         "`Timestamp` is on."),
             ],
             outputs=[],
             modes=[

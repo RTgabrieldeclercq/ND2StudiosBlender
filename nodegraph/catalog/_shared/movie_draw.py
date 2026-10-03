@@ -89,17 +89,10 @@ def _time_text(index: int, interval_s: float, total: int) -> str:
     the honest reading of what the envelope carries — `dt_s` is a scalar — and it is why the
     socket is overridable.
     """
+    from nodegraph.placement import elapsed_text
     t = float(interval_s) * int(index)
     span = float(interval_s) * max(0, int(total) - 1)
-    if span < 90.0:
-        return f"{t:.1f} s"
-    if span < 5400.0:                                  # under 90 min -> mm:ss
-        return f"{int(t) // 60:02d}:{int(round(t)) % 60:02d}"
-    if span < 86400.0:                                 # under a day -> hh:mm:ss
-        s = int(round(t))
-        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-    s = int(round(t))                                  # multi-day -> Nd hh:mm:ss
-    return f"{s // 86400}d {(s % 86400) // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+    return elapsed_text(t, span)       # one formatter, shared with the Viewer's timestamp
 
 
 def _scalebar(width_px: int, pixel_size_um: Optional[float],

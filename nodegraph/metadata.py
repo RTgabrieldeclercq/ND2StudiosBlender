@@ -439,11 +439,13 @@ def stamp_source_file(env: "MetaEnvelope", path: str) -> "MetaEnvelope":
 #: list silently pairs frame 0 of one acquisition against frame 0 of the other's ORIGINAL
 #: numbering, and channel.merge then reads two different moments as one.
 #:
-#: One member today. ``frame_timestamps_s`` is deliberately absent: it never reaches a
-#: Dataset (:data:`nodelab_v2.ingest.PLACEMENT_KEYS` does not carry it), and ``dt_s`` is a
-#: scalar INTERVAL rather than a per-T list, so a subset re-spaces it instead of reindexing
-#: it (see :func:`respaced`).
-PER_TIME_KEYS: Tuple[str, ...] = ("frame_time_jd",)
+#: Two members: the clock in Julian days and its readable twin ``frame_datetime``
+#: (``YYYY-MM-DD HH:MM:SS.mmm``, 2026-10-02), which must reindex together or a frame would
+#: show one time and pair by another. ``frame_timestamps_s`` is deliberately absent: it
+#: never reaches a Dataset (:data:`nodelab_v2.ingest.PLACEMENT_KEYS` does not carry it),
+#: and ``dt_s`` is a scalar INTERVAL rather than a per-T list, so a subset re-spaces it
+#: instead of reindexing it (see :func:`respaced`).
+PER_TIME_KEYS: Tuple[str, ...] = ("frame_time_jd", "frame_datetime")
 
 
 def time_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
@@ -1350,11 +1352,36 @@ class ChainMember:
         return self.count if axis == "m" else max(1, int(getattr(self.input_axes, axis)))
 
 
+#: ``util.timeseries``'s ``chain_order`` values. ``time`` (the default since 2026-10-02)
+#: sorts the files by their first frame's absolute clock; ``sequence`` by the counting
+#: field in their names; ``loaded`` keeps the wiring order.
+CHAIN_ORDERS: Tuple[str, ...] = ("time", "sequence", "loaded")
+
+
+def chain_member_clock(mm: "ChainMember") -> Optional[float]:
+    """The Julian day of a member's FIRST frame, or ``None`` when its input carries no
+    per-T clock. A member of a bundle shares its input's list, which describes the
+    bundle's first file only, so a bundle's members all answer with the same instant —
+    they then keep their name order among themselves (the sort is stable) while the
+    bundle as a block is placed by that instant."""
+    jd = mm.metadata.get("frame_time_jd")
+    if not isinstance(jd, (list, tuple)) or not jd:
+        return None
+    try:
+        v = float(jd[0])
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
 def chain_members(inputs: Sequence[Tuple[Mapping[str, Any], AxisSizes]], axis: str, *,
-                  sequence_order: bool = True
+                  sequence_order: bool = True, order: Optional[str] = None
                   ) -> Tuple[List[ChainMember], int, Optional[str]]:
-    """``util.chain``'s file members, in OUTPUT order — shared by the compute and
+    """``util.timeseries``'s file members, in OUTPUT order — shared by the compute and
     :func:`chain_grow` so the card and the pull cannot disagree about the result.
+
+    ``order`` is one of :data:`CHAIN_ORDERS`; the older ``sequence_order`` flag maps onto
+    ``"sequence"`` / ``"loaded"`` and is kept for callers that predate ``time``.
 
     ``inputs`` is ``(metadata, axes)`` per wired Dataset, in wiring order. Each input is
     split into its files by :func:`source_file_runs`; an input carrying no usable
@@ -1375,14 +1402,20 @@ def chain_members(inputs: Sequence[Tuple[Mapping[str, Any], AxisSizes]], axis: s
     same number of POSITIONS, since the result has one position axis and a file with more
     has nowhere to put them.
 
-    **Ordering.** With ``sequence_order`` the members are sorted by the counting field in
-    their names (:func:`nodegraph.file_sequence.order`), but only when EVERY member has a
-    name: a half-named list has no coherent order, and sorting it would put the named files
-    in sequence and the rest wherever they fell, which reads as working. Otherwise the
-    order is the wiring order — inputs in socket order, each input's own files in bundle
-    order — which is the only information that exists in that case.
+    **Ordering.** ``time`` sorts the members by their first frame's absolute clock
+    (:func:`chain_member_clock`), but only when EVERY member has one — a half-clocked set
+    has no coherent order — and falls back to ``sequence`` otherwise; ties (the members of
+    one bundle, which share a clock) keep their relative order. ``sequence`` sorts by the
+    counting field in the names (:func:`nodegraph.file_sequence.order`), again only when
+    EVERY member has a name: a half-named list sorted would put the named files in sequence
+    and the rest wherever they fell, which reads as working. Otherwise the order is the
+    wiring order — inputs in socket order, each input's own files in bundle order — which
+    is the only information that exists in that case. :func:`chain_order_used` names the
+    rule that actually applied.
     """
     axis = str(axis).lower()
+    if order is None:
+        order = "sequence" if sequence_order else "loaded"
     members: List[ChainMember] = []
     for i, (md, ax) in enumerate(inputs):
         runs = source_file_runs(md, int(ax.m)) or [("", 0, int(ax.m))]
@@ -1425,9 +1458,27 @@ def chain_members(inputs: Sequence[Tuple[Mapping[str, Any], AxisSizes]], axis: s
             f"(Files may differ freely on {axis.upper()} itself — that is what is being "
             f"chained.)")
     n = counts[0] if axis != "m" else 0
-    if sequence_order and all(mm.name for mm in members):
+    used = chain_order_used(members, order)
+    if used == "time":
+        clocks = [chain_member_clock(mm) for mm in members]
+        members = [members[j] for j in sorted(range(len(members)),
+                                              key=lambda j: (clocks[j], j))]
+    elif used == "sequence":
         members = [members[j] for j in _seq_order([mm.name for mm in members])]
     return members, n, None
+
+
+def chain_order_used(members: Sequence["ChainMember"], order: str) -> str:
+    """Which ordering rule ``order`` resolves to on these members: ``time`` needs a clock
+    on every member, ``sequence`` a name on every member; each falls back to the next
+    (``time`` → ``sequence`` → ``wired``). ``wired`` is the stamped word for wiring order,
+    whether chosen (``loaded``) or fallen back to."""
+    if order == "time" and members and all(chain_member_clock(mm) is not None
+                                           for mm in members):
+        return "time"
+    if order in ("time", "sequence") and members and all(mm.name for mm in members):
+        return "sequence"
+    return "wired"
 
 
 #: How far one position's recorded LATERAL location may wander across chained files and
@@ -1688,7 +1739,7 @@ def chain_grow(env: MetaEnvelope, params: Mapping, modes: Mapping,
         return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({axis, "m"}))
     members, n, problem = chain_members(
         [(e.metadata, e.axes) for e in envs], axis,
-        sequence_order=str((modes or {}).get("chain_order", "sequence")) == "sequence")
+        order=str((modes or {}).get("chain_order", "time")))
     if problem is not None:
         return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({axis, "m"}))
     if len(members) < 2:
