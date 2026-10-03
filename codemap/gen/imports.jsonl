@@ -1029,6 +1029,7 @@
 {"dst":"nodegraph.hotreload","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.iterate","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
@@ -1238,6 +1239,7 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.palette","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.readiness","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.runner","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.scene","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.sequence_dialog","k":"imp","lazy":true,"src":"nodelab_v2.window"}

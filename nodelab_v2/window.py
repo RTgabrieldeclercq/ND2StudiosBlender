@@ -45,7 +45,8 @@ from nodelab_v2.minimap import MiniMapOverlay
 from nodelab_v2.node_item import NodeItem
 from nodelab_v2.ops import MOVIE_OP, CALIB_OVERRIDE_KEYS, DOCK_OP, LOAD_OP, PRECISION_UNSET
 from nodelab_v2.palette import PalettePanel
-from nodelab_v2.picker import Calibration
+from nodelab_v2.picker import Calibration, request_for
+from nodelab_v2 import readiness as RD
 from nodelab_v2.runner import EngineRunner, ensure_gui_ops
 from nodelab_v2.scene import GraphScene, GraphView
 from nodelab_v2.spreadsheet import SpreadsheetPanel
@@ -545,6 +546,12 @@ class MainWindow(QMainWindow):
         self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
         self.inspector.add_requested.connect(self._on_add_requested)
+        # the panel-hosted drawing (2026-10-02): Draw Regions' controls live in its panel
+        self._pick_return: Optional[str] = None      # node to go back to after Apply/Cancel
+        self._draw_arm_pending: Optional[str] = None  # arm once this node's pull lands
+        self.inspector.draw_control.connect(self._on_draw_control)
+        self.inspector.region_requested.connect(self._on_region_requested)
+        self.viewer.pick_readout_changed.connect(self._on_pick_readout)
         self.runner.baked.connect(self._on_baked)
         self.viewer.pick_committed.connect(self._on_pick_committed)
         self.viewer.pick_armed.connect(self._on_pick_armed)
@@ -1084,6 +1091,18 @@ class MainWindow(QMainWindow):
         or a Crop upstream changes what one pixel is worth, and a radius picked on the image
         has to be expressed in the microns *this* node will convert back to pixels. That is
         precisely what ``propagate_meta`` already tracks, so the pick inherits it for free."""
+        if req.kind == "shapes" and not req.tools_in_panel:
+            # A drawn region is never configured on the image (2026-10-02). From a node that
+            # WANTS a region, go and draw it on a Draw Regions node in line; from a node
+            # that IS the drawing, arm it with its controls in the panel. Either way the
+            # card's ◎ glyph and the panel's button take the same route.
+            rec = self.doc.nodes.get(req.node_id)
+            alt = RD.EMPTY_PICKS.get((rec.op_key, req.socket)) if rec is not None else None
+            if alt and alt[0]:
+                self._on_region_requested(req.node_id, req.socket)
+            else:
+                self._arm_draw(req.node_id)
+            return
         if req.surface != "instant" and not self.viewer.has_image():
             self.statusBar().showMessage(
                 "Pull a node first — picking aims at the image, and there is nothing "
@@ -1111,6 +1130,136 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Picking — Esc cancels, Enter applies")
         else:
             self.statusBar().clearMessage()
+            self.inspector.set_draw_state(None, False)
+            if self._pick_return is not None:
+                # after the commit that may follow this signal (Enter → disarm → commit),
+                # hence deferred: the node we go back to must see the new shapes
+                QTimer.singleShot(0, self._return_from_draw)
+
+    def _on_pick_readout(self, text: str) -> None:
+        nid = self.viewer.pick_node_id()
+        if nid is not None:
+            self.inspector.set_draw_state(nid, True, text)
+
+    # ── drawing in the node's panel (2026-10-02) ──────────────────────────────
+    def _draw_shapes_socket(self, node_id: str):
+        rec = self.doc.nodes.get(node_id)
+        spec = rec.spec() if rec is not None else None
+        if spec is None:
+            return None
+        for s in self.doc.input_specs(node_id):
+            if getattr(s, "pick_kind", "") == "shapes":
+                alt = RD.EMPTY_PICKS.get((spec.op_key, s.name))
+                if not (alt and alt[0]):
+                    return s
+        return None
+
+    def _arm_draw(self, node_id: str) -> None:
+        """Arm the drawing for ``node_id`` (a node that IS a drawing). The viewer must show
+        THAT node's image so the shapes land in its frame: if it already does, arm at once;
+        otherwise pull it and arm when the result lands (:meth:`_on_run_finished`)."""
+        if self._draw_shapes_socket(node_id) is None:
+            return
+        if self.viewer.has_image() and getattr(self.viewer, "_node_id", None) == node_id:
+            self._arm_draw_now(node_id)
+            return
+        self._draw_arm_pending = node_id
+        self.pull_node(node_id)
+
+    def _arm_draw_now(self, node_id: str) -> None:
+        s = self._draw_shapes_socket(node_id)
+        if s is None or not self.viewer.has_image():
+            return
+        from dataclasses import replace as _dc_replace
+        req = _dc_replace(request_for(node_id, s), tools_in_panel=True)
+        md = {}
+        try:
+            md = dict(self.doc.env(node_id).metadata or {})
+        except Exception:                     # noqa: BLE001 — an un-propagated node
+            md = {}
+        self._open_viewer()
+        self.viewer.arm_pick(req, Calibration.from_metadata(md))
+        self._sync_draw_session(node_id)
+        self.inspector.set_draw_state(node_id, True, self.viewer._pick.readout()
+                                      if self.viewer._pick is not None else "")
+
+    def _sync_draw_session(self, node_id: str) -> None:
+        """Push the node's tool / operation / brush settings into the armed gesture."""
+        if self.viewer.pick_node_id() != node_id:
+            return
+        rec = self.doc.nodes.get(node_id)
+        spec = rec.spec() if rec is not None else None
+        if spec is None:
+            return
+
+        def val(name, default):
+            v = rec.params.get(name)
+            if v in (None, ""):
+                s = spec.input(name)
+                v = s.default if s is not None else default
+            return v
+        self.viewer.set_pick_tool(str(val("tool", "rect")))
+        self.viewer.set_pick_op(str(val("op", "add")))
+        try:
+            self.viewer.set_pick_brush(float(val("brush_px", 8.0)))
+        except (TypeError, ValueError):
+            pass
+
+    def _on_draw_control(self, node_id: str, what: str, _value) -> None:
+        if what == "arm":
+            self._arm_draw(node_id)
+        elif what == "sync":
+            self._sync_draw_session(node_id)
+        elif self.viewer.pick_node_id() != node_id:
+            return
+        elif what == "apply":
+            self.viewer.apply_pick()
+        elif what == "cancel":
+            self.viewer.cancel_pick()
+        elif what in ("undo", "clear", "close", "invert"):
+            self.viewer.pick_action(what)
+
+    def _on_region_requested(self, node_id: str, socket: str) -> None:
+        """A node that WANTS a region (Subtract Background's `Background sample`): drop a
+        Draw Regions node in line on its region input — or use the one already wired
+        there — switch to it, arm its drawing, and remember where to come back to."""
+        rec = self.doc.nodes.get(node_id)
+        spec = rec.spec() if rec is not None else None
+        alt = RD.EMPTY_PICKS.get((spec.op_key, socket)) if spec is not None else None
+        if not (alt and alt[0]):
+            return
+        alt_in, alt_op, _need = alt
+        feeders = [e for e in self.doc.edges if e[2] == node_id and e[3] == alt_in]
+        target = None
+        for e in feeders:
+            src = self.doc.nodes.get(e[0])
+            if src is not None and src.op_key == alt_op:
+                target = e[0]
+                break
+        if target is None:
+            target = self._on_add_requested(node_id, alt_op, alt_in)
+        if target is None:
+            return
+        self._pick_return = node_id
+        self._select_only(target)
+        self._arm_draw(target)
+        self.statusBar().showMessage(
+            f"drawing regions on {target} — Apply there brings you back to {node_id}")
+
+    def _return_from_draw(self) -> None:
+        back, self._pick_return = self._pick_return, None
+        if back is None or back not in self.doc.nodes:
+            return
+        self._select_only(back)
+        self.pull_node(back)
+
+    def _select_only(self, node_id: str) -> None:
+        item = self.scene.node_items.get(node_id)
+        if item is None:
+            return
+        self.scene.clearSelection()
+        item.setSelected(True)
+        self.inspector.set_node(item)        # even when the selection signal is debounced
 
     def _sync_overlay_frames(self, pane, node_id: str) -> None:
         """Hand ``pane`` what each overlaid source is showing at its cursor, and how many
@@ -2865,6 +3014,10 @@ class MainWindow(QMainWindow):
                 self.movie_editor.on_fetched(node_id, full)
         if plane:
             self._open_viewer()       # there is something to see now — unfold the pane
+        if plane and self._draw_arm_pending == node_id:
+            # the Draw Regions node's own image is on screen now: arm its drawing on it
+            self._draw_arm_pending = None
+            QTimer.singleShot(0, lambda n=node_id: self._arm_draw_now(n))
         panes = self._panes_showing(node_id)
         for pane in panes:
             pane.show_result(node_id, plane, axes, seconds, dataset=payload,

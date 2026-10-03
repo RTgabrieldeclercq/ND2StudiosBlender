@@ -10,7 +10,7 @@ import numpy as np
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDataset
+from nodegraph.registry import Granularity, InDataset, InFloat, InString, Mode, OutDataset
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
@@ -195,6 +195,43 @@ register_node(
                  "so the list is scriptable and diffable. Each region shape becomes one "
                  "labelled region, numbered in draw order; a Cut shape carves out of the "
                  "regions before it. Empty draws nothing and the output layer is all zero."),
+        # ── the drawing tools, as node settings (presentation: outside the recipe hash,
+        # never read by the compute — the GUI reads them live and drives the gesture) ──
+        InString("tool", "Tool", field=False, default="rect", presentation=True,
+                 choices=["rect", "ellipse", "circle", "polygon", "brush"],
+                 choice_docs={
+                     "rect": "Rectangle — press one corner on the image and drag to the "
+                             "opposite corner; the region is the axis-aligned box.",
+                     "ellipse": "Ellipse — drag its bounding box; the region is the ellipse "
+                                "inscribed in that box (a circle if the box is square).",
+                     "circle": "Circle — press at the centre and drag outward; the radius is "
+                               "the drag distance, so the centre stays where you pressed.",
+                     "polygon": "Closed polygon — click each corner in turn and double-click "
+                                "(or press Enter) to close it; at least three corners.",
+                     "brush": "Freehand band — drag a path; the region is the path thickened "
+                              "to `Brush size` pixels, for an irregular patch of background.",
+                 },
+                 description=
+                 "Which shape the next drag on the image makes. A node setting rather than a "
+                 "toolbar on the viewer, so the whole drawing is configured here; it does "
+                 "not change the result (the shapes do) and is remembered with the node."),
+        InString("op", "Operation", field=False, default="add", presentation=True,
+                 choices=["add", "cut"],
+                 choice_docs={
+                     "add": "The next shape is a region of its own: it gets the next id and "
+                            "overwrites any earlier region where they overlap.",
+                     "cut": "The next shape is carved OUT of every region drawn before it — "
+                            "for excluding a cell that sits inside a background patch.",
+                 },
+                 description=
+                 "Whether the next shape adds a region or cuts a hole in the regions drawn so "
+                 "far. Presentation only: it configures the gesture, the shapes carry the "
+                 "result."),
+        InFloat("brush_px", "Brush size", unit="px", field=False, default=8.0,
+                presentation=True,
+                description=
+                "Width in pixels of the freehand band (the `brush` tool only). Read live while "
+                "drawing; changing it does not re-run anything."),
         InString("name", "Output layer", field=False, default="regions",
                  layer_out=(Domain.VOXEL, Domain.LABEL),
                  description=

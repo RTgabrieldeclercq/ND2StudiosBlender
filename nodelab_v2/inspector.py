@@ -54,6 +54,7 @@ from nodelab_v2.document import is_driver_edge as _is_driver
 from nodelab_v2.ops import DOCK_OP, MOVIE_OP, PRECISION_UNSET, bake_record
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 from nodelab_v2 import readiness as RD
+from nodegraph.registry import NODES
 
 _UNIT = {"um": "µm", "um_axial": "µm↕", "um2": "µm²", "um3": "µm³",
          "nm": "nm", "s": "s", "px": "px"}
@@ -292,12 +293,25 @@ class InspectorPanel(QScrollArea):
     #: of labour as the signals above: the panel asks, the window owns the document and
     #: the canvas, so it places the node, re-routes the wires and relays out the scene.
     add_requested = Signal(str, str, str)
+    #: a drawing control in a Draw Regions (or ROI Mask) panel: ``(node_id, what, value)``
+    #: with ``what`` one of ``arm`` / ``apply`` / ``cancel`` / ``undo`` / ``clear`` /
+    #: ``close`` / ``sync`` (the tool, operation or brush setting changed — re-read them).
+    #: The panel hosts the controls (2026-10-02: nothing about the drawing is configured on
+    #: the image); the window owns the viewer's gesture and relays.
+    draw_control = Signal(str, str, object)
+    #: a node that WANTS a region (Subtract Background's `Background sample`) asked for
+    #: one: ``(node_id, socket)``. The window drops a Draw Regions node in line on the
+    #: region input, switches to it, and comes back here when its drawing is applied.
+    region_requested = Signal(str, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWidgetResizable(True)
         self._problems: list = []          # readiness problems of the shown node
         self._problem_sockets: dict = {}   # socket name -> Problem (what is painted red)
+        self._draw_armed: Optional[str] = None   # node id whose drawing is armed, if any
+        self._draw_readout = ""
+        self._draw_widgets: dict = {}      # live widgets of the Draw section, if shown
         # wide enough for the richest param row (label + spinbox + unit + ƒ-auto button)
         # PLUS the vertical scrollbar, so the right edge (the ƒ-auto buttons) never clips.
         self.setFixedWidth(376)
@@ -566,6 +580,14 @@ class InspectorPanel(QScrollArea):
             for s in params:
                 sec._lay.addWidget(self._param_row(node, s))  # type: ignore[attr-defined]
             self._v.addWidget(sec)
+            self._v.addWidget(self._sep())
+
+        # the Draw section (2026-10-02) — for a node that IS a drawing (Draw Regions, ROI
+        # Mask): the gesture's controls live here, not on the viewer
+        self._draw_widgets = {}
+        shapes_sock = self._shapes_socket(node)
+        if shapes_sock is not None:
+            self._v.addWidget(self._draw_section(node, shapes_sock))
             self._v.addWidget(self._sep())
 
         # in-body modes (non-dim), mode-gated like the sockets above: a Mode the selected
@@ -1245,9 +1267,152 @@ class InspectorPanel(QScrollArea):
             outer.addWidget(self._vocab_box(node, s))
         elif s.type is SocketType.STRING and getattr(s, "pick_kind", "") == "channels":
             outer.addWidget(self._channel_box(node, s))
+        if getattr(s, "pick_kind", "") == "shapes":
+            # A drawn region is never configured on the image (2026-10-02). A node that
+            # WANTS a region gets a button that brings in a Draw Regions node; a node that
+            # IS the drawing (Draw Regions, ROI Mask) gets the Draw section below instead.
+            alt = RD.EMPTY_PICKS.get((node.op_key, s.name))
+            if alt and alt[0]:
+                outer.addWidget(self._region_button(node, s, alt))
+            return block
         if getattr(s, "pick_kind", "") and self._leads_pick(node, s):
             outer.addWidget(self._pick_button(node, s))
         return block
+
+    def _region_button(self, node: NodeItem, s, alt) -> QWidget:
+        """`Draw <socket>…` on a node that takes a region from another node: the window
+        drops a Draw Regions node in line on the region input (or finds the one already
+        there), switches to it, and switches back when its drawing is applied."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(78, 0, 0, 2)
+        lay.setSpacing(6)
+        btn = QToolButton()
+        btn.setProperty("role", "pick")
+        alt_in, alt_op, _need = alt
+        alt_spec = NODES.get(alt_op) if alt_op else None
+        alt_label = alt_spec.label if alt_spec is not None else alt_op
+        a = node.spec.input(alt_in) if node.spec is not None else None
+        in_label = (a.label or a.name) if a is not None else alt_in
+        btn.setText(f"{PICK_GLYPH}  Draw {s.label or s.name} on a {alt_label} node…")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(f"Adds a {alt_label} node wired into `{in_label}` (or opens the one "
+                       f"already wired there), fed from this node's own image, and switches "
+                       f"to it. Draw the region(s) there — tool, add/cut and Apply are in "
+                       f"its panel — and Apply brings you back here.")
+        btn.clicked.connect(
+            lambda _c, nid=node.node_id, sk=s.name: self.region_requested.emit(nid, sk))
+        lay.addWidget(btn)
+        lay.addStretch(1)
+        return row
+
+    # ── the Draw section (2026-10-02) ───────────────────────────────────────
+    def _shapes_socket(self, node: NodeItem):
+        """The node's active ``pick_kind="shapes"`` socket when the node IS the drawing
+        (no Dataset alternative in :data:`readiness.EMPTY_PICKS`), else ``None``."""
+        for s in node._active_inputs():
+            if getattr(s, "pick_kind", "") != "shapes":
+                continue
+            alt = RD.EMPTY_PICKS.get((node.op_key, s.name))
+            if alt and alt[0]:
+                return None
+            return s
+        return None
+
+    def _draw_section(self, node: NodeItem, s) -> QWidget:
+        """The drawing controls, in the node's panel: Draw (arm the gesture on the viewer),
+        then Undo / Clear / Close polygon, the live readout, and Apply / Cancel. The tool,
+        add/cut and brush size are the node's own presentation params in the Parameters
+        section above and are read live while the gesture is armed (``sync``). Nothing
+        about the drawing is configured on the image — the viewer only takes the mouse."""
+        sec = self._section("Draw")
+        lay = sec._lay  # type: ignore[attr-defined]
+        armed = self._draw_armed == node.node_id
+        w: dict = {}
+        hint = QLabel("Press Draw, then drag on the image. Each finished shape is pinned to "
+                      "the frame you are looking at. Apply writes the shapes to this node."
+                      if not armed else
+                      "Drawing on the image — drag to make a shape; Apply when done.")
+        hint.setProperty("role", "muted"); hint.setWordWrap(True)
+        hf = hint.font(); hf.setPointSize(9); hint.setFont(hf)
+        lay.addWidget(hint)
+        w["hint"] = hint
+        row = QHBoxLayout(); row.setSpacing(6)
+        nid = node.node_id
+
+        def button(text, what, tip, role="pick"):
+            b = QToolButton(); b.setText(text); b.setProperty("role", role)
+            b.setCursor(Qt.PointingHandCursor); b.setToolTip(tip)
+            b.clicked.connect(lambda _c, n=nid, k=what: self.draw_control.emit(n, k, None))
+            return b
+        if not armed:
+            draw = button(f"{PICK_GLYPH}  Draw", "arm",
+                          "Arm the drawing on the viewer: the next drags on the image make "
+                          "shapes with the Tool / Operation set above.")
+            row.addWidget(draw); w["draw"] = draw
+        else:
+            for text, what, tip in (
+                    ("Undo", "undo", "Drop the last shape (or the polygon in progress)"),
+                    ("Clear", "clear", "Start over: everything drawn so far is discarded"),
+                    ("Close polygon", "close", "Finish the polygon in progress")):
+                row.addWidget(button(text, what, tip, role=""))
+        row.addStretch(1)
+        lay.addLayout(row)
+        readout = QLabel(self._draw_readout if armed else self._shape_summary(node, s))
+        readout.setProperty("role", "muted"); readout.setWordWrap(True)
+        rf = readout.font(); rf.setPointSize(9); readout.setFont(rf)
+        lay.addWidget(readout); w["readout"] = readout
+        if armed:
+            row2 = QHBoxLayout(); row2.setSpacing(6)
+            row2.addWidget(button("✓  Apply", "apply",
+                                  "Write the drawn shapes into this node (Enter on the "
+                                  "viewer does the same) and go back to the node that asked "
+                                  "for them, if one did."))
+            row2.addWidget(button("Cancel", "cancel",
+                                  "Leave the node's shapes as they were (Esc).", role=""))
+            row2.addStretch(1)
+            lay.addLayout(row2)
+        self._draw_widgets = w
+        return sec
+
+    @staticmethod
+    def _shape_summary(node: NodeItem, s) -> str:
+        """What the node holds: "3 shapes on 2 frames" — read from the socket's JSON."""
+        import json as _json
+        raw = node.params.get(s.name, "")
+        try:
+            shapes = _json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or [])
+        except ValueError:
+            return "the shapes list is not valid JSON — Clear and redraw"
+        if not isinstance(shapes, list) or not shapes:
+            return "nothing drawn yet"
+        regions = [x for x in shapes if isinstance(x, dict)
+                   and x.get("type") in ("rect", "ellipse", "circle", "polygon", "brush")]
+        frames = {tuple(x["frame"]) for x in regions if isinstance(x.get("frame"), list)}
+        every = sum(1 for x in regions if "frame" not in x)
+        parts = [f"{len(regions)} shape{'s' if len(regions) != 1 else ''}"]
+        if frames:
+            parts.append(f"on {len(frames)} frame{'s' if len(frames) != 1 else ''}")
+        if every:
+            parts.append(f"{every} on every frame")
+        return " · ".join(parts)
+
+    def set_draw_state(self, node_id: Optional[str], armed: bool, readout: str = "") -> None:
+        """The window's word on the gesture: armed for ``node_id`` or not, plus the live
+        readout. Rebuilds the panel when the armed state flips (the Draw section's buttons
+        change), updates the readout in place otherwise."""
+        was = self._draw_armed
+        self._draw_armed = node_id if armed else None
+        self._draw_readout = readout
+        if was != self._draw_armed:
+            self._rebuild()
+            return
+        lab = self._draw_widgets.get("readout")
+        if lab is not None and armed:
+            try:
+                lab.setText(readout)
+            except RuntimeError:
+                pass
 
     @staticmethod
     def _driver_of(node: NodeItem, socket_name: str) -> Optional[str]:
@@ -1793,6 +1958,8 @@ class InspectorPanel(QScrollArea):
         rec.set_locked(rec.locked | {name})     # editing pins (sticky __locked__)
         node.doc.touch(node.node_id)
         # don't full-rebuild (keeps focus in the box); the card refreshes via sync
+        if name in ("tool", "op", "brush_px") and self._shapes_socket(node) is not None:
+            self.draw_control.emit(node.node_id, "sync", None)   # re-read while armed
 
     def _set_mode(self, node: NodeItem, name: str, value: str) -> None:
         node.rec.modes[name] = value            # modes are NOT params (serialize split)

@@ -70,7 +70,7 @@
     "categories": 12,
     "roles": 19,
     "stages": 5,
-    "inputs": 604,
+    "inputs": 607,
     "outputs": 98,
     "gui_ops_included": true
   },
@@ -1705,6 +1705,59 @@
           "default": "",
           "pick_kind": "shapes",
           "description": "The drawn regions. DRAW them on the viewer with the Pick button: rectangle, ellipse, circle, closed polygon (double-click to close) or freehand, with Add and Cut; each finished shape is stamped with the frame (m, t, z) you were looking at, so under `scope = drawn_frame` it appears on that frame only — step to another frame and draw its regions there. The shapes are stored as a JSON list in full-frame pixel coordinates (a region drawn inside a troubleshooting window is shifted back into the full frame), so the list is scriptable and diffable. Each region shape becomes one labelled region, numbered in draw order; a Cut shape carves out of the regions before it. Empty draws nothing and the output layer is all zero."
+        },
+        {
+          "name": "tool",
+          "label": "Tool",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "rect",
+          "choices": [
+            "rect",
+            "ellipse",
+            "circle",
+            "polygon",
+            "brush"
+          ],
+          "choice_docs": {
+            "brush": "Freehand band — drag a path; the region is the path thickened to `Brush size` pixels, for an irregular patch of background.",
+            "circle": "Circle — press at the centre and drag outward; the radius is the drag distance, so the centre stays where you pressed.",
+            "ellipse": "Ellipse — drag its bounding box; the region is the ellipse inscribed in that box (a circle if the box is square).",
+            "polygon": "Closed polygon — click each corner in turn and double-click (or press Enter) to close it; at least three corners.",
+            "rect": "Rectangle — press one corner on the image and drag to the opposite corner; the region is the axis-aligned box."
+          },
+          "presentation": true,
+          "description": "Which shape the next drag on the image makes. A node setting rather than a toolbar on the viewer, so the whole drawing is configured here; it does not change the result (the shapes do) and is remembered with the node."
+        },
+        {
+          "name": "op",
+          "label": "Operation",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "add",
+          "choices": [
+            "add",
+            "cut"
+          ],
+          "choice_docs": {
+            "add": "The next shape is a region of its own: it gets the next id and overwrites any earlier region where they overlap.",
+            "cut": "The next shape is carved OUT of every region drawn before it — for excluding a cell that sits inside a background patch."
+          },
+          "presentation": true,
+          "description": "Whether the next shape adds a region or cuts a hole in the regions drawn so far. Presentation only: it configures the gesture, the shapes carry the result."
+        },
+        {
+          "name": "brush_px",
+          "label": "Brush size",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 8.0,
+          "presentation": true,
+          "description": "Width in pixels of the freehand band (the `brush` tool only). Read live while drawing; changing it does not re-run anything."
         },
         {
           "name": "name",

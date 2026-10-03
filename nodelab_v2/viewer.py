@@ -962,6 +962,9 @@ class ViewerPanel(QWidget):
     #: a pick was armed (True) / disarmed (False) — keeps the inspector's Pick buttons in
     #: the right state and lets the status bar say what is going on.
     pick_armed = Signal(bool)
+    #: the armed pick's live readout ("2 shapes · rect", …) — for a panel that hosts the
+    #: drawing controls instead of the viewer's bar (2026-10-02)
+    pick_readout_changed = Signal(str)
     #: the live surface reported what it can hold, in px of one texture axis. Forwarded to the
     #: runner, which decides full-resolution-whole vs pyramid-plus-patch from it.
     display_limits = Signal(int)
@@ -3630,11 +3633,17 @@ class ViewerPanel(QWidget):
         self._pick = PickSession(req, calib or Calibration())
         self._pick_bar.configure(req)
         self._pick_bar.set_readout(self._pick.readout())
-        self._pick_bar.show()
+        if req.tools_in_panel:
+            # the controls live in the node's panel (Draw Regions): the image takes the
+            # mouse and shows the live shape, and nothing else
+            self._pick_bar.hide()
+        else:
+            self._pick_bar.show()
         if req.surface == "canvas":
             self._install_pick_filter(True)
         self.setFocus(Qt.OtherFocusReason)    # so Esc / Enter reach keyPressEvent
         self.pick_armed.emit(True)
+        self.pick_readout_changed.emit(self._pick.readout())
         self._refresh_surface()
 
     def cancel_pick(self, *, quiet: bool = False) -> None:
@@ -3742,8 +3751,44 @@ class ViewerPanel(QWidget):
 
     def _sync_pick_readout(self) -> None:
         if self._pick is not None:
-            self._pick_bar.set_readout(self._pick.readout())
+            text = self._pick.readout()
+            self._pick_bar.set_readout(text)
+            self.pick_readout_changed.emit(text)
         self._refresh_surface()
+
+    # ── the panel-hosted drawing controls (2026-10-02) ─────────────────────────
+    # Draw Regions keeps its tool, add/cut, brush size, Undo, Clear and Apply in the node's
+    # own panel; the window relays them here. Thin public wrappers over the same setters
+    # the (now hidden) bar used, so the two routes cannot drift.
+    def set_pick_tool(self, tool: str) -> None:
+        self._set_pick_tool(str(tool))
+
+    def set_pick_op(self, op: str) -> None:
+        self._set_pick_op(str(op))
+
+    def set_pick_brush(self, px: float) -> None:
+        if self._pick is not None:
+            self._pick.brush_px = max(1.0, float(px))
+
+    def pick_action(self, what: str) -> None:
+        """``undo`` / ``clear`` / ``invert`` / ``close`` (finish the polygon in progress)."""
+        if self._pick is None:
+            return
+        if what == "close":
+            self._pick.close_polygon()
+            self._sync_pick_readout()
+            return
+        self._pick_action(what)
+
+    def apply_pick(self) -> None:
+        self._apply_pick()
+
+    def pick_node_id(self) -> Optional[str]:
+        """The node the armed pick writes to, or ``None``."""
+        return self._pick.req.node_id if self._pick is not None else None
+
+    def pick_shape_count(self) -> int:
+        return len(self._pick.shapes) if self._pick is not None else 0
 
     def _refresh_surface(self) -> None:
         ref = getattr(self._view, "refresh", None)

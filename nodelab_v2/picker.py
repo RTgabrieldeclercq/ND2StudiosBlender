@@ -225,6 +225,10 @@ class PickRequest:
     #: what is viewed is not a canvas: on a canvas that runs toward stage −x / −y a screen
     #: delta runs against stage µm, so the nudge must reverse it. Filled by the window.
     mirror: Optional[Tuple[bool, bool]] = None
+    #: True when the gesture's controls (tool, add/cut, undo, apply) live in the node's
+    #: panel instead of on the viewer (2026-10-02, Draw Regions): the viewer then takes the
+    #: mouse but shows no bar — nothing about the drawing is configured on the image.
+    tools_in_panel: bool = False
 
     @property
     def surface(self) -> str:

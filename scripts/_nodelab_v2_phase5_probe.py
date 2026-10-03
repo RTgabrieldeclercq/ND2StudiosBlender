@@ -5447,6 +5447,77 @@ def main(argv) -> int:
         "`regions`; a missing Label offers Connected Components first and inserts it on the "
         "wire; an unwired node reports that alone; a satisfied node shows the green tick")
 
+    # ── RD2: drawing lives in the NODE'S PANEL, and a node that wants a region goes and
+    # draws it on a Draw Regions node in line, then comes back (2026-10-02) ───────────
+    from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF
+    from PySide6.QtGui import QMouseEvent as _QME
+    from nodelab_v2.node_item import NodeItem as _NodeItem
+    _rdoc.add_node("io.load", node_id="RD2L", x=0, y=1300)
+    _rdoc.add_node("enhance.subtract_background", node_id="RD2B", x=400, y=1300,
+                   modes={"approach": "zero_regions"})
+    _rdoc.connect("RD2L", "image", "RD2B", "data")
+    win.scene.sync(); app.processEvents()
+    win.viewer.cancel_pick()
+    win._select_only("RD2B"); app.processEvents()
+    _pk = [b for b in win.inspector.findChildren(_QTB) if b.property("role") == "pick"]
+    assert len(_pk) == 1 and "Draw Regions node" in _pk[0].text(), [b.text() for b in _pk]
+    _before = set(_rdoc.nodes)
+    _pk[0].click()                               # → add Draw Regions in line, select, pull, arm
+    _await_pull(); app.processEvents(); time.sleep(0.05); app.processEvents()
+    _dr = [nid for nid in _rdoc.nodes if nid not in _before]
+    assert len(_dr) == 1 and _rdoc.nodes[_dr[0]].op_key == "analysis.draw_regions", _dr
+    assert ("RD2L", "image", _dr[0], "data") in _rdoc.edges and \
+        (_dr[0], "out", "RD2B", "regions") in _rdoc.edges, "in line on the region input"
+    _sel = [i.node_id for i in win.scene.selectedItems() if isinstance(i, _NodeItem)]
+    assert _sel == [_dr[0]] and win.inspector._node.node_id == _dr[0], (_sel, "switched to it")
+    assert win.viewer.picking() and win.viewer.pick_node_id() == _dr[0], "armed on the draw node"
+    assert not win.viewer._pick_bar.isVisible(), "NO drawing controls on the image"
+    assert win._pick_return == "RD2B"
+    _texts = {b.text() for b in win.inspector.findChildren(_QTB)}
+    assert {"Undo", "Clear", "Close polygon", "✓  Apply", "Cancel"} <= _texts, _texts
+    # the node's own Tool / Operation params drive the gesture
+    _drn = win.inspector._node
+    win.inspector._set_param(_drn, "tool", "circle"); app.processEvents()
+    assert win.viewer._pick.tool == "circle", win.viewer._pick.tool
+    win.inspector._set_param(_drn, "op", "cut"); app.processEvents()
+    assert win.viewer._pick.op == "cut"
+    win.inspector._set_param(_drn, "tool", "rect"); win.inspector._set_param(_drn, "op", "add")
+    app.processEvents()
+    # a real drag on the image → one shape, and the PANEL's readout says so
+    _surf = win.viewer._pick_targets()[-1]
+    _ctr = _surf.rect().center()
+    for _t, _dx, _dy, _btn in ((_QEv.MouseButtonPress, -15, -10, Qt.LeftButton),
+                               (_QEv.MouseMove, 15, 12, Qt.LeftButton),
+                               (_QEv.MouseButtonRelease, 15, 12, Qt.LeftButton)):
+        _pt = _QPF(_ctr.x() + _dx, _ctr.y() + _dy)
+        app.sendEvent(_surf, _QME(_t, _pt, _pt, Qt.LeftButton, _btn, Qt.NoModifier))
+    app.processEvents()
+    assert win.viewer.pick_shape_count() == 1, win.viewer.pick_shape_count()
+    _ro = win.inspector._draw_widgets.get("readout")
+    assert _ro is not None and "1 shape" in _ro.text(), (_ro and _ro.text())
+    # Apply in the panel: shapes land on the draw node, stamped; we are back on RD2B
+    [b for b in win.inspector.findChildren(_QTB) if b.text() == "✓  Apply"][0].click()
+    app.processEvents(); _await_pull(); app.processEvents()
+    _shp = json.loads(_rdoc.nodes[_dr[0]].params["shapes"])
+    assert len(_shp) == 1 and _shp[0]["type"] == "rect" and "frame" in _shp[0], _shp
+    _sel = [i.node_id for i in win.scene.selectedItems() if isinstance(i, _NodeItem)]
+    assert _sel == ["RD2B"] and win.inspector._node.node_id == "RD2B", _sel
+    assert not win.viewer.picking() and win._pick_return is None
+    assert not any(l.text().startswith("⚠  ") for l in win.inspector.findChildren(_QL)), \
+        "with regions wired and drawn, Subtract Background is ready"
+    # on the draw node itself: its panel summarises what it holds, and Draw re-arms there
+    win._select_only(_dr[0]); app.processEvents()
+    _ro = win.inspector._draw_widgets.get("readout")
+    assert _ro is not None and "1 shape" in _ro.text() and "1 frame" in _ro.text(), _ro.text()
+    for nid in ("RD2B", _dr[0], "RD2L"):
+        _rdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("RD2 draw in the panel: Subtract Background's region button drops a Draw Regions "
+        "node in line on `regions`, switches to it and arms its drawing with NO bar on the "
+        "image; Tool/Operation params drive the gesture; a real drag makes a shape the panel "
+        "readout counts; Apply in the panel writes stamped shapes and returns to Subtract "
+        "Background, now ready")
+
     _probe_movie_editor(win, app)
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
