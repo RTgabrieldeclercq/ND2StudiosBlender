@@ -1402,6 +1402,12 @@ class MainWindow(QMainWindow):
             item.changed.emit(item)
         what = ", ".join(f"{k} = {v}" for k, v in values.items())
         self.statusBar().showMessage(f"{node_id}: {what}")
+        if any(getattr(rec.spec().input(k), "pick_kind", "") == "shapes"
+               for k in values if rec.spec() is not None and rec.spec().input(k) is not None):
+            # A drawing was applied: run the node so the regions it now defines are on
+            # screen (2026-10-02). Without this the shapes landed in the param and nothing
+            # visible changed, which read as "the drawing node does not work".
+            self.pull_node(node_id)
 
     def _add_at_center(self, op_key: str) -> None:
         c = self.view.mapToScene(self.view.viewport().rect().center())

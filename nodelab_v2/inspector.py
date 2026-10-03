@@ -56,6 +56,10 @@ from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 from nodelab_v2 import readiness as RD
 from nodegraph.registry import NODES
 
+#: a drawing node's tool settings (presentation params), edited inside its Draw section
+#: in workflow order rather than in the general Parameters list
+_DRAW_TOOL_PARAMS = ("tool", "op", "brush_px")
+
 _UNIT = {"um": "µm", "um_axial": "µm↕", "um2": "µm²", "um3": "µm³",
          "nm": "nm", "s": "s", "px": "px"}
 
@@ -557,6 +561,10 @@ class InspectorPanel(QScrollArea):
 
         # parameters
         params = [s for s in node._active_inputs() if s.type is not SocketType.DATASET]
+        # a drawing node's tool settings belong to its Draw section (the workflow: Draw,
+        # pick a shape, add or cut, Apply), not to the general parameter list
+        if self._shapes_socket(node) is not None:
+            params = [s for s in params if s.name not in _DRAW_TOOL_PARAMS]
         if params:
             sec = self._section("Parameters", str(len(params)))
             # What the LOADED MODEL says, at the top of the params it speaks for (V2.23b).
@@ -1320,19 +1328,23 @@ class InspectorPanel(QScrollArea):
         return None
 
     def _draw_section(self, node: NodeItem, s) -> QWidget:
-        """The drawing controls, in the node's panel: Draw (arm the gesture on the viewer),
-        then Undo / Clear / Close polygon, the live readout, and Apply / Cancel. The tool,
-        add/cut and brush size are the node's own presentation params in the Parameters
-        section above and are read live while the gesture is armed (``sync``). Nothing
-        about the drawing is configured on the image — the viewer only takes the mouse."""
-        sec = self._section("Draw")
+        """The drawing WORKFLOW, top to bottom in the node's panel: **Draw regions** (arm
+        the gesture on the viewer), then the shape to draw, add or cut, the brush size,
+        then Undo / Clear / Close polygon with the live readout, then **Apply** / Cancel.
+        The tool settings are the node's own presentation params, edited here (not in the
+        Parameters list) and pushed into the armed gesture as they change (``sync``).
+        Nothing about the drawing is configured on the image — the viewer only takes the
+        mouse and shows the live shape."""
+        sec = self._section("Draw regions")
         lay = sec._lay  # type: ignore[attr-defined]
         armed = self._draw_armed == node.node_id
         w: dict = {}
-        hint = QLabel("Press Draw, then drag on the image. Each finished shape is pinned to "
-                      "the frame you are looking at. Apply writes the shapes to this node."
+        hint = QLabel("1. Press Draw regions.  2. Pick a shape, Add or Cut.  3. Drag on the "
+                      "image — each finished shape is pinned to the frame you are looking "
+                      "at.  4. Apply writes the regions into this node's data."
                       if not armed else
-                      "Drawing on the image — drag to make a shape; Apply when done.")
+                      "Drawing on the image — pick a shape and Add/Cut below, drag to make "
+                      "it; Apply when done.")
         hint.setProperty("role", "muted"); hint.setWordWrap(True)
         hf = hint.font(); hf.setPointSize(9); hint.setFont(hf)
         lay.addWidget(hint)
@@ -1346,18 +1358,26 @@ class InspectorPanel(QScrollArea):
             b.clicked.connect(lambda _c, n=nid, k=what: self.draw_control.emit(n, k, None))
             return b
         if not armed:
-            draw = button(f"{PICK_GLYPH}  Draw", "arm",
+            draw = button(f"{PICK_GLYPH}  Draw regions", "arm",
                           "Arm the drawing on the viewer: the next drags on the image make "
-                          "shapes with the Tool / Operation set above.")
+                          "shapes with the shape / Add-Cut settings below.")
             row.addWidget(draw); w["draw"] = draw
-        else:
+            row.addStretch(1)
+            lay.addLayout(row)
+        # the tool settings, in the order they are used: what to draw, add or cut, how wide
+        spec = node.spec
+        for name in _DRAW_TOOL_PARAMS:
+            ps = spec.input(name) if spec is not None else None
+            if ps is not None and ps in node._active_inputs():
+                lay.addWidget(self._param_row(node, ps))
+        if armed:
             for text, what, tip in (
                     ("Undo", "undo", "Drop the last shape (or the polygon in progress)"),
                     ("Clear", "clear", "Start over: everything drawn so far is discarded"),
                     ("Close polygon", "close", "Finish the polygon in progress")):
                 row.addWidget(button(text, what, tip, role=""))
-        row.addStretch(1)
-        lay.addLayout(row)
+            row.addStretch(1)
+            lay.addLayout(row)
         readout = QLabel(self._draw_readout if armed else self._shape_summary(node, s))
         readout.setProperty("role", "muted"); readout.setWordWrap(True)
         rf = readout.font(); rf.setPointSize(9); readout.setFont(rf)
@@ -1958,7 +1978,7 @@ class InspectorPanel(QScrollArea):
         rec.set_locked(rec.locked | {name})     # editing pins (sticky __locked__)
         node.doc.touch(node.node_id)
         # don't full-rebuild (keeps focus in the box); the card refreshes via sync
-        if name in ("tool", "op", "brush_px") and self._shapes_socket(node) is not None:
+        if name in _DRAW_TOOL_PARAMS and self._shapes_socket(node) is not None:
             self.draw_control.emit(node.node_id, "sync", None)   # re-read while armed
 
     def _set_mode(self, node: NodeItem, name: str, value: str) -> None:

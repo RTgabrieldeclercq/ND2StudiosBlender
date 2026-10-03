@@ -53,7 +53,11 @@ def _compute_roi_mask(ctx: EvalContext) -> Dataset:
     if prov is None:
         raise ValueError("ROI mask needs an image provider on its input Dataset")
     ax = prov.axes
+    from nodegraph.catalog._shared.regions import shapes_in_frame
     shapes = _roi_shapes(ctx.params.get("shapes"))    # list of shape dicts, or None
+    if shapes is not None:
+        # full-frame pixels → the window this compute may be running on (2026-10-02)
+        shapes = shapes_in_frame(shapes, ds.metadata)
     if has_region(shapes):
         m2d = np.asarray(build_roi_mask(shapes, ax.y, ax.x), dtype=np.int64)
     else:

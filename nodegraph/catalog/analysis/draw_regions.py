@@ -122,7 +122,10 @@ def _compute_draw_regions(ctx: EvalContext) -> Dataset:
     if prov is None:
         raise ValueError("draw regions needs an image provider on its input Dataset")
     ax = prov.axes
-    shapes = _parse_shapes(ctx.params.get("shapes"))
+    from nodegraph.catalog._shared.regions import shapes_in_frame
+    # the shapes are stored in FULL-FRAME pixels; under a troubleshooting window this
+    # compute runs on the window, so move them into it first (regions.py says why)
+    shapes = shapes_in_frame(_parse_shapes(ctx.params.get("shapes")), ds.metadata)
     modes = ctx.params.get("__modes__", {}) or {}
     scope = str(modes.get("scope") or "drawn_frame")
     if scope not in _SCOPES:

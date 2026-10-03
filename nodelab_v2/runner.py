@@ -846,6 +846,12 @@ def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEn
         out = out.with_axes(replace(out.axes, y=win_axes.y, x=win_axes.x))
         if moved:
             out = out.with_metadata(**moved)
+        # WHERE the window sits, in source pixels (2026-10-02): a drawn shape is stored in
+        # full-frame pixels, so the nodes that rasterize one (Draw Regions, ROI Mask,
+        # Subtract Background's sample) shift it by this before rasterizing onto the window
+        # — without it the shape landed (y0, x0) too far down and right, or off the frame.
+        from nodegraph.catalog._shared.regions import WINDOW_ORIGIN_KEY
+        out = out.with_metadata(**{WINDOW_ORIGIN_KEY: [int(y0), int(x0)]})
     return view, out
 
 

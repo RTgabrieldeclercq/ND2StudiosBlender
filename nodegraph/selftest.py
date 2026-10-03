@@ -23576,6 +23576,50 @@ def test_draw_regions() -> None:
     graph("drawn_frame", shapes, sock_shapes=tiny).pull("B").image.get_region(
         0, 0, 0, 0, 0, 0, Y, 0, X)
 
+    # 3b. under a troubleshooting WINDOW (2026-10-02): the runner stamps where the window
+    # sits and every shapes consumer shifts the full-frame shapes into it — the bug was a
+    # rect drawn at source (248, 247) rasterizing at window (248, 247) of a 256² window,
+    # i.e. off its frame, instead of at (120, 119)
+    from nodegraph.catalog._shared.regions import WINDOW_ORIGIN_KEY, shapes_in_frame
+    moved = shapes_in_frame([{"type": "rect", "op": "add", "vertices": [[248, 247], [261, 263]]},
+                             {"type": "circle", "op": "add", "center": [200.0, 300.0],
+                              "radius": 4.0}], {WINDOW_ORIGIN_KEY: [128, 128]})
+    assert moved[0]["vertices"] == [[120.0, 119.0], [133.0, 135.0]], moved[0]
+    assert moved[1]["center"] == [72.0, 172.0], moved[1]
+    assert shapes_in_frame(moved, {})[0] is moved[0], "no window → the same dicts back"
+    win_ds = Dataset(axes=ax, metadata=dict(meta, **{WINDOW_ORIGIN_KEY: [10, 20]})
+                     ).with_image(ArrayProvider(arr))
+    g_w = Graph()
+    g_w.add(NodeInstance("S", "io.drseed"))
+    g_w.add(NodeInstance("R", "analysis.draw_regions", params={"shapes": _json.dumps(
+        [{"type": "rect", "op": "add", "vertices": [[12, 22], [20, 30]]}])},
+        modes={"scope": "all_frames"}))
+    g_w.add(NodeInstance("M", "analysis.roi_mask", params={"shapes": _json.dumps(
+        [{"type": "rect", "op": "add", "vertices": [[12, 22], [20, 30]]}])}))
+    g_w.connect("S", "R")
+    g_w.connect("S", "M")
+    e_w2 = Engine(g_w, computes=COMPUTES, seeds={"S": win_ds},
+                  meta_seeds={"S": MetaEnvelope(axes=ax, metadata=win_ds.metadata)})
+    lab_w = e_w2.pull("R").get(Domain.VOXEL, "regions").values[0, 0, 0, 0]
+    ys_w, xs_w = np.nonzero(lab_w)
+    assert (ys_w.min(), ys_w.max(), xs_w.min(), xs_w.max()) == (2, 10, 2, 10), \
+        (ys_w.min(), ys_w.max(), xs_w.min(), xs_w.max())
+    roi_w = e_w2.pull("M").get(Domain.VOXEL, "roi_mask").values[0, 0, 0, 0]
+    assert roi_w[5, 5] == 1 and roi_w[15, 25] == 0, "ROI Mask shifts into the window too"
+    # ...and Subtract Background's own socket drawing under a window: a patch stored at
+    # source (12..24, 22..36) on a window at origin (10, 20) samples window (2..14, 2..16)
+    g_sb = Graph()
+    g_sb.add(NodeInstance("S", "io.drseed"))
+    g_sb.add(NodeInstance("B", "enhance.subtract_background",
+                          params={"tolerance": 3.0, "shapes": _json.dumps(
+                              [{"type": "rect", "op": "add", "vertices": [[12, 22], [24, 36]]}])},
+                          modes={"approach": "zero_regions", "detector": "sampled_region"}))
+    g_sb.connect("S", "B")
+    got_w = Engine(g_sb, computes=COMPUTES, seeds={"S": win_ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=win_ds.metadata)}
+                   ).pull("B").image.get_region(0, 0, 0, 0, 0, 0, Y, 0, X)
+    assert float((got_w[empty] == 0.0).mean()) > 0.99, "the shifted sample still zeroes the field"
+
     # 4. refusals
     def refuses(fn, needle):
         try:

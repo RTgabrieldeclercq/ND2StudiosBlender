@@ -649,12 +649,15 @@ def _compute_zero_regions(ctx: EvalContext, ds: Dataset, modes) -> Dataset:
                     "everything that looks like them. With nothing drawn there is nothing to "
                     "compare against, so refusing is the only honest answer (the ROI Mask "
                     "node's whole-frame default would mean 'everything is background').")
+            from nodegraph.catalog._shared.regions import shapes_in_frame
+            shapes = shapes_in_frame(shapes, ds.metadata)   # into the window, if any
             region2d = np.asarray(build_roi_mask(shapes, ax.y, ax.x), dtype=bool)
             if int(region2d.sum()) < _MIN_SAMPLE:
                 raise ValueError(
                     f"subtract background (sampled region): the drawn region covers "
-                    f"{int(region2d.sum())} pixel(s); at least {_MIN_SAMPLE} are needed to "
-                    "estimate a spread. Draw a larger patch.")
+                    f"{int(region2d.sum())} pixel(s) of this frame; at least {_MIN_SAMPLE} "
+                    "are needed to estimate a spread. Draw a larger patch — or, under a "
+                    "troubleshooting window, one that lies inside the window.")
     else:
         node = "subtract background (adaptive)"
         degenerate = ("compares every pixel to itself, so the local cut equals the pixel and "
