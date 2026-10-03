@@ -51,6 +51,8 @@ MODULES: Tuple[str, ...] = (
     "util.zproject",
     "util.crop",
     "util.select_group",
+    "util.split_positions",
+    "util.select_position",
     "enhance.morphological_gradient",
     "enhance.bilateral",
     "enhance.nlm",

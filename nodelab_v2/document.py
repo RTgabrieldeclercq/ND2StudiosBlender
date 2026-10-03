@@ -97,6 +97,15 @@ SELECT_BATCH_OP = "util.select_batch"
 #: op_keys whose GUI card grows one synthetic per-MEMBER output socket (``bat0…``).
 BATCH_TAP_OPS = (UNBATCH_OP,)
 
+#: op_keys whose GUI card grows one synthetic per-POSITION output socket (``pos0…``) per
+#: multipoint on the wire reaching it — materialized into ``util.select_position`` taps at
+#: graph-build (2026-10-02), the M-axis member of the same family as
+#: :data:`CHANNEL_TAP_OPS`. Resolved from the edit-time ENVELOPE
+#: (:meth:`GraphDocument.position_descriptors`): the position count is an axis, which the
+#: envelope pass predicts exactly, and the names are the per-M ``position_name`` list the
+#: loader stamps — so neither is captured into params.
+POSITION_TAP_OPS = ("util.split_positions",)
+
 
 
 #: Columns of a JOINED domain that a ``column_in`` picker must not offer, because the
@@ -487,7 +496,47 @@ class GraphDocument:
             if len(members) >= 2:
                 for i, name in enumerate(members):
                     base.append(OutDataset(f"bat{i}", label=f"{i} · {name}"))
+        if rec.op_key in POSITION_TAP_OPS:
+            # Same floor again: one position is the whole Dataset, so a lone `pos0` would
+            # duplicate `out`.
+            positions = self.position_descriptors(node_id)
+            if len(positions) >= 2:
+                for i, pd in enumerate(positions):
+                    base.append(OutDataset(f"pos{i}", label=pd["label"]))
         return base
+
+    def position_descriptors(self, node_id: str) -> list:
+        """The multipoint positions on the wire reaching ``node_id``, from its edit-time
+        envelope: ``[{"index", "name", "group", "label"}, …]`` — ``[]`` when the envelope
+        does not know ``m`` (an unresolved source) or has one position.
+
+        ``name`` is the acquisition's point label (``position_name``) when the file carries
+        one of the right length, else ``m{i}``; ``group`` the position's specimen key
+        (``position_group``) when known. ``label`` is what the socket shows:
+        ``"2 · B03"`` or ``"2 · B03 · G1"``. Read live from the envelope rather than
+        captured, like the batch member names: the count is an axis the envelope predicts
+        exactly, so a rewire moves the sockets with it."""
+        try:
+            env = self.env(node_id)
+        except Exception:                      # noqa: BLE001 — an un-propagated node
+            return []
+        if "m" in getattr(env, "unknown_axes", frozenset()):
+            return []
+        m = int(env.axes.m)
+        if m <= 0:
+            return []
+        md = env.metadata or {}
+        names = md.get("position_name")
+        names = [str(v) for v in names] if isinstance(names, (list, tuple)) \
+            and len(names) == m else [f"m{i}" for i in range(m)]
+        groups = md.get("position_group")
+        groups = [str(v) if v is not None else "" for v in groups] \
+            if isinstance(groups, (list, tuple)) and len(groups) == m else [""] * m
+        out = []
+        for i in range(m):
+            label = f"{i} · {names[i]}" + (f" · {groups[i]}" if groups[i] else "")
+            out.append({"index": i, "name": names[i], "group": groups[i], "label": label})
+        return out
 
     def input_specs(self, node_id: str) -> list:
         """The live INPUT socket specs of one node instance, plus — once the document

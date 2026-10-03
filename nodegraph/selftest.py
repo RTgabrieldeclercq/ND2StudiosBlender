@@ -23862,6 +23862,136 @@ def test_timeseries_clock_order() -> None:
         "jd_to_datetime_text / elapsed_text exact")
 
 
+def test_split_positions() -> None:
+    """``util.split_positions`` + ``util.select_position`` (2026-10-02): the M-axis tap
+    family, mirroring ``channel.split`` → ``channel.select``.
+
+    1. **Select Position** keeps one position by index or by acquisition name: m → 1,
+       pixels are that position's, per-M lists subset (``stage_xy_um``, ``position_name``),
+       a Voxel layer and a Label table follow, envelope == payload, the stamp names the
+       index; EMPTY passes through; an unknown position is refused with the list; a
+       single-position input is the identity whatever is asked.
+    2. **Split Positions** is a pass-through of the whole set (m unchanged, no transform).
+    3. **The document** grows ``pos0…`` sockets on a Split card from the envelope with the
+       point names as labels (none under two positions), ``to_graph(materialize=True)``
+       turns a wired ``posK`` into a shared ``util.select_position`` tap carrying ``K``,
+       and a pull through that graph hands each branch its own position's pixels while
+       ``out`` still carries them all.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+
+    define_node("io.spseed", "S", outputs=[OutDataset()])
+    M, T, Y, X = 3, 2, 6, 8
+    arr = np.zeros((M, T, 1, 1, Y, X), dtype=float)
+    for m in range(M):
+        arr[m] = 10.0 * (m + 1)
+    ax = AxisSizes(m=M, t=T, z=1, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "stage_xy_um": [[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]],
+            "position_name": ["A1", "B2", "C3"], "position_group": ["G1", "G1", "G2"],
+            "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 100.0], [0.0, 0.0, 200.0]]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, 1, 1, Y, X), dtype=np.int64)
+    for m in range(M):
+        mask[m, :, :, :, m, m] = 1                      # one pixel per position
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.LABEL, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 1, 2]), "t": np.array([0, 0, 0]),
+        "c": np.array([0, 0, 0]), "area": np.array([1, 1, 1]), "z": np.array([0, 0, 0]),
+        "y": np.array([0.0, 1.0, 2.0]), "x": np.array([0.0, 1.0, 2.0])},
+        layer="mask", z_kind="plane_index"))
+
+    def pull(op, params=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.spseed"))
+        g.add(NodeInstance("N", op, params=params or {}))
+        g.connect("S", "N")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)})
+        return e, e.pull("N")
+
+    def px(out, m=0):
+        return float(out.image.get_region(0, m, 0, 0, 0, 0, Y, 0, X)[0, 0])
+
+    # 1. select by index and by name
+    for want, k in (("1", 1), ("C3", 2), ("A1", 0)):
+        e, out = pull("util.select_position", {"position": want})
+        assert out.axes.m == 1 and px(out) == 10.0 * (k + 1), (want, out.axes, px(out))
+        assert out.metadata["position_name"] == [meta["position_name"][k]]
+        assert out.metadata["stage_xy_um"] == [meta["stage_xy_um"][k]]
+        assert out.metadata["origin_um"] == [meta["origin_um"][k]], out.metadata["origin_um"]
+        lay = out.get(Domain.VOXEL, "mask").values
+        assert lay.shape[0] == 1 and lay[0, 0, 0, 0, k, k] == 1 and lay.sum() == T
+        ids = out.get(Domain.LABEL, "id", layer="mask").values
+        assert list(ids) == [k + 1] and list(out.get(Domain.LABEL, "m", layer="mask").values) == [0]
+        assert e.env("N").axes == out.axes and e.env("N").metadata["position_name"] == \
+            out.metadata["position_name"], "envelope == payload"
+        assert f"m:select_position[{k}]" in str(out.metadata.get(SAMPLING_KEY, "")), \
+            out.metadata.get(SAMPLING_KEY)
+    _, same = pull("util.select_position", {"position": ""})
+    assert same.axes.m == M, "empty keeps everything"
+    try:
+        pull("util.select_position", {"position": "Z9"})
+        raise AssertionError("an unknown position must be refused")
+    except ValueError as exc:
+        assert "no position 'Z9'" in str(exc) and "B2" in str(exc), str(exc)
+    one = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=Y, x=X), metadata={"pixel_size_um": 0.5}
+                  ).with_image(ArrayProvider(np.ones((1, 1, 1, 1, Y, X))))
+    g1 = Graph(); g1.add(NodeInstance("S", "io.spseed"))
+    g1.add(NodeInstance("N", "util.select_position", params={"position": "0"})); g1.connect("S", "N")
+    assert Engine(g1, computes=COMPUTES, seeds={"S": one},
+                  meta_seeds={"S": MetaEnvelope(axes=one.axes, metadata=one.metadata)}
+                  ).pull("N").axes.m == 1
+
+    # 2. the split is a pass-through
+    e2, out2 = pull("util.split_positions")
+    assert out2.axes.m == M and [px(out2, m) for m in range(M)] == [10.0, 20.0, 30.0]
+    assert e2.env("N").axes.m == M
+
+    # 3. the document: sockets from the envelope, taps at graph build, a pull per branch
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L")
+    doc.meta_seeds["L"] = MetaEnvelope(axes=ax, metadata=meta)
+    doc.add_node("util.split_positions", node_id="SP")
+    assert [s.name for s in doc.output_specs("SP")] == ["out"], "unwired: no positions known"
+    doc.connect("L", "image", "SP", "data")
+    outs = doc.output_specs("SP")
+    assert [s.name for s in outs] == ["out", "pos0", "pos1", "pos2"], [s.name for s in outs]
+    assert [s.label for s in outs[1:]] == ["0 · A1 · G1", "1 · B2 · G1", "2 · C3 · G2"], \
+        [s.label for s in outs[1:]]
+    doc.add_node("enhance.gaussian", node_id="G1"); doc.add_node("enhance.gaussian", node_id="G2")
+    doc.add_node("enhance.gaussian", node_id="G3")
+    doc.connect("SP", "pos1", "G1", "data")
+    doc.connect("SP", "pos1", "G2", "data")          # two consumers of one position
+    doc.connect("SP", "out", "G3", "data")
+    assert doc.env("G1").axes.m == 1 and doc.env("G3").axes.m == M, "the envelope sees the tap"
+    g = doc.to_graph(for_run=True, materialize=True)
+    taps = [n for n in g.nodes.values() if n.op_key == "util.select_position"]
+    assert len(taps) == 1 and taps[0].params == {"position": "1"}, \
+        [(n.id, n.params) for n in taps]
+    assert sum(1 for e in g.edges if e.src == taps[0].id) == 2, "one tap shared by both branches"
+    eng = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": MetaEnvelope(axes=ax, metadata=meta)})
+    o1, o3 = eng.pull("G1"), eng.pull("G3")
+    assert o1.axes.m == 1 and abs(px(o1) - 20.0) < 1e-6, (o1.axes, px(o1))
+    assert o3.axes.m == M
+    # a single-position envelope grows no sockets
+    doc.meta_seeds["L"] = MetaEnvelope(axes=_replace(ax, m=1), metadata={"pixel_size_um": 0.5})
+    doc.touch("L")
+    assert [s.name for s in doc.output_specs("SP")] == ["out"]
+    _ok("split positions: Select Position keeps one position by index or point name (m→1, "
+        "pixels, per-M lists, Voxel layer and Label rows follow, envelope == payload; empty "
+        "passes, unknown refused with the list, a lone position is the identity); Split "
+        "Positions passes the set through; the card grows `pos0…` with point-name labels "
+        "from the envelope, a wired posK becomes one shared util.select_position tap "
+        "carrying K, and each branch pulls its own position")
+
+
 def test_multiotsu_outputs() -> None:
     """``analysis.multiotsu`` ``output`` Mode (2026-10-02): ``merged`` (the class index, as
     before), ``per_class`` (one 0/1 mask per tier, a partition), ``selected`` (one mask of
@@ -24034,6 +24164,7 @@ def main() -> int:
     test_draw_regions()
     test_readiness()
     test_timeseries_clock_order()
+    test_split_positions()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

@@ -1185,6 +1185,46 @@ def select_group(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnve
                .with_metadata(**position_subset(env.metadata, keep)))
 
 
+def position_pick(metadata: Mapping[str, Any], m: int, raw: Any) -> Optional[int]:
+    """Resolve ``util.select_position``'s ``position`` to one index into ``m`` positions
+    (2026-10-02) — shared by its compute and :func:`select_position` so the card and the
+    pull cannot disagree. An exact match on :data:`POSITION_NAME_KEY` first (the
+    acquisition's own point label, when the file carries one), else a bare 0-based index
+    in range. ``None`` for empty (nothing asked for) or for a value that names nothing;
+    the caller decides whether that is a no-op or a refusal."""
+    want = str(raw if raw is not None else "").strip()
+    if not want or m <= 0:
+        return None
+    names = metadata.get(POSITION_NAME_KEY)
+    if isinstance(names, (list, tuple)) and len(names) == m:
+        for i, nm in enumerate(names):
+            if str(nm) == want:
+                return i
+    if want.isdigit():
+        i = int(want)
+        if 0 <= i < m:
+            return i
+    return None
+
+
+def select_position(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.select_position``: narrow M to ONE position, by name or 0-based index
+    (2026-10-02) — the multipoint twin of :func:`batch_select`, and the tap
+    ``util.split_positions``'s per-position outputs materialize into.
+
+    Only M moves, exactly as in :func:`select_group`: no re-spacing, no origin shift, and
+    every per-M list follows through :func:`position_subset`. Empty, or a value that
+    resolves to nothing, HOLDS the envelope rather than marking ``m`` unknown — the compute
+    refuses the second case with the positions listed, and an unknown axis would grey the
+    whole downstream graph behind a plausible-looking card."""
+    ax = env.axes
+    k = position_pick(env.metadata, int(ax.m), params.get("position"))
+    if k is None or int(ax.m) <= 1:
+        return env
+    return (env.with_axes(replace(ax, m=1))
+               .with_metadata(**position_subset(env.metadata, [k])))
+
+
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """Tile stitch: M→1, Y/X grow. The output extent is UNKNOWN unless supplied
     (it depends on estimated registration) — never a silent guess (V2.03 §2 A3)."""

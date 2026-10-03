@@ -80,6 +80,10 @@ GRP_SOCKET_RE = re.compile(r"^grp(\d+)$")
 #: hash still agreeing, while a name either still resolves or refuses.
 BAT_SOCKET_RE = re.compile(r"^bat(\d+)$")
 
+#: the synthetic per-POSITION output sockets a ``util.split_positions`` card grows
+#: (``pos0…``), materialized into ``util.select_position`` taps (2026-10-02)
+POS_SOCKET_RE = re.compile(r"^pos(\d+)$")
+
 
 def batch_member_identity(node: Any, node_id: str) -> str:
     """A batch member's identity: the base name of the file its source node carries.
@@ -890,12 +894,14 @@ def prepare_run_graph(graph: Graph) -> Graph:
     envelope pass too, where unrolling would delete the node ids the inspector looks up.
     :func:`nodelab_v2.document.GraphDocument.to_graph` unrolls first, under its own flag;
     :func:`headless_engine` does the same."""
-    # Batch FIRST, then groups, then channels: each narrows a different axis (B, then M,
-    # then C) so they commute on the data, and running them outermost-axis-first keeps
-    # each tap closest to the node that asked for it — the order the card reads in.
+    # Batch FIRST, then groups, then positions, then channels: each narrows a different
+    # axis (B, then M twice — a group is a set of positions, a position one of them — then
+    # C) so they commute on the data, and running them outermost-axis-first keeps each tap
+    # closest to the node that asked for it — the order the card reads in.
     return materialize_channel_taps(
-        materialize_group_taps(
-            materialize_batch_taps(cut_docked_inputs(graph))))
+        materialize_position_taps(
+            materialize_group_taps(
+                materialize_batch_taps(cut_docked_inputs(graph)))))
 
 
 def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -1212,6 +1218,23 @@ def materialize_batch_taps(graph: Graph) -> Graph:
         return {"member": names[k]}
 
     return _materialize_taps(graph, BAT_SOCKET_RE, "util.select_batch", "b", params_for)
+
+
+def materialize_position_taps(graph: Graph) -> Graph:
+    """Rewire every GUI-synthetic per-POSITION output edge (``posK``) on a
+    ``util.split_positions`` card through a real ``util.select_position`` tap — the M-axis
+    twin of :func:`materialize_channel_taps` (2026-10-02).
+
+    **The tap carries the position's INDEX**, unlike the group and batch taps. A position's
+    index in its file IS its identity — the acquisition's point list is fixed when the file
+    is written and every per-M list is addressed by it — while a point name is an optional
+    label many files lack; so ``posK`` means "the (K+1)-th position of whatever is wired",
+    exactly as ``chK`` means the (K+1)-th channel. ``util.select_position`` refuses an
+    index past the end with the positions listed, so a split rewired onto a smaller file
+    says so rather than silently serving another position.
+    """
+    return _materialize_taps(graph, POS_SOCKET_RE, "util.select_position", "p",
+                             lambda node, k: {"position": str(k)})
 
 
 def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],

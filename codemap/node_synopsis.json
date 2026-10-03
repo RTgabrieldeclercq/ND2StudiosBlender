@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 91,
+    "nodes": 93,
     "categories": 12,
     "roles": 19,
     "stages": 5,
-    "inputs": 622,
-    "outputs": 98,
+    "inputs": 625,
+    "outputs": 100,
     "gui_ops_included": true
   },
   "stages": {
@@ -93,6 +93,8 @@
         "util.merge",
         "util.select_batch",
         "util.select_group",
+        "util.select_position",
+        "util.split_positions",
         "util.timeseries",
         "util.unbatch"
       ]
@@ -259,7 +261,7 @@
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
       "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions.",
-      "count": 8,
+      "count": 10,
       "ops": [
         {
           "op": "channel.select",
@@ -290,6 +292,16 @@
           "op": "util.select_group",
           "label": "Select Group",
           "summary": "Keep only the multipoints of one specimen group — the 3x3 mosaic, the plate well — recovered from the stage coordinates or read from the acquisition. Lazy: no pixels move, and per-position metadata, layers and structure rows follow the selection."
+        },
+        {
+          "op": "util.select_position",
+          "label": "Select Position",
+          "summary": "Keep one multipoint position, by index or acquisition name. The tap Split Positions' per-position outputs materialize into, and usable on its own."
+        },
+        {
+          "op": "util.split_positions",
+          "label": "Split Positions",
+          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels."
         },
         {
           "op": "util.timeseries",
@@ -934,6 +946,8 @@
       "util.resample",
       "util.select_batch",
       "util.select_group",
+      "util.select_position",
+      "util.split_positions",
       "util.stack",
       "util.stitch",
       "util.timeseries",
@@ -15786,6 +15800,122 @@
         "gap_factor",
         "group"
       ]
+    },
+    "util.select_position": {
+      "op": "util.select_position",
+      "label": "Select Position",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "module": "nodegraph/catalog/util/select_position.py",
+      "gui_only": false,
+      "summary": "Keep one multipoint position, by index or acquisition name. The tap Split Positions' per-position outputs materialize into, and usable on its own.",
+      "overview": "Keep exactly one position of a multipoint Dataset. Resolved spec (build-node-v2 §0, 2026-10-02) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.select_position\"``, category ``\"utility\"``, ``meta_transform=select_position``. * **Data contract** ``Dataset → the same Dataset with m = 1``. No calibration changes: nothing is cut out of a plane, no axis is re-spaced, and the kept position keeps the ``origin_um`` it already had. Everything indexed BY m follows — the per-M metadata family (:data:`~nodegraph.metadata.PER_POSITION_KEYS`), lattice layers, structure rows (filtered and renumbered) — through the same helpers ``util.select_group`` uses. * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the corresponding input unit of the kept position. * **Sockets** ``position`` (name or 0-based index). No modes. * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider` with one position. Resolution is shared with the edit-time transform (:func:`~nodegraph.metadata.position_pick`) so the card and the pull agree. EMPTY is a genuine no-op (the input back, untouched); a value that names no position is REFUSED with the positions listed — handing back some other position's pixels under the name asked for is the failure a selector exists to prevent. A single-position input is returned as is, whatever is asked: selecting the only position there is, is the identity.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "position",
+          "label": "Position",
+          "type": "string",
+          "role": "parameter",
+          "is_field": true,
+          "description": "WHICH POSITION (multipoint / stage location) to keep: its 0-based index on the M axis, or the point name the acquisition recorded for it when the file carries one (the names the Split Positions card shows). EMPTY keeps every position, which makes an unconfigured node a true no-op. A value that names no position is refused, with the real positions listed, rather than falling back to one of them. No pixels are copied — this is a lazy view — but M really narrows to one, and everything indexed by it (stage coordinates, per-position masks, labels and measurement rows) follows."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_select_position",
+      "meta_transform": "select_position",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "position"
+      ]
+    },
+    "util.split_positions": {
+      "op": "util.split_positions",
+      "label": "Split Positions",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "module": "nodegraph/catalog/util/split_positions.py",
+      "gui_only": false,
+      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
+      "overview": "Split Positions — a domain-transparent pass-through of the full multipoint bundle, the M-axis twin of ``channel.split`` (2026-10-02). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-position output socket (``pos0…posM-1``, labelled with the acquisition's point name where the file carries one, else ``m0…``) once the wire carries two or more positions, and each wired per-position tap is materialized into a real ``util.select_position`` at graph-build time — the engine is one-payload-per-node, so distinct per-position payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a multipoint Load (or after a Timeseries Builder laid files onto M) to run a different branch per well, dish or field.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": null,
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The multipoint Dataset to fan out. Its positions appear as one output socket each on the card, labelled with the file's point names when it has them; `out` still carries the whole set."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_split_positions",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": []
     },
     "util.stack": {
       "op": "util.stack",

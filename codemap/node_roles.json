@@ -34,7 +34,7 @@
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
       "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions.",
-      "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group"]
+      "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group", "util.split_positions", "util.select_position"]
     },
     "image_restoration": {
       "label": "Image restoration",

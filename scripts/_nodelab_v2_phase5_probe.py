@@ -5542,6 +5542,38 @@ def main(argv) -> int:
         "readout counts; Apply in the panel writes stamped shapes and returns to Subtract "
         "Background, now ready")
 
+    # ── SP1: Split Positions grows one output per stage position on the LIVE canvas and
+    # its wires are drawable (2026-10-02) ───────────────────────────────────────────
+    _spdoc = win.doc
+    _spdoc.add_node("io.load", node_id="SPL", x=0, y=1500)
+    _spdoc.meta_seeds["SPL"] = MetaEnvelope(
+        axes=AxisSizes(m=3, t=2, z=1, c=1, y=64, x=64),
+        metadata={"pixel_size_um": 0.5, "position_name": ["A1", "B2", "C3"]})
+    _spdoc.add_node("util.split_positions", node_id="SPS", x=300, y=1500)
+    _spdoc.connect("SPL", "image", "SPS", "data")
+    _spdoc.add_node("view.viewer", node_id="SPV", x=600, y=1500)
+    _spdoc.connect("SPS", "pos2", "SPV", "data")
+    win.scene.sync(); app.processEvents()
+    _spitem = win.scene.node_items["SPS"]
+    _spouts = [s.name for s in _spdoc.output_specs("SPS")]
+    assert _spouts == ["out", "pos0", "pos1", "pos2"], _spouts
+    assert [s.label for s in _spdoc.output_specs("SPS")][1:] == ["0 · A1", "1 · B2", "2 · C3"]
+    # the card lays the synthetic sockets out (one port item per output, by name)
+    _ports = [getattr(p, "name", None) for p in getattr(_spitem, "_outs", {}).values()] \
+        if isinstance(getattr(_spitem, "_outs", None), dict) else None
+    if _ports is not None:
+        assert {"pos0", "pos1", "pos2"} <= set(_ports), _ports
+    assert _spdoc.env("SPV").axes.m == 1, "the viewer sees one position through the tap"
+    _g = _spdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.select_position" and n.params == {"position": "2"}
+               for n in _g.nodes.values()), [(n.id, n.op_key) for n in _g.nodes.values()]
+    for nid in ("SPV", "SPS", "SPL"):
+        _spdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("SP1 split positions: a 3-position source grows pos0..pos2 on the card with the "
+        "file's point names, a wire from pos2 is drawable, the envelope downstream reads "
+        "m=1, and the run graph carries a util.select_position tap with position '2'")
+
     _probe_movie_editor(win, app)
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
