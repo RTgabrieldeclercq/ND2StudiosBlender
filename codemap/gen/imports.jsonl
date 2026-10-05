@@ -1078,6 +1078,7 @@
 {"dst":"nodelab_v2.lablink.tuning","k":"imp","lazy":false,"src":"nodelab_v2.lablink.panel"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.lablink.panel"}
 {"dst":"nodelab_v2.lablink.client","k":"imp","lazy":true,"src":"nodelab_v2.lablink.presets"}
+{"dst":"nodelab_v2.version","k":"imp","lazy":false,"src":"nodelab_v2.lablink.protocol"}
 {"dst":"nodegraph.registry","k":"imp","lazy":true,"src":"nodelab_v2.lablink.recipe"}
 {"dst":"nodegraph.serialize","k":"imp","lazy":true,"src":"nodelab_v2.lablink.recipe"}
 {"dst":"nodelab_v2.lablink","k":"imp","lazy":false,"src":"nodelab_v2.lablink.recipe"}
@@ -1266,6 +1267,7 @@
 {"dst":"nodelab_v2.sequence_dialog","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.spreadsheet","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.version","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.viewer","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.welcome","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.app","k":"imp","lazy":true,"src":"run"}

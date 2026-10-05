@@ -37,6 +37,7 @@ from nodegraph.iterate import (
     ITERATE_OP, SWEEP_KEY, SWEEP_OWNER_KEY, SWEEP_ROWS_KEY, plan as iterate_plan)
 from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
+from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
@@ -256,7 +257,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         ensure_gui_ops()
-        self.setWindowTitle("NodeLab v2 — nodegraph canvas")
+        self.setWindowTitle(f"{PRODUCT} — nodegraph canvas")
         self.setStyleSheet(_window_qss())
 
         self.doc = GraphDocument()
@@ -913,7 +914,8 @@ class MainWindow(QMainWindow):
         """What this editor covers. (Was the Phase-7 "v2 vs legacy v1" note; NodeLab v1
         was removed 2026-07-29 — see `V2.05_phase7_capability_matrix.md` §6.)"""
         QMessageBox.information(
-            self, "NodeLab — capabilities",
+            self, f"{PRODUCT} — capabilities",
+            f"{PRODUCT} {APP_VERSION}.\n\n"
             "NodeLab runs on the nodegraph engine: a lazy-pull, per-tile streaming, "
             "two-hash-memoized graph with a metadata-intelligent node catalog.\n\n"
             "Covered:\n"

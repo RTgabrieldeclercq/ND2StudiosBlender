@@ -36,6 +36,8 @@ conformance check can read it without building an engine).
 """
 from __future__ import annotations
 
+from nodelab_v2.version import VERSION_LABEL, __version__ as _APP_VERSION
+
 # ── identity ────────────────────────────────────────────────────────────────────
 
 #: What we answer in ``hello.worker`` — the adapter's name, not the app's.
@@ -48,10 +50,11 @@ WORKER_NAME = "nd2studios"
 WORKER_VERSION = "1.0.0"
 
 #: Human name of the software being held warm, for the hub's console and banner.
-SOFTWARE_NAME = "ND2 Studios V2 (NodeLab)"
+SOFTWARE_NAME = f"{VERSION_LABEL} (NodeLab)"
 
-#: The engine/app version this adapter fronts.
-SOFTWARE_VERSION = "2.21"
+#: The engine/app version this adapter fronts — :data:`nodelab_v2.version.__version__`,
+#: never a literal here (V4.00: one place writes the number).
+SOFTWARE_VERSION = _APP_VERSION
 
 #: The ``*.nd2graph.json`` format we can read. Reported in ``hello`` so a hub whose
 #: recipes were saved by a newer editor fails at the handshake with something to read,

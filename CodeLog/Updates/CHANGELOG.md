@@ -3,6 +3,21 @@
 All notable changes to the standalone NodeLab GUI. The vendored `nd2studios/`
 backend is a copy and is **not** modified here (see `pipeline_kit` parity).
 
+## [4.0.0-dev] — Workspaces (ND2Studios V4.00) — opened 2026-10-05
+
+The V4 generation turns the single canvas into a **workspace** of typed node-graph pages
+(Image Input → Image Refinement → Image Processing → Analysis, plus Free for legacy graphs)
+with named outputs flowing between pages, linked pages that share a master's nodes with
+their own parameter values, every panel poppable into its own window with several
+instances, and an analysis toolkit of plot and table nodes. Design record and step list:
+`CodeLog/ClaudesPlan/V4.00_workspaces.md`. Each step lands as its own PR and adds a line here.
+
+### Step 0 — version and plan record (2026-10-05)
+- `nodelab_v2/version.py`: `__version__ = "4.0.0"`, `APP_NAME`, `VERSION_LABEL`, `PRODUCT` —
+  the one place the number is written. Window title and Help → Capabilities read it; the
+  LabLink `hello` reports `SOFTWARE_NAME`/`SOFTWARE_VERSION` from it (was a stale `"2.21"`).
+- Package name `nodelab_v2` is unchanged by decision: the version is a label, not a path.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

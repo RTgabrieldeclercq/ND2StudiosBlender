@@ -1,4 +1,4 @@
-# NodeLab — User Manual
+# ND2Studios V4 (NodeLab) — User Manual
 
 **ND2Studios_Blender** is a Blender-geometry-nodes-style node editor for microscopy image
 analysis. You build an **acquire → enhance → segment → measure → track** pipeline by wiring
@@ -8,6 +8,8 @@ live multi-channel viewer or as a table.
 The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 [`nodelab_v2/`](nodelab_v2/). For how it works internally, see
 [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md).
+
+> **V4.00 — Workspaces (opened 2026-10-05, in progress).** ND2Studios V4 turns the single canvas into a workspace of typed node-graph pages (Image Input → Image Refinement → Image Processing → Analysis) with named outputs flowing between them, linked pages that share a master's nodes with their own parameter values, pop-out dockable panels with several instances, and an analysis toolkit of plot and table nodes. The design record and step list are in [CodeLog/ClaudesPlan/V4.00_workspaces.md](CodeLog/ClaudesPlan/V4.00_workspaces.md); each delivered step adds its own section to this manual. The version number lives in `nodelab_v2/version.py` and nowhere else.
 
 > **State:** node counts and gate results now live in
 > [codemap/STATE.md](codemap/STATE.md), generated from the live registry — it is the only file
