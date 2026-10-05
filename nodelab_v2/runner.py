@@ -76,12 +76,14 @@ from nodegraph.provider import (
     _picked, subset_index)
 from nodegraph.streaming import StreamProvider, TileCache, WindowView
 from nodelab_v2 import region_box
-from nodelab_v2.document import BUNDLE_PATHS_KEY
+from nodelab_v2.document import BUNDLE_PATHS_KEY, GraphDocument
 from nodelab_v2.ops import (ACCESS_AUTO, ACCESS_DIRECT, ACCESS_INGEST, ACCESS_MODE,
                             CALIB_OVERRIDE_KEYS, GROUPING_AUTO, GROUPING_DEFAULT,
                             GROUPING_MODE, LOAD_OP,
                             calib_overrides, dock_seeds, dock_store_of,
                             source_access_of)
+from nodelab_v2.workspace import (GraphSource, RUN_SEP, Workspace, doc_id_of, qualify,
+                                  split_run_id)
 
 #: byte-budget LRU cap for the persistent Memo (Memo GC). The persistent memo is the
 #: V2.04-flagged hazard: an eager full-raster node in a high-T zone would otherwise
@@ -922,7 +924,7 @@ PROGRESS_MIN_INTERVAL_S = 0.05
 
 
 def _doc_id_of(run_id: str) -> str:
-    """The document node id a RUN-graph id answers to.
+    """The document node id a RUN-graph id answers to — page prefix kept (V4.00 step 2).
 
     The run graph renames two kinds of node: an Iterate clone is
     ``{doc_id}#{iterate_id}@{i}`` (and the zone's synthetic advance node
@@ -930,16 +932,17 @@ def _doc_id_of(run_id: str) -> str:
     body node is ``{body_id}%{instance_id}`` — nesting appends further ``%instance``
     segments, and the LAST one is the instance that actually sits on the canvas.
     Everything else passes through unchanged. Used to store run cones in document
-    terms, so a delete or edit of a card matches the runs computing its clones."""
-    head = run_id.split("#", 1)[0]
-    return head.rsplit("%", 1)[-1] if "%" in head else head
+    terms, so a delete or edit of a card matches the runs computing its clones. The
+    grammar lives in :func:`nodelab_v2.workspace.doc_id_of` so the selftest reaches it
+    without Qt; this is that function."""
+    return doc_id_of(run_id)
 
 
 class _Job:
     __slots__ = ("epoch", "graph", "revision", "node_id", "pull_id", "coords", "channels",
                  "sources", "all_sources", "pin", "bake", "cancelled")
 
-    def __init__(self, epoch: int, graph: Graph, revision: int, node_id: str,
+    def __init__(self, epoch: int, graph: Graph, revision: Any, node_id: str,
                  coords: Optional[Tuple[int, int, int, int]],
                  channels: Optional[Tuple[int, ...]],
                  sources: Dict[str, Dict[str, Any]],
@@ -949,6 +952,8 @@ class _Job:
                  pull_id: Optional[str] = None) -> None:
         self.epoch = epoch
         self.graph = graph
+        # The run identity of the pulled node's PAGE — `Workspace.revision_of`, a digest over
+        # every page the composed graph splices in (V4.00 step 2); a document revision before.
         self.revision = revision
         self.node_id = node_id
         # The id actually pulled from the run graph, which differs from `node_id` for a
@@ -1033,6 +1038,10 @@ class _PullThread:
         self._q.put(job)
 
 
+#: "this delivery carries no overlay context" — a bake, a fetch, a failure, a cancellation
+_NO_CTX: Tuple[bool, Any] = (False, None)
+
+
 class _Worker(QRunnable):
     def __init__(self, runner: "EngineRunner", job: _Job) -> None:
         super().__init__()
@@ -1059,7 +1068,7 @@ class _Worker(QRunnable):
                 r._run_bake(engine, job)
                 r._done.emit((job.epoch, job.node_id, None, None, None,
                               time.perf_counter() - t0, None, job.revision,
-                              None, None, job.pin))
+                              None, None, job.pin, _NO_CTX))
                 return
             payload = engine.pull(job.pull_id)
             if job.cancelled:
@@ -1070,9 +1079,10 @@ class _Worker(QRunnable):
             # the worker, because pulling the secondary is real work (and normally a memo
             # hit); the compose itself happens per displayed plane in `_decode_planes`.
             # A payload-only fetch (`EngineRunner.fetch`) is never displayed, so it skips it.
+            octx = _NO_CTX
             if job.epoch not in r._fetches:
-                r._overlay_ctxs[job.node_id] = r._resolve_overlay(
-                    engine, job.graph, job.pull_id, payload)
+                octx = (True, r._resolve_overlay(engine, job.graph, job.pull_id, payload))
+                r._overlay_ctxs[job.node_id] = octx[1]
             plane = None                    # dict {channel_index: 2-D native plane}
             axes = None
             if isinstance(payload, Dataset) and payload.image is not None:
@@ -1094,8 +1104,11 @@ class _Worker(QRunnable):
                                              pin=job.pin, overlay_all=True,
                                              as_dtype=_display_dtype(payload))
             dt = time.perf_counter() - t0
+            # the overlay context rides IN the packet as well (V4.00 step 2): an edit that
+            # does not touch this run's cone still clears the shared map meanwhile, and the
+            # delivered result must not lose its overlay to that
             r._done.emit((job.epoch, job.node_id, payload, plane, axes, dt, None,
-                          job.revision, job.coords, job.channels, job.pin))
+                          job.revision, job.coords, job.channels, job.pin, octx))
         except PullCancelled:
             # An aborted pull still delivers a packet — `_deliver` is the ONLY place the
             # pull slot is freed and the queue advanced, so a cancel that skipped it would
@@ -1104,11 +1117,11 @@ class _Worker(QRunnable):
             # drops this packet without painting anything.
             r._done.emit((job.epoch, job.node_id, None, None, None,
                           time.perf_counter() - t0, None, job.revision,
-                          None, None, job.pin))
+                          None, None, job.pin, _NO_CTX))
         except Exception:  # noqa: BLE001 — full trace to the GUI, never a dead thread
             r._done.emit((job.epoch, job.node_id, None, None, None,
                           time.perf_counter() - t0, traceback.format_exc(),
-                          job.revision, job.coords, job.channels, job.pin))
+                          job.revision, job.coords, job.channels, job.pin, _NO_CTX))
 
 
 class _IngestJob(QRunnable):
@@ -1374,7 +1387,19 @@ class _DetailJob(QRunnable):
 
 
 class EngineRunner(QObject):
-    """Submit pulls; receive results on the GUI thread; drop stale epochs."""
+    """Submit pulls; receive results on the GUI thread; drop stale epochs.
+
+    **Run ids are page-qualified** (V4.00 step 2). The runner is bound to a
+    :class:`~nodelab_v2.workspace.GraphSource` — the window's
+    :class:`~nodelab_v2.workspace.Workspace` — rather than to one document, and every id it
+    stores, hands to the engine or emits on a signal is ``"<page id>/<node id>"``
+    (:func:`~nodelab_v2.workspace.qualify`): the composed run graph of a page carries its
+    upstream pages under their own prefixes, so the same refinement chain pulled from three
+    processing pages is ONE memo entry and two pages' ``n3`` can never collide. A public
+    method accepts a bare document id and takes it to be on the ACTIVE page
+    (:meth:`run_id`); a signal always carries the qualified form, and the window splits it
+    (:func:`~nodelab_v2.workspace.split_run_id`). ``EngineRunner(doc)`` still works — a
+    bare document is wrapped into a one-page workspace."""
 
     started = Signal(str)                        # node_id
     finished = Signal(str, object, object, object, float)   # id, payload, plane, axes, s
@@ -1435,9 +1460,11 @@ class EngineRunner(QObject):
     _planes_done = Signal(object)                # internal: _DecodeJob → GUI thread
     _ingest_done = Signal(object)                # internal: _IngestJob → GUI thread
 
-    def __init__(self, document) -> None:
+    def __init__(self, source) -> None:
         super().__init__()
-        self.document = document
+        #: where graphs come from — a Workspace, or any GraphSource (see the class note)
+        self._source: GraphSource = (Workspace.single(source)
+                                     if isinstance(source, GraphDocument) else source)
         #: the shared pool, for the jobs that only READ providers (display decode, prefetch,
         #: viewport detail). Deliberately NOT the pull: see :class:`_PullThread`.
         self._pool = QThreadPool.globalInstance()
@@ -1526,6 +1553,12 @@ class EngineRunner(QObject):
         #: Memo's own budget. An edit bumps the revision, so a stale entry is never reachable
         #: — it just ages out.
         self._results: "OrderedDict[Tuple[str, int], Tuple[Any, Any]]" = OrderedDict()
+        #: the overlay context each remembered result was delivered with, under the same
+        #: key (V4.00 step 2). An edit on ANOTHER page clears the display caches — overlay
+        #: contexts included — but leaves this page's results valid (its run identity did
+        #: not move), so a re-served result must bring its context back or its overlay
+        #: channels silently vanish until something forces a re-pull.
+        self._result_ctx: Dict[Tuple[str, Any], Any] = {}
         self._announced: Dict[str, Any] = {}     # node_id → last announced source key
         self._node_source_key: Dict[str, Any] = {}
         #: (node_id, document revision) → EngineRunner.raw_source result — the hover
@@ -1642,7 +1675,71 @@ class EngineRunner(QObject):
         self._detail_done.connect(self._deliver_detail)
         self._preload_tick.connect(self._deliver_preload_tick)
         self._ingest_done.connect(self._deliver_ingest)
-        document.on_change(self._prune)
+        self._source.on_change(self._prune)
+
+    # ── the graph source and run ids (V4.00 step 2) ──────────────────────────
+    @property
+    def source(self) -> GraphSource:
+        """The workspace (or other :class:`GraphSource`) this runner serves."""
+        return self._source
+
+    @source.setter
+    def source(self, src) -> None:
+        """Re-bind to another source (the probes swap a scratch document in). Everything
+        remembered about the old pages — the cached engine, the finished results, the held
+        views — belongs to them and is dropped; the memo and the resolved providers are
+        content-addressed and stay."""
+        if isinstance(src, GraphDocument):
+            src = Workspace.single(src)
+        try:
+            self._source.off_change(self._prune)
+        except Exception:  # noqa: BLE001 — a source without off_change keeps the listener
+            pass
+        self._source = src
+        src.on_change(self._prune)
+        self._engine = None
+        self._engine_rev = -1
+        self._results.clear()
+        self._raw_src.clear()
+        self._views.clear()
+
+    @property
+    def document(self):
+        """The ACTIVE page's document — for callers that predate pages. Prefer
+        :attr:`source`: a runner serves every page of a workspace, not one document."""
+        pid = self._source.active
+        return self._source.document_of(pid) if pid else None
+
+    @document.setter
+    def document(self, doc) -> None:
+        self.source = doc
+
+    def run_id(self, node_id: str) -> str:
+        """The page-qualified run id for ``node_id``: a bare document id is taken to be on
+        the ACTIVE page; an already qualified id passes through unchanged."""
+        node_id = str(node_id)
+        if RUN_SEP in node_id:
+            return node_id
+        pid = self._source.active
+        return qualify(pid, node_id) if pid else node_id
+
+    _rid = run_id
+
+    def _rids(self, node_ids: Iterable[str]) -> List[str]:
+        return [self.run_id(n) for n in node_ids]
+
+    def _rev(self, run_id: str) -> str:
+        """The run identity of ``run_id``'s page (:meth:`Workspace.revision_of`) — what a
+        finished result, a held view and the cached engine are keyed on. It changes when
+        any page in that page's dependency closure changes, and only then."""
+        pid, _nid = split_run_id(run_id)
+        return self._source.revision_of(pid or (self._source.active or ""))
+
+    def _compose(self, run_id: str, *, live_docks: frozenset = frozenset()):
+        """The composed run graph of ``run_id``'s page, under this runner's sweep scope."""
+        pid, _nid = split_run_id(run_id)
+        return self._source.compose(pid or (self._source.active or ""),
+                                    live_docks=live_docks, sweep_all=self._sweep_all)
 
     # ── per-source ingest (V2.21) ─────────────────────────────────────────────
     def source_state(self, node_id: str) -> str:
@@ -1652,7 +1749,8 @@ class EngineRunner(QObject):
         immediate), ``"running"`` (its ingest is in flight or queued), ``"cold"`` (it would
         start one), ``"synthetic"`` (an empty path — the demo source needs no ingest),
         ``"missing"`` (the path names no file) or ``"not-a-source"``."""
-        rec = self.document.nodes.get(node_id)
+        node_id = self._rid(node_id)
+        rec = self._source.record(node_id)
         if rec is None or rec.op_key != LOAD_OP:
             return "not-a-source"
         if node_id in self._ingesting:
@@ -1704,10 +1802,11 @@ class EngineRunner(QObject):
 
         Idempotent: a file already in :attr:`_providers` reports ``"ready"`` and starts
         nothing, and two cards naming the same path share one job."""
+        node_id = self._rid(node_id)
         state = self.source_state(node_id)
         if state != "cold":
             return state
-        rec = self.document.nodes[node_id]
+        rec = self._source.record(node_id)
         paths = _clean_source_paths(dict(rec.params))
         access = source_access_of(rec)
         key = self._source_key_of(paths, access)
@@ -1724,8 +1823,8 @@ class EngineRunner(QObject):
         state}``, the per-card result of :meth:`ingest_source`. The whole point of a
         multi-file load: drop five ND2s on the canvas and put them all on disk in one go,
         :func:`ingest_workers` at a time."""
-        return {rec.id: self.ingest_source(rec.id)
-                for rec in self.document.nodes.values() if rec.op_key == LOAD_OP}
+        return {rid: self.ingest_source(rid)
+                for rid, rec in self._source.all_records() if rec.op_key == LOAD_OP}
 
     def ingesting(self) -> Tuple[str, ...]:
         """The node ids whose ingest is in flight or queued (GUI thread)."""
@@ -1769,8 +1868,8 @@ class EngineRunner(QObject):
             #   was already seeded from this very file at load time (`read_meta_only`), so
             #   the answer is identical and the bump would cost a re-pull for nothing.
             for nid, env in self._fresh_envs():
-                if self.document.meta_seeds.get(nid) != env:
-                    self.document.set_meta_seed(nid, env)
+                if self._source.meta_seed(nid) != env:
+                    self._source.set_meta_seed(nid, env)
         for nid in done:
             self.ingest_finished.emit(nid, float(seconds), err)
 
@@ -1828,6 +1927,7 @@ class EngineRunner(QObject):
         Latest-wins by generation rather than by a queue: while the user is still zooming,
         every intermediate rect is dead on arrival, and rendering them in order would just
         put the pool behind the cursor."""
+        node_id = self._rid(node_id)
         view = self._view_of(node_id) or self._rearm_view(node_id)
         if view is None or view.provider is None or view.axes is None:
             return False
@@ -1937,7 +2037,8 @@ class EngineRunner(QObject):
         clicks into a committed pull, so idly selecting four cards during a long
         segmentation silently signed the machine up for four more — the opposite of a
         preview. A pull the user explicitly asked for (double-click, F5, Run) still queues."""
-        if node_id not in self.document.nodes:
+        node_id = self._rid(node_id)
+        if self._source.record(node_id) is None:
             return
         if self._busy:
             if self._serve_finished(node_id, coords, channels):
@@ -1964,12 +2065,13 @@ class EngineRunner(QObject):
 
         Only for the CURRENT document revision — an edit bumps it, and a re-pull is then
         genuinely required rather than merely slow."""
-        key = (node_id, self.document.revision)
+        key = (node_id, self._rev(node_id))
         entry = self._results.get(key)
         if entry is None:
             return False
         payload, axes = entry
         self._results.move_to_end(key)               # keep the branches in active use warm
+        self._restore_ctx(key)
         if isinstance(payload, Dataset) and payload.image is not None:
             self._hold_view(node_id, payload, pin=None)
         self.finished.emit(node_id, payload, None, axes, 0.0)
@@ -1985,6 +2087,7 @@ class EngineRunner(QObject):
     def in_flight(self, node_id: str) -> bool:
         """Whether a live run (the one on the worker or one waiting behind it) reads
         ``node_id`` — i.e. whether an edit to it now would cancel work in progress."""
+        node_id = self._rid(node_id)
         return (any(node_id in cone for cone in self._run_cones.values())
                 or node_id in self._queue)
 
@@ -1993,7 +2096,8 @@ class EngineRunner(QObject):
         ``None``. A frame-scoped (solo) payload is never returned: it holds only the frames
         it was scoped to, and handing it out as the node's answer would play a truncated
         series."""
-        entry = self._results.get((node_id, self.document.revision))
+        node_id = self._rid(node_id)
+        entry = self._results.get((node_id, self._rev(node_id)))
         return entry[0] if entry is not None else None
 
     def fetch(self, node_id: str) -> None:
@@ -2008,7 +2112,8 @@ class EngineRunner(QObject):
 
         Served at once when the answer is already in hand; otherwise queued behind every
         user-requested pull, and a repeat request while one is waiting is a no-op."""
-        if node_id not in self.document.nodes:
+        node_id = self._rid(node_id)
+        if self._source.record(node_id) is None:
             return
         have = self.finished_result(node_id)
         if have is not None:
@@ -2033,7 +2138,7 @@ class EngineRunner(QObject):
         Evicts the least-recently held node past :data:`HELD_VIEWS` — eviction is cheap
         to undo (:meth:`_rearm_view`), so the cap only bounds pinned providers."""
         self._views[node_id] = _HeldView(payload.image, payload.axes,
-                                         self.document.revision, pin,
+                                         self._rev(node_id), pin,
                                          _display_dtype(payload))
         self._views.move_to_end(node_id)
         while len(self._views) > HELD_VIEWS:
@@ -2048,15 +2153,36 @@ class EngineRunner(QObject):
         Unpinned results only, because :attr:`_results` stores nothing else: a scoped
         payload holds only its picked frames and re-serving it as the node's whole
         answer would show a truncated series."""
-        entry = self._results.get((node_id, self.document.revision))
+        rev = self._rev(node_id)
+        entry = self._results.get((node_id, rev))
         if entry is None:
             return None
         payload, _axes = entry
         if not (isinstance(payload, Dataset) and payload.image is not None):
             return None
-        self._results.move_to_end((node_id, self.document.revision))
+        self._results.move_to_end((node_id, rev))
+        self._restore_ctx((node_id, rev))
         self._hold_view(node_id, payload, pin=None)
         return self._views[node_id]
+
+    def _remember(self, key: Tuple[str, Any], payload: Any, axes: Any, *,
+                  ctx: Any = None, has_ctx: bool = False) -> None:
+        """File a finished result (and the overlay context it was delivered with) under
+        ``key``; the oldest past :data:`_FINISHED_RESULTS` age out together."""
+        self._results[key] = (payload, axes)
+        self._results.move_to_end(key)
+        if has_ctx:
+            self._result_ctx[key] = ctx
+        else:
+            self._result_ctx.pop(key, None)
+        while len(self._results) > _FINISHED_RESULTS:
+            old, _ = self._results.popitem(last=False)
+            self._result_ctx.pop(old, None)
+
+    def _restore_ctx(self, key: Tuple[str, Any]) -> None:
+        """Put a remembered result's overlay context back (see :attr:`_result_ctx`)."""
+        if key in self._result_ctx:
+            self._overlay_ctxs[key[0]] = self._result_ctx[key]
 
     def request_plane(self, node_id: str,
                       coords: Optional[Tuple[int, int, int, int]] = None,
@@ -2077,12 +2203,13 @@ class EngineRunner(QObject):
         is a cursor move *within* a multi-frame selection — the pin is unchanged there, so
         it stays on the fast path. Z and channel moves always do, and between them that is
         most of the interactive scrubbing a troubleshooting session does."""
-        if node_id not in self.document.nodes:
+        node_id = self._rid(node_id)
+        if self._source.record(node_id) is None:
             return
         if coords is not None:
             view = self._view_of(node_id) or self._rearm_view(node_id)
             if (view is not None and view.provider is not None
-                    and self.document.revision == view.rev
+                    and self._rev(node_id) == view.rev
                     and self._pin_for(coords) == view.pin):
                 # `sub` is the Play-all sub-tick (overlay planes only). A full pull below
                 # draws sub-tick 0: it happens at a document change, never mid-playback.
@@ -2140,7 +2267,7 @@ class EngineRunner(QObject):
             dropped = list(self._queue)
             self._queue.clear()
         else:
-            touched = frozenset(nodes)
+            touched = frozenset(self._rids(nodes))
             dead = [rid for rid, cone in self._run_cones.items() if cone & touched]
             # A run with no recorded cone is one this registry never saw finish registering;
             # treat it as affected rather than assume it is safe.
@@ -2149,7 +2276,7 @@ class EngineRunner(QObject):
         # `_start_next` would skip it when its turn came, but until then it holds a place
         # in line, inflates `queue_depth`, and — because its card no longer exists — has
         # nothing left to resolve it.
-        for qid in [q for q in self._queue if q not in self.document.nodes]:
+        for qid in [q for q in self._queue if self._source.record(q) is None]:
             del self._queue[qid]
             dropped.append(qid)
         for rid in dead:
@@ -2662,6 +2789,7 @@ class EngineRunner(QObject):
 
         The FIRST flickering source decides the rate: two sources blinking out of phase is
         not a comparison of anything."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return 0.0
@@ -2677,6 +2805,7 @@ class EngineRunner(QObject):
         appends how many more there are — plus, loudly, any source that had to be dropped
         for want of a shader channel, because a silently missing layer is the one thing this
         readout exists to prevent."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return ""
@@ -2693,6 +2822,7 @@ class EngineRunner(QObject):
 
     def overlay_channels(self, node_id: str) -> Dict[int, str]:
         """``{channel index: label}`` the overlay contributes, for the channel strip."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return {}
@@ -2743,7 +2873,7 @@ class EngineRunner(QObject):
         """Whether ``node_id``'s op declares any ``view_source`` Dataset input."""
         try:
             from nodegraph.registry import NODES
-            node = self.document.nodes.get(node_id)
+            node = self._source.record(node_id)
             spec = NODES.get(node.op_key) if node is not None else None
             return bool(spec) and any(getattr(s, "view_source", False)
                                       for s in spec.inputs)
@@ -2812,7 +2942,7 @@ class EngineRunner(QObject):
             from nodegraph.placement import plan_placement
             from nodegraph.nodes import SAMPLING_KEY
             base_id, _sep, role = str(ovl_id).partition("#")
-            node = self.document.nodes.get(base_id)
+            node = self._source.record(base_id)
             if node is None or payload is None or sec is None:
                 return stamped
             # The node's OWN settings reader, not a list kept here: a list here is how every
@@ -2853,7 +2983,7 @@ class EngineRunner(QObject):
         payload cannot carry them either, or a hit would serve the value the slider used to
         have. The document is the live truth, and reading it here is what makes dragging an
         overlay's opacity a repaint instead of a re-bake."""
-        node = self.document.nodes.get(ovl_id)
+        node = self._source.record(ovl_id)
         try:
             return float((node.params if node is not None else {}).get(name, default))
         except (TypeError, ValueError):
@@ -2936,6 +3066,7 @@ class EngineRunner(QObject):
         294 µm sliver of a 1760 µm frame — so percentiles taken from it describe a different
         image than the one the user tuned while looking at that file, which is what made the
         overlay "rewrite the LUT" and look nothing like its source."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id) if hasattr(self, "_overlay_ctxs")             else self._overlay_ctx
         if not ctx or (ctx.get("node") not in (None, node_id)):
             return {}
@@ -2953,6 +3084,7 @@ class EngineRunner(QObject):
         """How many ticks Play all splits each primary frame into for ``node_id``'s overlay:
         the most any source asked for (its entry's ``sub_ticks``), else 1. A same-rate chain
         is 1 — playback is exactly what it always was."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id) if hasattr(self, "_overlay_ctxs") else None
         if not ctx or ctx.get("node") != node_id:
             return 1
@@ -2967,6 +3099,7 @@ class EngineRunner(QObject):
         are ``None`` where the source has no frame (the pairing ran off its end). ``z`` is the
         dominant plane of a linear blend. Resolved through the compositor's own
         :meth:`_source_frame`, so the readout IS the frame on screen."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx.get("node") != node_id:
             return []
@@ -2999,7 +3132,7 @@ class EngineRunner(QObject):
     def _pins_of(self, ovl_id: str, name: str) -> tuple:
         """The overlay node's live pins (canonical rows), ``()`` when absent or malformed."""
         from nodegraph.placement import parse_pins
-        node = self.document.nodes.get(ovl_id)
+        node = self._source.record(ovl_id)
         try:
             return parse_pins((node.params if node is not None else {}).get(name, ""),
                               axis=name[0])
@@ -3023,18 +3156,23 @@ class EngineRunner(QObject):
     def _source_label_of(self, src: Dict[str, Any]) -> str:
         from nodelab_v2.document import TITLE_KEY
         from nodelab_v2.ops import batch_member_identity
-        doc = self.document
-        node = doc.nodes.get(str(src.get("ovl_id")))
+        node = self._source.record(str(src.get("ovl_id")))
         own = str((node.params if node is not None else {}).get("label") or "").strip()
         if own:
             return own
         sid = str(src.get("sec_id") or "")
-        sec = doc.nodes.get(sid)
+        sec = self._source.record(sid)
         title = str((sec.params if sec is not None else {}).get(TITLE_KEY) or "").strip()
         if title:
             return title
-        # the root of the secondary's primary spine — the file it came from
-        cur, seen = sid, set()
+        # the root of the secondary's primary spine — the file it came from. Walked on the
+        # secondary's OWN page, in that page's document ids: a run id names the page first.
+        pid, cur = split_run_id(sid)
+        try:
+            doc = self._source.document_of(pid or (self._source.active or ""))
+        except KeyError:
+            return ""
+        seen: set = set()
         while cur and cur not in seen:
             seen.add(cur)
             preds = [e[0] for e in doc.edges if e[2] == cur and e[3] == "data"]
@@ -3054,6 +3192,8 @@ class EngineRunner(QObject):
         meaning the same frames after an upstream crop re-numbers them: each file's frame
         clock (``frame_time_jd``) for a T pin, each plane's absolute focus (µm) for a Z pin.
         ``(None, None)`` where either file lacks it — the pin then pairs by index."""
+        node_id = self._rid(node_id)
+        ovl_id = self._rid(str(ovl_id))      # matched against the context's run ids
         ctx = self._overlay_ctxs.get(node_id)
         src = next((s for s in (ctx or {}).get("sources", ())
                     if str(s.get("ovl_id")) == str(ovl_id)), None)
@@ -3080,7 +3220,7 @@ class EngineRunner(QObject):
         """Move one overlay source's DISPLAYED frame by ``(dt, dz)`` from its mapped frame
         (``(0, 0)`` clears it) — the Viewer's ◀▶ steppers. Display-only: the document is not
         touched, nothing re-runs, and the planes composed under it are keyed apart."""
-        key = str(ovl_id)
+        key = self._rid(str(ovl_id))
         now = self._src_override.get(key, (0, 0))
         new = (int(dt), int(dz))
         if new == now:
@@ -3099,6 +3239,7 @@ class EngineRunner(QObject):
     def overlay_style(self, node_id: str) -> Dict[int, Tuple[int, float, float]]:
         """``{channel index: (blend mode, opacity, checker cells)}`` for the overlay's
         channels — what the shader and its CPU mirror need to composite them."""
+        node_id = self._rid(node_id)
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
             return {}
@@ -3233,7 +3374,8 @@ class EngineRunner(QObject):
         the revision is what keeps it honest: any edit that could change the answer (a new
         wire, a different path, a crop inserted upstream) bumps it.
         """
-        ck = (node_id, self.document.revision)
+        node_id = self._rid(node_id)
+        ck = (node_id, self._rev(node_id))
         hit = self._raw_src.get(ck)
         if hit is not None:
             return hit
@@ -3246,7 +3388,7 @@ class EngineRunner(QObject):
             return None
         self._raw_src[ck] = got
         if len(self._raw_src) > 64:              # bounded: revisions climb forever
-            for stale in [k for k in self._raw_src if k[1] != self.document.revision]:
+            for stale in [k for k in self._raw_src if k[1] != self._rev(k[0])]:
                 self._raw_src.pop(stale, None)
         return got
 
@@ -3259,7 +3401,7 @@ class EngineRunner(QObject):
             return None
         prov, env = entry
         try:
-            node_env = self.document.env(node_id)
+            node_env = self._source.env(node_id)
         except Exception:                        # noqa: BLE001 — an un-propagated node
             return None
         a, b = node_env.axes, env.axes
@@ -3280,6 +3422,7 @@ class EngineRunner(QObject):
         *is* the load and nothing is pinned, it reuses the display path's own key rather
         than minting a second one — hovering over a raw source then costs no extra read
         and no extra memory."""
+        node_id = self._rid(node_id)
         got = self.raw_source(node_id)
         if got is None:
             return None
@@ -3480,6 +3623,7 @@ class EngineRunner(QObject):
           licence to READ them all, never to COMPUTE them all: on a whole-volume chain this
           queued a preload measured in hours, and playback waited for it.
         """
+        node_id = self._rid(node_id)
         view = self._view_of(node_id)
         if view is None or view.provider is None or view.axes is None:
             return 0
@@ -3569,6 +3713,7 @@ class EngineRunner(QObject):
         """Whether the whole T range of a held node's frames fits the budget — i.e.
         whether a preload can make playback read-free rather than merely warmer.
         ``node_id`` names which pane's node; default is the most recently held one."""
+        node_id = self._rid(node_id) if node_id is not None else None
         view = (self._view_of(node_id) if node_id is not None
                 else next(reversed(self._views.values()), None))
         if axes is None:
@@ -3595,6 +3740,7 @@ class EngineRunner(QObject):
         uploads on an ingested file, and a queue of computes on a deconvolution. Unknown
         nodes (never pulled, no held view) answer False — the cautious direction, since it
         costs a smooth playback and the other costs a frozen one."""
+        node_id = self._rid(node_id)
         view = self._view_of(node_id)
         if view is None or view.provider is None:
             return False
@@ -3730,10 +3876,9 @@ class EngineRunner(QObject):
         upstream (a memo hit still *participates*, and reports itself ``cached``). Read
         off the run graph so it matches what the engine will actually walk — muted nodes
         are bypassed there, and group bodies are expanded."""
+        node_id = self._rid(node_id)
         try:
-            graph = graph if graph is not None else self.document.to_graph(
-                for_run=True, materialize=True, unroll_iterate=True,
-                sweep_all=self._sweep_all)
+            graph = graph if graph is not None else self._compose(node_id).graph
         except Exception:  # noqa: BLE001 — an unbuildable graph plans as just the target
             return [node_id]
         if node_id not in graph.nodes:
@@ -3774,6 +3919,7 @@ class EngineRunner(QObject):
         whole series. That is a troubleshooting shortcut, not a result: the checkpoint
         then contains a *truncated* series and every node downstream runs on it, which is
         why the caller has to ask for it explicitly and the card stays marked."""
+        node_id = self._rid(node_id)
         if self._busy:
             return False
         self._stop_bake = False          # a stop never leaks into the next bake
@@ -3781,12 +3927,11 @@ class EngineRunner(QObject):
         self._last_progress.clear()
         self._last_frame.clear()
         self._last_sweep.clear()
-        graph = self.document.to_graph(for_run=True, materialize=True,
-                                       unroll_iterate=True, sweep_all=self._sweep_all,
-                                       live_docks=frozenset({node_id}))
-        pull_id = self._pull_id(node_id, graph)
+        composed = self._compose(node_id, live_docks=frozenset({node_id}))
+        graph = composed.graph
+        pull_id = self._pull_id(node_id, graph, composed)
         sources, every = self._sources_for(pull_id, graph)
-        job = _Job(self._epoch, graph, self.document.revision, node_id, None, None,
+        job = _Job(self._epoch, graph, composed.revision, node_id, None, None,
                    sources, pin=self._pin_for(coords) if scoped else None,
                    bake={"store": store, "precision": precision, "bake_id": bake_id,
                          "signature": signature, "scoped": bool(scoped),
@@ -3875,6 +4020,7 @@ class EngineRunner(QObject):
         Refuses a non-Dataset for the same reason :meth:`_run_bake` does: the alternative is a
         seed the engine cannot use, surfacing later as a confusing type error inside a compute
         rather than here where the user pressed the button."""
+        node_id = self._rid(node_id)
         if not isinstance(payload, Dataset):
             raise TypeError(
                 f"a Dock can only hold a Dataset; this one's input produced "
@@ -3890,6 +4036,7 @@ class EngineRunner(QObject):
         Rebuilds the engine for the mirror of :meth:`hold`'s reason: without it the cached
         engine keeps the stale seed and would go on serving the released payload until the
         next document edit happened to invalidate it."""
+        node_id = self._rid(node_id)
         had = self._held.pop(node_id, None) is not None
         self._held_envs.pop(node_id, None)
         if had:
@@ -3925,7 +4072,7 @@ class EngineRunner(QObject):
         cached engine would quietly walk the 1-clone one it still held. Clearing
         ``_engine_rev`` is the narrow form of that: no memo is dropped, so every iteration
         already computed is still a hit."""
-        ids = frozenset(node_ids)
+        ids = frozenset(self._rids(node_ids))
         if ids != self._sweep_all:
             self._sweep_all = ids
             self._engine_rev = -1
@@ -3943,6 +4090,7 @@ class EngineRunner(QObject):
         there is nothing to select on. That is acceptable here precisely because a dock
         makes most of it dead — the tiles of a chain nothing will read again — and what
         survives is one decompress away."""
+        node_ids = self._rids(node_ids)
         n = self._memo.drop_nodes(list(node_ids))
         self._tiles.clear()
         self._planes.clear()
@@ -3952,6 +4100,7 @@ class EngineRunner(QObject):
         gone = set(node_ids)
         for key in [k for k in self._results if k[0] in gone]:
             self._results.pop(key, None)
+            self._result_ctx.pop(key, None)
         self._prefetch_gen += 1
         return n
 
@@ -3962,7 +4111,7 @@ class EngineRunner(QObject):
         # a saved graph opened by an older build, the LabLink protocol — still names a real
         # file instead of an empty one.
         out: Dict[str, Dict[str, Any]] = {}
-        for rec in self.document.nodes.values():
+        for rid, rec in self._source.all_records():
             if rec.op_key != LOAD_OP:
                 continue
             cfg: Dict[str, Any] = {"path": str(rec.params.get("path", "") or ""),
@@ -3992,7 +4141,7 @@ class EngineRunner(QObject):
             members = rec.params.get(BUNDLE_PATHS_KEY)
             if isinstance(members, (list, tuple)) and len(members) >= 2:
                 cfg[BUNDLE_PATHS_KEY] = [str(p or "") for p in members]
-            out[rec.id] = cfg
+            out[rid] = cfg
         return out
 
     def _sources_for(self, node_id: str, graph: Graph
@@ -4019,12 +4168,12 @@ class EngineRunner(QObject):
         self._last_progress.clear()
         self._last_frame.clear()
         self._last_sweep.clear()
-        graph = self.document.to_graph(for_run=True, materialize=True,
-                                       unroll_iterate=True, sweep_all=self._sweep_all)
-        pull_id = self._pull_id(node_id, graph)
+        composed = self._compose(node_id)
+        graph = composed.graph
+        pull_id = self._pull_id(node_id, graph, composed)
         sources, every = self._sources_for(pull_id, graph)
         job = _Job(self._epoch, graph,
-                   self.document.revision, node_id, coords, channels, sources,
+                   composed.revision, node_id, coords, channels, sources,
                    pin=None if fetch else self._pin_for(coords), all_sources=every,
                    pull_id=pull_id)
         if fetch:
@@ -4040,11 +4189,30 @@ class EngineRunner(QObject):
         # `n#it@2` and inlined group bodies `b%inst`, and `invalidate` matches this set
         # against the ids the document reports touched — a delete or param edit on the
         # card `n` must hit a run that is computing `n`'s clones.
-        self._run_cones[self._epoch] = frozenset(
-            _doc_id_of(c) for c in self.planned_nodes(pull_id, graph))
-        self.plan.emit(node_id, self.planned_nodes(pull_id, graph))
+        planned = self.planned_nodes(pull_id, graph)
+        # …plus the card itself: a bound Page Input is served by its upstream Output, so it
+        # is in no plan, yet re-pointing its Source must cancel the pull of it
+        self._run_cones[self._epoch] = self._cone_of(planned, composed) | {_doc_id_of(node_id)}
+        self.plan.emit(node_id, planned)
         (self.fetch_started if fetch else self.started).emit(node_id)
         self._pull_thread.start(_Worker(self, job))
+
+    @staticmethod
+    def _cone_of(planned: Iterable[str], composed: Any = None) -> frozenset:
+        """The DOCUMENT ids a run computes — what an edit's touched set is matched against.
+
+        Run-graph ids map back to their cards (:func:`_doc_id_of`). A resolved ``page.input``
+        has no node in the composed graph — its consumers read the upstream Output directly
+        — so it is added explicitly whenever one of its consumers is planned
+        (:attr:`~nodelab_v2.workspace.ComposedGraph.inputs`): otherwise re-pointing a Page
+        Input's Source mid-run would cancel nothing, and the run's now-stale result would be
+        filed under the page's new revision as if it were current."""
+        ids = set(planned)
+        cone = {_doc_id_of(c) for c in ids}
+        for inp, consumers in (getattr(composed, "inputs", None) or {}).items():
+            if consumers & ids:
+                cone.add(inp)
+        return frozenset(cone)
 
     def _start_next(self) -> None:
         """Free the pull slot and start the next queued branch, if any.
@@ -4055,14 +4223,14 @@ class EngineRunner(QObject):
         self._busy = False
         while self._queue:
             _nid, req = self._queue.popitem(last=False)
-            if req[0] in self.document.nodes:
+            if self._source.record(req[0]) is not None:
                 self._submit(*req)
                 return
             self.cancelled.emit(req[0])      # the node was deleted while it waited
         # only once no pull the user asked for is waiting: an editor's source fetch
         while self._fetch_queue:
             nid, _ = self._fetch_queue.popitem(last=False)
-            if nid not in self.document.nodes:
+            if self._source.record(nid) is None:
                 continue
             have = self.finished_result(nid)
             if have is not None:              # a user pull computed it while it waited
@@ -4071,7 +4239,7 @@ class EngineRunner(QObject):
             self._submit(nid, None, None, fetch=True)
             return
 
-    def _pull_id(self, node_id: str, graph: Graph) -> str:
+    def _pull_id(self, node_id: str, graph: Graph, composed: Any = None) -> str:
         """Which id in the RUN graph serves ``node_id``.
 
         Itself, except for a node inside an Iterate segment: the rewrite replaced it with
@@ -4079,15 +4247,24 @@ class EngineRunner(QObject):
         any more and is served by the clone for the iteration the strip is on. Without this
         the pull would raise a bare KeyError on the node the user just clicked — the most
         ordinary thing to do while tuning a swept parameter is to look at the node being
-        swept."""
+        swept. The same holds for a bound ``page.input`` (V4.00 step 2): composition drops
+        it and wires its consumers to the upstream Output, so the card is served by that
+        Output — which is exactly the Dataset the Input passes on."""
+        node_id = self._rid(node_id)
         if node_id in graph.nodes:
             return node_id
-        alias = self.document.iterate_aliases(sweep_all=self._sweep_all).get(node_id)
+        pid, _nid = split_run_id(node_id)
+        if composed is not None:
+            up = composed.id_map.get((pid or (self._source.active or ""), _nid))
+            if up and up != node_id and up in graph.nodes:
+                return up
+        alias = self._source.iterate_aliases(pid or (self._source.active or ""),
+                                             sweep_all=self._sweep_all).get(node_id)
         return alias if alias and alias in graph.nodes else node_id
 
     def _deliver(self, packet) -> None:          # GUI thread (queued)
         (epoch, node_id, payload, plane, axes, dt, err, revision, coords, channels,
-         pin) = packet
+         pin, octx) = packet
         self._run_cones.pop(epoch, None)
         # `_busy` is cleared by `_start_next` alone (see there), so every exit path below
         # frees the slot AND starts the next branch, and neither can be forgotten separately.
@@ -4119,7 +4296,7 @@ class EngineRunner(QObject):
         stale = self._runs.pop(epoch, None) is None
         # G8 live re-seed: hand newly resolved source envelopes to the document
         for nid, env in self._fresh_envs():
-            self.document.set_meta_seed(nid, env)
+            self._source.set_meta_seed(nid, env)
         # A queued request for THIS SAME node does supersede this result — that is a newer
         # view of the node the user is looking at (a moved cursor, a changed channel set),
         # and showing the older one first would be a visible flicker backwards. A queued
@@ -4142,10 +4319,7 @@ class EngineRunner(QObject):
             # plane decoded, no `finished` — so no pane is retargeted and none is left
             # showing a run that never delivers.
             if isinstance(payload, Dataset):
-                self._results[(node_id, self.document.revision)] = (payload, axes)
-                self._results.move_to_end((node_id, self.document.revision))
-                while len(self._results) > _FINISHED_RESULTS:
-                    self._results.popitem(last=False)
+                self._remember((node_id, self._rev(node_id)), payload, axes)
             self.fetched.emit(node_id, payload, dt)
             return
         # Hold the image provider so subsequent coords-only requests skip the engine
@@ -4157,11 +4331,14 @@ class EngineRunner(QObject):
         # branch is still computing (:meth:`_serve_finished`). Unpinned results only: a
         # frame-scoped payload holds ONLY those frames, so re-serving it later as if it were
         # the node's whole answer would quietly show a truncated series.
+        has_ctx, ctx = octx
+        if has_ctx:
+            # re-asserted from the packet: an edit outside this run's cone may have cleared
+            # the shared map since the worker resolved it
+            self._overlay_ctxs[node_id] = ctx
         if pin is None and err is None:
-            self._results[(node_id, self.document.revision)] = (payload, axes)
-            self._results.move_to_end((node_id, self.document.revision))
-            while len(self._results) > _FINISHED_RESULTS:
-                self._results.popitem(last=False)
+            self._remember((node_id, self._rev(node_id)), payload, axes,
+                           ctx=ctx, has_ctx=has_ctx)
         if isinstance(payload, Dataset) and payload.image is not None:
             self._hold_view(node_id, payload, pin=pin)   # which frame this held payload IS
         # The worker only ever ASSIGNS one overlay-context key; the bound is applied here,
@@ -4196,20 +4373,21 @@ class EngineRunner(QObject):
         """Drop bookkeeping for deleted io.load nodes so it doesn't grow unbounded
         (the resolved-provider cache is keyed by source path, shared across nodes, so
         it is left intact — reopening the same file is a hit)."""
-        live = set(self.document.nodes)
+        def gone(rid: str) -> bool:
+            return self._source.record(rid) is None
         for nid in list(self._node_source_key):
-            if nid not in live:
+            if gone(nid):
                 self._node_source_key.pop(nid, None)
                 self._announced.pop(nid, None)
         # A card deleted mid-ingest stops being tracked, but the JOB is deliberately left
         # to finish: it is writing a store keyed by the file, not by the card, and killing
         # it halfway is what leaves a torn one behind. Its delivery finds nothing to
         # announce and quietly lands in `_providers` for whoever loads that file next.
-        for nid in [n for n in self._ingesting if n not in live]:
+        for nid in [n for n in self._ingesting if gone(n)]:
             self._ingesting.pop(nid, None)
-        for ck in [k for k in self._raw_src if k[0] not in live]:
+        for ck in [k for k in self._raw_src if gone(k[0])]:
             self._raw_src.pop(ck, None)
-        for nid in [n for n in self._views if n not in live]:
+        for nid in [n for n in self._views if gone(n)]:
             self._views.pop(nid, None)
 
     def _ensure_engine(self, job: _Job) -> Engine:   # worker thread
@@ -4385,7 +4563,8 @@ class EngineRunner(QObject):
         is not set to auto, names a bundle (each member decides independently; there is
         no single reason for the card), or has not been decided yet (nothing has pulled
         or ingested it this session)."""
-        rec = self.document.nodes.get(node_id)
+        node_id = self._rid(node_id)
+        rec = self._source.record(node_id)
         if rec is None or source_access_of(rec) != ACCESS_AUTO:
             return ""
         paths = _clean_source_paths(dict(rec.params))

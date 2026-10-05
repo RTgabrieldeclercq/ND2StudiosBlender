@@ -1200,6 +1200,7 @@
 {"dst":"nodelab_v2.overlay_compose","k":"imp","lazy":true,"src":"nodelab_v2.runner"}
 {"dst":"nodelab_v2.position_groups","k":"imp","lazy":true,"src":"nodelab_v2.runner"}
 {"dst":"nodelab_v2.region_box","k":"imp","lazy":false,"src":"nodelab_v2.runner"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":false,"src":"nodelab_v2.runner"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
@@ -1314,6 +1315,7 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"scripts._dock_hold_probe"}
 {"dst":"nodelab_v2.runner","k":"imp","lazy":false,"src":"scripts._dock_hold_probe"}
 {"dst":"nodelab_v2.window","k":"imp","lazy":false,"src":"scripts._dock_hold_probe"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":false,"src":"scripts._dock_hold_probe"}
 {"dst":"nodegraph.catalog._shared.psf","k":"imp","lazy":false,"src":"scripts._fibro_four_methods"}
 {"dst":"nodegraph.kernels","k":"imp","lazy":false,"src":"scripts._fibro_four_methods"}
 {"dst":"nodegraph.kernels.zsdeconvnet","k":"imp","lazy":false,"src":"scripts._fibro_four_methods"}
@@ -1377,6 +1379,7 @@
 {"dst":"nodelab_v2.theme","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.viewer","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.window","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.window","k":"imp","lazy":false,"src":"scripts._nodelab_v2_shot"}
 {"dst":"nodelab_v2.nd2_compat","k":"imp","lazy":false,"src":"scripts._noise_model_probe"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"scripts._probe_bundle_card"}

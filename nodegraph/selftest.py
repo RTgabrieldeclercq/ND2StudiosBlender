@@ -17040,8 +17040,12 @@ def test_overlay_placement() -> None:
     _vsb = Dataset(axes=_vsax, metadata=dict(_vsmd)).with_image(
         ArrayProvider(np.ones((1, 1, 1, 1, 8, 8))))
 
+    class _FakeSource:
+        record = staticmethod({"V": NodeInstance("V", "analysis.voronoi")}.get)
+
     class _FakeRunner:
-        document = type("D", (), {"nodes": {"V": NodeInstance("V", "analysis.voronoi")}})()
+        # records come through the runner's GraphSource (V4.00 step 2), keyed by run id
+        _source = _FakeSource()
     _ent = EngineRunner._view_source_entry(_FakeRunner(), "V", _vsa, _vsb)
     assert _ent is not None, \
         "a sibling branch must be placeable with NO stage log — it needs none, and a TIFF " \
@@ -18008,7 +18012,7 @@ def test_overlay_after_geometry_change() -> None:
     # the STAMPED plan still describes the two pre-stitch fields — it is a record, not a
     # claim about the stitched canvas
     assert sorted(dict((m, v) for m, v in stamped["tiles"])) == [0, 1]
-    fake = SimpleNamespace(document=SimpleNamespace(nodes=dict(g2.nodes)))
+    fake = SimpleNamespace(_source=SimpleNamespace(record=dict(g2.nodes).get))  # by run id
     fresh = EngineRunner._replan(fake, "O", stamped, stitched, sec)
     assert sorted(dict((m, v) for m, v in fresh["tiles"])) == [0], fresh["tiles"]
     # ...and it draws across the WHOLE stitched canvas, spanning what both fields covered
@@ -18626,6 +18630,7 @@ def test_display_resolution_policy() -> None:
             PRELOAD_JOBS=EngineRunner.PRELOAD_JOBS,
             _pool=SimpleNamespace(start=queued.append, maxThreadCount=lambda: 8))
         r._view_of = r._views.get
+        r._rid = lambda nid: nid          # its ids are already run ids (V4.00 step 2)
         r.display_dim = lambda a, **k: EngineRunner.display_dim(r, a, **k)
         r._frame_bytes = lambda a, ch, **k: EngineRunner._frame_bytes(r, a, ch, **k)
         r._prefetch_span = EngineRunner._prefetch_span
@@ -18801,6 +18806,13 @@ def test_held_views() -> None:
                         document=SimpleNamespace(revision=7),
                         _results=OrderedDict())
     r._view_of = r._views.get
+    # results and views are keyed on the PAGE's run identity (V4.00 step 2); this fake's ids
+    # are already run ids and its identity is the document revision it carries
+    r._rev = lambda rid: r.document.revision
+    r._rid = lambda nid: nid
+    r._result_ctx = {}
+    r._overlay_ctxs = {}
+    r._restore_ctx = lambda key: EngineRunner._restore_ctx(r, key)
     r._hold_view = lambda *a, **k: EngineRunner._hold_view(r, *a, **k)
 
     a, b, c = _ds(12), _ds(), _ds(12)
@@ -19006,6 +19018,7 @@ def test_overlay_zoom_detail() -> None:
     fake = SimpleNamespace(_overlay_ctxs={"O": ctx}, _texture_limit=8192, _views={},
                            _src_override={}, _ovr_gen=0)
     fake._view_of = fake._views.get
+    fake._rid = lambda nid: nid          # its ids are already run ids (V4.00 step 2)
     fake._payload_coords = lambda coords, pin: coords
     fake._clamp_coords = lambda coords, axes: EngineRunner._clamp_coords(fake, coords, axes)
     fake._compose_overlay = lambda *a, **k: EngineRunner._compose_overlay(fake, *a, **k)
@@ -19154,7 +19167,10 @@ def test_overlay_subtick_cache() -> None:
         _prefetch_gen=0, _preload_gen=0, _preload_node=None, _preload_total=0,
         _preload_done=0, PRELOAD_JOBS=EngineRunner.PRELOAD_JOBS,
         _pool=SimpleNamespace(start=queued.append, maxThreadCount=lambda: 8),
-        document=SimpleNamespace(nodes={}, edges=[]))
+        # the runner's GraphSource (V4.00 step 2): no cards, an empty page
+        _source=SimpleNamespace(record=lambda rid: None, active="",
+                                document_of=lambda pid: SimpleNamespace(nodes={}, edges=[])))
+    r._rid = lambda nid: nid             # its ids are already run ids
     for name in ("_plane_addrs", "_cached_planes", "_decode_planes", "_compose_overlay",
                  "_source_frame", "_warm_overlay", "overlay_sub_ticks", "overlay_channels",
                  "source_label", "_source_label_of", "display_dim", "_clamp_coords",
@@ -24503,6 +24519,213 @@ def test_lablink_page_select() -> None:
         "refused; workspace format advertised in step with the serializer")
 
 
+def test_runner_qualified_ids() -> None:
+    """V4.00 step 2: the grammar the runner keys everything on, and the GraphSource surface
+    it binds to — Qt-free, so the runner's contract is pinned here and the runner itself in
+    the GUI probe (WS2)."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.workspace import (Workspace, doc_id_of, local_ids, qualify,
+                                      split_run_id)
+    # the run-id grammar: the page is the FIRST "/"-part, the inner grammar is untouched
+    assert qualify("pg1", "n3#it@2") == "pg1/n3#it@2"
+    assert split_run_id("pg1/n3#it@2") == ("pg1", "n3#it@2")
+    assert split_run_id("n3#it@2") == ("", "n3#it@2")
+    # the document id a run-graph id answers to — bare ids as before, qualified ones keep
+    # their page (a cone is matched against a page's qualified `last_touched`)
+    assert doc_id_of("n7") == "n7"
+    assert doc_id_of("bg0#it2@3") == "bg0" and doc_id_of("it2#adv@0") == "it2"
+    assert doc_id_of("body%inst") == "inst" and doc_id_of("b%mid%g7#it1@0") == "g7"
+    assert doc_id_of("pg1/n7") == "pg1/n7"
+    assert doc_id_of("pg1/bg0#it2@3") == "pg1/bg0" and doc_id_of("pg2/it2#adv@0") == "pg2/it2"
+    assert doc_id_of("pg1/body%inst") == "pg1/inst"
+    assert doc_id_of("pg3/b%mid%g7#it1@0") == "pg3/g7"
+    # which of a mixed id set belongs to a page; bare ids belong to the default page
+    assert local_ids(["pg1/a", "pg2/b", "c"], "pg1", "pg1") == frozenset({"a", "c"})
+    assert local_ids(["pg1/a", "pg2/b", "c"], "pg2", "pg1") == frozenset({"b"})
+    assert local_ids(["pg1/a", "c"], "pg1") == frozenset({"a", "c"})
+    assert local_ids([], "pg1") == frozenset()
+
+    # the GraphSource surface the runner uses, on the four-page fixture
+    ws, _ds, env, ax = _ws_fixture()
+    for name in ("compose", "revision_of", "record", "env", "meta_seed", "set_meta_seed",
+                 "document_of", "page_ids", "all_records", "iterate_aliases", "on_change",
+                 "off_change"):
+        assert callable(getattr(ws, name)), name
+    assert ws.page_ids() == ("pg1", "pg2", "pg3", "pg4")
+    recs = dict(ws.all_records())
+    assert recs["pg1/L"].op_key == "io.load" and recs["pg3/X"].op_key == "enhance.gamma"
+    assert set(recs) == {"pg1/L", "pg1/O", "pg2/IN", "pg2/G", "pg2/O", "pg3/IN", "pg3/X",
+                         "pg4/IN", "pg4/X"}, sorted(recs)
+    assert ws.record("pg2/G") is ws.pages["pg2"].doc.nodes["G"]
+    assert ws.record("pg9/G") is None and ws.record("pg2/nope") is None
+    ws.active = "pg2"
+    assert ws.record("G") is ws.pages["pg2"].doc.nodes["G"], "a bare id means the active page"
+    assert ws.meta_seed("pg1/L") == env and ws.meta_seed("pg2/G") is None
+    assert ws.env("pg2/G").axes == ax
+    assert ws.revision_of("nope") == "", "an unknown page has no run identity, and raises nothing"
+    r3 = ws.revision_of("pg3")
+    assert isinstance(r3, str) and r3 and r3 != ws.revision_of("pg4"), "two pages, two identities"
+    assert ws.iterate_aliases("pg2") == {} and ws.iterate_aliases("pg9") == {}
+    # an Iterate segment aliases in run ids, with the sweep scope read in run ids too
+    from nodegraph.iterate import ITERATE_OP, SEG_TO
+    Z = ws.add_page("Zone", "free")
+    Z.doc.add_node("io.load", node_id="IL")
+    Z.doc.meta_seeds["IL"] = env
+    Z.doc.add_node("analysis.threshold", node_id="ITH", modes={"method": "fixed"})
+    Z.doc.add_node("analysis.label", node_id="ILB")
+    Z.doc.add_node("analysis.reduce_scalar", node_id="IRS",
+                   params={"source": "area", "name": "n_cells"})
+    Z.doc.add_node(ITERATE_OP, node_id="ITT",
+                   params={"v0_list": "0.2, 0.4, 0.6", "index": 1},
+                   modes={"mode": "sweep", "variables": "1", "v0_source": "list",
+                          "preserve": "picked"})
+    Z.doc.connect("IL", "image", "ITH", "data")
+    Z.doc.connect("ITH", "out", "ILB", "data")
+    Z.doc.connect("ILB", "out", "IRS", "data")
+    Z.doc.connect("IRS", "out", "ITT", SEG_TO)
+    Z.doc.connect("ITT", "var0", "ITH", "threshold")
+    bare = Z.doc.iterate_aliases()
+    assert bare == {"ITH": "ITH#ITT@1", "ILB": "ILB#ITT@1"}, bare
+    qual = ws.iterate_aliases(Z.id)
+    assert qual == {qualify(Z.id, k): qualify(Z.id, v) for k, v in bare.items()}, (bare, qual)
+    assert all(split_run_id(k)[0] == Z.id and split_run_id(v)[0] == Z.id
+               for k, v in qual.items())
+    # …and the composed graph carries those clones under the page prefix
+    compz = ws.compose(Z.id)
+    assert qualify(Z.id, "ILB#ITT@1") in compz.graph.nodes, sorted(compz.graph.nodes)
+    assert doc_id_of(qualify(Z.id, "ILB#ITT@1")) == qualify(Z.id, "ILB")
+    ws.remove_page(Z.id)
+    # a channel tap materialized inside a page keeps its id free of the page separator, so
+    # a qualified tap id still splits as (page, tap)
+    T = ws.add_page("Taps", "free")
+    T.doc.add_node("io.load", node_id="L")
+    T.doc.meta_seeds["L"] = MetaEnvelope(axes=AxisSizes(m=1, t=1, z=1, c=2, y=8, x=8),
+                                         metadata={"pixel_size_um": 0.5})
+    T.doc.add_node("channel.split", node_id="CS")
+    T.doc.add_node("enhance.gamma", node_id="G", params={"gamma": 1.0})
+    T.doc.connect("L", "image", "CS", "data")
+    T.doc.connect("CS", "ch0", "G", "data")
+    comp = ws.compose(T.id)
+    assert {split_run_id(n)[0] for n in comp.graph.nodes} == {T.id}, sorted(comp.graph.nodes)
+    assert all(n.count("/") == 1 for n in comp.graph.nodes), sorted(comp.graph.nodes)
+    taps = [n for n in comp.graph.nodes if "__tap__" in n]
+    assert taps and all(doc_id_of(n) == n for n in taps), taps
+    ws.remove_page(T.id)
+    # a bare document wrapped by Workspace.single is what `EngineRunner(doc)` still binds to
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="n1")
+    single = Workspace.single(doc)
+    assert single.record("n1") is doc.nodes["n1"] and single.page_ids() == ("pg1",)
+    assert dict(single.all_records()) == {"pg1/n1": doc.nodes["n1"]}
+    # a resolved Input has no node in the composed graph, so the run cone names it
+    # explicitly (via its consumers): re-pointing its Source mid-run must cancel the run
+    from nodelab_v2.runner import EngineRunner
+    ws3, _ds3, _env3, _ax3 = _ws_fixture()
+    c3 = ws3.compose("pg3")
+    assert c3.inputs == {"pg2/IN": frozenset({"pg2/G"}), "pg3/IN": frozenset({"pg3/X"})}, \
+        c3.inputs
+    assert "pg3/IN" not in c3.graph.nodes and "pg2/IN" not in c3.graph.nodes
+    cone = EngineRunner._cone_of(sorted(c3.graph.nodes), c3)
+    assert {"pg3/IN", "pg2/IN", "pg1/L", "pg3/X"} <= cone, sorted(cone)
+    only_up = EngineRunner._cone_of(["pg1/L", "pg1/O"], c3)
+    assert "pg3/IN" not in only_up and "pg2/IN" not in only_up, \
+        "an Input joins a cone only when one of its consumers is planned"
+    assert EngineRunner._cone_of(["pg1/n3#it@2", "pg1/b%g7"]) == {"pg1/n3", "pg1/g7"}
+    # the run identity never repeats across a load: fresh page documents restart their
+    # revision counters, so the digest carries each document's process-wide uid
+    from nodelab_v2.workspace import Workspace as _W
+    w5, _d5, _e5, _a5 = _ws_fixture()
+    blob = w5.to_dict()
+    wa, wb = _W(), _W()
+    wa.load_dict(blob)
+    wb.load_dict(blob)
+    assert wa.pages["pg1"].doc.revision == wb.pages["pg1"].doc.revision
+    assert wa.revision_of("pg1") != wb.revision_of("pg1"), \
+        "two loads of the same file must not share a run identity"
+    ida = wa.revision_of("pg3")
+    wa.load_dict(blob)                                 # File → Open again, same window
+    assert wa.revision_of("pg3") != ida
+    # a reference cycle (only Free pages can form one, from a hand-edited file) never makes
+    # the run identity or the composition raise; the Input that closes it stays unbound
+    wc = _W()
+    fa, fb = wc.add_page("A", "free"), wc.add_page("B", "free")
+    for pg, other, nm in ((fa, fb, "a"), (fb, fa, "b")):
+        pg.doc.add_node("page.input", node_id="IN",
+                        params={"source": f"{other.id}:{'b' if nm == 'a' else 'a'}"})
+        pg.doc.add_node("enhance.gamma", node_id="X", params={"gamma": 1.0})
+        pg.doc.add_node("page.output", node_id="O", params={"name": nm})
+        pg.doc.connect("IN", "out", "X", "data")
+        pg.doc.connect("X", "out", "O", "data")
+    try:
+        wc.dependency_closure(fa.id)
+        raise AssertionError("a cycle must still be reported by the strict closure")
+    except ValueError:
+        pass
+    assert wc.revision_of(fa.id) and wc.revision_of(fb.id)
+    cyc = wc.compose(fa.id)
+    # neither direction of a Free-page cycle is acyclic, so BOTH Inputs on it stay unbound
+    # roots (each says so when pulled) — and nothing raises
+    assert sorted(n for n, i in cyc.graph.nodes.items() if i.op_key == "page.input") == \
+        [f"{fa.id}/IN", f"{fb.id}/IN"], sorted(cyc.graph.nodes)
+    assert wc.resolve_source(fa.id, f"{fb.id}:b") is None
+    # a reference AGAINST the kind order is no dependency (it can never resolve)
+    wk = _W()
+    kr, kp = wk.add_page("R", "refine"), wk.add_page("P", "process")
+    kp.doc.add_node("page.output", node_id="O", params={"name": "m"})
+    kr.doc.add_node("page.input", node_id="IN", params={"source": f"{kp.id}:m"})
+    assert wk.dependency_closure(kr.id) == [kr.id] and wk.page_deps(kr.id) == []
+    # the Workspace hears an edit FIRST — before listeners registered earlier — so the
+    # runner has cancelled what an edit makes stale before anything (the Movie Editor's
+    # refetch) submits new work; and a File → Open keeps it first
+    d = GraphDocument()
+    order: List[str] = []
+    d.on_change(lambda: order.append("early"))
+    w = Workspace.single(d)
+    w.on_change(lambda: order.append("ws"))
+    d.on_change(lambda: order.append("late"))
+    d.add_node("io.load", node_id="L")
+    assert order == ["ws", "early", "late"], order
+    w.load_dict(w.to_dict())
+    order.clear()
+    d.add_node("io.load", node_id="L2")
+    assert order == ["ws", "early", "late"], order
+    # page-level changes publish what a RUN can see: adding or duplicating a page cancels
+    # nothing; renaming one re-stamps its Outputs' `condition`, so every node on it is
+    # touched; removing one touches every node it had — and re-describes its readers,
+    # whose Inputs no longer resolve
+    ws2, _ds2, _env2, ax2 = _ws_fixture()
+    seen: List[Any] = []
+    ws2.on_change(lambda: seen.append(ws2.last_touched))
+    ws2.add_page("Extra", "analyze")
+    assert seen[-1] == frozenset(), seen[-1]
+    dup = ws2.duplicate_page("pg3")
+    assert seen[-1] == frozenset(), seen[-1]
+    ws2.remove_page(dup.id)
+    assert seen[-1] == frozenset({qualify(dup.id, "IN"), qualify(dup.id, "X")}), seen[-1]
+    ws2.rename_page("pg2", "Refine B")
+    assert seen[-1] == frozenset({"pg2/O", "pg3/IN", "pg4/IN"}), \
+        ("a rename re-stamps the Outputs' condition: the Outputs and their readers", seen[-1])
+    assert ws2.pages["pg3"].doc.envs["IN"].axes == ax2
+    # an edit to an Output can re-bind a reader on another page: its Inputs are touched
+    ws2.pages["pg2"].doc.nodes["O"].params["condition"] = "x"
+    ws2.pages["pg2"].doc.touch("O")
+    assert seen[-1] == frozenset({"pg2/O", "pg3/IN", "pg4/IN"}), seen[-1]
+    ws2.pages["pg2"].doc.nodes["G"].params["sigma"] = 1.5
+    ws2.pages["pg2"].doc.touch("G")
+    assert seen[-1] == frozenset({"pg2/G"}), ("an ordinary edit names itself only", seen[-1])
+    ws2.remove_page("pg2")
+    assert seen[-1] == frozenset({"pg2/IN", "pg2/G", "pg2/O", "pg3/IN", "pg4/IN"}), seen[-1]
+    assert ws2.pages["pg3"].doc.envs["IN"].axes != ax2, \
+        "a removed page's readers must be re-described, not left on its old envelope"
+    _ok("runner qualified ids: doc_id_of keeps the page prefix through #it@/%inst, local_ids "
+        "splits a mixed set per page, the Workspace serves the GraphSource surface "
+        "(records/envs/seeds/aliases in run ids; unknown page → no identity), taps split "
+        "clean; the Workspace hears an edit first (and still after a load); add/duplicate "
+        "publish nothing, rename/remove touch exactly the page's nodes, and a removed page's "
+        "readers are re-described")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -24591,6 +24814,7 @@ def main() -> int:
     test_workspace_format_v3()
     test_page_kind_catalog()
     test_lablink_page_select()
+    test_runner_qualified_ids()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

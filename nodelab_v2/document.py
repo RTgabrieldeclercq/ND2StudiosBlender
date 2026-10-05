@@ -19,6 +19,7 @@ Qt-free; standard library + nodegraph only (testable headless).
 """
 from __future__ import annotations
 
+import itertools
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from nodegraph.domains import AXIS_ORDER, Domain
@@ -217,6 +218,10 @@ class FrameRecord:
 EdgeTuple = Tuple[str, str, str, str]        # (src, src_socket, dst, dst_socket)
 
 
+#: source of :attr:`GraphDocument.uid`
+_DOC_UIDS = itertools.count(1)
+
+
 class GraphDocument:
     """The editable model + envelope cache. ``on_change`` callbacks fire after every
     structural edit or re-propagation (the canvas/inspector re-seed from them)."""
@@ -233,6 +238,11 @@ class GraphDocument:
         self.envs: Dict[str, MetaEnvelope] = {}
         self.path: Optional[str] = None           # last save/load file
         self.revision = 0                          # bumped on every edit
+        #: unique per document INSTANCE, process-wide (V4.00 step 2). A page's run identity
+        #: digests it beside the revision: two document objects can share a revision number
+        #: — every fresh page a File → Open builds starts again at 0 — and an identity that
+        #: repeats would hand a new file's pull the previous file's cached engine and results.
+        self.uid = next(_DOC_UIDS)
         # zones/groups + zone back-edges aren't GUI-editable yet, but a loaded file's
         # are carried through VERBATIM so re-saving never silently destroys them
         # (review 2026-07-22 BLOCKER). The GUI reads/writes only the FORWARD nodes+
@@ -277,8 +287,16 @@ class GraphDocument:
         self.page_sources: Callable[[], list] = lambda: []
 
     # ── listeners ────────────────────────────────────────────────────────────
-    def on_change(self, fn: Callable[[], None]) -> None:
-        self._listeners.append(fn)
+    def on_change(self, fn: Callable[[], None], *, first: bool = False) -> None:
+        """Call ``fn`` after every change. ``first`` puts it AHEAD of every listener already
+        registered — how the Workspace attaches (V4.00 step 2), so it hears an edit, and the
+        runner cancels what the edit made stale, before any other listener can act on it:
+        the Movie Editor re-fetches its sources from inside its own change handler, and a
+        fetch submitted before the cancel would be cancelled the moment it started."""
+        if first:
+            self._listeners.insert(0, fn)
+        else:
+            self._listeners.append(fn)
 
     def off_change(self, fn: Callable[[], None]) -> None:
         """Forget a listener registered with :meth:`on_change` — a removed page's scene, a

@@ -18,6 +18,32 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   LabLink `hello` reports `SOFTWARE_NAME`/`SOFTWARE_VERSION` from it (was a stale `"2.21"`).
 - Package name `nodelab_v2` is unchanged by decision: the version is a label, not a path.
 
+### Step 1 — workspace model, file format 3.0, page kinds (2026-10-05)
+- `nodelab_v2/workspace.py`: a saved file is a **workspace** of typed pages (`input` →
+  `refine` → `process` → `analyze`, plus `free`); `format_version` 3.0 with `workspace:
+  {active, next_page_seq, pages}`; a 2.0 single-graph file opens as one Free page named after
+  the file. `page.output` names a Dataset as a variable of its page (and stamps `condition`);
+  `page.input` reads `<page id>:<name>` from an earlier kind. `Workspace.compose` splices the
+  pages a target reads from into one run graph under page-qualified ids, so a shared upstream
+  chain is one memo entry however many pages pull it. LabLink opens 3.0 files and runs the
+  recipe's `"page"`. The window still shows one page.
+
+### Step 2 — the runner on the workspace (2026-10-05)
+- `EngineRunner` is bound to the Workspace (any `GraphSource`) instead of one document. Every
+  run id it stores, hands to the engine or emits is **page-qualified** (`pg1/n3`); a bare id
+  passed to a public method means the active page. A pull on any page composes its upstream
+  pages in; results, held views, cones and the cached engine are keyed on the page's composed
+  revision digest. The window splits run ids and touches the canvas only for the page it
+  shows; a run on another page still marks the cards it computes on the shown page.
+  Invalidation goes through the Workspace's qualified touched set, so an edit on one page
+  cancels exactly the runs on other pages that read it.
+- Fixed before release (review): a page's run identity no longer repeats after File → Open;
+  a bound Page Input card can be pulled (it shows its upstream Output); re-pointing an Input
+  or re-binding it through an Output rename cancels the runs reading through it; a
+  page-reference cycle leaves its Inputs unbound instead of making every pull raise; an
+  overlay keeps its channels when its result is re-served after an unrelated edit; Pin T/Z
+  works again.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

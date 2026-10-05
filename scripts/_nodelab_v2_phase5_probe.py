@@ -165,7 +165,8 @@ def _probe_movie_editor(win, app) -> None:
     viewed, held = win._viewed, set(win.runner._views)
     ed.compute_sources()
     assert wait(lambda: ed._payloads.get("A") is not None), "source A never arrived"
-    assert win._viewed == viewed and set(win.runner._views) == held and "S" not in shown, (
+    assert win._viewed == viewed and set(win.runner._views) == held \
+        and win.runner.run_id("S") not in shown, (
         "a Movie Editor fetch reached the Viewer", win._viewed, shown)
     assert wait(lambda: ed.frame_count() > 0), ed._status.text()
 
@@ -221,7 +222,8 @@ def _probe_movie_editor(win, app) -> None:
     win.runner.finished.connect(lambda nid, *a: done.setdefault(nid, True))
     win.runner.failed.connect(lambda nid, tr: done.setdefault("err", tr))
     win.export_movie("M")
-    assert wait(lambda: "M" in done or "err" in done), "the export never finished"
+    assert wait(lambda: win.runner.run_id("M") in done or "err" in done), \
+        "the export never finished"
     assert "err" not in done, done.get("err")
     shots = sorted(_glob.glob(os.path.join(tmp, "m_*.png")))
     assert wait(lambda: ed.frame_count() == n_want)
@@ -301,6 +303,7 @@ def main(argv) -> int:
     win = MainWindow()
     win.resize(1500, 880)
     win.show()
+    _rq = win.runner.run_id              # bare node id → page-qualified run id (V4.00 step 2)
     _seen_fail = []
     win.runner.failed.connect(
         lambda nid, tr: _seen_fail.append((nid, tr.strip().splitlines()[-1])))
@@ -874,6 +877,109 @@ def main(argv) -> int:
     _ok("WS1 workspace file: Save writes format 3.0 (one Free page, app_version stamped); "
         "reload keeps the canvas bound to the same document; a 2.0 file opens as a Free page")
 
+    # ── WS2: the RUNNER on the workspace (V4.00 step 2) — a pull on a page the canvas is
+    #    NOT showing composes its upstream page in and runs under page-qualified ids; the
+    #    shared chain is one memo entry across pages; an edit on the shown page cancels
+    #    exactly the other page's runs that read it ─────────────────────────────────────
+    from nodegraph.metadata import MetaEnvelope as _ME2
+    from nodelab_v2 import runner as _RN2
+    win.file_new()
+    app.processEvents()
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner.invalidate()
+    ws = win.workspace
+    pA = ws.page(ws.active)                                   # the Free page on the canvas
+    assert pA.doc is win.doc
+    win.doc.add_node("io.load", node_id="S", x=0, y=0)
+    win.doc.set_meta_seed("S", _ME2(axes=_RN2._SYNTH_AXES, metadata=dict(_RN2._SYNTH_META)))
+    win.doc.add_node("page.output", node_id="O", x=220, y=0, params={"name": "raw"})
+    win.doc.connect("S", "image", "O", "data")
+    pB = ws.add_page("Proc", "process")                       # NOT on the canvas
+    pB.doc.add_node("page.input", node_id="IN", params={"source": f"{pA.id}:raw"})
+    pB.doc.add_node("enhance.gamma", node_id="X", params={"gamma": 1.4})
+    pB.doc.connect("IN", "out", "X", "data")
+    app.processEvents()
+    assert ws.active == pA.id and win.doc is pA.doc
+    _rx = f"{pB.id}/X"
+    assert win.runner.run_id("S") == f"{pA.id}/S" and win.runner.run_id(_rx) == _rx
+    assert win.runner.planned_nodes(_rx) == sorted([f"{pA.id}/S", f"{pA.id}/O", _rx]), \
+        win.runner.planned_nodes(_rx)
+    assert win.runner.planned_nodes("O") == sorted([f"{pA.id}/S", f"{pA.id}/O"])
+    _ws2: dict = {}
+    _ev2: list = []
+    _c1 = win.runner.finished.connect(lambda nid, *a: _ws2.setdefault("id", nid))
+    _c2 = win.runner.failed.connect(lambda nid, tr: _ws2.setdefault("err", tr))
+    _c3 = win.runner.node_progress.connect(lambda ev, nid, info: _ev2.append((ev, nid)))
+    win.runner.pull(_rx)                                      # the page the canvas is not showing
+    t0 = time.time()
+    while not _ws2 and time.time() - t0 < 120:
+        app.processEvents()
+        time.sleep(0.01)
+    assert _ws2.get("err") is None, _ws2.get("err")
+    assert _ws2.get("id") == _rx, _ws2
+    assert win.runner.finished_result(_rx) is not None, "the other page's result must be remembered"
+    assert set(win.runner._engine.graph.nodes) >= {f"{pA.id}/S", f"{pA.id}/O", _rx}, \
+        sorted(win.runner._engine.graph.nodes)
+    assert ("done", _rx) in _ev2, _ev2
+    assert win._viewed is None, "a result for a page not on the canvas must not retarget the Viewer"
+    # the shown page's cards DID run (they are the other page's upstream): they say so,
+    # nothing is left transient, and the finished run no longer claims them
+    _states = {n: it.run_state() for n, it in win.scene.node_items.items()}
+    assert _states == {"S": "done", "O": "done"}, _states
+    assert win.scene.planned_nodes() == frozenset(), win.scene._plans
+    # the shared chain is ONE memo entry: pulling the Output on ITS page is a hit
+    _ws2.clear(); _ev2.clear()
+    win.pull_node("O")
+    t0 = time.time()
+    while not _ws2 and time.time() - t0 < 120:
+        app.processEvents()
+        time.sleep(0.01)
+    assert _ws2.get("err") is None, _ws2.get("err")
+    assert _ws2.get("id") == f"{pA.id}/O", _ws2
+    assert ("cached", f"{pA.id}/O") in _ev2, _ev2
+    # the pulled card wears the run's wall time (`finish_run` stamps it `done`); its memo
+    # hit is the `cached` event asserted above, exactly as a same-page re-pull reports
+    assert win._viewed == "O" and win.scene.node_items["O"].run_state() in ("done", "cached"), \
+        win.scene.node_items["O"].run_state()
+    assert win.runner.finished_result("O") is not None and win.runner.finished_result(_rx) is not None
+    # an edit on the SHOWN page cancels the other page's run that reads it — and only that
+    _canc2: list = []
+    _c4 = win.runner.cancelled.connect(_canc2.append)
+    win.runner._runs[9400] = _rx
+    win.runner._run_cones[9400] = frozenset(win.runner.planned_nodes(_rx))   # reads pA/S
+    win.runner._runs[9401] = _rx
+    win.runner._run_cones[9401] = frozenset([_rx])                            # does not
+    win.doc.nodes["S"].params["path"] = ""
+    win.doc.touch("S")
+    app.processEvents()
+    assert 9400 not in win.runner._runs and 9401 in win.runner._runs, sorted(win.runner._runs)
+    assert _canc2 == [_rx], _canc2
+    # …and re-pointing the OTHER page's Page Input cancels the run that reads through it,
+    # although the Input itself has no node in the run graph (its cone names it explicitly)
+    _canc2.clear()
+    win.runner._runs.clear(); win.runner._run_cones.clear()
+    _compB = win.runner._compose(_rx)
+    win.runner._runs[9402] = _rx
+    win.runner._run_cones[9402] = win.runner._cone_of(win.runner.planned_nodes(_rx, _compB.graph),
+                                                      _compB)
+    assert f"{pB.id}/IN" in win.runner._run_cones[9402], sorted(win.runner._run_cones[9402])
+    pB.doc.nodes["IN"].params["source"] = f"{pA.id}:nope"
+    pB.doc.touch("IN")
+    app.processEvents()
+    assert 9402 not in win.runner._runs and _canc2 == [_rx], (sorted(win.runner._runs), _canc2)
+    win.runner._runs.clear(); win.runner._run_cones.clear()
+    for sig, c in ((win.runner.finished, _c1), (win.runner.failed, _c2),
+                   (win.runner.node_progress, _c3), (win.runner.cancelled, _c4)):
+        sig.disconnect(c)
+    ws.remove_page(pB.id)
+    ws.load_file(tmp)                 # back to the demo graph G7 pulls next
+    app.processEvents()
+    _ok("WS2 runner on the workspace: a pull on a page the canvas is not showing composes "
+        "the upstream page in and finishes under its qualified id without touching the "
+        "Viewer or the cards; the shared Output is a memo hit from its own page; an edit on "
+        "the shown page cancels only the other page's run that reads it")
+
     # ── G7 + G4: a real pull on the synthetic source through to viewer pixels ──
     done = {}
     win.runner.finished.connect(lambda nid, *a: done.setdefault("id", nid))
@@ -884,7 +990,7 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.01)
     assert done.get("err") is None, f"pull failed:\n{done.get('err')}"
-    assert done.get("id") == "n3"
+    assert done.get("id") == _rq("n3"), done
     pm = win.viewer._view._item.pixmap()   # viewer is now a QGraphicsView (was a QLabel)
     assert pm is not None and not pm.isNull() and pm.width() > 100
     assert "pulled in" in win.viewer._status.text()
@@ -899,7 +1005,7 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.005)
     repull = time.time() - t0
-    assert done.get("id") == "n3" and repull < 5.0
+    assert done.get("id") == _rq("n3") and repull < 5.0
     _ok(f"G7: re-pull hits the persistent memo ({repull*1000:.0f} ms)")
 
     # ── G2: palette content ─────────────────────────────────────────────────────
@@ -1064,11 +1170,14 @@ def main(argv) -> int:
     from nodelab_v2.ops import CALIB_OVERRIDE_KEYS as _CK, LOAD_OP as _LOAD
     _cdoc = GraphDocument()
     _crec = _cdoc.add_node(_LOAD, x=0, y=0, params={"path": "C:/nonexistent/vol.ome.tif"})
-    class _CR: document = _cdoc
-    assert not any(k in _ER._all_sources(_CR())[_crec.id] for k in _CK), \
+    from nodelab_v2.workspace import Workspace as _WSc
+    _csrc = _WSc.single(_cdoc)
+    class _CR: _source = _csrc                         # the runner reads its GraphSource…
+    _ckey = f"{_csrc.active}/{_crec.id}"               # …and keys sources by run id
+    assert not any(k in _ER._all_sources(_CR())[_ckey] for k in _CK), \
         "an untouched card must override nothing (0/absent = whatever the file says)"
     _crec.params["z_step_um"] = 1.0                    # the user types it (inspector path)
-    _ccfg = _ER._all_sources(_CR())[_crec.id]
+    _ccfg = _ER._all_sources(_CR())[_ckey]
     assert _ccfg.get("z_step_um") == 1.0, \
         "the typed Z step must reach the worker thread's cfg, or the pull cannot see it"
     from nodelab_v2.runner import _with_card_calib as _wcc
@@ -1758,16 +1867,16 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.01)
     app.processEvents()
-    assert plans and plans[-1][0] == "n4"
-    assert set(plans[-1][1]) == {"n1", "n2", "n3", "n4"}, plans[-1]
-    kinds = [(ev, nid) for ev, nid, _f in events]
+    assert plans and plans[-1][0] == _rq("n4"), plans[-1]
+    assert set(plans[-1][1]) == {_rq(n) for n in ("n1", "n2", "n3", "n4")}, plans[-1]
+    kinds = [(ev, win._local(nid)) for ev, nid, _f in events]   # the runner emits run ids
     assert ("start", "n4") in kinds and ("done", "n4") in kinds, kinds
     n3_last = max(i for i, k in enumerate(kinds) if k[1] == "n3")
     assert n3_last < kinds.index(("start", "n4")), kinds   # upstream settles first
     assert kinds[n3_last][0] in ("done", "cached"), kinds[n3_last]
     # analysis.threshold is EAGER (per-plane) so it reports real fractions; the last one
     # always lands on 1.0 (the runner never throttles the final update)
-    fr = [f for ev, nid, f in events if ev == "progress" and nid == "n4"]
+    fr = [f for ev, nid, f in events if ev == "progress" and nid == _rq("n4")]
     assert fr and fr[-1] == 1.0 and all(0.0 <= f <= 1.0 for f in fr), fr
     items = win.scene.node_items
     assert items["n4"].run_state() == "done" and items["n4"]._run_text().endswith(
@@ -1958,10 +2067,10 @@ def main(argv) -> int:
     win.scene.clearSelection()
     win.scene.node_items["n5"].setSelected(True)       # "click" the label node
     t0 = time.time()
-    while "n5" not in pulled and time.time() - t0 < 60:
+    while _rq("n5") not in pulled and time.time() - t0 < 60:
         app.processEvents()
         time.sleep(0.005)
-    assert "n5" in pulled, f"click did not preview the node (pulled={pulled})"
+    assert _rq("n5") in pulled, f"click did not preview the node (pulled={pulled})"
     assert win._viewed == "n5" and win.scene.viewed_id == "n5"
     assert win.scene.node_items["n5"]._viewed          # accent spine marks the card
     assert not win.scene.node_items["n3"]._viewed
@@ -1986,7 +2095,7 @@ def main(argv) -> int:
     time.sleep(0.3)
     app.processEvents()
     assert len(pulled) - n_before == 1, f"debounce queued {len(pulled)-n_before} pulls"
-    assert pulled[-1] in ("n2", "n3", "n4"), pulled[-1]
+    assert win._local(pulled[-1]) in ("n2", "n3", "n4"), pulled[-1]
     _ok(f"Mini-map: a multi-node selection debounces to a single pull ({pulled[-1]})")
 
     # the mini-map moves/resizes and re-anchors, then docks back unharmed
@@ -2018,10 +2127,10 @@ def main(argv) -> int:
 
     def _wait_pull(nid, timeout=120):
         t0 = time.time()
-        while nid not in done_cmp and time.time() - t0 < timeout:
+        while _rq(nid) not in done_cmp and time.time() - t0 < timeout:
             app.processEvents()
             time.sleep(0.01)
-        assert nid in done_cmp, f"{nid} never finished (got {done_cmp})"
+        assert _rq(nid) in done_cmp, f"{nid} never finished (got {done_cmp})"
 
     win.pull_node("n3")                     # primary: the 3D gaussian (z=5)
     _wait_pull("n3")
@@ -3416,8 +3525,9 @@ def main(argv) -> int:
     # the run graph really is cut, and the document really is not
     _rg = win.doc.to_graph(for_run=True, materialize=True)
     assert not _rg.preds("DK") and len(win.doc.to_graph().preds("DK")) == 1
-    assert win.runner.planned_nodes("DT", _rg) == ["DK", "DT"], \
-        win.runner.planned_nodes("DT", _rg)
+    _rgq = win.workspace.compose(win.workspace.active).graph     # the runner's own (qualified) view
+    assert win.runner.planned_nodes("DT", _rgq) == [_rq("DK"), _rq("DT")], \
+        win.runner.planned_nodes("DT", _rgq)
 
     # a docked pull returns the checkpoint, and produces the same mask as the live chain
     _pulls.clear()
@@ -3553,7 +3663,7 @@ def main(argv) -> int:
         app.processEvents()
         # the held display state is per NODE since V2.28 (`_views`, one _HeldView per
         # Viewer pane) rather than a set of `_viewer_*` singletons
-        _view = win.runner._view_of("n3")
+        _view = win.runner._view_of(_rq("n3"))
         assert _view is not None, "the pulled node must hold a display view"
         _prov = _view.provider
         assert getattr(_prov, "volume_unit", False), type(_prov).__name__
@@ -3574,7 +3684,7 @@ def main(argv) -> int:
         assert win.runner._engine.tiles is win.runner._tiles, \
             "the rebuilt engine must keep the SAME tile cache or every memo-hit lazy " \
             "provider re-runs its whole unit per plane"
-        assert win.runner._view_of("n3").provider._cache is not _NOC, \
+        assert win.runner._view_of(_rq("n3")).provider._cache is not _NOC, \
             "the held lazy provider must still read through a LIVE cache after a rebuild"
 
         # (c) prefetch is gated on what a neighbouring plane costs
@@ -3582,13 +3692,13 @@ def main(argv) -> int:
             "a volume-unit compute provider must not warm T-neighbours (one each = a " \
             "whole extra unit)"
         assert win.runner._prefetch_span(win.runner._providers[
-            win.runner._node_source_key["n1"]][0]) == 8, \
+            win.runner._node_source_key[_rq("n1")]][0]) == 8, \
             "a store-backed provider still prefetches freely — it is a decompress"
 
         # (b) a COLD frame never decodes on the GUI thread; a warm one never leaves it
         _c = win.viewer.coords()
         _chans = win.viewer.channels()
-        _vax = win.runner._view_of("n3").axes
+        _vax = win.runner._view_of(_rq("n3")).axes
         _cold = (_c[0], _c[1], (_c[2] + 1) % max(1, _vax.z), _c[3])
         _seen.clear()
         _reads.clear()
@@ -3613,7 +3723,7 @@ def main(argv) -> int:
         # a volume-unit job carries a whole unit's working set, so one per pool thread is
         # not an option
         win.runner._planes.clear()
-        _zmax = max(1, win.runner._view_of("n3").axes.z)
+        _zmax = max(1, win.runner._view_of(_rq("n3")).axes.z)
         for _dz in range(1, 5):
             win.runner.request_plane(
                 "n3", (_c[0], _c[1], (_c[2] + _dz) % _zmax, _c[3]), _chans)
@@ -3665,7 +3775,7 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.005)
     app.processEvents()
-    _view3 = win.runner._view_of("n3")
+    _view3 = win.runner._view_of(_rq("n3"))
     assert _view3 is not None and getattr(_view3.provider, "volume_unit", False), \
         "this probe needs the whole-unit provider the section above pulled"
     assert win.runner.frames_are_reads("n3") is False, \
@@ -3709,8 +3819,8 @@ def main(argv) -> int:
     from nodelab_v2.runner import _HeldView as _HV
     _bytes_view = _HV(_AP(np.zeros((1, 4, 1, 1, 32, 32), np.uint16)),
                       AxisSizes(m=1, t=4, z=1, c=1, y=32, x=32),
-                      win.doc.revision, None, np.uint16)
-    win.runner._views["n3"] = _bytes_view
+                      win.runner._rev(_rq("n3")), None, np.uint16)
+    win.runner._views[_rq("n3")] = _bytes_view
     assert win.runner.frames_are_reads("n3") is True
     assert _ERn._preload_jobs(_bytes_view.provider) == _ERn.PRELOAD_JOBS
 
@@ -3725,7 +3835,8 @@ def main(argv) -> int:
     from nodelab_v2.window import PLAY_PREPARE_MAX_S as _PREP_CAP
     _pbase = _AP(np.zeros((1, 6, 1, 1, 32, 32), np.uint16))
     _mapp = _MCP(_pbase, lambda p, *a: p, fp="probe-perplane", cache=_TCache())
-    win.runner._views["n3"] = _HV(_mapp, _pbase.axes, win.doc.revision, None, np.uint16)
+    win.runner._views[_rq("n3")] = _HV(_mapp, _pbase.axes, win.runner._rev(_rq("n3")),
+                                        None, np.uint16)
     win.runner._planes.clear()   # planes cached by the sections above share this node id —
     # a warm series would make the preload a no-op and this probe about nothing
     assert _ERn._preload_jobs(_mapp) == _ERn.PRELOAD_JOBS, \
@@ -3772,7 +3883,7 @@ def main(argv) -> int:
     assert not win.viewer.play_gated(), \
         "a capped hold whose ETA projects past PLAY_PREPARE_MAX_S must release playback"
     win._drop_play_gate("n3")                        # already down: must be a quiet no-op
-    win.runner._views.pop("n3", None)
+    win.runner._views.pop(_rq("n3"), None)
 
     _ok("V1b play policy by COST (2026-08-06 whole-unit; 2026-08-10 per-plane): a "
         "whole-volume chain queues nothing, raises no gate and starts playing on the spot, "
@@ -3882,7 +3993,7 @@ def main(argv) -> int:
     assert _vp._detail_rect is None
 
     # now zoom in and drive the debounce the way a wheel event would
-    _dview = win.runner._view_of(_node)
+    _dview = win.runner._view_of(_rq(_node))
     assert _dview is not None, "the viewed node must hold a display view"
     _prov, _ax = _dview.provider, _dview.axes
     assert _prov is not None and _ax is not None
@@ -3895,7 +4006,7 @@ def main(argv) -> int:
         time.sleep(0.005)
     assert _detail_seen, "no detail patch arrived"
     _nid, _dplanes, _drect, _dcoords = _detail_seen[-1]
-    assert _nid == _node and _dplanes, (_nid, list(_dplanes))
+    assert _nid == _rq(_node) and _dplanes, (_nid, list(_dplanes))
     assert tuple(_dcoords)[:3] == tuple(_vp.coords())[:3], \
         "the patch must carry the (m,t,z) it was read at — the panel's staleness check " \
         "hangs off it"
@@ -3992,7 +4103,7 @@ def main(argv) -> int:
 
     def _grab(nid, payload, plane, axes, secs):
         nonlocal _pay
-        if nid == _node:
+        if nid == _rq(_node):
             _pay = payload
     win.runner.finished.connect(_grab)
     win.runner.pull(_node, _vp.coords(), _vp.channels())
@@ -4334,15 +4445,20 @@ def main(argv) -> int:
         "a node in the MIDDLE is served by one clone; there is nothing to select there"
     _al = idoc.iterate_aliases()
     assert _al == {"ITH": "ITH#ITT@1", "ILB": "ILB#ITT@1"}, _al
-    _saved_doc = win.runner.document          # the probe's idoc is not the window's
-    win.runner.document = idoc
+    from nodelab_v2.workspace import Workspace as _WS2
+    _saved_src = win.runner.source            # the probe's idoc is not the window's
+    _iws = _WS2.single(idoc)
+    win.runner.source = _iws
     try:
-        assert win.runner._pull_id("ILB", _run) == "ILB#ITT@1", \
+        _runq = _iws.compose(_iws.active).graph          # the composed, page-qualified run graph
+        _pq = lambda n: f"{_iws.active}/{n}"             # noqa: E731
+        assert win.runner._pull_id("ILB", _runq) == _pq("ILB#ITT@1"), \
             "double-clicking a node inside the segment must pull its clone, not KeyError"
-        assert win.runner._pull_id("IRS", _run) == "IRS" and \
-            win.runner._pull_id("IL", _run) == "IL"
+        assert win.runner._pull_id(_pq("ILB"), _runq) == _pq("ILB#ITT@1")
+        assert win.runner._pull_id("IRS", _runq) == _pq("IRS") and \
+            win.runner._pull_id("IL", _runq) == _pq("IL")
     finally:
-        win.runner.document = _saved_doc
+        win.runner.source = _saved_src
     # a branch off the END needs no re-routing: it reads the selector
     idoc.add_node("view.viewer", node_id="IVW")
     idoc.connect("IRS", "out", "IVW", "data")
@@ -4448,7 +4564,7 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.01)
     assert cdone.get("err") is None, f"two-channel measure failed:\n{cdone.get('err')}"
-    assert cdone.get("id") == "cms"
+    assert cdone.get("id") == _rq("cms"), cdone
 
     # (c) the Viewer tells the two branches apart. Same axes on both, so a size-keyed strip
     #     would show the first branch's channel for the second.
@@ -4722,16 +4838,16 @@ def main(argv) -> int:
     win.runner._busy = True                       # pretend a long branch is running
     win.runner.pull("bg0")
     win.runner.pull("bg1")
-    assert win.runner.queued_nodes() == ("bg0", "bg1"), win.runner.queued_nodes()
-    assert [n for n, _d in _q] == ["bg0", "bg1"], _q
+    assert win.runner.queued_nodes() == (_rq("bg0"), _rq("bg1")), win.runner.queued_nodes()
+    assert [n for n, _d in _q] == [_rq("bg0"), _rq("bg1")], _q
     win.runner.pull("bg0")                        # a repeat KEEPS its place, adds no second
-    assert win.runner.queued_nodes() == ("bg0", "bg1"), win.runner.queued_nodes()
+    assert win.runner.queued_nodes() == (_rq("bg0"), _rq("bg1")), win.runner.queued_nodes()
     assert win.runner.queue_depth() == 2
 
     # (2) the queued branches' cards say `queued` while the other one holds `running`
     win.scene.set_run_plan("bgX", ["bl", "bs", "bgX"])   # the (fictional) running branch
     win.scene._set_state("bgX", "running")
-    win.scene.set_queued("bg0", win.runner.planned_nodes("bg0"))
+    win.scene.set_queued("bg0", win._local_ids(win.runner.planned_nodes("bg0")))
     assert win.scene._run.get("bgX", ("",))[0] == "running", win.scene._run.get("bgX")
     assert win.scene._run.get("bg0", ("",))[0] == "queued", win.scene._run.get("bg0")
     win.runner._queue.clear()
@@ -4743,8 +4859,8 @@ def main(argv) -> int:
     _await_pull()
     win.pull_node("bg1")
     _await_pull()
-    _r0 = win.runner._results.get(("bg0", win.doc.revision))
-    _r1 = win.runner._results.get(("bg1", win.doc.revision))
+    _r0 = win.runner._results.get((_rq("bg0"), win.runner._rev(_rq("bg0"))))
+    _r1 = win.runner._results.get((_rq("bg1"), win.runner._rev(_rq("bg1"))))
     assert _r0 is not None and _r1 is not None, sorted(win.runner._results)
     _p0 = _r0[0].image.read_region(0, 0, 0, 0, 0, 0, 8, 0, 8)
     _p1 = _r1[0].image.read_region(0, 0, 0, 0, 0, 0, 8, 0, 8)
@@ -4755,17 +4871,17 @@ def main(argv) -> int:
     win.runner._busy = True
     _served: list = []
     _fin = win.runner.finished.connect(lambda nid, *a: _served.append(nid))
-    assert win.runner._serve_finished("bg0", None, None), \
+    assert win.runner._serve_finished(_rq("bg0"), None, None), \
         "a finished branch must be viewable while another branch runs"
     app.processEvents()
-    assert _served == ["bg0"], _served
+    assert _served == [_rq("bg0")], _served
     assert win.runner.queue_depth() == 0, "serving from cache must not queue a pull"
     win.runner.finished.disconnect(_fin)
     win.runner._busy = False
 
     # (5) editing the finished branch does NOT cancel the other one
     win.runner._runs.clear(); win.runner._run_cones.clear()
-    win.runner._runs[9001] = "bg1"                       # pretend bg1 is still computing
+    win.runner._runs[9001] = _rq("bg1")                  # pretend bg1 is still computing
     win.runner._run_cones[9001] = frozenset(win.runner.planned_nodes("bg1"))
     _cancels.clear()
     bdoc.nodes["bg0"].params["gamma"] = 0.55
@@ -4779,10 +4895,10 @@ def main(argv) -> int:
     bdoc.touch("bg1")
     app.processEvents()
     assert 9001 not in win.runner._runs, "an edit in a run's own cone must cancel it"
-    assert _cancels == ["bg1"], _cancels
+    assert _cancels == [_rq("bg1")], _cancels
     # ...and a structural edit (unknown scope) still cancels everything, as before
-    win.runner._runs[9002] = "bg0"
-    win.runner._run_cones[9002] = frozenset(["bg0"])
+    win.runner._runs[9002] = _rq("bg0")
+    win.runner._run_cones[9002] = frozenset([_rq("bg0")])
     bdoc.touch()                                          # no node named → assume everything
     app.processEvents()
     assert not win.runner._runs, "an unscoped edit must still cancel every in-flight run"
@@ -4795,16 +4911,16 @@ def main(argv) -> int:
     # for two branches ran the first, silently dropped the second, and left its card on
     # `queued` for good. It reports an EMPTY touched set, which means "changed nothing a run
     # can see", and that is a different thing from `None`.
-    win.runner._runs[9003] = "bg1"
+    win.runner._runs[9003] = _rq("bg1")
     win.runner._run_cones[9003] = frozenset(win.runner.planned_nodes("bg1"))
-    win.runner._queue["bg0"] = ("bg0", None, None)
+    win.runner._queue[_rq("bg0")] = (_rq("bg0"), None, None)
     _cancels.clear()
     bdoc.set_meta_seed("bl", MetaEnvelope(axes=_RN._SYNTH_AXES,
                                           metadata=dict(_RN._SYNTH_META)))
     app.processEvents()
     assert 9003 in win.runner._runs, \
         "the source re-seed cancelled a live run — it resolves metadata that run already had"
-    assert win.runner.queued_nodes() == ("bg0",), \
+    assert win.runner.queued_nodes() == (_rq("bg0"),), \
         f"the source re-seed emptied the queue — {win.runner.queued_nodes()}"
     assert _cancels == [], _cancels
     win.runner._queue.clear(); win.runner._runs.clear(); win.runner._run_cones.clear()
@@ -4838,8 +4954,8 @@ def main(argv) -> int:
     # click-to-preview (which fires on every settled selection) went from latest-wins to
     # ENQUEUEING, so clicking around during a long run silently committed the machine to
     # every card touched.
-    win.runner._runs[9101] = "bg1"
-    win.runner._run_cones[9101] = frozenset(["bl", "bs", "bg1"])
+    win.runner._runs[9101] = _rq("bg1")
+    win.runner._run_cones[9101] = frozenset(_rq(n) for n in ("bl", "bs", "bg1"))
     _cancels.clear()
     _fr = bdoc.add_frame("probe-frame", members=["bg0"])
     bdoc.set_collapsed("bg0", True)
@@ -4857,7 +4973,7 @@ def main(argv) -> int:
     assert win.runner.queued_nodes() == (), \
         f"click-to-preview queued a pull: {win.runner.queued_nodes()}"
     win.runner.pull("bg0", None, None)
-    assert win.runner.queued_nodes() == ("bg0",), win.runner.queued_nodes()
+    assert win.runner.queued_nodes() == (_rq("bg0"),), win.runner.queued_nodes()
     win.runner._busy = False
     win.runner._queue.clear(); win.runner._runs.clear(); win.runner._run_cones.clear()
 
@@ -4897,17 +5013,22 @@ def main(argv) -> int:
     assert _RN._doc_id_of("it2#adv@0") == "it2"        # the zone's advance node
     assert _RN._doc_id_of("body%inst") == "inst"       # an inlined group body node
     assert _RN._doc_id_of("b%mid%g7#it1@0") == "g7"    # nested groups inside a zone
+    # …and a PAGE-QUALIFIED run id (V4.00 step 2) keeps its page: the cone an edit on a page
+    # is matched against is written in these terms
+    assert _RN._doc_id_of("pg1/n7") == "pg1/n7"
+    assert _RN._doc_id_of("pg1/bg0#it2@3") == "pg1/bg0" and _RN._doc_id_of("pg2/it2#adv@0") == "pg2/it2"
+    assert _RN._doc_id_of("pg1/body%inst") == "pg1/inst" and _RN._doc_id_of("pg3/b%mid%g7#it1@0") == "pg3/g7"
 
     # (2) deleting one branch leaves the other branch's run AND queued request alone
-    win.runner._runs[9101] = "bg1"
-    win.runner._run_cones[9101] = frozenset(["bl", "bs", "bg1"])
-    win.runner._queue["bg1"] = ("bg1", None, None)
+    win.runner._runs[9101] = _rq("bg1")
+    win.runner._run_cones[9101] = frozenset(_rq(n) for n in ("bl", "bs", "bg1"))
+    win.runner._queue[_rq("bg1")] = (_rq("bg1"), None, None)
     _cancels.clear()
     bdoc.remove_node("bg0")
     app.processEvents()
     assert 9101 in win.runner._runs, \
         "deleting one branch cancelled the OTHER branch's run — a delete must narrow"
-    assert win.runner.queued_nodes() == ("bg1",), win.runner.queued_nodes()
+    assert win.runner.queued_nodes() == (_rq("bg1"),), win.runner.queued_nodes()
     assert _cancels == [], _cancels
 
     # (3)+(4) deleting the node whose run is ON the worker: run dead, queued request
@@ -4922,10 +5043,10 @@ def main(argv) -> int:
     assert _act.cancelled is True, \
         "the deleted node's RUNNING job must latch its cancel flag — otherwise the " \
         "engine grinds the dead pull to completion with the queue waiting behind it"
-    assert set(_cancels) == {"bg1"}, _cancels          # its run + its queued request
+    assert set(_cancels) == {_rq("bg1")}, _cancels     # its run + its queued request
     # ...while a bake job is never latched: its checkpoint resolves outside staleness
-    win.runner._runs[9102] = "bs"
-    win.runner._run_cones[9102] = frozenset(["bl", "bs"])
+    win.runner._runs[9102] = _rq("bs")
+    win.runner._run_cones[9102] = frozenset([_rq("bl"), _rq("bs")])
     _bact = _SNS(epoch=9102, bake={"hold": False}, cancelled=False)
     win.runner._active = _bact
     bdoc.remove_node("bs")
@@ -4962,7 +5083,7 @@ def main(argv) -> int:
     _slow_done = {"finished": False}
 
     def _slow_gamma(ctx):
-        if ctx.node_id != "cg0":
+        if ctx.node_id != _rq("cg0"):              # the engine runs page-qualified ids
             return _real_gamma(ctx)
         for _i in range(600):                          # ≥6 s unless the abort fires
             ctx.progress(_i + 1, 600, "slow")
@@ -4978,15 +5099,15 @@ def main(argv) -> int:
         _pulls.clear()
         win.pull_node("cg0")                           # the slow branch takes the slot
         _t0 = time.time()
-        while ("start", "cg0") not in _events and time.time() - _t0 < 30.0:
+        while ("start", _rq("cg0")) not in _events and time.time() - _t0 < 30.0:
             app.processEvents()
             time.sleep(0.005)
-        assert ("start", "cg0") in _events, "the slow pull never started"
+        assert ("start", _rq("cg0")) in _events, "the slow pull never started"
         win.runner.pull("cg1")                         # queue the branch we want instead
-        assert win.runner.queued_nodes() == ("cg1",), win.runner.queued_nodes()
+        assert win.runner.queued_nodes() == (_rq("cg1"),), win.runner.queued_nodes()
         win.scene.delete_nodes(["cg0"])                # the canvas delete path
         _await_pull(limit=60.0)                        # cg1's result, behind the abort
-        assert _pulls and _pulls[-1][0] == "cg1", _pulls
+        assert _pulls and _pulls[-1][0] == _rq("cg1"), _pulls
         assert not _slow_done["finished"], \
             "the deleted node's compute ran to completion — the abort never fired"
         assert "cg0" not in cdoc.nodes

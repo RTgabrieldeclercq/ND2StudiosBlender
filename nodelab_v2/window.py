@@ -38,7 +38,7 @@ from nodegraph.iterate import (
 from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
-from nodelab_v2.workspace import Workspace
+from nodelab_v2.workspace import Workspace, local_ids, qualify, split_run_id
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
@@ -268,7 +268,7 @@ class MainWindow(QMainWindow):
         self.workspace = Workspace.single(self.doc)
         self.scene = GraphScene(self.doc)
         self.view = GraphView(self.scene)
-        self.runner = EngineRunner(self.doc)
+        self.runner = EngineRunner(self.workspace)   # every page; run ids are page-qualified
         self._viewed: Optional[str] = None
         # ── the side-by-side compare pane (V2.28) ──────────────────────────────
         # A SECOND ViewerPanel, created on first use (open_compare) and shown beside the
@@ -483,21 +483,21 @@ class MainWindow(QMainWindow):
         self.view.op_dropped.connect(self._on_op_dropped)
         self.view.files_dropped.connect(self._on_files_dropped)
         self.doc.on_change(self._on_doc_changed)
+        # the RUNNER is told through the workspace (V4.00 step 2): its touched set is
+        # page-qualified, and an edit on a page the canvas is not showing still has to
+        # cancel the runs that read it
+        self.workspace.on_change(self._on_workspace_changed)
         self.doc.on_change(self.inspector.refresh_derived)   # G8 live ƒmd re-seed
         self.scene.pull_requested.connect(self.pull_node)
         self.scene.compare_requested.connect(self.open_compare)
         self.scene.nodes_deleted.connect(self._on_nodes_deleted)
-        self.runner.started.connect(
-            lambda nid: (self.statusBar().showMessage(f"pulling {nid}…"),
-                         [p.show_running(nid) for p in self._panes_showing(nid)],
-                         self._set_led("busy"),
-                         self.minimap.set_state("busy")))
+        self.runner.started.connect(self._on_run_started)
         # The Movie Editor's sources arrive on their own signal (a payload-only fetch never
         # reaches a pane), and the Viewer's settled LUT edits feed its linked channels.
         self.runner.fetched.connect(self._on_movie_fetched)
         self.runner.fetch_started.connect(
             lambda nid: self.statusBar().showMessage(
-                f"computing {nid} for the Movie Editor…"))
+                f"computing {self._local(nid) or nid} for the Movie Editor…"))
         self.viewer.display_changed.connect(self._on_viewer_display)
         self.runner.finished.connect(self._on_run_finished)
         self.runner.plane_ready.connect(self._on_plane_ready)
@@ -569,7 +569,7 @@ class MainWindow(QMainWindow):
         # reads the rect off the GUI thread and answers on `detail_ready`.
         self.viewer.detail_cb = self._request_detail
         self.viewer.own_layers_cb = self.doc.own_label_layers
-        self.runner.detail_ready.connect(self.viewer.on_detail_ready)
+        self.runner.detail_ready.connect(self._on_detail_ready)
         self.view.maximize_toggled.connect(self.set_maximized)
         self.minimap.restore_requested.connect(lambda: self.set_maximized(False))
         self.doc.on_change(self._sync_welcome)
@@ -1046,6 +1046,46 @@ class MainWindow(QMainWindow):
             # backlog of pulls nobody asked for.
             self.pull_node(nid, allow_ingest=False, queue=False)
 
+    # ── run ids (V4.00 step 2) ────────────────────────────────────────────────
+    #
+    # The runner speaks PAGE-QUALIFIED run ids, ``"pg1/n3"``: every signal carries one and
+    # every method accepts one (or a bare id, which it takes to be on the active page). The
+    # canvas, the viewer and the inspector still speak the active page's bare node ids —
+    # until step 5 puts several pages on screen — so each runner handler first asks which
+    # page a run id is on and touches the scene only when it is the page being shown.
+    def _local(self, run_id: str) -> Optional[str]:
+        """``run_id``'s bare node id when it is on the ACTIVE page (or bare), else ``None``."""
+        pid, nid = split_run_id(str(run_id))
+        return nid if (not pid or pid == self.workspace.active) else None
+
+    def _local_ids(self, run_ids) -> List[str]:
+        """The bare ids among ``run_ids`` that belong to the active page, in order."""
+        out = [self._local(r) for r in run_ids]
+        return [n for n in out if n is not None]
+
+    def _on_workspace_changed(self) -> None:
+        """A page edit, anywhere in the workspace: cancel only the runs it can affect.
+        ``last_touched`` is already qualified — ``None`` is "unknown, assume everything",
+        ``frozenset()`` is "nothing a run can see" (the G8 re-seed, a page switch)."""
+        self.runner.invalidate(self.workspace.last_touched)
+
+    def _on_run_started(self, run_id: str) -> None:
+        nid = self._local(run_id)
+        self.statusBar().showMessage(f"pulling {nid or run_id}…")
+        if nid is not None:
+            for p in self._panes_showing(nid):
+                p.show_running(nid)
+        self._set_led("busy")
+        self.minimap.set_state("busy")
+
+    def _on_detail_ready(self, run_id: str, planes, rect01, coords=None) -> None:
+        nid = self._local(run_id)
+        if nid is None:
+            return
+        for pane in (self.viewer, self.viewer2):
+            if pane is not None:
+                pane.on_detail_ready(nid, planes, rect01, coords)
+
     # ── document plumbing ─────────────────────────────────────────────────────
     def _on_doc_changed(self) -> None:
         # Only the runs this edit could have changed (2026-08-06). `last_touched` is the node
@@ -1053,7 +1093,8 @@ class MainWindow(QMainWindow):
         # node accounts for — in which case every in-flight pull still goes, as before. This
         # is what lets a finished branch be re-tuned while another branch is still computing.
         touched = self.doc.last_touched
-        self.runner.invalidate(touched)
+        # (the runner was told through the workspace — `_on_workspace_changed` — whose
+        # touched set is page-qualified; this handler keeps the canvas honest)
         # A terminal `done` badge now OUTLIVES an unrelated branch starting (so a finished
         # branch keeps saying so), which means the edit that actually invalidates a result has
         # to retire it — or the card claims a result that no longer describes the node. The
@@ -1297,7 +1338,10 @@ class MainWindow(QMainWindow):
         pin at a primary frame that already had one replaces it; the source's stepped offset
         is dropped, since the pin now makes the mapping land where the stepper was."""
         from nodegraph.placement import parse_pins, pins_json
-        rec = self.doc.nodes.get(ovl_id)
+        # the strip hands back the RUN id it was given (V4.00 step 2): the pin is written
+        # on the page's own card, under its document id
+        run_ovl, ovl_id = ovl_id, self._local(ovl_id)
+        rec = self.doc.nodes.get(ovl_id) if ovl_id is not None else None
         if rec is None or axis not in ("t", "z") or self._viewed is None:
             return
         name = f"{axis}_pins"
@@ -1307,7 +1351,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{ovl_id}: cannot add a pin — {exc}", 6000)
             return
         m = self.viewer.coords()[0]
-        a_pri, a_sec = self.runner.overlay_pin_anchors(self._viewed, ovl_id, axis, m,
+        a_pri, a_sec = self.runner.overlay_pin_anchors(self._viewed, run_ovl, axis, m,
                                                        int(pri), int(sec))
         rows = [r for r in rows if int(r[0]) != int(pri)]
         rows.append((int(pri), int(sec), a_pri, a_sec))
@@ -1318,7 +1362,7 @@ class MainWindow(QMainWindow):
             return
         rec.params[name] = text
         rec.set_locked(rec.locked | {name})
-        self.runner.set_source_override(ovl_id, 0, 0)
+        self.runner.set_source_override(run_ovl, 0, 0)
         self.doc.touch(ovl_id)
         item = self.scene.node_items.get(ovl_id)
         if item is not None:
@@ -1541,7 +1585,7 @@ class MainWindow(QMainWindow):
     def _sync_ingest(self) -> None:
         """Tell the canvas which source cards are mid-ingest, so a pull's card reset
         leaves their rails alone (:meth:`nodelab_v2.scene.GraphScene.set_ingesting`)."""
-        self.scene.set_ingesting(self.runner.ingesting())
+        self.scene.set_ingesting(self._local_ids(self.runner.ingesting()))
 
     def _idle_led(self) -> None:
         """Back to idle — unless files are still ingesting, which is real work the footer
@@ -1607,10 +1651,19 @@ class MainWindow(QMainWindow):
         self._sync_ingest()
         # the card goes 'running' straight away — the job may sit in the pool's queue for
         # a while behind the other files, and a card that shows nothing reads as ignored.
-        self.scene.on_node_progress("start", node_id, {})
+        nid = self._local(node_id)
+        if nid is not None:
+            self.scene.on_node_progress("start", nid, {})
 
     def _on_ingest_finished(self, node_id: str, seconds: float, err) -> None:
         self._sync_ingest()
+        nid = self._local(node_id)
+        if nid is None:                      # a source on a page the canvas is not showing
+            self._idle_led()
+            self.statusBar().showMessage(
+                f"{node_id} " + ("FAILED to ingest" if err else f"ingested in {seconds:.1f}s"))
+            return
+        node_id = nid
         name = self._source_label(node_id)
         if err:
             self.scene.on_node_progress("error", node_id, {})
@@ -1758,7 +1811,7 @@ class MainWindow(QMainWindow):
             self.viewer2.raw_plane_cb = self.runner.raw_plane
             self.viewer2.detail_cb = self._request_detail
             self.viewer2.own_layers_cb = self.doc.own_label_layers
-            self.runner.detail_ready.connect(self.viewer2.on_detail_ready)
+            # detail patches reach it through `_on_detail_ready`, like the primary pane
             self._compare_box = _CompareBox(self.viewer2, self.close_compare)
             self._viewer_split = QSplitter(Qt.Horizontal)
             self._viewer_split.setChildrenCollapsible(False)
@@ -2227,7 +2280,7 @@ class MainWindow(QMainWindow):
         elif action == "release":
             self.runner.release(node_id)
             self.doc.set_dock_hold(node_id, False)
-            self.doc.set_held_nodes(self.runner.held)
+            self.doc.set_held_nodes(self._local_ids(self.runner.held))
             self.runner.invalidate()
             self.statusBar().showMessage(
                 f"{node_id} released — the chain above runs live again")
@@ -2339,6 +2392,12 @@ class MainWindow(QMainWindow):
         self.movie_editor.bind(node_id)
 
     def _on_movie_fetched(self, node_id: str, payload, _seconds: float) -> None:
+        run_id, node_id = node_id, self._local(node_id)
+        if node_id is None:                 # a page the canvas is not showing
+            self.scene.clear_run_plan(run_id)
+            self.scene.finish_run(None)
+            self._set_led("idle")
+            return
         self.scene.finish_run(node_id)
         self._set_led("idle")
         self.movie_editor.on_fetched(node_id, payload)
@@ -2505,14 +2564,15 @@ class MainWindow(QMainWindow):
         rec = self.doc.nodes.get(node_id)
         if rec is None or rec.op_key != ITERATE_OP:
             return
-        current = set(self.runner.sweep_all)
+        current = set(self._local_ids(self.runner.sweep_all))
+        others = [r for r in self.runner.sweep_all if self._local(r) is None]   # other pages
         if action == "sweep":
             current.add(node_id)
         elif action == "stop_sweep":
             current.discard(node_id)
         else:
             return
-        self.runner.set_sweep_all(current)
+        self.runner.set_sweep_all(others + sorted(current))
         if action == "sweep" and not self.runner.solo_frame:
             self.statusBar().showMessage(
                 "running every iteration over the WHOLE series — F9 (troubleshoot) and a "
@@ -2633,8 +2693,10 @@ class MainWindow(QMainWindow):
     def _on_held(self, node_id: str, spec: dict) -> None:
         """Record a finished hold: pin the payload, flip the mode, grey the chain."""
         self.runner.hold(node_id, spec["payload"], spec.get("env"))
-        self.doc.set_dock_hold(node_id, True)
-        self.doc.set_held_nodes(self.runner.held)
+        pid, node_id = split_run_id(str(node_id))      # the run id names the page
+        doc = self.workspace.document_of(pid) if pid else self.doc
+        doc.set_dock_hold(node_id, True)
+        doc.set_held_nodes(local_ids(self.runner.held, pid or self.workspace.active))
         self.runner.invalidate()
         self.statusBar().showMessage(
             f"{node_id} held in memory — the chain above is frozen and greyed out. "
@@ -2648,34 +2710,40 @@ class MainWindow(QMainWindow):
         if spec.get("hold"):
             self._on_held(node_id, spec)
             return
+        # the run id names the page: record the bake on THAT page's document
+        pid, node_id = split_run_id(str(node_id))
+        doc = self.workspace.document_of(pid) if pid else self.doc
         if spec.get("cancelled"):
             self.statusBar().showMessage(
                 f"{node_id} bake stopped — nothing was recorded, so the dock still reads "
                 f"as un-baked and the half-written folder is safe to re-bake over")
             return
         man = spec.get("manifest") or {}
-        self.doc.set_dock_bake(
+        doc.set_dock_bake(
             node_id, store=spec["store"], bake_id=str(man.get("bake_id", "")),
             precision=str(man.get("precision", spec.get("precision", ""))),
             signature=str(spec.get("signature", "")),
             nbytes=int(spec.get("bytes", 0) or 0),
             when=getattr(self, "_baked_at", ""))
         self.runner.invalidate()
-        freed = self._release_dormant()
+        freed = self._release_dormant(doc, pid)
         from nodelab_v2.inspector import _human_bytes
         self.statusBar().showMessage(
             f"{node_id} docked — {_human_bytes(spec.get('bytes', 0))} on disk; "
-            f"{freed} cached result(s) released and {len(self.doc.dormant)} node(s) "
+            f"{freed} cached result(s) released and {len(doc.dormant)} node(s) "
             f"greyed out"
             + ("  ·  SCOPED bake: a truncated series" if spec.get("scoped") else ""))
         if self._viewed is not None:
             self.pull_node(self._viewed)
 
-    def _release_dormant(self) -> int:
+    def _release_dormant(self, doc=None, page_id: Optional[str] = None) -> int:
         """Free the memory the dock exists to free — the memo payloads of every node a
         docked run no longer evaluates. This is the "unload it from the software" half
-        of docking; greying the cards is only the half you can see."""
-        return self.runner.unload(sorted(self.doc.dormant))
+        of docking; greying the cards is only the half you can see. ``doc``/``page_id``
+        name the page the dock is on (default: the one on the canvas)."""
+        doc = doc if doc is not None else self.doc
+        pid = page_id or self.workspace.active
+        return self.runner.unload([qualify(pid, n) if pid else n for n in sorted(doc.dormant)])
 
     @staticmethod
     def _reveal(path: str) -> None:
@@ -2996,7 +3064,7 @@ class MainWindow(QMainWindow):
                               lambda: self._drop_play_gate(node))
 
     def _on_preload_progress(self, node_id: str, done: int, total: int) -> None:
-        if node_id != self._viewed or not total:
+        if self._local(node_id) != self._viewed or not total:
             return
         self._set_progress(done / float(total))
         self.statusBar().showMessage(
@@ -3017,7 +3085,7 @@ class MainWindow(QMainWindow):
         lap instead of holding a blank stare. No-op unless ``node_id`` is still the viewed
         node with its gate up: the watchdog that arms this at ▶ may fire long after the
         preload finished, the node changed, or playback stopped."""
-        if node_id != self._viewed or not self.viewer.play_gated():
+        if self._local(node_id) != self._viewed or not self.viewer.play_gated():
             return
         self.viewer.set_play_gate(False)
         self.statusBar().showMessage(
@@ -3031,7 +3099,7 @@ class MainWindow(QMainWindow):
         up there would strand playback in a paused state whose button says it is playing, which
         is worse than playing a frame cold."""
         self._set_progress(None)
-        if completed and node_id == self._viewed:
+        if completed and self._local(node_id) == self._viewed:
             # said whether or not the gate is still up: a hold released early by the cap
             # reaches this point playing cold, and this is the moment it turns warm
             self.statusBar().showMessage("playing from memory", 2500)
@@ -3039,6 +3107,17 @@ class MainWindow(QMainWindow):
             self.viewer.set_play_gate(False)
 
     def _on_run_finished(self, node_id, payload, plane, axes, seconds) -> None:
+        run_id, node_id = node_id, self._local(node_id)
+        if node_id is None:
+            # a page the canvas is not showing (step 5 puts it on screen): the runner has
+            # remembered the result; here the run's claim on this page's cards (the
+            # upstream chain it computed) is retired, and the footer and LED move on
+            self.scene.clear_run_plan(run_id)
+            self.scene.finish_run(None)
+            self._idle_led()
+            self._set_progress(None)
+            self.statusBar().showMessage(f"{run_id} pulled in {seconds:.2f}s")
+            return
         # A source the Movie Editor is waiting on may have just been computed by an
         # ordinary pull; it takes the payload the same way it takes a fetched one. Only the
         # runner's UNPINNED result: a solo-scoped payload holds a few frames, and a movie
@@ -3094,26 +3173,32 @@ class MainWindow(QMainWindow):
 
     # ── per-node progress (G7 + 2026-07-28) ──────────────────────────────────
     def _on_run_plan(self, target: str, node_ids) -> None:
-        self._run_target = target
-        self._run_plan = [n for n in node_ids if n in self.doc.nodes]
+        tgt = self._local(target)
+        self._run_target = tgt or target
+        self._run_plan = [n for n in self._local_ids(node_ids) if n in self.doc.nodes]
         self._run_computed = 0
         self._run_cached = 0
-        self.scene.set_run_plan(target, self._run_plan)
+        # a run on ANOTHER page claims the cards it computes on this one (its upstream
+        # chain) under its qualified id, so they read queued → running → done like any
+        # other participant; the claim is retired when that run ends
+        self.scene.set_run_plan(tgt or target, self._run_plan)
 
     def _on_run_queued(self, node_id: str, depth: int) -> None:
         """A pull joined the queue behind the running one: claim its cards as ``queued`` and
         say so in the status bar. The branch is lined up, not lost."""
-        plan = [n for n in self.runner.planned_nodes(node_id) if n in self.doc.nodes]
-        self.scene.set_queued(node_id, plan)
+        nid = self._local(node_id)
+        plan = [n for n in self._local_ids(self.runner.planned_nodes(node_id))
+                if n in self.doc.nodes]
+        self.scene.set_queued(nid or node_id, plan)
         running = self._run_target or "a node"
         self.statusBar().showMessage(
-            f"{node_id} queued behind {running} — {depth} waiting")
+            f"{nid or node_id} queued behind {running} — {depth} waiting")
 
     def _on_run_cancelled(self, node_id: str) -> None:
         """A queued or running pull was dropped because an edit landed inside its cone.
         Retire its claim and clear the cards nothing else wants, so no card is left
         reporting work that will never finish."""
-        self.scene.clear_run_plan(node_id)
+        self.scene.clear_run_plan(self._local(node_id) or node_id)
         self.scene.finish_run(None)
         if not self.runner.busy:
             self._set_led("idle")
@@ -3157,7 +3242,10 @@ class MainWindow(QMainWindow):
         _put(self._prog, fraction)
 
     def _on_node_progress(self, event: str, node_id: str, info: dict) -> None:
-        self.scene.on_node_progress(event, node_id, info)
+        nid = self._local(node_id)
+        if nid is not None:
+            self.scene.on_node_progress(event, nid, info)
+        node_id = nid or node_id              # the footer names the node either way
         # An ingest reports with no epoch (it belongs to a file, not to a run). Its card
         # rail is updated above like any other node's, but it must not touch the pull's
         # counters or relabel the footer "pulling …" — and while a pull IS in flight it
@@ -3198,6 +3286,10 @@ class MainWindow(QMainWindow):
     def _on_plane_ready(self, node_id, planes, axes, seconds) -> None:
         # fast-path display update (scrub/play): no dataset re-delivery, no spreadsheet
         # refresh — only the showing pane's frame changes.
+        node_id = self._local(node_id)
+        if node_id is None:
+            self._set_progress(None)
+            return
         for pane in self._panes_showing(node_id):
             pane.show_planes(node_id, planes, axes, seconds)
             self._sync_overlay_frames(pane, node_id)
@@ -3240,14 +3332,19 @@ class MainWindow(QMainWindow):
         # is more precise than the pulled node). The CONSOLE gets the whole trace,
         # selectable, because the other three are all uncopyable: a status line is truncated
         # to the window width, a tooltip cannot be selected, and a red card is not text.
-        self.scene.finish_run(node_id, failed=True)
-        for pane in self._panes_showing(node_id):
-            pane.show_error(node_id, trace)
+        run_id, node_id = node_id, self._local(node_id)
+        if node_id is not None:
+            self.scene.finish_run(node_id, failed=True)
+            for pane in self._panes_showing(node_id):
+                pane.show_error(node_id, trace)
+        else:
+            self.scene.clear_run_plan(run_id)
+            self.scene.finish_run(None)
         self._set_led("error")
         self._set_progress(None)              # a failed run must not leave a stale bar
         self.minimap.set_state("error")
         last = [ln for ln in trace.strip().splitlines() if ln.strip()]
-        self.console.error(f"{node_id} FAILED\n{trace.rstrip()}")
+        self.console.error(f"{node_id or run_id} FAILED\n{trace.rstrip()}")
         # Raise it on the FIRST failure of a session rather than every time: a user who has
         # deliberately closed it while working through a chain of errors should not have to
         # close it again after each one.
@@ -3256,7 +3353,7 @@ class MainWindow(QMainWindow):
             self._console_dock.show()
             self._console_dock.raise_()
         self.statusBar().showMessage(
-            f"{node_id} FAILED — {last[-1] if last else 'see Console'}")
+            f"{node_id or run_id} FAILED — {last[-1] if last else 'see Console'}")
 
     # ── file (G6) ────────────────────────────────────────────────────────────
     def _forget_display_state(self) -> None:

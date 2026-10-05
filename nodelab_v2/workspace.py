@@ -86,6 +86,36 @@ def split_run_id(run_id: str) -> Tuple[str, str]:
     return "", run_id
 
 
+def doc_id_of(run_id: str) -> str:
+    """The DOCUMENT node a run-graph id answers to, page prefix kept (V4.00 step 2).
+
+    The run graph renames two kinds of node: an Iterate clone is ``{doc_id}#{iterate_id}@{i}``
+    (and the zone's synthetic advance node ``{iterate_id}#adv@{i}`` belongs to the Iterate
+    card itself), and an inlined group body node is ``{body_id}%{instance_id}`` — nesting
+    appends further ``%instance`` segments, and the LAST one is the instance that actually
+    sits on the canvas. So ``"pg1/n3#it@2"`` → ``"pg1/n3"``, ``"pg1/it#adv@0"`` →
+    ``"pg1/it"``, ``"pg1/body%inst"`` → ``"pg1/inst"``; a bare id follows the same rules
+    without a prefix. The runner stores run cones in these terms, so a page's qualified
+    ``last_touched`` matches the runs computing that node's clones."""
+    pid, nid = split_run_id(run_id)
+    head = nid.split("#", 1)[0]
+    base = head.rsplit("%", 1)[-1] if "%" in head else head
+    return qualify(pid, base) if pid else base
+
+
+def local_ids(ids: Iterable[str], page_id: str,
+              default_page: Optional[str] = None) -> FrozenSet[str]:
+    """The BARE node ids among ``ids`` that belong to ``page_id``: every qualified id whose
+    page is ``page_id``, plus every bare id when bare means ``page_id`` — i.e. when
+    ``default_page`` is ``page_id`` (or ``None``, "bare ids are this page's")."""
+    out = set()
+    for rid in ids:
+        p, n = split_run_id(str(rid))
+        if p == page_id or (not p and (default_page is None or default_page == page_id)):
+            out.add(n)
+    return frozenset(out)
+
+
 def kind_label(kind: str) -> str:
     return str(R.page_meta(kind).get("label") or kind)
 
@@ -120,6 +150,11 @@ class ComposedGraph:
     #: :meth:`Workspace.revision_of` at composition — changes when any page in the closure
     #: changes, so the runner rebuilds its engine exactly when it must.
     revision: str
+    #: every RESOLVED ``page.input`` → the run ids that read it. Such an Input has no node in
+    #: the composed graph (its consumers are wired to the upstream Output), so no run's plan
+    #: names it; the runner adds it to the cone of any run that plans one of its consumers,
+    #: or an edit to its Source mid-run would cancel nothing (V4.00 step 2).
+    inputs: Dict[str, FrozenSet[str]] = field(default_factory=dict)
 
 
 class GraphSource(Protocol):
@@ -134,9 +169,15 @@ class GraphSource(Protocol):
     def revision_of(self, page_id: str) -> str: ...
     def record(self, run_id: str) -> Optional[NodeRecord]: ...
     def env(self, run_id: str) -> MetaEnvelope: ...
+    def meta_seed(self, run_id: str) -> Optional[MetaEnvelope]: ...
     def set_meta_seed(self, run_id: str, env: MetaEnvelope) -> None: ...
     def document_of(self, page_id: str) -> GraphDocument: ...
+    def page_ids(self) -> Tuple[str, ...]: ...
+    def all_records(self) -> Iterable[Tuple[str, NodeRecord]]: ...
+    def iterate_aliases(self, page_id: str, *,
+                        sweep_all: frozenset = frozenset()) -> Dict[str, str]: ...
     def on_change(self, fn: Callable[[], None]) -> None: ...
+    def off_change(self, fn: Callable[[], None]) -> None: ...
 
 
 class Workspace:
@@ -163,6 +204,9 @@ class Workspace:
         #: True while this object itself is driving document changes (a load, a cascade),
         #: so the per-page listener does not re-enter
         self._quiet = False
+        #: each page's ``page.output`` node ids as of its last change — so a DELETED Output
+        #: is still recognized as one when its page publishes the change
+        self._out_ids: Dict[str, FrozenSet[str]] = {}
 
     # ── construction ──────────────────────────────────────────────────────────
     @classmethod
@@ -222,6 +266,17 @@ class Workspace:
     def document_of(self, page_id: str) -> GraphDocument:
         return self.pages[page_id].doc
 
+    def page_ids(self) -> Tuple[str, ...]:
+        """Every page id, in page order."""
+        return tuple(self.pages)
+
+    def all_records(self) -> Iterable[Tuple[str, NodeRecord]]:
+        """``(run id, record)`` for every node on every page, page order then node order —
+        how the runner enumerates the sources of a whole workspace."""
+        for pid, page in self.pages.items():
+            for rec in page.doc.nodes.values():
+                yield qualify(pid, rec.id), rec
+
     def add_page(self, name: str, kind: str = FREE, *, doc: Optional[GraphDocument] = None,
                  page_id: Optional[str] = None, index: Optional[int] = None) -> Page:
         """A new plain page. ``doc`` adopts an existing document (the window's); ``index``
@@ -241,7 +296,9 @@ class Workspace:
         self._attach(page)
         if self.active is None:
             self.active = pid
-        self._notify(None)
+        # a new page is read by nothing — its id was never minted before — so no run can
+        # see it: "nothing", not "unknown", or adding a page would cancel every pull in flight
+        self._notify(())
         return page
 
     def remove_page(self, page_id: str) -> None:
@@ -254,12 +311,17 @@ class Workspace:
             raise ValueError(
                 f"page {page.name!r} is the master of {len(dependents)} linked page(s); make "
                 f"them unique first")
+        # its readers are found BEFORE it goes: once deleted it is no page's dependency, and
+        # the cascade would re-describe nobody — leaving their Inputs on its old envelopes
+        readers = self._downstream_of(page_id)
+        gone = {qualify(page_id, n) for n in page.doc.nodes} | self._reader_inputs(page_id)
         self._detach(page)
         del self.pages[page_id]
         if self.active == page_id:
             self.active = next(iter(self.pages), None)
-        self._cascade(page_id)
-        self._notify(None)
+        self._cascade(page_id, readers)
+        # every node it had: exactly the runs that read the page (their cones hold its ids)
+        self._notify(gone)
 
     def rename_page(self, page_id: str, name: str) -> None:
         name = (name or "").strip()
@@ -271,10 +333,12 @@ class Workspace:
         if page.name == name:
             return
         page.name = name
-        # the name is stamped into Outputs' `condition` at compose time, so a rename changes
-        # what dependents run — exactly as an edit on this page would
+        # the name is stamped into the Outputs' `condition` at compose time, so a rename
+        # changes what reads THROUGH an Output — and nothing else on the page: touch the
+        # Outputs and the Inputs that read them
         self._cascade(page_id)
-        self._notify(())
+        self._notify({qualify(page_id, n) for n in self._output_ids(page_id)}
+                     | self._reader_inputs(page_id))
 
     def move_page(self, page_id: str, index: int) -> None:
         page = self.pages.pop(page_id)
@@ -307,7 +371,8 @@ class Workspace:
             page.doc.repropagate()
         finally:
             self._quiet = False
-        self._notify(None)
+        self._out_ids[page.id] = self._output_ids(page.id)
+        self._notify(())                    # a new page: read by nothing yet
         return page
 
     def reset(self) -> None:
@@ -358,8 +423,9 @@ class Workspace:
             self._on_page_change(pid)
 
         doc.seed_hooks.append(hook)
-        doc.on_change(listener)
+        doc.on_change(listener, first=True)      # before the canvas, the editors, anyone
         self._hooks[pid] = (listener, hook)
+        self._out_ids[pid] = self._output_ids(pid)
 
     def _detach(self, page: Page) -> None:
         doc = page.doc
@@ -368,6 +434,7 @@ class Workspace:
             doc.off_change(listener)
         if hook is not None and hook in doc.seed_hooks:
             doc.seed_hooks.remove(hook)
+        self._out_ids.pop(page.id, None)
         doc.page_sources = lambda: []
         doc.store_tag = ""
         doc.page_kind = None
@@ -378,21 +445,61 @@ class Workspace:
         doc = self.pages[page_id].doc
         self.revision += 1
         lt = doc.last_touched
-        self.last_touched = None if lt is None else frozenset(qualify(page_id, n) for n in lt)
+        outs_before = self._out_ids.get(page_id, frozenset())
+        outs_now = self._output_ids(page_id)
+        self._out_ids[page_id] = outs_now
+        if lt is None:
+            self.last_touched = None
+        else:
+            touched = {qualify(page_id, n) for n in lt}
+            # An Output edited, added or deleted can RE-BIND an Input on another page (a
+            # name now matches, or no longer does) — a run reading through that Input has
+            # the Input in its cone but not necessarily this Output, so name the Inputs too.
+            if set(lt) & (outs_before | outs_now):
+                touched |= self._reader_inputs(page_id)
+            self.last_touched = frozenset(touched)
         self._cascade(page_id)
         self._fire()
 
-    def _cascade(self, page_id: str) -> None:
-        """Re-describe every page downstream of ``page_id``, upstream first: their Inputs'
-        envelopes come from it. Quiet, so the cascade cannot re-enter itself."""
+    def _output_ids(self, page_id: str) -> FrozenSet[str]:
+        page = self.pages.get(page_id)
+        if page is None:
+            return frozenset()
+        return frozenset(r.id for r in page.doc.nodes.values() if r.op_key == PAGE_OUTPUT_OP)
+
+    def _reader_inputs(self, page_id: str) -> set:
+        """The run ids of every ``page.input`` on another page that names ``page_id``."""
+        out = set()
+        for q, page in self.pages.items():
+            if q == page_id:
+                continue
+            for rec in page.doc.nodes.values():
+                if rec.op_key == PAGE_INPUT_OP and \
+                        self.parse_source(rec.params.get(PAGE_SOURCE_KEY))[0] == page_id:
+                    out.add(qualify(q, rec.id))
+        return out
+
+    def _refresh_out_ids(self) -> None:
+        self._out_ids = {pid: self._output_ids(pid) for pid in self.pages}
+
+    def _downstream_of(self, page_id: str) -> List[str]:
+        """Every page that reads ``page_id``, transitively, upstream first."""
         affected = {page_id}
+        out: List[str] = []
+        for q in self._topo_pages():
+            if q != page_id and self._page_deps(q) & affected:
+                affected.add(q)
+                out.append(q)
+        return out
+
+    def _cascade(self, page_id: str, pages: Optional[List[str]] = None) -> None:
+        """Re-describe every page downstream of ``page_id`` (or exactly ``pages``), upstream
+        first: their Inputs' envelopes come from it. Quiet, so the cascade cannot re-enter
+        itself."""
         self._quiet = True
         try:
-            for q in self._topo_pages():
-                if q == page_id:
-                    continue
-                if self._page_deps(q) & affected:
-                    affected.add(q)
+            for q in (self._downstream_of(page_id) if pages is None else pages):
+                if q in self.pages:
                     self.pages[q].doc.repropagate()
         finally:
             self._quiet = False
@@ -418,16 +525,28 @@ class Workspace:
             if rec.op_key != PAGE_INPUT_OP:
                 continue
             pid, _name = self.parse_source(rec.params.get(PAGE_SOURCE_KEY))
-            if pid and pid != page_id and pid in self.pages:
+            if pid and pid != page_id and pid in self.pages and self._kinds_allow(pid, page_id):
                 deps.add(pid)
         return frozenset(deps)
+
+    def _kinds_allow(self, up_id: str, page_id: str) -> bool:
+        """The ORDER half of :meth:`_may_feed`, which needs no closure: two ordered kinds may
+        feed only strictly forward; a ``free`` page on either side defers to acyclicity. A
+        reference against the order is no dependency at all — the Input can never resolve,
+        so it must not pull the named page into this one's closure (or form a cycle there)."""
+        ou = R.page_order(self.pages[up_id].kind)
+        op = R.page_order(self.pages[page_id].kind)
+        return ou is None or op is None or ou < op
 
     def page_deps(self, page_id: str) -> List[str]:
         return sorted(self._page_deps(page_id))
 
-    def dependency_closure(self, page_id: str) -> List[str]:
+    def dependency_closure(self, page_id: str, *, strict: bool = True) -> List[str]:
         """Every page ``page_id`` reads from, transitively, upstream first, ``page_id`` last.
-        Raises :class:`ValueError` on a cycle."""
+        Raises :class:`ValueError` on a cycle — or, with ``strict=False``, ignores the
+        reference that would close it (the run identity and the composition use that: a
+        cycle only Free pages can form, from a hand-edited file, must leave the Input on it
+        unbound rather than make every pull, cursor move and repaint raise)."""
         order: List[str] = []
         state: Dict[str, int] = {}                    # 1 = visiting, 2 = done
 
@@ -436,6 +555,8 @@ class Workspace:
             if st == 2:
                 return
             if st == 1:
+                if not strict:
+                    return
                 raise ValueError("pages read from each other in a cycle: "
                                  + " → ".join(path + (pid,)))
             state[pid] = 1
@@ -453,11 +574,7 @@ class Workspace:
         done: List[str] = []
         seen = set()
         for pid in self.pages:
-            try:
-                closure = self.dependency_closure(pid)
-            except ValueError:
-                closure = [pid]
-            for q in closure:
+            for q in self.dependency_closure(pid, strict=False):
                 if q not in seen:
                     seen.add(q)
                     done.append(q)
@@ -539,9 +656,11 @@ class Workspace:
         """The run identity of a page: a digest over the (id, name, document revision) of
         every page in its dependency closure. Changes when any of them changes — and when
         a page is renamed, because the name is stamped into its Outputs' ``condition``."""
-        closure = self.dependency_closure(page_id)
-        return digest("ws", tuple((q, self.pages[q].name, self.pages[q].doc.revision)
-                                  for q in closure))
+        if page_id not in self.pages:
+            return ""
+        closure = self.dependency_closure(page_id, strict=False)
+        return digest("ws", tuple((q, self.pages[q].name, self.pages[q].doc.uid,
+                                   self.pages[q].doc.revision) for q in closure))
 
     def record(self, run_id: str) -> Optional[NodeRecord]:
         pid, nid = split_run_id(run_id)
@@ -553,11 +672,28 @@ class Workspace:
         page = self.pages.get(pid or (self.active or ""))
         return page.doc.env(nid) if page is not None else MetaEnvelope()
 
+    def meta_seed(self, run_id: str) -> Optional[MetaEnvelope]:
+        """The envelope a source node was last seeded with, or ``None``."""
+        pid, nid = split_run_id(run_id)
+        page = self.pages.get(pid or (self.active or ""))
+        return page.doc.meta_seeds.get(nid) if page is not None else None
+
     def set_meta_seed(self, run_id: str, env: MetaEnvelope) -> None:
         pid, nid = split_run_id(run_id)
         page = self.pages.get(pid or (self.active or ""))
         if page is not None:
             page.doc.set_meta_seed(nid, env)
+
+    def iterate_aliases(self, page_id: str, *,
+                        sweep_all: frozenset = frozenset()) -> Dict[str, str]:
+        """:meth:`GraphDocument.iterate_aliases` for one page, in run ids: ``{"pg1/n3":
+        "pg1/n3#it@1", …}`` — which clone serves a card INSIDE an Iterate segment.
+        ``sweep_all`` is qualified (a bare id means this page)."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return {}
+        local = page.doc.iterate_aliases(sweep_all=local_ids(sweep_all, page_id, page_id))
+        return {qualify(page_id, k): qualify(page_id, v) for k, v in local.items()}
 
     # ── composition ───────────────────────────────────────────────────────────
     def compose(self, page_id: str, *, live_docks: frozenset = frozenset(),
@@ -572,29 +708,24 @@ class Workspace:
         blank ``condition`` on an Output is filled with the page's name here, because only
         the Workspace knows it. ``live_docks``/``sweep_all`` are QUALIFIED run ids (a bare id
         means the target page)."""
-        order = self.dependency_closure(page_id)
+        order = self.dependency_closure(page_id, strict=False)
         g = Graph()
         id_map: Dict[Tuple[str, str], str] = {}
         meta: Dict[str, MetaEnvelope] = {}
-
-        def mine(ids: frozenset, pid: str) -> frozenset:
-            out = set()
-            for rid in ids:
-                p, n = split_run_id(rid)
-                if p == pid or (not p and pid == page_id):
-                    out.add(n)
-            return frozenset(out)
-
+        readers: Dict[str, set] = {}              # resolved input -> its consumers
+        done: set = set()                         # pages already spliced in
         for pid in order:
             page = self.pages[pid]
             sub = page.doc.to_graph(for_run=True, materialize=True, unroll_iterate=True,
-                                    live_docks=mine(live_docks, pid),
-                                    sweep_all=mine(sweep_all, pid))
+                                    live_docks=local_ids(live_docks, pid, page_id),
+                                    sweep_all=local_ids(sweep_all, pid, page_id))
             replaced: Dict[str, str] = {}             # local input id -> upstream run id
             for nid, inst in sub.nodes.items():
                 if inst.op_key == PAGE_INPUT_OP:
                     res = self.resolve_source(pid, inst.params.get(PAGE_SOURCE_KEY))
-                    if res is not None:
+                    # only from a page ALREADY spliced in: a reference that would close a
+                    # cycle (dropped from the tolerant closure) stays an unbound root
+                    if res is not None and res[0] in done:
                         up, out_nid = res
                         replaced[nid] = id_map.get((up, out_nid), qualify(up, out_nid))
                         id_map[(pid, nid)] = replaced[nid]
@@ -611,14 +742,17 @@ class Workspace:
                     continue
                 if e.src in replaced:
                     src, ss = replaced[e.src], "out"
+                    readers.setdefault(qualify(pid, e.src), set()).add(qualify(pid, e.dst))
                 else:
                     src, ss = qualify(pid, e.src), e.src_socket
                 g.connect(src, qualify(pid, e.dst), src_socket=ss,
                           dst_socket=e.dst_socket, kind=e.kind)
             for nid, env in page.doc.meta_seeds.items():
                 meta[qualify(pid, nid)] = env
+            done.add(pid)
         return ComposedGraph(g, page_id, tuple(order), meta, id_map,
-                             self.revision_of(page_id))
+                             self.revision_of(page_id),
+                             {k: frozenset(v) for k, v in readers.items()})
 
     # ── file ──────────────────────────────────────────────────────────────────
     def to_dict(self) -> Dict[str, Any]:
@@ -684,6 +818,7 @@ class Workspace:
                 self.pages[pid].doc.repropagate()
         finally:
             self._quiet = False
+        self._refresh_out_ids()
         self._notify(None)
 
     def _name_from_path(self) -> str:
@@ -717,5 +852,5 @@ def _editable(self: Page) -> bool:
 Page.editable_topology_doc = _editable      # a plain page's document can be reused on load
 
 
-__all__ = ["RUN_SEP", "FREE", "DEFAULT_PAGE_NAME", "qualify", "split_run_id", "kind_label",
-           "Page", "ComposedGraph", "GraphSource", "Workspace"]
+__all__ = ["RUN_SEP", "FREE", "DEFAULT_PAGE_NAME", "qualify", "split_run_id", "doc_id_of",
+           "local_ids", "kind_label", "Page", "ComposedGraph", "GraphSource", "Workspace"]

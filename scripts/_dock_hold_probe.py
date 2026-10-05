@@ -38,6 +38,7 @@ app = QApplication.instance() or QApplication([])
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.ops import DOCK_OP, DOCK_HELD, DOCK_LIVE, ensure_ops
 from nodelab_v2.runner import EngineRunner
+from nodelab_v2.workspace import local_ids
 from nodegraph.dataset import AxisSizes, Dataset
 from nodegraph.provider import ArrayProvider
 
@@ -75,7 +76,7 @@ frozen = Dataset(axes=ax, metadata={"pixel_size_um": 0.5, "bit_depth": 12}).with
 
 assert runner.held == frozenset()
 runner.hold("D", frozen)
-assert runner.held == frozenset({"D"}), runner.held
+assert runner.held == frozenset({runner.run_id("D")}), runner.held   # run ids are page-qualified (V4.00 step 2)
 ok("runner.hold pins the payload and reports it in `held`")
 
 rev_before = runner._engine_rev
@@ -94,19 +95,19 @@ doc.set_dock_hold("D", True)
 assert doc.nodes["D"].modes["state"] == DOCK_HELD
 assert doc.dock_status("D")[0] == "released", \
     "before the runner's set is mirrored, the badge must read released"
-doc.set_held_nodes(runner.held)
+doc.set_held_nodes(local_ids(runner.held, runner.source.active))
 st, why = doc.dock_status("D")
 assert st == "held" and why == "", (st, why)
 ok("document.set_held_nodes flips the badge from `released` to `held`")
 
 rev = doc.revision
-doc.set_held_nodes(runner.held)          # idempotent
+doc.set_held_nodes(local_ids(runner.held, runner.source.active))          # idempotent
 assert doc.revision == rev, "a no-op set_held_nodes must not bump the revision"
 doc.set_held_nodes(frozenset())
 assert doc.revision == rev, \
     "set_held_nodes must NOT bump the revision — that would drop every memo entry"
 assert doc.dock_status("D")[0] == "released"
-doc.set_held_nodes(runner.held)
+doc.set_held_nodes(local_ids(runner.held, runner.source.active))
 ok("set_held_nodes clears the status cache without bumping the revision")
 
 # ── 3. the chain greys out, exactly as it does when docked ───────────────────
@@ -117,7 +118,7 @@ ok(f"a held dock greys out its chain: {sorted(doc.dormant)}")
 assert runner.release("D") is True
 assert runner.release("D") is False, "releasing twice must report nothing was released"
 doc.set_dock_hold("D", False)
-doc.set_held_nodes(runner.held)
+doc.set_held_nodes(local_ids(runner.held, runner.source.active))
 assert doc.nodes["D"].modes["state"] == DOCK_LIVE
 assert doc.dock_status("D")[0] == "live", doc.dock_status("D")
 assert doc.dormant == frozenset(), doc.dormant
@@ -126,7 +127,7 @@ ok("release un-freezes: state live, badge live, nothing greyed")
 # ── 5. a SAVED graph with a held dock reloads as `released`, not as broken ────
 doc.set_dock_hold("D", True)
 runner.hold("D", frozen)
-doc.set_held_nodes(runner.held)
+doc.set_held_nodes(local_ids(runner.held, runner.source.active))
 path = os.path.join(tempfile.mkdtemp(prefix="heldsave-"), "g.nd2graph.json")
 doc.save_file(path)
 raw = open(path, encoding="utf-8").read()

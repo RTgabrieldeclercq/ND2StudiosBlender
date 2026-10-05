@@ -1,0 +1,137 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg2",
+    "next_page_seq": 3,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "raw",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "load",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "load",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {}
+            },
+            {
+              "id": "raw",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "raw"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "input",
+        "master": null,
+        "name": "Input",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "load": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 0.0
+            },
+            "raw": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": 0.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "view",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "blur",
+              "src_socket": "out"
+            },
+            {
+              "dst": "blur",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "in",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "blur",
+              "modes": {
+                "dim": "2D"
+              },
+              "op_key": "enhance.gaussian",
+              "params": {
+                "sigma": 1.5
+              }
+            },
+            {
+              "id": "in",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:raw"
+              }
+            },
+            {
+              "id": "view",
+              "modes": {},
+              "op_key": "view.viewer",
+              "params": {}
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg2",
+        "kind": "refine",
+        "master": null,
+        "name": "Refine",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "blur": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": 0.0
+            },
+            "in": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 0.0
+            },
+            "view": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 0.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

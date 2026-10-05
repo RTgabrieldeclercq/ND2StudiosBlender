@@ -92,11 +92,12 @@ def main() -> int:
     runner.failed.connect(lambda nid, tb: err.setdefault(nid, tb))
     runner.pull("mea")
     t0 = time.time()
-    while "mea" not in done and not err and time.time() - t0 < 300:
+    _mea = runner.run_id("mea")                  # run ids are page-qualified (V4.00 step 2)
+    while _mea not in done and not err and time.time() - t0 < 300:
         app.processEvents()
         time.sleep(0.01)
     assert not err, f"the bundle pull FAILED:\n{list(err.values())[0]}"
-    ds = done.get("mea")
+    ds = done.get(_mea)
     assert ds is not None, "the bundle pull produced no payload (timed out)"
 
     print(f"pulled: axes.m = {ds.axes.m} (1 + 1 + 1)")
