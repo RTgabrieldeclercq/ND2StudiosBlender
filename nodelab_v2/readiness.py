@@ -6,8 +6,13 @@ about, which the panel highlights in red, and carries :class:`Suggestion` rows �
 whose output would satisfy the gap — which the panel turns into *Add* buttons and the
 window turns into a node inserted upstream and wired in.
 
-Four kinds of problem, in the order they are reported:
+Six kinds of problem, in the order they are reported:
 
+* ``unbound`` — a ``page.input`` whose Source names no output an earlier page offers
+  (V4.00): nothing else about it can be judged, so it is the only problem reported.
+* ``duplicate_output`` — a ``page.output`` whose name another Output on the same page
+  already uses, so a later page could not tell them apart (an unnamed Output is a
+  ``validation`` problem: nothing can pick it).
 * ``unwired`` — the node's primary Dataset input has no wire. Nothing else can be judged
   until it does, so this is the only problem reported when it holds.
 * ``domain`` — a domain the node reads (``reads_domains``, resolved against its mode
@@ -32,7 +37,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from nodegraph.domains import Domain
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType
-from nodelab_v2.ops import HIDDEN_OP_PREFIXES
+from nodelab_v2.ops import (
+    HIDDEN_OP_PREFIXES, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY)
 
 
 @dataclass(frozen=True)
@@ -47,7 +53,8 @@ class Suggestion:
 
 @dataclass(frozen=True)
 class Problem:
-    kind: str                    # "unwired" | "domain" | "empty" | "validation"
+    kind: str                    # "unbound" | "duplicate_output" | "unwired" | "domain" |
+                                 # "empty" | "validation"
     socket: Optional[str]        # the input this is about (highlighted); None = node-level
     message: str
     suggestions: Tuple[Suggestion, ...] = ()
@@ -128,6 +135,34 @@ def problems(doc, node_id: str) -> List[Problem]:
     active = list(doc.input_specs(node_id))
     ds_in = [s for s in active if s.type is SocketType.DATASET]
     wired = _wired_inputs(doc, node_id)
+
+    # 0. page boundaries (V4.00): an Input must name an output an earlier page offers; an
+    #    Output must carry a name no sibling Output on this page already uses
+    if spec.op_key == PAGE_INPUT_OP:
+        value = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+        offered = {v for v, _label in doc.source_choices(node_id)}
+        if value in offered:
+            return []
+        if not value:
+            msg = "no source chosen — pick a named output of an earlier page in `Source`"
+        elif not offered:
+            msg = (f"`{value}` cannot be read here — no earlier page has a named Page "
+                   f"Output yet")
+        else:
+            msg = (f"`{value}` is not an output any earlier page offers — renamed, deleted, "
+                   f"or on a page that cannot feed this one")
+        return [Problem("unbound", PAGE_SOURCE_KEY, msg)]
+    if spec.op_key == PAGE_OUTPUT_OP:
+        name = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+        if not name:
+            out.append(Problem("validation", PAGE_NAME_KEY,
+                               "this output has no name — later pages pick outputs by name"))
+        elif any(r.id != node_id and r.op_key == PAGE_OUTPUT_OP
+                 and str(r.params.get(PAGE_NAME_KEY, "") or "").strip() == name
+                 for r in doc.nodes.values()):
+            out.append(Problem("duplicate_output", PAGE_NAME_KEY,
+                               f"another Page Output on this page is also named `{name}` — "
+                               f"a later page could not tell them apart"))
 
     # 1. the primary Dataset input — the first declared, never a display-only tap
     primary = next((s for s in ds_in if not getattr(s, "view_source", False)), None)

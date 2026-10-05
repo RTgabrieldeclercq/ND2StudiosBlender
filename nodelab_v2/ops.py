@@ -158,6 +158,29 @@ BAKE_KEY = "__bake__"
 #: ends up spelled differently.
 LOAD_OP = "io.load"
 
+#: The page-boundary ops of a V4 Workspace (2026-10-05) — GUI-layer like ``io.load`` and
+#: ``view.viewer``: registered by :func:`ensure_ops`, never part of the Qt-free catalog, and
+#: deliberately NOT in :data:`HIDDEN_OP_PREFIXES` (they are placed by hand). ``page.output``
+#: names the Dataset wired into it as a VARIABLE of its page; ``page.input`` on a page of a
+#: later kind reads one by ``"<page_id>:<name>"``. At run time the Workspace splices the
+#: upstream page in and the Input node disappears
+#: (:meth:`nodelab_v2.workspace.Workspace.compose`); its compute exists only to say so when a
+#: graph is run without a Workspace.
+PAGE_INPUT_OP = "page.input"
+PAGE_OUTPUT_OP = "page.output"
+PAGE_OPS = (PAGE_INPUT_OP, PAGE_OUTPUT_OP)
+#: ``page.input``'s source reference, ``"<page_id>:<variable name>"``.
+PAGE_SOURCE_KEY = "source"
+#: ``page.output``'s variable name — a PRESENTATION socket: renaming a variable re-keys no
+#: memo entry, because the Dataset it names is the same Dataset.
+PAGE_NAME_KEY = "name"
+#: ``page.output``'s condition label, stamped into the Dataset's metadata so a downstream
+#: table can say which experimental condition a row came from. Blank = the page's own name,
+#: filled in at compose time (the node cannot know what its page is called).
+PAGE_CONDITION_KEY = "condition"
+#: What an unresolved ``page.input`` says when it is pulled.
+PAGE_UNBOUND_MESSAGE = "Page Input is not bound to an upstream Output"
+
 #: op prefixes hidden from the palette / link search / readiness suggestions (boundary +
 #: fixture ops, plus the source loader ``io.load`` — it is created from File → Load
 #: ND2/TIFF file…, never dragged). Lives here, Qt-free, so :mod:`nodelab_v2.readiness` can
@@ -290,10 +313,36 @@ def _compute_viewer(ctx: EvalContext):
     return ctx.inputs[0]
 
 
+def _compute_page_output(ctx: EvalContext):
+    """``page.output`` — a pass-through that NAMES its input as one of its page's variables.
+    The name is presentation (the window and the Workspace read it off the document); the
+    only thing the compute adds is the ``condition`` label, stamped into the metadata so a
+    table built downstream of several pages can say which condition each row came from."""
+    ds = ctx.inputs[0]
+    cond = str(ctx.params.get(PAGE_CONDITION_KEY, "") or "").strip()
+    return ds.with_metadata(condition=cond) if cond else ds
+
+
+def _meta_page_output(env, params, modes):
+    """Edit-time twin of :func:`_compute_page_output` — the same stamp, in lockstep."""
+    cond = str(params.get(PAGE_CONDITION_KEY, "") or "").strip()
+    return env.with_metadata(condition=cond) if cond else env
+
+
+def _compute_page_input(ctx: EvalContext):
+    """``page.input`` — never evaluated inside a Workspace (compose replaces it by a wire
+    from the upstream page's Output). Reached only when the node is unbound or the graph is
+    run on its own, so the refusal says exactly that."""
+    src = str(ctx.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+    hint = (f": {src!r} names no output an earlier page offers" if src
+            else ": pick a named output of an earlier page in its Source menu")
+    raise ValueError(PAGE_UNBOUND_MESSAGE + hint)
+
+
 def ensure_ops() -> None:
-    """Idempotently register ``io.load`` (source, no compute) + ``view.viewer``
-    (pass-through). Safe to call repeatedly and from any thread (pure registry
-    writes)."""
+    """Idempotently register ``io.load`` (source, no compute), ``view.viewer``
+    (pass-through) and the V4 page boundaries ``page.output`` / ``page.input``. Safe to
+    call repeatedly and from any thread (pure registry writes)."""
     spec = NODES.get("io.load")
     _access_mode = next((m for m in spec.modes if m.name == ACCESS_MODE), None) \
         if spec is not None else None
@@ -699,6 +748,63 @@ def ensure_ops() -> None:
 # `Engine.pull` never walks the chain behind it, never computes those nodes and never
 # memoizes their (full-raster) payloads. The node is the switch; the rewrite is the
 # mechanism.
+    if NODES.get(PAGE_OUTPUT_OP) is None:
+        register_node(
+            _compute_page_output,
+            op_key=PAGE_OUTPUT_OP, label="Page Output", category="page",
+            inputs=[
+                InDataset("data", label="Data",
+                          description=
+                          "The Dataset this page hands on under the name below — an image, "
+                          "a mask, a labelled set, a table-carrying Dataset, whatever the "
+                          "chain in front of it produced. Pulling this node previews exactly "
+                          "what a later page's Page Input will receive."),
+                InString(PAGE_NAME_KEY, "Name", field=False, default="", presentation=True,
+                         description=
+                         "The variable name a later page picks this output by (its Page "
+                         "Input's Source menu lists `<this page> · <name>`). Give every "
+                         "output on one page a different name, or a later page cannot tell "
+                         "them apart. Renaming re-keys nothing: the Dataset is the same, so "
+                         "every memoized result downstream is kept."),
+                InString(PAGE_CONDITION_KEY, "Condition", field=False, default="",
+                         description=
+                         "The experimental-condition label stamped into the Dataset's "
+                         "metadata (`condition`), which a table built downstream of several "
+                         "pages carries as a column. Leave blank to use this page's own name "
+                         "— a linked page then labels its rows with ITS name, which is the "
+                         "point of linking one workflow per dish. Changing it re-runs only "
+                         "the stamp (this node), not the chain in front of it."),
+            ],
+            outputs=[OutDataset("out")],
+            granularity=Granularity.TILEABLE,
+            kernel_axes=frozenset(),
+            meta_transform=_meta_page_output,
+            description="Name the Dataset wired in as a VARIABLE of this page, for a Page "
+                        "Input on a later page to read. A pass-through: nothing is copied or "
+                        "changed except an optional `condition` label in the metadata.")
+    if NODES.get(PAGE_INPUT_OP) is None:
+        register_node(
+            _compute_page_input,
+            op_key=PAGE_INPUT_OP, label="Page Input", category="page",
+            inputs=[
+                InString(PAGE_SOURCE_KEY, "Source", field=False, default="",
+                         description=
+                         "Which earlier page's named output this page starts from — pick "
+                         "one from the menu (`<page> · <name>`; only pages of an earlier "
+                         "kind, or Free pages, are offered, so the page graph can never "
+                         "loop). Stored as `<page id>:<name>`, so renaming a page keeps the "
+                         "link and renaming the OUTPUT breaks it — the panel then shows this "
+                         "input as unbound until you re-pick."),
+            ],
+            outputs=[OutDataset("out")],
+            granularity=Granularity.TILEABLE,
+            kernel_axes=frozenset(),
+            description="Start this page from a named output of an earlier page. At run "
+                        "time the upstream page is spliced in and this node disappears, so "
+                        "a result the upstream page already computed is reused from the "
+                        "memo rather than recomputed; at edit time the node carries the "
+                        "upstream output's envelope (axes, calibration, layers), so every "
+                        "derived default on this page is right before anything is pulled.")
 
 
 def dock_state_of(rec: Any) -> str:
@@ -1279,6 +1385,8 @@ def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
 
 
 __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
+           "PAGE_INPUT_OP", "PAGE_OUTPUT_OP", "PAGE_OPS", "PAGE_SOURCE_KEY", "PAGE_NAME_KEY",
+           "PAGE_CONDITION_KEY", "PAGE_UNBOUND_MESSAGE",
            "materialize_group_taps", "GRP_SOCKET_RE", "GROUPS_KEY",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",

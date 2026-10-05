@@ -304,13 +304,13 @@ class Worker:
         ``hello`` genuinely means ready — an import storm that fails exits non-zero with
         the reason on stderr, which the hub reports as ``worker_exited`` plus our own
         stderr tail rather than as a mysterious ``open_timeout``."""
-        from nodegraph.serialize import FORMAT_VERSION
+        from nodegraph.serialize import FORMAT_VERSION, SUPPORTED_VERSIONS
 
         emit(id=None, ev="hello",
              protocol=P.WORKER_PROTOCOL_VERSION,
              worker=P.WORKER_NAME, worker_version=P.WORKER_VERSION,
              software=P.SOFTWARE_NAME, software_version=P.SOFTWARE_VERSION,
-             graph_format=FORMAT_VERSION,
+             graph_format=FORMAT_VERSION, graph_formats=sorted(SUPPORTED_VERSIONS),
              pid=os.getpid(), clock=time.time(),
              capabilities=list(P.WORKER_COMMANDS),
              features={
@@ -322,6 +322,9 @@ class Worker:
                  "zones": True,                  # Repeat/Sim unrolling
                  "iterate": True,                # flow.iterate sweeps
                  "docks": True,                  # io.dock checkpoints
+                 # a V4 workspace file: the recipe's "page" (id or name) picks the page,
+                 # which runs composed with every page it reads from (V4.00)
+                 "workspaces": P.WORKSPACE_GRAPH_FORMAT,
                  # We read a `*.job.json` beside an input and let it OVERRIDE the file's own
                  # metadata, and we refuse a run whose recipe requires a field nothing
                  # supplies. Advertised so an operator can tell a hub that enforces the
@@ -453,7 +456,6 @@ class Worker:
 
     # ── open ────────────────────────────────────────────────────────────────────
     def cmd_open(self, mid: Any, cmd: dict) -> None:
-        from nodegraph.serialize import from_dict
         from nodelab_v2.ops import ensure_ops
 
         recipe = cmd.get("recipe") or {}
@@ -486,7 +488,9 @@ class Worker:
         import nodegraph.catalog     # noqa: F401 — importing registers the catalog
         ensure_ops()
         try:
-            graph, zones, groups = from_dict(raw)
+            graph, zones, groups, page_id = graph_for_recipe(
+                raw, page=str(recipe.get("page") or cmd.get("page") or ""),
+                graph_path=graph_path)
         except ValueError as exc:
             raise WorkerFault("bad_recipe", f"{exc}") from None
 
@@ -515,7 +519,7 @@ class Worker:
              f"target {recipe.get('target')!r}")
         self._answer(mid, "result", validated=True, targets=list(self.targets),
                      node_count=len(graph.nodes), graph_format=raw.get("format_version"),
-                     zones=len(zones), groups=len(groups))
+                     page=page_id, zones=len(zones), groups=len(groups))
 
     # ── tier-2 validation ───────────────────────────────────────────────────────
     def validate_recipe(self, recipe: dict, graph: Any) -> List[str]:
@@ -1492,6 +1496,36 @@ def _as_bytes(value: Any) -> Optional[int]:
 
 # ── recipe checking (tier 2, before anything is uploaded) ───────────────────────
 
+def graph_for_recipe(raw: Dict[str, Any], *, page: str = "", graph_path: str = ""
+                     ) -> Tuple[Any, list, list, str]:
+    """``(graph, zones, groups, page_id)`` for a recipe's graph document.
+
+    A single-graph (2.0) document is read as it always was. A WORKSPACE (3.0) document is
+    loaded through the :class:`~nodelab_v2.workspace.Workspace` and the named page — by id
+    or by name, else the file's active page — is COMPOSED with every page it reads from, so
+    the worker runs exactly the graph the editor would. Its node ids are the qualified run
+    ids ``<page>/<node>``; a recipe's knob and target ids are these. The zones and groups
+    reported are those of every page in the composition (zones gate ``allow_zones``).
+    """
+    from nodegraph.serialize import from_dict, is_workspace_dict
+    if not is_workspace_dict(raw):
+        graph, zones, groups = from_dict(raw)
+        return graph, zones, groups, ""
+    from nodelab_v2.workspace import Workspace
+    ws = Workspace()
+    ws.path = graph_path or None
+    ws.load_dict(raw)
+    pid = ws.page_id_for(page) if page else ws.active
+    if pid is None:
+        names = ", ".join(f"{p.id} ({p.name!r})" for p in ws.pages.values())
+        raise ValueError(f"the recipe names page {page!r}, which the workspace does not "
+                         f"have (pages: {names})")
+    composed = ws.compose(pid)
+    zones = [z for q in composed.pages for z in ws.pages[q].doc._zones]
+    groups = [g for q in composed.pages for g in ws.pages[q].doc._groups]
+    return composed.graph, zones, groups, pid
+
+
 def _local_tier1(manifest: Dict[str, Any], graph: Any) -> List[str]:
     """The manifest-only rules a *generator* gets wrong, checked here as well as on the hub.
 
@@ -1653,11 +1687,11 @@ def check_recipe_dir(directory: str) -> Tuple[bool, List[str]]:
         return False, problems + [f"{graph_path} is not valid JSON: {exc}"]
 
     import nodegraph.catalog     # noqa: F401 — importing registers the catalog
-    from nodegraph.serialize import from_dict
     from nodelab_v2.ops import ensure_ops
     ensure_ops()
     try:
-        graph, zones, _groups = from_dict(raw)
+        graph, zones, _groups, _page = graph_for_recipe(
+            raw, page=str(manifest.get("page") or ""), graph_path=graph_path)
     except ValueError as exc:
         return False, problems + [f"the graph is not a readable nd2graph document: {exc}"]
 

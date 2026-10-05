@@ -38,6 +38,7 @@ from nodegraph.iterate import (
 from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
+from nodelab_v2.workspace import Workspace
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
@@ -261,6 +262,10 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(_window_qss())
 
         self.doc = GraphDocument()
+        # V4.00 step 1: the document is one Free page of a Workspace; the file on disk
+        # is the workspace (format 3.0). The page switcher and per-page canvases arrive
+        # in step 5 — until then `self.doc` IS the active page's document.
+        self.workspace = Workspace.single(self.doc)
         self.scene = GraphScene(self.doc)
         self.view = GraphView(self.scene)
         self.runner = EngineRunner(self.doc)
@@ -3262,7 +3267,7 @@ class MainWindow(QMainWindow):
                 pane.forget_display_state()
 
     def file_new(self) -> None:
-        self.doc.clear()          # → _on_doc_changed closes the compare pane too
+        self.workspace.reset()    # clears the page's document → _on_doc_changed closes the compare pane too
         self._forget_display_state()
         self._viewed = None
         self.scene.set_viewed(None)
@@ -3681,12 +3686,17 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self.doc.load_file(path)
+            self.workspace.load_file(path)       # reuses self.doc for the active page
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Open failed", str(exc))
             return
         self._forget_display_state()
         self.view.fit_all()
+        if len(self.workspace.pages) > 1:
+            act = self.workspace.page(self.workspace.active)
+            self.statusBar().showMessage(
+                f"workspace of {len(self.workspace.pages)} pages — showing {act.name!r}; "
+                f"the page switcher arrives in V4 step 5")
         if self.doc.has_unedited_structure:
             QMessageBox.information(
                 self, "Zones / groups preserved",
@@ -3705,7 +3715,7 @@ class MainWindow(QMainWindow):
             self.file_save_as()
             return
         self._stamp_all_movies()
-        self.doc.save_file(self.doc.path)
+        self.workspace.save_file(self.doc.path)
         self.statusBar().showMessage(f"saved {self.doc.path}")
 
     def file_save_as(self) -> None:
@@ -3714,7 +3724,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._stamp_all_movies()
-        self.doc.save_file(path)
+        self.workspace.save_file(path)
         self.statusBar().showMessage(f"saved {path}")
 
     def file_export(self) -> None:

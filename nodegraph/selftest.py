@@ -24082,6 +24082,427 @@ def test_multiotsu_outputs() -> None:
         "states hash apart")
 
 
+# ── ND2Studios V4.00 step 1: the Workspace — pages, kinds, named outputs, composition ─────
+
+def _ws_fixture():
+    """A four-page workspace with a seeded synthetic source: Input ``L → O "raw"`` →
+    Refine ``IN → gaussian → O "smooth"`` → two Processing pages ``IN → gamma``. Returns
+    ``(ws, seed Dataset, seed envelope, axes)``. Real catalog ops throughout — a fixture op
+    is never needed, and must never shadow a real op_key."""
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=32, x=32)
+    md = {"pixel_size_um": 0.5}
+    arr = np.zeros((1, 1, 1, 1, 32, 32), np.float32)
+    arr[0, 0, 0, 0, 10:20, 10:20] = 100.0
+    ds = Dataset(axes=ax, metadata=md).with_image(ArrayProvider(arr))
+    env = MetaEnvelope(axes=ax, metadata=md)
+    ws = Workspace()
+    I = ws.add_page("Input", "input")
+    Rf = ws.add_page("Refine", "refine")
+    P1 = ws.add_page("P1", "process")
+    P2 = ws.add_page("P2", "process")
+    assert [p.id for p in ws.pages.values()] == ["pg1", "pg2", "pg3", "pg4"], list(ws.pages)
+    I.doc.add_node("io.load", node_id="L")
+    I.doc.meta_seeds["L"] = env
+    I.doc.add_node("page.output", node_id="O", params={"name": "raw"})
+    I.doc.connect("L", "image", "O", "data")
+    Rf.doc.add_node("page.input", node_id="IN", params={"source": "pg1:raw"})
+    Rf.doc.add_node("enhance.gaussian", node_id="G", params={"sigma": 1.0}, modes={"dim": "2D"})
+    Rf.doc.add_node("page.output", node_id="O", params={"name": "smooth"})
+    Rf.doc.connect("IN", "out", "G", "data")
+    Rf.doc.connect("G", "out", "O", "data")
+    for P in (P1, P2):
+        P.doc.add_node("page.input", node_id="IN", params={"source": "pg2:smooth"})
+        P.doc.add_node("enhance.gamma", node_id="X", params={"gamma": 1.0})
+        P.doc.connect("IN", "out", "X", "data")
+    return ws, ds, env, ax
+
+
+def test_workspace_model() -> None:
+    """``nodelab_v2.workspace`` (V4.00 step 1): page ids are minted from a counter and never
+    re-used; a Page Input may read only from a STRICTLY earlier kind, or across a Free page
+    while the page graph stays acyclic; a resolved Input carries the upstream Output's
+    envelope at edit time and the readiness block names an unbound one; an edit on one page
+    publishes qualified ``last_touched``, re-keys every page downstream (``revision_of``)
+    WITHOUT bumping their documents' revisions, and re-describes their Inputs; a rename
+    re-keys dependents (the `condition` stamp); each page docks into its own folder; a
+    duplicate is a unique copy; reset keeps the active document object the canvas holds."""
+    from nodelab_v2 import readiness as RD
+    from nodelab_v2.workspace import qualify, split_run_id
+    ws, ds, env, ax = _ws_fixture()
+    I, Rf, P1, P2 = (ws.pages[p] for p in ("pg1", "pg2", "pg3", "pg4"))
+    assert qualify("pg1", "n3#it@2") == "pg1/n3#it@2"
+    assert split_run_id("pg1/n3#it@2") == ("pg1", "n3#it@2") and split_run_id("n3") == ("", "n3")
+    # ids: a counter, never rewound
+    assert ws.add_page("Scratch", "free").id == "pg5"
+    ws.remove_page("pg5")
+    assert ws.add_page("Scratch", "free").id == "pg6"
+    ws.remove_page("pg6")
+    try:
+        ws.add_page("Odd", "weird")
+        raise AssertionError("unknown kind accepted")
+    except ValueError:
+        pass
+    # who may read from whom
+    assert ws.outputs_of("pg1") == [("raw", "O")]
+    assert ws.available_sources("pg2") == [("pg1:raw", "Input · raw")]
+    assert ws.available_sources("pg1") == []
+    assert [v for v, _l in ws.available_sources("pg3")] == ["pg1:raw", "pg2:smooth"]
+    assert ws.resolve_source("pg3", "pg2:smooth") == ("pg2", "O")
+    assert ws.resolve_source("pg2", "pg3:x") is None, "a later kind may not feed an earlier one"
+    assert ws.resolve_source("pg3", "pg2:nope") is None, "an unknown name resolves to nothing"
+    fr = ws.add_page("Free", "free")
+    fr.doc.add_node("page.input", node_id="IN", params={"source": "pg2:smooth"})
+    fr.doc.add_node("page.output", node_id="O", params={"name": "f"})
+    assert ws.resolve_source(fr.id, "pg2:smooth") == ("pg2", "O"), "a free page reads a typed page"
+    assert ws.resolve_source("pg3", f"{fr.id}:f") == (fr.id, "O"), "and feeds a later one"
+    assert ws.resolve_source("pg1", f"{fr.id}:f") is None, "but never one it reads from (cycle)"
+    assert ws.dependency_closure(fr.id) == ["pg1", "pg2", fr.id]
+    ws.remove_page(fr.id)
+    # the edit-time seam: the Input's envelope is the upstream Output's
+    assert Rf.doc.envs["IN"].axes == ax, Rf.doc.envs.get("IN")
+    assert Rf.doc.envs["O"].metadata.get("pixel_size_um") == 0.5
+    assert RD.problems(Rf.doc, "IN") == []
+    Rf.doc.add_node("page.input", node_id="BAD", params={"source": "pg9:nope"})
+    assert [p.kind for p in RD.problems(Rf.doc, "BAD")] == ["unbound"]
+    Rf.doc.remove_node("BAD")
+    Rf.doc.add_node("page.output", node_id="O2", params={"name": "smooth"})
+    kinds = [p.kind for p in RD.problems(Rf.doc, "O2")]
+    assert kinds == ["duplicate_output", "unwired"], kinds
+    Rf.doc.remove_node("O2")
+    # an edit on one page: qualified last_touched, dependents re-keyed but not bumped
+    rev3, d3 = ws.revision_of("pg3"), P1.doc.revision
+    Rf.doc.nodes["G"].params["sigma"] = 2.0
+    Rf.doc.touch("G")
+    assert ws.last_touched == frozenset({"pg2/G"}), ws.last_touched
+    assert ws.revision_of("pg3") != rev3 and P1.doc.revision == d3
+    Rf.doc._notify()                     # "unknown / everything" — what a rewire publishes
+    assert ws.last_touched is None
+    Rf.doc._notify(())                   # "nothing a run can see" — what a re-seed publishes
+    assert ws.last_touched == frozenset()
+    # a source re-seed cascades to every downstream page's Inputs, revisions untouched
+    d3 = P1.doc.revision
+    ax2 = AxisSizes(m=1, t=1, z=1, c=1, y=48, x=48)
+    ws.set_meta_seed("pg1/L", MetaEnvelope(axes=ax2, metadata={"pixel_size_um": 0.5}))
+    assert P1.doc.envs["IN"].axes == ax2 and P2.doc.envs["IN"].axes == ax2
+    assert P1.doc.revision == d3
+    ws.set_meta_seed("pg1/L", env)
+    # a rename re-keys dependents (its name is their rows' condition) and must be unique
+    rev3 = ws.revision_of("pg3")
+    ws.rename_page("pg2", "Refine B")
+    assert ws.revision_of("pg3") != rev3
+    try:
+        ws.rename_page("pg3", "refine b")
+        raise AssertionError("duplicate page name accepted")
+    except ValueError:
+        pass
+    ws.rename_page("pg2", "Refine")
+    # each page docks into its own folder
+    assert Rf.doc.default_dock_store("n3").replace("\\", "/").endswith("/pg2/n3")
+    # duplicate = a unique copy right after the source
+    cp = ws.duplicate_page("pg2")
+    assert cp.kind == "refine" and set(cp.doc.nodes) == set(Rf.doc.nodes)
+    assert cp.doc.nodes["G"].params["sigma"] == 2.0 and list(ws.pages).index(cp.id) == 2
+    cp.doc.nodes["G"].params["sigma"] = 3.0
+    cp.doc.touch("G")
+    assert Rf.doc.nodes["G"].params["sigma"] == 2.0, "a unique copy shares nothing"
+    ws.remove_page(cp.id)
+    # reset keeps the active page's document object (the canvas is bound to it)
+    keep = ws.pages[ws.active].doc
+    ws.reset()
+    assert list(ws.pages) == [ws.active] and ws.pages[ws.active].doc is keep
+    assert ws.pages[ws.active].kind == "free" and not keep.nodes
+    _ok("workspace model: counter ids never re-used; strictly-earlier-kind and acyclic-free "
+        "feeding rules; Input envelopes seeded from upstream Outputs; unbound/duplicate "
+        "readiness; qualified last_touched; dependents re-keyed, not bumped; rename re-keys; "
+        "per-page dock folders; unique duplicate; reset keeps the document")
+
+
+def test_page_composition_memo_reuse() -> None:
+    """``Workspace.compose`` splices every upstream page in under qualified ids and drops the
+    resolved Inputs; a blank Output `condition` becomes the page's name. On ONE shared memo
+    the refinement chain pulled from the first processing page is a cache hit from the
+    second — and from the refinement page itself — because no recipe hash carries a node id
+    except a root's ``__source__``, which carries the OWNING page's prefix. An unresolved
+    Input stays a root and its pull says exactly what is wrong."""
+    from nodelab_v2 import ops as OPS
+    ws, ds, env, ax = _ws_fixture()
+    comp = ws.compose("pg3")
+    assert set(comp.graph.nodes) == {"pg1/L", "pg1/O", "pg2/G", "pg2/O", "pg3/X"}, set(comp.graph.nodes)
+    edges = {(e.src, e.src_socket, e.dst, e.dst_socket) for e in comp.graph.edges}
+    assert ("pg2/O", "out", "pg3/X", "data") in edges and ("pg1/O", "out", "pg2/G", "data") in edges
+    assert comp.graph.nodes["pg1/O"].params["condition"] == "Input"
+    assert comp.id_map[("pg3", "IN")] == "pg2/O" and comp.id_map[("pg3", "X")] == "pg3/X"
+    assert "pg1/L" in comp.meta_seeds and comp.pages == ("pg1", "pg2", "pg3")
+    assert comp.revision == ws.revision_of("pg3")
+
+    starts, cached = [], []
+
+    def obs(ev, nid, info):
+        if ev == "start":
+            starts.append(nid)
+        elif ev == "cached":
+            cached.append(nid)
+
+    memo = Memo()
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=memo, observer=obs)
+    out = eng.pull("pg3/X")
+    assert out.axes == ax and {"pg2/G", "pg3/X"} <= set(starts), starts
+    assert eng.pull("pg2/O").metadata.get("condition") == "Refine"
+    starts.clear(); cached.clear()
+    comp2 = ws.compose("pg4")
+    eng2 = OPS.headless_engine(comp2.graph, seeds={"pg1/L": ds}, meta_seeds=comp2.meta_seeds,
+                               memo=memo, observer=obs)
+    eng2.pull("pg4/X")
+    assert starts == [] and "pg2/G" in cached, (starts, cached)
+    assert "pg4/X" in cached, "the same gamma on the same upstream IS the same computation"
+    starts.clear(); cached.clear()
+    comp3 = ws.compose("pg2")
+    eng3 = OPS.headless_engine(comp3.graph, seeds={"pg1/L": ds}, meta_seeds=comp3.meta_seeds,
+                               memo=memo, observer=obs)
+    eng3.pull("pg2/O")
+    assert starts == [], "the refinement page itself is a full hit after a downstream pull"
+    # a changed upstream param re-computes from there on, on every page
+    ws.pages["pg2"].doc.nodes["G"].params["sigma"] = 2.0
+    ws.pages["pg2"].doc.touch("G")
+    starts.clear()
+    comp4 = ws.compose("pg3")
+    assert comp4.revision != comp.revision
+    eng4 = OPS.headless_engine(comp4.graph, seeds={"pg1/L": ds}, meta_seeds=comp4.meta_seeds,
+                               memo=memo, observer=obs)
+    eng4.pull("pg3/X")
+    assert set(starts) == {"pg2/G", "pg2/O", "pg3/X"}, starts
+    # an unresolved Input stays a root; pulling through it says so
+    ws.pages["pg3"].doc.nodes["IN"].params["source"] = "pg2:gone"
+    ws.pages["pg3"].doc.touch("IN")
+    comp5 = ws.compose("pg3")
+    # the page it NAMES is still a dependency (the structure reads from it); the Input itself
+    # stays, a root with no wire into it
+    assert "pg3/IN" in comp5.graph.nodes and comp5.pages == ("pg1", "pg2", "pg3")
+    assert not any(e.dst == "pg3/IN" for e in comp5.graph.edges)
+    eng5 = OPS.headless_engine(comp5.graph, seeds={}, meta_seeds=comp5.meta_seeds, memo=Memo())
+    try:
+        eng5.pull("pg3/X")
+        raise AssertionError("an unbound Page Input ran")
+    except Exception as exc:                 # noqa: BLE001 — the engine may wrap it
+        assert OPS.PAGE_UNBOUND_MESSAGE in str(exc), exc
+    _ok("page composition: upstream pages spliced under qualified ids, Inputs dropped and "
+        "rewired to the Output, condition stamped with the page name; one memo serves the "
+        "refinement chain to every page that reads it (and the page itself); an upstream "
+        "edit recomputes from there; an unbound Input refuses with its message")
+
+
+def test_workspace_format_v3() -> None:
+    """The workspace file (format 3.0) round-trips pages, order, active page and the id
+    counter; ``from_dict`` on it yields the ACTIVE page; ``from_dict_page`` picks by id or
+    name and refuses an unknown one; a 2.0 file imports as one Free page named after the
+    file with ``_OP_RENAMES`` applied; a reload reuses the active page's document object;
+    bad versions and malformed page records are refused; a linked page record is refused
+    with a clear message until step 6."""
+    import json as _json
+    from nodegraph.serialize import (
+        WORKSPACE_FORMAT_VERSION, from_dict, from_dict_page, is_workspace_dict,
+        to_workspace_dict, workspace_pages)
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.workspace import Workspace
+    ws, ds, env, ax = _ws_fixture()
+    ws.pages["pg2"].doc.nodes["G"].params["sigma"] = 2.5
+    ws.pages["pg2"].doc.touch("G")
+    ws.pages["pg2"].doc.set_pos("G", 11.0, 22.0)
+    ws.set_active("pg2")
+    d = ws.to_dict()
+    assert d["format_version"] == WORKSPACE_FORMAT_VERSION == "3.0" and d["app_version"]
+    assert is_workspace_dict(d) and [p["id"] for p in d["workspace"]["pages"]] == ["pg1", "pg2", "pg3", "pg4"]
+    s = _json.dumps(d, sort_keys=True)
+    assert _json.dumps(ws.to_dict(), sort_keys=True) == s, "deterministic"
+    ws2 = Workspace()
+    ws2.load_dict(_json.loads(s))
+    assert [(p.id, p.name, p.kind) for p in ws2.pages.values()] == \
+           [("pg1", "Input", "input"), ("pg2", "Refine", "refine"), ("pg3", "P1", "process"),
+            ("pg4", "P2", "process")]
+    g2 = ws2.pages["pg2"].doc.nodes["G"]
+    assert g2.params["sigma"] == 2.5 and (g2.x, g2.y) == (11.0, 22.0)
+    assert ws2.active == "pg2" and ws2.next_page_seq == 5
+    assert ws2.pages["pg3"].doc.envs["IN"].axes != ax, "a file carries no resolved source envelope"
+    ws2.set_meta_seed("pg1/L", env)
+    assert ws2.pages["pg3"].doc.envs["IN"].axes == ax, "…until the Load is re-seeded, then the cascade runs"
+    # single-graph readers see the active page
+    g, _z, _g = from_dict(d)
+    assert set(g.nodes) == {"IN", "G", "O"}
+    g, _z, _g = from_dict_page(d, "P1")
+    assert set(g.nodes) == {"IN", "X"}
+    g, _z, _g = from_dict_page(d, "pg1")
+    assert set(g.nodes) == {"L", "O"}
+    for bad in ("nope", "pg99"):
+        try:
+            from_dict_page(d, bad)
+            raise AssertionError(f"unknown page {bad!r} accepted")
+        except ValueError as exc:
+            assert bad in str(exc) and "pg2" in str(exc)
+    # refusals
+    for mutate, why in ((lambda x: x.update(format_version="9.9"), "bad version"),
+                        (lambda x: x.pop("format_version"), "no version"),
+                        (lambda x: x.pop("workspace"), "no workspace"),
+                        (lambda x: x["workspace"]["pages"].append({"id": "pg1", "name": "dup", "kind": "free", "graph": {}}), "duplicate id"),
+                        (lambda x: x["workspace"]["pages"].append({"id": "pgx", "name": "n", "kind": "free"}), "no graph")):
+        x = _json.loads(s)
+        mutate(x)
+        try:
+            Workspace().load_dict(x)
+            raise AssertionError(f"{why} accepted")
+        except ValueError:
+            pass
+    try:
+        to_workspace_dict([{"id": "a", "name": "", "kind": "free", "graph": {}, "master": "b"}],
+                          active="a", next_page_seq=2)
+        raise AssertionError("a page with both a graph and a master was accepted")
+    except ValueError:
+        pass
+    # a linked record: readable through the single-graph readers (its master), refused by
+    # the Workspace until step 6 — with a message that says so
+    x = _json.loads(s)
+    x["workspace"]["pages"].append({"id": "pg7", "name": "Dish B", "kind": "refine",
+                                    "master": "pg2", "overrides": {}})
+    x["workspace"]["active"] = "pg7"
+    assert len(workspace_pages(x)) == 5
+    g, _z, _g = from_dict(x)
+    assert set(g.nodes) == {"IN", "G", "O"}, "a linked active page reads as its master"
+    try:
+        from_dict_page(x, "Dish B")
+        raise AssertionError("a linked page handed out as a graph")
+    except ValueError as exc:
+        assert "linked" in str(exc)
+    try:
+        Workspace().load_dict(x)
+        raise AssertionError("linked pages loaded before step 6")
+    except ValueError as exc:
+        assert "step 6" in str(exc)
+    # a 2.0 file: one Free page named after the file, op renames applied, the counter set
+    doc = GraphDocument()
+    doc.add_node("util.chain", node_id="C")
+    d2 = doc.to_dict()
+    assert d2["format_version"] == "2.0" and not is_workspace_dict(d2)
+    rec = workspace_pages(d2)
+    assert len(rec) == 1 and rec[0]["kind"] == "free" and "graph" in rec[0]
+    ws3 = Workspace()
+    ws3.path = r"C:\data\MyExperiment.nd2graph.json"
+    ws3.load_dict(d2)
+    p = ws3.pages["pg1"]
+    assert list(ws3.pages) == ["pg1"] and p.kind == "free" and p.name == "MyExperiment"
+    assert p.doc.nodes["C"].op_key == "util.timeseries" and ws3.next_page_seq == 2
+    assert p.doc.path == ws3.path
+    # a reload reuses the active page's document object (the canvas stays bound)
+    keep = p.doc
+    ws3.load_dict(_json.loads(s))
+    assert ws3.pages[ws3.active].doc is keep and ws3.active == "pg2"
+    assert set(keep.nodes) == {"IN", "G", "O"}
+    _ok("workspace format 3.0: round-trip (pages, order, positions, active, counter); "
+        "from_dict = the active page, from_dict_page by id or name; 2.0 imports as one Free "
+        "page named after the file with op renames; reload keeps the active document "
+        "object; bad versions, malformed records and (for now) linked pages refused clearly")
+
+
+def test_page_kind_catalog() -> None:
+    """``codemap/node_roles.json`` schema 2: every op is offered on at least one typed page
+    kind, ``op_pages`` overrides its role, Free offers everything, the kinds are ordered,
+    and the GUI-layer page ops are not catalog ops."""
+    from nodegraph import roles as R
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.ops import HIDDEN_OP_PREFIXES
+    OPS.ensure_ops()
+    R.reload()
+    kinds = [k for k, _m in R.pages()]
+    assert kinds == ["input", "refine", "process", "analyze"], kinds
+    assert [R.page_order(k) for k in kinds] == [0, 1, 2, 3] and R.page_order("free") is None
+    assert R.page_kinds() == kinds + ["free"] and R.is_page_kind("free") and not R.is_page_kind("x")
+    every = [op for r in R.load()["roles"].values() for op in r["ops"]]
+    for op in every:
+        assert R.pages_of(op), f"{op} is offered on no page kind"
+        assert all(k in kinds for k in R.pages_of(op)), (op, R.pages_of(op))
+    for rname, r in R.load()["roles"].items():
+        assert r.get("pages"), f"role {rname!r} has no pages"
+    assert R.pages_of("enhance.gaussian") == ("refine",)
+    assert R.pages_of("analysis.threshold") == ("refine", "process")
+    assert R.pages_of("analysis.piv") == ("process",)
+    assert R.pages_of("io.dock") == tuple(kinds), "op_pages widens a role's pages"
+    assert R.pages_of("io.write_tiff") == ("analyze",), "…and narrows them"
+    assert R.pages_of("page.input") == ("refine", "process", "analyze")
+    assert R.pages_of("page.output") == ("input", "refine", "process")
+    assert R.op_in_page("enhance.gaussian", "refine") and not R.op_in_page("enhance.gaussian", "input")
+    assert R.op_in_page("enhance.gaussian", "free") and R.op_in_page("enhance.gaussian", None)
+    assert R.pages_of("test.not_a_real_op") == tuple(kinds), "an unassigned op stays placeable"
+    assert set(R.ops_for_page("free")) == set(every) and len(R.ops_for_page("input")) < len(every)
+    assert set(R.ops_for_page("refine")) == {op for op in every if "refine" in R.pages_of(op)}
+    assert {rk for rk, _r in R.roles_in_page("input")} >= {"input_output", "page_boundary"}
+    for op in ("page.input", "page.output"):
+        assert NODES.get(op) is not None and not _is_catalog_op(op), op
+    assert not any(op.startswith(HIDDEN_OP_PREFIXES) for op in ("page.input", "page.output")), \
+        "page boundaries are placed by hand, never hidden"
+    _ok("page kinds: four ordered kinds + free; every op on ≥1 kind; op_pages widens (io.dock) "
+        "and narrows (io.write_tiff) a role; page.* are GUI-layer, visible, on their kinds")
+
+
+def test_lablink_page_select() -> None:
+    """A LabLink recipe against a workspace file names its page (``"page"``: id or name;
+    absent = the active page) and the worker runs that page COMPOSED with every page it
+    reads from — qualified run ids, the Output as a target. A 2.0 file is untouched by the
+    page machinery; an unknown page is a clear ``bad_recipe``; the advertised workspace
+    format tracks the serializer."""
+    import io as _io
+    import json as _json
+    import os as _os
+    import tempfile
+    from contextlib import redirect_stdout
+    from nodegraph.serialize import WORKSPACE_FORMAT_VERSION
+    from nodelab_v2.lablink import protocol as LP
+    from nodelab_v2.lablink.worker import Worker, WorkerFault, graph_for_recipe
+    assert LP.WORKSPACE_GRAPH_FORMAT == WORKSPACE_FORMAT_VERSION, (
+        "the worker advertises a workspace format the serializer does not write")
+    ws, ds, env, ax = _ws_fixture()
+    d = ws.to_dict()
+    tmp = tempfile.mkdtemp(prefix="nd2ws_")
+    gpath = _os.path.join(tmp, "graph.nd2graph.json")
+    with open(gpath, "w", encoding="utf-8") as fh:
+        _json.dump(d, fh)
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    worker = Worker(repo)
+    recipe = {"name": "ws", "target": "pg2/O", "page": "Refine", "allow_zones": False,
+              "inputs": [{"role": "image", "node": "pg1/L", "required": False,
+                          "match": ["*.nd2", "*.tif", "*.tiff"]}],
+              "knobs": [], "outputs": []}
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        worker.cmd_open(1, {"recipe": recipe, "graph_path": gpath})
+    assert set(worker.graph.nodes) == {"pg1/L", "pg1/O", "pg2/G", "pg2/O"}, set(worker.graph.nodes)
+    assert "pg2/O" in worker.targets
+    answer = _json.loads(buf.getvalue().strip().splitlines()[-1])
+    assert answer.get("page") == "pg2" and answer.get("graph_format") == "3.0", answer
+    g, _z, _g, pid = graph_for_recipe(d, page="pg3")
+    assert pid == "pg3" and {"pg3/X", "pg2/G", "pg1/L"} <= set(g.nodes)
+    g, _z, _g, pid = graph_for_recipe(d)
+    assert pid == "pg1" and set(g.nodes) == {"pg1/L", "pg1/O"}, "absent page = the active one"
+    g, _z, _g, pid = graph_for_recipe(ws.pages["pg1"].doc.to_dict())
+    assert pid == "" and set(g.nodes) == {"L", "O"}, "a 2.0 file is read as it always was"
+    try:
+        graph_for_recipe(d, page="nope")
+        raise AssertionError("an unknown page was accepted")
+    except ValueError as exc:
+        assert "nope" in str(exc) and "pg2" in str(exc)
+    try:
+        with redirect_stdout(_io.StringIO()):
+            worker.cmd_open(2, {"recipe": {**recipe, "page": "nope"}, "graph_path": gpath})
+        raise AssertionError("cmd_open accepted an unknown page")
+    except WorkerFault as exc:
+        assert "nope" in str(exc) or getattr(exc, "code", "") == "bad_recipe", exc
+    _ok("LabLink page select: a recipe's page (by name or id, else active) runs composed "
+        "under qualified ids with the Output as target; 2.0 files unchanged; unknown page "
+        "refused; workspace format advertised in step with the serializer")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -24165,6 +24586,11 @@ def main() -> int:
     test_readiness()
     test_timeseries_clock_order()
     test_split_positions()
+    test_workspace_model()
+    test_page_composition_memo_reuse()
+    test_workspace_format_v3()
+    test_page_kind_catalog()
+    test_lablink_page_select()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

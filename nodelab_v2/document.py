@@ -19,7 +19,7 @@ Qt-free; standard library + nodegraph only (testable headless).
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from nodegraph.domains import AXIS_ORDER, Domain
 from nodegraph.graph import Edge, Graph, NodeInstance
@@ -36,7 +36,8 @@ from nodegraph.iterate import (
 )
 from nodegraph.metadata import MetaEnvelope, propagate_meta
 from nodegraph.registry import InDataset, InString, NODES, OutDataset
-from nodegraph.serialize import from_dict as _ng_from_dict, to_dict as _ng_to_dict
+from nodegraph.serialize import (
+    from_dict as _ng_from_dict, page_from_dict as _ng_page_from_dict, to_dict as _ng_to_dict)
 from nodegraph.sockets import (
     Direction, SocketType, can_connect as _can_connect, can_convert as _can_convert)
 from nodegraph.zones import Zone, unroll as _unroll
@@ -220,6 +221,11 @@ class GraphDocument:
     """The editable model + envelope cache. ``on_change`` callbacks fire after every
     structural edit or re-propagation (the canvas/inspector re-seed from them)."""
 
+    #: Can nodes, edges and frames be added, removed or rewired here? A page LINKED to a
+    #: master (V4 step 6) answers ``False`` and takes parameter edits only; the GUI checks
+    #: this before offering a topology edit. A class attribute so the check costs nothing.
+    editable_topology: bool = True
+
     def __init__(self) -> None:
         self.nodes: Dict[str, NodeRecord] = {}
         self.edges: List[EdgeTuple] = []
@@ -254,10 +260,33 @@ class GraphDocument:
         #: Read by listeners during their change callback (see :meth:`_notify`); meaningless
         #: outside one, since the next edit overwrites it.
         self.last_touched: Optional[frozenset] = None
+        # ── V4.00 workspace hooks ── installed by :class:`nodelab_v2.workspace.Workspace`
+        # when this document becomes a PAGE; each is a plain default here, so a document
+        # outside a workspace behaves exactly as before.
+        #: Extra envelope seeds for ROOTS, consulted by :meth:`propagate` right after the
+        #: dock seeds: how a ``page.input`` root gets the upstream page's Output envelope.
+        self.seed_hooks: List[Callable[[], Mapping[str, MetaEnvelope]]] = []
+        #: The page kind the palette and the link-drag search filter by (``None`` = no
+        #: filter, the pre-V4 behaviour and the ``free`` page).
+        self.page_kind: Optional[str] = None
+        #: A sub-folder tag for :meth:`default_dock_store` — the page id, so two pages that
+        #: both dock their ``n3`` never bake into one folder.
+        self.store_tag: str = ""
+        #: ``() -> [(value, label), ...]``: the named outputs of earlier pages a
+        #: ``page.input`` on this document may read (:meth:`source_choices`).
+        self.page_sources: Callable[[], list] = lambda: []
 
     # ── listeners ────────────────────────────────────────────────────────────
     def on_change(self, fn: Callable[[], None]) -> None:
         self._listeners.append(fn)
+
+    def off_change(self, fn: Callable[[], None]) -> None:
+        """Forget a listener registered with :meth:`on_change` — a removed page's scene, a
+        Workspace letting a document go. Unknown listeners are ignored."""
+        try:
+            self._listeners.remove(fn)
+        except ValueError:
+            pass
 
     def _notify(self, touched: Optional[Iterable[str]] = None) -> None:
         """Bump the revision, re-propagate envelopes, and tell the listeners.
@@ -281,6 +310,19 @@ class GraphDocument:
         is what made deleting any card silently kill every computation in flight."""
         self.revision += 1
         self.last_touched = None if touched is None else frozenset(touched)
+        self.propagate()
+        for fn in list(self._listeners):
+            fn()
+
+    def repropagate(self) -> None:
+        """Re-run the envelope pass and tell the listeners WITHOUT bumping the revision
+        (V4.00): an UPSTREAM PAGE changed what this page's Inputs carry. Nothing in this
+        document changed, so its revision must not move — the run graph's identity is the
+        composed revision the Workspace digests over every page it reads
+        (:meth:`nodelab_v2.workspace.Workspace.revision_of`), and that is what the runner
+        compares. Published with an EMPTY touched set for the same reason
+        :meth:`set_meta_seed` is: no run of THIS document's own nodes is invalidated by it."""
+        self.last_touched = frozenset()
         self.propagate()
         for fn in list(self._listeners):
             fn()
@@ -1422,6 +1464,12 @@ class GraphDocument:
             # rails. Seeded per propagate rather than cached because the user can
             # re-bake, repoint or delete a dock at any time; the read is one small JSON.
             seeds.update(self._dock_seed_envs())
+            # A PAGE INPUT is a root here too (V4.00): its envelope is the upstream page's
+            # Output envelope, supplied by the Workspace through a hook and read without
+            # touching a pixel, exactly like a dock's manifest. Outside a workspace there is
+            # no hook and the Input stays all-unknown, which is the truth.
+            for hook in list(self.seed_hooks):
+                seeds.update(hook())
             # A source card may STATE its own calibration, overriding (or supplying) what
             # the file carries — the only way to give a plain TIFF a Z spacing, which it
             # never records. Applied to the seed here rather than only in the runner so the
@@ -1538,12 +1586,15 @@ class GraphDocument:
             base = stem + ".docks"
         else:
             base = os.path.join(os.getcwd(), "untitled.docks")
+        # a page's docks live one folder down (its page id), so two pages' `n3` never
+        # bake into one folder (V4.00)
+        leaf = (self.store_tag, node_id) if self.store_tag else (node_id,)
         target = store_dir(os.path.dirname(base))
         if os.path.abspath(target) == os.path.abspath(os.path.dirname(base)):
-            return os.path.join(base, node_id)
+            return os.path.join(base, *leaf)
         tag = hashlib.blake2b(base.lower().encode("utf-8"), digest_size=6).hexdigest()
         return os.path.join(target,
-                            f"{os.path.basename(base)}.{tag}", node_id)
+                            f"{os.path.basename(base)}.{tag}", *leaf)
 
     def dock_signature(self, node_id: str) -> str:
         """The upstream signature of ``node_id`` right now — compared against the one
@@ -1670,6 +1721,12 @@ class GraphDocument:
 
     def env(self, node_id: str) -> MetaEnvelope:
         return self.envs.get(node_id, MetaEnvelope())
+
+    def source_choices(self, node_id: str) -> list:
+        """``[(value, label), ...]`` a ``page.input``'s Source menu offers (V4.00): the named
+        outputs of the pages that may feed this one, supplied by the Workspace through
+        :attr:`page_sources`. Empty outside a workspace — there is nothing to read."""
+        return list(self.page_sources())
 
     # ── layer picker (V2.11) ───────────────────────────────────────────────────
     def layer_choices(self, node_id: str, sock) -> list:
@@ -1911,9 +1968,28 @@ class GraphDocument:
         }
         return d
 
+    def to_page_dict(self) -> Dict[str, Any]:
+        """:meth:`to_dict` without the ``format_version`` — the body this document contributes
+        to a workspace file as ONE page (V4.00)."""
+        d = self.to_dict()
+        d.pop("format_version", None)
+        return d
+
     def load_dict(self, d: Dict[str, Any]) -> None:
+        """Load a single-graph document (``format_version`` checked by the serializer; a
+        WORKSPACE document loads its active page — see :class:`nodelab_v2.workspace.Workspace`
+        for all of them)."""
         graph, zones, groups = _ng_from_dict(d)
-        ui = d.get("ui", {}) if isinstance(d.get("ui", {}), dict) else {}
+        self._load_parsed(graph, zones, groups, d.get("ui"))
+
+    def load_page(self, rec: Dict[str, Any]) -> None:
+        """Load ONE workspace page record (V4.00): a single-graph body plus ``ui``, with no
+        ``format_version`` of its own — the Workspace checked the document's."""
+        graph, zones, groups = _ng_page_from_dict(rec)
+        self._load_parsed(graph, zones, groups, rec.get("ui"))
+
+    def _load_parsed(self, graph, zones, groups, ui_raw) -> None:
+        ui = ui_raw if isinstance(ui_raw, dict) else {}
         ui_nodes = ui.get("nodes", {}) if isinstance(ui.get("nodes", {}), dict) else {}
         self.nodes.clear()
         self.edges = []
@@ -1979,18 +2055,25 @@ class GraphDocument:
         GUI-manageable (make/ungroup), so they no longer count."""
         return bool(self._zones or self._back_edges)
 
-    def save_file(self, path: str) -> None:
-        import json
-        # Dock store paths are stored RELATIVE to the saved graph whenever they sit
-        # beside it, so a project folder stays movable. That makes them a function of
-        # `self.path` — so a Save As must re-anchor every one of them, or the docks would
-        # silently point at the old location's folders. Resolve to absolute against the
-        # OLD path first, then re-relativize against the new one.
+    def rebase_path(self, path: str) -> None:
+        """Make ``path`` this document's file, re-anchoring every dock store to it.
+
+        Dock store paths are stored RELATIVE to the saved graph whenever they sit beside
+        it, so a project folder stays movable. That makes them a function of `self.path`
+        — so a Save As must re-anchor every one of them, or the docks would silently point
+        at the old location's folders. Resolve to absolute against the OLD path first, then
+        re-relativize against the new one. Split out of :meth:`save_file` (V4.00) because a
+        workspace file re-anchors every page's docks to ONE path before writing."""
         absolute = {nid: self.dock_store(nid) for nid in self.dock_nodes()}
         self.path = path
         for nid, store in absolute.items():
             if store:
                 self.nodes[nid].params["store"] = self._relative_store(store)
+
+    def save_file(self, path: str) -> None:
+        """Write this document alone as a single-graph (2.0) file."""
+        import json
+        self.rebase_path(path)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, sort_keys=True)
 

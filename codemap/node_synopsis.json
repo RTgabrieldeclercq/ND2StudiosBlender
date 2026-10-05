@@ -1,5 +1,5 @@
 {
-  "schema": "nd2studios-node-synopsis/1",
+  "schema": "nd2studios-node-synopsis/2",
   "generated_by": "scripts/_node_synopsis.py write",
   "source": "nodegraph.registry.NODES after importing nodegraph.nodes + nodelab_v2.ops.ensure_ops()",
   "how_to_read": {
@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 93,
-    "categories": 12,
-    "roles": 19,
+    "nodes": 95,
+    "categories": 13,
+    "roles": 20,
     "stages": 5,
-    "inputs": 625,
-    "outputs": 100,
+    "inputs": 629,
+    "outputs": 102,
     "gui_ops_included": true
   },
   "stages": {
@@ -209,13 +209,16 @@
       "roles": [
         "control_flow",
         "graph_structure",
-        "visualization"
+        "visualization",
+        "page_boundary"
       ],
       "ops": [
         "flow.advance",
         "flow.iterate",
         "group.input",
         "group.output",
+        "page.input",
+        "page.output",
         "rr.reroute",
         "view.canvas",
         "view.overlay",
@@ -845,6 +848,24 @@
           "summary": "Display sink — shows the primary image stream, and any extra streams wired into the slots that appear as you fill them, merged or tiled, with an optional scale bar. No output: what it shows goes nowhere downstream (V2.00 §10; sources, layout and scale bar 2026-10-02)."
         }
       ]
+    },
+    "page_boundary": {
+      "label": "Page boundary",
+      "stage": "control_and_present",
+      "description": "The V4 workspace's seams: Page Output names the Dataset wired into it as a variable of its page, and Page Input on a later page reads one by `<page>:<name>`. Pass-throughs at run time - the Workspace splices the upstream page in and the Input node disappears - so neither changes a pixel.",
+      "count": 2,
+      "ops": [
+        {
+          "op": "page.input",
+          "label": "Page Input",
+          "summary": "Start this page from a named output of an earlier page. At run time the upstream page is spliced in and this node disappears, so a result the upstream page already computed is reused from the memo rather than recomputed; at edit time the node carries the upstream output's envelope (axes, calibration, layers), so every derived default on this page is right before anything is pulled."
+        },
+        {
+          "op": "page.output",
+          "label": "Page Output",
+          "summary": "Name the Dataset wired in as a VARIABLE of this page, for a Page Input on a later page to read. A pass-through: nothing is copied or changed except an optional `condition` label in the metadata."
+        }
+      ]
     }
   },
   "categories": {
@@ -924,6 +945,10 @@
       "io.write_tiff",
       "view.viewer"
     ],
+    "page": [
+      "page.input",
+      "page.output"
+    ],
     "registration": [
       "align.drift",
       "registration.align_to",
@@ -973,6 +998,9 @@
       "category": "registration",
       "role": "registration_and_alignment",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/align/drift.py",
       "gui_only": false,
       "summary": "Rigid drift correction across Timepoints (phase cross-correlation on a reference plane); stores the per-frame shift as Frame attributes.",
@@ -1034,6 +1062,9 @@
       "category": "analysis",
       "role": "motion_and_deformation_fields",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/accumulate_field.py",
       "gui_only": false,
       "summary": "Compose a previous-frame DVC increment series into cumulative displacement + strain fields by Lagrangian point-tracking (ported ALDVC build_accumulated_results); inherits the reference config from the upstream DVC node; emits a cumulative Point layer with the same schema.",
@@ -1118,6 +1149,10 @@
       "category": "analysis",
       "role": "shape_and_distance_geometry",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/boundary_band.py",
       "gui_only": false,
       "summary": "Outward boundary band per label region (any Voxel label raster — cells, nuclei, granules; dilation or EDT, µm-aware) → band-label raster, 3D (ported v1 kernel).",
@@ -1257,6 +1292,9 @@
       "category": "analysis",
       "role": "measurement_and_statistics",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/cluster_points.py",
       "gui_only": false,
       "summary": "Cluster a Point cloud into groups (GaussianMixture / KMeans, BIC model-order sweep over n_clusters ± relax%) → a per-point cluster-id label column; µm-scaled so anisotropic Z doesn't bias the fit (ported v1 kernel; scikit-learn).",
@@ -1382,6 +1420,9 @@
       "category": "analysis",
       "role": "motion_and_deformation_fields",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/dic_correlate.py",
       "gui_only": false,
       "summary": "2D digital image correlation (pyALDIC: IC-GN + ADMM over an adaptive FE mesh) → a Point displacement field (subset centers, disp µm, optional strain); fixed/previous self-reference or an external reference Dataset + optional ROI mask. Solves the whole T stack in one call per (m, z). Wired to the vendored kernel; needs al-dic (dep-gated: friendly ImportError at run time until installed).",
@@ -1660,6 +1701,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/draw_regions.py",
       "gui_only": false,
       "summary": "Hand-drawn labelled regions (rect / circle / ellipse / polygon / freehand), each pinned to the frame (m, t, z) it was drawn on → a Label raster + Label table; Subtract Background's `Background regions` input samples them.",
@@ -1814,6 +1859,9 @@
       "category": "analysis",
       "role": "motion_and_deformation_fields",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/dvc_field.py",
       "gui_only": false,
       "summary": "3D Augmented-Lagrangian digital volume correlation (official pyALDVC: pyramid-NCC seed + 12-DOF IC-GN + global compatibility/ADMM) → a Point displacement + strain field on the subset grid (disp µm, dimensionless strain, per-subset ZNCC). Fixed-frame or previous-frame self-reference, or an external reference Dataset. Solves the whole T stack in one call per m. 3D ONLY — 2D is the DIC (pyALDIC) node. Needs al-dvc (dep-gated: friendly error at run time until installed).",
@@ -2224,6 +2272,10 @@
       "category": "analysis",
       "role": "shape_and_distance_geometry",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/edt.py",
       "gui_only": false,
       "summary": "Euclidean distance transform of a Voxel mask → a µm distance field (anisotropic in 3D); 2D per-plane vs 3D volumetric.",
@@ -2337,6 +2389,10 @@
       "category": "analysis",
       "role": "shape_and_distance_geometry",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/extract_boundary.py",
       "gui_only": false,
       "summary": "A label region's outline → boundary Points (2D contours / 3D surface vertices); wraps boundary.extract_boundary. For a MESH of a label raster use analysis.tessellate (label_surface), which meshes per region.",
@@ -2447,6 +2503,9 @@
       "category": "analysis",
       "role": "object_filtering_and_selection",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/filter_labels.py",
       "gui_only": false,
       "summary": "Keep or drop WHOLE labels by thresholding one per-label column (mean_intensity, area, eccentricity, n_sub — anything the table carries), with the cut chosen by a histogram method over the population of label values, or given explicitly as a fixed level / percentile. `scope` groups the labels the way analysis.threshold's does (plane/volume/series/dataset, never pooling channels). Writes a NEW Label instance — raster + table, every original column plus the `cut` each row was judged against — with the surviving ids UNCHANGED, so upstream measurements and tracks still join on them. Non-finite values are excluded from both the population and the survivors rather than being given a side.",
@@ -2633,6 +2692,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/histogram_threshold.py",
       "gui_only": false,
       "summary": "Histogram threshold segmentation (2D per-plane) → Voxel mask + Label raster + region table; 4 methods × 4 directions, morphology cleanup (ported v1 kernel). low/high/strict/permissive are FLOAT and read in the image's OWN units — raw counts while a bit depth is declared, the data's own scale once one is not (after a Normalize, 0.35 means 0.35), or whatever `full_scale` pins for a float image outside [0,1]. 0 = unset, with no default — the percentile/relative methods self-scale instead; only the current method's params are shown. Optional `raw` input re-measures the region intensities on those pixels.",
@@ -3077,6 +3140,9 @@
       "category": "analysis",
       "role": "object_filtering_and_selection",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/if_else.py",
       "gui_only": false,
       "summary": "Split objects into a PASS set and a FAIL set by up to four conditions on the structure table's own columns, combined with all/any. The condition dropdown offers the columns the graph has actually measured — `area` and the centroid from segmentation, Measure's intensity statistics and regionprops shape metrics, Object Metrics' speed and neighbour distances, and Track Objects' `track_length`, joined onto the member rows by `member_id`. Both sides are written as new instances (ids UNCHANGED, so upstream measurements and tracks still join), so the else branch can be wired onward by pointing a downstream layer picker at the fail layer. An object whose column was never measured fails, and is counted on the rail.",
@@ -3515,6 +3581,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/label.py",
       "gui_only": false,
       "summary": "Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn); connectivity defaults to 8 (2D) / 26 (3D), overridable.",
@@ -3639,6 +3709,9 @@
       "category": "analysis",
       "role": "measurement_and_statistics",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/measure.py",
       "gui_only": false,
       "summary": "Measures the image over a structure table's members. On LABEL members: per-region statistics (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops. On POINT members: each detection's physical position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the voxel it sits on. Both branches also report each row's absolute `stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing objects across a multi-position acquisition (NaN when the file carries no placement metadata). Optional `raw` input measures THOSE pixels instead (segment on enhanced, measure on raw); the structure, the labels and the shape metrics always come from the main input.",
@@ -3827,6 +3900,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/multiotsu.py",
       "gui_only": false,
       "summary": "Multi-level Otsu → a class-index Voxel raster (0..K-1), optionally one binary mask per class so each tier can be processed differently, or one mask of the classes you keep; needs the whole volume histogram.",
@@ -3941,6 +4018,9 @@
       "category": "analysis",
       "role": "measurement_and_statistics",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/object_field.py",
       "gui_only": false,
       "summary": "Gridded Eulerian fields from per-object measurements — density (objects/µm²), mean area, intensity, fold change, velocity/speed (µm/s), divergence and curl (1/s) — as a Point layer on a grid_step lattice, ready for transform.rasterize_field. Ports Cell-Tracker's compute_spatial_fields; 2D, per (m,t,z,c).",
@@ -4143,6 +4223,9 @@
       "category": "analysis",
       "role": "measurement_and_statistics",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/object_metrics.py",
       "gui_only": false,
       "summary": "Per-object derived metrics onto the member layer: velocity/speed (µm/s), K-nearest-neighbour distances (µm), local divergence/curl (1/s), and frame- or self-normalized intensity fold change. Ports Cell-Tracker's compute_spatial_metrics + self-fold + mean_velocity; 2D, per (m,t,z,c).",
@@ -4317,6 +4400,9 @@
       "category": "analysis",
       "role": "motion_and_deformation_fields",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/optical_flow.py",
       "gui_only": false,
       "summary": "Dense per-pixel 2D motion between frames (scikit-image TV-L1 or iterative Lucas-Kanade) → Voxel layers `<name>_y`/`<name>_x`/`<name>_mag` in µm (+y down; NaN where no pair exists). The dense sibling of analysis.piv: per-pixel resolution on continuous texture (monolayers, cytoplasmic streaming) where sparse-tracer correlation wins instead. 2D per-plane; previous/fixed reference; no extra dependency.",
@@ -4550,6 +4636,9 @@
       "category": "analysis",
       "role": "motion_and_deformation_fields",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/piv.py",
       "gui_only": false,
       "summary": "2D particle image velocimetry (OpenPIV: multipass FFT correlation with window deformation, universal outlier detection, per-vector S/N) → a Point displacement field per frame pair; previous/fixed self-reference, ENSEMBLE correlation averaging (one time-averaged field — the micro-PIV method for sparse seeding), or an external reference Dataset + optional ROI mask; optional vy/vx/speed µm/s via the file's dt_s and optional per-vector unc_y/unc_x µm (Sciacchitano image-matching, dep: pivuq). The FLOW sibling of DIC — independent windows, far faster, per-vector confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError at run time until installed).",
@@ -4870,6 +4959,9 @@
       "category": "analysis",
       "role": "measurement_and_statistics",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/reduce_scalar.py",
       "gui_only": false,
       "summary": "Collapse any attribute layer or structure column to ONE number on the Global domain — object count, mean area, total mask volume. The scalar a sweep compares, and the only node in the catalog that writes Global.",
@@ -5019,6 +5111,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/roi_mask.py",
       "gui_only": false,
       "summary": "Rasterize a serializable shape list ([y,x] verts, in-order add/cut/invert/clear) → a boolean Voxel ROI mask; empty → whole frame (ported v1 kernel).",
@@ -5102,6 +5198,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/segment.py",
       "gui_only": false,
       "summary": "THE segmentation node: image → a Voxel label raster + a Label table, with the algorithm as a `method` Mode — threshold+CCL, distance-transform watershed, StarDist (CNN), or CellSAM (SAM + CellFinder foundation model). Shared across every method: hole filling, the µm²/µm³ size filter, globally-unique ids and the region table. 2D segments each plane independently, 3D each volume (the two learned methods are 2D-per-plane and refuse the 3D lever).",
@@ -5750,6 +5850,10 @@
       "category": "analysis",
       "role": "shape_and_distance_geometry",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/tessellate.py",
       "gui_only": false,
       "summary": "Tessellate a labeled Point cloud (convex/concave/Voronoi boundary) or a Voxel label raster (marching cubes) → a MESH: one closed surface per label, with analytic volume/area/density per element; 3D (ports v1 granule_tessellate). Feed transform.rasterize_mesh to get a Label volume.",
@@ -5973,6 +6077,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/threshold.py",
       "gui_only": false,
       "summary": "Binarize to a Voxel mask — fixed, or a histogram method (otsu/li/yen/triangle/mean) whose level is derived over the chosen Scope: per plane (default), per volume, per position's whole series, or one level across the entire dataset. The threshold socket shows only under `fixed` (the others self-derive); Scope only under the others.",
@@ -6151,6 +6259,10 @@
       "category": "analysis",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/threshold_local.py",
       "gui_only": false,
       "summary": "Adaptive local threshold → a Voxel mask (uneven-illumination robust); per-plane 2D, block size in µm.",
@@ -6247,6 +6359,9 @@
       "category": "analysis",
       "role": "tracking",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/track_field.py",
       "gui_only": false,
       "summary": "SerialTrack's post-processing half: a TRACKED object field (any linker's `track_id`, on Label or Point members) → per-particle displacement (µm), optional velocity (µm/s), the MLS deformation gradient and strain (4 measures), and optional isotropic linear-elastic stress + von Mises / pressure (Pa). Cumulative or incremental reference; 2D-per-plane vs full 3D inherited from the members' z_kind. Emits the same Point schema as analysis.dvc_field, so transform.rasterize_field turns it into maps.",
@@ -6523,6 +6638,10 @@
       "category": "analysis",
       "role": "shape_and_distance_geometry",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/analysis/voronoi.py",
       "gui_only": false,
       "summary": "Voronoi tessellation LINKING dots to areas: one cell per seed Point, nearest-seed in µm space, clipped to a Label region (per-region arenas) or a mask → a territory Label raster + table (area, local density, source dot and area) and, in 3D, a MESH of the cell surfaces.",
@@ -6764,6 +6883,12 @@
       "category": "channel",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/channel/select.py",
       "gui_only": false,
       "summary": "Subset/reorder the channel axis (metadata follows in lockstep).",
@@ -6829,6 +6954,9 @@
       "category": "channel",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/channel/split.py",
       "gui_only": false,
       "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'.",
@@ -6882,6 +7010,10 @@
       "category": "analysis",
       "role": "object_detection",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/detect/particles.py",
       "gui_only": false,
       "summary": "Particle/small-object detection → Points (LoG local-maxima or component centroids, sub-voxel refined; beads, puncta, foci); min distance = LoG σ + NMS radius (µm→px); 2D per-plane vs 3D volume (ported v1 kernel).",
@@ -7054,6 +7186,10 @@
       "category": "analysis",
       "role": "object_detection",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/detect/spots.py",
       "gui_only": false,
       "summary": "LoG/DoG spot detection → Points (bright or dark polarity); radii derive from the diffraction limit (σ = r/√ndim); 2D per-plane vs 3D.",
@@ -7256,6 +7392,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/bilateral.py",
       "gui_only": false,
       "summary": "Edge-preserving bilateral denoise — stack-of-2D even in 3D mode (skimage denoise_bilateral is 2D-only, H15).",
@@ -7359,6 +7498,9 @@
       "category": "enhancement",
       "role": "background_and_intensity_correction",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/clahe.py",
       "gui_only": false,
       "summary": "Contrast-limited adaptive histogram equalization; 2D per-plane vs 3D. `tile_grid` sets the regions per axis (8 = Cell-Tracker's OpenCV default).",
@@ -7464,6 +7606,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/deconvolve.py",
       "gui_only": false,
       "summary": "Richardson–Lucy deconvolution with a PSF derived from optics metadata (NA, emission λ, pixel/z size); 2D lateral PSF vs 3D anisotropic PSF. Output is no longer raw integer counts, so the declared bit depth is dropped.",
@@ -7596,6 +7741,9 @@
       "category": "enhancement",
       "role": "image_filtering",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/dog.py",
       "gui_only": false,
       "summary": "Band-pass (blob) enhancement; low σ derives from the diffraction limit; high σ 0 ⇒ auto 1.6× low. 2D per-plane vs anisotropic 3D. Optional clip-and-stretch to the full range reproduces Cell-Tracker's DoG.",
@@ -7737,6 +7885,9 @@
       "category": "enhancement",
       "role": "background_and_intensity_correction",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/flatten_field.py",
       "gui_only": false,
       "summary": "Flatten uneven illumination by removing a large-σ Gaussian background: subtract / subtract+mean / divide+mean / ratio, estimated per plane or averaged over T. Ports Cell-Tracker's Background Subtract, Spatial Flatness and Local Contrast. `ratio` drops bit_depth (dimensionless).",
@@ -7858,6 +8009,9 @@
       "category": "enhancement",
       "role": "background_and_intensity_correction",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/gamma.py",
       "gui_only": false,
       "summary": "Power-law γ over a declared intensity scale: `full_range` uses 2**bit_depth-1 (a fixed transfer curve — Cell-Tracker's behaviour, with the significant sensor depth in place of the dtype width), `plane_max` the pre-V2.13 per-plane maximum. full_range falls back to the plane max when no bit_depth is declared, which is why the footprint is WHOLE_PLANE either way.",
@@ -7939,6 +8093,9 @@
       "category": "enhancement",
       "role": "image_filtering",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/gaussian.py",
       "gui_only": false,
       "summary": "Gaussian blur with a metadata-intelligent σ (µm); 2D per-plane vs 3D.",
@@ -8054,6 +8211,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/median.py",
       "gui_only": false,
       "summary": "Edge-preserving median filter; 2D per-plane vs anisotropic 3D window.",
@@ -8169,6 +8329,9 @@
       "category": "enhancement",
       "role": "image_filtering",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/morphological_gradient.py",
       "gui_only": false,
       "summary": "Dilation − erosion edge map; 2D per-plane vs anisotropic 3D. Optional full-range stretch + blend-with-original reproduce Cell-Tracker's plugin.",
@@ -8304,6 +8467,9 @@
       "category": "enhancement",
       "role": "image_filtering",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/morphology.py",
       "gui_only": false,
       "summary": "Grayscale morphology (erode/dilate/open/close); 2D vs anisotropic 3D.",
@@ -8438,6 +8604,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/nlm.py",
       "gui_only": false,
       "summary": "Non-local-means denoise — genuinely volumetric in 3D (denoise_nl_means is true n-D).",
@@ -8555,6 +8724,9 @@
       "category": "enhancement",
       "role": "background_and_intensity_correction",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/normalize.py",
       "gui_only": false,
       "summary": "Rescale to [0,1] from percentile bounds — the statistics scope (plane/volume/series) is a Mode, not the 2D/3D lever (H24) — or from an ABSOLUTE intensity window typed in the image's own units, which is one fixed transfer curve for the whole series and the only way to express a window at absolute positions (Cell-Tracker's Local Contrast display window after Flatten Illumination method=ratio). Scope and the percentile sockets show only under `percentile`, the value sockets only under `absolute`. Drops bit_depth either way — the output is no longer raw integer counts.",
@@ -8719,6 +8891,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/remove_blobs.py",
       "gui_only": false,
       "summary": "Detect bright round artifacts (dust, debris, hot pixels) with LoG/DoG and paint them out — zero / ring-mean interpolate / local median. Ports Cell-Tracker's Blob Subtract; radii in µm, per channel, mask radius σ·√2.",
@@ -8875,6 +9050,9 @@
       "category": "enhancement",
       "role": "background_and_intensity_correction",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/subtract_background.py",
       "gui_only": false,
       "summary": "Estimate a background surface and remove it — rolling ball (Sternberg / ImageJ), tunable ellipsoid, morphological opening, box minimum / median / percentile, large-sigma Gaussian, least-squares polynomial surface, or one whole-unit percentile. Dark or light background, subtract / signed subtract / divide, or output the estimate itself. Auto-shrinks the expensive estimators (ImageJ's factor table); `divide` drops bit_depth. Or, as a second approach, DECIDE which pixels are background — by similarity to a drawn sample, or by an adaptive local cut clamped to a range — and set exactly those to nothing, leaving every object pixel untouched.",
@@ -9409,6 +9587,9 @@
       "category": "enhancement",
       "role": "background_and_intensity_correction",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/temporal_gain.py",
       "gui_only": false,
       "summary": "Correct intensity drift along T by a per-frame gain: reference series_mean (Cell-Tracker Bleach Correction) / rolling_mean (its Temporal Fold Correction) / exponential_fit (the decay model its UI promised but never ran), at global / tile / gaussian spatial extent. Per (m,z,c); refuses T=1.",
@@ -9565,6 +9746,9 @@
       "category": "enhancement",
       "role": "image_filtering",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/tophat.py",
       "gui_only": false,
       "summary": "White/black top-hat (flatten background / pop dark features); 2D vs anisotropic 3D.",
@@ -9695,6 +9879,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/tv_denoise.py",
       "gui_only": false,
       "summary": "Total-variation (Chambolle) edge-preserving denoise — genuinely 3D in 3D mode (denoise_tv_chambolle is true n-D).",
@@ -9790,6 +9977,9 @@
       "category": "enhancement",
       "role": "image_filtering",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/unsharp.py",
       "gui_only": false,
       "summary": "Unsharp-mask sharpening (blur radius in µm); 2D vs anisotropic 3D.",
@@ -9915,6 +10105,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/wavelet_denoise.py",
       "gui_only": false,
       "summary": "Wavelet (BayesShrink) denoise — stack-of-2D even in 3D mode (skimage denoise_wavelet is 2D-only); declared as such (H15).",
@@ -9995,6 +10188,9 @@
       "category": "enhancement",
       "role": "image_restoration",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/enhance/zs_deconvnet.py",
       "gui_only": false,
       "summary": "Zero-shot deconvolution network (Qiao et al. 2024): a dual-stage CNN trained self-supervised on the incoming data itself — no ground truth — or a published checkpoint run inference-only. Denoises and sharpens past the diffraction limit, optionally on a 2x finer grid. Output is percentile-normalized, so the declared bit depth is dropped.",
@@ -10667,6 +10863,12 @@
       "category": "flow",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/flow/advance.py",
       "gui_only": false,
       "summary": "One step of an Iterate node's feedback search (hidden; minted by the iterate rewrite, never placed by hand).",
@@ -10729,6 +10931,12 @@
       "category": "flow",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/flow/iterate.py",
       "gui_only": false,
       "summary": "Re-run a stretch of the graph once per parameter value and keep one result. Wire the segment — the last node of the series into 'To', optionally the first into 'From' — then pick what to iterate from the panel's dropdown (it lists every parameter in that stretch). The result comes out of the series' own end node, so anything already reading it keeps working and the sweep runs by itself whenever you view it. Flip through the iterations on the Viewer's strip; 'best' picks by a Global scalar and 'feedback' searches for the value that maximizes it or hits a target.",
@@ -11790,6 +11998,12 @@
       "category": "group",
       "role": "graph_structure",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/group/interface.py",
       "gui_only": false,
       "summary": "Group interface marker (pass-through); paired Input/Output bound a reusable subgraph — see nodegraph.groups.",
@@ -11843,6 +12057,12 @@
       "category": "group",
       "role": "graph_structure",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/group/interface.py",
       "gui_only": false,
       "summary": "Group interface marker (pass-through); paired Input/Output bound a reusable subgraph — see nodegraph.groups.",
@@ -11896,6 +12116,12 @@
       "category": "io",
       "role": "input_output",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodelab_v2/ops.py",
       "gui_only": true,
       "summary": "Bake everything upstream to disk once, then serve it as if it were a freshly loaded file. The nodes behind it grey out and stop being evaluated — their results are read back from the checkpoint instead of recomputed — so a long chain on a big series stops costing memory and re-runs. Masks, labels, tracks and measurements are baked alongside the image, and the full-size ones are memory-mapped, so a docked segmentation costs no RAM. Edit something upstream and the dock says so and keeps serving the old bake until you re-bake.",
@@ -12000,6 +12226,9 @@
       "category": "io",
       "role": "input_output",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodelab_v2/ops.py",
       "gui_only": true,
       "summary": "Open an ND2 or TIFF as the pipeline source. Access defaults to Direct — read the ND2 in place, no copy; switch to Auto to build a compressed b2nd store when it clearly pays off, or to Ingest to always build one. Empty path = synthetic demo. Exposes one output per channel + a combined 'All channels' output.",
@@ -12111,6 +12340,9 @@
       "category": "io",
       "role": "input_output",
       "stage": "acquire_and_organize",
+      "pages": [
+        "analyze"
+      ],
       "module": "nodegraph/catalog/io/write_movie.py",
       "gui_only": false,
       "summary": "Render the Dataset on this wire to an H.264 MP4, an animated GIF or a numbered PNG/JPEG sequence — the presentation counterpart to Export TIFF. Channels composite by their emission tints, the display window is measured once and held so a timelapse does not pulse, and the acquisition's own calibration is burned into the corners: the frame counter, the elapsed experiment time interpolated from the file's frame interval, a round-number scale bar from the pixel size, and the channel names. With Sweep = 'timeline' it plays the Movie Editor's layout instead: clips from up to three sources in sequence, grids of positions/channels/z/timepoints, z sweeps cut in between timepoints, and label rasters drawn with their ids. Hands the Dataset through unchanged, so it can sit mid-chain.",
@@ -12671,6 +12903,9 @@
       "category": "io",
       "role": "input_output",
       "stage": "acquire_and_organize",
+      "pages": [
+        "analyze"
+      ],
       "module": "nodegraph/catalog/io/write_tiff.py",
       "gui_only": false,
       "summary": "Write the Dataset on this wire to a TIFF, streaming one plane at a time so peak memory is a single plane no matter how large the series. The calibration envelope is transcribed verbatim into OME-XML — physical XY/Z sizes, frame interval, significant bits, channel names and emission wavelengths, per-plane stage position and time offset — so the exported file describes the pixels it contains rather than the file they came from. Hands the Dataset through unchanged, so it can sit mid-chain.",
@@ -12833,12 +13068,152 @@
         "split_positions"
       ]
     },
+    "page.input": {
+      "op": "page.input",
+      "label": "Page Input",
+      "category": "page",
+      "role": "page_boundary",
+      "stage": "control_and_present",
+      "pages": [
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodelab_v2/ops.py",
+      "gui_only": true,
+      "summary": "Start this page from a named output of an earlier page. At run time the upstream page is spliced in and this node disappears, so a result the upstream page already computed is reused from the memo rather than recomputed; at edit time the node carries the upstream output's envelope (axes, calibration, layers), so every derived default on this page is right before anything is pulled.",
+      "overview": "``page.input`` — never evaluated inside a Workspace (compose replaces it by a wire from the upstream page's Output). Reached only when the node is unbound or the graph is run on its own, so the refusal says exactly that.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "source",
+          "label": "Source",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Which earlier page's named output this page starts from — pick one from the menu (`<page> · <name>`; only pages of an earlier kind, or Free pages, are offered, so the page graph can never loop). Stored as `<page id>:<name>`, so renaming a page keeps the link and renaming the OUTPUT breaks it — the panel then shows this input as unbound until you re-pick."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_page_input",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": null,
+      "params_read": []
+    },
+    "page.output": {
+      "op": "page.output",
+      "label": "Page Output",
+      "category": "page",
+      "role": "page_boundary",
+      "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process"
+      ],
+      "module": "nodelab_v2/ops.py",
+      "gui_only": true,
+      "summary": "Name the Dataset wired in as a VARIABLE of this page, for a Page Input on a later page to read. A pass-through: nothing is copied or changed except an optional `condition` label in the metadata.",
+      "overview": "``page.output`` — a pass-through that NAMES its input as one of its page's variables. The name is presentation (the window and the Workspace read it off the document); the only thing the compute adds is the ``condition`` label, stamped into the metadata so a table built downstream of several pages can say which condition each row came from.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "Data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset this page hands on under the name below — an image, a mask, a labelled set, a table-carrying Dataset, whatever the chain in front of it produced. Pulling this node previews exactly what a later page's Page Input will receive."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "The variable name a later page picks this output by (its Page Input's Source menu lists `<this page> · <name>`). Give every output on one page a different name, or a later page cannot tell them apart. Renaming re-keys nothing: the Dataset is the same, so every memoized result downstream is kept."
+        },
+        {
+          "name": "condition",
+          "label": "Condition",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The experimental-condition label stamped into the Dataset's metadata (`condition`), which a table built downstream of several pages carries as a column. Leave blank to use this page's own name — a linked page then labels its rows with ITS name, which is the point of linking one workflow per dish. Changing it re-runs only the stamp (this node), not the chain in front of it."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_page_output",
+      "meta_transform": "_meta_page_output",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": null,
+      "params_read": []
+    },
     "registration.align_to": {
       "op": "registration.align_to",
       "label": "Align To",
       "category": "registration",
       "role": "registration_and_alignment",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/registration/align_to.py",
       "gui_only": false,
       "summary": "Measure how far this input's stage log sits from a reference's, per field, by phase-correlating their physical overlap — and RECORD the correction rather than applying it to pixels. Overlay and every other placement consumer honour it automatically. A field whose match is not believed keeps its stage position.",
@@ -12957,6 +13332,9 @@
       "category": "registration",
       "role": "registration_and_alignment",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/registration/stabilize.py",
       "gui_only": false,
       "summary": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature models, first/previous/mean/template anchor; stores per-frame shift (ported v1 kernel).",
@@ -13099,6 +13477,12 @@
       "category": "general",
       "role": "graph_structure",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/rr/reroute.py",
       "gui_only": false,
       "summary": "Identity pass-through used to route wires cleanly on the canvas.",
@@ -13152,6 +13536,9 @@
       "category": "analysis",
       "role": "tracking",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/track/link.py",
       "gui_only": false,
       "summary": "Frame-to-frame tracking → a Track membership: label mode links by maximum IoU overlap, point mode by nearest neighbour within max_distance (µm). Runs per (m,c) across the whole T axis.",
@@ -13315,6 +13702,9 @@
       "category": "analysis",
       "role": "tracking",
       "stage": "quantify",
+      "pages": [
+        "process"
+      ],
       "module": "nodegraph/catalog/track/objects.py",
       "gui_only": false,
       "summary": "Frame-to-frame object tracking with five interchangeable linkers (centroid Hungarian / SerialTrack topology PTV / Cell-Tracker topology, fingerprint, mask-overlap IoU) → a Track membership + a track_id column on the member layer. 2D per (m,c,z); Label or Point members. The richer alternative to track.link. NOTE: serialtrack is 1–2 orders of magnitude slower than the others (≈8-18 s on 1k–15k detections, plus a one-time numba JIT) — the cheap default is centroid.",
@@ -13655,6 +14045,10 @@
       "category": "transform",
       "role": "segmentation_and_labeling",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/transform/grow_points.py",
       "gui_only": false,
       "summary": "Grows seeds into measurable objects — a Voxel label raster AND its Label table. `points` turns each detection of a Point table into a disc (2D) or ellipsoid (3D) of a physical µm radius; `surface`, `scale` and `stamp` grow an existing Label segmentation from its OWN shape — outward from each region's border by a µm distance (outline conserved), by resampling that outline about its centroid (growth proportional to size), or by replacing it with an ellipsoid. `overlap` decides contested voxels: `union` (fixed-size stamps, lower id wins), `nearest` (a tessellation capped at the growth, ~139x cheaper than the equivalent Voronoi Cells) or `merge` (touching regions fuse into one), and `protect` keeps growth out of a neighbour's interior. The inverse of transform.label_to_points.",
@@ -13965,6 +14359,10 @@
       "category": "transform",
       "role": "representation_transfer",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/transform/label_to_points.py",
       "gui_only": false,
       "summary": "Every label region → one Point at its centre (centroid / guaranteed-inside / intensity-weighted), keeping a `label` column back to the region. 2D vs 3D is inherited from the Label instance's own provenance. The seed cloud for Cluster Points, Tessellate, point tracking and Voronoi Cells.",
@@ -14077,6 +14475,10 @@
       "category": "transform",
       "role": "representation_transfer",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/transform/rasterize_field.py",
       "gui_only": false,
       "summary": "Interpolate a Point vector/scalar field (e.g. DVC) up to full-resolution Voxel layers (one per attribute column); 2D-per-plane vs volumetric is inherited from the field's z_kind (§7b); nearest-filled out-of-hull.",
@@ -14177,6 +14579,10 @@
       "category": "transform",
       "role": "representation_transfer",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/transform/rasterize_mesh.py",
       "gui_only": false,
       "summary": "Rasterize a MESH → one filled Voxel Label region per element (interior test inherited from the mesh provenance: convex hull, or faces-based parity so concavity survives) + a per-element Label table (centroid, analytic volume_um3/density/n_points/surface_area, realized voxel_count); 3D (ports v1 granule_volume_mask).",
@@ -14298,6 +14704,9 @@
       "category": "transform",
       "role": "geometric_transformation",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/transform/rigid.py",
       "gui_only": false,
       "summary": "Move selected channels' pixels inside a FIXED frame — translate in X/Y (and Z in 3D) and rotate in-plane about the centre — cropping whatever leaves the frame and zero-filling what it vacates. Channels not named pass through at their original position, so corrected and raw ones arrive downstream on one wire and can be compared directly; the usual reason to reach for it is a chromatic or filter-cube offset before colocalization. Axes, pixel size and origin are unchanged — only content moves. Interpolation is linear / nearest / cubic; Voxel layers such as masks ride along with the same transform (integer rasters always nearest), and a Label / Point / Track table on the wire is refused because its coordinate columns cannot be honestly rewritten.",
@@ -14459,6 +14868,10 @@
       "category": "transform",
       "role": "representation_transfer",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/transform/transfer_domain.py",
       "gui_only": false,
       "summary": "Move a lattice attribute between domains (reduce coarsens over dropped axes / broadcast refines); lattice ONLY — for Label/Point/Track use Transfer Structure.",
@@ -14606,6 +15019,10 @@
       "category": "transform",
       "role": "representation_transfer",
       "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
       "module": "nodegraph/catalog/transform/transfer_structure.py",
       "gui_only": false,
       "summary": "Move an attribute across the detected-structure spine — Voxel↔Label↔Point↔Track and structure→Frame (15 pairs). Coarsening reduces (mean in mask, points in region, gather over a track); refining broadcasts (paint by label, splat, broadcast a track's value onto its members). Dimensionality is inherited from the structures' own provenance.",
@@ -14816,6 +15233,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/batch.py",
       "gui_only": false,
       "summary": "Stack two or more files on the batch axis so one pipeline runs over all of them independently — per-file statistics, not pooled. Unbatch splits the results back apart.",
@@ -14887,6 +15307,9 @@
       "category": "utility",
       "role": "geometric_transformation",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/util/crop.py",
       "gui_only": false,
       "summary": "Crop Y,X (and Z in 3D mode), or keep only chosen M/T/Z frames; pixel size preserved (origin deferred).",
@@ -15127,6 +15550,9 @@
       "category": "utility",
       "role": "geometric_transformation",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/util/crop_to.py",
       "gui_only": false,
       "summary": "Crop to the field another file occupies in absolute stage coordinates; M collapses to the covering position, pixel size preserved.",
@@ -15324,6 +15750,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/merge.py",
       "gui_only": false,
       "summary": "Merge two or more Datasets by growing ONE chosen axis. 'C' places and resamples channels the way the retired Merge Channels did (handles mismatched pixel size/focus); 'T'/'M'/'Z' lay inputs end to end with no resampling, refusing unless every other axis already matches — the shape a 'before'/'after' pair needs to become one series for tracking.",
@@ -15559,6 +15988,9 @@
       "category": "utility",
       "role": "geometric_transformation",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/util/resample.py",
       "gui_only": false,
       "summary": "Rescale Y,X (and Z in 3D) by a factor; pixel size scales inversely (finer when upsampling).",
@@ -15670,6 +16102,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/select_batch.py",
       "gui_only": false,
       "summary": "Keep one file of a batch, by name. The tap Unbatch's per-file outputs materialize into, and usable on its own to pull a single member out.",
@@ -15733,6 +16168,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/select_group.py",
       "gui_only": false,
       "summary": "Keep only the multipoints of one specimen group — the 3x3 mosaic, the plate well — recovered from the stage coordinates or read from the acquisition. Lazy: no pixels move, and per-position metadata, layers and structure rows follow the selection.",
@@ -15807,6 +16245,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/select_position.py",
       "gui_only": false,
       "summary": "Keep one multipoint position, by index or acquisition name. The tap Split Positions' per-position outputs materialize into, and usable on its own.",
@@ -15870,6 +16311,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/split_positions.py",
       "gui_only": false,
       "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
@@ -15923,6 +16367,9 @@
       "category": "utility",
       "role": "projection_and_stitching",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/util/stack.py",
       "gui_only": false,
       "summary": "Stack the Timepoint axis → one frame (SNR↑) with a robust combiner (mean/median/sigma-clip/trimmed); drops dt_s.",
@@ -16003,6 +16450,9 @@
       "category": "utility",
       "role": "projection_and_stitching",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/util/stitch.py",
       "gui_only": false,
       "summary": "Stitch the multipoint axis into one mosaic (M→1, Y/X grow): tiles placed from the file's stage log (optionally refined by phase correlation) or on an explicit grid, blended feather/max/mean/overwrite.",
@@ -16191,6 +16641,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/timeseries.py",
       "gui_only": false,
       "summary": "Build one series from many source FILES: wire each file (or multi-file card) into its own slot — a new empty slot appears as you fill the last — and the files are laid onto ONE axis (Time by default; or Channels, Z, positions) in the order their acquisition clocks say, so the series is right whatever order you dropped them in. Falls back to the counting number in the filenames, then to wiring order, and says which on the card. A pure index remap: nothing is resampled or copied. Put it directly after the loaders — it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses. (Formerly Chain Files, util.chain.)",
@@ -16369,6 +16822,9 @@
       "category": "utility",
       "role": "dataset_and_channel_organization",
       "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
       "module": "nodegraph/catalog/util/unbatch.py",
       "gui_only": false,
       "summary": "Fan a batch back out into one output per file — each a single-file Dataset, named after its source. The whole batch also passes through 'out'. Put per-object analysis (segment, measure, track) AFTER this: structure rows carry no batch column, so they cannot tell two files apart while the batch is still stacked.",
@@ -16422,6 +16878,9 @@
       "category": "utility",
       "role": "projection_and_stitching",
       "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
       "module": "nodegraph/catalog/util/zproject.py",
       "gui_only": false,
       "summary": "Project the Z axis (max/mean/sum/min/median) → a 2D (z==1) Dataset; drops z_step_um and marks z_collapsed. Method 'none' resets the node to a pass-through: the full Z stack comes back with z_step_um intact.",
@@ -16524,6 +16983,12 @@
       "category": "view",
       "role": "visualization",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/view/canvas.py",
       "gui_only": false,
       "summary": "One blank field spanning every wired file's fields at their true stage positions — the primary to chain Overlays onto when the files share no field (adjacent regions of a well, several wells of a plate), so all of them appear in ONE view, each exactly where the stage put it. Reads no pixels and holds none.",
@@ -16622,6 +17087,12 @@
       "category": "view",
       "role": "visualization",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/view/overlay.py",
       "gui_only": false,
       "summary": "Draw a second Dataset inside this one's field, placed by absolute stage position, pixel size and focus — so two files that ran through different graphs line up on the microscope's own coordinates. The primary defines the canvas and passes through untouched; the secondary is matched tile by tile, and the pairing, coverage, time and focus offsets are reported rather than assumed. Chain Overlays for a third source.",
@@ -16980,6 +17451,12 @@
       "category": "io",
       "role": "visualization",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodelab_v2/ops.py",
       "gui_only": true,
       "summary": "Display sink — shows the primary image stream, and any extra streams wired into the slots that appear as you fill them, merged or tiled, with an optional scale bar. No output: what it shows goes nowhere downstream (V2.00 §10; sources, layout and scale bar 2026-10-02).",
@@ -17233,6 +17710,12 @@
       "category": "zone",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/zone/frame.py",
       "gui_only": false,
       "summary": "Per-frame-T slice: inside a zone body, iteration t yields frame t of its (T-stacked) input (t==1). Drives the Simulation per-frame pattern.",
@@ -17288,6 +17771,12 @@
       "category": "zone",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/zone/boundary.py",
       "gui_only": false,
       "summary": "Zone boundary marker (pass-through); paired In/Out bound the iterated body — see nodegraph.zones.",
@@ -17341,6 +17830,12 @@
       "category": "zone",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/zone/boundary.py",
       "gui_only": false,
       "summary": "Zone boundary marker (pass-through); paired In/Out bound the iterated body — see nodegraph.zones.",
@@ -17394,6 +17889,12 @@
       "category": "zone",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/zone/boundary.py",
       "gui_only": false,
       "summary": "Zone boundary marker (pass-through); paired In/Out bound the iterated body — see nodegraph.zones.",
@@ -17447,6 +17948,12 @@
       "category": "zone",
       "role": "control_flow",
       "stage": "control_and_present",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
       "module": "nodegraph/catalog/zone/boundary.py",
       "gui_only": false,
       "summary": "Zone boundary marker (pass-through); paired In/Out bound the iterated body — see nodegraph.zones.",

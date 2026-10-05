@@ -847,6 +847,33 @@ def main(argv) -> int:
     assert set(g2.nodes) == set(doc.nodes)
     _ok("G6: save/load round-trip (positions kept; headless loader reads the file)")
 
+    # ── WS1: the WORKSPACE file (V4.00 step 1) — Save writes format 3.0 with one Free page;
+    #    a reload reads it back into the SAME document the canvas is bound to ──────────────
+    ws = win.workspace
+    assert ws.active and ws.page(ws.active).doc is win.doc and ws.page(ws.active).kind == "free"
+    assert win.doc.page_kind == "free" and win.doc.store_tag == ws.active
+    tmpw = os.path.join(tempfile.mkdtemp(prefix="nd2ws_"), "w.nd2graph.json")
+    n_before = (len(win.doc.nodes), len(win.doc.edges))
+    ws.save_file(tmpw)
+    with open(tmpw, encoding="utf-8") as f:
+        raww = json.load(f)
+    assert raww["format_version"] == "3.0" and raww["app_version"], raww.get("format_version")
+    assert len(raww["workspace"]["pages"]) == 1 and raww["workspace"]["pages"][0]["kind"] == "free"
+    assert win.doc.path == tmpw, win.doc.path
+    ws.load_file(tmpw)
+    assert ws.page(ws.active).doc is win.doc, "a reload must keep the canvas bound to its document"
+    assert (len(win.doc.nodes), len(win.doc.edges)) == n_before
+    assert (win.doc.nodes["n3"].x, win.doc.nodes["n3"].y) == (123.0, 456.0)
+    # the 2.0 file G6 wrote still opens — as one Free page named after the file
+    ws.load_file(tmp)
+    assert ws.page(ws.active).doc is win.doc and ws.page(ws.active).name == "t"
+    assert (len(win.doc.nodes), len(win.doc.edges)) == n_before
+    # the palette still offers everything on a Free page (page.* included, never hidden)
+    from nodelab_v2.scene import visible_specs as _visible_ws1   # main() rebinds the bare name later
+    assert {s.op_key for s in _visible_ws1()} >= {"page.input", "page.output"}
+    _ok("WS1 workspace file: Save writes format 3.0 (one Free page, app_version stamped); "
+        "reload keeps the canvas bound to the same document; a 2.0 file opens as a Free page")
+
     # ── G7 + G4: a real pull on the synthetic source through to viewer pixels ──
     done = {}
     win.runner.finished.connect(lambda nid, *a: done.setdefault("id", nid))
@@ -3350,7 +3377,11 @@ def main(argv) -> int:
     _insp_dock = win.scene.node_items["DK"]
     win.inspector.set_node(_insp_dock)
     app.processEvents()
-    assert win.doc.default_dock_store("DK").endswith(os.path.join("docktest.docks", "DK"))
+    # V4.00: a page's docks live one folder down, under its page id, so two pages' `n3`
+    # never bake into one folder — the single-page window is page `pg1` of its workspace
+    assert win.doc.default_dock_store("DK").endswith(
+        os.path.join("docktest.docks", win.workspace.active, "DK")), \
+        win.doc.default_dock_store("DK")
 
     win.doc.nodes["DK"].modes["precision"] = "float32"
     win.doc.touch()

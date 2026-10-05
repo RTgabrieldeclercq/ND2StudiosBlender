@@ -33,7 +33,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 OUT_PATH = os.path.join(ROOT, "codemap", "node_synopsis.json")
 ROLES_PATH = os.path.join(ROOT, "codemap", "node_roles.json")
-SCHEMA = "nd2studios-node-synopsis/1"
+SCHEMA = "nd2studios-node-synopsis/2"
 
 
 class RolesError(RuntimeError):
@@ -44,7 +44,10 @@ def load_roles(ops: List[str]) -> Dict[str, Any]:
     """The curated role map, validated against the live op list.
 
     Every shipped op must appear in exactly one role, every op named must exist, and every
-    role must name a declared stage. Raising rather than warning is the point: a node added
+    role must name a declared stage. Since V4.00 every role must also list the typed PAGE
+    KINDS whose palette offers it (``pages``, all declared in the file's ``pages`` section),
+    every ``op_pages`` override must name a real op and real kinds, and every declared kind
+    must be used by at least one op. Raising rather than warning is the point: a node added
     without a role would otherwise ship unclassified and nobody would notice."""
     with open(ROLES_PATH, encoding="utf-8") as fh:
         roles = json.load(fh)
@@ -64,6 +67,38 @@ def load_roles(ops: List[str]) -> Dict[str, Any]:
     if missing:
         problems.append("shipped ops with NO role (add them to node_roles.json): "
                         + ", ".join(missing))
+    # V4.00 page kinds
+    pages = roles.get("pages")
+    if not isinstance(pages, dict) or not pages:
+        problems.append("no 'pages' section (V4.00: the typed page kinds, in pipeline order)")
+        pages = {}
+    used_pages: set = set()
+    for rname, r in roles["roles"].items():
+        rp = r.get("pages")
+        if not isinstance(rp, list) or not rp:
+            problems.append(f"role {rname!r} has no 'pages' list (which page kinds offer it?)")
+            continue
+        bad = [p for p in rp if p not in pages]
+        if bad:
+            problems.append(f"role {rname!r} names unknown page kind(s) {bad}")
+        used_pages.update(rp)
+    op_pages = roles.get("op_pages") or {}
+    if not isinstance(op_pages, dict):
+        problems.append("'op_pages' must be an object {op: [kinds]}")
+        op_pages = {}
+    for op, ps in op_pages.items():
+        if op not in seen:
+            problems.append(f"op_pages names {op!r}, which is in no role")
+        if not isinstance(ps, list) or not ps:
+            problems.append(f"op_pages[{op!r}] must be a non-empty list of page kinds")
+            continue
+        bad = [p for p in ps if p not in pages]
+        if bad:
+            problems.append(f"op_pages[{op!r}] names unknown page kind(s) {bad}")
+        used_pages.update(ps)
+    unused = sorted(set(pages) - used_pages)
+    if unused:
+        problems.append("page kind(s) no op is offered on: " + ", ".join(unused))
     if problems:
         raise RolesError("codemap/node_roles.json needs attention:\n  " + "\n  ".join(problems))
     return roles
@@ -329,13 +364,18 @@ def build() -> Dict[str, Any]:
         rname = role_of[op]
         rec["role"] = rname
         rec["stage"] = roles["roles"][rname]["stage"]
-        # Put role/stage right after category so a reader sees both groupings together.
+        # the typed page kinds whose palette offers this op (V4.00): the per-op override
+        # first, else the role's list — the same rule nodegraph.roles.pages_of applies
+        rec["pages"] = list((roles.get("op_pages") or {}).get(op)
+                            or roles["roles"][rname].get("pages") or [])
+        # Put role/stage/pages right after category so a reader sees every grouping together.
         ordered = {}
         for k, v in rec.items():
             ordered[k] = v
             if k == "category":
                 ordered["role"] = rec["role"]
                 ordered["stage"] = rec["stage"]
+                ordered["pages"] = rec["pages"]
         nodes[op] = ordered
 
     doc = {

@@ -183,6 +183,11 @@ anchors: sym:nodelab_v2.runner.EngineRunner, file:nodelab_v2/ingest.py
    `nodegraph.provider.B2ndProvider` plus a `MetaEnvelope`. `nodelab_v2.nd2_meta` parses the
    optics and calibration — pixel size, z step, frame interval, emission per channel, NA,
    magnification — which is what makes every `unit`/`derive` socket downstream work (CON-05).
+   Beside the calibration rides the **placement vocabulary**, `ingest.PLACEMENT_KEYS`:
+   `z_home_index`, `z_bottom_to_top`, the per-T `frame_time_jd` and its readable twin
+   `frame_datetime` (2026-10-02; the Viewer's timestamp overlay and the Timeseries Builder
+   read it), `stage_layout_source`, `acquisition_start`, and the per-M `position_name` —
+   each best-effort, and dropped whole rather than padded when the file carries it short.
 2b. **There are two routes, chosen by `io.load`'s `access` mode**, and the store is only
    one of them. Under `access="direct"` — **the default** (`ops.ACCESS_DEFAULT`), for a
    freshly placed card and for every graph saved before this mode existed alike — the

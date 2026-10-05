@@ -1,6 +1,6 @@
 {
-  "schema": "nd2studios-node-roles/1",
-  "about": "Curated, hand-written. Every shipped node has exactly one functional ROLE (what it does to the data), and every role belongs to one pipeline STAGE (where it sits in acquire -> prepare -> find -> quantify -> present). `scripts/_node_synopsis.py` merges this into codemap/node_synopsis.json and its check fails if a node is unassigned, assigned twice, or no longer exists. The registry `category` field is the palette grouping the GUI shows; a role is a finer, purpose-based cut (the 20 `enhancement` nodes split three ways here, the 12 `utility` nodes four ways).",
+  "schema": "nd2studios-node-roles/2",
+  "about": "Curated, hand-written. Every shipped node has exactly one functional ROLE (what it does to the data), and every role belongs to one pipeline STAGE (where it sits in acquire -> prepare -> find -> quantify -> present). `scripts/_node_synopsis.py` merges this into codemap/node_synopsis.json and its check fails if a node is unassigned, assigned twice, or no longer exists. The registry `category` field is the palette grouping the GUI shows; a role is a finer, purpose-based cut (the 20 `enhancement` nodes split three ways here, the 12 `utility` nodes four ways). V4.00 (2026-10-05) adds PAGES: `pages` declares the typed page kinds of a Workspace in pipeline order, each role lists the kinds whose palette offers its nodes (`pages`), and `op_pages` overrides that per op; the GUI, the Workspace and the synopsis all read these through nodegraph.roles. The `free` kind (every node) is deliberately not listed: it is the absence of a filter.",
   "stages": {
     "acquire_and_organize": {
       "label": "Acquire & organize",
@@ -23,120 +23,177 @@
       "description": "Shape how the graph executes and how results are seen: iteration, zones, grouping, routing, viewing and overlay."
     }
   },
+  "pages": {
+    "input": {
+      "label": "Image Input",
+      "order": 0,
+      "description": "Bring files on, lay them along an axis, split or select positions and channels, and name an experimental condition as an output. No pixel values change."
+    },
+    "refine": {
+      "label": "Image Refinement",
+      "order": 1,
+      "description": "Denoise, correct, align, crop and project, then find structure: cleaned images and masks, labels and points, named as outputs for the processing pages."
+    },
+    "process": {
+      "label": "Image Processing",
+      "order": 2,
+      "description": "Quantify structure over space and time: measurements, object fields, tracks, PIV and deformation fields, named as outputs for the analysis pages."
+    },
+    "analyze": {
+      "label": "Analysis",
+      "order": 3,
+      "description": "Synthesize the outputs of refinement and processing pages: overlays, plots and tables, written out as figures, movies and TIFFs."
+    }
+  },
   "roles": {
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
+      "pages": ["input"],
       "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie or image sequence.",
       "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie"]
     },
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
+      "pages": ["input"],
       "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions.",
       "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group", "util.split_positions", "util.select_position"]
     },
     "image_restoration": {
       "label": "Image restoration",
       "stage": "prepare_image",
+      "pages": ["refine"],
       "description": "Recover the underlying signal: denoise (edge-preserving, non-local, variational, wavelet), deblur by deconvolution with a metadata-derived or learned PSF, and paint out dust and hot-pixel artefacts.",
       "ops": ["enhance.bilateral", "enhance.median", "enhance.nlm", "enhance.tv_denoise", "enhance.wavelet_denoise", "enhance.deconvolve", "enhance.zs_deconvnet", "enhance.remove_blobs"]
     },
     "background_and_intensity_correction": {
       "label": "Background & intensity correction",
       "stage": "prepare_image",
+      "pages": ["refine"],
       "description": "Make intensities comparable across the field and across time: remove a background surface, flatten uneven illumination, correct bleaching or gain drift along T, and rescale or re-curve the intensity range (normalize, gamma, CLAHE).",
       "ops": ["enhance.subtract_background", "enhance.flatten_field", "enhance.temporal_gain", "enhance.normalize", "enhance.gamma", "enhance.clahe"]
     },
     "image_filtering": {
       "label": "Image filtering & feature enhancement",
       "stage": "prepare_image",
+      "pages": ["refine"],
       "description": "Linear and morphological filters that emphasise or suppress features at a physical scale: Gaussian blur, difference-of-Gaussians band-pass, unsharp sharpening, top-hat, grayscale morphology and the morphological gradient edge map.",
       "ops": ["enhance.gaussian", "enhance.dog", "enhance.unsharp", "enhance.tophat", "enhance.morphology", "enhance.morphological_gradient"]
     },
     "registration_and_alignment": {
       "label": "Registration & alignment",
       "stage": "prepare_image",
+      "pages": ["refine"],
       "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another.",
       "ops": ["align.drift", "registration.stabilize", "registration.align_to"]
     },
     "geometric_transformation": {
       "label": "Geometric transformation",
       "stage": "prepare_image",
+      "pages": ["refine"],
       "description": "Move, cut or rescale the pixel lattice while the calibration follows: translate and rotate inside a fixed frame, crop by region or by frame selection, crop to another file's field, resample by a factor.",
       "ops": ["transform.rigid", "util.crop", "util.crop_to", "util.resample"]
     },
     "projection_and_stitching": {
       "label": "Projection & stitching",
       "stage": "prepare_image",
+      "pages": ["refine"],
       "description": "Collapse or join an axis: Z-projection to a single plane, T-stacking to one frame with a robust combiner, and M-stitching of multipoint tiles into one mosaic.",
       "ops": ["util.zproject", "util.stack", "util.stitch"]
     },
     "segmentation_and_labeling": {
       "label": "Segmentation & labeling",
       "stage": "find_structure",
+      "pages": ["refine", "process"],
       "description": "From intensities to regions: global, local and multi-level thresholds, the unified Segmentation node (threshold, watershed, StarDist, CellSAM), connected-component labeling, ROI rasterization, hand-drawn labelled regions pinned to a frame, and growing seed points into measurable label regions.",
       "ops": ["analysis.threshold", "analysis.threshold_local", "analysis.multiotsu", "analysis.histogram_threshold", "analysis.segment", "analysis.label", "analysis.roi_mask", "analysis.draw_regions", "transform.grow_points"]
     },
     "object_detection": {
       "label": "Object detection (points)",
       "stage": "find_structure",
+      "pages": ["refine", "process"],
       "description": "Find small bright or dark objects as sub-voxel Points rather than regions: LoG/DoG spot detection sized from the diffraction limit, and particle detection by local maxima or component centroids.",
       "ops": ["detect.spots", "detect.particles"]
     },
     "shape_and_distance_geometry": {
       "label": "Shape & distance geometry",
       "stage": "find_structure",
+      "pages": ["refine", "process"],
       "description": "Geometry derived from existing structure: distance transforms, outward boundary bands, region outlines as points, closed surface meshes per label, and Voronoi territories linking seed points to arenas.",
       "ops": ["analysis.edt", "analysis.boundary_band", "analysis.extract_boundary", "analysis.tessellate", "analysis.voronoi"]
     },
     "representation_transfer": {
       "label": "Representation transfer",
       "stage": "find_structure",
+      "pages": ["refine", "process"],
       "description": "Convert structure or attributes between the Voxel, Label, Point, Track, Mesh and Frame domains: label regions to centre points, meshes and point fields back to voxel rasters, and the two generic domain-transfer nodes.",
       "ops": ["transform.label_to_points", "transform.rasterize_mesh", "transform.rasterize_field", "transform.transfer_domain", "transform.transfer_structure"]
     },
     "measurement_and_statistics": {
       "label": "Measurement & statistics",
       "stage": "quantify",
+      "pages": ["process"],
       "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, point clustering, and reduction of any layer or column to one Global scalar.",
       "ops": ["analysis.measure", "analysis.object_metrics", "analysis.object_field", "analysis.cluster_points", "analysis.reduce_scalar"]
     },
     "object_filtering_and_selection": {
       "label": "Object filtering & selection",
       "stage": "quantify",
+      "pages": ["process"],
       "description": "Keep or split objects by their measured columns: whole-label filtering with a histogram-chosen cut, and the If/Else split of a structure table into PASS and FAIL sets.",
       "ops": ["analysis.filter_labels", "analysis.if_else"]
     },
     "tracking": {
       "label": "Tracking",
       "stage": "quantify",
+      "pages": ["process"],
       "description": "Follow objects through time: frame-to-frame linking by overlap or nearest neighbour, the multi-linker Track Objects node, and per-particle displacement, velocity and strain from an existing track membership.",
       "ops": ["track.link", "track.objects", "analysis.track_field"]
     },
     "motion_and_deformation_fields": {
       "label": "Motion & deformation fields",
       "stage": "quantify",
+      "pages": ["process"],
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
       "ops": ["analysis.dic_correlate", "analysis.dvc_field", "analysis.piv", "analysis.optical_flow", "analysis.accumulate_field"]
     },
     "control_flow": {
       "label": "Control flow",
       "stage": "control_and_present",
+      "pages": ["input", "refine", "process", "analyze"],
       "description": "Nodes that change how the graph runs rather than what it computes: Iterate and its hidden search step, the per-frame slice, and the Repeat and Simulation zone boundaries.",
       "ops": ["flow.iterate", "flow.advance", "zone.frame", "zone.repeat_in", "zone.repeat_out", "zone.sim_in", "zone.sim_out"]
     },
     "graph_structure": {
       "label": "Graph structure",
       "stage": "control_and_present",
+      "pages": ["input", "refine", "process", "analyze"],
       "description": "Pass-through markers with no effect on data: the Group Input/Output pair that bounds a reusable subgraph, and Reroute for tidy wiring.",
       "ops": ["group.input", "group.output", "rr.reroute"]
     },
     "visualization": {
       "label": "Visualization",
       "stage": "control_and_present",
+      "pages": ["input", "refine", "process", "analyze"],
       "description": "Look at results: the Viewer display sink, Overlay, which composites a second Dataset into this one's field on the microscope's own stage coordinates, and Experiment Canvas, the blank stage-spanning field that Overlays are chained onto when the files share no field.",
       "ops": ["view.viewer", "view.overlay", "view.canvas"]
+    },
+    "page_boundary": {
+      "label": "Page boundary",
+      "stage": "control_and_present",
+      "pages": ["input", "refine", "process", "analyze"],
+      "description": "The V4 workspace's seams: Page Output names the Dataset wired into it as a variable of its page, and Page Input on a later page reads one by `<page>:<name>`. Pass-throughs at run time - the Workspace splices the upstream page in and the Input node disappears - so neither changes a pixel.",
+      "ops": ["page.input", "page.output"]
     }
+  },
+  "op_pages": {
+    "io.load": ["input"],
+    "io.dock": ["input", "refine", "process", "analyze"],
+    "io.write_tiff": ["analyze"],
+    "io.write_movie": ["analyze"],
+    "channel.select": ["input", "refine", "process", "analyze"],
+    "page.input": ["refine", "process", "analyze"],
+    "page.output": ["input", "refine", "process"]
   }
 }

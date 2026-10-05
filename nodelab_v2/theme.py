@@ -98,6 +98,10 @@ CATEGORY = {
     # the drawing) and from every processing colour, because reading a graph means seeing at
     # a glance where the fan-out is.
     "flow": c("#6fbf73"),
+    # `page` is a seam, not a step: Page Output names what leaves a page, Page Input is
+    # where the next page starts (V4.00). A teal of its own so the boundary of a page reads
+    # at a glance on a canvas that is otherwise all processing colours.
+    "page": c("#4d9e9a"),
 }
 
 

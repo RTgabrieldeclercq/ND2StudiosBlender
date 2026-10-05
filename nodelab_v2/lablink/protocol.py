@@ -62,6 +62,14 @@ SOFTWARE_VERSION = _APP_VERSION
 #: :data:`nodegraph.serialize.FORMAT_VERSION` by the self-test.
 GRAPH_FORMAT = "2.0"
 
+#: The WORKSPACE document format (ND2Studios V4.00): one file holding several pages, one of
+#: which a recipe names with ``"page"`` (by id or by name; absent = the file's active page).
+#: The worker COMPOSES that page with every page it reads from and runs the result, so the
+#: knob and target ids of such a recipe are the qualified run ids ``<page>/<node>``. Kept
+#: in step with :data:`nodegraph.serialize.WORKSPACE_FORMAT_VERSION` by the self-test;
+#: advertised in ``hello`` as ``graph_formats`` next to the single-graph ``graph_format``.
+WORKSPACE_GRAPH_FORMAT = "3.0"
+
 
 # ── LWP/1: the hub <-> worker protocol ──────────────────────────────────────────
 
