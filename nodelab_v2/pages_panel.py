@@ -8,8 +8,10 @@ page what connects it to the others: what its Page Inputs **read** and which Out
 **publishes**. A master page carries ★, a linked page names its master.
 
 Click a page to show it on the active canvas; double-click to rename; right-click for the
-page switcher's menu (duplicate, link, set as master, save as page recipe, delete). The
-panel only reads the workspace — every change goes through the window.
+page switcher's menu (duplicate, link, set as master, save as page recipe, close tab,
+delete). A page whose TAB was closed (V4.00 step 11d) is listed here in italics, "tab
+closed": the panel is where every page stays reachable, and clicking it opens its tab
+again. The panel only reads the workspace — every change goes through the window.
 """
 from __future__ import annotations
 
@@ -25,9 +27,11 @@ from nodelab_v2.canvas import kind_icon
 
 _PID = Qt.UserRole
 _ROLE = Qt.UserRole + 1          # "kind" | "page" | "detail"
+_OPEN = Qt.UserRole + 2          # a page row: is its tab open
 
-#: one row of the panel: (page id, label, kind, master page name or "", reads, publishes)
-PageRow = Tuple[str, str, str, str, Tuple[str, ...], Tuple[str, ...]]
+#: one row of the panel: (page id, label, kind, master page name or "", reads, publishes,
+#: whether the page's tab is open)
+PageRow = Tuple[str, str, str, str, Tuple[str, ...], Tuple[str, ...], bool]
 
 
 class PagesPanel(QWidget):
@@ -102,11 +106,19 @@ class PagesPanel(QWidget):
             head.setForeground(0, QBrush(T.INK))
             head.setBackground(0, QBrush(T.mix(T.PANEL, T.ACCENT_DIM, 0.45)))
             self.tree.addTopLevelItem(head)
-            for pid, text, _k, master, reads, publishes in mine:
-                it = QTreeWidgetItem([text])
+            for pid, text, _k, master, reads, publishes, is_open in mine:
+                it = QTreeWidgetItem([text if is_open else f"{text}   · tab closed"])
                 it.setData(0, _PID, pid)
                 it.setData(0, _ROLE, "page")
-                it.setToolTip(0, self._tip(text, master, reads, publishes))
+                it.setData(0, _OPEN, bool(is_open))
+                tip = self._tip(text, master, reads, publishes)
+                if not is_open:
+                    tip += "\nits tab is closed — click to show the page and open its tab"
+                    shut = QFont(self.font())
+                    shut.setItalic(True)
+                    it.setFont(0, shut)
+                    it.setForeground(0, QBrush(T.MUTED))
+                it.setToolTip(0, tip)
                 if pid == active:
                     it.setFont(0, bold)
                     current = it
@@ -145,9 +157,11 @@ class PagesPanel(QWidget):
         bold = QFont(self.font())
         bold.setBold(True)
         plain = QFont(self.font())
+        shut = QFont(self.font())
+        shut.setItalic(True)
         for it in self.page_items():
             on = it.data(0, _PID) == active
-            it.setFont(0, bold if on else plain)
+            it.setFont(0, bold if on else (plain if it.data(0, _OPEN) is not False else shut))
             if on:
                 self.tree.setCurrentItem(it)
 

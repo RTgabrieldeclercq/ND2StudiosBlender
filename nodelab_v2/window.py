@@ -53,6 +53,7 @@ from nodelab_v2.document import GraphDocument
 from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedDocument, LinkedPageError
 from nodelab_v2 import page_recipes as PR
 from nodelab_v2.new_page_dialog import NewPageDialog, SavePageRecipeDialog
+from nodelab_v2.mode_switch import ModeSwitch
 from nodelab_v2.pages_panel import PagesPanel
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
@@ -71,6 +72,7 @@ from nodelab_v2.scene import GraphScene, GraphView
 from nodelab_v2.shell import DockShell, PanelSpec
 from nodelab_v2.spreadsheet import SpreadsheetPanel
 from nodelab_v2.viewer import ViewerPanel
+from nodelab_v2.viewer_controls import ViewerControlsPanel
 from nodelab_v2.welcome import WelcomeCard
 
 #: how long a selection must settle before the mini-map pulls it (ms). Long enough that
@@ -140,12 +142,20 @@ def _as_float(v) -> Optional[float]:
 #: the default layout, and a Viewer dock the first time it opens. The app LAUNCHES with the
 #: Viewer on screen (V4.00 step 11a) — blank until the first result — above the canvas,
 #: which keeps the larger share: the welcome card and the graph are what a new session
-#: works in first.
-VIEWER_SHARE = 0.45
+#: works in first. Since step 11d the Viewer dock holds the IMAGE only — its Playback and
+#: Channels panels sit under it (:data:`CONTROLS_H`) — so the share is smaller than the
+#: 0.45 the whole panel took, and the canvas keeps about what it had.
+VIEWER_SHARE = 0.30
 #: The default layout's side-column widths (px): Nodes on the left, Properties on the right.
 PALETTE_W, INSPECTOR_W = 330, 376
 #: the default height of the Pages panel, as a share of the left column (step 11)
 PAGES_SHARE = 0.30
+#: The panel kinds of the Viewer's controls (V4.00 step 11d): the M/T/Z cursor and play
+#: buttons, and the channel / histogram columns — one panel each, showing the ACTIVE
+#: Viewer's (nodelab_v2.viewer_controls).
+PLAYBACK_KIND, CHANNELS_KIND = "playback", "channels"
+#: Their default height (px), side by side under the first Viewer.
+CONTROLS_H = 180
 #: The panel kind of a Viewer dock (V4.00 step 4): several instances, ``viewer:<n>``.
 VIEWER_KIND = "viewer"
 #: The panel kind of a docked canvas (V4.00 step 5) — every canvas but the main one.
@@ -336,6 +346,9 @@ class MainWindow(QMainWindow):
         #: given their Page Input — for this session (V4.00 step 11)
         self._welcome_dismissed: set = set()
         self._seeded_pages: set = set()
+        #: pages whose TAB the user closed (V4.00 step 11d): out of the canvases' sub-tab
+        #: rows, still in the workspace and the Pages panel; showing one opens its tab again
+        self._closed_pages: set = set()
         self._scenes: Dict[str, GraphScene] = {}
         #: per page: (its document, the listeners `_wire_scene` installed on it)
         self._page_hooks: Dict[str, Tuple[Any, List[Any]]] = {}
@@ -427,6 +440,14 @@ class MainWindow(QMainWindow):
         #: the page of the Export Movie the editor is bound to (`_movie_pid`)
         self._movie_page: Optional[str] = None
         self.movie_editor = MovieEditorPanel(_MovieHost(self))
+        # the Viewer's controls as panels of their own (V4.00 step 11d): every Viewer the
+        # window makes hands its two sections over (`_make_viewer`); these show the active one's
+        self.playback_panel = ViewerControlsPanel(
+            "Playback", "The M / T / Z cursor and play buttons of the active Viewer appear "
+            "here once a Viewer is open.")
+        self.channels_panel = ViewerControlsPanel(
+            "Channels", "The channels and histograms of the active Viewer appear here once "
+            "a Viewer is open.")
         self.shell = DockShell(self, allow_close=self._allow_panel_close)
         for spec in self._panel_specs():
             self.shell.register(spec)
@@ -439,6 +460,7 @@ class MainWindow(QMainWindow):
         self.shell.activated.connect(self._on_panel_activated)
         self.shell.changed.connect(self._prune_viewers)
         self.shell.changed.connect(self._prune_canvases)
+        self._sync_viewer_controls()
         self._console_dock = self.shell.docks_of("console")[0]
         self._movie_dock = self.shell.docks_of("movie")[0]
         self._lablink_dock = self.shell.docks_of("lablink")[0]
@@ -618,6 +640,15 @@ class MainWindow(QMainWindow):
             # is on screen from launch (step 11a), more by '+', View ▸ New or Compare
             PanelSpec(VIEWER_KIND, "Viewer", self._make_viewer, glyph="◉", multi=True,
                       default_area=top, default_hidden=False),
+            # the active Viewer's controls (V4.00 step 11d): Playback under the Viewer (three
+            # short rows — no scroll area, so it is never scrolled sideways), Channels beside
+            # it, in a scroll area: a narrow panel wraps its channel columns onto more rows,
+            # and a short one scrolls them rather than holding up the window's height
+            PanelSpec(PLAYBACK_KIND, "Playback", lambda: self.playback_panel, glyph="▷",
+                      default_area=top, split_from=VIEWER_KIND, split=Qt.Vertical),
+            PanelSpec(CHANNELS_KIND, "Channels", lambda: self.channels_panel, glyph="◐",
+                      default_area=top, split_from=PLAYBACK_KIND, split=Qt.Horizontal,
+                      scroll=True),
             # more canvases (V4.00 step 5): '+', View ▸ New, or a page's "Open in a new
             # canvas"; the main canvas is the window's centre and is not one of these
             PanelSpec(CANVAS_KIND, "Canvas", self._make_canvas, glyph="⬚", multi=True,
@@ -707,7 +738,16 @@ class MainWindow(QMainWindow):
         # reads the rect off the GUI thread and answers on `detail_ready`.
         v.detail_cb = self._request_detail
         v.own_layers_cb = self._own_layers
+        # its M/T/Z + play rows and its channel columns live in panels of their own
+        self._home_controls(v)
         return v
+
+    def _home_controls(self, v: ViewerPanel) -> None:
+        """``v``'s two control sections into the Playback and Channels panels (V4.00 step
+        11d) — on creation, and when the mini-map hands them back."""
+        ax, ch = v.detach_controls()
+        self.playback_panel.adopt(v, ax)
+        self.channels_panel.adopt(v, ch)
 
     @staticmethod
     def _viewer_slot(v: ViewerPanel, signal: str):
@@ -861,6 +901,39 @@ class MainWindow(QMainWindow):
         doc = self._page_doc(pid)
         return list(doc.own_label_layers(nid)) if doc is not None else []
 
+    # ── the Viewer's controls as panels (V4.00 step 11d) ──────────────────────
+    def _control_docks(self) -> List[Any]:
+        """The Playback and Channels docks (whichever exist)."""
+        return [d for k in (PLAYBACK_KIND, CHANNELS_KIND) for d in self.shell.docks_of(k)]
+
+    def _viewer_label(self, v: Optional[ViewerPanel]) -> str:
+        """``"Viewer 2"`` (``"Viewer 2 · compare"``) — how the control panels name the Viewer
+        they serve once there are several."""
+        d = self._viewer_dock(v)
+        if d is None:
+            return ""
+        return f"Viewer {d.index + 1}" + (" · compare" if v in self._links else "")
+
+    def _sync_viewer_controls(self) -> None:
+        """The Playback and Channels panels show the ACTIVE Viewer's sections. A Compare
+        viewer whose cursor is linked to its leader's has its own row hidden — one set of
+        sliders moves both — so Playback shows the LEADER's then; the mini-map viewer (canvas
+        maximized) holds its own sections, compact, and both panels say so."""
+        pb, ch = getattr(self, "playback_panel", None), getattr(self, "channels_panel", None)
+        if pb is None or ch is None or not hasattr(self, "shell"):
+            return
+        v = self._active_viewer()
+        ax = v
+        if v is not None and v in self._linked and v is not self._mini_viewer:
+            ax = self._links.get(v) or v
+        pb.show_for(ax)
+        ch.show_for(v)
+        several = len(self.viewers) > 1
+        for panel, who in ((pb, ax), (ch, v)):
+            d = self.shell.dock_of(panel)
+            if d is not None:
+                d.set_binding_title(self._viewer_label(who) if several and who else "")
+
     def _activate_viewer(self, v: Optional[ViewerPanel]) -> None:
         d = self._viewer_dock(v)
         if d is not None:
@@ -877,6 +950,7 @@ class MainWindow(QMainWindow):
         if dock.kind != VIEWER_KIND:
             return
         v = dock.panel
+        self._sync_viewer_controls()          # Playback and Channels follow it (step 11d)
         self.scene.set_viewed(self._bound_local(v))
         # the scope's INDICATORS move to this viewer (its region box, the chip); the
         # runner's scope does not — clicking a viewer is not an edit, and under F9 a changed
@@ -905,6 +979,10 @@ class MainWindow(QMainWindow):
             self._preview_prev = None
         self._max_hidden = [d for d in self._max_hidden
                             if self.shell.docks.get(d.objectName()) is d]
+        # a closed Viewer's control sections go with it
+        self.playback_panel.prune(alive)
+        self.channels_panel.prune(alive)
+        self._sync_viewer_controls()
 
     def _allow_panel_close(self, dock) -> bool:
         """The shell's close veto — a pure QUESTION. It is asked when a close is attempted
@@ -1129,6 +1207,11 @@ class MainWindow(QMainWindow):
             lambda _=False, c=c: self.open_canvas(c.page_id))
         menu.addAction("Rename page…").triggered.connect(
             lambda _=False, c=c: self.rename_page(c.page_id))
+        ct = menu.addAction("Close tab")
+        ct.setToolTip("Take this page's tab off the tab row. The page is kept: the Pages panel "
+                      "and its kind's tab show it again.")
+        ct.setEnabled(any(p not in self._closed_pages and p != c.page_id for p in ws.pages))
+        ct.triggered.connect(lambda _=False, c=c: self.close_page_tab(c.page_id))
         sv = menu.addAction("Save as page recipe…")
         sv.setToolTip("Keep this page's graph as a starting point for new pages (New page… ▸ "
                       "Page recipe). Not a LabLink recipe — Graph ▸ Publish is that.")
@@ -1143,8 +1226,15 @@ class MainWindow(QMainWindow):
         self._activate_canvas(c)
 
     # ── page tabs, the Pages panel, the start card (V4.00 step 11) ─────────────
-    def page_tab_items(self) -> List[Tuple[str, str, str, str]]:
-        """``(page id, label, kind, tooltip)`` per page, in page order — the canvases' tabs."""
+    def page_tab_kinds(self) -> List[Tuple[str, str]]:
+        """``(kind, label)`` for every page kind in pipeline order — the tab strip's top row
+        (it shows the kinds that have pages)."""
+        from nodegraph import roles as R
+        return [(k, kind_label(k)) for k in R.page_kinds()]
+
+    def page_tab_items(self) -> List[Tuple[str, str, str, str, bool]]:
+        """``(page id, label, kind, tooltip, open)`` per page, in page order — the canvases'
+        sub-tabs. ``open`` is False for a page whose tab was closed (:meth:`close_page_tab`)."""
         ws = self.workspace
         out = []
         for p in ws.pages.values():
@@ -1154,9 +1244,72 @@ class MainWindow(QMainWindow):
                 tip.append("reads: " + ", ".join(reads))
             if pubs:
                 tip.append("publishes: " + ", ".join(pubs))
-            tip.append("drag to reorder · double-click to rename · right-click for the page menu")
-            out.append((p.id, self._page_label(p), p.kind, "\n".join(tip)))
+            tip.append("drag to reorder · double-click to rename · right-click for the page "
+                       "menu · ✕ closes the tab (the page stays in the Pages panel)")
+            out.append((p.id, self._page_label(p), p.kind, "\n".join(tip),
+                        p.id not in self._closed_pages))
         return out
+
+    def show_kind(self, c: CanvasPanel, kind: str) -> None:
+        """The tab of page kind ``kind`` was clicked on canvas ``c``: show the page of that
+        kind ``c`` showed last if its tab is open, else the first open one — and when every
+        page of the kind has its tab closed, the one shown last (else the first), whose
+        tab comes back."""
+        ids = [p.id for p in self.workspace.pages.values() if p.kind == kind]
+        if not ids:
+            return
+        opened = [p for p in ids if p not in self._closed_pages]
+        last = c.last_of_kind.get(kind)
+        if opened:
+            self._show_page(c, last if last in opened else opened[0])
+        else:
+            self._show_page(c, last if last in ids else ids[0])
+
+    def reorder_pages(self, order: List[str]) -> None:
+        """Sub-tabs dragged into a new order: ``order`` is the whole page order with the
+        dragged pages swapped among the places they held."""
+        ws = self.workspace
+        if sorted(order) != sorted(ws.pages) or order == list(ws.pages):
+            return
+        for i, pid in enumerate(order):
+            if list(ws.pages).index(pid) != i:
+                ws.move_page(pid, i)
+
+    def close_page_tab(self, page_id: str) -> bool:
+        """Close ``page_id``'s tab (its ✕, or Close tab in the page menu). The PAGE stays —
+        in the workspace, in the Pages panel, on its kind's tab — and showing it again by any
+        route opens its tab again. A canvas that was showing it moves to the nearest open
+        page, of the same kind first. The last open tab cannot close: a canvas always shows
+        a page. ``False`` when nothing closed."""
+        ws = self.workspace
+        if page_id not in ws.pages or page_id in self._closed_pages:
+            return False
+        order = list(ws.pages)
+        opened = [p for p in order if p not in self._closed_pages and p != page_id]
+        if not opened:
+            self.statusBar().showMessage("the last open page tab stays — a canvas always "
+                                         "shows a page")
+            return False
+        kind = ws.pages[page_id].kind
+        at = order.index(page_id)
+
+        def nearest(cands):
+            return min(cands, key=lambda p: (abs(order.index(p) - at), order.index(p) > at),
+                       default=None)
+
+        dest = nearest([p for p in opened if ws.pages[p].kind == kind]) or nearest(opened)
+        work = self._canvas
+        for c in self.canvases():                     # every canvas off it FIRST: a page on
+            if c.page_id == page_id:                  # screen counts as open
+                c.set_page(dest)
+        self._closed_pages.add(page_id)
+        if work.page_id == dest:
+            self._activate_canvas(work)
+        self._refresh_page_views()
+        self.statusBar().showMessage(
+            f"“{ws.pages[page_id].name}” tab closed — the page is still in the Pages panel "
+            f"and under its kind's tab")
+        return True
 
     def next_page_kind(self, page_id: Optional[str]) -> str:
         """The kind a new page started from ``page_id`` most likely wants: the next one in
@@ -1176,6 +1329,12 @@ class MainWindow(QMainWindow):
         only when what they show changed)."""
         from nodegraph import roles as R
         ws = self.workspace
+        self._closed_pages &= set(ws.pages)
+        for c in self.canvases():
+            self._closed_pages.discard(c.page_id)          # what a canvas shows is open
+            page = ws.pages.get(c.page_id)
+            if page is not None:
+                c.last_of_kind[page.kind] = page.id
         panel = getattr(self, "pages_panel", None)
         if panel is not None:
             rows = []
@@ -1183,7 +1342,7 @@ class MainWindow(QMainWindow):
                 reads, pubs = ws.page_summary(p.id)
                 master = ws.pages[p.master].name if p.master in ws.pages else ""
                 rows.append((p.id, self._page_label(p), p.kind, master, tuple(reads),
-                             tuple(pubs)))
+                             tuple(pubs), p.id not in self._closed_pages))
             panel.refresh([(k, kind_label(k)) for k in R.page_kinds()], rows, ws.active or "")
         for c in self.canvases():
             c.sync_tabs()
@@ -1859,6 +2018,11 @@ class MainWindow(QMainWindow):
             "it off for real results.")
         self._solo_act.toggled.connect(self.set_solo_frame)
         m_run.addAction(self._solo_act)
+        # the same mode, always in sight (V4.00 step 11d): Normal | Troubleshooting at the
+        # right end of the menu bar — the action stays the one source of truth (F9, Run ▸)
+        self.mode_switch = ModeSwitch(self._solo_act.toolTip())
+        self.mode_switch.mode_changed.connect(self._solo_act.setChecked)
+        self.menuBar().setCornerWidget(self.mode_switch, Qt.TopRightCorner)
         clear_picks = QAction("Clear picked &frames", self)
         clear_picks.setToolTip("Drop the M/T/Z picks — the scope goes back to the single "
                                "frame the Viewer's cursor is on, whole volume")
@@ -2111,9 +2275,11 @@ class MainWindow(QMainWindow):
         QApplication.instance().setPalette(T.palette())   # light mode gets the light palette
         self.setStyleSheet(_window_qss())
         for panel in (self.palette, self.pages_panel, self.inspector, self.sheet, self.lablink,
-                      self.console, self.movie_editor, *self.viewers, *self.canvases()):
+                      self.console, self.movie_editor, self.playback_panel,
+                      self.channels_panel, *self.viewers, *self.canvases()):
             panel.restyle()
         self.shell.restyle()       # the panels' title bars, floating or docked
+        self.mode_switch.restyle()
         self._paint_led()          # the LED colors come from the tokens, not from QSS
         self._sync_solo_chip()     # ditto for the solo chip's amber
         for c in self.canvases():
@@ -2165,6 +2331,13 @@ class MainWindow(QMainWindow):
             mini_dock.toggleViewAction().setEnabled(False)
             # a linked Compare viewer leaves its leader behind (hidden): it scrubs alone
             mini.set_axes_hidden(False)
+            # its controls come with it, compact (V4.00 step 11d): the docked Playback and
+            # Channels panels step aside like the Viewers, a floating one stays and says so
+            self._max_ctrl_hidden = [d for d in self._control_docks()
+                                     if not d.isHidden() and not d.isFloating()]
+            for d in self._max_ctrl_hidden:
+                d.hide()
+            mini.attach_controls()
             mini.set_compact(True)
             self.minimap.attach(mini)
             self.minimap.reposition()
@@ -2183,6 +2356,7 @@ class MainWindow(QMainWindow):
             md = self._viewer_dock(mini)
             if mini is not None and md is not None:
                 mini.set_compact(False)
+                self._home_controls(mini)      # its controls back into their panels
                 md.setWidget(mini)             # back into its own dock
                 mini.show()
                 md.toggleViewAction().setEnabled(True)
@@ -2201,6 +2375,10 @@ class MainWindow(QMainWindow):
                 self.resizeDocks(sized, hs, Qt.Vertical)
                 QTimer.singleShot(0, lambda: self._resize_docks_alive(sized, hs))
             self._max_hidden, self._max_heights = [], {}
+            for d in getattr(self, "_max_ctrl_hidden", []):
+                if self.shell.docks.get(d.objectName()) is d:
+                    d.show()
+            self._max_ctrl_hidden = []
             self._follow_act.setChecked(getattr(self, "_follow_before_max", False))
         # keep both entry points (canvas button + View menu) in sync, no signal loop
         if on:
@@ -2213,6 +2391,7 @@ class MainWindow(QMainWindow):
         self._max_act.setChecked(on)
         self._max_act.blockSignals(False)
         self._sync_minimap_title()
+        self._sync_viewer_controls()
         # the close veto (`_allow_panel_close`) follows this state: the mini-map viewer's
         # dock shows its ✕ disabled while maximized, live again once docked back
         self.shell.sync_close_buttons()
@@ -2261,8 +2440,25 @@ class MainWindow(QMainWindow):
             d = viewers[0]
             if not d.isHidden() and not d.isFloating() and self.dockWidgetArea(d) in (
                     Qt.TopDockWidgetArea, Qt.BottomDockWidgetArea):
-                self.resizeDocks([d], [max(1, int(VIEWER_SHARE * self._column_height()))],
-                                 Qt.Vertical)
+                docks, sizes = [d], [max(1, int(VIEWER_SHARE * self._column_height()))]
+                # the Playback / Channels row under it (step 11d), when it is there
+                ctl = next((c for c in self._control_docks() if not c.isHidden()
+                            and not c.isFloating() and self.dockWidgetArea(c)
+                            == self.dockWidgetArea(d)), None)
+                if ctl is not None:
+                    docks.append(ctl)
+                    sizes.append(CONTROLS_H)
+                self.resizeDocks(docks, sizes, Qt.Vertical)
+                # side by side: Playback needs a strip's width, Channels a column per channel
+                row = [c for c in self._control_docks() if not c.isHidden()
+                       and not c.isFloating() and self.dockWidgetArea(c)
+                       == self.dockWidgetArea(d)]
+                if len(row) == 2:
+                    w = sum(c.width() for c in row)
+                    pb = row[0] if row[0].kind == PLAYBACK_KIND else row[1]
+                    pw = min(w // 2, self.playback_panel.minimumSizeHint().width() + 24)
+                    self.resizeDocks([pb, *[c for c in row if c is not pb]], [pw, w - pw],
+                                     Qt.Horizontal)
             d._sized = True                # its first appearance is sized: this is it
         for name, w in (("palette:0", PALETTE_W), ("inspector:0", INSPECTOR_W)):
             sd = self.shell.dock(name)
@@ -3321,6 +3517,7 @@ class MainWindow(QMainWindow):
             self._linked.discard(f)
         f.set_axes_hidden(linked and f is not self._mini_viewer)
         self._sync_viewer_title(f)
+        self._sync_viewer_controls()          # a linked Compare viewer: the leader's strips
         fn = self._binding_full(f)
         if linked and fn is not None:
             m, t, z, _c = lead.coords()
@@ -4342,6 +4539,7 @@ class MainWindow(QMainWindow):
             self._solo_act.blockSignals(True)
             self._solo_act.setChecked(on)
             self._solo_act.blockSignals(False)
+        self.mode_switch.set_troubleshooting(on)  # the menu bar's Normal | Troubleshooting
         self._repull_viewed()                  # show the new scope now, not on the next click
         self.statusBar().showMessage(          # after the pull: `started` also writes here
             f"troubleshooting: pulls analyse {self._scope_phrase()} — ctrl+click the T or "
@@ -5021,6 +5219,7 @@ class MainWindow(QMainWindow):
     def file_new(self) -> None:
         self._welcome_dismissed.clear()
         self._seeded_pages.clear()
+        self._closed_pages.clear()
         self.__dict__.pop("_recipe_cache", None)
         self.workspace.reset()    # clears the page → _on_doc_changed closes Compare viewers
         self._forget_display_state()
@@ -5478,14 +5677,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open failed", str(exc))
             return
         self._forget_display_state()
+        # the session's per-page state described the LAST file's pages (their ids repeat)
+        self._welcome_dismissed.clear()
+        self._seeded_pages.clear()
+        self._closed_pages.clear()
         for c in self.canvases():
             c._viewpoints.clear()          # where it looked at the LAST file's pages
+            c.last_of_kind.clear()
+        self._refresh_page_views()
         self.view.fit_all()
         if len(self.workspace.pages) > 1:
             act = self.workspace.page(self.workspace.active)
             self.statusBar().showMessage(
                 f"workspace of {len(self.workspace.pages)} pages — showing {act.name!r}; "
-                f"the switcher in the canvas's top-left corner changes page")
+                f"the tabs above the canvas (and the Pages panel) change page")
         if self.doc.has_unedited_structure:
             QMessageBox.information(
                 self, "Zones / groups preserved",

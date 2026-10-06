@@ -152,21 +152,28 @@ once per detected cell). A CUDA torch build is picked up automatically
 
 NodeLab opens on the **Image Input page** of a fresh workspace of four pages — Image Input,
 Image Refinement, Image Processing, Analysis (**Pages**, below) — with a start card: *Load
-image… / Load sequence… / Example graph*. A **tab per page** runs along the top of the canvas,
-and the **Pages** panel (left, above Nodes) lists every page by kind. The **Viewer** sits above the canvas from the start
-(about 45 % of the height) and shows what you load or pull; the Nodes palette is on the left,
-Properties on the right with the Spreadsheet and LabLink tabbed behind it. A panel popped out
-with **⇱** is a frameless window with a thin edge in the theme's colour.
+image… / Load sequence… / Example graph*. Two rows of **tabs** run along the top of the canvas
+— one per page kind, and under it the pages of that kind — and the **Pages** panel (left,
+above Nodes) lists every page by kind. The **Viewer** sits above the canvas from the start and
+shows what you load or pull; under it sit its **Playback** panel (the M / T / Z strips and play
+buttons) and its **Channels** panel (a column per channel: toggle, histogram, black and white
+point). The Nodes palette is on the left, Properties on the right with the Spreadsheet and
+LabLink as tabs above it. A panel popped out with **⇱** is a frameless window with a thin edge
+in the theme's colour.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ File  Edit  Run  Graph  View  Help                                   │
+│ File  Edit  Run  Graph  View  Help          [Normal|Troubleshooting] │
 ├──────────┬───────────────────────────────────────────┬───────────────┤
-│ Palette  │              VIEWER                       │  Properties   │
-│ (search, │  image · channel strip · LUT · overlays   │  (inspector)  │
-│  grouped │───────────────────────────────────────────┤               │
-│  by      │              NODE CANVAS              [⛶] │  Spreadsheet  │
-│  category│  cards · wires · frames · mini-map        │  (tables)     │
+│ Pages    │              VIEWER  (the image)          │ Properties ·  │
+│──────────│─────────────────┬─────────────────────────┤ Spreadsheet · │
+│ Palette  │ PLAYBACK        │ CHANNELS                │ LabLink (tabs)│
+│ (search, │ M/T/Z strips ▶  │ Auto Fit Split Overlays │               │
+│  grouped │                 │ one column per channel  │  Properties   │
+│  by      │─────────────────┴─────────────────────────┤  (inspector)  │
+│  stage)  │ kind tabs · page tabs                     │               │
+│          │              NODE CANVAS              [⛶] │               │
+│          │  cards · wires · frames · mini-map        │               │
 ├──────────┴───────────────────────────────────────────┴───────────────┤
 │ Console (log + full tracebacks, Copy all / Clear)                    │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -186,25 +193,35 @@ with **⇱** is a frameless window with a thin edge in the theme's colour.
   from the registry. Click a stage or role header for that group's description. Double-click a row to place the node at
   the view centre, or drag it onto the canvas.
 * **Node canvas** — pan by dragging empty space, zoom with the wheel, `Home` fits the graph.
-  The `⛶` button in the top-right (or `Ctrl+Space`) maximises it.
+  The `⛶` button in the top-right (or `Ctrl+Space`) maximises it; the button beside it **fits
+  the view to the nodes**, as `Home` does.
+* **Normal | Troubleshooting** — the switch at the right end of the menu bar: which mode the
+  pulls run in, always in sight. *Troubleshooting* (lit amber) is
+  [troubleshooting mode](#troubleshooting-mode-analyse-the-frames-you-pick--f9), the same as
+  `F9`; *Normal* runs the whole series.
 * **Viewer** — the pulled node's image. See [§7](#7-the-viewer).
+* **Playback / Channels** — the active Viewer's M / T / Z strips and play buttons, and its
+  channel toggles, histograms and LUT tools, each a panel of its own. See [§7](#7-the-viewer).
 * **Properties (Inspector)** — the selected node's parameters. See [§8](#8-the-inspector--parameters-units-autopinned).
 * **Spreadsheet** — the pulled node's structure tables (Label / Point / Track / Mesh).
 * **Console** — a selectable log; every failed pull lands here with its **full traceback**
   and a *Copy all* button. This is where you look when a node goes red.
 * **Status bar** — a pulsing LED (idle / busy / error) plus the current node and timing.
 
-**Panels** (V4.00). Every panel — the Viewers, Nodes, Properties, Spreadsheet, LabLink,
-Console, Movie Editor — has its own title bar: **⇱** pops it out into its own window (double-clicking
+**Panels** (V4.00). Every panel — the Viewers, Playback, Channels, Pages, Nodes, Properties,
+Spreadsheet, LabLink, Console, Movie Editor — has its own title bar: **⇱** pops it out into its own window (double-clicking
 the title does the same), **⇲** docks it back, **✕** closes it, and **View ▸ Panels** brings
 a closed one back where it was. Drag a panel by its title to another edge, or onto another
-panel's title to tab them together. The arrangement — what is where, what floats, what is
+panel's title to tab them together — a group of tabbed panels carries its **tabs along the
+top**. The arrangement — what is where, what floats, what is
 closed, and the window size — is remembered between sessions in
 `~/.nd2studios/layout.json`; **View ▸ Reset layout** puts everything back as a fresh install
 has it. A layout file that is damaged, or was written by another version of the layout format
 — an older build's, too: V4.00 changed the default layout — is set aside as
 `layout.json.rejected` once (the app opens on the default layout, says so in the status bar
-and writes a fresh one on quit);
+and writes a fresh one on quit). A panel your saved layout has never heard of — one a newer
+build added, like Playback and Channels — opens in its default place and the rest of your
+arrangement stays;
 `NODELAB_LAYOUT=0` turns the memory off, and `NODELAB_LAYOUT_FILE` points it at another file.
 
 **Pages** (V4.00). A file holds several node graphs — **pages** — each of a kind: **Image
@@ -214,9 +231,16 @@ from before V4 opens as one Free page). **File → New holds the four standard p
 each kind in that order, Image Input active. The button in a canvas's top-left corner is the
 **page switcher**: it names the page shown and lists every page by kind; its menu adds a page
 of any kind, duplicates, renames or deletes one, or opens it in a new canvas. **Keeping track
-of pages:** every canvas has a **tab per page** along its top edge — click one to show that
-page, drag it to reorder the pages, double-click to rename, right-click for the same menu, **+**
-for *New page…*; the **Pages** panel lists them grouped by kind in pipeline order, each with
+of pages:** every canvas has **two rows of tabs** along its top edge. The top row has a tab per
+page **kind** in pipeline order (*Image Input · Image Refinement · Image Processing · Analysis*,
+then *Free*), with a count when a kind holds several pages; click one to show that kind's
+page. The row under it has the **pages of the kind shown** — click one to show it, drag to
+reorder those pages, double-click to rename, right-click for the same menu, **+** for *New
+page…* of that kind, and **✕ to close the tab**. Closing a tab **keeps the page**: it leaves the
+tab row and nothing else — the Pages panel still lists it (in italics, *tab closed*), and
+clicking it there, or the kind's tab when every page of that kind is closed, shows the page and
+brings its tab back (the page menu has *Close tab* too; the last open tab has no ✕). The
+**Pages** panel lists every page grouped by kind in pipeline order, each with
 what its Page Inputs **read** and which Outputs it **publishes** (a master page carries ★, a
 linked one names its master) — click to show, double-click to rename, right-click for the
 menu. A new page is placed after the last page of its kind (or an earlier one), so the pages
@@ -734,7 +758,8 @@ nothing recomputes.
 ### Troubleshooting mode: analyse the frames you pick — `F9`
 
 Tuning a threshold on a 200-frame acquisition should not cost 200 frames of segmentation.
-Press **`F9`** (**Run → Troubleshoot: picked frames only**) and every pull is evaluated over
+Press **`F9`** (**Run → Troubleshoot: picked frames only**, or pick **Troubleshooting** on the
+**Normal | Troubleshooting** switch at the right end of the menu bar) and every pull is evaluated over
 **just what the Viewer's M/T/Z strips scope to** — the boxes you have *picked*, or the
 single frame the cursor is on if you have picked nothing.
 
@@ -1092,11 +1117,21 @@ The cards simply leave `queued`/`running` and the slot moves on.
 
 ## 7. The Viewer
 
-The Viewer renders the pulled Dataset as a **multi-channel colour composite**. There is no
-title bar — the image fills the top; all controls sit in one strip beneath it, and the
-viewed node's name is folded into the status line at the bottom. Several Viewers can be open
-at once, each a panel of its own ([§2](#2-the-window)); two results side by side with one shared
-cursor is [Compare](#two-results-side-by-side--compare-v228).
+The Viewer renders the pulled Dataset as a **multi-channel colour composite**. The image
+fills the panel, with the hover readout and the status line (the viewed node's name, its size,
+the pull time) under it. Several Viewers can be open at once, each a panel of its own
+([§2](#2-the-window)); two results side by side with one shared cursor is
+[Compare](#two-results-side-by-side--compare-v228).
+
+**Its controls are two panels of their own** (V4.00 step 11d): **Playback** — the M / T / Z
+strips with their play buttons ([Navigation](#navigation)) — under the Viewer, and
+**Channels** — *Auto*, *Fit*, *Split*, *Overlays* over one column per channel ([Channels and
+contrast](#channels-and-contrast)) — beside Playback. Dock, tab, float or close them like any
+panel (**View ▸ Panels** brings one back). There is one of each however many Viewers are open:
+they show the **active** Viewer's controls (click a Viewer to make it the active one) and name
+it once several are open — a linked Compare viewer shows its leader's strips, which move both.
+The channel columns sit side by side while they fit and **wrap onto further rows** when the
+Channels panel is narrow, so a panel docked down a side edge stacks them.
 
 ### Navigation
 
@@ -1296,7 +1331,9 @@ closes its Viewer — a Viewer still showing a node that is gone would be a lie.
 `Ctrl+Space` (or the `⛶` button, or **View → Maximize node canvas**) hides the docked Viewers,
 so the graph gets the whole centre, and re-homes **the active Viewer itself** (not a copy) into
 a mini-map HUD pinned to the canvas's top-left corner — channels, LUT, playback and overlays
-all carry across. A Viewer you popped out into its own window stays where it is. While
+all carry across: its Playback and Channels controls ride inside the mini-map, compact, and the
+docked Playback and Channels panels step aside until the Viewer goes back. A Viewer you popped
+out into its own window stays where it is. While
 maximised, **clicking any node previews it live** (debounced, so marquee-selecting a chain is
 one pull), and the previewed card wears an accent spine. Drag the mini-map header to move it
 (it re-anchors to the nearest corner), drag the bottom-right grip to resize, and double-click
@@ -2321,11 +2358,11 @@ print(report.summary(), report.removed, report.added)
 | `F8` | **Compare selected beside viewed** — a Compare Viewer docked beside the active one; one cursor when the M/T/Z match |
 | `Shift+F8` | Close the Compare Viewer |
 | `F6` | **Bake selected dock** — freeze everything above a Dock Data node to disk |
-| `F9` | **Troubleshoot: picked frames only** — scope every pull to the picked M/T/Z boxes (or the viewed frame); drag the amber box on the Viewer to scope it to a region of the frame too |
+| `F9` | **Troubleshoot: picked frames only** (the menu bar's *Normal \| Troubleshooting* switch shows and sets it) — scope every pull to the picked M/T/Z boxes (or the viewed frame); drag the amber box on the Viewer to scope it to a region of the frame too |
 | `Ctrl+R` | **Reload node code** — run the node/kernel files as they are on disk now, without restarting |
 | `Ctrl+J` | Frame selection |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / Ungroup selection |
-| `Home` | Fit graph |
+| `Home` | Fit graph (the button beside the canvas's `⛶` does the same) |
 | `Ctrl+Space` | Maximize node canvas (`Esc` to leave) |
 | `Ctrl+Shift+O` | Overlays… |
 
@@ -2479,7 +2516,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | **Split Positions** | `util.split_positions` | one `Image` in; `out` (the whole set) plus one synthetic output **per stage position** (`pos0…`, labelled `K · <point name>` — the acquisition's point names when the file carries them, else `mK` — with the specimen group key appended when known), shown once the wire carries two or more positions | The **M-axis twin of Split Channels**: drop it after a multipoint Load (or after a Timeseries Builder that laid files onto M) to run a different branch per well, dish or field, or to put each position on its own Viewer. A pure pass-through: each wired `posK` is materialized at run time into a **Select Position** tap carrying that index, shared by every branch leaving the socket, so four consumers of one position cost one tap and one memo entry. The socket means "the (K+1)-th position of whatever is wired", exactly as `chK` means the channel — rewire onto a smaller file and the tap refuses with the positions listed |
 | **Select Position** | `util.select_position` | `Position` (0-based index or the acquisition's point name); empty ⇒ pass everything | Keep **one** stage position: M narrows to 1 and everything indexed by it follows — stage coordinates and `origin_um`, per-position masks, labels and measurement rows (filtered and renumbered). The tap Split Positions' outputs become, and usable on its own. A value that names no position is refused with the real positions listed, never silently replaced by another; a single-position input passes through unchanged. Lazy (no pixels copied), `TILEABLE`; the stamp `m:select_position[K]` records which position so two selections compare |
 | **Page Output** | `page.output` | `Data` in; `Name` (the variable a later page picks this by); `Condition` (blank = the page's own name, unless a condition was TYPED on an Output further upstream, which a blank one keeps); `out` | V4.00: names the Dataset wired in as a **variable of its page**, for a Page Input on a later page. A pass-through — the only thing it adds is a `condition` label in the metadata, which Table Concat writes as a column; pulling it previews exactly what the next page receives. The name is presentation: renaming re-runs nothing. Two Outputs on one page with the same name are flagged in the Ready-to-run block |
-| **Page Input** | `page.input` | `Source` (`<page> · <name>` from the menu — pages of an earlier kind, or Free pages; stored as `<page id>:<name>`); `out` | V4.00: start a page from a named output of an earlier page. At edit time it carries the upstream output's envelope (axes, calibration, layers), so every derived default on the page is right before a pull; at run time the upstream page is spliced in and the node disappears, so a result the upstream page already computed is a memo hit rather than a recomputation. The panel marks it **unbound** (red) when its source names nothing an earlier page offers; pulled unbound, it refuses with "Page Input is not bound to an upstream Output" |
+| **Page Input** | `page.input` | `Source` (`<page> · <name>` from the menu — pages of an earlier kind, or Free pages; stored as `<page id>:<name>`); `out`, and one output **per channel** (`0 · GFP`, `1 · R-B`, …) as on the Load card | V4.00: start a page from a named output of an earlier page. `out` carries every channel — every node on the page works on all of them; a channel output (step 11d) carries that one channel, named as on the Load card the data came from, through any number of pages. At edit time it carries the upstream output's envelope (axes, calibration, layers), so every derived default on the page is right before a pull; at run time the upstream page is spliced in and the node disappears, so a result the upstream page already computed is a memo hit rather than a recomputation. The panel marks it **unbound** (red) when its source names nothing an earlier page offers; pulled unbound, it refuses with "Page Input is not bound to an upstream Output" |
 | Resample | `util.resample` | `scale_xy`, `scale_z` | pixel size scales inversely; lever |
 | Stack (T→1) | `util.stack` | method `mean/median/sigma_clip/trimmed_mean/max/sum` | SNR stacking; drops `dt_s`; `sum` widens `bit_depth` |
 | Stitch (M→1) | `util.stitch` | layout `stage/stage+refine/grid`, blend `feather/max/mean/overwrite`, `flip_x`/`flip_y`, `refine_*`, `grid_cols` | M→1 mosaic from the file's stage log; Y/X **grow to an extent the header reports UNKNOWN** (it depends on the position log, which rides the payload); one canvas plane streamed at a time; refuses a missing/short stage log, an M axis of repeat visits, and any Dataset carrying a structure table |
@@ -3463,7 +3500,11 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **I loaded an image and the canvas jumped to another page** | By design (V4.00): a loaded image always lands on the **Image Input** page — the canvas switches there — and is published as a Page Output named after the file. Go back to the page you were on: a new downstream page starts with a Page Input reading it, and an existing empty page gets one the first time you open it |
 | **A Refinement page is empty and I cannot get the image into it** | Load the image first (it is published on Image Input), then open the page — it gets a bound Page Input; or place a Page Input from the palette's **Pages** band, which binds to the nearest named Output. Nothing to bind to yet? *Go to Image Input* under its Source menu |
 | **The start card covers my page / will not go away** | Its **✕** (top right) or *Start empty* hides it for that page; File → New brings the cards back. On a Refinement, Processing or Analysis page it is a banner along the bottom edge, below the page's Page Input |
-| **I lose track of my pages** | Use the **tabs** along the top of the canvas (one per page, drag to reorder) and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, with what it reads and publishes |
+| **I lose track of my pages** | Use the **tabs** along the top of the canvas — a row of page kinds, and under it the pages of the kind shown (drag to reorder, ✕ to close a tab you do not need on screen) — and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, with what it reads and publishes |
+| **I closed a page tab and the page is gone** | It is not: closing a tab keeps the page. It is in the **Pages** panel (*tab closed*, in italics) — click it to show it and bring its tab back; or click its kind's tab when every page of that kind is closed |
+| **NodeLab closes by itself right after starting** (the terminal shows nothing, or only *Could not parse stylesheet of object QLabel*) | Fixed in V4.00 step 11d. Restoring a panel layout saved by an earlier build — one without the Playback and Channels panels — crashed inside Qt on Windows; the new panels are now placed after the rest of the layout is restored. The stylesheet line was a separate, harmless warning from a label on the LabLink tab, also fixed. If a launch still closes, run `.venv\Scripts\python.exe -X faulthandler run.py` and send the trace it prints |
+| **The Viewer's M/T/Z strips or the histograms are gone** | Since V4.00 step 11d they are panels of their own — **Playback** and **Channels** — under the Viewer by default. A closed one comes back from View ▸ Panels; View ▸ Reset layout puts both back under the Viewer |
+| **A refinement node seems to work on the first channel only** | Every refinement node works on every channel of the Dataset wired into it, through a Page Input too (tested on every common refinement node). Check what is wired: a Load card's or a Page Input's **channel outputs** (`0 · GFP`, …) carry ONE channel; `image` / `out` carries all of them. Check the **Channels** panel too: a channel switched off there is left out of the composite |
 | **A popped-out panel had a white border, or light bars under the Viewer** | Fixed in V4.00 (the dock's frame and the panel bodies paint the theme now). If a light edge ever shows again: View ▸ Reset layout, and report which panel |
 | **My panel layout reset itself after updating** | Once, by design: V4.00 changed the default layout (the Viewer is visible from the start), so a layout file saved by an older build is set aside as `layout.json.rejected` and the new default applies; arrange the panels again and they are remembered from then on |
 | **Adding, deleting or wiring a node is refused: "this page is linked to its master"** | the page is a linked copy and its graph follows the master. Make the change on the master (every linked page follows), or *Make unique* in the page switcher |

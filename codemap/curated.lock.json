@@ -134,6 +134,7 @@
    "sym:nodelab_v2.workspace.Workspace": "e2b4360003ef3d619631e8bd0a633d3f",
    "sym:nodelab_v2.workspace.Workspace.compose": "12d1f3e3036cef7a9e8d0ea9f5cd917e",
    "sym:nodelab_v2.workspace.Workspace.default_source": "e9c0c81f73682d061d73d245baed0507",
+   "sym:nodelab_v2.workspace.Workspace.input_channels": "9d4f119e13f7478b6ada7eb5534834f7",
    "sym:nodelab_v2.workspace.Workspace.node_defaults": "3ea79eea448cd6880994cde08df6a326"
   },
   "blessed": "2026-10-06",
@@ -161,6 +162,8 @@
    "sym:nodelab_v2.layout_store.load_layout": "2d9bf2042b19c91bcb222708fe9287ad",
    "sym:nodelab_v2.shell.DockShell": "133a342d1f8a3391b2398f98b13ba846",
    "sym:nodelab_v2.shell.PanelDock.paintEvent": "9cb762539f3786fa2daa4f71729736c7",
+   "sym:nodelab_v2.viewer.ViewerPanel.detach_controls": "9496b92f94536b2a2f05dc7d0cea8139",
+   "sym:nodelab_v2.viewer_controls.ViewerControlsPanel": "f7711c370dbc77d6512023d1d9d5e16c",
    "sym:nodelab_v2.window.MainWindow._apply_default_sizes": "36f1f85979460272e8c399182ebedb61"
   },
   "blessed": "2026-10-06",

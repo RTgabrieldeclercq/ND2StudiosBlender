@@ -594,6 +594,7 @@ class Workspace:
         doc.store_tag = pid
         doc.page_sources = lambda pid=pid: self.available_sources(pid)
         doc.page_feeders = lambda pid=pid: self.feeder_pages(pid)
+        doc.page_channels = lambda nid, pid=pid: self.input_channels(pid, nid)
         doc.node_defaults = lambda op, pid=pid: self.node_defaults(pid, op)
         doc.cross_page_signature = lambda nid, pid=pid: self.cross_page_signature(pid, nid)
         doc.workspace_revision = lambda pid=pid: self.revision_of(pid)
@@ -624,6 +625,7 @@ class Workspace:
             doc.detach()
         doc.page_sources = lambda: []
         doc.page_feeders = lambda: []
+        doc.page_channels = lambda _nid: []
         doc.node_defaults = lambda _op: {}
         doc.cross_page_signature = lambda _nid: ""
         doc.workspace_revision = lambda: ""
@@ -1009,6 +1011,22 @@ class Workspace:
             except Exception:                        # noqa: BLE001 — mid-edit
                 parts.append((inp, up_pid, None))
         return digest("cross-page-sig", parts)
+
+    def input_channels(self, page_id: str, node_id: str) -> List[dict]:
+        """The channel descriptors (``[{name, emission_nm, color}, ...]``) of what the Page
+        Input ``node_id`` on ``page_id`` reads: its upstream Output's, as that page's
+        document resolves them — the Load card's captured names and colours, through any
+        chain of pages (acyclic: :meth:`resolve_source` only reads earlier pages). ``[]`` while the
+        Input is unbound (V4.00 step 11d)."""
+        page = self.pages.get(page_id)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None or rec.op_key != PAGE_INPUT_OP:
+            return []
+        res = self.resolve_source(page_id, rec.params.get(PAGE_SOURCE_KEY))
+        if res is None:
+            return []
+        up, out_nid = res
+        return list(self.pages[up].doc.channel_descriptors(out_nid))
 
     def _input_seeds(self, page_id: str) -> Dict[str, MetaEnvelope]:
         """The seed hook: each resolved ``page.input`` of a page → its upstream Output's

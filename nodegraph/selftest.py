@@ -27168,6 +27168,125 @@ def test_page_order_and_summary() -> None:
         "page reads (unbound marked) and publishes")
 
 
+def _split_channel_fixture(textured: bool = False):
+    """Input ``L (2 channels, 3 positions) → Split Positions → pos1 → O "wellB"`` on pg1,
+    and an empty Refinement page pg2 — the user's report (2026-10-06) as a fixture. The
+    Load card carries captured channel descriptors (``__channels__``), as a file opened in
+    the app does. ``textured`` adds a deterministic fine texture, so an edge-preserving
+    filter has something to smooth too. Returns ``(ws, seed Dataset, the raw array)``."""
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    ax = AxisSizes(m=3, t=1, z=1, c=2, y=32, x=32)
+    md = {"pixel_size_um": 0.5}
+    arr = np.full((3, 1, 1, 2, 32, 32), 10.0, np.float32)
+    for m in range(3):
+        arr[m, 0, 0, 0, 8:20, 8:20] = 100.0 * (m + 1)
+        arr[m, 0, 0, 1, 14:26, 4:12] = 60.0 * (m + 1)
+    if textured:
+        yy, xx = np.mgrid[0:32, 0:32]
+        arr += ((yy * 7 + xx * 3) % 11).astype(np.float32)
+    ds = Dataset(axes=ax, metadata=md).with_image(ArrayProvider(arr))
+    ws = Workspace()
+    I = ws.add_page("Input", "input")
+    ws.add_page("Refine", "refine")
+    I.doc.add_node("io.load", node_id="L", params={"__channels__": [
+        {"name": "DAPI", "emission_nm": 461, "color": None},
+        {"name": "GFP", "emission_nm": 510, "color": None}]})
+    I.doc.meta_seeds["L"] = MetaEnvelope(axes=ax, metadata=md)
+    I.doc.add_node("util.split_positions", node_id="S")
+    I.doc.add_node("page.output", node_id="O", params={"name": "wellB"})
+    I.doc.connect("L", "image", "S", "data")
+    I.doc.repropagate()
+    I.doc.connect("S", "pos1", "O", "data")
+    return ws, ds, arr
+
+
+def test_page_input_channel_taps() -> None:
+    """A Page Input offers one output per channel, exactly as the Load card it reads from
+    does (V4.00 step 11d — "on the page input, the channels should also be options just as
+    if it was the original IO node"): named after the file's channels through every page
+    boundary, materialized into a ``channel.select`` tap that the composer splices onto the
+    upstream Output; an unbound Input offers none."""
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    ws, ds, arr = _split_channel_fixture()
+    R = ws.pages["pg2"]
+    R.doc.add_node("page.input", node_id="IN", params={"source": "pg1:wellB"})
+    R.doc.repropagate()
+    outs = [(s.name, s.label) for s in R.doc.output_specs("IN")]
+    assert outs == [("out", ""), ("ch0", "0 · DAPI"), ("ch1", "1 · GFP")], outs
+    R.doc.add_node("enhance.gaussian", node_id="G1", params={"sigma": 1.0},
+                   modes={"dim": "2D"})
+    R.doc.add_node("enhance.gaussian", node_id="GA", params={"sigma": 1.0},
+                   modes={"dim": "2D"})
+    R.doc.connect("IN", "ch1", "G1", "data")
+    R.doc.connect("IN", "out", "GA", "data")
+    R.doc.add_node("page.output", node_id="O", params={"name": "smooth"})
+    R.doc.connect("GA", "out", "O", "data")
+    # the full image keeps the file's names downstream of the Input
+    assert [d["name"] for d in R.doc.channel_descriptors("GA")] == ["DAPI", "GFP"]
+    # ...and across a second boundary
+    P = ws.add_page("Proc", "process")
+    P.doc.add_node("page.input", node_id="IN", params={"source": "pg2:smooth"})
+    P.doc.repropagate()
+    assert [s.label for s in P.doc.output_specs("IN")][1:] == ["0 · DAPI", "1 · GFP"]
+    # unbound: no channel sockets (nothing to name, nothing to count). An explicit blank
+    # source — a new Page Input is otherwise bound by the Workspace's node defaults
+    P.doc.add_node("page.input", node_id="UN", params={"source": ""})
+    assert [s.name for s in P.doc.output_specs("UN")] == ["out"]
+    comp = ws.compose("pg2")
+    assert "pg2/__tap__IN__c1" in comp.graph.nodes and "pg2/IN" not in comp.graph.nodes
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    one = eng.pull("pg2/G1")
+    assert one.axes.c == 1 and one.axes.m == 1, one.axes
+    got = one.image.read_region(0, 0, 0, 0, 0, 0, 32, 0, 32)
+    assert abs(float(got.sum()) - float(arr[1, 0, 0, 1].sum())) < 1e-3, \
+        "ch1 of the second position, blurred (a Gaussian keeps the sum)"
+    _ok("Page Input channel taps: one output per channel named after the file's channels "
+        "through two page boundaries; ch1 materializes as a channel.select tap spliced onto "
+        "the upstream Output and pulls exactly channel 1 of the split position")
+
+
+#: Refinement nodes checked by `test_refine_ops_all_channels`: the common image filters,
+#: each fast on a 32 px plane. (The full Refinement palette was swept by hand on 2026-10-06
+#: — every node that runs on this fixture changes every channel.)
+_ALL_CHANNEL_OPS = ("enhance.gaussian", "enhance.median", "enhance.unsharp", "enhance.dog",
+                    "enhance.tophat", "enhance.subtract_background", "enhance.clahe",
+                    "enhance.normalize", "enhance.bilateral", "enhance.tv_denoise",
+                    "enhance.morphology")
+
+
+def test_refine_ops_all_channels() -> None:
+    """The user's report (2026-10-06): "when I pass image data into the image refinement
+    from a split positions node, the image refinement is only working on the first
+    channel". It does not: through Split Positions → a Page Output → a Page Input, every
+    common refinement node changes BOTH channels of the position read — a node that
+    touched one channel and passed the other through would fail here."""
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    ran = 0
+    for op in _ALL_CHANNEL_OPS:
+        ws, ds, arr = _split_channel_fixture(textured=True)
+        R = ws.pages["pg2"]
+        R.doc.add_node("page.input", node_id="IN", params={"source": "pg1:wellB"})
+        R.doc.add_node(op, node_id="X")
+        R.doc.connect("IN", "out", "X", "data")
+        comp = ws.compose("pg2")
+        eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds},
+                                  meta_seeds=comp.meta_seeds, memo=Memo())
+        out = eng.pull("pg2/X")
+        assert out.axes.c == 2 and out.axes.m == 1, (op, out.axes)
+        changed = [not np.allclose(out.image.read_region(0, 0, 0, 0, c, 0, 32, 0, 32),
+                                   arr[1, 0, 0, c]) for c in range(2)]
+        assert changed == [True, True], (op, "changed per channel", changed)
+        ran += 1
+    _ok(f"refinement on every channel: {ran} refinement nodes, each reading a split position "
+        f"through a Page Input, change both channels — none works on the first one only")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -27346,6 +27465,8 @@ def main() -> int:
     test_page_recipe_roundtrip()
     test_page_master_flag()
     test_page_order_and_summary()
+    test_page_input_channel_taps()
+    test_refine_ops_all_channels()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

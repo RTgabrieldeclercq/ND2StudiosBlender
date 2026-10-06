@@ -47,7 +47,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform)
 from PySide6.QtWidgets import (
@@ -609,7 +609,9 @@ class HistogramLUT(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumHeight(56)
-        self.setMinimumWidth(160)
+        # 100 since V4.00 step 11d (was 160): four channels side by side fit a Channels
+        # panel ~430 px wide, and the columns wrap (ChannelColumns) when even that is too much
+        self.setMinimumWidth(100)
         self.setCursor(Qt.SizeHorCursor)
         self.setToolTip("Drag the handles to set the LUT · drag the middle dot up/down "
                         "for gamma · wheel to zoom · double-click to reset the zoom")
@@ -929,6 +931,116 @@ def _short(node_id) -> str:
     return s.split("/", 1)[1] if "/" in s else s
 
 
+class ChannelColumns(QWidget):
+    """The per-channel LUT columns — each channel's toggle over its histogram over its
+    black/white point — side by side while they fit, and WRAPPED onto further rows when they
+    do not (V4.00 step 11d): docked in a narrow panel, four channels stack two by two or
+    one under another instead of being squeezed below a usable histogram width.
+
+    The same ``addWidget(widget, stretch)`` call the ``QHBoxLayout`` it replaces took, so
+    :meth:`ViewerPanel._rebuild_channels` builds its columns unchanged; a column taken out
+    with ``setParent(None)`` simply drops out of the next reflow."""
+
+    #: a column narrower than this cannot show a usable histogram (HistogramLUT's minimum)
+    MIN_COL_W = 100
+
+    def __init__(self, min_col_w: int = MIN_COL_W, spacing: int = 8) -> None:
+        super().__init__()
+        #: the narrowest a column may get before the next one wraps — the histogram's
+        #: minimum for the channel columns; a button's width for the tool row above them
+        self.min_col_w = int(min_col_w)
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(spacing)
+        self._grid.setVerticalSpacing(6)
+        self._cols: List[QWidget] = []
+        self._ncols = 0
+
+    def addWidget(self, w: QWidget, stretch: int = 1) -> None:   # noqa: N802 — Qt-style
+        w.setParent(self)
+        self._cols.append(w)
+        self._reflow(force=True)
+
+    def columns(self) -> List[QWidget]:
+        """The live columns, in channel order (one hidden by hand takes no place)."""
+        live = []
+        for w in self._cols:
+            try:
+                if w.parentWidget() is self:
+                    live.append(w)
+            except RuntimeError:            # deleted under us (a rebuild's deleteLater)
+                pass
+        self._cols = live
+        # hidden BY HAND (compact mode's buttons) — a widget just reparented here also reads
+        # as hidden until the layout shows it, and that one does take a cell
+        return [w for w in live
+                if not (w.isHidden() and w.testAttribute(Qt.WA_WState_ExplicitShowHide))]
+
+    def per_row(self) -> int:
+        """How many columns fit side by side at the current width (at least one).
+
+        Inside a scroll area (the Channels panel) the answer must not depend on the
+        scrollbar it causes: two rows bring a vertical scrollbar, the scrollbar takes width,
+        and the narrower width keeps two rows — a stable but wrong state when one row would
+        have fitted without it. So when the bar is showing, the width WITHOUT it is tried
+        too, and kept if the rows it gives fit the visible height (the bar then goes)."""
+        cols = self.columns()
+        if not cols:
+            return 0
+        sp = self._grid.horizontalSpacing()
+
+        def fit(width: int) -> int:
+            return min(len(cols), max(1, (max(1, width) + sp) // (self.min_col_w + sp)))
+
+        n = fit(self.width())
+        sa = self._scroll_area()
+        bar = sa.verticalScrollBar() if sa is not None else None
+        if bar is not None and bar.isVisible() and sa.widget() is not None:
+            wide = fit(self.width() + bar.width())
+            if wide > n:
+                row_h = max(c.minimumSizeHint().height() for c in cols)
+                fewer = -(-len(cols) // n) - -(-len(cols) // wide)
+                need = (sa.widget().minimumSizeHint().height()
+                        - fewer * (row_h + self._grid.verticalSpacing()))
+                if need <= sa.viewport().height():
+                    n = wide
+        return n
+
+    def _scroll_area(self):
+        from PySide6.QtWidgets import QScrollArea
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, QScrollArea):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def _reflow(self, force: bool = False) -> None:
+        cols = self.columns()
+        n = self.per_row()
+        if not force and n == self._ncols:
+            return
+        self._ncols = n
+        for w in self._cols:                 # the hidden ones too: they take no cell
+            self._grid.removeWidget(w)
+        for c in range(self._grid.columnCount()):
+            self._grid.setColumnStretch(c, 0)
+        for i, w in enumerate(cols):
+            self._grid.addWidget(w, i // max(1, n), i % max(1, n))
+        for c in range(max(1, n)):
+            self._grid.setColumnStretch(c, 1)
+
+    def minimumSizeHint(self):                        # noqa: N802 — Qt override
+        # one column wide: the panel may be made as narrow as one histogram; the rows it
+        # then needs are this widget's height for that width, which the reflow provides
+        hint = super().minimumSizeHint()
+        return QSize(min(hint.width(), self.min_col_w), hint.height())
+
+    def resizeEvent(self, event) -> None:            # noqa: N802 — Qt override
+        super().resizeEvent(event)
+        self._reflow()
+
+
 class ViewerPanel(QWidget):
     """Shows the viewed node's colour composite; emits ``request_changed`` when the
     coords (m,t,z) or the active channel set move, so the window re-pulls.
@@ -1066,6 +1178,24 @@ class ViewerPanel(QWidget):
         cv = QVBoxLayout(controls)
         cv.setContentsMargins(0, 2, 0, 0)
         cv.setSpacing(1)
+        # Two SECTIONS (V4.00 step 11d): PLAYBACK — the M/T/Z cursor and play buttons, the
+        # overlay source strip, the iteration strip — and CHANNELS — the display tools over
+        # one column per channel. Under the image by default; the window hands both to panels
+        # of their own (`detach_controls`, nodelab_v2.viewer_controls), so the user can put
+        # them anywhere. Every control below is built exactly as before, inside its section.
+        self._detached = False
+        self.axes_section = QWidget()
+        self.axes_section.setObjectName("viewerPlayback")
+        self._axes_lay = QVBoxLayout(self.axes_section)
+        self._axes_lay.setContentsMargins(0, 0, 0, 0)
+        self._axes_lay.setSpacing(1)
+        self.channel_section = QWidget()
+        self.channel_section.setObjectName("viewerChannels")
+        self._chan_lay = QVBoxLayout(self.channel_section)
+        self._chan_lay.setContentsMargins(0, 0, 0, 0)
+        self._chan_lay.setSpacing(1)
+        cv.addWidget(self.axes_section)
+        cv.addWidget(self.channel_section)
 
         # One box per frame (nodelab_v2.framestrip) rather than a groove: the row doubles
         # as the run-scope picker, and M/T picks are what the troubleshooting scope runs.
@@ -1121,7 +1251,7 @@ class ViewerPanel(QWidget):
         # layout is not a thing Qt can do.
         self._axes_box = QWidget()
         self._axes_box.setLayout(grid)
-        cv.addWidget(self._axes_box)
+        self._axes_lay.addWidget(self._axes_box)
 
         # ── the overlay SOURCE strip (2026-09-30) ──────────────────────────────────
         # One row per overlaid file: its label, the frame and plane it is showing right now,
@@ -1139,7 +1269,7 @@ class ViewerPanel(QWidget):
         self._src_lay.setContentsMargins(0, 0, 0, 0)
         self._src_lay.setSpacing(0)
         self._src_box.hide()
-        cv.addWidget(self._src_box)
+        self._axes_lay.addWidget(self._src_box)
 
         # ── the ITERATION strip (V2.19) ─────────────────────────────────────────
         # Deliberately NOT a fourth member of `_AXES`: iteration is not an acquisition
@@ -1165,12 +1295,10 @@ class ViewerPanel(QWidget):
         irow.addWidget(self._iter_lbl)
         self._iter_row.setVisible(False)
         self._iter_values: List[str] = []
-        cv.addWidget(self._iter_row)
+        self._axes_lay.addWidget(self._iter_row)
+        self._axes_lay.addStretch(1)
 
         # ── display tools: per-frame Auto contrast, Fit-zoom, overlay toggles ────
-        tools = QHBoxLayout()
-        tools.setSpacing(6)
-        tools.setContentsMargins(0, 0, 0, 0)
         self._lut_auto = QPushButton("Auto")
         self._lut_auto.setCheckable(True)
         self._lut_auto.setCursor(Qt.PointingHandCursor)
@@ -1188,10 +1316,13 @@ class ViewerPanel(QWidget):
             "Split-channel view (NIS Elements style) — one pane per active channel plus "
             "the composite, all sharing the zoom/pan. Needs 2+ active channels.")
         self._split_btn.toggled.connect(self._on_split_toggled)
+        # (a wrapping row since V4.00 step 11d: in a narrow Channels panel the four buttons
+        # go two by two, so the panel — and the channel columns under them — can be made
+        # as narrow as one histogram)
+        tools = ChannelColumns(min_col_w=78, spacing=6)
         tools.addWidget(self._lut_auto)
         tools.addWidget(self._lut_fit)
         tools.addWidget(self._split_btn)
-        tools.addStretch(1)
         # ONE overlay control: the popup owns every domain's look (and its on/off), so the
         # strip no longer grows a checkbox per domain as domains are added.
         self._ovl_btn = QPushButton(_OVL_LABEL[0])
@@ -1200,18 +1331,15 @@ class ViewerPanel(QWidget):
                                  "Voxel) overlays — size, opacity, look, colour")
         self._ovl_btn.clicked.connect(self.open_overlay_dialog)
         tools.addWidget(self._ovl_btn)
-        self._tools_row = QWidget()
-        self._tools_row.setLayout(tools)
-        cv.addWidget(self._tools_row)
+        self._tools_row = tools
+        self._chan_lay.addWidget(self._tools_row)
 
-        # ── per-channel LUT strip: each channel's toggle over its own histogram,
-        #    all channels side by side (built in _rebuild_channels). ──────────────
-        self._lut_strip = QHBoxLayout()
-        self._lut_strip.setSpacing(8)
-        self._lut_strip.setContentsMargins(0, 0, 0, 0)
-        self._lut_strip_w = QWidget()
-        self._lut_strip_w.setLayout(self._lut_strip)
-        cv.addWidget(self._lut_strip_w)
+        # ── per-channel LUT strip: each channel's toggle over its own histogram, side
+        #    by side while they fit and wrapped onto more rows when not (built in
+        #    _rebuild_channels; V4.00 step 11d: ChannelColumns). ─────────────────────
+        self._lut_strip_w = ChannelColumns()
+        self._lut_strip = self._lut_strip_w
+        self._chan_lay.addWidget(self._lut_strip_w, 1)
         v.addWidget(controls)
 
         self._chan_btns: Dict[int, QPushButton] = {}
@@ -1487,6 +1615,16 @@ class ViewerPanel(QWidget):
         if on == self._compact and not force:
             return
         self._compact = on
+        # the mini-map has one status line's worth of room, and it is spoken for
+        self._hover_lbl.setVisible(not on)
+        lay = self.layout()
+        lay.setContentsMargins(*((3, 2, 3, 2) if on else (6, 6, 6, 4)))
+        lay.setSpacing(2 if on else 4)
+        self._apply_image_minimum()
+        if self._detached:
+            # the controls live in their own panels (V4.00 step 11d), which the mini-map
+            # does not shrink: they stay whole, and only the image and status are compact
+            return
         # compact keeps the channel toggles (they head each LUT column) but drops the
         # histograms + the LUT tool buttons + the fps spinners.
         self._lut_auto.setVisible(not on)
@@ -1504,12 +1642,52 @@ class ViewerPanel(QWidget):
         for lbl in self._val_lbls.values():
             lbl.setMinimumWidth(52 if on else 92)
         self._ovl_btn.setText(_OVL_LABEL[1] if on else _OVL_LABEL[0])
-        # the mini-map has one status line's worth of room, and it is spoken for
-        self._hover_lbl.setVisible(not on)
-        lay = self.layout()
-        lay.setContentsMargins(*((3, 2, 3, 2) if on else (6, 6, 6, 4)))
-        lay.setSpacing(2 if on else 4)
-        self._apply_image_minimum()
+        self._tools_row._reflow(force=True)       # the hidden buttons give up their cells
+
+    def detach_controls(self) -> Tuple[QWidget, QWidget]:
+        """Hand the PLAYBACK and CHANNELS sections to panels of their own (V4.00 step 11d):
+        ``(axes_section, channel_section)``, out of this panel's layout and unparented, for
+        the caller to reparent (:class:`nodelab_v2.viewer_controls.ViewerControlsPanel`).
+        They stay this viewer's widgets — every signal, slot and attribute is unchanged —
+        and keep its stylesheet (:meth:`restyle`). Compact (mini-map) mode leaves them whole.
+        Once only: a second call returns the same pair."""
+        if not self._detached:
+            self._detached = True
+            lay = self._controls.layout()
+            for sec in (self.axes_section, self.channel_section):
+                lay.removeWidget(sec)
+                sec.setParent(None)
+            self._controls.hide()
+            self._reapply_section_qss()
+        return self.axes_section, self.channel_section
+
+    def attach_controls(self) -> None:
+        """Take the two sections back under the image — the mini-map (canvas maximized)
+        carries its viewer's controls, compact, as it did before they had panels. The
+        panels hosting them drop them from their stacks as they leave; give them back with
+        :meth:`detach_controls`."""
+        if not self._detached:
+            return
+        self._detached = False
+        lay = self._controls.layout()
+        for sec in (self.axes_section, self.channel_section):
+            sec.setParent(self._controls)
+            lay.addWidget(sec)
+            sec.show()
+        self._controls.show()
+        self._reapply_section_qss()
+
+    @property
+    def controls_detached(self) -> bool:
+        """Do this viewer's controls live in panels of their own (:meth:`detach_controls`)?"""
+        return self._detached
+
+    def _reapply_section_qss(self) -> None:
+        """The sections take the viewer's stylesheet with them: once out of its widget tree,
+        the panel's sheet no longer reaches them."""
+        qss = self.styleSheet()
+        for sec in (self.axes_section, self.channel_section):
+            sec.setStyleSheet(qss if self._detached else "")
 
     def _apply_image_minimum(self) -> None:
         """The image surface's floor. Both backends ship a 200×200 minimum, which alone
@@ -1571,7 +1749,8 @@ class ViewerPanel(QWidget):
             row["z_box"].setVisible(int(r.get("n_z", 1)) > 1)
             row["t_box"].setVisible(int(r.get("n_t", 1)) > 1)
             row["reset"].setVisible(bool(dt or dz))
-        self._src_box.setVisible(bool(self._ovl_frames) and not self._compact)
+        self._src_box.setVisible(bool(self._ovl_frames)
+                                 and (self._detached or not self._compact))
         self._sync_play_tip()
 
     def _rebuild_source_strip(self) -> None:
@@ -3286,7 +3465,7 @@ class ViewerPanel(QWidget):
             self._style_channel_btn(btn, i)
             hst = HistogramLUT()
             hst.set_tint(self._chan_colors.get(i, (120, 170, 255)))
-            hst.setVisible(not self._compact)
+            hst.setVisible(self._detached or not self._compact)
             hst.window_changed.connect(lambda lo, hi, c=i: self._on_lut_window(c, lo, hi))
             hst.gamma_changed.connect(lambda gm, c=i: self._on_lut_gamma(c, gm))
             # editable black/white readouts — click to type an exact value
@@ -3295,7 +3474,7 @@ class ViewerPanel(QWidget):
                 e.setProperty("role", "lutedit")
                 e.setAlignment(Qt.AlignCenter)
                 e.setToolTip(f"{which} — type a value + Enter")
-                e.setVisible(not self._compact)
+                e.setVisible(self._detached or not self._compact)
                 e.editingFinished.connect(lambda c=i: self._on_lut_edit(c))
             erow = QHBoxLayout()
             erow.setContentsMargins(0, 0, 0, 0)
@@ -5392,6 +5571,7 @@ class ViewerPanel(QWidget):
                 background:{T.ACCENT_DIM.name()}; border-color:{T.ACCENT.name()};
                 color:{T.ACCENT.name()}; }}
         """)
+        self._reapply_section_qss()      # a section hosted in its own panel (step 11d)
         # self-painted (elided) → QSS can't reach it. A live "showing the previous result"
         # warning keeps its tint: a theme change must not turn it back into a routine line.
         self._status.set_color(T.ERROR if self._status_error else T.MUTED)
@@ -5404,4 +5584,5 @@ class ViewerPanel(QWidget):
             dlg.restyle()
 
 
-__all__ = ["ViewerPanel", "plane_to_qimage", "composite_to_qimage", "mosaic_with_clim"]
+__all__ = ["ViewerPanel", "ChannelColumns", "plane_to_qimage", "composite_to_qimage",
+           "mosaic_with_clim"]

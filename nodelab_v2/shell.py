@@ -39,7 +39,7 @@ from PySide6.QtCore import QObject, QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QDockWidget, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QScrollArea,
-    QSizePolicy, QToolButton, QWidget)
+    QSizePolicy, QTabWidget, QToolButton, QWidget)
 
 from nodelab_v2 import layout_store as LS
 from nodelab_v2 import theme as T
@@ -68,6 +68,11 @@ class PanelSpec:
     default_hidden: bool = False
     #: the kind this one sits behind as a tab in the default layout
     tabify_with: str = ""
+    #: the kind whose (first) panel this one is split off in the default layout, and the
+    #: direction — ``Qt.Vertical`` puts it under that panel, ``Qt.Horizontal`` beside it
+    #: (V4.00 step 11d: Playback under the Viewer, Channels beside Playback)
+    split_from: str = ""
+    split: Any = Qt.Vertical
     #: the visible tab of its group in the default layout
     raise_default: bool = False
     #: wrap the panel in a scroll area, so its minimum size can never become the window's
@@ -324,6 +329,10 @@ class DockShell(QObject):
         window.setDockNestingEnabled(True)
         window.setDockOptions(QMainWindow.AnimatedDocks | QMainWindow.AllowNestedDocks
                               | QMainWindow.AllowTabbedDocks)
+        # panels grouped as tabs carry their tabs on TOP, like every other tab row in the
+        # app (V4.00 step 11d) — Qt's default for a dock tab group is along the bottom edge,
+        # where the tabs read as a footer of the panel above them rather than its headers
+        window.setTabPosition(Qt.AllDockWidgetAreas, QTabWidget.North)
         # the side columns own all four corners, so a bottom panel sits under the CANVAS
         # rather than under the full-height Properties column (see the Movie Editor note
         # in window.py: spanning the width raised the window's minimum height off-screen),
@@ -496,6 +505,8 @@ class DockShell(QObject):
                     anchor = placed.get(spec.tabify_with)
                     if anchor is not None:
                         self.win.tabifyDockWidget(anchor, d)
+                    elif placed.get(spec.split_from) is not None:
+                        self.win.splitDockWidget(placed[spec.split_from], d, spec.split)
                     placed[spec.kind] = d
                 else:
                     # beside the PREVIOUS instance, so they line up in index order (beside
@@ -511,6 +522,28 @@ class DockShell(QObject):
 
     def reset_layout(self) -> None:
         self.apply_default_layout()
+
+    def place_default(self, dock: PanelDock) -> None:
+        """Put ONE panel where the default layout has it, leaving every other panel where it
+        is — for a panel the saved layout never heard of (one added by a newer build).
+
+        Out of the layout first, then in: re-adding a dock that is still in the window's
+        layout is not safe — after a ``restoreState`` that did not know the dock it is an
+        access violation in Qt on the native platform (2026-10-06, the user's layout from
+        the step-11c build; the offscreen platform survived it, so every probe passed)."""
+        spec = dock.spec
+        self.win.removeDockWidget(dock)
+        self.win.addDockWidget(spec.default_area, dock)
+        if dock.isFloating():           # in the layout now: docking back is the ordinary ⇲
+            dock.setFloating(False)
+        tab = self.dock(LS.dock_name(spec.tabify_with, 0)) if spec.tabify_with else None
+        split = self.dock(LS.dock_name(spec.split_from, 0)) if spec.split_from else None
+        if tab is not None and not tab.isFloating() and not tab.isHidden():
+            self.win.tabifyDockWidget(tab, dock)
+        elif split is not None and not split.isFloating() and not split.isHidden() \
+                and self.win.dockWidgetArea(split) == spec.default_area:
+            self.win.splitDockWidget(split, dock, spec.split)
+        dock.setVisible(not spec.default_hidden)
 
     def layout_record(self) -> Dict[str, Any]:
         """The JSON-able layout of the window right now (:func:`layout_store.make_layout`)."""
@@ -546,11 +579,21 @@ class DockShell(QObject):
             dock = self.spawn(spec.kind, index=d["index"], show=False)
             if d.get("binding") is not None and spec.apply_binding is not None:
                 bindings.append((spec, dock, d["binding"]))
+        # a panel this layout was saved without (added by a newer build) is taken OUT of the
+        # window before Qt restores the rest, and put in its default place after: Qt must
+        # never lay out a dock its saved state does not describe (see `place_default`)
+        saved = {d["name"] for d in rec["docks"]}
+        unknown = [dock for spec in self.specs.values() for dock in self.docks_of(spec.kind)
+                   if dock.objectName() not in saved]
+        for dock in unknown:
+            self.win.removeDockWidget(dock)
         if rec["geometry"]:
             self.win.restoreGeometry(rec["geometry"])
         if not self.win.restoreState(rec["state"], LS.LAYOUT_VERSION):
             self.apply_default_layout()
             return False
+        for dock in unknown:
+            self.place_default(dock)
         for spec, dock, binding in bindings:
             try:
                 spec.apply_binding(dock.panel, binding)

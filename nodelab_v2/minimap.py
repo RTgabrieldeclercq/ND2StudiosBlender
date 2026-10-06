@@ -68,10 +68,10 @@ class ElidedLabel(QLabel):
 
 
 class HudButton(QAbstractButton):
-    """A small painted HUD button — the canvas's maximize toggle and the mini-map's dock
-    button. The glyph is drawn with QPainter (``kind``: ``"maximize"`` / ``"restore"`` /
-    ``"dock"``) rather than taken from an icon font, so it never depends on a platform
-    symbol font and it re-reads the theme tokens on every repaint."""
+    """A small painted HUD button — the canvas's maximize toggle, its fit-to-nodes button and
+    the mini-map's dock button. The glyph is drawn with QPainter (``kind``: ``"maximize"`` /
+    ``"restore"`` / ``"fit"`` / ``"dock"``) rather than taken from an icon font, so it never
+    depends on a platform symbol font and it re-reads the theme tokens on every repaint."""
 
     def __init__(self, kind: str = "maximize", parent: Optional[QWidget] = None,
                  size: int = 26) -> None:
@@ -113,6 +113,19 @@ class HudButton(QAbstractButton):
         p.setBrush(Qt.NoBrush)
         c = r.center()
         box = QRectF(c.x() - 6.5, c.y() - 5.5, 13.0, 11.0)
+        if self._kind == "fit":
+            # a frame drawn close round two linked cards — "frame the nodes" (V4.00 step 11d)
+            p.drawRoundedRect(box.adjusted(-1.0, -1.0, 1.0, 1.0), 2.5, 2.5)
+            a = QRectF(box.left() + 2.2, box.top() + 2.2, 4.0, 3.2)
+            b = QRectF(box.right() - 6.2, box.bottom() - 5.4, 4.0, 3.2)
+            p.setPen(QPen(col, 1.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawLine(a.center(), b.center())
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(a, 0.8, 0.8)
+            p.drawRoundedRect(b, 0.8, 0.8)
+            p.end()
+            return
         if self._kind == "dock":
             # a pane with a filled top band — "put the Viewer back above the canvas"
             p.drawRoundedRect(box, 2.0, 2.0)

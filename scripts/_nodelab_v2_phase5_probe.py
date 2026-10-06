@@ -2208,6 +2208,15 @@ def main(argv) -> int:
     # metadata match (same M/T/Z) → linked: one cursor, the Compare viewer's row is gone
     assert win.viewer2 in win._linked
     assert not win.viewer2._axes_box.isVisible()
+    # (step 11d) the Playback panel shows the active viewer's strips — for a LINKED Compare
+    # viewer its leader's, which move both; Channels shows the Compare viewer's own
+    _lead_c = win._links[win.viewer2]
+    win._activate_viewer(win.viewer2)
+    app.processEvents()
+    assert win.playback_panel.shown_viewer() is _lead_c
+    assert win.channels_panel.shown_viewer() is win.viewer2
+    win._activate_viewer(_lead_c)
+    app.processEvents()
     assert "linked" in _cd.title_bar.title_text() and "n4" in _cd.title_bar.title_text()
     _ok("Compare (V2.28 → V4.00): a second Viewer DOCK opens beside the active one (leader "
         "left, Compare right), shows its own node's result, and LINKS to one cursor when "
@@ -2239,7 +2248,13 @@ def main(argv) -> int:
     assert win._viewed2 == zp.id
     assert len(win.shell.docks_of("viewer")) == 2, "re-targeted, not a third viewer"
     assert win.viewer2 not in win._linked
-    assert win.viewer2._axes_box.isVisible(), "different M/T/Z → the viewer's own sliders"
+    assert not win.viewer2._axes_box.isHidden(), "different M/T/Z → the viewer's own sliders"
+    _lead_c = win._links[win.viewer2]
+    win._activate_viewer(win.viewer2)
+    app.processEvents()
+    assert win.playback_panel.shown_viewer() is win.viewer2, "…in the Playback panel"
+    win._activate_viewer(_lead_c)
+    app.processEvents()
     assert "own cursor" in win._viewer_dock(win.viewer2).title_bar.title_text()
     _ok("Compare: a result with different M/T/Z (Z-Project, z 5→1) re-targets the same "
         "Compare viewer and gives it its own sliders — the link is re-derived from the "
@@ -6896,8 +6911,8 @@ def main(argv) -> int:
     from nodelab_v2.shell import DOCK_GLYPH as _DOCKG, PanelDock as _PD, PanelSpec as _PS
     _sh = win.shell
     assert [n for n in _sh.docks if not n.startswith("viewer:")] == [
-        "pages:0", "palette:0", "inspector:0", "sheet:0", "lablink:0", "console:0",
-        "movie:0"], \
+        "playback:0", "channels:0", "pages:0", "palette:0", "inspector:0", "sheet:0",
+        "lablink:0", "console:0", "movie:0"], \
         list(_sh.docks)
     assert _sh.docks_of("viewer"), "the Viewers are shell docks too (V4.00 step 4)"
     _want = (_QDW.DockWidgetMovable | _QDW.DockWidgetFloatable | _QDW.DockWidgetClosable)
@@ -6912,8 +6927,10 @@ def main(argv) -> int:
     assert win._console_dock is _sh.docks["console:0"]
     win._panels_menu.aboutToShow.emit()
     _pacts = win._panels_menu.actions()
-    assert [a.text() for a in _pacts if not a.text().startswith("Viewer")][:5] == [
-        "Pages", "Nodes", "Properties", "Spreadsheet", "LabLink"], [a.text() for a in _pacts]
+    assert [a.text().split(" · ")[0] for a in _pacts
+            if not a.text().startswith("Viewer")][:7] == [
+        "Playback", "Channels", "Pages", "Nodes", "Properties", "Spreadsheet", "LabLink"], \
+        [a.text() for a in _pacts]
     assert win._console_act in _pacts, "the Console entry is the Ctrl+` action itself"
     assert win._new_menu.menuAction().isVisible(), "View ▸ New lists the Viewer kind"
     # pop out and dock back from the title bar
@@ -6986,7 +7003,12 @@ def main(argv) -> int:
     _tcol = _wt.height() - _wt.menuBar().height() - _wt.statusBar().height()
     assert not _tv.isHidden() and _wt.dockWidgetArea(_tv) == _Qt.TopDockWidgetArea
     assert not _tv.panel.has_image() and getattr(_tv, "_sized", False)
-    assert 0.40 * _tcol <= _tv.height() <= 0.50 * _tcol, (_tv.height(), _tcol)
+    # (step 11d) the Viewer dock is the image now — its controls sit under it, in panels
+    assert 0.25 * _tcol <= _tv.height() <= 0.35 * _tcol, (_tv.height(), _tcol)
+    _tpb = _wt.shell.docks["playback:0"]
+    assert not _tpb.isHidden() and _tpb.geometry().top() >= _tv.geometry().bottom() - 2
+    assert 0.40 * _tcol <= _tv.height() + _tpb.height() <= 0.55 * _tcol, \
+        (_tv.height(), _tpb.height(), _tcol)
     _tp, _ti = _wt.shell.docks["palette:0"], _wt.shell.docks["inspector:0"]
     assert abs(_tp.width() - _PALW) <= 2, (_tp.width(), _PALW)
     assert abs(_ti.width() - max(_INSW, _ti.minimumSizeHint().width())) <= 2, \
@@ -7042,7 +7064,7 @@ def main(argv) -> int:
     assert isinstance(_vp, _VP) and not _v0d.isFloating()
     _pi = _vp.grab().toImage()
     _pw, _ph = _pi.width(), _pi.height()
-    _gap = _vp._controls.geometry().top() - 2
+    _gap = _vp._hover_lbl.geometry().top() - 2      # (11d: the controls are panels now)
     assert _pi.pixelColor(2, _ph - 2).name() == _TH.PANEL.name(), _pi.pixelColor(2, _ph - 2).name()
     assert _pi.pixelColor(_pw // 2, _gap).name() == _TH.PANEL.name(), \
         _pi.pixelColor(_pw // 2, _gap).name()
@@ -7704,35 +7726,54 @@ def main(argv) -> int:
         "empty dismiss it for the page and File ▸ New brings it back; a recipe button fills "
         "the page in view; a deleted seed does not come back")
 
-    # PT1 the page tabs: one per page, in page order, the shown page current; a click shows
-    # the page, a drag reorders the pages, a rename shows; a new page lands in pipeline order
+    # PT1 the page tabs (two rows since step 11d): a tab per page KIND in pipeline order, and
+    # under it the pages of the kind shown; a kind tab shows its page, a sub-tab drag reorders
+    # those pages, a rename shows; a new page lands in pipeline order; + presets the kind
     _tabs12 = win._main_canvas.tabs
-    _bar12 = _tabs12.bar
-    assert _tabs12.page_ids() == list(_ws12.pages), (_tabs12.page_ids(), list(_ws12.pages))
+    _bar12, _kb12 = _tabs12.bar, _tabs12.kind_bar
+    _kind12 = lambda p: _ws12.pages[p].kind                                  # noqa: E731
+    assert _tabs12.kinds() == ["input", "refine", "process", "analyze"], _tabs12.kinds()
+    assert _kb12.tabData(_kb12.currentIndex()) == _kind12(_ws12.active)
+    assert _tabs12.page_ids() == [p for p in _ws12.pages if _kind12(p) == _kind12(_ws12.active)]
     assert _bar12.tabData(_bar12.currentIndex()) == _ws12.active
     _ana12 = next(p.id for p in _ws12.pages.values() if p.kind == "analyze")
-    _bar12.setCurrentIndex(list(_ws12.pages).index(_ana12))
-    app.processEvents()
+    _ref12 = next(p.id for p in _ws12.pages.values() if p.kind == "refine")
+    _kb12.setCurrentIndex(_tabs12.kinds().index("analyze"))
+    for _ in range(3):
+        app.processEvents()
     assert _ws12.active == _ana12 and win.canvas.page_id == _ana12
+    assert _tabs12.page_ids() == [_ana12] and _tabs12.kind == "analyze"
     _np12 = win.new_page("refine")
     app.processEvents()
-    assert list(_ws12.pages).index(_np12) == 2 and _tabs12.page_ids() == list(_ws12.pages)
+    assert list(_ws12.pages).index(_np12) == 2
+    assert _tabs12.kind == "refine" and _tabs12.page_ids() == [_ref12, _np12]
     assert _bar12.tabData(_bar12.currentIndex()) == _np12
+    assert _kb12.tabText(_tabs12.kinds().index("refine")).endswith("2"), \
+        "a kind holding several pages says how many"
     _order12 = list(_ws12.pages)
-    _bar12.moveTab(2, 1)
+    _bar12.moveTab(1, 0)
     app.processEvents()
-    assert list(_ws12.pages)[1] == _np12 and _tabs12.page_ids() == list(_ws12.pages)
-    _bar12.moveTab(1, 2)
+    assert list(_ws12.pages)[1:3] == [_np12, _ref12] and _tabs12.page_ids() == [_np12, _ref12]
+    _bar12.moveTab(0, 1)
     app.processEvents()
     assert list(_ws12.pages) == _order12
     win.rename_page(_np12, "Dish B refine")
     app.processEvents()
-    assert _bar12.tabText(list(_ws12.pages).index(_np12)) == "Dish B refine"
+    assert _bar12.tabText(_tabs12.page_ids().index(_np12)) == "Dish B refine"
     assert win._main_canvas.tabs.add_btn.isVisible()
-    assert "reads" not in _bar12.tabToolTip(0) and "Image Input page" in _bar12.tabToolTip(0)
-    _ok("PT1 the page tabs: one per page in page order, the shown page current; a click shows "
-        "that page, dragging a tab reorders the pages, a rename and a new page (placed in "
-        "pipeline order) show at once; + opens New page…")
+    assert "Image Refinement page" in _bar12.tabToolTip(0)
+    _asked12: list = []
+    _npd12 = win.new_page_dialog
+    win.new_page_dialog = lambda **k: _asked12.append(k)          # the dialog is modal
+    try:
+        _tabs12.add_btn.click()
+    finally:
+        win.new_page_dialog = _npd12
+    assert _asked12 and _asked12[0]["kind"] == "refine", _asked12
+    _ok("PT1 the page tabs, two rows: one tab per page kind in pipeline order (with a count "
+        "when it holds several) and under it the pages of the kind shown; a kind tab shows "
+        "its page, dragging a sub-tab reorders those pages, a rename and a new page (placed "
+        "in pipeline order) show at once; + opens New page… preset to the kind shown")
 
     # PP1 the Pages panel: pages by kind in pipeline order, what each reads and publishes; a
     # click shows the page
@@ -7754,10 +7795,68 @@ def main(argv) -> int:
     assert win.workspace.active == _ppid12
     assert any(r.font(0).bold() and r.data(0, _Qt12.UserRole) == _ppid12
                for r in _pp12.page_items()), "the active page is marked, not rebuilt"
-    assert win._main_canvas.tabs.page_ids() == list(win.workspace.pages)
-    os.environ.pop(_PR11.ENV_DIR, None)
+    assert win._main_canvas.tabs.page_ids() == [
+        p for p in win.workspace.pages if win.workspace.pages[p].kind == "process"]
     _ok("PP1 the Pages panel (left, above Nodes) lists the pages by kind in pipeline order "
         "with what each reads and publishes; a click shows the page on the active canvas")
+
+    # PT2 closing a page TAB keeps the page (V4.00 step 11d): ✕ takes it off the sub-tab row,
+    # the canvas moves to the nearest open page of its kind, the Pages panel lists it "tab
+    # closed" and a click there brings it back; with every tab of a kind closed the kind tab
+    # stays and reopens the last one shown; the last open tab has no ✕
+    _ws15 = win.workspace
+    _tabs15 = win._main_canvas.tabs
+    _r1 = next(p.id for p in _ws15.pages.values() if p.kind == "refine")
+    win._show_page(win._main_canvas, _r1)
+    _r2 = win.new_page("refine")
+    app.processEvents()
+    assert _tabs15.page_ids() == [_r1, _r2] and _ws15.active == _r2
+    _tabs15.close_buttons()[_r2].click()
+    for _ in range(3):
+        app.processEvents()
+    assert _r2 in _ws15.pages and _r2 in win._closed_pages
+    assert _tabs15.page_ids() == [_r1] and _ws15.active == _r1, (_tabs15.page_ids(), _ws15.active)
+    _row15 = next(r for r in _pp12.page_items() if r.data(0, _Qt12.UserRole) == _r2)
+    assert "tab closed" in _row15.text(0) and _row15.font(0).italic()
+    assert "2 pages" in _tabs15.kind_bar.tabToolTip(_tabs15.kinds().index("refine"))
+    _pp12.tree.itemClicked.emit(_row15, 0)
+    for _ in range(3):
+        app.processEvents()
+    assert _ws15.active == _r2 and _r2 not in win._closed_pages
+    assert _tabs15.page_ids() == [_r1, _r2]
+    assert not any(r.font(0).italic() for r in _pp12.page_items())
+    # every Refinement tab closed: the kind tab stays and brings back the one shown last
+    win.close_page_tab(_r1)
+    win.close_page_tab(_r2)
+    app.processEvents()
+    assert {_r1, _r2} <= win._closed_pages and _ws15.pages[_ws15.active].kind != "refine"
+    assert "refine" in _tabs15.kinds()
+    _tabs15.kind_bar.setCurrentIndex(_tabs15.kinds().index("refine"))
+    for _ in range(3):
+        app.processEvents()
+    assert _ws15.active == _r2 and _r2 not in win._closed_pages and _r1 in win._closed_pages
+    # the page menu's Close tab; and the last open tab stays
+    from PySide6.QtWidgets import QMenu as _QM15
+    _m15 = _QM15()
+    win.fill_page_menu(_m15, win._main_canvas)
+    _ct15 = next(a for a in _m15.actions() if a.text() == "Close tab")
+    assert _ct15.isEnabled()
+    for _p15 in [p for p in _ws15.pages if p != _ws15.active]:
+        win._closed_pages.add(_p15)
+    win._refresh_page_views()
+    app.processEvents()
+    assert not _tabs15.close_buttons(), "the last open tab has no ✕"
+    assert win.close_page_tab(_ws15.active) is False
+    win.fill_page_menu(_m15, win._main_canvas)
+    assert not next(a for a in _m15.actions() if a.text() == "Close tab").isEnabled()
+    win.file_new()
+    app.processEvents()
+    assert not win._closed_pages and len(_tabs15.kinds()) == 4
+    _ok("PT2 a closed page tab keeps the page: ✕ moves the canvas to the nearest open page of "
+        "its kind, the Pages panel lists the page \"tab closed\" and a click there opens it "
+        "again; the kind tab of a kind whose tabs are all closed reopens the last one shown; "
+        "Close tab is in the page menu, and the last open tab has no ✕")
+    os.environ.pop(_PR11.ENV_DIR, None)
 
     # ── SP2: a split position read on the next page is what the Viewer shows there ───
     # (user report 2026-10-06: Split Positions → an Output of one position → on Image
@@ -7824,6 +7923,274 @@ def main(argv) -> int:
     _ok("SP2 a split position published on Image Input and read on Image Refinement: "
         "arriving on the page shows what it reads (one position, not the load's three), and "
         "selecting a Page Output or Page Input card previews it with click-to-preview off")
+
+    # ── CT1: a Page Input offers the file's channels, like the Load card (step 11d) ────
+    # (user report 2026-10-06: "on the page input, the channels should also be options just
+    # as if it was the original IO node for the image")
+    win.file_new()
+    app.processEvents()
+    _cp16 = os.path.join(tempfile.mkdtemp(prefix="nd2chan_"), "two.tif")
+    _a16 = np.zeros((2, 2, 24, 28), np.uint16)
+    _a16[0, :, 4:12, 4:12] = 1000
+    _a16[1, :, 12:20, 14:24] = 3000
+    _tiff11.imwrite(_cp16, _a16, metadata={"axes": "CZYX"})
+    _done16: list = []
+    win.runner.finished.connect(lambda nid, *a: _done16.append(nid))
+    win._load_source_paths([_cp16])
+    _pin16 = win.workspace.active
+    _ld16 = next(r for r in win.doc.nodes.values() if r.op_key == "io.load")
+    _t016 = time.time()
+    while _q11(_pin16, _ld16.id) not in _done16 and time.time() - _t016 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    _lab16 = [s.label for s in win.doc.output_specs(_ld16.id) if s.name.startswith("ch")]
+    assert len(_lab16) == 2, _lab16
+    _rf16 = next(p.id for p in win.workspace.pages.values() if p.kind == "refine")
+    win._show_page(win._main_canvas, _rf16)
+    app.processEvents()
+    _in16 = next(r for r in win.doc.nodes.values() if r.op_key == "page.input")
+    _outs16 = win.doc.output_specs(_in16.id)
+    assert [s.name for s in _outs16] == ["out", "ch0", "ch1"], [s.name for s in _outs16]
+    assert [s.label for s in _outs16[1:]] == _lab16, "named as on the Load card"
+    assert [s.name for s in win.scene.node_items[_in16.id]._active_outputs()] == \
+        ["out", "ch0", "ch1"], "the card grows them too"
+    _g16 = win.doc.add_node("enhance.gaussian", x=360, y=150)
+    win.doc.connect(_in16.id, "ch1", _g16.id, "data")
+    app.processEvents()
+    _done16.clear()
+    win.pull_node(_g16.id)
+    _t016 = time.time()
+    while _q11(_rf16, _g16.id) not in _done16 and time.time() - _t016 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    for _ in range(3):
+        app.processEvents()
+    assert not [f for f in _seen_fail if _g16.id in f[0]], _seen_fail[-3:]
+    _ax16 = win.viewer.axes() if callable(win.viewer.axes) else win.viewer.axes
+    assert _ax16 is not None and _ax16.c == 1, _ax16
+    assert float(win.viewer._planes[0].max()) > 1500, "channel 1's 3000 square, blurred"
+    _ok("CT1 a Page Input offers one output per channel, named as on the Load card it reads "
+        "through; wiring its ch1 into a Gaussian on the Refinement page pulls that one channel")
+
+    # ── DT1: panels grouped as tabs carry their tabs on TOP (step 11d) ─────────────────
+    from PySide6.QtWidgets import QTabBar as _QTB16, QTabWidget as _QTW16
+    for _ar16 in (_Qt12.LeftDockWidgetArea, _Qt12.RightDockWidgetArea,
+                  _Qt12.TopDockWidgetArea, _Qt12.BottomDockWidgetArea):
+        assert win.tabPosition(_ar16) == _QTW16.North, _ar16
+    _insd16 = win.shell.docks["inspector:0"]
+    _insd16.raise_()
+    app.processEvents()
+    _tbar16 = next(b for b in win.findChildren(_QTB16) if b.parent() is win and b.isVisible()
+                   and any(b.tabText(i) == "Properties" for i in range(b.count())))
+    assert _tbar16.geometry().bottom() <= _insd16.geometry().top() + 2, \
+        (_tbar16.geometry(), _insd16.geometry())
+    _ok("DT1 panels grouped as tabs show their tabs on top: Properties, Spreadsheet and "
+        "LabLink head their column rather than footing it")
+
+    # ── MS1: the menu bar's Normal | Troubleshooting switch (step 11d) ─────────────────
+    from nodelab_v2.mode_switch import NORMAL as _MSN, TROUBLESHOOTING as _MST
+    _ms17 = win.mode_switch
+    assert win.menuBar().cornerWidget(_Qt12.TopRightCorner) is _ms17 and _ms17.isVisible()
+    assert not win.runner.solo_frame and _ms17.buttons[_MSN].isChecked()
+    _ms17.buttons[_MST].click()
+    app.processEvents()
+    assert win.runner.solo_frame and win._solo_act.isChecked() and _ms17.troubleshooting()
+    assert _TH.DIM2D.name() in _ms17.styleSheet(), "Troubleshooting lights amber"
+    win._solo_act.setChecked(False)                       # F9 / Run ▸ — the switch follows
+    app.processEvents()
+    assert not win.runner.solo_frame and _ms17.buttons[_MSN].isChecked()
+    win.set_solo_frame(True)                              # a programmatic change too
+    assert _ms17.troubleshooting() and win._solo_act.isChecked()
+    _ms17.buttons[_MSN].click()
+    app.processEvents()
+    assert not win.runner.solo_frame and not win._solo_act.isChecked()
+    _ok("MS1 the menu bar's Normal | Troubleshooting switch: picking a segment turns the "
+        "troubleshooting scope on and off (Troubleshooting lit amber), and F9, the Run menu "
+        "and a programmatic change all move it")
+
+    # ── FB1: fit-to-nodes beside the canvas's maximize button (step 11d) ──────────────
+    _gv17 = win.view
+    _fb17 = _gv17._fit_btn
+    assert _fb17.isVisible() and _fb17.kind == "fit"
+    assert _fb17.geometry().right() < _gv17._max_btn.geometry().left() and \
+        abs(_fb17.geometry().top() - _gv17._max_btn.geometry().top()) <= 1, "beside ⛶"
+    win.doc.add_node("enhance.gamma", x=3000, y=2400)
+    _gv17.resetTransform()
+    _gv17.centerOn(-4000, -4000)
+    app.processEvents()
+    _vis17 = lambda: all(_gv17.viewport().rect().intersects(               # noqa: E731
+        _gv17.mapFromScene(it.sceneBoundingRect()).boundingRect())
+        for it in win.scene.node_items.values())
+    assert win.scene.node_items and not _vis17()
+    _fb17.click()
+    app.processEvents()
+    assert _vis17(), "every card in view after Fit"
+    _ok("FB1 a fit-to-nodes button sits beside the canvas's maximize button and brings every "
+        "card into view, as Home does")
+
+    # ── VC1: the Viewer's controls as panels of their own (step 11d) ──────────────────
+    # (user request 2026-10-06: the M/T/Z and play buttons, and the histograms and colour
+    # channel options, each their own window, placed wherever; channels stacked if needed)
+    from nodelab_v2.window import CHANNELS_KIND as _CHK16, PLAYBACK_KIND as _PBK16
+    _sh16 = win.shell
+    for _dx16 in _sh16.docks_of("viewer")[1:]:          # one Viewer, as a fresh session
+        _dx16.close()
+    app.processEvents()
+    _vd16 = _sh16.docks_of("viewer")[0]
+    _v16 = _vd16.panel
+    win._activate_viewer(_v16)
+    win.reset_layout()
+    for _ in range(3):
+        app.processEvents()
+    _pbd16, _chd16 = _sh16.docks[f"{_PBK16}:0"], _sh16.docks[f"{_CHK16}:0"]
+    _TOP = _Qt12.TopDockWidgetArea
+    assert not _pbd16.isHidden() and not _chd16.isHidden()
+    assert win.dockWidgetArea(_pbd16) == win.dockWidgetArea(_chd16) == \
+        win.dockWidgetArea(_vd16) == _TOP
+    assert _pbd16.geometry().top() >= _vd16.geometry().bottom() - 2, "Playback under the Viewer"
+    assert _chd16.geometry().left() >= _pbd16.geometry().right() - 2 and \
+        abs(_chd16.geometry().top() - _pbd16.geometry().top()) <= 2, "Channels beside Playback"
+    assert _v16.controls_detached and not _v16._controls.isVisible()
+    assert win.playback_panel.isAncestorOf(_v16._sliders["z"])
+    assert win.playback_panel.isAncestorOf(_v16._play_btns["t"])
+    assert win.channels_panel.isAncestorOf(_v16._lut_auto)
+    assert win.channels_panel.isAncestorOf(_v16._chan_btns[0])
+    # one column per channel, side by side while they fit, stacked when the panel is narrow
+    _cols16 = _v16._lut_strip_w
+    _show16 = win._show_page
+    _show16(win._main_canvas, _pin16)
+    app.processEvents()
+    _done16.clear()
+    win.pull_node(_ld16.id)
+    _t016 = time.time()
+    while _q11(_pin16, _ld16.id) not in _done16 and time.time() - _t016 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    for _ in range(3):
+        app.processEvents()
+    assert len(_cols16.columns()) == 2, len(_cols16.columns())
+    _chd16.setFloating(True)
+    _chd16.resize(200, 700)
+    for _ in range(4):
+        app.processEvents()
+    _ys16 = [c.geometry().top() for c in _cols16.columns()]
+    assert _cols16.per_row() == 1 and _ys16[1] > _ys16[0], ("stacked when narrow", _ys16)
+    _chd16.resize(700, 260)
+    for _ in range(4):
+        app.processEvents()
+    _ys16 = [c.geometry().top() for c in _cols16.columns()]
+    assert _cols16.per_row() == 2 and _ys16[0] == _ys16[1], ("side by side when wide", _ys16)
+    _chd16.setFloating(False)
+    app.processEvents()
+    # the sections keep the Viewer's look through a theme change
+    win.set_theme("light")
+    assert _TH.PANEL.name() in _v16.axes_section.styleSheet()
+    assert _TH.PANEL.name() in _v16.channel_section.styleSheet()
+    win.set_theme("dark")
+    assert _TH.PANEL.name() in _v16.channel_section.styleSheet()
+    # a second Viewer: both panels follow the ACTIVE one and name it
+    _d216 = _sh16.spawn("viewer", beside=_vd16)
+    app.processEvents()
+    assert win.playback_panel.shown_viewer() is _d216.panel
+    assert win.channels_panel.shown_viewer() is _d216.panel
+    assert "Viewer 2" in _pbd16.windowTitle() and "Viewer 2" in _chd16.windowTitle()
+    win._activate_viewer(_v16)
+    app.processEvents()
+    assert win.playback_panel.shown_viewer() is _v16 and "Viewer 1" in _pbd16.windowTitle()
+    _d216.close()
+    app.processEvents()
+    assert len(win.playback_panel._sections) == 1 and len(win.channels_panel._sections) == 1
+    assert _pbd16.windowTitle() == "Playback", _pbd16.windowTitle()
+    # maximized: the docked panels step aside and the mini-map carries the controls, compact
+    win.set_maximized(True)
+    app.processEvents()
+    assert _pbd16.isHidden() and _chd16.isHidden() and not _v16.controls_detached
+    assert _v16.isAncestorOf(_v16._sliders["z"]) and not any(
+        h.isVisible() for h in _v16._hists.values()), "compact: no histograms in the mini-map"
+    win.set_maximized(False)
+    app.processEvents()
+    assert not _pbd16.isHidden() and not _chd16.isHidden() and _v16.controls_detached
+    assert win.playback_panel.shown_viewer() is _v16
+    assert win.channels_panel.isAncestorOf(_v16._hists[0]) and all(
+        h.isVisible() for h in _v16._hists.values())
+    # a panel a saved layout never heard of goes to its default place
+    _pbd16.setFloating(True)
+    app.processEvents()
+    _sh16.place_default(_pbd16)
+    app.processEvents()
+    assert not _pbd16.isFloating() and win.dockWidgetArea(_pbd16) == _TOP
+    _ok("VC1 the Viewer's controls are panels of their own: Playback (M/T/Z, play) under the "
+        "Viewer and Channels (tools + a column per channel) beside it; the channel columns "
+        "stack when the panel is narrow and sit side by side when it is wide; both follow "
+        "the active Viewer and name it once there are several; maximized, the mini-map "
+        "carries them compact and the panels come back after; a panel unknown to a saved "
+        "layout lands in its default place")
+
+    # VC2 a layout saved BEFORE these panels existed (the step-11c build) restores with them
+    # in their default place and everything else as saved. They are taken out of the window
+    # before Qt restores the rest and placed after: re-adding a dock that restoreState had
+    # laid out without knowing it was an access violation on the native platform (the user's
+    # crash, 2026-10-06; offscreen survived it, so this pins the order and the result)
+    from nodelab_v2 import layout_store as _LS18
+    from nodelab_v2.window import MainWindow as _MW18
+    _lay18 = os.path.join(tempfile.mkdtemp(prefix="nd2layout_"), "layout.json")
+    _env18 = {k: os.environ.get(k) for k in (_LS18.ENV_FILE, _LS18.ENV_ENABLED)}
+    os.environ[_LS18.ENV_FILE] = _lay18
+    try:
+        _wa18 = _MW18(persist_layout=False)
+        _wa18.show()
+        app.processEvents()
+        for _n18 in ("playback:0", "channels:0"):
+            _wa18.removeDockWidget(_wa18.shell.docks[_n18])
+        _wa18.shell.docks["sheet:0"].setFloating(True)      # something the user arranged
+        app.processEvents()
+        _rec18 = _wa18.shell.layout_record()
+        _rec18["docks"] = [d for d in _rec18["docks"]
+                           if d["name"] not in ("playback:0", "channels:0")]
+        _LS18.save_layout(_rec18, _lay18)
+        _wa18.close()
+        _ev18: list = []
+        _rm18, _rs18 = _MW18.removeDockWidget, _MW18.restoreState
+
+        def _spy_rm18(self, d, _e=_ev18):
+            _e.append(("remove", d.objectName()))
+            return _rm18(self, d)
+
+        def _spy_rs18(self, *a, _e=_ev18):
+            _e.append(("restore", ""))
+            return _rs18(self, *a)
+        _MW18.removeDockWidget, _MW18.restoreState = _spy_rm18, _spy_rs18
+        try:
+            _wb18 = _MW18(persist_layout=True)
+        finally:
+            _MW18.removeDockWidget, _MW18.restoreState = _rm18, _rs18
+        _wb18.show()
+        app.processEvents()
+        assert _wb18._layout_restored
+        _sb18 = _wb18.shell
+        _vb18 = _sb18.docks["viewer:0"]
+        _pb18, _cb18 = _sb18.docks["playback:0"], _sb18.docks["channels:0"]
+        _at18 = _ev18.index(("restore", ""))
+        assert {("remove", "playback:0"), ("remove", "channels:0")} <= set(_ev18[:_at18]) \
+            and _ev18[_at18 - 2:_at18] == [("remove", "playback:0"), ("remove", "channels:0")], \
+            ("the unknown panels leave the window right before Qt restores", _ev18[-6:])
+        assert not _pb18.isHidden() and not _cb18.isHidden()
+        assert _wb18.dockWidgetArea(_pb18) == _wb18.dockWidgetArea(_cb18) == \
+            _Qt12.TopDockWidgetArea
+        assert _pb18.geometry().top() >= _vb18.geometry().bottom() - 2
+        assert _sb18.docks["sheet:0"].isFloating(), "the rest of the layout is as saved"
+        _wb18._persist_layout = False
+        _wb18.close()
+        app.processEvents()
+    finally:
+        for _k18, _v18 in _env18.items():
+            if _v18 is None:
+                os.environ.pop(_k18, None)
+            else:
+                os.environ[_k18] = _v18
+    _ok("VC2 a layout saved before the Playback and Channels panels existed restores with "
+        "them under the Viewer and everything else as saved; they are out of the window while "
+        "Qt restores the rest (re-adding such a dock afterwards crashed natively)")
 
     # a LabLink panel left on screen polls its hub over HTTP on a QThread; a socket connect
     # still in flight when os._exit tears the process down crashes it (exit 139 after every

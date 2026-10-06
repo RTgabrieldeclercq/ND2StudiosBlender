@@ -856,7 +856,9 @@ _UNIT = {"um": "µm", "um2": "µm²", "um3": "µm³",
 
 
 def _dim(label: QLabel) -> QLabel:
-    label.setStyleSheet(f"color: {T.MUTED};")
+    # `.name()`: an f-string of the QColor itself is its Python repr, which Qt cannot parse
+    # ("Could not parse stylesheet of object QLabel" whenever the LabLink tab was shown)
+    label.setStyleSheet(f"color: {T.MUTED.name()};")
     return label
 
 

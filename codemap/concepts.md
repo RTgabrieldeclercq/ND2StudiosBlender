@@ -409,7 +409,7 @@ see: [MANUAL §16 I](../MANUAL.md) · INV-09 · CON-14
 ---
 
 ### CON-17 — workspace and pages
-anchors: sym:nodelab_v2.workspace.Workspace, sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.workspace.ComposedGraph, sym:nodelab_v2.workspace.Workspace.node_defaults, sym:nodelab_v2.workspace.Workspace.default_source
+anchors: sym:nodelab_v2.workspace.Workspace, sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.workspace.ComposedGraph, sym:nodelab_v2.workspace.Workspace.node_defaults, sym:nodelab_v2.workspace.Workspace.default_source, sym:nodelab_v2.workspace.Workspace.input_channels
 
 A V4.00 file holds a **workspace**: ordered **pages**, each a node graph (`GraphDocument`) of a
 **kind** — `input` < `refine` < `process` < `analyze`, plus `free` (any node, any wiring; a
@@ -435,7 +435,14 @@ switches there first, since the loaders read the active scene) and published as 
 `page.output` named after the file. The pages stay in sight on every canvas's tab strip
 (`canvas.PageTabs`) and in the Pages panel (`pages_panel.PagesPanel`), both fed by
 `Workspace.page_summary` (what a page reads and publishes); `insert_index_for` keeps a new
-page in pipeline order. A page's Input is seeded once per session (`_seeded_pages`), and its
+page in pipeline order. Since step 11d the strip is two rows — the page KINDS, then the pages
+of the kind shown as sub-tabs — and a sub-tab can be CLOSED (`MainWindow.close_page_tab`,
+session state `_closed_pages`): the page stays, listed "tab closed" in the Pages panel, and
+any route that shows it again (the panel, the page menu, its kind tab) opens its tab again —
+a page on a canvas is always open. A `page.input` grows one synthetic `chK` output per channel
+like a Load card (`CHANNEL_TAP_OPS`), named from the upstream Output's descriptors
+(`Workspace.input_channels`, installed as `doc.page_channels`); a `chK` edge materializes into
+a `channel.select` tap that `compose` splices onto the upstream Output with the Input itself. A page's Input is seeded once per session (`_seeded_pages`), and its
 start card (`welcome.WelcomeCard.configure`) is worded for its kind and dismissible (`_publish_source`; a TIFF card starts on `ingest`, the only
 access mode that can read it). Page-op DEFAULTS have one choke point: `Workspace._attach`
 installs `doc.node_defaults`, which `GraphDocument.add_node` merges UNDER explicit params — a
@@ -503,7 +510,7 @@ see: CON-11 · [MANUAL §15 Plotting](../MANUAL.md)
 ---
 
 ### CON-20 — dock shell and layout memory
-anchors: sym:nodelab_v2.shell.DockShell, sym:nodelab_v2.shell.PanelDock.paintEvent, sym:nodelab_v2.layout_store.load_layout, sym:nodelab_v2.window.MainWindow._apply_default_sizes
+anchors: sym:nodelab_v2.shell.DockShell, sym:nodelab_v2.shell.PanelDock.paintEvent, sym:nodelab_v2.layout_store.load_layout, sym:nodelab_v2.window.MainWindow._apply_default_sizes, sym:nodelab_v2.viewer_controls.ViewerControlsPanel, sym:nodelab_v2.viewer.ViewerPanel.detach_controls
 
 Every panel is a `PanelDock` (a `QDockWidget` with a custom `PanelTitleBar`: kind glyph, title,
 `+` on a multi kind, float/dock, ✕), registered by kind in the `DockShell` from the window's
@@ -517,7 +524,21 @@ the panel bodies set `WA_StyledBackground` (a QWidget SUBCLASS does not auto-pai
 stylesheet background), and `theme.palette()` is pushed as the application palette so
 dialogs, popups and empty viewports follow the theme. The ✕ is disabled when the window's
 `_allow_panel_close` would veto the close (`sync_close_buttons`), which is a pure predicate;
-the un-maximize that a closing mini-map canvas needs happens in `_prune_canvases`.
+the un-maximize that a closing mini-map canvas needs happens in `_prune_canvases`. Panels
+grouped as tabs carry their tabs on top (`setTabPosition(…, North)`; Qt's default is South).
+
+**The Viewer's controls are panels (step 11d).** A `ViewerPanel` builds two SECTIONS
+(`axes_section`: M/T/Z strips, play, the overlay-source and iteration strips;
+`channel_section`: the display tools over `ChannelColumns`, which wraps the per-channel
+columns onto rows when narrow). The window takes both out of every Viewer it makes
+(`detach_controls`) into the single `playback` and `channels` docks
+(`viewer_controls.ViewerControlsPanel`, a stack of every Viewer's section), which show the
+ACTIVE Viewer's (`MainWindow._sync_viewer_controls`; a linked Compare viewer shows its
+leader's strips). The sections stay the Viewer's widgets — every slot and attribute is
+unchanged — and carry its stylesheet. Maximized, the mini-map Viewer takes them back
+(`attach_controls`, compact) and the docked control panels hide. A `PanelSpec` may name
+`split_from`/`split` for its default place, and `restore_layout` puts a dock the saved layout
+never heard of in that place (`DockShell.place_default`) rather than wherever Qt left it.
 
 **Layout memory.** `layout_store` keeps `~/.nd2studios/layout.json` — Qt's `saveState`
 bytes plus the multi docks' bindings — under `LAYOUT_FORMAT` / `LAYOUT_VERSION`

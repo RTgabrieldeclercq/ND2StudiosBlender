@@ -1125,6 +1125,10 @@ class GraphView(QGraphicsView):
             "Maximize the node canvas (Ctrl+Space) — the Viewer becomes a mini-map "
             "in the top-left corner and follows the node you click")
         self._max_btn.toggled.connect(self._on_max_toggled)
+        # beside it: fit the view to the nodes (V4.00 step 11d) — what Home does
+        self._fit_btn = HudButton("fit", self)
+        self._fit_btn.setToolTip("Fit the view to the nodes (Home)")
+        self._fit_btn.clicked.connect(lambda _=False: self.fit_all())
         # the page switcher (V4.00 step 5): which page this canvas shows, and the menu that
         # changes it — top-left, where the troubleshooting badge steps aside for it
         self.page_button = QToolButton(self)
@@ -1141,10 +1145,12 @@ class GraphView(QGraphicsView):
         self._style_page_button()
         self._place_corner_chrome()
 
-    # ── corner chrome (maximize + the troubleshooting badge) ──────────────────
+    # ── corner chrome (maximize, fit to nodes, the troubleshooting badge) ──────
     def _place_corner_chrome(self) -> None:
         self._max_btn.move(self.width() - self._max_btn.width() - 12, 12)
         self._max_btn.raise_()
+        self._fit_btn.move(self._max_btn.x() - self._fit_btn.width() - 6, 12)
+        self._fit_btn.raise_()
         pb = getattr(self, "page_button", None)
         if pb is not None and pb.text():
             pb.adjustSize()
@@ -1427,6 +1433,13 @@ class GraphView(QGraphicsView):
             self.resetTransform()
             self.centerOn(0, 0)
             return
+        # the view scrolls only inside the scene rect, which starts as a fixed area round the
+        # origin: a card placed beyond it was scaled into view but could not be centred on,
+        # and stayed off screen (V4.00 step 11d, the fit-to-nodes button) — so it grows first
+        sc = self.scene()
+        want = r.adjusted(-4000, -4000, 4000, 4000)
+        if not sc.sceneRect().contains(want):
+            sc.setSceneRect(sc.sceneRect().united(want))
         self.fitInView(r.adjusted(-70, -70, 70, 70), Qt.KeepAspectRatio)
 
     # palette drag-and-drop (G2) + desktop file drop (V3.01)

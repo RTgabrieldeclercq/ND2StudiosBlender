@@ -74,7 +74,13 @@ BUNDLE_PATHS_KEY = "paths"
 
 #: op_keys whose GUI card grows one synthetic per-channel output socket (``ch0…``) per
 #: channel — materialized into ``channel.select`` taps at graph-build (see nodelab_v2.ops).
-CHANNEL_TAP_OPS = ("io.load", "channel.split")
+#:
+#: ``page.input`` since V4.00 step 11d: a later page reads an image through its Page Input,
+#: and that card is where the user picks a channel on that page, exactly as the Load card
+#: is on Image Input. Its channel list is the upstream Output's
+#: (:attr:`GraphDocument.page_channels`); a ``chK`` edge on it materializes like any other,
+#: and the composer splices the tap onto the upstream Output with the Input itself.
+CHANNEL_TAP_OPS = ("io.load", "channel.split", "page.input")
 
 #: op_keys whose GUI card grows one synthetic per-GROUP output socket (``grp0…``) per
 #: position group — materialized into ``util.select_group`` taps at graph-build.
@@ -298,6 +304,11 @@ class GraphDocument:
         #: ``() -> [(page id, page name), ...]``: the pages a ``page.input`` on this document
         #: may read, nearest first — the inspector's "Go to <page>" (V4.00 step 11).
         self.page_feeders: Callable[[], list] = lambda: []
+        #: ``(node_id) -> [{name, emission_nm, color}, ...]`` (V4.00 step 11d): the channels
+        #: of the Output a ``page.input`` on this document reads — the file's real channel
+        #: names, which the envelope does not carry across the page boundary. ``[]`` outside
+        #: a workspace or while the Input is unbound.
+        self.page_channels: Callable[[str], list] = lambda _nid: []
         #: set by the Workspace (V4.00 step 5): a digest of what ``node_id`` reads from OTHER
         #: pages through Page Inputs ("" when nothing) — part of a dock's signature — and the
         #: page's run identity, which moves when an upstream page is edited
@@ -731,6 +742,11 @@ class GraphDocument:
         if isinstance(chans, list) and chans:
             return chans
         env_descs = self._env_channel_descriptors(self.env(node_id))
+        if rec.op_key == "page.input":
+            # the page boundary: the upstream Output's own descriptors (the Load card's names
+            # and colours), while they still describe what crosses — the envelope's count
+            up = self._page_channels(node_id)
+            return up if up and (not env_descs or len(up) == len(env_descs)) else env_descs
         spec = rec.spec()
         if spec is not None and getattr(spec, "fresh_output", False):
             return env_descs            # a NEW Dataset (a plot's picture): its own channels
@@ -810,11 +826,21 @@ class GraphDocument:
             chans = rec.params.get(CHANNELS_KEY) if rec is not None else None
             if isinstance(chans, list) and chans:
                 return chans
+            if rec is not None and rec.op_key == "page.input":
+                return self._page_channels(src)     # the walk crosses the page boundary
             spec = rec.spec() if rec is not None else None
             if spec is not None and getattr(spec, "fresh_output", False):
                 return []               # the walk stops at a NEW Dataset (a plot's picture)
             return self._inherited_channel_descriptors(src, _depth + 1)
         return []
+
+    def _page_channels(self, node_id: str) -> list:
+        """:attr:`page_channels`, never raising — it is asked while cards are laid out."""
+        try:
+            out = self.page_channels(node_id)
+        except Exception:                      # noqa: BLE001 — mid-edit upstream
+            return []
+        return list(out) if isinstance(out, (list, tuple)) else []
 
     @staticmethod
     def _env_channel_descriptors(env: MetaEnvelope) -> list:
