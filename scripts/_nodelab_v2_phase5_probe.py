@@ -6258,6 +6258,156 @@ def main(argv) -> int:
         "(its held view, overlay channels and a running preload); an edit on its own page "
         "still drops them")
 
+    # ── LK1–LK3: linked pages (V4.00 step 6) ──────────────────────────────────────────
+    from PySide6.QtCore import QTimer as _LkTimer
+    from nodelab_v2.linked_document import LinkedDocument as _LkDoc, TOPOLOGY_HINT as _LkHint
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _lm_id = win.workspace.active
+    _lm = win.doc
+    _m6 = _PMenu()
+    win.fill_page_menu(_m6, win.canvas)
+    assert "Duplicate as linked page" in [a.text() for a in _m6.actions()]
+    _lp = win.duplicate_page(_lm_id, linked=True)
+    app.processEvents()
+    _lk = win.doc
+    assert win.workspace.active == _lp and isinstance(_lk, _LkDoc) and _lk.master is _lm
+    assert win.workspace.page(_lp).master == _lm_id
+    assert set(win.scene.node_items) == set(_lm.nodes), "the master's cards"
+    _m6 = _PMenu()
+    win.fill_page_menu(_m6, win.canvas)
+    _t6 = [a.text() for a in _m6.actions()]
+    assert {"Go to master page", "Make unique"} <= set(_t6), _t6
+    assert any(t.startswith(win.workspace.page(_lp).name) and t.endswith("· linked")
+               for t in _t6), _t6
+    # every structural gesture is refused with the hint, and nothing changes
+    _n6 = set(_lk.nodes)
+    win.statusBar().clearMessage()
+    win._on_op_dropped("enhance.gamma", QPointF(300.0, 300.0))
+    assert win.statusBar().currentMessage() == _LkHint and set(_lk.nodes) == _n6
+    win.statusBar().clearMessage()
+    assert win.scene.delete_nodes(["n3"]) is None and "n3" in _lk.nodes
+    assert win.statusBar().currentMessage() == _LkHint
+    _cm = _PMenu()
+    win.scene._fill_node_menu(_cm, win.scene.node_items["n3"])
+    win.scene._lock_structural(_cm)
+    _del = next(a for a in _cm.actions() if a.text().startswith("Delete"))
+    assert not _del.isEnabled() and _del.toolTip() == _LkHint, "greyed out, saying why"
+    win.statusBar().clearMessage()
+    _LkTimer.singleShot(0, lambda: _lk.add_node("enhance.gamma"))    # no guard: the backstop
+    _t0 = time.time()
+    while not win.statusBar().currentMessage() and time.time() - _t0 < 5:
+        app.processEvents()
+    assert win.statusBar().currentMessage() == _LkHint and set(_lk.nodes) == _n6
+    # a value edit is this page's override: marked in Properties, reset to the master's
+    win.scene.clearSelection()
+    win.scene.node_items["n3"].setSelected(True)
+    app.processEvents()
+    _ins = win.inspector
+    assert "Linked to" in _ins._linked_text and "0 overrides" in _ins._linked_text
+    _ins._set_param(win.scene.node_items["n3"], "sigma", 3.25)
+    app.processEvents()
+    assert _lk.is_overridden("n3", "sigma") and _lm.nodes["n3"].params.get("sigma") != 3.25
+    assert "sigma" in _lk.nodes["n3"].locked, "an override is a pinned value"
+    _ins.set_node(win.scene.node_items["n3"])
+    assert ("n3", "sigma") in _ins._override_rows and "1 override" in _ins._linked_text
+    _ins.reset_override("n3", "sigma")
+    _t0 = time.time()
+    while ("n3", "sigma") in _ins._override_rows and time.time() - _t0 < 5:
+        app.processEvents()
+    assert not _lk.is_overridden("n3", "sigma")
+    assert _lk.nodes["n3"].params.get("sigma") == _lm.nodes["n3"].params.get("sigma")
+    # a master edit reaches the linked page; a card moved on either page moves on the other
+    _lm.nodes["n4"].params["threshold"] = 1234.0
+    _lm.touch("n4")
+    app.processEvents()
+    assert _lk.nodes["n4"].params.get("threshold") == 1234.0
+    _it = win.scene.node_items["n4"]
+    _it.setPos(_it.pos().x() + 55.0, _it.pos().y() + 21.0)
+    app.processEvents()
+    _mi = win.scene_for(_lm_id).node_items["n4"]
+    assert (_mi.pos().x(), _mi.pos().y()) == (_it.pos().x(), _it.pos().y())
+    _pdone.clear()
+    win.pull_node("n3")
+    _pwait(_pq(_lp, "n3"))
+    _ok("LK1 Duplicate as linked page shows the master's cards on a page of its own; adding, "
+        "deleting or rewiring nodes is refused with the hint (the context menu greys them "
+        "out, and a refusal from anywhere reaches the status bar); a value changed there is "
+        "an override, marked in Properties and reset to the master's; master edits and card "
+        "moves reach it; it pulls")
+
+    # LK2 the file keeps the link; Make unique; deleting a master frees its linked pages
+    _lk.nodes["n3"].params["sigma"] = 2.5
+    _lk.touch("n3")
+    _lfile = os.path.join(tempfile.mkdtemp(prefix="nd2linked_"), "linked.nd2graph.json")
+    win.workspace.save_file(_lfile)
+    win.file_new()
+    app.processEvents()
+    win.workspace.load_file(_lfile)
+    app.processEvents()
+    _lpg = win.workspace.page(_lp)
+    assert isinstance(_lpg.doc, _LkDoc) and _lpg.doc.nodes["n3"].params["sigma"] == 2.5
+    win._show_page(win.canvas, _lp)
+    app.processEvents()
+    assert set(win.scene.node_items) == set(_lpg.doc.nodes)
+    win.scene.clearSelection()
+    win.scene.node_items["n3"].setSelected(True)
+    app.processEvents()
+    win.inspector.linked_action.emit("unique", "n3")
+    app.processEvents()
+    assert _lpg.master is None and not isinstance(_lpg.doc, _LkDoc)
+    assert win.scene.doc is _lpg.doc and set(win.scene.node_items) == set(_lpg.doc.nodes)
+    assert win.inspector._node is None or win.inspector._node.scene() is win.scene
+    _n6 = set(_lpg.doc.nodes)
+    win._on_op_dropped("enhance.gamma", QPointF(300.0, 300.0))
+    assert len(set(_lpg.doc.nodes) - _n6) == 1, "its graph is editable again"
+    _l2 = win.duplicate_page(_lm_id, linked=True)
+    app.processEvents()
+    assert win.workspace.dependents_of(_lm_id) == [_l2]
+    assert win.delete_page(_lm_id, confirm=False)
+    app.processEvents()
+    assert win.workspace.page(_l2).master is None and win.workspace.page(_l2).doc.nodes
+    _ok("LK2 a linked page survives save and reopen (master + overrides); Make unique turns "
+        "it into a page of its own with an editable graph; deleting a master turns its "
+        "linked pages into pages of their own")
+
+    # LK3 (step 6 review) the window's own structural actions act on the ACTIVE page and are
+    # refused on a linked one: Edit > Dissolve (bound to the page shown, not the first one)
+    # and Edit > Delete keep the hint; Make unique keeps the selection
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _lm3 = win.workspace.active
+    win.scene.clearSelection()
+    win.scene.node_items["n7"].setSelected(True)                 # selected on the master
+    _lp3 = win.duplicate_page(_lm3, linked=True)
+    app.processEvents()
+    win.scene.clearSelection()
+    win.scene.node_items["n4"].setSelected(True)
+    app.processEvents()
+    _n3 = set(win.workspace.page(_lm3).doc.nodes)
+    win.statusBar().clearMessage()
+    win._sync_edit_actions()                  # what opening the Edit menu does
+    assert win._dissolve_act.isEnabled()
+    win._dissolve_act.trigger()
+    app.processEvents()
+    assert set(win.workspace.page(_lm3).doc.nodes) == _n3, "Dissolve never reaches the master"
+    assert win.statusBar().currentMessage() == _LkHint
+    win.statusBar().clearMessage()
+    win.delete_selection()
+    assert win.statusBar().currentMessage() == _LkHint and "n4" in win.doc.nodes
+    win.scene.clearSelection()
+    win.scene.node_items["n5"].setSelected(True)
+    app.processEvents()
+    assert win.make_unique(_lp3)
+    app.processEvents()
+    assert [i.node_id for i in win.scene.selectedItems() if isinstance(i, _NodeItem)] == ["n5"]
+    assert win.inspector._node is not None and win.inspector._node.node_id == "n5"
+    _ok("LK3 Edit > Dissolve and Edit > Delete on a linked page are refused with the hint and "
+        "never reach the master (Dissolve acts on the page shown); Make unique keeps the "
+        "selection and Properties")
+
     # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
     from PySide6.QtGui import QMouseEvent as _QME

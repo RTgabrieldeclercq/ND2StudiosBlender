@@ -36,7 +36,7 @@ from typing import List, Mapping, Optional, Sequence
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu,
     QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -308,11 +308,17 @@ class InspectorPanel(QScrollArea):
     #: one: ``(node_id, socket)``. The window drops a Draw Regions node in line on the
     #: region input, switches to it, and comes back here when its drawing is applied.
     region_requested = Signal(str, str)
+    #: the Linked page banner (V4.00 step 6): ``(action, node_id)`` with action ``master``
+    #: (show the master page, this node selected — the graph is edited there) or ``unique``
+    #: (turn this page into a page of its own). The panel asks; the window owns the pages.
+    linked_action = Signal(str, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWidgetResizable(True)
         self._problems: list = []          # readiness problems of the shown node
+        #: (node_id, name) of every row marked as overridden on a linked page (V4.00 step 6)
+        self._override_rows: list = []
         self._problem_sockets: dict = {}   # socket name -> Problem (what is painted red)
         self._draw_armed: Optional[str] = None   # node id whose drawing is armed, if any
         self._draw_readout = ""
@@ -502,6 +508,12 @@ class InspectorPanel(QScrollArea):
         of = op.font(); of.setPointSize(9); op.setFont(of); hl.addWidget(op)
         self._v.addWidget(hd)
         self._v.addWidget(self._sep())
+        self._override_rows = []
+        if not getattr(node.doc, "editable_topology", True):
+            # a LINKED page (V4.00 step 6): whose graph this is, how far this page departs
+            # from it, and the two ways out
+            self._v.addWidget(self._linked_section(node))
+            self._v.addWidget(self._sep())
 
         # readiness (2026-10-02) — can it run as wired? Each problem names the input it is
         # about, which the rows below paint red, and offers the nodes that would fix it.
@@ -1256,6 +1268,7 @@ class InspectorPanel(QScrollArea):
                 f"background:{_h(T.mix(T.PANEL, T.ERROR, 0.10))}; border-radius:4px; }}")
             outer.setContentsMargins(6, 2, 2, 2)
             block.setToolTip("⚠ " + prob.message)
+        self._mark_override(block, node, s.name)
         driver = self._driver_of(node, s.name)
         if driver is not None:
             # A driven param's editor is dead: the rewrite bakes the sweep's value over
@@ -1933,7 +1946,92 @@ class InspectorPanel(QScrollArea):
             combo.setCurrentText(cur)
         combo.currentTextChanged.connect(lambda t, nm=m.name: self._set_mode(node, nm, t))
         lay.addWidget(combo)
+        self._mark_override(row, node, m.name)
         return row
+
+    # ── linked pages (V4.00 step 6) ─────────────────────────────────────────
+    def _linked_section(self, node: NodeItem) -> QWidget:
+        """The banner of a node on a LINKED page: the master page it follows, how many
+        values this page overrides (on the page, and on this node), and the two ways out —
+        Go to master, where the graph is edited, and Make unique."""
+        doc = node.doc
+        master = doc.master_name() or "its master"
+        n = doc.override_count()
+        ov = doc.overrides.get(node.node_id) or {}
+        k = len(ov.get("params") or {}) + len(ov.get("modes") or {})
+        sec = self._section("Linked page",
+                            f"{n} override{'' if n == 1 else 's'} · {k} on this node")
+        self._linked_text = f"Linked to “{master}” · {n} override{'' if n == 1 else 's'}"
+        head = QLabel(self._linked_text)
+        hf = head.font(); hf.setBold(True); head.setFont(hf)
+        sec._lay.addWidget(head)  # type: ignore[attr-defined]
+        msg = QLabel("Its nodes, wires and card positions are the master's — add, remove or "
+                     "rewire nodes there and every linked page follows. A value changed here "
+                     "is this page's own (marked by the bar on its row; right-click the row "
+                     "to reset it to the master's).")
+        msg.setWordWrap(True)
+        msg.setProperty("role", "muted")
+        mf = msg.font(); mf.setPointSize(9); msg.setFont(mf)
+        sec._lay.addWidget(msg)  # type: ignore[attr-defined]
+        row = QHBoxLayout()
+        for text, act, tip in (
+                ("Go to master", "master",
+                 "Show the master page with this node selected — the graph is edited there "
+                 "and every page linked to it follows."),
+                ("Make unique", "unique",
+                 "Make this a page of its own, holding its current graph and values. The "
+                 "master's edits stop reaching it and its graph becomes editable.")):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(
+                lambda _c=False, a=act, nid=node.node_id: self.linked_action.emit(a, nid))
+            row.addWidget(b)
+        row.addStretch(1)
+        sec._lay.addLayout(row)  # type: ignore[attr-defined]
+        return sec
+
+    def _mark_override(self, w: QWidget, node: NodeItem, name: str) -> None:
+        """On a linked page, mark a value this page overrides: an accent bar on its row,
+        the master's value in the tooltip, and a right-click *Reset to master*."""
+        doc = node.doc
+        if getattr(doc, "editable_topology", True) or not doc.is_overridden(node.node_id, name):
+            return
+        mv = doc.master_value(node.node_id, name)
+        tip = (f"Overridden on this page — the master's value is {mv!r}." if mv is not None
+               else "Overridden on this page — the master leaves it at its default.")
+        tip += "  Right-click: Reset to master."
+        if not w.objectName():                 # a problem's red bar wins the background
+            w.setObjectName("ovrRow")
+            w.setAttribute(Qt.WA_StyledBackground, True)
+            w.setStyleSheet(
+                f"QWidget#ovrRow {{ border-left:3px solid {_h(T.ACCENT)}; "
+                f"background:{_h(T.mix(T.PANEL, T.ACCENT, 0.08))}; border-radius:4px; }}")
+            lay = w.layout()
+            if lay is not None:
+                m = lay.contentsMargins()
+                lay.setContentsMargins(6, m.top(), m.right(), m.bottom())
+        w.setToolTip(tip + ("\n\n" + w.toolTip() if w.toolTip() else ""))
+        w.setContextMenuPolicy(Qt.CustomContextMenu)
+        w.customContextMenuRequested.connect(
+            lambda pos, ww=w, nid=node.node_id, nm=name: self._override_menu(ww, pos, nid, nm))
+        self._override_rows.append((node.node_id, name))
+
+    def _override_menu(self, w: QWidget, pos, node_id: str, name: str) -> None:
+        menu = QMenu(self)                     # not the row: the reset rebuilds the panel
+        menu.addAction("Reset to master").triggered.connect(
+            lambda: self.reset_override(node_id, name))
+        menu.exec(w.mapToGlobal(pos))
+
+    def reset_override(self, node_id: str, name: Optional[str] = None) -> None:
+        """Back to the master's value (``name``; every value of the node when ``None``)."""
+        node = self._node
+        doc = node.doc if node is not None else None
+        if doc is None or getattr(doc, "editable_topology", True):
+            return
+        doc.reset_override(node_id, name)
+        QTimer.singleShot(0, self._rebuild)    # after the menu that asked has closed
 
     def _conn_label(self, text: str, col, problem: str = "") -> QWidget:
         """One connection line. ``problem`` (a readiness message) paints the line red with a

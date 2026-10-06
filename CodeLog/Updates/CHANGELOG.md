@@ -97,6 +97,21 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   page stales a dock under its blank-condition Page Output; Properties refreshes when a page
   is renamed or deleted from another canvas's switcher.
 
+### Step 6 — linked pages (2026-10-05)
+- **Duplicate as linked page**: a page that follows its master's graph — cards, wires,
+  positions and every later edit — with parameter and mode values of its own (overrides). A
+  linked page re-uses everything its master computed up to the first node it overrides.
+- Properties shows a **Linked page** banner (master, override count, Go to master, Make
+  unique); an overridden row carries an accent bar, the master's value on hover and *Reset to
+  master* on right-click.
+- Structural edits on a linked page are refused with a status-bar hint (its context menu
+  greys them out); moving or folding a card acts on both pages, live.
+- **Make unique** turns a linked page into a page of its own; deleting a master does that for
+  its linked pages after a confirmation. Files store a linked page as master + overrides.
+- A Dock's checkpoint (folder, bake, held state) is per page; a Load reading another file
+  describes only its page; an override stays until reset. Edit ▸ Dissolve acts on the page
+  shown (it acted on the first page since step 5).
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

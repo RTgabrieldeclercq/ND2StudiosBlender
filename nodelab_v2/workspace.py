@@ -59,6 +59,7 @@ from nodegraph.metadata import MetaEnvelope
 from nodegraph.serialize import (
     is_workspace_dict, page_from_dict, to_workspace_dict, workspace_pages)
 from nodelab_v2.document import GraphDocument, NodeRecord
+from nodelab_v2.linked_document import LinkedDocument, check_overrides
 from nodelab_v2.ops import (
     PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
     is_frozen, upstream_signature)
@@ -359,11 +360,24 @@ class Workspace:
     def duplicate_page(self, page_id: str, *, dependent: bool = False,
                        name: Optional[str] = None) -> Page:
         """A copy of ``page_id`` placed right after it: a UNIQUE copy (its own nodes and
-        values) or — V4 step 6 — a LINKED one (the master's nodes, its own values)."""
-        if dependent:
-            raise NotImplementedError("linked pages arrive in V4 step 6")
+        values) or — V4 step 6 — a LINKED one (the master's nodes, its own values). A page
+        linked to a linked page links to that page's master (one level deep) and starts from
+        its overrides."""
         src = self.pages[page_id]
         order = list(self.pages)
+        if dependent:
+            root_id = src.master or page_id
+            root = self.pages[root_id]
+            doc = LinkedDocument(root.doc, overrides=(src.doc.overrides_dict()
+                                                      if src.master else None))
+            doc.path = self.path
+            page = self.add_page(name or f"{src.name} (linked)", src.kind, doc=doc,
+                                 index=order.index(page_id) + 1)
+            page.master = root_id
+            self._out_ids[page.id] = self._output_ids(page.id)
+            page.doc.repropagate()          # now its Page Inputs see the upstream Outputs
+            self._notify(())                # a new page: read by nothing yet
+            return page
         page = self.add_page(name or f"{src.name} copy", src.kind,
                              index=order.index(page_id) + 1)
         self._quiet = True
@@ -377,16 +391,40 @@ class Workspace:
         self._notify(())                    # a new page: read by nothing yet
         return page
 
+    def dependents_of(self, page_id: str) -> List[str]:
+        """The pages LINKED to ``page_id`` (its dependents), in page order."""
+        return [p.id for p in self.pages.values() if p.master == page_id]
+
+    def make_unique(self, page_id: str) -> Page:
+        """Turn a linked page into a plain one holding its current graph and values; master
+        edits no longer reach it (V4 step 6). A plain page is returned unchanged."""
+        page = self.pages[page_id]
+        if not page.master:
+            return page
+        old = page.doc
+        self._detach(page)
+        page.doc = old.make_unique()
+        page.master, page.overrides = None, {}
+        self._attach(page)
+        page.doc.repropagate()              # with the Page Input seeds now installed
+        # the same graph and values under a new document: what reads it is unchanged, but
+        # its run identity moves (a new document uid) — say which nodes, not "everything"
+        self._notify({qualify(page_id, n) for n in page.doc.nodes})
+        return page
+
     def reset(self) -> None:
         """File → New: back to ONE empty Free page named "Graph", keeping the active page's
         document object (the canvas is bound to it)."""
         keep = self.pages[self.active] if self.active in self.pages else None
+        if keep is not None and not keep.editable_topology_doc():
+            keep = None                     # a linked page's document cannot be emptied
         for pid in list(self.pages):
             if keep is None or pid != keep.id:
                 self._detach(self.pages[pid])
                 del self.pages[pid]
         self.path = None
         if keep is None:
+            self.active = None              # the fresh page becomes the active one
             self.add_page(DEFAULT_PAGE_NAME, FREE)
             return
         keep.name, keep.kind, keep.master, keep.overrides = DEFAULT_PAGE_NAME, FREE, None, {}
@@ -414,11 +452,16 @@ class Workspace:
     # ── a document becomes a page ─────────────────────────────────────────────
     def _attach(self, page: Page) -> None:
         doc, pid = page.doc, page.id
+        if isinstance(doc, LinkedDocument):
+            doc.attach()                    # a page re-attached by a rolled-back load
         doc.page_kind = page.kind
         doc.store_tag = pid
         doc.page_sources = lambda pid=pid: self.available_sources(pid)
         doc.cross_page_signature = lambda nid, pid=pid: self.cross_page_signature(pid, nid)
         doc.workspace_revision = lambda pid=pid: self.revision_of(pid)
+        if isinstance(doc, LinkedDocument):
+            doc.master_name = (lambda p=page: self.pages[p.master].name
+                               if p.master in self.pages else "")
 
         def hook(pid=pid) -> Mapping[str, MetaEnvelope]:
             return self._input_seeds(pid)
@@ -439,6 +482,8 @@ class Workspace:
         if hook is not None and hook in doc.seed_hooks:
             doc.seed_hooks.remove(hook)
         self._out_ids.pop(page.id, None)
+        if isinstance(doc, LinkedDocument):
+            doc.detach()
         doc.page_sources = lambda: []
         doc.cross_page_signature = lambda _nid: ""
         doc.workspace_revision = lambda: ""
@@ -828,7 +873,9 @@ class Workspace:
             rec: Dict[str, Any] = {"id": p.id, "name": p.name, "kind": p.kind,
                                    "master": p.master}
             if p.master:
-                rec["overrides"] = {k: dict(v) for k, v in p.overrides.items()}
+                rec["overrides"] = (p.doc.overrides_dict()
+                                    if isinstance(p.doc, LinkedDocument) else
+                                    {k: dict(v) for k, v in p.overrides.items()})
             else:
                 rec.update(p.doc.to_page_dict())
             recs.append(rec)
@@ -855,13 +902,18 @@ class Workspace:
             if not PAGE_ID_RE.match(str(rec["id"])):
                 raise ValueError(f"page id {rec['id']!r} may contain only letters, digits "
                                  f"and _")
-            if rec.get("master"):
-                raise ValueError(
-                    f"page {rec['id']!r} is linked to a master page; linked pages arrive in "
-                    f"V4 step 6 and this build cannot open them yet")
             if not R.is_page_kind(rec.get("kind") or FREE):
                 raise ValueError(f"page {rec['id']!r} has unknown kind {rec.get('kind')!r} "
                                  f"(kinds: {', '.join(R.page_kinds())})")
+            if rec.get("master"):
+                m = next((r for r in recs if r["id"] == rec["master"]), None)
+                if m is None or m.get("master"):
+                    raise ValueError(
+                        f"page {rec['id']!r} is linked to {rec['master']!r}, which is not a "
+                        f"plain page of this file")
+                check_overrides(rec.get("overrides") or {},
+                                where=f"page {rec['id']!r} overrides")
+                continue                       # its graph is its master's
             parsed[rec["id"]] = page_from_dict(rec)
             bad = sorted(n for n in parsed[rec["id"]][0].nodes if RUN_SEP in n)
             if bad:
@@ -871,12 +923,15 @@ class Workspace:
         if self.active in self.pages and self.pages[self.active].editable_topology_doc():
             keep = self.pages[self.active].doc
         before = (dict(self.pages), self.active, self.next_page_seq)
+        # the canvas page's document is LOADED IN PLACE below: keep what it held, so a load
+        # that fails afterwards can put it back
+        keep_was = keep.to_page_dict() if keep is not None else None
         self._quiet = True
         try:
             for pid in list(self.pages):
                 self._detach(self.pages[pid])
             self.pages.clear()
-            for rec in recs:
+            for rec in [r for r in recs if not r.get("master")]:
                 doc = keep if (rec["id"] == active and keep is not None) else GraphDocument()
                 doc.path = self.path
                 name = rec.get("name") or ""
@@ -889,9 +944,21 @@ class Workspace:
             # the Movie Editor) qualifies bare ids against the page being shown
             self.active = active
             # the canvas document LAST, so its listeners see every other page in place
-            for rec in sorted(recs, key=lambda r: self.pages[r["id"]].doc is keep):
+            plain = [r for r in recs if not r.get("master")]
+            for rec in sorted(plain, key=lambda r: self.pages[r["id"]].doc is keep):
                 graph, zones, groups = parsed[rec["id"]]
                 self.pages[rec["id"]].doc._load_parsed(graph, zones, groups, rec.get("ui"))
+            # then the LINKED pages, over their loaded masters, in file order
+            for rec in [r for r in recs if r.get("master")]:
+                doc = LinkedDocument(self.pages[rec["master"]].doc,
+                                     overrides=dict(rec.get("overrides") or {}))
+                doc.path = self.path
+                page = Page(rec["id"], rec.get("name") or rec["id"],
+                            rec.get("kind") or FREE, doc, master=rec["master"])
+                self.pages[page.id] = page
+                self._attach(page)
+            # …and the file's page ORDER, which the linked pages were appended out of
+            self.pages = {r["id"]: self.pages[r["id"]] for r in recs}
             seq = wsd.get("next_page_seq") if is_ws else None
             highest = max((int(m.group(1)) for m in
                            (re.match(r"^pg(\d+)$", i) for i in ids) if m), default=0)
@@ -904,6 +971,11 @@ class Workspace:
             for pid in list(self.pages):
                 self._detach(self.pages[pid])
             self.pages, self.active, self.next_page_seq = before
+            if keep is not None and keep_was is not None:
+                try:
+                    keep.load_page(keep_was)
+                except Exception:                      # noqa: BLE001 — best effort
+                    pass
             for page in self.pages.values():
                 self._attach(page)
             raise

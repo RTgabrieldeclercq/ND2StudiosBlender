@@ -160,6 +160,26 @@ PROGRESS_TICK_MS = 60
 TRANSIENT_RUN_STATES = ("queued", "running", "decoding")
 
 
+def _needs_topology(fn):
+    """A gesture that changes the graph's SHAPE: refused on a linked page (V4.00 step 6),
+    whose graph is its master's — the scene says why (``topology_refused``) and does
+    nothing, rather than half-starting a drag the document will then refuse."""
+    import functools
+
+    @functools.wraps(fn)
+    def guarded(self, *a, **k):
+        if getattr(self.doc, "editable_topology", True):
+            return fn(self, *a, **k)
+        from nodelab_v2.linked_document import TOPOLOGY_HINT
+        self.topology_refused.emit(TOPOLOGY_HINT)
+        return None
+    return guarded
+
+
+#: the context-menu entries a linked page greys out (their labels' first words)
+_STRUCTURAL_MENU = ("Muted", "Delete", "Dissolve", "Fan out", "Insert reroute")
+
+
 class GraphScene(QGraphicsScene):
     """Document-mirroring scene + the wire-drag state machine."""
 
@@ -180,6 +200,9 @@ class GraphScene(QGraphicsScene):
     #: a source card's context-menu *Ingest this file* — the same thing double-clicking a
     #: not-yet-ingested source does, spelled out for discoverability.
     ingest_requested = Signal(str)
+    #: a structural gesture was refused — the page is LINKED to a master (V4.00 step 6):
+    #: the hint, for the window's status bar
+    topology_refused = Signal(str)
 
     def __init__(self, document: GraphDocument) -> None:
         super().__init__()
@@ -207,7 +230,17 @@ class GraphScene(QGraphicsScene):
         self._anim.timeout.connect(self._tick_progress)
         self.setSceneRect(-400, -300, 3200, 2000)
         document.on_change(self.sync)
+        document.on_moved(self._on_moved)
         self.sync()
+
+    def _on_moved(self, node_id: str) -> None:
+        """A card moved in the document — from another canvas showing this page or its
+        master/linked twin (V4.00 step 6): put this scene's card where the record says."""
+        item = self.node_items.get(node_id)
+        rec = self.doc.nodes.get(node_id)
+        if item is not None and rec is not None and \
+                (item.pos().x(), item.pos().y()) != (rec.x, rec.y):
+            item.setPos(rec.x, rec.y)
 
     def release(self) -> None:
         """Stop listening to the document: the window is dropping this scene (its page was
@@ -215,6 +248,7 @@ class GraphScene(QGraphicsScene):
         listener list raises on the document's next edit, and the live listeners after it —
         the scene that replaced it, the window's hooks — never run."""
         self.doc.off_change(self.sync)
+        self.doc.off_moved(self._on_moved)
         self._anim.stop()
 
     # ── model → canvas ────────────────────────────────────────────────────────
@@ -501,6 +535,7 @@ class GraphScene(QGraphicsScene):
         sel = [i.node_id for i in self.selectedItems() if isinstance(i, NodeItem)]
         self.delete_nodes(sel if node_id in sel and len(sel) > 1 else [node_id])
 
+    @_needs_topology
     def delete_nodes(self, node_ids: Iterable[str]) -> List[str]:
         """Remove nodes from the document (their wires go with them). Returns the ids
         actually removed."""
@@ -514,6 +549,7 @@ class GraphScene(QGraphicsScene):
             self.nodes_deleted.emit(gone)
         return gone
 
+    @_needs_topology
     def dissolve_node(self, node_id: str) -> bool:
         """Delete ``node_id`` but **heal the chain**: its incoming Dataset wire is
         reconnected to every Dataset consumer it fed. The chain survives the removal of a
@@ -594,6 +630,7 @@ class GraphScene(QGraphicsScene):
         return True
 
     # ── wire dragging (G1) ────────────────────────────────────────────────────
+    @_needs_topology
     def begin_wire(self, socket: SocketItem, scene_pos: QPointF) -> None:
         fixed = socket
         if socket.io == "in":
@@ -765,6 +802,22 @@ class GraphScene(QGraphicsScene):
         super().mouseDoubleClickEvent(e)
 
     # ── context menu (the discoverable delete) ────────────────────────────────
+    @_needs_topology
+    def _mute_selection(self) -> None:
+        for it in self.selectedItems():
+            if isinstance(it, NodeItem):
+                self.doc.set_muted(it.node_id, not it.rec.muted)
+
+    def _lock_structural(self, menu: QMenu) -> None:
+        """On a linked page the menu's structural entries are greyed out, saying why."""
+        if getattr(self.doc, "editable_topology", True):
+            return
+        from nodelab_v2.linked_document import TOPOLOGY_HINT
+        for act in menu.actions():
+            if act.text().startswith(_STRUCTURAL_MENU):
+                act.setEnabled(False)
+                act.setToolTip(TOPOLOGY_HINT)
+
     def contextMenuEvent(self, e) -> None:
         node = next((it for it in self.items(e.scenePos())
                      if isinstance(it, NodeItem)), None)
@@ -783,6 +836,7 @@ class GraphScene(QGraphicsScene):
             act = menu.addAction("Fit graph")
             act.triggered.connect(lambda: [v.fit_all() for v in self.views()
                                            if hasattr(v, "fit_all")])
+        self._lock_structural(menu)
         menu.exec(e.screenPos())
         e.accept()
 
@@ -889,6 +943,7 @@ class GraphScene(QGraphicsScene):
         menu.addAction("Delete frame (keeps the nodes)\tDel").triggered.connect(
             lambda: self.doc.remove_frame(frame.frame_id))
 
+    @_needs_topology
     def fan_out_batch(self, unbatch_id: str) -> list:
         """Give every file of the batch its own card, wired to that file's output.
 
@@ -927,6 +982,7 @@ class GraphScene(QGraphicsScene):
             made.append(rec.id)
         return made
 
+    @_needs_topology
     def _reroute_on(self, edge: EdgeItem, pos: QPointF) -> None:
         r = T.RR_SIZE / 2.0
         rec = self.doc.add_node("rr.reroute", x=pos.x() - r, y=pos.y() - r)
@@ -951,9 +1007,7 @@ class GraphScene(QGraphicsScene):
             e.accept()
             return
         if e.key() == Qt.Key_M:
-            for it in self.selectedItems():
-                if isinstance(it, NodeItem):
-                    self.doc.set_muted(it.node_id, not it.rec.muted)
+            self._mute_selection()
             e.accept()
             return
         if e.key() == Qt.Key_C:
@@ -964,6 +1018,7 @@ class GraphScene(QGraphicsScene):
             return
         super().keyPressEvent(e)
 
+    @_needs_topology
     def delete_selection(self) -> None:
         edges = [it.model_edge for it in self.selectedItems()
                  if isinstance(it, EdgeItem)]
@@ -976,6 +1031,7 @@ class GraphScene(QGraphicsScene):
             self.doc.remove_frame(fid)
         self.delete_nodes(nodes)
 
+    @_needs_topology
     def dissolve_selection(self) -> None:
         for nid in [it.node_id for it in self.selectedItems()
                     if isinstance(it, NodeItem)]:

@@ -267,6 +267,10 @@ class GraphDocument:
         #: avoid.
         self._held_nodes: frozenset = frozenset()
         self._listeners: List[Callable[[], None]] = []
+        #: GUI-only: called with a node id when its card MOVED (:meth:`set_pos`). Not a model
+        #: edit — no revision, no run disturbed — but a linked page and its master show the
+        #: same cards in the same places (V4.00 step 6), so each canvas follows the other.
+        self._move_listeners: List[Callable[[str], None]] = []
         #: The nodes the most recent edit touched, or ``None`` for "unknown / everything".
         #: Read by listeners during their change callback (see :meth:`_notify`); meaningless
         #: outside one, since the next edit overwrites it.
@@ -507,8 +511,20 @@ class GraphDocument:
 
     def set_pos(self, node_id: str, x: float, y: float) -> None:
         rec = self.nodes.get(node_id)
-        if rec is not None:
+        if rec is not None and (rec.x, rec.y) != (float(x), float(y)):
             rec.x, rec.y = float(x), float(y)   # position is not a model edit: no notify
+            for fn in list(self._move_listeners):
+                fn(node_id)                     # …but the canvases showing it follow
+
+    def on_moved(self, fn: Callable[[str], None]) -> None:
+        """Call ``fn(node_id)`` whenever a card's position changes (GUI only)."""
+        self._move_listeners.append(fn)
+
+    def off_moved(self, fn: Callable[[str], None]) -> None:
+        try:
+            self._move_listeners.remove(fn)
+        except ValueError:
+            pass
 
     def set_muted(self, node_id: str, muted: bool) -> None:
         """Mute/unmute a node (G3 pass-through). A REAL graph change — the run graph bypasses

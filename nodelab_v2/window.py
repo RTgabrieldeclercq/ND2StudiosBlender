@@ -23,6 +23,8 @@ or a header double-click puts the Viewer back in its dock. A floating viewer sta
 from __future__ import annotations
 
 import functools
+import sys
+import weakref
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -47,6 +49,7 @@ from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
 from nodelab_v2.canvas import CanvasPanel, kind_icon
 from nodelab_v2.workspace import Workspace, kind_label, local_ids, qualify, split_run_id
 from nodelab_v2.document import GraphDocument
+from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedPageError
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
@@ -174,6 +177,46 @@ QTabBar::tab:hover {{ background:{T.PANEL_HI.name()}; }}
 """ + T.controls_qss()
 
 FILE_FILTER = "nd2graph (*.nd2graph.json);;All files (*)"
+
+
+def _needs_topology(fn):
+    """A window action that changes the active page's graph SHAPE: refused on a linked page
+    (V4.00 step 6) with the hint in the status bar, before any dialog opens."""
+    @functools.wraps(fn)
+    def guarded(self, *a, **k):
+        if not self._topology_ok():
+            return None
+        return fn(self, *a, **k)
+    return guarded
+
+
+#: the windows the LinkedPageError backstop reports to (weakly held — a closed one goes)
+_LINKED_HOOK_WINDOWS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _install_linked_hook(win: "MainWindow") -> None:
+    """The backstop for a structural edit no guard caught: Qt hands an exception escaping a
+    slot to ``sys.excepthook``, and a :class:`LinkedPageError` there is a refusal for the
+    user, not a crash — it goes to the status bar. Installed once; every other exception
+    reaches the previous hook unchanged."""
+    _LINKED_HOOK_WINDOWS.add(win)
+    if getattr(sys.excepthook, "_nd2_linked", False):
+        return
+    prev = sys.excepthook
+
+    def hook(et, ev, tb):
+        if et is not None and issubclass(et, LinkedPageError):
+            for w in list(_LINKED_HOOK_WINDOWS):
+                try:
+                    w.statusBar().showMessage(str(ev), 8000)
+                    return
+                except RuntimeError:          # a window already torn down
+                    continue
+            return
+        prev(et, ev, tb)
+
+    hook._nd2_linked = True                   # type: ignore[attr-defined]
+    sys.excepthook = hook
 
 
 class _MovieHost:
@@ -469,6 +512,10 @@ class MainWindow(QMainWindow):
         self._draw_arm_pending: Optional[str] = None  # arm once this node's pull lands
         self.inspector.draw_control.connect(self._on_draw_control)
         self.inspector.region_requested.connect(self._on_region_requested)
+        # linked pages (V4.00 step 6): the banner's Go to master / Make unique, and the
+        # backstop that turns a refused structural edit into a status-bar hint
+        self.inspector.linked_action.connect(self._on_linked_action)
+        _install_linked_hook(self)
         self.runner.baked.connect(self._on_baked)
         self.runner.detail_ready.connect(self._on_detail_ready)
 
@@ -870,6 +917,7 @@ class MainWindow(QMainWindow):
         sc.ingest_requested.connect(self.ingest_source)
         sc.pick_requested.connect(self._arm_pick)
         sc.dock_action.connect(self._on_dock_action)
+        sc.topology_refused.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         doc = self.workspace.page(page_id).doc
         hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id)]
         for fn in hooks:
@@ -938,7 +986,9 @@ class MainWindow(QMainWindow):
                 continue
             menu.addSection(kind_label(kind))
             for p in pages:
-                act = menu.addAction(kind_icon(kind), p.name)
+                act = menu.addAction(kind_icon(kind), p.name + ("   · linked" if p.master else ""))
+                if p.master and p.master in ws.pages:
+                    act.setToolTip(f"linked to “{ws.pages[p.master].name}”")
                 act.setCheckable(True)
                 act.setChecked(p.id == c.page_id)
                 act.triggered.connect(lambda _=False, pid=p.id, c=c: self._show_page(c, pid))
@@ -951,6 +1001,18 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Duplicate page").triggered.connect(
             lambda _=False, c=c: self.duplicate_page(c.page_id, canvas=c))
+        lk = menu.addAction("Duplicate as linked page")
+        lk.setToolTip("A page with the same nodes and wiring that follows every edit of the "
+                      "master's graph, with parameter values of its own — one workflow "
+                      "tuned per position or condition.")
+        lk.triggered.connect(
+            lambda _=False, c=c: self.duplicate_page(c.page_id, canvas=c, linked=True))
+        shown = ws.pages.get(c.page_id)
+        if shown is not None and shown.master:
+            menu.addAction("Go to master page").triggered.connect(
+                lambda _=False, c=c, m=shown.master: self._show_page(c, m))
+            menu.addAction("Make unique").triggered.connect(
+                lambda _=False, c=c: self.make_unique(c.page_id))
         menu.addAction("Open in a new canvas").triggered.connect(
             lambda _=False, c=c: self.open_canvas(c.page_id))
         menu.addAction("Rename page…").triggered.connect(
@@ -972,11 +1034,66 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"new {kind_label(kind)} page “{page.name}”")
         return page.id
 
-    def duplicate_page(self, page_id: str, *, canvas: Optional[CanvasPanel] = None) -> str:
-        page = self.workspace.duplicate_page(page_id)
+    def duplicate_page(self, page_id: str, *, canvas: Optional[CanvasPanel] = None,
+                       linked: bool = False) -> str:
+        """Copy a page (``linked``: a page LINKED to it — its master's graph, values of its
+        own; V4.00 step 6) and show the copy on ``canvas``."""
+        page = self.workspace.duplicate_page(page_id, dependent=linked)
         self._show_page(canvas or self._canvas, page.id)
-        self.statusBar().showMessage(f"duplicated as “{page.name}”")
+        if linked:
+            master = self.workspace.pages[page.master].name
+            self.statusBar().showMessage(
+                f"“{page.name}” follows “{master}”: change values here, edit the graph there")
+        else:
+            self.statusBar().showMessage(f"duplicated as “{page.name}”")
         return page.id
+
+    def make_unique(self, page_id: str) -> bool:
+        """A linked page becomes a page of its own, holding its current graph and values
+        (V4.00 step 6). Its canvas, viewers and selection carry over by node id."""
+        page = self.workspace.pages.get(page_id)
+        if page is None or not page.master:
+            return False
+        old = self._scenes.get(page_id)
+        try:
+            sel = [i.node_id for i in old.selectedItems() if isinstance(i, NodeItem)] \
+                if old is not None else []
+        except RuntimeError:
+            sel = []
+        self.workspace.make_unique(page_id)   # its scene is rebuilt on the new document
+        if sel and page_id in self._scenes:
+            sc = self._scenes[page_id]
+            for nid in sel:
+                item = sc.node_items.get(nid)
+                if item is not None:
+                    item.setSelected(True)
+            if page_id == self.workspace.active:
+                first = sc.node_items.get(sel[0])
+                if first is not None:
+                    self.inspector.set_node(first)
+        self.statusBar().showMessage(
+            f"“{page.name}” is a page of its own now — its master's edits no longer reach it")
+        return True
+
+    def _topology_ok(self, doc=None) -> bool:
+        """May the graph of ``doc`` (default: the active page's) change shape? Not on a
+        linked page: its graph is its master's — say so and refuse."""
+        doc = doc if doc is not None else self.doc
+        if getattr(doc, "editable_topology", True):
+            return True
+        self.statusBar().showMessage(TOPOLOGY_HINT, 8000)
+        return False
+
+    def _on_linked_action(self, action: str, node_id: str) -> None:
+        """The inspector's Linked page banner, for a node of the ACTIVE page."""
+        page = self.workspace.pages.get(self.workspace.active or "")
+        if page is None or not page.master:
+            return
+        if action == "unique":
+            self.make_unique(page.id)
+        elif action == "master" and page.master in self.workspace.pages:
+            self._show_page(self._canvas, page.master)
+            self._select_only(node_id)
 
     def rename_page(self, page_id: str, name: Optional[str] = None) -> bool:
         page = self.workspace.pages.get(page_id)
@@ -1003,12 +1120,22 @@ class MainWindow(QMainWindow):
         if len(ws.pages) <= 1:
             self.statusBar().showMessage("the last page cannot be deleted")
             return False
-        if confirm and page.doc.nodes and QMessageBox.question(
+        deps = ws.dependents_of(page_id)
+        linked_note = ""
+        if deps:
+            names = ", ".join(f"“{ws.pages[d].name}”" for d in deps)
+            linked_note = (f"\n\nIt is the master of {len(deps)} linked page(s): {names}. "
+                           f"They become pages of their own, keeping their current graph "
+                           f"and values.")
+        if confirm and (page.doc.nodes or deps) and QMessageBox.question(
                 self, "Delete page",
                 f"Delete page “{page.name}” and its {len(page.doc.nodes)} node(s)?\n\n"
-                f"Page Inputs on other pages that read its Outputs become unbound.",
+                f"Page Inputs on other pages that read its Outputs become unbound."
+                + linked_note,
                 QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
             return False
+        for d in deps:                      # its linked pages keep what they show
+            ws.make_unique(d)
         try:
             ws.remove_page(page_id)
         except ValueError as exc:
@@ -1089,6 +1216,10 @@ class MainWindow(QMainWindow):
                  if pid not in ws.pages or getattr(sc, "doc", None) is not ws.pages[pid].doc}
         for pid in stale:
             self._drop_scene(pid)
+        if ws.active in stale:
+            # Properties holds a card of the scene just dropped: re-read the new one's
+            # selection below (a Make unique swaps the document, not the page)
+            self._ui_page = None
         for c in self.canvases():
             if c.page_id not in ws.pages:
                 gone = c.page_id
@@ -1122,6 +1253,8 @@ class MainWindow(QMainWindow):
                 # active page stayed: the shown node's Page Input Source menu and its
                 # Ready-to-run read the page list, so the panel is rebuilt for it
                 self.inspector.rebuild()
+        elif getattr(self, "_ui_page", None) is None:
+            self._sync_active_page_ui()
 
     def _sync_active_page_ui(self) -> None:
         """What follows the active page: the palette's kind, the inspector (the page's own
@@ -1195,7 +1328,8 @@ class MainWindow(QMainWindow):
         self._dissolve_act.setShortcutContext(Qt.WidgetWithChildrenShortcut)
         self._dissolve_act.setToolTip(
             "Delete the selected node(s) and reconnect each one's input to whatever it fed")
-        self._dissolve_act.triggered.connect(self.scene.dissolve_selection)
+        # the ACTIVE page's scene at the time — bound once, it would act on the first page
+        self._dissolve_act.triggered.connect(lambda *_: self.scene.dissolve_selection())
         self.view.addAction(self._dissolve_act)
         m_edit.addAction(self._dissolve_act)
         m_edit.addSeparator()
@@ -1487,6 +1621,7 @@ class MainWindow(QMainWindow):
                 return f"'{spec.label if spec else it.op_key}'"
         return "selection"
 
+    @_needs_topology
     def delete_selection(self) -> None:
         """Edit → Delete: remove the selected nodes/wires/frames. Reports what went, so a
         deletion is never silent (the canvas is busy — a card vanishing off-screen would
@@ -2121,6 +2256,7 @@ class MainWindow(QMainWindow):
             f"{ovl_id}: pinned primary {axis}={pri} to source {axis}={sec}"
             + ("" if a_pri is not None else " (by index — no clock/focus to anchor it)"), 5000)
 
+    @_needs_topology
     def _on_add_requested(self, node_id: str, op_key: str, wire_to: str) -> Optional[str]:
         """A *Ready to run* suggestion was taken: add ``op_key`` and wire it into
         ``node_id``'s ``wire_to`` input (2026-10-02). Returns the new node's id.
@@ -2217,10 +2353,12 @@ class MainWindow(QMainWindow):
             # visible changed, which read as "the drawing node does not work".
             self.pull_node(node_id, page_id=pid)
 
+    @_needs_topology
     def _add_at_center(self, op_key: str) -> None:
         c = self.view.mapToScene(self.view.viewport().rect().center())
         self.doc.add_node(op_key, x=c.x() - 100, y=c.y() - 40)
 
+    @_needs_topology
     def wrap_repeat(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
         if not sel:
@@ -2238,6 +2376,7 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"wrapped {len(sel)} node(s) in a Repeat×{n} zone")
 
+    @_needs_topology
     def group_selection(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
         if not sel:
@@ -2260,6 +2399,7 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
         self.statusBar().showMessage(f"grouped {len(sel)} node(s) into '{name or 'Group'}'")
 
+    @_needs_topology
     def ungroup_selection(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems()
                if isinstance(i, NodeItem) and i._is_group]
@@ -2271,6 +2411,7 @@ class MainWindow(QMainWindow):
         n = sum(1 for nid in sel if self.doc.ungroup(nid))
         self.statusBar().showMessage(f"ungrouped {n} group(s)")
 
+    @_needs_topology
     def frame_selection(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
         if not sel:
@@ -2283,6 +2424,7 @@ class MainWindow(QMainWindow):
         self.doc.add_frame(title or "Frame", sel)
         self.statusBar().showMessage(f"framed {len(sel)} node(s)")
 
+    @_needs_topology
     def _on_op_dropped(self, op_key: str, pos: QPointF) -> None:
         # splice-on-wire: if the node is dropped on a link, insert it into that wire
         e = self.scene.edge_at(pos)
@@ -2291,6 +2433,7 @@ class MainWindow(QMainWindow):
         if edge_tuple is not None:
             self.scene.splice_onto(rec.id, edge_tuple)
 
+    @_needs_topology
     def _on_files_dropped(self, paths: list, pos: QPointF, target: str) -> None:
         """Image files dragged from the desktop onto the canvas (V3.01).
 
@@ -2985,6 +3128,7 @@ class MainWindow(QMainWindow):
             f"{names}: Output → resample — the secondary is now written as a real channel")
         return True
 
+    @_needs_topology
     def flatten_to_large_image(self, node_id: Optional[str] = None) -> None:
         """Dock the chain at ``node_id`` (default: the viewed node) so it is served from a
         chunked, pyramidal store instead of recomputed per frame.
@@ -4469,6 +4613,7 @@ class MainWindow(QMainWindow):
         self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))
         return rec, axes
 
+    @_needs_topology
     def file_load_source(self) -> None:
         """File → Load ND2/TIFF file…: pick **one or more** images, read each file's
         metadata (no pixels), and drop one pre-loaded ``io.load`` source node per file
@@ -4500,6 +4645,7 @@ class MainWindow(QMainWindow):
             return
         self._load_source_paths(paths, group=self._ask_group(paths))
 
+    @_needs_topology
     def file_load_sequence(self) -> None:
         """File → Load file sequence…: pick ONE file of a numbered series, get all of it.
 
@@ -4586,6 +4732,7 @@ class MainWindow(QMainWindow):
         if written:
             self.statusBar().showMessage(f"recipe written to {written}")
 
+    @_needs_topology
     def lablink_load_result(self, path: str) -> None:
         """A hub returned an image; put it on the canvas as a source node.
 
@@ -4611,6 +4758,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"loaded {os.path.basename(path)} from the hub — it is a source node now")
 
+    @_needs_topology
     def _load_source_paths(self, paths: list, group: bool = False,
                            chain_axis: str = "") -> None:
         """Drop one ``io.load`` card per path, stacked, selected, and scrolled into view —
@@ -4822,6 +4970,7 @@ class MainWindow(QMainWindow):
             dock.raise_()
         self.palette.focus_search()
 
+    @_needs_topology
     def build_demo(self) -> None:
         """Replace the canvas with the small example chain (Load → Select → enhance →
         threshold → label → measure, plus a deconvolve → Viewer branch). Reachable from

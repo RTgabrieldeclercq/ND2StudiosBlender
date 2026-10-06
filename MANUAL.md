@@ -223,6 +223,25 @@ keeps editing the Export Movie of the page it was opened on (its title names the
 decides what the menus *offer*; it is not a lock — a node dragged from the palette onto a
 canvas, or the Example graph, lands on that canvas's page whatever its kind.
 
+**Linked pages** (V4.00). The switcher's *Duplicate as linked page* makes a page that follows
+another — its **master** — card for card: the same nodes, wires and positions, and every
+later change to the master's graph arrives on it. What it keeps of its own are **values**:
+change a parameter or a mode there and it becomes that page's **override**, marked by a bar
+on its row in Properties (hover for the master's value; right-click → *Reset to master*);
+every value it does not override follows the master. That is how one workflow is tuned per
+position or condition without copying it — and a linked page re-uses everything its master
+computed up to the first node it overrides. Its graph cannot change shape: adding, deleting,
+rewiring or muting nodes is refused with a hint in the status bar (make the change on the
+master, and every linked page follows), while moving or folding a card moves it on both
+pages. Properties shows a **Linked page** banner (`Linked to "Refinement" · 2 overrides`)
+with **Go to master** and **Make unique**; *Make unique* (also in the switcher) turns it into
+a page of its own, keeping its graph and values. Deleting a master asks first, then turns its
+linked pages into pages of their own. A file stores a linked page as its master and its
+overrides. A value you set on a linked page stays its own until you reset it, even if the
+master later reaches the same value. A **Dock** keeps its checkpoint per page: baking or
+holding it on a linked page uses that page's own folder and never the master's, and a Load
+pointed at another file describes only its own page.
+
 **Several Viewers** (V4.00). **+** on a Viewer's title bar, or **View ▸ New ▸ Viewer**, opens
 another Viewer beside it; pop one out onto a second screen with **⇱**. Each Viewer keeps
 showing the node it was given, and its title bar names it (`Viewer · n3 · Gaussian Blur`). The

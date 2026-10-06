@@ -24393,8 +24393,8 @@ def test_workspace_format_v3() -> None:
         raise AssertionError("a page with both a graph and a master was accepted")
     except ValueError:
         pass
-    # a linked record: readable through the single-graph readers (its master), refused by
-    # the Workspace until step 6 — with a message that says so
+    # a linked record: readable through the single-graph readers (its master); the Workspace
+    # loads it OVER its master (V4.00 step 6) and refuses one whose master is not in the file
     x = _json.loads(s)
     x["workspace"]["pages"].append({"id": "pg7", "name": "Dish B", "kind": "refine",
                                     "master": "pg2", "overrides": {}})
@@ -24407,11 +24407,18 @@ def test_workspace_format_v3() -> None:
         raise AssertionError("a linked page handed out as a graph")
     except ValueError as exc:
         assert "linked" in str(exc)
+    from nodelab_v2.linked_document import LinkedDocument as _LD
+    wsx = Workspace()
+    wsx.load_dict(x)
+    assert wsx.active == "pg7" and isinstance(wsx.pages["pg7"].doc, _LD)
+    assert wsx.pages["pg7"].doc.master is wsx.pages["pg2"].doc
+    assert set(wsx.pages["pg7"].doc.nodes) == {"IN", "G", "O"}
+    x["workspace"]["pages"][-1]["master"] = "pg99"
     try:
         Workspace().load_dict(x)
-        raise AssertionError("linked pages loaded before step 6")
+        raise AssertionError("a linked page without its master loaded")
     except ValueError as exc:
-        assert "step 6" in str(exc)
+        assert "pg99" in str(exc)
     # a 2.0 file: one Free page named after the file, op renames applied, the counter set
     doc = GraphDocument()
     doc.add_node("util.chain", node_id="C")
@@ -25074,6 +25081,333 @@ def test_pages_seam() -> None:
         "an edit drops the display caches of the pages it reaches, and only those")
 
 
+def test_linked_document_mirrors_master() -> None:
+    """``nodelab_v2.linked_document`` (V4.00 step 6): a linked page IS its master's graph —
+    nodes, wires, frames and positions follow every master edit — kept IN PLACE (a node keeps
+    its record object while the master keeps it with the same type, so the canvas updates
+    cards instead of rebuilding them); every structural edit on it is refused with the hint
+    the window shows; moving and folding cards act on the master."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.linked_document import LinkedDocument, LinkedPageError, TOPOLOGY_HINT
+    OPS.ensure_ops()
+    m = GraphDocument()
+    m.add_node("enhance.gaussian", node_id="G", params={"sigma": 1.0}, modes={"dim": "2D"})
+    m.add_node("analysis.threshold", node_id="T")
+    m.connect("G", "out", "T", "data")
+    m.add_frame("chain", members=["G", "T"])
+    lk = LinkedDocument(m)
+    assert set(lk.nodes) == {"G", "T"} and lk.edges == m.edges and set(lk.frames) == set(m.frames)
+    assert lk.nodes["G"] is not m.nodes["G"], "its own records: its own values"
+    rec_t = lk.nodes["T"]
+    seen = []
+    lk.on_change(lambda: seen.append(lk.last_touched))
+    m.nodes["G"].params["sigma"] = 2.5
+    m.touch("G")
+    assert lk.nodes["G"].params["sigma"] == 2.5, "a master value reaches the linked page"
+    assert lk.nodes["T"] is rec_t, "the mirror is IN PLACE: the record object survives"
+    assert seen and seen[-1] == frozenset({"G"}), "…and says which node the master touched"
+    m.add_node("enhance.gamma", node_id="X", x=300.0)
+    m.connect("T", "out", "X", "data")
+    assert "X" in lk.nodes and ("T", "out", "X", "data") in lk.edges
+    m.set_pos("X", 410.0, 20.0)
+    m.touch("X")
+    assert (lk.nodes["X"].x, lk.nodes["X"].y) == (410.0, 20.0)
+    for bad in (lambda: lk.add_node("enhance.gamma"), lambda: lk.remove_node("X"),
+                lambda: lk.connect("G", "out", "X", "data"),
+                lambda: lk.disconnect("T", "out", "X", "data"),
+                lambda: lk.set_muted("G", True), lambda: lk.add_frame("f", members=["G"]),
+                lambda: lk.clear(), lambda: lk.make_group(["G", "T"])):
+        try:
+            bad()
+            raise AssertionError("a structural edit on a linked page must be refused")
+        except LinkedPageError as exc:
+            assert str(exc) == TOPOLOGY_HINT
+    ok, why = lk.can_connect("G", "out", "X", "data")
+    assert not ok and why == TOPOLOGY_HINT
+    lk.set_pos("G", 77.0, 66.0)                              # moves the master's card
+    assert (m.nodes["G"].x, m.nodes["G"].y) == (77.0, 66.0)
+    moved = []
+    lk.on_moved(moved.append)
+    rev = (m.revision, lk.revision)
+    m.set_pos("T", 12.0, 34.0)                               # …and the master's moves reach it
+    assert (lk.nodes["T"].x, lk.nodes["T"].y) == (12.0, 34.0) and moved == ["T"]
+    assert (m.revision, lk.revision) == rev, "a move is not a model edit"
+    m.set_pos("T", 12.0, 34.0)
+    assert moved == ["T"], "an unchanged position reports nothing"
+    lk.set_collapsed("T", True)
+    assert m.nodes["T"].collapsed and lk.nodes["T"].collapsed
+    m.remove_node("X")
+    assert "X" not in lk.nodes and not any("X" in e for e in lk.edges)
+    _ok("linked page: mirrors its master in place (records survive master edits, the "
+        "touched set is the master's), new nodes/wires/positions follow, every structural "
+        "edit is refused with the hint, moving and folding a card act on the master")
+
+
+def test_linked_overrides_roundtrip() -> None:
+    """A linked page's own values are OVERRIDES: an edit records only what differs from the
+    master (a removed pin as UNSET), survives master edits of the same value, is reset to the
+    master on demand, and round-trips through a workspace file as master + overrides — no graph."""
+    import json as _json
+    import tempfile as _tf
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.linked_document import UNSET, LinkedDocument
+    from nodelab_v2.workspace import Workspace
+    ws, _ds, _env, _ax = _ws_fixture()
+    lp = ws.duplicate_page("pg3", dependent=True)
+    assert lp.master == "pg3" and isinstance(lp.doc, LinkedDocument)
+    assert lp.name == "P1 (linked)" and list(ws.pages).index(lp.id) == \
+        list(ws.pages).index("pg3") + 1
+    lk, m = lp.doc, ws.pages["pg3"].doc
+    lk.nodes["X"].params["gamma"] = 0.5
+    lk.touch("X")
+    assert lk.overrides == {"X": {"params": {"gamma": 0.5}, "modes": {}}}, lk.overrides
+    assert lk.is_overridden("X", "gamma") and not lk.is_overridden("IN")
+    assert lk.override_count() == 1 and lk.master_value("X", "gamma") == 1.0
+    m.nodes["X"].params["gamma"] = 2.0
+    m.touch("X")
+    assert lk.nodes["X"].params["gamma"] == 0.5, "an override survives a master edit"
+    lk.reset_override("X", "gamma")
+    assert lk.nodes["X"].params["gamma"] == 2.0 and not lk.overrides
+    del lk.nodes["X"].params["gamma"]                        # back to the node's default
+    lk.touch("X")
+    assert lk.overrides["X"]["params"]["gamma"] == UNSET
+    m.touch("X")
+    assert "gamma" not in lk.nodes["X"].params, "an UNSET override keeps the key off"
+    lk.nodes["X"].params["gamma"] = 0.7
+    lk.touch("X")
+    # pins are derived, not overridden: a value set here is pinned here, a master pin
+    # added later reaches this page, and resetting to the default unpins
+    from nodelab_v2.document import LOCKED_KEY
+    lk.nodes["X"].set_locked(lk.nodes["X"].locked | {"gamma"})
+    lk.touch("X")
+    assert LOCKED_KEY not in lk.overrides["X"]["params"], lk.overrides
+    assert "gamma" in lk.nodes["X"].locked
+    m.nodes["X"].params["gain"] = 3.0
+    m.nodes["X"].set_locked(m.nodes["X"].locked | {"gain"})
+    m.touch("X")
+    assert lk.nodes["X"].params["gain"] == 3.0 and {"gain", "gamma"} <= lk.nodes["X"].locked
+    del lk.nodes["X"].params["gain"]
+    lk.nodes["X"].set_locked(lk.nodes["X"].locked - {"gain"})
+    lk.touch("X")
+    assert lk.overrides["X"]["params"]["gain"] == UNSET and "gain" not in lk.nodes["X"].locked
+    lk.reset_override("X", "gain")
+    assert "gain" in lk.nodes["X"].locked, "reset to the master: its pin is back"
+    # a dependent of a dependent links to the same master and starts from its values
+    lp2 = ws.duplicate_page(lp.id, dependent=True)
+    assert lp2.master == "pg3" and lp2.doc.master is m
+    assert lp2.doc.nodes["X"].params["gamma"] == 0.7
+    # the file: master + overrides, no graph; loads back over the master
+    d = ws.to_dict()
+    recs = {r["id"]: r for r in d["workspace"]["pages"]}
+    assert recs[lp.id]["master"] == "pg3" and "graph" not in recs[lp.id]
+    assert recs[lp.id]["overrides"] == {"X": {"params": {"gamma": 0.7}, "modes": {}}}
+    path = __import__("os").path.join(_tf.mkdtemp(), "linked.nd2graph.json")
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump(d, f)
+    ws2 = Workspace()
+    ws2.load_file(path)
+    l2 = ws2.pages[lp.id]
+    assert isinstance(l2.doc, LinkedDocument) and l2.master == "pg3"
+    assert l2.doc.master is ws2.pages["pg3"].doc and l2.doc.nodes["X"].params["gamma"] == 0.7
+    assert list(ws2.pages) == list(ws.pages), "the page order survives"
+    try:
+        ws2.remove_page("pg3")
+        raise AssertionError("a master with linked pages is not removed while they are linked")
+    except ValueError:
+        pass
+    _ok("linked overrides: an edit records only what differs (a removed pin as UNSET), "
+        "survives master edits of the same value and resets to the master; a dependent of "
+        "a dependent links to the master with its values; the file holds master + overrides "
+        "and loads back in page order; a master with dependents is not deleted")
+
+
+def test_linked_make_unique() -> None:
+    """Make unique: the page becomes a plain page with its current graph and values, and
+    master edits stop reaching it; the Workspace swaps the document and the page is no
+    longer anyone's dependent."""
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.linked_document import LinkedDocument
+    ws, _ds, _env, _ax = _ws_fixture()
+    lp = ws.duplicate_page("pg3", dependent=True)
+    lp.doc.nodes["X"].params["gamma"] = 0.4
+    lp.doc.touch("X")
+    old = lp.doc
+    page = ws.make_unique(lp.id)
+    assert page.master is None and type(page.doc) is GraphDocument and page.doc is not old
+    assert page.doc.nodes["X"].params["gamma"] == 0.4 and set(page.doc.nodes) == {"IN", "X"}
+    assert page.doc.editable_topology
+    m = ws.pages["pg3"].doc
+    m.nodes["X"].params["gamma"] = 3.0
+    m.touch("X")
+    assert page.doc.nodes["X"].params["gamma"] == 0.4, "the master no longer reaches it"
+    m.add_node("enhance.median", node_id="M")
+    assert "M" not in page.doc.nodes and "M" not in old.nodes
+    page.doc.add_node("enhance.gamma", node_id="Y")           # and it is editable again
+    ws.remove_page("pg3")                                      # no dependents left
+    _ok("make unique: a plain page with the linked page's graph and values, master edits "
+        "stop reaching it, its graph is editable, and its master can then be deleted")
+
+
+def test_linked_page_shares_prefix() -> None:
+    """On ONE memo, a linked page re-uses everything its master already computed up to the
+    first node it overrides: the upstream chain and every un-overridden node are cache hits
+    (their recipes are equal), and only the overridden node and what follows it run."""
+    from nodelab_v2 import ops as OPS
+    ws, ds, _env, _ax = _ws_fixture()
+    lp = ws.duplicate_page("pg3", dependent=True)
+    starts, cached = [], []
+
+    def obs(ev, nid, info):
+        (starts if ev == "start" else cached if ev == "cached" else []).append(nid)
+
+    memo = Memo()
+    comp = ws.compose("pg3")
+    OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                        memo=memo, observer=obs).pull("pg3/X")
+    starts.clear(); cached.clear()
+    lc = ws.compose(lp.id)
+    OPS.headless_engine(lc.graph, seeds={"pg1/L": ds}, meta_seeds=lc.meta_seeds,
+                        memo=memo, observer=obs).pull(f"{lp.id}/X")
+    assert starts == [] and f"{lp.id}/X" in cached, (starts, cached)
+    lp.doc.nodes["X"].params["gamma"] = 0.5
+    lp.doc.touch("X")
+    starts.clear(); cached.clear()
+    lc = ws.compose(lp.id)
+    OPS.headless_engine(lc.graph, seeds={"pg1/L": ds}, meta_seeds=lc.meta_seeds,
+                        memo=memo, observer=obs).pull(f"{lp.id}/X")
+    assert starts == [f"{lp.id}/X"] and "pg2/G" in cached, (starts, cached)
+    _ok("linked page memo: un-overridden, a linked page is a full cache hit on its master's "
+        "results; overriding one node re-runs that node alone — the shared prefix stays cached")
+
+
+def test_linked_page_state() -> None:
+    """What a linked page keeps of its OWN (V4.00 step 6, review): a Dock's checkpoint — its
+    folder, bake record and state — never the master's, and kept through Save As; its file
+    seeds (a Load reading another file re-describes only this page); an override, which
+    stays one when the master later reaches the same value. And the lifecycle around it: a
+    new linked page and Make unique show known envelopes at once (Page Inputs included, the
+    held set carried), File > New on a linked page leaves a valid active page, and a file
+    with malformed overrides is refused leaving the open workspace exactly as it was."""
+    import json as _json
+    import os as _os
+    import tempfile as _tf
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.linked_document import LinkedDocument, check_overrides
+    from nodelab_v2.workspace import Workspace
+    # ── a Dock's checkpoint is the page's own, and survives Save As ───────────────
+    ws, _ds, env, ax = _ws_fixture()
+    tmp = _tf.mkdtemp(prefix="nd2_linked_")
+    ws.save_file(_os.path.join(tmp, "a.nd2graph.json"))
+    m = ws.pages["pg3"].doc
+    m.add_node(OPS.DOCK_OP, node_id="D")
+    m.connect("X", "out", "D", "data")
+    m.set_dock_bake("D", store=m.default_dock_store("D"), bake_id="m1", precision="float32",
+                    signature="s")
+    lp = ws.duplicate_page("pg3", dependent=True)
+    lk = lp.doc
+    assert lk.path == ws.path, "a new linked page has the workspace's path"
+    assert lk.nodes["D"].modes.get("state") != OPS.DOCK_DOCKED and \
+        not lk.nodes["D"].params.get("store"), "the master's bake is not the linked page's"
+    assert lk.dock_status("D")[0] == "live" and lk.override_count() == 0
+    own = lk.default_dock_store("D")
+    assert _os.path.normcase(own) != _os.path.normcase(m.dock_store("D"))
+    lk.set_dock_bake("D", store=own, bake_id="l1", precision="float32", signature="s")
+    assert m.nodes["D"].params[OPS.BAKE_KEY]["id"] == "m1", "the master keeps its bake"
+    assert lk.override_count() == 0 and not lk.is_overridden("D"), "a bake is not an override"
+    m.set_dock_hold("D", True)
+    assert lk.nodes["D"].modes.get("state") == OPS.DOCK_DOCKED, "a Hold on the master stays there"
+    m.set_dock_hold("D", False)
+    ws.save_file(_os.path.join(_tf.mkdtemp(prefix="nd2_linked_b_"), "b.nd2graph.json"))
+    assert _os.path.normcase(lk.dock_store("D")) == _os.path.normcase(own), "Save As re-anchors"
+    ws2 = Workspace()
+    ws2.load_file(ws.path)
+    assert _os.path.normcase(ws2.pages[lp.id].doc.dock_store("D")) == _os.path.normcase(own)
+    assert ws2.pages[lp.id].doc.nodes["D"].params[OPS.BAKE_KEY]["id"] == "l1"
+    # ── a Load reading another file re-describes only its own page ─────────────
+    ws, _ds, env, ax = _ws_fixture()
+    lp = ws.duplicate_page("pg1", dependent=True)
+    src, lk = ws.pages["pg1"].doc, lp.doc
+    assert lk.meta_seeds["L"] == src.meta_seeds["L"], "an un-overridden Load takes the master's"
+    lk.nodes["L"].params["path"] = "C:/data/conditionB.nd2"
+    lk.touch("L")
+    envB = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 2.0})
+    ws.set_meta_seed(lp.id + "/L", envB)
+    assert src.meta_seeds["L"].metadata["pixel_size_um"] == 0.5, "the master keeps file A's"
+    assert lk.envs["L"].metadata["pixel_size_um"] == 2.0
+    ws.set_meta_seed("pg1/L", MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.7}))
+    assert lk.envs["L"].metadata["pixel_size_um"] == 2.0, "…and file B stays on the linked page"
+    # ── an override stays one when the master reaches the same value ──────────────
+    ws, _ds, env, ax = _ws_fixture()
+    m = ws.pages["pg3"].doc
+    lk = ws.duplicate_page("pg3", dependent=True).doc
+    lk.nodes["X"].params["gamma"] = 0.5
+    lk.touch("X")
+    m.nodes["X"].params["gamma"] = 0.5
+    m.touch("X")
+    lk.nodes["X"].params["gain"] = 2.0
+    lk.touch("X")
+    m.nodes["X"].params["gamma"] = 3.0
+    m.touch("X")
+    assert lk.nodes["X"].params["gamma"] == 0.5 and lk.is_overridden("X", "gamma")
+    # ── envelopes are known at once: a new linked page, Make unique ───────────────
+    ws, _ds, env, ax = _ws_fixture()
+    lp = ws.duplicate_page("pg3", dependent=True)
+    assert lp.doc.envs["X"].axes.y == 32 and not lp.doc.envs["X"].unknown_axes, \
+        "the linked page's Page Input sees its upstream at once"
+    lp.doc.set_held_nodes({"X"})
+    page = ws.make_unique(lp.id)
+    assert page.doc.envs["X"].axes.y == 32 and not page.doc.envs["X"].unknown_axes
+    assert page.doc._held_nodes == frozenset({"X"}), "the held set carries over"
+    # ── File > New on a linked page ──────────────────────────────────────────────
+    ws, _ds, env, ax = _ws_fixture()
+    lp = ws.duplicate_page("pg3", dependent=True)
+    ws.set_active(lp.id)
+    master = ws.pages["pg3"].doc
+    ws.reset()
+    assert ws.active in ws.pages and not ws.page(ws.active).doc.nodes
+    assert not any(isinstance(getattr(f, "__self__", None), LinkedDocument)
+                   for f in master._listeners), "the removed linked page let go"
+    # ── a file with malformed overrides: refused, the open workspace untouched ───────
+    for bad in ({"X": {"modes": "oops"}}, {"X": {"params": {"gamma": 1}, "extra": {}}},
+                {"X": {"modes": {"dim": 3}}}, ["X"]):
+        try:
+            check_overrides(bad)
+            raise AssertionError(f"malformed overrides must be refused: {bad}")
+        except ValueError:
+            pass
+    ws, _ds, env, ax = _ws_fixture()
+    lp = ws.duplicate_page("pg3", dependent=True)
+    ws.set_active("pg3")
+    keep = ws.pages["pg3"].doc
+    other, _d2, _e2, _a2 = _ws_fixture()
+    other.pages["pg3"].doc.add_node("enhance.gamma", node_id="EXTRA")
+    olp = other.duplicate_page("pg3", dependent=True)
+    other.set_active("pg3")
+    d = other.to_dict()
+    for r in d["workspace"]["pages"]:
+        if r["id"] == olp.id:
+            r["overrides"] = {"X": {"params": {"gamma": 0.5}, "modes": "oops"}}
+    path = _os.path.join(_tf.mkdtemp(), "bad.nd2graph.json")
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump(d, f)
+    try:
+        ws.load_file(path)
+        raise AssertionError("a file with malformed overrides must be refused")
+    except ValueError:
+        pass
+    assert ws.pages["pg3"].doc is keep and "EXTRA" not in keep.nodes
+    keep.nodes["X"].params["gamma"] = 5.0
+    keep.touch("X")
+    assert ws.pages[lp.id].doc.nodes["X"].params["gamma"] == 5.0, "the linked page still follows"
+    _ok("linked page state: a Dock's checkpoint is the page's own (not an override, not the "
+        "master's bake or Hold) and survives Save As and reopening; a Load reading another "
+        "file re-describes only its page; an override stays one when the master reaches its "
+        "value; a new linked page and Make unique show known envelopes (held set carried); "
+        "File > New on a linked page leaves a valid active page; malformed overrides are "
+        "refused and leave the open workspace as it was")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -25166,6 +25500,11 @@ def main() -> int:
     test_layout_store()
     test_viewer_routing()
     test_pages_seam()
+    test_linked_document_mirrors_master()
+    test_linked_overrides_roundtrip()
+    test_linked_make_unique()
+    test_linked_page_shares_prefix()
+    test_linked_page_state()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

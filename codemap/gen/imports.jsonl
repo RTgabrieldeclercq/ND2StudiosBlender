@@ -975,6 +975,7 @@
 {"dst":"nodelab_v2.lablink.sidecar","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.lablink.worker","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.layout_store","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.linked_document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.movie_preview","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.nd2_compat","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.nd2_direct","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1116,6 +1117,8 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"nodelab_v2.lablink.worker"}
 {"dst":"nodelab_v2.tables","k":"imp","lazy":true,"src":"nodelab_v2.lablink.worker"}
 {"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"nodelab_v2.lablink.worker"}
+{"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.linked_document"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.linked_document"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.minimap"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.minimap"}
 {"dst":"nodegraph.catalog._shared","k":"imp","lazy":false,"src":"nodelab_v2.movie_editor"}
@@ -1216,6 +1219,7 @@
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
 {"dst":"nodelab_v2.edge_item","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
 {"dst":"nodelab_v2.frame_item","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
+{"dst":"nodelab_v2.linked_document","k":"imp","lazy":true,"src":"nodelab_v2.scene"}
 {"dst":"nodelab_v2.minimap","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.scene"}
@@ -1275,6 +1279,7 @@
 {"dst":"nodelab_v2.lablink.authoring","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.lablink.panel","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.layout_store","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.linked_document","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.minimap","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.movie_editor","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.window"}
@@ -1300,6 +1305,7 @@
 {"dst":"nodegraph.roles","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodegraph.serialize","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
+{"dst":"nodelab_v2.linked_document","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.version","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.app","k":"imp","lazy":true,"src":"run"}
@@ -1387,6 +1393,7 @@
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.inspector","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.layout_store","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.linked_document","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.overlay_dialog","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
