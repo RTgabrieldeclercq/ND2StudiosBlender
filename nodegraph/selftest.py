@@ -24849,6 +24849,16 @@ def test_layout_store() -> None:
             assert LS.load_layout() is None, text[:50]
         tmp.write_bytes(b"\xff\xfe\x00garbage")
         assert LS.load_layout() is None
+        # the PREVIOUS generation, in the literal shape a pre-11a build wrote (format "/1",
+        # version 1): V4.00 step 11a bumped it to 2 because the Viewer is on screen by
+        # default since, and a state saved by a build that launched without one would keep
+        # hiding it — so a v1 file is refused outright rather than restored
+        v1 = {"format": "nd2studios.layout/1", "version": 1, "app_version": "4.0.0",
+              "geometry": rec["geometry"], "state": rec["state"],
+              "docks": [{"name": "palette:0", "kind": "palette", "binding": None}]}
+        tmp.write_text(json.dumps(v1), encoding="utf-8")
+        assert LS.load_layout() is None, "a generation-1 layout must not restore"
+        assert LS.LAYOUT_VERSION == 2 and LS.LAYOUT_FORMAT == "nd2studios.layout/2"
         tmp.unlink()
         assert LS.load_layout() is None, "no file is simply no layout"
         # malformed dock entries are DROPPED; the rest of the layout still restores

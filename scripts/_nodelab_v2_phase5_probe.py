@@ -31,7 +31,8 @@ from PySide6.QtWidgets import QApplication    # noqa: E402
 
 
 def _load_fonts() -> None:
-    for name in ("segoeui.ttf", "consola.ttf", "arial.ttf", "seguisb.ttf"):
+    # seguisym: the panel title bars' glyphs (◉ ◫ ☰ ⇱ ⇲ ✕) name Segoe UI Symbol as fallback
+    for name in ("segoeui.ttf", "consola.ttf", "arial.ttf", "seguisb.ttf", "seguisym.ttf"):
         path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", name)
         if os.path.exists(path):
             QFontDatabase.addApplicationFont(path)
@@ -6951,6 +6952,146 @@ def main(argv) -> int:
         "floating panel restyles with the theme); ✕ hides and View ▸ Panels brings it back; "
         "the Console's Ctrl+` action is its Panels entry; Browse nodes reopens the palette")
 
+    # the default layout (V4.00 step 11a): the Viewer is ON SCREEN from the start, above the
+    # canvas at its share of the canvas column (menu bar to status bar); Nodes left;
+    # Properties right with Spreadsheet and LabLink as its tabs; Console and Movie hidden
+    from nodelab_v2.window import (INSPECTOR_W as _INSW, MainWindow as _MW1,
+                                   PALETTE_W as _PALW, VIEWER_SHARE as _VSHARE)
+    _v0d = _sh.docks["viewer:0"]
+    assert not _v0d.isHidden() and win.dockWidgetArea(_v0d) == _Qt.TopDockWidgetArea
+    _col = win.height() - win.menuBar().height() - win.statusBar().height()
+    # the share — or the dock's MINIMUM height when the share is below it: this window is
+    # 880 px tall and its viewer shows a picture, whose LUT controls raise the panel's
+    # minimum (measured 2026-10-06: 401 px blank, 509 px with an image, at 1500 px wide;
+    # 0.45 of this column is 374) — a dock cannot be made smaller than its minimum
+    _want, _floor = int(_VSHARE * _col), _v0d.minimumSizeHint().height()
+    assert abs(_v0d.height() - max(_want, _floor)) <= 2, (_v0d.height(), _want, _floor, _col)
+    assert win.dockWidgetArea(_sh.docks["palette:0"]) == _Qt.LeftDockWidgetArea
+    _insp = _sh.docks["inspector:0"]
+    assert win.dockWidgetArea(_insp) == _Qt.RightDockWidgetArea
+    assert {d.objectName() for d in win.tabifiedDockWidgets(_insp)} >= {"sheet:0", "lablink:0"}, \
+        [d.objectName() for d in win.tabifiedDockWidgets(_insp)]
+    # …and on a FRESH window large enough for every default size to be reachable (the
+    # offscreen screen is 800×800, but a window that restores no layout is not clamped to
+    # it): the blank Viewer at 0.40–0.50 of the column, Nodes at its width, Properties at
+    # its width or its own minimum — the launch state a first install sees on a big monitor
+    _wt = _MW1()
+    _extra_t = [_wt]
+    _wt.resize(1920, 1400)
+    _wt.show()
+    for _ in range(3):
+        app.processEvents()
+    _tv = _wt.shell.docks["viewer:0"]
+    _tcol = _wt.height() - _wt.menuBar().height() - _wt.statusBar().height()
+    assert not _tv.isHidden() and _wt.dockWidgetArea(_tv) == _Qt.TopDockWidgetArea
+    assert not _tv.panel.has_image() and getattr(_tv, "_sized", False)
+    assert 0.40 * _tcol <= _tv.height() <= 0.50 * _tcol, (_tv.height(), _tcol)
+    _tp, _ti = _wt.shell.docks["palette:0"], _wt.shell.docks["inspector:0"]
+    assert abs(_tp.width() - _PALW) <= 2, (_tp.width(), _PALW)
+    assert abs(_ti.width() - max(_INSW, _ti.minimumSizeHint().width())) <= 2, \
+        (_ti.width(), _INSW, _ti.minimumSizeHint().width())
+    assert _wt.shell.docks["console:0"].isHidden() and _wt.shell.docks["movie:0"].isHidden()
+    assert not _wt._layout_restored and _wt._first_show_done
+    _wt.close()
+    app.processEvents()
+    _ok(f"SH1b default layout: the Viewer is on screen from launch, above the canvas, at "
+        f"{_VSHARE:.2f} of the canvas column when that is reachable (a fresh 1920×1400 "
+        f"window: {_tv.height() / _tcol:.2f}) and at its minimum height otherwise (this "
+        f"window: {_v0d.height()} px, minimum {_floor}, column {_col}); Nodes left at "
+        f"{_tp.width()} px; Properties right at {_ti.width()} px with Spreadsheet and LabLink "
+        f"tabbed behind it; Console and Movie Editor hidden")
+
+    # CH1 dock chrome (V4.00 step 11a): a floating panel is framed and filled from the theme,
+    # not from Qt's default light palette (#efefef showed in the frame gutter and through the
+    # panels' transparent margins); the panel bodies paint their QSS background; the app
+    # palette follows the theme; the title-bar glyphs are in the title bar's font
+    from PySide6.QtCore import QPoint as _QPt
+    from PySide6.QtGui import QFontMetrics as _QFM, QPalette as _QPal
+    from nodelab_v2.shell import FLOAT_GLYPH as _FLOATG
+    from nodelab_v2.viewer import ViewerPanel as _VP
+    _LIGHT = {"#efefef", "#f0f0f0", "#ffffff"}
+    _DARKS = {_TH.BG.name(), _TH.BODY.name(), _TH.PANEL.name()}
+    _sd = _sh.docks["sheet:0"]
+    _sd.title_bar.float_btn.click()
+    for _ in range(3):
+        app.processEvents()
+    assert _sd.isFloating()
+    _img = _sd.grab().toImage()
+    _w, _h = _img.width(), _img.height()
+    for _x, _y in ((0, _h // 2), (_w - 1, _h // 2), (_w // 2, 0), (_w // 2, _h - 1)):
+        assert _img.pixelColor(_x, _y).name() == _TH.BORDER.name(), \
+            ("floating frame", (_x, _y), _img.pixelColor(_x, _y).name())
+    for _x, _y in ((1, _h // 2), (_w // 2, _h - 2)):
+        _c = _img.pixelColor(_x, _y).name()
+        assert _c in _DARKS and _c != "#efefef", ("inside the frame", (_x, _y), _c)
+    _sd.title_bar.float_btn.click()
+    for _ in range(3):
+        app.processEvents()
+    assert not _sd.isFloating()
+    _img = _sd.grab().toImage()
+    _w, _h = _img.width(), _img.height()
+    for _x, _y in ((0, _h // 2), (_w - 1, _h // 2), (_w // 2, 0), (_w // 2, _h - 1)):
+        assert _img.pixelColor(_x, _y).name() not in _LIGHT, \
+            ("docked edge", (_x, _y), _img.pixelColor(_x, _y).name())
+    # the Viewer's body: its bottom margin and the gap above the controls are PAINTED —
+    # both as the panel grabs itself and, the one that matters, as seen THROUGH its dock
+    # (a widget's own grab paints its palette background as the root, so only the dock's
+    # grab shows what the user saw: the dock behind the panel's transparent margins)
+    _vp = _v0d.panel
+    assert isinstance(_vp, _VP) and not _v0d.isFloating()
+    _pi = _vp.grab().toImage()
+    _pw, _ph = _pi.width(), _pi.height()
+    _gap = _vp._controls.geometry().top() - 2
+    assert _pi.pixelColor(2, _ph - 2).name() == _TH.PANEL.name(), _pi.pixelColor(2, _ph - 2).name()
+    assert _pi.pixelColor(_pw // 2, _gap).name() == _TH.PANEL.name(), \
+        _pi.pixelColor(_pw // 2, _gap).name()
+    _di = _v0d.grab().toImage()
+    _o = _vp.mapTo(_v0d, _QPt(0, 0))
+    for _x, _y in ((_o.x() + 2, _o.y() + _ph - 2), (_o.x() + _pw // 2, _o.y() + _gap),
+                   (_o.x() + 2, _o.y() + _ph // 2)):
+        assert _di.pixelColor(_x, _y).name() == _TH.PANEL.name(), \
+            ("viewer body through the dock", (_x, _y), _di.pixelColor(_x, _y).name())
+    # the Movie Editor's scroll wrapper: its viewport is dark too
+    _md = _sh.docks["movie:0"]
+    _md.show()
+    app.processEvents()
+    _md.title_bar.float_btn.click()
+    for _ in range(3):
+        app.processEvents()
+    assert _md.isFloating()
+    _mo = _md.widget().viewport().mapTo(_md, _QPt(0, 0))
+    _mi = _md.grab().toImage()
+    _mc = _mi.pixelColor(_mo.x(), _mo.y()).name()
+    assert _mc not in _LIGHT, ("movie viewport corner", (_mo.x(), _mo.y()), _mc)
+    _md.title_bar.float_btn.click()
+    app.processEvents()
+    _md.hide()
+    app.processEvents()
+    assert _md.isHidden() and not _md.isFloating()
+    # the application palette is the theme's, in both modes
+    assert app.palette().color(_QPal.Window).name() == _TH.BG.name(), \
+        app.palette().color(_QPal.Window).name()
+    _dark_bg = _TH.BG.name()
+    win.set_theme("light")
+    app.processEvents()
+    assert app.palette().color(_QPal.Window).name() == _TH.BG.name() != _dark_bg, \
+        (app.palette().color(_QPal.Window).name(), _TH.BG.name())
+    win.set_theme("dark")
+    app.processEvents()
+    assert app.palette().color(_QPal.Window).name() == _TH.BG.name() == _dark_bg
+    # every glyph a title bar shows is in the title bar's font (Segoe UI Symbol fallback)
+    _tb = _sh.docks["palette:0"].title_bar
+    _fm = _QFM(_tb._glyph.font())
+    for _g in sorted({_FLOATG, _DOCKG, "✕"} | {s.glyph for s in _sh.specs.values() if s.glyph}):
+        assert _fm.inFontUcs4(ord(_g)), (_g, hex(ord(_g)), _tb._glyph.font().families())
+    assert _tb.close_btn.isEnabled(), "a dock the window does not veto has a live ✕"
+    _ok("CH1 dock chrome: a floating panel is framed 1px in the border colour and filled "
+        "dark inside it (no #efefef), and shows no light edge once docked back; the Viewer's "
+        "margins and the gap above its controls paint the panel colour, seen through the "
+        "dock; the Movie Editor's scroll viewport is dark; the application palette follows "
+        "the theme in both modes; every title-bar glyph is in the title bar's font; a "
+        "non-vetoed dock's ✕ is enabled")
+
     # SH2 several instances of a kind: '+', the lowest free index, the active one, a veto
     _sh.register(_PS("probe_panel", "Probe", lambda: _SHL("probe"), glyph="◇", multi=True))
     assert win._new_menu.menuAction().isVisible(), "a multi kind appears under View ▸ New"
@@ -6978,6 +7119,9 @@ def main(argv) -> int:
     assert "probe_panel:1" not in _sh.docks and _sh.active("probe_panel") is _p0
     assert _sh.spawn("probe_panel").objectName() == "probe_panel:1", "lowest free index"
     _sh.allow_close = lambda d: d.kind != "probe_panel"  # e.g. "never the last canvas"
+    _sh.sync_close_buttons()
+    assert not _p0.title_bar.close_btn.isEnabled(), "a vetoed dock shows its ✕ disabled"
+    assert _sh.docks["inspector:0"].title_bar.close_btn.isEnabled(), "…only the vetoed one"
     _p0.close()
     app.processEvents()
     assert "probe_panel:0" in _sh.docks and not _p0.isHidden(), "a vetoed close is refused"
@@ -6986,6 +7130,8 @@ def main(argv) -> int:
     assert not _p0.isHidden() and _p0.toggleViewAction().isChecked(), \
         "a vetoed close from View ▸ Panels must leave its tick on"
     _sh.allow_close = lambda d: True
+    _sh.sync_close_buttons()
+    assert _p0.title_bar.close_btn.isEnabled(), "the ✕ is live again once the veto lifts"
     # '+' beside an instance that sits in a TAB GROUP joins the group, in front — Qt's
     # split of a tabbed dock would have taken both out of the group and off screen
     _sh.register(_PS("probe_tab", "ProbeTab", lambda: _SHL("tab"), multi=True,
@@ -7027,6 +7173,11 @@ def main(argv) -> int:
     try:
         _w2 = _MW(persist_layout=True)
         _extra.append(_w2)
+        # the Viewer is on screen from launch (V4.00 step 11a); hidden HERE so the window's
+        # minimum height — what the restored-size check below is measured against — is the
+        # canvas column's alone, and so a hidden Viewer is one more thing the restore has
+        # to bring back as it was
+        _w2.shell.docks["viewer:0"].hide()
         # a size that fits the screen: Qt clamps a RESTORED window to its screen (the
         # offscreen one is small), so only a dimension that fits can be compared exactly
         _avail = app.primaryScreen().availableGeometry()
@@ -7068,6 +7219,7 @@ def main(argv) -> int:
         assert _s3.docks["lablink:0"].isHidden(), "a closed panel stays closed"
         assert "viewer:1" in _s3.docks and _s3.docks["viewer:1"].isFloating(), \
             "a second, floating Viewer comes back as it was"
+        assert _s3.docks["viewer:0"].isHidden(), "a Viewer hidden by hand stays hidden"
         assert _saved_wh[1] != _minh.height(), "the saved height is what a fresh window gets"
         assert _w3.height() == _saved_wh[1], (_w3.height(), _saved_wh, _avail)
         if _saved_wh[0] < _avail.width() - 2:

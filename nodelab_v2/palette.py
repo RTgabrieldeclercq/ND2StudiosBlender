@@ -188,6 +188,7 @@ class PalettePanel(QWidget):
 
     def __init__(self, on_add: Callable[[str], None]) -> None:
         super().__init__()
+        self.setAttribute(Qt.WA_StyledBackground, True)   # a subclass must ask for its QSS fill
         self._on_add = on_add
         #: the kind of the page being edited (V4.00 step 5): the palette offers its nodes
         self._page_kind: Optional[str] = None

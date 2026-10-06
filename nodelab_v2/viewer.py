@@ -995,6 +995,10 @@ class ViewerPanel(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        # QStyleSheetStyle paints `QWidget { background }` by itself only on a PLAIN QWidget;
+        # on this subclass the rule matched and painted nothing, so the margins and the gap
+        # above the controls showed the dock behind them (V4.00 step 11a)
+        self.setAttribute(Qt.WA_StyledBackground, True)
         v = QVBoxLayout(self)
         v.setContentsMargins(6, 6, 6, 4)
         v.setSpacing(4)

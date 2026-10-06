@@ -32,11 +32,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 #: The layout generation. Bumped when the panel set or the ``objectName`` scheme changes
-#: incompatibly; it is ALSO the version handed to ``saveState``/``restoreState``, so Qt itself
-#: refuses a state blob from another generation.
-LAYOUT_VERSION = 1
+#: incompatibly, or when the default layout changes in a way an old saved state would hide
+#: (V4.00 step 11a → 2: the Viewer is on screen from the start, and a layout saved by a
+#: build that launched without one would keep hiding it); it is ALSO the version handed to
+#: ``saveState``/``restoreState``, so Qt itself refuses a state blob from another generation.
+LAYOUT_VERSION = 2
 #: The file's own format tag — a second, independent guard on top of :data:`LAYOUT_VERSION`.
-LAYOUT_FORMAT = "nd2studios.layout/1"
+LAYOUT_FORMAT = "nd2studios.layout/2"
 #: Where a user's layout lives unless :data:`ENV_FILE` says otherwise.
 USER_FILE = Path.home() / ".nd2studios" / "layout.json"
 #: Points persistence at another file.

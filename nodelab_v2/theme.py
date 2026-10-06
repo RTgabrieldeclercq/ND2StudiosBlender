@@ -9,7 +9,7 @@ them). A widget with a cached QSS string re-reads the tokens via its own ``resty
 """
 from __future__ import annotations
 
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
 
 from nodegraph.domains import Domain, domain_color
 from nodegraph.sockets import SOCKET_COLOR, SocketType
@@ -61,6 +61,29 @@ def apply(mode: str) -> None:
 
 
 apply("dark")
+
+
+def palette() -> QPalette:
+    """The application palette from the LIVE tokens — what Qt paints wherever no stylesheet
+    rule reaches: a floating dock's window fill before its ``paintEvent``, a scroll area's
+    viewport, a native dialog, a widget's default text. Without it those surfaces came out
+    in Qt's default light palette (``#efefef``) inside a dark window (V4.00 step 11a).
+    Not applied at import: the window hands it to ``QApplication.setPalette`` on start-up
+    and again after every :func:`apply`, so the light mode gets the light palette."""
+    p = QPalette()
+    for role, col in ((QPalette.Window, BG), (QPalette.Base, BG),
+                      (QPalette.AlternateBase, PANEL), (QPalette.ToolTipBase, PANEL),
+                      (QPalette.Text, INK), (QPalette.WindowText, INK),
+                      (QPalette.ButtonText, INK), (QPalette.HighlightedText, INK),
+                      (QPalette.ToolTipText, INK), (QPalette.Button, BODY),
+                      (QPalette.Highlight, ACCENT_DIM), (QPalette.PlaceholderText, MUTED),
+                      (QPalette.Mid, BORDER), (QPalette.Dark, BORDER),
+                      (QPalette.Light, PANEL_HI), (QPalette.Link, ACCENT)):
+        p.setColor(role, col)
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        p.setColor(QPalette.Disabled, role, MUTED)
+    return p
+
 
 # socket dot colors, straight from the headless model (theme-independent)
 SOCKET = {t: c(SOCKET_COLOR[t]) for t in SocketType}

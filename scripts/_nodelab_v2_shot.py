@@ -24,7 +24,7 @@ def _load_fonts() -> None:
     """The offscreen QPA platform loads no system fonts, so register the actual
     Windows TTFs by path — purely so the verification PNG shows real glyphs (the
     on-display app already has these families)."""
-    for name in ("segoeui.ttf", "consola.ttf", "arial.ttf", "seguisb.ttf"):
+    for name in ("segoeui.ttf", "consola.ttf", "arial.ttf", "seguisb.ttf", "seguisym.ttf"):
         path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", name)
         if os.path.exists(path):
             QFontDatabase.addApplicationFont(path)

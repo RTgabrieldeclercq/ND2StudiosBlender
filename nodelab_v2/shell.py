@@ -18,8 +18,16 @@ Three pieces:
   saves/restores the layout through :mod:`nodelab_v2.layout_store`.
 
 A single panel's close only HIDES it (View ▸ Panels brings it back, exactly as it was); a
-multi panel's close DESTROYS that instance, unless the window's ``allow_close`` vetoes it
-(the last canvas, from step 5).
+multi panel's close DESTROYS that instance, unless the window's ``allow_close`` vetoes it.
+The one veto today is ``MainWindow._allow_panel_close``: while the canvas is maximized, the
+dock of the viewer living in the mini-map stays (closing it would leave that viewer with no
+home). A vetoed dock shows its ✕ disabled (:meth:`DockShell.sync_close_buttons`), and the
+close is refused if asked anyway.
+
+The dock paints its own surface (:meth:`PanelDock.paintEvent`, V4.00 step 11a): with a
+custom title bar ``QDockWidget`` paints nothing at all, so a floating dock — a frameless
+top-level window — showed its palette's Window brush (Qt's default light grey) through the
+frame gutter around the panel.
 """
 from __future__ import annotations
 
@@ -28,7 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QPoint, Qt, Signal
-from PySide6.QtGui import QAction, QFontMetrics, QGuiApplication
+from PySide6.QtGui import QAction, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QDockWidget, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QScrollArea,
     QSizePolicy, QToolButton, QWidget)
@@ -124,10 +132,18 @@ class PanelTitleBar(QWidget):
                                         dock.request_new)
             h.addWidget(self.add_btn)
         self.float_btn = self._button(FLOAT_GLYPH, "", dock.toggle_float)
-        self.close_btn = self._button("✕", "Close this panel — View ▸ Panels brings it back"
-                                      if not spec.multi else "Close this panel", dock.close)
+        self._close_tip = ("Close this panel — View ▸ Panels brings it back"
+                           if not spec.multi else "Close this panel")
+        self.close_btn = self._button("✕", self._close_tip, dock.close)
         h.addWidget(self.float_btn)
         h.addWidget(self.close_btn)
+        # the glyphs (◉ ◫ ☰ ⇱ ⇲ ✕ …) live in Segoe UI Symbol; naming it as the fallback
+        # family keeps them from rendering as boxes where the UI font lacks them (the QSS
+        # below sets only the size, so the families stand)
+        for w in (self._glyph, self.float_btn, self.close_btn):
+            f = QFont(w.font())
+            f.setFamilies([T.SANS, "Segoe UI Symbol"])
+            w.setFont(f)
         self.set_floating(False)
         self.restyle()
 
@@ -157,6 +173,14 @@ class PanelTitleBar(QWidget):
             self._active = bool(on)
             self.restyle()
 
+    def sync_close(self, enabled: bool) -> None:
+        """Show whether the ✕ would work: a dock the window vetoes right now (the mini-map's
+        viewer while the canvas is maximized) has it disabled, with the reason as the tip,
+        instead of a button that looks live and does nothing."""
+        self.close_btn.setEnabled(bool(enabled))
+        self.close_btn.setToolTip(self._close_tip if enabled
+                                  else "This panel cannot be closed right now")
+
     def mousePressEvent(self, e) -> None:            # noqa: N802 — Qt override
         """A press on the title bar makes this the active instance, then goes on to the
         dock (QWidget ignores it), which is what drags or pops the panel out."""
@@ -167,7 +191,7 @@ class PanelTitleBar(QWidget):
         return self._active
 
     def restyle(self) -> None:
-        edge = T.ACCENT.name() if self._active else T.BODY.name()
+        edge = T.ACCENT.name() if self._active else T.BORDER.name()
         self.setAutoFillBackground(True)
         self.setStyleSheet(
             f"PanelTitleBar {{ background:{T.BODY.name()}; border-bottom:1px solid "
@@ -176,7 +200,8 @@ class PanelTitleBar(QWidget):
             f"font-weight:800; background:transparent; }}"
             f"QToolButton {{ color:{T.MUTED.name()}; background:transparent; border:0; "
             f"border-radius:4px; padding:0 5px; font-size:12px; }}"
-            f"QToolButton:hover {{ background:{T.PANEL_HI.name()}; color:{T.INK.name()}; }}")
+            f"QToolButton:hover {{ background:{T.PANEL_HI.name()}; color:{T.INK.name()}; }}"
+            f"QToolButton:disabled {{ color:{T.BORDER.name()}; }}")
 
 
 class PanelDock(QDockWidget):
@@ -207,18 +232,39 @@ class PanelDock(QDockWidget):
         body: QWidget = panel
         if spec.scroll:
             sc = QScrollArea()
+            sc.setObjectName("panelScroll")        # styled by the window's QSS (dark viewport)
             sc.setWidgetResizable(True)
             sc.setFrameShape(QFrame.NoFrame)
+            sc.viewport().setAutoFillBackground(False)
             sc.setWidget(panel)
             body = sc
         self.setWidget(body)
         self.title_bar = PanelTitleBar(self)
         self.setTitleBarWidget(self.title_bar)
         self.topLevelChanged.connect(self.title_bar.set_floating)
+        self.topLevelChanged.connect(lambda _on=False: self.update())   # the frame (paintEvent)
 
     @property
     def kind(self) -> str:
         return self.spec.kind
+
+    def paintEvent(self, event) -> None:                # noqa: N802 — Qt override
+        """The dock's own surface. With a custom title bar ``QDockWidget`` paints NOTHING,
+        so a floating dock — a frameless top-level window — showed its palette's Window brush
+        (Qt's default light grey) in the frame gutter around the panel, and a docked one let
+        it through wherever the panel's margins are transparent. Fill with the theme's
+        background; a floating dock also gets a 1 px border, so it has an edge against
+        whatever is behind it."""
+        p = QPainter(self)
+        p.fillRect(self.rect(), T.BG)
+        if self.isFloating():
+            p.setPen(QPen(T.BORDER, 1))
+            p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        p.end()
+
+    def sync_close(self) -> None:
+        """Reflect the window's veto on the title bar's ✕ (:meth:`PanelTitleBar.sync_close`)."""
+        self.title_bar.sync_close(bool(self.can_close(self)))
 
     def toggle_float(self) -> None:
         self.setFloating(not self.isFloating())
@@ -355,6 +401,7 @@ class DockShell(QObject):
             dock.raise_()               # '+' asked to SEE another one: its tab goes in front
         if spec.multi and show:
             self.activate(dock)
+        self.sync_close_buttons()
         self.changed.emit()
         return dock
 
@@ -376,6 +423,14 @@ class DockShell(QObject):
         except Exception:                               # noqa: BLE001 — a veto must not crash
             return True
 
+    def sync_close_buttons(self) -> None:
+        """Every dock's ✕ reflects whether the window would let it close right now. The
+        veto is a function of window state, so this runs whenever that state moves: a
+        dock spawned or destroyed, the default layout applied, the canvas maximized or
+        restored (``MainWindow.set_maximized``)."""
+        for d in list(self.docks.values()):
+            d.sync_close()
+
     def _on_closed(self, dock: PanelDock) -> None:
         if not dock.spec.multi:
             return                                     # hidden; View ▸ Panels brings it back
@@ -387,6 +442,7 @@ class DockShell(QObject):
                 self.activate(rest[0])
         self.win.removeDockWidget(dock)
         dock.deleteLater()
+        self.sync_close_buttons()
         self.changed.emit()
 
     # ── the active instance of each kind ─────────────────────────────────────
@@ -451,6 +507,7 @@ class DockShell(QObject):
             if spec.raise_default:
                 for d in self.docks_of(spec.kind):
                     d.raise_()
+        self.sync_close_buttons()
 
     def reset_layout(self) -> None:
         self.apply_default_layout()
@@ -541,6 +598,7 @@ class DockShell(QObject):
     def restyle(self) -> None:
         for d in self.docks.values():
             d.title_bar.restyle()
+            d.update()                  # the dock's own fill and frame read the tokens too
 
 
 __all__ = ["PanelSpec", "PanelTitleBar", "PanelDock", "DockShell", "FLOAT_GLYPH",

@@ -133,10 +133,14 @@ def _as_float(v) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-#: The share of the canvas column a Viewer dock takes the first time it opens
-#: (Viewer-dominant, ~2.5:1). The app LAUNCHES with no Viewer on screen — nothing has been
-#: pulled yet, so the blank welcome canvas gets the whole centre; the first result opens one.
-VIEWER_SHARE = 0.72
+#: The share of the canvas column (menu bar to status bar) the first Viewer dock takes in
+#: the default layout, and a Viewer dock the first time it opens. The app LAUNCHES with the
+#: Viewer on screen (V4.00 step 11a) — blank until the first result — above the canvas,
+#: which keeps the larger share: the welcome card and the graph are what a new session
+#: works in first.
+VIEWER_SHARE = 0.45
+#: The default layout's side-column widths (px): Nodes on the left, Properties on the right.
+PALETTE_W, INSPECTOR_W = 280, 360
 #: The panel kind of a Viewer dock (V4.00 step 4): several instances, ``viewer:<n>``.
 VIEWER_KIND = "viewer"
 #: The panel kind of a docked canvas (V4.00 step 5) — every canvas but the main one.
@@ -166,10 +170,19 @@ QProgressBar::chunk {{ background:{T.ACCENT.name()}; border-radius:3px; }}
 /* the frame/total-frames bar stacked above the within-the-frame one — same shape, the
    orange that means "series position" everywhere else in the UI. */
 QProgressBar#frameProgress::chunk {{ background:{T.PROG_FRAME.name()}; }}
-QDockWidget {{ color:{T.MUTED.name()}; font-size:10px; font-weight:800;
+/* every dock has a custom title bar, so QDockWidget itself paints nothing (PanelDock's
+   paintEvent fills it); `background` here sets its palette Window brush, so the fill Qt
+   gives a floating dock BEFORE that paintEvent is already dark rather than #efefef. The
+   1px border is what keeps the frame gutter: once a rule has a background, the style takes
+   PM_DockWidgetFrameWidth from the rule's border, and `border:0` would let the panel cover
+   the frame paintEvent draws (measured, 2026-10-06). */
+QDockWidget {{ background:{T.BG.name()}; border:1px solid {T.BORDER.name()};
+  color:{T.MUTED.name()}; font-size:10px; font-weight:800;
   titlebar-close-icon:none; titlebar-normal-icon:none; }}
-QDockWidget::title {{ background:{T.BODY.name()}; color:{T.MUTED.name()};
-  padding:6px 13px; border-bottom:1px solid {T.BORDER.name()}; }}
+/* the scroll wrapper around a `scroll` panel (the Movie Editor): its viewport shows
+   wherever the panel does not reach, so it takes the window background, not the palette's */
+QScrollArea#panelScroll {{ background:{T.BG.name()}; border:0; }}
+QScrollArea#panelScroll > QWidget#qt_scrollarea_viewport {{ background:{T.BG.name()}; }}
 QSplitter::handle {{ background:{T.BG.name()}; }}
 QSplitter::handle:hover {{ background:{T.BORDER.name()}; }}
 QSplitter::handle:vertical {{ height:3px; }}
@@ -305,6 +318,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         ensure_gui_ops()
         self.setWindowTitle(f"{PRODUCT} — nodegraph canvas")
+        # the palette first: it is what Qt paints where no QSS rule reaches (a floating
+        # dock's window fill, a scroll viewport, a native dialog) — the default one is light
+        QApplication.instance().setPalette(T.palette())
         self.setStyleSheet(_window_qss())
 
         # V4.00: the file on disk is a Workspace of PAGES (format 3.0). Every page has its
@@ -337,8 +353,8 @@ class MainWindow(QMainWindow):
         # neither float nor close (Qt lays docks out around a central widget, and gives a
         # window without one to its side columns); every further canvas is a dock. The
         # Viewer docks sit above it, in the top dock area, which the side columns' corners
-        # keep to the canvas' width. The app launches with no Viewer on screen (the blank
-        # welcome canvas owns the centre); the first result opens one.
+        # keep to the canvas' width. The first Viewer is on screen from launch (V4.00 step
+        # 11a), blank until the first result; the canvas below it keeps the larger share.
         self._main_canvas = CanvasPanel(self, self.workspace.active)
         #: the canvas the user works in — its page is the workspace's active page
         self._canvas: CanvasPanel = self._main_canvas
@@ -399,7 +415,7 @@ class MainWindow(QMainWindow):
             if spec.kind != CANVAS_KIND:        # docked canvases are opened on demand
                 self.shell.spawn(spec.kind, show=False)
         self.shell.apply_default_layout()
-        # one Viewer exists from the start — hidden until there is something to show — and
+        # one Viewer exists from the start — on screen, blank until the first result — and
         # it is the active one, so "the Viewer" always names a panel
         self.shell.activate(self.shell.docks_of(VIEWER_KIND)[0])
         self.shell.activated.connect(self._on_panel_activated)
@@ -550,15 +566,25 @@ class MainWindow(QMainWindow):
         self._persist_layout = (LS.layout_enabled() if persist_layout is None
                                 else bool(persist_layout))
         #: whether a saved layout (geometry included) was applied — the launcher then shows
-        #: the window as saved instead of imposing its own size (`nodelab_v2.app.run`)
+        #: the window as saved instead of imposing its own size (`nodelab_v2.app.run`), and
+        #: the default SIZES (`_apply_default_sizes`) are not imposed on the first show
         self._layout_restored = False
+        #: the first `showEvent` has run (the default sizes are applied once, then)
+        self._first_show_done = False
         if self._persist_layout:
+            lay_path = LS.layout_path()
+            had_file = lay_path.exists()
             try:
                 self._layout_restored = bool(self.shell.restore_layout(quarantine=True))
             except Exception:                        # noqa: BLE001 — see above
                 self.shell.apply_default_layout()
-        # a restored layout can put a viewer on screen while the first one stays hidden:
-        # the one on screen is the one to work in
+            if not self._layout_restored and had_file and not lay_path.exists():
+                # the file was set aside (`<name>.rejected`): damaged, or from another layout
+                # generation — V4.00 step 11a bumped it, so every pre-11a layout lands here
+                self.statusBar().showMessage(
+                    "panel layout reset to the new default (your old layout.json was set aside)")
+        # a restored layout can put a viewer on screen while the first one is hidden: the
+        # one on screen is the one to work in
         act = self.shell.active(VIEWER_KIND)
         shown = [d for d in self.shell.docks_of(VIEWER_KIND) if not d.isHidden()]
         if (act is None or act.isHidden()) and shown:
@@ -570,10 +596,10 @@ class MainWindow(QMainWindow):
         left, right = Qt.LeftDockWidgetArea, Qt.RightDockWidgetArea
         bottom, top = Qt.BottomDockWidgetArea, Qt.TopDockWidgetArea
         return [
-            # several at once (V4.00 step 4): above the canvas, hidden until a result
-            # opens one — the first is made here, more by '+', View ▸ New or Compare
+            # several at once (V4.00 step 4): above the canvas; the first is made here and
+            # is on screen from launch (step 11a), more by '+', View ▸ New or Compare
             PanelSpec(VIEWER_KIND, "Viewer", self._make_viewer, glyph="◉", multi=True,
-                      default_area=top, default_hidden=True),
+                      default_area=top, default_hidden=False),
             # more canvases (V4.00 step 5): '+', View ▸ New, or a page's "Open in a new
             # canvas"; the main canvas is the window's centre and is not one of these
             PanelSpec(CANVAS_KIND, "Canvas", self._make_canvas, glyph="⬚", multi=True,
@@ -607,12 +633,12 @@ class MainWindow(QMainWindow):
         if self._maximized:
             self.set_maximized(False)        # the mini-map's viewer goes home first
         self.shell.reset_layout()
-        # a fresh install hides the Viewer only because there is nothing to show yet: one
-        # that HAS a picture stays on screen, at the Viewer's share of the canvas column
-        for d in self.shell.docks_of(VIEWER_KIND):
+        # a fresh install shows ONE Viewer (the first); a further one stays on screen only
+        # when it has a picture to show, and every one is re-sized on its next appearance
+        for i, d in enumerate(self.shell.docks_of(VIEWER_KIND)):
             d._sized = False
-            if d.panel.has_image():
-                self._show_viewer_dock(d)
+            d.setVisible(i == 0 or d.panel.has_image())
+        self._apply_default_sizes()
         self.statusBar().showMessage("layout reset — every panel is back in its default place")
 
     # ── viewers (V4.00 step 4) ────────────────────────────────────────────────
@@ -688,7 +714,8 @@ class MainWindow(QMainWindow):
 
     def _ensure_viewer(self) -> ViewerPanel:
         """The active viewer — or, after the last one was closed, a new one, hidden until a
-        result opens it (like the first)."""
+        result opens it (the first Viewer of a session is on screen from launch; a
+        replacement for one the user closed is not, until there is something to show)."""
         v = self._active_viewer()
         if v is None:
             d = self.shell.spawn(VIEWER_KIND, show=False)
@@ -856,18 +883,25 @@ class MainWindow(QMainWindow):
                             if self.shell.docks.get(d.objectName()) is d]
 
     def _allow_panel_close(self, dock) -> bool:
-        """The shell's close veto: while the canvas is maximized, the dock of the viewer
-        living in the mini-map stays — closing it would leave that viewer with no home. A
-        docked canvas that IS the maximized one may close, but the viewer in its mini-map
-        goes home first: the mini-map is a child of the canvas being destroyed."""
-        if dock.kind == CANVAS_KIND and self._maximized and dock.panel is self._max_canvas:
-            self.set_maximized(False)
-            return True
+        """The shell's close veto — a pure QUESTION. It is asked when a close is attempted
+        and again whenever the title bars paint their ✕ (``DockShell.sync_close_buttons``,
+        V4.00 step 11a), so it must not act: an earlier version un-maximized the canvas from
+        here, and asked after ``set_maximized(True)`` it undid the maximize it was asked
+        about. While the canvas is maximized, the dock of the viewer living in the mini-map
+        stays — closing it would leave that viewer with no home. A docked canvas that IS the
+        maximized one may close; the viewer in its mini-map goes home as the canvas goes
+        (:meth:`_prune_canvases`), the mini-map being a child of the canvas destroyed."""
         return not (dock.kind == VIEWER_KIND and self._maximized
                     and dock.panel is self._mini_viewer)
 
     def _prune_canvases(self) -> None:
-        """A docked canvas closed: when it was the one worked in, the main canvas is."""
+        """A docked canvas closed. When it was the MAXIMIZED one, the viewer in its mini-map
+        goes back to its dock first: the shell has taken the dock out of the window but the
+        canvas widget lives until the event loop runs its ``deleteLater``, so the mini-map
+        can still hand the viewer over. When it was the one worked in, the main canvas is."""
+        if self._maximized and self._max_canvas is not None \
+                and self._max_canvas not in self.canvases():
+            self.set_maximized(False)
         if self._canvas is not self._main_canvas and self._canvas not in self.canvases():
             self._canvas = self._main_canvas
             if self._max_canvas is not None and self._max_canvas not in self.canvases():
@@ -1776,6 +1810,7 @@ class MainWindow(QMainWindow):
         """Rebind the palette (G9) and re-apply it everywhere: node cards repaint from
         the tokens, QSS panels restyle, the canvas background updates."""
         T.apply(mode)
+        QApplication.instance().setPalette(T.palette())   # light mode gets the light palette
         self.setStyleSheet(_window_qss())
         for panel in (self.palette, self.inspector, self.sheet, self.lablink,
                       self.console, self.movie_editor, *self.viewers, *self.canvases()):
@@ -1880,15 +1915,18 @@ class MainWindow(QMainWindow):
         self._max_act.setChecked(on)
         self._max_act.blockSignals(False)
         self._sync_minimap_title()
+        # the close veto (`_allow_panel_close`) follows this state: the mini-map viewer's
+        # dock shows its ✕ disabled while maximized, live again once docked back
+        self.shell.sync_close_buttons()
         self.statusBar().showMessage(
             "canvas maximized — click any node to preview it in the mini-map (Esc to "
             "dock the Viewer back)" if on else "Viewer docked")
 
     def _open_viewer(self, v: Optional[ViewerPanel] = None) -> None:
         """Make sure viewer ``v`` (default: the active one) is on screen before it shows a
-        result: the first viewer launches hidden (blank canvas, nothing pulled), and a
-        viewer can be hidden by hand. A viewer the user has placed and sized is left exactly
-        as it is. While the canvas is maximized a docked viewer waits for the restore."""
+        result: a viewer can be hidden by hand, and one spawned to replace the last closed
+        viewer starts hidden. A viewer the user has placed and sized is left exactly as it
+        is. While the canvas is maximized a docked viewer waits for the restore."""
         v = v if v is not None else self._active_viewer()
         d = self._viewer_dock(v)
         if d is None or v is self._mini_viewer:
@@ -1900,11 +1938,52 @@ class MainWindow(QMainWindow):
         if d.isHidden():
             self._show_viewer_dock(d)
 
+    def _column_height(self) -> int:
+        """The canvas column's height — the window between the menu bar and the status bar —
+        which the Viewer's share (:data:`VIEWER_SHARE`) is measured against, the same way
+        in the default layout and when a Viewer dock first opens."""
+        return max(1, self.height() - self.menuBar().height() - self.statusBar().height())
+
+    def _apply_default_sizes(self) -> None:
+        """The default layout's SIZES (V4.00 step 11a). ``DockShell.apply_default_layout``
+        only PLACES the docks, and Qt then sizes them from their hints: the Viewer at its
+        minimum, the side columns at whatever their widgets ask. Here the first Viewer takes
+        :data:`VIEWER_SHARE` of the canvas column, Nodes :data:`PALETTE_W` and Properties
+        :data:`INSPECTOR_W`. Run on the first show (a dock resized before the window is laid
+        out is overridden by its minimum) when no saved layout was restored, and after View ▸
+        Reset layout. A floating or hidden dock is left alone.
+
+        A request below a dock's minimum (or against a fixed size) is clamped by Qt, so the
+        Viewer sits at its minimum height on a short window, and the Properties column is
+        today held at the LabLink tab's minimum width (868 px, measured 2026-10-06) with the
+        panel itself fixed at 376 (``InspectorPanel.setFixedWidth``) — that request is a
+        no-op until those panels can shrink."""
+        viewers = self.shell.docks_of(VIEWER_KIND)
+        if viewers:
+            d = viewers[0]
+            if not d.isHidden() and not d.isFloating() and self.dockWidgetArea(d) in (
+                    Qt.TopDockWidgetArea, Qt.BottomDockWidgetArea):
+                self.resizeDocks([d], [max(1, int(VIEWER_SHARE * self._column_height()))],
+                                 Qt.Vertical)
+            d._sized = True                # its first appearance is sized: this is it
+        for name, w in (("palette:0", PALETTE_W), ("inspector:0", INSPECTOR_W)):
+            sd = self.shell.dock(name)
+            if sd is not None and not sd.isHidden() and not sd.isFloating():
+                self.resizeDocks([sd], [w], Qt.Horizontal)
+
+    def showEvent(self, event) -> None:                      # noqa: N802 — Qt override
+        super().showEvent(event)
+        if not getattr(self, "_first_show_done", True):
+            self._first_show_done = True
+            if not self._layout_restored:
+                # after this show is laid out: a resize inside the show itself is overridden
+                QTimer.singleShot(0, self._apply_default_sizes)
+
     def _show_viewer_dock(self, d) -> None:
         """Show a Viewer dock. Its FIRST appearance takes the Viewer's share of the canvas
-        column (:data:`VIEWER_SHARE`) — a fresh dock would open at its minimum height;
-        after that the user's own size stands."""
-        col = self.view.height()
+        column (:data:`VIEWER_SHARE`, measured as the default layout measures it) — a fresh
+        dock would open at its minimum height; after that the user's own size stands."""
+        col = self._column_height()
         d.show()
         if getattr(d, "_sized", False) or d.isFloating():
             return

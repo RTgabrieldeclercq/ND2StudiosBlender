@@ -30,6 +30,7 @@ class ConsolePanel(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setAttribute(Qt.WA_StyledBackground, True)   # a subclass must ask for its QSS fill
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 6, 8, 8)
         v.setSpacing(5)

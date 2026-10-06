@@ -55,6 +55,7 @@ class SpreadsheetPanel(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setAttribute(Qt.WA_StyledBackground, True)   # a subclass must ask for its QSS fill
         self.restyle()
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 8, 8, 8)
