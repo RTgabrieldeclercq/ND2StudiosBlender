@@ -21,7 +21,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from PySide6.QtCore import QMimeData, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLineEdit, QSplitter, QStyledItemDelegate, QTextBrowser,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QSplitter, QStyledItemDelegate, QTextBrowser,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -183,6 +183,8 @@ class PalettePanel(QWidget):
     def __init__(self, on_add: Callable[[str], None]) -> None:
         super().__init__()
         self._on_add = on_add
+        #: the kind of the page being edited (V4.00 step 5): the palette offers its nodes
+        self._page_kind: Optional[str] = None
         self._current_op: Optional[str] = None
         self.restyle()
         lay = QVBoxLayout(self)
@@ -207,6 +209,13 @@ class PalettePanel(QWidget):
         top.setSpacing(6)
         top.addWidget(self._search, 1)
         top.addWidget(self._refresh)
+        # which nodes this is: the active page's kind decides (V4.00 step 5)
+        self._kind_chip = QLabel("All nodes")
+        self._kind_chip.setObjectName("kindChip")
+        self._kind_chip.setToolTip(
+            "The palette offers the nodes of the active page's kind — an Input page the "
+            "loaders and organisers, a Refinement page image preparation and segmentation, "
+            "and so on. A Free page offers every node.")
         self._tree = _PaletteTree()
         # the OVERVIEW: the bottom third of the panel, a scrolling rich-text card
         self._overview = QTextBrowser()
@@ -220,6 +229,7 @@ class PalettePanel(QWidget):
         self._split.setStretchFactor(1, 1)
         self._split.setChildrenCollapsible(False)
         self._split.setSizes([600, 300])
+        lay.addWidget(self._kind_chip)
         lay.addLayout(top)
         lay.addWidget(self._split, 1)
         self._search.textChanged.connect(self.refill)
@@ -237,6 +247,20 @@ class PalettePanel(QWidget):
         re-read too, so a role written for a new node appears without a restart."""
         R.reload()
         self.refill(self._search.text())
+
+    def set_page_kind(self, kind: Optional[str], label: str = "") -> None:
+        """Offer the nodes of a page of ``kind`` (``None``/``free``: every node), and say
+        so on the chip above the search."""
+        kind = kind or None
+        free = kind is None or kind == R.FREE_PAGE
+        self._kind_chip.setText("All nodes" if free else f"{label or kind} nodes")
+        if kind == self._page_kind:
+            return
+        self._page_kind = kind
+        self.refill(self._search.text())
+
+    def page_kind(self) -> Optional[str]:
+        return self._page_kind
 
     def focus_search(self) -> None:
         """Select the search box (the welcome card's 'Browse nodes' lands here)."""
@@ -270,7 +294,7 @@ class PalettePanel(QWidget):
     def refill(self, text: str = "") -> None:
         t = (text or "").lower()
         self._tree.clear()
-        specs = {s.op_key: s for s in visible_specs()
+        specs = {s.op_key: s for s in visible_specs(self._page_kind)
                  if not t or t in s.label.lower() or t in s.op_key.lower()}
         # stage -> role -> [spec], in the taxonomy's own order; unclassified ops last
         buckets: Dict[str, Dict[str, List]] = {}

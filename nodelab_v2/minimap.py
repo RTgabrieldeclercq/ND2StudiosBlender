@@ -160,7 +160,8 @@ class MiniMapOverlay(QWidget):
         self._title = "viewer"
         self._state = "idle"
         self._anchor: Tuple[str, str] = ("left", "top")     # the corner it sticks to
-        self._offset = QPoint(14, 14)                       # distance from that corner
+        # distance from that corner — below the canvas's page switcher (V4.00 step 5)
+        self._offset = QPoint(14, 48)
         self._want = QSize(*self.DEFAULT_SIZE)              # size the user asked for
         self._drag: Optional[str] = None                    # 'move' | 'resize'
         self._drag_at = QPoint()

@@ -1106,6 +1106,7 @@ def upstream_signature(graph: Graph, node_id: str) -> str:
 
 
 def dock_status(graph: Graph, node_id: str, *,
+                signature: Optional[str] = None,
                 store: Optional[str] = None,
                 held: Any = ()) -> Tuple[str, str]:
     """``(status, detail)`` for a dock, for the card badge and the inspector.
@@ -1156,7 +1157,8 @@ def dock_status(graph: Graph, node_id: str, *,
     if want != PRECISION_UNSET and want != str(man.get("precision", "")):
         return ("stale", f"baked at {man.get('precision')}, set to {want} — "
                          f"re-bake to apply")
-    if str(rec.get("sig", "")) and rec["sig"] != upstream_signature(graph, node_id):
+    now = upstream_signature(graph, node_id) if signature is None else signature
+    if str(rec.get("sig", "")) and rec["sig"] != now:
         return ("stale", "something upstream changed since this was baked — re-bake to "
                          "apply it")
     return (DOCK_DOCKED, "")

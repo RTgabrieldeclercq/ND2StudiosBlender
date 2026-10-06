@@ -61,7 +61,8 @@ from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
 from nodelab_v2.document import (
     BATCH_OP, BUNDLE_PATHS_KEY, GraphDocument, NodeRecord, TITLE_KEY, UNBATCH_OP)
-from nodelab_v2.ops import DOCK_OP
+from nodelab_v2.ops import (DOCK_OP, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP,
+                            PAGE_SOURCE_KEY)
 from nodelab_v2.picker import PICK_ACTION, PICK_GLYPH, request_for
 
 #: a synthetic per-channel output socket name — ``ch0``, ``ch1``, …
@@ -1415,6 +1416,7 @@ class NodeItem(QGraphicsObject):
         # a source node titled with its loaded file name (a group with its group name,
         # else the node-type label)
         label = (self._group_name or self.rec.params.get(TITLE_KEY)
+                 or self._page_boundary_label()
                  or (spec.label if spec else self.rec.op_key))
         label = QFontMetricsF(tf).elidedText(label, Qt.ElideRight, title_w)
         p.drawText(QRectF(12, 15, title_w, 16), Qt.AlignVCenter | Qt.AlignLeft, label)
@@ -1734,6 +1736,19 @@ class NodeItem(QGraphicsObject):
         self._apply_card_tip()
         self.update()
 
+    def _page_boundary_label(self) -> str:
+        """A page boundary card is titled by what it carries (V4.00 step 5): ``Output · raw``
+        for a Page Output named ``raw``, ``Input · raw`` for a Page Input reading one —
+        what tells two of them apart on a canvas. Empty for every other card."""
+        op = self.rec.op_key
+        if op == PAGE_OUTPUT_OP:
+            name = str(self.rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+            return f"Output · {name}" if name else ""
+        if op == PAGE_INPUT_OP:
+            src = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+            return f"Input · {src.split(':', 1)[-1]}" if src else ""
+        return ""
+
     def _footprint_line(self) -> str:
         """One plain-text line naming the footprint and WHAT DECIDES IT (V2.27).
 
@@ -1768,7 +1783,8 @@ class NodeItem(QGraphicsObject):
         Called from :meth:`_layout` as well as :meth:`set_run_state`, because until V2.27 the
         only writer was the run path — so a card that had never been pulled had no tooltip at
         all, and the footprint was unreadable on a COLLAPSED card, which paints no band."""
-        label = self._group_name or (self.spec.label if self.spec else self.rec.op_key)
+        label = (self._group_name or self._page_boundary_label()
+                 or (self.spec.label if self.spec else self.rec.op_key))
         parts = [f"{self.rec.id} · {label}"]
         foot = self._footprint_line()
         if foot:

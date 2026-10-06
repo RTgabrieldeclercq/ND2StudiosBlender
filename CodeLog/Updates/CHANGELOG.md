@@ -74,6 +74,29 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   maximized saves the docked layout; F8 on a card that the click just previewed compares it
   beside what was viewed before; a Compare viewer in the mini-map scrubs on its own.
 
+### Step 5 — pages in the GUI (2026-10-05)
+- Every page of a file has its own canvas scene; the **page switcher** in a canvas's top-left
+  corner lists the pages by kind and adds, duplicates, renames, deletes or opens one in a new
+  canvas; Ctrl+PgDn / Ctrl+PgUp step through them. More canvases are docks (View ▸ New ▸
+  Canvas); the main canvas stays the window's centre. The canvas clicked last decides the
+  active page — palette, Properties, edits and the title bar follow it.
+- The palette, the link-drag search and the Ready-to-run suggestions offer the nodes of the
+  page's kind; a later page's missing source is suggested as a Page Input.
+- A Page Input's Source is a dropdown of the named Page Outputs it may read; both cards say
+  what they carry (`Output · raw`, `Input · raw`).
+- Runs on any page update that page's cards, and viewers key results by page, so two pages'
+  `n3` never share a picture or a contrast setting.
+- A dock fed through a Page Input goes stale when the upstream page changes (a single-page
+  dock keeps the signature its bake recorded); an edit drops cached planes and views only on
+  the pages it can reach.
+- Work started on a page stays with that page when another canvas is clicked: a pick is
+  applied to the page it was armed on, the Movie Editor keeps the page it was opened on, and
+  Shift+F5, F9 and the Hold/Bake/Release re-pulls reach a Viewer's node on another page. A
+  Hold or a Bake retires its card claims on every page; opening a file rebinds every page's
+  canvas; an edit on one page keeps another page's overlay channels and preload; renaming a
+  page stales a dock under its blank-condition Page Output; Properties refreshes when a page
+  is renamed or deleted from another canvas's switcher.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

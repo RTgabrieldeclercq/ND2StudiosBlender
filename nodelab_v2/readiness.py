@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from nodegraph import roles as R
 from nodegraph.domains import Domain
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType
@@ -90,11 +91,13 @@ def _visible(op_key: str) -> bool:
     return not op_key.startswith(HIDDEN_OP_PREFIXES)
 
 
-def producers_of(domain: Domain) -> List[Any]:
-    """Visible node specs whose output adds ``domain``, preferred ones first."""
+def producers_of(domain: Domain, kind: Optional[str] = None) -> List[Any]:
+    """Visible node specs whose output adds ``domain``, preferred ones first — on a page of
+    ``kind``, only those that page offers (V4.00 step 5)."""
     pref = PREFERRED.get(domain, ())
     specs = [s for s in NODES.all()
-             if domain in getattr(s, "adds_domains", frozenset()) and _visible(s.op_key)]
+             if domain in getattr(s, "adds_domains", frozenset()) and _visible(s.op_key)
+             and R.op_in_page(s.op_key, kind)]
 
     def rank(s):
         try:
@@ -170,10 +173,15 @@ def problems(doc, node_id: str) -> List[Problem]:
         has_source = any(_is_source(r.spec()) for r in doc.nodes.values()
                          if r.spec() is not None and r.id != node_id)
         sugg: Tuple[Suggestion, ...] = ()
-        if not has_source:
+        if not has_source and R.op_in_page("io.load", getattr(doc, "page_kind", None)):
             sugg = (Suggestion("io.load", "Load", primary.name,
                                "the graph has no source yet — a Load node reads the file "
                                "this node will work on"),)
+        elif not has_source:
+            # a later page reads its data from an earlier one, not from a file (V4.00)
+            sugg = (Suggestion(PAGE_INPUT_OP, "Page Input", primary.name,
+                               "this page has no source yet — a Page Input reads a named "
+                               "Output of an earlier page"),)
         out.append(Problem(
             "unwired", primary.name,
             f"nothing is wired into `{primary.label or primary.name}` — this node has no "
@@ -182,7 +190,7 @@ def problems(doc, node_id: str) -> List[Problem]:
 
     # 2. domains the node reads that nothing upstream produces
     for d in sorted(doc.missing_domains(node_id), key=lambda d: d.value):
-        prods = producers_of(d)[:MAX_SUGGESTIONS]
+        prods = producers_of(d, getattr(doc, "page_kind", None))[:MAX_SUGGESTIONS]
         where = primary.name if primary is not None else None
         out.append(Problem(
             "domain", where,

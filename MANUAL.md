@@ -200,6 +200,29 @@ has it. A layout file that is damaged, or was written by a newer version, is set
 `layout.json.rejected` (the app opens on the default layout and writes a fresh one on quit);
 `NODELAB_LAYOUT=0` turns the memory off, and `NODELAB_LAYOUT_FILE` points it at another file.
 
+**Pages** (V4.00). A file holds several node graphs — **pages** — each of a kind: **Image
+Input** (load and organise the data), **Image Refinement** (prepare the image, find structure),
+**Image Processing** (find and measure objects), **Analysis**, or **Free** (anything; a file
+from before V4 opens as one Free page). The button in a canvas's top-left corner is the **page
+switcher**: it names the page shown and lists every page by kind; its menu adds a page of any
+kind, duplicates, renames or deletes one, or opens it in a new canvas. `Ctrl+PgDn` / `Ctrl+PgUp`
+step through the pages. The **palette, the link-drag search and the Ready-to-run suggestions
+offer the nodes of the page's kind** (a chip above the palette's search says which); a Free
+page offers every node. Pages hand data on by name: a **Page Output** node gives a Dataset a
+name on its page (its card reads `Output · raw`), and a **Page Input** on a later page picks it
+from its **Source** menu (`Input · raw`) — an Input page feeds Refinement, Refinement feeds
+Processing, and so on, while a Free page may feed or read any page. A pull reaches across pages:
+the upstream page's nodes run (or are served from memory) under ids like `pg1/n3`. **More
+canvases**: View ▸ New ▸ Canvas (or the switcher's *Open in a new canvas*) adds a canvas panel
+that can show another page side by side or pop out; the canvas you last clicked is the one
+the palette, Properties and every edit follow, and the window title names its page. The main
+canvas always stays in the window's centre. Work started on one page stays with it when you
+click another canvas: a pick armed on a node is applied to that page's node, the Movie Editor
+keeps editing the Export Movie of the page it was opened on (its title names the page), and
+**Shift+F5** pulls again whatever the active Viewer shows, on its own page. A page's kind
+decides what the menus *offer*; it is not a lock — a node dragged from the palette onto a
+canvas, or the Example graph, lands on that canvas's page whatever its kind.
+
 **Several Viewers** (V4.00). **+** on a Viewer's title bar, or **View ▸ New ▸ Viewer**, opens
 another Viewer beside it; pop one out onto a second screen with **⇱**. Each Viewer keeps
 showing the node it was given, and its title bar names it (`Viewer · n3 · Gaussian Blur`). The
@@ -2164,7 +2187,7 @@ print(report.summary(), report.removed, report.added)
   page. Each page's docks bake under `<graph>.docks/<page id>/<node>`. A LabLink recipe
   names its page with `"page"` (id or name; absent = the active page) and the worker runs
   that page **composed** with every page it reads from — its knob and target ids are the run
-  ids `<page>/<node>`. Until the page switcher lands (V4 step 5) the window shows one page.
+  ids `<page>/<node>`. The window shows every page through the page switcher (§2, **Pages**).
 
 ---
 

@@ -203,10 +203,11 @@ def _probe_movie_editor(win, app) -> None:
                                                       ed._status.text())
 
     # a settled Viewer LUT on S is stamped into A's linked channels
-    win.viewer._clim[("S", 0)] = (100.0, 900.0)
-    win.viewer._clim_user.add(("S", 0))        # a window the user SET, not an auto one
-    win.viewer._gammas[("S", 0)] = 1.5
-    win._on_viewer_display("S")
+    _S = win.runner.run_id("S")                # the viewer keys a node by its run id
+    win.viewer._clim[(_S, 0)] = (100.0, 900.0)
+    win.viewer._clim_user.add((_S, 0))         # a window the user SET, not an auto one
+    win.viewer._gammas[(_S, 0)] = 1.5
+    win._on_viewer_display(_S)
     app.processEvents()
     spec = MT.normalize_spec(rec.params["timeline"])
     d0 = spec["segments"][0]["panels"][0]["display"]["0"]
@@ -2078,7 +2079,8 @@ def main(argv) -> int:
     _vd0 = win._viewer_dock(win.viewer)
     assert _vd0 is not None and _vd0.objectName().startswith("viewer:")
     assert not _vd0.isHidden() and win.dockWidgetArea(_vd0) == _QtE9.TopDockWidgetArea
-    assert win.centralWidget() is win.view, "the canvas is the centre; viewers are docks"
+    assert win.centralWidget() is win._main_canvas and win.view is win._main_canvas.view, \
+        "the main canvas is the centre; viewers are docks"
     docked_h = _vd0.height()
     win.set_maximized(True)
     for _ in range(3):
@@ -2734,7 +2736,10 @@ def main(argv) -> int:
         "the badge names the same scope as the status chip"
     assert _left_border_amber(), "the canvas must wear the amber frame"
     _bg = _view._ts_badge.geometry()
-    assert _bg.left() < 40 and _bg.top() < 40, f"badge belongs top-left, at {_bg}"
+    # top-left, on the top strip — beside the page switcher, which owns the very corner
+    # (V4.00 step 5)
+    assert _bg.top() < 40 and _bg.left() < _view.width() / 2, f"badge belongs top-left, at {_bg}"
+    assert not _bg.intersects(_view.page_button.geometry()), "…without covering the switcher"
 
     # the pulse only re-renders the badge's TEXT (a 200 px label); a pulsing frame would
     # repaint every node on the canvas twice a second
@@ -2751,13 +2756,15 @@ def main(argv) -> int:
     _bg, _mm = _view._ts_badge.geometry(), win.minimap.geometry()
     assert win.minimap.isVisible() and not _bg.intersects(_mm), \
         f"badge {_bg} must dodge the mini-map {_mm}"
-    assert _bg.left() >= _mm.right() and _bg.top() < _mm.top() + 60, \
+    assert _bg.top() < 40 and not _bg.intersects(_view.page_button.geometry()), \
         "…by moving right of it, not off the top strip"
     assert _left_border_amber(), "the frame survives the maximize"
     win.set_maximized(False)
     for _ in range(3):
         app.processEvents()
-    assert _view._ts_badge.geometry().left() < 40, "…and returns to the corner after"
+    assert _view._ts_badge.geometry().top() < 40 \
+        and not _view._ts_badge.geometry().intersects(_view.page_button.geometry()), \
+        "…and returns to the corner after"
 
     _pulls.clear()
     win.set_solo_frame(False)
@@ -4115,10 +4122,10 @@ def main(argv) -> int:
     # so during playback / a fast scrub a windowed read that took longer than the frame
     # cadence lands generation-current — the (m,t,z) stamp is the guard that catches it
     _m0, _t0c, _z0, _c0 = _vp.coords()
-    _vp.on_detail_ready(_node, _dplanes, _drect, (_m0, _t0c + 1, _z0, _c0))
+    _vp.on_detail_ready(_nid, _dplanes, _drect, (_m0, _t0c + 1, _z0, _c0))
     assert _vp._detail_rect is None, \
         "a detail patch from a previous frame must not be painted over the current one"
-    _vp.on_detail_ready(_node, _dplanes, _drect, (_m0, _t0c, _z0, _c0))
+    _vp.on_detail_ready(_nid, _dplanes, _drect, (_m0, _t0c, _z0, _c0))
     assert _vp._detail_rect is not None, "…while the current frame's patch still lands"
     _surf.fit()
     app.processEvents()
@@ -5255,11 +5262,12 @@ def main(argv) -> int:
     _await_planes(2)
     # a node whose DATA changed under the same id re-auto-contrasts: a stale window
     # from another file is a channel that looks switched off
-    win.viewer._clim[("cl", 0)] = (1e9, 2e9)
-    win.viewer._lut_ident["cl"] = ((2, ("other",), ()), set())
+    _cl = _rq("cl")                            # the viewer keys a node by its run id
+    win.viewer._clim[(_cl, 0)] = (1e9, 2e9)
+    win.viewer._lut_ident[_cl] = ((2, ("other",), ()), set())
     win.pull_node("cl")
     _await_pull(limit=60.0)
-    assert win.viewer._clim.get(("cl", 0), (0.0, 0.0))[0] < 1e9, win.viewer._clim.get(("cl", 0))
+    assert win.viewer._clim.get((_cl, 0), (0.0, 0.0))[0] < 1e9, win.viewer._clim.get((_cl, 0))
     _ok("V6 channels never switch themselves off (2026-09-30): 2-channel -> 1-channel "
         "tap -> 2-channel returns with BOTH channels on and both planes delivered "
         "without a click; a channel the user switched off stays off through the same "
@@ -5709,7 +5717,7 @@ def main(argv) -> int:
     assert _sel == [_dr[0]] and win.inspector._node.node_id == _dr[0], (_sel, "switched to it")
     assert win.viewer.picking() and win.viewer.pick_node_id() == _dr[0], "armed on the draw node"
     assert not win.viewer._pick_bar.isVisible(), "NO drawing controls on the image"
-    assert win._pick_return == "RD2B"
+    assert win._pick_return == (win.workspace.active, "RD2B")
     _texts = {b.text() for b in win.inspector.findChildren(_QTB)}
     assert {"Undo", "Clear", "Close polygon", "✓  Apply", "Cancel"} <= _texts, _texts
     # the node's own Tool / Operation params drive the gesture
@@ -5789,6 +5797,467 @@ def main(argv) -> int:
 
     _probe_movie_editor(win, app)
 
+    # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────
+    from PySide6.QtCore import QEvent as _PEv, QPointF as _PPF, Qt as _PQt
+    from PySide6.QtGui import QAction, QMouseEvent as _PME
+    from PySide6.QtWidgets import QMenu as _PMenu
+    from nodelab_v2.inspector import _NoWheelCombo as _PCombo
+    from nodelab_v2.scene import compatible_ops as _pcompat, visible_specs as _pvis
+    from nodelab_v2.workspace import qualify as _pq
+    win.set_solo_frame(False)
+    win._follow_act.setChecked(False)
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _pdone: list = []
+    win.runner.finished.connect(lambda nid, *a: _pdone.append(nid))
+
+    def _pwait(rid, timeout=180):
+        t0 = time.time()
+        while rid not in _pdone and time.time() - t0 < timeout:
+            app.processEvents()
+            time.sleep(0.005)
+        assert rid in _pdone, (rid, _pdone)
+        for _ in range(3):
+            app.processEvents()
+
+    def _press(view):
+        """A real left press (and release) on a canvas's empty corner."""
+        vp = view.viewport()
+        pt = _PPF(vp.width() - 30.0, vp.height() - 30.0)
+        for et, btns in ((_PEv.MouseButtonPress, _PQt.LeftButton),
+                         (_PEv.MouseButtonRelease, _PQt.NoButton)):
+            QApplication.sendEvent(vp, _PME(et, pt, pt, _PQt.LeftButton, btns,
+                                            _PQt.NoModifier))
+        app.processEvents()
+
+    def _palette_ops():
+        out, stack = set(), [win.palette._tree.topLevelItem(i)
+                             for i in range(win.palette._tree.topLevelItemCount())]
+        while stack:
+            it = stack.pop()
+            op = it.data(0, _PQt.UserRole)
+            if op:
+                out.add(op)
+            stack.extend(it.child(i) for i in range(it.childCount()))
+        return out
+
+    _p1 = win.workspace.active
+    _main = win._main_canvas
+    # PG1 a Refinement page: the canvas switches to it, empty; the palette, the link search
+    # and the window title follow its kind
+    _all = _palette_ops()
+    _p2 = win.new_page("refine")
+    app.processEvents()
+    assert win.workspace.active == _p2 and win.canvas is _main and _main.page_id == _p2
+    assert not win.doc.nodes and win.welcome.isVisible()
+    _ref = _palette_ops()
+    assert _ref == {s.op_key for s in _pvis("refine")} and _ref < _all, (len(_ref), len(_all))
+    assert "io.load" not in _ref and "enhance.gaussian" in _ref and "page.input" in _ref
+    assert "Refinement" in win.palette._kind_chip.text(), win.palette._kind_chip.text()
+    assert "Refinement" in win.windowTitle(), win.windowTitle()
+    assert _main.view.page_button.isVisible() and \
+        _main.view.page_button.text().strip() == win.workspace.page(_p2).name
+    _gspec = next(s for s in _pvis(None) if s.op_key == "enhance.gaussian")
+    assert all(op in _ref for op in {s.op_key for s, _n in
+                                      _pcompat(_gspec.outputs[0], "out", "refine")}), \
+        "the link search offers only the page's nodes"
+    _ok("PG1 New page ▸ Refinement: the canvas shows the new, empty page (welcome card up); "
+        "the palette, the link search and the readiness suggestions offer only the "
+        "refinement nodes; the switcher and the window title name the page and its kind")
+
+    # PG7 a named Page Output on page 1, read on the Refinement page through the inspector's
+    # Source menu: the card says what it reads, the envelope crosses, a pull runs through it
+    win._show_page(_main, _p1)
+    app.processEvents()
+    _out = win.doc.add_node("page.output", x=560, y=650, params={"name": "raw"})
+    win.doc.connect("n2", "out", _out.id, "data")
+    win.scene.sync()
+    assert win.scene.node_items[_out.id]._page_boundary_label() == "Output · raw"
+    win._show_page(_main, _p2)
+    app.processEvents()
+    _pin = win.doc.add_node("page.input", x=40, y=120)
+    _gam = win.doc.add_node("enhance.gamma", x=320, y=120)
+    win.doc.connect(_pin.id, "out", _gam.id, "data")
+    win.scene.sync()
+    win.scene.clearSelection()
+    win.scene.node_items[_pin.id].setSelected(True)
+    app.processEvents()
+    _src = next((c for c in win.inspector.findChildren(_PCombo)
+                 if any(c.itemData(i) == f"{_p1}:raw" for i in range(c.count()))), None)
+    assert _src is not None, "the Page Input's Source menu lists the upstream Output"
+    _i = next(i for i in range(_src.count()) if _src.itemData(i) == f"{_p1}:raw")
+    assert "raw" in _src.itemText(_i) and not _src.isEditable()
+    _src.setCurrentIndex(_i)
+    _src.activated.emit(_i)
+    app.processEvents()
+    assert win.doc.nodes[_pin.id].params.get("source") == f"{_p1}:raw"
+    assert win.scene.node_items[_pin.id]._page_boundary_label() == "Input · raw"
+    assert win.doc.env(_pin.id).axes is not None, "the upstream envelope crosses the pages"
+    _pdone.clear()
+    win.pull_node(_gam.id)
+    _pwait(_pq(_p2, _gam.id))
+    assert win.viewer.binding == (_p2, _gam.id) and win.viewer.has_image()
+    _ok("PG7 a named Page Output on one page is offered by a Page Input's Source menu on a "
+        "Refinement page (a closed list, labelled page · name); both cards say what they "
+        "carry; the upstream envelope crosses and a pull through the Input runs")
+
+    # PG2 two canvases on two pages: a press on one makes ITS page the active page
+    _c2 = win.open_canvas(_p1)
+    app.processEvents()
+    assert _c2.page_id == _p1 and win.canvas is _c2 and win.workspace.active == _p1
+    assert win.view is _c2.view and win.scene is win.scene_for(_p1)
+    assert win.shell.dock_of(_c2) is not None, "a second canvas is a dock"
+    _press(_main.view)
+    assert win.canvas is _main and win.workspace.active == _p2 and win.view is _main.view
+    assert "Refinement" in win.palette._kind_chip.text()
+    _press(_c2.view)
+    assert win.canvas is _c2 and win.workspace.active == _p1
+    assert "All nodes" in win.palette._kind_chip.text(), "a Free page offers every node"
+    _ok("PG2 a second canvas (a dock) shows another page; a press on a canvas makes its "
+        "page the active one — the palette, the inspector and every edit follow")
+
+    # PG6 the same node id on two pages: two viewers, one per page, never share a result
+    assert _gam.id in win.workspace.page(_p1).doc.nodes, \
+        "the fixture relies on page ids colliding across pages"
+    _vb6 = win.viewer
+    _vo = win.shell.spawn("viewer", beside=win._viewer_dock(_vb6)).panel
+    _pdone.clear()
+    win.pull_node(_gam.id, viewer=_vo)                       # the active page: p1
+    _pwait(_pq(_p1, _gam.id))
+    assert _vo.binding == (_p1, _gam.id) and _vo.showing()[0] == _pq(_p1, _gam.id)
+    assert _vb6.binding == (_p2, _gam.id) and _vb6.showing()[0] == _pq(_p2, _gam.id), \
+        "the other page's same-id result must not land here"
+    win._viewer_dock(_vo).close()
+    app.processEvents()
+    _ok("PG6 two pages each with node " + _gam.id + ": a viewer bound to one page's node "
+        "never shows the other page's (run ids are page-qualified end to end)")
+
+    # PG9 (step 5 review) Shift+F5 pulls again what the active viewer shows — on ITS page,
+    # while another page is the active one (`_viewed` names a node of the active page only)
+    assert win.workspace.active == _p1 and win._active_viewer() is _vb6
+    assert _vb6.binding == (_p2, _gam.id) and win._viewed is None
+    _again = next(a for a in win.findChildren(QAction)
+                  if a.shortcut().toString() == "Shift+F5")
+    _st9: list = []
+
+    def _on_st9(nid):
+        _st9.append(nid)
+
+    win.runner.started.connect(_on_st9)
+    _pdone.clear()
+    _again.trigger()
+    _pwait(_pq(_p2, _gam.id))
+    win.runner.started.disconnect(_on_st9)
+    assert _pq(_p2, _gam.id) in _st9, _st9
+    _ok("PG9 Shift+F5 re-pulls the active viewer's node on its own page while another page "
+        "is the active one (F9, Hold, Bake and Release re-pull the same way)")
+
+    # PG10 (step 5 review) a pick armed for one page's node is written THERE when another
+    # page — a duplicate, holding the same node ids — is active by the time it is applied
+    from nodelab_v2.picker import request_for as _pgrq
+    _d1 = win.workspace.page(_p1).doc
+    _d1.add_node("enhance.gamma", node_id="PKG", x=548, y=650)
+    _d1.connect("n2", "out", "PKG", "data")
+    _d1.add_node("io.write_movie", node_id="PKM", x=1064, y=430)
+    _d1.connect("n3", "out", "PKM", "data")
+    _mv_vis = win._movie_dock.isVisible()
+    _pd = win.duplicate_page(_p1, canvas=_main)              # the copy, on the main canvas
+    app.processEvents()
+    _dd = win.workspace.page(_pd).doc
+    assert {"PKG", "PKM"} <= set(_dd.nodes)
+    _press(_c2.view)                                          # page 1 is the one worked in
+    assert win.workspace.active == _p1
+    _pdone.clear()
+    win.pull_node("PKG")
+    _pwait(_pq(_p1, "PKG"))
+    _vk = win._active_viewer()
+    win._arm_pick(_pgrq("PKG", _d1.nodes["PKG"].spec().input("gamma")))
+    assert _vk.pick_node_id() == "PKG" and _vk.pick_page_id() == _p1
+    _vk._on_lut_gamma(_vk._lut_channel(), 0.55)               # the user drags the gamma dot
+    _press(_main.view)                                        # …glances at the copy
+    assert win.workspace.active == _pd
+    _vk.apply_pick()                                          # …and applies the pick
+    app.processEvents()
+    assert _d1.nodes["PKG"].params.get("gamma") == 0.55 and "gamma" in _d1.nodes["PKG"].locked
+    assert _dd.nodes["PKG"].params.get("gamma") is None and "gamma" not in _dd.nodes["PKG"].locked
+    _ok("PG10 a pick armed for a node of one page is applied to THAT page's node after a "
+        "page holding the same node ids became the active one")
+
+    # PG11 (step 5 review) the Movie Editor stays on the page it was opened on: with the
+    # copy active, its edits land on its own page's Export Movie and its fetches reach it
+    _press(_c2.view)
+    win.open_movie_editor("PKM")
+    assert win._movie_pid() == _p1 and win.movie_editor.bound() == "PKM"
+    _press(_main.view)
+    assert win.workspace.active == _pd and win._movie_pid() == _p1
+    assert win.workspace.page(_p1).name in win.movie_editor._title.text(), \
+        win.movie_editor._title.text()
+    win.movie_editor._host.set_sweep("PKM", "timeline")
+    app.processEvents()
+    assert _d1.nodes["PKM"].modes.get("sweep") == "timeline" and \
+        _d1.nodes["PKM"].params.get("timeline"), "converted on the editor's own page"
+    assert _dd.nodes["PKM"].modes.get("sweep") != "timeline" and \
+        not _dd.nodes["PKM"].params.get("timeline"), "the copy's movie is untouched"
+    _fx: list = []
+    win.movie_editor.on_fetched = lambda n, p: _fx.append(n)
+    try:
+        win._on_movie_fetched(_pq(_p1, "n3"), None, 0.0)     # its own page's source
+        win._on_movie_fetched(_pq(_pd, "n3"), None, 0.0)     # the copy's: not its business
+    finally:
+        del win.movie_editor.on_fetched                      # the class method again
+    assert _fx == ["n3"], _fx
+    _ok("PG11 the Movie Editor keeps editing the Export Movie of the page it was opened on — "
+        "its title names that page, its edits land there and its fetched sources reach it — "
+        "while a copy with the same node ids is the active page")
+
+    # PG12 (step 5 review) a Hold or a Bake — finished or stopped — retires its run's claims
+    # on every page's canvas, as a finished pull does: no card is left 'queued'
+    _tg = _pq(_pd, "PKG")
+    win._on_run_plan(_tg, [_pq(_p1, "n1"), _pq(_p1, "n2"), _tg])
+    assert win.scene_for(_p1)._plans.get(_tg), "the run claims page 1's cards"
+    win._on_baked(_tg, {"cancelled": True})                   # a stopped bake
+    app.processEvents()
+    assert _tg not in win.scene_for(_p1)._plans and "PKG" not in win.scene_for(_pd)._plans
+    _tg2 = _pq(_pd, "gone")
+    win._on_run_plan(_tg2, [_pq(_p1, "n1"), _tg2])
+    assert win.scene_for(_p1)._plans.get(_tg2)
+    win._on_held(_tg2, {})                                    # its card went away meanwhile
+    app.processEvents()
+    assert _tg2 not in win.scene_for(_p1)._plans
+    assert not any(v[0] in ("queued", "running") for v in win.scene_for(_p1)._run.values())
+    _ok("PG12 a stopped Bake and a Hold retire their run's claims on every page's canvas — no "
+        "card is left reading 'queued' on the page the run computed through")
+    win._show_page(_main, _p2)
+    app.processEvents()
+    assert win.delete_page(_pd, confirm=False)
+    _d1.remove_node("PKG")
+    _d1.remove_node("PKM")
+    app.processEvents()
+    _press(_c2.view)
+    assert win.workspace.active == _p1 and _main.page_id == _p2
+    assert win.movie_editor.bound() is None, "its movie node is gone"
+    win._movie_dock.setVisible(_mv_vis)
+    app.processEvents()
+
+    # PG3 the switcher's menu, and the page operations behind it
+    _m = _PMenu()
+    win.fill_page_menu(_m, _main)
+    _texts = [a.text() for a in _m.actions()]
+    _names = [p.name for p in win.workspace.pages.values()]
+    assert all(n in _texts for n in _names), (_texts, _names)
+    assert {"New page", "Duplicate page", "Rename page…", "Delete page"} <= set(_texts), _texts
+    _checked = [a.text() for a in _m.actions() if a.isCheckable() and a.isChecked()]
+    assert _checked == [win.workspace.page(_main.page_id).name], _checked
+    assert win.rename_page(_p2, "Refine A")
+    app.processEvents()
+    assert _main.view.page_button.text().strip() == "Refine A"
+    _p3 = win.duplicate_page(_p2, canvas=_main)
+    app.processEvents()
+    assert _main.page_id == _p3 and win.workspace.page(_p3).name == "Refine A copy"
+    assert set(win.doc.nodes) == set(win.workspace.page(_p2).doc.nodes)
+    assert win.delete_page(_p3, confirm=False)
+    app.processEvents()
+    assert _p3 not in win.workspace.pages and _main.page_id in win.workspace.pages
+    assert _p3 not in win._scenes, "a deleted page's scene goes with it"
+    _ok("PG3 the switcher lists every page grouped by kind (the shown one ticked) with New "
+        "page, Duplicate, Rename and Delete; a rename re-titles the switcher, a duplicate "
+        "copies the graph and is shown, a delete drops the page and its scene")
+
+    # PG13 (step 5 review) a page renamed or deleted from ANOTHER canvas's switcher while the
+    # active page stays: the inspector re-reads the page list — a Page Input's Source names
+    # the new page name, and once its Output's page is gone it reads unbound, in the menu and
+    # in Ready-to-run
+    win._show_page(_main, _p2)
+    _press(_main.view)
+    win.scene.clearSelection()
+    win.scene.node_items[_pin.id].setSelected(True)
+    app.processEvents()
+    assert win.workspace.active == _p2 and win.inspector._node.node_id == _pin.id
+
+    def _srcbox(value):
+        return next((c for c in win.inspector.findChildren(_PCombo)
+                     if any(c.itemData(i) == value for i in range(c.count()))), None)
+
+    _nm1 = win.workspace.page(_p1).name
+    assert win.rename_page(_p1, "Acquired")
+    app.processEvents()
+    assert win.workspace.active == _p2, "renaming another page leaves the active one"
+    _b13 = _srcbox(f"{_p1}:raw")
+    assert _b13 is not None and _b13.currentText().startswith("Acquired"), \
+        [_b13.itemText(i) for i in range(_b13.count())] if _b13 is not None else None
+    assert win.rename_page(_p1, _nm1)
+    app.processEvents()
+    _px = win.workspace.add_page("Scratch input", "input").id
+    win.workspace.page(_px).doc.add_node("page.output", node_id="TO", params={"name": "tmp"})
+    win.doc.nodes[_pin.id].params["source"] = f"{_px}:tmp"
+    win.doc.touch(_pin.id)
+    win.inspector.set_node(win.scene.node_items[_pin.id])
+    app.processEvents()
+    assert "unbound" not in _srcbox(f"{_px}:tmp").currentText()
+    assert not any(p.kind == "unbound" for p in win.inspector._problems)
+    assert win.delete_page(_px, confirm=False)
+    app.processEvents()
+    assert win.workspace.active == _p2
+    _b13 = _srcbox(f"{_px}:tmp")
+    assert _b13 is not None and "unbound" in _b13.currentText(), \
+        [_b13.itemText(i) for i in range(_b13.count())] if _b13 is not None else None
+    assert any(p.kind == "unbound" for p in win.inspector._problems), win.inspector._problems
+    win.doc.nodes[_pin.id].params["source"] = f"{_p1}:raw"
+    win.doc.touch(_pin.id)
+    app.processEvents()
+    _ok("PG13 a page renamed or deleted from another canvas's switcher: the shown Page "
+        "Input's Source follows the new name, and reads unbound — in its menu and in "
+        "Ready-to-run — once the page holding its Output is gone")
+
+    # PG4 Ctrl+PgDn / Ctrl+PgUp step the active canvas through the pages
+    _order = list(win.workspace.pages)
+    _next = next(a for a in win.findChildren(QAction) if a.shortcut().toString() == "Ctrl+PgDown")
+    _prev = next(a for a in win.findChildren(QAction) if a.shortcut().toString() == "Ctrl+PgUp")
+    _before = win.canvas.page_id
+    _next.trigger()
+    app.processEvents()
+    assert win.canvas.page_id == _order[(_order.index(_before) + 1) % len(_order)]
+    _prev.trigger()
+    app.processEvents()
+    assert win.canvas.page_id == _before
+    _ok("PG4 Ctrl+PgDn / Ctrl+PgUp step the active canvas through the workspace's pages")
+
+    # PG5 a page keeps its selection and the canvas its viewpoint across a round trip
+    win._show_page(_main, _p1)
+    app.processEvents()
+    win.scene.clearSelection()
+    win.scene.node_items["n3"].setSelected(True)
+    _main.view.resetTransform()
+    _main.view.scale(1.7, 1.7)
+    app.processEvents()
+    _z = _main.view.transform().m11()
+    win._show_page(_main, _p2)
+    app.processEvents()
+    win._show_page(_main, _p1)
+    app.processEvents()
+    assert win.scene.node_items["n3"].isSelected(), "the page kept its selection"
+    assert abs(_main.view.transform().m11() - _z) < 1e-9, "the canvas kept its viewpoint"
+    _ok("PG5 switching a canvas away from a page and back keeps the page's selection and "
+        "the canvas's zoom and position")
+
+    # PG8 a file of several pages, opened over a window whose active page has ANOTHER id:
+    # every page comes back on its own scene (a load keeps the active page's document
+    # object for the new active page, so a scene cached under the old id is stale)
+    _pfile = os.path.join(tempfile.mkdtemp(prefix="nd2pages_"), "pages.nd2graph.json")
+    win.workspace.save_file(_pfile)
+    _saved_active = win.workspace.active
+    _other = next(p for p in win.workspace.pages if p != _saved_active)
+    win._show_page(_main, _other)
+    app.processEvents()
+    win.file_new()
+    app.processEvents()
+    assert list(win.workspace.pages) == [_other]
+    win.workspace.load_file(_pfile)
+    app.processEvents()
+    assert win.workspace.active == _saved_active and win.canvas.page_id == _saved_active
+    for _pid, _pg in win.workspace.pages.items():
+        _sc = win.scene_for(_pid)
+        assert _sc.doc is _pg.doc and set(_sc.node_items) == set(_pg.doc.nodes), \
+            (_pid, sorted(_sc.node_items), sorted(_pg.doc.nodes))
+    win._show_page(_main, _other)
+    app.processEvents()
+    assert win.view.scene() is win.scene_for(_other)
+    assert set(win.scene.node_items) == set(win.workspace.page(_other).doc.nodes)
+    # the dropped scenes listen to nothing: an edit on every page reaches its own scene,
+    # and a palette drop draws its card (a dead listener raised before the live ones ran)
+    from nodelab_v2.scene import GraphScene as _GSpg
+    for _pid, _pg in win.workspace.pages.items():
+        assert sum(1 for _fn in _pg.doc._listeners
+                   if getattr(_fn, "__func__", None) is _GSpg.sync) == 1, _pid
+        _pg.doc.touch()
+    _before = set(win.doc.nodes)
+    win._on_op_dropped("enhance.gamma", QPointF(300.0, 300.0))
+    app.processEvents()
+    _new = set(win.doc.nodes) - _before
+    assert len(_new) == 1 and _new <= set(win.scene.node_items), (_new, sorted(win.scene.node_items))
+    _ok("PG8 a file of several pages opens with every page on its own scene, even over a "
+        "window whose active page had another id; the scenes it replaced listen to nothing, "
+        "so the next edit and a palette drop reach the live canvas")
+
+    # a docked canvas closes — even while maximized: the viewer in its mini-map goes back
+    # to its dock first (the mini-map dies with the canvas); the main canvas cannot close
+    if not win.viewer.has_image():
+        _pdone.clear()
+        win.pull_node("n3")
+        _pwait(_pq(win.workspace.active, "n3"))
+    win._on_canvas_maximize(_c2, True)
+    app.processEvents()
+    assert win._maximized and win._max_canvas is _c2 and win.minimap.parentWidget() is _c2.view
+    _mv = win._mini_viewer
+    _d2 = win.shell.dock_of(_c2)
+    _d2.close()
+    app.processEvents()
+    assert not win._maximized and win._max_canvas is None
+    assert win._viewer_dock(_mv) is not None and win._viewer_dock(_mv).widget() is _mv
+    assert _mv.has_image(), "the viewer survived its mini-map's canvas"
+    assert win.canvases() == [_main] and win.canvas is _main
+    assert win.centralWidget() is _main and win.shell.dock_of(_main) is None
+    _ok("PG canvases: a docked canvas closes and the main one takes over; the main canvas "
+        "is the window's centre, so the last canvas can never be closed")
+
+    # PG14 (step 5 review) an edit on a page that another page does not read leaves that
+    # page's viewer whole — its held view, its overlay channels (a Viewer node's second
+    # source) and a preload in flight; an edit on its own page still drops them
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _q1 = win.workspace.active
+    _dq = win.doc
+    _dq.add_node("view.viewer", node_id="PGV", x=1330, y=430)
+    _dq.connect("n3", "out", "PGV", "data")
+    _dq.connect("n2", "out", "PGV", "source_2")
+    _q2 = win.new_page("free")
+    app.processEvents()
+    _dq2 = win.workspace.page(_q2).doc
+    _gq = _dq2.add_node("enhance.gamma", x=0, y=0)
+    win._show_page(win.canvas, _q1)
+    app.processEvents()
+    _qr = _pq(_q1, "PGV")
+    _pdone.clear()
+    win.pull_node("PGV")
+    _pwait(_qr)
+    _rn = win.runner
+    _ql = dict(_rn.overlay_channels(_qr))
+    assert _ql, "the second source is composited as overlay channels"
+    _qo = sorted(_ql)[0]
+    _qp: list = []
+
+    def _on_qp(nid, pl, *_a):
+        _qp.append((nid, sorted(pl)))
+
+    _rn.plane_ready.connect(_on_qp)
+
+    def _qserve():
+        _qp.clear()
+        _rn.request_plane(_qr, (0, 0, 0, 0), (0, _qo))
+        t0 = time.time()
+        while not any(n == _qr for n, _p in _qp) and time.time() - t0 < 120:
+            app.processEvents()
+            time.sleep(0.005)
+        return [p for n, p in _qp if n == _qr][-1]
+
+    assert _qo in _qserve()
+    _rn._preload_total, _rn._preload_done, _rn._preload_node = 9, 0, _qr   # page 1 plays
+    _dq2.nodes[_gq.id].params["gamma"] = 2.0
+    _dq2.touch(_gq.id)                                        # page 2 reads nothing of page 1
+    app.processEvents()
+    assert _rn._view_of(_qr) is not None and dict(_rn.overlay_channels(_qr)) == _ql
+    assert _rn.preloading() and _rn._preload_node == _qr, "page 1's preload keeps going"
+    assert _qo in _qserve(), "page 1's overlay channel is still served"
+    _dq.touch("n3")                                           # an edit on page 1 itself
+    app.processEvents()
+    assert not _rn.preloading() and _rn._view_of(_qr) is None
+    _rn.plane_ready.disconnect(_on_qp)
+    _ok("PG14 an edit on a page another page does not read leaves that page's viewer whole "
+        "(its held view, overlay channels and a running preload); an edit on its own page "
+        "still drops them")
+
     # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
     from PySide6.QtGui import QMouseEvent as _QME
@@ -5838,7 +6307,7 @@ def main(argv) -> int:
     _vw_wait("n4")
     assert _vb.binding[1] == "n4" and _vb.has_image() and "n4" in _db.title_bar.title_text()
     assert _va.binding[1] == "n3" and "n3" in _da.title_bar.title_text()
-    assert _va.showing()[0] == "n3", "the other viewer keeps its own result"
+    assert _va.showing()[0] == _rq("n3"), "the other viewer keeps its own result"
     assert win.scene.viewed_id == "n4", "the canvas marks the ACTIVE viewer's card"
     _ok("VW1 View ▸ New ▸ Viewer opens another Viewer dock beside the first, active and "
         "empty; a pull lands in the ACTIVE viewer and binds it (its title names the node); "
@@ -5859,7 +6328,7 @@ def main(argv) -> int:
     win.scene.clearSelection()
     win.scene.node_items[_vv.id].setSelected(True)
     _vw_wait(_vv.id)
-    assert _va.binding[1] == _vv.id and _va.showing()[0] == _vv.id, _va.binding
+    assert _va.binding[1] == _vv.id and _va.showing()[0] == _rq(_vv.id), _va.binding
     assert _vb.binding[1] == "n4", "only the ACTIVE viewer follows the click"
     assert win.scene.viewed_id == _vv.id
     _ok("VW2 selecting a Viewer node shows it in the active viewer at once (click-to-preview "
@@ -6009,7 +6478,7 @@ def main(argv) -> int:
     _vw_done.clear()
     win.pull_node("n4")
     _vw_wait("n4")
-    assert _vd.panel.showing()[0] == "n4" and _vd.isFloating()
+    assert _vd.panel.showing()[0] == _rq("n4") and _vd.isFloating()
     _vd.title_bar.float_btn.click()
     app.processEvents()
     assert not _vd.isFloating() and _vd.panel.has_image()

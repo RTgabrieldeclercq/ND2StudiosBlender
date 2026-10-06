@@ -408,6 +408,14 @@ class DockShell(QObject):
             dock.activated.emit(dock)
             self.activated.emit(dock)
 
+    def deactivate(self, kind: str) -> None:
+        """No instance of ``kind`` is the active one any more — the window's work moved to
+        something that is not one of these docks (V4.00 step 5: the MAIN canvas, the window's
+        centre). Clears the accent, and the record a later close or press would act on."""
+        self._active.pop(kind, None)
+        for d in self.docks_of(kind):
+            d.title_bar.set_active(False)
+
     def _on_focus(self, _old, new) -> None:
         try:
             d = self.dock_of(new) if new is not None else None

@@ -921,6 +921,14 @@ class PickBar(QWidget):
         self._readout.setText(text)
 
 
+def _short(node_id) -> str:
+    """How a node is NAMED on screen: its own id, without the page part of a run id
+    (``"pg2/n3"`` → ``"n3"``). The window hands the viewer run ids (V4.00 step 5) so that two
+    pages' ``n3`` never share a LUT; the user reads the node."""
+    s = str(node_id or "")
+    return s.split("/", 1)[1] if "/" in s else s
+
+
 class ViewerPanel(QWidget):
     """Shows the viewed node's colour composite; emits ``request_changed`` when the
     coords (m,t,z) or the active channel set move, so the window re-pulls.
@@ -995,6 +1003,10 @@ class ViewerPanel(QWidget):
         # The bar sits ABOVE the image and stays hidden until a pick is armed, so the
         # gesture's instructions and its live readout never cover the data being aimed at.
         self._pick: Optional[PickSession] = None
+        #: the page of the node the pick writes to (V4.00 step 5). The window names it when it
+        #: arms the pick, so a pick applied after another page became active still writes to
+        #: the node it was armed for. Kept past the commit, which reads it.
+        self._pick_page: Optional[str] = None
         self._pick_bar = PickBar()
         self._pick_bar.hide()
         self._pick_bar.applied.connect(self._apply_pick)
@@ -2161,7 +2173,7 @@ class ViewerPanel(QWidget):
                 self._gl.clear()
             else:
                 self._view.set_pixmap(QPixmap())
-            self._set_status(f"{node_id} · no image on this output · "
+            self._set_status(f"{_short(node_id)} · no image on this output · "
                              f"pulled in {seconds:.2f}s")
             return
         self._display(node_id, planes, self._axes)
@@ -2193,7 +2205,7 @@ class ViewerPanel(QWidget):
         # that never appears.
         over = len(shown) - _GL_MAX_CH
         self._set_status(
-            f"{node_id} · {w}×{h} px · {chans}{extra}{self._solo_note()} · "
+            f"{_short(node_id)} · {w}×{h} px · {chans}{extra}{self._solo_note()} · "
             f"pulled in {seconds:.2f}s"
             + (f"  ·  COMPOSITE SHOWS THE FIRST {_GL_MAX_CH} CHANNELS ONLY "
                f"({over} more switched on; split view shows each one)" if over > 0 else "")
@@ -2576,7 +2588,7 @@ class ViewerPanel(QWidget):
         if self._source_layout == "both":
             tiles.append(("Merged", tuple(chans), neutral))
         if primary:
-            tiles.append((str(self._node_id or "primary"), primary, neutral))
+            tiles.append((_short(self._node_id) or "primary", primary, neutral))
         for name, members in groups.items():
             tiles.append((name, tuple(members), self._chan_colors.get(members[0], neutral)))
         return tiles if len(tiles) >= 2 else None
@@ -3075,11 +3087,11 @@ class ViewerPanel(QWidget):
         last = [ln for ln in trace.strip().splitlines() if ln.strip()][-1]
         stale = (" · SHOWING THE PREVIOUS RESULT — the image and the M/T/Z ranges below "
                  "are the last successful pull's, not this graph's" if self._planes else "")
-        self._set_status(f"{node_id} FAILED — {last}{stale}", error=True)
+        self._set_status(f"{_short(node_id)} FAILED — {last}{stale}", error=True)
         self._view.setToolTip(trace)
 
     def show_running(self, node_id: str) -> None:
-        self._set_status(f"pulling {node_id}…")
+        self._set_status(f"pulling {_short(node_id)}…")
 
     def _set_status(self, text: str, *, error: bool = False) -> None:
         """Write the status line, tinting it :data:`~nodelab_v2.theme.ERROR` for a failed
@@ -3768,7 +3780,8 @@ class ViewerPanel(QWidget):
         at otherwise, and arming one would look like the button was broken."""
         return self._ref_plane is not None
 
-    def arm_pick(self, req: PickRequest, calib: Optional[Calibration] = None) -> None:
+    def arm_pick(self, req: PickRequest, calib: Optional[Calibration] = None, *,
+                 page_id: Optional[str] = None) -> None:
         """Begin (or re-target) a pick. ``calib`` comes from the window, which owns the
         document and therefore the node's propagated ``pixel_size_um`` — the viewer holds
         only pixels, so it cannot work out microns for itself.
@@ -3776,8 +3789,10 @@ class ViewerPanel(QWidget):
         The three surfaces diverge here. An INSTANT kind ("use the channel I'm looking at")
         has nothing to aim, so it commits immediately and never shows a bar; a HISTOGRAM kind
         shows the bar so the user can move the handles first; a CANVAS kind shows the bar and
-        takes over the mouse."""
+        takes over the mouse. ``page_id`` names the page of ``req.node_id``
+        (:meth:`pick_page_id`)."""
         self.cancel_pick(quiet=True)
+        self._pick_page = page_id
         if req.surface == "instant":
             m, t, z, c = self.coords()
             # The RAW picks plus the cursor, kept separate: a `frames` pick fills an axis with
@@ -3947,6 +3962,11 @@ class ViewerPanel(QWidget):
     def pick_node_id(self) -> Optional[str]:
         """The node the armed pick writes to, or ``None``."""
         return self._pick.req.node_id if self._pick is not None else None
+
+    def pick_page_id(self) -> Optional[str]:
+        """The page of the node the last pick was armed for (``None``: the window did not
+        say, which means the active page). Still set while its commit is delivered."""
+        return self._pick_page
 
     def pick_shape_count(self) -> int:
         return len(self._pick.shapes) if self._pick is not None else 0

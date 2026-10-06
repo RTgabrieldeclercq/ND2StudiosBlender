@@ -44,7 +44,8 @@ from nodelab_v2 import layout_store as LS
 from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
-from nodelab_v2.workspace import Workspace, local_ids, qualify, split_run_id
+from nodelab_v2.canvas import CanvasPanel, kind_icon
+from nodelab_v2.workspace import Workspace, kind_label, local_ids, qualify, split_run_id
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
@@ -129,6 +130,8 @@ def _as_float(v) -> Optional[float]:
 VIEWER_SHARE = 0.72
 #: The panel kind of a Viewer dock (V4.00 step 4): several instances, ``viewer:<n>``.
 VIEWER_KIND = "viewer"
+#: The panel kind of a docked canvas (V4.00 step 5) — every canvas but the main one.
+CANVAS_KIND = "canvas"
 
 def _window_qss() -> str:
     return f"""
@@ -185,41 +188,51 @@ class _MovieHost:
     def __init__(self, win: "MainWindow") -> None:
         self._w = win
 
+    # The editor holds a BARE node id; every call resolves it on the editor's own page —
+    # the one it was opened on (`MainWindow._movie_pid`), which another page becoming
+    # active does not change (V4.00 step 5).
+    def _pid(self) -> str:
+        return self._w._movie_pid()
+
     def movie_state(self, node_id: Optional[str]) -> Optional[Dict[str, Any]]:
-        rec = self._w.doc.nodes.get(node_id) if node_id else None
+        doc = self._w._page_doc(self._pid())
+        rec = doc.nodes.get(node_id) if (node_id and doc is not None) else None
         if rec is None or rec.op_key != MOVIE_OP:
             return None
         spec = rec.spec()
         try:
-            env = self._w.doc.env(node_id)
+            env = doc.env(node_id)
         except Exception:                  # noqa: BLE001 — an un-propagated node
             env = None
+        label = f"{spec.label if spec else rec.op_key} ({node_id})"
+        if len(self._w.workspace.pages) > 1:      # whose movie, once there are several pages
+            label = f"{self._w.page_title(self._pid())[0]} › {label}"
         return {"spec": spec, "params": dict(rec.params), "modes": dict(rec.modes),
-                "env": env, "label": f"{spec.label if spec else rec.op_key} ({node_id})"}
+                "env": env, "label": label}
 
     def movie_sources(self, node_id: str) -> Dict[str, Dict[str, Any]]:
-        return self._w._movie_sources(node_id)
+        return self._w._movie_sources(node_id, page_id=self._pid())
 
     def source_payload(self, node_id: str) -> Any:
-        return self._w.runner.finished_result(node_id)
+        return self._w.runner.finished_result(qualify(self._pid(), node_id))
 
     def fetch(self, node_id: str) -> None:
-        self._w.runner.fetch(node_id)
+        self._w.runner.fetch(qualify(self._pid(), node_id))
 
     def commit_timeline(self, node_id: str, text: str) -> None:
-        self._w.write_movie_timeline(node_id, text)
+        self._w.write_movie_timeline(node_id, text, page_id=self._pid())
 
     def set_sweep(self, node_id: str, value: str) -> None:
-        self._w.set_movie_sweep(node_id, value)
+        self._w.set_movie_sweep(node_id, value, page_id=self._pid())
 
     def live_display(self, node_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
-        return self._w.live_display(node_id, spec)
+        return self._w.live_display(node_id, spec, page_id=self._pid())
 
     def capture(self, node_id: str) -> None:
-        self._w.stamp_movie_links(node_id)
+        self._w.stamp_movie_links(node_id, page_id=self._pid())
 
     def export(self, node_id: str) -> None:
-        self._w.export_movie(node_id)
+        self._w.export_movie(node_id, page_id=self._pid())
 
 
 class MainWindow(QMainWindow):
@@ -232,13 +245,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{PRODUCT} — nodegraph canvas")
         self.setStyleSheet(_window_qss())
 
-        self.doc = GraphDocument()
-        # V4.00 step 1: the document is one Free page of a Workspace; the file on disk
-        # is the workspace (format 3.0). The page switcher and per-page canvases arrive
-        # in step 5 — until then `self.doc` IS the active page's document.
-        self.workspace = Workspace.single(self.doc)
-        self.scene = GraphScene(self.doc)
-        self.view = GraphView(self.scene)
+        # V4.00: the file on disk is a Workspace of PAGES (format 3.0). Every page has its
+        # own scene (`scene_for`) and a canvas shows one page at a time; `doc`, `scene`,
+        # `view`, `minimap` and `welcome` name the active page's and the active canvas's.
+        self.workspace = Workspace.single(GraphDocument())
+        self._scenes: Dict[str, GraphScene] = {}
+        #: per page: (its document, the listeners `_wire_scene` installed on it)
+        self._page_hooks: Dict[str, Tuple[Any, List[Any]]] = {}
         self.runner = EngineRunner(self.workspace)   # every page; run ids are page-qualified
         # ── viewers (V4.00 step 4) ─────────────────────────────────────────────
         # Every Viewer is a dock (`viewer:<n>`, built by `_make_viewer`), BOUND to the node
@@ -258,24 +271,23 @@ class MainWindow(QMainWindow):
         #: (`_preview_pull`) — F8 on that card compares it beside what was viewed before
         self._preview_prev: Optional[Tuple[ViewerPanel, str, str]] = None
 
-        # centre: the node canvas. The Viewer docks sit above it, in the top dock area,
-        # which the side columns' corners keep to the canvas' width — the old
-        # Viewer-over-canvas split, made of docks. The app launches with no Viewer on
-        # screen (the blank welcome canvas owns the centre); the first result opens one.
-        self.setCentralWidget(self.view)
-
-        # the canvas opens EMPTY: this card invites the first node and steps aside as
-        # soon as the document has one (File → New brings it back).
-        self.welcome = WelcomeCard(self.view)
-        self.welcome.load_image_requested.connect(self.file_load_source)
-        self.welcome.browse_nodes_requested.connect(self.focus_palette)
-        self.welcome.example_requested.connect(self.build_demo)
-        self.welcome.op_dropped.connect(self._on_op_dropped)
+        # centre: the MAIN canvas (V4.00 step 5) — the window's central widget, so it can
+        # neither float nor close (Qt lays docks out around a central widget, and gives a
+        # window without one to its side columns); every further canvas is a dock. The
+        # Viewer docks sit above it, in the top dock area, which the side columns' corners
+        # keep to the canvas' width. The app launches with no Viewer on screen (the blank
+        # welcome canvas owns the centre); the first result opens one.
+        self._main_canvas = CanvasPanel(self, self.workspace.active)
+        #: the canvas the user works in — its page is the workspace's active page
+        self._canvas: CanvasPanel = self._main_canvas
+        #: the canvas whose mini-map hosts a viewer while maximized
+        self._max_canvas: Optional[CanvasPanel] = None
+        self._wire_canvas(self._main_canvas)
+        self.setCentralWidget(self._main_canvas)
 
         # maximized canvas (Ctrl+Space / the ⛶ button): the docked viewers step aside and
         # the active one moves into this HUD frame over the canvas' top-left corner, where
         # it keeps following whatever node you click.
-        self.minimap = MiniMapOverlay(self.view)
         self._maximized = False
         #: the viewer the mini-map hosts while maximized, and the docks the maximize hid
         self._mini_viewer: Optional[ViewerPanel] = None
@@ -316,17 +328,21 @@ class MainWindow(QMainWindow):
         # just a parameter list". It talks to the window only through the `_MovieHost`
         # adapter; the window owns the runner and the document.
         from nodelab_v2.movie_editor import MovieEditorPanel
+        #: the page of the Export Movie the editor is bound to (`_movie_pid`)
+        self._movie_page: Optional[str] = None
         self.movie_editor = MovieEditorPanel(_MovieHost(self))
         self.shell = DockShell(self, allow_close=self._allow_panel_close)
         for spec in self._panel_specs():
             self.shell.register(spec)
-            self.shell.spawn(spec.kind, show=False)
+            if spec.kind != CANVAS_KIND:        # docked canvases are opened on demand
+                self.shell.spawn(spec.kind, show=False)
         self.shell.apply_default_layout()
         # one Viewer exists from the start — hidden until there is something to show — and
         # it is the active one, so "the Viewer" always names a panel
         self.shell.activate(self.shell.docks_of(VIEWER_KIND)[0])
         self.shell.activated.connect(self._on_panel_activated)
         self.shell.changed.connect(self._prune_viewers)
+        self.shell.changed.connect(self._prune_canvases)
         self._console_dock = self.shell.docks_of("console")[0]
         self._movie_dock = self.shell.docks_of("movie")[0]
         self._lablink_dock = self.shell.docks_of("lablink")[0]
@@ -396,20 +412,12 @@ class MainWindow(QMainWindow):
         self._set_led("idle")
         self.statusBar().showMessage("ready")
 
-        # signals
-        self.scene.selectionChanged.connect(self._on_selection)
-        self.scene.node_activated.connect(self.pull_node)
-        self.view.op_dropped.connect(self._on_op_dropped)
-        self.view.files_dropped.connect(self._on_files_dropped)
-        self.doc.on_change(self._on_doc_changed)
+        # signals — a page's scene and document are wired when the page first gets a
+        # scene (`_wire_scene`), a canvas's view and HUD when it is made (`_wire_canvas`)
         # the RUNNER is told through the workspace (V4.00 step 2): its touched set is
         # page-qualified, and an edit on a page the canvas is not showing still has to
         # cancel the runs that read it
         self.workspace.on_change(self._on_workspace_changed)
-        self.doc.on_change(self.inspector.refresh_derived)   # G8 live ƒmd re-seed
-        self.scene.pull_requested.connect(self.pull_node)
-        self.scene.compare_requested.connect(self.open_compare)
-        self.scene.nodes_deleted.connect(self._on_nodes_deleted)
         self.runner.started.connect(self._on_run_started)
         # The Movie Editor's sources arrive on their own signal (a payload-only fetch never
         # reaches a pane), and the Viewer's settled LUT edits feed its linked channels.
@@ -424,7 +432,6 @@ class MainWindow(QMainWindow):
         # once and none of them is "the run".
         self.runner.ingest_started.connect(self._on_ingest_started)
         self.runner.ingest_finished.connect(self._on_ingest_finished)
-        self.scene.ingest_requested.connect(self.ingest_source)
         #: the source card to open in the Viewer when its ingest lands — the LAST one
         #: double-clicked, so files finishing minutes apart don't fight over the pane.
         self._view_after_ingest: Optional[str] = None
@@ -447,29 +454,26 @@ class MainWindow(QMainWindow):
         # the viewer directly, because arming needs the node's calibration and committing
         # needs the document, and only the window has both.
         self.inspector.pick_requested.connect(self._arm_pick)
-        self.scene.pick_requested.connect(self._arm_pick)
         # Dock (V2.18): both surfaces that can start a bake — the inspector's buttons and
         # the card's context menu — route to one handler, for the same reason picks do.
         # Only the window has the runner (to run it), the document (to record it) and the
         # dormant set (to release what the bake made redundant).
         self.inspector.dock_action.connect(self._on_dock_action)
-        self.scene.dock_action.connect(self._on_dock_action)
         self.inspector.iterate_action.connect(self._on_iterate_action)
         self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
         self.inspector.add_requested.connect(self._on_add_requested)
         # the panel-hosted drawing (2026-10-02): Draw Regions' controls live in its panel
-        self._pick_return: Optional[str] = None      # node to go back to after Apply/Cancel
+        #: (page, node) to go back to after Apply/Cancel of a region drawn for it
+        self._pick_return: Optional[Tuple[str, str]] = None
         self._draw_arm_pending: Optional[str] = None  # arm once this node's pull lands
         self.inspector.draw_control.connect(self._on_draw_control)
         self.inspector.region_requested.connect(self._on_region_requested)
         self.runner.baked.connect(self._on_baked)
         self.runner.detail_ready.connect(self._on_detail_ready)
-        self.view.maximize_toggled.connect(self.set_maximized)
-        self.minimap.restore_requested.connect(lambda: self.set_maximized(False))
-        self.doc.on_change(self._sync_welcome)
 
         self._sync_welcome()          # open on a blank, welcoming canvas
+        self._sync_pages()            # the switcher, the palette's kind, the title
 
         # the saved panel layout (V4.00 step 3) — once every panel exists, before the window
         # is shown. Skipped under NODELAB_LAYOUT=0, and for a file that is missing, damaged
@@ -501,6 +505,12 @@ class MainWindow(QMainWindow):
             # opens one — the first is made here, more by '+', View ▸ New or Compare
             PanelSpec(VIEWER_KIND, "Viewer", self._make_viewer, glyph="◉", multi=True,
                       default_area=top, default_hidden=True),
+            # more canvases (V4.00 step 5): '+', View ▸ New, or a page's "Open in a new
+            # canvas"; the main canvas is the window's centre and is not one of these
+            PanelSpec(CANVAS_KIND, "Canvas", self._make_canvas, glyph="⬚", multi=True,
+                      default_area=bottom,
+                      binding_of=lambda c: c.page_id,
+                      apply_binding=self._apply_canvas_binding),
             PanelSpec("palette", "Nodes", lambda: self.palette, glyph="◫",
                       default_area=left),
             PanelSpec("inspector", "Properties", lambda: self.inspector, glyph="☰",
@@ -561,7 +571,7 @@ class MainWindow(QMainWindow):
             # the Viewer's settled LUT edits feed the Movie Editor's linked channels
             "display_changed": self._on_viewer_display,
             "pick_readout_changed": part(self._on_pick_readout, viewer=v),
-            "pick_committed": self._on_pick_committed,
+            "pick_committed": part(self._on_pick_committed, viewer=v),
             "pick_armed": self._on_pick_armed,
             # a press on its image makes a viewer the active one
             "activated": part(self._activate_viewer, v),
@@ -577,7 +587,7 @@ class MainWindow(QMainWindow):
         # viewport detail-on-demand: the panel asks (debounced, on pan/zoom), the runner
         # reads the rect off the GUI thread and answers on `detail_ready`.
         v.detail_cb = self._request_detail
-        v.own_layers_cb = self.doc.own_label_layers
+        v.own_layers_cb = self._own_layers
         return v
 
     @staticmethod
@@ -628,6 +638,16 @@ class MainWindow(QMainWindow):
         """The newest Compare viewer, or ``None`` — V2.28's second pane, by its old name."""
         return list(self._links)[-1] if self._links else None
 
+    def _repull_viewed(self) -> None:
+        """Pull again what the ACTIVE viewer shows, on that node's own page — Shift+F5, and
+        after F9, a Hold, a Bake or a Release. ``_viewed`` names the node only while its page
+        is the active one, and a viewer may show another page's node (V4.00 step 5)."""
+        v = self._active_viewer()
+        b = getattr(v, "binding", None) if v is not None else None
+        doc = self._page_doc(b[0]) if b else None
+        if doc is not None and b[1] in doc.nodes:
+            self.pull_node(b[1], viewer=v, page_id=b[0])
+
     def _bound_local(self, v: Optional[ViewerPanel]) -> Optional[str]:
         """The node ``v`` is bound to, when it is on the page the canvas shows."""
         b = getattr(v, "binding", None) if v is not None else None
@@ -647,39 +667,79 @@ class MainWindow(QMainWindow):
         """The node the newest Compare viewer is bound to (V2.28's ``_viewed2``)."""
         return self._bound_local(self.viewer2)
 
-    def _bind(self, v: ViewerPanel, node_id: Optional[str]) -> None:
-        """Bind ``v`` to ``node_id`` on the active page (``None`` unbinds): that node's
-        results land in ``v`` from now on, its title names it, and — when ``v`` is the
-        active viewer — the canvas marks the card it shows."""
+    def _bind(self, v: ViewerPanel, node_id: Optional[str], *,
+              page_id: Optional[str] = None) -> None:
+        """Bind ``v`` to ``node_id`` of page ``page_id`` (default: the active page; ``None``
+        unbinds): that node's results land in ``v`` from now on, its title names it, and —
+        when ``v`` is the active viewer — the canvas marks the card it shows."""
+        pid = page_id or self.workspace.active or ""
         if node_id is None:
             v.unbind()
         else:
-            v.bind(self.workspace.active or "", node_id)
-            self._asker[self.runner.run_id(node_id)] = v
+            v.bind(pid, node_id)
+            self._asker[qualify(pid, node_id)] = v
         self._sync_viewer_title(v)
         if v is self._active_viewer():
-            self.scene.set_viewed(node_id)
+            self.scene.set_viewed(self._bound_local(v))
         self._sync_minimap_title()
 
     def _sync_viewer_title(self, v: ViewerPanel) -> None:
         """Name what ``v`` shows on its dock — title bar, floating caption, View ▸ Panels —
-        as ``n3 · Gaussian``; a Compare viewer adds whether its cursor follows its
-        leader's (V2.28's compare header)."""
+        as ``n3 · Gaussian`` (``Refinement › n3 · Gaussian`` once there are several pages);
+        a Compare viewer adds whether its cursor follows its leader's (V2.28's header)."""
         d = self._viewer_dock(v)
         if d is None:
             return
-        nid = self._bound_local(v)
+        b = v.binding
         text = ""
-        if nid is not None:
-            rec = self.doc.nodes.get(nid)
+        if b:
+            page = self.workspace.pages.get(b[0])
+            rec = page.doc.nodes.get(b[1]) if page is not None else None
             spec = rec.spec() if rec is not None else None
             label = spec.label if spec else (rec.op_key if rec is not None else "?")
-            text = f"{nid} · {label}"
+            text = f"{b[1]} · {label}"
+            if page is not None and len(self.workspace.pages) > 1:
+                text = f"{page.name} › {text}"
         if v in self._links:
             tag = ("compare, linked — one cursor moves both" if v in self._linked
                    else "compare, own cursor (different M/T/Z)")
             text = f"{text} — {tag}" if text else tag
         d.set_binding_title(text)
+
+    # ── run ids on every page (V4.00 step 5) ──────────────────────────────────
+    def _page_of(self, run_id) -> str:
+        """The page a run id is on (a bare id is the active page's)."""
+        pid, _nid = split_run_id(str(run_id))
+        return pid or (self.workspace.active or "")
+
+    def _full(self, run_id) -> str:
+        """``run_id`` page-qualified — how the viewers key what they show, so two pages'
+        ``n3`` never share a LUT."""
+        pid, nid = split_run_id(str(run_id))
+        return qualify(pid or (self.workspace.active or ""), nid)
+
+    def _key_on(self, run_id, page_id: str) -> str:
+        """How the scene of ``page_id`` names a run: by its bare id when the run is on that
+        page, by its run id when it is another page's (whose chain crosses this one)."""
+        full = self._full(run_id)
+        pid, nid = split_run_id(full)
+        return nid if pid == page_id else full
+
+    def _page_doc(self, page_id: str) -> Optional[GraphDocument]:
+        page = self.workspace.pages.get(page_id or "")
+        return page.doc if page is not None else None
+
+    @staticmethod
+    def _binding_full(v: Optional[ViewerPanel]) -> Optional[str]:
+        """The run id of what ``v`` is bound to, any page."""
+        b = getattr(v, "binding", None) if v is not None else None
+        return qualify(b[0], b[1]) if b else None
+
+    def _own_layers(self, run_id: str) -> list:
+        """The viewer's ``own_layers_cb``: a node's own label layers, from its page."""
+        pid, nid = split_run_id(self._full(run_id))
+        doc = self._page_doc(pid)
+        return list(doc.own_label_layers(nid)) if doc is not None else []
 
     def _activate_viewer(self, v: Optional[ViewerPanel]) -> None:
         d = self._viewer_dock(v)
@@ -689,7 +749,11 @@ class MainWindow(QMainWindow):
     def _on_panel_activated(self, dock) -> None:
         """A panel became the one the user works in. A viewer takes with it what follows
         the active viewer: the canvas marks ITS card, the troubleshooting scope is read off
-        its strips and region box, and the spreadsheet shows its result."""
+        its strips and region box, and the spreadsheet shows its result. A canvas makes
+        its page the active page."""
+        if dock.kind == CANVAS_KIND:
+            self._activate_canvas(dock.panel)
+            return
         if dock.kind != VIEWER_KIND:
             return
         v = dock.panel
@@ -700,7 +764,7 @@ class MainWindow(QMainWindow):
         self._sync_solo(push=False)
         nid, ds = v.showing()
         if ds is not None and nid:
-            self.sheet.show_dataset(nid, ds)
+            self.sheet.show_dataset(split_run_id(nid)[1], ds)
 
     def _prune_viewers(self) -> None:
         """A panel came or went: forget every reference to a viewer that was closed, and
@@ -724,9 +788,362 @@ class MainWindow(QMainWindow):
 
     def _allow_panel_close(self, dock) -> bool:
         """The shell's close veto: while the canvas is maximized, the dock of the viewer
-        living in the mini-map stays — closing it would leave that viewer with no home."""
+        living in the mini-map stays — closing it would leave that viewer with no home. A
+        docked canvas that IS the maximized one may close, but the viewer in its mini-map
+        goes home first: the mini-map is a child of the canvas being destroyed."""
+        if dock.kind == CANVAS_KIND and self._maximized and dock.panel is self._max_canvas:
+            self.set_maximized(False)
+            return True
         return not (dock.kind == VIEWER_KIND and self._maximized
                     and dock.panel is self._mini_viewer)
+
+    def _prune_canvases(self) -> None:
+        """A docked canvas closed: when it was the one worked in, the main canvas is."""
+        if self._canvas is not self._main_canvas and self._canvas not in self.canvases():
+            self._canvas = self._main_canvas
+            if self._max_canvas is not None and self._max_canvas not in self.canvases():
+                self._max_canvas = None
+            self._activate_canvas(self._main_canvas)
+        self._sync_canvas_accents()
+
+    # ── pages and canvases (V4.00 step 5) ─────────────────────────────────────
+    #
+    # Every page of the workspace has its own SCENE (`scene_for`), made the first time a
+    # canvas shows the page and kept until the page is deleted — so a page keeps its
+    # selection, its cards' run states and its layout while no canvas shows it. A canvas
+    # (`CanvasPanel`) shows one page at a time: the MAIN canvas is the central widget, every
+    # further canvas a `canvas:<n>` dock. The canvas the user works in is the active one, and
+    # its page is the workspace's ACTIVE page — what `doc`, `scene`, `view`, `minimap` and
+    # `welcome` name, so everything that edits "the graph" edits the page being looked at.
+    @property
+    def doc(self) -> GraphDocument:
+        """The active page's document."""
+        return self.workspace.page(self.workspace.active).doc
+
+    @property
+    def scene(self) -> GraphScene:
+        """The active page's scene."""
+        return self.scene_for(self.workspace.active)
+
+    @property
+    def canvas(self) -> CanvasPanel:
+        """The canvas the user works in."""
+        return self._canvas
+
+    @property
+    def view(self):
+        return self._canvas.view
+
+    @property
+    def minimap(self):
+        """The mini-map hosting a viewer while maximized, else the active canvas's."""
+        return (self._max_canvas or self._canvas).minimap
+
+    @property
+    def welcome(self):
+        return self._canvas.welcome
+
+    def canvases(self) -> List[CanvasPanel]:
+        """Every canvas: the main one, then the docked ones in dock order."""
+        return [self._main_canvas] + [d.panel for d in self.shell.docks_of(CANVAS_KIND)] \
+            if hasattr(self, "shell") else [self._main_canvas]
+
+    def scene_for(self, page_id: str) -> GraphScene:
+        """``page_id``'s scene — made (and wired) the first time a canvas shows the page."""
+        sc = self._scenes.get(page_id)
+        if sc is None:
+            sc = GraphScene(self.workspace.page(page_id).doc)
+            self._scenes[page_id] = sc
+            self._wire_scene(page_id, sc)
+        return sc
+
+    def _wire_scene(self, page_id: str, sc: GraphScene) -> None:
+        """Connect a page's scene and document to the window. Everything a scene emits comes
+        from a canvas the user is working in, which made its page the active one first (a
+        press activates — `GraphView.pressed`), so the handlers act on the active page."""
+        part = functools.partial
+        sc.selectionChanged.connect(part(self._on_scene_selection, page_id))
+        sc.node_activated.connect(self.pull_node)
+        sc.pull_requested.connect(self.pull_node)
+        sc.compare_requested.connect(self.open_compare)
+        sc.nodes_deleted.connect(self._on_nodes_deleted)
+        sc.ingest_requested.connect(self.ingest_source)
+        sc.pick_requested.connect(self._arm_pick)
+        sc.dock_action.connect(self._on_dock_action)
+        doc = self.workspace.page(page_id).doc
+        hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id)]
+        for fn in hooks:
+            doc.on_change(fn)
+        self._page_hooks[page_id] = (doc, hooks)
+
+    def _drop_scene(self, page_id: str) -> None:
+        """Forget a deleted page's scene (no canvas shows it any more)."""
+        doc, hooks = self._page_hooks.pop(page_id, (None, []))
+        for fn in hooks:
+            if doc is not None:
+                doc.off_change(fn)
+        sc = self._scenes.pop(page_id, None)
+        if sc is not None:
+            sc.release()                    # its own listener too, not only the window's
+            sc.deleteLater()
+
+    def _on_page_doc_edit(self, page_id: str) -> None:
+        """Any page's document changed: its canvases' welcome cards, and the inspector's
+        derived values (G8 — it shows a node of the active page, which may read this one)."""
+        self._sync_welcome()
+        self.inspector.refresh_derived()
+
+    def _make_canvas(self) -> CanvasPanel:
+        """A new docked canvas, on the active page — the factory of the ``canvas`` kind."""
+        c = CanvasPanel(self, self.workspace.active)
+        self._wire_canvas(c)
+        return c
+
+    def _wire_canvas(self, c: CanvasPanel) -> None:
+        part = functools.partial
+        c.activated.connect(self._activate_canvas)
+        c.page_changed.connect(self._on_canvas_page_changed)
+        c.view.op_dropped.connect(self._on_op_dropped)
+        c.view.files_dropped.connect(self._on_files_dropped)
+        c.view.maximize_toggled.connect(part(self._on_canvas_maximize, c))
+        c.minimap.restore_requested.connect(lambda: self.set_maximized(False))
+        # the welcome card: the canvas it sits on becomes the one worked in first (its
+        # buttons take focus, which activates a docked canvas; the main one is told here)
+        for sig, fn in ((c.welcome.load_image_requested, self.file_load_source),
+                        (c.welcome.browse_nodes_requested, self.focus_palette),
+                        (c.welcome.example_requested, self.build_demo)):
+            sig.connect(lambda _=None, c=c, fn=fn: (self._activate_canvas(c), fn()))
+        c.welcome.op_dropped.connect(
+            lambda op, pos, c=c: (self._activate_canvas(c), self._on_op_dropped(op, pos)))
+
+    def _apply_canvas_binding(self, c: CanvasPanel, page_id) -> None:
+        """A restored canvas shows its saved page when the workspace has it."""
+        if isinstance(page_id, str) and page_id in self.workspace.pages:
+            c.set_page(page_id)
+
+    def page_title(self, page_id: str) -> Tuple[str, str]:
+        """``(name, kind)`` of a page, for a canvas's switcher."""
+        page = self.workspace.pages.get(page_id)
+        return (page.name, page.kind) if page is not None else (page_id, "free")
+
+    def fill_page_menu(self, menu, c: CanvasPanel) -> None:
+        """A canvas's page switcher: every page grouped by kind (the one shown ticked), then
+        New page ▸ <kind>, Duplicate, Open in a new canvas, Rename…, Delete."""
+        from nodegraph import roles as R
+        menu.clear()
+        ws = self.workspace
+        for kind in R.page_kinds():
+            pages = [p for p in ws.pages.values() if p.kind == kind]
+            if not pages:
+                continue
+            menu.addSection(kind_label(kind))
+            for p in pages:
+                act = menu.addAction(kind_icon(kind), p.name)
+                act.setCheckable(True)
+                act.setChecked(p.id == c.page_id)
+                act.triggered.connect(lambda _=False, pid=p.id, c=c: self._show_page(c, pid))
+        menu.addSeparator()
+        new = menu.addMenu("New page")
+        for kind in R.page_kinds():
+            act = new.addAction(kind_icon(kind), kind_label(kind))
+            act.setToolTip(str(R.page_meta(kind).get("description") or ""))
+            act.triggered.connect(lambda _=False, k=kind, c=c: self.new_page(k, canvas=c))
+        menu.addSeparator()
+        menu.addAction("Duplicate page").triggered.connect(
+            lambda _=False, c=c: self.duplicate_page(c.page_id, canvas=c))
+        menu.addAction("Open in a new canvas").triggered.connect(
+            lambda _=False, c=c: self.open_canvas(c.page_id))
+        menu.addAction("Rename page…").triggered.connect(
+            lambda _=False, c=c: self.rename_page(c.page_id))
+        dele = menu.addAction("Delete page")
+        dele.setEnabled(len(ws.pages) > 1)
+        dele.triggered.connect(lambda _=False, c=c: self.delete_page(c.page_id))
+
+    def _show_page(self, c: CanvasPanel, page_id: str) -> None:
+        """Show ``page_id`` on canvas ``c`` and work there."""
+        c.set_page(page_id)
+        self._activate_canvas(c)
+
+    def new_page(self, kind: str, *, canvas: Optional[CanvasPanel] = None,
+                 name: Optional[str] = None) -> str:
+        """Add a page of ``kind`` and show it on ``canvas`` (default: the active one)."""
+        page = self.workspace.add_page(name or kind_label(kind), kind)
+        self._show_page(canvas or self._canvas, page.id)
+        self.statusBar().showMessage(f"new {kind_label(kind)} page “{page.name}”")
+        return page.id
+
+    def duplicate_page(self, page_id: str, *, canvas: Optional[CanvasPanel] = None) -> str:
+        page = self.workspace.duplicate_page(page_id)
+        self._show_page(canvas or self._canvas, page.id)
+        self.statusBar().showMessage(f"duplicated as “{page.name}”")
+        return page.id
+
+    def rename_page(self, page_id: str, name: Optional[str] = None) -> bool:
+        page = self.workspace.pages.get(page_id)
+        if page is None:
+            return False
+        if name is None:
+            name, ok = QInputDialog.getText(self, "Rename page", "Page name:", text=page.name)
+            if not ok:
+                return False
+        try:
+            self.workspace.rename_page(page_id, name)
+        except ValueError as exc:
+            QMessageBox.information(self, "Rename page", str(exc))
+            return False
+        return True
+
+    def delete_page(self, page_id: str, *, confirm: bool = True) -> bool:
+        """Delete a page (never the last one). A page with nodes is confirmed first: Page
+        Inputs on other pages that read its Outputs become unbound."""
+        ws = self.workspace
+        page = ws.pages.get(page_id)
+        if page is None:
+            return False
+        if len(ws.pages) <= 1:
+            self.statusBar().showMessage("the last page cannot be deleted")
+            return False
+        if confirm and page.doc.nodes and QMessageBox.question(
+                self, "Delete page",
+                f"Delete page “{page.name}” and its {len(page.doc.nodes)} node(s)?\n\n"
+                f"Page Inputs on other pages that read its Outputs become unbound.",
+                QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
+            return False
+        try:
+            ws.remove_page(page_id)
+        except ValueError as exc:
+            QMessageBox.information(self, "Delete page", str(exc))
+            return False
+        self.statusBar().showMessage(f"deleted page “{page.name}”")
+        return True
+
+    def open_canvas(self, page_id: Optional[str] = None) -> CanvasPanel:
+        """Another canvas (a dock), showing ``page_id`` (default: the active page)."""
+        d = self.shell.spawn(CANVAS_KIND)
+        c = d.panel
+        if page_id and page_id != c.page_id:
+            c.set_page(page_id)
+        self._activate_canvas(c)
+        return c
+
+    def step_page(self, step: int) -> None:
+        """Ctrl+PgDn / Ctrl+PgUp: the active canvas shows the next / previous page."""
+        order = list(self.workspace.pages)
+        if len(order) < 2:
+            return
+        i = order.index(self._canvas.page_id) if self._canvas.page_id in order else 0
+        self._show_page(self._canvas, order[(i + step) % len(order)])
+
+    def _activate_canvas(self, c: CanvasPanel) -> None:
+        """``c`` becomes the canvas the user works in, and its page the active page."""
+        if c is not self._canvas:
+            self._canvas = c
+            dock = self.shell.dock_of(c) if hasattr(self, "shell") else None
+            if dock is not None:
+                self.shell.activate(dock)
+            elif hasattr(self, "shell"):
+                # the MAIN canvas is no dock: the shell must not go on thinking a docked
+                # canvas is the active one (a later close would activate the next docked
+                # canvas, a press on a stale one would do nothing)
+                self.shell.deactivate(CANVAS_KIND)
+            self._sync_canvas_accents()
+        if self.workspace.active != c.page_id and c.page_id in self.workspace.pages:
+            self.workspace.set_active(c.page_id)         # → `_on_workspace_changed`
+        else:
+            self._sync_active_page_ui()
+
+    def _sync_canvas_accents(self) -> None:
+        cs = self.canvases()
+        for c in cs:
+            c.set_active(c is self._canvas and len(cs) > 1)
+
+    def _on_canvas_page_changed(self, c: CanvasPanel, page_id: str) -> None:
+        dock = self.shell.dock_of(c) if hasattr(self, "shell") else None
+        if dock is not None:
+            page = self.workspace.pages.get(page_id)
+            dock.set_binding_title(page.name if page is not None else page_id)
+        self._sync_welcome()
+        if c is self._canvas and self.workspace.active != page_id \
+                and page_id in self.workspace.pages:
+            self.workspace.set_active(page_id)
+
+    def _on_canvas_maximize(self, c: CanvasPanel, on: bool) -> None:
+        """A canvas's ⛶: it becomes the active canvas, then the window maximizes it."""
+        if on and self._maximized and self._max_canvas is not c:
+            self.set_maximized(False)
+        self._activate_canvas(c)
+        self.set_maximized(on)
+
+    def _sync_pages(self) -> None:
+        """Keep the GUI in step with the workspace's pages: canvases on a page that is gone
+        move to the active one, its scene is dropped, viewers bound to it are unbound, the
+        switchers and the window title follow renames — and the active canvas always shows
+        the active page. Cheap: it runs on every workspace change (every edit included)."""
+        ws = self.workspace
+        if not ws.pages or ws.active not in ws.pages:
+            return
+        # a scene is stale when its page is gone — or when the page's DOCUMENT changed under
+        # it: a file load keeps the active page's document object for the NEW active page,
+        # so the scene cached under the old id would show another page's graph
+        stale = {pid for pid, sc in self._scenes.items()
+                 if pid not in ws.pages or getattr(sc, "doc", None) is not ws.pages[pid].doc}
+        for pid in stale:
+            self._drop_scene(pid)
+        for c in self.canvases():
+            if c.page_id not in ws.pages:
+                gone = c.page_id
+                c.set_page(ws.active)
+                c.forget_page(gone)
+            elif c.page_id in stale:
+                c.view.setScene(self.scene_for(c.page_id))
+        for v in self.viewers:
+            b = v.binding
+            if b and b[0] not in ws.pages:
+                self._bind(v, None)
+        mp = getattr(self, "_movie_page", None)
+        if mp is not None and (mp not in ws.pages or mp in stale):
+            self._movie_page = None          # its movie's page is gone, or a load replaced it
+            if getattr(self, "movie_editor", None) is not None:
+                self.movie_editor.bind(None)
+        if self._canvas.page_id != ws.active:
+            self._canvas.set_page(ws.active)
+        sig = tuple((p.id, p.name, p.kind) for p in ws.pages.values()) + (ws.active,)
+        if sig != getattr(self, "_pages_sig", None):
+            self._pages_sig = sig
+            for c in self.canvases():
+                c.sync_title()
+                dock = self.shell.dock_of(c) if hasattr(self, "shell") else None
+                if dock is not None:
+                    dock.set_binding_title(ws.pages[c.page_id].name)
+            before = getattr(self, "_ui_page", None)
+            self._sync_active_page_ui()
+            if getattr(self, "_ui_page", None) == before and hasattr(self, "inspector"):
+                # a page added, renamed or deleted — from another canvas's switcher — while the
+                # active page stayed: the shown node's Page Input Source menu and its
+                # Ready-to-run read the page list, so the panel is rebuilt for it
+                self.inspector.rebuild()
+
+    def _sync_active_page_ui(self) -> None:
+        """What follows the active page: the palette's kind, the inspector (the page's own
+        selection), the canvas's viewed-card spine, the window title."""
+        ws = self.workspace
+        page = ws.pages.get(ws.active or "")
+        if page is None:
+            return
+        if not hasattr(self, "palette"):
+            return                              # still building the window
+        self.palette.set_page_kind(page.kind, kind_label(page.kind))
+        kl = kind_label(page.kind)
+        self.setWindowTitle(f"{PRODUCT} — {kl}" + ("" if page.name == kl else f" · {page.name}"))
+        if getattr(self, "_ui_page", None) != page.id:
+            self._ui_page = page.id
+            try:
+                sel = [i for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
+            except RuntimeError:
+                sel = []
+            self.inspector.set_node(sel[0] if sel else None)
+            self.scene.set_viewed(self._viewed)
+            self._sync_solo()
 
     # ── chrome (G10) ─────────────────────────────────────────────────────────
     def _build_menus(self) -> None:
@@ -797,7 +1214,7 @@ class MainWindow(QMainWindow):
         m_run.addAction(pull)
         again = QAction("Pull &viewed again", self)
         again.setShortcut("Shift+F5")
-        again.triggered.connect(lambda: self._viewed and self.pull_node(self._viewed))
+        again.triggered.connect(lambda *_: self._repull_viewed())
         m_run.addAction(again)
         comp = QAction("&Compare selected beside viewed", self)
         comp.setShortcut("F8")
@@ -969,6 +1386,15 @@ class MainWindow(QMainWindow):
                                  "a mini-map in the canvas' top-left corner")
         self._max_act.toggled.connect(self.set_maximized)
         m_view.addAction(self._max_act)
+        # pages (V4.00 step 5): the active canvas steps through the workspace's pages
+        for text, seq, step in (("Next &page", "Ctrl+PgDown", 1),
+                                ("Previous p&age", "Ctrl+PgUp", -1)):
+            act = QAction(text, self)
+            act.setShortcut(seq)
+            act.setToolTip("Show the next / previous page of the workspace on the canvas "
+                           "you are working in")
+            act.triggered.connect(lambda _=False, s=step: self.step_page(s))
+            m_view.addAction(act)
         self._follow_act = QAction("&Preview clicked node", self)
         self._follow_act.setCheckable(True)
         self._follow_act.setToolTip("Pull and show a node as soon as you click it "
@@ -1119,16 +1545,17 @@ class MainWindow(QMainWindow):
         the tokens, QSS panels restyle, the canvas background updates."""
         T.apply(mode)
         self.setStyleSheet(_window_qss())
-        for panel in (self.palette, self.inspector, self.sheet,
-                      self.minimap, self.welcome, self.view, self.lablink,
-                      self.console, self.movie_editor, *self.viewers):
+        for panel in (self.palette, self.inspector, self.sheet, self.lablink,
+                      self.console, self.movie_editor, *self.viewers, *self.canvases()):
             panel.restyle()
         self.shell.restyle()       # the panels' title bars, floating or docked
         self._paint_led()          # the LED colors come from the tokens, not from QSS
         self._sync_solo_chip()     # ditto for the solo chip's amber
-        self.view.setBackgroundBrush(T.BG)
-        self.scene.update()
-        self.view.viewport().update()
+        for c in self.canvases():
+            c.view.setBackgroundBrush(T.BG)
+            c.view.viewport().update()
+        for sc in self._scenes.values():
+            sc.update()
 
     # ── maximized canvas + mini-map (2026-07-27) ──────────────────────────────
     def set_maximized(self, on: bool) -> None:
@@ -1166,6 +1593,7 @@ class MainWindow(QMainWindow):
                 d.hide()
             mini = mini_dock.panel
             self._mini_viewer = mini
+            self._max_canvas = self._canvas
             self.shell.activate(mini_dock)
             # its dock is empty while the viewer lives in the mini-map: View ▸ Panels must
             # not open it as an empty panel (Esc or the dock button bring the viewer back)
@@ -1186,6 +1614,7 @@ class MainWindow(QMainWindow):
             mini, self._mini_viewer = self._mini_viewer, None
             self.minimap.detach()
             self.minimap.hide()
+            max_view = self.minimap.parentWidget()
             md = self._viewer_dock(mini)
             if mini is not None and md is not None:
                 mini.set_compact(False)
@@ -1209,7 +1638,12 @@ class MainWindow(QMainWindow):
             self._max_hidden, self._max_heights = [], {}
             self._follow_act.setChecked(getattr(self, "_follow_before_max", False))
         # keep both entry points (canvas button + View menu) in sync, no signal loop
-        self.view.set_maximized(on)
+        if on:
+            self._max_canvas.view.set_maximized(True)
+        else:
+            if isinstance(max_view, GraphView):
+                max_view.set_maximized(False)
+            self._max_canvas = None
         self._max_act.blockSignals(True)
         self._max_act.setChecked(on)
         self._max_act.blockSignals(False)
@@ -1318,47 +1752,48 @@ class MainWindow(QMainWindow):
         ``last_touched`` is already qualified — ``None`` is "unknown, assume everything",
         ``frozenset()`` is "nothing a run can see" (the G8 re-seed, a page switch)."""
         self.runner.invalidate(self.workspace.last_touched)
+        self._sync_pages()
 
     def _on_run_started(self, run_id: str) -> None:
-        nid = self._local(run_id)
-        self.statusBar().showMessage(f"pulling {nid or run_id}…")
-        if nid is not None:
-            for p in self._viewers_for(run_id):
-                p.show_running(nid)
+        full = self._full(run_id)
+        self.statusBar().showMessage(f"pulling {self._local(run_id) or full}…")
+        for p in self._viewers_for(full):
+            p.show_running(full)
         self._set_led("busy")
         self.minimap.set_state("busy")
 
     def _on_detail_ready(self, run_id: str, planes, rect01, coords=None) -> None:
-        nid = self._local(run_id)
-        if nid is None:
-            return
+        full = self._full(run_id)
         for pane in self.viewers:            # each keeps the patch only for its own view
-            pane.on_detail_ready(nid, planes, rect01, coords)
+            pane.on_detail_ready(full, planes, rect01, coords)
 
     # ── document plumbing ─────────────────────────────────────────────────────
-    def _on_doc_changed(self) -> None:
+    def _on_doc_changed(self, page_id: Optional[str] = None) -> None:
+        """A page's document changed (``page_id``; default: the active page)."""
+        pid = page_id or self.workspace.active or ""
+        doc = self._page_doc(pid)
+        if doc is None:
+            return
         # Only the runs this edit could have changed (2026-08-06). `last_touched` is the node
         # the inspector or the card just wrote, or None for a structural edit that no single
-        # node accounts for — in which case every in-flight pull still goes, as before. This
-        # is what lets a finished branch be re-tuned while another branch is still computing.
-        touched = self.doc.last_touched
-        # (the runner was told through the workspace — `_on_workspace_changed` — whose
-        # touched set is page-qualified; this handler keeps the canvas honest)
-        # A terminal `done` badge now OUTLIVES an unrelated branch starting (so a finished
-        # branch keeps saying so), which means the edit that actually invalidates a result has
-        # to retire it — or the card claims a result that no longer describes the node. The
-        # edited nodes and everything DOWNSTREAM of them are what a param change can alter;
-        # an unscoped edit retires the lot.
-        if touched is None:
-            self.scene.clear_run_states()
-        elif touched:
-            self.scene.clear_run_states_for(self.doc.downstream_of(touched))
-        # a viewer bound to a node that is gone (deleted, or reloaded away): a Compare
-        # viewer closes — a pane still showing a node that is no longer on the canvas is a
-        # lie, and the one the user cannot detect — and any other viewer is unbound
+        # node accounts for. (The runner was told through the workspace —
+        # `_on_workspace_changed` — whose touched set is page-qualified; this handler keeps
+        # the page's canvas honest.) A terminal `done` badge OUTLIVES an unrelated branch
+        # starting, so the edit that actually invalidates a result has to retire it: the
+        # edited nodes and everything DOWNSTREAM of them; an unscoped edit retires the lot.
+        touched = doc.last_touched
+        sc = self._scenes.get(pid)
+        if sc is not None:
+            if touched is None:
+                sc.clear_run_states()
+            elif touched:
+                sc.clear_run_states_for(doc.downstream_of(touched))
+        # a viewer bound to a node of this page that is gone (deleted, or reloaded away): a
+        # Compare viewer closes — a pane still showing a node that is no longer on the canvas
+        # is a lie, and the one the user cannot detect — and any other viewer is unbound
         for v in self.viewers:
-            nid = self._bound_local(v)
-            if nid is None or nid in self.doc.nodes:
+            b = v.binding
+            if not b or b[0] != pid or b[1] in doc.nodes:
                 continue
             if v in self._links and v is not self._mini_viewer:
                 d = self._viewer_dock(v)
@@ -1374,9 +1809,17 @@ class MainWindow(QMainWindow):
             if was_active:
                 self.minimap.set_state("idle")
         self._sync_solo()                 # a rewired source changes the frame count
-        self.movie_editor.on_doc_changed(touched, self.doc.downstream_of)
-        name = self.doc.path or "untitled"
-        self.statusBar().showMessage(f"{name} — rev {self.doc.revision}")
+        if pid == self._movie_pid():        # the editor's movie lives on ITS page
+            self.movie_editor.on_doc_changed(touched, doc.downstream_of)
+        if pid == self.workspace.active:
+            name = doc.path or "untitled"
+            self.statusBar().showMessage(f"{name} — rev {doc.revision}")
+
+    def _on_scene_selection(self, page_id: str) -> None:
+        """A page's selection changed — only the ACTIVE page's drives the inspector and
+        click-to-preview (another page's changes only programmatically)."""
+        if page_id == self.workspace.active:
+            self._on_selection()
 
     def _on_selection(self) -> None:
         try:
@@ -1441,7 +1884,14 @@ class MainWindow(QMainWindow):
                 mirror=canvas_flip(md) if md.get("canvas_flip") is not None else None)
         v = v if v is not None else self._ensure_viewer()
         self._open_viewer(v)
-        v.arm_pick(req, Calibration.from_metadata(md))
+        # the pick is for a node of the ACTIVE page: say so, so that it is written back
+        # there even if another page is active by the time it is applied
+        v.arm_pick(req, Calibration.from_metadata(md), page_id=self.workspace.active)
+
+    def _pick_page_of(self, v: Optional[ViewerPanel]) -> str:
+        """The page of the node ``v``'s pick writes to (the active page when unnamed)."""
+        pid = v.pick_page_id() if v is not None else None
+        return pid or (self.workspace.active or "")
 
     def _on_pick_armed(self, on: bool) -> None:
         if on:
@@ -1457,7 +1907,8 @@ class MainWindow(QMainWindow):
     def _on_pick_readout(self, text: str, viewer: Optional[ViewerPanel] = None) -> None:
         v = viewer if viewer is not None else self._active_viewer()
         nid = v.pick_node_id() if v is not None else None
-        if nid is not None:
+        # the inspector shows a node of the ACTIVE page: another page's same id is not it
+        if nid is not None and self._pick_page_of(v) == (self.workspace.active or ""):
             self.inspector.set_draw_state(nid, True, text)
 
     # ── drawing in the node's panel (2026-10-02) ──────────────────────────────
@@ -1473,9 +1924,13 @@ class MainWindow(QMainWindow):
                     return s
         return None
 
-    def _pick_viewer(self, node_id: str) -> Optional[ViewerPanel]:
-        """The viewer whose ARMED pick writes to ``node_id``, or ``None``."""
-        return next((v for v in self.viewers if v.pick_node_id() == node_id), None)
+    def _pick_viewer(self, node_id: str,
+                     page_id: Optional[str] = None) -> Optional[ViewerPanel]:
+        """The viewer whose ARMED pick writes to ``node_id`` of ``page_id`` (default: the
+        active page, whose node the inspector shows), or ``None``."""
+        pid = page_id or self.workspace.active or ""
+        return next((v for v in self.viewers
+                     if v.pick_node_id() == node_id and self._pick_page_of(v) == pid), None)
 
     def _arm_draw(self, node_id: str) -> None:
         """Arm the drawing for ``node_id`` (a node that IS a drawing). The active viewer
@@ -1485,10 +1940,10 @@ class MainWindow(QMainWindow):
         if self._draw_shapes_socket(node_id) is None:
             return
         v = self._active_viewer()
-        if v is not None and v.has_image() and v.showing()[0] == node_id:
+        if v is not None and v.has_image() and v.showing()[0] == self._full(node_id):
             self._arm_draw_now(node_id, v)
             return
-        self._draw_arm_pending = node_id
+        self._draw_arm_pending = self._full(node_id)     # its page's: ids repeat across pages
         self.pull_node(node_id)
 
     def _arm_draw_now(self, node_id: str, viewer: Optional[ViewerPanel] = None) -> None:
@@ -1504,7 +1959,7 @@ class MainWindow(QMainWindow):
         except Exception:                     # noqa: BLE001 — an un-propagated node
             md = {}
         self._open_viewer(v)
-        v.arm_pick(req, Calibration.from_metadata(md))
+        v.arm_pick(req, Calibration.from_metadata(md), page_id=self.workspace.active)
         self._sync_draw_session(node_id)
         self.inspector.set_draw_state(node_id, True, v._pick.readout()
                                       if v._pick is not None else "")
@@ -1570,7 +2025,7 @@ class MainWindow(QMainWindow):
             target = self._on_add_requested(node_id, alt_op, alt_in)
         if target is None:
             return
-        self._pick_return = node_id
+        self._pick_return = (self.workspace.active or "", node_id)
         self._select_only(target)
         self._arm_draw(target)
         self.statusBar().showMessage(
@@ -1578,10 +2033,15 @@ class MainWindow(QMainWindow):
 
     def _return_from_draw(self) -> None:
         back, self._pick_return = self._pick_return, None
-        if back is None or back not in self.doc.nodes:
+        if back is None:
             return
-        self._select_only(back)
-        self.pull_node(back)
+        pid, nid = back                      # the node's own page, whichever is active now
+        doc = self._page_doc(pid)
+        if doc is None or nid not in doc.nodes:
+            return
+        if pid == self.workspace.active:
+            self._select_only(nid)
+        self.pull_node(nid, page_id=pid)
 
     def _select_only(self, node_id: str) -> None:
         item = self.scene.node_items.get(node_id)
@@ -1624,10 +2084,12 @@ class MainWindow(QMainWindow):
         from nodegraph.placement import parse_pins, pins_json
         # the strip hands back the RUN id it was given (V4.00 step 2): the pin is written
         # on the page's own card, under its document id
-        run_ovl, ovl_id = ovl_id, self._local(ovl_id)
-        rec = self.doc.nodes.get(ovl_id) if ovl_id is not None else None
+        run_ovl = self._full(ovl_id)
+        opid, ovl_id = split_run_id(run_ovl)
+        odoc = self._page_doc(opid)
+        rec = odoc.nodes.get(ovl_id) if odoc is not None else None
         v = viewer if viewer is not None else self._active_viewer()
-        viewed = self._bound_local(v)
+        viewed = self._binding_full(v)
         if rec is None or axis not in ("t", "z") or viewed is None:
             return
         name = f"{axis}_pins"
@@ -1649,8 +2111,9 @@ class MainWindow(QMainWindow):
         rec.params[name] = text
         rec.set_locked(rec.locked | {name})
         self.runner.set_source_override(run_ovl, 0, 0)
-        self.doc.touch(ovl_id)
-        item = self.scene.node_items.get(ovl_id)
+        odoc.touch(ovl_id)
+        osc = self._scenes.get(opid)
+        item = osc.node_items.get(ovl_id) if osc is not None else None
         if item is not None:
             item.refresh()
             item.changed.emit(item)
@@ -1716,35 +2179,43 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         return new.id
 
-    def _on_pick_committed(self, node_id: str, values: dict) -> None:
-        """Write a finished pick into the document.
+    def _on_pick_committed(self, node_id: str, values: dict,
+                           viewer: Optional[ViewerPanel] = None) -> None:
+        """Write a finished pick into the document of the page it was ARMED on
+        (:meth:`ViewerPanel.pick_page_id`) — not the active one: the user may have pressed
+        another canvas before applying it, and a duplicated page holds the same node ids.
 
         Deliberately the same two lines the inspector's ``_set_param`` runs — the value plus
         the sticky pin — so a picked param is in every later respect a hand-entered one: it
         shows as pinned, it can be unpinned back to its metadata-derived default, it
         serializes identically and it keys the memo identically. A pick is a nicer way to
         arrive at a number, not a different kind of number."""
-        rec = self.doc.nodes.get(node_id)
+        pid = self._pick_page_of(viewer)
+        doc = self._page_doc(pid)
+        rec = doc.nodes.get(node_id) if doc is not None else None
         if rec is None or not values:
             return
         for name, value in values.items():
             rec.params[name] = value
         rec.set_locked(rec.locked | set(values))
-        self.doc.touch()
-        item = self.scene.node_items.get(node_id)
+        doc.touch()
+        sc = self._scenes.get(pid)
+        item = sc.node_items.get(node_id) if sc is not None else None
         if item is not None:
             # the inspector rebuilds off the item's `changed`, so a pick made from the
             # CANVAS still refreshes the panel (and vice versa)
             item.refresh()
             item.changed.emit(item)
         what = ", ".join(f"{k} = {v}" for k, v in values.items())
-        self.statusBar().showMessage(f"{node_id}: {what}")
+        where = (node_id if pid == self.workspace.active
+                 else f"{self.page_title(pid)[0]} › {node_id}")
+        self.statusBar().showMessage(f"{where}: {what}")
         if any(getattr(rec.spec().input(k), "pick_kind", "") == "shapes"
                for k in values if rec.spec() is not None and rec.spec().input(k) is not None):
             # A drawing was applied: run the node so the regions it now defines are on
             # screen (2026-10-02). Without this the shapes landed in the param and nothing
             # visible changed, which read as "the drawing node does not work".
-            self.pull_node(node_id)
+            self.pull_node(node_id, page_id=pid)
 
     def _add_at_center(self, op_key: str) -> None:
         c = self.view.mapToScene(self.view.viewport().rect().center())
@@ -1871,7 +2342,9 @@ class MainWindow(QMainWindow):
     def _sync_ingest(self) -> None:
         """Tell the canvas which source cards are mid-ingest, so a pull's card reset
         leaves their rails alone (:meth:`nodelab_v2.scene.GraphScene.set_ingesting`)."""
-        self.scene.set_ingesting(self._local_ids(self.runner.ingesting()))
+        ing = list(self.runner.ingesting())
+        for p, sc in list(self._scenes.items()):
+            sc.set_ingesting(local_ids(ing, p, self.workspace.active))
 
     def _idle_led(self) -> None:
         """Back to idle — unless files are still ingesting, which is real work the footer
@@ -1937,14 +2410,20 @@ class MainWindow(QMainWindow):
         self._sync_ingest()
         # the card goes 'running' straight away — the job may sit in the pool's queue for
         # a while behind the other files, and a card that shows nothing reads as ignored.
-        nid = self._local(node_id)
-        if nid is not None:
-            self.scene.on_node_progress("start", nid, {})
+        pid, nid = split_run_id(self._full(node_id))
+        sc = self._scenes.get(pid)
+        if sc is not None:
+            sc.on_node_progress("start", nid, {})
 
     def _on_ingest_finished(self, node_id: str, seconds: float, err) -> None:
         self._sync_ingest()
+        pid, pnid = split_run_id(self._full(node_id))
         nid = self._local(node_id)
         if nid is None:                      # a source on a page the canvas is not showing
+            sc = self._scenes.get(pid)
+            if sc is not None:
+                sc.on_node_progress("error" if err else "done", pnid,
+                                    {} if err else {"seconds": seconds})
             self._idle_led()
             self.statusBar().showMessage(
                 f"{node_id} " + ("FAILED to ingest" if err else f"ingested in {seconds:.1f}s"))
@@ -1954,7 +2433,7 @@ class MainWindow(QMainWindow):
         if err:
             self.scene.on_node_progress("error", node_id, {})
             for p in self._viewers_for(node_id):   # where that file is being shown
-                p.show_error(node_id, str(err))
+                p.show_error(self._full(node_id), str(err))
             self._set_led("error")
             last = [ln for ln in str(err).strip().splitlines() if ln.strip()]
             self.statusBar().showMessage(
@@ -1975,7 +2454,8 @@ class MainWindow(QMainWindow):
             self.pull_node(node_id)          # now immediate: the store is warm
 
     def pull_node(self, node_id: str, *, allow_ingest: bool = True,
-                  queue: bool = True, viewer: Optional[ViewerPanel] = None) -> None:
+                  queue: bool = True, viewer: Optional[ViewerPanel] = None,
+                  page_id: Optional[str] = None) -> None:
         """Double-click / F5 on a card: compute it and show it in the Viewer.
 
         On a **source** card whose file has not been ingested yet, this starts that file's
@@ -1997,8 +2477,11 @@ class MainWindow(QMainWindow):
 
         ``viewer`` is the viewer to show it in — by default the active one (a new one
         when every viewer was closed). The viewer is BOUND to the node: its results land
-        there from now on (V4.00 step 4)."""
-        state = self.runner.source_state(node_id)
+        there from now on (V4.00 step 4). ``page_id`` names the node's page (default: the
+        active one)."""
+        pid = page_id or self.workspace.active or ""
+        rid = qualify(pid, node_id)
+        state = self.runner.source_state(rid)
         if state in ("cold", "running"):
             if not allow_ingest:
                 if state == "cold":
@@ -2011,30 +2494,28 @@ class MainWindow(QMainWindow):
             return
         v = viewer if viewer is not None else self._ensure_viewer()
         self._preview_prev = None              # see `_preview_pull`
-        self._bind(v, node_id)                 # its results land in `v` from now on
+        self._bind(v, node_id, page_id=pid)    # its results land in `v` from now on
         # BEFORE reading the cursor: a new node may sit on a different source chain, so the
         # frame chooser's extent has to be right before the coords it produces are sent.
         self._sync_solo()
         # the troubleshooting scope is the ACTIVE viewer's — a Compare viewer shares it
         act = self._active_viewer() or v
         self.runner.set_frame_selection(*act.frame_selection())
-        self.runner.pull(node_id, v.coords(), v.channels(), queue=queue)
+        self.runner.pull(rid, v.coords(), v.channels(), queue=queue)
 
     # ── which viewer shows what (V4.00 step 4) ────────────────────────────────
     def _viewers_for(self, run_id: str) -> List[ViewerPanel]:
-        """Which viewer(s) a delivery for ``run_id`` lands in: every viewer BOUND to that
-        node; failing that, the one that last asked for it (re-bound since — the first
-        result to land is viewable while the next one computes); failing that, the active
-        viewer, which shows whatever finishes (V2's primary pane)."""
-        nid = self._local(run_id)
-        if nid is None:
-            return []
+        """Which viewer(s) a delivery for ``run_id`` lands in — any page: every viewer
+        BOUND to that node; failing that, the one that last asked for it (re-bound since —
+        the first result to land is viewable while the next one computes); failing that,
+        the active viewer, which shows whatever finishes (V2's primary pane)."""
+        full = self._full(run_id)
+        key = split_run_id(full)
         vs = self.viewers
-        key = (self.workspace.active or "", nid)
         bound = [v for v in vs if v.binding == key]
         if bound:
             return bound
-        asker = self._asker.get(self.runner.run_id(nid))
+        asker = self._asker.get(full)
         if asker is not None:
             return [asker] if asker in vs else []
         act = self._active_viewer()
@@ -2139,7 +2620,7 @@ class MainWindow(QMainWindow):
             self._linked.discard(f)
         f.set_axes_hidden(linked and f is not self._mini_viewer)
         self._sync_viewer_title(f)
-        fn = self._bound_local(f)
+        fn = self._binding_full(f)
         if linked and fn is not None:
             m, t, z, _c = lead.coords()
             if (m, t, z) != tuple(f.coords()[:3]):
@@ -2577,8 +3058,7 @@ class MainWindow(QMainWindow):
             self.runner.invalidate()
             self.statusBar().showMessage(
                 f"{node_id} released — the chain above runs live again")
-            if self._viewed is not None:
-                self.pull_node(self._viewed)
+            self._repull_viewed()
         elif action == "undock":
             self.doc.set_dock_state(node_id, False)
             self.runner.invalidate()
@@ -2606,7 +3086,7 @@ class MainWindow(QMainWindow):
         return self.doc.iterate_card_at(node_id or "")
 
     def _sync_iteration_strip(self, node_id: Optional[str],
-                              viewer: Optional[ViewerPanel] = None) -> None:
+                              viewer: Optional[ViewerPanel] = None, *, doc=None) -> None:
         """Show ``viewer``'s (default: the active one's) iteration strip for an Iterate
         node, captioned with the value each iteration used. Silent about a misconfigured
         sweep — the inspector panel is where that is reported, and two copies of the same
@@ -2614,12 +3094,13 @@ class MainWindow(QMainWindow):
         v = viewer if viewer is not None else self._active_viewer()
         if v is None:
             return
-        owner = self._iterate_owner(node_id)
+        doc = doc if doc is not None else self.doc
+        owner = doc.iterate_card_at(node_id or "")
         if owner is None:
             v.set_iterations(())
             return
         try:
-            plan = iterate_plan(self.doc.to_graph(), owner, envs=self.doc.envs)
+            plan = iterate_plan(doc.to_graph(), owner, envs=doc.envs)
         except Exception:                     # noqa: BLE001 — half-wired: no strip, no noise
             v.set_iterations(())
             return
@@ -2628,7 +3109,7 @@ class MainWindow(QMainWindow):
             parts = [("—" if v is None else (f"{v:g}" if isinstance(v, (int, float))
                                              else str(v))) for v in it.values]
             labels.append(" · ".join(parts))
-        current = int(self.doc.nodes[owner].params.get("index", 0) or 0)
+        current = int(doc.nodes[owner].params.get("index", 0) or 0)
         v.set_iterations(labels, current)
 
     def _on_iteration_changed(self, index: int,
@@ -2639,22 +3120,24 @@ class MainWindow(QMainWindow):
         iteration under 'best' would otherwise change nothing visible, since the metric
         still decides. Picking one by eye IS the statement that you want that one."""
         v = viewer if viewer is not None else self._active_viewer()
-        viewed = self._bound_local(v)
-        owner = self._iterate_owner(viewed)
+        b = getattr(v, "binding", None)
+        pid, viewed = (b[0], b[1]) if b else (self.workspace.active, None)
+        doc = self._page_doc(pid)
+        owner = doc.iterate_card_at(viewed or "") if doc is not None else None
         if owner is None:
             return
-        rec = self.doc.nodes[owner]
+        rec = doc.nodes[owner]
         if int(rec.params.get("index", 0) or 0) == index \
                 and rec.modes.get("preserve") == "picked":
             return
         rec.params["index"] = int(index)
         rec.modes["preserve"] = "picked"
-        self.doc.touch()
+        doc.touch()
         # Re-pull what is being VIEWED, not the card: the strip normally appears while the
         # user is looking at the segment's end node, and re-pulling the card there would
         # move the viewer off the node they are tuning to answer a question they asked
         # about it.
-        self.pull_node(viewed or owner, viewer=v)
+        self.pull_node(viewed or owner, viewer=v, page_id=pid)
 
     def _on_movie_action(self, node_id: str, action: str) -> None:
         """The inspector's *Open Movie Editor*: raise the dock on ``node_id``."""
@@ -2690,61 +3173,94 @@ class MainWindow(QMainWindow):
             if want > self._movie_dock.height():
                 self._movie_dock.setMinimumHeight(want)
                 QTimer.singleShot(0, lambda: self._movie_dock.setMinimumHeight(0))
+        pid = self.workspace.active or ""
+        if pid != self._movie_pid():
+            self.movie_editor.bind(None)     # another page's movie: a fresh binding
+        self._movie_page = pid
         self.movie_editor.bind(node_id)
 
+    def _movie_pid(self) -> str:
+        """The page of the Export Movie the Movie Editor is bound to: the page it was opened
+        on, which stays its page while another page is active (V4.00 step 5). Unbound, the
+        active page."""
+        pid = getattr(self, "_movie_page", None)
+        return pid if pid in self.workspace.pages else (self.workspace.active or "")
+
     def _on_movie_fetched(self, node_id: str, payload, _seconds: float) -> None:
-        run_id, node_id = node_id, self._local(node_id)
-        if node_id is None:                 # a page the canvas is not showing
-            self.scene.clear_run_plan(run_id)
-            self.scene.finish_run(None)
-            self._set_led("idle")
-            return
-        self.scene.finish_run(node_id)
+        run_id = self._full(node_id)
+        pid, nid = split_run_id(run_id)
+        for p, sc in list(self._scenes.items()):
+            if p == pid:
+                sc.finish_run(nid)
+            else:
+                sc.clear_run_plan(self._key_on(run_id, p))
+                sc.finish_run(None)
         self._set_led("idle")
-        self.movie_editor.on_fetched(node_id, payload)
-        self.statusBar().showMessage(f"{node_id} ready for the Movie Editor")
+        if pid != self._movie_pid():        # a page the editor is not editing
+            return
+        self.movie_editor.on_fetched(nid, payload)
+        self.statusBar().showMessage(f"{nid} ready for the Movie Editor")
 
     def _on_viewer_display(self, node_id: str) -> None:
-        """The Viewer's look of ``node_id`` settled: stamp it into every Export Movie whose
-        linked panels read that node, then let the editor re-render."""
-        for mid in self._movie_nodes():
-            if self._movie_links_to(mid, node_id):
-                self.stamp_movie_links(mid)
-        self.movie_editor.on_display_changed()
+        """The Viewer's look of ``node_id`` (a run id, or a bare id on the active page)
+        settled: stamp it into every Export Movie whose linked panels read that node, then
+        let the editor re-render. The movies of the node's own page: a node id names a node
+        of ONE page."""
+        pid, nid = split_run_id(self._full(node_id))
+        for mid in self._movie_nodes(pid):
+            if self._movie_links_to(mid, nid, pid):
+                self.stamp_movie_links(mid, page_id=pid)
+        if pid == self._movie_pid():
+            self.movie_editor.on_display_changed()
 
     # ── Export Movie ↔ Viewer LUT link ────────────────────────────────────────────
-    def _movie_nodes(self) -> List[str]:
-        return [n for n, r in self.doc.nodes.items() if r.op_key == MOVIE_OP]
+    def _movie_doc(self, page_id: Optional[str] = None):
+        """The document of ``page_id`` — the active page when ``None``. Every Export Movie
+        helper below takes the movie's page: the editor passes its own (``_movie_pid``)."""
+        return self._page_doc(page_id or self.workspace.active or "")
 
-    def _movie_sources(self, movie_id: str) -> Dict[str, Dict[str, Any]]:
+    def _movie_nodes(self, page_id: Optional[str] = None) -> List[str]:
+        doc = self._movie_doc(page_id)
+        if doc is None:
+            return []
+        return [n for n, r in doc.nodes.items() if r.op_key == MOVIE_OP]
+
+    def _movie_sources(self, movie_id: str,
+                       page_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """``{letter: {"node", "label", "env"}}`` for an Export Movie's three inputs, each
         the REAL node feeding it (through reroutes and muted nodes)."""
         from nodegraph.catalog._shared.movie_timeline import SOURCE_SOCKETS
+        doc = self._movie_doc(page_id)
         out: Dict[str, Dict[str, Any]] = {}
+        if doc is None:
+            return out
         for letter, socket in SOURCE_SOCKETS.items():
-            src = self.doc.real_source(movie_id, socket)
+            src = doc.real_source(movie_id, socket)
             if src is None:
                 out[letter] = {"node": None}
                 continue
-            rec = self.doc.nodes.get(src)
+            rec = doc.nodes.get(src)
             spec = rec.spec() if rec is not None else None
             label = f"{spec.label if spec is not None else rec.op_key} ({src})"
             try:
-                env = self.doc.env(src)
+                env = doc.env(src)
             except Exception:              # noqa: BLE001 — an un-propagated node
                 env = None
             out[letter] = {"node": src, "label": label, "env": env}
         return out
 
-    def _movie_links_to(self, movie_id: str, node_id: str) -> bool:
-        rec = self.doc.nodes.get(movie_id)
+    def _movie_links_to(self, movie_id: str, node_id: str,
+                        page_id: Optional[str] = None) -> bool:
+        doc = self._movie_doc(page_id)
+        rec = doc.nodes.get(movie_id) if doc is not None else None
         if rec is None or str(rec.modes.get("sweep", "time")) != "timeline":
             return False
-        srcs = self._movie_sources(movie_id)
+        srcs = self._movie_sources(movie_id, page_id)
         return any((i or {}).get("node") == node_id for i in srcs.values()) \
             or node_id == movie_id
 
-    def live_display(self, movie_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+    def live_display(self, movie_id: str, spec: Dict[str, Any],
+                     page_id: Optional[str] = None) -> Dict[str, Any]:
         """``spec`` with every Viewer-linked channel filled in from the Viewer, NOT written.
 
         Each linked channel takes its panel source's node's LUT; a channel the Viewer holds
@@ -2753,7 +3269,7 @@ class MainWindow(QMainWindow):
         last time, or none, which renders as auto contrast."""
         import copy as _copy
         out = _copy.deepcopy(spec)
-        srcs = self._movie_sources(movie_id)
+        srcs = self._movie_sources(movie_id, page_id)
         states: Dict[str, Dict[int, Dict[str, Any]]] = {}
 
         def state_of(node: Optional[str], letter: str) -> Dict[int, Dict[str, Any]]:
@@ -2762,9 +3278,9 @@ class MainWindow(QMainWindow):
                 env = (srcs.get(letter) or {}).get("env")
                 names = list((getattr(env, "metadata", {}) or {}).get("channel_names")
                              or [])
-                got = self._display_state_of(node, names) if node else {}
+                got = self._display_state_of(node, names, page_id) if node else {}
                 if letter == "A":
-                    for c, d in self._display_state_of(movie_id, names).items():
+                    for c, d in self._display_state_of(movie_id, names, page_id).items():
                         got.setdefault(c, d)
                 states[key] = got
             return states[key]
@@ -2790,19 +3306,23 @@ class MainWindow(QMainWindow):
                         d[k] = got[k]
         return out
 
-    def _display_state_of(self, node_id: str, names) -> Dict[int, Dict[str, Any]]:
-        """The Viewer's look of ``node_id`` — from the active viewer when it holds one,
-        else from the first viewer that does (each viewer keeps its own LUTs)."""
+    def _display_state_of(self, node_id: str, names,
+                          page_id: Optional[str] = None) -> Dict[int, Dict[str, Any]]:
+        """The Viewer's look of ``node_id`` of ``page_id`` (default: the active page) —
+        from the active viewer when it holds one, else from the first viewer that does
+        (each viewer keeps its own LUTs)."""
         act = self._active_viewer()
         order = ([act] if act is not None else []) + [v for v in self.viewers
                                                       if v is not act]
+        # viewers key a node by its run id
+        full = self._full(node_id) if page_id is None else qualify(page_id, node_id)
         for v in order:
-            got = v.display_state(node_id, names)
+            got = v.display_state(full, names)
             if got:
                 return dict(got)
         return {}
 
-    def stamp_movie_links(self, movie_id: str) -> bool:
+    def stamp_movie_links(self, movie_id: str, page_id: Optional[str] = None) -> bool:
         """Write the Viewer's current look into ``movie_id``'s linked channels. ``True`` if
         the node's timeline changed.
 
@@ -2811,49 +3331,57 @@ class MainWindow(QMainWindow):
         movie node itself is being computed, because an edit inside a running export's cone
         would cancel it; it is retried a moment later."""
         from nodegraph.catalog._shared.movie_timeline import canonical_json, try_normalize
-        rec = self.doc.nodes.get(movie_id)
+        pid = page_id or self.workspace.active or ""
+        doc = self._movie_doc(pid)
+        rec = doc.nodes.get(movie_id) if doc is not None else None
         if rec is None or str(rec.modes.get("sweep", "time")) != "timeline":
             return False
         spec, _err = try_normalize(rec.params.get("timeline", "") or "")
         if spec is None:
             return False
-        text = canonical_json(self.live_display(movie_id, spec))
+        text = canonical_json(self.live_display(movie_id, spec, pid))
         if text == rec.params.get("timeline"):
             return False
-        if self.runner.in_flight(movie_id):
-            QTimer.singleShot(1500, lambda m=movie_id: self.stamp_movie_links(m))
+        if self.runner.in_flight(qualify(pid, movie_id)):
+            QTimer.singleShot(1500, lambda m=movie_id, p=pid: self.stamp_movie_links(m, p))
             return False
-        self.write_movie_timeline(movie_id, text)
+        self.write_movie_timeline(movie_id, text, page_id=pid)
         return True
 
-    def write_movie_timeline(self, movie_id: str, text: str) -> None:
+    def write_movie_timeline(self, movie_id: str, text: str,
+                             page_id: Optional[str] = None) -> None:
         """The one write path for an Export Movie's ``timeline``: the value, the lock that
         tells a re-seed the user owns it, and the narrowed touch — the same three steps an
         inspector edit takes (``node_item._write_param``)."""
-        rec = self.doc.nodes.get(movie_id)
+        doc = self._movie_doc(page_id)
+        rec = doc.nodes.get(movie_id) if doc is not None else None
         if rec is None:
             return
         rec.params["timeline"] = text
         rec.set_locked(rec.locked | {"timeline"})
-        self.doc.touch(movie_id)
+        doc.touch(movie_id)
 
-    def set_movie_sweep(self, movie_id: str, value: str) -> None:
-        rec = self.doc.nodes.get(movie_id)
+    def set_movie_sweep(self, movie_id: str, value: str,
+                        page_id: Optional[str] = None) -> None:
+        doc = self._movie_doc(page_id)
+        rec = doc.nodes.get(movie_id) if doc is not None else None
         if rec is None or rec.modes.get("sweep") == value:
             return
-        item = self._node_item(movie_id)
+        item = self._node_item(movie_id, page_id)
         if item is not None:
             item._write_mode("sweep", value)     # THE mode-write path: re-gates the card
         else:
             rec.modes["sweep"] = value
-            self.doc.touch(movie_id)
+            doc.touch(movie_id)
 
-    def export_movie(self, movie_id: str) -> None:
+    def export_movie(self, movie_id: str, page_id: Optional[str] = None) -> None:
         """Stamp the linked LUTs, make sure there is a file to write, and pull the node."""
-        rec = self.doc.nodes.get(movie_id)
+        pid = page_id or self.workspace.active or ""
+        doc = self._movie_doc(pid)
+        rec = doc.nodes.get(movie_id) if doc is not None else None
         if rec is None:
             return
-        self.stamp_movie_links(movie_id)
+        self.stamp_movie_links(movie_id, pid)
         if not str(rec.params.get("path", "") or "").strip():
             path, _f = QFileDialog.getSaveFileName(
                 self, "Export movie to", "movie.mp4",
@@ -2863,14 +3391,13 @@ class MainWindow(QMainWindow):
                 return
             rec.params["path"] = path
             rec.set_locked(rec.locked | {"path"})
-            self.doc.touch(movie_id)
-        self.pull_node(movie_id)
+            doc.touch(movie_id)
+        self.pull_node(movie_id, page_id=pid)
 
-    def _node_item(self, node_id: str):
-        for it in self.scene.items():
-            if isinstance(it, NodeItem) and it.node_id == node_id:
-                return it
-        return None
+    def _node_item(self, node_id: str, page_id: Optional[str] = None):
+        """``node_id``'s card on ``page_id``'s scene (default: the active page), if any."""
+        sc = self._scenes.get(page_id or self.workspace.active or "")
+        return sc.node_items.get(node_id) if sc is not None else None
 
     def _on_iterate_action(self, node_id: str, action: str) -> None:
         """Run sweep / stop sweeping, from the Iterate panel."""
@@ -3012,6 +3539,7 @@ class MainWindow(QMainWindow):
     def _on_held(self, node_id: str, spec: dict) -> None:
         """Record a finished hold: pin the payload, flip the mode, grey the chain."""
         run_id = node_id
+        self._retire_claims(run_id)          # it ran as a pull: its claims end here
         pid, node_id = split_run_id(str(node_id))      # the run id names the page
         page = self.workspace.pages.get(pid or self.workspace.active or "")
         if page is None or node_id not in page.doc.nodes:
@@ -3028,14 +3556,14 @@ class MainWindow(QMainWindow):
             f"{node_id} held in memory — the chain above is frozen and greyed out. "
             f"Nothing was written, so this does NOT free memory and does NOT survive "
             f"reopening the file; Bake it if you need either.")
-        if self._viewed is not None:
-            self.pull_node(self._viewed)
+        self._repull_viewed()
 
     def _on_baked(self, node_id: str, spec: dict) -> None:
         """Record a finished bake, dock the node, and release what it made redundant."""
         if spec.get("hold"):
             self._on_held(node_id, spec)
             return
+        self._retire_claims(node_id)         # finished or stopped, its claims end here
         # the run id names the page: record the bake on THAT page's document
         pid, node_id = split_run_id(str(node_id))
         page = self.workspace.pages.get(pid or self.workspace.active or "")
@@ -3065,8 +3593,7 @@ class MainWindow(QMainWindow):
             f"{freed} cached result(s) released and {len(doc.dormant)} node(s) "
             f"greyed out"
             + ("  ·  SCOPED bake: a truncated series" if spec.get("scoped") else ""))
-        if self._viewed is not None:
-            self.pull_node(self._viewed)
+        self._repull_viewed()
 
     def _release_dormant(self, doc=None, page_id: Optional[str] = None) -> int:
         """Free the memory the dock exists to free — the memo payloads of every node a
@@ -3113,8 +3640,7 @@ class MainWindow(QMainWindow):
             self._solo_act.blockSignals(True)
             self._solo_act.setChecked(on)
             self._solo_act.blockSignals(False)
-        if self._viewed is not None:
-            self.pull_node(self._viewed)       # show the new scope now, not on the next click
+        self._repull_viewed()                  # show the new scope now, not on the next click
         self.statusBar().showMessage(          # after the pull: `started` also writes here
             f"troubleshooting: pulls analyse {self._scope_phrase()} — ctrl+click the T or "
             f"Z strip to pick more, F9 to run the full series"
@@ -3163,17 +3689,19 @@ class MainWindow(QMainWindow):
             v.clear_region()
 
     # ── the Viewer node's display settings (2026-10-02) ───────────────────────
-    def _viewer_layout(self, node_id: Optional[str]) -> str:
+    def _viewer_layout(self, node_id: Optional[str], doc=None) -> str:
         """The viewed node's ``layout`` Mode if it is a ``view.viewer``, else ``merged``."""
-        rec = self.doc.nodes.get(node_id) if node_id else None
+        doc = doc if doc is not None else self.doc
+        rec = doc.nodes.get(node_id) if node_id else None
         if rec is None or rec.op_key != "view.viewer":
             return "merged"
         return str((rec.modes or {}).get("layout") or "merged")
 
-    def _viewer_scalebar(self, node_id: Optional[str]):
+    def _viewer_scalebar(self, node_id: Optional[str], doc=None):
         """The viewed node's scale-bar settings if it is a ``view.viewer`` with the bar on,
         else ``None``. Presentation params: read from the document, never the payload."""
-        rec = self.doc.nodes.get(node_id) if node_id else None
+        doc = doc if doc is not None else self.doc
+        rec = doc.nodes.get(node_id) if node_id else None
         if rec is None or rec.op_key != "view.viewer":
             return None
         spec = rec.spec()
@@ -3194,11 +3722,12 @@ class MainWindow(QMainWindow):
         return {"um": um, "corner": str(val("scalebar_corner") or "bottom_right"),
                 "color": str(val("scalebar_color") or "white")}
 
-    def _viewer_timestamp(self, node_id: Optional[str]):
+    def _viewer_timestamp(self, node_id: Optional[str], doc=None):
         """The viewed node's timestamp settings if it is a ``view.viewer`` with the
         timestamp on, else ``None`` (2026-10-02). Presentation params, read from the
         document like the scale bar's."""
-        rec = self.doc.nodes.get(node_id) if node_id else None
+        doc = doc if doc is not None else self.doc
+        rec = doc.nodes.get(node_id) if node_id else None
         if rec is None or rec.op_key != "view.viewer":
             return None
         spec = rec.spec()
@@ -3231,9 +3760,9 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"troubleshooting: pulls analyse "
                                      f"{self._scope_phrase()}")
-        nid = self._bound_local(v)
-        if nid is not None:
-            self.pull_node(nid, viewer=v)
+        b = v.binding
+        if b:
+            self.pull_node(b[1], viewer=v, page_id=b[0])
 
     def _on_frame_selection(self, viewer: Optional[ViewerPanel] = None) -> None:
         """A viewer's M/T/Z picks changed — that is a change to *what a pull computes*,
@@ -3258,9 +3787,9 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"troubleshooting: pulls analyse "
                                      f"{self._scope_phrase()}")
-        nid = self._bound_local(v)
-        if nid is not None:
-            self.pull_node(nid, viewer=v)
+        b = v.binding
+        if b:
+            self.pull_node(b[1], viewer=v, page_id=b[0])
 
     def _sync_solo(self, _node_id: Optional[str] = None, *, push: bool = True) -> None:
         """Re-point every viewer's frame chooser at ITS node's source extent — a linked
@@ -3272,11 +3801,13 @@ class MainWindow(QMainWindow):
         on = self.runner.solo_frame
         act = self._active_viewer()
         for v in self.viewers:
-            nid = self._bound_local(v)
-            v.set_solo(self.doc.source_scope_totals(nid) if (on and nid) else None)
+            b = v.binding
+            doc = self._page_doc(b[0]) if b else None
+            nid = b[1] if (b and doc is not None and b[1] in doc.nodes) else None
+            v.set_solo(doc.source_scope_totals(nid) if (on and nid) else None)
             # the region box spans the SOURCE frame for the same reason the strips span the
             # source series; a remembered window is re-clamped, not dropped
-            v.set_region_extent(self.doc.source_scope_extent(nid)
+            v.set_region_extent(doc.source_scope_extent(nid)
                                 if (on and nid and v is act) else None)
         if push and on and act is not None and self.runner.region != act.region:
             self.runner.set_region(act.region)
@@ -3308,10 +3839,12 @@ class MainWindow(QMainWindow):
         itself being unmistakably marked."""
         if not self.runner.solo_frame:
             self._solo_chip.hide()
-            self.view.set_troubleshooting(False)
+            for c in self.canvases():
+                c.view.set_troubleshooting(False)
             return
         name = self._scope_tag()
-        self.view.set_troubleshooting(True, name)
+        for c in self.canvases():
+            c.view.set_troubleshooting(True, name)
         self._solo_chip.setText(f"SOLO {name}")
         self._solo_chip.setToolTip(f"{self._solo_act.toolTip()}\n\n"
                                    f"Now: pulls analyse {self._scope_phrase()}.")
@@ -3325,7 +3858,7 @@ class MainWindow(QMainWindow):
         v = viewer if viewer is not None else self._active_viewer()
         if v is None:
             return
-        nid = self._bound_local(v)
+        nid = self._binding_full(v)
         if nid is not None:
             # coords/channel-only change → runner serves from the decoded-plane cache
             # (no graph snapshot / engine re-pull) when the graph is unchanged. Under the
@@ -3338,7 +3871,7 @@ class MainWindow(QMainWindow):
         # Compare viewer with it — mirror silently, then ask for that viewer's planes.
         m, t, z, _c = v.coords()
         for f in self._followers_of(v):
-            fn = self._bound_local(f)
+            fn = self._binding_full(f)
             if f in self._linked and fn is not None:
                 f.set_cursor(m, t, z)
                 self.runner.request_plane(fn, f.coords(), f.channels())
@@ -3384,7 +3917,7 @@ class MainWindow(QMainWindow):
         v = viewer if viewer is not None else self._active_viewer()
         if v is None:
             return
-        viewed = self._bound_local(v)
+        viewed = self._binding_full(v)
         reads = viewed is not None and self.runner.frames_are_reads(viewed)
         if on:
             # decided for EVERY axis, not just T: a cold Z step through a whole-volume chain
@@ -3431,7 +3964,7 @@ class MainWindow(QMainWindow):
 
     def _on_preload_progress(self, node_id: str, done: int, total: int) -> None:
         v = self._preload_viewer or self._active_viewer()
-        if v is None or self._local(node_id) != self._bound_local(v) or not total:
+        if v is None or self._full(node_id) != self._binding_full(v) or not total:
             return
         self._set_progress(done / float(total))
         self.statusBar().showMessage(
@@ -3453,7 +3986,7 @@ class MainWindow(QMainWindow):
         playing viewer shows with its gate up: the watchdog that arms this at ▶ may fire
         long after the preload finished, the node changed, or playback stopped."""
         v = self._preload_viewer or self._active_viewer()
-        if v is None or self._local(node_id) != self._bound_local(v) \
+        if v is None or self._full(node_id) != self._binding_full(v) \
                 or not v.play_gated():
             return
         v.set_play_gate(False)
@@ -3469,7 +4002,7 @@ class MainWindow(QMainWindow):
         is worse than playing a frame cold."""
         self._set_progress(None)
         v = self._preload_viewer or self._active_viewer()
-        if completed and v is not None and self._local(node_id) == self._bound_local(v):
+        if completed and v is not None and self._full(node_id) == self._binding_full(v):
             # said whether or not the gate is still up: a hold released early by the cap
             # reaches this point playing cold, and this is the moment it turns warm
             self.statusBar().showMessage("playing from memory", 2500)
@@ -3479,62 +4012,65 @@ class MainWindow(QMainWindow):
 
     def _on_run_finished(self, node_id, payload, plane, axes, seconds,
                          request=None) -> None:
-        run_id, node_id = node_id, self._local(node_id)
-        if node_id is None:
-            # a page the canvas is not showing (step 5 puts it on screen): the runner has
-            # remembered the result; here the run's claim on this page's cards (the
-            # upstream chain it computed) is retired, and the footer and LED move on
-            self.scene.clear_run_plan(run_id)
-            self.scene.finish_run(None)
-            self._idle_led()
-            self._set_progress(None)
-            self.statusBar().showMessage(f"{run_id} pulled in {seconds:.2f}s")
-            return
+        run_id = self._full(node_id)
+        pid, node_id = split_run_id(run_id)
+        on_active = pid == self.workspace.active
+        doc = self._page_doc(pid)
+        # every OTHER page's canvas retires this run's claim on its cards — the upstream
+        # chain it computed there, for a page that reads through a Page Input
+        for p, sc in list(self._scenes.items()):
+            if p != pid:
+                sc.clear_run_plan(self._key_on(run_id, p))
+                sc.finish_run(None)
         # A source the Movie Editor is waiting on may have just been computed by an
         # ordinary pull; it takes the payload the same way it takes a fetched one. Only the
         # runner's UNPINNED result: a solo-scoped payload holds a few frames, and a movie
-        # built from it would silently be a truncated one.
-        if payload is not None and getattr(self, "movie_editor", None) is not None:
-            full = self.runner.finished_result(node_id)
-            if full is not None:
-                self.movie_editor.on_fetched(node_id, full)
+        # built from it would silently be a truncated one. (The editor edits a node of ITS
+        # page, the one it was opened on.)
+        if (pid == self._movie_pid() and payload is not None
+                and getattr(self, "movie_editor", None) is not None):
+            unpinned = self.runner.finished_result(run_id)
+            if unpinned is not None:
+                self.movie_editor.on_fetched(node_id, unpinned)
         panes = self._viewers_for(run_id)
         routed = self._route_planes(panes, plane, request)
         for pane, planes in routed:
             if planes:
                 self._open_viewer(pane)   # there is something to see now — open its dock
-        if plane and self._draw_arm_pending == node_id:
-            # the Draw Regions node's own image is on screen now: arm its drawing on it
+        if plane and self._draw_arm_pending == run_id:
+            # the Draw Regions node's own image is on screen now: arm its drawing on it —
+            # while its page is the one being edited (the drawing is armed for that page)
             self._draw_arm_pending = None
             target = next((p for p, pl in routed if pl), None)
-            QTimer.singleShot(0, lambda n=node_id, v=target: self._arm_draw_now(n, v))
+            if on_active:
+                QTimer.singleShot(0, lambda n=node_id, v=target: self._arm_draw_now(n, v))
         for pane, planes in routed:
             # no planes for this viewer — a frame another viewer of the node asked for, or a
             # result re-served while its planes follow on the decode lane: a viewer already
             # showing the node KEEPS its frame rather than blanking to "no image"
-            keep = not planes and pane.showing()[0] == node_id and pane.has_image()
-            pane.show_result(node_id, planes, axes, seconds, dataset=payload,
-                             overlay=self.runner.overlay_channels(node_id),
-                             overlay_note=self.runner.overlay_note(node_id),
-                             overlay_style=self.runner.overlay_style(node_id),
-                             overlay_src=self.runner.overlay_sources(node_id),
+            keep = not planes and pane.showing()[0] == run_id and pane.has_image()
+            pane.show_result(run_id, planes, axes, seconds, dataset=payload,
+                             overlay=self.runner.overlay_channels(run_id),
+                             overlay_note=self.runner.overlay_note(run_id),
+                             overlay_style=self.runner.overlay_style(run_id),
+                             overlay_src=self.runner.overlay_sources(run_id),
                              keep_image=keep)
             # flicker is a property of TIME, not of the composite, so it is driven here
             # rather than folded into the style map the shader reads
-            pane.set_overlay_flicker(self.runner.overlay_flicker_hz(node_id))
-            self._sync_overlay_frames(pane, node_id)
+            pane.set_overlay_flicker(self.runner.overlay_flicker_hz(run_id))
+            self._sync_overlay_frames(pane, run_id)
             # the Viewer NODE's own display settings (2026-10-02): its layout Mode and the
-            # presentation-only scale bar, read live from the document — "merged" and no
+            # presentation-only scale bar, read live from the node's page — "merged" and no
             # bar for every other node, so viewing a filter never inherits them
-            pane.set_source_layout(self._viewer_layout(node_id))
-            pane.set_scalebar(self._viewer_scalebar(node_id))
-            pane.set_timestamp(self._viewer_timestamp(node_id))
-            self._sync_iteration_strip(node_id, pane)     # each viewer, for its own node
+            pane.set_source_layout(self._viewer_layout(node_id, doc))
+            pane.set_scalebar(self._viewer_scalebar(node_id, doc))
+            pane.set_timestamp(self._viewer_timestamp(node_id, doc))
+            self._sync_iteration_strip(node_id, pane, doc=doc)   # each viewer, its own node
             if not planes and (plane or keep):
                 # …and asks for the frame at ITS cursor, off the decode lane — never by a
                 # pull: under the solo scope that pull would take the other viewer's frame
                 # back, and the other viewer's would take it again, forever
-                self.runner.request_plane(node_id, pane.coords(), pane.channels(),
+                self.runner.request_plane(run_id, pane.coords(), pane.channels(),
                                           pull=False)
         mini = self._mini_viewer
         if self._maximized and mini is not None and mini in panes:
@@ -3546,7 +4082,8 @@ class MainWindow(QMainWindow):
             # the spreadsheet and the sweep table follow the ACTIVE viewer: a delivery to
             # another viewer must not yank them off the node being tuned
             self.sheet.show_dataset(node_id, payload)
-            self._record_sweep(node_id, payload)
+            if on_active:
+                self._record_sweep(node_id, payload)
         for pane in panes:
             self._sync_links_of(pane)
         self.minimap.set_state("live")
@@ -3554,41 +4091,65 @@ class MainWindow(QMainWindow):
         self._set_progress(None)              # the run is over — no bar to show
         # settle the cards: nothing is queued now, and the pulled node wears the run's
         # wall time (its own compute may have been microseconds — the wait was the read)
-        self.scene.finish_run(node_id, seconds=seconds)
+        sc = self._scenes.get(pid)
+        if sc is not None:
+            sc.finish_run(node_id, seconds=seconds)
         computed = getattr(self, "_run_computed", 0)
         cached = getattr(self, "_run_cached", 0)
         detail = f" ({computed} computed, {cached} cached)" if (computed or cached) else ""
-        self.statusBar().showMessage(f"{node_id} pulled in {seconds:.2f}s{detail}")
+        self.statusBar().showMessage(
+            f"{node_id if on_active else run_id} pulled in {seconds:.2f}s{detail}")
 
     # ── per-node progress (G7 + 2026-07-28) ──────────────────────────────────
     def _on_run_plan(self, target: str, node_ids) -> None:
-        tgt = self._local(target)
-        self._run_target = tgt or target
-        self._run_plan = [n for n in self._local_ids(node_ids) if n in self.doc.nodes]
+        full = self._full(target)
+        active = self.workspace.active
+        self._run_target = self._local(target) or full
+        planned = list(node_ids)
+        self._run_plan = [r for r in planned
+                          if self._page_doc(self._page_of(r)) is not None
+                          and split_run_id(self._full(r))[1]
+                          in self._page_doc(self._page_of(r)).nodes]
         self._run_computed = 0
         self._run_cached = 0
-        # a run on ANOTHER page claims the cards it computes on this one (its upstream
-        # chain) under its qualified id, so they read queued → running → done like any
-        # other participant; the claim is retired when that run ends
-        self.scene.set_run_plan(tgt or target, self._run_plan)
+        # every page with a canvas marks its participating cards — a run of ANOTHER page
+        # claims the cards it computes on this one (its upstream chain) under its run id, so
+        # they read queued → running → done like any other participant; the claim is
+        # retired when that run ends
+        for p, sc in list(self._scenes.items()):
+            doc = self._page_doc(p)
+            ids = [n for n in local_ids(planned, p, active) if doc is not None and n in doc.nodes]
+            sc.set_run_plan(self._key_on(full, p), ids)
 
     def _on_run_queued(self, node_id: str, depth: int) -> None:
         """A pull joined the queue behind the running one: claim its cards as ``queued`` and
         say so in the status bar. The branch is lined up, not lost."""
-        nid = self._local(node_id)
-        plan = [n for n in self._local_ids(self.runner.planned_nodes(node_id))
-                if n in self.doc.nodes]
-        self.scene.set_queued(nid or node_id, plan)
+        full = self._full(node_id)
+        active = self.workspace.active
+        planned = list(self.runner.planned_nodes(full))
+        for p, sc in list(self._scenes.items()):
+            doc = self._page_doc(p)
+            ids = [n for n in local_ids(planned, p, active) if doc is not None and n in doc.nodes]
+            sc.set_queued(self._key_on(full, p), ids)
         running = self._run_target or "a node"
         self.statusBar().showMessage(
-            f"{nid or node_id} queued behind {running} — {depth} waiting")
+            f"{self._local(node_id) or full} queued behind {running} — {depth} waiting")
+
+    def _retire_claims(self, run_id: str) -> None:
+        """``run_id``'s run is over: every page's canvas retires its claim (the plan
+        :meth:`_on_run_plan` fanned out to each page the run computes on) and drops the
+        queued/running marks nothing else claims. A finished, failed or fetched run does this
+        in its own handler; a cancel, a Hold and a Bake (stopped or not) end here."""
+        full = self._full(run_id)
+        for p, sc in list(self._scenes.items()):
+            sc.clear_run_plan(self._key_on(full, p))
+            sc.finish_run(None)
 
     def _on_run_cancelled(self, node_id: str) -> None:
         """A queued or running pull was dropped because an edit landed inside its cone.
         Retire its claim and clear the cards nothing else wants, so no card is left
         reporting work that will never finish."""
-        self.scene.clear_run_plan(self._local(node_id) or node_id)
-        self.scene.finish_run(None)
+        self._retire_claims(node_id)
         if not self.runner.busy:
             self._set_led("idle")
             self.minimap.set_state("idle")
@@ -3631,10 +4192,12 @@ class MainWindow(QMainWindow):
         _put(self._prog, fraction)
 
     def _on_node_progress(self, event: str, node_id: str, info: dict) -> None:
-        nid = self._local(node_id)
-        if nid is not None:
-            self.scene.on_node_progress(event, nid, info)
-        node_id = nid or node_id              # the footer names the node either way
+        full = self._full(node_id)
+        pid, nid = split_run_id(full)
+        sc = self._scenes.get(pid)
+        if sc is not None:
+            sc.on_node_progress(event, nid, info)
+        node_id = self._local(node_id) or full    # the footer names the node either way
         # An ingest reports with no epoch (it belongs to a file, not to a run). Its card
         # rail is updated above like any other node's, but it must not touch the pull's
         # counters or relabel the footer "pulling …" — and while a pull IS in flight it
@@ -3675,15 +4238,12 @@ class MainWindow(QMainWindow):
     def _on_plane_ready(self, node_id, planes, axes, seconds, request=None) -> None:
         # fast-path display update (scrub/play): no dataset re-delivery, no spreadsheet
         # refresh — only the showing viewer's frame changes.
-        run_id, node_id = node_id, self._local(node_id)
-        if node_id is None:
-            self._set_progress(None)
-            return
+        run_id = self._full(node_id)
         for pane, pl in self._route_planes(self._viewers_for(run_id), planes, request):
             if pl is None:
                 continue                  # another viewer's frame of the same node
-            pane.show_planes(node_id, pl, axes, seconds)
-            self._sync_overlay_frames(pane, node_id)
+            pane.show_planes(run_id, pl, axes, seconds)
+            self._sync_overlay_frames(pane, run_id)
         # A COLD frame is decoded off the GUI thread and announces itself as "reading
         # planes" while it runs (EngineRunner._serve_from_cache); the frame landing is the
         # end of that, so the rail goes back to idle. A warm frame never raised it.
@@ -3723,14 +4283,17 @@ class MainWindow(QMainWindow):
         # is more precise than the pulled node). The CONSOLE gets the whole trace,
         # selectable, because the other three are all uncopyable: a status line is truncated
         # to the window width, a tooltip cannot be selected, and a red card is not text.
-        run_id, node_id = node_id, self._local(node_id)
-        if node_id is not None:
-            self.scene.finish_run(node_id, failed=True)
-            for pane in self._viewers_for(run_id):
-                pane.show_error(node_id, trace)
-        else:
-            self.scene.clear_run_plan(run_id)
-            self.scene.finish_run(None)
+        run_id = self._full(node_id)
+        pid, nid = split_run_id(run_id)
+        for p, sc in list(self._scenes.items()):
+            if p == pid:
+                sc.finish_run(nid, failed=True)
+            else:
+                sc.clear_run_plan(self._key_on(run_id, p))
+                sc.finish_run(None)
+        for pane in self._viewers_for(run_id):
+            pane.show_error(run_id, trace)
+        node_id = self._local(run_id)
         self._set_led("error")
         self._set_progress(None)              # a failed run must not leave a stale bar
         self.minimap.set_state("error")
@@ -4179,12 +4742,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open failed", str(exc))
             return
         self._forget_display_state()
+        for c in self.canvases():
+            c._viewpoints.clear()          # where it looked at the LAST file's pages
         self.view.fit_all()
         if len(self.workspace.pages) > 1:
             act = self.workspace.page(self.workspace.active)
             self.statusBar().showMessage(
                 f"workspace of {len(self.workspace.pages)} pages — showing {act.name!r}; "
-                f"the page switcher arrives in V4 step 5")
+                f"the switcher in the canvas's top-left corner changes page")
         if self.doc.has_unedited_structure:
             QMessageBox.information(
                 self, "Zones / groups preserved",
@@ -4193,10 +4758,11 @@ class MainWindow(QMainWindow):
                 "save — editing/creating them in the GUI is a later phase.")
 
     def _stamp_all_movies(self) -> None:
-        """Before a save: write the Viewer's current LUTs into every linked movie channel,
-        so the file on disk reproduces the movies the user was looking at."""
-        for mid in self._movie_nodes():
-            self.stamp_movie_links(mid)
+        """Before a save: write the Viewer's current LUTs into every linked movie channel
+        of every page, so the file on disk reproduces the movies the user was looking at."""
+        for pid in list(self.workspace.pages):
+            for mid in self._movie_nodes(pid):
+                self.stamp_movie_links(mid, pid)
 
     def file_save(self) -> None:
         if not self.doc.path:
@@ -4237,12 +4803,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"exported {n} rows → {path}")
 
     # ── empty canvas / example content ────────────────────────────────────────
-    def _sync_welcome(self) -> None:
-        """Show the welcome card exactly while the canvas holds no nodes."""
-        self.welcome.setVisible(not self.doc.nodes)
-        if self.welcome.isVisible():
-            self.welcome.raise_()
-            self.minimap.raise_()          # the mini-map still owns its corner
+    def _sync_welcome(self, *_a) -> None:
+        """Show each canvas's welcome card exactly while its page holds no nodes."""
+        ws = self.workspace
+        for c in self.canvases():
+            page = ws.pages.get(c.page_id)
+            c.welcome.setVisible(page is not None and not page.doc.nodes)
+            if c.welcome.isVisible():
+                c.welcome.raise_()
+                c.minimap.raise_()          # the mini-map still owns its corner
 
     def focus_palette(self) -> None:
         """Put the cursor in the Nodes palette search (the welcome card's shortcut to

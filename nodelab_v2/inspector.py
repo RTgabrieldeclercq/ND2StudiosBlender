@@ -51,7 +51,8 @@ from nodegraph.iterate import (
     candidate_targets, plan as iterate_plan,
 )
 from nodelab_v2.document import is_driver_edge as _is_driver
-from nodelab_v2.ops import DOCK_OP, MOVIE_OP, PRECISION_UNSET, bake_record
+from nodelab_v2.ops import (DOCK_OP, MOVIE_OP, PAGE_INPUT_OP, PAGE_SOURCE_KEY,
+                            PRECISION_UNSET, bake_record)
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 from nodelab_v2 import readiness as RD
 from nodegraph.registry import NODES
@@ -1621,6 +1622,10 @@ class InspectorPanel(QScrollArea):
             box = QSpinBox(); box.setRange(0, NUM_MAX_INT)
             box.setSingleStep(int(value_step(s, ival, integer=True)))
             box.setValue(ival)
+        elif (s.type is SocketType.STRING and node.op_key == PAGE_INPUT_OP
+              and s.name == PAGE_SOURCE_KEY):
+            lay.addWidget(self._page_source_box(node, s))
+            return row
         elif s.type is SocketType.STRING and getattr(s, "choices", ()):
             lay.addWidget(self._choice_box(node, s))
             return row
@@ -1778,6 +1783,42 @@ class InspectorPanel(QScrollArea):
                   "the name.",
             note="\n(free text is allowed — some layer names cannot be predicted "
                  "before the graph runs)")
+
+    def _page_source_box(self, node: NodeItem, s):
+        """A Page Input's Source (V4.00 step 5): a CLOSED menu of the named Outputs of the
+        pages that may feed this one — "Input · raw" — rather than a typed reference. An
+        earlier page's Output is the only thing a Page Input can read, so there is nothing
+        legitimate to type that the menu does not list; a reference that no longer resolves
+        (its page or Output renamed or deleted) stays as the first entry, marked, so the
+        setting is never silently changed."""
+        from PySide6.QtCore import Qt
+        try:
+            choices = list(node.doc.source_choices(node.node_id))
+        except Exception:                            # never let a picker break the panel
+            choices = []
+        current = str(node.params.get(s.name, s.default or "") or "")
+        box = _NoWheelCombo()
+        box.setFocusPolicy(Qt.StrongFocus)
+        box.blockSignals(True)
+        values = [v for v, _label in choices]
+        if not current:
+            box.addItem("— choose an upstream Output —", "")
+        elif current not in values:
+            box.addItem(f"{current}  (unbound — not offered any more)", current)
+        for value, label in choices:
+            box.addItem(label, value)
+        idx = box.findData(current)
+        box.setCurrentIndex(idx if idx >= 0 else 0)
+        box.blockSignals(False)
+        box.setToolTip(
+            "Reads a named Output of an earlier page (by kind: an Input page feeds Refinement,"
+            " Refinement feeds Processing, …; a Free page may feed or read any page). "
+            + ("Offered: " + ", ".join(label for _v, label in choices) if choices else
+               "No page that may feed this one has a named Page Output yet — add a Page "
+               "Output node there and give it a name."))
+        box.activated.connect(
+            lambda _i, nm=s.name, b=box: self._set_param(node, nm, str(b.currentData() or "")))
+        return box
 
     def _column_box(self, node: NodeItem, s):
         """A CLOSED dropdown for a ``column_in`` socket: the columns the edit-time pass

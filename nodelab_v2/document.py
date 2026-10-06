@@ -42,6 +42,7 @@ from nodegraph.serialize import (
 from nodegraph.sockets import (
     Direction, SocketType, can_connect as _can_connect, can_convert as _can_convert)
 from nodegraph.zones import Zone, unroll as _unroll
+from nodegraph.memo import digest
 from nodelab_v2.ops import (
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
@@ -285,6 +286,11 @@ class GraphDocument:
         #: ``() -> [(value, label), ...]``: the named outputs of earlier pages a
         #: ``page.input`` on this document may read (:meth:`source_choices`).
         self.page_sources: Callable[[], list] = lambda: []
+        #: set by the Workspace (V4.00 step 5): a digest of what ``node_id`` reads from OTHER
+        #: pages through Page Inputs ("" when nothing) — part of a dock's signature — and the
+        #: page's run identity, which moves when an upstream page is edited
+        self.cross_page_signature: Callable[[str], str] = lambda _nid: ""
+        self.workspace_revision: Callable[[], str] = lambda: ""
 
     # ── listeners ────────────────────────────────────────────────────────────
     def on_change(self, fn: Callable[[], None], *, first: bool = False) -> None:
@@ -1621,7 +1627,12 @@ class GraphDocument:
         """The upstream signature of ``node_id`` right now — compared against the one
         recorded at bake time to decide whether the dock has gone stale."""
         try:
-            return upstream_signature(self.to_graph(bypass_muted=True), node_id)
+            sig = upstream_signature(self.to_graph(bypass_muted=True), node_id)
+            # A dock fed through a Page Input depends on the upstream page's chain too
+            # (V4.00 step 5): fold it in — and only then, so a dock whose chain stays on its
+            # page keeps exactly the signature its bake recorded.
+            ext = self.cross_page_signature(node_id)
+            return digest("dock-sig-pages", sig, ext) if ext else sig
         except Exception:  # noqa: BLE001 — mid-edit: never claim staleness on a bad graph
             return ""
 
@@ -1644,14 +1655,16 @@ class GraphDocument:
         # `held` node ("held" vs "released") without editing the graph, so it cannot bump the
         # revision — bumping it would invalidate every memo entry, which is the opposite of
         # what a hold is for.
-        key = (node_id, self.revision, self._held_nodes)
+        # …and the workspace's run identity of this page: an edit on an UPSTREAM page can
+        # stale a dock fed through a Page Input without bumping this page's revision
+        key = (node_id, self.revision, self._held_nodes, self.workspace_revision())
         hit = self._dock_status_cache.get(key)
         if hit is not None:
             return hit
         try:
             g = self.to_graph(bypass_muted=True)
-            got = (_dock_status(g, node_id, store=self.dock_store(node_id),
-                                held=self._held_nodes)
+            got = (_dock_status(g, node_id, signature=self.dock_signature(node_id),
+                                store=self.dock_store(node_id), held=self._held_nodes)
                    if node_id in g.nodes else ("", ""))
         except Exception:  # noqa: BLE001 — mid-edit: say nothing rather than crash a paint
             return ("", "")

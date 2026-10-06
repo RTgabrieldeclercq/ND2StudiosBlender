@@ -60,7 +60,8 @@ from nodegraph.serialize import (
     is_workspace_dict, page_from_dict, to_workspace_dict, workspace_pages)
 from nodelab_v2.document import GraphDocument, NodeRecord
 from nodelab_v2.ops import (
-    PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY)
+    PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
+    is_frozen, upstream_signature)
 from nodelab_v2.version import __version__
 
 #: Separates the page id from the node id in a RUN id: ``pg1/n3``. Not ``#``, ``@`` or ``%``,
@@ -416,6 +417,8 @@ class Workspace:
         doc.page_kind = page.kind
         doc.store_tag = pid
         doc.page_sources = lambda pid=pid: self.available_sources(pid)
+        doc.cross_page_signature = lambda nid, pid=pid: self.cross_page_signature(pid, nid)
+        doc.workspace_revision = lambda pid=pid: self.revision_of(pid)
 
         def hook(pid=pid) -> Mapping[str, MetaEnvelope]:
             return self._input_seeds(pid)
@@ -437,6 +440,8 @@ class Workspace:
             doc.seed_hooks.remove(hook)
         self._out_ids.pop(page.id, None)
         doc.page_sources = lambda: []
+        doc.cross_page_signature = lambda _nid: ""
+        doc.workspace_revision = lambda: ""
         doc.store_tag = ""
         doc.page_kind = None
 
@@ -632,6 +637,63 @@ class Workspace:
             if n == name:
                 return pid, nid
         return None
+
+    def cross_page_signature(self, page_id: str, node_id: str,
+                             _seen: Optional[FrozenSet[str]] = None) -> str:
+        """A digest of what ``node_id`` on ``page_id`` reads from OTHER pages: every Page
+        Input upstream of it (the walk stops where the run graph stops, at a frozen node), and
+        for each the Output it resolves to with that page's own upstream signature — so an
+        edit on an upstream page stales a dock fed through it (V4.00 step 5). It also holds
+        the page's NAME when a Page Output upstream on this page leaves its condition blank:
+        compose stamps the name there, so a rename changes what the dock would serve.
+        ``""`` when neither applies: a dock's signature is then exactly what its bake
+        recorded."""
+        page = self.pages.get(page_id)
+        seen_pages = (_seen or frozenset()) | {page_id}
+        if page is None:
+            return ""
+        try:
+            g = page.doc.to_graph(bypass_muted=True)
+        except Exception:                            # noqa: BLE001 — mid-edit
+            return ""
+        inputs, stamped, seen = [], [], set()
+        stack = [e.src for e in g.preds(node_id)] if node_id in g.nodes else []
+        while stack:
+            nid = stack.pop()
+            if nid in seen or nid not in g.nodes:
+                continue
+            seen.add(nid)
+            node = g.nodes[nid]
+            if is_frozen(node):
+                continue
+            if node.op_key == PAGE_INPUT_OP:
+                inputs.append(nid)
+            elif node.op_key == PAGE_OUTPUT_OP and not str(
+                    (node.params or {}).get(PAGE_CONDITION_KEY, "") or "").strip():
+                stamped.append(nid)          # compose fills its condition with page.name
+            stack.extend(e.src for e in g.preds(nid))
+        if not inputs and not stamped:
+            return ""
+        parts: list = [("stamped", tuple(sorted(stamped)), page.name)] if stamped else []
+        for inp in sorted(inputs):
+            res = self.resolve_source(page_id, g.nodes[inp].params.get(PAGE_SOURCE_KEY))
+            if res is None or res[0] in seen_pages:
+                parts.append((inp, None))
+                continue
+            up_pid, out_nid = res
+            try:
+                up_g = self.pages[up_pid].doc.to_graph(bypass_muted=True)
+                out = up_g.nodes[out_nid]
+                # the condition the Output STAMPS: its own, or — blank — its page's name,
+                # filled in at compose time; so renaming that page stales the dock too
+                cond = str((out.params or {}).get(PAGE_CONDITION_KEY, "") or "").strip()
+                parts.append((inp, up_pid, out_nid, dict(out.params or {}),
+                              cond or self.pages[up_pid].name,
+                              upstream_signature(up_g, out_nid),
+                              self.cross_page_signature(up_pid, out_nid, seen_pages)))
+            except Exception:                        # noqa: BLE001 — mid-edit
+                parts.append((inp, up_pid, None))
+        return digest("cross-page-sig", parts)
 
     def _input_seeds(self, page_id: str) -> Dict[str, MetaEnvelope]:
         """The seed hook: each resolved ``page.input`` of a page → its upstream Output's

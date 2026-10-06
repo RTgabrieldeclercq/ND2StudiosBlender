@@ -36,10 +36,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QPen, QTransform
 from PySide6.QtWidgets import (
-    QGraphicsPathItem, QGraphicsScene, QGraphicsView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMenu, QVBoxLayout, QWidget,
+    QApplication, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QToolButton, QVBoxLayout, QWidget,
 )
 
+from nodegraph import roles as R
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType, can_connect as _sock_can_connect
 from nodelab_v2 import theme as T
@@ -60,17 +61,21 @@ from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PRECISION_UNSE
 # readiness checker can rank suggested nodes without importing Qt; still exported here.
 
 
-def visible_specs():
+def visible_specs(kind: Optional[str] = None):
+    """The node types the palette and the link search offer. On a page of ``kind``, only
+    those the roles file assigns to that kind (V4.00 step 5) — ``None`` or ``free`` offers
+    every one."""
     return [s for s in NODES.all()
-            if not s.op_key.startswith(HIDDEN_OP_PREFIXES)]
+            if not s.op_key.startswith(HIDDEN_OP_PREFIXES) and R.op_in_page(s.op_key, kind)]
 
 
-def compatible_ops(fixed_spec, fixed_io: str) -> List[Tuple[object, str]]:
+def compatible_ops(fixed_spec, fixed_io: str,
+                   kind: Optional[str] = None) -> List[Tuple[object, str]]:
     """Ops (spec, socket_name) whose default-state sockets can pair with the fixed
-    socket — the link-drag search menu (G1)."""
+    socket — the link-drag search menu (G1), on a page of ``kind``."""
     fixed = fixed_spec.instantiate()
     out = []
-    for spec in visible_specs():
+    for spec in visible_specs(kind):
         state = spec.default_state()
         pool = (spec.active_inputs(state) if fixed_io == "out"
                 else spec.active_outputs(state))
@@ -203,6 +208,14 @@ class GraphScene(QGraphicsScene):
         self.setSceneRect(-400, -300, 3200, 2000)
         document.on_change(self.sync)
         self.sync()
+
+    def release(self) -> None:
+        """Stop listening to the document: the window is dropping this scene (its page was
+        deleted, or a file load gave the page another document). A dropped scene left on the
+        listener list raises on the document's next edit, and the live listeners after it —
+        the scene that replaced it, the window's hooks — never run."""
+        self.doc.off_change(self.sync)
+        self._anim.stop()
 
     # ── model → canvas ────────────────────────────────────────────────────────
     def sync(self) -> None:
@@ -684,13 +697,18 @@ class GraphScene(QGraphicsScene):
     def _open_link_search(self, fixed: SocketItem, scene_pos: QPointF,
                           screen_pos) -> None:
         entries = [(f"{spec.label}   ·  {sock}", spec.op_key, sock)
-                   for spec, sock in compatible_ops(fixed.spec, fixed.io)]
+                   for spec, sock in compatible_ops(fixed.spec, fixed.io,
+                                                    getattr(self.doc, "page_kind", None))]
         if not entries:
             return
         views = self.views()
         if not views:
             return
-        view = views[0]
+        # the view the drag ended in: two canvases can show one page (V4.00 step 5)
+        under = QApplication.widgetAt(screen_pos) if screen_pos is not None else None
+        view = next((v for v in views
+                     if under is not None and (under is v or v.isAncestorOf(under))),
+                    views[0])
 
         fixed_id = fixed.node_item.node_id
         fixed_name = fixed.spec.name
@@ -985,6 +1003,9 @@ class GraphView(QGraphicsView):
     #: on when that node is a Batch point, else ``""``; the window decides what to build.
     files_dropped = Signal(list, QPointF, str)
     maximize_toggled = Signal(bool)
+    #: a press on the canvas (or a drop onto it): the user is working in THIS canvas — the
+    #: window makes its page the active one before the press does anything (V4.00 step 5)
+    pressed = Signal()
 
     #: troubleshooting frame: stroke width, and the inset its rounded rect sits at.
     TS_BORDER = 3
@@ -1033,13 +1054,55 @@ class GraphView(QGraphicsView):
             "Maximize the node canvas (Ctrl+Space) — the Viewer becomes a mini-map "
             "in the top-left corner and follows the node you click")
         self._max_btn.toggled.connect(self._on_max_toggled)
+        # the page switcher (V4.00 step 5): which page this canvas shows, and the menu that
+        # changes it — top-left, where the troubleshooting badge steps aside for it
+        self.page_button = QToolButton(self)
+        self.page_button.setObjectName("pageSwitch")
+        self.page_button.setPopupMode(QToolButton.InstantPopup)
+        self.page_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.page_button.setCursor(Qt.PointingHandCursor)
+        self.page_button.setToolTip(
+            "The page this canvas shows. Click for every page of the workspace, grouped by "
+            "kind, and to add, duplicate, rename or delete one (Ctrl+PgUp / Ctrl+PgDn step "
+            "through them).")
+        self.page_button.hide()                     # until the window names a page
+        self._canvas_active = False
+        self._style_page_button()
         self._place_corner_chrome()
 
     # ── corner chrome (maximize + the troubleshooting badge) ──────────────────
     def _place_corner_chrome(self) -> None:
         self._max_btn.move(self.width() - self._max_btn.width() - 12, 12)
         self._max_btn.raise_()
+        pb = getattr(self, "page_button", None)
+        if pb is not None and pb.text():
+            pb.adjustSize()
+            pb.move(12, 12)
+            pb.raise_()
         self._place_ts_badge()
+
+    # ── the page switcher (V4.00 step 5) ──────────────────────────────────────
+    def set_page_title(self, text: str, icon=None) -> None:
+        """Name the page this canvas shows on its switcher (with its kind's dot)."""
+        self.page_button.setText(f" {text}")
+        if icon is not None:
+            self.page_button.setIcon(icon)
+        self.page_button.show()
+        self._place_corner_chrome()
+
+    def set_canvas_active(self, on: bool) -> None:
+        """An accent on the switcher while this is the canvas the user works in — what
+        tells two canvases apart once there are several."""
+        self._canvas_active = bool(on)
+        self._style_page_button()
+
+    def _style_page_button(self) -> None:
+        edge = T.ACCENT if self._canvas_active else T.BORDER
+        self.page_button.setStyleSheet(
+            f"QToolButton#pageSwitch {{ background:{T.PANEL.name()}; color:{T.INK.name()}; "
+            f"border:1px solid {edge.name()}; border-radius:6px; "
+            f"padding:3px 18px 3px 6px; font-size:11px; font-weight:700; }}"
+            f"QToolButton#pageSwitch:hover {{ background:{T.PANEL_HI.name()}; }}")
 
     def _hud_siblings(self) -> List[QWidget]:
         """The other *floating* HUD widgets over the canvas (mini-map, welcome card,
@@ -1174,6 +1237,7 @@ class GraphView(QGraphicsView):
     def restyle(self) -> None:
         self._max_btn.update()
         self._style_ts_badge()          # amber + ink come from the theme tokens
+        self._style_page_button()
         self._place_corner_chrome()
 
     def resizeEvent(self, e) -> None:
@@ -1216,6 +1280,7 @@ class GraphView(QGraphicsView):
     # keeps the rubber-band marquee, and a drag that starts on a node/socket/edge
     # falls through to the default handling (move node / start wire).
     def mousePressEvent(self, e) -> None:
+        self.pressed.emit()                 # this canvas becomes the one worked in, first
         if (e.button() == Qt.LeftButton
                 and self.itemAt(e.position().toPoint()) is None
                 and not (e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier))):
@@ -1346,6 +1411,7 @@ class GraphView(QGraphicsView):
             super().dragMoveEvent(e)
 
     def dropEvent(self, e) -> None:
+        self.pressed.emit()                 # a drop lands on THIS canvas's page
         if e.mimeData().hasFormat("application/x-nd2studios-op"):
             op = bytes(e.mimeData().data("application/x-nd2studios-op")).decode("utf-8")
             self.op_dropped.emit(op, self.mapToScene(e.position().toPoint()))

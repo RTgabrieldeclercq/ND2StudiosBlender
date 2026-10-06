@@ -24976,6 +24976,104 @@ def test_viewer_routing() -> None:
         "every viewer; Viewer and plot cards are visual outputs")
 
 
+def test_pages_seam() -> None:
+    """V4.00 step 5, the Qt-free half of pages in the GUI: a page's KIND decides which nodes
+    its readiness suggestions offer (a later page's missing source is a Page Input, not a
+    file); a dock fed through a Page Input goes stale when the upstream page changes, while a
+    dock whose chain stays on its page keeps exactly the signature its bake recorded; and an
+    edit drops the display caches only on the pages it can reach."""
+    from types import SimpleNamespace
+    from nodegraph import roles as R
+    from nodegraph.domains import Domain
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import readiness as RD
+    from nodelab_v2.runner import EngineRunner, PlaneCache
+    ws, _ds, _env, _ax = _ws_fixture()
+    I, Rf, P1, P2 = (ws.pages[p] for p in ("pg1", "pg2", "pg3", "pg4"))
+
+    # readiness: producers by kind, and the source a page of that kind starts from
+    every = {s.op_key for s in RD.producers_of(Domain.LABEL)}
+    refine = {s.op_key for s in RD.producers_of(Domain.LABEL, "refine")}
+    inp = {s.op_key for s in RD.producers_of(Domain.LABEL, "input")}
+    assert refine and refine <= every and inp <= every, (refine, inp)
+    assert all(R.op_in_page(op, "refine") for op in refine)
+    assert all(R.op_in_page(op, "input") for op in inp) and inp != every
+    Rf.doc.add_node("enhance.median", node_id="LONE")          # nothing wired into it
+    Rf.doc.remove_node("IN")                                  # …and no source on the page
+    probs = [p for p in RD.problems(Rf.doc, "LONE") if p.kind == "unwired"]
+    assert probs and probs[0].suggestions[0].op_key == OPS.PAGE_INPUT_OP, probs
+    I.doc.add_node("enhance.median", node_id="LONE")
+    I.doc.remove_node("L")
+    probs = [p for p in RD.problems(I.doc, "LONE") if p.kind == "unwired"]
+    assert probs and probs[0].suggestions[0].op_key == "io.load", probs
+    ws, _ds, _env, _ax = _ws_fixture()                        # a clean fixture again
+    I, Rf, P1, P2 = (ws.pages[p] for p in ("pg1", "pg2", "pg3", "pg4"))
+
+    # a dock's signature across pages
+    P1.doc.add_node(OPS.DOCK_OP, node_id="D")
+    P1.doc.connect("X", "out", "D", "data")
+    plain = OPS.upstream_signature(P1.doc.to_graph(bypass_muted=True), "D")
+    s0 = P1.doc.dock_signature("D")
+    assert s0 and s0 != plain, "a chain through a Page Input folds the upstream page in"
+    Rf.doc.nodes["G"].params["sigma"] = 2.0
+    Rf.doc.touch("G")
+    s1 = P1.doc.dock_signature("D")
+    assert s1 != s0, "an edit on the upstream page stales the dock"
+    I.doc.nodes["O"].params["name"] = "raw"                   # a no-op write…
+    I.doc.touch("O")
+    assert P1.doc.dock_signature("D") == s1, "…changes nothing"
+    # renaming the upstream page changes what its Output stamps as the condition while the
+    # Output leaves it blank — so it stales the dock — and nothing once a condition is set
+    ws.rename_page("pg2", "Refine B")
+    s2 = P1.doc.dock_signature("D")
+    assert s2 != s1, "the condition the upstream Output stamps changed"
+    # …and the same rename stales a dock on the Output's OWN page, fed by it: the condition
+    # that blank Output stamps is this page's name too
+    Rf.doc.add_node(OPS.DOCK_OP, node_id="DO")
+    Rf.doc.connect("O", "out", "DO", "data")
+    u0 = Rf.doc.dock_signature("DO")
+    ws.rename_page("pg2", "Refine B2")
+    assert Rf.doc.dock_signature("DO") != u0, "a blank Output on the dock's own page"
+    Rf.doc.nodes["O"].params["condition"] = "treated"
+    Rf.doc.touch("O")
+    s3 = P1.doc.dock_signature("D")
+    u3 = Rf.doc.dock_signature("DO")
+    ws.rename_page("pg2", "Refine C")
+    assert P1.doc.dock_signature("D") == s3, "an explicit condition does not follow the name"
+    assert Rf.doc.dock_signature("DO") == u3, "…on the Output's own page either"
+    I.doc.add_node(OPS.DOCK_OP, node_id="D2")
+    I.doc.connect("L", "image", "D2", "data")
+    assert I.doc.dock_signature("D2") == OPS.upstream_signature(
+        I.doc.to_graph(bypass_muted=True), "D2"), \
+        "a dock whose chain stays on its page keeps the signature its bake recorded"
+    # a page with no Page Input: its blank Output still stamps the page's name
+    I.doc.add_node(OPS.DOCK_OP, node_id="D3")
+    I.doc.connect("O", "out", "D3", "data")
+    v0 = I.doc.dock_signature("D3")
+    assert v0 != OPS.upstream_signature(I.doc.to_graph(bypass_muted=True), "D3")
+    ws.rename_page("pg1", "Input B")
+    assert I.doc.dock_signature("D3") != v0, "renaming the page stales it"
+
+    # the display caches an edit drops: the pages it can reach, no others
+    fake = SimpleNamespace(_source=ws)
+    fake._page_of_run = lambda r: EngineRunner._page_of_run(fake, r)
+    reach = lambda *ids: EngineRunner._pages_reading(fake, ids)          # noqa: E731
+    assert reach("pg2/G") == {"pg2", "pg3", "pg4"}, reach("pg2/G")
+    assert reach("pg3/X") == {"pg3"}
+    assert reach("pg1/L") == {"pg1", "pg2", "pg3", "pg4"}
+    pc = PlaneCache(budget_bytes=1 << 20)
+    for key in (("pg1/a", 0), ("pg3/b", 0), ("pg4/c", 0)):
+        pc.put(key, np.zeros((4, 4), np.uint16))
+    assert pc.drop_where(lambda k: fake._page_of_run(k[0]) in reach("pg3/X")) == 1
+    assert pc.get(("pg1/a", 0)) is not None and pc.get(("pg4/c", 0)) is not None
+    assert pc.get(("pg3/b", 0)) is None
+    _ok("pages seam (V4.00 step 5): readiness offers the producers a page's kind offers and "
+        "starts a later page from a Page Input; a dock fed through a Page Input goes stale "
+        "on an upstream edit, and a dock under a blank-condition Page Output on a rename of "
+        "the page that Output stamps, while a single-page dock keeps its recorded signature; "
+        "an edit drops the display caches of the pages it reaches, and only those")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -25067,6 +25165,7 @@ def main() -> int:
     test_runner_qualified_ids()
     test_layout_store()
     test_viewer_routing()
+    test_pages_seam()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

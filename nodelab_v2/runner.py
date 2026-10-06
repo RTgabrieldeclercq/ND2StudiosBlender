@@ -55,7 +55,8 @@ import time
 import traceback
 from collections import OrderedDict
 from dataclasses import replace
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (Any, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence,
+                    Tuple)
 
 import numpy as np
 
@@ -911,6 +912,15 @@ class PlaneCache:
         with self._lock:
             self._d.clear()
             self._bytes = 0
+
+    def drop_where(self, pred) -> int:
+        """Drop every plane whose key satisfies ``pred`` (V4.00 step 5: the planes of the
+        pages an edit can reach); returns how many went."""
+        with self._lock:
+            gone = [k for k in self._d if pred(k)]
+            for k in gone:
+                self._bytes -= int(getattr(self._d.pop(k), "nbytes", 0))
+            return len(gone)
 
 
 #: minimum gap between two *fractional* progress deliveries for one node (seconds). A
@@ -2307,7 +2317,15 @@ class EngineRunner(QObject):
             # later frame re-pulled through the engine at ~3.4 s instead of serving the
             # planes it had already decoded.
             return
-        self._views.clear()
+        # the held views and the decoded planes describe pixels the edit may have moved — on
+        # the pages it can REACH (V4.00 step 5): the touched pages and every page that reads
+        # them through Page Inputs. Another page's viewers keep scrubbing from memory.
+        reach = None if nodes is None else self._pages_reading(nodes)
+        if reach is None:
+            self._views.clear()
+        else:
+            for rid in [r for r in self._views if self._page_of_run(r) in reach]:
+                self._views.pop(rid, None)
         self.invalidate_detail()
         dropped: List[str] = []          # queued requests this call retires
         if nodes is None:
@@ -2354,19 +2372,54 @@ class EngineRunner(QObject):
         # …and the same for an in-flight viewport detail patch, which is reading through
         # the provider this call is about to drop
         self.invalidate_detail()
-        # A preload is reading that provider too, and its planes are about to be wrong.
-        self.cancel_preload()
+        # A preload is reading that provider too, and its planes are about to be wrong —
+        # when it plays a page the edit reaches (another page's playback keeps going).
+        if reach is None or self._page_of_run(self._preload_node or "") in reach:
+            self.cancel_preload()
         # the composed overlay belongs to the graph that produced it — an edit can change
         # the placement, the pairing or the secondary chain entirely. Except a run that
         # SURVIVED this call: no touched id is in its cone, so the context it resolved from
-        # that cone is still true — and its worker may be about to decode its first plane
+        # that cone is still true — and its worker may be about to decode its first plane.
+        # And except another page's: its held view is kept, and only a RE-ARM restores a
+        # context, so dropping it would strip that page's overlay from its next scrub.
         live = set(self._runs.values())
-        for nid in [n for n in self._overlay_ctxs if n not in live]:
+        for nid in [n for n in self._overlay_ctxs if n not in live
+                    and (reach is None or self._page_of_run(n) in reach)]:
             self._overlay_ctxs.pop(nid, None)
         # ...and the per-source LUT with them: it is keyed by SOURCE NODE, so editing that
         # node's path would otherwise leave the previous file's window on the overlay.
-        self._src_lut_cache.clear()
-        self._planes.clear()
+        if reach is None:
+            self._src_lut_cache.clear()
+        else:
+            for key in [k for k in self._src_lut_cache if self._page_of_run(k) in reach]:
+                self._src_lut_cache.pop(key, None)
+        if reach is None:
+            self._planes.clear()
+        else:
+            self._planes.drop_where(lambda k: self._page_of_run(str(k[0])) in reach)
+
+    def _page_of_run(self, run_id: str) -> str:
+        pid, _nid = split_run_id(str(run_id))
+        return pid or (getattr(self._source, "active", None) or "")
+
+    def _pages_reading(self, nodes) -> Optional[FrozenSet[str]]:
+        """The pages an edit of ``nodes`` can change results on: their own pages and every
+        page that reads one of them through Page Inputs, transitively. ``None`` when that
+        cannot be told (a source without page dependencies) — then everything is."""
+        src = self._source
+        closure = getattr(src, "dependency_closure", None)
+        ids = list(src.page_ids()) if hasattr(src, "page_ids") else []
+        touched = {self._page_of_run(str(r)) for r in nodes}
+        if closure is None or not ids:
+            return None
+        out = set(touched)
+        for q in ids:
+            try:
+                if touched & set(closure(q, strict=False)):
+                    out.add(q)
+            except Exception:                        # noqa: BLE001 — assume it reads them
+                out.add(q)
+        return frozenset(out)
 
     # ── the solo-frame (troubleshooting) scope ─────────────────────────────────
     @property
