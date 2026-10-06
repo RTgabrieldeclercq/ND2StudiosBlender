@@ -1,0 +1,51 @@
+{
+  "app_version": "4.0.0",
+  "description": "Plot Distribution \u2014 a histogram of `area` over every object; switch `kind` to box, violin, kde or ecdf and `value` to another column.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "analyze",
+  "name": "Distribution",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "plot",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "in",
+          "src_socket": "out"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "in",
+          "modes": {},
+          "op_key": "page.input",
+          "params": {
+            "source": ""
+          }
+        },
+        {
+          "id": "plot",
+          "modes": {},
+          "op_key": "plot.distribution",
+          "params": {}
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "in": {
+          "x": 0,
+          "y": 150
+        },
+        "plot": {
+          "x": 306,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

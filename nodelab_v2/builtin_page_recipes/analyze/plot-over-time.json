@@ -1,0 +1,51 @@
+{
+  "app_version": "4.0.0",
+  "description": "Plot Time Series of `area` per frame (mean \u00b1 sem band) from the measured table a Processing page hands on; change `value` for another column.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "analyze",
+  "name": "Plot over time",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "plot",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "in",
+          "src_socket": "out"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "in",
+          "modes": {},
+          "op_key": "page.input",
+          "params": {
+            "source": ""
+          }
+        },
+        {
+          "id": "plot",
+          "modes": {},
+          "op_key": "plot.timeseries",
+          "params": {}
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "in": {
+          "x": 0,
+          "y": 150
+        },
+        "plot": {
+          "x": 306,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

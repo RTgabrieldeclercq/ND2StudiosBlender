@@ -50,7 +50,9 @@ from nodelab_v2.canvas import CanvasPanel, kind_icon
 from nodelab_v2.workspace import (FREE as FREE_KIND, Workspace, build_example, kind_label,
                                   local_ids, qualify, split_run_id)
 from nodelab_v2.document import GraphDocument
-from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedPageError
+from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedDocument, LinkedPageError
+from nodelab_v2 import page_recipes as PR
+from nodelab_v2.new_page_dialog import NewPageDialog, SavePageRecipeDialog
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
@@ -977,6 +979,7 @@ class MainWindow(QMainWindow):
         sc.pick_requested.connect(self._arm_pick)
         sc.dock_action.connect(self._on_dock_action)
         sc.topology_refused.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
+        sc.new_page_from_output.connect(part(self._new_page_from_output, page_id))
         doc = self.workspace.page(page_id).doc
         hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id)]
         for fn in hooks:
@@ -1022,6 +1025,10 @@ class MainWindow(QMainWindow):
             sig.connect(lambda _=None, c=c, fn=fn: (self._activate_canvas(c), fn()))
         c.welcome.op_dropped.connect(
             lambda op, pos, c=c: (self._activate_canvas(c), self._on_op_dropped(op, pos)))
+        c.welcome.recipe_requested.connect(
+            lambda _=None, c=c: (self._activate_canvas(c), self.new_page_dialog(
+                kind=self.workspace.pages[c.page_id].kind, canvas=c, into=c.page_id,
+                start=PR.START_RECIPE)))
 
     def _apply_canvas_binding(self, c: CanvasPanel, page_id) -> None:
         """A restored canvas shows its saved page when the workspace has it."""
@@ -1031,7 +1038,7 @@ class MainWindow(QMainWindow):
     def page_title(self, page_id: str) -> Tuple[str, str]:
         """``(name, kind)`` of a page, for a canvas's switcher."""
         page = self.workspace.pages.get(page_id)
-        return (page.name, page.kind) if page is not None else (page_id, "free")
+        return (self._page_label(page), page.kind) if page is not None else (page_id, "free")
 
     def fill_page_menu(self, menu, c: CanvasPanel) -> None:
         """A canvas's page switcher: every page grouped by kind (the one shown ticked), then
@@ -1045,9 +1052,12 @@ class MainWindow(QMainWindow):
                 continue
             menu.addSection(kind_label(kind))
             for p in pages:
-                act = menu.addAction(kind_icon(kind), p.name + ("   · linked" if p.master else ""))
+                act = menu.addAction(kind_icon(kind), self._page_label(p))
                 if p.master and p.master in ws.pages:
-                    act.setToolTip(f"linked to “{ws.pages[p.master].name}”")
+                    act.setToolTip(f"linked to “{ws.pages[p.master].name}” — its values are its "
+                                   f"own, its graph is the master's")
+                elif p.is_master:
+                    act.setToolTip("a master page: offered first when a new page is linked to one")
                 act.setCheckable(True)
                 act.setChecked(p.id == c.page_id)
                 act.triggered.connect(lambda _=False, pid=p.id, c=c: self._show_page(c, pid))
@@ -1057,6 +1067,14 @@ class MainWindow(QMainWindow):
             act = new.addAction(kind_icon(kind), kind_label(kind))
             act.setToolTip(str(R.page_meta(kind).get("description") or ""))
             act.triggered.connect(lambda _=False, k=kind, c=c: self.new_page(k, canvas=c))
+        shown = ws.pages.get(c.page_id)
+        dlg = menu.addAction("New page…")
+        dlg.setToolTip("A new page with its kind, name and start settled first: empty, from a "
+                       "page recipe (a prebuilt page graph), or linked to a master page — and "
+                       "which earlier Output it reads.")
+        dlg.triggered.connect(
+            lambda _=False, c=c, k=(PR.next_kind(shown.kind) or shown.kind) if shown else "refine":
+            self.new_page_dialog(kind=k, canvas=c))
         menu.addSeparator()
         menu.addAction("Duplicate page").triggered.connect(
             lambda _=False, c=c: self.duplicate_page(c.page_id, canvas=c))
@@ -1066,7 +1084,14 @@ class MainWindow(QMainWindow):
                       "tuned per position or condition.")
         lk.triggered.connect(
             lambda _=False, c=c: self.duplicate_page(c.page_id, canvas=c, linked=True))
-        shown = ws.pages.get(c.page_id)
+        mst = menu.addAction("Set as master page")
+        mst.setCheckable(True)
+        mst.setChecked(bool(shown is not None and shown.is_master))
+        mst.setEnabled(shown is not None and not shown.master)
+        mst.setToolTip("Offer this page first (★) when a new page is linked to a master. Any "
+                       "plain page can still be chosen; a linked page cannot be a master.")
+        mst.triggered.connect(
+            lambda on, c=c: self.set_master_page(c.page_id, bool(on)))
         if shown is not None and shown.master:
             menu.addAction("Go to master page").triggered.connect(
                 lambda _=False, c=c, m=shown.master: self._show_page(c, m))
@@ -1076,6 +1101,10 @@ class MainWindow(QMainWindow):
             lambda _=False, c=c: self.open_canvas(c.page_id))
         menu.addAction("Rename page…").triggered.connect(
             lambda _=False, c=c: self.rename_page(c.page_id))
+        sv = menu.addAction("Save as page recipe…")
+        sv.setToolTip("Keep this page's graph as a starting point for new pages (New page… ▸ "
+                      "Page recipe). Not a LabLink recipe — Graph ▸ Publish is that.")
+        sv.triggered.connect(lambda _=False, c=c: self.save_page_as_recipe(c.page_id))
         dele = menu.addAction("Delete page")
         dele.setEnabled(len(ws.pages) > 1)
         dele.triggered.connect(lambda _=False, c=c: self.delete_page(c.page_id))
@@ -1084,6 +1113,106 @@ class MainWindow(QMainWindow):
         """Show ``page_id`` on canvas ``c`` and work there."""
         c.set_page(page_id)
         self._activate_canvas(c)
+
+    # ── New page… / masters / page recipes (V4.00 step 11) ───────────────────
+    @staticmethod
+    def _override_count(page) -> int:
+        doc = page.doc
+        return int(doc.override_count()) if isinstance(doc, LinkedDocument) else 0
+
+    def _page_label(self, page) -> str:
+        """``★ name`` for a master page; ``name  (linked · N overrides)`` for a linked one."""
+        text = ("★ " if getattr(page, "is_master", False) else "") + page.name
+        if page.master:
+            n = self._override_count(page)
+            text += f"  (linked · {n} override{'' if n == 1 else 's'})"
+        return text
+
+    def new_page_dialog(self, *, kind: str, canvas: Optional[CanvasPanel] = None,
+                        source: Optional[str] = None, start: str = PR.START_EMPTY,
+                        into: Optional[str] = None, master: Optional[str] = None,
+                        recipe: Optional[str] = None) -> Optional[str]:
+        """*New page…*: the dialog, then :meth:`_apply_new_page`. Returns the page id, or
+        ``None`` when cancelled or refused (the reason is on the status bar)."""
+        dlg = NewPageDialog(self, self.workspace, kind=kind, source=source, start=start,
+                            into=into, master=master, recipe=recipe)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return self._apply_new_page(dlg.spec(), canvas=canvas, into=into)
+
+    def _apply_new_page(self, spec, *, canvas: Optional[CanvasPanel] = None,
+                        into: Optional[str] = None) -> Optional[str]:
+        """Apply a :class:`~nodelab_v2.page_recipes.NewPageSpec` and show the page (the
+        probe drives this without the dialog)."""
+        try:
+            page = PR.apply_new_page(self.workspace, spec, into=into)
+        except (ValueError, LinkedPageError) as exc:
+            self.statusBar().showMessage(f"new page refused: {exc}", 8000)
+            return None
+        self._show_page(canvas or self._canvas, page.id)
+        if spec.start == PR.START_RECIPE and spec.recipe is not None:
+            msg = f"new {kind_label(page.kind)} page “{page.name}” from the page recipe “{spec.recipe.name}”"
+        elif spec.start == PR.START_LINKED and page.master in self.workspace.pages:
+            master = self.workspace.pages[page.master].name
+            msg = f"“{page.name}” follows “{master}”: change values here, edit the graph there"
+        else:
+            msg = f"new {kind_label(page.kind)} page “{page.name}”"
+        reads = [str(r.params.get(PAGE_SOURCE_KEY) or "") for r in page.doc.nodes.values()
+                 if r.op_key == PAGE_INPUT_OP]
+        if reads:
+            labels = dict(page.doc.source_choices(""))
+            msg += f" — its Page Input reads {labels.get(reads[0], reads[0])}"
+        self.statusBar().showMessage(msg)
+        return page.id
+
+    def _new_page_from_output(self, page_id: str, node_id: str) -> Optional[str]:
+        """A Page Output's *New page from this output…*: the dialog, pre-set to a page of the
+        next kind whose Page Input reads this Output."""
+        page = self.workspace.pages.get(page_id)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None:
+            return None
+        name = str(rec.params.get(PAGE_NAME_KEY) or "").strip()
+        if not name:
+            self.statusBar().showMessage("give this Output a Name first", 6000)
+            return None
+        kind = PR.next_kind(page.kind) or page.kind
+        start = PR.START_RECIPE if PR.list_recipes(kind) else PR.START_EMPTY
+        return self.new_page_dialog(kind=kind, canvas=self._canvas,
+                                    source=f"{page_id}:{name}", start=start)
+
+    def set_master_page(self, page_id: str, on: bool) -> bool:
+        """The switcher's *Set as master page*."""
+        try:
+            self.workspace.set_master(page_id, on)
+        except (KeyError, ValueError) as exc:
+            self.statusBar().showMessage(str(exc), 8000)
+            return False
+        page = self.workspace.pages[page_id]
+        self.statusBar().showMessage(
+            f"“{page.name}” is {'now' if on else 'no longer'} a master page"
+            + (" — offered first when a new page is linked to one" if on else ""))
+        return True
+
+    def save_page_as_recipe(self, page_id: str, *, name: Optional[str] = None,
+                            description: str = "") -> Optional[str]:
+        """*Save as page recipe…*: the page's graph, as a starting point for new pages
+        (:mod:`nodelab_v2.page_recipes`). Returns the file written, or ``None``."""
+        page = self.workspace.pages.get(page_id)
+        if page is None:
+            return None
+        if name is None:
+            dlg = SavePageRecipeDialog(self, page)
+            if dlg.exec() != QDialog.Accepted:
+                return None
+            name, description = dlg.name(), dlg.description()
+        try:
+            path = PR.save_recipe(PR.recipe_from_page(page, name, description))
+        except (RuntimeError, OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"page recipe not saved: {exc}", 8000)
+            return None
+        self.statusBar().showMessage(f"page recipe “{name}” written to {path}")
+        return str(path)
 
     # ── where a loaded image goes (V4.00 step 11) ─────────────────────────────
     def _input_page(self, *, create: bool = True) -> Optional[str]:
@@ -1389,6 +1518,13 @@ class MainWindow(QMainWindow):
                 self.inspector.rebuild()
         elif getattr(self, "_ui_page", None) is None:
             self._sync_active_page_ui()
+        # ★ and "(linked · N overrides)" ride the switcher's label (V4.00 step 11) — kept out
+        # of `sig`, which would rebuild the Properties panel on every value edit of a linked page
+        tsig = tuple((p.id, p.is_master, self._override_count(p)) for p in ws.pages.values())
+        if tsig != getattr(self, "_title_sig", None):
+            self._title_sig = tsig
+            for c in self.canvases():
+                c.sync_title()
 
     def _sync_active_page_ui(self) -> None:
         """What follows the active page: the palette's kind, the inspector (the page's own
@@ -1641,6 +1777,12 @@ class MainWindow(QMainWindow):
             "install.")
         publish.triggered.connect(self.publish_recipe)
         m_graph.addAction(publish)
+        save_pr = QAction("Save page as a &page recipe…", self)
+        save_pr.setToolTip(
+            "Keep the active page's graph as a starting point for new pages (the page "
+            "switcher's New page… ▸ Page recipe). Not a LabLink recipe — Publish is that.")
+        save_pr.triggered.connect(lambda: self.save_page_as_recipe(self.workspace.active))
+        m_graph.addAction(save_pr)
 
         m_view = self.menuBar().addMenu("&View")
         fit = QAction("&Fit graph", self)
@@ -5206,6 +5348,8 @@ class MainWindow(QMainWindow):
             page = ws.pages.get(c.page_id)
             c.welcome.setVisible(page is not None and not any(
                 r.op_key != PAGE_INPUT_OP for r in page.doc.nodes.values()))
+            if page is not None:
+                c.welcome.set_page_kind(page.kind, bool(ws.available_sources(page.id)))
             if c.welcome.isVisible():
                 c.welcome.raise_()
                 c.minimap.raise_()          # the mini-map still owns its corner

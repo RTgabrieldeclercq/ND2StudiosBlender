@@ -1,0 +1,93 @@
+{
+  "app_version": "4.0.0",
+  "description": "Gaussian Blur, then a global Threshold; hands the mask on as the Output `mask` for a Processing page to label and measure.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "refine",
+  "name": "Smooth & threshold",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "blur",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "in",
+          "src_socket": "out"
+        },
+        {
+          "dst": "thr",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "blur",
+          "src_socket": "out"
+        },
+        {
+          "dst": "out",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "thr",
+          "src_socket": "out"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "in",
+          "modes": {},
+          "op_key": "page.input",
+          "params": {
+            "source": ""
+          }
+        },
+        {
+          "id": "blur",
+          "modes": {
+            "dim": "2D"
+          },
+          "op_key": "enhance.gaussian",
+          "params": {
+            "sigma": 1.0
+          }
+        },
+        {
+          "id": "thr",
+          "modes": {},
+          "op_key": "analysis.threshold",
+          "params": {
+            "name": "mask"
+          }
+        },
+        {
+          "id": "out",
+          "modes": {},
+          "op_key": "page.output",
+          "params": {
+            "name": "mask"
+          }
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "blur": {
+          "x": 306,
+          "y": 150
+        },
+        "in": {
+          "x": 0,
+          "y": 150
+        },
+        "out": {
+          "x": 918,
+          "y": 150
+        },
+        "thr": {
+          "x": 612,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

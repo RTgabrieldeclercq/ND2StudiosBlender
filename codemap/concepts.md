@@ -467,7 +467,12 @@ not override that is fed only by those. A root on the linked page itself (an `io
 any seeded source) carries that page's own run id as `__source__`, so a linked Image Input
 page computes its own chain.
 
-see: CON-17 · CON-09 · [MANUAL §2 Linked pages](../MANUAL.md)
+Since step 11 the switcher labels a linked page `(linked · N overrides)`, and *New page… ▸
+Linked to a master page* makes one with its Page Input's `source` already written as an
+override — `source` is an ordinary param, so a copy reads a different Output than its master
+without touching the master (CON-21).
+
+see: CON-17 · CON-09 · CON-21 · [MANUAL §2 Linked pages](../MANUAL.md)
 
 ---
 
@@ -519,3 +524,31 @@ another version is set aside as `layout.json.rejected` once and the default layo
 `NODELAB_LAYOUT_FILE` redirects it.
 
 see: [MANUAL §2 Panels](../MANUAL.md) · CON-17
+
+---
+
+### CON-21 — page recipe
+anchors: sym:nodelab_v2.page_recipes.PageRecipe, sym:nodelab_v2.page_recipes.apply_new_page, sym:nodelab_v2.page_recipes.instantiate, sym:nodelab_v2.workspace.Workspace.set_master
+
+A **page recipe** is one page's graph — its `to_page_dict` body (nodes, wires, zones, groups,
+positions) — under a name, a kind and a line of description, as a starting point for a new
+page: *New page… ▸ Page recipe*. Built-ins ship in `nodelab_v2/builtin_page_recipes/<kind>/<slug>.json`
+("Smooth & threshold", "Label & measure", …); the user's own are written by *Save as page
+recipe…* to `~/.nd2studios/page_recipes/` (`NODELAB_PAGE_RECIPES_DIR` redirects,
+`NODELAB_PAGE_RECIPES=0` disables) and shadow a built-in of the same kind and name. A file is
+`{"format": "nd2studios.page-recipe/1", name, kind, description, app_version, page}`; a file
+that is not one is skipped, never trusted. `instantiate` adds a page (or takes over an empty
+one holding only its seeded Page Input), loads the body through `Workspace.load_page_body`
+(so `_OP_RENAMES` apply), binds its Page Inputs to the chosen Output or the page's default
+source, and keeps its Output names unique. It is **not a LabLink recipe** (a whole graph
+published for a hub, `nodelab_v2.lablink.recipe`): both labels carry their qualifier.
+
+The *New page…* dialog settles kind, name, start — empty / page recipe / **linked to a master
+page** — and the Output the page reads; `apply_new_page` applies the `NewPageSpec`: a linked
+start is `Workspace.duplicate_page(dependent=True)` with the chosen source written as that
+page's override. **Masters:** `Page.is_master` (★ in the switcher, in the file only when set;
+never on a linked page) puts a page first in the dialog's *Master* menu — any plain page may
+still be chosen. `Workspace.sources_for_kind` / `default_source_for_kind` answer for a page
+that does not exist yet.
+
+see: CON-17 · CON-18 · [MANUAL §2 Pages](../MANUAL.md)

@@ -265,6 +265,21 @@ master later reaches the same value. A **Dock** keeps its checkpoint per page: b
 holding it on a linked page uses that page's own folder and never the master's, and a Load
 pointed at another file describes only its own page.
 
+**Page recipes and masters** (V4.00). The switcher's **New page…** settles a page before it
+exists: its kind and name, how it **starts** — *Empty page* (one Page Input, bound), *Page
+recipe*, or *Linked to a master page* — and which earlier **Output** its Page Input reads
+(more Inputs can be added on the page at any time). A **page recipe** is a prebuilt page
+graph: built-ins such as *Smooth & threshold* (Refinement), *Label & measure* and *Track
+objects* (Processing), *Plot over time* and *Distribution* (Analysis), plus any page you keep
+with **Save as page recipe…** (the switcher, or Graph ▸ *Save page as a page recipe…*), stored
+in `~/.nd2studios/page_recipes/`; a saved recipe with a built-in's name replaces it in the list.
+A page recipe is *not* a LabLink recipe (§17b) — one is a starting point for a page of this
+editor, the other a whole graph published for a hub. **Set as master page** (the switcher)
+marks a page with ★ and offers it first when a new page is *linked to a master*; any plain
+page can still be chosen, and the linked page's switcher label reads `(linked · N overrides)`.
+The welcome card of an empty Refinement, Processing or Analysis page offers *Start from a page
+recipe…*, and a Page Output's right-click menu offers *New page from this output…*.
+
 **Several Viewers** (V4.00). **+** on a Viewer's title bar, or **View ▸ New ▸ Viewer**, opens
 another Viewer beside it; pop one out onto a second screen with **⇱**. Each Viewer keeps
 showing the node it was given, and its title bar names it (`Viewer · n3 · Gaussian Blur`). The
@@ -295,13 +310,17 @@ workflow tuned per dish, compared on one plot.
 2. **Refinement page.** Open the Image Refinement page (the switcher, or `Ctrl+PgDn`): it
    arrives with a **Page Input** reading the newest Output — set its **Source** to
    `Image Input · dishA` → Gaussian Blur → Threshold → a Page Output named `mask` (the
-   Ready-to-run block on Threshold offers *+ Page Output*; rename it).
+   Ready-to-run block on Threshold offers *+ Page Output*; rename it). Or let the welcome
+   card's *Start from a page recipe…* place *Smooth & threshold* and set its Source.
 3. **A variant.** The switcher's *Duplicate as linked page*. On the copy, change Threshold's
    level and point its Page Input at `dishB` — both become that page's **overrides** (a bar
    on the row). Adding or rewiring a node there is refused: edit the master, and both follow.
-4. **Processing pages.** Open the Image Processing page: its Page Input reads
-   `Image Refinement · mask` → Connected Components → Measure → Page Output `cells`.
-   Duplicate it as a linked page and point its input at the linked refinement's `mask`.
+4. **Processing pages.** Open the Image Processing page. Its Page Input arrives bound to
+   the NEWEST Refinement page — the linked copy from step 3 — so set its Source to
+   `Image Refinement · mask` first → Connected Components → Measure → Page Output `cells`
+   (or *New page… ▸ Page recipe ▸ Label & measure*). Duplicate it as a linked page — or
+   *New page… ▸ Linked to a master page* — and point its input at
+   `Image Refinement (linked) · mask`.
 5. **Analysis page.** *New page ▸ Analysis*: two Page Inputs (`Image Processing · cells`,
    `Image Processing (linked) · cells`) → **Table Concat** (a `condition` column names each row's
    source) → **Table Aggregate** (Table `combined` — Table Concat passes the first input's own table on too — Group by `condition,t`) → **Plot XY** (Table `summary`,
@@ -2256,8 +2275,9 @@ print(report.summary(), report.removed, report.added)
   opened, and no importer will be built.
 * **V4.00 — the file is a workspace.** Save writes `format_version` **`3.0`**:
   `{format_version, app_version, workspace: {active, next_page_seq, pages: [...]}}`, one
-  record per node-graph page (`id`, `name`, `kind`, then the single-graph body
-  `graph`/`zones`/`groups`/`ui`). A pre-V4 single-graph file (`2.0`) still opens — as one
+  record per node-graph page (`id`, `name`, `kind`, `is_master` when set, then the
+  single-graph body `graph`/`zones`/`groups`/`ui`; a linked page carries `master` and
+  `overrides` instead). A pre-V4 single-graph file (`2.0`) still opens — as one
   **Free** page named after the file — and a tool that only knows single graphs
   (`nodegraph.serialize.from_dict`, an older recipe tool) reads a 3.0 file as its **active
   page**. Page ids (`pg1`, `pg2`, …) come from a counter stored in the file and are never

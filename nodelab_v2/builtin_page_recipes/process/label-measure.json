@@ -1,0 +1,87 @@
+{
+  "app_version": "4.0.0",
+  "description": "Connected Components on the `mask` layer, then Measure (mean / max / min / count per object); hands the measured dataset on as `cells` for an Analysis page.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "process",
+  "name": "Label & measure",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "label",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "in",
+          "src_socket": "out"
+        },
+        {
+          "dst": "measure",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "label",
+          "src_socket": "out"
+        },
+        {
+          "dst": "out",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "measure",
+          "src_socket": "out"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "in",
+          "modes": {},
+          "op_key": "page.input",
+          "params": {
+            "source": ""
+          }
+        },
+        {
+          "id": "label",
+          "modes": {},
+          "op_key": "analysis.label",
+          "params": {}
+        },
+        {
+          "id": "measure",
+          "modes": {},
+          "op_key": "analysis.measure",
+          "params": {}
+        },
+        {
+          "id": "out",
+          "modes": {},
+          "op_key": "page.output",
+          "params": {
+            "name": "cells"
+          }
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "in": {
+          "x": 0,
+          "y": 150
+        },
+        "label": {
+          "x": 306,
+          "y": 150
+        },
+        "measure": {
+          "x": 612,
+          "y": 150
+        },
+        "out": {
+          "x": 918,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

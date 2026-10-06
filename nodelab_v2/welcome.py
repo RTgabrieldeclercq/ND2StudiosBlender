@@ -32,6 +32,9 @@ class WelcomeCard(QWidget):
     load_image_requested = Signal()
     browse_nodes_requested = Signal()
     example_requested = Signal()
+    #: the primary button on an empty page that reads earlier pages (V4.00 step 11): start
+    #: it from a page recipe (or linked to a master) instead of loading an image
+    recipe_requested = Signal()
     op_dropped = Signal(str, QPointF)     # (op_key, scene position) — drop passthrough
 
     def __init__(self, parent: QWidget) -> None:
@@ -79,13 +82,48 @@ class WelcomeCard(QWidget):
             row.addWidget(b)
         lay.addLayout(row)
 
-        self._btn_load.clicked.connect(self.load_image_requested.emit)
+        self._recipe_mode = False
+        self._btn_load.clicked.connect(self._on_primary)
         self._btn_browse.clicked.connect(self.browse_nodes_requested.emit)
         self._btn_example.clicked.connect(self.example_requested.emit)
 
         parent.installEventFilter(self)
         self.hide()
         self.restyle()
+
+    # ── what the card says on which page (V4.00 step 11) ───────────────────────
+    def _on_primary(self) -> None:
+        (self.recipe_requested if self._recipe_mode else self.load_image_requested).emit()
+
+    def set_page_kind(self, kind: str, has_upstream: bool) -> None:
+        """Word the card for its page: an Input (or Free) page invites a load; a later page
+        with something to read offers a page recipe and names the Page Input."""
+        from nodelab_v2.workspace import kind_label
+        recipe = kind not in ("input", "free") and bool(has_upstream)
+        if recipe == self._recipe_mode and getattr(self, "_kind_shown", None) == kind:
+            return
+        self._recipe_mode, self._kind_shown = recipe, kind
+        if recipe:
+            self._title.setText(f"Start your {kind_label(kind)} page")
+            self._sub.setText("A Page Input already reads an earlier page — build on it, "
+                              "or start from a page recipe.")
+            self._btn_load.setText("Start from a page recipe…")
+            self._btn_load.setToolTip("Fill this page from a built-in or saved page recipe, or "
+                                      "link it to a master page (New page…)")
+            texts = ("The <b>Page Input</b> at the top left reads a named Output of an earlier "
+                     "page — wire it into the first node",
+                     "The <b>Pages</b> band of the Nodes palette holds Page Input and Page Output",
+                     "Double-click any node to preview it · <b>Ctrl+Space</b> maximizes the canvas")
+        else:
+            self._title.setText("Start your graph")
+            self._sub.setText("The canvas is empty — place a node to begin.")
+            self._btn_load.setText("Load image…")
+            self._btn_load.setToolTip("File → Load ND2/TIFF file… (Ctrl+L)")
+            texts = ("Double-click a node in the <b>Nodes</b> palette — or drag it onto the canvas",
+                     "<b>Ctrl+L</b> loads an ND2/TIFF and drops a source node with its channels",
+                     "Double-click any node to preview it · <b>Ctrl+Space</b> maximizes the canvas")
+        for lab, text in zip(self._hints, texts):
+            lab.setText(text)
 
     # ── placement ──────────────────────────────────────────────────────────────
     def eventFilter(self, obj, ev) -> bool:        # noqa: N802 — Qt override

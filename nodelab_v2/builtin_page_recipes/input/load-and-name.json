@@ -1,0 +1,51 @@
+{
+  "app_version": "4.0.0",
+  "description": "A Load card published as the Output `raw` \u2014 the shape a loaded image takes on the Image Input page. Set the card's path, or drop a file on the page instead.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "input",
+  "name": "Load & name",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "out",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "load",
+          "src_socket": "image"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "load",
+          "modes": {},
+          "op_key": "io.load",
+          "params": {}
+        },
+        {
+          "id": "out",
+          "modes": {},
+          "op_key": "page.output",
+          "params": {
+            "name": "raw"
+          }
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "load": {
+          "x": 0,
+          "y": 150
+        },
+        "out": {
+          "x": 306,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

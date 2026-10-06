@@ -26887,6 +26887,250 @@ def test_example_workspace() -> None:
         "bound, the Analysis page composes the whole chain and its Viewer and plot pull")
 
 
+def test_page_recipes_builtin_load() -> None:
+    """Built-in page recipes (V4.00 step 11): every shipped recipe loads, names only ops that
+    exist and are offered on its kind, instantiates on a workspace with its Page Input bound
+    and its Output names unique, composes with no error-grade readiness problem; "Smooth &
+    threshold" then "Label & measure" pull end to end on the synthetic fixture."""
+    import os
+    from nodegraph import roles as R
+    from nodegraph.domains import Domain
+    from nodegraph.memo import Memo
+    from nodegraph.registry import NODES
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import page_recipes as PR
+    from nodelab_v2 import readiness as RD
+    OPS.ensure_ops()
+    saved = os.environ.get(PR.ENV_ENABLED)
+    os.environ[PR.ENV_ENABLED] = "0"                  # built-ins only — never the user folder
+    try:
+        recipes = PR.list_recipes()
+        assert len(recipes) >= 7 and all(r.builtin for r in recipes), [r.name for r in recipes]
+        assert {r.kind for r in recipes} == {"input", "refine", "process", "analyze"}
+        ws, ds, env, ax = _ws_fixture()
+        # each kind reads the chain the earlier recipes built (list order is kind order):
+        # Refinement the fixture's image, Processing the recipe mask, Analysis the cells
+        src = {"refine": "pg1:raw"}
+        for r in recipes:
+            ops = [n["op_key"] for n in r.body["graph"]["nodes"]]
+            assert all(NODES.get(op) is not None for op in ops), (r.name, ops)
+            assert all(R.op_in_page(op, r.kind) for op in ops), (r.name, ops)
+            assert r.description and PR.slugify(r.name), r.name
+            page = PR.instantiate(ws, r, source=src.get(r.kind))
+            if r.name == "Smooth & threshold":
+                src["process"] = f"{page.id}:mask"
+            elif r.name == "Label & measure":
+                src["analyze"] = f"{page.id}:cells"
+            assert page.kind == r.kind and page.name == r.name, (page.name, page.kind)
+            ins = [n for n in page.doc.nodes.values() if n.op_key == "page.input"]
+            if r.kind == "input":
+                assert not ins, r.name
+            else:
+                assert ins and all(ws.resolve_source(page.id, n.params.get("source"))
+                                   for n in ins), (r.name, [n.params for n in ins])
+            names = [n for n, _ in ws.outputs_of(page.id)]
+            assert len(names) == len(set(names)), names
+            if r.kind == "analyze":
+                assert not names, (r.name, names)
+            errs = [(nid, p.kind) for nid in page.doc.nodes
+                    for p in RD.problems(page.doc, nid) if p.severity == "error"]
+            assert not errs, (r.name, errs)
+            comp = ws.compose(page.id)
+            assert not any(n.op_key == "page.input" for n in comp.graph.nodes.values()), r.name
+        ws2, ds2, env2, ax2 = _ws_fixture()
+        st = next(r for r in PR.list_recipes("refine") if r.name == "Smooth & threshold")
+        lm = next(r for r in PR.list_recipes("process") if r.name == "Label & measure")
+        rp = PR.instantiate(ws2, st, source="pg1:raw")
+        assert [n.params.get("source") for n in rp.doc.nodes.values()
+                if n.op_key == "page.input"] == ["pg1:raw"]
+        assert ws2.outputs_of(rp.id) == [("mask", "out")], ws2.outputs_of(rp.id)
+        memo = Memo()
+        comp = ws2.compose(rp.id)
+        out = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds2}, meta_seeds=comp.meta_seeds,
+                                  memo=memo).pull(f"{rp.id}/out")
+        assert out.axes == ax2 and out.has(Domain.VOXEL, "mask"), "the recipe made the mask"
+        pp = PR.instantiate(ws2, lm, source=f"{rp.id}:mask")
+        comp2 = ws2.compose(pp.id)
+        out2 = OPS.headless_engine(comp2.graph, seeds={"pg1/L": ds2},
+                                   meta_seeds=comp2.meta_seeds, memo=memo).pull(f"{pp.id}/out")
+        ids = [a for a in out2.layers_on(Domain.LABEL) if getattr(a, "name", "") == "id"]
+        rows = len(np.asarray(ids[0].values)) if ids else 0
+        assert rows >= 1, ("Label & measure found the fixture's square",
+                           [getattr(a, "name", "") for a in out2.layers_on(Domain.LABEL)])
+    finally:
+        if saved is None:
+            os.environ.pop(PR.ENV_ENABLED, None)
+        else:
+            os.environ[PR.ENV_ENABLED] = saved
+    _ok("built-in page recipes: every shipped recipe lists, names only ops its kind offers, "
+        "instantiates bound and unique, composes clean; Smooth & threshold then Label & "
+        "measure pull end to end")
+
+
+def test_page_recipe_roundtrip() -> None:
+    """User page recipes (V4.00 step 11): saved under the redirected folder as
+    <kind>/<slug>.json and listed as the user's, shadowing a built-in of the same name; a
+    damaged file is skipped; a recipe made from a page reproduces its ids, wires and
+    positions, re-bound to the chosen source; saving is refused when the folder is off."""
+    import json
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import page_recipes as PR
+    OPS.ensure_ops()
+    tmp = tempfile.mkdtemp(prefix="nd2recipes_")
+    saved = {k: os.environ.get(k) for k in (PR.ENV_DIR, PR.ENV_ENABLED)}
+    os.environ[PR.ENV_DIR] = tmp
+    os.environ.pop(PR.ENV_ENABLED, None)
+    try:
+        ws, ds, env, ax = _ws_fixture()
+        g = ws.pages["pg2"].doc.nodes["G"]
+        g.x, g.y = 123.0, 45.0
+        ws.pages["pg2"].doc.touch("G")
+        r = PR.recipe_from_page(ws.pages["pg2"], "My smooth", "two steps")
+        p = PR.save_recipe(r)
+        assert p == Path(tmp) / "refine" / "my-smooth.json" and p.is_file(), p
+        d = json.loads(p.read_text(encoding="utf-8"))
+        assert (d["format"], d["kind"], d["name"]) == (PR.RECIPE_FORMAT, "refine", "My smooth")
+        mine = [x for x in PR.list_recipes("refine") if x.name == "My smooth"]
+        assert len(mine) == 1 and not mine[0].builtin and mine[0].path == str(p), mine
+        bi = next(x for x in PR.list_recipes("refine") if x.builtin)
+        PR.save_recipe(PR.recipe_from_page(ws.pages["pg2"], bi.name, "mine"))
+        same = [x for x in PR.list_recipes("refine") if x.name.lower() == bi.name.lower()]
+        assert len(same) == 1 and not same[0].builtin and same[0].description == "mine", same
+        (Path(tmp) / "refine" / "bad.json").write_text("{not json", encoding="utf-8")
+        (Path(tmp) / "refine" / "wrong.json").write_text(json.dumps({"format": "x"}),
+                                                         encoding="utf-8")
+        assert all(x.name not in ("bad", "wrong") for x in PR.list_recipes())
+        rp = PR.instantiate(ws, mine[0], source="pg1:raw")
+        assert set(rp.doc.nodes) == {"IN", "G", "O"}, sorted(rp.doc.nodes)
+        assert rp.doc.nodes["IN"].params["source"] == "pg1:raw"
+        assert (rp.doc.nodes["G"].x, rp.doc.nodes["G"].y) == (123.0, 45.0)
+        assert ("G", "out", "O", "data") in rp.doc.edges and ("IN", "out", "G", "data") in rp.doc.edges
+        assert ws.outputs_of(rp.id) == [("smooth", "O")]
+        os.environ[PR.ENV_ENABLED] = "0"
+        assert PR.user_dir() is None and all(x.builtin for x in PR.list_recipes())
+        try:
+            PR.save_recipe(r)
+            raise AssertionError("saving must refuse when the folder is switched off")
+        except RuntimeError:
+            pass
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("page recipe round trip: saved as <kind>/<slug>.json in the redirected folder, listed "
+        "as the user's and shadowing a built-in of the same name, damaged files skipped, ids/"
+        "wires/positions reproduced and re-bound, saving refused when switched off")
+
+
+def test_page_master_flag() -> None:
+    """Masters and the New page spec (V4.00 step 11): set_master (refused on a linked page),
+    masters() order, is_master in the 3.0 record only when set (round trip; linked +
+    is_master refused), sources_for_kind / default_source_for_kind, next_kind,
+    apply_new_page three ways (empty with a bound Input, recipe, linked with a different
+    source recorded as an override) and into a seeded empty page."""
+    import json
+    import os
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import page_recipes as PR
+    from nodelab_v2.linked_document import LinkedDocument
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    ws, ds, env, ax = _ws_fixture()
+    assert not any(p.is_master for p in ws.pages.values())
+    ws.set_master("pg2", True)
+    assert ws.pages["pg2"].is_master
+    assert [p.id for p in ws.masters("process")] == ["pg2", "pg3", "pg4", "pg1"], \
+        [p.id for p in ws.masters("process")]
+    lk = ws.duplicate_page("pg3", dependent=True)
+    try:
+        ws.set_master(lk.id, True)
+        raise AssertionError("a linked page cannot be a master")
+    except ValueError:
+        pass
+    assert [p.id for p in ws.masters()] == ["pg2", "pg1", "pg3", "pg4"], [p.id for p in ws.masters()]
+    d = ws.to_dict()
+    recs = {r["id"]: r for r in d["workspace"]["pages"]}
+    assert recs["pg2"].get("is_master") is True
+    assert all("is_master" not in recs[i] for i in ("pg1", "pg3", "pg4", lk.id)), recs.keys()
+    ws2 = Workspace()
+    ws2.load_dict(d)
+    assert ws2.pages["pg2"].is_master and not ws2.pages["pg1"].is_master
+    bad = json.loads(json.dumps(d))
+    next(r for r in bad["workspace"]["pages"] if r["id"] == lk.id)["is_master"] = True
+    try:
+        Workspace().load_dict(bad)
+        raise AssertionError("a linked page flagged as a master must be refused")
+    except ValueError:
+        pass
+    assert ws.sources_for_kind("process") == ws.available_sources("pg3")
+    assert ws.sources_for_kind("input") == [] and ws.default_source_for_kind("input") == ""
+    assert ws.default_source_for_kind("refine") == "pg1:raw"
+    assert ws.default_source_for_kind("process") == "pg2:smooth"
+    assert {v for v, _ in ws.sources_for_kind("free")} == {"pg1:raw", "pg2:smooth"}
+    assert [PR.next_kind(k) for k in ("input", "refine", "process", "analyze", "free")] == \
+        ["refine", "process", "analyze", None, "refine"]
+    p_e = PR.apply_new_page(ws, PR.NewPageSpec(kind="process", name="E", source="pg2:smooth"))
+    assert (p_e.kind, p_e.name) == ("process", "E")
+    assert [n.params for n in p_e.doc.nodes.values() if n.op_key == "page.input"] == \
+        [{"source": "pg2:smooth"}]
+    p_e2 = PR.apply_new_page(ws, PR.NewPageSpec(kind="process"))
+    assert [n.params.get("source") for n in p_e2.doc.nodes.values()] == ["pg2:smooth"], \
+        "an empty start with no source is seeded with the default"
+    saved = os.environ.get(PR.ENV_ENABLED)
+    os.environ[PR.ENV_ENABLED] = "0"
+    try:
+        lm = next(r for r in PR.list_recipes("process") if r.name == "Label & measure")
+        p_r = PR.apply_new_page(ws, PR.NewPageSpec(kind="process", start=PR.START_RECIPE,
+                                                   recipe=lm, source="pg2:smooth"))
+        assert p_r.name == "Label & measure" and ws.outputs_of(p_r.id) == [("cells", "out")]
+        assert p_r.doc.nodes["in"].params["source"] == "pg2:smooth"
+        p_l = PR.apply_new_page(ws, PR.NewPageSpec(kind="process", name="L",
+                                                   start=PR.START_LINKED, master="pg3",
+                                                   source="pg1:raw"))
+        assert isinstance(p_l.doc, LinkedDocument) and p_l.master == "pg3" and p_l.name == "L"
+        assert p_l.doc.nodes["IN"].params["source"] == "pg1:raw"
+        assert ws.pages["pg3"].doc.nodes["IN"].params["source"] == "pg2:smooth", "the master's own"
+        assert p_l.doc.overrides.get("IN", {}).get("params", {}).get("source") == "pg1:raw", \
+            p_l.doc.overrides
+        rec = next(r for r in ws.to_dict()["workspace"]["pages"] if r["id"] == p_l.id)
+        assert rec["master"] == "pg3" and "graph" not in rec
+        assert rec["overrides"]["IN"]["params"]["source"] == "pg1:raw"
+        e1 = ws.add_page("Empty", "process", seed_input=True)
+        assert PR.only_seed(e1) and len(e1.doc.nodes) == 1
+        got = PR.apply_new_page(ws, PR.NewPageSpec(kind="process", start=PR.START_RECIPE,
+                                                   recipe=lm), into=e1.id)
+        assert got.id == e1.id and set(got.doc.nodes) == {"in", "label", "measure", "out"}
+        assert got.doc.nodes["in"].params["source"] == "pg2:smooth"
+        e2 = ws.add_page("Empty 2", "process", seed_input=True)
+        n = len(ws.pages)
+        got2 = PR.apply_new_page(ws, PR.NewPageSpec(kind="process", start=PR.START_LINKED,
+                                                    master="pg3"), into=e2.id)
+        assert e2.id not in ws.pages and got2.master == "pg3" and len(ws.pages) == n, \
+            "a linked start replaces the empty page"
+        try:
+            PR.apply_new_page(ws, PR.NewPageSpec(kind="process", start=PR.START_RECIPE,
+                                                 recipe=lm), into="pg3")
+            raise AssertionError("a page with nodes is not taken over")
+        except ValueError:
+            pass
+    finally:
+        if saved is None:
+            os.environ.pop(PR.ENV_ENABLED, None)
+        else:
+            os.environ[PR.ENV_ENABLED] = saved
+    _ok("masters and New page: set_master (refused on a linked page), masters() order, "
+        "is_master only when set and round-tripped (linked+master refused), sources and the "
+        "default for a page not yet made, next_kind; apply_new_page empty / recipe / linked "
+        "(a different source becomes an override) and into a seeded empty page")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -27061,6 +27305,9 @@ def main() -> int:
     test_default_source_rule()
     test_readiness_fixes()
     test_example_workspace()
+    test_page_recipes_builtin_load()
+    test_page_recipe_roundtrip()
+    test_page_master_flag()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

@@ -54,8 +54,8 @@ from nodelab_v2.edge_item import EdgeItem, wire_path
 from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.minimap import HudButton
 from nodelab_v2.node_item import NodeItem, SocketItem
-from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PAGE_OUTPUT_OP,
-                            PRECISION_UNSET, bake_record)
+from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PAGE_NAME_KEY,
+                            PAGE_OUTPUT_OP, PRECISION_UNSET, bake_record)
 
 # ``HIDDEN_OP_PREFIXES`` moved to the Qt-free :mod:`nodelab_v2.ops` (2026-10-02) so the
 # readiness checker can rank suggested nodes without importing Qt; still exported here.
@@ -203,6 +203,9 @@ class GraphScene(QGraphicsScene):
     #: a structural gesture was refused — the page is LINKED to a master (V4.00 step 6):
     #: the hint, for the window's status bar
     topology_refused = Signal(str)
+    #: a Page Output's *New page from this output…* (V4.00 step 11): the node id — the window
+    #: opens the New page dialog pre-set to read it
+    new_page_from_output = Signal(str)
 
     def __init__(self, document: GraphDocument) -> None:
         super().__init__()
@@ -878,6 +881,14 @@ class GraphScene(QGraphicsScene):
                 "output. Cards already wired to a member are left alone, so this is safe "
                 "to run again after adding files to the batch.")
             act.triggered.connect(lambda: self.fan_out_batch(nid))
+        if node.op_key == PAGE_OUTPUT_OP:
+            oname = str((rec.params.get(PAGE_NAME_KEY) if rec is not None else "") or "").strip()
+            act = menu.addAction("New page from this output…")
+            act.setEnabled(bool(oname))
+            act.setToolTip("Add a page of the next kind whose Page Input reads this Output — "
+                           "empty, from a page recipe, or linked to a master page."
+                           if oname else "Give this Output a Name first")
+            act.triggered.connect(lambda: self.new_page_from_output.emit(nid))
         mute = menu.addAction("Muted (pass through)\tM")
         mute.setCheckable(True)
         mute.setChecked(bool(rec.muted) if rec is not None else False)

@@ -6296,7 +6296,7 @@ def main(argv) -> int:
     win.fill_page_menu(_m6, win.canvas)
     _t6 = [a.text() for a in _m6.actions()]
     assert {"Go to master page", "Make unique"} <= set(_t6), _t6
-    assert any(t.startswith(win.workspace.page(_lp).name) and t.endswith("· linked")
+    assert any(t.startswith(win.workspace.page(_lp).name) and "(linked · " in t
                for t in _t6), _t6
     # every structural gesture is refused with the hint, and nothing changes
     _n6 = set(_lk.nodes)
@@ -7456,6 +7456,164 @@ def main(argv) -> int:
     _ok("EX1 the welcome card's Example graph spans the four standard pages with every "
         "boundary named and bound (no error-grade readiness problem); the Analysis page's "
         "Viewer pulls through the whole chain")
+
+    # ── NP1–NP4: New page…, page recipes, masters (V4.00 step 11, part B) ──────────────
+    from PySide6.QtCore import QTimer as _QT11
+    from PySide6.QtWidgets import QMenu as _QM11
+    from nodelab_v2 import page_recipes as _PR11
+    from nodelab_v2.new_page_dialog import NewPageDialog as _NPD11
+    _rdir11 = tempfile.mkdtemp(prefix="nd2recipes_")
+    os.environ[_PR11.ENV_DIR] = _rdir11
+    os.environ.pop(_PR11.ENV_ENABLED, None)
+    # EX1 left the example workspace: four pages, Image Input active
+    _in11 = next(p.id for p in _ws11.pages.values() if p.kind == "input")
+    _ref11 = next(p.id for p in _ws11.pages.values() if p.kind == "refine")
+    # NP1 the dialog lists recipes, masters and sources; _apply_new_page makes each start
+    _dlg = _NPD11(win, _ws11, kind="process")
+    assert _dlg._recipe.count() >= 2 and all("(built-in)" in _dlg._recipe.itemText(i)
+                                             for i in range(_dlg._recipe.count()))
+    assert _dlg._source.count() >= 2 and _dlg._source.currentData() == f"{_ref11}:mask", \
+        [_dlg._source.itemData(i) for i in range(_dlg._source.count())]
+    assert _dlg._master.count() == 4, "every plain page is offered as a master"
+    assert win.set_master_page(_ref11, True)
+    app.processEvents()
+    _dlg2 = _NPD11(win, _ws11, kind="process")
+    assert _dlg2._master.itemText(0).startswith("★ ") and _dlg2._master.itemData(0) == _ref11
+    _dlg2._r_recipe.setChecked(True)
+    app.processEvents()
+    _spec = _dlg2.spec()
+    assert _spec.start == "recipe" and _spec.recipe is not None and \
+        _spec.source == f"{_ref11}:mask", _spec
+    _n0 = len(_ws11.pages)
+    _pid_r = win._apply_new_page(_spec, canvas=win._main_canvas)
+    assert _pid_r and len(_ws11.pages) == _n0 + 1 and _ws11.active == _pid_r
+    assert {r.op_key for r in win.doc.nodes.values()} == \
+        {"page.input", "analysis.label", "analysis.measure", "page.output"}, sorted(win.doc.nodes)
+    assert win.doc.nodes["in"].params["source"] == f"{_ref11}:mask" and not win.welcome.isVisible()
+    assert all(nid in win.scene.node_items for nid in win.doc.nodes), "cards on the canvas"
+    _dlg3 = _NPD11(win, _ws11, kind="process", start="linked", master=_ref11)
+    assert _dlg3._r_linked.isChecked() and not _dlg3._kind.isEnabled()
+    assert _dlg3._kind.currentData() == "refine", "a linked page takes its master's kind"
+    _spec3 = _dlg3.spec()
+    assert (_spec3.start, _spec3.master, _spec3.kind) == ("linked", _ref11, "refine"), _spec3
+    _pid_l = win._apply_new_page(_spec3, canvas=win._main_canvas)
+    assert _pid_l and _ws11.pages[_pid_l].master == _ref11
+    assert "linked · 0 overrides" in win._main_canvas.view.page_button.text(), \
+        win._main_canvas.view.page_button.text()
+    _pid_e = win._apply_new_page(_PR11.NewPageSpec(kind="analyze", name="Plots",
+                                                   source=f"{_pid_r}:cells"),
+                                 canvas=win._main_canvas)
+    assert _ws11.pages[_pid_e].name == "Plots"
+    assert [r.params.get("source") for r in win.doc.nodes.values()] == [f"{_pid_r}:cells"]
+    for _d in (_dlg, _dlg2, _dlg3):
+        _d.deleteLater()
+    app.processEvents()
+    _ok("NP1 New page… lists the kind's page recipes (built-in marked), the masters (★ first) "
+        "and the Outputs a new page could read (the nearest preselected); applying the spec "
+        "makes a page from a recipe (bound, cards on the canvas), a linked page (its master's "
+        "kind, the switcher says linked · 0 overrides) and an empty page with a bound Input")
+
+    # NP2 the switcher menu: New page…, Set as master page (★ on the row and the button),
+    # Save as page recipe…; a linked page cannot be set as master
+    win._show_page(win._main_canvas, _ref11)
+    app.processEvents()
+    _m11 = _QM11()
+    win.fill_page_menu(_m11, win._main_canvas)
+    _texts11 = [a.text() for a in _m11.actions()]
+    for _want in ("New page…", "Set as master page", "Save as page recipe…"):
+        assert _want in _texts11, (_want, _texts11)
+    _mst = next(a for a in _m11.actions() if a.text() == "Set as master page")
+    assert _mst.isCheckable() and _mst.isChecked() and _mst.isEnabled()
+    assert any(t.startswith("★ ") and _ws11.pages[_ref11].name in t for t in _texts11), _texts11
+    assert win._main_canvas.view.page_button.text().strip().startswith("★ ")
+    _mst.trigger()
+    app.processEvents()
+    assert not _ws11.pages[_ref11].is_master
+    assert not win._main_canvas.view.page_button.text().strip().startswith("★")
+    win._show_page(win._main_canvas, _pid_l)
+    app.processEvents()
+    _m12 = _QM11()
+    win.fill_page_menu(_m12, win._main_canvas)
+    assert not next(a for a in _m12.actions() if a.text() == "Set as master page").isEnabled()
+    _ok("NP2 the page switcher offers New page…, Set as master page (checkable; ★ on the "
+        "row and on the button, both gone when unset; disabled on a linked page) and Save as "
+        "page recipe…")
+
+    # NP3 a Page Output's context menu: New page from this output… (disabled while unnamed);
+    # accepted, the dialog makes a page of the next kind reading that Output
+    win._show_page(win._main_canvas, _in11)
+    app.processEvents()
+    _out11 = next(r for r in win.doc.nodes.values() if r.op_key == "page.output")
+    _m13 = _QM11()
+    win.scene._fill_node_menu(_m13, win.scene.node_items[_out11.id])
+    _npo = next(a for a in _m13.actions() if a.text() == "New page from this output…")
+    assert _npo.isEnabled()
+    _un11 = win.doc.add_node("page.output", params={"name": ""})
+    win.scene.sync()
+    app.processEvents()
+    _m14 = _QM11()
+    win.scene._fill_node_menu(_m14, win.scene.node_items[_un11.id])
+    assert not next(a for a in _m14.actions()
+                    if a.text() == "New page from this output…").isEnabled()
+    win.doc.remove_node(_un11.id)
+    app.processEvents()
+    _n1 = len(_ws11.pages)
+
+    _seen11: list = []
+
+    def _accept11(want_recipe=False, into=None, recipe=None):
+        for _w in QApplication.topLevelWidgets():
+            if isinstance(_w, _NPD11) and _w.isVisible():
+                _seen11.append((_w._r_recipe.isChecked(), _w._into))
+                if want_recipe:
+                    for _i in range(_w._recipe.count()):
+                        if _w._recipe.itemData(_i).name == recipe:
+                            _w._recipe.setCurrentIndex(_i)
+                else:
+                    _w._r_empty.setChecked(True)
+                _w.accept()
+                return
+        _QT11.singleShot(50, lambda: _accept11(want_recipe, into, recipe))
+    _QT11.singleShot(50, lambda: _accept11(False))
+    _npo.trigger()                              # modal: the timer accepts it
+    app.processEvents()
+    assert len(_ws11.pages) == _n1 + 1, "the dialog added a page"
+    _newp = _ws11.pages[_ws11.active]
+    assert _newp.kind == "refine", _newp.kind
+    assert [r.params.get("source") for r in _newp.doc.nodes.values()] == \
+        [f"{_in11}:{_out11.params['name']}"]
+    _ok("NP3 a named Page Output's context menu offers New page from this output… (disabled "
+        "while unnamed); accepted, a page of the next kind reads that Output")
+
+    # NP4 an empty Refinement page with something upstream: the welcome card offers a page
+    # recipe and the recipe takes the seeded page over; Save as page recipe writes under the
+    # redirected folder; the Input page's card still says Load image…
+    _pid_n = win.new_page("refine")
+    app.processEvents()
+    assert win.welcome.isVisible(), "a seeded page keeps its card"
+    assert win.welcome._btn_load.text() == "Start from a page recipe…", win.welcome._btn_load.text()
+    _n2 = len(_ws11.pages)
+    _seen11.clear()
+    _QT11.singleShot(50, lambda: _accept11(True, _pid_n, "Smooth & threshold"))
+    win.welcome._btn_load.click()
+    app.processEvents()
+    assert _seen11 == [(True, _pid_n)], ("the card opens the dialog on Page recipe, into "
+                                          "this page", _seen11)
+    assert len(_ws11.pages) == _n2 and _ws11.active == _pid_n, "the recipe took the page over"
+    assert {r.op_key for r in win.doc.nodes.values()} >= \
+        {"page.input", "enhance.gaussian", "analysis.threshold", "page.output"}, sorted(win.doc.nodes)
+    assert not win.welcome.isVisible()
+    _path11 = win.save_page_as_recipe(_pid_n, name="Probe smooth", description="from the probe")
+    assert _path11 and os.path.isfile(_path11) and \
+        os.path.abspath(_path11).startswith(os.path.abspath(_rdir11)), _path11
+    assert any(r.name == "Probe smooth" and not r.builtin for r in _PR11.list_recipes("refine"))
+    win.file_new()
+    app.processEvents()
+    assert win.welcome.isVisible() and win.welcome._btn_load.text() == "Load image…"
+    os.environ.pop(_PR11.ENV_DIR, None)
+    _ok("NP4 the welcome card of a seeded Refinement page offers Start from a page recipe…, "
+        "and the recipe takes the page over; Save as page recipe writes under the recipe "
+        "folder and lists as the user's; the Input page's card still loads an image")
 
     # a LabLink panel left on screen polls its hub over HTTP on a QThread; a socket connect
     # still in flight when os._exit tears the process down crashes it (exit 139 after every

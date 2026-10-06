@@ -1,0 +1,87 @@
+{
+  "app_version": "4.0.0",
+  "description": "Subtract the estimated background surface, then deconvolve (NA, emission and Z step come from the file's metadata; type them when it has none); hands the image on as `restored`.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "refine",
+  "name": "Background & deconvolve",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "bg",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "in",
+          "src_socket": "out"
+        },
+        {
+          "dst": "dec",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "bg",
+          "src_socket": "out"
+        },
+        {
+          "dst": "out",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "dec",
+          "src_socket": "out"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "in",
+          "modes": {},
+          "op_key": "page.input",
+          "params": {
+            "source": ""
+          }
+        },
+        {
+          "id": "bg",
+          "modes": {},
+          "op_key": "enhance.subtract_background",
+          "params": {}
+        },
+        {
+          "id": "dec",
+          "modes": {},
+          "op_key": "enhance.deconvolve",
+          "params": {}
+        },
+        {
+          "id": "out",
+          "modes": {},
+          "op_key": "page.output",
+          "params": {
+            "name": "restored"
+          }
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "bg": {
+          "x": 306,
+          "y": 150
+        },
+        "dec": {
+          "x": 612,
+          "y": 150
+        },
+        "in": {
+          "x": 0,
+          "y": 150
+        },
+        "out": {
+          "x": 918,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

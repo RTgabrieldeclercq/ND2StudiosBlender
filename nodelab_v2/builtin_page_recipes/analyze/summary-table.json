@@ -1,0 +1,51 @@
+{
+  "app_version": "4.0.0",
+  "description": "Table Aggregate \u2014 one row per frame (mean, sem, count of `area`) as the table `summary`, for the Spreadsheet and for export.",
+  "format": "nd2studios.page-recipe/1",
+  "kind": "analyze",
+  "name": "Summary table",
+  "page": {
+    "graph": {
+      "edges": [
+        {
+          "dst": "agg",
+          "dst_socket": "data",
+          "kind": "forward",
+          "src": "in",
+          "src_socket": "out"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "in",
+          "modes": {},
+          "op_key": "page.input",
+          "params": {
+            "source": ""
+          }
+        },
+        {
+          "id": "agg",
+          "modes": {},
+          "op_key": "table.aggregate",
+          "params": {}
+        }
+      ]
+    },
+    "groups": [],
+    "ui": {
+      "frames": {},
+      "nodes": {
+        "agg": {
+          "x": 306,
+          "y": 150
+        },
+        "in": {
+          "x": 0,
+          "y": 150
+        }
+      }
+    },
+    "zones": []
+  }
+}

@@ -166,6 +166,16 @@
   "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
+ "CON-21": {
+  "anchors": {
+   "sym:nodelab_v2.page_recipes.PageRecipe": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodelab_v2.page_recipes.apply_new_page": "e2ceaa10c60438a915f02cfd82484723",
+   "sym:nodelab_v2.page_recipes.instantiate": "b7d248e8dc5aa53132fe9397e58b3ade",
+   "sym:nodelab_v2.workspace.Workspace.set_master": "b8206355d3f4bfdc2638c7593ed3bfd8"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",

@@ -159,6 +159,9 @@ class Page:
     #: A linked page's parameter/mode overrides, ``{node_id: {"params": {...}, "modes":
     #: {...}}}``. Carried through the file for a plain page too (always empty).
     overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: Offered first (★) as a master to link a new page to (V4.00 step 11); any plain page
+    #: may still be chosen. Never set on a linked page. In the file only when True.
+    is_master: bool = False
 
 
 @dataclass(frozen=True)
@@ -428,15 +431,7 @@ class Workspace:
             return page
         page = self.add_page(name or f"{src.name} copy", src.kind,
                              index=order.index(page_id) + 1)
-        self._quiet = True
-        try:
-            page.doc.load_page(src.doc.to_page_dict())
-            page.doc.meta_seeds.update(src.doc.meta_seeds)
-            page.doc.repropagate()
-        finally:
-            self._quiet = False
-        self._out_ids[page.id] = self._output_ids(page.id)
-        self._notify(())                    # a new page: read by nothing yet
+        self.load_page_body(page.id, src.doc.to_page_dict(), meta_seeds=src.doc.meta_seeds)
         return page
 
     def dependents_of(self, page_id: str) -> List[str]:
@@ -460,6 +455,91 @@ class Workspace:
         self._notify({qualify(page_id, n) for n in page.doc.nodes})
         return page
 
+
+    # ── masters and starting points (V4.00 step 11) ───────────────────────────
+    def set_master(self, page_id: str, on: bool = True) -> None:
+        """Flag ``page_id`` as a master: ★ in the switcher, offered first when a new page is
+        linked to one. Any plain page may still be chosen; a linked page follows a master and
+        cannot be one. A flag changes no run."""
+        page = self.pages[page_id]
+        if page.master:
+            raise ValueError(f"page {page.name!r} is linked to a master; make it unique first")
+        if page.is_master == bool(on):
+            return
+        page.is_master = bool(on)
+        self._notify(())
+
+    def masters(self, kind: Optional[str] = None) -> List[Page]:
+        """The plain pages a new page may link to: flagged masters first, then pages of
+        ``kind``, then the rest — page order within each group."""
+        order = list(self.pages)
+        cands = [p for p in self.pages.values() if not p.master]
+        cands.sort(key=lambda p: (not p.is_master, kind is not None and p.kind != kind,
+                                  order.index(p.id)))
+        return cands
+
+    def feeders_for_kind(self, kind: str) -> List[Page]:
+        """The pages a NEW page of ``kind`` could read, nearest first — :meth:`feeder_pages`
+        for a page that does not exist yet: typed kinds strictly below, the highest first,
+        later pages before earlier ones, a Free feeder last; a new Free page may read any
+        page, latest first."""
+        order = list(self.pages)
+        op = R.page_order(kind)
+        out: List[Page] = []
+        for up in self.pages.values():
+            ou = R.page_order(up.kind)
+            if op is not None and ou is not None and not ou < op:
+                continue
+            out.append(up)
+        if op is not None:
+            def key(up: Page) -> Tuple[int, int, int]:
+                ou = R.page_order(up.kind)
+                if ou is None:
+                    return (1, 0, -order.index(up.id))
+                return (0, -ou, -order.index(up.id))
+        else:
+            def key(up: Page) -> Tuple[int, int, int]:
+                return (0, 0, -order.index(up.id))
+        out.sort(key=key)
+        return out
+
+    def sources_for_kind(self, kind: str) -> List[Tuple[str, str]]:
+        """:meth:`available_sources` for a page that does not exist yet: every named Output
+        of every page a new page of ``kind`` could read, in page order — what the *New page*
+        dialog's *Read output* menu lists."""
+        feeders = {p.id for p in self.feeders_for_kind(kind)}
+        out = []
+        for up in self.pages.values():
+            if up.id not in feeders:
+                continue
+            for name, _nid in self.outputs_of(up.id):
+                out.append((f"{up.id}:{name}", f"{up.name} · {name}"))
+        return out
+
+    def default_source_for_kind(self, kind: str) -> str:
+        """:meth:`default_source` for a page that does not exist yet."""
+        for up in self.feeders_for_kind(kind):
+            outs = self._outputs_in_order(up.id)
+            if outs:
+                return f"{up.id}:{outs[-1][0]}"
+        return ""
+
+    def load_page_body(self, page_id: str, body: Mapping[str, Any], *,
+                       meta_seeds: Optional[Mapping[str, MetaEnvelope]] = None) -> None:
+        """Load a page dict (:meth:`GraphDocument.to_page_dict`) into ``page_id`` — a unique
+        duplicate, a page recipe — quietly, then re-describe it and publish the change."""
+        page = self.pages[page_id]
+        self._quiet = True
+        try:
+            page.doc.load_page(dict(body))
+            if meta_seeds:
+                page.doc.meta_seeds.update(meta_seeds)
+            page.doc.repropagate()
+        finally:
+            self._quiet = False
+        self._out_ids[page_id] = self._output_ids(page_id)
+        self._notify(())
+
     def reset(self) -> None:
         """File → New (V4.00 step 11): back to the four standard pages, empty, Image Input
         active — keeping the active page's document object (the canvas is bound to it) as
@@ -481,6 +561,7 @@ class Workspace:
         # rename/re-kind BEFORE adding the other pages: each add_page publishes a change the
         # window answers by re-reading every page's name and kind
         keep.name, keep.kind, keep.master, keep.overrides = kind_label(head), head, None, {}
+        keep.is_master = False
         keep.doc.page_kind = head
         self.active = keep.id
         for kind in kinds[1:]:
@@ -1030,6 +1111,8 @@ class Workspace:
         for p in self.pages.values():
             rec: Dict[str, Any] = {"id": p.id, "name": p.name, "kind": p.kind,
                                    "master": p.master}
+            if p.is_master:
+                rec["is_master"] = True     # only when set: older files stay byte-identical
             if p.master:
                 rec["overrides"] = (p.doc.overrides_dict()
                                     if isinstance(p.doc, LinkedDocument) else
@@ -1063,6 +1146,8 @@ class Workspace:
             if not R.is_page_kind(rec.get("kind") or FREE):
                 raise ValueError(f"page {rec['id']!r} has unknown kind {rec.get('kind')!r} "
                                  f"(kinds: {', '.join(R.page_kinds())})")
+            if rec.get("master") and rec.get("is_master"):
+                raise ValueError(f"page {rec['id']!r} is linked to a master and cannot be one")
             if rec.get("master"):
                 m = next((r for r in recs if r["id"] == rec["master"]), None)
                 if m is None or m.get("master"):
@@ -1095,7 +1180,8 @@ class Workspace:
                 name = rec.get("name") or ""
                 if not name:
                     name = self._name_from_path() if not is_ws else rec["id"]
-                page = Page(rec["id"], name, rec.get("kind") or FREE, doc)
+                page = Page(rec["id"], name, rec.get("kind") or FREE, doc,
+                            is_master=bool(rec.get("is_master", False)))
                 self.pages[page.id] = page
                 self._attach(page)
             # active BEFORE any page loads: a listener reacting to the load (the canvas,

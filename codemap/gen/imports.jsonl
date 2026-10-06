@@ -1056,6 +1056,7 @@
 {"dst":"nodelab_v2.overlay_compose","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.overlay_render","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.page_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.position_groups","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.readiness","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1212,6 +1213,14 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"nodelab_v2.nd2_direct"}
 {"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.nd2_meta"}
 {"dst":"nodelab_v2.nd2_compat","k":"imp","lazy":true,"src":"nodelab_v2.nd2_meta"}
+{"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodegraph.roles","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodelab_v2.canvas","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodelab_v2.page_recipes","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":false,"src":"nodelab_v2.new_page_dialog"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodegraph.groups","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
@@ -1239,6 +1248,12 @@
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.overlay_dialog"}
 {"dst":"nodegraph.catalog._shared.label_paint","k":"imp","lazy":false,"src":"nodelab_v2.overlays"}
 {"dst":"nodelab_v2.overlay_render","k":"imp","lazy":true,"src":"nodelab_v2.overlays"}
+{"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
+{"dst":"nodegraph.roles","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
+{"dst":"nodegraph.serialize","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
+{"dst":"nodelab_v2.version","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.nodes","k":"imp","lazy":true,"src":"nodelab_v2.palette"}
@@ -1333,6 +1348,7 @@
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.welcome"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.welcome"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"nodelab_v2.welcome"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":true,"src":"nodelab_v2.window"}
@@ -1357,8 +1373,10 @@
 {"dst":"nodelab_v2.linked_document","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.minimap","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.movie_editor","k":"imp","lazy":true,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.new_page_dialog","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.page_recipes","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.palette","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.readiness","k":"imp","lazy":false,"src":"nodelab_v2.window"}
@@ -1474,10 +1492,12 @@
 {"dst":"nodelab_v2.lablink.recipe","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.layout_store","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.linked_document","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.new_page_dialog","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.overlay_dialog","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.page_recipes","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.readiness","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.region_box","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
