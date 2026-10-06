@@ -24789,6 +24789,117 @@ def test_runner_qualified_ids() -> None:
         "readers are re-described")
 
 
+def test_layout_store() -> None:
+    """V4.00 step 3: the panel-layout file — the Qt-free half of the dock shell. Names,
+    environment switches, an atomic round trip, and a file that is never trusted: anything
+    damaged, foreign or from another layout generation is ignored rather than raised, and
+    malformed dock entries are dropped while the rest restores."""
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    from nodelab_v2 import layout_store as LS
+    assert LS.dock_name("viewer", 1) == "viewer:1"
+    assert LS.parse_dock_name("viewer:1") == ("viewer", 1)
+    assert LS.parse_dock_name("movie_editor:12") == ("movie_editor", 12)
+    for bad in ("Viewer:1", "viewer", "viewer:-1", "viewer:1:2", "", "a b:0", "1x:0"):
+        assert LS.parse_dock_name(bad) is None, bad
+    old = {k: os.environ.get(k) for k in (LS.ENV_FILE, LS.ENV_ENABLED)}
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="nd2layout_")) / "sub" / "layout.json"
+        os.environ.pop(LS.ENV_FILE, None)
+        os.environ.pop(LS.ENV_ENABLED, None)
+        assert LS.layout_path() == LS.USER_FILE and LS.layout_enabled()
+        os.environ[LS.ENV_FILE] = str(tmp)
+        assert LS.layout_path() == tmp
+        for off in ("0", "false", "No", " off "):
+            os.environ[LS.ENV_ENABLED] = off
+            assert not LS.layout_enabled(), off
+        os.environ[LS.ENV_ENABLED] = "1"
+        assert LS.layout_enabled()
+        rec = LS.make_layout(geometry=b"\x01geo", state=b"\x00\xffstate", docks=[
+            {"name": "palette:0", "kind": "palette", "binding": None},
+            {"name": "viewer:1", "kind": "viewer", "binding": {"page": "pg2", "node": "n3"}}],
+            app_version="4.0.0")
+        assert json.loads(json.dumps(rec)) == rec, "the record is plain JSON"
+        assert LS.save_layout(rec) == tmp and tmp.exists(), "the folder is created"
+        assert not tmp.with_name(tmp.name + ".part").exists(), "the write is atomic"
+        got = LS.load_layout()
+        assert got["geometry"] == b"\x01geo" and got["state"] == b"\x00\xffstate"
+        assert got["docks"] == [
+            {"name": "palette:0", "kind": "palette", "index": 0, "binding": None},
+            {"name": "viewer:1", "kind": "viewer", "index": 1,
+             "binding": {"page": "pg2", "node": "n3"}}], got["docks"]
+        # never trusted: damaged, foreign, another generation, a bad blob → None, no raise
+        for text in ("{not json", "[]", "null",
+                     json.dumps({**rec, "version": LS.LAYOUT_VERSION + 1}),
+                     json.dumps({**rec, "format": "someone.else/1"}),
+                     json.dumps({**rec, "state": "!!not base64"}),
+                     json.dumps({**rec, "state": ""})):
+            tmp.write_text(text, encoding="utf-8")
+            assert LS.load_layout() is None, text[:50]
+        tmp.write_bytes(b"\xff\xfe\x00garbage")
+        assert LS.load_layout() is None
+        tmp.unlink()
+        assert LS.load_layout() is None, "no file is simply no layout"
+        # malformed dock entries are DROPPED; the rest of the layout still restores
+        bad = {**rec, "docks": [{"name": "palette:0"}, {"name": "nope"}, {"name": "palette:0"},
+                                "x", {"name": "viewer:2", "kind": "canvas"}]}
+        tmp.write_text(json.dumps(bad), encoding="utf-8")
+        assert [d["name"] for d in LS.load_layout()["docks"]] == ["palette:0"]
+        # never raises, whatever the file holds: a non-list `docks` is no docks (the rest
+        # still restores), and nesting deep enough to exhaust json's recursion is no layout
+        tmp.write_text(json.dumps({**rec, "docks": 5}), encoding="utf-8")
+        assert LS.load_layout()["docks"] == []
+        tmp.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+        assert LS.load_layout() is None
+        # an unusable file is SET ASIDE when asked (a newer build's layout survives an older
+        # build's session), and left where it is otherwise
+        tmp.write_text(json.dumps({**rec, "version": LS.LAYOUT_VERSION + 1}), encoding="utf-8")
+        assert LS.load_layout() is None and tmp.exists()
+        assert LS.load_layout(quarantine=True) is None and not tmp.exists()
+        side = tmp.with_name(tmp.name + ".rejected")
+        assert json.loads(side.read_text(encoding="utf-8"))["version"] == LS.LAYOUT_VERSION + 1
+        # a write that fails midway leaves the PREVIOUS layout intact and no part file
+        LS.save_layout(rec)
+        real_dump = LS.json.dump
+
+        def _half(obj, f, **kw):
+            f.write('{"format": "half')
+            raise RuntimeError("disk full")
+        LS.json.dump = _half
+        try:
+            LS.save_layout({**rec, "app_version": "9.9"})
+            raise AssertionError("a failed write was reported as written")
+        except RuntimeError:
+            pass
+        finally:
+            LS.json.dump = real_dump
+        assert LS.load_layout()["app_version"] == "4.0.0", "the old layout must survive"
+        assert not [x for x in tmp.parent.iterdir() if x.name.endswith(".part")], \
+            list(tmp.parent.iterdir())
+        # and a record that could not be restored is refused when it is MADE
+        for docks in ([{"name": "bad"}], [{"name": "viewer:0", "kind": "canvas"}],
+                      [{"name": "viewer:0", "binding": object()}]):
+            try:
+                LS.make_layout(geometry=b"", state=b"s", docks=docks)
+                raise AssertionError(f"accepted {docks}")
+            except (ValueError, TypeError):
+                pass
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    _ok("layout store: dock names '<kind>:<index>'; NODELAB_LAYOUT_FILE / NODELAB_LAYOUT=0 "
+        "honoured; round trip with the folder created; a write that fails midway leaves the "
+        "previous layout intact and no part file; damaged, foreign, other-generation, "
+        "bad-blob and over-nested files ignored without raising, and set aside as "
+        ".rejected when asked; malformed dock entries dropped while the rest restores; "
+        "unrestorable records refused when made")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -24878,6 +24989,7 @@ def main() -> int:
     test_page_kind_catalog()
     test_lablink_page_select()
     test_runner_qualified_ids()
+    test_layout_store()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

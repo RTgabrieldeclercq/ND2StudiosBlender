@@ -22,6 +22,7 @@ import time
 import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["NODELAB_LAYOUT"] = "0"               # never read or write the user's panel layout
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtCore import QPointF            # noqa: E402
@@ -5764,6 +5765,221 @@ def main(argv) -> int:
         "m=1, and the run graph carries a util.select_position tap with position '2'")
 
     _probe_movie_editor(win, app)
+
+    # ── SH1–SH4: the dock shell (V4.00 step 3) ─────────────────────────────────────────
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtWidgets import QDockWidget as _QDW, QLabel as _SHL
+    from nodelab_v2 import layout_store as _LS
+    from nodelab_v2 import theme as _TH
+    from nodelab_v2.shell import DOCK_GLYPH as _DOCKG, PanelDock as _PD, PanelSpec as _PS
+    _sh = win.shell
+    assert list(_sh.docks) == ["palette:0", "inspector:0", "sheet:0", "lablink:0",
+                               "console:0", "movie:0"], list(_sh.docks)
+    _want = (_QDW.DockWidgetMovable | _QDW.DockWidgetFloatable | _QDW.DockWidgetClosable)
+    for _d in _sh.docks.values():
+        assert isinstance(_d, _PD) and _d.titleBarWidget() is _d.title_bar, _d.objectName()
+        assert (_d.features() & _want) == _want, (_d.objectName(), _d.features())
+    assert all(isinstance(d, _PD) for d in win.findChildren(_QDW)), \
+        "every dock in the window is a shell panel"
+    assert _sh.dock_of(win.inspector) is _sh.docks["inspector:0"]
+    assert _sh.dock_of(win.movie_editor) is win._movie_dock is _sh.docks["movie:0"], \
+        "the Movie Editor is found through its scroll area"
+    assert win._console_dock is _sh.docks["console:0"]
+    win._panels_menu.aboutToShow.emit()
+    _pacts = win._panels_menu.actions()
+    assert [a.text() for a in _pacts[:4]] == ["Nodes", "Properties", "Spreadsheet", "LabLink"], \
+        [a.text() for a in _pacts]
+    assert win._console_act in _pacts, "the Console entry is the Ctrl+` action itself"
+    assert not win._new_menu.menuAction().isVisible(), "no multi-instance panel kind yet"
+    # pop out and dock back from the title bar
+    _sd = _sh.docks["sheet:0"]
+    _sd.title_bar.float_btn.click()
+    app.processEvents()
+    assert _sd.isFloating() and _sd.title_bar.float_btn.text() == _DOCKG
+    win.set_theme("light")                              # a floating panel restyles too
+    app.processEvents()
+    assert _TH.BODY.name() in _sd.title_bar.styleSheet()
+    win.set_theme("dark")
+    _sd.title_bar.float_btn.click()
+    app.processEvents()
+    assert not _sd.isFloating() and win.dockWidgetArea(_sd) == _Qt.RightDockWidgetArea
+    # close from the title bar; View ▸ Panels brings it back
+    _ld = _sh.docks["lablink:0"]
+    _ld.title_bar.close_btn.click()
+    app.processEvents()
+    assert _ld.isHidden() and not _ld.toggleViewAction().isChecked()
+    _ld.toggleViewAction().trigger()
+    app.processEvents()
+    assert not _ld.isHidden() and _ld.toggleViewAction().isChecked()
+    # the Console's own action and its panel stay one thing
+    win._console_act.setChecked(True)
+    app.processEvents()
+    assert not win._console_dock.isHidden()
+    win._console_dock.title_bar.close_btn.click()
+    app.processEvents()
+    assert win._console_dock.isHidden() and not win._console_act.isChecked()
+    # the welcome card's "Browse nodes" finds the palette's panel even when it is closed
+    _sh.docks["palette:0"].close()
+    win.focus_palette()
+    app.processEvents()
+    assert not _sh.docks["palette:0"].isHidden()
+    _ok("SH1 dock shell: every side panel is a movable/floatable/closable shell dock named "
+        "'<kind>:0' with its own title bar; pop-out and dock-back from the title bar (a "
+        "floating panel restyles with the theme); ✕ hides and View ▸ Panels brings it back; "
+        "the Console's Ctrl+` action is its Panels entry; Browse nodes reopens the palette")
+
+    # SH2 several instances of a kind: '+', the lowest free index, the active one, a veto
+    _sh.register(_PS("probe_panel", "Probe", lambda: _SHL("probe"), glyph="◇", multi=True))
+    assert win._new_menu.menuAction().isVisible(), "a multi kind appears under View ▸ New"
+    _p0 = _sh.spawn("probe_panel")
+    _p1 = _sh.spawn("probe_panel", beside=_p0)
+    assert (_p0.objectName(), _p1.objectName()) == ("probe_panel:0", "probe_panel:1")
+    assert _p1.title_bar.add_btn is not None and _sh.active("probe_panel") is _p1
+    _p1.title_bar.add_btn.click()                       # '+' opens another beside it
+    app.processEvents()
+    assert [d.objectName() for d in _sh.docks_of("probe_panel")] == \
+        ["probe_panel:0", "probe_panel:1", "probe_panel:2"]
+    _sh.activate(_p0)
+    assert _p0.title_bar.is_active() and not _p1.title_bar.is_active()
+    app.processEvents()
+    # …and the accent is PAINTED, not only flagged: the left edge of the active title bar
+    # is the accent colour, the inactive one's is not
+    _ia, _ib = _p0.title_bar.grab().toImage(), _p1.title_bar.grab().toImage()
+    assert _ia.pixelColor(1, _ia.height() // 2).name() == _TH.ACCENT.name(), \
+        _ia.pixelColor(1, _ia.height() // 2).name()
+    assert _ib.pixelColor(1, _ib.height() // 2).name() != _TH.ACCENT.name()
+    _sh._on_focus(None, _p1.panel)                      # focus moving in activates it
+    assert _sh.active("probe_panel") is _p1 and _p1.title_bar.is_active()
+    _p1.close()                                         # a multi panel's close destroys it
+    app.processEvents()
+    assert "probe_panel:1" not in _sh.docks and _sh.active("probe_panel") is _p0
+    assert _sh.spawn("probe_panel").objectName() == "probe_panel:1", "lowest free index"
+    _sh.allow_close = lambda d: d.kind != "probe_panel"  # e.g. "never the last canvas"
+    _p0.close()
+    app.processEvents()
+    assert "probe_panel:0" in _sh.docks and not _p0.isHidden(), "a vetoed close is refused"
+    _p0.toggleViewAction().trigger()                    # the same, from View ▸ Panels
+    app.processEvents()
+    assert not _p0.isHidden() and _p0.toggleViewAction().isChecked(), \
+        "a vetoed close from View ▸ Panels must leave its tick on"
+    _sh.allow_close = lambda d: True
+    # '+' beside an instance that sits in a TAB GROUP joins the group, in front — Qt's
+    # split of a tabbed dock would have taken both out of the group and off screen
+    _sh.register(_PS("probe_tab", "ProbeTab", lambda: _SHL("tab"), multi=True,
+                     tabify_with="inspector"))
+    _t0 = _sh.spawn("probe_tab")
+    win.tabifyDockWidget(_sh.docks["inspector:0"], _t0)
+    _t0.raise_()
+    app.processEvents()
+    _t0.title_bar.add_btn.click()
+    app.processEvents()
+    _t1 = _sh.docks["probe_tab:1"]
+    assert {d.objectName() for d in win.tabifiedDockWidgets(_t1)} >= {"inspector:0", "probe_tab:0"}, \
+        [d.objectName() for d in win.tabifiedDockWidgets(_t1)]
+    assert not _t1.visibleRegion().isEmpty(), "the new tab must be the one in front"
+    _t0.raise_()
+    app.processEvents()
+    assert not _t0.visibleRegion().isEmpty(), "…and the old one is still there"
+    for _d in list(_sh.docks_of("probe_tab")):
+        _d.close()
+    app.processEvents()
+    _sh.docks["inspector:0"].raise_()
+    for _d in list(_sh.docks_of("probe_panel")):
+        _d.close()
+    app.processEvents()
+    assert not _sh.docks_of("probe_panel")
+    _ok("SH2 multi-instance panels: View ▸ New lists a multi kind; '+' on a title bar opens "
+        "another beside it — as a tab, in front, when it sits in a tab group; instances are "
+        "'<kind>:<n>' with the lowest free n reused; focus makes one the active instance "
+        "(its accent painted); closing destroys that instance and the window can veto a "
+        "close, from the title bar or from View ▸ Panels (whose tick stays on)")
+
+    # SH3/SH4 the layout survives a restart; Reset layout; a damaged file is harmless.
+    # Two more windows on a TEMP layout file — the user's own is never read or written.
+    from nodelab_v2.window import MainWindow as _MW
+    _lay = os.path.join(tempfile.mkdtemp(prefix="nd2layout_"), "layout.json")
+    _envs = {k: os.environ.get(k) for k in (_LS.ENV_FILE, _LS.ENV_ENABLED)}
+    os.environ[_LS.ENV_FILE] = _lay
+    _extra = []
+    try:
+        _w2 = _MW(persist_layout=True)
+        _extra.append(_w2)
+        # a size that fits the screen: Qt clamps a RESTORED window to its screen (the
+        # offscreen one is small), so only a dimension that fits can be compared exactly
+        _avail = app.primaryScreen().availableGeometry()
+        _minh = _w2.minimumSizeHint()
+        _w2.show()
+        app.processEvents()
+        # a height between the window's minimum and the screen's: a fresh window opens at
+        # its minimum, so only a RESTORE can bring this one back. Qt clamps a restored window
+        # so that height + title bar fits the screen — the STYLE's title-bar height, which
+        # can exceed the frame this platform reports — so that much room is left too.
+        from PySide6.QtWidgets import QStyle as _QStyle
+        _frame = max(0, _w2.frameGeometry().height() - _w2.height(),
+                     _w2.style().pixelMetric(_QStyle.PM_TitleBarHeight))
+        _th = min(_avail.height() - _frame - 4, _minh.height() + 30)
+        assert _th > _minh.height(), ("no room on this screen to test a restored size",
+                                      _minh, _avail, _frame)
+        _w2.resize(max(_minh.width(), _avail.width() - 120), _th)
+        app.processEvents()
+        _s2 = _w2.shell
+        assert not _s2.docks["sheet:0"].isFloating(), "no file yet: the default layout"
+        _s2.docks["sheet:0"].setFloating(True)
+        _s2.docks["console:0"].show()
+        _s2.docks["lablink:0"].close()
+        app.processEvents()
+        _saved_wh = (_w2.width(), _w2.height())
+        _w2.close()
+        app.processEvents()
+        _rec = _LS.load_layout(_lay)
+        assert _rec is not None and [d["name"] for d in _rec["docks"]] == list(_s2.docks), _rec
+        _w3 = _MW(persist_layout=True)
+        _extra.append(_w3)
+        _w3.show()
+        app.processEvents()
+        _s3 = _w3.shell
+        assert _s3.docks["sheet:0"].isFloating(), "a floating panel comes back floating"
+        assert not _s3.docks["console:0"].isHidden(), "a shown panel comes back shown"
+        assert _s3.docks["lablink:0"].isHidden(), "a closed panel stays closed"
+        assert _saved_wh[1] != _minh.height(), "the saved height is what a fresh window gets"
+        assert _w3.height() == _saved_wh[1], (_w3.height(), _saved_wh, _avail)
+        if _saved_wh[0] < _avail.width() - 2:
+            assert _w3.width() == _saved_wh[0], (_w3.width(), _saved_wh, _avail)
+        assert _w3._layout_restored, "the launcher is told a layout was restored"
+        _w3.reset_layout()
+        app.processEvents()
+        assert not _s3.docks["sheet:0"].isFloating() and _s3.docks["console:0"].isHidden()
+        assert not _s3.docks["lablink:0"].isHidden() and _s3.docks["movie:0"].isHidden()
+        assert _w3.dockWidgetArea(_s3.docks["palette:0"]) == _Qt.LeftDockWidgetArea
+        assert _w3.tabifiedDockWidgets(_s3.docks["inspector:0"]), "Properties tabs are back"
+        _w3.close()
+        app.processEvents()
+        with open(_lay, "w", encoding="utf-8") as _f:
+            _f.write("{ damaged")
+        _w4 = _MW(persist_layout=True)                  # must open, on the default layout
+        _extra.append(_w4)
+        _w4.show()
+        app.processEvents()
+        assert not _w4.shell.docks["sheet:0"].isFloating()
+        assert _w4.shell.docks["console:0"].isHidden()
+        assert not _w4._layout_restored
+        with open(_lay + ".rejected", encoding="utf-8") as _f:
+            assert _f.read() == "{ damaged", "the unusable file is set aside, intact"
+        _w4.close()
+        app.processEvents()
+        assert _LS.load_layout(_lay) is not None, "closing rewrites a good layout over it"
+    finally:
+        for _k, _v in _envs.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+    assert not win._persist_layout, "the probe's own window runs with NODELAB_LAYOUT=0"
+    _ok("SH3 layout memory: a floating, a shown and a closed panel, and the window size, "
+        "come back after a restart; View ▸ Reset layout docks everything back with the "
+        "default tabs and hidden panels; SH4 a damaged layout file opens on the default "
+        "layout, is kept aside as layout.json.rejected and replaced on close; the probe's own "
+        "window never reads or writes one")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

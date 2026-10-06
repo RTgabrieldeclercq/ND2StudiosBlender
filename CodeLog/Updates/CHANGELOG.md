@@ -37,6 +37,15 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   shows; a run on another page still marks the cards it computes on the shown page.
   Invalidation goes through the Workspace's qualified touched set, so an edit on one page
   cancels exactly the runs on other pages that read it.
+
+### Step 3 — the dock shell (2026-10-05)
+- `nodelab_v2/shell.py` (`PanelSpec`, `PanelDock`, `PanelTitleBar`, `DockShell`): every side
+  panel is a dock with its own title bar — pop out / dock back / close, View ▸ Panels to bring
+  a closed one back, View ▸ Reset layout. Multi-instance machinery (`'<kind>:<n>'`, `+`,
+  the active instance, close vetoes) is in place for the viewers and canvases of steps 4–5.
+- `nodelab_v2/layout_store.py`: the layout survives a restart in `~/.nd2studios/layout.json`
+  (`NODELAB_LAYOUT=0` off, `NODELAB_LAYOUT_FILE` elsewhere); a damaged or foreign file is
+  ignored, never fatal.
 - Fixed before release (review): a page's run identity no longer repeats after File → Open;
   a bound Page Input card can be pulled (it shows its upstream Output); re-pointing an Input
   or re-binding it through an Output rename cancels the runs reading through it; a

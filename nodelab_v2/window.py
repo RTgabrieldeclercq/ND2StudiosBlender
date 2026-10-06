@@ -28,13 +28,14 @@ from collections import OrderedDict
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDockWidget, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QApplication, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QMainWindow, QMessageBox, QProgressBar, QSplitter, QToolButton, QVBoxLayout,
     QWidget,
 )
 
 from nodegraph.iterate import (
     ITERATE_OP, SWEEP_KEY, SWEEP_OWNER_KEY, SWEEP_ROWS_KEY, plan as iterate_plan)
+from nodelab_v2 import layout_store as LS
 from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
@@ -51,6 +52,7 @@ from nodelab_v2.picker import Calibration, request_for
 from nodelab_v2 import readiness as RD
 from nodelab_v2.runner import EngineRunner, ensure_gui_ops
 from nodelab_v2.scene import GraphScene, GraphView
+from nodelab_v2.shell import DockShell, PanelSpec
 from nodelab_v2.spreadsheet import SpreadsheetPanel
 from nodelab_v2.viewer import ViewerPanel
 from nodelab_v2.welcome import WelcomeCard
@@ -255,7 +257,10 @@ class _MovieHost:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, persist_layout: Optional[bool] = None) -> None:
+        """``persist_layout``: restore the saved panel layout now and save it on close
+        (V4.00 step 3). ``None`` follows ``NODELAB_LAYOUT`` (on unless it is ``0`` — every
+        probe and script sets it, so a test run never touches a user's layout)."""
         super().__init__()
         ensure_gui_ops()
         self.setWindowTitle(f"{PRODUCT} — nodegraph canvas")
@@ -318,43 +323,20 @@ class MainWindow(QMainWindow):
         self._follow_timer.setInterval(FOLLOW_DELAY_MS)
         self._follow_timer.timeout.connect(self._follow_pull)
 
-        # docks
+        # panels (V4.00 step 3): every side panel is a dock of the DockShell — it pops out
+        # into its own window, docks back, closes (View ▸ Panels brings it back) and keeps
+        # its place across a restart (nodelab_v2.layout_store). The Viewer/canvas splitter
+        # stays the central widget until steps 4–5 make those panels too.
         self.palette = PalettePanel(on_add=self._add_at_center)
         self.palette.refresh_requested.connect(self.refresh_node_list)
-        pd = QDockWidget("Nodes", self)
-        pd.setWidget(self.palette)
-        pd.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
-        self.addDockWidget(Qt.LeftDockWidgetArea, pd)
-
-        # right sidebar: Properties + Spreadsheet (tabbed)
         self.inspector = InspectorPanel()
-        idock = QDockWidget("Properties", self)
-        idock.setWidget(self.inspector)
-        idock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
-        self.addDockWidget(Qt.RightDockWidgetArea, idock)
-
         self.sheet = SpreadsheetPanel()
-        sdock = QDockWidget("Spreadsheet", self)
-        sdock.setWidget(self.sheet)
-        sdock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
-        self.addDockWidget(Qt.RightDockWidgetArea, sdock)
-        self.tabifyDockWidget(idock, sdock)
-
         # LabLink: whether this machine is serving the lab, and how to send work out to
-        # another hub. Tabbed with the other two rather than given its own edge — it is
+        # another hub. Tabbed with Properties rather than given its own edge — it is
         # consulted occasionally, not watched while editing — and it starts BEHIND
-        # Properties (the `idock.raise_()` below), so the dock exists without competing for
-        # attention on every launch.
+        # Properties, so the panel exists without competing for attention on every launch.
         self.lablink = LabLinkPanel()
-        ldock = QDockWidget("LabLink", self)
-        ldock.setWidget(self.lablink)
-        ldock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
-        self.addDockWidget(Qt.RightDockWidgetArea, ldock)
-        self.tabifyDockWidget(idock, ldock)
-        self._lablink_dock = ldock
         self.lablink.send.load_into_graph.connect(self.lablink_load_result)
-        idock.raise_()
-
         # Console (restored 2026-09-15, asked for by name: "errors should be in a console
         # that can be copy/pasted into"). It had been removed for the bottom-dock space,
         # leaving a failure as a status-bar line TRUNCATED to the terminal's width and a
@@ -365,56 +347,25 @@ class MainWindow(QMainWindow):
         # raises itself on the first failure (`_on_run_failed`) — the moment it is worth the
         # room. View ▸ Console toggles it by hand.
         self.console = ConsolePanel()
-        cdock = QDockWidget("Console", self)
-        cdock.setObjectName("console_dock")
-        cdock.setWidget(self.console)
-        cdock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
-        self.addDockWidget(Qt.BottomDockWidgetArea, cdock)
-        cdock.hide()
-        self._console_dock = cdock
         self._console_shown = False
-
-        # The Movie Editor (2026-09-30): a bottom dock tabbed with the Console that binds to
-        # an Export Movie node when one is selected — asked for as "a movie editor when on
-        # the node, rather than just a parameter list". Floatable, so it can live on a second
-        # screen while the Viewer keeps the centre. It talks to the window only through the
-        # `_MovieHost` adapter; the window owns the runner and the document.
+        # The Movie Editor (2026-09-30): a bottom panel that binds to an Export Movie node
+        # when one is selected — asked for as "a movie editor when on the node, rather than
+        # just a parameter list". It talks to the window only through the `_MovieHost`
+        # adapter; the window owns the runner and the document.
         from nodelab_v2.movie_editor import MovieEditorPanel
         self.movie_editor = MovieEditorPanel(_MovieHost(self))
-        mdock = QDockWidget("Movie Editor", self)
-        mdock.setObjectName("movie_editor_dock")
-        # Inside a scroll area, so the editor's own minimum size can never become the MAIN
-        # WINDOW's: a dock that cannot shrink below its content grows the window instead,
-        # and a maximized window then runs off the screen. Too small a dock scrolls.
-        from PySide6.QtWidgets import QFrame, QScrollArea
-        mscroll = QScrollArea()
-        mscroll.setWidgetResizable(True)
-        mscroll.setFrameShape(QFrame.NoFrame)
-        mscroll.setWidget(self.movie_editor)
-        mdock.setWidget(mscroll)
-        mdock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea
-                              | Qt.RightDockWidgetArea)
-        mdock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
-                          | QDockWidget.DockWidgetFeature.DockWidgetFloatable
-                          | QDockWidget.DockWidgetFeature.DockWidgetClosable)
-        # NOT tabbed with the Console: a tabbed dock takes the tab group's size and ignores
-        # `resizeDocks`, so it opened at the Console's sliver of height with a monitor
-        # 200 px tall. Both visible at once simply share the bottom edge.
-        #
-        # The side columns own the bottom corners, so a bottom dock sits under the CANVAS
-        # rather than under the full-height Properties/LabLink column. Spanning the width,
-        # its height stacked on top of that column's minimum: showing the editor raised the
-        # window's minimum height from 756 to 1023 px, which on a maximized 1080p window put
-        # the dock — and every button in it — below the bottom of the screen.
-        self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
-        self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
-        self.addDockWidget(Qt.BottomDockWidgetArea, mdock)
-        mdock.hide()
-        self._movie_dock = mdock
+        self.shell = DockShell(self)
+        for spec in self._panel_specs():
+            self.shell.register(spec)
+            self.shell.spawn(spec.kind, show=False)
+        self.shell.apply_default_layout()
+        self._console_dock = self.shell.docks_of("console")[0]
+        self._movie_dock = self.shell.docks_of("movie")[0]
+        self._lablink_dock = self.shell.docks_of("lablink")[0]
         # Keep the View ▸ Console tick honest when the dock is closed by its own ✕ or
         # raised by a failure — a menu tick that disagrees with what is on screen is the
         # same defect as a control that does nothing.
-        cdock.visibilityChanged.connect(self._sync_console_action)
+        self._console_dock.visibilityChanged.connect(self._sync_console_action)
 
         # Live node reload. `prime()` must run here — after the catalog and the GUI ops are
         # imported, before the user can edit anything — because it baselines the source
@@ -575,6 +526,53 @@ class MainWindow(QMainWindow):
         self.doc.on_change(self._sync_welcome)
 
         self._sync_welcome()          # open on a blank, welcoming canvas
+
+        # the saved panel layout (V4.00 step 3) — once every panel exists, before the window
+        # is shown. Skipped under NODELAB_LAYOUT=0, and for a file that is missing, damaged
+        # or from another layout generation: a layout must never stop the app starting.
+        self._persist_layout = (LS.layout_enabled() if persist_layout is None
+                                else bool(persist_layout))
+        #: whether a saved layout (geometry included) was applied — the launcher then shows
+        #: the window as saved instead of imposing its own size (`nodelab_v2.app.run`)
+        self._layout_restored = False
+        if self._persist_layout:
+            try:
+                self._layout_restored = bool(self.shell.restore_layout(quarantine=True))
+            except Exception:                        # noqa: BLE001 — see above
+                self.shell.apply_default_layout()
+
+    # ── panels (V4.00 step 3) ────────────────────────────────────────────────
+    def _panel_specs(self) -> List[PanelSpec]:
+        """The window's side panels, in View ▸ Panels order, with their default places."""
+        left, right = Qt.LeftDockWidgetArea, Qt.RightDockWidgetArea
+        bottom, top = Qt.BottomDockWidgetArea, Qt.TopDockWidgetArea
+        return [
+            PanelSpec("palette", "Nodes", lambda: self.palette, glyph="◫",
+                      default_area=left),
+            PanelSpec("inspector", "Properties", lambda: self.inspector, glyph="☰",
+                      default_area=right, raise_default=True),
+            PanelSpec("sheet", "Spreadsheet", lambda: self.sheet, glyph="▦",
+                      default_area=right, tabify_with="inspector"),
+            PanelSpec("lablink", "LabLink", lambda: self.lablink, glyph="⇄",
+                      default_area=right, tabify_with="inspector"),
+            PanelSpec("console", "Console", lambda: self.console, glyph="›",
+                      default_area=bottom, allowed_areas=bottom | right,
+                      default_hidden=True),
+            # NOT tabbed with the Console: a tabbed dock takes the tab group's size and
+            # ignores `resizeDocks`, so it opened at the Console's sliver of height with a
+            # monitor 200 px tall. Inside a scroll area (`scroll`), so the editor's own
+            # minimum size can never become the MAIN WINDOW's: a dock that cannot shrink
+            # below its content grows the window instead, and a maximized window then runs
+            # off the screen.
+            PanelSpec("movie", "Movie Editor", lambda: self.movie_editor, glyph="▶",
+                      default_area=bottom, allowed_areas=bottom | top | right,
+                      default_hidden=True, scroll=True),
+        ]
+
+    def reset_layout(self) -> None:
+        """View ▸ Reset layout: every panel docked back where a fresh install has it."""
+        self.shell.reset_layout()
+        self.statusBar().showMessage("layout reset — every panel is back in its default place")
 
     # ── chrome (G10) ─────────────────────────────────────────────────────────
     def _build_menus(self) -> None:
@@ -808,7 +806,7 @@ class MainWindow(QMainWindow):
         m_view = self.menuBar().addMenu("&View")
         fit = QAction("&Fit graph", self)
         fit.setShortcut("Home")
-        fit.triggered.connect(self.view.fit_all)
+        fit.triggered.connect(lambda: self.view.fit_all())
         m_view.addAction(fit)
         self._max_act = QAction("&Maximize node canvas", self)
         self._max_act.setCheckable(True)
@@ -831,11 +829,28 @@ class MainWindow(QMainWindow):
         self._console_act.toggled.connect(self._toggle_console)
         m_view.addAction(self._console_act)
         m_view.addSeparator()
+        # panels (V4.00 step 3): a tick per panel (the Console keeps the Ctrl+` action),
+        # New ▸ for the kinds that can have several instances, and Reset layout
+        self._panels_menu = m_view.addMenu("&Panels")
+        _console_override = {self._console_dock.objectName(): self._console_act}
+        self._panels_menu.aboutToShow.connect(
+            lambda: self.shell.fill_panels_menu(self._panels_menu, _console_override))
+        self.shell.fill_panels_menu(self._panels_menu, _console_override)
+        self._new_menu = m_view.addMenu("&New")
+        self._new_menu.aboutToShow.connect(lambda: self.shell.fill_new_menu(self._new_menu))
+        self.shell.changed.connect(lambda: self.shell.fill_new_menu(self._new_menu))
+        self.shell.fill_new_menu(self._new_menu)
+        reset = QAction("&Reset layout", self)
+        reset.setToolTip("Put every panel back where a fresh install has it — docked, in "
+                         "its default place")
+        reset.triggered.connect(self.reset_layout)
+        m_view.addAction(reset)
+        m_view.addSeparator()
         ovl = QAction("&Overlays…", self)
         ovl.setShortcut("Ctrl+Shift+O")
         ovl.setToolTip("Configure the Point / Label / Track overlays — size, opacity, "
                        "look, colour — and save the look as a default")
-        ovl.triggered.connect(self.viewer.open_overlay_dialog)
+        ovl.triggered.connect(lambda: self.viewer.open_overlay_dialog())
         m_view.addAction(ovl)
         m_view.addSeparator()
         self._light = QAction("&Light theme", self)
@@ -956,6 +971,7 @@ class MainWindow(QMainWindow):
             panel.restyle()
         if self._compare_box is not None:
             self._compare_box.restyle()   # restyles viewer2 with it
+        self.shell.restyle()       # the panels' title bars, floating or docked
         self._paint_led()          # the LED colors come from the tokens, not from QSS
         self._sync_solo_chip()     # ditto for the solo chip's amber
         self.view.setBackgroundBrush(T.BG)
@@ -1948,7 +1964,15 @@ class MainWindow(QMainWindow):
         parents it is a crash on exit — and it would land at the worst possible moment, when
         the user has already asked to quit and has no way to read the traceback.
         Best-effort: a failure here must not prevent the window from closing.
+
+        The panel layout is saved first (V4.00 step 3) — failing to remember it must not
+        block quitting either.
         """
+        if getattr(self, "_persist_layout", False):
+            try:
+                self.shell.save_layout()
+            except Exception:                                # noqa: BLE001 — see above
+                pass
         try:
             self.lablink.shutdown()
         except Exception:                                    # noqa: BLE001 — see above
@@ -3873,12 +3897,10 @@ class MainWindow(QMainWindow):
     def focus_palette(self) -> None:
         """Put the cursor in the Nodes palette search (the welcome card's shortcut to
         placing a first node)."""
-        w = self.palette.parentWidget()
-        while w is not None and not isinstance(w, QDockWidget):
-            w = w.parentWidget()
-        if w is not None:
-            w.show()
-            w.raise_()
+        dock = self.shell.dock_of(self.palette)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
         self.palette.focus_search()
 
     def build_demo(self) -> None:

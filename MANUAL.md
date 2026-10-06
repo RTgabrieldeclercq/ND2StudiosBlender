@@ -189,6 +189,17 @@ your first pull returns an image, which unfolds the Viewer to a ~2.5:1 split.
   and a *Copy all* button. This is where you look when a node goes red.
 * **Status bar** — a pulsing LED (idle / busy / error) plus the current node and timing.
 
+**Panels** (V4.00). Every side panel — Nodes, Properties, Spreadsheet, LabLink, Console,
+Movie Editor — has its own title bar: **⇱** pops it out into its own window (double-clicking
+the title does the same), **⇲** docks it back, **✕** closes it, and **View ▸ Panels** brings
+a closed one back where it was. Drag a panel by its title to another edge, or onto another
+panel's title to tab them together. The arrangement — what is where, what floats, what is
+closed, and the window size — is remembered between sessions in
+`~/.nd2studios/layout.json`; **View ▸ Reset layout** puts everything back as a fresh install
+has it. A layout file that is damaged, or was written by a newer version, is set aside as
+`layout.json.rejected` (the app opens on the default layout and writes a fresh one on quit);
+`NODELAB_LAYOUT=0` turns the memory off, and `NODELAB_LAYOUT_FILE` points it at another file.
+
 Light theme: **View → Light theme**.
 
 ---

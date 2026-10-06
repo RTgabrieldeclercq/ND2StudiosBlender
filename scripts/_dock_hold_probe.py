@@ -27,6 +27,7 @@ import sys
 import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["NODELAB_LAYOUT"] = "0"               # never touch the user's panel layout
 os.environ.setdefault("NODELAB_GL", "0")
 sys.path.insert(0, r"c:\Users\McGheeLab - Analysis\Documents\GitHub\ND2StudiosBlender")
 

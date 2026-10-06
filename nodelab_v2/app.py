@@ -18,8 +18,11 @@ def run() -> int:
         QSurfaceFormat.setDefaultFormat(default_surface_format())
     app = QApplication.instance() or QApplication(sys.argv)
     win = MainWindow()
-    win.resize(1600, 1000)          # generous default so the Viewer opens large
-    win.showMaximized()             # …and fill the screen on launch
+    if getattr(win, "_layout_restored", False):
+        win.show()                  # as saved: geometry and window state (maximized too)
+    else:
+        win.resize(1600, 1000)      # generous default so the Viewer opens large
+        win.showMaximized()         # …and fill the screen on launch
     win.view.fit_all()
     return app.exec()
 
