@@ -432,7 +432,11 @@ New hold — is one page per typed kind (`standard_kinds()`, read from the roles
 Input active; `reset()` returns to it, keeping the active page's document as Image Input's.
 A loaded image is routed to the Image Input page (`MainWindow._input_page`; the canvas
 switches there first, since the loaders read the active scene) and published as a
-`page.output` named after the file (`_publish_source`; a TIFF card starts on `ingest`, the only
+`page.output` named after the file. The pages stay in sight on every canvas's tab strip
+(`canvas.PageTabs`) and in the Pages panel (`pages_panel.PagesPanel`), both fed by
+`Workspace.page_summary` (what a page reads and publishes); `insert_index_for` keeps a new
+page in pipeline order. A page's Input is seeded once per session (`_seeded_pages`), and its
+start card (`welcome.WelcomeCard.configure`) is worded for its kind and dismissible (`_publish_source`; a TIFF card starts on `ingest`, the only
 access mode that can read it). Page-op DEFAULTS have one choke point: `Workspace._attach`
 installs `doc.node_defaults`, which `GraphDocument.add_node` merges UNDER explicit params — a
 hand-placed Output gets `unique_output_name` (`out`, `out2`, …), a hand-placed Input gets

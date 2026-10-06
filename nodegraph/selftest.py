@@ -27131,6 +27131,43 @@ def test_page_master_flag() -> None:
         "(a different source becomes an override) and into a seeded empty page")
 
 
+def test_page_order_and_summary() -> None:
+    """New pages keep the pipeline order (V4.00 step 11): ``insert_index_for`` puts a page
+    after the last page of its kind or an earlier one (a Free page last), and the New page
+    paths use it; ``page_summary`` says what each page reads and publishes — bound labels,
+    ``(unbound)`` — for the page tabs and the Pages panel."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import page_recipes as PR
+    from nodelab_v2.workspace import Workspace, build_example
+    OPS.ensure_ops()
+    ws = Workspace.standard()
+    assert [ws.insert_index_for(k) for k in ("input", "refine", "process", "analyze", "free")] \
+        == [1, 2, 3, 4, None]
+    r2 = PR.apply_new_page(ws, PR.NewPageSpec(kind="refine", name="R2"))
+    assert list(ws.pages).index(r2.id) == 2, list(ws.pages)
+    fr = ws.add_page("F", "free")
+    assert ws.insert_index_for("analyze") == 5 and list(ws.pages)[-1] == fr.id
+    a2 = PR.apply_new_page(ws, PR.NewPageSpec(kind="analyze", name="A2"))
+    assert list(ws.pages)[-2:] == [a2.id, fr.id], "a new Analysis page goes before the Free one"
+    ws2 = Workspace.standard()
+    pids = build_example(ws2)
+    assert ws2.page_summary(pids["input"]) == ([], ["raw"])
+    assert ws2.page_summary(pids["refine"]) == (["Image Input · raw"], ["mask"])
+    assert ws2.page_summary(pids["process"]) == (["Image Refinement · mask"], ["cells"])
+    assert ws2.page_summary(pids["analyze"]) == (["Image Processing · cells"], [])
+    d = ws2.pages[pids["analyze"]].doc
+    d.nodes["in"].params["source"] = ""
+    d.touch("in")
+    assert ws2.page_summary(pids["analyze"])[0] == ["(unbound)"]
+    d.nodes["in"].params["source"] = "pg9:gone"
+    d.touch("in")
+    assert ws2.page_summary(pids["analyze"])[0] == ["pg9:gone (unbound)"]
+    assert ws2.page_summary("nope") == ([], [])
+    _ok("page order and summary: new pages land after the last page of their kind or an "
+        "earlier one (Free last), the New page paths use it; page_summary lists what each "
+        "page reads (unbound marked) and publishes")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -27308,6 +27345,7 @@ def main() -> int:
     test_page_recipes_builtin_load()
     test_page_recipe_roundtrip()
     test_page_master_flag()
+    test_page_order_and_summary()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

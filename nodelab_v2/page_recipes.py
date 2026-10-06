@@ -247,14 +247,16 @@ def instantiate(ws: Workspace, recipe: PageRecipe, *, name: Optional[str] = None
                 kind: Optional[str] = None, source: Optional[str] = None,
                 index: Optional[int] = None, into: Optional[str] = None) -> Page:
     """Put ``recipe`` on a page: a new one (``name``, ``kind`` — default the recipe's own —
-    at ``index``) or the existing empty page ``into``. Its Page Inputs are bound to
+    at ``index``, default its place in the pipeline order) or the existing empty page ``into``. Its Page Inputs are bound to
     ``source`` or the page's default source, its Output names made unique."""
     if into is not None:
         page = _take_over(ws, into)
         if name and name != page.name:
             ws.rename_page(page.id, name)
     else:
-        page = ws.add_page(name or recipe.name, kind or recipe.kind, index=index)
+        k = kind or recipe.kind
+        page = ws.add_page(name or recipe.name, k,
+                           index=index if index is not None else ws.insert_index_for(k))
     ws.load_page_body(page.id, copy.deepcopy(recipe.body))
     if R.op_in_page(PAGE_INPUT_OP, page.kind):
         src = source or ws.default_source(page.id)
@@ -294,7 +296,8 @@ def apply_new_page(ws: Workspace, spec: NewPageSpec, *, into: Optional[str] = No
         if spec.name and spec.name != page.name:
             ws.rename_page(page.id, spec.name)
     else:
-        page = ws.add_page(spec.name or kind_label(spec.kind), spec.kind)
+        page = ws.add_page(spec.name or kind_label(spec.kind), spec.kind,
+                           index=ws.insert_index_for(spec.kind))
     if spec.source and R.op_in_page(PAGE_INPUT_OP, page.kind):
         page.doc.add_node(PAGE_INPUT_OP, x=40.0, y=120.0, params={PAGE_SOURCE_KEY: spec.source})
     elif R.op_in_page(PAGE_INPUT_OP, page.kind):

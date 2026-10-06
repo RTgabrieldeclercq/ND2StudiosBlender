@@ -53,6 +53,7 @@ from nodelab_v2.document import GraphDocument
 from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedDocument, LinkedPageError
 from nodelab_v2 import page_recipes as PR
 from nodelab_v2.new_page_dialog import NewPageDialog, SavePageRecipeDialog
+from nodelab_v2.pages_panel import PagesPanel
 from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
@@ -143,6 +144,8 @@ def _as_float(v) -> Optional[float]:
 VIEWER_SHARE = 0.45
 #: The default layout's side-column widths (px): Nodes on the left, Properties on the right.
 PALETTE_W, INSPECTOR_W = 330, 376
+#: the default height of the Pages panel, as a share of the left column (step 11)
+PAGES_SHARE = 0.30
 #: The panel kind of a Viewer dock (V4.00 step 4): several instances, ``viewer:<n>``.
 VIEWER_KIND = "viewer"
 #: The panel kind of a docked canvas (V4.00 step 5) — every canvas but the main one.
@@ -329,6 +332,10 @@ class MainWindow(QMainWindow):
         # own scene (`scene_for`) and a canvas shows one page at a time; `doc`, `scene`,
         # `view`, `minimap` and `welcome` name the active page's and the active canvas's.
         self.workspace = Workspace.standard(GraphDocument())   # the four standard pages
+        #: pages whose start card was dismissed (✕ / Start empty), and pages already
+        #: given their Page Input — for this session (V4.00 step 11)
+        self._welcome_dismissed: set = set()
+        self._seeded_pages: set = set()
         self._scenes: Dict[str, GraphScene] = {}
         #: per page: (its document, the listeners `_wire_scene` installed on it)
         self._page_hooks: Dict[str, Tuple[Any, List[Any]]] = {}
@@ -383,6 +390,15 @@ class MainWindow(QMainWindow):
         # its place across a restart (nodelab_v2.layout_store). The Viewer/canvas splitter
         # stays the central widget until steps 4–5 make those panels too.
         self.palette = PalettePanel(on_add=self._add_at_center)
+        # every page by kind, with what each reads and publishes (V4.00 step 11)
+        self.pages_panel = PagesPanel()
+        self.pages_panel.page_requested.connect(
+            lambda pid: self._show_page(self._canvas, pid))
+        self.pages_panel.rename_requested.connect(self.rename_page)
+        self.pages_panel.menu_requested.connect(self._pages_menu)
+        self.pages_panel.new_page_requested.connect(
+            lambda: self.new_page_dialog(kind=self.next_page_kind(self.workspace.active),
+                                         canvas=self._canvas))
         self.palette.refresh_requested.connect(self.refresh_node_list)
         self.inspector = InspectorPanel()
         self.sheet = SpreadsheetPanel()
@@ -608,6 +624,9 @@ class MainWindow(QMainWindow):
                       default_area=bottom,
                       binding_of=lambda c: c.page_id,
                       apply_binding=self._apply_canvas_binding),
+            # above the Nodes palette: every page of the workspace (V4.00 step 11)
+            PanelSpec("pages", "Pages", lambda: self.pages_panel, glyph="▤",
+                      default_area=left),
             PanelSpec("palette", "Nodes", lambda: self.palette, glyph="◫",
                       default_area=left),
             PanelSpec("inspector", "Properties", lambda: self.inspector, glyph="☰",
@@ -1020,9 +1039,18 @@ class MainWindow(QMainWindow):
         # the welcome card: the canvas it sits on becomes the one worked in first (its
         # buttons take focus, which activates a docked canvas; the main one is told here)
         for sig, fn in ((c.welcome.load_image_requested, self.file_load_source),
+                        (c.welcome.load_sequence_requested, self.file_load_sequence),
                         (c.welcome.browse_nodes_requested, self.focus_palette),
-                        (c.welcome.example_requested, self.build_example_workspace)):
+                        (c.welcome.example_requested, self.build_example_workspace),
+                        (c.welcome.goto_input_requested, self._goto_input_page)):
             sig.connect(lambda _=None, c=c, fn=fn: (self._activate_canvas(c), fn()))
+        c.welcome.recipe_chosen.connect(
+            lambda name, c=c: (self._activate_canvas(c), self._start_page_from_recipe(c, name)))
+        c.welcome.link_requested.connect(
+            lambda _=None, c=c: (self._activate_canvas(c), self.new_page_dialog(
+                kind=self.workspace.pages[c.page_id].kind, canvas=c, into=c.page_id,
+                start=PR.START_LINKED)))
+        c.welcome.dismissed.connect(lambda _=None, c=c: self._dismiss_welcome(c))
         c.welcome.op_dropped.connect(
             lambda op, pos, c=c: (self._activate_canvas(c), self._on_op_dropped(op, pos)))
         c.welcome.recipe_requested.connect(
@@ -1113,6 +1141,115 @@ class MainWindow(QMainWindow):
         """Show ``page_id`` on canvas ``c`` and work there."""
         c.set_page(page_id)
         self._activate_canvas(c)
+
+    # ── page tabs, the Pages panel, the start card (V4.00 step 11) ─────────────
+    def page_tab_items(self) -> List[Tuple[str, str, str, str]]:
+        """``(page id, label, kind, tooltip)`` per page, in page order — the canvases' tabs."""
+        ws = self.workspace
+        out = []
+        for p in ws.pages.values():
+            reads, pubs = ws.page_summary(p.id)
+            tip = [f"{kind_label(p.kind)} page"]
+            if reads:
+                tip.append("reads: " + ", ".join(reads))
+            if pubs:
+                tip.append("publishes: " + ", ".join(pubs))
+            tip.append("drag to reorder · double-click to rename · right-click for the page menu")
+            out.append((p.id, self._page_label(p), p.kind, "\n".join(tip)))
+        return out
+
+    def next_page_kind(self, page_id: Optional[str]) -> str:
+        """The kind a new page started from ``page_id`` most likely wants: the next one in
+        the pipeline (Analysis, and a Free page, start another of their own kind)."""
+        page = self.workspace.pages.get(page_id or "")
+        if page is None:
+            return "refine"
+        return (PR.next_kind(page.kind) if page.kind != FREE_KIND else None) or page.kind
+
+    def move_page(self, page_id: str, index: int) -> None:
+        """A page tab dragged to ``index``: the page order follows."""
+        if page_id in self.workspace.pages:
+            self.workspace.move_page(page_id, index)
+
+    def _refresh_page_views(self) -> None:
+        """The Pages panel and every canvas's tabs follow the workspace (cheap: both rebuild
+        only when what they show changed)."""
+        from nodegraph import roles as R
+        ws = self.workspace
+        panel = getattr(self, "pages_panel", None)
+        if panel is not None:
+            rows = []
+            for p in ws.pages.values():
+                reads, pubs = ws.page_summary(p.id)
+                master = ws.pages[p.master].name if p.master in ws.pages else ""
+                rows.append((p.id, self._page_label(p), p.kind, master, tuple(reads),
+                             tuple(pubs)))
+            panel.refresh([(k, kind_label(k)) for k in R.page_kinds()], rows, ws.active or "")
+        for c in self.canvases():
+            c.sync_tabs()
+
+    def _pages_menu(self, page_id: str, global_pos) -> None:
+        """Right-click on the Pages panel: show that page, then the switcher's menu."""
+        from PySide6.QtWidgets import QMenu
+        if page_id != self._canvas.page_id:
+            self._show_page(self._canvas, page_id)
+        m = QMenu(self)
+        self.fill_page_menu(m, self._canvas)
+        m.exec(global_pos)
+
+    def _frame_seed(self, c: CanvasPanel, node_id: str) -> None:
+        """Bring a page's freshly seeded Page Input into view at the canvas's top left, at
+        100 %, clear of the start banner along the bottom edge."""
+        page = self.workspace.pages.get(c.page_id)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None:
+            return
+        vp = c.view.viewport()
+        c.view.resetTransform()
+        c.view.centerOn(QPointF(float(rec.x) + vp.width() / 2.0 - 48.0,
+                                float(rec.y) + vp.height() / 2.0 - 48.0))
+
+    def _recipes_for(self, kind: str) -> list:
+        """The page recipes of ``kind`` (cached: the start card asks on every page change)."""
+        cache = self.__dict__.setdefault("_recipe_cache", {})
+        if kind not in cache:
+            cache[kind] = PR.list_recipes(kind)
+        return cache[kind]
+
+    def _start_page_from_recipe(self, c: CanvasPanel, name: str) -> Optional[str]:
+        """A recipe button on a page's start card: fill THAT page from the page recipe, its
+        Page Input reading what the seeded one read."""
+        page = self.workspace.pages.get(c.page_id)
+        if page is None:
+            return None
+        recipe = next((r for r in self._recipes_for(page.kind) if r.name == name), None)
+        if recipe is None:
+            self.statusBar().showMessage(f"no page recipe “{name}” for this page", 6000)
+            return None
+        src = None
+        for rec in page.doc.nodes.values():
+            v = rec.params.get(PAGE_SOURCE_KEY) if rec.op_key == PAGE_INPUT_OP else None
+            if v and self.workspace.resolve_source(page.id, v):
+                src = str(v)
+                break
+        spec = PR.NewPageSpec(kind=page.kind, start=PR.START_RECIPE, recipe=recipe, source=src)
+        pid = self._apply_new_page(spec, canvas=c, into=page.id)
+        if pid:
+            c.view.fit_all()
+        return pid
+
+    def _dismiss_welcome(self, c: CanvasPanel) -> None:
+        """✕ / *Start empty* on a start card: hidden for that page for the session."""
+        self._welcome_dismissed.add(c.page_id)
+        self._sync_welcome()
+        self.statusBar().showMessage(
+            "start card hidden for this page — the page switcher's New page… offers the "
+            "same starts", 6000)
+
+    def _goto_input_page(self) -> None:
+        pid = self._input_page(create=False)
+        if pid:
+            self._show_page(self._canvas, pid)
 
     # ── New page… / masters / page recipes (V4.00 step 11) ───────────────────
     @staticmethod
@@ -1211,6 +1348,7 @@ class MainWindow(QMainWindow):
         except (RuntimeError, OSError, ValueError) as exc:
             self.statusBar().showMessage(f"page recipe not saved: {exc}", 8000)
             return None
+        self.__dict__.pop("_recipe_cache", None)     # the start cards list it from now on
         self.statusBar().showMessage(f"page recipe “{name}” written to {path}")
         return str(path)
 
@@ -1284,8 +1422,13 @@ class MainWindow(QMainWindow):
         """Add a page of ``kind`` and show it on ``canvas`` (default: the active one). A page
         whose kind reads earlier pages starts with a Page Input already bound to the nearest
         named Output (V4.00 step 11, ``seed_input``) — when there is one to read."""
-        page = self.workspace.add_page(name or kind_label(kind), kind, seed_input=True)
+        page = self.workspace.add_page(name or kind_label(kind), kind, seed_input=True,
+                                       index=self.workspace.insert_index_for(kind))
         self._show_page(canvas or self._canvas, page.id)
+        seeds = [r.id for r in page.doc.nodes.values() if r.op_key == PAGE_INPUT_OP]
+        if seeds:
+            self._seeded_pages.add(page.id)
+            self._frame_seed(canvas or self._canvas, seeds[0])
         reads = [str(r.params.get(PAGE_SOURCE_KEY) or "") for r in page.doc.nodes.values()
                  if r.op_key == PAGE_INPUT_OP]
         labels = dict(page.doc.source_choices(""))
@@ -1423,6 +1566,7 @@ class MainWindow(QMainWindow):
 
     def _activate_canvas(self, c: CanvasPanel) -> None:
         """``c`` becomes the canvas the user works in, and its page the active page."""
+        arrived = self.workspace.active != c.page_id
         if c is not self._canvas:
             self._canvas = c
             dock = self.shell.dock_of(c) if hasattr(self, "shell") else None
@@ -1438,9 +1582,17 @@ class MainWindow(QMainWindow):
             self.workspace.set_active(c.page_id)         # → `_on_workspace_changed`
         else:
             self._sync_active_page_ui()
-        # an empty downstream page shown for the first time with something to read starts
-        # with its Page Input (V4.00 step 11; the standard pages exist before any image does)
-        self.workspace.seed_input(c.page_id)
+        # an empty downstream page shown with something to read starts with its Page Input
+        # (V4.00 step 11; the standard pages exist before any image does) — ONCE per page:
+        # an Input the user deleted does not come back on the next click
+        if c.page_id not in self._seeded_pages:
+            nid = self.workspace.seed_input(c.page_id)
+            if nid:
+                self._seeded_pages.add(c.page_id)
+                self._frame_seed(c, nid)
+                arrived = True
+        if arrived:
+            self._preview_page_reads(c.page_id)
 
     def _sync_canvas_accents(self) -> None:
         cs = self.canvases()
@@ -1525,6 +1677,7 @@ class MainWindow(QMainWindow):
             self._title_sig = tsig
             for c in self.canvases():
                 c.sync_title()
+        self._refresh_page_views()
 
     def _sync_active_page_ui(self) -> None:
         """What follows the active page: the palette's kind, the inspector (the page's own
@@ -1957,7 +2110,7 @@ class MainWindow(QMainWindow):
         T.apply(mode)
         QApplication.instance().setPalette(T.palette())   # light mode gets the light palette
         self.setStyleSheet(_window_qss())
-        for panel in (self.palette, self.inspector, self.sheet, self.lablink,
+        for panel in (self.palette, self.pages_panel, self.inspector, self.sheet, self.lablink,
                       self.console, self.movie_editor, *self.viewers, *self.canvases()):
             panel.restyle()
         self.shell.restyle()       # the panels' title bars, floating or docked
@@ -2115,6 +2268,10 @@ class MainWindow(QMainWindow):
             sd = self.shell.dock(name)
             if sd is not None and not sd.isHidden() and not sd.isFloating():
                 self.resizeDocks([sd], [w], Qt.Horizontal)
+        pd = self.shell.dock("pages:0")          # the Pages panel: a third of the column
+        if pd is not None and not pd.isHidden() and not pd.isFloating():
+            self.resizeDocks([pd], [max(120, int(PAGES_SHARE * self._column_height()))],
+                             Qt.Vertical)
 
     def showEvent(self, event) -> None:                      # noqa: N802 — Qt override
         super().showEvent(event)
@@ -2173,6 +2330,40 @@ class MainWindow(QMainWindow):
             # queueing here would turn clicking around during a long run into a committed
             # backlog of pulls nobody asked for.
             self._preview_pull(nid)
+
+    def _previews_on_select(self, rec) -> bool:
+        """Does selecting this card show it in the active Viewer even with click-to-preview
+        off? A card that exists to be LOOKED at (a Viewer node, a plot), and since V4.00
+        step 11 a page boundary that carries data: a Page Input that resolves (what this page
+        reads) and a Page Output with something wired in (what a later page will read)."""
+        op = getattr(rec, "op_key", "")
+        if is_visual_output(op):
+            return True
+        if op == PAGE_INPUT_OP:
+            return bool(self.workspace.resolve_source(
+                self.workspace.active or "", rec.params.get(PAGE_SOURCE_KEY)))
+        if op == PAGE_OUTPUT_OP:
+            return any(e[2] == rec.id for e in self.doc.edges)
+        return False
+
+    def _preview_page_reads(self, page_id: str) -> None:
+        """Arriving on a page while the active Viewer shows another page's node (or
+        nothing): show what THIS page reads — its first Page Input that resolves (V4.00 step
+        11). Without it, a page that reads one split position of an image went on showing
+        the load's preview of every position from Image Input, which reads as the wrong
+        data reaching the page. A preview: it starts no ingest and queues behind no run."""
+        page = self.workspace.pages.get(page_id)
+        v = self._active_viewer()
+        if page is None or v is None:
+            return
+        b = getattr(v, "binding", None)
+        if b and b[0] == page_id:
+            return
+        for rec in page.doc.nodes.values():
+            if rec.op_key == PAGE_INPUT_OP and self.workspace.resolve_source(
+                    page_id, rec.params.get(PAGE_SOURCE_KEY)):
+                self._preview_pull(rec.id)
+                return
 
     def _preview_pull(self, node_id: str) -> None:
         """A pull the SELECTION made (click-to-preview, a visual card) rather than one the
@@ -2291,11 +2482,12 @@ class MainWindow(QMainWindow):
         if sel and self._follow_act.isChecked():
             self._follow_pending = sel[0].node_id
             self._follow_timer.start()
-        elif (len(sel) == 1 and is_visual_output(sel[0].rec.op_key)
+        elif (len(sel) == 1 and self._previews_on_select(sel[0].rec)
               and sel[0].node_id != self._viewed):
             # a VISUAL card (a Viewer node, a plot) exists to be looked at, so selecting it
             # shows it in the active viewer even with click-to-preview off (V4.00 step 4) —
-            # and, like a preview, never starts an ingest or queues behind a running pull
+            # and, like a preview, never starts an ingest or queues behind a running pull;
+            # so does a page boundary that carries data (step 11)
             self._preview_pull(sel[0].node_id)
 
     # ── interactive parameter picking (V2.16) ────────────────────────────────
@@ -4827,6 +5019,9 @@ class MainWindow(QMainWindow):
             pane.forget_display_state()
 
     def file_new(self) -> None:
+        self._welcome_dismissed.clear()
+        self._seeded_pages.clear()
+        self.__dict__.pop("_recipe_cache", None)
         self.workspace.reset()    # clears the page → _on_doc_changed closes Compare viewers
         self._forget_display_state()
         for v in self.viewers:
@@ -4970,8 +5165,12 @@ class MainWindow(QMainWindow):
         labels = _unique_labels(list(paths))
         total_m = sum(int(h[1].m) for h in heads)
         axes = AxisSizes(m=total_m, t=ax0.t, z=ax0.z, c=ax0.c, y=ax0.y, x=ax0.x)
+        # a bundle with any TIFF in it starts on `ingest`, as a single TIFF card does: the
+        # default `direct` reads ND2 only, so the bundle's first pull would fail
+        from nodelab_v2.ingest import _is_tiff
+        modes = {ACCESS_MODE: ACCESS_INGEST} if any(_is_tiff(p) for p in paths) else None
         rec = self.doc.add_node(
-            LOAD_OP, x=x, y=y,
+            LOAD_OP, x=x, y=y, modes=modes,
             params={"path": paths[0], BUNDLE_PATHS_KEY: list(paths),
                     TITLE_KEY: f"{len(paths)} files",
                     CHANNELS_KEY: chans})
@@ -5341,15 +5540,27 @@ class MainWindow(QMainWindow):
 
     # ── empty canvas / example content ────────────────────────────────────────
     def _sync_welcome(self, *_a) -> None:
-        """Show each canvas's welcome card while its page holds no node — or nothing but the
-        Page Input it was seeded with (V4.00 step 11): the card still says how to begin."""
+        """Show each canvas's start card while its page holds no node — or nothing but the
+        Page Input it was seeded with — unless it was dismissed on that page; and word it
+        for the page's kind (V4.00 step 11): a load on Image Input, the kind's page recipes
+        on a later page (a banner along the bottom, clear of the seeded Input)."""
+        from nodegraph import roles as R
         ws = self.workspace
+        gone = self._welcome_dismissed
         for c in self.canvases():
             page = ws.pages.get(c.page_id)
-            c.welcome.setVisible(page is not None and not any(
+            show = (page is not None and page.id not in gone and not any(
                 r.op_key != PAGE_INPUT_OP for r in page.doc.nodes.values()))
-            if page is not None:
-                c.welcome.set_page_kind(page.kind, bool(ws.available_sources(page.id)))
+            if show:
+                labels = dict(ws.available_sources(page.id))
+                reads = [labels[s] for s in (
+                    str(r.params.get(PAGE_SOURCE_KEY) or "") for r in page.doc.nodes.values()
+                    if r.op_key == PAGE_INPUT_OP) if s in labels]
+                c.welcome.configure(
+                    page.kind, reads=", ".join(reads), has_upstream=bool(labels),
+                    recipes=[(r.name, r.description) for r in self._recipes_for(page.kind)],
+                    description=str(R.page_meta(page.kind).get("description") or ""))
+            c.welcome.setVisible(show)
             if c.welcome.isVisible():
                 c.welcome.raise_()
                 c.minimap.raise_()          # the mini-map still owns its corner

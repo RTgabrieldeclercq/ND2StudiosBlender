@@ -151,8 +151,9 @@ once per detected cell). A CUDA torch build is picked up automatically
 ## 2. The window
 
 NodeLab opens on the **Image Input page** of a fresh workspace of four pages — Image Input,
-Image Refinement, Image Processing, Analysis (**Pages**, below) — with a welcome card: *Load
-image… / Browse nodes / Example graph*. The **Viewer** sits above the canvas from the start
+Image Refinement, Image Processing, Analysis (**Pages**, below) — with a start card: *Load
+image… / Load sequence… / Example graph*. A **tab per page** runs along the top of the canvas,
+and the **Pages** panel (left, above Nodes) lists every page by kind. The **Viewer** sits above the canvas from the start
 (about 45 % of the height) and shows what you load or pull; the Nodes palette is on the left,
 Properties on the right with the Spreadsheet and LabLink tabbed behind it. A panel popped out
 with **⇱** is a frameless window with a thin edge in the theme's colour.
@@ -212,7 +213,14 @@ Input** (load and organise the data), **Image Refinement** (prepare the image, f
 from before V4 opens as one Free page). **File → New holds the four standard pages**, one of
 each kind in that order, Image Input active. The button in a canvas's top-left corner is the
 **page switcher**: it names the page shown and lists every page by kind; its menu adds a page
-of any kind, duplicates, renames or deletes one, or opens it in a new canvas. `Ctrl+PgDn` /
+of any kind, duplicates, renames or deletes one, or opens it in a new canvas. **Keeping track
+of pages:** every canvas has a **tab per page** along its top edge — click one to show that
+page, drag it to reorder the pages, double-click to rename, right-click for the same menu, **+**
+for *New page…*; the **Pages** panel lists them grouped by kind in pipeline order, each with
+what its Page Inputs **read** and which Outputs it **publishes** (a master page carries ★, a
+linked one names its master) — click to show, double-click to rename, right-click for the
+menu. A new page is placed after the last page of its kind (or an earlier one), so the pages
+stay in pipeline order however they were added. `Ctrl+PgDn` /
 `Ctrl+PgUp` step through the pages. The **palette, the link-drag search and the Ready-to-run
 suggestions offer the nodes of the page's kind** (a chip above the palette's search says
 which); a Free page offers every node.
@@ -221,7 +229,12 @@ Pages hand data on **by name — and the app does the naming for you.** **Loadin
 its card on the Image Input page** (the canvas switches there, whatever page you were on) **and
 publishes it as a Page Output named after the file**; a **new Refinement, Processing or
 Analysis page starts with a Page Input already reading the nearest earlier page's newest
-Output**, and an empty one gets that Input the first time you open it. A **Page Output** names
+Output**, and an empty one gets that Input the first time you open it (once: delete it and
+it stays deleted). An empty page shows a **start card** for its kind: a load on Image Input;
+on a later page a banner along the bottom that names what its Page Input reads and offers the
+kind's **page recipes** as buttons, *More recipes…*, *Link to a master…* and *Start empty* —
+or *Go to Image Input* while there is nothing to read. **✕** or *Start empty* hides it for
+that page; File → New brings the cards back. A **Page Output** names
 a Dataset as a variable of its page (its card reads `Output · raw`; placed by hand it is named
 `out`, `out2`, …), and a **Page Input** on a later page reads one (`Input · Image Input ·
 raw`; placed by hand it binds to the nearest Output, and its **Source** menu lists the rest) —
@@ -277,8 +290,9 @@ A page recipe is *not* a LabLink recipe (§17b) — one is a starting point for 
 editor, the other a whole graph published for a hub. **Set as master page** (the switcher)
 marks a page with ★ and offers it first when a new page is *linked to a master*; any plain
 page can still be chosen, and the linked page's switcher label reads `(linked · N overrides)`.
-The welcome card of an empty Refinement, Processing or Analysis page offers *Start from a page
-recipe…*, and a Page Output's right-click menu offers *New page from this output…*.
+The start card of an empty Refinement, Processing or Analysis page offers the kind's recipes
+as buttons (and *More recipes…*), and a Page Output's right-click menu offers *New page from
+this output…*.
 
 **Several Viewers** (V4.00). **+** on a Viewer's title bar, or **View ▸ New ▸ Viewer**, opens
 another Viewer beside it; pop one out onto a second screen with **⇱**. Each Viewer keeps
@@ -310,8 +324,8 @@ workflow tuned per dish, compared on one plot.
 2. **Refinement page.** Open the Image Refinement page (the switcher, or `Ctrl+PgDn`): it
    arrives with a **Page Input** reading the newest Output — set its **Source** to
    `Image Input · dishA` → Gaussian Blur → Threshold → a Page Output named `mask` (the
-   Ready-to-run block on Threshold offers *+ Page Output*; rename it). Or let the welcome
-   card's *Start from a page recipe…* place *Smooth & threshold* and set its Source.
+   Ready-to-run block on Threshold offers *+ Page Output*; rename it). Or let the start
+   card's *Smooth & threshold* button fill the page and set its Source.
 3. **A variant.** The switcher's *Duplicate as linked page*. On the copy, change Threshold's
    level and point its Page Input at `dishB` — both become that page's **overrides** (a bar
    on the row). Adding or rewiring a node there is refused: edit the master, and both follow.
@@ -3448,6 +3462,8 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **"Page Input is not bound to an upstream Output"** | its Source names no Output a page before it offers — the Output was renamed or deleted, its page was deleted, or the source page comes later in the order. Pick the source again in Properties, or click *Bind to …* in the Ready-to-run block, which lists every unbound Input; the card itself reads `Input · (unbound)` in red |
 | **I loaded an image and the canvas jumped to another page** | By design (V4.00): a loaded image always lands on the **Image Input** page — the canvas switches there — and is published as a Page Output named after the file. Go back to the page you were on: a new downstream page starts with a Page Input reading it, and an existing empty page gets one the first time you open it |
 | **A Refinement page is empty and I cannot get the image into it** | Load the image first (it is published on Image Input), then open the page — it gets a bound Page Input; or place a Page Input from the palette's **Pages** band, which binds to the nearest named Output. Nothing to bind to yet? *Go to Image Input* under its Source menu |
+| **The start card covers my page / will not go away** | Its **✕** (top right) or *Start empty* hides it for that page; File → New brings the cards back. On a Refinement, Processing or Analysis page it is a banner along the bottom edge, below the page's Page Input |
+| **I lose track of my pages** | Use the **tabs** along the top of the canvas (one per page, drag to reorder) and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, with what it reads and publishes |
 | **A popped-out panel had a white border, or light bars under the Viewer** | Fixed in V4.00 (the dock's frame and the panel bodies paint the theme now). If a light edge ever shows again: View ▸ Reset layout, and report which panel |
 | **My panel layout reset itself after updating** | Once, by design: V4.00 changed the default layout (the Viewer is visible from the start), so a layout file saved by an older build is set aside as `layout.json.rejected` and the new default applies; arrange the panels again and they are remembered from then on |
 | **Adding, deleting or wiring a node is refused: "this page is linked to its master"** | the page is a linked copy and its graph follows the master. Make the change on the master (every linked page follows), or *Make unique* in the page switcher |

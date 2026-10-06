@@ -828,6 +828,38 @@ class Workspace:
             return {PAGE_SOURCE_KEY: src} if src else {}
         return {}
 
+    def insert_index_for(self, kind: str) -> Optional[int]:
+        """Where a NEW page of ``kind`` goes in the page order: right after the last page
+        whose kind comes no later in the pipeline, so the pages stay grouped Image Input →
+        Refinement → Processing → Analysis however they were added; ``None`` (last) for a
+        Free page, which has no place in that order."""
+        o = R.page_order(kind)
+        if o is None:
+            return None
+        last = -1
+        for i, p in enumerate(self.pages.values()):
+            po = R.page_order(p.kind)
+            if po is not None and po <= o:
+                last = i
+        return last + 1
+
+    def page_summary(self, page_id: str) -> Tuple[List[str], List[str]]:
+        """``(reads, publishes)`` of a page: what each of its Page Inputs reads, by label
+        (``"Image Input · raw"``; ``"(unbound)"`` / ``"<value> (unbound)"`` when it resolves
+        to nothing), and the names of its named Outputs in the order they were added — what
+        the page tabs and the Pages panel show."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return [], []
+        labels = dict(self.available_sources(page_id))
+        reads: List[str] = []
+        for rec in page.doc.nodes.values():
+            if rec.op_key != PAGE_INPUT_OP:
+                continue
+            src = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+            reads.append(labels.get(src) or (f"{src} (unbound)" if src else "(unbound)"))
+        return reads, [n for n, _nid in self._outputs_in_order(page_id)]
+
     def seed_input(self, page_id: str) -> Optional[str]:
         """Give an EMPTY page whose kind reads earlier pages ONE Page Input, bound to
         :meth:`default_source` — when the page holds no node yet, is not linked (its graph is

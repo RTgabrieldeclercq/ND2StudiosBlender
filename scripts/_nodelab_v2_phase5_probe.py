@@ -6896,7 +6896,8 @@ def main(argv) -> int:
     from nodelab_v2.shell import DOCK_GLYPH as _DOCKG, PanelDock as _PD, PanelSpec as _PS
     _sh = win.shell
     assert [n for n in _sh.docks if not n.startswith("viewer:")] == [
-        "palette:0", "inspector:0", "sheet:0", "lablink:0", "console:0", "movie:0"], \
+        "pages:0", "palette:0", "inspector:0", "sheet:0", "lablink:0", "console:0",
+        "movie:0"], \
         list(_sh.docks)
     assert _sh.docks_of("viewer"), "the Viewers are shell docks too (V4.00 step 4)"
     _want = (_QDW.DockWidgetMovable | _QDW.DockWidgetFloatable | _QDW.DockWidgetClosable)
@@ -6911,8 +6912,8 @@ def main(argv) -> int:
     assert win._console_dock is _sh.docks["console:0"]
     win._panels_menu.aboutToShow.emit()
     _pacts = win._panels_menu.actions()
-    assert [a.text() for a in _pacts if not a.text().startswith("Viewer")][:4] == [
-        "Nodes", "Properties", "Spreadsheet", "LabLink"], [a.text() for a in _pacts]
+    assert [a.text() for a in _pacts if not a.text().startswith("Viewer")][:5] == [
+        "Pages", "Nodes", "Properties", "Spreadsheet", "LabLink"], [a.text() for a in _pacts]
     assert win._console_act in _pacts, "the Console entry is the Ctrl+` action itself"
     assert win._new_menu.menuAction().isVisible(), "View ▸ New lists the Viewer kind"
     # pop out and dock back from the title bar
@@ -7590,12 +7591,12 @@ def main(argv) -> int:
     # redirected folder; the Input page's card still says Load image…
     _pid_n = win.new_page("refine")
     app.processEvents()
-    assert win.welcome.isVisible(), "a seeded page keeps its card"
-    assert win.welcome._btn_load.text() == "Start from a page recipe…", win.welcome._btn_load.text()
+    assert win.welcome.isVisible() and win.welcome.is_banner, "a seeded page keeps its card"
+    assert win.welcome.button("More recipes…") is not None, win.welcome.button_texts()
     _n2 = len(_ws11.pages)
     _seen11.clear()
     _QT11.singleShot(50, lambda: _accept11(True, _pid_n, "Smooth & threshold"))
-    win.welcome._btn_load.click()
+    win.welcome.button("More recipes…").click()
     app.processEvents()
     assert _seen11 == [(True, _pid_n)], ("the card opens the dialog on Page recipe, into "
                                           "this page", _seen11)
@@ -7611,9 +7612,218 @@ def main(argv) -> int:
     app.processEvents()
     assert win.welcome.isVisible() and win.welcome._btn_load.text() == "Load image…"
     os.environ.pop(_PR11.ENV_DIR, None)
-    _ok("NP4 the welcome card of a seeded Refinement page offers Start from a page recipe…, "
+    _ok("NP4 the start card of a seeded Refinement page offers More recipes… (New page… on "
+        "that page), "
         "and the recipe takes the page over; Save as page recipe writes under the recipe "
         "folder and lists as the user's; the Input page's card still loads an image")
+
+    # ── WC1 / PT1 / PP1: the start card per kind, the page tabs, the Pages panel ─────────
+    # (V4.00 step 11, after the user's feedback: the card could not be dismissed and asked
+    # the same thing on every page; pages were hard to keep track of)
+    from PySide6.QtCore import Qt as _Qt12
+    _ws12 = win.workspace
+    os.environ[_PR11.ENV_DIR] = tempfile.mkdtemp(prefix="nd2recipes_")   # built-ins only
+    win.file_new()
+    app.processEvents()
+    _in12 = _ws12.active
+    assert _ws12.page(_in12).kind == "input"
+    assert win.welcome.isVisible() and not win.welcome.is_banner
+    assert win.welcome.button_texts() == ["Load image…", "Load sequence…", "Example graph"], \
+        win.welcome.button_texts()
+    win.welcome._close.click()
+    app.processEvents()
+    assert not win.welcome.isVisible() and _in12 in win._welcome_dismissed
+    win._sync_welcome()
+    app.processEvents()
+    assert not win.welcome.isVisible(), "a dismissed card stays hidden on its page"
+    # nothing upstream yet: a later page's banner says so and offers Image Input
+    _ref12 = next(p.id for p in _ws12.pages.values() if p.kind == "refine")
+    win._show_page(win._main_canvas, _ref12)
+    app.processEvents()
+    assert not win.doc.nodes, "nothing to read: no Page Input is seeded"
+    assert win.welcome.isVisible() and win.welcome.is_banner
+    assert win.welcome.button_texts()[0] == "Go to Image Input", win.welcome.button_texts()
+    win.welcome.button("Go to Image Input").click()
+    app.processEvents()
+    assert _ws12.active == _in12 and win.canvas.page_id == _in12
+    # something to read: the banner sits at the bottom, below the seeded Page Input, names
+    # what it reads and offers the kind's page recipes; a recipe button fills the page
+    _L12 = win.doc.add_node("io.load", x=0, y=0)
+    _O12 = win.doc.add_node("page.output", x=300, y=0, params={"name": "raw"})
+    win.doc.connect(_L12.id, "image", _O12.id, "data")
+    app.processEvents()
+    win._show_page(win._main_canvas, _ref12)
+    app.processEvents()
+    assert [r.op_key for r in win.doc.nodes.values()] == ["page.input"], \
+        "the page is given its Page Input when it has something to read"
+    assert win.welcome.isVisible() and win.welcome.is_banner
+    _wg12 = win.welcome.geometry()
+    assert _wg12.bottom() >= win.view.height() - 40, (_wg12, win.view.height())
+    _seed12 = next(iter(win.doc.nodes.values()))
+    _sr12 = win.view.mapFromScene(
+        win.scene.node_items[_seed12.id].sceneBoundingRect()).boundingRect()
+    assert win.view.viewport().rect().contains(_sr12.center()), "the seeded Input is in view"
+    assert not _wg12.intersects(_sr12.translated(win.view.viewport().pos())), \
+        ("the banner does not cover the seeded Input", _wg12, _sr12)
+    assert f"{_ws12.page(_in12).name} · raw" in win.welcome._sub.text(), win.welcome._sub.text()
+    _bt12 = win.welcome.button_texts()
+    assert _bt12[:2] == ["Background & deconvolve", "Smooth & threshold"], _bt12
+    assert "More recipes…" in _bt12 and _bt12[-1] == "Start empty", _bt12
+    assert win.welcome._compact or "Link to a master…" in _bt12, _bt12   # one row when short
+    # the seeded Input is given ONCE: deleted, it does not come back on the next click
+    win.doc.remove_node(_seed12.id)
+    app.processEvents()
+    win._activate_canvas(win._main_canvas)
+    app.processEvents()
+    assert not win.doc.nodes, "a deleted seed does not come back"
+    win.welcome.button("Smooth & threshold").click()
+    app.processEvents()
+    assert {r.op_key for r in win.doc.nodes.values()} == \
+        {"page.input", "enhance.gaussian", "analysis.threshold", "page.output"}, \
+        sorted(r.op_key for r in win.doc.nodes.values())
+    assert win.doc.nodes["in"].params["source"] == f"{_in12}:raw"
+    assert not win.welcome.isVisible()
+    _vp12 = win.view.viewport().rect()
+    assert all(_vp12.intersects(win.view.mapFromScene(it.sceneBoundingRect()).boundingRect())
+               for it in win.scene.node_items.values()), "the recipe's cards are in view"
+    # Start empty dismisses; File ▸ New brings every card back
+    _pro12 = next(p.id for p in _ws12.pages.values() if p.kind == "process")
+    win._show_page(win._main_canvas, _pro12)
+    app.processEvents()
+    assert win.welcome.is_banner and "Image Refinement · mask" in win.welcome._sub.text(), \
+        win.welcome._sub.text()
+    win.welcome.button("Start empty").click()
+    app.processEvents()
+    assert not win.welcome.isVisible() and _pro12 in win._welcome_dismissed
+    win.file_new()
+    app.processEvents()
+    assert win.welcome.isVisible() and not win._welcome_dismissed and not win._seeded_pages
+    _ok("WC1 the start card asks for what each page needs: a load on Image Input, the kind's "
+        "page recipes on a later page (a banner along the bottom, clear of the seeded Page "
+        "Input, naming what it reads), Go to Image Input with nothing to read; ✕ and Start "
+        "empty dismiss it for the page and File ▸ New brings it back; a recipe button fills "
+        "the page in view; a deleted seed does not come back")
+
+    # PT1 the page tabs: one per page, in page order, the shown page current; a click shows
+    # the page, a drag reorders the pages, a rename shows; a new page lands in pipeline order
+    _tabs12 = win._main_canvas.tabs
+    _bar12 = _tabs12.bar
+    assert _tabs12.page_ids() == list(_ws12.pages), (_tabs12.page_ids(), list(_ws12.pages))
+    assert _bar12.tabData(_bar12.currentIndex()) == _ws12.active
+    _ana12 = next(p.id for p in _ws12.pages.values() if p.kind == "analyze")
+    _bar12.setCurrentIndex(list(_ws12.pages).index(_ana12))
+    app.processEvents()
+    assert _ws12.active == _ana12 and win.canvas.page_id == _ana12
+    _np12 = win.new_page("refine")
+    app.processEvents()
+    assert list(_ws12.pages).index(_np12) == 2 and _tabs12.page_ids() == list(_ws12.pages)
+    assert _bar12.tabData(_bar12.currentIndex()) == _np12
+    _order12 = list(_ws12.pages)
+    _bar12.moveTab(2, 1)
+    app.processEvents()
+    assert list(_ws12.pages)[1] == _np12 and _tabs12.page_ids() == list(_ws12.pages)
+    _bar12.moveTab(1, 2)
+    app.processEvents()
+    assert list(_ws12.pages) == _order12
+    win.rename_page(_np12, "Dish B refine")
+    app.processEvents()
+    assert _bar12.tabText(list(_ws12.pages).index(_np12)) == "Dish B refine"
+    assert win._main_canvas.tabs.add_btn.isVisible()
+    assert "reads" not in _bar12.tabToolTip(0) and "Image Input page" in _bar12.tabToolTip(0)
+    _ok("PT1 the page tabs: one per page in page order, the shown page current; a click shows "
+        "that page, dragging a tab reorders the pages, a rename and a new page (placed in "
+        "pipeline order) show at once; + opens New page…")
+
+    # PP1 the Pages panel: pages by kind in pipeline order, what each reads and publishes; a
+    # click shows the page
+    _pp12 = win.pages_panel
+    _pd12 = win.shell.dock_of(_pp12)
+    assert _pd12 is not None and win.dockWidgetArea(_pd12) == _Qt12.LeftDockWidgetArea
+    _heads12 = [_pp12.tree.topLevelItem(i).text(0).split("  ·  ")[0]
+                for i in range(_pp12.tree.topLevelItemCount())]
+    assert _heads12 == ["Image Input", "Image Refinement", "Image Processing", "Analysis"], _heads12
+    assert [r.data(0, _Qt12.UserRole) for r in _pp12.page_items()] == list(_ws12.pages)
+    win.build_example_workspace()
+    app.processEvents()
+    _rows12 = {win.workspace.page(r.data(0, _Qt12.UserRole)).kind: r for r in _pp12.page_items()}
+    _det12 = [_rows12["refine"].child(j).text(0) for j in range(_rows12["refine"].childCount())]
+    assert _det12 == ["reads  Image Input · raw", "publishes  mask"], _det12
+    _ppid12 = _rows12["process"].data(0, _Qt12.UserRole)
+    _pp12.tree.itemClicked.emit(_rows12["process"], 0)
+    app.processEvents()
+    assert win.workspace.active == _ppid12
+    assert any(r.font(0).bold() and r.data(0, _Qt12.UserRole) == _ppid12
+               for r in _pp12.page_items()), "the active page is marked, not rebuilt"
+    assert win._main_canvas.tabs.page_ids() == list(win.workspace.pages)
+    os.environ.pop(_PR11.ENV_DIR, None)
+    _ok("PP1 the Pages panel (left, above Nodes) lists the pages by kind in pipeline order "
+        "with what each reads and publishes; a click shows the page on the active canvas")
+
+    # ── SP2: a split position read on the next page is what the Viewer shows there ───
+    # (user report 2026-10-06: Split Positions → an Output of one position → on Image
+    # Refinement the Page Input read that one position, but the Viewer still showed every
+    # position — click-to-preview is off, so nothing was pulled on arriving)
+    win.file_new()
+    app.processEvents()
+    _sd13 = tempfile.mkdtemp(prefix="nd2split_")
+    _sp13 = []
+    for _k13, _v13 in enumerate((1000, 2000, 3000)):
+        _p13 = os.path.join(_sd13, f"well{_k13}.tif")
+        _tiff11.imwrite(_p13, np.full((2, 24, 28), _v13, np.uint16), metadata={"axes": "ZYX"})
+        _sp13.append(_p13)
+    _done13: list = []
+    win.runner.finished.connect(lambda nid, *a: _done13.append(nid))
+    win._load_source_paths(_sp13, group=True)          # one bundle card: three positions
+    app.processEvents()
+    _pin13 = win.workspace.active
+    _bun13 = next(r for r in win.doc.nodes.values() if r.op_key == "io.load")
+    _t013 = time.time()
+    while _q11(_pin13, _bun13.id) not in _done13 and time.time() - _t013 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    assert win.doc.env(_bun13.id).axes.m == 3, win.doc.env(_bun13.id).axes
+    _ax13 = win.viewer.axes() if callable(win.viewer.axes) else win.viewer.axes
+    assert _ax13 is not None and _ax13.m == 3, ("the load previews all three", _ax13)
+    _spl13 = win.doc.add_node("util.split_positions", x=300, y=400)
+    win.doc.connect(_bun13.id, "image", _spl13.id, "data")
+    _out13 = win.doc.add_node("page.output", x=620, y=400, params={"name": "wellB"})
+    win.doc.connect(_spl13.id, "pos1", _out13.id, "data")
+    app.processEvents()
+    _ref13 = next(p.id for p in win.workspace.pages.values() if p.kind == "refine")
+    _done13.clear()
+    win._show_page(win._main_canvas, _ref13)
+    app.processEvents()
+    _in13 = next(r for r in win.doc.nodes.values() if r.op_key == "page.input")
+    assert _in13.params.get("source") == f"{_pin13}:wellB", _in13.params
+    _t013 = time.time()
+    while not _done13 and time.time() - _t013 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    for _ in range(3):
+        app.processEvents()
+    assert win.viewer.binding == (_ref13, _in13.id), ("arriving shows what the page reads",
+                                                      win.viewer.binding)
+    _ax13 = win.viewer.axes() if callable(win.viewer.axes) else win.viewer.axes
+    assert _ax13 is not None and _ax13.m == 1, ("ONE position on the Refinement page", _ax13)
+    # selecting a page boundary card previews it, click-to-preview off
+    win._show_page(win._main_canvas, _pin13)
+    app.processEvents()
+    assert not win._follow_act.isChecked()
+    _done13.clear()
+    win.scene.clearSelection()
+    win.scene.node_items[_out13.id].setSelected(True)
+    _t013 = time.time()
+    while not _done13 and time.time() - _t013 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    for _ in range(3):
+        app.processEvents()
+    assert win.viewer.binding == (_pin13, _out13.id), win.viewer.binding
+    _ax13 = win.viewer.axes() if callable(win.viewer.axes) else win.viewer.axes
+    assert _ax13.m == 1, _ax13
+    _ok("SP2 a split position published on Image Input and read on Image Refinement: "
+        "arriving on the page shows what it reads (one position, not the load's three), and "
+        "selecting a Page Output or Page Input card previews it with click-to-preview off")
 
     # a LabLink panel left on screen polls its hub over HTTP on a QThread; a socket connect
     # still in flight when os._exit tears the process down crashes it (exit 139 after every

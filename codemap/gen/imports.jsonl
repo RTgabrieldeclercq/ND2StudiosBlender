@@ -1092,8 +1092,10 @@
 {"dst":"nodelab_v2.app","k":"imp","lazy":false,"src":"nodelab_v2.__main__"}
 {"dst":"nodelab_v2.glview","k":"imp","lazy":true,"src":"nodelab_v2.app"}
 {"dst":"nodelab_v2.window","k":"imp","lazy":true,"src":"nodelab_v2.app"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2.minimap","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2.scene","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2.welcome","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.console"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.console"}
@@ -1254,6 +1256,9 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
 {"dst":"nodelab_v2.version","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
 {"dst":"nodelab_v2.workspace","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.pages_panel"}
+{"dst":"nodelab_v2.canvas","k":"imp","lazy":false,"src":"nodelab_v2.pages_panel"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.pages_panel"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.nodes","k":"imp","lazy":true,"src":"nodelab_v2.palette"}
@@ -1348,7 +1353,6 @@
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.welcome"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.welcome"}
-{"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"nodelab_v2.welcome"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":true,"src":"nodelab_v2.window"}
@@ -1377,6 +1381,7 @@
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.page_recipes","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.pages_panel","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.palette","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.readiness","k":"imp","lazy":false,"src":"nodelab_v2.window"}
