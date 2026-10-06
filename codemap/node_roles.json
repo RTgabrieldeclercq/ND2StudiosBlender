@@ -183,8 +183,8 @@
       "label": "Plotting",
       "stage": "control_and_present",
       "pages": ["analyze"],
-      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, one series per group, optionally averaged with error bars.",
-      "ops": ["plot.xy"]
+      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, and Plot Heatmap a table summary on a grid or a Voxel layer's plane.",
+      "ops": ["plot.xy", "plot.timeseries", "plot.distribution", "plot.heatmap"]
     },
     "page_boundary": {
       "label": "Page boundary",

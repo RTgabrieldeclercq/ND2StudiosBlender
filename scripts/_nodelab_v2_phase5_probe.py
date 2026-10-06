@@ -6469,6 +6469,74 @@ def main(argv) -> int:
         _ok("PL2 an optional column socket offers (none) and goes back to blank; a plot's "
             "channels read R/G/B, not the source file's")
 
+        # PL3 (V4.00 step 8) a PER-FRAME Plot XY in the Viewer: one figure per frame of a
+        # three-frame series, the frame chooser spans them, and moving it shows that frame's
+        # own figure; Plot Distribution, Heatmap and Time Series are offered on Analysis pages
+        from nodelab_v2 import runner as _RN8
+        # the synthetic source's caches and size are put back as found: later sections
+        # rely on the multi-frame source an earlier one left cached
+        _synth_before = _RN8._SYNTH_AXES
+        _cache_before = (dict(win.runner._providers), dict(win.runner._announced),
+                         dict(win.runner._raw_src))
+        win.runner._providers.clear()
+        win.runner._announced.clear()
+        win.runner._raw_src.clear()
+        win.runner.invalidate()
+        _RN8._SYNTH_AXES = AxisSizes(m=1, t=3, z=1, c=2, y=96, x=128)
+        try:
+            win.file_new()
+            win.build_demo()
+            app.processEvents()
+            _d8 = win.doc
+            _d8.set_meta_seed("n1", MetaEnvelope(axes=_RN8._SYNTH_AXES,
+                                                 metadata=dict(_RN8._SYNTH_META)))
+            _d8.nodes["n3"].modes["dim"] = "2D"
+            _d8.touch("n3")
+            _d8.add_node("plot.xy", node_id="PF", x=1600.0, y=150.0,
+                         modes={"per": "frame"})
+            _d8.connect("n6", "out", "PF", "data")
+            win.scene.sync()
+            app.processEvents()
+            _fe = _d8.env("PF")
+            assert _fe.axes.t == 3 and _fe.axes.c == 3, _fe.axes
+            _frid = _pq(win.workspace.active, "PF")
+            _pdone.clear()
+            win.pull_node("PF")
+            _pwait(_frid, timeout=300)
+            _fv = win.viewer
+            assert _fv.binding == (win.workspace.active, "PF") and _fv.has_image()
+            assert _fv._dataset.axes.t == 3 and _fv._sliders["t"].maximum() == 2, \
+                (_fv._dataset.axes, _fv._sliders["t"].maximum())
+            _f0 = {c: np.array(a, copy=True) for c, a in _fv._planes.items()}
+            _fv._sliders["t"].setValue(2)
+            _t0 = time.time()
+            while time.time() - _t0 < 60:
+                app.processEvents()
+                time.sleep(0.01)
+                if _fv._planes and _fv._payload_coords()[1] == 2 and any(
+                        c in _f0 and not np.array_equal(_f0[c], a)
+                        for c, a in _fv._planes.items()):
+                    break
+            assert _fv._payload_coords()[1] == 2 and any(
+                c in _f0 and not np.array_equal(_f0[c], a) for c, a in _fv._planes.items()), \
+                "frame 2 shows its own figure"
+            _fv._sliders["t"].setValue(0)
+            app.processEvents()
+            win.new_page("analyze")
+            app.processEvents()
+            assert {"plot.distribution", "plot.heatmap", "plot.timeseries"} <= \
+                _palette_ops(), "an Analysis page offers the step 8 plots"
+        finally:
+            _RN8._SYNTH_AXES = _synth_before
+            for _cache, _saved in zip((win.runner._providers, win.runner._announced,
+                                       win.runner._raw_src), _cache_before):
+                _cache.clear()
+                _cache.update(_saved)
+            win.runner.invalidate()
+        _ok("PL3 a per-frame Plot XY of a three-frame series: its envelope and payload carry "
+            "T = 3, the Viewer's frame chooser spans them and frame 2 shows its own figure; "
+            "an Analysis page offers Plot Distribution, Heatmap and Time Series")
+
     # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
     from PySide6.QtGui import QMouseEvent as _QME
@@ -6959,6 +7027,17 @@ def main(argv) -> int:
         "default tabs and hidden panels; SH4 a damaged layout file opens on the default "
         "layout, is kept aside as layout.json.rejected and replaced on close; the probe's own "
         "window never reads or writes one")
+
+    # a LabLink panel left on screen polls its hub over HTTP on a QThread; a socket connect
+    # still in flight when os._exit tears the process down crashes it (exit 139 after every
+    # check passed, a false failure — caught with -X faulthandler, 2026-10-06). Stop the
+    # polling and let the last request finish, as the app's own close path does.
+    from nodelab_v2.lablink.panel import _TaskHost as _LLHost
+    for _h in win.findChildren(_LLHost):
+        _tm = getattr(_h, "_timer", None)
+        if _tm is not None:
+            _tm.stop()
+        _h.stop_tasks()
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

@@ -32,6 +32,8 @@ the payload in lockstep (INV-04).
 from __future__ import annotations
 
 import importlib.util
+import json
+from collections import OrderedDict
 from dataclasses import replace
 import logging
 import math
@@ -43,7 +45,7 @@ import numpy as np
 
 from nodegraph.dataset import AxisSizes, Dataset
 from nodegraph.domains import Domain
-from nodegraph.provider import ArrayProvider
+from nodegraph.provider import ArrayProvider, TileProvider
 from nodegraph.registry import InBool, InFloat, InInt, InString, Mode
 
 # ── styles ─────────────────────────────────────────────────────────────────────
@@ -170,8 +172,14 @@ _PALETTE_DOCS = {
 }
 
 
-def style_modes() -> list:
-    """The ``style`` / ``detail`` / ``palette`` / ``font`` modes of a plot node."""
+def style_modes(*, palette: bool = True) -> list:
+    """The ``style`` / ``detail`` / ``palette`` / ``font`` modes of a plot node — without
+    ``palette`` for a plot that colours by a colour map instead (a heatmap)."""
+    modes = _style_modes()
+    return modes if palette else [m for m in modes if m.name != "palette"]
+
+
+def _style_modes() -> list:
     return [
         Mode("style", list(STYLE_PRESETS), default="paper", label="Style",
              description="The figure's size, resolution, type sizes and line weights as one "
@@ -204,9 +212,10 @@ def style_modes() -> list:
     ]
 
 
-def style_sockets() -> list:
-    """The labels, ranges, scales and custom style fields of a plot node."""
-    return [
+def style_sockets(*, axes: bool = True) -> list:
+    """The labels, ranges, scales and custom style fields of a plot node — without the
+    ranges and log axes when ``axes`` is False (a heatmap has neither)."""
+    socks = [
         InString("title", "Title", field=False, default="",
                  description="The text above the chart. Blank draws no title — the usual "
                              "choice for a manuscript, whose caption carries it."),
@@ -261,6 +270,21 @@ def style_sockets() -> list:
                description="Name each group in a legend. Only drawn when there are named "
                            "groups (a Group by column is set)."),
     ]
+    if not axes:
+        # a heatmap: no data axes to range or log; Grid outlines its cells and Legend is
+        # its colour bar, so they say so
+        socks = [s for s in socks
+                 if s.name not in ("x_range", "y_range", "log_x", "log_y", "grid", "legend")]
+        socks += [
+            InBool("grid", "Grid", field=False, default=False, available_in=_CUSTOM,
+                   description="Outline every cell of a table heatmap with a thin line in the "
+                               "background colour, so neighbouring cells of a similar colour "
+                               "stay apart. A Voxel plane has no cells to outline."),
+            InBool("legend", "Legend", field=False, default=True, available_in=_CUSTOM,
+                   description="Show the colour bar that says which value each colour "
+                               "stands for. Off leaves the scale to a caption."),
+        ]
+    return socks
 
 
 def parse_range(text: Any, *, socket: str) -> List[Optional[float]]:
@@ -317,6 +341,21 @@ def _is_missing(v: Any) -> bool:
     return False
 
 
+def _series_key(v: Any) -> Any:
+    """``v`` as a dictionary key: one key for every missing value, numpy scalars as Python."""
+    if _is_missing(v):
+        return _MISSING_KEY
+    return v.item() if isinstance(v, np.generic) else v
+
+
+def _series_order(key: Any):
+    return (2, 0.0, "") if key is _MISSING_KEY else _sort_key(key)
+
+
+def _series_label(key: Any) -> str:
+    return MISSING_GROUP if key is _MISSING_KEY else _label(key)
+
+
 def group_parts(group, keep: np.ndarray) -> List[Tuple[str, np.ndarray]]:
     """``[(label, row indices)]`` per distinct value of ``group`` among the kept rows, in ONE
     pass over the rows, in a stable order — numbers ascending, then text, then the rows with
@@ -325,18 +364,11 @@ def group_parts(group, keep: np.ndarray) -> List[Tuple[str, np.ndarray]]:
     g = np.asarray(group, dtype=object).tolist()
     buckets: Dict[Any, List[int]] = {}
     for i, (v, k) in enumerate(zip(g, np.asarray(keep, dtype=bool).tolist())):
-        if not k:
-            continue
-        key = _MISSING_KEY if _is_missing(v) else (v.item() if isinstance(v, np.generic)
-                                                   else v)
-        buckets.setdefault(key, []).append(i)
+        if k:
+            buckets.setdefault(_series_key(v), []).append(i)
+    return [(_series_label(key), np.asarray(buckets[key], dtype=np.int64))
+            for key in sorted(buckets, key=_series_order)]
 
-    def order(key):
-        return (2, 0.0, "") if key is _MISSING_KEY else _sort_key(key)
-
-    return [(MISSING_GROUP if key is _MISSING_KEY else _label(key),
-             np.asarray(buckets[key], dtype=np.int64))
-            for key in sorted(buckets, key=order)]
 
 def _label(v) -> str:
     """A group value as a legend entry: 1.0 → "1", a string as itself."""
@@ -402,6 +434,209 @@ def xy_series(x, y, group=None, error: str = "none", *, log_x: bool = False,
     return out
 
 
+def distribution_series(values, group=None) -> List[Dict[str, Any]]:
+    """One series of the finite ``values`` per ``group`` value (one in all when ``None``)."""
+    v = np.asarray(values, dtype=float)
+    keep = np.isfinite(v)
+    if group is None:
+        return [{"label": "", "values": v[keep].tolist(), "n": int(keep.sum())}]
+    return [{"label": label, "values": v[idx].tolist(), "n": int(idx.size)}
+            for label, idx in group_parts(group, keep)]
+
+
+#: what a heatmap cell can summarise its rows with
+HEAT_REDUCERS = ("mean", "median", "sum", "min", "max", "count", "std")
+
+
+def heatmap_grid(rows, cols, values, reducer: str = "mean"
+                 ) -> Tuple[List[str], List[str], List[List[Optional[float]]]]:
+    """``(row labels, column labels, matrix)``: one cell per (row value, column value) — the
+    ``reducer`` of the finite values that fall in it; an empty cell is ``None`` (drawn blank,
+    not as zero)."""
+    r = np.asarray(rows, dtype=object).tolist()
+    c = np.asarray(cols, dtype=object).tolist()
+    v = np.asarray(values, dtype=float)
+    keep = np.isfinite(v)
+    r = [_series_key(x) for x in r]
+    c = [_series_key(x) for x in c]
+    rk = sorted({x for x, k in zip(r, keep.tolist()) if k}, key=_series_order)
+    ck = sorted({x for x, k in zip(c, keep.tolist()) if k}, key=_series_order)
+    ri = {x: i for i, x in enumerate(rk)}
+    ci = {x: i for i, x in enumerate(ck)}
+    cells: Dict[Tuple[int, int], List[float]] = {}
+    for x, y, val, k in zip(r, c, v.tolist(), keep.tolist()):
+        if k:
+            cells.setdefault((ri[x], ci[y]), []).append(val)
+    fns = {"mean": np.mean, "median": np.median, "sum": np.sum, "min": np.min,
+           "max": np.max, "count": len,
+           "std": lambda a: float(np.std(a, ddof=1)) if len(a) > 1 else 0.0}
+    fn = fns.get(reducer, np.mean)
+    mat: List[List[Optional[float]]] = [[None] * len(ck) for _ in rk]
+    for (i, j), vals in cells.items():
+        mat[i][j] = float(fn(np.asarray(vals)))
+    return [_series_label(x) for x in rk], [_series_label(x) for x in ck], mat
+
+
+def frame_times(n_frames: int, *, frame_time_jd: Any = None, dt_s: Any = None,
+                mode: str = "elapsed") -> Tuple[List[float], str, str]:
+    """``(x value per frame, axis label, kind)`` for a time axis of ``mode`` elapsed | clock |
+    frame. ``kind`` is ``"clock"`` when the values are wall-clock dates, else ``""``.
+
+    elapsed — seconds since the first frame from the file's own per-frame clock
+    (``frame_time_jd``), else ``t x dt_s``, else the frame index (the label says so); the
+    unit is picked ONCE from the span (s / min / h). clock — each frame's wall-clock time
+    (matplotlib date numbers), when the file has a per-frame clock; otherwise elapsed.
+    frame — the frame index."""
+    n = max(0, int(n_frames))
+    idx = list(range(n))
+    jd = None
+    if frame_time_jd is not None:
+        try:
+            vals = [float(v) for v in list(frame_time_jd)[:n]]
+            if len(vals) == n and n and all(math.isfinite(v) for v in vals):
+                jd = vals
+        except (TypeError, ValueError):
+            jd = None
+    if mode == "frame":
+        return [float(i) for i in idx], "frame", ""
+    if mode == "clock" and jd is not None:
+        return [v - 2440587.5 for v in jd], "clock time", "clock"   # JD of 1970-01-01
+    try:
+        dt = float(dt_s) if dt_s not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        dt = 0.0
+    if jd is not None:
+        secs = [(v - jd[0]) * 86400.0 for v in jd]
+    elif dt > 0:
+        secs = [i * dt for i in idx]
+    else:
+        return [float(i) for i in idx], "frame (no frame times in the file)", ""
+    span = (max(secs) - min(secs)) if secs else 0.0
+    if span < 90.0:
+        return secs, "time (s)", ""
+    if span < 5400.0:
+        return [s / 60.0 for s in secs], "time (min)", ""
+    return [s / 3600.0 for s in secs], "time (h)", ""
+
+
+def padded_range(values: Sequence[float]) -> List[Optional[float]]:
+    """``[lo, hi]`` of the finite ``values`` with 5 % padding — the fixed axis every frame of a
+    per-frame figure shares, so the chart does not jump as the frames play."""
+    v = np.asarray(list(values), dtype=float)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return [None, None]
+    lo, hi = float(v.min()), float(v.max())
+    pad = (hi - lo) * 0.05 or (abs(hi) * 0.05 or 1.0)
+    return [lo - pad, hi + pad]
+
+
+def frame_clock(md: Mapping[str, Any], frames: int,
+                dt_s: Any = None) -> Tuple[Dict[str, Any], List[str]]:
+    """The input's per-frame clock for a PER-FRAME picture: the metadata the Viewer's
+    timestamp reads (``frame_time_jd`` / ``frame_datetime`` of those frames, ``dt_s``), and one
+    title stamp per frame — the elapsed time when there is a clock, else ``frame k/T``."""
+    from nodegraph.placement import elapsed_text
+    n = max(1, int(frames))
+    extra: Dict[str, Any] = {}
+    jd, fd = (md or {}).get("frame_time_jd"), (md or {}).get("frame_datetime")
+    if isinstance(jd, (list, tuple)) and len(jd) >= n:
+        extra["frame_time_jd"] = list(jd)[:n]
+    if isinstance(fd, (list, tuple)) and len(fd) >= n:
+        extra["frame_datetime"] = list(fd)[:n]
+    try:
+        dt = float(dt_s) if dt_s not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        dt = 0.0
+    if dt > 0:
+        extra["dt_s"] = dt
+    secs: Optional[List[float]] = None
+    if "frame_time_jd" in extra:
+        try:
+            v = [float(x) for x in extra["frame_time_jd"]]
+            secs = [(x - v[0]) * 86400.0 for x in v]
+        except (TypeError, ValueError):
+            secs = None
+    if secs is None and dt > 0:
+        secs = [i * dt for i in range(n)]
+    if secs is None:
+        return extra, [f"frame {i + 1}/{n}" for i in range(n)]
+    span = (max(secs) - min(secs)) if secs else 0.0
+    return extra, [elapsed_text(s, span) for s in secs]
+
+
+def json_value(v: Any) -> Any:
+    """``v`` as a plain JSON value — a figure spec rides in metadata and in files."""
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        f = float(v)
+        return f if math.isfinite(f) else None
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    return str(v)
+
+
+def axis_range(values: Any, *, log: bool = False) -> List[Optional[float]]:
+    """The fixed axis every frame of a per-frame figure shares: the finite ``values``' range
+    with 5 % padding — multiplicative, and over the positive values only, on a log axis."""
+    v = np.asarray(list(values), dtype=float)
+    v = v[np.isfinite(v)]
+    if log:
+        v = v[v > 0]
+        if not v.size:
+            return [None, None]
+        return [float(v.min()) / 1.1, float(v.max()) * 1.1]
+    return padded_range(v)
+
+
+#: the ``per`` mode every time-aware plot shares
+PER_DOCS = {
+    "all": "One figure of every row, drawn once — the whole experiment in a single picture.",
+    "frame": "One figure per frame of the input, drawn when the frame is shown, on axes "
+             "every frame shares — scrub or play it in the Viewer, or export it as a movie.",
+}
+
+
+def frame_spec(spec: Mapping[str, Any], t: int) -> Dict[str, Any]:
+    """The figure of frame ``t`` of a PER-FRAME spec (``per = "frame"``): the rows of that frame
+    (``xy``), or the course up to it with a cursor (``timeseries``), on the axes every frame
+    shares. A spec drawn whole is returned as it is."""
+    if spec.get("per") != "frame":
+        return dict(spec)
+    rows = spec.get("rows") or {}
+    tt = np.asarray(rows.get("t", []), dtype=float)
+    sel = (tt <= t) if spec.get("kind") == "timeseries" else (tt == t)
+    pick = lambda key: (np.asarray(rows[key], dtype=object)[sel]       # noqa: E731
+                        if rows.get(key) is not None else None)
+    x = np.asarray(rows.get("x", []), dtype=float)[sel]
+    y = np.asarray(rows.get("y", []), dtype=float)[sel]
+    a = dict(spec.get("axes") or {})
+    out = dict(spec)
+    out["series"] = xy_series(x, y, pick("g"), str(spec.get("error", "none")),
+                              log_x=bool(a.get("log_x")), log_y=bool(a.get("log_y")))
+    if rows.get("g") is not None:
+        g_all = rows["g"]
+        order = {label: i for i, (label, _idx) in
+                 enumerate(group_parts(g_all, np.ones(len(g_all), dtype=bool)))}
+        for s in out["series"]:
+            s["color_index"] = order.get(s["label"], 0)
+    out["per"] = "all"
+    out.pop("rows", None)
+    times = spec.get("frame_x") or []
+    if spec.get("kind") == "timeseries" and 0 <= t < len(times):
+        out["cursor_x"] = times[t]
+    label = (spec.get("frame_labels") or [])
+    stamp = label[t] if 0 <= t < len(label) else f"frame {t + 1}"
+    a["title"] = (f"{a['title']} — {stamp}" if a.get("title") else stamp)
+    out["axes"] = a
+    return out
+
+
 # ── drawing ─────────────────────────────────────────────────────────────────────
 _ONCE = threading.Lock()
 _READY = False
@@ -413,6 +648,25 @@ _RENDER_LOCK = threading.RLock()
 #: the largest picture a render may make — a typo in a size or resolution (6000 dpi for 600)
 #: is refused rather than allowed to ask for gigabytes
 MAX_PIXELS = 100_000_000
+
+
+def check_pixels(h: int, w: int) -> None:
+    """Refuse a figure past :data:`MAX_PIXELS` — before anything is allocated or drawn."""
+    if int(h) * int(w) > MAX_PIXELS:
+        raise ValueError(f"the figure would be {w} x {h} px ({h * w / 1e6:.0f} Mpx) — more "
+                         f"than {MAX_PIXELS // 1_000_000} Mpx; lower its size or resolution")
+
+
+#: the drawing code's identity: a live reload of this module re-executes it, so a per-frame
+#: figure built after the reload is a different provider (and memo entry) from the one
+#: built before — its frames are never a mix of old and new drawing code
+_DRAW_CODE = ""
+try:
+    import hashlib as _hashlib
+    with open(__file__, "rb") as _fh:
+        _DRAW_CODE = _hashlib.blake2b(_fh.read(), digest_size=8).hexdigest()
+except Exception:                                       # noqa: BLE001 — frozen / no source
+    _DRAW_CODE = "unknown"
 
 
 def _matplotlib():
@@ -446,9 +700,7 @@ def draw(spec: Mapping[str, Any]):
     style.update(spec.get("style") or {})
     dpi = float(style["dpi"])
     h, w = figure_pixels(style["width_mm"], style["height_mm"], dpi)
-    if h * w > MAX_PIXELS:
-        raise ValueError(f"the figure would be {w} x {h} px ({h * w / 1e6:.0f} Mpx) — more "
-                         f"than {MAX_PIXELS // 1_000_000} Mpx; lower its size or resolution")
+    check_pixels(h, w)
     # +0.5 px: Agg truncates figsize*dpi, so an exact W/dpi can land on W-1 by a rounding ulp
     fig = Figure(figsize=((w + 0.5) / dpi, (h + 0.5) / dpi), dpi=dpi)
     FigureCanvasAgg(fig)
@@ -460,12 +712,26 @@ def draw(spec: Mapping[str, Any]):
     ax = fig.add_subplot(1, 1, 1)
     ax.set_facecolor(bg)
     colors = PALETTES.get(str(style.get("palette", "colorblind")), PALETTES["colorblind"])
+    kind = str(spec.get("kind", "xy"))
+    series = list(spec.get("series") or [])
+    if kind == "distribution":
+        _draw_distribution(ax, spec, colors, fg, lw, ms)
+    elif kind == "heatmap":
+        _draw_heatmap(fig, ax, spec, fg, pt, fam, style=style, bg=bg, lw=lw)
+    else:
+        _draw_xy(ax, spec, colors, lw, ms)
+    if spec.get("cursor_x") is not None:
+        ax.axvline(float(spec["cursor_x"]), color=fg, lw=lw * 0.8, ls="--", alpha=0.7)
+    _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw)
+    return fig, (h, w)
+
+
+def _draw_xy(ax, spec, colors, lw, ms) -> None:
     dr = spec.get("draw") or {}
     mode = str(dr.get("mode", "line"))
     band = str(dr.get("error_style", "bars")) == "band"
-    series = list(spec.get("series") or [])
-    for i, s in enumerate(series):
-        col = colors[i % len(colors)]
+    for i, s in enumerate(list(spec.get("series") or [])):
+        col = colors[int(s.get("color_index", i)) % len(colors)]
         x = np.asarray(s.get("x", []), dtype=float)
         y = np.asarray(s.get("y", []), dtype=float)
         label = str(s.get("label", "")) or None
@@ -482,6 +748,124 @@ def draw(spec: Mapping[str, Any]):
             else:
                 ax.errorbar(x, y, yerr=e, fmt="none", ecolor=col, elinewidth=lw * 0.8,
                             capsize=ms * 0.8)
+
+
+def _hist_edges(allv: np.ndarray, n: int, axes: Mapping[str, Any]):
+    """Histogram bin edges: ``n`` bins over the fixed X range when one is set (else the data's
+    range), spaced geometrically on a log x axis — so the bins asked for are the bins seen."""
+    v = allv[np.isfinite(allv)]
+    log = bool(axes.get("log_x"))
+    if log:
+        v = v[v > 0]
+    xl, xh = (list(axes.get("x_range") or [None, None]) + [None, None])[:2]
+    lo = float(xl) if xl is not None else (float(v.min()) if v.size else None)
+    hi = float(xh) if xh is not None else (float(v.max()) if v.size else None)
+    if log and lo is not None and lo <= 0:
+        lo = float(v.min()) if v.size else None
+    if lo is None or hi is None or not hi > lo:
+        return np.histogram_bin_edges(allv, bins=n) if allv.size else 10
+    if log:
+        return np.geomspace(lo, hi, n + 1)
+    return np.linspace(lo, hi, n + 1)
+
+
+def _draw_distribution(ax, spec, colors, fg, lw, ms) -> None:
+    dr = spec.get("draw") or {}
+    kind = str(dr.get("mode", "histogram"))
+    series = [s for s in (spec.get("series") or []) if s.get("values")]
+    multi = len(series) > 1
+    allv = (np.concatenate([np.asarray(s["values"], float) for s in series])
+            if series else np.zeros(0))
+    if kind == "histogram":
+        edges = _hist_edges(allv, max(1, int(dr.get("bins", 30))), spec.get("axes") or {})
+        norm = str(dr.get("normalize", "count"))
+        for i, s in enumerate(series):
+            v = np.asarray(s["values"], float)
+            col = colors[i % len(colors)]
+            ax.hist(v, bins=edges, density=(norm == "density"),
+                    weights=(np.full(v.size, 100.0 / v.size) if norm == "percent" else None),
+                    histtype="stepfilled", alpha=0.45 if multi else 0.85, color=col,
+                    edgecolor=col, linewidth=lw * 0.6, label=s.get("label") or None)
+    elif kind == "kde":
+        if allv.size:
+            from scipy.stats import gaussian_kde
+            lo, hi = float(allv.min()), float(allv.max())
+            pad = (hi - lo) * 0.1 or 1.0
+            grid = np.linspace(lo - pad, hi + pad, 256)
+            for i, s in enumerate(series):
+                v = np.asarray(s["values"], float)
+                col = colors[i % len(colors)]
+                if v.size < 2 or float(np.ptp(v)) == 0.0:
+                    ax.axvline(float(v.mean()), color=col, lw=lw,
+                               label=s.get("label") or None)
+                    continue
+                ax.plot(grid, gaussian_kde(v)(grid), color=col, lw=lw,
+                        label=s.get("label") or None)
+    elif kind == "ecdf":
+        for i, s in enumerate(series):
+            v = np.sort(np.asarray(s["values"], float))
+            ax.step(v, np.arange(1, v.size + 1) / v.size, where="post",
+                    color=colors[i % len(colors)], lw=lw, label=s.get("label") or None)
+        ax.set_ylim(0.0, 1.02)
+    else:                                                     # box | violin
+        data = [np.asarray(s["values"], float) for s in series]
+        pos = list(range(1, len(data) + 1))
+        if data and kind == "box":
+            bp = ax.boxplot(data, positions=pos, widths=0.6, patch_artist=True,
+                            medianprops={"color": fg, "linewidth": lw},
+                            whiskerprops={"color": fg, "linewidth": lw * 0.8},
+                            capprops={"color": fg, "linewidth": lw * 0.8},
+                            flierprops={"markersize": ms, "markeredgecolor": fg})
+            for i, b in enumerate(bp["boxes"]):
+                b.set_facecolor(colors[i % len(colors)])
+                b.set_alpha(0.7)
+                b.set_edgecolor(fg)
+        elif data:
+            vp = ax.violinplot(data, positions=pos, showmedians=True, widths=0.8)
+            for i, b in enumerate(vp["bodies"]):
+                b.set_facecolor(colors[i % len(colors)])
+                b.set_edgecolor(fg)
+                b.set_alpha(0.7)
+            for k in ("cmedians", "cmins", "cmaxes", "cbars"):
+                if k in vp:
+                    vp[k].set_color(fg)
+                    vp[k].set_linewidth(lw * 0.8)
+        if pos:
+            ax.set_xticks(pos, [s.get("label") or "all" for s in series])
+
+
+def _draw_heatmap(fig, ax, spec, fg, pt, fam, *, style=None, bg="#ffffff",
+                  lw=1.0) -> None:
+    dr = spec.get("draw") or {}
+    mat = np.array([[np.nan if v is None else v for v in row]
+                    for row in (spec.get("matrix") or [])], dtype=float)
+    if mat.ndim != 2 or not mat.size:
+        mat = np.full((1, 1), np.nan)
+    lo, hi = (list(dr.get("color_range") or [None, None]) + [None, None])[:2]
+    im = ax.imshow(mat, cmap=str(dr.get("colormap", "viridis")), aspect="auto",
+                   interpolation="nearest", vmin=lo, vmax=hi, origin="upper")
+    rl, cl = spec.get("row_labels") or [], spec.get("col_labels") or []
+    for labels, setter in ((rl, ax.set_yticks), (cl, ax.set_xticks)):
+        if labels:
+            # every k-th value past 40, so the ticks always name the real row / column
+            k = max(1, -(-len(labels) // 40))
+            idx = list(range(0, len(labels), k))
+            setter(idx, [labels[i] for i in idx])
+    style = style or {}
+    if style.get("grid") and str((spec.get("source") or {}).get("source")) != "voxel":
+        ax.set_xticks(np.arange(-0.5, mat.shape[1], 1.0), minor=True)
+        ax.set_yticks(np.arange(-0.5, mat.shape[0], 1.0), minor=True)
+        ax.grid(which="minor", color=bg, linewidth=lw * 0.8)
+        ax.tick_params(which="minor", length=0)
+    if style.get("legend", True):
+        cb = fig.colorbar(im, ax=ax)
+        cb.ax.tick_params(labelsize=pt * 0.85, colors=fg)
+        cb.set_label(str(dr.get("value_label", "")), fontsize=pt, color=fg, family=fam)
+        cb.outline.set_edgecolor(fg)
+
+
+def _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw) -> None:
+    """Axes, labels, ticks, spines, grid and legend — the same on every kind of figure."""
     a = spec.get("axes") or {}
     if a.get("log_x"):
         ax.set_xscale("log")
@@ -505,25 +889,33 @@ def draw(spec: Mapping[str, Any]):
         sp.set_linewidth(lw * 0.6)
         if side in ("top", "right"):
             sp.set_visible(False)
-    if style.get("grid"):
+    if a.get("x_kind") == "clock":
+        import matplotlib.dates as mdates
+        loc = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(loc)
+        ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(loc))
+    if style.get("grid") and kind != "heatmap":
         ax.grid(True, color=grid, linewidth=lw * 0.5)
         ax.set_axisbelow(True)
-    named = [s for s in series if str(s.get("label", ""))]
-    if style.get("legend") and 1 <= len(named) <= LEGEND_MAX:
+    if style.get("legend") and kind not in ("heatmap",) and \
+            not (kind == "distribution" and str((spec.get("draw") or {}).get("mode"))
+                 in ("box", "violin")) and \
+            1 <= len([s for s in series if str(s.get("label", ""))]) <= LEGEND_MAX:
         leg = ax.legend(frameon=False, prop={"family": fam, "size": pt * 0.9})
-        for t in leg.get_texts():
-            t.set_color(fg)
-    if not series:
+        for txt in leg.get_texts():
+            txt.set_color(fg)
+    empty = (not spec.get("matrix")) if kind == "heatmap" else \
+        not any(s.get("values") or s.get("x") for s in series)
+    if empty:
         ax.text(0.5, 0.5, "no rows to plot", transform=ax.transAxes, ha="center",
                 va="center", color=fg, fontsize=pt, family=fam)
     fig.tight_layout(pad=0.4)
-    return fig, (h, w)
 
 
 def render_rgb(spec: Mapping[str, Any]) -> np.ndarray:
     """``spec`` rendered to an ``(H, W, 3)`` uint8 array, ``(H, W)`` = :func:`figure_pixels`."""
     with _RENDER_LOCK:
-        fig, (h, w) = draw(spec)
+        fig, (h, w) = draw(frame_spec(spec, 0) if spec.get("per") == "frame" else spec)
         fig.canvas.draw()
         rgb = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
     out = np.zeros((h, w, 3), np.uint8)
@@ -577,9 +969,10 @@ PICTURE_METADATA: Dict[str, Any] = {
 }
 
 
-def picture_dataset(rgb: np.ndarray, spec: Mapping[str, Any]) -> Dataset:
+def picture_dataset(rgb: np.ndarray, spec: Mapping[str, Any],
+                    extra: Optional[Mapping[str, Any]] = None) -> Dataset:
     """A Picture dataset of ``rgb`` (``(H, W, 3)`` uint8), carrying ``spec`` — fresh metadata,
-    no calibration, no structure layers."""
+    no calibration (but ``extra``: a time plot's ``dt_s``), no structure layers."""
     arr = np.ascontiguousarray(np.moveaxis(np.asarray(rgb, dtype=np.uint8), -1, 0)
                                [None, None, None])                 # (1, 1, 1, 3, H, W)
     prov = ArrayProvider(arr)
@@ -589,15 +982,111 @@ def picture_dataset(rgb: np.ndarray, spec: Mapping[str, Any]) -> Dataset:
     md["channel_names"] = list(PICTURE_METADATA["channel_names"])
     md.update(figure_spec=dict(spec), figure_dpi=st.get("dpi"),
               figure_size_mm=[st.get("width_mm"), st.get("height_mm")])
+    md.update(dict(extra or {}))
     return Dataset(axes=prov.axes, metadata=md).with_image(prov)
 
 
-def picture_axes(h: int, w: int) -> AxisSizes:
-    return AxisSizes(m=1, t=1, z=1, c=3, y=int(h), x=int(w))
+def picture_axes(h: int, w: int, t: int = 1) -> AxisSizes:
+    return AxisSizes(m=1, t=max(1, int(t)), z=1, c=3, y=int(h), x=int(w))
+
+
+class FigureProvider(TileProvider):
+    """A PER-FRAME figure series: frame ``t`` is drawn on its first read (from
+    :func:`frame_spec`) and the last few are kept. One pyramid level, axes
+    ``(1, T, 1, 3, H, W)``, uint8. Its identity is the spec's digest, so two pulls of the same
+    figure are one memo entry and an edit re-keys it."""
+
+    def __init__(self, spec: Mapping[str, Any], frames: int, h: int, w: int, *,
+                 keep: int = 8) -> None:
+        from nodegraph.memo import digest
+        self.spec = dict(spec)
+        self.axes = AxisSizes(m=1, t=max(1, int(frames)), z=1, c=3, y=int(h), x=int(w))
+        self.levels = 1
+        self.tile = 512
+        self._keep = int(keep)
+        self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._lock = threading.Lock()
+        self._key = digest("figure-provider", _DRAW_CODE,
+                           json.dumps(self.spec, sort_keys=True, default=str))
+        self._busy: Dict[int, threading.Event] = {}
+        self.dtype = np.dtype(np.uint8)
+
+    #: a read RUNS a figure render (it is not a decompress): the runner's prefetch and
+    #: playback policies treat it like a computing provider, not like bytes on disk
+    computes_on_read = True
+
+    @property
+    def nbytes(self) -> int:
+        """What this provider can hold resident: its frame cache at its fullest. The memo's
+        byte budget reads it, so superseded per-frame figures are evicted like any image."""
+        return int(min(self._keep, self.axes.t) * self.axes.y * self.axes.x * 3)
+
+    def frame(self, t: int) -> np.ndarray:
+        """Frame ``t``, drawn ONCE however many readers ask at the same time (the R, G and B
+        planes of one frame are read on different threads during playback)."""
+        t = int(t)
+        while True:
+            with self._lock:
+                got = self._cache.get(t)
+                if got is not None:
+                    self._cache.move_to_end(t)
+                    return got
+                ev = self._busy.get(t)
+                if ev is None:
+                    ev = self._busy[t] = threading.Event()
+                    break                                # this reader draws it
+            ev.wait()                                    # another reader is drawing it
+        rgb = None
+        try:
+            rgb = render_rgb(frame_spec(self.spec, t))
+        finally:
+            with self._lock:
+                if rgb is not None:
+                    self._cache[t] = rgb
+                    while len(self._cache) > self._keep:
+                        self._cache.popitem(last=False)
+                self._busy.pop(t, None)
+            ev.set()                                     # a failed draw lets a waiter retry
+        return rgb
+
+    def read_region(self, level: int, m: int, t: int, z: int, c: int,
+                    y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
+        return np.ascontiguousarray(self.frame(t)[y0:y1, x0:x1, c])
+
+    def fingerprint(self) -> tuple:
+        return ("figure", self._key, self.axes.t, self.axes.y, self.axes.x)
+
+
+def picture_series(spec: Mapping[str, Any], frames: int, h: int, w: int,
+                   extra: Optional[Mapping[str, Any]] = None) -> Dataset:
+    """A PER-FRAME Picture: ``frames`` figures drawn on demand, with the picture metadata,
+    ``spec`` and ``extra`` (the input's per-frame clock, so the Viewer's timestamp works)."""
+    check_pixels(h, w)
+    prov = FigureProvider(spec, frames, h, w)
+    st = dict(spec.get("style") or {})
+    md = dict(PICTURE_METADATA)
+    md["channel_colors"] = [list(c) for c in PICTURE_METADATA["channel_colors"]]
+    md["channel_names"] = list(PICTURE_METADATA["channel_names"])
+    md.update(figure_spec=dict(spec), figure_dpi=st.get("dpi"),
+              figure_size_mm=[st.get("width_mm"), st.get("height_mm")])
+    md.update(dict(extra or {}))
+    return Dataset(axes=prov.axes, metadata=md).with_image(prov)
 
 
 # ── the edit-time envelope of a plot node ────────────────────────────────────────
 def figure_frame(env, params: Mapping[str, Any], modes: Mapping[str, str]):
+    return _figure_env(env, params, modes, clock=False)
+
+
+def figure_frame_clocked(env, params: Mapping[str, Any], modes: Mapping[str, str]):
+    """:func:`figure_frame` for a plot on a TIME axis (``plot.timeseries``): the input's frame
+    interval ``dt_s`` stays on the picture's envelope, because the plot reads it
+    (``ctx.calib`` reads this node's own envelope) and stamps it on the picture."""
+    return _figure_env(env, params, modes, clock=True)
+
+
+def _figure_env(env, params: Mapping[str, Any], modes: Mapping[str, str], *,
+                clock: bool):
     """The ``meta_transform`` of a ``plot.*`` node: ONE RGB picture of the size its style
     gives — axes ``(1, 1, 1, 3, H, W)`` from :func:`picture_pixels`, exactly what the compute
     renders — with no calibration but ``bit_depth = 8``. Total: never raises (it runs on every
@@ -610,9 +1099,29 @@ def figure_frame(env, params: Mapping[str, Any], modes: Mapping[str, str]):
         h, w = picture_pixels(params or {}, modes or {})
     except Exception:                                   # noqa: BLE001 — total by contract
         h, w = picture_pixels({}, {})
-    md = {"bit_depth": 8,
-          "channel_names": list(PICTURE_METADATA["channel_names"]),
-          "channel_colors": [list(c) for c in PICTURE_METADATA["channel_colors"]]}
+    per = str((modes or {}).get("per", "all")) == "frame"
+    md: Dict[str, Any] = {
+        "bit_depth": 8,
+        "channel_names": list(PICTURE_METADATA["channel_names"]),
+        "channel_colors": [list(c) for c in PICTURE_METADATA["channel_colors"]]}
+    src = env.metadata or {}
+    if (per or clock) and src.get("dt_s") is not None:
+        md["dt_s"] = src["dt_s"]                       # the input's clock, kept
+    if per:
+        # the per-frame times the payload carries (frame_clock): the Viewer's timestamp and
+        # Export Movie's read them, and the envelope says what the payload holds
+        from nodegraph.metadata import PER_TIME_KEYS
+        t_in = int(getattr(env.axes, "t", 1) or 1)
+        for key in PER_TIME_KEYS:
+            vals = src.get(key)
+            if isinstance(vals, (list, tuple)) and len(vals) >= t_in:
+                md[key] = list(vals)[:t_in]
+        # one figure per frame of the input: its T, and a T it cannot know yet stays
+        # unknown rather than guessed
+        t_in = getattr(env.axes, "t", 1) or 1
+        unknown = frozenset({"t"}) & frozenset(getattr(env, "unknown_axes", ()) or ())
+        return replace(env, axes=picture_axes(h, w, t_in), metadata=md,
+                       unknown_axes=unknown, layers=())
     return replace(env, axes=picture_axes(h, w), metadata=md,
                    unknown_axes=frozenset(), layers=())
 
@@ -622,4 +1131,8 @@ __all__ = ["STYLE_PRESETS", "PALETTES", "MATPLOTLIB_MISSING", "PICTURE_METADATA"
            "picture_pixels", "style_modes", "style_sockets", "parse_range", "table_columns",
            "column", "xy_series", "draw", "render_rgb", "render_file", "part_path",
            "picture_dataset", "picture_axes", "SAVE_FORMATS", "figure_frame",
-           "group_parts", "MISSING_GROUP", "LEGEND_MAX", "MAX_PIXELS"]
+           "distribution_series", "heatmap_grid", "HEAT_REDUCERS", "frame_times",
+           "padded_range", "frame_spec", "FigureProvider", "picture_series",
+           "frame_clock", "PER_DOCS", "json_value", "axis_range",
+           "figure_frame_clocked", "check_pixels", "group_parts", "MISSING_GROUP", "LEGEND_MAX",
+           "MAX_PIXELS"]

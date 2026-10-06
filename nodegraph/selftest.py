@@ -25719,6 +25719,406 @@ def test_plot_review() -> None:
         "in colour")
 
 
+def _plot_chain(ds, seedenv, op, params=None, modes=None):
+    """``S -> op`` on ``ds``: the engine and the pulled picture."""
+    from nodegraph.nodes import COMPUTES
+    if "io.seed_plot" not in NODES:
+        define_node("io.seed_plot", "Seed", outputs=[OutDataset()])
+    g = Graph()
+    g.add(NodeInstance("S", "io.seed_plot"))
+    g.add(NodeInstance("P", op, params=dict(params or {}), modes=dict(modes or {})))
+    g.connect("S", "P")
+    eng = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": seedenv})
+    return eng, eng.pull("P")
+
+
+def _plot_seed(ds):
+    return MetaEnvelope(axes=ds.axes, metadata={k: v for k, v in ds.metadata.items()
+                                                if k in ("pixel_size_um", "bit_depth", "dt_s",
+                                                         "frame_time_jd", "frame_datetime")},
+                        domains=frozenset({Domain.LABEL, Domain.VOXEL}),
+                        layer_names=((Domain.LABEL, "cells"), (Domain.VOXEL, "mask")))
+
+
+def test_plot_distribution() -> None:
+    """``plot.distribution`` (V4.00 step 8): the spread of one column per group as a picture —
+    every kind draws and re-keys the memo, the groups carry their own rows, the envelope
+    predicts the picture, log axes drop what they cannot place."""
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot.distribution: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    ds, _run = _plot_fixture()
+    env0 = _plot_seed(ds)
+    hashes = set()
+    for kind in ("histogram", "kde", "box", "violin", "ecdf"):
+        eng, out = _plot_chain(ds, env0, "plot.distribution", {"group_by": "dose"},
+                               {"kind": kind})
+        assert out.axes == eng.env("P").axes and out.axes.c == 3, (kind, out.axes)
+        spec = out.metadata["figure_spec"]
+        assert [s["label"] for s in spec["series"]] == ["0", "1"]
+        assert [s["n"] for s in spec["series"]] == [12, 12]
+        assert _picture_pixels(out)[1].std() > 0, kind
+        hashes.add(eng.entry("P").recipe_hash)
+    assert len(hashes) == 5, "every kind is its own recipe"
+    _e, pct = _plot_chain(ds, env0, "plot.distribution", {}, {"normalize": "percent"})
+    assert pct.metadata["figure_spec"]["axes"]["y_label"] == "% of rows"
+    s = FIG.distribution_series([1.0, float("nan"), 3.0, 4.0], ["a", "a", "b", "b"])
+    assert [(x["label"], x["values"]) for x in s] == [("a", [1.0]), ("b", [3.0, 4.0])]
+    _ok("plot.distribution: histogram, kde, box, violin and ecdf each draw a picture the "
+        "envelope predicts and are their own recipe; groups carry their own rows; "
+        "non-finite values are left out")
+
+
+def test_plot_heatmap() -> None:
+    """``plot.heatmap`` (V4.00 step 8): a table column summarised per (row, column) value with
+    the chosen reducer — empty cells blank, not zero — or a Voxel layer's plane (frame and
+    position picked, Z max-projected); the Source mode decides which domain the node reads."""
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot.heatmap: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    ds, _run = _plot_fixture()
+    raster = np.zeros((1, 3, 1, 1, 8, 8), np.float32)
+    raster[0, 1, 0, 0, 2:4, 2:4] = 7.0
+    ds = ds.with_layer(Domain.VOXEL, "mask", raster)
+    env0 = _plot_seed(ds)
+    _e, out = _plot_chain(ds, env0, "plot.heatmap", {"row": "t", "column": "dose"})
+    spec = out.metadata["figure_spec"]
+    assert spec["row_labels"] == ["0", "1", "2"] and spec["col_labels"] == ["0", "1"]
+    assert spec["matrix"] == [[11.5, 11.5], [12.5, 13.5], [13.5, 15.5]], spec["matrix"]
+    _e, cnt = _plot_chain(ds, env0, "plot.heatmap", {"row": "t", "column": "dose"},
+                          {"reducer": "count"})
+    assert cnt.metadata["figure_spec"]["matrix"] == [[4.0, 4.0]] * 3
+    rl, cl, mat = FIG.heatmap_grid([0, 1], ["a", "b"], [1.0, 2.0], "mean")
+    assert mat == [[1.0, None], [None, 2.0]], "an empty cell is blank, not zero"
+    eng, vox = _plot_chain(ds, env0, "plot.heatmap", {"table": "mask", "frame": 1},
+                           {"source": "voxel"})
+    m = vox.metadata["figure_spec"]["matrix"]
+    assert len(m) == 8 and m[2][2] == 7.0 and m[0][0] == 0.0, "frame 1, Z max-projected"
+    spec_h = NODES.get("plot.heatmap")
+    assert spec_h.resolve_reads_domains({"source": "voxel"}) == frozenset({Domain.VOXEL})
+    assert spec_h.resolve_reads_domains({"source": "point"}) == frozenset({Domain.POINT})
+    _ok("plot.heatmap: mean and count per (row, column) cell are right and an empty cell "
+        "stays blank; a Voxel layer's plane is drawn at the chosen frame, Z max-projected; "
+        "Source decides the domain the node requires")
+
+
+def test_plot_timeseries() -> None:
+    """``plot.timeseries`` (V4.00 step 8): rows placed on the experiment's own clock —
+    ``frame_time_jd`` elapsed in s/min/h by the span, else frame x ``dt_s``, else the frame
+    index with the label saying so; the mean per frame with its spread by default."""
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot.timeseries: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    jd0 = 2460000.5
+    xs, lab, kind = FIG.frame_times(3, frame_time_jd=[jd0, jd0 + 30 / 86400, jd0 + 60 / 86400])
+    assert lab == "time (s)" and np.allclose(xs, [0, 30, 60]) and kind == ""
+    xs, lab, _k = FIG.frame_times(3, dt_s=3600.0)
+    assert lab == "time (h)" and np.allclose(xs, [0, 1, 2])
+    xs, lab, _k = FIG.frame_times(3)
+    assert lab.startswith("frame") and xs == [0.0, 1.0, 2.0]
+    xs, lab, kind = FIG.frame_times(2, frame_time_jd=[jd0, jd0 + 1], mode="clock")
+    assert kind == "clock" and xs[1] - xs[0] == 1.0
+    ds, _run = _plot_fixture()
+    ds = ds.with_metadata(dt_s=60.0)
+    env0 = _plot_seed(ds)
+    eng, out = _plot_chain(ds, env0, "plot.timeseries", {"group_by": "dose"})
+    spec = out.metadata["figure_spec"]
+    assert spec["axes"]["x_label"] == "time (min)", spec["axes"]
+    assert spec["series"][1]["x"] == [0.0, 1.0, 2.0] and \
+        spec["series"][1]["y"] == [11.5, 13.5, 15.5], spec["series"][1]
+    assert spec["series"][0]["err"] is not None, "sem by default"
+    assert ("dt_s", 60.0) in dict(eng.entry("P").reads).items() or \
+        "dt_s" in dict(eng.entry("P").reads), "the clock is a fenced read"
+    _ok("plot.timeseries: the axis follows the file's own clock (frame_time_jd in s/min/h, "
+        "else frame x dt_s, else the frame index, labelled), clock time when asked; each "
+        "frame's rows become mean +/- sem by default; dt_s is a fenced read")
+
+
+def test_plot_per_frame() -> None:
+    """``per = frame`` (V4.00 step 8): one figure per frame of the input — a lazy
+    ``FigureProvider`` drawing frame t when read, the input's T and clock on the picture (the
+    envelope predicts the T), every frame on the same axes; Export Figure writes one chosen
+    frame; Export Movie of the picture keeps its true colours."""
+    import importlib.util
+    import os as _os
+    import shutil
+    import tempfile
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("per-frame plots: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    ds, _run = _plot_fixture()
+    jd0 = 2460000.5
+    ds = ds.with_metadata(frame_time_jd=[jd0, jd0 + 30 / 86400, jd0 + 60 / 86400])
+    env0 = _plot_seed(ds)
+    eng, out = _plot_chain(ds, env0, "plot.xy", {"x": "dose", "y": "area"},
+                           {"per": "frame", "kind": "scatter"})
+    assert out.axes.t == 3 and out.axes == eng.env("P").axes, (out.axes, eng.env("P").axes)
+    assert isinstance(out.image, FIG.FigureProvider)
+    assert out.metadata["frame_time_jd"] == ds.metadata["frame_time_jd"]
+    f0 = np.asarray(out.image.read_region(0, 0, 0, 0, 2, 0, out.axes.y, 0, out.axes.x))
+    f2 = np.asarray(out.image.read_region(0, 0, 2, 0, 2, 0, out.axes.y, 0, out.axes.x))
+    assert f0.dtype == np.uint8 and not np.array_equal(f0, f2), "each frame its own rows"
+    spec = out.metadata["figure_spec"]
+    fr = FIG.frame_spec(spec, 1)
+    assert sum(s["n"] for s in fr["series"]) == 8 and fr["axes"]["x_range"] == \
+        spec["axes"]["x_range"], "frame 1's rows, on the shared axes"
+    assert fr["axes"]["title"].startswith("30.0 s"), fr["axes"]["title"]
+    _e2, again = _plot_chain(ds, env0, "plot.xy", {"x": "dose", "y": "area"},
+                             {"per": "frame", "kind": "scatter"})
+    assert again.image.fingerprint() == out.image.fingerprint(), "a deterministic identity"
+    eng_t, ts = _plot_chain(ds, env0, "plot.timeseries", {}, {"per": "frame"})
+    assert ts.axes.t == 3 and abs(FIG.frame_spec(ts.metadata["figure_spec"], 1)["cursor_x"] - 30.0) < 1e-3
+    tmp = tempfile.mkdtemp(prefix="nd2sb_perframe_")
+    try:
+        g = Graph()
+        g.add(NodeInstance("S", "io.seed_plot"))
+        g.add(NodeInstance("P", "plot.xy", params={"x": "dose", "y": "area"},
+                           modes={"per": "frame"}))
+        g.add(NodeInstance("W", "io.write_figure",
+                           params={"path": _os.path.join(tmp, "f2"), "frame": 2, "dpi": 100}))
+        g.add(NodeInstance("M", "io.write_movie",
+                           params={"path": _os.path.join(tmp, "mov")},
+                           modes={"format": "png"}))
+        g.connect("S", "P")
+        g.connect("P", "W")
+        g.connect("P", "M")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0})
+        e.pull("W")
+        assert _os.path.exists(_os.path.join(tmp, "f2.png"))
+        try:
+            e.pull("M")
+            from PIL import Image
+            pngs = sorted(f for f in _os.listdir(tmp) if f.startswith("mov") and
+                          f.endswith(".png"))
+            assert pngs, _os.listdir(tmp)
+            with Image.open(_os.path.join(tmp, pngs[0])) as im:
+                med = np.median(np.asarray(im.convert("RGB")).reshape(-1, 3), axis=0)
+            assert med.min() >= 240, f"the white figure stays white in a movie, not {med}"
+        except ImportError:
+            pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("per-frame plots: one figure per input frame drawn on read (FigureProvider), the "
+        "input's T and clock on the picture as the envelope predicts, every frame on shared "
+        "axes with its own stamp, a deterministic identity; timeseries draws the course up "
+        "to the frame with a cursor; Export Figure writes a chosen frame; Export Movie keeps "
+        "a picture's true colours")
+
+
+def test_plot_groups_and_frames() -> None:
+    """The step 7 review's lessons on the step 8 plots: Distribution groups in one pass with
+    missing values as ONE last group; a Heatmap row or column with missing values is one
+    `(missing)` row or column, not a crash; every plot's envelope is its own Voxel domain and
+    R/G/B; a per-frame figure's envelope carries the per-frame times its payload does; Export
+    Movie of a per-frame figure animates it (its frames differ)."""
+    import importlib.util
+    import os as _os
+    import shutil
+    import tempfile
+    import time as _time
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot groups and frames: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    rng = np.random.default_rng(2)
+    n = 100_000
+    t0 = _time.perf_counter()
+    ser = FIG.distribution_series(rng.random(n), rng.integers(0, 2000, n))
+    assert len(ser) == 2000 and _time.perf_counter() - t0 < 5.0, _time.perf_counter() - t0
+    ser = FIG.distribution_series([1.0, 2.0, 3.0, 4.0, 5.0],
+                                  [float("nan"), "b", None, "a", float("nan")])
+    assert [(s["label"], s["values"]) for s in ser] == \
+        [("a", [4.0]), ("b", [2.0]), (FIG.MISSING_GROUP, [1.0, 3.0, 5.0])], ser
+    rl, cl, mat = FIG.heatmap_grid([0, float("nan"), 0, float("nan")], [1, 1, None, 2],
+                                   [1.0, 2.0, 3.0, 4.0], "sum")
+    assert rl == ["0", FIG.MISSING_GROUP] and cl == ["1", "2", FIG.MISSING_GROUP], (rl, cl)
+    assert mat == [[1.0, None, 3.0], [2.0, 4.0, None]], mat
+    ds, _run = _plot_fixture()
+    jd0 = 2460000.5
+    ds = ds.with_metadata(frame_time_jd=[jd0, jd0 + 30 / 86400, jd0 + 60 / 86400])
+    env0 = _plot_seed(ds)
+    for op, modes in (("plot.distribution", {}), ("plot.heatmap", {}),
+                      ("plot.timeseries", {}), ("plot.xy", {"per": "frame"}),
+                      ("plot.timeseries", {"per": "frame"})):
+        eng, out = _plot_chain(ds, env0, op, {}, modes)
+        env = eng.env("P")
+        assert env.domains == frozenset({Domain.VOXEL}), (op, env.domains)
+        assert NODES.get(op).out_domains(frozenset({Domain.LABEL})) == \
+            frozenset({Domain.VOXEL}), op
+        assert list(env.metadata["channel_names"]) == ["R", "G", "B"], op
+        if modes.get("per") == "frame":
+            assert env.metadata.get("frame_time_jd") == out.metadata["frame_time_jd"] == \
+                ds.metadata["frame_time_jd"], (op, env.metadata.get("frame_time_jd"))
+        else:
+            assert "frame_time_jd" not in env.metadata and \
+                "frame_time_jd" not in out.metadata, op
+    tmp = tempfile.mkdtemp(prefix="nd2sb_plotmov_")
+    try:
+        g = Graph()
+        g.add(NodeInstance("S", "io.seed_plot"))
+        g.add(NodeInstance("P", "plot.xy", params={"x": "dose", "y": "area"},
+                           modes={"per": "frame"}))
+        g.add(NodeInstance("M", "io.write_movie", params={"path": _os.path.join(tmp, "a")},
+                           modes={"format": "png"}))
+        g.connect("S", "P")
+        g.connect("P", "M")
+        Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0}).pull("M")
+        from PIL import Image
+        pngs = sorted(f for f in _os.listdir(tmp) if f.endswith(".png"))
+        assert len(pngs) == 3, pngs
+        frames = []
+        for f in pngs:
+            with Image.open(_os.path.join(tmp, f)) as im:
+                frames.append(np.asarray(im.convert("RGB")))
+        assert not np.array_equal(frames[0], frames[2]), "each frame its own figure"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("plot groups and frames: Distribution groups 100k rows / 2000 groups in one pass, "
+        "missing values as ONE last group; a Heatmap's missing row / column values are one "
+        "`(missing)` row / column; every plot's envelope is its own Voxel domain and R/G/B; a "
+        "per-frame figure's envelope carries the per-frame times its payload does; Export "
+        "Movie animates a per-frame figure")
+
+
+def test_plot_frames_review() -> None:
+    """The step 8 review: a group keeps its colour in every frame of a per-frame figure; a
+    heatmap past 40 rows labels its ticks with the rows' values; histogram bins span a fixed X
+    range and are geometric on a log axis; a per-frame XY axis holds every frame's error bars;
+    a FigureProvider counts its resident bytes, draws each frame once for concurrent readers,
+    is re-keyed by a code reload, refuses a gigapixel series at pull time and is prefetched
+    sparingly; a picture's movie carries no R/G/B legend; a heatmap's Legend is its colour
+    bar, its Grid outlines its cells, and it offers no Palette."""
+    import importlib.util
+    import os as _os
+    import shutil
+    import tempfile
+    import threading
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot frames review: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    small = dict(FIG.STYLE_PRESETS["paper"], dpi=60)
+    # one colour per group in every frame
+    rows = {"x": [0, 1, 2, 3, 4], "y": [1, 2, 3, 4, 5], "g": ["b", "b", "a", "b", "a"],
+            "t": [0, 0, 1, 1, 2]}
+    spec = {"kind": "xy", "per": "frame", "rows": rows, "error": "none", "series": [],
+            "draw": {"mode": "scatter"}, "axes": {"x_range": [0, 5], "y_range": [0, 6]},
+            "style": small}
+    ci = [{s["label"]: s["color_index"] for s in FIG.frame_spec(spec, f)["series"]}
+          for f in range(3)]
+    assert ci[0]["b"] == ci[1]["b"] and ci[1]["a"] == ci[2]["a"] and \
+        ci[0]["b"] != ci[1]["a"], ci
+    # a heatmap past 40 rows names its rows
+    hm = {"kind": "heatmap", "matrix": [[float(i)] for i in range(60)],
+          "row_labels": [str(101 + i) for i in range(60)], "col_labels": ["0"],
+          "draw": {"colormap": "viridis", "color_range": [None, None], "value_label": "v"},
+          "axes": {}, "style": small, "source": {"source": "label"}}
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(hm)
+    ax = fig.axes[0]
+    ticks = [t.get_text() for t in ax.get_yticklabels()]
+    assert "101" in ticks and "0" not in ticks, ticks
+    assert len(fig.axes) == 2, "the Legend (default on) is the colour bar"
+    with FIG._RENDER_LOCK:
+        fig2, _hw = FIG.draw(dict(hm, style=dict(small, legend=False, grid=True)))
+    assert len(fig2.axes) == 1 and fig2.axes[0].get_xticks(minor=True).size > 0
+    assert "palette" not in [m.name for m in NODES.get("plot.heatmap").modes]
+    # histogram bins over the fixed range, geometric on a log x axis
+    v = np.array([0.5, 2.0, 50.0, 5000.0])
+    e = FIG._hist_edges(v, 10, {"x_range": [0, 100]})
+    assert e[0] == 0 and e[-1] == 100 and len(e) == 11
+    e = FIG._hist_edges(v, 4, {"log_x": True})
+    assert np.allclose(np.diff(np.log10(e)), np.diff(np.log10(e))[0]), e
+    # a per-frame XY axis holds every frame's mean +/- sd
+    ds, _run = _plot_fixture()
+    env0 = _plot_seed(ds)
+    _e, pf = _plot_chain(ds, env0, "plot.xy", {"x": "dose", "y": "area", "dpi": 60},
+                         {"per": "frame", "error": "sd", "detail": "custom"})
+    sp = pf.metadata["figure_spec"]
+    top = max(v + e for f in range(3) for s in FIG.frame_spec(sp, f)["series"]
+              for v, e in zip(s["y"], s["err"] or [0] * len(s["y"])))
+    assert sp["axes"]["y_range"][1] >= top, (sp["axes"]["y_range"], top)
+    # the provider: bytes, one draw per frame, reload identity, budget, prefetch
+    prov = pf.image
+    assert prov.nbytes == min(8, prov.axes.t) * prov.axes.y * prov.axes.x * 3 > 0
+    calls = []
+    real = FIG.render_rgb
+
+    def counting(s):
+        calls.append(1)
+        return real(s)
+
+    FIG.render_rgb = counting
+    try:
+        fresh = FIG.FigureProvider(sp, 3, prov.axes.y, prov.axes.x)
+        th = [threading.Thread(target=fresh.read_region,
+                               args=(0, 0, 1, 0, c, 0, 4, 0, 4)) for c in (0, 1, 2)]
+        [x.start() for x in th]
+        [x.join() for x in th]
+    finally:
+        FIG.render_rgb = real
+    assert len(calls) == 1, f"frame 1 drawn {len(calls)} times"
+    before = fresh.fingerprint()
+    saved = FIG._DRAW_CODE
+    FIG._DRAW_CODE = "reloaded"
+    try:
+        assert FIG.FigureProvider(sp, 3, prov.axes.y, prov.axes.x).fingerprint() != before
+    finally:
+        FIG._DRAW_CODE = saved
+    try:
+        FIG.picture_series(sp, 3, 20000, 20000)
+        raise AssertionError("a gigapixel series must be refused at pull time")
+    except ValueError as exc:
+        assert "Mpx" in str(exc), exc
+    from nodelab_v2.runner import EngineRunner
+    assert EngineRunner._prefetch_span(prov) == 2 and prov.computes_on_read
+    # a picture's movie: no R / G / B channel legend over the chart
+    tmp = tempfile.mkdtemp(prefix="nd2sb_review8_")
+    try:
+        g = Graph()
+        g.add(NodeInstance("S", "io.seed_plot"))
+        g.add(NodeInstance("P", "plot.xy", params={"x": "dose", "y": "area", "dpi": 60},
+                           modes={"per": "frame", "detail": "custom"}))
+        g.add(NodeInstance("M", "io.write_movie", params={"path": _os.path.join(tmp, "mv")},
+                           modes={"format": "png"}))
+        g.connect("S", "P")
+        g.connect("P", "M")
+        eng = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0})
+        pic = eng.pull("P")
+        eng.pull("M")
+        from PIL import Image
+        png = sorted(f for f in _os.listdir(tmp) if f.endswith(".png"))[0]
+        with Image.open(_os.path.join(tmp, png)) as im:
+            mv = np.asarray(im.convert("RGB")).astype(int)
+        f0 = np.stack([np.asarray(pic.image.read_region(0, 0, 0, 0, c, 0, pic.axes.y, 0,
+                                                       pic.axes.x)) for c in range(3)], -1)
+
+        def pure(a):
+            return int(sum(((a == np.array(col)).all(-1)).sum()
+                           for col in ((255, 0, 0), (0, 255, 0), (0, 0, 255))))
+
+        assert pure(mv) <= pure(f0.astype(int)), (pure(mv), pure(f0))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("plot frames review: a group keeps its colour in every frame; a heatmap past 40 rows "
+        "names its rows, its Legend is the colour bar, its Grid outlines cells, no Palette; "
+        "histogram bins span the fixed X range (geometric on log x); a per-frame XY axis "
+        "holds every frame's error bars; a FigureProvider counts its bytes, draws a frame "
+        "once for three concurrent readers, is re-keyed by a reload, refuses a gigapixel "
+        "series at pull time and is prefetched sparingly; a picture's movie has no channel "
+        "legend")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -25819,6 +26219,12 @@ def main() -> int:
     test_plot_xy()
     test_write_figure()
     test_plot_review()
+    test_plot_distribution()
+    test_plot_heatmap()
+    test_plot_timeseries()
+    test_plot_per_frame()
+    test_plot_groups_and_frames()
+    test_plot_frames_review()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

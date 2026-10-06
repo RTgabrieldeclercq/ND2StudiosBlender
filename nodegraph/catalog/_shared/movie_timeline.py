@@ -1061,7 +1061,8 @@ class Timeline:
         tiled_c = v0.tile_axis == "c"
         px = (float(src.px_um) / c.sc) if (src.px_um and c.sc > 0) else None
         return _annotate(canvas, lines=lines, pixel_size_um=px,
-                         ch_names=[] if tiled_c else v0.names, tints=v0.tints,
+                         ch_names=[] if (tiled_c or getattr(src, "picture", False))
+                         else v0.names, tints=v0.tints,
                          position=("" if v0.tile_axis == "m" else src.position_name(m0)),
                          show={"scalebar": ann["scalebar"], "channels": ann["channels"],
                                "position": ann["position"]},

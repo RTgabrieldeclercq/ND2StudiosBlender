@@ -1,6 +1,8 @@
 """plot.xy — a line or scatter chart of two columns of a structure table (V4.00 step 7)."""
 from __future__ import annotations
 
+import numpy as np
+
 from nodegraph.catalog._base import register_node
 import nodegraph.catalog._shared.figure as FIG
 from nodegraph.catalog._shared.labels import _resolve_layer, _structure_layers
@@ -51,6 +53,9 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
     log_y = bool(ctx.params.get("log_y", False))
     series = FIG.xy_series(x, y, g, error, log_x=log_x, log_y=log_y)
     style = FIG.style_from_ctx(ctx)
+    per = str(modes.get("per", "all"))
+    x_range = FIG.parse_range(ctx.params.get("x_range", ""), socket="x_range")
+    y_range = FIG.parse_range(ctx.params.get("y_range", ""), socket="y_range")
     spec = {
         "kind": "xy",
         "series": series,
@@ -60,12 +65,45 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
                  "x_label": str(ctx.params.get("x_label", "") or "") or xname,
                  "y_label": str(ctx.params.get("y_label", "") or "") or yname,
                  "log_x": log_x, "log_y": log_y,
-                 "x_range": FIG.parse_range(ctx.params.get("x_range", ""), socket="x_range"),
-                 "y_range": FIG.parse_range(ctx.params.get("y_range", ""), socket="y_range")},
+                 "x_range": x_range, "y_range": y_range},
         "style": style,
         "source": {"domain": domain.value, "table": layer, "x": xname, "y": yname,
                    "group_by": gname, "error": error},
     }
+    if per == "frame":
+        # one figure per frame of the input: the rows of that frame, on axes every frame
+        # shares (the data's whole range unless a range is fixed), drawn when shown
+        tcol = FIG.column(cols, "t", node="plot xy", socket="per", layer=layer)
+        frames = max(1, int(ds.axes.t))
+        extra, labels = FIG.frame_clock(ds.metadata or {}, frames, ctx.calib("dt_s"))
+        a = spec["axes"]
+        if a["x_range"] == [None, None]:
+            a["x_range"] = FIG.axis_range(x, log=log_x)
+        if a["y_range"] == [None, None]:
+            vals = list(y)
+            if error != "none":
+                vals = []
+                garr = None if g is None else np.asarray(g, dtype=object)
+                tt = np.asarray(tcol, dtype=float)
+                for f in range(frames):
+                    sel = tt == f
+                    for s in FIG.xy_series(x[sel], y[sel],
+                                           None if garr is None else garr[sel], error,
+                                           log_x=log_x, log_y=log_y):
+                        vals += list(s["y"])
+                        if s.get("err"):
+                            vals += [v + e for v, e in zip(s["y"], s["err"])]
+                            vals += [v - e for v, e in zip(s["y"], s["err"])]
+            a["y_range"] = FIG.axis_range(vals or list(y), log=log_y)
+        spec.update(per="frame", error=error, frame_labels=labels,
+                    rows={"x": [FIG.json_value(v) for v in x],
+                          "y": [FIG.json_value(v) for v in y],
+                          "g": (None if g is None else [FIG.json_value(v) for v in g]),
+                          "t": [FIG.json_value(v) for v in tcol]})
+        spec["series"] = []
+        h, w = FIG.figure_pixels(style["width_mm"], style["height_mm"], style["dpi"])
+        ctx.progress(0, 1, f"{frames} frames, each drawn when shown")
+        return FIG.picture_series(spec, frames, h, w, extra)
     ctx.progress(0, 1, f"drawing {sum(s['n'] for s in series)} rows")
     return FIG.picture_dataset(FIG.render_rgb(spec), spec)
 
@@ -133,6 +171,9 @@ register_node(
                  "band": "A translucent band between the lower and upper bounds — reads "
                          "best for a dense time course, where bars would overlap.",
              }),
+        Mode("per", ["all", "frame"], default="all", label="Per",
+             description="One figure of every row, or one figure per frame of the input.",
+             choice_docs=FIG.PER_DOCS),
         *FIG.style_modes(),
     ],
     granularity=Granularity.WHOLE_SERIES, kernel_axes=frozenset(),

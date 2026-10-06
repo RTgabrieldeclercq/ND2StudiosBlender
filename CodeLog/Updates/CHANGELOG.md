@@ -126,6 +126,22 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   thread-safe) and capped at 100 Mpx; Export Figure clamps 50–1200 dpi; Export Movie, the
   Movie Editor and LabLink quicklooks keep a picture's colours; F9 re-pull no longer recurses.
 
+### Step 8 — plots II (2026-10-05)
+- **Plot Distribution** (`plot.distribution`): histogram, kde, box, violin or ecdf of one
+  column, one distribution per group.
+- **Plot Heatmap** (`plot.heatmap`): a table summarised per row and column value with a
+  reducer, or a Voxel layer's plane, with a colour bar.
+- **Plot Time Series** (`plot.timeseries`): a column over the file's own clock (elapsed, wall
+  clock or frame), mean ± spread per frame, one curve per group.
+- **Per frame** on Plot XY and Plot Time Series: one figure per input frame, drawn when shown
+  and carrying the input's clock; the Viewer scrubs it, Export Movie animates it, and Export
+  Figure's new `frame` socket writes one of them.
+- Review fixes: a group keeps its colour in every frame; heatmap ticks past 40 rows name
+  the rows; histogram bins span a fixed X range (geometric on log); per-frame XY error bars
+  fit; a per-frame figure counts in the memory budget, draws each frame once, is re-keyed by a
+  reload, is refused past 100 Mpx at pull time and is prefetched sparingly; no channel legend
+  on a chart's movie; the heatmap's Legend / Grid work and it has no Palette.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

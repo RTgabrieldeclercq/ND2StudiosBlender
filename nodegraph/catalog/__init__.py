@@ -176,6 +176,10 @@ MODULES: Tuple[str, ...] = (
     # link-drag search menu's order, and appending keeps every earlier position).
     "plot.xy",
     "io.write_figure",
+    # V4.00 step 8: the other plots, appended for the same reason
+    "plot.distribution",
+    "plot.heatmap",
+    "plot.timeseries",
 )
 
 

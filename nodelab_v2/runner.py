@@ -3864,6 +3864,8 @@ class EngineRunner(QObject):
         view = self._view_of(node_id)
         if view is None or view.provider is None:
             return False
+        if getattr(view.provider, "computes_on_read", False):
+            return False                              # each frame is a render, not bytes
         return not isinstance(view.provider, StreamProvider)
 
     @staticmethod
@@ -3916,6 +3918,8 @@ class EngineRunner(QObject):
         neighbour is one kernel and prefetching is still the right trade), none across
         frames of a whole-unit compute — there, the useful neighbours are the other z of the
         unit already in hand, and they are cached by the read that displayed it."""
+        if getattr(prov, "computes_on_read", False):
+            return 2                                  # a read RUNS something (a figure)
         if not isinstance(prov, StreamProvider):
             return 8                                  # decompress-only: warm freely
         if getattr(prov, "volume_unit", False):

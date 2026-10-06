@@ -57,6 +57,11 @@ def _compute_write_figure(ctx: EvalContext) -> Dataset:
         raise ValueError(f"Export Figure: {target} already exists and Existing is 'refuse' — "
                          f"move it, pick another name, or set Existing to overwrite")
     FIG.require_matplotlib()
+    if spec.get("per") == "frame":
+        # a per-frame figure: write the chosen frame (the last one when past the end)
+        frames = max(1, int(ds.axes.t))
+        spec = FIG.frame_spec(spec, min(max(0, int(ctx.params.get("frame", 0) or 0)),
+                                        frames - 1))
     folder = os.path.dirname(os.path.abspath(target))
     os.makedirs(folder, exist_ok=True)
     ctx.progress(0, 1, f"writing {os.path.basename(target)}")
@@ -80,6 +85,10 @@ register_node(
                  description="Where the figure is written. There is no default and an empty "
                              "value is refused. Without an extension the format's is added; "
                              "an extension naming another figure format is refused."),
+        InInt("frame", "Frame", unit="", field=False, default=0,
+              description="Which frame of a PER-FRAME figure to write (the first is 0; past "
+                          "the last, the last). A figure drawn whole has one frame and "
+                          "ignores it; a movie of all frames is Export Movie's job."),
         InInt("dpi", "Resolution", unit="dpi", field=False, default=300,
               available_in={"format": frozenset({"png", "tiff"})},
               description="Pixels per inch of a PNG or TIFF. The figure is drawn again at "
