@@ -18846,6 +18846,21 @@ def test_held_views() -> None:
     r._results[("D", 7)] = (Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4),
                                     metadata={}), None)
     assert EngineRunner._rearm_view(r, "D") is None
+    # a re-armed result brings back the overlay context it was delivered with (V4.00 step
+    # 2): an edit elsewhere clears the shared map, the result itself stays valid
+    _ctx_e = {"node": "E", "sources": [], "dropped": 0}
+    EngineRunner._remember(r, ("E", 7), a, a.axes, ctx=_ctx_e, has_ctx=True)
+    r._overlay_ctxs.clear()
+    assert EngineRunner._rearm_view(r, "E") is not None
+    assert r._overlay_ctxs.get("E") is _ctx_e, r._overlay_ctxs
+    # …and the remembered contexts age out in lockstep with the results they belong to
+    from nodelab_v2.runner import _FINISHED_RESULTS
+    for _k in range(_FINISHED_RESULTS + 2):
+        EngineRunner._remember(r, (f"F{_k}", 7), a, a.axes, ctx={"k": _k}, has_ctx=True)
+    assert set(r._result_ctx) <= set(r._results) and ("E", 7) not in r._result_ctx, \
+        (sorted(r._result_ctx), sorted(r._results))
+    EngineRunner._remember(r, ("G", 7), a, a.axes)          # no context: none remembered
+    assert ("G", 7) in r._results and ("G", 7) not in r._result_ctx
 
     # ── the OVERLAY context is per-node for the same reason ──────────────────────
     #
@@ -24594,6 +24609,10 @@ def test_runner_qualified_ids() -> None:
     # …and the composed graph carries those clones under the page prefix
     compz = ws.compose(Z.id)
     assert qualify(Z.id, "ILB#ITT@1") in compz.graph.nodes, sorted(compz.graph.nodes)
+    # the selector's owner is qualified, so the sweep table it stamps knows its page
+    from nodegraph.iterate import OWNER_KEY as _OWN
+    _owners = {n.params[_OWN] for n in compz.graph.nodes.values() if n.params.get(_OWN)}
+    assert _owners == {qualify(Z.id, "ITT")}, _owners
     assert doc_id_of(qualify(Z.id, "ILB#ITT@1")) == qualify(Z.id, "ILB")
     ws.remove_page(Z.id)
     # a channel tap materialized inside a page keeps its id free of the page separator, so
@@ -24675,6 +24694,49 @@ def test_runner_qualified_ids() -> None:
     kp.doc.add_node("page.output", node_id="O", params={"name": "m"})
     kr.doc.add_node("page.input", node_id="IN", params={"source": f"{kp.id}:m"})
     assert wk.dependency_closure(kr.id) == [kr.id] and wk.page_deps(kr.id) == []
+    # "/" separates page from node in a run id: no node id may carry it, and a file whose
+    # pages do is refused WITHOUT touching the open workspace (File → Open is atomic)
+    try:
+        GraphDocument().add_node("io.load", node_id="a/b")
+        raise AssertionError("a node id with '/' was accepted")
+    except ValueError:
+        pass
+    import json
+    wo, _do, _eo, _ao = _ws_fixture()
+    good = wo.to_dict()
+    for mangle in ("node", "page"):
+        bad = json.loads(json.dumps(good))
+        pages = bad["workspace"]["pages"]
+        if mangle == "node":                  # renamed consistently: '/' is the only fault
+            body = pages[2]["graph"]
+            for n in body["nodes"]:
+                n["id"] = "x/y" if n["id"] == "X" else n["id"]
+            for e in body["edges"]:
+                e["dst"] = "x/y" if e["dst"] == "X" else e["dst"]
+        else:
+            pages[1]["id"] = "p/2"
+        snapshot = (list(wo.pages), wo.active, {p: id(wo.pages[p].doc) for p in wo.pages},
+                    {p: sorted(wo.pages[p].doc.nodes) for p in wo.pages})
+        try:
+            wo.load_dict(bad)
+            raise AssertionError(f"a {mangle} id with '/' was accepted")
+        except ValueError:
+            pass
+        assert (list(wo.pages), wo.active, {p: id(wo.pages[p].doc) for p in wo.pages},
+                {p: sorted(wo.pages[p].doc.nodes) for p in wo.pages}) == snapshot, \
+            f"a refused {mangle} id changed the open workspace"
+        assert wo.compose("pg3").graph.nodes, "the open workspace still composes"
+    # the active page id is set BEFORE the canvas document reloads (its listeners qualify
+    # bare ids against the page being shown), and that document reloads last
+    seen_active: List[Any] = []
+    good["workspace"]["active"] = "pg2"
+    wo.set_active("pg1")
+    keep_doc = wo.pages["pg1"].doc
+    seen_active.clear()
+    keep_doc.on_change(lambda: seen_active.append(wo.active))
+    wo.load_dict(good)
+    assert wo.pages["pg2"].doc is keep_doc and seen_active and set(seen_active) == {"pg2"}, \
+        seen_active
     # the Workspace hears an edit FIRST — before listeners registered earlier — so the
     # runner has cancelled what an edit makes stale before anything (the Movie Editor's
     # refetch) submits new work; and a File → Open keeps it first
@@ -24722,7 +24784,8 @@ def test_runner_qualified_ids() -> None:
         "splits a mixed set per page, the Workspace serves the GraphSource surface "
         "(records/envs/seeds/aliases in run ids; unknown page → no identity), taps split "
         "clean; the Workspace hears an edit first (and still after a load); add/duplicate "
-        "publish nothing, rename/remove touch exactly the page's nodes, and a removed page's "
+        "publish nothing, a rename touches the page's Outputs and their readers, a removal "
+        "the page's nodes and its readers, and a removed page's "
         "readers are re-described")
 
 

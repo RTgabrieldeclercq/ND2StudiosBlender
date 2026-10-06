@@ -1081,8 +1081,14 @@ class _Worker(QRunnable):
             # A payload-only fetch (`EngineRunner.fetch`) is never displayed, so it skips it.
             octx = _NO_CTX
             if job.epoch not in r._fetches:
-                octx = (True, r._resolve_overlay(engine, job.graph, job.pull_id, payload))
-                r._overlay_ctxs[job.node_id] = octx[1]
+                ctx = r._resolve_overlay(engine, job.graph, job.pull_id, payload)
+                if ctx is not None and job.pull_id != job.node_id:
+                    # served by another id (a bound Page Input, an Iterate clone): the
+                    # context is filed and asked for under the CARD's id, so it must say so
+                    # or every reader rejects it as some other node's
+                    ctx = dict(ctx, node=job.node_id)
+                octx = (True, ctx)
+                r._overlay_ctxs[job.node_id] = ctx
             plane = None                    # dict {channel_index: 2-D native plane}
             axes = None
             if isinstance(payload, Dataset) and payload.image is not None:
@@ -1691,6 +1697,9 @@ class EngineRunner(QObject):
         content-addressed and stay."""
         if isinstance(src, GraphDocument):
             src = Workspace.single(src)
+        # a run still in flight belongs to the OLD source: let it deliver and it would be
+        # filed as the new source's same-id node
+        self.invalidate(None)
         try:
             self._source.off_change(self._prune)
         except Exception:  # noqa: BLE001 — a source without off_change keeps the listener
@@ -2173,8 +2182,8 @@ class EngineRunner(QObject):
         self._results.move_to_end(key)
         if has_ctx:
             self._result_ctx[key] = ctx
-        else:
-            self._result_ctx.pop(key, None)
+        # without a context (a fetch) a stored one STAYS: the same key is the same node at
+        # the same run identity, so the context still describes the payload
         while len(self._results) > _FINISHED_RESULTS:
             old, _ = self._results.popitem(last=False)
             self._result_ctx.pop(old, None)
@@ -2306,8 +2315,12 @@ class EngineRunner(QObject):
         # A preload is reading that provider too, and its planes are about to be wrong.
         self.cancel_preload()
         # the composed overlay belongs to the graph that produced it — an edit can change
-        # the placement, the pairing or the secondary chain entirely
-        self._overlay_ctxs.clear()
+        # the placement, the pairing or the secondary chain entirely. Except a run that
+        # SURVIVED this call: no touched id is in its cone, so the context it resolved from
+        # that cone is still true — and its worker may be about to decode its first plane
+        live = set(self._runs.values())
+        for nid in [n for n in self._overlay_ctxs if n not in live]:
+            self._overlay_ctxs.pop(nid, None)
         # ...and the per-source LUT with them: it is keyed by SOURCE NODE, so editing that
         # node's path would otherwise leave the previous file's window on the overlay.
         self._src_lut_cache.clear()
@@ -3877,19 +3890,26 @@ class EngineRunner(QObject):
         off the run graph so it matches what the engine will actually walk — muted nodes
         are bypassed there, and group bodies are expanded."""
         node_id = self._rid(node_id)
+        composed = None
         try:
-            graph = graph if graph is not None else self._compose(node_id).graph
+            if graph is None:
+                composed = self._compose(node_id)
+                graph = composed.graph
         except Exception:  # noqa: BLE001 — an unbuildable graph plans as just the target
             return [node_id]
-        if node_id not in graph.nodes:
+        # a card with no node of its own (a bound Page Input, a node inside an Iterate
+        # segment) plans what SERVES it — plus itself, the card that will report the run
+        start = node_id if node_id in graph.nodes else self._pull_id(node_id, graph, composed)
+        if start not in graph.nodes:
             return [node_id]
-        seen, stack = set(), [node_id]
+        seen, stack = set(), [start]
         while stack:
             nid = stack.pop()
             if nid in seen:
                 continue
             seen.add(nid)
             stack.extend(e.src for e in graph.preds(nid) if e.src not in seen)
+        seen.add(node_id)
         return sorted(seen)
 
     # ── bake (Dock) ───────────────────────────────────────────────────────────
@@ -4193,7 +4213,8 @@ class EngineRunner(QObject):
         # …plus the card itself: a bound Page Input is served by its upstream Output, so it
         # is in no plan, yet re-pointing its Source must cancel the pull of it
         self._run_cones[self._epoch] = self._cone_of(planned, composed) | {_doc_id_of(node_id)}
-        self.plan.emit(node_id, planned)
+        # a card served by another id is in no plan of its own: name it, so it reads queued
+        self.plan.emit(node_id, planned if node_id in planned else planned + [node_id])
         (self.fetch_started if fetch else self.started).emit(node_id)
         self._pull_thread.start(_Worker(self, job))
 

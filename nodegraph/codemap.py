@@ -755,8 +755,13 @@ def anchor_hash(anchor: str, built: Dict[str, Any]) -> Optional[str]:
         path = os.path.join(ROOT, rest.replace("/", os.sep))
         if not os.path.exists(path):
             return None
+        # Line endings are normalized first: `.gitattributes` pins blobs to LF, but a working
+        # copy made before it may still hold CRLF files, and raw bytes then pin a curated
+        # entry to ONE machine's line endings — every LF checkout (the other developer's, a
+        # fresh clone, a worktree) reads it as CHANGED although not a character moved.
         with open(path, "rb") as fh:
-            return hashlib.blake2b(fh.read(), digest_size=16).hexdigest()
+            data = fh.read().replace(b"\r\n", b"\n")
+        return hashlib.blake2b(data, digest_size=16).hexdigest()
     if kind == "doc":
         rel, _, heading = rest.partition("#")
         path = os.path.join(ROOT, rel.replace("/", os.sep))

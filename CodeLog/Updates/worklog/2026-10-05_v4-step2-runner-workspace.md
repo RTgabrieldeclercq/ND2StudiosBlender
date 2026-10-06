@@ -65,6 +65,31 @@ failure mode, each finding put to independent verifiers who tried to refute it) 
 8. **Pin T/Z silently did nothing**: the window's handler now splits the strip's run id. A bake
    on another page releases that page's dormant chain rather than the active page's.
 
+**A second review pass** covered the id boundary, the tests and probes, the Workspace semantics
+and the fixes above. All 15 findings were upheld, and this change fixes them:
+
+9. **Bound Page Input card display.** Its overlay context was stamped with the Output's id, so
+   no overlay drew, and it had no raw hover value. The context now carries the card's id, which
+   also fixes Iterate-aliased cards. `planned_nodes` of such a card plans what serves it, plus
+   the card itself.
+10. **Overlay context durability.** Re-filing a result without a context (a fetch) no longer
+    wipes the stored one. An invalidate keeps the contexts of runs that survive it, so their
+    first decoded plane keeps its overlay.
+11. **File → Open is atomic.** Every page is parsed and checked (page ids, node ids) before
+    anything changes, and a failure rolls the old pages back. The active page id is set before
+    any page loads, and the canvas document loads last.
+12. **Ids may not contain `/`**, the run-id separator: `GraphDocument` refuses such a node id,
+    and the Workspace refuses such a page id.
+13. **Re-binding the runner's `source` cancels in-flight runs first.**
+14. **Sweep tables land on the right page.** An Iterate selector's owner is qualified during
+    composition, so its table is recorded on its own page.
+15. **A bake or hold delivered for a page or card that has gone** is reported in the status bar
+    instead of raising.
+16. **The tests now prove the real paths:** WS2 pulls a bound Page Input and an ordinary node
+    through `pull()` and checks the cone `_submit` really records; the Pin T/Z probe passes a
+    run id; `test_held_views` proves that a context comes back with a re-armed result and ages
+    out in lockstep with it; two pass messages now say what their assertions prove.
+
 The test fakes that call runner methods unbound now carry the `GraphSource` interface. One
 finding is deferred to step 5: a Dock fed through a Page Input still signs only its own page's
 upstream chain, so it would not read "stale" after an upstream page changes. No GUI path can
@@ -132,7 +157,7 @@ that step added, and the "did anything else break" question is a merge-time ques
   `test_write_movie`'s codec-rounding monotonicity (means 53.14, 53.14, 52.40 …, identical on
   `origin/Blender`), which aborts the tests registered after it. All 144 registered tests were
   also run one by one, continuing past failures: 143 pass, `test_write_movie` fails.
-- [x] `PYTHONUTF8=1 python scripts/_nodelab_v2_phase5_probe.py out.png` -> ALL PHASE-5 GUI PROBES PASSED (90 checks, WS2 included)
+- [x] `PYTHONUTF8=1 python scripts/_nodelab_v2_phase5_probe.py out.png` -> ALL PHASE-5 GUI PROBES PASSED (90 checks, WS2 included). Under heavy machine load one run then exited 139 instead of 0: `PYTHONFAULTHANDLER=1` shows an access violation INSIDE the probe's final `os._exit(0)`, the Windows teardown race its docstring names, with LabLink's poll thread mid-`urlopen`. Every check had already passed; the exit code is timing noise, not a V4 regression.
 - [x] `scripts/_dock_hold_probe.py` -> ALL 11 DOCK HOLD-TIER PROBES PASSED. Two non-gate probes
   fail IDENTICALLY on `origin/Blender` (`e1ae0e2`) before any V4 work, so not this change:
   `_hotreload_probe.py` ("palette lost the node") and `_probe_file_bundle_e2e.py` (a TIFF card

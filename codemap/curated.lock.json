@@ -9,7 +9,7 @@
  },
  "CON-02": {
   "anchors": {
-   "file:nodegraph/domains.py": "34fad697bc3c81400beb2c8b4e52344b",
+   "file:nodegraph/domains.py": "169b3940597f271bbc4829679b9d5a77",
    "sym:nodegraph.domains.Domain": "9a3c5f1b642fd7e854ee86e10df4f05a"
   },
   "blessed": "2026-10-05",
@@ -80,7 +80,7 @@
  },
  "CON-11": {
   "anchors": {
-   "file:nodegraph/provider.py": "92eba47f124f55c70b37ad8e35f7eba1",
+   "file:nodegraph/provider.py": "bb00221068ebd24e973c891e9c8b6752",
    "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
   },
   "blessed": "2026-10-05",
@@ -96,7 +96,7 @@
  },
  "CON-13": {
   "anchors": {
-   "file:.claude/skills/wire-node-v2/SKILL.md": "e8b4f0fa732a753c959a81c11b27c386"
+   "file:.claude/skills/wire-node-v2/SKILL.md": "51b524fbb4e7fd87fcb0293574a50f42"
   },
   "blessed": "2026-10-05",
   "file": "codemap/concepts.md"
@@ -138,7 +138,7 @@
  },
  "INV-02": {
   "anchors": {
-   "file:nodegraph/streaming.py": "12ee7862f34df5f251d28b501af772b1",
+   "file:nodegraph/streaming.py": "1592cbc04a588a5fb5be0baeda454715",
    "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
   },
   "blessed": "2026-10-05",
@@ -176,14 +176,14 @@
  },
  "INV-07": {
   "anchors": {
-   "file:nodelab_v2/nd2_compat.py": "883f4c62906051f799980ceb7faa9d21"
+   "file:nodelab_v2/nd2_compat.py": "7c736a375e1e0da83a094c6cca917fbe"
   },
   "blessed": "2026-10-05",
   "file": "codemap/invariants.md"
  },
  "INV-08": {
   "anchors": {
-   "file:nodegraph/codemap.py": "2fdeed885bb99b254c71d423f98ab957",
+   "file:nodegraph/codemap.py": "3e210dacf2a65e4b4e03b8c4543cbf5f",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
   "blessed": "2026-10-05",
@@ -199,14 +199,14 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "d618b88776ab8a51bb87bd11d2c0e6c5"
+   "file:nodegraph/kernels/README.md": "0ec6a239bc96ea8c8ee6b6a4741db54a"
   },
   "blessed": "2026-10-05",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "d618b88776ab8a51bb87bd11d2c0e6c5"
+   "file:nodegraph/kernels/README.md": "0ec6a239bc96ea8c8ee6b6a4741db54a"
   },
   "blessed": "2026-10-05",
   "file": "codemap/invariants.md"

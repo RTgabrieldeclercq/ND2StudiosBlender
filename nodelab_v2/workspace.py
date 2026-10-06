@@ -53,10 +53,11 @@ from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Opt
 
 from nodegraph import roles as R
 from nodegraph.graph import Graph, NodeInstance
+from nodegraph.iterate import OWNER_KEY
 from nodegraph.memo import digest
 from nodegraph.metadata import MetaEnvelope
 from nodegraph.serialize import (
-    is_workspace_dict, to_workspace_dict, workspace_pages)
+    is_workspace_dict, page_from_dict, to_workspace_dict, workspace_pages)
 from nodelab_v2.document import GraphDocument, NodeRecord
 from nodelab_v2.ops import (
     PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY)
@@ -732,6 +733,10 @@ class Workspace:
                         continue
                 q = qualify(pid, nid)
                 params = dict(inst.params)
+                if params.get(OWNER_KEY):
+                    # an Iterate selector names its card; the sweep table it stamps must
+                    # say WHICH page that card is on
+                    params[OWNER_KEY] = qualify(pid, str(params[OWNER_KEY]))
                 if inst.op_key == PAGE_OUTPUT_OP and \
                         not str(params.get(PAGE_CONDITION_KEY) or "").strip():
                     params[PAGE_CONDITION_KEY] = page.name
@@ -781,7 +786,13 @@ class Workspace:
         active = wsd.get("active") if is_ws else ids[0]
         if active not in ids:
             active = ids[0]
+        # Everything is parsed and checked BEFORE anything changes: a file that fails to open
+        # must leave the open workspace — and the canvas bound to it — exactly as it was.
+        parsed: Dict[str, Tuple[Any, Any, Any]] = {}
         for rec in recs:
+            if not PAGE_ID_RE.match(str(rec["id"])):
+                raise ValueError(f"page id {rec['id']!r} may contain only letters, digits "
+                                 f"and _")
             if rec.get("master"):
                 raise ValueError(
                     f"page {rec['id']!r} is linked to a master page; linked pages arrive in "
@@ -789,9 +800,15 @@ class Workspace:
             if not R.is_page_kind(rec.get("kind") or FREE):
                 raise ValueError(f"page {rec['id']!r} has unknown kind {rec.get('kind')!r} "
                                  f"(kinds: {', '.join(R.page_kinds())})")
+            parsed[rec["id"]] = page_from_dict(rec)
+            bad = sorted(n for n in parsed[rec["id"]][0].nodes if RUN_SEP in n)
+            if bad:
+                raise ValueError(f"page {rec['id']!r}: node id(s) {bad} contain {RUN_SEP!r}, "
+                                 f"which separates the page from the node in a run id")
         keep: Optional[GraphDocument] = None
         if self.active in self.pages and self.pages[self.active].editable_topology_doc():
             keep = self.pages[self.active].doc
+        before = (dict(self.pages), self.active, self.next_page_seq)
         self._quiet = True
         try:
             for pid in list(self.pages):
@@ -806,9 +823,13 @@ class Workspace:
                 page = Page(rec["id"], name, rec.get("kind") or FREE, doc)
                 self.pages[page.id] = page
                 self._attach(page)
-            for rec in recs:
-                self.pages[rec["id"]].doc.load_page(rec)
+            # active BEFORE any page loads: a listener reacting to the load (the canvas,
+            # the Movie Editor) qualifies bare ids against the page being shown
             self.active = active
+            # the canvas document LAST, so its listeners see every other page in place
+            for rec in sorted(recs, key=lambda r: self.pages[r["id"]].doc is keep):
+                graph, zones, groups = parsed[rec["id"]]
+                self.pages[rec["id"]].doc._load_parsed(graph, zones, groups, rec.get("ui"))
             seq = wsd.get("next_page_seq") if is_ws else None
             highest = max((int(m.group(1)) for m in
                            (re.match(r"^pg(\d+)$", i) for i in ids) if m), default=0)
@@ -816,6 +837,14 @@ class Workspace:
                                      highest + 1, 1)
             for pid in self._topo_pages():             # Inputs see their upstream Outputs
                 self.pages[pid].doc.repropagate()
+        except Exception:
+            # roll back: the previous pages, their order, the active page and the counter
+            for pid in list(self.pages):
+                self._detach(self.pages[pid])
+            self.pages, self.active, self.next_page_seq = before
+            for page in self.pages.values():
+                self._attach(page)
+            raise
         finally:
             self._quiet = False
         self._refresh_out_ids()

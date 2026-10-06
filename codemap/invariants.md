@@ -104,9 +104,9 @@ One arrow: `scripts/` → `nodelab_v2/` → `nodegraph/`. The single sanctioned 
 second would mean the engine can no longer run headless, and the headless gate is the one that
 runs everywhere.
 
-Corollary for GUI code: `document.py`, `ops.py`, `tables.py`, `overlay_render.py` and the
-headless half of `picker.py` must stay import-clean of Qt, because that is what lets the
-selftest cover them at all.
+Corollary for GUI code: `document.py`, `ops.py`, `tables.py`, `overlay_render.py`,
+`workspace.py` (V4.00) and the headless half of `picker.py` must stay import-clean of Qt,
+because that is what lets the selftest cover them at all.
 
 ---
 

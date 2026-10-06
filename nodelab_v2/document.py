@@ -358,6 +358,9 @@ class GraphDocument:
         nid = node_id or self.new_id()
         if nid in self.nodes:
             raise ValueError(f"duplicate node id {nid!r}")
+        if "/" in nid:
+            # "/" separates the page from the node in a page-qualified run id (V4.00)
+            raise ValueError(f"node id {nid!r} may not contain '/'")
         rec = NodeRecord(nid, op_key, params=params, modes=modes, x=x, y=y)
         self.nodes[nid] = rec
         # A brand-new id cannot be in any in-flight run's cone, so naming it here cancels
@@ -2007,6 +2010,11 @@ class GraphDocument:
         self._load_parsed(graph, zones, groups, rec.get("ui"))
 
     def _load_parsed(self, graph, zones, groups, ui_raw) -> None:
+        bad = sorted(n for n in graph.nodes if "/" in n)
+        if bad:
+            # refused before anything changes: "/" separates the page from the node in a
+            # page-qualified run id (V4.00), so such a node could never be pulled
+            raise ValueError(f"node id(s) {bad} contain '/', which this version reserves")
         ui = ui_raw if isinstance(ui_raw, dict) else {}
         ui_nodes = ui.get("nodes", {}) if isinstance(ui.get("nodes", {}), dict) else {}
         self.nodes.clear()

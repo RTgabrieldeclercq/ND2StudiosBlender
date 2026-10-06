@@ -943,6 +943,40 @@ def main(argv) -> int:
     assert win._viewed == "O" and win.scene.node_items["O"].run_state() in ("done", "cached"), \
         win.scene.node_items["O"].run_state()
     assert win.runner.finished_result("O") is not None and win.runner.finished_result(_rx) is not None
+    # a BOUND Page Input card is pullable through the real path: it has no node in the run
+    # graph, so `_submit` serves it with the upstream Output and puts the card in the cone
+    _rin = f"{pB.id}/IN"
+    _ws2.clear()
+    win.runner.pull(_rin)
+    _live = [r for r, n in win.runner._runs.items() if n == _rin]
+    assert _live, ("the Input's pull did not start", win.runner._runs)
+    _cone_in = win.runner._run_cones[_live[0]]
+    assert _rin in _cone_in and f"{pA.id}/O" in _cone_in, sorted(_cone_in)
+    t0 = time.time()
+    while not _ws2 and time.time() - t0 < 120:
+        app.processEvents()
+        time.sleep(0.01)
+    assert _ws2.get("err") is None, _ws2.get("err")
+    assert _ws2.get("id") == _rin, _ws2
+    assert win.runner.finished_result(_rin).axes == win.runner.finished_result("O").axes, \
+        "the Input card shows exactly what the upstream Output passes on"
+    # its plan is what serves it, plus the card (the hover readout finds its source there)
+    _pin_plan = win.runner.planned_nodes(_rin)
+    assert {_rin, f"{pA.id}/S", f"{pA.id}/O"} <= set(_pin_plan), _pin_plan
+    # a bake or hold delivered for a page that has gone is reported, not a KeyError
+    win._on_baked("pg99/DK", {"store": "x", "manifest": {}})
+    win._on_baked("pg99/DK", {"hold": True, "payload": None})
+    # …and an ordinary pull reading THROUGH the Input records the Input in its real cone
+    _ws2.clear()
+    win.runner.pull(_rx)
+    _real_cone = next(c for r, c in win.runner._run_cones.items()
+                      if win.runner._runs.get(r) == _rx)
+    assert _rin in _real_cone and f"{pA.id}/S" in _real_cone, sorted(_real_cone)
+    t0 = time.time()
+    while not _ws2 and time.time() - t0 < 120:
+        app.processEvents()
+        time.sleep(0.01)
+    assert _ws2.get("id") == _rx and _ws2.get("err") is None, _ws2
     # an edit on the SHOWN page cancels the other page's run that reads it — and only that
     _canc2: list = []
     _c4 = win.runner.cancelled.connect(_canc2.append)
@@ -959,11 +993,8 @@ def main(argv) -> int:
     # although the Input itself has no node in the run graph (its cone names it explicitly)
     _canc2.clear()
     win.runner._runs.clear(); win.runner._run_cones.clear()
-    _compB = win.runner._compose(_rx)
     win.runner._runs[9402] = _rx
-    win.runner._run_cones[9402] = win.runner._cone_of(win.runner.planned_nodes(_rx, _compB.graph),
-                                                      _compB)
-    assert f"{pB.id}/IN" in win.runner._run_cones[9402], sorted(win.runner._run_cones[9402])
+    win.runner._run_cones[9402] = _real_cone          # the cone `_submit` really recorded
     pB.doc.nodes["IN"].params["source"] = f"{pA.id}:nope"
     pB.doc.touch("IN")
     app.processEvents()
@@ -976,9 +1007,12 @@ def main(argv) -> int:
     ws.load_file(tmp)                 # back to the demo graph G7 pulls next
     app.processEvents()
     _ok("WS2 runner on the workspace: a pull on a page the canvas is not showing composes "
-        "the upstream page in and finishes under its qualified id without touching the "
-        "Viewer or the cards; the shared Output is a memo hit from its own page; an edit on "
-        "the shown page cancels only the other page's run that reads it")
+        "the upstream page in and finishes under its qualified id without retargeting the "
+        "Viewer (the shown page's cards it computed read done, and nothing stays claimed); "
+        "the shared Output is a memo hit from its own page; a bound Page Input card is "
+        "pullable and shows its upstream Output; the real run cone names the Input it reads "
+        "through, so an edit on the shown page or a re-pointed Input cancels exactly the "
+        "other page's run that reads it")
 
     # ── G7 + G4: a real pull on the synthetic source through to viewer pixels ──
     done = {}
@@ -5405,9 +5439,12 @@ def main(argv) -> int:
     # the window writes a pin as canonical JSON, pinned, through the edit path
     ovl = doc.add_node("view.overlay", x=1400, y=900)
     win._viewed = win._viewed or "n3"
-    win._on_overlay_pin(ovl.id, "t", 5, 20)
-    win._on_overlay_pin(ovl.id, "t", 1, 4)
-    win._on_overlay_pin(ovl.id, "t", 5, 21)            # re-pinning a frame replaces it
+    # the overlay strip hands back the RUN id it was given (V4.00 step 2), as here
+    _ovl_rid = win.runner.run_id(ovl.id)
+    assert _ovl_rid != ovl.id
+    win._on_overlay_pin(_ovl_rid, "t", 5, 20)
+    win._on_overlay_pin(_ovl_rid, "t", 1, 4)
+    win._on_overlay_pin(_ovl_rid, "t", 5, 21)          # re-pinning a frame replaces it
     assert doc.nodes[ovl.id].params["t_pins"] == "[[1,4],[5,21]]", \
         doc.nodes[ovl.id].params["t_pins"]
     assert "t_pins" in doc.nodes[ovl.id].locked

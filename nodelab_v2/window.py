@@ -2599,15 +2599,19 @@ class MainWindow(QMainWindow):
         # selector wears the segment END's id (V2.22), so the pull that carries a results
         # table is usually of an ordinary analysis node. The card named in the payload is
         # the one whose panel shows the table and whose `index` the strip edits.
-        owner = str(md.get(SWEEP_OWNER_KEY) or node_id)
-        rec = self.doc.nodes.get(owner)
+        # The owner is page-qualified when the pull was composed (V4.00): the table belongs
+        # on the Iterate card's OWN page, which an upstream sweep is not the shown one.
+        pid, owner = split_run_id(str(md.get(SWEEP_OWNER_KEY) or node_id))
+        page = self.workspace.pages.get(pid or self.workspace.active or "")
+        rec = page.doc.nodes.get(owner) if page is not None else None
         if rec is None or rec.op_key != ITERATE_OP:
             return
         rec.params[SWEEP_KEY] = {"rows": [
             {"iter": r.get("iter"), "metric": r.get("metric"), "won": r.get("won")}
             for r in rows]}
         shown = getattr(self.inspector, "_node", None)
-        if shown is not None and getattr(shown, "node_id", None) == owner:
+        if (shown is not None and getattr(shown, "node_id", None) == owner
+                and page.doc is self.doc):
             self.inspector.set_node(shown)      # redraw the table with the new metrics
 
     def _start_bake(self, node_id: str, *, scoped: bool = False) -> None:
@@ -2692,9 +2696,16 @@ class MainWindow(QMainWindow):
 
     def _on_held(self, node_id: str, spec: dict) -> None:
         """Record a finished hold: pin the payload, flip the mode, grey the chain."""
-        self.runner.hold(node_id, spec["payload"], spec.get("env"))
+        run_id = node_id
         pid, node_id = split_run_id(str(node_id))      # the run id names the page
-        doc = self.workspace.document_of(pid) if pid else self.doc
+        page = self.workspace.pages.get(pid or self.workspace.active or "")
+        if page is None or node_id not in page.doc.nodes:
+            self.statusBar().showMessage(
+                f"{node_id}: its page or card went away while it held — nothing was "
+                f"pinned", 8000)
+            return
+        self.runner.hold(run_id, spec["payload"], spec.get("env"))
+        doc = page.doc
         doc.set_dock_hold(node_id, True)
         doc.set_held_nodes(local_ids(self.runner.held, pid or self.workspace.active))
         self.runner.invalidate()
@@ -2712,7 +2723,13 @@ class MainWindow(QMainWindow):
             return
         # the run id names the page: record the bake on THAT page's document
         pid, node_id = split_run_id(str(node_id))
-        doc = self.workspace.document_of(pid) if pid else self.doc
+        page = self.workspace.pages.get(pid or self.workspace.active or "")
+        if page is None or node_id not in page.doc.nodes:
+            self.statusBar().showMessage(
+                f"{node_id}: its page or card went away while it baked — the checkpoint "
+                f"is on disk at {spec.get('store', '?')} but nothing records it", 8000)
+            return
+        doc = page.doc
         if spec.get("cancelled"):
             self.statusBar().showMessage(
                 f"{node_id} bake stopped — nothing was recorded, so the dock still reads "
