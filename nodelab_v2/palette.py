@@ -31,6 +31,12 @@ from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
 from nodelab_v2.scene import visible_specs
 
+#: the role whose nodes hand data between pages (``codemap/node_roles.json``) — on a
+#: typed page it leads the tree as the "Pages" band (V4.00 step 11)
+PAGE_ROLE = "page_boundary"
+#: the pinned band's key in the tree (not a stage of the taxonomy)
+PAGES_BAND = "pages"
+
 #: item-data slots
 _OP = Qt.UserRole            # a node row: its op_key
 _KIND = Qt.UserRole + 1      # "stage" | "role" | "node"
@@ -301,62 +307,87 @@ class PalettePanel(QWidget):
         for op, spec in specs.items():
             rk, sk = R.role_of(op)
             buckets.setdefault(sk, {}).setdefault(rk, []).append(spec)
+        # V4.00 step 11: on a typed page the page boundary — Page Input / Page Output — is
+        # the first thing to reach for, so it leads the tree as its own "Pages" band; a Free
+        # page keeps it inside Control & present like any other role
+        pinned: List = []
+        if self._page_kind and self._page_kind != R.FREE_PAGE:
+            for sk in list(buckets):
+                pinned += buckets[sk].pop(PAGE_ROLE, None) or []
+                if not buckets[sk]:
+                    del buckets[sk]
+        if pinned:
+            head = self._stage_head(
+                "Pages", PAGES_BAND,
+                "Hand data from page to page: a Page Output names what this page produces; "
+                "a Page Input reads a named Output of an earlier page.")
+            self._add_role_rows(head, PAGE_ROLE, pinned)
+            head.setExpanded(True)
         order = [sk for sk, _ in R.stages()] + [R.OTHER_STAGE]
         for sk in order:
             roles = buckets.get(sk)
             if not roles:
                 continue
             smeta = R.stage_meta(sk)
-            # The stage is a BAND, not a column entry: its text sits in column 0 and spans
-            # the row, so it starts at the panel's left edge instead of after the dots
-            # column, and it gets a filled background so the five stages read as sections
-            # at a glance. (The first cut put the label in the middle column in small muted
-            # caps, which left it both indented and the faintest thing on the panel.)
-            head = QTreeWidgetItem([str(smeta.get("label", sk)), "", ""])
-            head.setFlags(Qt.ItemIsEnabled)
-            head.setData(0, _KIND, "stage")
-            head.setData(0, _KEY, sk)
-            head.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
-            head.setBackground(0, QBrush(T.ACCENT_DIM))
-            head.setForeground(0, QBrush(T.INK))
-            head.setToolTip(0, _squash(smeta.get("description")))
-            f = head.font(0)
-            f.setBold(True)
-            head.setFont(0, f)
-            head.setSizeHint(0, QSize(0, 24))
-            self._tree.addTopLevelItem(head)
-            head.setFirstColumnSpanned(True)      # only takes effect once it is in the tree
+            head = self._stage_head(str(smeta.get("label", sk)), sk,
+                                    _squash(smeta.get("description")))
             role_order = [rk for rk, _ in R.roles_in(sk)] + [R.OTHER_ROLE]
             for rk in role_order:
                 group = roles.get(rk)
                 if not group:
                     continue
-                rmeta = R.role_meta(rk)
-                # a role is a sub-heading: spanned and left-justified like the stage, one
-                # indent step in, with a lighter tint so stage > role > node reads as depth
-                rrow = QTreeWidgetItem([str(rmeta.get("label", rk)), "", ""])
-                rrow.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                rrow.setData(0, _KIND, "role")
-                rrow.setData(0, _KEY, rk)
-                rrow.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
-                rrow.setBackground(0, QBrush(T.mix(T.PANEL, T.ACCENT_DIM, 0.45)))
-                rrow.setForeground(0, QBrush(T.ACCENT))
-                rrow.setToolTip(0, _squash(rmeta.get("description")))
-                head.addChild(rrow)
-                rrow.setFirstColumnSpanned(True)
-                for spec in sorted(group, key=lambda s: s.label):
-                    row = QTreeWidgetItem(["", spec.label, ""])
-                    row.setData(0, _OP, spec.op_key)
-                    row.setData(0, _KIND, "node")
-                    ins, outs = _dataset_in_colors(spec), _dataset_out_colors(spec)
-                    row.setIcon(0, _dots_icon(ins, align_right=True))
-                    row.setIcon(2, _dots_icon(outs))
-                    row.setToolTip(0, "IN: " + ", ".join(w for _, w in ins))
-                    row.setToolTip(2, "OUT: " + ", ".join(w for _, w in outs))
-                    row.setToolTip(1, f"{spec.op_key}\n{_squash(spec.description)}")
-                    rrow.addChild(row)
-                rrow.setExpanded(True)
+                self._add_role_rows(head, rk, group)
             head.setExpanded(True)
+
+    def _stage_head(self, label: str, key: str, tip: str) -> QTreeWidgetItem:
+        """A stage BAND: its text sits in column 0 and spans the row, so it starts at the
+        panel's left edge instead of after the dots column, and it gets a filled background
+        so the stages read as sections at a glance. (The first cut put the label in the
+        middle column in small muted caps, which left it both indented and the faintest
+        thing on the panel.)"""
+        head = QTreeWidgetItem([label, "", ""])
+        head.setFlags(Qt.ItemIsEnabled)
+        head.setData(0, _KIND, "stage")
+        head.setData(0, _KEY, key)
+        head.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+        head.setBackground(0, QBrush(T.ACCENT_DIM))
+        head.setForeground(0, QBrush(T.INK))
+        head.setToolTip(0, tip)
+        f = head.font(0)
+        f.setBold(True)
+        head.setFont(0, f)
+        head.setSizeHint(0, QSize(0, 24))
+        self._tree.addTopLevelItem(head)
+        head.setFirstColumnSpanned(True)      # only takes effect once it is in the tree
+        return head
+
+    def _add_role_rows(self, head: QTreeWidgetItem, rk: str, group: List) -> None:
+        """A role is a sub-heading under its stage: spanned and left-justified like the
+        stage, one indent step in, with a lighter tint so stage > role > node reads as
+        depth; its nodes follow, by label."""
+        rmeta = R.role_meta(rk)
+        rrow = QTreeWidgetItem([str(rmeta.get("label", rk)), "", ""])
+        rrow.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        rrow.setData(0, _KIND, "role")
+        rrow.setData(0, _KEY, rk)
+        rrow.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+        rrow.setBackground(0, QBrush(T.mix(T.PANEL, T.ACCENT_DIM, 0.45)))
+        rrow.setForeground(0, QBrush(T.ACCENT))
+        rrow.setToolTip(0, _squash(rmeta.get("description")))
+        head.addChild(rrow)
+        rrow.setFirstColumnSpanned(True)
+        for spec in sorted(group, key=lambda s: s.label):
+            row = QTreeWidgetItem(["", spec.label, ""])
+            row.setData(0, _OP, spec.op_key)
+            row.setData(0, _KIND, "node")
+            ins, outs = _dataset_in_colors(spec), _dataset_out_colors(spec)
+            row.setIcon(0, _dots_icon(ins, align_right=True))
+            row.setIcon(2, _dots_icon(outs))
+            row.setToolTip(0, "IN: " + ", ".join(w for _, w in ins))
+            row.setToolTip(2, "OUT: " + ", ".join(w for _, w in outs))
+            row.setToolTip(1, f"{spec.op_key}\n{_squash(spec.description)}")
+            rrow.addChild(row)
+        rrow.setExpanded(True)
 
     # ── selection → overview ──────────────────────────────────────────────────
 

@@ -73,8 +73,30 @@ RUN_SEP = "/"
 PAGE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 #: The kind a pre-V4 file opens as (re-exported from :mod:`nodegraph.roles`).
 FREE = R.FREE_PAGE
-#: Default name of the one page a fresh workspace holds.
+#: Default name of a one-page workspace (:meth:`Workspace.single`; a pre-V4 file with no
+#: path opens under it).
 DEFAULT_PAGE_NAME = "Graph"
+#: The name a hand-placed Page Output starts with (``out``, ``out2``, …).
+DEFAULT_OUTPUT_BASE = "out"
+#: Characters a Page Output name may not carry: ``:`` splits a Source value
+#: (:meth:`Workspace.parse_source`), ``/`` is :data:`RUN_SEP`.
+_OUTPUT_NAME_BAD = re.compile(r"[:/\\]+")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def standard_kinds() -> Tuple[str, ...]:
+    """The kinds a fresh workspace holds, in page order — ``input``, ``refine``, ``process``,
+    ``analyze`` — read from the roles file, never a literal, so the catalog's page taxonomy
+    stays the single source (V4.00 step 11)."""
+    return tuple(k for k, _meta in R.pages())
+
+
+def sanitize_output_name(name: Any, limit: int = 48) -> str:
+    """A Page Output name a Source value can carry: ``:`` ``/`` ``\\`` → ``_``, whitespace
+    collapsed, at most ``limit`` characters; ``""`` when nothing is left."""
+    s = _OUTPUT_NAME_BAD.sub("_", str(name or ""))
+    s = _WHITESPACE.sub(" ", s).strip()
+    return s[:limit].strip()
 
 
 def qualify(page_id: str, node_id: str) -> str:
@@ -216,11 +238,30 @@ class Workspace:
     @classmethod
     def single(cls, doc: GraphDocument, *, kind: str = FREE,
                name: str = DEFAULT_PAGE_NAME) -> "Workspace":
-        """A workspace of one page around an EXISTING document — how the window wraps the
-        document its canvas is bound to."""
+        """A workspace of one page around an EXISTING document — how the runner wraps a bare
+        document and how a fixture gets a page."""
         ws = cls()
         ws.add_page(name, kind, doc=doc)
         return ws
+
+    @classmethod
+    def standard(cls, doc: Optional[GraphDocument] = None) -> "Workspace":
+        """A fresh workspace as the window opens it (V4.00 step 11): one page per standard
+        kind — Image Input, Image Refinement, Image Processing, Analysis — Image Input
+        active. ``doc`` is adopted by the Image Input page (the document the main canvas is
+        bound to)."""
+        ws = cls()
+        ws._populate_standard(doc)
+        return ws
+
+    def _populate_standard(self, doc: Optional[GraphDocument] = None) -> None:
+        first: Optional[str] = None
+        for i, kind in enumerate(standard_kinds()):
+            page = self.add_page(kind_label(kind), kind, doc=doc if i == 0 else None)
+            if first is None:
+                first = page.id
+        if first is not None:
+            self.active = first
 
     # ── listeners ─────────────────────────────────────────────────────────────
     def on_change(self, fn: Callable[[], None]) -> None:
@@ -282,9 +323,13 @@ class Workspace:
                 yield qualify(pid, rec.id), rec
 
     def add_page(self, name: str, kind: str = FREE, *, doc: Optional[GraphDocument] = None,
-                 page_id: Optional[str] = None, index: Optional[int] = None) -> Page:
+                 page_id: Optional[str] = None, index: Optional[int] = None,
+                 seed_input: bool = False) -> Page:
         """A new plain page. ``doc`` adopts an existing document (the window's); ``index``
-        places it in the page order (default: last)."""
+        places it in the page order (default: last). ``seed_input`` (V4.00 step 11, the
+        page switcher's *New page*) starts a page whose kind reads earlier pages with ONE
+        Page Input, bound to :meth:`default_source` — only when an earlier page has a named
+        Output to read."""
         if not R.is_page_kind(kind):
             raise ValueError(f"unknown page kind {kind!r} (kinds: {', '.join(R.page_kinds())})")
         pid = page_id or self.new_page_id()
@@ -300,6 +345,8 @@ class Workspace:
         self._attach(page)
         if self.active is None:
             self.active = pid
+        if seed_input:
+            self.seed_input(pid)
         # a new page is read by nothing — its id was never minted before — so no run can
         # see it: "nothing", not "unknown", or adding a page would cancel every pull in flight
         self._notify(())
@@ -414,8 +461,9 @@ class Workspace:
         return page
 
     def reset(self) -> None:
-        """File → New: back to ONE empty Free page named "Graph", keeping the active page's
-        document object (the canvas is bound to it)."""
+        """File → New (V4.00 step 11): back to the four standard pages, empty, Image Input
+        active — keeping the active page's document object (the canvas is bound to it) as
+        the Image Input page's document."""
         keep = self.pages[self.active] if self.active in self.pages else None
         if keep is not None and not keep.editable_topology_doc():
             keep = None                     # a linked page's document cannot be emptied
@@ -424,13 +472,19 @@ class Workspace:
                 self._detach(self.pages[pid])
                 del self.pages[pid]
         self.path = None
+        kinds = standard_kinds()
         if keep is None:
-            self.active = None              # the fresh page becomes the active one
-            self.add_page(DEFAULT_PAGE_NAME, FREE)
+            self.active = None              # the fresh Image Input page becomes the active one
+            self._populate_standard()
             return
-        keep.name, keep.kind, keep.master, keep.overrides = DEFAULT_PAGE_NAME, FREE, None, {}
-        keep.doc.page_kind = FREE
+        head = kinds[0] if kinds else FREE
+        # rename/re-kind BEFORE adding the other pages: each add_page publishes a change the
+        # window answers by re-reading every page's name and kind
+        keep.name, keep.kind, keep.master, keep.overrides = kind_label(head), head, None, {}
+        keep.doc.page_kind = head
         self.active = keep.id
+        for kind in kinds[1:]:
+            self.add_page(kind_label(kind), kind)
         keep.doc.clear()                 # notifies → the page listener → our listeners
 
     def _insert(self, page: Page, index: Optional[int]) -> None:
@@ -458,6 +512,8 @@ class Workspace:
         doc.page_kind = page.kind
         doc.store_tag = pid
         doc.page_sources = lambda pid=pid: self.available_sources(pid)
+        doc.page_feeders = lambda pid=pid: self.feeder_pages(pid)
+        doc.node_defaults = lambda op, pid=pid: self.node_defaults(pid, op)
         doc.cross_page_signature = lambda nid, pid=pid: self.cross_page_signature(pid, nid)
         doc.workspace_revision = lambda pid=pid: self.revision_of(pid)
         if isinstance(doc, LinkedDocument):
@@ -486,6 +542,8 @@ class Workspace:
         if isinstance(doc, LinkedDocument):
             doc.detach()
         doc.page_sources = lambda: []
+        doc.page_feeders = lambda: []
+        doc.node_defaults = lambda _op: {}
         doc.cross_page_signature = lambda _nid: ""
         doc.workspace_revision = lambda: ""
         doc.store_tag = ""
@@ -672,6 +730,104 @@ class Workspace:
             for name, _nid in self.outputs_of(up.id):
                 out.append((f"{up.id}:{name}", f"{up.name} · {name}"))
         return out
+
+    # ── what a new page op starts with (V4.00 step 11) ───────────────────────
+    def node_defaults(self, page_id: str, op_key: str) -> Dict[str, Any]:
+        """The params a page op STARTS with on ``page_id`` when its creator gives none: a
+        Page Output is named (``out``, ``out2``, …) so it is addressable at once; a Page
+        Input is bound to :meth:`default_source` when one exists (no key otherwise, so the
+        inspector still says "no source chosen"). Installed on every page document as
+        ``doc.node_defaults`` and merged UNDER explicit params by
+        :meth:`GraphDocument.add_node` — so every creation path (palette, drop, link-drag, a
+        readiness fix, a loader) gets them and a loaded file keeps its own values."""
+        if op_key == PAGE_OUTPUT_OP:
+            return {PAGE_NAME_KEY: self.unique_output_name(page_id, DEFAULT_OUTPUT_BASE)}
+        if op_key == PAGE_INPUT_OP:
+            src = self.default_source(page_id)
+            return {PAGE_SOURCE_KEY: src} if src else {}
+        return {}
+
+    def seed_input(self, page_id: str) -> Optional[str]:
+        """Give an EMPTY page whose kind reads earlier pages ONE Page Input, bound to
+        :meth:`default_source` — when the page holds no node yet, is not linked (its graph is
+        its master's) and an earlier page has a named Output to read. Called for a new page
+        (``add_page(seed_input=True)``) and by the window the first time an empty page is
+        shown: the standard pages exist before any image is loaded, so seeding at creation
+        alone would find nothing. Returns the new node's id, else ``None``."""
+        page = self.pages.get(page_id)
+        if page is None or page.doc.nodes or page.master:
+            return None
+        if not getattr(page.doc, "editable_topology", True):
+            return None
+        if not R.op_in_page(PAGE_INPUT_OP, page.kind) or not self.default_source(page_id):
+            return None
+        return page.doc.add_node(PAGE_INPUT_OP, x=40.0, y=120.0).id
+
+    def unique_output_name(self, page_id: str, base: str = DEFAULT_OUTPUT_BASE) -> str:
+        """``base``, else ``base2``, ``base3``, … — a name no other Output on ``page_id``
+        carries (case-insensitive, like page names). ``base`` is sanitised first
+        (:func:`sanitize_output_name`); an empty result falls back to
+        :data:`DEFAULT_OUTPUT_BASE`."""
+        base = sanitize_output_name(base) or DEFAULT_OUTPUT_BASE
+        taken = {n.lower() for n, _nid in self.outputs_of(page_id)}
+        if base.lower() not in taken:
+            return base
+        n = 2
+        while f"{base}{n}".lower() in taken:
+            n += 1
+        return f"{base}{n}"
+
+    def _outputs_in_order(self, page_id: str) -> List[Tuple[str, str]]:
+        """:meth:`outputs_of` in NODE order — the order the Outputs were added — so "the
+        most recent one" has a meaning."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return []
+        out = []
+        for rec in page.doc.nodes.values():
+            if rec.op_key == PAGE_OUTPUT_OP:
+                name = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+                if name:
+                    out.append((name, rec.id))
+        return out
+
+    def feeder_pages(self, page_id: str) -> List[Tuple[str, str]]:
+        """``[(page id, page name), ...]`` — every page a Page Input on ``page_id`` may read,
+        NEAREST first: for a typed page the highest kind strictly below its own (a Processing
+        page reads Refinement before Image Input), later pages before earlier ones within a
+        kind, a ``free`` page only after every typed one; for a ``free`` page the nearest
+        preceding page first, then the following ones. Listed whether or not the page has a
+        named Output yet — the inspector sends the user there to add one."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return []
+        order = list(self.pages)
+        cands = [up for up in self.pages.values() if self._may_feed(up.id, page_id)]
+        if R.page_order(page.kind) is not None:
+            def key(up: Page) -> Tuple[int, int, int]:
+                ou = R.page_order(up.kind)
+                if ou is None:
+                    return (1, 0, -order.index(up.id))
+                return (0, -ou, -order.index(up.id))
+        else:
+            me = order.index(page_id)
+
+            def key(up: Page) -> Tuple[int, int, int]:
+                i = order.index(up.id)
+                return (0, me - i, 0) if i < me else (1, i - me, 0)
+        cands.sort(key=key)
+        return [(up.id, up.name) for up in cands]
+
+    def default_source(self, page_id: str) -> str:
+        """The Source a new Page Input on ``page_id`` starts with: the most recently added
+        named Output of the nearest feeder page (:meth:`feeder_pages`) that has one; ``""``
+        when no page that may feed it has a named Output. Always a choice when any exists —
+        an unbound Input cannot run, and the card and the Source menu say what was picked."""
+        for pid, _name in self.feeder_pages(page_id):
+            outs = self._outputs_in_order(pid)
+            if outs:
+                return f"{pid}:{outs[-1][0]}"
+        return ""
 
     def resolve_source(self, page_id: str, value: Any) -> Optional[Tuple[str, str]]:
         """``(upstream page id, Output node id)`` for a source value, or ``None`` when it
@@ -1018,4 +1174,68 @@ Page.editable_topology_doc = _editable      # a plain page's document can be reu
 
 
 __all__ = ["RUN_SEP", "FREE", "DEFAULT_PAGE_NAME", "qualify", "split_run_id", "doc_id_of",
-           "local_ids", "kind_label", "Page", "ComposedGraph", "GraphSource", "Workspace"]
+           "local_ids", "kind_label", "Page", "ComposedGraph", "GraphSource", "Workspace",
+           "DEFAULT_OUTPUT_BASE", "standard_kinds", "sanitize_output_name", "build_example"]
+
+
+# ── the example workspace (V4.00 step 11) ────────────────────────────────────
+def build_example(ws: Workspace, *, reset: bool = True) -> Dict[str, str]:
+    """The welcome card's *Example graph*: one analysis spread over the four standard pages,
+    every page boundary already named and bound — the shape the standard workflow produces.
+
+    * **Image Input** — a Load card with no path (the synthetic demo image), published as
+      the Output ``raw``.
+    * **Image Refinement** — Page Input ``raw`` → Gaussian Blur → Threshold → Output
+      ``mask``.
+    * **Image Processing** — Page Input ``mask`` → Label → Measure → Output ``cells``.
+    * **Analysis** — Page Input ``cells`` → Plot XY, and a Viewer on the same table.
+
+    ``ws`` is reset first unless ``reset`` is False (the window calls File → New itself).
+    Every name and source is passed explicitly, so this fixture does not depend on
+    :meth:`Workspace.node_defaults`. Returns ``{kind: page id}``."""
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    if reset:
+        ws.reset()
+    by_kind = {p.kind: p.id for p in ws.pages.values()}
+    kinds = standard_kinds()
+    missing = [k for k in kinds if k not in by_kind]
+    if missing:
+        raise RuntimeError(f"the example needs the standard pages; missing {missing}")
+    inp, ref, pro, ana = (by_kind[k] for k in kinds)
+
+    def chain(doc: GraphDocument, wires: Iterable[Tuple[str, str, str, str]]) -> None:
+        for s, ss, d, ds in wires:
+            doc.connect(s, ss, d, ds)
+
+    d = ws.pages[inp].doc
+    d.add_node("io.load", node_id="load", x=30, y=150)
+    d.add_node(PAGE_OUTPUT_OP, node_id="raw", x=330, y=150, params={PAGE_NAME_KEY: "raw"})
+    chain(d, [("load", "image", "raw", "data")])
+
+    d = ws.pages[ref].doc
+    d.add_node(PAGE_INPUT_OP, node_id="in", x=30, y=150,
+               params={PAGE_SOURCE_KEY: f"{inp}:raw"})
+    d.add_node("enhance.gaussian", node_id="blur", x=330, y=150)
+    d.add_node("analysis.threshold", node_id="thr", x=630, y=150)
+    d.add_node(PAGE_OUTPUT_OP, node_id="mask", x=930, y=150, params={PAGE_NAME_KEY: "mask"})
+    chain(d, [("in", "out", "blur", "data"), ("blur", "out", "thr", "data"),
+              ("thr", "out", "mask", "data")])
+
+    d = ws.pages[pro].doc
+    d.add_node(PAGE_INPUT_OP, node_id="in", x=30, y=150,
+               params={PAGE_SOURCE_KEY: f"{ref}:mask"})
+    d.add_node("analysis.label", node_id="label", x=330, y=150)
+    d.add_node("analysis.measure", node_id="measure", x=630, y=150)
+    d.add_node(PAGE_OUTPUT_OP, node_id="cells", x=930, y=150,
+               params={PAGE_NAME_KEY: "cells"})
+    chain(d, [("in", "out", "label", "data"), ("label", "out", "measure", "data"),
+              ("measure", "out", "cells", "data")])
+
+    d = ws.pages[ana].doc
+    d.add_node(PAGE_INPUT_OP, node_id="in", x=30, y=150,
+               params={PAGE_SOURCE_KEY: f"{pro}:cells"})
+    d.add_node("plot.xy", node_id="plot", x=330, y=60)
+    d.add_node("view.viewer", node_id="view", x=330, y=330)
+    chain(d, [("in", "out", "plot", "data"), ("in", "out", "view", "data")])
+    return {k: by_kind[k] for k in kinds}

@@ -54,8 +54,8 @@ from nodelab_v2.edge_item import EdgeItem, wire_path
 from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.minimap import HudButton
 from nodelab_v2.node_item import NodeItem, SocketItem
-from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PRECISION_UNSET,
-                            bake_record)
+from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PAGE_OUTPUT_OP,
+                            PRECISION_UNSET, bake_record)
 
 # ``HIDDEN_OP_PREFIXES`` moved to the Qt-free :mod:`nodelab_v2.ops` (2026-10-02) so the
 # readiness checker can rank suggested nodes without importing Qt; still exported here.
@@ -736,6 +736,10 @@ class GraphScene(QGraphicsScene):
         entries = [(f"{spec.label}   ·  {sock}", spec.op_key, sock)
                    for spec, sock in compatible_ops(fixed.spec, fixed.io,
                                                     getattr(self.doc, "page_kind", None))]
+        if fixed.io == "out":
+            # a dataset dragged into empty canvas on a page that feeds later pages: naming
+            # it for them is the first offer (V4.00 step 11); the rest keep their order
+            entries.sort(key=lambda e: 0 if e[1] == PAGE_OUTPUT_OP else 1)
         if not entries:
             return
         views = self.views()

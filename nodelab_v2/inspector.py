@@ -302,6 +302,12 @@ class InspectorPanel(QScrollArea):
     #: of labour as the signals above: the panel asks, the window owns the document and
     #: the canvas, so it places the node, re-routes the wires and relays out the scene.
     add_requested = Signal(str, str, str)
+    #: a suggestion that adds a node DOWNSTREAM (V4.00 step 11): ``(node_id, op_key,
+    #: from_socket)`` — the window places it right of this node and wires this node's
+    #: ``from_socket`` into it ("+ Page Output" after a terminal node or a loader)
+    append_requested = Signal(str, str, str)
+    #: *Go to <page>* under a Page Input's Source (V4.00 step 11): show that page
+    page_requested = Signal(str)
     #: a drawing control in a Draw Regions (or ROI Mask) panel: ``(node_id, what, value)``
     #: with ``what`` one of ``arm`` / ``apply`` / ``cancel`` / ``undo`` / ``clear`` /
     #: ``close`` / ``sync`` (the tool, operation or brush setting changed — re-read them).
@@ -664,56 +670,84 @@ class InspectorPanel(QScrollArea):
 
     # ── readiness (2026-10-02) ──────────────────────────────────────────────
     def _readiness_section(self, node: NodeItem, probs: list) -> QWidget:
-        """*Ready to run*: a green line when nothing is missing; otherwise one red block per
-        problem, each with *Add <node>* buttons for the nodes that would supply the gap.
+        """*Ready to run*: a green line when nothing is missing; otherwise one block per
+        problem — red for what blocks a run, accent for a hint — each with one-click fixes:
+        *+ <node>* buttons that add a node (upstream, or downstream for an ``append``
+        suggestion) and plain buttons that set a value (``set_param``: bind a Page Input,
+        name a Page Output; V4.00 step 11).
 
         The section sits directly under the title because it is the first question about
         a node that is not running — before its parameters. The same problems colour the
         param rows and connection labels below, so the eye lands on the input in question
         without reading; this block is where the words are."""
-        sec = self._section("Ready to run", "" if probs else "✓")
-        if not probs:
+        errors = [p for p in probs if getattr(p, "severity", "error") == "error"]
+        sec = self._section("Ready to run", "" if errors else "✓")
+        if not errors:
             lab = QLabel("✓  every input this node needs is present")
             lab.setProperty("role", "muted"); lab.setWordWrap(True)
             lf = lab.font(); lf.setPointSize(9); lab.setFont(lf)
             lab.setStyleSheet(f"color:{_h(T.WIRE)};")
             sec._lay.addWidget(lab)       # type: ignore[attr-defined]
-            return sec
         for p in probs:
+            is_hint = getattr(p, "severity", "error") != "error"
+            tone = T.ACCENT if is_hint else T.ERROR
             block = QFrame()
             block.setObjectName("readyProblem")
             block.setStyleSheet(
-                f"QFrame#readyProblem {{ border-left:3px solid {_h(T.ERROR)}; "
-                f"background:{_h(T.mix(T.PANEL, T.ERROR, 0.10))}; border-radius:4px; }}")
+                f"QFrame#readyProblem {{ border-left:3px solid {_h(tone)}; "
+                f"background:{_h(T.mix(T.PANEL, tone, 0.10))}; border-radius:4px; }}")
             bl = QVBoxLayout(block); bl.setContentsMargins(9, 6, 8, 6); bl.setSpacing(5)
-            msg = QLabel("⚠  " + p.message)
+            msg = QLabel(("·  " if is_hint else "⚠  ") + p.message)
             msg.setWordWrap(True)
-            msg.setStyleSheet(f"color:{_h(T.ERROR)}; background:transparent;")
+            msg.setStyleSheet(f"color:{_h(tone)}; background:transparent;")
             mf = msg.font(); mf.setPointSize(9); msg.setFont(mf)
             bl.addWidget(msg)
             if p.suggestions:
-                hint = QLabel("add to the graph, wired in:")
+                actions = {getattr(s, "action", "add") for s in p.suggestions}
+                hint = QLabel("add to the graph, wired in:" if "add" in actions else
+                              "add after this node:" if "append" in actions else "fix:")
                 hint.setProperty("role", "muted")
                 hint.setStyleSheet(f"color:{_h(T.MUTED)}; background:transparent;")
                 hf = hint.font(); hf.setPointSize(8); hint.setFont(hf)
                 bl.addWidget(hint)
                 row = QHBoxLayout(); row.setSpacing(6)
                 for sgg in p.suggestions:
+                    action = getattr(sgg, "action", "add")
                     btn = QToolButton()
-                    btn.setText(f"+ {sgg.label}")
+                    btn.setText(sgg.label if action == "set_param" else f"+ {sgg.label}")
                     btn.setProperty("role", "add")
                     btn.setCursor(Qt.PointingHandCursor)
-                    btn.setToolTip(f"{sgg.label} ({sgg.op_key})\n{sgg.reason}\n\n"
-                                   f"Adds the node and wires its output into "
-                                   f"`{sgg.wire_to}`.")
-                    btn.clicked.connect(
-                        lambda _c, nid=node.node_id, op=sgg.op_key, w=sgg.wire_to:
-                        self.add_requested.emit(nid, op, w))
+                    if action == "set_param":
+                        btn.setToolTip(f"{sgg.reason}\n\nSets `{sgg.param}` to "
+                                       f"`{sgg.value}`.")
+                        btn.clicked.connect(
+                            lambda _c, n=node, pn=sgg.param, v=sgg.value:
+                            self._apply_fix(n, pn, v))
+                    elif action == "append":
+                        btn.setToolTip(f"{sgg.label} ({sgg.op_key})\n{sgg.reason}\n\n"
+                                       f"Adds the node after this one, fed from "
+                                       f"`{sgg.wire_to}`.")
+                        btn.clicked.connect(
+                            lambda _c, nid=node.node_id, op=sgg.op_key, w=sgg.wire_to:
+                            self.append_requested.emit(nid, op, w))
+                    else:
+                        btn.setToolTip(f"{sgg.label} ({sgg.op_key})\n{sgg.reason}\n\n"
+                                       f"Adds the node and wires its output into "
+                                       f"`{sgg.wire_to}`.")
+                        btn.clicked.connect(
+                            lambda _c, nid=node.node_id, op=sgg.op_key, w=sgg.wire_to:
+                            self.add_requested.emit(nid, op, w))
                     row.addWidget(btn)
                 row.addStretch(1)
                 bl.addLayout(row)
             sec._lay.addWidget(block)     # type: ignore[attr-defined]
         return sec
+
+    def _apply_fix(self, node: NodeItem, param: str, value) -> None:
+        """A ``set_param`` suggestion was taken: write the value and rebuild on the next turn
+        (the button that asked is inside the section being torn down)."""
+        self._set_param(node, param, value)
+        QTimer.singleShot(0, self._rebuild)
 
     # ── iterate section (V2.19) ─────────────────────────────────────────────
     def _iterate_section(self, node: NodeItem) -> QWidget:
@@ -1803,16 +1837,24 @@ class InspectorPanel(QScrollArea):
 
     def _page_source_box(self, node: NodeItem, s):
         """A Page Input's Source (V4.00 step 5): a CLOSED menu of the named Outputs of the
-        pages that may feed this one — "Input · raw" — rather than a typed reference. An
-        earlier page's Output is the only thing a Page Input can read, so there is nothing
+        pages that may feed this one — "Image Input · raw" — rather than a typed reference.
+        An earlier page's Output is the only thing a Page Input can read, so there is nothing
         legitimate to type that the menu does not list; a reference that no longer resolves
         (its page or Output renamed or deleted) stays as the first entry, marked, so the
-        setting is never silently changed."""
+        setting is never silently changed.
+
+        Under the menu (V4.00 step 11): what to do when it is empty or stale, in words on the
+        panel rather than in a tooltip, and a *Go to <page>* button for the page to do it on —
+        the nearest page that may feed this one, or the page a bound source comes from."""
         from PySide6.QtCore import Qt
         try:
             choices = list(node.doc.source_choices(node.node_id))
         except Exception:                            # never let a picker break the panel
             choices = []
+        try:
+            feeders = [(str(p), str(n)) for p, n in node.doc.page_feeders()]
+        except Exception:                            # noqa: BLE001 — a bare document
+            feeders = []
         current = str(node.params.get(s.name, s.default or "") or "")
         box = _NoWheelCombo()
         box.setFocusPolicy(Qt.StrongFocus)
@@ -1835,7 +1877,51 @@ class InspectorPanel(QScrollArea):
                "Output node there and give it a name."))
         box.activated.connect(
             lambda _i, nm=s.name, b=box: self._set_param(node, nm, str(b.currentData() or "")))
-        return box
+
+        hint = ""
+        goto: list = []
+        if not choices:
+            where = feeders[0][1] if feeders else "an earlier page"
+            hint = (f"No earlier page has a named Page Output yet — load an image on {where}, "
+                    f"or add a Page Output there and give it a name.")
+            goto = feeders[:2]
+        elif current and current not in values:
+            where = feeders[0][1] if feeders else "the page it came from"
+            hint = (f"Unbound — pick a source again, or go to {where} to restore the Output "
+                    f"it read.")
+            goto = feeders[:2]
+        elif not current:
+            hint = ("No source chosen — pick an Output above, or take a *Bind to …* button in "
+                    "the Ready-to-run block.")
+            goto = feeders[:1]
+        else:
+            src_pid = current.split(":", 1)[0]
+            goto = [(p, n) for p, n in feeders if p == src_pid][:1]
+        if not hint and not goto:
+            return box
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap); wl.setContentsMargins(0, 0, 0, 0); wl.setSpacing(4)
+        wl.addWidget(box)
+        if hint:
+            lab = QLabel(hint)
+            lab.setWordWrap(True)
+            lab.setProperty("role", "muted")
+            lab.setStyleSheet(f"color:{_h(T.MUTED)}; background:transparent;")
+            lf = lab.font(); lf.setPointSize(8); lab.setFont(lf)
+            wl.addWidget(lab)
+        if goto:
+            row = QHBoxLayout(); row.setSpacing(6)
+            for pid, pname in goto:
+                b = QToolButton()
+                b.setText(f"Go to {pname}")
+                b.setProperty("role", "add")
+                b.setCursor(Qt.PointingHandCursor)
+                b.setToolTip(f"Show the page “{pname}” on this canvas")
+                b.clicked.connect(lambda _c, p=pid: self.page_requested.emit(p))
+                row.addWidget(b)
+            row.addStretch(1)
+            wl.addLayout(row)
+        return wrap
 
     def _column_box(self, node: NodeItem, s):
         """A CLOSED dropdown for a ``column_in`` socket: the columns the edit-time pass

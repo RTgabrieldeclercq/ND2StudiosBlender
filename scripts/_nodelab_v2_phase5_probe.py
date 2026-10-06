@@ -855,15 +855,16 @@ def main(argv) -> int:
     # ── WS1: the WORKSPACE file (V4.00 step 1) — Save writes format 3.0 with one Free page;
     #    a reload reads it back into the SAME document the canvas is bound to ──────────────
     ws = win.workspace
-    assert ws.active and ws.page(ws.active).doc is win.doc and ws.page(ws.active).kind == "free"
-    assert win.doc.page_kind == "free" and win.doc.store_tag == ws.active
+    assert ws.active and ws.page(ws.active).doc is win.doc and ws.page(ws.active).kind == "input"
+    assert win.doc.page_kind == "input" and win.doc.store_tag == ws.active
     tmpw = os.path.join(tempfile.mkdtemp(prefix="nd2ws_"), "w.nd2graph.json")
     n_before = (len(win.doc.nodes), len(win.doc.edges))
     ws.save_file(tmpw)
     with open(tmpw, encoding="utf-8") as f:
         raww = json.load(f)
     assert raww["format_version"] == "3.0" and raww["app_version"], raww.get("format_version")
-    assert len(raww["workspace"]["pages"]) == 1 and raww["workspace"]["pages"][0]["kind"] == "free"
+    assert [p["kind"] for p in raww["workspace"]["pages"]] == \
+        ["input", "refine", "process", "analyze"], "File ▸ New is the standard workspace (step 11)"
     assert win.doc.path == tmpw, win.doc.path
     ws.load_file(tmpw)
     assert ws.page(ws.active).doc is win.doc, "a reload must keep the canvas bound to its document"
@@ -876,7 +877,8 @@ def main(argv) -> int:
     # the palette still offers everything on a Free page (page.* included, never hidden)
     from nodelab_v2.scene import visible_specs as _visible_ws1   # main() rebinds the bare name later
     assert {s.op_key for s in _visible_ws1()} >= {"page.input", "page.output"}
-    _ok("WS1 workspace file: Save writes format 3.0 (one Free page, app_version stamped); "
+    _ok("WS1 workspace file: Save writes format 3.0 (the four standard pages, app_version "
+        "stamped); "
         "reload keeps the canvas bound to the same document; a 2.0 file opens as a Free page")
 
     # ── WS2: the RUNNER on the workspace (V4.00 step 2) — a pull on a page the canvas is
@@ -5633,6 +5635,11 @@ def main(argv) -> int:
     # red, and offers the nodes that would fix it; pressing one adds the node AND wires it —
     # on the primary wire for a missing domain, into the side input for a background sample.
     from PySide6.QtWidgets import QLabel as _QL, QToolButton as _QTB
+    # on a FREE page: the demo page is an Image Input page since V4.00 step 11, and a page's
+    # readiness suggestions offer only the nodes its kind offers (Label is not one of them)
+    _rd_home = win.workspace.active
+    win.new_page("free")
+    app.processEvents()
     _rdoc = win.doc
     _rl = _rdoc.add_node("io.load", node_id="RDL", x=0, y=900)
     _rdoc.meta_seeds["RDL"] = MetaEnvelope(axes=AxisSizes(m=1, t=4, z=1, c=1, y=64, x=64),
@@ -5650,7 +5657,10 @@ def main(argv) -> int:
         return [l.text() for l in win.inspector.findChildren(_QL) if l.text().startswith("⚠ in")]
 
     def _adds():
-        return [b for b in win.inspector.findChildren(_QTB) if b.property("role") == "add"]
+        # the problems' fix buttons — not the "+ Page Output" of the `unpublished` HINT a
+        # terminal node on a typed page carries since V4.00 step 11 (RF1 covers that one)
+        return [b for b in win.inspector.findChildren(_QTB)
+                if b.property("role") == "add" and b.text() != "+ Page Output"]
     win.inspector.set_node(win.scene.node_items["RDB"]); app.processEvents()
     assert any("Background sample" in w for w in _warns()), _warns()
     assert "shapes" in win.inspector._problem_sockets, win.inspector._problem_sockets
@@ -5762,6 +5772,8 @@ def main(argv) -> int:
         "image; Tool/Operation params drive the gesture; a real drag makes a shape the panel "
         "readout counts; Apply in the panel writes stamped shapes and returns to Subtract "
         "Background, now ready")
+    win._show_page(win._main_canvas, _rd_home)      # back to the demo page
+    app.processEvents()
 
     # ── SP1: Split Positions grows one output per stage position on the LIVE canvas and
     # its wires are drawable (2026-10-02) ───────────────────────────────────────────
@@ -5846,7 +5858,7 @@ def main(argv) -> int:
     _main = win._main_canvas
     # PG1 a Refinement page: the canvas switches to it, empty; the palette, the link search
     # and the window title follow its kind
-    _all = _palette_ops()
+    _all = {s.op_key for s in _pvis(None)}         # a Free page's set: everything
     _p2 = win.new_page("refine")
     app.processEvents()
     assert win.workspace.active == _p2 and win.canvas is _main and _main.page_id == _p2
@@ -5877,6 +5889,8 @@ def main(argv) -> int:
     win._show_page(_main, _p2)
     app.processEvents()
     _pin = win.doc.add_node("page.input", x=40, y=120)
+    assert win.doc.nodes[_pin.id].params.get("source") == f"{_p1}:raw", \
+        "a hand-placed Page Input is bound to the default source (step 11)"
     _gam = win.doc.add_node("enhance.gamma", x=320, y=120)
     win.doc.connect(_pin.id, "out", _gam.id, "data")
     win.scene.sync()
@@ -5892,7 +5906,8 @@ def main(argv) -> int:
     _src.activated.emit(_i)
     app.processEvents()
     assert win.doc.nodes[_pin.id].params.get("source") == f"{_p1}:raw"
-    assert win.scene.node_items[_pin.id]._page_boundary_label() == "Input · raw"
+    assert win.scene.node_items[_pin.id]._page_boundary_label() == \
+        f"Input · {win.workspace.page(_p1).name} · raw"
     assert win.doc.env(_pin.id).axes is not None, "the upstream envelope crosses the pages"
     _pdone.clear()
     win.pull_node(_gam.id)
@@ -5913,7 +5928,7 @@ def main(argv) -> int:
     assert "Refinement" in win.palette._kind_chip.text()
     _press(_c2.view)
     assert win.canvas is _c2 and win.workspace.active == _p1
-    assert "All nodes" in win.palette._kind_chip.text(), "a Free page offers every node"
+    assert "Image Input" in win.palette._kind_chip.text(), win.palette._kind_chip.text()
     _ok("PG2 a second canvas (a dock) shows another page; a press on a canvas makes its "
         "page the active one — the palette, the inspector and every edit follow")
 
@@ -6152,7 +6167,8 @@ def main(argv) -> int:
     app.processEvents()
     win.file_new()
     app.processEvents()
-    assert list(win.workspace.pages) == [_other]
+    assert list(win.workspace.pages)[0] == _other and len(win.workspace.pages) == 4
+    assert win.workspace.pages[_other].kind == "input"
     win.workspace.load_file(_pfile)
     app.processEvents()
     assert win.workspace.active == _saved_active and win.canvas.page_id == _saved_active
@@ -7093,6 +7109,201 @@ def main(argv) -> int:
         "default tabs and hidden panels; SH4 a damaged layout file opens on the default "
         "layout, is kept aside as layout.json.rejected and replaced on close; the probe's own "
         "window never reads or writes one")
+
+    # ── SW1 / LD1 / LD2 / SW3 / RF1 / EX1: the standard workflow (V4.00 step 11) ─────────
+    from PySide6.QtCore import QPointF as _QPF11
+    from PySide6.QtWidgets import QToolButton as _QTB11
+    import tifffile as _tiff11
+    from nodelab_v2 import readiness as _RD11
+    from nodelab_v2.workspace import qualify as _q11, standard_kinds as _skinds11
+    win.set_solo_frame(False)
+    win._follow_act.setChecked(False)
+    win.file_new()
+    app.processEvents()
+    _ws11 = win.workspace
+    _kinds11 = list(_skinds11())
+    assert [p.kind for p in _ws11.pages.values()] == _kinds11 and _kinds11[0] == "input", \
+        [(p.id, p.kind) for p in _ws11.pages.values()]
+    assert _ws11.page(_ws11.active).kind == "input" and win.canvas.page_id == _ws11.active
+    assert "Image Input" in win.windowTitle(), win.windowTitle()
+    _tree11 = win.palette._tree
+    assert _tree11.topLevelItem(0).text(0) == "Pages", _tree11.topLevelItem(0).text(0)
+    _band11 = _tree11.topLevelItem(0).child(0)
+    assert [_band11.child(i).text(1) for i in range(_band11.childCount())] == ["Page Output"]
+    assert "Image Input" in win.palette._kind_chip.text(), win.palette._kind_chip.text()
+    _ok("SW1 File ▸ New: the four standard pages in order, Image Input active and in the "
+        "title; the palette leads with the Pages band (Page Output alone on an Input page)")
+
+    # LD1 a load while the Analysis page is active: the card lands on Image Input (the
+    # canvas switches there), published as a Page Output named after the file, previewed
+    _pg_in11 = _ws11.active
+    _pg_an11 = next(p.id for p in _ws11.pages.values() if p.kind == "analyze")
+    win._show_page(win._main_canvas, _pg_an11)
+    app.processEvents()
+    assert _ws11.active == _pg_an11
+    _ld11 = tempfile.mkdtemp(prefix="nd2ld_")
+    _ldp11 = os.path.join(_ld11, "blobs.tif")
+    _tiff11.imwrite(_ldp11, np.random.default_rng(11).integers(0, 4000, size=(3, 40, 44))
+                    .astype(np.uint16), metadata={"axes": "ZYX"})
+    _done11: list = []
+    win.runner.finished.connect(lambda nid, *a: _done11.append(nid))
+    win._load_source_paths([_ldp11])
+    app.processEvents()
+    assert _ws11.active == _pg_in11 and win.canvas.page_id == _pg_in11, "switched to Image Input"
+    _loads11 = [r for r in win.doc.nodes.values() if r.op_key == "io.load"]
+    _outs11 = [r for r in win.doc.nodes.values() if r.op_key == "page.output"]
+    assert len(_loads11) == 1 and len(_outs11) == 1, (len(_loads11), len(_outs11))
+    assert _outs11[0].params.get("name") == "blobs", _outs11[0].params
+    assert (_loads11[0].id, "image", _outs11[0].id, "data") in set(win.doc.edges), win.doc.edges
+    assert _loads11[0].modes.get("access") == "ingest", "a TIFF starts on ingest"
+    # (the status line said "published as “blobs”" until the preview pull replaced it)
+    # the load pulls the card: a TIFF ingests first, then the run binds the Viewer (File ▸
+    # New left the old picture on the surface, so has_image() alone proves nothing)
+    _rid11 = _q11(_pg_in11, _loads11[0].id)
+    _t011 = time.time()
+    while _rid11 not in _done11 and time.time() - _t011 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    assert _rid11 in _done11, ("the load did not preview its card", _done11[-3:])
+    for _ in range(3):
+        app.processEvents()
+    assert win.viewer.has_image() and win.viewer.binding == (_pg_in11, _loads11[0].id), \
+        (win.viewer.has_image(), win.viewer.binding)
+    win._load_source_paths([_ldp11])
+    app.processEvents()
+    assert [n for n, _ in _ws11.outputs_of(_pg_in11)] == ["blobs", "blobs2"]
+    assert all(r.id in win.scene.node_items for r in win.doc.nodes.values())
+    _ok("LD1 a load while Analysis is active lands on Image Input (the canvas switches), is "
+        "published as a Page Output named after the file (blobs, then blobs2), starts a TIFF "
+        "on ingest and shows in the Viewer")
+
+    # LD2 a desktop drop: onto the Analysis canvas → Image Input, published; onto a Batch
+    # point → stays on that page, nothing published
+    win._show_page(win._main_canvas, _pg_an11)
+    app.processEvents()
+    win._on_files_dropped([_ldp11], _QPF11(100.0, 100.0), "")
+    app.processEvents()
+    assert _ws11.active == _pg_in11, "a plain drop lands on Image Input"
+    assert [n for n, _ in _ws11.outputs_of(_pg_in11)] == ["blobs", "blobs2", "blobs3"]
+    _bt11 = win.doc.add_node("util.batch", x=700, y=400)
+    _n_out11 = len(_ws11.outputs_of(_pg_in11))
+    win._on_files_dropped([_ldp11], _QPF11(700.0, 600.0), _bt11.id)
+    app.processEvents()
+    assert len(_ws11.outputs_of(_pg_in11)) == _n_out11, "a drop on a Batch point publishes nothing"
+    assert any(e[2] == _bt11.id and e[3] == "data" for e in win.doc.edges)
+    win.doc.remove_node(_bt11.id)
+    app.processEvents()
+    _ok("LD2 a desktop drop on another page's canvas lands on Image Input and is published; "
+        "a drop on a Batch point stays with the point and publishes nothing")
+
+    # SW3 New page ▸ Refinement arrives with a Page Input already reading the newest Output
+    _pg_r11 = win.new_page("refine")
+    app.processEvents()
+    _ins11 = [r for r in win.doc.nodes.values() if r.op_key == "page.input"]
+    assert _ws11.active == _pg_r11 and len(_ins11) == 1, _ins11
+    assert _ins11[0].params.get("source") == f"{_pg_in11}:blobs3", _ins11[0].params
+    assert win.doc.env(_ins11[0].id).axes is not None, "the envelope crosses"
+    _inname11 = _ws11.page(_pg_in11).name
+    assert win.scene.node_items[_ins11[0].id]._page_boundary_label() == \
+        f"Input · {_inname11} · blobs3"
+    assert win.welcome.isVisible(), "the card stays while the page holds only its seeded Input"
+    assert f"reads {_inname11} · blobs3" in win.statusBar().currentMessage(), \
+        win.statusBar().currentMessage()
+    _band11 = win.palette._tree.topLevelItem(0)
+    assert _band11.text(0) == "Pages" and \
+        [_band11.child(0).child(i).text(1) for i in range(_band11.child(0).childCount())] == \
+        ["Page Input", "Page Output"]
+    _ok("SW3 New page ▸ Refinement starts with a Page Input bound to the newest upstream "
+        "Output (card: Input · page · name, envelope across, status says so); the Pages "
+        "band offers both boundary nodes")
+
+    # RF1 readiness one-click fixes: a terminal node's hint appends a wired Page Output; an
+    # unbound Input offers Bind buttons (default first) and Go to <page>; a loader nothing
+    # publishes gets the same hint
+    _pin11 = _ins11[0]
+    _g11 = win.doc.add_node("enhance.gaussian", x=320, y=120)
+    win.doc.connect(_pin11.id, "out", _g11.id, "data")
+    win.scene.sync()
+    _pr11 = _RD11.problems(win.doc, _g11.id)
+    assert [(p.kind, p.severity) for p in _pr11] == [("unpublished", "hint")], _pr11
+    assert _RD11.ready(win.doc, _g11.id), "a hint never blocks"
+    win.scene.clearSelection()
+    win.scene.node_items[_g11.id].setSelected(True)
+    app.processEvents()
+    win.inspector.rebuild()
+    app.processEvents()
+    _btn11 = next((b for b in win.inspector.findChildren(_QTB11)
+                   if b.text() == "+ Page Output"), None)
+    assert _btn11 is not None, "the hint offers + Page Output"
+    _btn11.click()
+    app.processEvents()
+    _nouts11 = [r for r in win.doc.nodes.values() if r.op_key == "page.output"]
+    assert len(_nouts11) == 1 and _nouts11[0].params.get("name") == "out", _nouts11
+    assert (_g11.id, "out", _nouts11[0].id, "data") in set(win.doc.edges)
+    assert _RD11.problems(win.doc, _g11.id) == []
+    win.doc.nodes[_pin11.id].params["source"] = ""
+    win.doc.touch(_pin11.id)
+    assert win.scene.node_items[_pin11.id]._page_boundary_label() == "Input · (unbound)"
+    assert win.scene.node_items[_pin11.id]._boundary_broken()
+    win.scene.clearSelection()
+    win.scene.node_items[_pin11.id].setSelected(True)
+    app.processEvents()
+    win.inspector.rebuild()
+    app.processEvents()
+    _bind11 = [b for b in win.inspector.findChildren(_QTB11) if b.text().startswith("Bind to ")]
+    assert _bind11 and _bind11[0].text() == f"Bind to {_inname11} · blobs3", \
+        [b.text() for b in _bind11]
+    _goto11 = [b for b in win.inspector.findChildren(_QTB11) if b.text().startswith("Go to ")]
+    assert _goto11 and _goto11[0].text() == f"Go to {_inname11}", [b.text() for b in _goto11]
+    _bind11[0].click()
+    app.processEvents()
+    assert win.doc.nodes[_pin11.id].params.get("source") == f"{_pg_in11}:blobs3"
+    assert not win.scene.node_items[_pin11.id]._boundary_broken()
+    win.inspector.rebuild()
+    app.processEvents()
+    _goto11 = [b for b in win.inspector.findChildren(_QTB11) if b.text().startswith("Go to ")]
+    assert _goto11 and _goto11[0].text() == f"Go to {_inname11}", "a bound Input links its page"
+    _goto11[0].click()
+    app.processEvents()
+    assert _ws11.active == _pg_in11 and win.canvas.page_id == _pg_in11, "Go to shows the page"
+    _lone11 = [r for r in win.doc.nodes.values() if r.op_key == "io.load"
+               and not any(e[0] == r.id for e in win.doc.edges)]
+    assert _lone11, "the Batch-drop loader is still unpublished"
+    _ph11 = _RD11.problems(win.doc, _lone11[0].id)
+    assert [(p.kind, p.severity, p.suggestions[0].wire_to) for p in _ph11] == \
+        [("unpublished", "hint", "image")], _ph11
+    _nid11 = win._on_append_requested(_lone11[0].id, "page.output", "image")
+    app.processEvents()
+    assert _nid11 and (_lone11[0].id, "image", _nid11, "data") in set(win.doc.edges)
+    assert _RD11.problems(win.doc, _lone11[0].id) == []
+    _ok("RF1 one-click fixes: a terminal node's hint appends a wired Page Output; an unbound "
+        "Input offers Bind (default first) and Go to <page>, and both act; a loader nothing "
+        "publishes gets the same hint and its Output is wired from `image`")
+
+    # EX1 the welcome card's Example graph: the four-page example, the Analysis Viewer pulls
+    win.build_example_workspace()
+    app.processEvents()
+    assert [p.kind for p in _ws11.pages.values()] == _kinds11
+    assert _ws11.page(_ws11.active).kind == "input" and win.canvas.page_id == _ws11.active
+    _ex_an11 = next(p for p in _ws11.pages.values() if p.kind == "analyze")
+    assert {r.op_key for r in _ex_an11.doc.nodes.values()} == \
+        {"page.input", "plot.xy", "view.viewer"}, sorted(_ex_an11.doc.nodes)
+    for _pg11 in _ws11.pages.values():
+        for _r11 in _pg11.doc.nodes.values():
+            _errs11 = [p for p in _RD11.problems(_pg11.doc, _r11.id) if p.severity == "error"]
+            assert not _errs11, (_pg11.name, _r11.id, [(p.kind, p.message) for p in _errs11])
+    _done11.clear()
+    win.pull_node("view", page_id=_ex_an11.id)
+    _t011 = time.time()
+    while _q11(_ex_an11.id, "view") not in _done11 and time.time() - _t011 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    assert _q11(_ex_an11.id, "view") in _done11, _done11
+    assert win.viewer.has_image() and win.viewer.binding == (_ex_an11.id, "view"), \
+        win.viewer.binding
+    _ok("EX1 the welcome card's Example graph spans the four standard pages with every "
+        "boundary named and bound (no error-grade readiness problem); the Analysis page's "
+        "Viewer pulls through the whole chain")
 
     # a LabLink panel left on screen polls its hub over HTTP on a QThread; a socket connect
     # still in flight when os._exit tears the process down crashes it (exit 139 after every

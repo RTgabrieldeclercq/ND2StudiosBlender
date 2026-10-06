@@ -409,7 +409,7 @@ see: [MANUAL §16 I](../MANUAL.md) · INV-09 · CON-14
 ---
 
 ### CON-17 — workspace and pages
-anchors: sym:nodelab_v2.workspace.Workspace, sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.workspace.ComposedGraph
+anchors: sym:nodelab_v2.workspace.Workspace, sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.workspace.ComposedGraph, sym:nodelab_v2.workspace.Workspace.node_defaults, sym:nodelab_v2.workspace.Workspace.default_source
 
 A V4.00 file holds a **workspace**: ordered **pages**, each a node graph (`GraphDocument`) of a
 **kind** — `input` < `refine` < `process` < `analyze`, plus `free` (any node, any wiring; a
@@ -426,6 +426,23 @@ page in its dependency closure, upstream first, node ids qualified `<page>/<node
 Output's run id. An unresolved Input stays a root whose pull says it is unbound.
 `ComposedGraph.revision` folds every page in the closure, so the runner rebuilds its engine
 exactly when one of them changes. `page.input` / `page.output` are GUI-layer ops (INV-16).
+
+**The standard workspace (step 11).** `Workspace.standard()` — what a fresh window and File →
+New hold — is one page per typed kind (`standard_kinds()`, read from the roles file), Image
+Input active; `reset()` returns to it, keeping the active page's document as Image Input's.
+A loaded image is routed to the Image Input page (`MainWindow._input_page`; the canvas
+switches there first, since the loaders read the active scene) and published as a
+`page.output` named after the file (`_publish_source`; a TIFF card starts on `ingest`, the only
+access mode that can read it). Page-op DEFAULTS have one choke point: `Workspace._attach`
+installs `doc.node_defaults`, which `GraphDocument.add_node` merges UNDER explicit params — a
+hand-placed Output gets `unique_output_name` (`out`, `out2`, …), a hand-placed Input gets
+`default_source` (the most recently added named Output of the nearest feeder page,
+`feeder_pages`: nearest kind, latest page, a Free feeder last); the load, duplicate and
+group paths build records directly and keep their values. `add_page(seed_input=True)` (the
+switcher's *New page*) and the first visit to an empty downstream page add one bound Input.
+Readiness (`readiness.problems`) states the fixes as `Suggestion.action` — `set_param`
+(bind, name) and `append` (a Page Output after a terminal node or an unpublished loader, the
+`unpublished` hint, severity `hint`, never blocking `ready()`).
 
 see: WF-08 · CON-18 · [MANUAL §2 Pages, §2b](../MANUAL.md)
 

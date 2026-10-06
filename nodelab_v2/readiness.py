@@ -6,7 +6,7 @@ about, which the panel highlights in red, and carries :class:`Suggestion` rows �
 whose output would satisfy the gap — which the panel turns into *Add* buttons and the
 window turns into a node inserted upstream and wired in.
 
-Six kinds of problem, in the order they are reported:
+Seven kinds of problem, in the order they are reported:
 
 * ``unbound`` — a ``page.input`` whose Source names no output an earlier page offers
   (V4.00): nothing else about it can be judged, so it is the only problem reported.
@@ -24,6 +24,15 @@ Six kinds of problem, in the order they are reported:
   (op, socket) rather than inferred: whether an empty drawing means "whole frame" (ROI
   Mask) or "nothing to compare against" (Subtract Background) is the node's own semantics.
 * ``validation`` — the 3D lever on data known to have one plane (the card's red badge).
+* ``unpublished`` — a HINT (``severity="hint"``, never blocks :func:`ready`; V4.00 step 11):
+  on a page whose kind feeds later pages, a loader nothing publishes yet, or the terminal
+  node of a page that has no Page Output at all — later pages read this page by its
+  Outputs, so the suggestion appends one.
+
+A :class:`Suggestion` is an ``action``: ``add`` inserts the node upstream and wires it in
+(the original), ``append`` adds it downstream (a Page Output after a node), ``set_param``
+writes ``value`` into ``param`` (bind an unbound Page Input, name an unnamed Output) —
+one click each, in the inspector.
 
 What this does NOT do: run anything, read pixels, or guess at values. A node with no
 problems may still fail at pull time for a reason only its compute can see; this is the
@@ -39,26 +48,33 @@ from nodegraph.domains import Domain
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType
 from nodelab_v2.ops import (
-    HIDDEN_OP_PREFIXES, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY)
+    HIDDEN_OP_PREFIXES, LOAD_OP, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY)
 
 
 @dataclass(frozen=True)
 class Suggestion:
-    """A node that would supply what is missing, and the socket on the checked node its
-    output should feed. ``reason`` is the one-line why, shown as the button's tooltip."""
+    """One click that fixes (part of) a problem. ``action="add"`` (the original): a node of
+    ``op_key`` that would supply what is missing, inserted upstream and wired into
+    ``wire_to``; ``"append"``: a node of ``op_key`` added DOWNSTREAM, fed from this node's
+    ``wire_to`` output; ``"set_param"``: write ``value`` into this node's ``param``
+    (``op_key`` is then ``""``). ``reason`` is the one-line why, the button's tooltip."""
     op_key: str
     label: str
     wire_to: str
     reason: str = ""
+    action: str = "add"          # "add" | "append" | "set_param"
+    param: str = ""
+    value: Any = None
 
 
 @dataclass(frozen=True)
 class Problem:
     kind: str                    # "unbound" | "duplicate_output" | "unwired" | "domain" |
-                                 # "empty" | "validation"
+                                 # "empty" | "validation" | "unpublished"
     socket: Optional[str]        # the input this is about (highlighted); None = node-level
     message: str
     suggestions: Tuple[Suggestion, ...] = ()
+    severity: str = "error"      # "error" blocks ready(); "hint" is advice
 
 
 #: the usual producer of each structure domain, first. Anything else in the registry that
@@ -85,6 +101,19 @@ EMPTY_PICKS: Dict[Tuple[str, str], Tuple[str, str, str]] = {
 
 #: how many producers a domain problem offers
 MAX_SUGGESTIONS = 3
+
+#: ops that END a chain on purpose — a Viewer, a plot, a file writer, a page boundary — so
+#: a page whose last node is one of these is not "unpublished"
+_SINK_PREFIXES = ("view.", "plot.", "io.write", "page.")
+
+
+def _defaults(doc, op_key: str) -> Dict[str, Any]:
+    """What the page would give a new ``op_key`` node (:attr:`GraphDocument.node_defaults`);
+    ``{}`` outside a workspace."""
+    try:
+        return dict(doc.node_defaults(op_key) or {})
+    except Exception:                       # noqa: BLE001 — a bare document
+        return {}
 
 
 def _visible(op_key: str) -> bool:
@@ -143,7 +172,8 @@ def problems(doc, node_id: str) -> List[Problem]:
     #    Output must carry a name no sibling Output on this page already uses
     if spec.op_key == PAGE_INPUT_OP:
         value = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
-        offered = {v for v, _label in doc.source_choices(node_id)}
+        choices = list(doc.source_choices(node_id))
+        offered = {v for v, _label in choices}
         if value in offered:
             return []
         if not value:
@@ -154,18 +184,36 @@ def problems(doc, node_id: str) -> List[Problem]:
         else:
             msg = (f"`{value}` is not an output any earlier page offers — renamed, deleted, "
                    f"or on a page that cannot feed this one")
-        return [Problem("unbound", PAGE_SOURCE_KEY, msg)]
+        # one click per offered Output, the page's own default first (V4.00 step 11)
+        default = str(_defaults(doc, PAGE_INPUT_OP).get(PAGE_SOURCE_KEY, "") or "")
+        ordered, seen = [], set()
+        for c in sorted(choices, key=lambda c: c[0] != default):
+            if c[0] not in seen:            # two Outputs of one name: one button
+                seen.add(c[0])
+                ordered.append(c)
+        sugg = tuple(Suggestion(
+            "", f"Bind to {label}", PAGE_SOURCE_KEY,
+            f"read `{label}`" + (" — the nearest earlier page's newest Output"
+                                 if v == default else ""),
+            action="set_param", param=PAGE_SOURCE_KEY, value=v)
+            for v, label in ordered[:MAX_SUGGESTIONS])
+        return [Problem("unbound", PAGE_SOURCE_KEY, msg, sugg)]
     if spec.op_key == PAGE_OUTPUT_OP:
         name = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+        fresh = str(_defaults(doc, PAGE_OUTPUT_OP).get(PAGE_NAME_KEY, "") or "") or "out"
+        rename = (Suggestion("", f"Name it “{fresh}”", PAGE_NAME_KEY,
+                             "a later page's Page Input picks this Output by its name",
+                             action="set_param", param=PAGE_NAME_KEY, value=fresh),)
         if not name:
             out.append(Problem("validation", PAGE_NAME_KEY,
-                               "this output has no name — later pages pick outputs by name"))
+                               "this output has no name — later pages pick outputs by name",
+                               rename))
         elif any(r.id != node_id and r.op_key == PAGE_OUTPUT_OP
                  and str(r.params.get(PAGE_NAME_KEY, "") or "").strip() == name
                  for r in doc.nodes.values()):
             out.append(Problem("duplicate_output", PAGE_NAME_KEY,
                                f"another Page Output on this page is also named `{name}` — "
-                               f"a later page could not tell them apart"))
+                               f"a later page could not tell them apart", rename))
 
     # 1. the primary Dataset input — the first declared, never a display-only tap
     primary = next((s for s in ds_in if not getattr(s, "view_source", False)), None)
@@ -229,11 +277,50 @@ def problems(doc, node_id: str) -> List[Problem]:
             "validation", None,
             "set to 3D but the incoming data has a single Z plane — switch the lever to 2D "
             "or feed it a stack"))
+
+    # 5. (a hint) nothing on this page is named for later pages yet (V4.00 step 11)
+    hint = _unpublished(doc, node_id, spec)
+    if hint is not None:
+        out.append(hint)
     return out
 
 
+def _unpublished(doc, node_id: str, spec) -> Optional[Problem]:
+    """The ``unpublished`` hint, or ``None``: only on a typed page whose kind may hold a Page
+    Output; for a loader with no Page Output on its wire, or for the terminal node (a
+    Dataset output, no outgoing wire, not a sink) of a page that has no Page Output at all."""
+    kind = getattr(doc, "page_kind", None)
+    if not kind or kind == R.FREE_PAGE or not R.op_in_page(PAGE_OUTPUT_OP, kind):
+        return None
+    if spec.op_key.startswith(_SINK_PREFIXES):
+        return None
+    out_sock = next((s.name for s in getattr(spec, "outputs", ())
+                     if s.type is SocketType.DATASET), None)
+    if out_sock is None:
+        return None
+    outgoing = [e for e in doc.edges if e[0] == node_id]
+    if spec.op_key == LOAD_OP:
+        if any(getattr(doc.nodes.get(e[2]), "op_key", "") == PAGE_OUTPUT_OP for e in outgoing):
+            return None
+        msg = "this image is not named for later pages yet — a Page Output publishes it"
+    else:
+        if outgoing:
+            return None
+        if any(r.op_key == PAGE_OUTPUT_OP for r in doc.nodes.values()):
+            return None
+        if not any(not r.op_key.startswith("page.") for r in doc.nodes.values()
+                   if r.id != node_id):
+            pass                            # a one-node page: still worth saying
+        msg = "later pages read this page by its Outputs — nothing here is named yet"
+    return Problem("unpublished", None, msg, (Suggestion(
+        PAGE_OUTPUT_OP, "Page Output", out_sock,
+        "names what this node produces so a later page's Page Input can read it",
+        action="append"),), severity="hint")
+
+
 def ready(doc, node_id: str) -> bool:
-    return not problems(doc, node_id)
+    """Nothing blocking: hints (``severity="hint"``) do not count."""
+    return not any(p.severity == "error" for p in problems(doc, node_id))
 
 
 def socket_problems(probs: Sequence[Problem]) -> Dict[str, Problem]:

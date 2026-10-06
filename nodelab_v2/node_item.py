@@ -1412,7 +1412,7 @@ class NodeItem(QGraphicsObject):
         p.drawText(QRectF(12, 5, title_w, 11), Qt.AlignVCenter | Qt.AlignLeft, tag)
         tf = QFont(T.SANS, 9); tf.setBold(True)
         p.setFont(tf)
-        p.setPen(T.ERROR if self.dim_invalid() else T.INK)
+        p.setPen(T.ERROR if (self.dim_invalid() or self._boundary_broken()) else T.INK)
         # a source node titled with its loaded file name (a group with its group name,
         # else the node-type label)
         label = (self._group_name or self.rec.params.get(TITLE_KEY)
@@ -1738,16 +1738,40 @@ class NodeItem(QGraphicsObject):
 
     def _page_boundary_label(self) -> str:
         """A page boundary card is titled by what it carries (V4.00 step 5): ``Output · raw``
-        for a Page Output named ``raw``, ``Input · raw`` for a Page Input reading one —
-        what tells two of them apart on a canvas. Empty for every other card."""
+        for a Page Output named ``raw``; ``Input · Image Input · raw`` for a Page Input
+        reading one (the page AND the name, V4.00 step 11). A broken boundary says so on its
+        face — ``Output · (unnamed)``, ``Input · (unbound)``, ``Input · raw (unbound)`` for a
+        source no earlier page offers any more. Empty for every other card."""
         op = self.rec.op_key
         if op == PAGE_OUTPUT_OP:
             name = str(self.rec.params.get(PAGE_NAME_KEY, "") or "").strip()
-            return f"Output · {name}" if name else ""
+            return f"Output · {name}" if name else "Output · (unnamed)"
         if op == PAGE_INPUT_OP:
             src = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
-            return f"Input · {src.split(':', 1)[-1]}" if src else ""
+            if not src:
+                return "Input · (unbound)"
+            try:
+                label = dict(self.doc.source_choices(self.rec.id)).get(src)
+            except Exception:                        # noqa: BLE001 — a bare document
+                label = None
+            return f"Input · {label}" if label else f"Input · {src.split(':', 1)[-1]} (unbound)"
         return ""
+
+    def _boundary_broken(self) -> bool:
+        """An unnamed Page Output, or a Page Input whose source no earlier page offers
+        (V4.00 step 11) — painted like a dim-lever conflict, in the error colour."""
+        op = self.rec.op_key
+        if op == PAGE_OUTPUT_OP:
+            return not str(self.rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+        if op == PAGE_INPUT_OP:
+            src = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+            if not src:
+                return True
+            try:
+                return src not in {v for v, _l in self.doc.source_choices(self.rec.id)}
+            except Exception:                        # noqa: BLE001
+                return False
+        return False
 
     def _footprint_line(self) -> str:
         """One plain-text line naming the footprint and WHAT DECIDES IT (V2.27).

@@ -132,7 +132,9 @@
   "anchors": {
    "sym:nodelab_v2.workspace.ComposedGraph": "e2b4360003ef3d619631e8bd0a633d3f",
    "sym:nodelab_v2.workspace.Workspace": "e2b4360003ef3d619631e8bd0a633d3f",
-   "sym:nodelab_v2.workspace.Workspace.compose": "12d1f3e3036cef7a9e8d0ea9f5cd917e"
+   "sym:nodelab_v2.workspace.Workspace.compose": "12d1f3e3036cef7a9e8d0ea9f5cd917e",
+   "sym:nodelab_v2.workspace.Workspace.default_source": "e9c0c81f73682d061d73d245baed0507",
+   "sym:nodelab_v2.workspace.Workspace.node_defaults": "3ea79eea448cd6880994cde08df6a326"
   },
   "blessed": "2026-10-06",
   "file": "codemap/concepts.md"

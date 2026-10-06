@@ -24244,12 +24244,14 @@ def test_workspace_model() -> None:
     # reset keeps the active page's document object (the canvas is bound to it)
     keep = ws.pages[ws.active].doc
     ws.reset()
-    assert list(ws.pages) == [ws.active] and ws.pages[ws.active].doc is keep
-    assert ws.pages[ws.active].kind == "free" and not keep.nodes
+    # V4.00 step 11: reset returns to the four standard pages, the kept document first
+    assert list(ws.pages)[0] == ws.active and ws.pages[ws.active].doc is keep
+    assert [p.kind for p in ws.pages.values()] == ["input", "refine", "process", "analyze"]
+    assert ws.pages[ws.active].kind == "input" and not keep.nodes
     _ok("workspace model: counter ids never re-used; strictly-earlier-kind and acyclic-free "
         "feeding rules; Input envelopes seeded from upstream Outputs; unbound/duplicate "
         "readiness; qualified last_touched; dependents re-keyed, not bumped; rename re-keys; "
-        "per-page dock folders; unique duplicate; reset keeps the document")
+        "per-page dock folders; unique duplicate; reset keeps the document as Image Input's")
 
 
 def test_page_composition_memo_reuse() -> None:
@@ -26624,6 +26626,257 @@ def test_publish_workspace_recipe() -> None:
         "page publishes as before")
 
 
+def test_workspace_standard() -> None:
+    """``Workspace.standard`` (V4.00 step 11): the four standard pages, Image Input active;
+    ``reset()`` returns to them keeping a plain active page's document as the Image Input
+    page's (a linked active page cannot be kept: fresh pages, same shape); ``single()``
+    still makes one Free page."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.workspace import (DEFAULT_PAGE_NAME, FREE, Workspace, kind_label,
+                                      standard_kinds)
+    OPS.ensure_ops()
+    kinds = standard_kinds()
+    assert kinds == ("input", "refine", "process", "analyze"), kinds
+    doc = GraphDocument()
+    ws = Workspace.standard(doc)
+    assert [p.kind for p in ws.pages.values()] == list(kinds)
+    assert [p.name for p in ws.pages.values()] == [kind_label(k) for k in kinds]
+    assert list(ws.pages) == ["pg1", "pg2", "pg3", "pg4"] and ws.active == "pg1"
+    assert ws.pages["pg1"].doc is doc and ws.available_sources("pg2") == []
+    assert all(p.doc.page_kind == p.kind for p in ws.pages.values())
+    # reset over a plain active page keeps its document — as the Image Input page's
+    ws.set_active("pg3")
+    keep = ws.pages["pg3"].doc
+    keep.add_node("enhance.gaussian")
+    ws.reset()
+    assert [p.kind for p in ws.pages.values()] == list(kinds), list(ws.pages.values())
+    assert list(ws.pages)[0] == "pg3" and ws.active == "pg3"
+    assert ws.pages["pg3"].doc is keep and not keep.nodes and keep.page_kind == "input"
+    assert ws.pages["pg3"].name == kind_label("input") and ws.path is None
+    assert ws.pages["pg3"].master is None and ws.pages["pg3"].overrides == {}
+    # reset over a LINKED active page cannot keep its document: fresh pages, same shape
+    ws2, _ds, _env, _ax = _ws_fixture()
+    lk = ws2.duplicate_page("pg2", dependent=True)
+    ws2.set_active(lk.id)
+    ws2.reset()
+    assert [p.kind for p in ws2.pages.values()] == list(kinds)
+    assert ws2.active == list(ws2.pages)[0] and not ws2.pages[ws2.active].doc.nodes
+    assert all(p.master is None for p in ws2.pages.values())
+    # single() is unchanged — the runner's and the fixtures' one-page workspace
+    s = Workspace.single(GraphDocument())
+    assert [(p.name, p.kind) for p in s.pages.values()] == [(DEFAULT_PAGE_NAME, FREE)]
+    _ok("Workspace.standard: the four standard pages (Image Input active, ids pg1..pg4); "
+        "reset returns to them keeping a plain active page's document as Image Input's, "
+        "over a linked active page it starts fresh; single() still makes one Free page")
+
+
+def test_page_defaults_hook() -> None:
+    """``GraphDocument.node_defaults`` (V4.00 step 11): a hand-placed Page Output is named
+    ``out``, ``out2``, …; a Page Input is bound to the default source when one exists and
+    carries no ``source`` key when none does; explicit params always win (a blank stays
+    blank); a loaded page keeps its own values; a detached document returns nothing; a
+    linked page still refuses ``add_node``; ``sanitize_output_name`` / ``unique_output_name``."""
+    from nodegraph.metadata import MetaEnvelope
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import readiness as RD
+    from nodelab_v2.linked_document import LinkedPageError
+    from nodelab_v2.workspace import Workspace, sanitize_output_name
+    OPS.ensure_ops()
+    ws = Workspace.standard()
+    p1, p2 = ws.pages["pg1"].doc, ws.pages["pg2"].doc
+    assert ws.node_defaults("pg1", "enhance.gaussian") == {}
+    assert p1.node_defaults("enhance.gaussian") == {}
+    o1 = p1.add_node("page.output")
+    o2 = p1.add_node("page.output")
+    assert (o1.params["name"], o2.params["name"]) == ("out", "out2"), (o1.params, o2.params)
+    o3 = p1.add_node("page.output", params={"name": "raw"})
+    assert o3.params["name"] == "raw", "an explicit name wins"
+    o4 = p1.add_node("page.output", params={"name": ""})
+    assert o4.params["name"] == "", "an explicit blank stays blank"
+    # a Page Input before any named Output upstream: no source key, the unbound problem
+    fresh = Workspace.standard()
+    i0 = fresh.pages["pg2"].doc.add_node("page.input")
+    assert "source" not in i0.params and fresh.default_source("pg2") == ""
+    assert [p.kind for p in RD.problems(fresh.pages["pg2"].doc, i0.id)] == ["unbound"]
+    # bound once an Output is named — the newest named one — and the envelope crosses
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=16, x=16)
+    L = p1.add_node("io.load")
+    p1.meta_seeds[L.id] = MetaEnvelope(axes=ax, metadata={})
+    p1.connect(L.id, "image", o3.id, "data")
+    i1 = p2.add_node("page.input")
+    assert i1.params.get("source") == "pg1:raw", i1.params
+    assert p2.env(i1.id).axes == ax, "the upstream envelope crosses through the default"
+    assert RD.problems(p2, i1.id) == []
+    # naming helpers
+    assert sanitize_output_name(" a:b/c" + chr(92) + "d  e ") == "a_b_c_d e"
+    assert sanitize_output_name("") == "" and sanitize_output_name("x" * 60) == "x" * 48
+    assert ws.unique_output_name("pg1", "raw") == "raw2"
+    assert ws.unique_output_name("pg1", "RAW") == "RAW2", "names are unique case-insensitively"
+    assert ws.unique_output_name("pg1", "") == "out3" and ws.unique_output_name("pg1", "a:b") == "a_b"
+    # a loaded page keeps its own values: the load path never consults the hook
+    cp = ws.add_page("Copy", "input")
+    cp.doc.load_page(p1.to_page_dict())
+    assert cp.doc.nodes[o4.id].params.get("name", "") == "", cp.doc.nodes[o4.id].params
+    # a detached document answers nothing
+    ws.remove_page(cp.id)
+    assert cp.doc.node_defaults("page.output") == {} and cp.doc.page_sources() == []
+    assert cp.doc.page_feeders() == []
+    # a linked page still refuses a new node outright
+    lk = ws.duplicate_page("pg2", dependent=True)
+    try:
+        lk.doc.add_node("page.input")
+        raise AssertionError("a linked page's add_node must refuse")
+    except LinkedPageError:
+        pass
+    _ok("node_defaults hook: Page Outputs named out/out2, Page Inputs bound to the default "
+        "source (no key when nothing upstream is named), explicit params win, a loaded page "
+        "keeps its values, a detached document answers nothing, linked pages still refuse; "
+        "sanitize_output_name and unique_output_name")
+
+
+def test_default_source_rule() -> None:
+    """``Workspace.default_source`` / ``feeder_pages`` (V4.00 step 11): the nearest feeder
+    kind first (Processing reads Refinement before Image Input), the latest page within a
+    kind, its most recently added named Output; a page without a named Output is skipped;
+    a Free page reads the nearest preceding page; a free feeder ranks after every typed
+    one; ``""`` when nothing upstream is named; ``outputs_of`` stays name-sorted."""
+    from nodelab_v2.workspace import Workspace
+    ws, ds, env, ax = _ws_fixture()       # Input pg1 "raw" → Refine pg2 "smooth" → P1 pg3, P2 pg4
+    assert ws.default_source("pg2") == "pg1:raw"
+    assert ws.default_source("pg3") == "pg2:smooth" and ws.default_source("pg4") == "pg2:smooth"
+    assert [p for p, _n in ws.feeder_pages("pg3")] == ["pg2", "pg1"]
+    Rf = ws.pages["pg2"].doc
+    Rf.add_node("page.output", node_id="O2", params={"name": "alpha"})
+    Rf.connect("G", "out", "O2", "data")
+    assert ws.default_source("pg3") == "pg2:alpha", "the most recently ADDED Output"
+    assert [n for n, _ in ws.outputs_of("pg2")] == ["alpha", "smooth"], "outputs_of by name"
+    R2 = ws.add_page("Refine 2", "refine")
+    assert ws.default_source("pg3") == "pg2:alpha", "a page with no named Output is skipped"
+    R2.doc.add_node("page.input", node_id="IN", params={"source": "pg1:raw"})
+    R2.doc.add_node("page.output", node_id="O", params={"name": "late"})
+    R2.doc.connect("IN", "out", "O", "data")
+    assert [p for p, _n in ws.feeder_pages("pg3")][:2] == [R2.id, "pg2"], ws.feeder_pages("pg3")
+    assert ws.default_source("pg3") == f"{R2.id}:late", "the later page of the same kind"
+    An = ws.add_page("An", "analyze")
+    assert ws.default_source(An.id) == f"{R2.id}:late", "no Processing Output yet: Refinement"
+    P1 = ws.pages["pg3"].doc
+    P1.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.connect("X", "out", "O", "data")
+    assert ws.default_source(An.id) == "pg3:cells", "the nearest kind wins over a later page"
+    Fr = ws.add_page("Scratch", "free")
+    feeders = [p for p, _n in ws.feeder_pages(Fr.id)]
+    assert feeders[:3] == [An.id, R2.id, "pg4"], feeders
+    assert ws.default_source(Fr.id) == f"{R2.id}:late", "a Free page: nearest preceding first"
+    Fr.doc.add_node("page.output", node_id="O", params={"name": "scratch"})
+    assert [p for p, _n in ws.feeder_pages("pg3")][-1] == Fr.id, "a free feeder ranks last"
+    assert ws.default_source("pg3") == f"{R2.id}:late"
+    assert Workspace.standard().default_source("pg4") == ""
+    _ok("default source: nearest kind, latest page, newest Output; pages without a named "
+        "Output skipped; a Free page reads the nearest preceding page and a free feeder "
+        "ranks last; nothing named → no default")
+
+
+def test_readiness_fixes() -> None:
+    """Readiness one-click fixes (V4.00 step 11): an unbound Page Input offers a ``set_param``
+    per offered source (the page's default first); an unnamed or duplicate Output offers a
+    unique name; the ``unpublished`` HINT (severity ``hint``, never blocking) sits on a
+    loader nothing publishes and on the terminal node of a page without an Output, and goes
+    away once one exists; a sink and a Free page get none; ``ready`` ignores hints."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import readiness as RD
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    ws = Workspace.standard()
+    p1, p2, p4 = (ws.pages[k].doc for k in ("pg1", "pg2", "pg4"))
+    L = p1.add_node("io.load")
+    pr = RD.problems(p1, L.id)
+    assert [(p.kind, p.severity) for p in pr] == [("unpublished", "hint")], pr
+    assert RD.ready(p1, L.id), "a hint never blocks"
+    s = pr[0].suggestions[0]
+    assert (s.op_key, s.action, s.wire_to) == ("page.output", "append", "image"), s
+    o = p1.add_node("page.output", params={"name": ""})
+    pr = RD.problems(p1, o.id)
+    assert pr[0].kind == "validation" and pr[0].suggestions[0].action == "set_param"
+    assert (pr[0].suggestions[0].param, pr[0].suggestions[0].value) == ("name", "out")
+    o.params["name"] = "raw"
+    p1.connect(L.id, "image", o.id, "data")
+    p1.touch(o.id)
+    assert RD.problems(p1, L.id) == [] and RD.problems(p1, o.id) == []
+    dup = p1.add_node("page.output", params={"name": "raw"})
+    pr = RD.problems(p1, dup.id)
+    assert pr[0].kind == "duplicate_output" and pr[0].suggestions[0].value == "out", pr
+    i = p2.add_node("page.input", params={"source": ""})
+    pr = RD.problems(p2, i.id)
+    assert pr[0].kind == "unbound" and not RD.ready(p2, i.id)
+    assert [(x.action, x.param, x.value) for x in pr[0].suggestions] == \
+        [("set_param", "source", "pg1:raw")], pr[0].suggestions
+    i.params["source"] = "pg1:raw"
+    p2.touch(i.id)
+    assert RD.problems(p2, i.id) == []
+    g = p2.add_node("enhance.gaussian")
+    p2.connect(i.id, "out", g.id, "data")
+    pr = RD.problems(p2, g.id)
+    assert [(p.kind, p.severity) for p in pr] == [("unpublished", "hint")] and RD.ready(p2, g.id)
+    assert (pr[0].suggestions[0].action, pr[0].suggestions[0].wire_to) == ("append", "out")
+    o2 = p2.add_node("page.output")
+    p2.connect(g.id, "out", o2.id, "data")
+    assert RD.problems(p2, g.id) == [], "an Output on the page: nothing left to hint"
+    i4 = p4.add_node("page.input")
+    v = p4.add_node("view.viewer")
+    p4.connect(i4.id, "out", v.id, "data")
+    assert RD.problems(p4, v.id) == [], "a sink ends a chain on purpose"
+    fr = ws.add_page("Scratch", "free")
+    Lf = fr.doc.add_node("io.load")
+    g2 = fr.doc.add_node("enhance.gaussian")
+    fr.doc.connect(Lf.id, "image", g2.id, "data")
+    assert RD.problems(fr.doc, Lf.id) == [] and \
+        not any(p.kind == "unpublished" for p in RD.problems(fr.doc, g2.id))
+    _ok("readiness fixes: bind (default first) / name / append-a-Page-Output suggestions; "
+        "the unpublished hint on a loader and a terminal node, gone once an Output exists, "
+        "absent on sinks and Free pages; hints never block ready()")
+
+
+def test_example_workspace() -> None:
+    """``build_example`` (V4.00 step 11): the welcome card's example spans the four standard
+    pages; every op is legal on its page; every boundary is named and bound (no error-grade
+    readiness problem anywhere); the Analysis page composes the whole chain with no Page
+    Input left, and its Viewer and its plot pull on the synthetic fixture."""
+    from nodegraph import roles as R
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2 import readiness as RD
+    from nodelab_v2.workspace import build_example
+    ws, ds, env, ax = _ws_fixture()
+    pids = build_example(ws)
+    assert list(pids) == ["input", "refine", "process", "analyze"], pids
+    assert [ws.pages[p].kind for p in pids.values()] == list(pids)
+    for p in ws.pages.values():
+        for r in p.doc.nodes.values():
+            assert R.op_in_page(r.op_key, p.kind), (p.kind, r.op_key)
+            errs = [x for x in RD.problems(p.doc, r.id) if x.severity == "error"]
+            assert not errs, (p.name, r.id, [(x.kind, x.message) for x in errs])
+    assert ws.dependency_closure(pids["analyze"]) == list(pids.values())
+    inp, an = pids["input"], pids["analyze"]
+    ws.pages[inp].doc.meta_seeds["load"] = env
+    comp = ws.compose(an)
+    assert not any(n.op_key == "page.input" for n in comp.graph.nodes.values())
+    eng = OPS.headless_engine(comp.graph, seeds={f"{inp}/load": ds},
+                              meta_seeds=comp.meta_seeds, memo=Memo())
+    out = eng.pull(f"{an}/view")
+    assert out.axes == ax, out.axes
+    try:
+        import matplotlib  # noqa: F401
+    except Exception:                                    # noqa: BLE001
+        _ok("example workspace: four pages, legal ops, no error-grade problem, composes "
+            "and the Viewer pulls (matplotlib missing: plot not pulled)")
+        return
+    pic = eng.pull(f"{an}/plot")
+    assert pic.axes.c == 3 and pic.metadata.get("picture") == "rgb", pic.metadata
+    _ok("example workspace: four pages, every op legal on its page, every boundary named and "
+        "bound, the Analysis page composes the whole chain and its Viewer and plot pull")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -26793,6 +27046,11 @@ def main() -> int:
     test_batch_never_silently_dropped()
     test_bundle_source_file_column()
     test_chain_files()
+    test_workspace_standard()
+    test_page_defaults_hook()
+    test_default_source_rule()
+    test_readiness_fixes()
+    test_example_workspace()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

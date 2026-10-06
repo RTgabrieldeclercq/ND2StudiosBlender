@@ -1479,6 +1479,7 @@
 {"dst":"nodelab_v2.overlay_dialog","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.readiness","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.region_box","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.runner","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.scene","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

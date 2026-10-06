@@ -290,6 +290,14 @@ class GraphDocument:
         #: ``() -> [(value, label), ...]``: the named outputs of earlier pages a
         #: ``page.input`` on this document may read (:meth:`source_choices`).
         self.page_sources: Callable[[], list] = lambda: []
+        #: ``(op_key) -> dict`` (V4.00 step 11): the params a node of ``op_key`` STARTS with
+        #: when its creator gives none for them — the Workspace names a Page Output and binds
+        #: a Page Input. :meth:`add_node` merges it UNDER the caller's ``params``, so an
+        #: explicit value always wins and a loaded file keeps its own.
+        self.node_defaults: Callable[[str], dict] = lambda _op: {}
+        #: ``() -> [(page id, page name), ...]``: the pages a ``page.input`` on this document
+        #: may read, nearest first — the inspector's "Go to <page>" (V4.00 step 11).
+        self.page_feeders: Callable[[], list] = lambda: []
         #: set by the Workspace (V4.00 step 5): a digest of what ``node_id`` reads from OTHER
         #: pages through Page Inputs ("" when nothing) — part of a dock's signature — and the
         #: page's run identity, which moves when an upstream page is edited
@@ -371,6 +379,13 @@ class GraphDocument:
         if "/" in nid:
             # "/" separates the page from the node in a page-qualified run id (V4.00)
             raise ValueError(f"node id {nid!r} may not contain '/'")
+        defaults = self.node_defaults(op_key) or {}
+        if defaults:
+            # the page's defaults UNDER the caller's values: a hand-placed Page Output is
+            # named and a Page Input bound at once, while an explicit value is never touched
+            merged = dict(defaults)
+            merged.update(params or {})
+            params = merged
         rec = NodeRecord(nid, op_key, params=params, modes=modes, x=x, y=y)
         self.nodes[nid] = rec
         # A brand-new id cannot be in any in-flight run's cone, so naming it here cancels

@@ -47,7 +47,8 @@ from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
 from nodelab_v2.canvas import CanvasPanel, kind_icon
-from nodelab_v2.workspace import Workspace, kind_label, local_ids, qualify, split_run_id
+from nodelab_v2.workspace import (FREE as FREE_KIND, Workspace, build_example, kind_label,
+                                  local_ids, qualify, split_run_id)
 from nodelab_v2.document import GraphDocument
 from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedPageError
 from nodelab_v2.framestrip import compact_list
@@ -55,7 +56,9 @@ from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
 from nodelab_v2.minimap import MiniMapOverlay
 from nodelab_v2.node_item import NodeItem
-from nodelab_v2.ops import (MOVIE_OP, CALIB_OVERRIDE_KEYS, DOCK_OP, LOAD_OP, PRECISION_UNSET,
+from nodelab_v2.ops import (MOVIE_OP, ACCESS_INGEST, ACCESS_MODE, CALIB_OVERRIDE_KEYS, DOCK_OP,
+                            LOAD_OP, PAGE_INPUT_OP,
+                            PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY, PRECISION_UNSET,
                             is_visual_output)
 from nodelab_v2.palette import PalettePanel
 from nodelab_v2.picker import Calibration, request_for
@@ -95,6 +98,9 @@ SOURCE_STACK_GAP = 34
 #: (scene px). Wide enough that the wire between them is visibly a wire rather than two
 #: touching cards — a source card is ~214 px, so this leaves a clear ~90 px span.
 SEQUENCE_CHAIN_GAP = 306
+#: x-gap from a freshly loaded source card to the Page Output that publishes it (V4.00
+#: step 11) — one wire-length to its right, like a sequence's chain card
+SOURCE_OUTPUT_GAP = 306
 
 #: What the axis a sequence was chained onto is CALLED, for the status line. The keys are
 #: ``util.timeseries``'s own ``chain_axis`` values; "M" is absent because the loader never drops
@@ -185,6 +191,19 @@ def _needs_topology(fn):
     @functools.wraps(fn)
     def guarded(self, *a, **k):
         if not self._topology_ok():
+            return None
+        return fn(self, *a, **k)
+    return guarded
+
+
+def _needs_source_page(fn):
+    """A window action that LOADS an image (V4.00 step 11): refused — with the hint in the
+    status bar, before any dialog opens — when the page the image will land on is a linked
+    page. That page is the Image Input page, not the active one
+    (:meth:`MainWindow._input_page`)."""
+    @functools.wraps(fn)
+    def guarded(self, *a, **k):
+        if not self._source_load_allowed():
             return None
         return fn(self, *a, **k)
     return guarded
@@ -291,7 +310,7 @@ class MainWindow(QMainWindow):
         # V4.00: the file on disk is a Workspace of PAGES (format 3.0). Every page has its
         # own scene (`scene_for`) and a canvas shows one page at a time; `doc`, `scene`,
         # `view`, `minimap` and `welcome` name the active page's and the active canvas's.
-        self.workspace = Workspace.single(GraphDocument())
+        self.workspace = Workspace.standard(GraphDocument())   # the four standard pages
         self._scenes: Dict[str, GraphScene] = {}
         #: per page: (its document, the listeners `_wire_scene` installed on it)
         self._page_hooks: Dict[str, Tuple[Any, List[Any]]] = {}
@@ -506,6 +525,9 @@ class MainWindow(QMainWindow):
         self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
         self.inspector.add_requested.connect(self._on_add_requested)
+        self.inspector.append_requested.connect(self._on_append_requested)
+        self.inspector.page_requested.connect(
+            lambda pid: self._show_page(self._canvas, pid))
         # the panel-hosted drawing (2026-10-02): Draw Regions' controls live in its panel
         #: (page, node) to go back to after Apply/Cancel of a region drawn for it
         self._pick_return: Optional[Tuple[str, str]] = None
@@ -959,7 +981,7 @@ class MainWindow(QMainWindow):
         # buttons take focus, which activates a docked canvas; the main one is told here)
         for sig, fn in ((c.welcome.load_image_requested, self.file_load_source),
                         (c.welcome.browse_nodes_requested, self.focus_palette),
-                        (c.welcome.example_requested, self.build_demo)):
+                        (c.welcome.example_requested, self.build_example_workspace)):
             sig.connect(lambda _=None, c=c, fn=fn: (self._activate_canvas(c), fn()))
         c.welcome.op_dropped.connect(
             lambda op, pos, c=c: (self._activate_canvas(c), self._on_op_dropped(op, pos)))
@@ -1026,12 +1048,84 @@ class MainWindow(QMainWindow):
         c.set_page(page_id)
         self._activate_canvas(c)
 
+    # ── where a loaded image goes (V4.00 step 11) ─────────────────────────────
+    def _input_page(self, *, create: bool = True) -> Optional[str]:
+        """The page a loaded image lands on: the first Image Input page — made first in the
+        page order when the workspace has typed pages but no Input page (``""`` instead when
+        ``create`` is False). ``None`` for a Free-only workspace (a pre-V4 file): there the
+        image lands on the active page, as it always did."""
+        ws = self.workspace
+        for p in ws.pages.values():
+            if p.kind == "input":
+                return p.id
+        if all(p.kind == FREE_KIND for p in ws.pages.values()):
+            return None
+        if not create:
+            return ""
+        return ws.add_page(kind_label("input"), "input", index=0).id
+
+    def _source_load_allowed(self) -> bool:
+        """Before a load dialog opens: may the page the image will land on take a new card?
+        The Image Input page's document is the one that matters, not the active page's — a
+        linked Input page refuses (hint on the status bar); a missing one will be made plain."""
+        pid = self._input_page(create=False)
+        if pid is None:
+            return self._topology_ok()
+        if not pid:
+            return True
+        return self._topology_ok(self.workspace.pages[pid].doc)
+
+    def _begin_source_load(self) -> Optional[bool]:
+        """Route a load to the Image Input page: switch the canvas there BEFORE any card is
+        placed (the loaders read the active scene and view), and say whether to publish what
+        lands — True on an Input page, False on a Free-only workspace (cards only, as before
+        V4.00), None when the target page is linked and refuses a card (hint shown)."""
+        pid = self._input_page()
+        if pid is None:
+            return False if self._topology_ok() else None
+        if not self._topology_ok(self.workspace.pages[pid].doc):
+            return None
+        if pid != self.workspace.active:
+            self._show_page(self._canvas, pid)
+        return True
+
+    def _publish_source(self, rec, stem: str, *, from_socket: str = "image"):
+        """Name a freshly loaded source as a variable of its page (V4.00 step 11): a Page
+        Output right of the card, wired from ``from_socket`` (the loader's whole dataset),
+        named after the file — unique on the page — which is what a later page's Page Input
+        reads. Returns the Output's record."""
+        import os
+        pid = self.workspace.active
+        base = os.path.splitext(os.path.basename(str(stem or "")))[0]
+        name = self.workspace.unique_output_name(pid, base)
+        out = self.doc.add_node(PAGE_OUTPUT_OP, x=float(rec.x) + SOURCE_OUTPUT_GAP,
+                                y=float(rec.y), params={PAGE_NAME_KEY: name})
+        self.doc.connect(rec.id, from_socket, out.id, "data")
+        return out
+
+    def _published_note(self, outs: list) -> str:
+        """``" — published as “raw” on Image Input"`` for the status bar."""
+        if not outs:
+            return ""
+        page = self.workspace.pages.get(self.workspace.active or "")
+        names = ", ".join(f"“{o.params.get(PAGE_NAME_KEY, '')}”" for o in outs[:3])
+        more = len(outs) - min(len(outs), 3)
+        return (f" — published as {names}" + (f" +{more} more" if more else "")
+                + (f" on {page.name}" if page is not None else ""))
+
     def new_page(self, kind: str, *, canvas: Optional[CanvasPanel] = None,
                  name: Optional[str] = None) -> str:
-        """Add a page of ``kind`` and show it on ``canvas`` (default: the active one)."""
-        page = self.workspace.add_page(name or kind_label(kind), kind)
+        """Add a page of ``kind`` and show it on ``canvas`` (default: the active one). A page
+        whose kind reads earlier pages starts with a Page Input already bound to the nearest
+        named Output (V4.00 step 11, ``seed_input``) — when there is one to read."""
+        page = self.workspace.add_page(name or kind_label(kind), kind, seed_input=True)
         self._show_page(canvas or self._canvas, page.id)
-        self.statusBar().showMessage(f"new {kind_label(kind)} page “{page.name}”")
+        reads = [str(r.params.get(PAGE_SOURCE_KEY) or "") for r in page.doc.nodes.values()
+                 if r.op_key == PAGE_INPUT_OP]
+        labels = dict(page.doc.source_choices(""))
+        self.statusBar().showMessage(
+            f"new {kind_label(kind)} page “{page.name}”"
+            + (f" — its Page Input reads {labels.get(reads[0], reads[0])}" if reads else ""))
         return page.id
 
     def duplicate_page(self, page_id: str, *, canvas: Optional[CanvasPanel] = None,
@@ -1178,6 +1272,9 @@ class MainWindow(QMainWindow):
             self.workspace.set_active(c.page_id)         # → `_on_workspace_changed`
         else:
             self._sync_active_page_ui()
+        # an empty downstream page shown for the first time with something to read starts
+        # with its Page Input (V4.00 step 11; the standard pages exist before any image does)
+        self.workspace.seed_input(c.page_id)
 
     def _sync_canvas_accents(self) -> None:
         cs = self.canvases()
@@ -2315,6 +2412,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         return new.id
 
+    @_needs_topology
+    def _on_append_requested(self, node_id: str, op_key: str, from_socket: str) -> Optional[str]:
+        """A *Ready to run* suggestion that adds a node DOWNSTREAM (V4.00 step 11: "+ Page
+        Output" after a terminal node, or after a loader nothing publishes yet): the new node
+        lands right of ``node_id`` and ``node_id.from_socket`` is wired into its first
+        Dataset input. Returns the new node's id."""
+        rec = self.doc.nodes.get(node_id)
+        if rec is None:
+            return None
+        from nodegraph.sockets import SocketType as _ST
+        new = self.doc.add_node(op_key, x=float(rec.x) + SOURCE_OUTPUT_GAP, y=float(rec.y))
+        nspec = new.spec()
+        new_in = next((s.name for s in getattr(nspec, "inputs", ())
+                       if s.type is _ST.DATASET), "data") if nspec is not None else "data"
+        try:
+            self.doc.connect(node_id, from_socket, new.id, new_in)
+            msg = f"added {nspec.label if nspec else op_key} after {node_id}"
+        except ValueError as exc:
+            msg = f"added {op_key} but could not wire it: {exc}"
+        self.doc.touch()
+        if hasattr(self.scene, "sync"):
+            self.scene.sync()
+        item = self.scene.node_items.get(node_id)
+        if item is not None:
+            item.refresh()
+            item.changed.emit(item)        # the inspector rebuilds: the hint is gone
+        self.statusBar().showMessage(msg)
+        return new.id
+
     def _on_pick_committed(self, node_id: str, values: dict,
                            viewer: Optional[ViewerPanel] = None) -> None:
         """Write a finished pick into the document of the page it was ARMED on
@@ -2433,7 +2559,6 @@ class MainWindow(QMainWindow):
         if edge_tuple is not None:
             self.scene.splice_onto(rec.id, edge_tuple)
 
-    @_needs_topology
     def _on_files_dropped(self, paths: list, pos: QPointF, target: str) -> None:
         """Image files dragged from the desktop onto the canvas (V3.01).
 
@@ -2452,7 +2577,19 @@ class MainWindow(QMainWindow):
         """
         from PySide6.QtWidgets import QMessageBox
         made, failed = [], []
+        # V4.00 step 11: a plain drop lands on the Image Input page and is published there;
+        # a drop ON a Batch point stays where the point is — the batch is the dataset
+        before = self.workspace.active
+        publish = ((False if self._topology_ok() else None) if target
+                   else self._begin_source_load())
+        if publish is None:
+            return
         x, y = pos.x(), pos.y()
+        if self.workspace.active != before:
+            # the drop position belongs to the canvas dropped on; on the Input page the
+            # cards land at the view's centre, as File → Load's do
+            c = self.view.mapToScene(self.view.viewport().rect().center())
+            x, y = c.x() - 107, c.y() - 40
         for i, p in enumerate(paths):
             try:
                 rec, _axes = self._add_source_node(p, x, y + i * 96.0)
@@ -2464,6 +2601,8 @@ class MainWindow(QMainWindow):
             # the order Unbatch hands results back in — so wire in the order dropped
             for rec in made:
                 self.doc.connect(rec.id, "image", target, "data")
+        outs = ([self._publish_source(rec, str(rec.params.get("path") or ""))
+                 for rec in made] if publish else [])
         if failed:
             import os
             lines = "\n".join(f"{os.path.basename(p)} — {exc}" for p, exc in failed)
@@ -2473,7 +2612,10 @@ class MainWindow(QMainWindow):
         if made:
             self.statusBar().showMessage(
                 f"loaded {len(made)} file(s)"
-                + (" into the batch point" if target else ""), 6000)
+                + (" into the batch point" if target else "")
+                + self._published_note(outs), 6000)
+            if outs:
+                self.pull_node(made[0].id)      # the Viewer shows what was loaded
 
     # ── run (G7) ─────────────────────────────────────────────────────────────
     def pull_selected(self) -> None:
@@ -4520,8 +4662,13 @@ class MainWindow(QMainWindow):
         # on, and `GraphDocument.to_graph` resolves the groups then
         # (`group_descriptors`, which falls back to the envelope), so nothing has to be
         # captured in advance.
+        # A TIFF has no direct-read path (`nd2_direct.decide_access`), and `direct` is the
+        # card's default: start a TIFF on `ingest` so its first pull — the preview a load
+        # triggers since V4.00 step 11 — works instead of asking the user to flip a mode.
+        from nodelab_v2.ingest import _is_tiff
+        modes = {ACCESS_MODE: ACCESS_INGEST} if _is_tiff(path) else None
         rec = self.doc.add_node(
-            LOAD_OP, x=x, y=y,
+            LOAD_OP, x=x, y=y, modes=modes,
             params={"path": path, TITLE_KEY: os.path.basename(path),
                     CHANNELS_KEY: chans, **prefill})
         # `source_file` rides the seed for the same reason the bundle card's does: the
@@ -4613,7 +4760,7 @@ class MainWindow(QMainWindow):
         self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))
         return rec, axes
 
-    @_needs_topology
+    @_needs_source_page
     def file_load_source(self) -> None:
         """File → Load ND2/TIFF file…: pick **one or more** images, read each file's
         metadata (no pixels), and drop one pre-loaded ``io.load`` source node per file
@@ -4645,7 +4792,7 @@ class MainWindow(QMainWindow):
             return
         self._load_source_paths(paths, group=self._ask_group(paths))
 
-    @_needs_topology
+    @_needs_source_page
     def file_load_sequence(self) -> None:
         """File → Load file sequence…: pick ONE file of a numbered series, get all of it.
 
@@ -4733,7 +4880,7 @@ class MainWindow(QMainWindow):
         if written:
             self.statusBar().showMessage(f"recipe written to {written}")
 
-    @_needs_topology
+    @_needs_source_page
     def lablink_load_result(self, path: str) -> None:
         """A hub returned an image; put it on the canvas as a source node.
 
@@ -4759,7 +4906,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"loaded {os.path.basename(path)} from the hub — it is a source node now")
 
-    @_needs_topology
+    @_needs_source_page
     def _load_source_paths(self, paths: list, group: bool = False,
                            chain_axis: str = "") -> None:
         """Drop one ``io.load`` card per path, stacked, selected, and scrolled into view —
@@ -4781,10 +4928,14 @@ class MainWindow(QMainWindow):
         for a chain to re-address."""
         import os
 
+        publish = self._begin_source_load()     # V4.00 step 11: onto the Image Input page
+        if publish is None:
+            return                              # a linked Input page refused; hint shown
         c = self.view.mapToScene(self.view.viewport().rect().center())
         x, y = c.x() - 107, c.y() - 40
         added: list = []
         failed: list = []
+        outs: list = []                         # the Page Outputs publishing what loaded
 
         if group and len(paths) >= 2:
             QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -4811,7 +4962,10 @@ class MainWindow(QMainWindow):
                 chain = self.doc.add_node("util.timeseries", x=x + SEQUENCE_CHAIN_GAP, y=y,
                                           modes={"chain_axis": chain_axis})
                 self.doc.connect(rec.id, "image", chain.id, "data")
-            ids = [rec.id] + ([chain.id] if chain is not None else [])
+            if publish:
+                src, sock = (chain, "out") if chain is not None else (rec, "image")
+                outs.append(self._publish_source(src, paths[0], from_socket=sock))
+            ids = [rec.id] + ([chain.id] if chain is not None else []) + [o.id for o in outs]
             items = [self.scene.node_items[i] for i in ids if i in self.scene.node_items]
             if items:
                 self.scene.clearSelection()
@@ -4829,6 +4983,10 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     f"bundled {len(paths)} files into one source — {axes.m} positions, "
                     f"{axes.c} channel(s); exported tables will carry a 'file' column")
+            if outs:
+                self.statusBar().showMessage(
+                    self.statusBar().currentMessage() + self._published_note(outs))
+                self.pull_node(rec.id)          # the Viewer shows what was loaded
             return
 
         # Reading N files' metadata is N ND2 header parses — fast per file, but visibly not
@@ -4842,6 +5000,8 @@ class MainWindow(QMainWindow):
                     failed.append((path, exc))
                     continue
                 added.append((rec, axes))
+                if publish:
+                    outs.append(self._publish_source(rec, path))
                 item = self.scene.node_items.get(rec.id)
                 # `card_rect` is the card's real geometry (boundingRect carries the glow
                 # margin). The item exists already: `add_node` notifies the document
@@ -4851,7 +5011,7 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        items = [self.scene.node_items[r.id] for r, _a in added
+        items = [self.scene.node_items[r.id] for r in [a[0] for a in added] + outs
                  if r.id in self.scene.node_items]
         if items:
             self.scene.clearSelection()
@@ -4880,6 +5040,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"loaded {len(added)} files — " + ", ".join(shown)
                 + (f" +{more} more" if more else ""))
+        if outs:
+            self.statusBar().showMessage(
+                self.statusBar().currentMessage() + self._published_note(outs))
+            self.pull_node(added[0][0].id)      # the Viewer shows what was loaded
 
     def file_open(self) -> None:
         path, _f = QFileDialog.getOpenFileName(self, "Open graph", "", FILE_FILTER)
@@ -4953,11 +5117,13 @@ class MainWindow(QMainWindow):
 
     # ── empty canvas / example content ────────────────────────────────────────
     def _sync_welcome(self, *_a) -> None:
-        """Show each canvas's welcome card exactly while its page holds no nodes."""
+        """Show each canvas's welcome card while its page holds no node — or nothing but the
+        Page Input it was seeded with (V4.00 step 11): the card still says how to begin."""
         ws = self.workspace
         for c in self.canvases():
             page = ws.pages.get(c.page_id)
-            c.welcome.setVisible(page is not None and not page.doc.nodes)
+            c.welcome.setVisible(page is not None and not any(
+                r.op_key != PAGE_INPUT_OP for r in page.doc.nodes.values()))
             if c.welcome.isVisible():
                 c.welcome.raise_()
                 c.minimap.raise_()          # the mini-map still owns its corner
@@ -4971,11 +5137,25 @@ class MainWindow(QMainWindow):
             dock.raise_()
         self.palette.focus_search()
 
+    def build_example_workspace(self) -> None:
+        """The welcome card's *Example graph* (V4.00 step 11): File → New, then one analysis
+        spread over the four standard pages (:func:`nodelab_v2.workspace.build_example`),
+        shown from the Image Input page — every page boundary named and bound, the shape the
+        standard workflow produces."""
+        self.file_new()
+        pids = build_example(self.workspace, reset=False)
+        self._show_page(self._canvas, pids["input"])
+        self.view.fit_all()
+        self.statusBar().showMessage(
+            "example workspace loaded — the page switcher (top left) walks Image Input → "
+            "Refinement → Processing → Analysis; double-click a node to view it")
+
     @_needs_topology
     def build_demo(self) -> None:
-        """Replace the canvas with the small example chain (Load → Select → enhance →
-        threshold → label → measure, plus a deconvolve → Viewer branch). Reachable from
-        the welcome card; also what the GUI probe drives."""
+        """Replace the ACTIVE page with the small flat example chain (Load → Select → enhance
+        → threshold → label → measure, plus a deconvolve → Viewer branch). What the GUI probe
+        drives; since V4.00 step 11 the welcome card builds :meth:`build_example_workspace`
+        instead — the same analysis spread over the four standard pages."""
         self.doc.clear()
         d = self.doc
         specs = [

@@ -150,9 +150,12 @@ once per detected cell). A CUDA torch build is picked up automatically
 
 ## 2. The window
 
-NodeLab opens on a **blank canvas** with a welcome card: *Load image… / Browse nodes /
-Example graph*. No Viewer is on screen yet — the canvas owns the whole centre until your
-first pull returns an image, which opens a Viewer above the canvas at a ~2.5:1 split.
+NodeLab opens on the **Image Input page** of a fresh workspace of four pages — Image Input,
+Image Refinement, Image Processing, Analysis (**Pages**, below) — with a welcome card: *Load
+image… / Browse nodes / Example graph*. The **Viewer** sits above the canvas from the start
+(about 45 % of the height) and shows what you load or pull; the Nodes palette is on the left,
+Properties on the right with the Spreadsheet and LabLink tabbed behind it. A panel popped out
+with **⇱** is a frameless window with a thin edge in the theme's colour.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -204,16 +207,30 @@ has it. A layout file that is damaged, or was written by a newer version, is set
 **Pages** (V4.00). A file holds several node graphs — **pages** — each of a kind: **Image
 Input** (load and organise the data), **Image Refinement** (prepare the image, find structure),
 **Image Processing** (find and measure objects), **Analysis**, or **Free** (anything; a file
-from before V4 opens as one Free page). The button in a canvas's top-left corner is the **page
-switcher**: it names the page shown and lists every page by kind; its menu adds a page of any
-kind, duplicates, renames or deletes one, or opens it in a new canvas. `Ctrl+PgDn` / `Ctrl+PgUp`
-step through the pages. The **palette, the link-drag search and the Ready-to-run suggestions
-offer the nodes of the page's kind** (a chip above the palette's search says which); a Free
-page offers every node. Pages hand data on by name: a **Page Output** node gives a Dataset a
-name on its page (its card reads `Output · raw`), and a **Page Input** on a later page picks it
-from its **Source** menu (`Input · raw`) — an Input page feeds Refinement, Refinement feeds
-Processing, and so on, while a Free page may feed or read any page. A pull reaches across pages:
-the upstream page's nodes run (or are served from memory) under ids like `pg1/n3`. **More
+from before V4 opens as one Free page). **File → New holds the four standard pages**, one of
+each kind in that order, Image Input active. The button in a canvas's top-left corner is the
+**page switcher**: it names the page shown and lists every page by kind; its menu adds a page
+of any kind, duplicates, renames or deletes one, or opens it in a new canvas. `Ctrl+PgDn` /
+`Ctrl+PgUp` step through the pages. The **palette, the link-drag search and the Ready-to-run
+suggestions offer the nodes of the page's kind** (a chip above the palette's search says
+which); a Free page offers every node.
+
+Pages hand data on **by name — and the app does the naming for you.** **Loading an image puts
+its card on the Image Input page** (the canvas switches there, whatever page you were on) **and
+publishes it as a Page Output named after the file**; a **new Refinement, Processing or
+Analysis page starts with a Page Input already reading the nearest earlier page's newest
+Output**, and an empty one gets that Input the first time you open it. A **Page Output** names
+a Dataset as a variable of its page (its card reads `Output · raw`; placed by hand it is named
+`out`, `out2`, …), and a **Page Input** on a later page reads one (`Input · Image Input ·
+raw`; placed by hand it binds to the nearest Output, and its **Source** menu lists the rest) —
+an Input page feeds Refinement, Refinement feeds Processing, and so on, while a Free page may
+feed or read any page. The palette leads with a **Pages** band holding both nodes, and dragging
+a wire into empty canvas offers *Page Output* first. A boundary that cannot work says so on its
+card — `Input · (unbound)`, `Output · (unnamed)` — and the **Ready to run** block offers the fix
+as one button: *Bind to <page · name>*, *Name it*, or *+ Page Output* after a page's last node
+or a loader nothing publishes yet (a hint, never a blocker), with *Go to <page>* under the
+Source menu. A pull reaches across pages: the upstream page's nodes run (or are served from
+memory) under ids like `pg1/n3`. **More
 canvases**: View ▸ New ▸ Canvas (or the switcher's *Open in a new canvas*) adds a canvas panel
 that can show another page side by side or pop out; the canvas you last clicked is the one
 the palette, Properties and every edit follow, and the window title names its page. The main
@@ -222,7 +239,10 @@ click another canvas: a pick armed on a node is applied to that page's node, the
 keeps editing the Export Movie of the page it was opened on (its title names the page), and
 **Shift+F5** pulls again whatever the active Viewer shows, on its own page. A page's kind
 decides what the menus *offer*; it is not a lock — a node dragged from the palette onto a
-canvas, or the Example graph, lands on that canvas's page whatever its kind.
+canvas lands on that canvas's page whatever its kind; a loaded image is the one thing routed
+to the Image Input page. The welcome card's **Example graph** builds one analysis across the
+four pages — load → `raw`; blur → threshold → `mask`; label → measure → `cells`; a plot and a
+Viewer — every boundary already named and bound.
 
 **Linked pages** (V4.00). The switcher's *Duplicate as linked page* makes a page that follows
 another — its **master** — card for card: the same nodes, wires and positions, and every
@@ -264,19 +284,22 @@ The pieces are described in §2 (**Pages**, **Linked pages**, **Panels**, **Seve
 this is one way to put them together — two dishes of one experiment, segmented with one
 workflow tuned per dish, compared on one plot.
 
-1. **Input page.** File → New, then the page switcher (top-left of the canvas) → *New page ▸
-   Image Input*. Load the file and wire each dataset a later page needs into a **Page
-   Output** with a **Name** (`dishA`, `dishB`). To see the dish names in the final table,
-   type the same text in each Output's **Condition** — a typed condition survives every
-   blank Output after it.
-2. **Refinement page.** *New page ▸ Image Refinement*. A **Page Input** whose **Source** is
-   `Image Input · dishA` → Gaussian Blur → Threshold → a Page Output named `mask`.
+1. **Input page.** File → New gives the four standard pages, Image Input active. Load the
+   file: its card lands here, published as a **Page Output** named after the file. For two
+   dishes, Split Positions and wire each position into its own Page Output (one placed by
+   hand is named `out`, `out2`, … — rename them `dishA`, `dishB`). To see the dish names in
+   the final table, type the same text in each Output's **Condition** — a typed condition
+   survives every blank Output after it.
+2. **Refinement page.** Open the Image Refinement page (the switcher, or `Ctrl+PgDn`): it
+   arrives with a **Page Input** reading the newest Output — set its **Source** to
+   `Image Input · dishA` → Gaussian Blur → Threshold → a Page Output named `mask` (the
+   Ready-to-run block on Threshold offers *+ Page Output*; rename it).
 3. **A variant.** The switcher's *Duplicate as linked page*. On the copy, change Threshold's
    level and point its Page Input at `dishB` — both become that page's **overrides** (a bar
    on the row). Adding or rewiring a node there is refused: edit the master, and both follow.
-4. **Processing pages.** *New page ▸ Image Processing*: Page Input `Image Refinement · mask` →
-   Connected Components → Measure → Page Output `cells`. Duplicate it as a linked page and
-   point its input at the linked refinement's `mask`.
+4. **Processing pages.** Open the Image Processing page: its Page Input reads
+   `Image Refinement · mask` → Connected Components → Measure → Page Output `cells`.
+   Duplicate it as a linked page and point its input at the linked refinement's `mask`.
 5. **Analysis page.** *New page ▸ Analysis*: two Page Inputs (`Image Processing · cells`,
    `Image Processing (linked) · cells`) → **Table Concat** (a `condition` column names each row's
    source) → **Table Aggregate** (Table `combined` — Table Concat passes the first input's own table on too — Group by `condition,t`) → **Plot XY** (Table `summary`,
@@ -3400,7 +3423,11 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **LabLink**: a preset applies but some knobs are missing | the recipe changed under it — a recipe has no version, so an operator can rename a knob or narrow a bound. The log names every knob that no longer fits rather than dropping it silently |
 | **LabLink**: *Promote to recipe…* says it cannot find the parent | promoting needs the parent recipe's **graph**, and a hub publishes a recipe's knobs but never its graph. Put the recipe directory in `~/.nd2studios/lablink-outbox/` and it will work |
 | **LabLink**: a generated recipe is refused for a knob name declared twice | two nodes with a 2D/3D lever both want to be called `dim`. The dialog disambiguates as a set (`dim`, `tophat_dim`); a hand-edited name can still collide |
-| **"Page Input is not bound to an upstream Output"** | its Source names no Output a page before it offers — the Output was renamed or deleted, its page was deleted, or the source page comes later in the order. Pick the source again in Properties; the Ready-to-run block lists every unbound Input |
+| **"Page Input is not bound to an upstream Output"** | its Source names no Output a page before it offers — the Output was renamed or deleted, its page was deleted, or the source page comes later in the order. Pick the source again in Properties, or click *Bind to …* in the Ready-to-run block, which lists every unbound Input; the card itself reads `Input · (unbound)` in red |
+| **I loaded an image and the canvas jumped to another page** | By design (V4.00): a loaded image always lands on the **Image Input** page — the canvas switches there — and is published as a Page Output named after the file. Go back to the page you were on: a new downstream page starts with a Page Input reading it, and an existing empty page gets one the first time you open it |
+| **A Refinement page is empty and I cannot get the image into it** | Load the image first (it is published on Image Input), then open the page — it gets a bound Page Input; or place a Page Input from the palette's **Pages** band, which binds to the nearest named Output. Nothing to bind to yet? *Go to Image Input* under its Source menu |
+| **A popped-out panel had a white border, or light bars under the Viewer** | Fixed in V4.00 (the dock's frame and the panel bodies paint the theme now). If a light edge ever shows again: View ▸ Reset layout, and report which panel |
+| **My panel layout reset itself after updating** | Once, by design: V4.00 changed the default layout (the Viewer is visible from the start), so a layout file saved by an older build is set aside as `layout.json.rejected` and the new default applies; arrange the panels again and they are remembered from then on |
 | **Adding, deleting or wiring a node is refused: "this page is linked to its master"** | the page is a linked copy and its graph follows the master. Make the change on the master (every linked page follows), or *Make unique* in the page switcher |
 | **The first plot takes several seconds** | matplotlib builds its font cache the first time it draws on a machine; later figures take a fraction of a second |
 | **A plot node refuses: needs matplotlib** | `pip install -r requirements.txt` — matplotlib is a core requirement since V4.00 |
