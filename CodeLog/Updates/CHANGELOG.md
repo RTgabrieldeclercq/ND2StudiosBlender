@@ -53,6 +53,27 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   overlay keeps its channels when its result is re-served after an unrelated edit; Pin T/Z
   works again.
 
+### Step 4 — viewers as docks (2026-10-05)
+- The Viewer is a dock (`viewer:<n>`), and there can be several: `+` on its title bar,
+  View ▸ New ▸ Viewer, or Compare. Each viewer is bound to the node it was asked to show (its
+  title bar names it) and receives that node's results; the active viewer — the one last
+  clicked in — gets pulls, click-to-preview, picks, the troubleshooting scope and the
+  Spreadsheet. The last viewer can be closed; the next pull opens a fresh one.
+- Selecting a Viewer node (any `view.*` / `plot.*` card) shows it in the active viewer at
+  once, even with click-to-preview off.
+- Two viewers can show one node at different frames: `EngineRunner.finished` / `plane_ready`
+  now carry the `(coords, channels)` they answer, and a frame lands only in the viewer whose
+  cursor asked for it.
+- Compare (F8) opens a Compare viewer docked beside the active one, linked to one cursor when
+  the M/T/Z extents match; maximize hides the docked viewers and restores them at their old
+  sizes; a floating viewer keeps its picture (`scripts/_nodelab_v2_gl_float_probe.py`, desktop).
+- Fixed: the scale bar ran past the right edge of an image narrower than 140 px.
+- Fixed before release (review): two viewers of one node under F9 no longer pull each other's
+  frame forever; a result re-served while the runner is busy no longer blanks the other viewers
+  of that node; clicking a viewer no longer cancels a scoped pull in flight; quitting while
+  maximized saves the docked layout; F8 on a card that the click just previewed compares it
+  beside what was viewed before; a Compare viewer in the mini-map scrubs on its own.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

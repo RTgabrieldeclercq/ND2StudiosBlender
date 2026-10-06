@@ -313,6 +313,10 @@ class GLImageView(QOpenGLWidget):
         # recreates the context when the widget is reparented — docking the Viewer into
         # the mini-map and back) can re-upload them instead of showing a black frame.
         self._last_planes: Dict[int, np.ndarray] = {}
+        #: how many GL contexts this widget has been given. Qt builds a new one whenever the
+        #: widget moves to another top-level window — a Viewer dock popped out or docked
+        #: back, the mini-map (V4.00 step 4) — and the picture must survive each one.
+        self._context_gen = 0
         self._img_wh: Optional[Tuple[int, int]] = None   # (w, h) of the texture
         # ── viewport detail patch (a second, finer texture over the visible rect) ──
         self._dtex: Dict[int, QOpenGLTexture] = {}
@@ -349,6 +353,7 @@ class GLImageView(QOpenGLWidget):
         self._dtex_key.clear()
         self._prog = self._vbo = self._vao = None
         self._ok = False
+        self._context_gen += 1
         try:
             f = self.context().functions()
             f.glClearColor(0.02, 0.03, 0.05, 1.0)
@@ -394,6 +399,10 @@ class GLImageView(QOpenGLWidget):
             self.limits_ready.emit(int(self._max_tex))
             print(f"[glview] GL ready — OpenGL {ver[0]}.{ver[1]}, "
                   f"max texture {self._max_tex} px", file=sys.stderr, flush=True)
+            # a new context sits in a new window, usually at a new size: ask again for the
+            # visible rect at full detail (debounced by the Viewer, so a no-op when nothing
+            # is shown) rather than stretching the old patch over a different viewport
+            self.view_changed.emit()
         except Exception as e:                   # noqa: BLE001 — degrade, never crash
             print(f"[glview] GL init failed → CPU fallback: {e}", file=sys.stderr, flush=True)
             self._ok = False

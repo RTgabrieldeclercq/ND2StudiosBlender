@@ -157,6 +157,12 @@ class PanelTitleBar(QWidget):
             self._active = bool(on)
             self.restyle()
 
+    def mousePressEvent(self, e) -> None:            # noqa: N802 — Qt override
+        """A press on the title bar makes this the active instance, then goes on to the
+        dock (QWidget ignores it), which is what drags or pops the panel out."""
+        self._dock.pressed.emit(self._dock)
+        super().mousePressEvent(e)
+
     def is_active(self) -> bool:
         return self._active
 
@@ -182,6 +188,8 @@ class PanelDock(QDockWidget):
     activated = Signal(object)
     #: the title bar's ``+``
     new_requested = Signal(object)
+    #: a press on the title bar — picking a panel up is working in it
+    pressed = Signal(object)
 
     def __init__(self, spec: PanelSpec, index: int, panel: QWidget,
                  parent: QMainWindow) -> None:
@@ -270,11 +278,14 @@ class DockShell(QObject):
         window.setDockNestingEnabled(True)
         window.setDockOptions(QMainWindow.AnimatedDocks | QMainWindow.AllowNestedDocks
                               | QMainWindow.AllowTabbedDocks)
-        # the side columns own the bottom corners, so a bottom panel sits under the CANVAS
+        # the side columns own all four corners, so a bottom panel sits under the CANVAS
         # rather than under the full-height Properties column (see the Movie Editor note
-        # in window.py: spanning the width raised the window's minimum height off-screen)
+        # in window.py: spanning the width raised the window's minimum height off-screen),
+        # and a top one — the Viewers (V4.00 step 4) — over it, as the old splitter had it
         window.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
         window.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+        window.setCorner(Qt.TopLeftCorner, Qt.LeftDockWidgetArea)
+        window.setCorner(Qt.TopRightCorner, Qt.RightDockWidgetArea)
         app = QApplication.instance()
         if app is not None:
             app.focusChanged.connect(self._on_focus)
@@ -328,6 +339,7 @@ class DockShell(QObject):
         dock.can_close = self._can_close
         dock.closed.connect(self._on_closed)
         dock.new_requested.connect(lambda d: self.spawn(d.kind, beside=d))
+        dock.pressed.connect(self.activate)
         self.docks[dock.objectName()] = dock
         if beside is not None and self.docks.get(beside.objectName()) is beside \
                 and not beside.isFloating():

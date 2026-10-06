@@ -191,6 +191,17 @@ HIDDEN_OP_PREFIXES = ("zone.", "group.", "test.", "io.seed", "io.stream_seed",
                       # never placed by hand — it exists only inside an unrolled graph
                       "flow.advance")
 
+#: op prefixes whose result is something to LOOK AT — a Viewer node, a plot (V4.00 step 4).
+#: Clicking such a card shows it in the active viewer even with click-to-preview off: the
+#: card exists to be seen, so selecting it is asking to see it.
+VISUAL_OUTPUT_PREFIXES = ("view.", "plot.")
+
+
+def is_visual_output(op_key: str) -> bool:
+    """Whether ``op_key``'s result is a picture to look at (:data:`VISUAL_OUTPUT_PREFIXES`)."""
+    return str(op_key or "").startswith(VISUAL_OUTPUT_PREFIXES)
+
+
 #: ``io.load``'s access mode and its three choices — how a source card reaches its pixels.
 #:
 #: ``direct`` reads an uncompressed ND2's memory-mapped frames in place — no copy, no

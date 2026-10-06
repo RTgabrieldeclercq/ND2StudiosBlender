@@ -938,6 +938,38 @@ def _doc_id_of(run_id: str) -> str:
     return doc_id_of(run_id)
 
 
+def _request_of(coords, channels) -> Optional[Tuple[Optional[Tuple[int, ...]],
+                                                    Optional[Tuple[int, ...]]]]:
+    """The ``(coords, channels)`` a delivery of planes answers, as plain sorted tuples —
+    what the window compares with each viewer's own cursor and channel set when several
+    viewers show the same node (:attr:`EngineRunner.plane_ready`)."""
+    try:
+        c = tuple(int(x) for x in coords) if coords is not None else None
+        ch = tuple(sorted(int(x) for x in channels)) if channels else None
+    except (TypeError, ValueError):
+        return None
+    return c, ch
+
+
+def request_answers(request, coords, channels) -> bool:
+    """Whether a delivery's ``request`` (:attr:`EngineRunner.plane_ready`) is the frame a
+    viewer at ``coords`` with ``channels`` on asked for: the same M/T/Z cursor and the same
+    channel set. How the window picks, among several viewers of one node, the ones a frame
+    belongs to (V4.00 step 4). ``None`` — a delivery with no planes, or a request that did
+    not say — answers every viewer, as a delivery always did."""
+    if request is None:
+        return True
+    try:
+        want, chans = request
+        if want is not None and tuple(int(x) for x in tuple(coords)[:3]) != tuple(want[:3]):
+            return False
+        if chans is not None and tuple(sorted(int(c) for c in channels)) != tuple(chans):
+            return False
+    except (TypeError, ValueError):
+        return True                      # an unreadable request must not hide a frame
+    return True
+
+
 class _Job:
     __slots__ = ("epoch", "graph", "revision", "node_id", "pull_id", "coords", "channels",
                  "sources", "all_sources", "pin", "bake", "cancelled")
@@ -1408,8 +1440,11 @@ class EngineRunner(QObject):
     bare document is wrapped into a one-page workspace."""
 
     started = Signal(str)                        # node_id
-    finished = Signal(str, object, object, object, float)   # id, payload, plane, axes, s
-    plane_ready = Signal(str, object, object, float)   # id, planes, axes, s (fast path)
+    #: id, payload, planes, axes, seconds, request — ``request`` is the ``(coords,
+    #: channels)`` the planes answer (``None`` without planes). Several viewers can show one
+    #: node at different cursors (V4.00 step 4): the request says which of them a frame is for.
+    finished = Signal(str, object, object, object, float, object)
+    plane_ready = Signal(str, object, object, float, object)   # … the fast path, same request
     failed = Signal(str, str)                    # node_id, traceback
     source_resolved = Signal(str, object)        # node_id, MetaEnvelope (G8 re-seed)
     #: the node set this pull may touch (the pulled node's ancestor closure), emitted on
@@ -2083,7 +2118,7 @@ class EngineRunner(QObject):
         self._restore_ctx(key)
         if isinstance(payload, Dataset) and payload.image is not None:
             self._hold_view(node_id, payload, pin=None)
-        self.finished.emit(node_id, payload, None, axes, 0.0)
+        self.finished.emit(node_id, payload, None, axes, 0.0, None)
         if coords is not None:
             # planes off the decode lane, exactly as a cursor move would fetch them
             self.request_plane(node_id, coords, channels)
@@ -2195,7 +2230,8 @@ class EngineRunner(QObject):
 
     def request_plane(self, node_id: str,
                       coords: Optional[Tuple[int, int, int, int]] = None,
-                      channels: Optional[Tuple[int, ...]] = None, sub: int = 0) -> None:
+                      channels: Optional[Tuple[int, ...]] = None, sub: int = 0, *,
+                      pull: bool = True) -> None:
         """Coords-only request. When ``node_id`` has a held view at the current document
         revision (only the M/T/Z cursor or the active-channel set moved), bypass the
         graph snapshot + ``engine.pull`` entirely and serve the plane straight from the
@@ -2211,7 +2247,12 @@ class EngineRunner(QObject):
         displayed: the scope must move with it, which means a real re-pull. The exception
         is a cursor move *within* a multi-frame selection — the pin is unchanged there, so
         it stays on the fast path. Z and channel moves always do, and between them that is
-        most of the interactive scrubbing a troubleshooting session does."""
+        most of the interactive scrubbing a troubleshooting session does.
+
+        ``pull=False`` serves only what the held view can serve and never falls back to a
+        pull (V4.00 step 4): a frame that ANOTHER viewer's delivery prompted must not start
+        one — under the solo scope two viewers at different frames of one node would pull
+        each other's scope back, forever."""
         node_id = self._rid(node_id)
         if self._source.record(node_id) is None:
             return
@@ -2222,9 +2263,10 @@ class EngineRunner(QObject):
                     and self._pin_for(coords) == view.pin):
                 # `sub` is the Play-all sub-tick (overlay planes only). A full pull below
                 # draws sub-tick 0: it happens at a document change, never mid-playback.
-                self._serve_from_cache(node_id, coords, channels, sub)
+                self._serve_from_cache(node_id, coords, channels, sub, pull=pull)
                 return
-        self.pull(node_id, coords, channels)
+        if pull:
+            self.pull(node_id, coords, channels)
 
     def invalidate(self, nodes: Optional[Iterable[str]] = None) -> None:
         """Drop the in-flight results a graph edit could have changed, and drop the held
@@ -3453,7 +3495,8 @@ class EngineRunner(QObject):
             self._planes.put(key, arr)
         return arr
 
-    def _serve_from_cache(self, node_id, coords, channels, sub: int = 0) -> None:  # GUI thread
+    def _serve_from_cache(self, node_id, coords, channels, sub: int = 0, *,
+                          pull: bool = True) -> None:  # GUI thread
         """Display the plane(s) at ``coords`` without going through the engine.
 
         A **warm** frame is served right here: the pixels are already decoded, so emitting
@@ -3463,13 +3506,15 @@ class EngineRunner(QObject):
         t0 = time.perf_counter()
         view = self._view_of(node_id)
         if view is None:                     # dropped between request and here: re-pull
-            self.pull(node_id, coords, channels)
+            if pull:
+                self.pull(node_id, coords, channels)
             return
         axes, pin = view.axes, view.pin
         warm = self._cached_planes(node_id, coords, channels, axes, pin=pin,
                                    provider=view.provider, dtype=view.dtype, sub=sub)
         if warm is not None:
-            self.plane_ready.emit(node_id, warm, axes, time.perf_counter() - t0)
+            self.plane_ready.emit(node_id, warm, axes, time.perf_counter() - t0,
+                                  _request_of(coords, channels))
             # Only on sub-tick 0: one prefetch warms every sub-tick of the frames ahead, and
             # each call supersedes the last (`_prefetch_gen`) — calling it on every Play-all
             # tick would cancel the warm after one compose, and it would never get ahead.
@@ -3479,7 +3524,7 @@ class EngineRunner(QObject):
                               tuple(channels) if channels else None, pin=pin)
             return
         if self._decode_busy:
-            self._decode_pending = (node_id, coords, channels, sub)   # latest-wins
+            self._decode_pending = (node_id, coords, channels, sub, pull)   # latest-wins
             return
         self._decode_gen += 1
         self._decode_busy = True
@@ -3506,7 +3551,7 @@ class EngineRunner(QObject):
             self.failed.emit(node_id, err)
         elif fresh and planes:
             self._progress.emit(("done", node_id, {"epoch": epoch, "seconds": dt}))
-            self.plane_ready.emit(node_id, planes, axes, dt)
+            self.plane_ready.emit(node_id, planes, axes, dt, _request_of(coords, channels))
             if not sub:
                 self.prefetch(node_id,
                               self._clamp_coords(self._payload_coords(coords, pin), axes),
@@ -3515,7 +3560,8 @@ class EngineRunner(QObject):
             # back through request_plane, not straight to the decode: the node, the document
             # revision and the pin all have to be re-checked, and a cursor that wandered
             # back onto a warm plane while this ran should serve inline
-            self.request_plane(*pending)
+            self.request_plane(*pending[:4], pull=bool(pending[4]) if len(pending) > 4
+                               else True)
 
     def prefetch(self, node_id, center, channels, *, span: int = 8,
                  pin: Optional[Pin] = None) -> None:
@@ -4368,7 +4414,8 @@ class EngineRunner(QObject):
         if len(self._overlay_ctxs) > HELD_VIEWS:
             for nid in [n for n in self._overlay_ctxs if n not in self._views]:
                 self._overlay_ctxs.pop(nid, None)
-        self.finished.emit(node_id, payload, plane, axes, dt)
+        self.finished.emit(node_id, payload, plane, axes, dt,
+                           _request_of(coords, channels) if plane else None)
         view = self._view_of(node_id)
         if coords is not None and view is not None and view.axes is not None:
             self.prefetch(node_id,

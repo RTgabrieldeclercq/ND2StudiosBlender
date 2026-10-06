@@ -980,6 +980,10 @@ class ViewerPanel(QWidget):
     #: source's index on screen)`` — "these frames go together". The window writes it into
     #: that Overlay's ``t_pins`` / ``z_pins`` — the viewer never touches the document.
     overlay_pin = Signal(str, str, int, int)
+    #: a mouse press on the image: the user is working in THIS viewer (V4.00 step 4). The
+    #: window makes it the active one — the surface takes no keyboard focus, so following
+    #: focus alone would never notice a click on the picture.
+    activated = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1301,6 +1305,10 @@ class ViewerPanel(QWidget):
         self._bit_depth: Optional[int] = None     # significant bit depth (metadata)
         self._clim_node: Optional[str] = None
         self._node_id: Optional[str] = None
+        #: what this viewer was ASKED to show, ``(page_id, node_id)`` — set by the window
+        #: (V4.00 step 4), which routes that node's results here. ``_node_id`` is what it
+        #: last DREW, which can lag: a result still landing for the node shown before.
+        self.binding: Optional[Tuple[str, str]] = None
         # hover readout: the window installs `raw_plane_cb` so the panel can put the
         # UNPROCESSED file value beside the viewed node's — the viewer owns no provider
         # and cannot reach the source itself (same division as `arm_pick`'s calibration).
@@ -1426,6 +1434,24 @@ class ViewerPanel(QWidget):
             self._install_pick_filter(True)
         if self._planes:
             self._display(self._node_id or "", self._planes, self._axes)
+
+    # ── binding (V4.00 step 4) ─────────────────────────────────────────────────
+    def bind(self, page_id: str, node_id: str) -> None:
+        """Remember that this viewer shows ``node_id`` of page ``page_id``. Only a
+        label for the window's routing: the pixels arrive on delivery, as before."""
+        self.binding = (str(page_id or ""), str(node_id))
+
+    def unbind(self) -> None:
+        self.binding = None
+
+    def shows(self, page_id: str, node_id: str) -> bool:
+        """Whether this viewer is bound to ``node_id`` of page ``page_id``."""
+        return self.binding == (str(page_id or ""), str(node_id))
+
+    def showing(self) -> Tuple[Optional[str], Any]:
+        """``(node id, Dataset)`` of the result on screen — what the spreadsheet takes
+        over when this viewer becomes the active one."""
+        return self._node_id, self._dataset
 
     # ── compact (mini-map) mode ────────────────────────────────────────────────
     def set_compact(self, on: bool, *, force: bool = False) -> None:
@@ -2064,14 +2090,18 @@ class ViewerPanel(QWidget):
     # ── result / error ─────────────────────────────────────────────────────────
     def show_result(self, node_id: str, planes, axes, seconds: float,
                     dataset=None, overlay=None, overlay_note: str = "",
-                    overlay_style=None, overlay_src=None) -> None:
+                    overlay_style=None, overlay_src=None, keep_image: bool = False) -> None:
         """Full-pull delivery: refresh dataset/axes/channels, then display. Contrast is
         (re)computed once for a new node/volume and cached across all subsequent frames.
 
         ``overlay`` is ``{channel index: label}`` for the composed planes a
         :mod:`view.overlay` node contributes above the payload's own channel count, and
         ``overlay_note`` the placement readout for the status line. Both empty for every
-        other node, which is why nothing else has to know overlays exist."""
+        other node, which is why nothing else has to know overlays exist.
+
+        ``keep_image`` (with no ``planes``): everything about the payload is taken, but the
+        frame on screen stays — the window passes it when this viewer already shows the
+        node and its own frame is on the way (V4.00 step 4), instead of a blank "no image"."""
         self._frame_landed()
         ovl = dict(overlay or {})
         if ovl != dict(getattr(self, "_overlay_chans", {}) or {}):
@@ -2120,6 +2150,10 @@ class ViewerPanel(QWidget):
                 for ck in [k for k in self._drange if k[0] == node_id]:
                     self._drange.pop(ck, None)
 
+        if not planes and keep_image and self._planes:
+            # the frame on screen stays: redrawn as it is under the new payload (which also
+            # puts back the status line a `show_running` replaced) until its own lands
+            planes = dict(self._planes)
         if not planes:
             self._planes = {}
             self._ref_plane = self._base_pix = None
@@ -2602,7 +2636,10 @@ class ViewerPanel(QWidget):
         if area.isEmpty() or length_w < 4.0:
             return None
         length_w = min(length_w, area.width() * 0.9)
-        margin, thick = 14.0, 4.0
+        # the inset shrinks with a small image (at most 5% of its width): a 90%-wide bar
+        # plus a fixed 14 px inset ran past the right edge of any image under 140 px wide —
+        # a tile of a split layout, a short Viewer dock (found by the GUI probe, V4.00 step 4)
+        margin, thick = min(14.0, area.width() * 0.05), 4.0
         corner = str(s.get("corner") or "bottom_right")
         x = area.left() + margin if "left" in corner else area.right() - margin - length_w
         top = corner.startswith("top")
@@ -3976,6 +4013,8 @@ class ViewerPanel(QWidget):
         part of aiming. Everything else about the press/drag/release is, so the underlying
         surface never pans or re-frames mid-gesture."""
         et = e.type()
+        if et == QEvent.MouseButtonPress:
+            self.activated.emit()          # working in THIS viewer (see `activated`)
         # The hover update runs FIRST and unconditionally: a pick consumes the move event
         # below, and reading the pixel you are aiming at is if anything more useful then.
         if et == QEvent.MouseMove:

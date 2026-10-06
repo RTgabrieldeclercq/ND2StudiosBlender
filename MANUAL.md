@@ -150,8 +150,8 @@ once per detected cell). A CUDA torch build is picked up automatically
 ## 2. The window
 
 NodeLab opens on a **blank canvas** with a welcome card: *Load image… / Browse nodes /
-Example graph*. The Viewer pane starts collapsed — the canvas owns the whole centre until
-your first pull returns an image, which unfolds the Viewer to a ~2.5:1 split.
+Example graph*. No Viewer is on screen yet — the canvas owns the whole centre until your
+first pull returns an image, which opens a Viewer above the canvas at a ~2.5:1 split.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -189,8 +189,8 @@ your first pull returns an image, which unfolds the Viewer to a ~2.5:1 split.
   and a *Copy all* button. This is where you look when a node goes red.
 * **Status bar** — a pulsing LED (idle / busy / error) plus the current node and timing.
 
-**Panels** (V4.00). Every side panel — Nodes, Properties, Spreadsheet, LabLink, Console,
-Movie Editor — has its own title bar: **⇱** pops it out into its own window (double-clicking
+**Panels** (V4.00). Every panel — the Viewers, Nodes, Properties, Spreadsheet, LabLink,
+Console, Movie Editor — has its own title bar: **⇱** pops it out into its own window (double-clicking
 the title does the same), **⇲** docks it back, **✕** closes it, and **View ▸ Panels** brings
 a closed one back where it was. Drag a panel by its title to another edge, or onto another
 panel's title to tab them together. The arrangement — what is where, what floats, what is
@@ -199,6 +199,17 @@ closed, and the window size — is remembered between sessions in
 has it. A layout file that is damaged, or was written by a newer version, is set aside as
 `layout.json.rejected` (the app opens on the default layout and writes a fresh one on quit);
 `NODELAB_LAYOUT=0` turns the memory off, and `NODELAB_LAYOUT_FILE` points it at another file.
+
+**Several Viewers** (V4.00). **+** on a Viewer's title bar, or **View ▸ New ▸ Viewer**, opens
+another Viewer beside it; pop one out onto a second screen with **⇱**. Each Viewer keeps
+showing the node it was given, and its title bar names it (`Viewer · n3 · Gaussian Blur`). The
+Viewer you last clicked in — its title bar carries the accent stripe — is the **active** one:
+a pull (double-click a card, `F5`), click-to-preview, and selecting a Viewer or plot card all
+show there, and parameter picking, troubleshooting mode (`F9`) and the Spreadsheet follow
+it. Selecting a **Viewer node** (or any other card that exists to be looked at) shows it in the
+active Viewer straight away, even with *Preview clicked node* off. Every Viewer closes with
+its **✕** — the last one too: the next pull opens a fresh one. Two Viewers can show the same
+node at different frames; each draws only the frames its own cursor asks for.
 
 Light theme: **View → Light theme**.
 
@@ -949,8 +960,9 @@ The cards simply leave `queued`/`running` and the slot moves on.
 
 The Viewer renders the pulled Dataset as a **multi-channel colour composite**. There is no
 title bar — the image fills the top; all controls sit in one strip beneath it, and the
-viewed node's name is folded into the status line at the bottom. Two results can be open at
-once, side by side — see [the compare pane](#two-results-side-by-side--the-compare-pane-v228).
+viewed node's name is folded into the status line at the bottom. Several Viewers can be open
+at once, each a panel of its own ([§2](#2-the-window)); two results side by side with one shared
+cursor is [Compare](#two-results-side-by-side--compare-v228).
 
 ### Navigation
 
@@ -1111,47 +1123,51 @@ Settings persist as JSON in three layers, later wins: built-in defaults → the 
 shipped in the package (meant to be committed) → this machine's file. Partial files merge,
 so a file written by an older build still loads.
 
-### Two results side by side — the compare pane (V2.28)
+### Two results side by side — Compare (V2.28)
 
 Right-click a card → **Compare beside viewed**, or select it and press `F8`, and its result
-opens in a **second Viewer pane** beside the one you are already looking at. The pane you
-were viewing stays on the left and keeps its result; the compared node goes on the right,
-with a header naming it. Drag the divider to change the split; `Shift+F8`, or the pane's
-`✕`, closes it.
+opens in a **Compare Viewer** docked beside the active Viewer. The Viewer you were looking
+at stays on the left and keeps its result; the compared node goes on the right, its title bar
+naming it and saying whether its cursor is linked. `F8` on another node re-targets the same
+Compare Viewer. Drag the divider between them to change the split; `Shift+F8`, or the Compare
+Viewer's **✕**, closes it. It is a Viewer like any other — pop it out onto a second screen.
 
 **The sliders link themselves from the metadata.** When both results span the same M/T/Z,
-there is only ever *one* cursor: the left pane's strips move **both** panes together, and
-the right pane's own cursor row disappears so there is nothing to get out of step. That is
+there is only ever *one* cursor: the left Viewer's strips move **both** Viewers together, and
+the Compare Viewer's own cursor row disappears so there is nothing to get out of step. That is
 the case you want for a before/after — a raw channel against its deconvolution, two
 thresholds of the same stack — where scrubbing has to compare the same frame.
 
-When the two results do **not** span the same axes, the right pane keeps its own strips and
-each pane scrubs independently. A Z-Project beside its input is the obvious example: one has
-five planes and the other has one, so a shared Z cursor would be meaningless. The link is
+When the two results do **not** span the same axes, the Compare Viewer keeps its own strips
+and each Viewer scrubs independently. A Z-Project beside its input is the obvious example: one
+has five planes and the other has one, so a shared Z cursor would be meaningless. The link is
 re-derived from the payloads' own axes after every pull, so it follows what the graph
-actually produces — change a node so the extents match and the panes link on the next pull.
+actually produces — change a node so the extents match and the Viewers link on the next pull.
 
-Each pane keeps its **own channels, contrast, LUT, zoom and overlays**, which is what makes
+Each Viewer keeps its **own channels, contrast, LUT, zoom and overlays**, which is what makes
 the comparison useful: you can hold two different windows on the same intensities, or show
-different channels of each. Both panes scrub on the same fast path as a single one — the
-runner now holds one display state per pane, so moving the linked cursor is a cache read for
-both, not a re-run of either.
+different channels of each. Both scrub on the same fast path as a single Viewer — the runner
+holds one display state per Viewer, so moving the linked cursor is a cache read for both, not
+a re-run of either.
 
-The compare pane is a **display surface only**. Parameter picking, troubleshooting mode
-(`F9`), the iteration strip, the spreadsheet and export all stay with the left pane, so the
-node you are tuning is never in doubt. Comparing a node whose file has not been ingested yet
-is refused with a note rather than starting a multi-minute ingest, and maximising the canvas
-(`Ctrl+Space`) closes the compare pane first — there is one mini-map, and it holds one panel.
+The left Viewer stays the **active** one: parameter picking, troubleshooting mode (`F9`), the
+Spreadsheet and export stay with it, so the node you are tuning is never in doubt. Comparing a
+node whose file has not been ingested yet is refused with a note rather than starting a
+multi-minute ingest. Maximising the canvas (`Ctrl+Space`) hides the Compare Viewer with the
+other docked Viewers; restoring brings it back, still linked. Deleting the compared node
+closes its Viewer — a Viewer still showing a node that is gone would be a lie.
 
 ### Maximised canvas + mini-map
 
-`Ctrl+Space` (or the `⛶` button, or **View → Maximize node canvas**) gives the whole centre
-to the graph and re-homes **the same Viewer** into a mini-map HUD pinned to the canvas's
-top-left corner — channels, LUT, playback and overlays all carry across. While maximised,
-**clicking any node previews it live** (debounced, so marquee-selecting a chain is one pull),
-and the previewed card wears an accent spine. Drag the mini-map header to move it (it
-re-anchors to the nearest corner), drag the bottom-right grip to resize, and double-click the
-header — or press its dock button, or `Esc` — to put the Viewer back at its old split size.
+`Ctrl+Space` (or the `⛶` button, or **View → Maximize node canvas**) hides the docked Viewers,
+so the graph gets the whole centre, and re-homes **the active Viewer itself** (not a copy) into
+a mini-map HUD pinned to the canvas's top-left corner — channels, LUT, playback and overlays
+all carry across. A Viewer you popped out into its own window stays where it is. While
+maximised, **clicking any node previews it live** (debounced, so marquee-selecting a chain is
+one pull), and the previewed card wears an accent spine. Drag the mini-map header to move it
+(it re-anchors to the nearest corner), drag the bottom-right grip to resize, and double-click
+the header — or press its dock button, or `Esc` — to put every Viewer back in its dock at its
+old size.
 
 ---
 
@@ -1474,8 +1490,8 @@ Two limits worth knowing before you reach for it on a long series:
   axially thin structure. Keep `nearest` when the number must come from one acquired plane.
 * **Play all** at n sub-ticks composes the overlay n times per primary frame, so a preload holds
   n× the overlay planes (counted in the fit check). It is capped at 16 sub-ticks per primary
-  frame; a source faster than that skips frames and the node card says so. The compare pane
-  mirrors the primary's frame but not its sub-tick.
+  frame; a source faster than that skips frames and the node card says so. A linked Compare
+  Viewer mirrors the left Viewer's frame but not its sub-tick.
 * A pin made on a file with **no frame clock** (T) or **no focus log** (Z) is stored by index
   alone, and re-points at different frames if an upstream crop re-numbers them; the Viewer says
   "by index" when it writes one.
@@ -2167,8 +2183,8 @@ print(report.summary(), report.removed, report.added)
 | `Ctrl+A` | Select all nodes |
 | `F5` | Pull selected node |
 | `Shift+F5` | Pull viewed node again |
-| `F8` | **Compare selected beside viewed** — a second Viewer pane; one cursor when the M/T/Z match |
-| `Shift+F8` | Close the compare pane |
+| `F8` | **Compare selected beside viewed** — a Compare Viewer docked beside the active one; one cursor when the M/T/Z match |
+| `Shift+F8` | Close the Compare Viewer |
 | `F6` | **Bake selected dock** — freeze everything above a Dock Data node to disk |
 | `F9` | **Troubleshoot: picked frames only** — scope every pull to the picked M/T/Z boxes (or the viewed frame); drag the amber box on the Viewer to scope it to a region of the frame too |
 | `Ctrl+R` | **Reload node code** — run the node/kernel files as they are on disk now, without restarting |

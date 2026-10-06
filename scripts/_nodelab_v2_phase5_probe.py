@@ -2072,14 +2072,22 @@ def main(argv) -> int:
         "and a console the user closed keeps recording without re-opening itself")
 
     # E9: maximized canvas + mini-map Viewer + click-to-preview ────────────────
-    docked_sizes = win._center.sizes()
-    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
+    # (V4.00 step 4: the Viewer is a dock above the canvas; maximizing hides the docked
+    # viewers and re-homes the ACTIVE one into the mini-map)
+    from PySide6.QtCore import Qt as _QtE9
+    _vd0 = win._viewer_dock(win.viewer)
+    assert _vd0 is not None and _vd0.objectName().startswith("viewer:")
+    assert not _vd0.isHidden() and win.dockWidgetArea(_vd0) == _QtE9.TopDockWidgetArea
+    assert win.centralWidget() is win.view, "the canvas is the centre; viewers are docks"
+    docked_h = _vd0.height()
     win.set_maximized(True)
     for _ in range(3):
-        app.processEvents()                            # splitter re-layout + reposition
-    # the SAME viewer widget moved into the overlay (not a copy) and left the splitter
+        app.processEvents()                            # dock re-layout + reposition
+    # the SAME viewer widget moved into the overlay (not a copy) and left its dock
     assert win.viewer.parent() is win.minimap and win.minimap.content is win.viewer
-    assert win._center.count() == 1 and win._center.widget(0) is win.view
+    assert _vd0.isHidden() and _vd0.widget() is None
+    assert not _vd0.toggleViewAction().isEnabled(), \
+        "View ▸ Panels must not open the mini-map viewer's dock as an empty panel"
     assert win.minimap.isVisible() and win.minimap.parent() is win.view
     assert win.view.is_maximized() and win._max_act.isChecked()
     # pinned to the canvas' TOP-LEFT corner, inside it
@@ -2142,21 +2150,25 @@ def main(argv) -> int:
     assert win.minimap.geometry().topLeft().x() == 24  # top-left anchor survives resize
     assert (win.minimap.width(), win.minimap.height()) == (300, 240)
     win.set_maximized(False)
-    app.processEvents()
-    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
+    for _ in range(3):
+        app.processEvents()
+    assert _vd0.widget() is win.viewer and not _vd0.isHidden()
+    assert _vd0.toggleViewAction().isEnabled()
     assert win.viewer.isVisible() and not win.minimap.isVisible()
     assert not win.viewer.compact
     assert all(h.isVisible() for h in win.viewer._hists.values())
     assert win.viewer._ovl_btn.text() == "◈ Overlays"
     assert not win.view.is_maximized() and not win._max_act.isChecked()
-    assert win._center.sizes() == docked_sizes, (win._center.sizes(), docked_sizes)
-    _ok("Restore: Viewer docks back at its old split size, full controls returned")
+    assert _vd0.height() == docked_h, (_vd0.height(), docked_h)
+    _ok("Restore: the Viewer goes back into its dock at its old height, full controls "
+        "returned")
 
-    # ── V2.28: the side-by-side compare pane ──────────────────────────────────
+    # ── V2.28 → V4.00 step 4: Compare — a second Viewer DOCK beside the active one ──
     #
-    # A second ViewerPanel opens beside the primary in a horizontal splitter. When both
-    # results span the same M/T/Z the panes share ONE cursor — the primary's strips move
-    # both and the compare pane drops its own row; different extents give it its own.
+    # Compare opens (or re-targets) the active viewer's Compare viewer: a dock split beside
+    # it. When both results span the same M/T/Z the two share ONE cursor — the leader's
+    # strips move both and the Compare viewer drops its own row; different extents give it
+    # its own.
     done_cmp: list = []
     win.runner.finished.connect(lambda nid, *a: done_cmp.append(nid))
 
@@ -2167,31 +2179,36 @@ def main(argv) -> int:
             time.sleep(0.01)
         assert _rq(nid) in done_cmp, f"{nid} never finished (got {done_cmp})"
 
-    win.pull_node("n3")                     # primary: the 3D gaussian (z=5)
+    win.pull_node("n3")                     # leader: the 3D gaussian (z=5)
     _wait_pull("n3")
     done_cmp.clear()
+    _lead = win.viewer
+    _ld = win._viewer_dock(_lead)
     win.open_compare("n4")                  # same source chain → same M/T/Z → LINKED
     _wait_pull("n4")
     for _ in range(3):
         app.processEvents()
     assert win._viewed == "n3" and win._viewed2 == "n4"
-    # structure: the centre's top slot is the horizontal split, primary pane FIRST
-    assert win._center.widget(0) is win._viewer_split
-    assert win._viewer_split.count() == 2
-    assert win._viewer_split.widget(0) is win.viewer
-    assert win._viewer_split.widget(1) is win._compare_box
-    assert win.viewer2.has_image(), "the compare pane must show n4's pixels"
+    assert win.viewer is _lead, "the leader stays the active viewer"
+    assert len(win.shell.docks_of("viewer")) == 2
+    assert win.viewer2 is not None and win.viewer2 is not _lead
+    _cd = win._viewer_dock(win.viewer2)
+    assert not _cd.isHidden() and not _cd.isFloating()
+    assert win.dockWidgetArea(_cd) == win.dockWidgetArea(_ld)
+    assert _cd.geometry().left() > _ld.geometry().left(), "leader left, Compare right"
+    assert win._links[win.viewer2] is _lead
+    assert win.viewer2.has_image(), "the Compare viewer must show n4's pixels"
     assert "n4" in win.viewer2._status.text()
-    assert "pulled in" in win.viewer._status.text()    # the primary KEPT its result
-    # metadata match (same M/T/Z) → linked: one cursor, the compare pane's row is gone
-    assert win._compare_linked is True
+    assert "pulled in" in win.viewer._status.text()    # the leader KEPT its result
+    # metadata match (same M/T/Z) → linked: one cursor, the Compare viewer's row is gone
+    assert win.viewer2 in win._linked
     assert not win.viewer2._axes_box.isVisible()
-    assert "linked" in win._compare_box._title.text()
-    _ok("Compare (V2.28): a second Viewer pane opens beside the first (primary left, "
-        "compare right), shows its own node's result, and LINKS to one cursor when the "
-        "two results' M/T/Z extents match")
+    assert "linked" in _cd.title_bar.title_text() and "n4" in _cd.title_bar.title_text()
+    _ok("Compare (V2.28 → V4.00): a second Viewer DOCK opens beside the active one (leader "
+        "left, Compare right), shows its own node's result, and LINKS to one cursor when "
+        "the two results' M/T/Z extents match; its title bar names the node and the link")
 
-    # the one cursor: the primary's strip moves the compare pane's silently and fetches
+    # the one cursor: the leader's strip moves the Compare viewer's silently and fetches
     # its plane off the decode lane — no bounce, and no re-pull of either node
     npull = len(pulled)
     win.viewer._sliders["z"].setValue(3)
@@ -2203,7 +2220,7 @@ def main(argv) -> int:
         app.processEvents()
         time.sleep(0.005)
     assert len(pulled) == npull, "a linked scrub must not re-pull either node"
-    _ok("Compare: the primary's strips move BOTH panes; scrubbing linked panes stays "
+    _ok("Compare: the leader's strips move BOTH viewers; scrubbing linked viewers stays "
         "on the coords-only fast path (no pull slot, both nodes' views held at once)")
 
     # DIFFERENT metadata unlinks: a Z-Project (z 5 → 1) gets its own cursor row back
@@ -2215,45 +2232,52 @@ def main(argv) -> int:
     for _ in range(3):
         app.processEvents()
     assert win._viewed2 == zp.id
-    assert win._compare_linked is False
-    assert win.viewer2._axes_box.isVisible(), "different M/T/Z → the pane's own sliders"
-    assert "own cursor" in win._compare_box._title.text()
-    _ok("Compare: a result with different M/T/Z (Z-Project, z 5→1) keeps its own "
-        "sliders — the link is re-derived from the payloads' own axes on every delivery")
+    assert len(win.shell.docks_of("viewer")) == 2, "re-targeted, not a third viewer"
+    assert win.viewer2 not in win._linked
+    assert win.viewer2._axes_box.isVisible(), "different M/T/Z → the viewer's own sliders"
+    assert "own cursor" in win._viewer_dock(win.viewer2).title_bar.title_text()
+    _ok("Compare: a result with different M/T/Z (Z-Project, z 5→1) re-targets the same "
+        "Compare viewer and gives it its own sliders — the link is re-derived from the "
+        "payloads' own axes on every delivery")
 
-    # close: one pane again, the centre exactly as it was
+    # close: one viewer again
     win.close_compare()
     app.processEvents()
-    assert win._viewed2 is None
-    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
-    assert win._viewer_split.parent() is None
-    # reopen: the primary must come back at index 0 (the box is still in the splitter
-    # from last time — a plain addWidget would flip the panes)
+    assert win._viewed2 is None and win.viewer2 is None and not win._links
+    assert [d.objectName() for d in win.shell.docks_of("viewer")] == [_ld.objectName()]
+    # reopen: beside the leader again
+    done_cmp.clear()
     win.open_compare("n4")
-    app.processEvents()
-    assert win._viewer_split.widget(0) is win.viewer
-    assert win._viewer_split.widget(1) is win._compare_box
-    # …and maximizing with a compare open closes it first (one HUD frame, one panel)
+    _wait_pull("n4")
+    for _ in range(3):
+        app.processEvents()
+    assert win._links.get(win.viewer2) is _lead and win.viewer2 in win._linked
+    # …maximizing hides the Compare viewer with the other docked viewers, and the restore
+    # brings both back, still linked
     win.set_maximized(True)
     for _ in range(3):
         app.processEvents()
-    assert win._viewed2 is None and win._center.widget(0) is win.view
+    assert win._viewer_dock(win.viewer2).isHidden() and win.minimap.content is _lead
     win.set_maximized(False)
-    app.processEvents()
-    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
-    # DELETING the compared node closes the pane: a pane still showing the result of a node
-    # that is no longer on the canvas is a lie, and it is the one the user cannot detect
+    for _ in range(3):
+        app.processEvents()
+    assert not win._viewer_dock(win.viewer2).isHidden() and win._viewed2 == "n4"
+    assert win.viewer2 in win._linked and _ld.widget() is _lead
+    # DELETING the compared node closes its viewer: one still showing the result of a node
+    # that is no longer on the canvas is a lie, and the one the user cannot detect
     done_cmp.clear()
     win.open_compare(zp.id)
     _wait_pull(zp.id)                       # settle first: deleting mid-pull is a
     assert win._viewed2 == zp.id            # different test, and not this one
     doc.remove_node(zp.id)                  # also leaves the demo graph as the next
     app.processEvents()                     # sections (and the screenshots) expect it
-    assert win._viewed2 is None, "deleting the compared node must close its pane"
-    assert win._center.count() == 2 and win._center.widget(0) is win.viewer
-    _ok("Compare: close restores the single-pane centre; reopen keeps primary-left; "
-        "maximize closes the compare pane first; deleting the compared node closes its "
-        "pane rather than leaving a result with no node; no dangling split")
+    assert win._viewed2 is None and not win._links, \
+        "deleting the compared node must close its viewer"
+    assert len(win.shell.docks_of("viewer")) == 1
+    _ok("Compare: close leaves one viewer; reopen sits beside the leader again; maximize "
+        "hides the Compare viewer with the docks and the restore brings it back linked; "
+        "deleting the compared node closes its viewer rather than leaving a result with no "
+        "node")
 
     # ── G10 + screenshots (dark + light + maximized) ─────────────────────────
     app.processEvents()
@@ -5377,9 +5401,9 @@ def main(argv) -> int:
     # real runner, re-request the viewed node (which overlays nothing) and have the window
     # hand the strip an empty readout mid-assertion. The window half (pin -> params) is
     # driven directly below.
-    vw.request_changed.disconnect(win._on_view_request)
-    vw.overlay_step.disconnect(win._on_overlay_step)
-    vw.overlay_pin.disconnect(win._on_overlay_pin)
+    _o11_sigs = ("request_changed", "overlay_step", "overlay_pin")
+    for _sig in _o11_sigs:            # the window's own slots on THIS viewer (V4.00 step 4)
+        getattr(vw, _sig).disconnect(win._viewer_slot(vw, _sig))
     vw._sliders["t"].blockSignals(True)
     vw._sliders["t"].setRange(0, 2)
     vw._sliders["t"].setValue(0)
@@ -5433,9 +5457,8 @@ def main(argv) -> int:
     vw._interval_ms("t")
     assert vw._sub_step == 8, vw._sub_step            # 480 ticks/s -> 8 per 60 Hz tick
     vw.set_overlay_frames(rows, 3)
-    vw.request_changed.connect(win._on_view_request)
-    vw.overlay_step.connect(win._on_overlay_step)
-    vw.overlay_pin.connect(win._on_overlay_pin)
+    for _sig in _o11_sigs:
+        getattr(vw, _sig).connect(win._viewer_slot(vw, _sig))
 
     # the window writes a pin as canonical JSON, pinned, through the edit path
     ovl = doc.add_node("view.overlay", x=1400, y=900)
@@ -5766,6 +5789,274 @@ def main(argv) -> int:
 
     _probe_movie_editor(win, app)
 
+    # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
+    from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
+    from PySide6.QtGui import QMouseEvent as _QME
+    from nodelab_v2.ops import is_visual_output as _isvis
+    from nodelab_v2.picker import request_for as _vrfor
+    win.set_solo_frame(False)
+    win._follow_act.setChecked(False)
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    doc = win.doc
+    _vv = doc.add_node("view.viewer", x=806, y=250)          # a light visual card, on n3
+    doc.connect("n3", "out", _vv.id, "data")
+    win.scene.sync()
+    _vw_done: list = []
+    win.runner.finished.connect(lambda nid, *a: _vw_done.append(nid))
+
+    def _vw_wait(nid, timeout=180):
+        rid = _rq(nid)
+        t0 = time.time()
+        while rid not in _vw_done and time.time() - t0 < timeout:
+            app.processEvents()
+            time.sleep(0.005)
+        assert rid in _vw_done, (nid, _vw_done)
+        for _ in range(3):
+            app.processEvents()
+
+    # VW1 a second viewer from View ▸ New: its own dock beside the first, empty and ACTIVE;
+    # a pull goes to the active viewer and binds it; the first keeps its own result
+    _va = win.viewer
+    _vw_done.clear()
+    win.pull_node("n3")
+    _vw_wait("n3")
+    _da = win._viewer_dock(_va)
+    win._new_menu.aboutToShow.emit()
+    _nact = [a for a in win._new_menu.actions() if a.text().endswith("Viewer")]
+    assert _nact, [a.text() for a in win._new_menu.actions()]
+    _nact[0].trigger()
+    app.processEvents()
+    _vb = win.viewer
+    _db = win._viewer_dock(_vb)
+    assert _vb is not _va and _db.objectName() != _da.objectName()
+    assert not _db.isHidden() and _db.title_bar.is_active() and not _da.title_bar.is_active()
+    assert not _vb.has_image() and _vb.binding is None
+    _vw_done.clear()
+    win.pull_node("n4")
+    _vw_wait("n4")
+    assert _vb.binding[1] == "n4" and _vb.has_image() and "n4" in _db.title_bar.title_text()
+    assert _va.binding[1] == "n3" and "n3" in _da.title_bar.title_text()
+    assert _va.showing()[0] == "n3", "the other viewer keeps its own result"
+    assert win.scene.viewed_id == "n4", "the canvas marks the ACTIVE viewer's card"
+    _ok("VW1 View ▸ New ▸ Viewer opens another Viewer dock beside the first, active and "
+        "empty; a pull lands in the ACTIVE viewer and binds it (its title names the node); "
+        "the first keeps its own result")
+
+    # VW2 selecting a VISUAL card (a Viewer node) shows it in the active viewer even with
+    # click-to-preview off; selecting an ordinary card does not
+    assert _isvis("view.viewer") and _isvis("plot.xy") and not _isvis("enhance.gaussian")
+    win._activate_viewer(_va)
+    _vw_done.clear()
+    win.scene.clearSelection()
+    win.scene.node_items["n5"].setSelected(True)      # an ordinary card: nothing pulls
+    for _ in range(5):
+        app.processEvents()
+    time.sleep(0.25)
+    app.processEvents()
+    assert _va.binding[1] == "n3" and not _vw_done, (_va.binding, _vw_done)
+    win.scene.clearSelection()
+    win.scene.node_items[_vv.id].setSelected(True)
+    _vw_wait(_vv.id)
+    assert _va.binding[1] == _vv.id and _va.showing()[0] == _vv.id, _va.binding
+    assert _vb.binding[1] == "n4", "only the ACTIVE viewer follows the click"
+    assert win.scene.viewed_id == _vv.id
+    _ok("VW2 selecting a Viewer node shows it in the active viewer at once (click-to-preview "
+        "off); selecting an ordinary node does not; the other viewer is left alone")
+
+    # VW2b …so F8 on that card compares it beside what the viewer showed BEFORE the click,
+    # not beside itself
+    _vw_done.clear()
+    win.pull_node("n3", viewer=_va)
+    _vw_wait("n3")
+    win.scene.clearSelection()
+    _vw_done.clear()
+    win.scene.node_items[_vv.id].setSelected(True)    # previews it into the active viewer
+    _vw_wait(_vv.id)
+    assert _va.binding[1] == _vv.id
+    _vw_done.clear()
+    win.compare_selected()                            # F8
+    _vw_wait("n3")
+    _vw_wait(_vv.id)
+    assert _va.binding[1] == "n3", _va.binding
+    assert win.viewer2 is not None and win.viewer2.binding[1] == _vv.id
+    win.close_compare()
+    app.processEvents()
+    assert len(win.shell.docks_of("viewer")) == 2
+    _ok("VW2b F8 on a card that selecting it just previewed compares it beside what the "
+        "viewer showed before the click")
+
+    # VW3 a press on a viewer's IMAGE makes it the active one: the canvas marks its card,
+    # the spreadsheet shows its result, and a pick arms on IT
+    _surf = _vb._pick_targets()[-1]
+    QApplication.sendEvent(_surf, _QME(_QEv.MouseButtonPress, _QPF(12, 12), _QPF(12, 12),
+                                       _QtV.LeftButton, _QtV.LeftButton, _QtV.NoModifier))
+    QApplication.sendEvent(_surf, _QME(_QEv.MouseButtonRelease, _QPF(12, 12), _QPF(12, 12),
+                                       _QtV.LeftButton, _QtV.NoButton, _QtV.NoModifier))
+    app.processEvents()
+    assert win.viewer is _vb and _db.title_bar.is_active() and not _da.title_bar.is_active()
+    assert win.scene.viewed_id == "n4"
+    assert win.sheet.node_id == "n4" and win.sheet.dataset is _vb.showing()[1]
+    doc.add_node("enhance.normalize", node_id="VWN", x=1200, y=660)
+    win.scene.sync()
+    _vn = doc.nodes["VWN"].spec()
+    win._arm_pick(_vrfor("VWN", _vn.input("low_pct"), _vn.input("high_pct")))
+    assert _vb.picking() and not _va.picking(), "a pick arms on the ACTIVE viewer"
+    _vb.cancel_pick()
+    app.processEvents()
+    # a press on a title bar does the same (it is how a floating viewer is picked up)
+    _da.title_bar.mousePressEvent(_QME(_QEv.MouseButtonPress, _QPF(5, 5), _QPF(5, 5),
+                                       _QtV.LeftButton, _QtV.LeftButton, _QtV.NoModifier))
+    assert win.viewer is _va and win.scene.viewed_id == _va.binding[1]
+    _ok("VW3 a press on a viewer's image or title bar makes it the active viewer: the "
+        "canvas marks its card, the spreadsheet shows its result, a pick arms on it")
+
+    # VW4 two viewers on ONE node at different cursors: each draws only its own frames
+    _vw_done.clear()
+    win.pull_node("n3", viewer=_va)
+    _vw_wait("n3")
+    _vw_done.clear()
+    win.pull_node("n3", viewer=_vb)
+    _vw_wait("n3")
+    assert _va.binding == _vb.binding and _va._axes is not None and _va._axes.z >= 3
+
+    def _vw_plane(v):
+        return {c: np.array(a, copy=True) for c, a in (v._planes or {}).items()}
+
+    def _vw_scrub(v, z):
+        before = _vw_plane(v)
+        v._sliders["z"].setValue(z)
+        t0 = time.time()
+        while time.time() - t0 < 60:
+            app.processEvents()
+            now = v._planes or {}
+            if now and any(not np.array_equal(now[c], before.get(c)) for c in now):
+                break
+            time.sleep(0.005)
+        for _ in range(3):
+            app.processEvents()
+
+    _vw_scrub(_va, 0)
+    _vw_scrub(_vb, _vb._axes.z - 1)
+    _pa, _pb = _vw_plane(_va), _vw_plane(_vb)
+    assert _va._sliders["z"].value() == 0 and _vb._sliders["z"].value() == _vb._axes.z - 1
+    assert any(not np.array_equal(_pa[c], _pb[c]) for c in _pa if c in _pb), \
+        "the two viewers must show different planes"
+    _vw_scrub(_vb, 1)
+    assert all(np.array_equal(_va._planes[c], _pa[c]) for c in _pa), \
+        "another viewer's frame of the same node must not land here"
+    # a result RE-SERVED without planes (the runner busy elsewhere: they follow on the
+    # decode lane) leaves the viewers already showing the node with their frames
+    _pay = win.runner.finished_result("n3")
+    assert _pay is not None
+    win._on_run_finished(_rq("n3"), _pay, None, _va._axes, 0.0, None)
+    for _ in range(5):
+        app.processEvents()
+    assert _va.has_image() and _vb.has_image(), "a re-served result must not blank them"
+    assert "no image" not in _va._status.text() and "no image" not in _vb._status.text(), \
+        (_va._status.text(), _vb._status.text())
+    # under the troubleshooting scope (F9) another T is another PULL: two viewers of one
+    # node at different T must not pull each other's frame back and forth
+    assert _vb._sliders["t"].maximum() > 0, "the demo needs T > 1 for this check"
+    _vb.set_cursor(t=1)
+    win._on_view_request(viewer=_vb)
+    t0 = time.time()
+    while time.time() - t0 < 1.0:
+        app.processEvents()
+        time.sleep(0.01)
+    _vw_starts: list = []
+    win.runner.started.connect(lambda nid: _vw_starts.append(nid))
+    win.set_solo_frame(True)
+    t0 = time.time()
+    while time.time() - t0 < 4.0:
+        app.processEvents()
+        time.sleep(0.01)
+    assert len(_vw_starts) <= 2, f"a pull loop under F9: {len(_vw_starts)} pulls in 4 s"
+    assert _va.has_image() and _vb.has_image()
+    win.set_solo_frame(False)
+    t0 = time.time()
+    while win.runner.busy and time.time() - t0 < 60:
+        app.processEvents()
+        time.sleep(0.01)
+    _ok("VW4 two viewers bound to the same node at different z: each frame lands only in "
+        "the viewer whose cursor asked for it; a result re-served without planes leaves "
+        "both frames up; under F9, viewers of one node at different T do not pull each "
+        "other's frame back and forth")
+
+    # VW5 every viewer can be closed; the next pull opens a fresh one, on screen
+    for _d in list(win.shell.docks_of("viewer")):
+        _d.close()
+    app.processEvents()
+    assert not win.shell.docks_of("viewer") and win._active_viewer() is None
+    assert win._viewed is None and not win._asker
+    _vw_done.clear()
+    win.pull_node("n3")
+    _vw_wait("n3")
+    _vds = win.shell.docks_of("viewer")
+    assert len(_vds) == 1 and _vds[0].objectName() == "viewer:0", \
+        [d.objectName() for d in _vds]
+    assert not _vds[0].isHidden() and _vds[0].panel.has_image()
+    _ok("VW5 the last viewer can be closed; the next pull opens a fresh viewer:0 on screen "
+        "and shows the result in it")
+
+    # VW6 a viewer pops out into its own window, keeps receiving, and docks back with its
+    # picture (the CPU surface offscreen; the GL context rebuild has its own desktop probe)
+    _vd = _vds[0]
+    _vd.title_bar.float_btn.click()
+    app.processEvents()
+    assert _vd.isFloating() and _vd.panel.has_image()
+    _vw_done.clear()
+    win.pull_node("n4")
+    _vw_wait("n4")
+    assert _vd.panel.showing()[0] == "n4" and _vd.isFloating()
+    _vd.title_bar.float_btn.click()
+    app.processEvents()
+    assert not _vd.isFloating() and _vd.panel.has_image()
+    _ok("VW6 a viewer pops out into its own window, keeps receiving results there, and "
+        "docks back with its picture")
+
+    # VW7 quitting while the canvas is maximized saves the DOCKED layout: the viewer comes
+    # back on screen at a real height, not as the mini-map left its dock (hidden, empty)
+    from nodelab_v2 import layout_store as _VLS
+    from nodelab_v2.window import MainWindow as _VMW
+    _vlay = os.path.join(tempfile.mkdtemp(prefix="nd2layout_vw_"), "layout.json")
+    _venv = os.environ.get(_VLS.ENV_FILE)
+    os.environ[_VLS.ENV_FILE] = _vlay
+    try:
+        _wq = _VMW(persist_layout=True)
+        _wq.resize(1200, 760)
+        _wq.show()
+        _wq.build_demo()
+        _qd: list = []
+        _wq.runner.finished.connect(lambda nid, *a: _qd.append(nid))
+        _wq.pull_node("n3")
+        t0 = time.time()
+        while _wq.runner.run_id("n3") not in _qd and time.time() - t0 < 120:
+            app.processEvents()
+            time.sleep(0.01)
+        for _ in range(3):
+            app.processEvents()
+        assert not _wq.shell.docks["viewer:0"].isHidden()
+        _wq.set_maximized(True)
+        app.processEvents()
+        _wq.close()
+        app.processEvents()
+        _wr = _VMW(persist_layout=True)
+        _wr.show()
+        app.processEvents()
+        _rd = _wr.shell.docks["viewer:0"]
+        assert not _rd.isHidden() and _rd.height() > 100, (_rd.isHidden(), _rd.height())
+        _wr.close()
+        app.processEvents()
+    finally:
+        if _venv is None:
+            os.environ.pop(_VLS.ENV_FILE, None)
+        else:
+            os.environ[_VLS.ENV_FILE] = _venv
+    _ok("VW7 quitting with the canvas maximized saves the docked layout: the viewer comes "
+        "back on screen at its height")
+
     # ── SH1–SH4: the dock shell (V4.00 step 3) ─────────────────────────────────────────
     from PySide6.QtCore import Qt as _Qt
     from PySide6.QtWidgets import QDockWidget as _QDW, QLabel as _SHL
@@ -5773,8 +6064,10 @@ def main(argv) -> int:
     from nodelab_v2 import theme as _TH
     from nodelab_v2.shell import DOCK_GLYPH as _DOCKG, PanelDock as _PD, PanelSpec as _PS
     _sh = win.shell
-    assert list(_sh.docks) == ["palette:0", "inspector:0", "sheet:0", "lablink:0",
-                               "console:0", "movie:0"], list(_sh.docks)
+    assert [n for n in _sh.docks if not n.startswith("viewer:")] == [
+        "palette:0", "inspector:0", "sheet:0", "lablink:0", "console:0", "movie:0"], \
+        list(_sh.docks)
+    assert _sh.docks_of("viewer"), "the Viewers are shell docks too (V4.00 step 4)"
     _want = (_QDW.DockWidgetMovable | _QDW.DockWidgetFloatable | _QDW.DockWidgetClosable)
     for _d in _sh.docks.values():
         assert isinstance(_d, _PD) and _d.titleBarWidget() is _d.title_bar, _d.objectName()
@@ -5787,10 +6080,10 @@ def main(argv) -> int:
     assert win._console_dock is _sh.docks["console:0"]
     win._panels_menu.aboutToShow.emit()
     _pacts = win._panels_menu.actions()
-    assert [a.text() for a in _pacts[:4]] == ["Nodes", "Properties", "Spreadsheet", "LabLink"], \
-        [a.text() for a in _pacts]
+    assert [a.text() for a in _pacts if not a.text().startswith("Viewer")][:4] == [
+        "Nodes", "Properties", "Spreadsheet", "LabLink"], [a.text() for a in _pacts]
     assert win._console_act in _pacts, "the Console entry is the Ctrl+` action itself"
-    assert not win._new_menu.menuAction().isVisible(), "no multi-instance panel kind yet"
+    assert win._new_menu.menuAction().isVisible(), "View ▸ New lists the Viewer kind"
     # pop out and dock back from the title bar
     _sd = _sh.docks["sheet:0"]
     _sd.title_bar.float_btn.click()
@@ -5927,6 +6220,8 @@ def main(argv) -> int:
         _s2.docks["sheet:0"].setFloating(True)
         _s2.docks["console:0"].show()
         _s2.docks["lablink:0"].close()
+        # a second Viewer, floating (V4.00 step 4): a multi-instance panel comes back too
+        _s2.spawn("viewer").setFloating(True)
         app.processEvents()
         _saved_wh = (_w2.width(), _w2.height())
         _w2.close()
@@ -5941,6 +6236,8 @@ def main(argv) -> int:
         assert _s3.docks["sheet:0"].isFloating(), "a floating panel comes back floating"
         assert not _s3.docks["console:0"].isHidden(), "a shown panel comes back shown"
         assert _s3.docks["lablink:0"].isHidden(), "a closed panel stays closed"
+        assert "viewer:1" in _s3.docks and _s3.docks["viewer:1"].isFloating(), \
+            "a second, floating Viewer comes back as it was"
         assert _saved_wh[1] != _minh.height(), "the saved height is what a fresh window gets"
         assert _w3.height() == _saved_wh[1], (_w3.height(), _saved_wh, _avail)
         if _saved_wh[0] < _avail.width() - 2:
@@ -5950,6 +6247,7 @@ def main(argv) -> int:
         app.processEvents()
         assert not _s3.docks["sheet:0"].isFloating() and _s3.docks["console:0"].isHidden()
         assert not _s3.docks["lablink:0"].isHidden() and _s3.docks["movie:0"].isHidden()
+        assert not _s3.docks["viewer:1"].isFloating() and _s3.docks["viewer:1"].isHidden()
         assert _w3.dockWidgetArea(_s3.docks["palette:0"]) == _Qt.LeftDockWidgetArea
         assert _w3.tabifiedDockWidgets(_s3.docks["inspector:0"]), "Properties tabs are back"
         _w3.close()
@@ -5975,8 +6273,9 @@ def main(argv) -> int:
             else:
                 os.environ[_k] = _v
     assert not win._persist_layout, "the probe's own window runs with NODELAB_LAYOUT=0"
-    _ok("SH3 layout memory: a floating, a shown and a closed panel, and the window size, "
-        "come back after a restart; View ▸ Reset layout docks everything back with the "
+    _ok("SH3 layout memory: a floating, a shown and a closed panel, a second floating "
+        "Viewer, and the window size come back after a restart; View ▸ Reset layout docks "
+        "everything back with the "
         "default tabs and hidden panels; SH4 a damaged layout file opens on the default "
         "layout, is kept aside as layout.json.rejected and replaced on close; the probe's own "
         "window never reads or writes one")

@@ -1349,6 +1349,7 @@
 {"dst":"nodegraph.registry","k":"imp","lazy":true,"src":"scripts._node_synopsis"}
 {"dst":"nodegraph.selftest","k":"imp","lazy":true,"src":"scripts._node_synopsis"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"scripts._node_synopsis"}
+{"dst":"nodelab_v2.window","k":"imp","lazy":true,"src":"scripts._nodelab_v2_gl_float_probe"}
 {"dst":"nodegraph","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.catalog._shared","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

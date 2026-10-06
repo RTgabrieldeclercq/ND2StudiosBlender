@@ -24900,6 +24900,82 @@ def test_layout_store() -> None:
         "unrestorable records refused when made")
 
 
+def test_viewer_routing() -> None:
+    """V4.00 step 4: several viewers can show ONE node at different cursors, so every plane
+    delivery says which request it answers, and the window's rule — a frame goes only to
+    the viewers whose cursor and channel set asked for exactly it — is a Qt-free predicate
+    pinned here (the GUI probe's VW4 drives it through two real viewers). Also the
+    visual-output test that makes a click on a Viewer or plot card show it."""
+    from types import SimpleNamespace
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.runner import EngineRunner, _request_of, request_answers
+
+    # the request a delivery carries: plain sorted tuples; unreadable input makes no claim
+    assert _request_of((0, 4, 2, 1), (2, 0)) == ((0, 4, 2, 1), (0, 2))
+    assert _request_of(None, None) == (None, None)
+    assert _request_of(("x",), (0,)) is None
+    # …and which viewer it answers: same M/T/Z cursor, same channel set
+    req = ((0, 4, 2, 1), (0, 2))
+    assert request_answers(req, (0, 4, 2, 0), (2, 0)), "the cursor's own c is not part of it"
+    assert not request_answers(req, (0, 5, 2, 0), (0, 2)), "another T is another frame"
+    assert not request_answers(req, (1, 4, 2, 0), (0, 2)), "another M is another frame"
+    assert not request_answers(req, (0, 4, 2, 0), (0,)), "another channel set"
+    assert request_answers(None, (9, 9, 9, 9), (7,)), "no request answers every viewer"
+    assert request_answers(((0, 4, 2, 1), None), (0, 4, 2, 0), (5,))
+    assert request_answers((None, (0, 2)), (3, 3, 3, 0), (2, 0))
+
+    # the runner's two plane paths emit the request their planes answer
+    class _Sig:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def emit(self, *a) -> None:
+            self.calls.append(a)
+
+    view = SimpleNamespace(axes="AX", pin=None, provider=None, dtype=None)
+    warm = SimpleNamespace(
+        _view_of=lambda nid: view, _cached_planes=lambda *a, **k: {0: "P0", 2: "P2"},
+        plane_ready=_Sig(), prefetch=lambda *a, **k: None,
+        _clamp_coords=lambda c, ax: c, _payload_coords=lambda c, pin: c)
+    EngineRunner._serve_from_cache(warm, "pg1/n3", (0, 4, 2, 1), (2, 0))
+    (nid, _planes, axes, _dt, rq), = warm.plane_ready.calls
+    assert (nid, axes, rq) == ("pg1/n3", "AX", ((0, 4, 2, 1), (0, 2))), warm.plane_ready.calls
+    cold = SimpleNamespace(
+        _decode_busy=True, _decode_pending=None, _decode_gen=3, _epoch=7,
+        failed=_Sig(), _progress=_Sig(), plane_ready=_Sig(),
+        prefetch=lambda *a, **k: None, _clamp_coords=lambda c, ax: c,
+        _payload_coords=lambda c, pin: c, request_plane=lambda *a: None)
+    EngineRunner._deliver_planes(cold, (3, 7, "pg1/n3", (0, 1, 0, 0), (1,), None, 0,
+                                        {1: "P1"}, "AX", 0.01, None))
+    (_n, _p, _a, _d, rq2), = cold.plane_ready.calls
+    assert rq2 == ((0, 1, 0, 0), (1,)), cold.plane_ready.calls
+    # a request another viewer's delivery prompted never starts a pull of its own — under
+    # the solo scope that is what kept two viewers of one node pulling forever
+    pulled = []
+    held = SimpleNamespace(
+        _rid=lambda n: n, _source=SimpleNamespace(record=lambda n: object()),
+        _view_of=lambda n: None, _rearm_view=lambda n: None,
+        pull=lambda *a, **k: pulled.append(a))
+    EngineRunner.request_plane(held, "pg1/n3", (0, 1, 0, 0), (0,), pull=False)
+    assert not pulled, "a pull-free request must not pull"
+    EngineRunner.request_plane(held, "pg1/n3", (0, 1, 0, 0), (0,))
+    assert pulled, "an ordinary request still falls back to a pull"
+    cold.plane_ready.calls.clear()               # a stale decode still emits nothing
+    EngineRunner._deliver_planes(cold, (2, 7, "pg1/n3", (0, 1, 0, 0), (1,), None, 0,
+                                        {1: "P1"}, "AX", 0.01, None))
+    assert not cold.plane_ready.calls
+
+    # a click on a VISUAL card shows it; every other card waits for a pull
+    assert OPS.is_visual_output("view.viewer") and OPS.is_visual_output("view.overlay")
+    assert OPS.is_visual_output("plot.xy") and not OPS.is_visual_output("enhance.gaussian")
+    assert not OPS.is_visual_output("") and not OPS.is_visual_output(None)
+    assert not OPS.is_visual_output("viewer.x"), "a prefix, not a substring"
+    _ok("viewer routing (V4.00 step 4): plane deliveries carry the (coords, channels) they "
+        "answer, from the warm and the decoded path alike; a frame answers only the viewers "
+        "whose M/T/Z cursor and channel set asked for it, and an unspecified request answers "
+        "every viewer; Viewer and plot cards are visual outputs")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -24990,6 +25066,7 @@ def main() -> int:
     test_lablink_page_select()
     test_runner_qualified_ids()
     test_layout_store()
+    test_viewer_routing()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()
