@@ -25408,6 +25408,317 @@ def test_linked_page_state() -> None:
         "refused and leave the open workspace as it was")
 
 
+def _plot_fixture():
+    """A Label table on a small image: two doses x three frames x four objects, area
+    deterministic (dose 0 grows by 1 per frame, dose 1 by 2), plus a seed node and an
+    engine factory for a chain ``S -> P [-> W]``."""
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    ids, ts, doses, areas = [], [], [], []
+    for dose in (0, 1):
+        for t in range(3):
+            for j in range(4):
+                ids.append(len(ids) + 1)
+                ts.append(t)
+                doses.append(float(dose))
+                areas.append(10.0 + t * (1 + dose) + j)
+    n = len(ids)
+    cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.array(ts),
+            "c": np.zeros(n, int), "area": np.array(areas, float), "z": np.zeros(n),
+            "y": np.arange(n, dtype=float), "x": np.arange(n, dtype=float),
+            "dose": np.array(doses, float)}
+    ax = AxisSizes(m=1, t=3, z=1, c=1, y=8, x=8)
+    md = {"pixel_size_um": 0.5, "bit_depth": 12}
+    ds = (Dataset(axes=ax, metadata=dict(md))
+          .with_image(ArrayProvider(np.zeros((1, 3, 1, 1, 8, 8), np.uint16)))
+          .with_structure(StructureTable(Domain.LABEL, cols, layer="cells",
+                                         z_kind="plane_index")))
+    seedenv = MetaEnvelope(axes=ax, metadata=dict(md), domains=frozenset({Domain.LABEL}),
+                           layer_names=((Domain.LABEL, "cells"),),
+                           column_names=((Domain.LABEL, "cells", "area"),
+                                         (Domain.LABEL, "cells", "dose")))
+    if "io.seed_plot" not in NODES:
+        define_node("io.seed_plot", "Seed", outputs=[OutDataset()])
+
+    def run(params=None, modes=None, *, write=None, wmodes=None, direct=False):
+        g = Graph()
+        g.add(NodeInstance("S", "io.seed_plot"))
+        last = "S"
+        if not direct:
+            g.add(NodeInstance("P", "plot.xy", params=dict(params or {}),
+                               modes=dict(modes or {})))
+            g.connect("S", "P")
+            last = "P"
+        if write is not None:
+            g.add(NodeInstance("W", "io.write_figure", params=dict(write),
+                               modes=dict(wmodes or {})))
+            g.connect(last, "W")
+            last = "W"
+        eng = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": seedenv})
+        return eng, eng.pull(last)
+    return ds, run
+
+
+def _picture_pixels(out):
+    return np.asarray(out.image.read_region(0, 0, 0, 0, 0, 0, out.axes.y, 0, out.axes.x)), \
+        np.stack([np.asarray(out.image.read_region(0, 0, 0, 0, c, 0, out.axes.y, 0,
+                                                   out.axes.x)) for c in range(3)], -1)
+
+
+def test_plot_xy() -> None:
+    """``plot.xy`` (V4.00 step 7): a chart of two table columns as a PICTURE dataset — one RGB
+    plane of uint8 whose size the style sets and ``figure_frame`` predicts exactly at edit
+    time, with fresh metadata (no calibration, ``bit_depth`` 8, R/G/B colours) and, through
+    ``fresh_output``, no input domain, layer or column left on its envelope. Groups, means
+    with their spread, styles, custom sizes, refusals, and rendering from two threads."""
+    import importlib.util
+    import threading
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot.xy: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    _ds, run = _plot_fixture()
+    eng, out = run()
+    env = eng.env("P")
+    assert out.axes == env.axes == AxisSizes(m=1, t=1, z=1, c=3, y=768, x=1004), \
+        (out.axes, env.axes)
+    assert (out.axes.y, out.axes.x) == FIG.figure_pixels(85, 65, 300)
+    plane, rgb = _picture_pixels(out)
+    assert plane.dtype == np.uint8 and rgb.std() > 0, "a drawn chart, not a blank"
+    assert out.metadata["bit_depth"] == 8 and out.metadata["picture"] == "rgb"
+    assert out.metadata["channel_colors"] == [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+    assert not any(k in out.metadata for k in ("pixel_size_um", "z_step_um", "dt_s"))
+    assert not out.attributes, "a picture carries no tables"
+    assert env.metadata["bit_depth"] == 8 and "pixel_size_um" not in env.metadata
+    assert env.domains == frozenset({Domain.VOXEL}) and env.layer_names == () and \
+        env.column_names == (), "fresh_output: the input's tables do not reach the envelope"
+    spec = out.metadata["figure_spec"]
+    assert spec["axes"]["x_label"] == "t" and spec["axes"]["y_label"] == "area"
+    assert len(spec["series"]) == 1 and spec["series"][0]["n"] == 24
+    h0 = eng.entry("P").recipe_hash
+    # groups, and the mean at each x with its spread
+    _e, out = run({"group_by": "dose"}, {"error": "sem", "kind": "line"})
+    ser = out.metadata["figure_spec"]["series"]
+    assert [s["label"] for s in ser] == ["0", "1"], [s["label"] for s in ser]
+    assert ser[1]["x"] == [0.0, 1.0, 2.0] and ser[1]["y"] == [11.5, 13.5, 15.5], ser[1]
+    sem = float(np.std([10, 11, 12, 13], ddof=1) / 2.0)
+    assert np.allclose(ser[0]["err"], [sem] * 3), ser[0]["err"]
+    # styles re-key the memo and change the pixels; a dark figure is dark
+    eng_d, dark = run(modes={"style": "dark"})
+    assert eng_d.entry("P").recipe_hash != h0
+    assert (dark.axes.y, dark.axes.x) == FIG.figure_pixels(160, 100, 150) == \
+        (eng_d.env("P").axes.y, eng_d.env("P").axes.x)
+    assert _picture_pixels(dark)[1].mean() < 100 < _picture_pixels(run()[1])[1].mean()
+    # custom sizes: what the envelope predicts is what is drawn
+    eng_c, cust = run({"width_mm": 50, "height_mm": 40, "dpi": 100}, {"detail": "custom"})
+    assert cust.axes == eng_c.env("P").axes and \
+        (cust.axes.y, cust.axes.x) == FIG.figure_pixels(50, 40, 100)
+    eng_p, pre = run({"width_mm": 50, "height_mm": 40, "dpi": 100})
+    assert pre.axes == out.axes, "custom fields are ignored under the preset"
+    # refusals name what the table carries
+    for params, word in (({"y": "volume"}, "volume"), ({"x_range": "abc"}, "x_range"),
+                         ({"group_by": "nope"}, "nope")):
+        try:
+            run(params)
+            raise AssertionError(f"plot.xy must refuse {params}")
+        except ValueError as exc:
+            assert word in str(exc), exc
+            if word in ("volume", "nope"):
+                assert "area" in str(exc), "the refusal lists the columns there are"
+    # log axes drop the rows they cannot place
+    s_log = FIG.xy_series([1, 2, 0, -1], [1, 0, 3, 4], log_y=True)
+    assert s_log[0]["x"] == [-1.0, 0.0, 1.0] and s_log[0]["y"] == [4.0, 3.0, 1.0], s_log
+    s_log = FIG.xy_series([1, 2, 0, -1], [1, 0, 3, 4], log_x=True, log_y=True)
+    assert s_log[0]["x"] == [1.0] and s_log[0]["y"] == [1.0], s_log
+    # two threads render what one does
+    sp = out.metadata["figure_spec"]
+    serial = FIG.render_rgb(sp)
+    got = {}
+
+    def _render(k):
+        got[k] = FIG.render_rgb(sp)
+
+    th = [threading.Thread(target=_render, args=(k,)) for k in range(2)]
+    [t.start() for t in th]
+    [t.join() for t in th]
+    assert all(np.array_equal(got[k], serial) for k in range(2)), "renders are thread-safe"
+    _ok("plot.xy: a chart of two table columns as a true-colour uint8 picture whose size the "
+        "style sets and figure_frame predicts exactly (custom sizes too); fresh metadata (no "
+        "calibration, bit_depth 8, R/G/B colours), its own Voxel domain and no input layer or "
+        "column on its envelope; groups and their mean +/- sem are right; styles re-key and re-draw; "
+        "unknown columns and bad ranges refused naming what there is; log axes drop "
+        "non-positive rows; two threads render identically")
+
+
+def test_write_figure() -> None:
+    """``io.write_figure`` (V4.00 step 7): the figure a plot drew, rendered again from its spec
+    — a PNG at the export's own resolution, a vector SVG whose text stays text, a PDF — written
+    atomically, the picture handed on unchanged; and the refusals (no figure, no path, a
+    mismatched extension, an existing file under ``refuse``)."""
+    import importlib.util
+    import os as _os
+    import shutil
+    import tempfile
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("io.write_figure: SKIPPED (matplotlib unavailable)")
+        return
+    from PIL import Image
+    import nodegraph.catalog._shared.figure as FIG
+    _ds, run = _plot_fixture()
+    tmp = tempfile.mkdtemp(prefix="nd2sb_figure_")
+    try:
+        _e, pic = run()
+        eng, out = run(write={"path": _os.path.join(tmp, "fig"), "dpi": 100})
+        png = _os.path.join(tmp, "fig.png")
+        assert _os.path.exists(png), _os.listdir(tmp)
+        with Image.open(png) as im:
+            assert (im.size[1], im.size[0]) == FIG.figure_pixels(85, 65, 100), im.size
+        assert out.axes == pic.axes and out.metadata["figure_spec"] == pic.metadata["figure_spec"]
+        assert eng.env("W").axes == eng.env("P").axes, "a pass-through"
+        svg = _os.path.join(tmp, "fig.svg")
+        run(write={"path": svg}, wmodes={"format": "svg"})
+        text = open(svg, encoding="utf-8").read()
+        assert text.startswith("<?xml") and "<svg" in text and "<text" in text, text[:200]
+        pdf = _os.path.join(tmp, "fig.pdf")
+        run(write={"path": pdf}, wmodes={"format": "pdf"})
+        assert open(pdf, "rb").read(5) == b"%PDF-"
+        assert not [f for f in _os.listdir(tmp) if ".part" in f], "no .part survives"
+        for write, wmodes, direct, word in (
+                ({"path": png}, {"existing": "refuse"}, False, "already exists"),
+                ({"path": _os.path.join(tmp, "x.svg")}, {"format": "png"}, False, "agree"),
+                ({"path": ""}, None, False, "no destination"),
+                ({"path": png}, None, True, "Plot")):
+            try:
+                run(write=write, wmodes=wmodes, direct=direct)
+                raise AssertionError(f"io.write_figure must refuse {write} {wmodes}")
+            except ValueError as exc:
+                assert word in str(exc), exc
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("io.write_figure: a plot's figure written again from its spec — PNG at the export's "
+        "resolution, SVG with text kept as text, PDF — atomically, the picture handed on "
+        "unchanged; no figure, no path, a mismatched extension and an existing file under "
+        "'refuse' are refused")
+
+
+def test_plot_review() -> None:
+    """The plot core under the step 7 review: grouping in one pass (100k rows, 2000 groups in
+    well under a second), missing group values as ONE group in a stable order, log axes
+    rendered from several threads at once, a pixel budget, a picture's envelope (its own
+    Voxel domain, R/G/B channels, nothing inherited), Export Figure's clamp and folder
+    refusal, Export Movie keeping a picture's colours, Track Objects' track_id on a blank
+    labels socket, LabLink drafts skipping the figure chain and quicklooks of a picture."""
+    import importlib.util
+    import os as _os
+    import shutil
+    import tempfile
+    import threading
+    import time as _time
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot review: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    # grouping: one pass, and the rows with no value are ONE group, last, every run alike
+    rng = np.random.default_rng(1)
+    n = 100_000
+    t0 = _time.perf_counter()
+    ser = FIG.xy_series(rng.random(n), rng.random(n), rng.integers(0, 2000, n), "none")
+    assert len(ser) == 2000 and _time.perf_counter() - t0 < 5.0, _time.perf_counter() - t0
+    grp = [1.0, float("nan"), 2.0, None, float("nan"), 1.0]
+    runs = {tuple((s["label"], s["n"]) for s in FIG.xy_series(range(6), range(6), grp))
+            for _ in range(5)}
+    assert runs == {(("1", 2), ("2", 1), (FIG.MISSING_GROUP, 3))}, runs
+    # log axes from several threads at once, identical to one thread
+    spec = {"kind": "xy", "series": [{"label": "", "x": [1, 10, 100], "y": [1, 10, 1000],
+                                      "err": None, "n": 3}],
+            "draw": {"mode": "line_markers"}, "axes": {"log_x": True, "log_y": True},
+            "style": dict(FIG.STYLE_PRESETS["paper"], dpi=100)}
+    serial = FIG.render_rgb(spec)
+    got, errs = {}, []
+
+    def _render(k):
+        try:
+            got[k] = FIG.render_rgb(spec)
+        except Exception as exc:                     # noqa: BLE001
+            errs.append(exc)
+
+    th = [threading.Thread(target=_render, args=(k,)) for k in range(4)]
+    [x.start() for x in th]
+    [x.join() for x in th]
+    assert not errs and all(np.array_equal(got[k], serial) for k in range(4)), errs
+    # a pixel budget: a typo in a size or resolution is refused, not allocated
+    try:
+        FIG.render_rgb(dict(spec, style=dict(spec["style"], width_mm=1200, height_mm=1200,
+                                             dpi=1200)))
+        raise AssertionError("a gigapixel figure must be refused")
+    except ValueError as exc:
+        assert "Mpx" in str(exc), exc
+    # the envelope: the picture's own Voxel domain and R/G/B, nothing of the input's
+    ds, run = _plot_fixture()
+    eng, out = run()
+    env = eng.env("P")
+    assert env.domains == frozenset({Domain.VOXEL}), env.domains
+    assert list(env.metadata["channel_names"]) == ["R", "G", "B"]
+    assert NODES.get("plot.xy").out_domains(frozenset({Domain.LABEL})) == \
+        frozenset({Domain.VOXEL})
+    assert NODES.get("plot.xy").default_state()["kind"] == "scatter", "a cloud by default"
+    # Export Figure: the resolution is clamped, a folder is refused
+    tmp = tempfile.mkdtemp(prefix="nd2sb_review7_")
+    try:
+        _e, _o = run(write={"path": _os.path.join(tmp, "big"), "dpi": 6000})
+        from PIL import Image
+        with Image.open(_os.path.join(tmp, "big.png")) as im:
+            assert (im.size[1], im.size[0]) == FIG.figure_pixels(85, 65, 1200), im.size
+        try:
+            run(write={"path": tmp})
+            raise AssertionError("a folder path must be refused")
+        except ValueError as exc:
+            assert "folder" in str(exc), exc
+        # Export Movie of a picture keeps its colours on 0-255 (white stays white)
+        g = Graph()
+        g.add(NodeInstance("S", "io.seed_plot"))
+        g.add(NodeInstance("P", "plot.xy"))
+        g.add(NodeInstance("M", "io.write_movie", params={"path": _os.path.join(tmp, "m")},
+                           modes={"format": "png"}))
+        g.connect("S", "P")
+        g.connect("P", "M")
+        seedenv = MetaEnvelope(axes=ds.axes, metadata={"pixel_size_um": 0.5, "bit_depth": 12})
+        Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": seedenv}).pull("M")
+        pngs = sorted(f for f in _os.listdir(tmp) if f.startswith("m") and f.endswith(".png"))
+        with Image.open(_os.path.join(tmp, pngs[0])) as im:
+            med = np.median(np.asarray(im.convert("RGB")).reshape(-1, 3), axis=0)
+        assert med.min() >= 240, f"a white figure stays white in a movie, not {med}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # Track Objects declares track_id on the only candidate when its labels socket is blank
+    cols = NODES.get("track.objects").adds_columns(
+        {}, {}, ((Domain.LABEL, "cells", "area"),))
+    assert (Domain.LABEL, "cells", "track_id") in cols, cols
+    # LabLink: a draft does not target the figure chain; a picture's quicklook is its RGB
+    from nodelab_v2.lablink import artifacts as AR
+    from nodelab_v2.lablink import recipe as RC
+    gg = Graph()
+    gg.add(NodeInstance("S", "io.seed_plot"))
+    gg.add(NodeInstance("P", "plot.xy"))
+    gg.add(NodeInstance("W", "io.write_figure"))
+    gg.connect("S", "P")
+    gg.connect("P", "W")
+    assert RC._guess_target(gg) == "S"
+    pic = AR._picture_rgb(out, 0, 0, 512)
+    assert pic is not None and pic.dtype == np.uint8 and pic.shape[2] == 3 and \
+        pic.mean() > 200, "the white chart, in colour"
+    assert AR._picture_rgb(ds, 0, 0, 512) is None
+    _ok("plot review: grouping is one pass (100k rows / 2000 groups) and missing values are "
+        "one group in a stable order; log axes render identically from four threads; a "
+        "gigapixel figure is refused; a picture's envelope is its own Voxel domain and R/G/B; "
+        "Plot XY scatters by default; Export Figure clamps its resolution and refuses a "
+        "folder; Export Movie keeps a picture's colours; Track Objects declares track_id on a "
+        "blank labels socket; LabLink drafts skip the figure chain and quicklook a picture "
+        "in colour")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -25505,6 +25816,9 @@ def main() -> int:
     test_linked_make_unique()
     test_linked_page_shares_prefix()
     test_linked_page_state()
+    test_plot_xy()
+    test_write_figure()
+    test_plot_review()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

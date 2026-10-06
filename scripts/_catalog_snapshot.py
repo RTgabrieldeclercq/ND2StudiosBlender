@@ -137,6 +137,7 @@ def snapshot() -> dict:
                        for value, domains in sorted(per_value.items())}
                 for mode, per_value in sorted(spec.reads_domains_by_mode.items())},
             "adds_domains": sorted(d.value for d in spec.adds_domains),
+            "fresh_output": bool(getattr(spec, "fresh_output", False)),
             "has_compute": spec.op_key in NN.COMPUTES,
             "compute": _fn(NN.COMPUTES.get(spec.op_key)),
             # WHICH module registered it. Recorded even though the point of the split is that

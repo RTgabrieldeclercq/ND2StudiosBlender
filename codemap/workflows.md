@@ -116,9 +116,10 @@ anchors: sym:nodegraph.catalog.module_order, sym:nodegraph.catalog._base.registe
    bounds, modes, conditional domain rails, choice docs) and records **which module** defined
    the node. That provenance is what `hotreload.is_catalog_op` uses to decide whether a node is
    shipped-catalog or GUI-layer, and therefore whether the catalog-wide gates cover it.
-5. `nodelab_v2.ops.ensure_ops()` separately registers three GUI-layer ops (`io.load`,
-   `view.viewer`, `io.dock`). They are real nodes but are not hot-reloadable and are outside
-   the catalog gates — the map marks them `gui_only`.
+5. `nodelab_v2.ops.ensure_ops()` separately registers the GUI-layer ops (`io.load`,
+   `view.viewer`, `io.dock`, and since V4.00 `page.input` / `page.output`). They are real
+   nodes but are not hot-reloadable and are outside the catalog gates — the map marks them
+   `gui_only`.
 
 **Do not** go looking for node definitions in `nodegraph/nodes.py`. Several older documents
 still say that; the split to one-file-per-node happened in V2.20.
@@ -138,7 +139,9 @@ Runs on **every keystroke**, with no pixels.
 2. `propagate_meta` walks the graph forward topologically. Each node's declared
    `meta_transform` predicts its output envelope (CON-07); `extra_layers` adds layers that have
    no output socket; `reads_domains` / `reads_domains_by_mode` decide whether the wiring is
-   even legal.
+   even legal. Domains, layers and columns otherwise flow on from the primary input — except
+   past a node declaring `fresh_output` (a plot's Picture, V4.00), whose output is a new
+   Dataset and carries only what it adds.
 3. The resulting envelope drives the GUI: axis sizes in the header, the layer picker's
    choices, the domain rail, and `derive` defaults resolved through
    `envelope_symbols` + `eval_derive` (CON-05).

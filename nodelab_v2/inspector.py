@@ -266,6 +266,10 @@ class SwitchWidget(QWidget):
         p.drawEllipse(kx, 2, knob, knob)
 
 
+#: the entry of a closed name list that sets an OPTIONAL column socket back to blank
+_NONE_ENTRY = "(none)"
+
+
 class InspectorPanel(QScrollArea):
     #: A param row's Pick button was pressed — carries a
     #: :class:`~nodelab_v2.picker.PickRequest`. The panel only *asks*: the window owns the
@@ -1888,6 +1892,13 @@ class InspectorPanel(QScrollArea):
         orphan = bool(current) and current not in shown
         if orphan:
             shown.insert(0, current)
+        # an OPTIONAL column (blank by default — e.g. Group by): a closed list must still
+        # offer the way back to blank, or a pick could never be undone
+        optional = (not editable) and not str(s.default or "")
+        if optional:
+            shown.insert(0, _NONE_ENTRY)
+            if not current:
+                current = _NONE_ENTRY
 
         box = _NoWheelCombo()
         box.setEditable(editable)
@@ -1920,7 +1931,8 @@ class InspectorPanel(QScrollArea):
         if orphan:
             box.setItemData(0, tip, Qt.ToolTipRole)
         box.activated.connect(
-            lambda _i, nm=s.name, b=box: self._set_param(node, nm, b.currentText()))
+            lambda _i, nm=s.name, b=box: self._set_param(
+                node, nm, "" if b.currentText() == _NONE_ENTRY else b.currentText()))
         if editable:
             box.lineEdit().editingFinished.connect(
                 lambda nm=s.name, b=box: self._set_param(node, nm, b.currentText()))

@@ -2277,6 +2277,10 @@ class ViewerPanel(QWidget):
         cached — this is what keeps ``np.percentile`` off the per-frame hot path."""
         ckey = self._lut_key(node_id, ch)
         lohi = self._clim.get(ckey)
+        if lohi is None and getattr(self, "_picture", False):
+            lohi = (0.0, 255.0)                  # a picture is shown as drawn
+            self._drange[ckey] = (0.0, 255.0)
+            self._clim[ckey] = lohi
         if lohi is None:
             a = np.asarray(plane, dtype=float)
             finite = a[np.isfinite(a)]
@@ -2391,7 +2395,7 @@ class ViewerPanel(QWidget):
                 self._drange.setdefault(self._lut_key(node_id, ch),
                                         self._range_for_depth(src.get("bit_depth"), pl))
                 continue
-            if self._auto_on:
+            if self._auto_on and not getattr(self, "_picture", False):
                 lohi = self._auto_clim(pl)
                 self._clim[self._lut_key(node_id, ch)] = lohi           # reflect on the histogram
                 self._clim_user.discard(self._lut_key(node_id, ch))
@@ -3186,15 +3190,16 @@ class ViewerPanel(QWidget):
         self._bit_depth = int(bd) if bd else None
         names = md.get("channel_names") or []
         emis = md.get("channel_emission_nm") or []
+        # a PICTURE (a plot's figure, V4.00 step 7) is RGB already: its channels are drawn in
+        # their own colours on a fixed 0-255 window, never stretched (`_clim_for`)
+        self._picture = bool(md.get("picture"))
         self._chan_names = [str(names[i]) if i < len(names) and names[i] else f"Ch{i + 1}"
                             for i in range(nc)]
         self._chan_colors = {}
         for i in range(nc):
-            nm = emis[i] if i < len(emis) else None
-            col = T.emission_qcolor(nm)
-            # a colour the user picked for this channel wins over its emission colour
+            # a colour the user picked for this channel wins over its own colour
             self._chan_colors[i] = self._chan_color_user.get(
-                self._color_key(i), (col.red(), col.green(), col.blue()))
+                self._color_key(i), self._emission_color(i, md))
 
         # ── overlay channels (V2.19) ─────────────────────────────────────────────
         # A `view.overlay` node contributes composed planes at indices ABOVE the payload's
@@ -3337,10 +3342,19 @@ class ViewerPanel(QWidget):
             return self._chan_names[idx]
         return f"#{idx}"
 
-    def _emission_color(self, idx: int) -> Tuple[int, int, int]:
+    def _emission_color(self, idx: int, md=None) -> Tuple[int, int, int]:
         """Channel ``idx``'s colour from its emission wavelength — what "Reset" returns
-        to, re-derived from the live dataset metadata."""
-        md = getattr(self._dataset, "metadata", {}) or {}
+        to, re-derived from the live dataset metadata. A PICTURE's channels carry their own
+        ``[r, g, b]`` (``channel_colors``) and keep it."""
+        md = md if md is not None else (getattr(self._dataset, "metadata", {}) or {})
+        if md.get("picture"):
+            cols = md.get("channel_colors") or []
+            rgb = cols[idx] if idx < len(cols) else None
+            if isinstance(rgb, (list, tuple)) and len(rgb) == 3:
+                try:
+                    return tuple(max(0, min(255, int(v))) for v in rgb)  # type: ignore[return-value]
+                except (TypeError, ValueError):
+                    pass
         emis = md.get("channel_emission_nm") or []
         col = T.emission_qcolor(emis[idx] if idx < len(emis) else None)
         return (col.red(), col.green(), col.blue())

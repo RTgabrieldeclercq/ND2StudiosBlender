@@ -716,6 +716,9 @@ class GraphDocument:
         if isinstance(chans, list) and chans:
             return chans
         env_descs = self._env_channel_descriptors(self.env(node_id))
+        spec = rec.spec()
+        if spec is not None and getattr(spec, "fresh_output", False):
+            return env_descs            # a NEW Dataset (a plot's picture): its own channels
         inherited = self._inherited_channel_descriptors(node_id)
         if inherited and len(inherited) == len(env_descs):
             return inherited
@@ -792,6 +795,9 @@ class GraphDocument:
             chans = rec.params.get(CHANNELS_KEY) if rec is not None else None
             if isinstance(chans, list) and chans:
                 return chans
+            spec = rec.spec() if rec is not None else None
+            if spec is not None and getattr(spec, "fresh_output", False):
+                return []               # the walk stops at a NEW Dataset (a plot's picture)
             return self._inherited_channel_descriptors(src, _depth + 1)
         return []
 
@@ -802,14 +808,19 @@ class GraphDocument:
             return []                               # channel count not yet known
         emis = env.metadata.get("channel_emission_nm")
         names = env.metadata.get("channel_names")
+        cols = env.metadata.get("channel_colors")
         out = []
         for i in range(c):
+            col = cols[i] if isinstance(cols, (list, tuple)) and i < len(cols) else None
             out.append({
                 "name": (names[i] if isinstance(names, (list, tuple)) and i < len(names)
                          else f"Ch{i}"),
                 "emission_nm": (emis[i] if isinstance(emis, (list, tuple))
                                 and i < len(emis) else None),
-                "color": None,
+                # an [r, g, b] triple (a picture's R/G/B); a packed int has an ambiguous
+                # byte order and is not used
+                "color": (list(col) if isinstance(col, (list, tuple)) and len(col) == 3
+                          else None),
             })
         return out
 

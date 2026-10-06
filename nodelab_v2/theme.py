@@ -102,6 +102,9 @@ CATEGORY = {
     # where the next page starts (V4.00). A teal of its own so the boundary of a page reads
     # at a glance on a canvas that is otherwise all processing colours.
     "page": c("#4d9e9a"),
+    # `plot` makes a FIGURE of the measurements rather than processing the image (V4.00
+    # step 7) — a rose of its own so a chart reads as a result, not another step.
+    "plot": c("#d06b8f"),
 }
 
 

@@ -50,8 +50,8 @@
       "label": "Input / output",
       "stage": "acquire_and_organize",
       "pages": ["input"],
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie or image sequence.",
-      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie"]
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or figure.",
+      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure"]
     },
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
@@ -179,6 +179,13 @@
       "description": "Look at results: the Viewer display sink, Overlay, which composites a second Dataset into this one's field on the microscope's own stage coordinates, and Experiment Canvas, the blank stage-spanning field that Overlays are chained onto when the files share no field.",
       "ops": ["view.viewer", "view.overlay", "view.canvas"]
     },
+    "plotting": {
+      "label": "Plotting",
+      "stage": "control_and_present",
+      "pages": ["analyze"],
+      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, one series per group, optionally averaged with error bars.",
+      "ops": ["plot.xy"]
+    },
     "page_boundary": {
       "label": "Page boundary",
       "stage": "control_and_present",
@@ -192,6 +199,7 @@
     "io.dock": ["input", "refine", "process", "analyze"],
     "io.write_tiff": ["analyze"],
     "io.write_movie": ["analyze"],
+    "io.write_figure": ["analyze"],
     "channel.select": ["input", "refine", "process", "analyze"],
     "page.input": ["refine", "process", "analyze"],
     "page.output": ["input", "refine", "process"]

@@ -1902,20 +1902,26 @@ def propagate_meta(graph: Graph,
         # is layered on afterward. (V2.06: the socket domain-rail + wire-tint source.)
         # An input declared `passes_domains=False` is read, not merged: its domains do not
         # reach this node's output (`io.write_movie`'s `source_b`/`source_c`).
-        if dpreds:
+        # A node whose output is a NEW Dataset (`NodeSpec.fresh_output` — a plot's Picture)
+        # passes nothing on: its domains, layers and columns are only what it adds.
+        fresh = bool(getattr(spec, "fresh_output", False)) if spec is not None else False
+        if fresh:
+            dom_in: FrozenSet[Domain] = frozenset()
+        elif dpreds:
             readonly = ({s.name for s in spec.inputs if not getattr(s, "passes_domains", True)}
                         if spec is not None else set())
-            dom_in: FrozenSet[Domain] = frozenset().union(
+            dom_in = frozenset().union(
                 *(out.get(e.src, MetaEnvelope()).domains for e in dpreds
                   if e.dst_socket not in readonly or e is dpreds[0]))
         else:
             dom_in = env_in.domains
         adds = spec.adds_domains if spec is not None else frozenset()
         env_out = env_out.with_domains(dom_in | adds)
+        base = MetaEnvelope() if fresh else env_in
         env_out = env_out.with_layer_names(
-            _layer_names_out(spec, node, env_in, env_out))
+            _layer_names_out(spec, node, base, env_out))
         out[nid] = env_out.with_column_names(
-            _column_names_out(spec, node, env_in, env_out))
+            _column_names_out(spec, node, base, env_out))
     return out
 
 

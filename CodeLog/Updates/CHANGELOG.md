@@ -112,6 +112,20 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   describes only its page; an override stays until reset. Edit ▸ Dissolve acts on the page
   shown (it acted on the first page since step 5).
 
+### Step 7 — plots (2026-10-05)
+- **Plot XY** (`plot.xy`): one column of a Label, Point or Track table against another, one
+  series per group, optionally averaged with sd / sem / 95 % CI as bars or a band; style
+  presets (paper, talk, poster, dark) or custom sizes, palette, labels, ranges, log axes.
+- A plot's output is a **Picture**: one RGB image with no calibration, shown in the Viewer in
+  true colour on a fixed 0–255 window; its input's tables do not pass on.
+- **Export Figure** (`io.write_figure`) writes it as PNG / TIFF at any resolution, or as SVG /
+  PDF with editable text, drawn again from the figure's own spec.
+- `matplotlib` is a core requirement (`pip install -r requirements.txt`).
+- Review fixes: Plot XY scatters by default; `group_by` offers `(none)` and groups rows in one
+  pass, blank values as one `(missing)` series; renders are serialised (log axes were not
+  thread-safe) and capped at 100 Mpx; Export Figure clamps 50–1200 dpi; Export Movie, the
+  Movie Editor and LabLink quicklooks keep a picture's colours; F9 re-pull no longer recurses.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

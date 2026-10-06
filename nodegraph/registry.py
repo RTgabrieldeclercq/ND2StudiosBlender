@@ -497,6 +497,13 @@ class NodeSpec:
     reads_domains_by_mode: Mapping[str, Mapping[str, FrozenSet[Domain]]] = field(
         default_factory=dict)
     adds_domains: FrozenSet[Domain] = frozenset()
+    #: The output is a NEW Dataset this node makes (V4.00 step 7 — a plot's Picture), not its
+    #: input carried on: at edit time no input domain, structure layer or column passes
+    #: through to it, only what it adds itself. Without it the envelope would keep
+    #: promising the input's tables downstream (layer and column pickers offering what the
+    #: payload no longer has) — ``passes_domains=False`` does this for an AUXILIARY input
+    #: only, since the primary input's domains always pass.
+    fresh_output: bool = False
     #: Layers this node creates that no ``layer_out`` socket can describe (V2.11):
     #: ``(params, modes) -> ((Domain, name), ...)``. Needed by the handful of producers
     #: that name a layer with NO socket at all (``align.drift``/``registration.stabilize``
@@ -667,6 +674,8 @@ class NodeSpec:
         """The accumulated domain-set on this node's Dataset output given the set
         ``incoming`` on its Dataset input(s): the upstream set unioned with what this
         node adds (domain-transparent by default)."""
+        if self.fresh_output:
+            return frozenset(self.adds_domains)    # a NEW Dataset: only what it adds
         return incoming | self.adds_domains
 
     def resolve_reads_domains(self,
@@ -1269,6 +1278,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                 reads_domains_by_mode: Optional[
                     Mapping[str, Mapping[str, FrozenSet[Domain]]]] = None,
                 adds_domains: FrozenSet[Domain] = frozenset(),
+                fresh_output: bool = False,
                 extra_layers: Optional[Callable[..., Any]] = None,
                 adds_columns: Optional[Callable[..., Any]] = None,
                 trained_params: Optional[Callable[..., Any]] = None,
@@ -1285,6 +1295,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
         reads_domains_by_mode={m: {v: frozenset(d) for v, d in per.items()}
                                for m, per in (reads_domains_by_mode or {}).items()},
         adds_domains=frozenset(adds_domains),
+        fresh_output=bool(fresh_output),
         extra_layers=extra_layers,
         adds_columns=adds_columns,
         trained_params=trained_params,

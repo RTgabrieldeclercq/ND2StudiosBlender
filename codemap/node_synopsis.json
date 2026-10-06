@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 95,
-    "categories": 13,
-    "roles": 20,
+    "nodes": 97,
+    "categories": 14,
+    "roles": 21,
     "stages": 5,
-    "inputs": 629,
-    "outputs": 102,
+    "inputs": 652,
+    "outputs": 104,
     "gui_ops_included": true
   },
   "stages": {
@@ -87,6 +87,7 @@
         "channel.split",
         "io.dock",
         "io.load",
+        "io.write_figure",
         "io.write_movie",
         "io.write_tiff",
         "util.batch",
@@ -210,6 +211,7 @@
         "control_flow",
         "graph_structure",
         "visualization",
+        "plotting",
         "page_boundary"
       ],
       "ops": [
@@ -219,6 +221,7 @@
         "group.output",
         "page.input",
         "page.output",
+        "plot.xy",
         "rr.reroute",
         "view.canvas",
         "view.overlay",
@@ -235,8 +238,8 @@
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie or image sequence.",
-      "count": 4,
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or figure.",
+      "count": 5,
       "ops": [
         {
           "op": "io.dock",
@@ -247,6 +250,11 @@
           "op": "io.load",
           "label": "Load ND2/TIFF file",
           "summary": "Open an ND2 or TIFF as the pipeline source. Access defaults to Direct — read the ND2 in place, no copy; switch to Auto to build a compressed b2nd store when it clearly pays off, or to Ingest to always build one. Empty path = synthetic demo. Exposes one output per channel + a combined 'All channels' output."
+        },
+        {
+          "op": "io.write_figure",
+          "label": "Export Figure",
+          "summary": "Write the figure a plot node drew to PNG, SVG, PDF or TIFF — drawn again at the export's resolution, vector formats with editable text — and hand the picture on unchanged."
         },
         {
           "op": "io.write_movie",
@@ -849,6 +857,19 @@
         }
       ]
     },
+    "plotting": {
+      "label": "Plotting",
+      "stage": "control_and_present",
+      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, one series per group, optionally averaged with error bars.",
+      "count": 1,
+      "ops": [
+        {
+          "op": "plot.xy",
+          "label": "Plot XY",
+          "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars — drawn as a true-colour picture the Viewer shows and Export Figure writes."
+        }
+      ]
+    },
     "page_boundary": {
       "label": "Page boundary",
       "stage": "control_and_present",
@@ -941,6 +962,7 @@
     "io": [
       "io.dock",
       "io.load",
+      "io.write_figure",
       "io.write_movie",
       "io.write_tiff",
       "view.viewer"
@@ -948,6 +970,9 @@
     "page": [
       "page.input",
       "page.output"
+    ],
+    "plot": [
+      "plot.xy"
     ],
     "registration": [
       "align.drift",
@@ -12334,6 +12359,127 @@
       "kernel_doc": null,
       "params_read": []
     },
+    "io.write_figure": {
+      "op": "io.write_figure",
+      "label": "Export Figure",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/io/write_figure.py",
+      "gui_only": false,
+      "summary": "Write the figure a plot node drew to PNG, SVG, PDF or TIFF — drawn again at the export's resolution, vector formats with editable text — and hand the picture on unchanged.",
+      "overview": "Write the figure a ``plot.*`` node drew, and hand the picture on unchanged. Resolved spec (V4.00 step 7, `build-node-v2`): * the input must be a PICTURE carrying ``figure_spec`` (what the plot node drew); the figure is RENDERED AGAIN from that spec, so a raster export can use another resolution than the picture on screen, and SVG / PDF are true vector files with editable text; * ``path`` is required (an empty one is refused, as Export TIFF does); the format's extension is added when missing; ``existing`` decides about a file already there; * written atomically through ``<stem>.part<ext>``; a pass-through tap like Export TIFF.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "format",
+          "label": "Format",
+          "choices": [
+            "png",
+            "svg",
+            "pdf",
+            "tiff"
+          ],
+          "default": "png",
+          "description": "The file format. Raster formats have a resolution; vector formats scale to any size and keep their text editable.",
+          "choice_docs": {
+            "png": "A lossless raster image at the chosen resolution — for slides, web pages and anything that just needs a picture.",
+            "svg": "A vector drawing whose text stays text, so labels can be edited in Inkscape or Illustrator and it scales without blur.",
+            "pdf": "A vector page with embedded TrueType fonts — what journals ask for, and what drops cleanly into a LaTeX document.",
+            "tiff": "An uncompressed raster image at the chosen resolution, for a journal or a layout tool that asks for TIFF specifically."
+          }
+        },
+        {
+          "name": "existing",
+          "label": "Existing",
+          "choices": [
+            "overwrite",
+            "refuse"
+          ],
+          "default": "overwrite",
+          "description": "What to do when a file is already at the path.",
+          "choice_docs": {
+            "overwrite": "Replace it — the default, since this node only runs again when the figure changed. The old file is replaced only once the new one is complete.",
+            "refuse": "Raise instead of touching an existing file, so a figure already sent for review is never silently replaced."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The figure to write — the output of a plot node. It is handed on unchanged."
+        },
+        {
+          "name": "path",
+          "label": "File",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "path_kind": "save_file",
+          "path_filter": "PNG (*.png);;SVG (*.svg);;PDF (*.pdf);;TIFF (*.tif *.tiff);;All files (*)",
+          "path_hint": "Browse… to choose where the figure is written",
+          "description": "Where the figure is written. There is no default and an empty value is refused. Without an extension the format's is added; an extension naming another figure format is refused."
+        },
+        {
+          "name": "dpi",
+          "label": "Resolution",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "dpi",
+          "default": 300,
+          "available_in": {
+            "format": [
+              "png",
+              "tiff"
+            ]
+          },
+          "description": "Pixels per inch of a PNG or TIFF. The figure is drawn again at this resolution, so its printed size, type and line weights stay what the plot's style set; 300 is print quality, 600 for line art; held to 50-1200. Vector formats have no resolution."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_write_figure",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "dpi",
+        "path"
+      ]
+    },
     "io.write_movie": {
       "op": "io.write_movie",
       "label": "Export Movie",
@@ -13204,6 +13350,462 @@
       "trained_params": false,
       "kernel_doc": null,
       "params_read": []
+    },
+    "plot.xy": {
+      "op": "plot.xy",
+      "label": "Plot XY",
+      "category": "plot",
+      "role": "plotting",
+      "stage": "control_and_present",
+      "pages": [
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/plot/xy.py",
+      "gui_only": false,
+      "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars — drawn as a true-colour picture the Viewer shows and Export Figure writes.",
+      "overview": "Draw ``y`` against ``x`` from one structure table, one series per ``group_by`` value. Resolved spec (V4.00 step 7, `build-node-v2`): * reads one table — ``domain`` label | point | track, its name from ``table`` (the only one on the wire when blank) — and its ``x``, ``y`` and optional ``group_by`` columns; * ``error = none`` draws every row; ``sd`` / ``sem`` / ``ci95`` summarise the rows that share an x as mean ± that spread, as bars or a band (``error_style``); * renders through matplotlib's Agg canvas (``_shared/figure``) into a PICTURE dataset — one RGB plane, ``(1, 1, 1, 3, H, W)`` uint8, fresh metadata with no calibration — whose size the style decides and ``figure_frame`` predicts at edit time; * footprint: the whole table at once, no image axes read (``WHOLE_SERIES``, no kernel axes); no 2D/3D lever — a chart has no Z.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ],
+            "track": [
+              "track"
+            ]
+          }
+        },
+        "adds": [
+          "voxel"
+        ]
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point",
+            "track"
+          ],
+          "default": "label",
+          "description": "Which kind of table the rows come from: one row per region, per detection, or per tracked object.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+          }
+        },
+        {
+          "name": "kind",
+          "label": "Kind",
+          "choices": [
+            "line",
+            "scatter",
+            "line_markers"
+          ],
+          "default": "scatter",
+          "description": "How each series is drawn.",
+          "choice_docs": {
+            "line": "Join the points of a series by a line ordered by x, with no markers — a clean time course when x is dense (with several rows per x, average them with Error first).",
+            "scatter": "Markers only, no line — for two measurements against each other, where joining neighbours in x would mean nothing.",
+            "line_markers": "A line through markers: a time course whose individual points still show, so a gap or an outlier is visible."
+          }
+        },
+        {
+          "name": "error",
+          "label": "Error",
+          "choices": [
+            "none",
+            "sd",
+            "sem",
+            "ci95"
+          ],
+          "default": "none",
+          "description": "Whether rows that share an x are summarised, and with what spread.",
+          "choice_docs": {
+            "none": "Draw every row as its own point; nothing is averaged. With many objects per frame this shows the whole population as a cloud.",
+            "sd": "Average the rows at each x and show ± one standard deviation — the spread of the population itself, which does not shrink as n grows.",
+            "sem": "Average the rows at each x and show ± the standard error of the mean (sd/√n) — how well the mean is known; narrows as n grows.",
+            "ci95": "Average the rows at each x and show the 95 % confidence interval of the mean (Student's t, n-1 degrees of freedom) — wider than sem, the honest bar for comparing two groups."
+          }
+        },
+        {
+          "name": "error_style",
+          "label": "Error style",
+          "choices": [
+            "bars",
+            "band"
+          ],
+          "default": "bars",
+          "available_in": {
+            "error": [
+              "ci95",
+              "sd",
+              "sem"
+            ]
+          },
+          "description": "How the spread is drawn around each mean.",
+          "choice_docs": {
+            "bars": "An error bar with caps at every x — reads best with few x values, and on a scatter.",
+            "band": "A translucent band between the lower and upper bounds — reads best for a dense time course, where bars would overlap."
+          }
+        },
+        {
+          "name": "style",
+          "label": "Style",
+          "choices": [
+            "paper",
+            "talk",
+            "poster",
+            "dark"
+          ],
+          "default": "paper",
+          "description": "The figure's size, resolution, type sizes and line weights as one preset for where it is going. Each re-renders the picture; switch Detail to custom to set any of them by hand.",
+          "choice_docs": {
+            "paper": "A one-column journal figure: 85 x 65 mm at 300 dpi, 8 pt text, thin lines and small markers, no grid, on white. Sized to drop into a manuscript at 100 %.",
+            "talk": "A slide: 160 x 100 mm at 150 dpi with 14 pt text and heavier lines, plus a light grid, so the chart reads from the back of a room on a projector.",
+            "poster": "A poster panel: 250 x 180 mm at 150 dpi with 20 pt text and the heaviest lines, readable from a couple of metres; the largest picture of the four.",
+            "dark": "The talk layout on a dark background with light text and grid — for slides and screens with a dark theme. Prints badly; pick another style for paper."
+          }
+        },
+        {
+          "name": "detail",
+          "label": "Detail",
+          "choices": [
+            "preset",
+            "custom"
+          ],
+          "default": "preset",
+          "description": "Whether the style preset decides every size and weight, or the custom fields below do.",
+          "choice_docs": {
+            "preset": "Use the chosen style exactly — size, dpi, type, lines, grid and legend — and hide the fields that would override it.",
+            "custom": "Show width, height, dpi, type size, line width, marker size, font, grid and legend, and draw with them. They start at the paper preset's values; the style still picks light or dark."
+          }
+        },
+        {
+          "name": "palette",
+          "label": "Palette",
+          "choices": [
+            "colorblind",
+            "tab10",
+            "viridis",
+            "greys"
+          ],
+          "default": "colorblind",
+          "description": "The colours the series (the groups) are drawn in, in order.",
+          "choice_docs": {
+            "colorblind": "Okabe & Ito's eight colours, chosen to stay distinguishable under the common colour-vision deficiencies. The safe default for any audience.",
+            "tab10": "matplotlib's ten-colour default cycle: familiar from other figures, but two of its pairs merge for red-green colour-blind readers.",
+            "viridis": "Five steps of the perceptually uniform viridis map, dark purple to yellow — for groups that have an ORDER (doses, timepoints), so the colour reads as one.",
+            "greys": "Four greys from black to light grey, for a figure printed in black and white; past four groups the shades repeat, so pair it with few groups."
+          }
+        },
+        {
+          "name": "font",
+          "label": "Font",
+          "choices": [
+            "sans",
+            "serif"
+          ],
+          "default": "sans",
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The typeface of every label. Both ship with the app, so a figure renders identically on every machine.",
+          "choice_docs": {
+            "sans": "DejaVu Sans, a plain sans-serif like most journals' figure text and every slide template — the default.",
+            "serif": "DejaVu Serif, for a document set in a serif face whose figures should match its body text."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table is plotted — anything carrying a Label, Point or Track table."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "Which table of the chosen domain to plot. Blank uses the only one on the wire, and asks when there are several."
+        },
+        {
+          "name": "x",
+          "label": "X",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "t",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column on the horizontal axis — `t` (the frame) for a time course, or any measured column against another."
+        },
+        {
+          "name": "y",
+          "label": "Y",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "area",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column on the vertical axis. The plot reads the values as they are in the table; it changes no measurement."
+        },
+        {
+          "name": "group_by",
+          "label": "Group by",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "Draw one series per distinct value of this column — a `condition` from a Page Output, a track id, a channel. Blank draws every row as one series, with no legend."
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The text above the chart. Blank draws no title — the usual choice for a manuscript, whose caption carries it."
+        },
+        {
+          "name": "x_label",
+          "label": "X label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The horizontal axis label. Blank uses the x column's name; add the unit here, e.g. 'time (min)'."
+        },
+        {
+          "name": "y_label",
+          "label": "Y label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The vertical axis label. Blank uses the y column's name; add the unit here, e.g. 'area (µm²)'."
+        },
+        {
+          "name": "x_range",
+          "label": "X range",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Fix the horizontal axis as 'low, high' (e.g. '0, 120'). Blank lets the data decide, and either side may be left blank ('0,' fixes only the low end). Values outside are not drawn."
+        },
+        {
+          "name": "y_range",
+          "label": "Y range",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Fix the vertical axis as 'low, high' (e.g. '0, 500'). Blank lets the data decide; '0,' starts the axis at zero, which keeps a bar of differences honest."
+        },
+        {
+          "name": "log_x",
+          "label": "Log x",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Draw the horizontal axis on a log scale. Rows whose x is zero or negative cannot be placed on it and are left out."
+        },
+        {
+          "name": "log_y",
+          "label": "Log y",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Draw the vertical axis on a log scale — for values spanning orders of magnitude. Rows whose y is zero or negative are left out."
+        },
+        {
+          "name": "width_mm",
+          "label": "Width",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "mm",
+          "default": 85.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The figure's printed width. Together with dpi it sets the picture's pixel size; text and lines keep their point sizes, so a wider figure gives the data more room, not bigger type."
+        },
+        {
+          "name": "height_mm",
+          "label": "Height",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "mm",
+          "default": 65.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The figure's printed height (see Width)."
+        },
+        {
+          "name": "dpi",
+          "label": "Resolution",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "dpi",
+          "default": 300,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "Pixels per inch of the picture. 300 is print quality; 150 is plenty on screen and four times fewer pixels. Export Figure can write another resolution without changing this."
+        },
+        {
+          "name": "font_pt",
+          "label": "Text size",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "pt",
+          "default": 8.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The axis-label size in points; tick labels are a little smaller and the title a little larger."
+        },
+        {
+          "name": "line_width",
+          "label": "Line width",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "pt",
+          "default": 1.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The data lines' width in points; axes, ticks and error bars scale with it."
+        },
+        {
+          "name": "marker_size",
+          "label": "Marker size",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "pt",
+          "default": 3.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The diameter of a point's marker in points."
+        },
+        {
+          "name": "grid",
+          "label": "Grid",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "Draw light grid lines behind the data at the major ticks."
+        },
+        {
+          "name": "legend",
+          "label": "Legend",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "Name each group in a legend. Only drawn when there are named groups (a Group by column is set)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "Figure",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_plot_xy",
+      "meta_transform": "figure_frame",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "dpi",
+        "font_pt",
+        "grid",
+        "group_by",
+        "height_mm",
+        "legend",
+        "line_width",
+        "log_x",
+        "log_y",
+        "marker_size",
+        "table",
+        "title",
+        "width_mm",
+        "x",
+        "x_label",
+        "x_range",
+        "y",
+        "y_label",
+        "y_range"
+      ]
     },
     "registration.align_to": {
       "op": "registration.align_to",

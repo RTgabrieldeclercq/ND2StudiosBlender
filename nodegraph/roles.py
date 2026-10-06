@@ -1,4 +1,4 @@
-"""The node taxonomy at runtime: 19 functional ROLES in 5 pipeline STAGES, and — since
+"""The node taxonomy at runtime: the functional ROLES in 5 pipeline STAGES, and — since
 ND2Studios V4.00 (2026-10-05) — the typed PAGE KINDS each role's nodes are offered on, all
 read from the hand-curated ``codemap/node_roles.json``.
 

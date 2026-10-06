@@ -2310,6 +2310,14 @@ class NodeItem(QGraphicsObject):
         listed = list(choices)
         if current and current not in listed:
             listed.insert(0, current)
+        none_act = None
+        if not free_text and not str(s.default or ""):
+            # an OPTIONAL column (blank by default): the way back to blank
+            none_act = menu.addAction("(none)")
+            none_act.setCheckable(True)
+            none_act.setChecked(not current)
+            none_act.setToolTip(option_hover_text("(none)", "Leave it blank — the node's "
+                                                  "default (e.g. one series, no grouping)."))
         for c in listed:
             act = menu.addAction(c)
             act.setCheckable(True)
@@ -2332,6 +2340,9 @@ class NodeItem(QGraphicsObject):
             return
         if typed is not None and chosen is typed:
             self._open_inline_edit(ctl)
+        elif none_act is not None and chosen is none_act:
+            if current:
+                self._write_param(s.name, "")
         elif chosen.text() != current:
             self._write_param(s.name, chosen.text())
 

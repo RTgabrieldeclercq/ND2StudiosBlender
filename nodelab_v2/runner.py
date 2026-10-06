@@ -2095,8 +2095,16 @@ class EngineRunner(QObject):
         if self._source.record(node_id) is None:
             return
         if self._busy:
-            if self._serve_finished(node_id, coords, channels):
-                return
+            # Serving a finished result asks for its planes, and a SCOPED request then pulls
+            # again — which, while busy, would serve again, and so on to a RecursionError.
+            # A pull arriving while a finished result is being served joins the queue.
+            if not getattr(self, "_serving", False):
+                self._serving = True
+                try:
+                    if self._serve_finished(node_id, coords, channels):
+                        return
+                finally:
+                    self._serving = False
             if not queue:
                 return          # a preview never commits the machine — see the docstring
             # assigning an existing key keeps its position, which is exactly the

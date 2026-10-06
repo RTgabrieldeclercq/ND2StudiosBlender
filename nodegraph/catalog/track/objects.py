@@ -21,7 +21,7 @@ from nodegraph.registry import (
 from nodegraph.structure import StructureTable
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.columns import TRACK_MEMBERSHIP, member_layer, on_layer
+from nodegraph.catalog._shared.columns import TRACK_MEMBERSHIP, member_layer, on_layer, resolved_layer
 from nodegraph.catalog._shared.labels import (
     _label_tables,
     _point_layers,
@@ -503,6 +503,11 @@ def _columns_track_objects(params, modes, incoming):
         tracks = on_layer(Domain.TRACK, str((params or {}).get("name") or "tracks"),
                           TRACK_MEMBERSHIP + ("track_length", "m", "c"))
         dom, lyr = member_layer(params, modes)
+        if not lyr:
+            # a blank labels/points socket resolves to the only candidate at pull time —
+            # declare onto the same one, or the closed column pickers never offer track_id
+            lyr = resolved_layer(params, "points" if dom is Domain.POINT else "labels",
+                                 incoming, dom)
         return tracks + on_layer(dom, lyr, ("track_id",))
     except Exception:                        # pragma: no cover - defensive
         return ()

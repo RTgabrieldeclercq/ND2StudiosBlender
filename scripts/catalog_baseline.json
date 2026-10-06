@@ -1,6 +1,6 @@
 {
  "computes_only": [],
- "n_ops": 95,
+ "n_ops": 97,
  "order": [
   "channel.select",
   "channel.split",
@@ -92,6 +92,8 @@
   "util.select_batch",
   "util.timeseries",
   "view.canvas",
+  "plot.xy",
+  "io.write_figure",
   "io.load",
   "view.viewer",
   "io.dock",
@@ -108,6 +110,7 @@
    "description": "Rigid drift correction across Timepoints (phase cross-correlation on a reference plane); stores the per-frame shift as Frame attributes.",
    "extra_layers": "_layers_drift",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -215,6 +218,7 @@
    "description": "Compose a previous-frame DVC increment series into cumulative displacement + strain fields by Lagrangian point-tracking (ported ALDVC build_accumulated_results); inherits the reference config from the upstream DVC node; emits a cumulative Point layer with the same schema.",
    "extra_layers": "_layers_accumulate_field",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -397,6 +401,7 @@
    "description": "Outward boundary band per label region (any Voxel label raster \u2014 cells, nuclei, granules; dilation or EDT, \u00b5m-aware) \u2192 band-label raster, 3D (ported v1 kernel).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -714,6 +719,7 @@
    "description": "Cluster a Point cloud into groups (GaussianMixture / KMeans, BIC model-order sweep over n_clusters \u00b1 relax%) \u2192 a per-point cluster-id label column; \u00b5m-scaled so anisotropic Z doesn't bias the fit (ported v1 kernel; scikit-learn).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -1021,6 +1027,7 @@
    "description": "2D digital image correlation (pyALDIC: IC-GN + ADMM over an adaptive FE mesh) \u2192 a Point displacement field (subset centers, disp \u00b5m, optional strain); fixed/previous self-reference or an external reference Dataset + optional ROI mask. Solves the whole T stack in one call per (m, z). Wired to the vendored kernel; needs al-dic (dep-gated: friendly ImportError at run time until installed).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -1772,6 +1779,7 @@
    "description": "Hand-drawn labelled regions (rect / circle / ellipse / polygon / freehand), each pinned to the frame (m, t, z) it was drawn on \u2192 a Label raster + Label table; Subtract Background's `Background regions` input samples them.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -2101,6 +2109,7 @@
    "description": "3D Augmented-Lagrangian digital volume correlation (official pyALDVC: pyramid-NCC seed + 12-DOF IC-GN + global compatibility/ADMM) \u2192 a Point displacement + strain field on the subset grid (disp \u00b5m, dimensionless strain, per-subset ZNCC). Fixed-frame or previous-frame self-reference, or an external reference Dataset. Solves the whole T stack in one call per m. 3D ONLY \u2014 2D is the DIC (pyALDIC) node. Needs al-dvc (dep-gated: friendly error at run time until installed).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -3189,6 +3198,7 @@
    "description": "Euclidean distance transform of a Voxel mask \u2192 a \u00b5m distance field (anisotropic in 3D); 2D per-plane vs 3D volumetric.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -3400,6 +3410,7 @@
    "description": "A label region's outline \u2192 boundary Points (2D contours / 3D surface vertices); wraps boundary.extract_boundary. For a MESH of a label raster use analysis.tessellate (label_surface), which meshes per region.",
    "extra_layers": "_layers_extract_boundary",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -3610,6 +3621,7 @@
    "description": "Keep or drop WHOLE labels by thresholding one per-label column (mean_intensity, area, eccentricity, n_sub \u2014 anything the table carries), with the cut chosen by a histogram method over the population of label values, or given explicitly as a fixed level / percentile. `scope` groups the labels the way analysis.threshold's does (plane/volume/series/dataset, never pooling channels). Writes a NEW Label instance \u2014 raster + table, every original column plus the `cut` each row was judged against \u2014 with the surviving ids UNCHANGED, so upstream measurements and tracks still join on them. Non-finite values are excluded from both the population and the survivors rather than being given a side.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -3980,6 +3992,7 @@
    "description": "Histogram threshold segmentation (2D per-plane) \u2192 Voxel mask + Label raster + region table; 4 methods \u00d7 4 directions, morphology cleanup (ported v1 kernel). low/high/strict/permissive are FLOAT and read in the image's OWN units \u2014 raw counts while a bit depth is declared, the data's own scale once one is not (after a Normalize, 0.35 means 0.35), or whatever `full_scale` pins for a float image outside [0,1]. 0 = unset, with no default \u2014 the percentile/relative methods self-scale instead; only the current method's params are shown. Optional `raw` input re-measures the region intensities on those pixels.",
    "extra_layers": null,
    "footprint_mode": "scope",
+   "fresh_output": false,
    "granularity": {
     "per_label": "whole_plane",
     "per_roi": "whole_plane",
@@ -4989,6 +5002,7 @@
    "description": "Split objects into a PASS set and a FAIL set by up to four conditions on the structure table's own columns, combined with all/any. The condition dropdown offers the columns the graph has actually measured \u2014 `area` and the centroid from segmentation, Measure's intensity statistics and regionprops shape metrics, Object Metrics' speed and neighbour distances, and Track Objects' `track_length`, joined onto the member rows by `member_id`. Both sides are written as new instances (ids UNCHANGED, so upstream measurements and tracks still join), so the else branch can be wired onward by pointing a downstream layer picker at the fail layer. An object whose column was never measured fails, and is counted on the rail.",
    "extra_layers": "_layers_if_else",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -5885,6 +5899,7 @@
    "description": "Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn); connectivity defaults to 8 (2D) / 26 (3D), overridable.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -6135,6 +6150,7 @@
    "description": "Measures the image over a structure table's members. On LABEL members: per-region statistics (mean/max/min/area) via the Voxel\u2192Label bridge, plus optional \u00b5m-aware `shape` geometry columns (eccentricity, perimeter, solidity, \u2026) from regionprops. On POINT members: each detection's physical position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the voxel it sits on. Both branches also report each row's absolute `stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing objects across a multi-position acquisition (NaN when the file carries no placement metadata). Optional `raw` input measures THOSE pixels instead (segment on enhanced, measure on raw); the structure, the labels and the shape metrics always come from the main input.",
    "extra_layers": "_layers_measure",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -6498,6 +6514,7 @@
    "description": "Multi-level Otsu \u2192 a class-index Voxel raster (0..K-1), optionally one binary mask per class so each tier can be processed differently, or one mask of the classes you keep; needs the whole volume histogram.",
    "extra_layers": "_layers_multiotsu",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -6739,6 +6756,7 @@
    "description": "Gridded Eulerian fields from per-object measurements \u2014 density (objects/\u00b5m\u00b2), mean area, intensity, fold change, velocity/speed (\u00b5m/s), divergence and curl (1/s) \u2014 as a Point layer on a grid_step lattice, ready for transform.rasterize_field. Ports Cell-Tracker's compute_spatial_fields; 2D, per (m,t,z,c).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -7194,6 +7212,7 @@
    "description": "Per-object derived metrics onto the member layer: velocity/speed (\u00b5m/s), K-nearest-neighbour distances (\u00b5m), local divergence/curl (1/s), and frame- or self-normalized intensity fold change. Ports Cell-Tracker's compute_spatial_metrics + self-fold + mean_velocity; 2D, per (m,t,z,c).",
    "extra_layers": "_layers_object_metrics",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -7570,6 +7589,7 @@
    "description": "Dense per-pixel 2D motion between frames (scikit-image TV-L1 or iterative Lucas-Kanade) \u2192 Voxel layers `<name>_y`/`<name>_x`/`<name>_mag` in \u00b5m (+y down; NaN where no pair exists). The dense sibling of analysis.piv: per-pixel resolution on continuous texture (monolayers, cytoplasmic streaming) where sparse-tracer correlation wins instead. 2D per-plane; previous/fixed reference; no extra dependency.",
    "extra_layers": "_layers_optical_flow",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -8143,6 +8163,7 @@
    "description": "2D particle image velocimetry (OpenPIV: multipass FFT correlation with window deformation, universal outlier detection, per-vector S/N) \u2192 a Point displacement field per frame pair; previous/fixed self-reference, ENSEMBLE correlation averaging (one time-averaged field \u2014 the micro-PIV method for sparse seeding), or an external reference Dataset + optional ROI mask; optional vy/vx/speed \u00b5m/s via the file's dt_s and optional per-vector unc_y/unc_x \u00b5m (Sciacchitano image-matching, dep: pivuq). The FLOW sibling of DIC \u2014 independent windows, far faster, per-vector confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError at run time until installed).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -9047,6 +9068,7 @@
    "description": "Collapse any attribute layer or structure column to ONE number on the Global domain \u2014 object count, mean area, total mask volume. The scalar a sweep compares, and the only node in the catalog that writes Global.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -9326,6 +9348,7 @@
    "description": "Rasterize a serializable shape list ([y,x] verts, in-order add/cut/invert/clear) \u2192 a boolean Voxel ROI mask; empty \u2192 whole frame (ported v1 kernel).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -9507,6 +9530,7 @@
    "description": "THE segmentation node: image \u2192 a Voxel label raster + a Label table, with the algorithm as a `method` Mode \u2014 threshold+CCL, distance-transform watershed, StarDist (CNN), or CellSAM (SAM + CellFinder foundation model). Shared across every method: hole filling, the \u00b5m\u00b2/\u00b5m\u00b3 size filter, globally-unique ids and the region table. 2D segments each plane independently, 3D each volume (the two learned methods are 2D-per-plane and refuse the 3D lever).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -10953,6 +10977,7 @@
    "description": "Tessellate a labeled Point cloud (convex/concave/Voronoi boundary) or a Voxel label raster (marching cubes) \u2192 a MESH: one closed surface per label, with analytic volume/area/density per element; 3D (ports v1 granule_tessellate). Feed transform.rasterize_mesh to get a Label volume.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -11428,6 +11453,7 @@
    "description": "Binarize to a Voxel mask \u2014 fixed, or a histogram method (otsu/li/yen/triangle/mean) whose level is derived over the chosen Scope: per plane (default), per volume, per position's whole series, or one level across the entire dataset. The threshold socket shows only under `fixed` (the others self-derive); Scope only under the others.",
    "extra_layers": null,
    "footprint_mode": "scope",
+   "fresh_output": false,
    "granularity": {
     "dataset": "multi_view",
     "per_label": "whole_volume",
@@ -11731,6 +11757,7 @@
    "description": "Adaptive local threshold \u2192 a Voxel mask (uneven-illumination robust); per-plane 2D, block size in \u00b5m.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -11950,6 +11977,7 @@
    "description": "SerialTrack's post-processing half: a TRACKED object field (any linker's `track_id`, on Label or Point members) \u2192 per-particle displacement (\u00b5m), optional velocity (\u00b5m/s), the MLS deformation gradient and strain (4 measures), and optional isotropic linear-elastic stress + von Mises / pressure (Pa). Cumulative or incremental reference; 2D-per-plane vs full 3D inherited from the members' z_kind. Emits the same Point schema as analysis.dvc_field, so transform.rasterize_field turns it into maps.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -12551,6 +12579,7 @@
    "description": "Voronoi tessellation LINKING dots to areas: one cell per seed Point, nearest-seed in \u00b5m space, clipped to a Label region (per-region arenas) or a mask \u2192 a territory Label raster + table (area, local density, source dot and area) and, in 3D, a MESH of the cell surfaces.",
    "extra_layers": "_layers_voronoi",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -13020,6 +13049,7 @@
    "description": "Subset/reorder the channel axis (metadata follows in lockstep).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -13156,6 +13186,7 @@
    "description": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -13257,6 +13288,7 @@
    "description": "Particle/small-object detection \u2192 Points (LoG local-maxima or component centroids, sub-voxel refined; beads, puncta, foci); min distance = LoG \u03c3 + NMS radius (\u00b5m\u2192px); 2D per-plane vs 3D volume (ported v1 kernel).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -13634,6 +13666,7 @@
    "description": "LoG/DoG spot detection \u2192 Points (bright or dark polarity); radii derive from the diffraction limit (\u03c3 = r/\u221andim); 2D per-plane vs 3D.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -14035,6 +14068,7 @@
    "description": "Edge-preserving bilateral denoise \u2014 stack-of-2D even in 3D mode (skimage denoise_bilateral is 2D-only, H15).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -14236,6 +14270,7 @@
    "description": "Contrast-limited adaptive histogram equalization; 2D per-plane vs 3D. `tile_grid` sets the regions per axis (8 = Cell-Tracker's OpenCV default).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -14441,6 +14476,7 @@
    "description": "Richardson\u2013Lucy deconvolution with a PSF derived from optics metadata (NA, emission \u03bb, pixel/z size); 2D lateral PSF vs 3D anisotropic PSF. Output is no longer raw integer counts, so the declared bit depth is dropped.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -14724,6 +14760,7 @@
    "description": "Band-pass (blob) enhancement; low \u03c3 derives from the diffraction limit; high \u03c3 0 \u21d2 auto 1.6\u00d7 low. 2D per-plane vs anisotropic 3D. Optional clip-and-stretch to the full range reproduces Cell-Tracker's DoG.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -15007,6 +15044,7 @@
    "description": "Flatten uneven illumination by removing a large-\u03c3 Gaussian background: subtract / subtract+mean / divide+mean / ratio, estimated per plane or averaged over T. Ports Cell-Tracker's Background Subtract, Spatial Flatness and Local Contrast. `ratio` drops bit_depth (dimensionless).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -15230,6 +15268,7 @@
    "description": "Power-law \u03b3 over a declared intensity scale: `full_range` uses 2**bit_depth-1 (a fixed transfer curve \u2014 Cell-Tracker's behaviour, with the significant sensor depth in place of the dtype width), `plane_max` the pre-V2.13 per-plane maximum. full_range falls back to the plane max when no bit_depth is declared, which is why the footprint is WHOLE_PLANE either way.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -15385,6 +15424,7 @@
    "description": "Gaussian blur with a metadata-intelligent \u03c3 (\u00b5m); 2D per-plane vs 3D.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -15594,6 +15634,7 @@
    "description": "Edge-preserving median filter; 2D per-plane vs anisotropic 3D window.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -15803,6 +15844,7 @@
    "description": "Dilation \u2212 erosion edge map; 2D per-plane vs anisotropic 3D. Optional full-range stretch + blend-with-original reproduce Cell-Tracker's plugin.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -16086,6 +16128,7 @@
    "description": "Grayscale morphology (erode/dilate/open/close); 2D vs anisotropic 3D.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -16317,6 +16360,7 @@
    "description": "Non-local-means denoise \u2014 genuinely volumetric in 3D (denoise_nl_means is true n-D).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -16559,6 +16603,7 @@
    "description": "Rescale to [0,1] from percentile bounds \u2014 the statistics scope (plane/volume/series) is a Mode, not the 2D/3D lever (H24) \u2014 or from an ABSOLUTE intensity window typed in the image's own units, which is one fixed transfer curve for the whole series and the only way to express a window at absolute positions (Cell-Tracker's Local Contrast display window after Flatten Illumination method=ratio). Scope and the percentile sockets show only under `percentile`, the value sockets only under `absolute`. Drops bit_depth either way \u2014 the output is no longer raw integer counts.",
    "extra_layers": null,
    "footprint_mode": "bounds",
+   "fresh_output": false,
    "granularity": {
     "absolute": "tileable",
     "percentile": "whole_series"
@@ -16868,6 +16913,7 @@
    "description": "Detect bright round artifacts (dust, debris, hot pixels) with LoG/DoG and paint them out \u2014 zero / ring-mean interpolate / local median. Ports Cell-Tracker's Blob Subtract; radii in \u00b5m, per channel, mask radius \u03c3\u00b7\u221a2.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -17199,6 +17245,7 @@
    "description": "Estimate a background surface and remove it \u2014 rolling ball (Sternberg / ImageJ), tunable ellipsoid, morphological opening, box minimum / median / percentile, large-sigma Gaussian, least-squares polynomial surface, or one whole-unit percentile. Dark or light background, subtract / signed subtract / divide, or output the estimate itself. Auto-shrinks the expensive estimators (ImageJ's factor table); `divide` drops bit_depth. Or, as a second approach, DECIDE which pixels are background \u2014 by similarity to a drawn sample, or by an adaptive local cut clamped to a range \u2014 and set exactly those to nothing, leaving every object pixel untouched.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -18233,6 +18280,7 @@
    "description": "Correct intensity drift along T by a per-frame gain: reference series_mean (Cell-Tracker Bleach Correction) / rolling_mean (its Temporal Fold Correction) / exponential_fit (the decay model its UI promised but never ran), at global / tile / gaussian spatial extent. Per (m,z,c); refuses T=1.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -18541,6 +18589,7 @@
    "description": "White/black top-hat (flatten background / pop dark features); 2D vs anisotropic 3D.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -18768,6 +18817,7 @@
    "description": "Total-variation (Chambolle) edge-preserving denoise \u2014 genuinely 3D in 3D mode (denoise_tv_chambolle is true n-D).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -18936,6 +18986,7 @@
    "description": "Unsharp-mask sharpening (blur radius in \u00b5m); 2D vs anisotropic 3D.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -19182,6 +19233,7 @@
    "description": "Wavelet (BayesShrink) denoise \u2014 stack-of-2D even in 3D mode (skimage denoise_wavelet is 2D-only); declared as such (H15).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -19309,6 +19361,7 @@
    "description": "Zero-shot deconvolution network (Qiao et al. 2024): a dual-stage CNN trained self-supervised on the incoming data itself \u2014 no ground truth \u2014 or a published checkpoint run inference-only. Denoises and sharpens past the diffraction limit, optionally on a 2x finer grid. Output is percentile-normalized, so the declared bit depth is dropped.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -20908,6 +20961,7 @@
    "description": "One step of an Iterate node's feedback search (hidden; minted by the iterate rewrite, never placed by hand).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -21009,6 +21063,7 @@
    "description": "Re-run a stretch of the graph once per parameter value and keep one result. Wire the segment \u2014 the last node of the series into 'To', optionally the first into 'From' \u2014 then pick what to iterate from the panel's dropdown (it lists every parameter in that stretch). The result comes out of the series' own end node, so anything already reading it keeps working and the sweep runs by itself whenever you view it. Flip through the iterations on the Viewer's strip; 'best' picks by a Global scalar and 'feedback' searches for the value that maximizes it or hits a target.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -23139,6 +23194,7 @@
    "description": "Group interface marker (pass-through); paired Input/Output bound a reusable subgraph \u2014 see nodegraph.groups.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -23238,6 +23294,7 @@
    "description": "Group interface marker (pass-through); paired Input/Output bound a reusable subgraph \u2014 see nodegraph.groups.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -23337,6 +23394,7 @@
    "description": "Bake everything upstream to disk once, then serve it as if it were a freshly loaded file. The nodes behind it grey out and stop being evaluated \u2014 their results are read back from the checkpoint instead of recomputed \u2014 so a long chain on a big series stops costing memory and re-runs. Masks, labels, tracks and measurements are baked alongside the image, and the full-size ones are memory-mapped, so a docked segmentation costs no RAM. Edit something upstream and the dock says so and keeps serving the old bake until you re-bake.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -23522,6 +23580,7 @@
    "description": "Open an ND2 or TIFF as the pipeline source. Access defaults to Direct \u2014 read the ND2 in place, no copy; switch to Auto to build a compressed b2nd store when it clearly pays off, or to Ingest to always build one. Empty path = synthetic demo. Exposes one output per channel + a combined 'All channels' output.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": null,
    "has_compute": false,
    "inputs": [
@@ -23727,6 +23786,226 @@
    "supports_true_3d": true,
    "three_d_fallback": ""
   },
+  "io.write_figure": {
+   "adds_domains": [],
+   "category": "io",
+   "compute": "_compute_write_figure",
+   "description": "Write the figure a plot node drew to PNG, SVG, PDF or TIFF \u2014 drawn again at the export's resolution, vector formats with editable text \u2014 and hand the picture on unchanged.",
+   "extra_layers": null,
+   "footprint_mode": "dim",
+   "fresh_output": false,
+   "granularity": "whole_series",
+   "has_compute": true,
+   "inputs": [
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": null,
+     "derive": "",
+     "description": "The figure to write \u2014 the output of a plot node. It is handed on unchanged.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "data",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.DATASET",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "Where the figure is written. There is no default and an empty value is refused. Without an extension the format's is added; an extension naming another figure format is refused.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "File",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "path",
+     "passes_domains": true,
+     "path_filter": "PNG (*.png);;SVG (*.svg);;PDF (*.pdf);;TIFF (*.tif *.tiff);;All files (*)",
+     "path_hint": "Browse\u2026 to choose where the figure is written",
+     "path_kind": "save_file",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "format": [
+       "png",
+       "tiff"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 300,
+     "derive": "",
+     "description": "Pixels per inch of a PNG or TIFF. The figure is drawn again at this resolution, so its printed size, type and line weights stay what the plot's style set; 300 is print quality, 600 for line art; held to 50-1200. Vector formats have no resolution.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Resolution",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "dpi",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.INT",
+     "unit": "dpi",
+     "view_source": false,
+     "vocab": []
+    }
+   ],
+   "kernel_axes": [],
+   "label": "Export Figure",
+   "meta_transform": null,
+   "modes": [
+    {
+     "available_in": null,
+     "choice_docs": {
+      "pdf": "A vector page with embedded TrueType fonts \u2014 what journals ask for, and what drops cleanly into a LaTeX document.",
+      "png": "A lossless raster image at the chosen resolution \u2014 for slides, web pages and anything that just needs a picture.",
+      "svg": "A vector drawing whose text stays text, so labels can be edited in Inkscape or Illustrator and it scales without blur.",
+      "tiff": "An uncompressed raster image at the chosen resolution, for a journal or a layout tool that asks for TIFF specifically."
+     },
+     "choices": [
+      "png",
+      "svg",
+      "pdf",
+      "tiff"
+     ],
+     "default": "png",
+     "derive": "",
+     "description": "The file format. Raster formats have a resolution; vector formats scale to any size and keep their text editable.",
+     "label": "Format",
+     "name": "format",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": null,
+     "choice_docs": {
+      "overwrite": "Replace it \u2014 the default, since this node only runs again when the figure changed. The old file is replaced only once the new one is complete.",
+      "refuse": "Raise instead of touching an existing file, so a figure already sent for review is never silently replaced."
+     },
+     "choices": [
+      "overwrite",
+      "refuse"
+     ],
+     "default": "overwrite",
+     "derive": "",
+     "description": "What to do when a file is already at the path.",
+     "label": "Existing",
+     "name": "existing",
+     "presentation": "body",
+     "role": ""
+    }
+   ],
+   "op_key": "io.write_figure",
+   "outputs": [
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": null,
+     "derive": "",
+     "description": "",
+     "dims": 3,
+     "direction": "Direction.OUT",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "out",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.DATASET",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    }
+   ],
+   "owner": "nodegraph.catalog.io.write_figure",
+   "reads_domains": [],
+   "reads_domains_by_mode": {},
+   "supports_2d": true,
+   "supports_true_3d": true,
+   "three_d_fallback": ""
+  },
   "io.write_movie": {
    "adds_domains": [],
    "category": "io",
@@ -23734,6 +24013,7 @@
    "description": "Render the Dataset on this wire to an H.264 MP4, an animated GIF or a numbered PNG/JPEG sequence \u2014 the presentation counterpart to Export TIFF. Channels composite by their emission tints, the display window is measured once and held so a timelapse does not pulse, and the acquisition's own calibration is burned into the corners: the frame counter, the elapsed experiment time interpolated from the file's frame interval, a round-number scale bar from the pixel size, and the channel names. With Sweep = 'timeline' it plays the Movie Editor's layout instead: clips from up to three sources in sequence, grids of positions/channels/z/timepoints, z sweeps cut in between timepoints, and label rasters drawn with their ids. Hands the Dataset through unchanged, so it can sit mid-chain.",
    "extra_layers": null,
    "footprint_mode": "sweep",
+   "fresh_output": false,
    "granularity": {
     "time": "whole_volume",
     "timeline": "multi_view",
@@ -24983,6 +25263,7 @@
    "description": "Write the Dataset on this wire to a TIFF, streaming one plane at a time so peak memory is a single plane no matter how large the series. The calibration envelope is transcribed verbatim into OME-XML \u2014 physical XY/Z sizes, frame interval, significant bits, channel names and emission wavelengths, per-plane stage position and time offset \u2014 so the exported file describes the pixels it contains rather than the file they came from. Hands the Dataset through unchanged, so it can sit mid-chain.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_plane",
    "has_compute": true,
    "inputs": [
@@ -25286,6 +25567,7 @@
    "description": "Start this page from a named output of an earlier page. At run time the upstream page is spliced in and this node disappears, so a result the upstream page already computed is reused from the memo rather than recomputed; at edit time the node carries the upstream output's envelope (axes, calibration, layers), so every derived default on this page is right before anything is pulled.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -25385,6 +25667,7 @@
    "description": "Name the Dataset wired in as a VARIABLE of this page, for a Page Input on a later page to read. A pass-through: nothing is copied or changed except an optional `condition` label in the metadata.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -25551,6 +25834,1026 @@
    "supports_true_3d": true,
    "three_d_fallback": ""
   },
+  "plot.xy": {
+   "adds_domains": [
+    "voxel"
+   ],
+   "category": "plot",
+   "compute": "_compute_plot_xy",
+   "description": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars \u2014 drawn as a true-colour picture the Viewer shows and Export Figure writes.",
+   "extra_layers": null,
+   "footprint_mode": "dim",
+   "fresh_output": true,
+   "granularity": "whole_series",
+   "has_compute": true,
+   "inputs": [
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": null,
+     "derive": "",
+     "description": "The Dataset whose table is plotted \u2014 anything carrying a Label, Point or Track table.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "data",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.DATASET",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "Which table of the chosen domain to plot. Blank uses the only one on the wire, and asks when there are several.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Table",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "domain",
+     "layer_out": [],
+     "multi": false,
+     "name": "table",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "table",
+     "column_in": null,
+     "column_in_mode": "domain",
+     "column_join": [],
+     "default": "t",
+     "derive": "",
+     "description": "The column on the horizontal axis \u2014 `t` (the frame) for a time course, or any measured column against another.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "X",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "x",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "table",
+     "column_in": null,
+     "column_in_mode": "domain",
+     "column_join": [],
+     "default": "area",
+     "derive": "",
+     "description": "The column on the vertical axis. The plot reads the values as they are in the table; it changes no measurement.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Y",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "y",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "table",
+     "column_in": null,
+     "column_in_mode": "domain",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "Draw one series per distinct value of this column \u2014 a `condition` from a Page Output, a track id, a channel. Blank draws every row as one series, with no legend.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Group by",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "group_by",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "The text above the chart. Blank draws no title \u2014 the usual choice for a manuscript, whose caption carries it.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Title",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "title",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "The horizontal axis label. Blank uses the x column's name; add the unit here, e.g. 'time (min)'.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "X label",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "x_label",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "The vertical axis label. Blank uses the y column's name; add the unit here, e.g. 'area (\u00b5m\u00b2)'.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Y label",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "y_label",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "Fix the horizontal axis as 'low, high' (e.g. '0, 120'). Blank lets the data decide, and either side may be left blank ('0,' fixes only the low end). Values outside are not drawn.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "X range",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "x_range",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": "",
+     "derive": "",
+     "description": "Fix the vertical axis as 'low, high' (e.g. '0, 500'). Blank lets the data decide; '0,' starts the axis at zero, which keeps a bar of differences honest.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Y range",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "y_range",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.STRING",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": false,
+     "derive": "",
+     "description": "Draw the horizontal axis on a log scale. Rows whose x is zero or negative cannot be placed on it and are left out.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Log x",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "log_x",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.BOOL",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": false,
+     "derive": "",
+     "description": "Draw the vertical axis on a log scale \u2014 for values spanning orders of magnitude. Rows whose y is zero or negative are left out.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Log y",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "log_y",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.BOOL",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 85.0,
+     "derive": "",
+     "description": "The figure's printed width. Together with dpi it sets the picture's pixel size; text and lines keep their point sizes, so a wider figure gives the data more room, not bigger type.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Width",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "width_mm",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.FLOAT",
+     "unit": "mm",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 65.0,
+     "derive": "",
+     "description": "The figure's printed height (see Width).",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Height",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "height_mm",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.FLOAT",
+     "unit": "mm",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 300,
+     "derive": "",
+     "description": "Pixels per inch of the picture. 300 is print quality; 150 is plenty on screen and four times fewer pixels. Export Figure can write another resolution without changing this.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Resolution",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "dpi",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.INT",
+     "unit": "dpi",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 8.0,
+     "derive": "",
+     "description": "The axis-label size in points; tick labels are a little smaller and the title a little larger.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Text size",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "font_pt",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.FLOAT",
+     "unit": "pt",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 1.0,
+     "derive": "",
+     "description": "The data lines' width in points; axes, ticks and error bars scale with it.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Line width",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "line_width",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.FLOAT",
+     "unit": "pt",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 3.0,
+     "derive": "",
+     "description": "The diameter of a point's marker in points.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Marker size",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "marker_size",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.FLOAT",
+     "unit": "pt",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": false,
+     "derive": "",
+     "description": "Draw light grid lines behind the data at the major ticks.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Grid",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "grid",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.BOOL",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": true,
+     "derive": "",
+     "description": "Name each group in a legend. Only drawn when there are named groups (a Group by column is set).",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Legend",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "legend",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.BOOL",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    }
+   ],
+   "kernel_axes": [],
+   "label": "Plot XY",
+   "meta_transform": "figure_frame",
+   "modes": [
+    {
+     "available_in": null,
+     "choice_docs": {
+      "label": "Per segmented region \u2014 one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+      "point": "Per detection \u2014 one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+      "track": "Per temporal identity \u2014 one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+     },
+     "choices": [
+      "label",
+      "point",
+      "track"
+     ],
+     "default": "label",
+     "derive": "",
+     "description": "Which kind of table the rows come from: one row per region, per detection, or per tracked object.",
+     "label": "Domain",
+     "name": "domain",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": null,
+     "choice_docs": {
+      "line": "Join the points of a series by a line ordered by x, with no markers \u2014 a clean time course when x is dense (with several rows per x, average them with Error first).",
+      "line_markers": "A line through markers: a time course whose individual points still show, so a gap or an outlier is visible.",
+      "scatter": "Markers only, no line \u2014 for two measurements against each other, where joining neighbours in x would mean nothing."
+     },
+     "choices": [
+      "line",
+      "scatter",
+      "line_markers"
+     ],
+     "default": "scatter",
+     "derive": "",
+     "description": "How each series is drawn.",
+     "label": "Kind",
+     "name": "kind",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": null,
+     "choice_docs": {
+      "ci95": "Average the rows at each x and show the 95 % confidence interval of the mean (Student's t, n-1 degrees of freedom) \u2014 wider than sem, the honest bar for comparing two groups.",
+      "none": "Draw every row as its own point; nothing is averaged. With many objects per frame this shows the whole population as a cloud.",
+      "sd": "Average the rows at each x and show \u00b1 one standard deviation \u2014 the spread of the population itself, which does not shrink as n grows.",
+      "sem": "Average the rows at each x and show \u00b1 the standard error of the mean (sd/\u221an) \u2014 how well the mean is known; narrows as n grows."
+     },
+     "choices": [
+      "none",
+      "sd",
+      "sem",
+      "ci95"
+     ],
+     "default": "none",
+     "derive": "",
+     "description": "Whether rows that share an x are summarised, and with what spread.",
+     "label": "Error",
+     "name": "error",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": {
+      "error": [
+       "ci95",
+       "sd",
+       "sem"
+      ]
+     },
+     "choice_docs": {
+      "band": "A translucent band between the lower and upper bounds \u2014 reads best for a dense time course, where bars would overlap.",
+      "bars": "An error bar with caps at every x \u2014 reads best with few x values, and on a scatter."
+     },
+     "choices": [
+      "bars",
+      "band"
+     ],
+     "default": "bars",
+     "derive": "",
+     "description": "How the spread is drawn around each mean.",
+     "label": "Error style",
+     "name": "error_style",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": null,
+     "choice_docs": {
+      "dark": "The talk layout on a dark background with light text and grid \u2014 for slides and screens with a dark theme. Prints badly; pick another style for paper.",
+      "paper": "A one-column journal figure: 85 x 65 mm at 300 dpi, 8 pt text, thin lines and small markers, no grid, on white. Sized to drop into a manuscript at 100 %.",
+      "poster": "A poster panel: 250 x 180 mm at 150 dpi with 20 pt text and the heaviest lines, readable from a couple of metres; the largest picture of the four.",
+      "talk": "A slide: 160 x 100 mm at 150 dpi with 14 pt text and heavier lines, plus a light grid, so the chart reads from the back of a room on a projector."
+     },
+     "choices": [
+      "paper",
+      "talk",
+      "poster",
+      "dark"
+     ],
+     "default": "paper",
+     "derive": "",
+     "description": "The figure's size, resolution, type sizes and line weights as one preset for where it is going. Each re-renders the picture; switch Detail to custom to set any of them by hand.",
+     "label": "Style",
+     "name": "style",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": null,
+     "choice_docs": {
+      "custom": "Show width, height, dpi, type size, line width, marker size, font, grid and legend, and draw with them. They start at the paper preset's values; the style still picks light or dark.",
+      "preset": "Use the chosen style exactly \u2014 size, dpi, type, lines, grid and legend \u2014 and hide the fields that would override it."
+     },
+     "choices": [
+      "preset",
+      "custom"
+     ],
+     "default": "preset",
+     "derive": "",
+     "description": "Whether the style preset decides every size and weight, or the custom fields below do.",
+     "label": "Detail",
+     "name": "detail",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": null,
+     "choice_docs": {
+      "colorblind": "Okabe & Ito's eight colours, chosen to stay distinguishable under the common colour-vision deficiencies. The safe default for any audience.",
+      "greys": "Four greys from black to light grey, for a figure printed in black and white; past four groups the shades repeat, so pair it with few groups.",
+      "tab10": "matplotlib's ten-colour default cycle: familiar from other figures, but two of its pairs merge for red-green colour-blind readers.",
+      "viridis": "Five steps of the perceptually uniform viridis map, dark purple to yellow \u2014 for groups that have an ORDER (doses, timepoints), so the colour reads as one."
+     },
+     "choices": [
+      "colorblind",
+      "tab10",
+      "viridis",
+      "greys"
+     ],
+     "default": "colorblind",
+     "derive": "",
+     "description": "The colours the series (the groups) are drawn in, in order.",
+     "label": "Palette",
+     "name": "palette",
+     "presentation": "body",
+     "role": ""
+    },
+    {
+     "available_in": {
+      "detail": [
+       "custom"
+      ]
+     },
+     "choice_docs": {
+      "sans": "DejaVu Sans, a plain sans-serif like most journals' figure text and every slide template \u2014 the default.",
+      "serif": "DejaVu Serif, for a document set in a serif face whose figures should match its body text."
+     },
+     "choices": [
+      "sans",
+      "serif"
+     ],
+     "default": "sans",
+     "derive": "",
+     "description": "The typeface of every label. Both ship with the app, so a figure renders identically on every machine.",
+     "label": "Font",
+     "name": "font",
+     "presentation": "body",
+     "role": ""
+    }
+   ],
+   "op_key": "plot.xy",
+   "outputs": [
+    {
+     "available_in": null,
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": null,
+     "derive": "",
+     "description": "",
+     "dims": 3,
+     "direction": "Direction.OUT",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Figure",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "out",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": false,
+     "type": "SocketType.DATASET",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    }
+   ],
+   "owner": "nodegraph.catalog.plot.xy",
+   "reads_domains": [],
+   "reads_domains_by_mode": {
+    "domain": {
+     "label": [
+      "label"
+     ],
+     "point": [
+      "point"
+     ],
+     "track": [
+      "track"
+     ]
+    }
+   },
+   "supports_2d": true,
+   "supports_true_3d": true,
+   "three_d_fallback": ""
+  },
   "registration.align_to": {
    "adds_domains": [],
    "category": "registration",
@@ -25558,6 +26861,7 @@
    "description": "Measure how far this input's stage log sits from a reference's, per field, by phase-correlating their physical overlap \u2014 and RECORD the correction rather than applying it to pixels. Overlay and every other placement consumer honour it automatically. A field whose match is not believed keeps its stage position.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "multi_view",
    "has_compute": true,
    "inputs": [
@@ -25885,6 +27189,7 @@
    "description": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature models, first/previous/mean/template anchor; stores per-frame shift (ported v1 kernel).",
    "extra_layers": "_layers_drift",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -26183,6 +27488,7 @@
    "description": "Identity pass-through used to route wires cleanly on the canvas.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -26284,6 +27590,7 @@
    "description": "Frame-to-frame tracking \u2192 a Track membership: label mode links by maximum IoU overlap, point mode by nearest neighbour within max_distance (\u00b5m). Runs per (m,c) across the whole T axis.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -26621,6 +27928,7 @@
    "description": "Frame-to-frame object tracking with five interchangeable linkers (centroid Hungarian / SerialTrack topology PTV / Cell-Tracker topology, fingerprint, mask-overlap IoU) \u2192 a Track membership + a track_id column on the member layer. 2D per (m,c,z); Label or Point members. The richer alternative to track.link. NOTE: serialtrack is 1\u20132 orders of magnitude slower than the others (\u22488-18 s on 1k\u201315k detections, plus a one-time numba JIT) \u2014 the cheap default is centroid.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -27378,6 +28686,7 @@
    "description": "Grows seeds into measurable objects \u2014 a Voxel label raster AND its Label table. `points` turns each detection of a Point table into a disc (2D) or ellipsoid (3D) of a physical \u00b5m radius; `surface`, `scale` and `stamp` grow an existing Label segmentation from its OWN shape \u2014 outward from each region's border by a \u00b5m distance (outline conserved), by resampling that outline about its centroid (growth proportional to size), or by replacing it with an ellipsoid. `overlap` decides contested voxels: `union` (fixed-size stamps, lower id wins), `nearest` (a tessellation capped at the growth, ~139x cheaper than the equivalent Voronoi Cells) or `merge` (touching regions fuse into one), and `protect` keeps growth out of a neighbour's interior. The inverse of transform.label_to_points.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -27992,6 +29301,7 @@
    "description": "Every label region \u2192 one Point at its centre (centroid / guaranteed-inside / intensity-weighted), keeping a `label` column back to the region. 2D vs 3D is inherited from the Label instance's own provenance. The seed cloud for Cluster Points, Tessellate, point tracking and Voronoi Cells.",
    "extra_layers": "_layers_label_to_points",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -28234,6 +29544,7 @@
    "description": "Interpolate a Point vector/scalar field (e.g. DVC) up to full-resolution Voxel layers (one per attribute column); 2D-per-plane vs volumetric is inherited from the field's z_kind (\u00a77b); nearest-filled out-of-hull.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -28436,6 +29747,7 @@
    "description": "Rasterize a MESH \u2192 one filled Voxel Label region per element (interior test inherited from the mesh provenance: convex hull, or faces-based parity so concavity survives) + a per-element Label table (centroid, analytic volume_um3/density/n_points/surface_area, realized voxel_count); 3D (ports v1 granule_volume_mask).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -28730,6 +30042,7 @@
    "description": "Move selected channels' pixels inside a FIXED frame \u2014 translate in X/Y (and Z in 3D) and rotate in-plane about the centre \u2014 cropping whatever leaves the frame and zero-filling what it vacates. Channels not named pass through at their original position, so corrected and raw ones arrive downstream on one wire and can be compared directly; the usual reason to reach for it is a chromatic or filter-cube offset before colocalization. Axes, pixel size and origin are unchanged \u2014 only content moves. Interpolation is linear / nearest / cubic; Voxel layers such as masks ride along with the same transform (integer rasters always nearest), and a Label / Point / Track table on the wire is refused because its coordinate columns cannot be honestly rewritten.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -29070,6 +30383,7 @@
    "description": "Move a lattice attribute between domains (reduce coarsens over dropped axes / broadcast refines); lattice ONLY \u2014 for Label/Point/Track use Transfer Structure.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_volume",
    "has_compute": true,
    "inputs": [
@@ -29299,6 +30613,7 @@
    "description": "Move an attribute across the detected-structure spine \u2014 Voxel\u2194Label\u2194Point\u2194Track and structure\u2192Frame (15 pairs). Coarsening reduces (mean in mask, points in region, gather over a track); refining broadcasts (paint by label, splat, broadcast a track's value onto its members). Dimensionality is inherited from the structures' own provenance.",
    "extra_layers": "_layers_transfer_structure",
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -29695,6 +31010,7 @@
    "description": "Stack two or more files on the batch axis so one pipeline runs over all of them independently \u2014 per-file statistics, not pooled. Unbatch splits the results back apart.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -29813,6 +31129,7 @@
    "description": "Crop Y,X (and Z in 3D mode), or keep only chosen M/T/Z frames; pixel size preserved (origin deferred).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -30271,6 +31588,7 @@
    "description": "Crop to the field another file occupies in absolute stage coordinates; M collapses to the covering position, pixel size preserved.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "tileable",
     "3D": "whole_volume"
@@ -30755,6 +32073,7 @@
    "description": "Merge two or more Datasets by growing ONE chosen axis. 'C' places and resamples channels the way the retired Merge Channels did (handles mismatched pixel size/focus); 'T'/'M'/'Z' lay inputs end to end with no resampling, refusing unless every other axis already matches \u2014 the shape a 'before'/'after' pair needs to become one series for tracking.",
    "extra_layers": null,
    "footprint_mode": "merge_axis",
+   "fresh_output": false,
    "granularity": {
     "C": "multi_view",
     "M": "tileable",
@@ -31222,6 +32541,7 @@
    "description": "Rescale Y,X (and Z in 3D) by a factor; pixel size scales inversely (finer when upsampling).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": {
     "2D": "whole_plane",
     "3D": "whole_volume"
@@ -31431,6 +32751,7 @@
    "description": "Keep one file of a batch, by name. The tap Unbatch's per-file outputs materialize into, and usable on its own to pull a single member out.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -31567,6 +32888,7 @@
    "description": "Keep only the multipoints of one specimen group \u2014 the 3x3 mosaic, the plate well \u2014 recovered from the stage coordinates or read from the acquisition. Lazy: no pixels move, and per-position metadata, layers and structure rows follow the selection.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -31740,6 +33062,7 @@
    "description": "Keep one multipoint position, by index or acquisition name. The tap Split Positions' per-position outputs materialize into, and usable on its own.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -31876,6 +33199,7 @@
    "description": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -31975,6 +33299,7 @@
    "description": "Stack the Timepoint axis \u2192 one frame (SNR\u2191) with a robust combiner (mean/median/sigma-clip/trimmed); drops dt_s.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "whole_series",
    "has_compute": true,
    "inputs": [
@@ -32103,6 +33428,7 @@
    "description": "Stitch the multipoint axis into one mosaic (M\u21921, Y/X grow): tiles placed from the file's stage log (optionally refined by phase correlation) or on an explicit grid, blended feather/max/mean/overwrite.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "multi_view",
    "has_compute": true,
    "inputs": [
@@ -32497,6 +33823,7 @@
    "description": "Build one series from many source FILES: wire each file (or multi-file card) into its own slot \u2014 a new empty slot appears as you fill the last \u2014 and the files are laid onto ONE axis (Time by default; or Channels, Z, positions) in the order their acquisition clocks say, so the series is right whatever order you dropped them in. Falls back to the counting number in the filenames, then to wiring order, and says which on the card. A pure index remap: nothing is resampled or copied. Put it directly after the loaders \u2014 it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses. (Formerly Chain Files, util.chain.)",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -33046,6 +34373,7 @@
    "description": "Fan a batch back out into one output per file \u2014 each a single-file Dataset, named after its source. The whole batch also passes through 'out'. Put per-object analysis (segment, measure, track) AFTER this: structure rows carry no batch column, so they cannot tell two files apart while the batch is still stacked.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -33145,6 +34473,7 @@
    "description": "Project the Z axis (max/mean/sum/min/median) \u2192 a 2D (z==1) Dataset; drops z_step_um and marks z_collapsed. Method 'none' resets the node to a pass-through: the full Z stack comes back with z_step_um intact.",
    "extra_layers": null,
    "footprint_mode": "method",
+   "fresh_output": false,
    "granularity": {
     "max": "whole_volume",
     "mean": "whole_volume",
@@ -33295,6 +34624,7 @@
    "description": "One blank field spanning every wired file's fields at their true stage positions \u2014 the primary to chain Overlays onto when the files share no field (adjacent regions of a well, several wells of a plate), so all of them appear in ONE view, each exactly where the stage put it. Reads no pixels and holds none.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -33542,6 +34872,7 @@
    "description": "Draw a second Dataset inside this one's field, placed by absolute stage position, pixel size and focus \u2014 so two files that ran through different graphs line up on the microscope's own coordinates. The primary defines the canvas and passes through untouched; the secondary is matched tile by tile, and the pairing, coverage, time and focus offsets are reported rather than assumed. Chain Overlays for a third source.",
    "extra_layers": null,
    "footprint_mode": "output",
+   "fresh_output": false,
    "granularity": {
     "display": "tileable",
     "resample": "multi_view"
@@ -34390,6 +35721,7 @@
    "description": "Display sink \u2014 shows the primary image stream, and any extra streams wired into the slots that appear as you fill them, merged or tiled, with an optional scale bar. No output: what it shows goes nowhere downstream (V2.00 \u00a710; sources, layout and scale bar 2026-10-02).",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": null,
    "has_compute": true,
    "inputs": [
@@ -35003,6 +36335,7 @@
    "description": "Per-frame-T slice: inside a zone body, iteration t yields frame t of its (T-stacked) input (t==1). Drives the Simulation per-frame pattern.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -35102,6 +36435,7 @@
    "description": "Zone boundary marker (pass-through); paired In/Out bound the iterated body \u2014 see nodegraph.zones.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -35201,6 +36535,7 @@
    "description": "Zone boundary marker (pass-through); paired In/Out bound the iterated body \u2014 see nodegraph.zones.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -35300,6 +36635,7 @@
    "description": "Zone boundary marker (pass-through); paired In/Out bound the iterated body \u2014 see nodegraph.zones.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [
@@ -35399,6 +36735,7 @@
    "description": "Zone boundary marker (pass-through); paired In/Out bound the iterated body \u2014 see nodegraph.zones.",
    "extra_layers": null,
    "footprint_mode": "dim",
+   "fresh_output": false,
    "granularity": "tileable",
    "has_compute": true,
    "inputs": [

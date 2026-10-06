@@ -172,6 +172,10 @@ MODULES: Tuple[str, ...] = (
     # primary's field; this makes a primary whose field is EVERY file's, so files that share
     # no field can still be overlaid into one view.
     "view.canvas",
+    # V4.00 step 7: the plot nodes and the figure writer, appended (this list's order is the
+    # link-drag search menu's order, and appending keeps every earlier position).
+    "plot.xy",
+    "io.write_figure",
 )
 
 

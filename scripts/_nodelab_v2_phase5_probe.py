@@ -6408,6 +6408,67 @@ def main(argv) -> int:
         "never reach the master (Dissolve acts on the page shown); Make unique keeps the "
         "selection and Properties")
 
+    # PL1 (V4.00 step 7) Plot XY on the example graph's measured table: its envelope is ONE
+    # RGB picture with no table on it; pulled, the viewer shows it in TRUE colour — R, G and
+    # B in their own colours on a fixed 0-255 window — and an Analysis page offers it
+    import importlib.util as _ilu
+    if _ilu.find_spec("matplotlib") is None:
+        _ok("PL1 SKIPPED — matplotlib is not installed")
+    else:
+        win.file_new()
+        win.build_demo()
+        app.processEvents()
+        _dp = win.doc
+        _dp.add_node("plot.xy", node_id="PL", x=1600.0, y=150.0)
+        _dp.connect("n6", "out", "PL", "data")
+        win.scene.sync()
+        app.processEvents()
+        _pe = _dp.env("PL")
+        assert _pe.axes.c == 3 and _pe.axes.t == 1 and {d.value for d in _pe.domains} == {"voxel"} and \
+            not _pe.layer_names, (_pe.axes, _pe.domains, _pe.layer_names)
+        _prid = _pq(win.workspace.active, "PL")
+        _pdone.clear()
+        win.pull_node("PL")
+        _pwait(_prid, timeout=300)
+        _pv = win.viewer
+        assert _pv.binding == (win.workspace.active, "PL") and _pv.has_image()
+        assert getattr(_pv, "_picture", False), "the viewer knows it shows a picture"
+        assert [_pv._chan_colors[i] for i in range(3)] == [(255, 0, 0), (0, 255, 0),
+                                                           (0, 0, 255)], _pv._chan_colors
+        assert _pv._planes and all(_pv._clim.get(_pv._lut_key(_prid, c)) == (0.0, 255.0)
+                                   for c in _pv._planes), \
+            {c: _pv._clim.get(_pv._lut_key(_prid, c)) for c in _pv._planes}
+        assert "pixel_size_um" not in (_pv._dataset.metadata or {}), "no scale bar on a chart"
+        win.new_page("analyze")
+        app.processEvents()
+        assert {"plot.xy", "io.write_figure"} <= _palette_ops(), "an Analysis page offers them"
+        _ok("PL1 Plot XY of the measured table: its envelope is one RGB picture (its own Voxel "
+            "domain) with no table; "
+            "the viewer shows it in true colour (R/G/B in their own colours on a fixed 0-255 "
+            "window, no calibration); an Analysis page offers Plot XY and Export Figure")
+
+        # PL2 (step 7 review) an optional column (Group by) can go back to blank: Properties
+        # and the card both offer "(none)"; the plot's channel descriptors are R/G/B
+        win._show_page(win.canvas, [p for p in win.workspace.pages][0])
+        app.processEvents()
+        win.scene.clearSelection()
+        win.scene.node_items["PL"].setSelected(True)
+        app.processEvents()
+        _dp.nodes["PL"].params["group_by"] = "t"
+        _dp.touch("PL")
+        win.inspector.set_node(win.scene.node_items["PL"])
+        app.processEvents()
+        _gb = next(c for c in win.inspector.findChildren(_PCombo)
+                   if c.count() and c.itemText(0) == "(none)")
+        assert _gb.currentText() == "t"
+        _gb.setCurrentIndex(0)
+        _gb.activated.emit(0)
+        app.processEvents()
+        assert _dp.nodes["PL"].params.get("group_by") == "", _dp.nodes["PL"].params
+        assert [d["name"] for d in _dp.channel_descriptors("PL")] == ["R", "G", "B"]
+        _ok("PL2 an optional column socket offers (none) and goes back to blank; a plot's "
+            "channels read R/G/B, not the source file's")
+
     # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
     from PySide6.QtGui import QMouseEvent as _QME

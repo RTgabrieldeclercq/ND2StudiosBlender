@@ -384,7 +384,7 @@ class MovieSource:
     """
 
     __slots__ = ("letter", "ds", "ax", "prov", "px_um", "z_step", "dt_s", "emis",
-                 "bit_depth", "names", "pos_names", "_vox")
+                 "bit_depth", "names", "pos_names", "_vox", "picture", "colors")
 
     def __init__(self, letter: str, ds, *, calib: Callable, meta: Callable) -> None:
         self.letter, self.ds, self.ax = letter, ds, ds.axes
@@ -393,6 +393,11 @@ class MovieSource:
         self.z_step = calib("z_step_um")
         self.dt_s = calib("dt_s")
         self.emis = list(calib("channel_emission_nm") or [])
+        # a PICTURE (a plot's figure, V4.00) is RGB already: its channels keep their own
+        # colours on a fixed 0-255 window, as the Viewer shows it
+        md = getattr(ds, "metadata", None) or {}
+        self.picture = bool(md.get("picture"))
+        self.colors = list(md.get("channel_colors") or []) if self.picture else []
         self.bit_depth = calib("bit_depth")
         # Names are DISPLAY metadata, and the GUI seeds them onto the source Dataset only,
         # never into the engine's envelope (`runner._channel_display`), so `ctx.meta` reports
@@ -605,8 +610,12 @@ class Timeline:
             v.tints, v.gammas, v.explicit = [], [], {}
             for ch in v.chans:
                 d = disp.get(str(ch)) or {}
+                pic = (src.colors[ch] if getattr(src, "picture", False)
+                       and ch < len(src.colors) else None)
                 if d.get("rgb") is not None:
                     v.tints.append(tuple(int(x) for x in d["rgb"]))
+                elif isinstance(pic, (list, tuple)) and len(pic) == 3:
+                    v.tints.append(tuple(int(x) for x in pic))
                 elif len(v.chans) == 1:
                     # one channel reads greyscale, not in its emission tint: a lone deep-blue
                     # channel is hard to see, and it is not what the Viewer shows either
@@ -617,6 +626,8 @@ class Timeline:
                 if d.get("lo") is not None and d.get("hi") is not None:
                     lo, hi = float(d["lo"]), float(d["hi"])
                     v.explicit[ch] = (lo, hi if hi > lo else lo + 1.0)
+                elif getattr(src, "picture", False):
+                    v.explicit[ch] = (0.0, 255.0)       # a picture is shown as drawn
             v.names = [src.channel_name(ch) for ch in v.chans]
             v.brightness = float(panel["brightness"])
             v.m = var.get("m", panel["m"])

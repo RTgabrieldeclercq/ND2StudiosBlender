@@ -680,6 +680,13 @@ def _guess_target(graph: Any) -> str:
     """The node a run should pull, when the caller did not say: the last in topological
     order, which is the graph's own answer to "what is this pipeline for"."""
     order = list(graph.topo_order())
+    # a plot and its Export Figure make a picture, not a table: a draft whose last node is
+    # one would run with an empty 'measurements' table — target what feeds them instead
+    fig = [n for n in order if str(getattr(graph.nodes[n], "op_key", "")).startswith("plot.")
+           or getattr(graph.nodes[n], "op_key", "") == "io.write_figure"]
+    rest = [n for n in order if n not in fig]
+    if rest:
+        order = rest
     return order[-1] if order else ""
 
 

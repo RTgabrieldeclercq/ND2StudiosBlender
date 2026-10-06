@@ -412,6 +412,7 @@ def _registry_pass(by_module: Dict[str, Any]) -> Dict[str, Any]:
 
         card: Dict[str, Any] = {
             "k": "node", "op": spec.op_key, "label": spec.label, "cat": spec.category,
+            **({"fresh": True} if getattr(spec, "fresh_output", False) else {}),
             "mod": mod_card.get("path", ""), "owner": owner, "compute": cname,
             "gran": _plain(spec.granularity), "kax": _plain(spec.kernel_axes),
             "fp_mode": spec.footprint_mode,

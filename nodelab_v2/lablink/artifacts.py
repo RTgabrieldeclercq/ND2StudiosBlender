@@ -307,6 +307,19 @@ def write_table(dataset: Any, out_dir: str, name: str, *, policy: str = "auto",
         extra={"rows": rows, "tables": len(tables)})
 
 
+def _picture_rgb(dataset: Any, m: int, t: int, max_px: int):
+    """A PICTURE's (a plot's figure) R, G and B planes as one uint8 image — or ``None`` for
+    anything else. A chart is not a microscope image: it has no channel to grey-stretch."""
+    md = getattr(dataset, "metadata", None) or {}
+    axes = getattr(dataset, "axes", None)
+    prov = getattr(dataset, "image", None)
+    if not md.get("picture") or axes is None or prov is None or getattr(axes, "c", 0) < 3:
+        return None
+    planes = [_stride_to(np.asarray(prov.get_region(0, m, t, 0, ch, 0, axes.y, 0, axes.x)),
+                         max_px) for ch in range(3)]
+    return np.clip(np.stack(planes, axis=-1), 0, 255).astype(np.uint8)
+
+
 def write_quicklook(dataset: Any, out_dir: str, name: str, *, policy: str = "auto",
                     max_px: int = QUICKLOOK_MAX_PX) -> Optional[Artifact]:
     """Render one plane of a pulled Dataset as a PNG, with a thumbnail beside it.
@@ -319,10 +332,13 @@ def write_quicklook(dataset: Any, out_dir: str, name: str, *, policy: str = "aut
     if axes is None:
         return None
     m, t, z, c = _plane_coords(axes)
-    rasters = _label_rasters(dataset)
-    under = _image_plane(dataset, m, t, z, c, max_px)
+    pic = _picture_rgb(dataset, m, t, max_px)       # a plot's figure: its own RGB as drawn
+    rasters = {} if pic is not None else _label_rasters(dataset)
+    under = None if pic is not None else _image_plane(dataset, m, t, z, c, max_px)
 
-    if rasters:
+    if pic is not None:
+        rgb, drew = pic, "picture"
+    elif rasters:
         # a stable pick: the first by name, so two runs of one recipe draw the same layer
         chosen = sorted(rasters)[0]
         vol = np.asarray(rasters[chosen])

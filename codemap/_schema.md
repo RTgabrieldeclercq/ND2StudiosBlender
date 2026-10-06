@@ -37,6 +37,7 @@ grep '"op":"enhance.gaussian"' codemap/gen/nodes.jsonl
 | `reads_by_mode` | the conditional half: `{mode: {value: [domain…]}}` — a per-branch rail |
 | `d2` `d3` | supports 2D / true 3D. **Always present**, so absence never has to be interpreted |
 | `meta` | name of the `meta_transform` — this node changes axes or calibration |
+| `fresh` | `fresh_output`: the output envelope inherits no domain, layer or column from the input (a plot's Picture). Absent = it inherits |
 | `extra_layers` | name of the resolver declaring layers that have no output socket |
 | `trained` | a loaded model checkpoint fills some of this node's sockets |
 | `kernel_doc` | path to the kernel's integration contract — usually the best next read |
