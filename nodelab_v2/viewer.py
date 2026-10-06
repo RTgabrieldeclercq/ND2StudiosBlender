@@ -4671,6 +4671,7 @@ class ViewerPanel(QWidget):
         for (dom, layer, name), attr in ds.attributes.items():
             if dom is Domain.POINT:
                 by_layer.setdefault(layer, {})[name] = attr.values
+        by_layer = self._drop_synth(by_layer, Domain.POINT)
         on = frame = 0
         for cols in by_layer.values():
             if "y" not in cols or "x" not in cols:
@@ -4687,6 +4688,18 @@ class ViewerPanel(QWidget):
                 # np.rint matches the paint path's round() — both round half to even
                 on += int((keep & (np.rint(np.asarray(zs, dtype=float)) == z)).sum())
         return (on, frame)
+
+    def _drop_synth(self, by_layer: Dict[Any, Dict[str, np.ndarray]],
+                    domain: Domain) -> Dict[Any, Dict[str, np.ndarray]]:
+        """``by_layer`` without the tables a table node wrote (V4.00): a Table Concat holds
+        other inputs' rows at positions on THEIR images, a Table Join repeats its left
+        table's — drawn over this image they would be detections it does not have. A Points
+        picker naming one still shows it (see :meth:`_point_marks`)."""
+        from nodegraph.catalog._shared.table_ops import synthesized
+        skip = synthesized(getattr(self._dataset, "metadata", None) or {}, domain)
+        if not skip:
+            return by_layer
+        return {k: v for k, v in by_layer.items() if str(k) not in skip}
 
     def _point_marks(self) -> List[OV.PointMark]:
         """Every Point-domain row that belongs on the viewed frame, as draw-ready marks.
@@ -4725,6 +4738,8 @@ class ViewerPanel(QWidget):
         _want = str(getattr(self.overlays.points, "layer", "") or "").strip()
         if _want and _want in {str(k) for k in by_layer}:
             by_layer = {k: v for k, v in by_layer.items() if str(k) == _want}
+        else:
+            by_layer = self._drop_synth(by_layer, Domain.POINT)
         out: List[OV.PointMark] = []
         # sorted: the per-layer colour must not depend on dict insertion order
         for li, layer in enumerate(sorted(by_layer, key=lambda v: str(v))):
@@ -5031,7 +5046,7 @@ class ViewerPanel(QWidget):
         for (dom, layer, name), attr in ds.attributes.items():
             if dom is Domain.TRACK:
                 out.setdefault(layer, {})[name] = attr.values
-        return out
+        return self._drop_synth(out, Domain.TRACK)
 
     @staticmethod
     def _best_member_layer(members: Dict[tuple, Dict[str, np.ndarray]],

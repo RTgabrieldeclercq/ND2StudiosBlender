@@ -112,10 +112,10 @@
  "CON-15": {
   "anchors": {
    "sym:nodegraph.metadata.MetaEnvelope.columns_in": "e30410e7eeff5e3f69ac1f7d15782fc8",
-   "sym:nodegraph.metadata._column_names_out": "cdbc7bd310ed6634f38c3921c61def4e",
+   "sym:nodegraph.metadata._column_names_out": "22800b478bbaba6a1c431bc8e568f759",
    "sym:nodelab_v2.document.GraphDocument.column_choices": "37d23240dfceebb958265784159f510c"
   },
-  "blessed": "2026-09-08",
+  "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
  "CON-16": {

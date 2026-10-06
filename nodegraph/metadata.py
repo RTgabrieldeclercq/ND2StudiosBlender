@@ -348,6 +348,18 @@ POSITION_NAME_KEY = "position_name"
 #: cannot disagree about the spelling.
 SOURCE_FILE_KEY = "source_file"
 
+#: The scalar metadata key naming the experimental CONDITION a Dataset belongs to — stamped by
+#: a Page Output (V4.00: blank = its page's name) and read by ``table.concat``, which writes
+#: it as a column so rows from several pages say where they came from. Named once here so the
+#: GUI-layer op and the catalog cannot disagree about the spelling.
+CONDITION_KEY = "condition"
+
+#: Set (``True``) beside :data:`CONDITION_KEY` when the condition was TYPED on a Page Output
+#: rather than filled in from the page's name. A later Output left blank keeps a typed
+#: condition instead of replacing it with its own page's name — so labelling the dishes once,
+#: on the first page, survives every page after it.
+CONDITION_SET_KEY = "condition_set"
+
 
 def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
     """The ``{key: subset}`` changes that reindex every :data:`PER_POSITION_KEYS` list in
@@ -1921,7 +1933,9 @@ def propagate_meta(graph: Graph,
         env_out = env_out.with_layer_names(
             _layer_names_out(spec, node, base, env_out))
         out[nid] = env_out.with_column_names(
-            _column_names_out(spec, node, base, env_out))
+            _column_names_out(spec, node, base, env_out,
+                              inputs=tuple((e.dst_socket, out.get(e.src, MetaEnvelope()))
+                                           for e in dpreds)))
     return out
 
 
@@ -1988,7 +2002,8 @@ def _layer_names_out(spec, node, env_in: MetaEnvelope,
 
 
 def _column_names_out(spec, node, env_in: MetaEnvelope,
-                      env_out: MetaEnvelope) -> Tuple[Tuple[Domain, str, str], ...]:
+                      env_out: MetaEnvelope, *, inputs: Tuple = ()
+                      ) -> Tuple[Tuple[Domain, str, str], ...]:
     """This node's outgoing STRUCTURE-column catalog: the input's, minus what its layer
     catalog dropped, plus what its ``adds_columns`` declares (V2.28).
 
@@ -2003,6 +2018,14 @@ def _column_names_out(spec, node, env_in: MetaEnvelope,
     goes with it. In practice structure domains are never reshaped and this is a no-op —
     but deriving it from the layer catalog rather than asserting that keeps the two from
     drifting if a future node does drop a structure layer.
+
+    **Every input, on request (V4.00).** The catalog flows from input 0 alone, which is right
+    for every node that passes one Dataset on — but a node that builds a table out of SEVERAL
+    inputs (``table.concat``'s many, ``table.join``'s ``other``) writes columns that only a
+    later input carries. A declaration marked ``wants_inputs = True`` is called with a fourth
+    argument, ``inputs`` — ``((socket, envelope), ...)`` for each Dataset input in canonical
+    order — so it can name them; without it every such column would be unpickable in the
+    closed column menus downstream.
     """
     surviving = {(d, n) for d, n in env_out.layer_names}
     cols: List[Tuple[Domain, str, str]] = [
@@ -2018,7 +2041,9 @@ def _column_names_out(spec, node, env_in: MetaEnvelope,
         state = {}
     params = getattr(node, "params", {}) or {}
     try:
-        for entry in adds(params, state, tuple(cols)) or ():
+        got = (adds(params, state, tuple(cols), tuple(inputs))
+               if getattr(adds, "wants_inputs", False) else adds(params, state, tuple(cols)))
+        for entry in got or ():
             dom, lyr, col = entry
             if isinstance(lyr, str) and isinstance(col, str) and lyr and col:
                 cols.append((dom, lyr, col))
@@ -2102,6 +2127,6 @@ __all__ = [
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
     "source_file_runs", "chain_grow", "chained_metadata",
     "ChainMember", "chain_members", "stamp_source_file",
-    "PER_TIME_KEYS", "time_subset", "respaced", "z_home_after",
+    "PER_TIME_KEYS", "CONDITION_KEY", "CONDITION_SET_KEY", "time_subset", "respaced", "z_home_after",
     "eval_derive", "resolve_dim_default",
 ]

@@ -141,7 +141,9 @@ Runs on **every keystroke**, with no pixels.
    no output socket; `reads_domains` / `reads_domains_by_mode` decide whether the wiring is
    even legal. Domains, layers and columns otherwise flow on from the primary input — except
    past a node declaring `fresh_output` (a plot's Picture, V4.00), whose output is a new
-   Dataset and carries only what it adds.
+   Dataset and carries only what it adds. A column declaration marked `wants_inputs`
+   (`table.concat`, `table.join`, V4.00) is also handed every input's envelope, so the
+   columns only a later input carries are named too.
 3. The resulting envelope drives the GUI: axis sizes in the header, the layer picker's
    choices, the domain rail, and `derive` defaults resolved through
    `envelope_symbols` + `eval_derive` (CON-05).

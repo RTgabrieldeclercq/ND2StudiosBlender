@@ -75,7 +75,7 @@ def _compute_plot_heatmap(ctx: EvalContext) -> Dataset:
         rl, cl, matrix = FIG.heatmap_grid(
             FIG.column(cols, rname, node="plot heatmap", socket="row", layer=layer),
             FIG.column(cols, cname, node="plot heatmap", socket="column", layer=layer),
-            FIG.column(cols, vname, node="plot heatmap", socket="value", layer=layer),
+            FIG.column(cols, vname, node="plot heatmap", socket="value", layer=layer, numeric=True),
             reducer)
         value_label = f"{reducer} of {vname}" if reducer != "count" else "rows"
         xl, yl = cname, rname

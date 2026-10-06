@@ -52,6 +52,11 @@ SOURCE_FILE_COLUMN = "file"
 #: knowing by heart that 27-35 was the fourth one.
 POSITION_GROUP_COLUMN = "group"
 
+#: The other provenance columns a table can carry — written by ``table.concat`` (V4.00):
+#: the row's condition, which input it came from, and its position's acquisition name.
+#: Ordered with ``file``/``group``, after the coordinates and before the measurements.
+_PROVENANCE_COLUMNS = ("condition", "input", "position_name")
+
 #: canonical position of each coordinate column, for :func:`_ordered_columns`. ``file`` sits
 #: immediately before ``m``, the column it explains: reading left to right gives which file,
 #: then which position inside it.
@@ -261,6 +266,9 @@ def _ordered_columns(cols: Dict[str, np.ndarray]) -> List[str]:
             return (0, _COORD_ORDER[n], n)
         if n in (SOURCE_FILE_COLUMN, POSITION_GROUP_COLUMN):
             return (1, 0, n)
+        if n in _PROVENANCE_COLUMNS:
+            # what Table Concat writes about a row's origin (V4.00): beside file/group
+            return (1, 1, n)
         return (2, 0, n)
 
     return sorted(cols, key=rank)

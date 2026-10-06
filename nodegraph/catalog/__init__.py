@@ -180,6 +180,10 @@ MODULES: Tuple[str, ...] = (
     "plot.distribution",
     "plot.heatmap",
     "plot.timeseries",
+    # V4.00 step 9: table synthesis, appended for the same reason
+    "table.concat",
+    "table.join",
+    "table.aggregate",
 )
 
 

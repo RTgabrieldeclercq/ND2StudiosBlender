@@ -42,7 +42,7 @@ def _compute_plot_distribution(ctx: EvalContext) -> Dataset:
     vname = str(ctx.params.get("value", "area") or "area")
     gname = str(ctx.params.get("group_by", "") or "")
     v = np.asarray(FIG.column(cols, vname, node="plot distribution", socket="value",
-                              layer=layer), dtype=float)
+                              layer=layer, numeric=True), dtype=float)
     g = FIG.column(cols, gname, node="plot distribution", socket="group_by",
                    layer=layer) if gname else None
     kind = str(modes.get("kind", "histogram"))

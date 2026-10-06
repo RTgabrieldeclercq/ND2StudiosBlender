@@ -6537,6 +6537,49 @@ def main(argv) -> int:
             "T = 3, the Viewer's frame chooser spans them and frame 2 shows its own figure; "
             "an Analysis page offers Plot Distribution, Heatmap and Time Series")
 
+    # TB1 (V4.00 step 9) Table Aggregate on the example graph's measured table: its summary
+    # table is in the envelope (columns a closed menu downstream can offer) and on the pulled
+    # result the spreadsheet tabulates; Plot XY draws it; Processing and Analysis pages offer
+    # the three table nodes
+    if _ilu.find_spec("matplotlib") is None:
+        _ok("TB1 SKIPPED — matplotlib is not installed")
+    else:
+        from nodelab_v2.tables import all_tables as _all_tables
+        win.file_new()
+        win.build_demo()
+        app.processEvents()
+        _dt = win.doc
+        _dt.add_node("table.aggregate", node_id="TA", x=1600.0, y=320.0)
+        _dt.connect("n6", "out", "TA", "data")
+        _dt.add_node("plot.xy", node_id="TP", x=1860.0, y=320.0,
+                     params={"table": "summary", "x": "t", "y": "area_mean"})
+        _dt.connect("TA", "out", "TP", "data")
+        win.scene.sync()
+        app.processEvents()
+        _te = _dt.env("TA")
+        assert any(n == "summary" for _d, n in _te.layer_names), _te.layer_names
+        assert {"n", "area_mean", "area_sem", "area_count"} <= \
+            {c for _d, lyr, c in _te.column_names if lyr == "summary"}
+        _trid = _pq(win.workspace.active, "TA")
+        _pdone.clear()
+        win.pull_node("TA")
+        _pwait(_trid, timeout=300)
+        _tabs = [t for (_d, lyr), t in _all_tables(win.viewer._dataset).items()
+                 if lyr == "summary"]
+        assert _tabs and "area_mean" in _tabs[0] and "n" in _tabs[0], list(_tabs[0])
+        _tprid = _pq(win.workspace.active, "TP")
+        _pdone.clear()
+        win.pull_node("TP")
+        _pwait(_tprid, timeout=300)
+        assert win.viewer.binding == (win.workspace.active, "TP") and win.viewer.has_image()
+        for _kind in ("process", "analyze"):
+            win.new_page(_kind)
+            app.processEvents()
+            assert {"table.concat", "table.join", "table.aggregate"} <= _palette_ops(), _kind
+        _ok("TB1 Table Aggregate of the measured table: a summary table in the envelope (n, "
+            "area_mean, area_sem, area_count) and on the pulled result; Plot XY draws it; "
+            "Processing and Analysis pages offer Table Concat, Join and Aggregate")
+
     # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
     from PySide6.QtGui import QMouseEvent as _QME

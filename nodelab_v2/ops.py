@@ -36,7 +36,7 @@ from nodegraph.checkpoint import (
 from nodegraph.engine import Engine, EvalContext
 from nodegraph.graph import Edge, Graph, NodeInstance
 from nodegraph.memo import digest
-from nodegraph.metadata import propagate_meta
+from nodegraph.metadata import CONDITION_KEY, CONDITION_SET_KEY, propagate_meta
 from nodegraph.nodes import COMPUTES, register_node
 from nodegraph.domains import Domain
 from nodegraph.registry import (
@@ -177,7 +177,10 @@ PAGE_NAME_KEY = "name"
 #: ``page.output``'s condition label, stamped into the Dataset's metadata so a downstream
 #: table can say which experimental condition a row came from. Blank = the page's own name,
 #: filled in at compose time (the node cannot know what its page is called).
-PAGE_CONDITION_KEY = "condition"
+PAGE_CONDITION_KEY = CONDITION_KEY
+#: Set by ``Workspace.compose`` on an Output whose condition it FILLED from the page's name
+#: (the run graph only): such a stamp gives way to a condition TYPED further upstream.
+PAGE_CONDITION_AUTO_KEY = "__condition_auto__"
 #: What an unresolved ``page.input`` says when it is pulled.
 PAGE_UNBOUND_MESSAGE = "Page Input is not bound to an upstream Output"
 
@@ -331,13 +334,23 @@ def _compute_page_output(ctx: EvalContext):
     table built downstream of several pages can say which condition each row came from."""
     ds = ctx.inputs[0]
     cond = str(ctx.params.get(PAGE_CONDITION_KEY, "") or "").strip()
-    return ds.with_metadata(condition=cond) if cond else ds
+    if not cond:
+        return ds
+    if ctx.params.get(PAGE_CONDITION_AUTO_KEY):
+        # blank here (compose filled in the page's name): a condition TYPED upstream wins
+        md = ds.metadata or {}
+        if md.get(CONDITION_SET_KEY) and str(md.get(CONDITION_KEY) or "").strip():
+            return ds
+        return ds.with_metadata(**{CONDITION_KEY: cond, CONDITION_SET_KEY: None})
+    return ds.with_metadata(**{CONDITION_KEY: cond, CONDITION_SET_KEY: True})
 
 
 def _meta_page_output(env, params, modes):
     """Edit-time twin of :func:`_compute_page_output` — the same stamp, in lockstep."""
     cond = str(params.get(PAGE_CONDITION_KEY, "") or "").strip()
-    return env.with_metadata(condition=cond) if cond else env
+    if not cond:
+        return env               # the page's name is filled in at compose time, not here
+    return env.with_metadata(**{CONDITION_KEY: cond, CONDITION_SET_KEY: True})
 
 
 def _compute_page_input(ctx: EvalContext):
@@ -780,11 +793,12 @@ def ensure_ops() -> None:
                 InString(PAGE_CONDITION_KEY, "Condition", field=False, default="",
                          description=
                          "The experimental-condition label stamped into the Dataset's "
-                         "metadata (`condition`), which a table built downstream of several "
-                         "pages carries as a column. Leave blank to use this page's own name "
-                         "— a linked page then labels its rows with ITS name, which is the "
-                         "point of linking one workflow per dish. Changing it re-runs only "
-                         "the stamp (this node), not the chain in front of it."),
+                         "metadata (`condition`), which Table Concat writes as a column. "
+                         "Leave blank to use this page's own name — a linked page then "
+                         "labels its rows with ITS name, the point of linking one workflow "
+                         "per dish — unless a condition was TYPED on an Output further "
+                         "upstream, which a blank one keeps. Changing it re-runs only the "
+                         "stamp (this node), not the chain in front of it."),
             ],
             outputs=[OutDataset("out")],
             granularity=Granularity.TILEABLE,
@@ -1399,7 +1413,7 @@ def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
 
 __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "PAGE_INPUT_OP", "PAGE_OUTPUT_OP", "PAGE_OPS", "PAGE_SOURCE_KEY", "PAGE_NAME_KEY",
-           "PAGE_CONDITION_KEY", "PAGE_UNBOUND_MESSAGE",
+           "PAGE_CONDITION_KEY", "PAGE_CONDITION_AUTO_KEY", "PAGE_UNBOUND_MESSAGE",
            "materialize_group_taps", "GRP_SOCKET_RE", "GROUPS_KEY",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",

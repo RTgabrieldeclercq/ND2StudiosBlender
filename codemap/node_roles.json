@@ -144,6 +144,13 @@
       "description": "Keep or split objects by their measured columns: whole-label filtering with a histogram-chosen cut, and the If/Else split of a structure table into PASS and FAIL sets.",
       "ops": ["analysis.filter_labels", "analysis.if_else"]
     },
+    "table_synthesis": {
+      "label": "Table synthesis",
+      "stage": "quantify",
+      "pages": ["process", "analyze"],
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, and Table Aggregate summarises a column per group (mean, sem, count, ...).",
+      "ops": ["table.concat", "table.join", "table.aggregate"]
+    },
     "tracking": {
       "label": "Tracking",
       "stage": "quantify",

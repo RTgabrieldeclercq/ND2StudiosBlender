@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 100,
-    "categories": 14,
-    "roles": 21,
+    "nodes": 103,
+    "categories": 15,
+    "roles": 22,
     "stages": 5,
-    "inputs": 711,
-    "outputs": 107,
+    "inputs": 727,
+    "outputs": 110,
     "gui_ops_included": true
   },
   "stages": {
@@ -183,6 +183,7 @@
       "roles": [
         "measurement_and_statistics",
         "object_filtering_and_selection",
+        "table_synthesis",
         "tracking",
         "motion_and_deformation_fields"
       ],
@@ -200,6 +201,9 @@
         "analysis.piv",
         "analysis.reduce_scalar",
         "analysis.track_field",
+        "table.aggregate",
+        "table.concat",
+        "table.join",
         "track.link",
         "track.objects"
       ]
@@ -715,6 +719,29 @@
         }
       ]
     },
+    "table_synthesis": {
+      "label": "Table synthesis",
+      "stage": "quantify",
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, and Table Aggregate summarises a column per group (mean, sem, count, ...).",
+      "count": 3,
+      "ops": [
+        {
+          "op": "table.aggregate",
+          "label": "Table Aggregate",
+          "summary": "Summarise a Label, Point or Track table per group — one row per frame, condition or position — with mean, median, sum, min, max, count, std or sem of a column, as a new Label table a plot can read."
+        },
+        {
+          "op": "table.concat",
+          "label": "Table Concat",
+          "summary": "Stack the Label or Point tables of several inputs (pages, conditions, variants) into one table, each row labelled with its condition, its input and its position group, ids kept unique — the table a plot groups by condition."
+        },
+        {
+          "op": "table.join",
+          "label": "Table Join",
+          "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame or track — left or inner — as a new joined table."
+        }
+      ]
+    },
     "tracking": {
       "label": "Tracking",
       "stage": "quantify",
@@ -999,6 +1026,11 @@
       "align.drift",
       "registration.align_to",
       "registration.stabilize"
+    ],
+    "table": [
+      "table.aggregate",
+      "table.concat",
+      "table.join"
     ],
     "transform": [
       "transform.grow_points",
@@ -13362,7 +13394,7 @@
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "description": "The experimental-condition label stamped into the Dataset's metadata (`condition`), which a table built downstream of several pages carries as a column. Leave blank to use this page's own name — a linked page then labels its rows with ITS name, which is the point of linking one workflow per dish. Changing it re-runs only the stamp (this node), not the chain in front of it."
+          "description": "The experimental-condition label stamped into the Dataset's metadata (`condition`), which Table Concat writes as a column. Leave blank to use this page's own name — a linked page then labels its rows with ITS name, the point of linking one workflow per dish — unless a condition was TYPED on an Output further upstream, which a blank one keeps. Changing it re-runs only the stamp (this node), not the chain in front of it."
         }
       ],
       "outputs": [
@@ -15555,6 +15587,472 @@
       "trained_params": false,
       "kernel_doc": "",
       "params_read": []
+    },
+    "table.aggregate": {
+      "op": "table.aggregate",
+      "label": "Table Aggregate",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/aggregate.py",
+      "gui_only": false,
+      "summary": "Summarise a Label, Point or Track table per group — one row per frame, condition or position — with mean, median, sum, min, max, count, std or sem of a column, as a new Label table a plot can read.",
+      "overview": "A summary table: one row per distinct ``group_by`` value, a column reduced over it. Resolved spec (V4.00 step 9, `build-node-v2`): * reads one table (``domain``, ``table``); ``group_by`` is a comma list of its columns (``t`` for one row per frame, ``condition,t`` per condition and frame; blank = ONE row for the whole table); a missing key value (NaN, blank text) is a group of its own, sorted last; the batch member ``b`` is always part of the key when the table has it; * ``value`` (numeric) is reduced per group by each of ``reducers`` — mean, median, sum, min, max, count (finite values), std (n - 1, NaN under two), sem (std / sqrt n) — into ``<value>_<reducer>``; ``n`` counts each group's rows; * the output is a LABEL table ``name`` (default ``summary``) — the domain every plot and export reads — keeping the invariant ``id, m, t, c, z, y, x``: ``id`` 1..K; a coordinate in ``group_by`` carries the key (``-1`` where it is missing), any other is 0, because a summary row has no position of its own; other key columns are carried (text as numpy unicode); ``z_kind`` plane_index; * WHOLE_SERIES, tables only; no axis or calibration change.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ],
+            "track": [
+              "track"
+            ]
+          }
+        },
+        "adds": [
+          "label"
+        ]
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point",
+            "track"
+          ],
+          "default": "label",
+          "description": "Which kind of table is summarised.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table is summarised; it is passed on with the summary table added."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "Which table of the chosen kind to summarise. Blank uses the only one on the wire, and asks when there are several."
+        },
+        {
+          "name": "group_by",
+          "label": "Group by",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "t",
+          "description": "Comma-separated columns whose distinct value combinations become the rows: `t` gives one row per frame, `condition,t` one per condition and frame, blank ONE row for the whole table. More columns give more, smaller groups (and noisier means)."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "area",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The numeric column summarised per group. The summary reads it as it is; it changes no measurement upstream."
+        },
+        {
+          "name": "reducers",
+          "label": "Reducers",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "mean,sem,count",
+          "vocab": [
+            "mean",
+            "median",
+            "sum",
+            "min",
+            "max",
+            "count",
+            "std",
+            "sem"
+          ],
+          "choice_docs": {
+            "count": "How many samples contributed — not their values. This is the reducer that answers \"how many objects\": run it over any column of a Label or Point table and you get the number of rows. NaNs are excluded from the count.",
+            "max": "The largest sample. Keeps the brightest contribution wherever it occurred, which is what you want for \"was this ever present\" and exactly what you do not want for a level: it is the reducer most sensitive to a single outlier.",
+            "mean": "Arithmetic average of the samples. Optimal when the spread is just Gaussian noise — it improves signal-to-noise by about √n — and the wrong choice when it is not: ONE cosmic ray, hot pixel or registration ghost shifts the result by its full value divided by n. NaNs are skipped rather than poisoning the result.",
+            "median": "The middle sample. Rejects up to half the population as outliers at a small cost in noise performance versus the mean, which makes it the default robust choice. It needs every sample at once, so it cannot fold across tiles the way mean/sum can.",
+            "min": "The smallest sample. Keeps only what is present across every sample, so it strips sporadic contributions — useful for a background floor, and equally vulnerable to a single dead pixel.",
+            "sem": "How well the MEAN is known: the standard deviation over the square root of the number of samples, NaN under two. Shrinks as samples accumulate, so it is the error bar for comparing two means — not a description of the population's spread.",
+            "std": "The SPREAD of the samples: their sample standard deviation (n - 1 in the denominator), NaN where fewer than two were measured. Describes the population itself, so it does not shrink as more samples arrive — the number to report for how variable a condition is.",
+            "sum": "Total of the samples, so the result grows with how many there are. Use it when the quantity is genuinely additive — total intensity, total volume, a count of events — and never to compare groups of different sizes."
+          },
+          "description": "The summaries computed per group, each its own column `<value>_<reducer>`. mean with sem is the usual condition-comparison pair; std describes the spread itself."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "summary",
+          "description": "Name of the summary table — a Label table, so every plot and export reads it. The input table is left as it is."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_table_aggregate",
+      "meta_transform": null,
+      "extra_layers": "_agg_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "group_by",
+        "name",
+        "reducers",
+        "table",
+        "value"
+      ]
+    },
+    "table.concat": {
+      "op": "table.concat",
+      "label": "Table Concat",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/concat.py",
+      "gui_only": false,
+      "summary": "Stack the Label or Point tables of several inputs (pages, conditions, variants) into one table, each row labelled with its condition, its input and its position group, ids kept unique — the table a plot groups by condition.",
+      "overview": "One table out of the same-kind tables of every input, rows labelled with their source. Resolved spec (V4.00 step 9, `build-node-v2`): * ``data`` takes any number of Datasets (the order they were wired in); ``domain`` label | point picks which kind of table; ``table`` names it on EVERY input (blank: each input's only one of that kind); * the output is input 0's Dataset plus the new ``name`` table (default ``combined``): the union of the inputs' columns — a column an input lacks is NaN (numbers) or ``\"\"`` (text) for its rows — plus ``condition`` (the input's ``condition`` metadata, which a Page Output stamps; else that input's entry in ``names``; else ``input_K``), ``input`` (K, the wiring position) and, from each input's OWN per-position metadata, ``group``, ``position_name`` and ``file`` when any input carries them; * ids stay unique: input K's ids are shifted by the largest id of the inputs before it (input 0's ids are unchanged, so it still joins against its own raster and tables); * text columns are numpy unicode (memo- and dock-safe); the 2D/3D kind (``z_kind``) must agree across inputs; a batch is combined only on its own (one input); * no image work: WHOLE_SERIES, nothing read but the tables; no axis or calibration change.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "description": "Which kind of table is stacked: one row per labelled region, or one per detected point.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "Inputs",
+          "type": "dataset",
+          "role": "dataset",
+          "multi": true,
+          "passes_domains": false,
+          "description": "The Datasets whose tables are stacked — typically one Page Input per page or variant. Order is the order you wired them in (the first is input 0, whose Dataset is passed on)."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "Which table of the chosen kind to take from EVERY input. Blank takes each input's only one, and asks when an input has several."
+        },
+        {
+          "name": "names",
+          "label": "Condition names",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Comma-separated condition labels, one per input in wiring order, used only for an input that carries no `condition` of its own (a Page Output stamps one). Blank entries fall back to input_0, input_1, ... Changes the labels, never a measurement."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "combined",
+          "description": "Name of the combined table this node writes on the output. The inputs' own tables are left as they are; reusing an existing table's name replaces that table on the output."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_table_concat",
+      "meta_transform": "_concat_meta",
+      "extra_layers": "_concat_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "name",
+        "names",
+        "table"
+      ]
+    },
+    "table.join": {
+      "op": "table.join",
+      "label": "Table Join",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/join.py",
+      "gui_only": false,
+      "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame or track — left or inner — as a new joined table.",
+      "overview": "A table with another table's columns added, matched row by row on a key. Resolved spec (V4.00 step 9, `build-node-v2`): * the LEFT table is ``table`` (of ``domain``) on ``data``; the OTHER is ``other_table`` (of ``other_domain``) on the ``other`` input — or on ``data`` itself when ``other`` is unwired, to join two tables of one wire; * ``on`` picks the key: ``id_m_t`` (the same object in the same position and frame — two measurements of one segmentation), ``id`` (globally unique ids), ``m_t`` (a per-frame table onto every object of that frame), ``track`` (``track_id`` and ``t`` — a Track table's per-frame columns onto the tracked objects; untracked ``track_id`` 0 never matches). The batch member ``b`` joins the key when both tables carry it; * the OTHER table may hold each key once (else the match is ambiguous and is refused — aggregate it first); the left may repeat a key (many-to-one); * ``how`` left keeps every left row (unmatched: NaN numbers, empty text); inner keeps only the matched ones, in left order; * the other's columns are added as ``prefix`` + name — all but the key and its coordinates (``id, m, t, c, z, y, x``, ``b``), which only repeat the matched object; a name the left already has is refused rather than overwritten; * the output is ``data``'s Dataset plus the ``name`` table on the left's domain, with the left's 2D/3D kind; WHOLE_SERIES, tables only.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ],
+            "track": [
+              "track"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point",
+            "track"
+          ],
+          "default": "label",
+          "description": "Which kind of table the LEFT one is — the joined table is of the same kind.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+          }
+        },
+        {
+          "name": "other_domain",
+          "label": "Other domain",
+          "choices": [
+            "label",
+            "point",
+            "track"
+          ],
+          "default": "label",
+          "description": "Which kind of table the OTHER one is.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+          }
+        },
+        {
+          "name": "on",
+          "label": "On",
+          "choices": [
+            "id_m_t",
+            "id",
+            "m_t",
+            "track"
+          ],
+          "default": "id_m_t",
+          "description": "Which columns must agree for two rows to match.",
+          "choice_docs": {
+            "id_m_t": "The same object id in the same position and frame — two measurements of ONE segmentation (another channel, a second Measure). The safe default: per-plane ids repeat across frames.",
+            "id": "The object id alone — only for ids unique across the whole series (3D or tracked labels); on per-frame ids it would match objects of different frames.",
+            "m_t": "Position and frame — a per-frame table (one row per frame, e.g. a background level) onto every object of that frame.",
+            "track": "track_id and frame — a Track table's per-frame columns onto the tracked objects; an untracked object (track_id 0) never matches."
+          }
+        },
+        {
+          "name": "how",
+          "label": "How",
+          "choices": [
+            "left",
+            "inner"
+          ],
+          "default": "left",
+          "description": "What happens to a left row with no match.",
+          "choice_docs": {
+            "left": "Keep every left row; where nothing matched the added columns are empty (NaN, or blank text) — row counts stay those of the left.",
+            "inner": "Keep only the left rows that matched — the table shrinks to the objects both tables know, which changes every count downstream."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset carrying the LEFT table — every row of it is kept (or only the matched ones, with How inner) — and passed on with the joined table."
+        },
+        {
+          "name": "other",
+          "label": "Other",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "The Dataset carrying the table whose columns are added — another branch's measurement, a tracking result. Leave it unwired to join two tables of the `data` wire."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "The left table. Blank uses the only one of its kind on the wire, and asks when there are several."
+        },
+        {
+          "name": "other_table",
+          "label": "Other table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "other_domain",
+          "layer_from": "other",
+          "description": "The table whose columns are added. Blank uses the only one of its kind on the Other wire (or on `data` when Other is unwired)."
+        },
+        {
+          "name": "prefix",
+          "label": "Prefix",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "other_",
+          "description": "Put before every added column's name (`other_area`), so the two tables' columns stay apart. Blank keeps the names, and the node refuses a name the left table already has."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "joined",
+          "description": "Name of the joined table written on the output. The two input tables are left as they are."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_table_join",
+      "meta_transform": null,
+      "extra_layers": "_join_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "name",
+        "other_table",
+        "prefix",
+        "table"
+      ]
     },
     "track.link": {
       "op": "track.link",

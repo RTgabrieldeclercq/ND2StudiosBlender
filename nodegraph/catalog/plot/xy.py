@@ -44,8 +44,8 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
     xname = str(ctx.params.get("x", "t") or "t")
     yname = str(ctx.params.get("y", "area") or "area")
     gname = str(ctx.params.get("group_by", "") or "")
-    x = FIG.column(cols, xname, node="plot xy", socket="x", layer=layer)
-    y = FIG.column(cols, yname, node="plot xy", socket="y", layer=layer)
+    x = FIG.column(cols, xname, node="plot xy", socket="x", layer=layer, numeric=True)
+    y = FIG.column(cols, yname, node="plot xy", socket="y", layer=layer, numeric=True)
     g = FIG.column(cols, gname, node="plot xy", socket="group_by", layer=layer) \
         if gname else None
     error = str(modes.get("error", "none"))
@@ -73,7 +73,7 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
     if per == "frame":
         # one figure per frame of the input: the rows of that frame, on axes every frame
         # shares (the data's whole range unless a range is fixed), drawn when shown
-        tcol = FIG.column(cols, "t", node="plot xy", socket="per", layer=layer)
+        tcol = FIG.column(cols, "t", node="plot xy", socket="per", layer=layer, numeric=True)
         frames = max(1, int(ds.axes.t))
         extra, labels = FIG.frame_clock(ds.metadata or {}, frames, ctx.calib("dt_s"))
         a = spec["axes"]

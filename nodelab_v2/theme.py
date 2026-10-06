@@ -105,6 +105,9 @@ CATEGORY = {
     # `plot` makes a FIGURE of the measurements rather than processing the image (V4.00
     # step 7) — a rose of its own so a chart reads as a result, not another step.
     "plot": c("#d06b8f"),
+    # table synthesis (V4.00): an olive apart from every other hue, so a table card never
+    # reads as an io card (which falls back to the general grey)
+    "table": c("#9aa443"),
 }
 
 

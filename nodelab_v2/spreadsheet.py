@@ -143,7 +143,7 @@ class SpreadsheetPanel(QWidget):
         out: List[str] = []
         for v in vals:
             s = str(v)
-            if s not in out:
+            if s.strip() and s not in out:      # a row with no file names no tab of its own
                 out.append(s)
         return out
 

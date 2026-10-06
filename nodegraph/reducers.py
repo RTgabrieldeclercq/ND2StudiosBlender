@@ -55,6 +55,25 @@ def _first(a: np.ndarray, axis: Tuple[int, ...]) -> np.ndarray:
     return out
 
 
+def _std(a: np.ndarray, axis: Tuple[int, ...]) -> np.ndarray:
+    """Sample standard deviation (``ddof=1``) of the finite samples; NaN where fewer than two."""
+    x = np.asarray(a, dtype=float)
+    x = np.where(np.isfinite(x), x, np.nan)          # an inf is not a sample of the spread
+    n = np.sum(np.isfinite(x), axis=axis)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.nansum(x, axis=axis, keepdims=True) / np.maximum(
+            np.sum(np.isfinite(x), axis=axis, keepdims=True), 1)
+        ss = np.nansum((x - mean) ** 2, axis=axis)
+        return np.where(n >= 2, np.sqrt(ss / np.maximum(n - 1, 1)), np.nan)
+
+
+def _sem(a: np.ndarray, axis: Tuple[int, ...]) -> np.ndarray:
+    """Standard error of the mean, ``std / sqrt(n)`` over the finite samples; NaN under two."""
+    n = np.sum(np.isfinite(np.asarray(a, dtype=float)), axis=axis)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return _std(a, axis) / np.sqrt(np.maximum(n, 1))
+
+
 def _has_nan(a: np.ndarray) -> bool:
     return np.issubdtype(a.dtype, np.floating) and bool(np.isnan(a).any())
 
@@ -127,6 +146,8 @@ REDUCERS: Dict[str, Reducer] = {
     "first": _first,
     "sigma_clip": _sigma_clip,
     "trimmed_mean": _trimmed_mean,
+    "std": _std,
+    "sem": _sem,
 }
 
 DEFAULT_REDUCER = "mean"
@@ -178,6 +199,15 @@ REDUCER_DOC: Dict[str, str] = {
         "predictable than sigma clipping — it always discards the same COUNT rather than "
         "whatever fails a test — and the right choice for a small stack where you know each "
         "end holds one bad sample. Needs at least three samples to trim anything.",
+    "std":
+        "The SPREAD of the samples: their sample standard deviation (n - 1 in the "
+        "denominator), NaN where fewer than two were measured. Describes the population "
+        "itself, so it does not shrink as more samples arrive — the number to report for "
+        "how variable a condition is.",
+    "sem":
+        "How well the MEAN is known: the standard deviation over the square root of the "
+        "number of samples, NaN under two. Shrinks as samples accumulate, so it is the error "
+        "bar for comparing two means — not a description of the population's spread.",
 }
 
 

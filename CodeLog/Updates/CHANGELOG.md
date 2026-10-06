@@ -142,6 +142,24 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   reload, is refused past 100 Mpx at pull time and is prefetched sparingly; no channel legend
   on a chart's movie; the heatmap's Legend / Grid work and it has no Palette.
 
+### Step 9 — tables (2026-10-06)
+- **Table Concat** (`table.concat`): the tables of several inputs (pages, variants) stacked into
+  one, ids kept unique, each row labelled with its `condition`, `input` and own position group.
+- **Table Join** (`table.join`): another table's columns added on id+position+frame, id,
+  position+frame or track, left or inner, prefixed; ambiguous keys refused.
+- **Table Aggregate** (`table.aggregate`): one row per group with mean, median, sum, min, max,
+  count, std or sem of a column — a Label table every plot reads.
+- `std` and `sem` reducers; text columns (numpy unicode, memo- and dock-safe); plots refuse a
+  text column as X, Y or Value.
+- A condition TYPED on a Page Output survives later blank Outputs (blank still means the
+  page's name).
+- Engine: a column declaration may see every input (`adds_columns.wants_inputs`), so joined and
+  concatenated columns are offered by the column menus downstream.
+- Review fixes: unique ids for 0-based tables; a nested concat keeps each row's provenance and
+  clears the scalar condition; per-row clocks (`time_s`, `time_jd`) after a concat; summary rows carry
+  the file / group they share; std / sem / count ignore inf; Names that would replace the table
+  read are refused; the Viewer leaves synthesized tables off the image; no blank file tab.
+
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 
 ### Added

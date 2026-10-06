@@ -315,9 +315,14 @@ def table_columns(ds: Dataset, domain: Domain, layer: str) -> Dict[str, np.ndarr
 
 
 def column(cols: Mapping[str, np.ndarray], name: str, *, node: str, socket: str,
-           layer: str) -> np.ndarray:
-    """``cols[name]``, or a refusal naming the columns the table does carry."""
+           layer: str, numeric: bool = False) -> np.ndarray:
+    """``cols[name]``, or a refusal naming the columns the table does carry. ``numeric``:
+    also refuse a TEXT column (a Table Concat ``condition``), which belongs in Group by."""
     if name in cols:
+        if numeric and np.asarray(cols[name]).dtype.kind in "USO":
+            raise ValueError(
+                f"{node}: column {name!r} holds text, not numbers, so it cannot be drawn on "
+                f"`{socket}` — pick a numeric column there, and use {name!r} as Group by.")
         return cols[name]
     raise ValueError(
         f"{node}: the {layer!r} table has no column {name!r} for `{socket}` — it carries "
@@ -338,6 +343,8 @@ def _is_missing(v: Any) -> bool:
         return True
     if isinstance(v, (float, np.floating)):
         return not math.isfinite(float(v))
+    if isinstance(v, (str, np.str_)):
+        return not v.strip()                 # a blank text cell names no group
     return False
 
 

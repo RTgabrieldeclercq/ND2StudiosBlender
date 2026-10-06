@@ -61,7 +61,8 @@ from nodegraph.serialize import (
 from nodelab_v2.document import GraphDocument, NodeRecord
 from nodelab_v2.linked_document import LinkedDocument, check_overrides
 from nodelab_v2.ops import (
-    PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
+    PAGE_CONDITION_AUTO_KEY, PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY,
+    PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
     is_frozen, upstream_signature)
 from nodelab_v2.version import __version__
 
@@ -847,6 +848,7 @@ class Workspace:
                 if inst.op_key == PAGE_OUTPUT_OP and \
                         not str(params.get(PAGE_CONDITION_KEY) or "").strip():
                     params[PAGE_CONDITION_KEY] = page.name
+                    params[PAGE_CONDITION_AUTO_KEY] = True
                 g.add(NodeInstance(q, inst.op_key, params=params, modes=dict(inst.modes)))
                 id_map[(pid, nid)] = q
             for e in sub.edges:

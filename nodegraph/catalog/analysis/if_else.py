@@ -127,7 +127,9 @@ def _track_joined(ds: Dataset, cols: Dict[str, np.ndarray],
             if name in ("member_id", "t") or name in cols or name in out:
                 continue
             vals = np.asarray(vals)
-            if vals.shape != member.shape:
+            if vals.shape != member.shape or vals.dtype.kind in "USO":
+                # a text column (a joined `condition`) is not something a numeric
+                # condition can test; joining it would only fail the float conversion
                 continue
             lookup = dict(zip(member.tolist(), np.asarray(vals, dtype=float).tolist()))
             out[name] = np.array([lookup.get(int(i), np.nan) for i in ids.tolist()],

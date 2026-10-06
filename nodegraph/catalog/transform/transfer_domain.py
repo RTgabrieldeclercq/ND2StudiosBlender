@@ -21,7 +21,7 @@ from nodegraph.catalog._shared.labels import _lattice_layers, _resolve_layer
 # control that always errors. Every lattice pair IS routable (transfer generates a
 # reduce/broadcast for any pair), so the cross-product holds no dead choice.
 _TRANSFER_DOMAINS: Tuple[str, ...] = tuple(d.value for d in Domain if is_lattice(d))
-#: Mirrors nodegraph.reducers.REDUCERS. This node is WHOLE_VOLUME and reduces eagerly,
+#: Mirrors the transfer-capable reducers of nodegraph.reducers.REDUCERS (not std/sem, which summarise a table's rows). This node is WHOLE_VOLUME and reduces eagerly,
 #: so the non-monoid entries (median / sigma_clip / trimmed_mean) are legal here.
 _TRANSFER_REDUCERS: Tuple[str, ...] = (
     "mean", "sum", "max", "min", "median", "count", "first",

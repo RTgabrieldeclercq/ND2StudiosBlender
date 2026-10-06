@@ -26119,6 +26119,431 @@ def test_plot_frames_review() -> None:
         "legend")
 
 
+def _table_ds(ids, ts, areas, *, md=None, layer="cells", extra=None,
+              zkind="plane_index", domain=None):
+    """A Dataset carrying one structure table (and its edit-time envelope) for the table
+    synthesis tests: coordinates, ``area`` and any ``extra`` columns."""
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    dom = domain or Domain.LABEL
+    n = len(ids)
+    cols = {"id": np.array(ids, np.int64), "m": np.zeros(n, np.int64),
+            "t": np.array(ts, np.int64), "c": np.zeros(n, np.int64), "z": np.zeros(n),
+            "y": np.arange(n, dtype=float), "x": np.arange(n, dtype=float),
+            "area": np.array(areas, float)}
+    cols.update(extra or {})
+    ax = AxisSizes(m=1, t=3, z=1, c=1, y=8, x=8)
+    ds = (Dataset(axes=ax, metadata=dict(md or {}))
+          .with_image(ArrayProvider(np.zeros((1, 3, 1, 1, 8, 8), np.uint16)))
+          .with_structure(StructureTable(dom, cols, layer=layer, z_kind=zkind)))
+    env = MetaEnvelope(axes=ax, metadata=dict(md or {}), domains=frozenset({dom}),
+                       layer_names=((dom, layer),),
+                       column_names=tuple((dom, layer, c) for c in cols))
+    return ds, env
+
+
+def _table_chain(inputs, op, params=None, modes=None, *, other=None, then=None):
+    """Seeds ``S0..Sk`` (each a ``(Dataset, envelope)``) wired into ``op`` as ``T`` — all into
+    ``data`` (a multi socket takes them in order), or ``other`` into the ``other`` socket;
+    ``then`` = ``(op, params, modes)`` appends a node ``U`` after ``T``. Returns
+    ``(engine, pulled T)``."""
+    from nodegraph.nodes import COMPUTES
+    if "io.seed_tab" not in NODES:
+        define_node("io.seed_tab", "Seed", outputs=[OutDataset()])
+    g = Graph()
+    seeds, metas = {}, {}
+    g.add(NodeInstance("T", op, params=dict(params or {}), modes=dict(modes or {})))
+    for k, (ds, env) in enumerate(inputs):
+        g.add(NodeInstance(f"S{k}", "io.seed_tab"))
+        g.connect(f"S{k}", "T")
+        seeds[f"S{k}"], metas[f"S{k}"] = ds, env
+    if other is not None:
+        g.add(NodeInstance("SO", "io.seed_tab"))
+        g.connect("SO", "T", dst_socket="other")
+        seeds["SO"], metas["SO"] = other
+    if then is not None:
+        g.add(NodeInstance("U", then[0], params=dict(then[1] or {}),
+                           modes=dict(then[2] or {})))
+        g.connect("T", "U")
+    eng = Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas)
+    return eng, eng.pull("T")
+
+
+def _table_cols(eng, nid, layer):
+    return {c for d, lyr, c in eng.env(nid).column_names if lyr == layer}
+
+
+def test_table_concat() -> None:
+    """``table.concat`` (V4.00 step 9): the tables of several inputs stacked into ONE — every
+    input's rows, ids kept unique (input 0's unchanged), the union of the columns with the
+    missing ones blank, each row labelled with its condition (the input's own `condition`
+    metadata, else Condition names, else input_K), its input, and its position group and file
+    FROM ITS OWN metadata; text columns are numpy unicode (memo- and dock-safe); the edit-time
+    catalog names columns only a later input carries; the inputs' tables are untouched; a
+    mix of 2D and 3D tables, a batch beside another input and a name that is a raster are
+    refused; re-using a table's name replaces it whole."""
+    import nodegraph.catalog._shared.table_ops as TB
+    from nodegraph.memo import digest
+    from nodegraph.structure import StructureTable
+    from nodelab_v2.tables import all_tables
+    d0, e0 = _table_ds([1, 2, 3], [0, 1, 2], [10, 20, 30],
+                       md={"condition": "dishA", "position_group": ["G1"],
+                           "source_file": ["a.nd2"]},
+                       extra={"mean_intensity": np.array([1.0, 2.0, 3.0])})
+    d1, e1 = _table_ds([1, 2], [0, 1], [5, 6], md={"position_group": ["G7"]},
+                       extra={"tag": TB.text_column(["p", "q"])})
+    d2, e2 = _table_ds([4], [2], [7])
+    eng, out = _table_chain([(d0, e0), (d1, e1), (d2, e2)], "table.concat",
+                            {"names": ",dishB"})
+    cols = TB.read_table(out, Domain.LABEL, "combined")
+    assert cols["id"].tolist() == [1, 2, 3, 4, 5, 6], cols["id"]
+    assert cols["condition"].tolist() == ["dishA"] * 3 + ["dishB"] * 2 + ["input_2"]
+    assert cols["input"].tolist() == [0, 0, 0, 1, 1, 2]
+    assert cols["group"].tolist() == ["G1"] * 3 + ["G7"] * 2 + [""], cols["group"]
+    assert cols["file"].tolist() == ["a.nd2"] * 3 + [""] * 3
+    assert "position_name" not in cols, "no input carries position names"
+    assert np.isnan(cols["mean_intensity"][3:]).all() and \
+        cols["mean_intensity"][:3].tolist() == [1.0, 2.0, 3.0]
+    assert cols["tag"].tolist() == ["", "", "", "p", "q", ""]
+    assert all(cols[c].dtype.kind == "U" for c in ("condition", "group", "file", "tag"))
+    assert len({len(v) for v in cols.values()}) == 1, "one length for every column"
+    digest(StructureTable(Domain.LABEL, cols, layer="combined").content_hash())
+    assert TB.read_table(out, Domain.LABEL, "cells")["id"].tolist() == [1, 2, 3], \
+        "input 0's own table is passed on as it was"
+    declared = _table_cols(eng, "T", "combined")
+    assert {"condition", "input", "group", "file", "tag", "mean_intensity",
+            "area"} <= declared and "position_name" not in declared, declared
+    tabs = [t for (_d, lyr), t in all_tables(out).items() if lyr == "combined"]
+    assert tabs and tabs[0]["group"].tolist() == cols["group"].tolist(), \
+        "the tabulator keeps each row's own group, not input 0's"
+    # refusals: 2D beside 3D, a batch beside another input, a raster's name
+    d3, e3 = _table_ds([1], [0], [1.0], zkind="subpixel")
+    for bad, msg in (([(d0, e0), (d3, e3)], "2D"),):
+        try:
+            _table_chain(bad, "table.concat")
+            raise AssertionError("must refuse")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+    dv = d0.with_layer(Domain.VOXEL, "combined", np.zeros((1, 3, 1, 1, 8, 8), np.int32))
+    try:
+        _table_chain([(dv, e0), (d1, e1)], "table.concat")
+        raise AssertionError("a raster's name must be refused")
+    except ValueError as exc:
+        assert "Voxel layer" in str(exc), exc
+    _e, again = _table_chain([(d0, e0), (d1, e1)], "table.concat", {"name": "cells"})
+    rep = TB.read_table(again, Domain.LABEL, "cells")
+    assert len({len(v) for v in rep.values()}) == 1 and len(rep["id"]) == 5, \
+        "a re-used name replaces the table whole (no ragged column)"
+    _ok("table.concat: several inputs' tables stacked into one with unique ids (input 0's "
+        "unchanged), the union of columns blank where missing, condition / input / group / "
+        "file per row from each input's own metadata, numpy unicode text (hashable), the "
+        "edit-time catalog naming later inputs' columns; 2D+3D and raster names refused; a "
+        "re-used name replaces its table whole")
+
+
+def test_table_join() -> None:
+    """``table.join`` (V4.00 step 9): another table's columns added row by row — on id, m and
+    t by default; left keeps every row (blank where unmatched), inner only the matched; the
+    other table may hold a key once (else refused, ambiguous); prefixes keep the columns apart
+    (a clash is refused, never overwritten); m+t spreads a per-frame table over its frame's
+    objects; track joins on track_id and t and never matches an untracked 0; unwired Other
+    joins two tables of one wire; the edit-time catalog offers the OTHER wire's columns
+    downstream (a column picker after the join can pick them)."""
+    import nodegraph.catalog._shared.table_ops as TB
+    dl, el = _table_ds([1, 2, 3], [0, 0, 1], [10, 20, 30],
+                       extra={"track_id": np.array([5, 0, 5], np.int64)})
+    do, eo = _table_ds([2, 3, 9], [0, 1, 1], [0, 0, 0], layer="cellsB",
+                       extra={"mean_intensity": np.array([7.0, 8.0, 9.0]),
+                              "label": TB.text_column(["a", "b", "c"])})
+    eng, out = _table_chain([(dl, el)], "table.join", {}, {}, other=(do, eo))
+    j = TB.read_table(out, Domain.LABEL, "joined")
+    assert j["id"].tolist() == [1, 2, 3]
+    mi = j["other_mean_intensity"]
+    assert np.isnan(mi[0]) and mi[1:].tolist() == [7.0, 8.0], mi
+    assert j["other_label"].tolist() == ["", "a", "b"] and j["other_label"].dtype.kind == "U"
+    assert not {"other_id", "other_t", "other_y"} & set(j), "nor the key, nor its coordinates"
+    declared = _table_cols(eng, "T", "joined")
+    assert {"area", "other_mean_intensity", "other_label"} <= declared, declared
+    _e, inner = _table_chain([(dl, el)], "table.join", {}, {"how": "inner"},
+                             other=(do, eo))
+    assert TB.read_table(inner, Domain.LABEL, "joined")["id"].tolist() == [2, 3]
+    # a per-frame table spread over each frame's objects (m, t)
+    df, ef = _table_ds([1, 2], [0, 1], [0, 0], layer="frames",
+                       extra={"background": np.array([100.0, 200.0])})
+    _e, mt = _table_chain([(dl, el)], "table.join", {}, {"on": "m_t"}, other=(df, ef))
+    assert TB.read_table(mt, Domain.LABEL, "joined")["other_background"].tolist() == \
+        [100.0, 100.0, 200.0]
+    # the track key: (track_id, t); an untracked 0 never matches
+    tr = {"track_id": np.array([5, 5], np.int64), "t": np.array([0, 1], np.int64),
+          "member_id": np.array([1, 3], np.int64),
+          "track_length": np.array([2.0, 2.0])}
+    from nodegraph.structure import StructureTable
+    dt = d_track = dl.with_structure(StructureTable(Domain.TRACK, tr, layer="tracks",
+                                                    z_kind="plane_index"))
+    et = MetaEnvelope(axes=dt.axes, domains=frozenset({Domain.LABEL, Domain.TRACK}),
+                      layer_names=((Domain.LABEL, "cells"), (Domain.TRACK, "tracks")),
+                      column_names=tuple((Domain.LABEL, "cells", c) for c in
+                                         TB.read_table(dl, Domain.LABEL, "cells")) +
+                      tuple((Domain.TRACK, "tracks", c) for c in tr))
+    _e, tj = _table_chain([(d_track, et)], "table.join", {"prefix": "trk_"},
+                          {"on": "track", "other_domain": "track"})
+    tl = TB.read_table(tj, Domain.LABEL, "joined")["trk_track_length"]
+    assert tl[0] == 2.0 and np.isnan(tl[1]) and tl[2] == 2.0, tl
+    # refusals: a repeated key on the other side; a prefix clash
+    dd, ed = _table_ds([2, 2], [0, 0], [0, 0], layer="dup")
+    for kw, msg in ((dict(other=(dd, ed)), "ambiguous"),
+                    (dict(params={"prefix": ""}, other=(do, eo)), "Prefix")):
+        try:
+            _table_chain([(dl, el)], "table.join", kw.get("params", {}), {},
+                         other=kw["other"])
+            raise AssertionError("must refuse")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+    _ok("table.join: the other table's columns added on id+m+t (left keeps every row, blank "
+        "where unmatched; inner the matched), text kept as text, the key not repeated; m+t "
+        "spreads a per-frame table; track joins on track_id+t and never matches 0; a "
+        "repeated other key and a prefix clash are refused; the OTHER wire's columns are in "
+        "the edit-time catalog")
+
+
+def test_table_aggregate() -> None:
+    """``table.aggregate`` (V4.00 step 9): one row per group with ``n`` and
+    ``<value>_<reducer>`` — the numbers equal numpy's; std (n - 1) and sem are NaN under two
+    rows; a text key (a concat's condition) stays text; blank Group by is one row; the output
+    is a Label table keeping the invariant coordinates (the key where grouped, else 0) and a
+    plot reads it; unknown columns, a text value and an unknown reducer are refused; the
+    declaration matches the payload."""
+    import nodegraph.catalog._shared.table_ops as TB
+    from nodegraph.reducers import reduce
+    areas = [10.0, 12.0, 20.0, 22.0, 26.0, 40.0]
+    d, e = _table_ds([1, 2, 3, 4, 5, 6], [0, 0, 1, 1, 1, 2], areas,
+                     extra={"condition": TB.text_column(["a", "b", "a", "b", "b", "a"])})
+    eng, out = _table_chain([(d, e)], "table.aggregate", {"reducers": "mean,sem,std,count"})
+    s = TB.read_table(out, Domain.LABEL, "summary")
+    a = np.array(areas)
+    assert s["t"].tolist() == [0, 1, 2] and s["n"].tolist() == [2, 3, 1]
+    for t_, idx in ((0, [0, 1]), (1, [2, 3, 4])):
+        assert abs(s["area_mean"][t_] - a[idx].mean()) < 1e-9
+        assert abs(s["area_std"][t_] - a[idx].std(ddof=1)) < 1e-9
+        assert abs(s["area_sem"][t_] - a[idx].std(ddof=1) / np.sqrt(len(idx))) < 1e-9
+    assert np.isnan(s["area_std"][2]) and np.isnan(s["area_sem"][2]), "NaN under two rows"
+    assert s["area_count"].dtype.kind == "i" and s["area_count"].tolist() == [2, 3, 1]
+    assert s["id"].tolist() == [1, 2, 3] and s["m"].tolist() == [0, 0, 0]
+    assert set(s) >= {"id", "m", "t", "c", "z", "y", "x"}
+    declared = _table_cols(eng, "T", "summary")
+    assert declared <= set(s) and set(s) - declared <= {"file"}, (set(s), declared)
+    assert abs(float(reduce(np.array([1.0, 2.0, 3.0]), (0,), "std")) - 1.0) < 1e-12
+    _e, by = _table_chain([(d, e)], "table.aggregate", {"group_by": "condition"})
+    sb = TB.read_table(by, Domain.LABEL, "summary")
+    assert sb["condition"].tolist() == ["a", "b"] and sb["condition"].dtype.kind == "U"
+    assert sb["t"].tolist() == [0, 0], "an ungrouped coordinate is 0"
+    _e, one = _table_chain([(d, e)], "table.aggregate", {"group_by": ""})
+    assert TB.read_table(one, Domain.LABEL, "summary")["n"].tolist() == [6]
+    for params, msg in (({"group_by": "dose"}, "dose"), ({"value": "condition"}, "text"),
+                        ({"reducers": "mean,mode"}, "mode")):
+        try:
+            _table_chain([(d, e)], "table.aggregate", params)
+            raise AssertionError("must refuse")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is not None:
+        _e, _o = _table_chain([(d, e)], "table.aggregate", {"group_by": "condition,t"},
+                              then=("plot.xy", {"table": "summary", "x": "t",
+                                                "y": "area_mean", "group_by": "condition"},
+                                    {"kind": "line_markers"}))
+        pic = _e.pull("U")
+        spec = pic.metadata["figure_spec"]
+        assert [x["label"] for x in spec["series"]] == ["a", "b"], spec["series"]
+        try:
+            _table_chain([(d, e)], "table.aggregate", {"group_by": "condition,t"},
+                         then=("plot.xy", {"table": "summary", "x": "condition",
+                                           "y": "area_mean"}, {}))[0].pull("U")
+            raise AssertionError("a text x must be refused")
+        except ValueError as exc:
+            assert "holds text" in str(exc), exc
+    _ok("table.aggregate: one row per group with n and <value>_<reducer> equal to numpy's "
+        "(std n-1, sem std/sqrt n, NaN under two); a text key stays text, blank Group by is "
+        "one row, ungrouped coordinates are 0; a Label table a plot reads (and a text x is "
+        "refused there); unknown columns, a text value and unknown reducers refused; the "
+        "declaration equals the payload")
+
+
+def test_table_declarations_total() -> None:
+    """The three table nodes' edit-time declarations (``extra_layers``, ``adds_columns``)
+    never raise — they run on every keystroke — under hostile params, modes and input
+    envelopes, and always yield ``(Domain, layer, column)`` with names; ``adds_columns`` of
+    concat and join opt into every input's envelope (``wants_inputs``) and still accept the
+    three-argument call."""
+    from nodegraph.domains import Domain as _D
+    shapes = [({}, {}), ({"name": None, "table": None}, {"domain": None}),
+              ({"name": 0, "group_by": 0, "reducers": None, "prefix": None, "names": 0},
+               {"domain": "nonsense", "on": None, "other_domain": 5}),
+              ({"group_by": "t,,condition", "reducers": "mea"}, {"domain": "track"})]
+    envs = [(), (("data", MetaEnvelope()),), (("data", None), ("other", object())),
+            (("data", MetaEnvelope(column_names=((_D.LABEL, "cells", "area"),),
+                                   layer_names=((_D.LABEL, "cells"),))),)]
+    for op in ("table.concat", "table.join", "table.aggregate"):
+        sp = NODES.get(op)
+        assert sp.extra_layers is not None and sp.adds_columns is not None, op
+        for params, modes in shapes:
+            for dom, name in sp.extra_layers(params, modes):
+                assert isinstance(dom, _D) and isinstance(name, str) and name, (op, name)
+            got = list(sp.adds_columns(params, modes, ()))
+            if getattr(sp.adds_columns, "wants_inputs", False):
+                for inputs in envs:
+                    got += list(sp.adds_columns(params, modes, (), inputs))
+            for entry in got:
+                dom, lyr, col = entry
+                assert isinstance(dom, _D) and lyr and col, (op, entry)
+    assert getattr(NODES.get("table.concat").adds_columns, "wants_inputs", False)
+    assert getattr(NODES.get("table.join").adds_columns, "wants_inputs", False)
+    _ok("table declarations: extra_layers and adds_columns of concat / join / aggregate are "
+        "total under hostile params, modes and input envelopes; concat and join see every "
+        "input's envelope")
+
+
+def test_page_condition_typed() -> None:
+    """A Page Output's ``condition`` (V4.00 step 9): blank stamps its page's name, but a
+    condition TYPED on an Output further upstream survives a blank one — so labelling the
+    dishes once, on the first page, holds through every later page; a typed condition
+    downstream still replaces it; the edit-time envelope marks a typed condition."""
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("page.output", node_id="O", params={"name": "done"})
+    P1.doc.connect("X", "out", "O", "data")
+
+    def cond_of():
+        comp = ws.compose("pg3")
+        eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds},
+                                  meta_seeds=comp.meta_seeds, memo=Memo())
+        return eng.pull("pg3/O").metadata.get("condition")
+
+    assert cond_of() == "P1", "blank everywhere: the last page's name"
+    ws.pages["pg1"].doc.nodes["O"].params["condition"] = "dishA"
+    ws.pages["pg1"].doc.touch("O")
+    assert cond_of() == "dishA", "a typed condition upstream survives blank Outputs"
+    assert ws.pages["pg1"].doc.envs["O"].metadata.get("condition_set") is True
+    P1.doc.nodes["O"].params["condition"] = "late"
+    P1.doc.touch("O")
+    assert cond_of() == "late", "a typed condition downstream replaces it"
+    _ok("Page Output condition: blank stamps the page's name, a condition typed upstream "
+        "survives later blank Outputs, a typed one downstream replaces it")
+
+
+def test_table_review() -> None:
+    """The step 9 review: 0-based (Point) and negative ids stay unique through a concat; a
+    concat of concatenated tables keeps each row's condition and group; a concat clears the
+    scalar condition it no longer describes (payload and envelope); a batch's per-M lists are
+    not read into `file`; a concat whose inputs all carry per-frame clocks writes each row's
+    own `time_s`, which Plot Time Series reads; summary rows carry the one file / group their
+    rows share, else blank; std, sem and count ignore inf; a Name that would replace the table
+    read is refused; synthesized tables are marked for the Viewer; a blank file names no
+    spreadsheet tab."""
+    import nodegraph.catalog._shared.table_ops as TB
+    from nodegraph.reducers import reduce
+    # ids
+    p0, q0 = _table_ds([0, 1, 2], [0, 0, 0], [1, 1, 1], domain=Domain.POINT, layer="spots")
+    p1, q1 = _table_ds([0, 1], [0, 0], [1, 1], domain=Domain.POINT, layer="spots")
+    _e, out = _table_chain([(p0, q0), (p1, q1)], "table.concat", {}, {"domain": "point"})
+    assert TB.read_table(out, Domain.POINT, "combined")["id"].tolist() == [0, 1, 2, 3, 4]
+    n0, e0 = _table_ds([-3, -2], [0, 0], [1, 1])
+    _e, neg = _table_chain([(n0, e0), (n0, e0)], "table.concat")
+    ids = TB.read_table(neg, Domain.LABEL, "combined")["id"].tolist()
+    assert len(set(ids)) == 4 and ids[:2] == [-3, -2], ids
+    # nested concat keeps per-row provenance; the scalar condition is cleared
+    a, ea = _table_ds([1, 2], [0, 0], [1, 2], md={"condition": "ctrl", "condition_set": True,
+                                                    "position_group": ["G1"]})
+    b, eb = _table_ds([1], [0], [3], md={"condition": "drug", "position_group": ["G9"]})
+    eng, first = _table_chain([(a, ea), (b, eb)], "table.concat")
+    assert first.metadata.get("condition") is None and \
+        first.metadata.get("condition_set") is None, first.metadata.get("condition")
+    assert eng.env("T").metadata.get("condition") is None
+    f_env = eng.env("T")
+    c, ec = _table_ds([5], [0], [9], md={"condition": "exp2"}, layer="combined")
+    _e, nested = _table_chain([(first, f_env), (c, ec)], "table.concat",
+                              {"table": "combined", "name": "all"})
+    nt = TB.read_table(nested, Domain.LABEL, "all")
+    assert nt["condition"].tolist() == ["ctrl", "ctrl", "drug", "exp2"], nt["condition"]
+    assert nt["group"].tolist() == ["G1", "G1", "G9", ""], nt["group"]
+    # a batch: no `file` from one member's list (the declaration agrees)
+    benv = MetaEnvelope(axes=AxisSizes(b=2, m=1, t=1, z=1, c=1, y=8, x=8),
+                        metadata={"source_file": ["a.nd2"]},
+                        layer_names=((Domain.LABEL, "cells"),),
+                        column_names=((Domain.LABEL, "cells", "area"),))
+    decl = {c for _d, _l, c in NODES.get("table.concat").adds_columns(
+        {}, {}, (), (("data", benv),))}
+    assert "file" not in decl and "area" in decl, decl
+    # each row's own clock
+    jd = 2460000.5
+    d1, f1 = _table_ds([1, 2, 3], [0, 1, 2], [1, 2, 3],
+                       md={"frame_time_jd": [jd, jd + 60 / 86400, jd + 120 / 86400],
+                           "condition": "slow"})
+    d2, f2 = _table_ds([1, 2, 3], [0, 1, 2], [1, 2, 3],
+                       md={"frame_time_jd": [jd, jd + 30 / 86400, jd + 60 / 86400],
+                           "condition": "fast"})
+    eng, tt = _table_chain([(d1, f1), (d2, f2)], "table.concat")
+    ts = TB.read_table(tt, Domain.LABEL, "combined")["time_s"]
+    assert np.allclose(ts, [0, 60, 120, 0, 30, 60]), ts
+    assert "time_s" in _table_cols(eng, "T", "combined")
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is not None:
+        _e, _o = _table_chain([(d1, f1), (d2, f2)], "table.concat", then=(
+            "plot.timeseries", {"table": "combined", "group_by": "condition",
+                                "value": "area"}, {"error": "none"}))
+        sp = _e.pull("U").metadata["figure_spec"]
+        xs = {s["label"]: s["x"] for s in sp["series"]}
+        assert np.allclose(xs["fast"], [0.0, 0.5, 1.0], atol=1e-4) and \
+            np.allclose(xs["slow"], [0.0, 1.0, 2.0], atol=1e-4), xs
+        _e, _o = _table_chain([(d1, f1), (d2, f2)], "table.concat", then=(
+            "plot.timeseries", {"table": "combined", "group_by": "condition",
+                                "value": "area"}, {"error": "none", "time": "clock"}))
+        cx = {s["label"]: s["x"] for s in _e.pull("U").metadata["figure_spec"]["series"]}
+        assert abs((cx["fast"][1] - cx["fast"][0]) * 86400 - 30) < 0.5 and \
+            abs((cx["slow"][1] - cx["slow"][0]) * 86400 - 60) < 0.5, cx
+    # summary rows: the one file / group their rows share
+    s0, e0s = _table_ds([1, 2, 3, 4], [0, 0, 1, 1], [1, 2, 3, 4],
+                        extra={"group": TB.text_column(["A", "B", "A", "A"])})
+    _e, sm = _table_chain([(s0, e0s)], "table.aggregate", {"group_by": "t"})
+    assert TB.read_table(sm, Domain.LABEL, "summary")["group"].tolist() == ["", "A"]
+    # inf
+    assert abs(float(reduce(np.array([1.0, np.inf, 3.0]), (0,), "std")) -
+               np.std([1.0, 3.0], ddof=1)) < 1e-12
+    i0, ie = _table_ds([1, 2, 3], [0, 0, 0], [1.0, np.inf, 3.0])
+    _e, si = _table_chain([(i0, ie)], "table.aggregate", {"reducers": "count,std"})
+    st = TB.read_table(si, Domain.LABEL, "summary")
+    assert st["area_count"].tolist() == [2] and np.isfinite(st["area_std"][0])
+    # a Name that would replace what it reads
+    from nodegraph.structure import StructureTable
+    two = i0.with_structure(StructureTable(
+        Domain.LABEL, dict(TB.read_table(i0, Domain.LABEL, "cells")), layer="cellsB",
+        z_kind="plane_index"))
+    two_env = MetaEnvelope(axes=two.axes, domains=frozenset({Domain.LABEL}),
+                           layer_names=((Domain.LABEL, "cells"), (Domain.LABEL, "cellsB")))
+    for op, params, src in (("table.aggregate", {"name": "cells"}, (i0, ie)),
+                            ("table.join", {"table": "cells", "other_table": "cellsB",
+                                            "name": "cellsB"}, (two, two_env))):
+        try:
+            _table_chain([src], op, params)
+            raise AssertionError(f"{op} must refuse")
+        except ValueError as exc:
+            assert "Name" in str(exc), exc
+    # the Viewer's mark; the spreadsheet's tabs
+    assert TB.synthesized(sm.metadata, Domain.LABEL) == {"summary"}
+    assert TB.synthesized(out.metadata, Domain.POINT) == {"combined"}
+    from nodelab_v2.spreadsheet import SpreadsheetPanel
+    assert SpreadsheetPanel._file_names({"file": np.array(["a.nd2", "", "a.nd2"])}) == \
+        ["a.nd2"]
+    _ok("table review: 0-based and negative ids stay unique; a nested concat keeps each "
+        "row's condition and group and the scalar condition is cleared; a batch's lists are "
+        "not read into file; each row's own clock (time_s) reaches Plot Time Series; summary "
+        "rows carry the file / group their rows share; std / sem / count ignore inf; a Name "
+        "replacing the table read is refused; synthesized tables are marked; a blank file "
+        "names no tab")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -26225,6 +26650,12 @@ def main() -> int:
     test_plot_per_frame()
     test_plot_groups_and_frames()
     test_plot_frames_review()
+    test_table_concat()
+    test_table_join()
+    test_table_aggregate()
+    test_table_declarations_total()
+    test_page_condition_typed()
+    test_table_review()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

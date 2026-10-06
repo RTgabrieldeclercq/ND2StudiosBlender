@@ -370,6 +370,12 @@ reaches the Label rows by `member_id`. The picker filters that domain's join KEY
 (`document._JOIN_KEYS`), because a name the menu offers and the pull then refuses is the
 live-control-that-does-nothing defect wearing a picker's clothes.
 
+The `incoming` catalog is INPUT 0's, like every edit-time catalog. A node that builds a table
+out of several inputs (V4.00: `table.concat`'s many, `table.join`'s `other`) marks its
+declaration `adds_columns.wants_inputs = True` and receives a fourth argument,
+`((socket, envelope), ...)` for every Dataset input, so it can name the columns only a later
+input carries — otherwise they would be unpickable downstream.
+
 see: CON-06 · CON-12 · `grep '"key":"analysis.if_else' gen/sockets.jsonl`
 
 ---
