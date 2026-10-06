@@ -236,3 +236,30 @@ to compute, and one member's output carries nothing to reconstruct the others fr
 two-file batch and fails if *any* node returns fewer files. As of 2026-09-27: 28 carry both
 through, 11 refuse loudly, 0 drop. Lifting one of the 11 means giving its unit loop the
 batch axis — never widening the guard.
+
+---
+
+### INV-15 — run ids are ALWAYS page-qualified
+anchors: sym:nodelab_v2.workspace.qualify, sym:nodelab_v2.workspace.split_run_id
+
+Every id that reaches the engine, the memo or a runner signal in the GUI is `<page>/<node>` —
+the target page's own nodes included. Cross-page reuse depends on it: a root's `__source__` is
+its run id, and two pages that both have an `n1` would otherwise share a source identity (and
+a cached result) they do not share in fact. Two places read a bare id, each deliberately:
+`EngineRunner.run_id` takes it to be on the active page, and `Workspace.compose` on the page
+being composed. Everything past them carries the qualified id. A Page Input's reference uses `:` (`pg1:raw`), never the run separator.
+
+---
+
+### INV-16 — `page.*` ops are GUI-layer and never live in `nodegraph/`
+anchors: sym:nodelab_v2.ops.ensure_ops
+
+`page.input` and `page.output` are registered by `nodelab_v2.ops.ensure_ops`, beside
+`io.load`, `view.viewer` and `io.dock`: they only mean something inside a `Workspace`, which is
+a `nodelab_v2` object. Moving them into the catalog would make the engine depend on the
+workspace model (INV-08) and put two ops into the catalog sweeps that cannot run headless on
+their own (an unbound Input refuses by design). The selftest's catalog sweeps
+(`hotreload.is_catalog_op`) therefore skip them, and `selftest.test_workspace_*` and the
+LabLink page tests cover them. They ARE in the catalog snapshot baseline and the synopsis
+(both call `ensure_ops`, role `page_boundary`): a change to their sockets or descriptions
+needs `_catalog_snapshot.py save` and `_node_synopsis.py write` like any node's.

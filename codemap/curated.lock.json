@@ -128,6 +128,32 @@
   "blessed": "2026-09-30",
   "file": "codemap/concepts.md"
  },
+ "CON-17": {
+  "anchors": {
+   "sym:nodelab_v2.workspace.ComposedGraph": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodelab_v2.workspace.Workspace": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodelab_v2.workspace.Workspace.compose": "12d1f3e3036cef7a9e8d0ea9f5cd917e"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/concepts.md"
+ },
+ "CON-18": {
+  "anchors": {
+   "sym:nodelab_v2.linked_document.LinkedDocument": "1b009cdc81d1e9fe6d23e19384964c60",
+   "sym:nodelab_v2.linked_document.LinkedDocument.touch": "4478d61e33e3a231c1ccf001c8bbea8e"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/concepts.md"
+ },
+ "CON-19": {
+  "anchors": {
+   "sym:nodegraph.catalog._shared.figure.FigureProvider": "1844598aae339f6fbbeb42cce5d3e603",
+   "sym:nodegraph.catalog._shared.figure.figure_frame": "b0bb8bad77c5d0f5e34d4a92949c481b",
+   "sym:nodegraph.catalog._shared.figure.picture_dataset": "dee64024da5ab3019e2127a239209b3d"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
@@ -183,10 +209,10 @@
  },
  "INV-08": {
   "anchors": {
-   "file:nodegraph/codemap.py": "d8302ab3236c712648655d4aa147b8d3",
+   "file:nodegraph/codemap.py": "c06b5bffb6978b80f72bfcabfb29ccdd",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-06",
   "file": "codemap/invariants.md"
  },
  "INV-09": {
@@ -231,6 +257,21 @@
    "sym:nodegraph.streaming.realize": "7611ff992d405155f0908c158d628226"
   },
   "blessed": "2026-09-27",
+  "file": "codemap/invariants.md"
+ },
+ "INV-15": {
+  "anchors": {
+   "sym:nodelab_v2.workspace.qualify": "45a8e0ce9ff9f97219e39d21deb305aa",
+   "sym:nodelab_v2.workspace.split_run_id": "ce46de0dd6c9675f4da681bcc74a3668"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/invariants.md"
+ },
+ "INV-16": {
+  "anchors": {
+   "sym:nodelab_v2.ops.ensure_ops": "860407ad0a338e95007889729b975022"
+  },
+  "blessed": "2026-10-06",
   "file": "codemap/invariants.md"
  },
  "WF-01": {
@@ -292,6 +333,15 @@
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
   "blessed": "2026-10-05",
+  "file": "codemap/workflows.md"
+ },
+ "WF-08": {
+  "anchors": {
+   "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846",
+   "sym:nodelab_v2.workspace.Workspace.compose": "12d1f3e3036cef7a9e8d0ea9f5cd917e",
+   "sym:nodelab_v2.workspace.split_run_id": "ce46de0dd6c9675f4da681bcc74a3668"
+  },
+  "blessed": "2026-10-06",
   "file": "codemap/workflows.md"
  }
 }

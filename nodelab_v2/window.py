@@ -4728,7 +4728,8 @@ class MainWindow(QMainWindow):
 
         written = publish_document(self, self.doc,
                                    hub=getattr(self.lablink.send, "_hub", None),
-                                   suggested_name="")
+                                   suggested_name="", workspace=self.workspace,
+                                   page_id=self.workspace.active or "")
         if written:
             self.statusBar().showMessage(f"recipe written to {written}")
 

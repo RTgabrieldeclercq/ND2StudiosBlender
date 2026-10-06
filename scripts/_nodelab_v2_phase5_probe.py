@@ -6580,6 +6580,29 @@ def main(argv) -> int:
             "area_mean, area_sem, area_count) and on the pulled result; Plot XY draws it; "
             "Processing and Analysis pages offer Table Concat, Join and Aggregate")
 
+    # PB1 (V4.00 step 10) the Publish-as-recipe dialog builds — for a page's single graph and
+    # for a page that reads other pages (published flattened): its target menu holds the
+    # draft's target and Validate's draft keeps it
+    from nodegraph.selftest import _ws_fixture as _wsf
+    from nodegraph.serialize import from_dict as _fd
+    from nodelab_v2.lablink import authoring as _AU
+    from nodelab_v2.lablink import recipe as _RCP
+    _wsp, _dsp, _envp, _axp = _wsf()
+    for _draft in (_RCP.draft_from_document(_wsp.pages["pg1"].doc, name="pb-single"),
+                   _RCP.draft_from_workspace(_wsp, "pg3", name="pb-pages")):
+        _gp = _fd(_draft.graph_doc)[0]
+        _dlg = _AU.RecipeDialog(win, draft=_draft, candidates=_RCP.candidates(_gp))
+        app.processEvents()
+        assert _dlg._target.count() > 0 and _dlg._target.currentData() == _draft.target, \
+            (_draft.name, _dlg._target.currentData(), _draft.target)
+        _d2, _pr = _dlg._collect()
+        assert _d2 is not None and _d2.target == _draft.target, _pr
+        _dlg.deleteLater()
+        app.processEvents()
+    _ok("PB1 the Publish-as-recipe dialog builds for a page's single graph and for a page "
+        "that reads other pages (published flattened); its target menu holds the draft's "
+        "target and the collected draft keeps it")
+
     # ── VW1–VW6: viewers as docks (V4.00 step 4) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _QEv, QPointF as _QPF, Qt as _QtV
     from PySide6.QtGui import QMouseEvent as _QME

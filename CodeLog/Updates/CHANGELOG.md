@@ -3,7 +3,7 @@
 All notable changes to the standalone NodeLab GUI. The vendored `nd2studios/`
 backend is a copy and is **not** modified here (see `pipeline_kit` parity).
 
-## [4.0.0-dev] — Workspaces (ND2Studios V4.00) — opened 2026-10-05
+## [4.0.0] — Workspaces (ND2Studios V4.00) — 2026-10-06
 
 The V4 generation turns the single canvas into a **workspace** of typed node-graph pages
 (Image Input → Image Refinement → Image Processing → Analysis, plus Free for legacy graphs)
@@ -159,6 +159,15 @@ instances, and an analysis toolkit of plot and table nodes. Design record and st
   clears the scalar condition; per-row clocks (`time_s`, `time_jd`) after a concat; summary rows carry
   the file / group they share; std / sem / count ignore inf; Names that would replace the table
   read are refused; the Viewer leaves synthesized tables off the image; no blank file tab.
+
+### Step 10 — documentation and closure (2026-10-06)
+- MANUAL §2b: one analysis across pages, step by step; §17b: workspace recipes (`"page"`, run
+  ids); §18: troubleshooting rows for pages, linked pages, plots and tables.
+- **Publish as a LabLink recipe** on a page that reads other pages publishes it together with
+  every page it reads, flattened into one graph a hub installs (`recipe.draft_from_workspace`,
+  planned in step 1): the page alone used to arrive with its Page Inputs unbound.
+- codemap: CON-17 workspace and pages, CON-18 linked page, CON-19 picture dataset, WF-08 a
+  pull across pages, INV-15 run ids are page-qualified, INV-16 `page.*` ops are GUI-layer.
 
 ## [0.1.0] — NodeLab initial build (ND2Studios V1.90)
 

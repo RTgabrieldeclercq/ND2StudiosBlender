@@ -663,7 +663,7 @@ def state_markdown(built: Dict[str, Any], verified: str) -> str:
 | | |
 |---|---|
 | catalog node types | **{cat}** |
-| GUI-layer ops (`io.load`, `view.viewer`, `io.dock`) | {gui} |
+| GUI-layer ops (`io.load`, `view.viewer`, `io.dock`, `page.input`, `page.output`) | {gui} |
 | sockets + mode selectors | {c['sockets']} |
 | mapped Python modules | {c['modules']} |
 | indexed symbols | {c['symbols']} |

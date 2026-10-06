@@ -405,3 +405,71 @@ the concrete `lo`/`hi`/`gamma`/`rgb` at commit points (a settled LUT edit, Captu
 Save), never per drag tick, and the renderer reads only the concrete values.
 
 see: [MANUAL §16 I](../MANUAL.md) · INV-09 · CON-14
+
+---
+
+### CON-17 — workspace and pages
+anchors: sym:nodelab_v2.workspace.Workspace, sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.workspace.ComposedGraph
+
+A V4.00 file holds a **workspace**: ordered **pages**, each a node graph (`GraphDocument`) of a
+**kind** — `input` < `refine` < `process` < `analyze`, plus `free` (any node, any wiring; a
+pre-V4 file opens as one Free page). The kind decides what the palette and the link search
+OFFER (`nodegraph.roles.ops_for_page`); it locks nothing. Pages hand data on BY NAME: a
+`page.output` node names its input as a variable of its page, and a `page.input` on a page of
+a strictly later kind (or across a Free page, while acyclic) reads it — its `source` param is
+`"<page id>:<name>"`. Page ids (`pg1`, ...) come from a counter stored in the file and are
+never re-used, so a reference cannot silently rebind.
+
+**A page never runs alone.** `Workspace.compose(page)` builds ONE run graph: the page plus every
+page in its dependency closure, upstream first, node ids qualified `<page>/<node>`
+(INV-15), each resolved `page.input` dropped and its consumers rewired to the upstream
+Output's run id. An unresolved Input stays a root whose pull says it is unbound.
+`ComposedGraph.revision` folds every page in the closure, so the runner rebuilds its engine
+exactly when one of them changes. `page.input` / `page.output` are GUI-layer ops (INV-16).
+
+see: WF-08 · CON-18 · [MANUAL §2 Pages, §2b](../MANUAL.md)
+
+---
+
+### CON-18 — linked page
+anchors: sym:nodelab_v2.linked_document.LinkedDocument, sym:nodelab_v2.linked_document.LinkedDocument.touch
+
+A **linked page** is a page whose document is a `LinkedDocument`: a live mirror of its
+**master** page — the same nodes, wires, positions, frames, zones and groups, rebuilt IN PLACE
+on every master change so record identity survives and the canvas does not rebuild its cards.
+What it owns are **overrides** `{node id: {"params", "modes", "local"}}`: a param or mode set
+on the linked page differs from the master's and stays the page's own (sticky, even if the
+master later reaches the same value) until *Reset to master*. Its topology is locked —
+add/remove/connect and the like raise `LinkedPageError` with the hint the status bar shows —
+and *Make unique* turns it into a plain page. One level deep: a link to a linked page links to
+its master. A file stores a linked page as `master` + `overrides`, no `graph`.
+
+The memo's recipe hash carries no node id, so a linked page shares with its master every
+cached result it READS through a Page Input from a shared upstream page, and every node it does
+not override that is fed only by those. A root on the linked page itself (an `io.load`, a Dock,
+any seeded source) carries that page's own run id as `__source__`, so a linked Image Input
+page computes its own chain.
+
+see: CON-17 · CON-09 · [MANUAL §2 Linked pages](../MANUAL.md)
+
+---
+
+### CON-19 — picture dataset
+anchors: sym:nodegraph.catalog._shared.figure.picture_dataset, sym:nodegraph.catalog._shared.figure.FigureProvider, sym:nodegraph.catalog._shared.figure.figure_frame
+
+A `plot.*` node returns a **Picture**: a Dataset whose image is the rendered figure — axes
+`(1, T, 1, 3, H, W)` uint8, channels R/G/B with their own colours, `bit_depth` 8, no
+calibration, `picture = "rgb"`, and the JSON `figure_spec` it was drawn from (Export Figure
+redraws that spec at any resolution, or as SVG/PDF). The node declares
+`NodeSpec.fresh_output`: the envelope inherits no domain, layer or column of its input, and
+its own Voxel domain comes from `adds_domains`. Viewer, Export Movie and LabLink quicklooks
+show a picture on a fixed 0–255 window in its channel colours.
+
+`T` is 1, except with `per = frame` (Plot XY, Plot Time Series): one figure per input frame,
+drawn on read by a `FigureProvider` (a `TileProvider` that renders frame t, keeps 8, draws
+each frame once for concurrent readers, counts its resident bytes for the memo budget and
+`computes_on_read` for the runner's prefetch), on axes every frame shares, with the input's
+per-frame clock on payload and envelope alike. Renders are serialised process-wide
+(matplotlib's text layout is not thread-safe) and refused past 100 Mpx.
+
+see: CON-11 · [MANUAL §15 Plotting](../MANUAL.md)

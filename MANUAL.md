@@ -9,7 +9,7 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 [`nodelab_v2/`](nodelab_v2/). For how it works internally, see
 [CodeLog/Architecture/ENGINEERING_NOTES.md](CodeLog/Architecture/ENGINEERING_NOTES.md).
 
-> **V4.00 — Workspaces (opened 2026-10-05, in progress).** ND2Studios V4 turns the single canvas into a workspace of typed node-graph pages (Image Input → Image Refinement → Image Processing → Analysis) with named outputs flowing between them, linked pages that share a master's nodes with their own parameter values, pop-out dockable panels with several instances, and an analysis toolkit of plot and table nodes. The design record and step list are in [CodeLog/ClaudesPlan/V4.00_workspaces.md](CodeLog/ClaudesPlan/V4.00_workspaces.md); each delivered step adds its own section to this manual. The version number lives in `nodelab_v2/version.py` and nowhere else.
+> **V4.00 — Workspaces (delivered 2026-10-06).** ND2Studios V4 turns the single canvas into a workspace of typed node-graph pages (Image Input → Image Refinement → Image Processing → Analysis) with named outputs flowing between them, linked pages that share a master's nodes with their own parameter values, pop-out dockable panels with several instances, and an analysis toolkit of plot and table nodes. The design record and step list are in [CodeLog/ClaudesPlan/V4.00_workspaces.md](CodeLog/ClaudesPlan/V4.00_workspaces.md); [§2b](#2b-a-multi-page-analysis-step-by-step-v400) walks through one analysis across pages. The version number lives in `nodelab_v2/version.py` and nowhere else.
 
 > **State:** node counts and gate results now live in
 > [codemap/STATE.md](codemap/STATE.md), generated from the live registry — it is the only file
@@ -42,6 +42,7 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 
 1. [Install & launch](#1-install--launch)
 2. [The window](#2-the-window)
+   - [A multi-page analysis, step by step](#2b-a-multi-page-analysis-step-by-step-v400)
 3. [Your first graph in five minutes](#3-your-first-graph-in-five-minutes)
 4. [Loading data](#4-loading-data)
 5. [Building graphs](#5-building-graphs)
@@ -170,7 +171,7 @@ first pull returns an image, which opens a Viewer above the canvas at a ~2.5:1 s
 ```
 
 * **Palette** — searchable, grouped by **pipeline stage → role** (Acquire & organize,
-  Prepare the image, Find structure, Quantify, Control & present; nineteen roles such as
+  Prepare the image, Find structure, Quantify, Control & present; roles such as
   Image restoration, Segmentation & labeling, Tracking). Every node row carries **dots**:
   on the left what flows *in* (the attribute domains it reads from its Dataset, then its
   parameter types), on the right what flows *out* (the domains it adds, then value
@@ -254,6 +255,39 @@ its **✕** — the last one too: the next pull opens a fresh one. Two Viewers c
 node at different frames; each draws only the frames its own cursor asks for.
 
 Light theme: **View → Light theme**.
+
+---
+
+## 2b. A multi-page analysis, step by step (V4.00)
+
+The pieces are described in §2 (**Pages**, **Linked pages**, **Panels**, **Several Viewers**);
+this is one way to put them together — two dishes of one experiment, segmented with one
+workflow tuned per dish, compared on one plot.
+
+1. **Input page.** File → New, then the page switcher (top-left of the canvas) → *New page ▸
+   Image Input*. Load the file and wire each dataset a later page needs into a **Page
+   Output** with a **Name** (`dishA`, `dishB`). To see the dish names in the final table,
+   type the same text in each Output's **Condition** — a typed condition survives every
+   blank Output after it.
+2. **Refinement page.** *New page ▸ Image Refinement*. A **Page Input** whose **Source** is
+   `Image Input · dishA` → Gaussian Blur → Threshold → a Page Output named `mask`.
+3. **A variant.** The switcher's *Duplicate as linked page*. On the copy, change Threshold's
+   level and point its Page Input at `dishB` — both become that page's **overrides** (a bar
+   on the row). Adding or rewiring a node there is refused: edit the master, and both follow.
+4. **Processing pages.** *New page ▸ Image Processing*: Page Input `Image Refinement · mask` →
+   Connected Components → Measure → Page Output `cells`. Duplicate it as a linked page and
+   point its input at the linked refinement's `mask`.
+5. **Analysis page.** *New page ▸ Analysis*: two Page Inputs (`Image Processing · cells`,
+   `Image Processing (linked) · cells`) → **Table Concat** (a `condition` column names each row's
+   source) → **Table Aggregate** (Table `combined` — Table Concat passes the first input's own table on too — Group by `condition,t`) → **Plot XY** (Table `summary`,
+   X `t`, Y `area_mean`, Group by `condition`) → **Export Figure** (SVG for the paper).
+6. **Look.** Double-click any card to see it. A pull reaches back across pages, and a result
+   one page already computed is reused by every page that reads it — the Console shows those
+   steps as cached. Pop the Viewer out with **⇱**, open a second with **+** to compare.
+7. **Save.** One `.nd2graph.json` holds every page (§13); the panel arrangement comes back on
+   the next launch by itself.
+8. **Send it out.** *Graph ▸ Publish as a LabLink recipe…* on the Analysis page publishes the
+   page together with every page it reads, as one graph, so a remote run computes exactly this (§17b).
 
 ---
 
@@ -3144,6 +3178,14 @@ the dunders are editor bookkeeping that would change the cache key without chang
 result. The generator **filters them out of the offer list** rather than letting you pick one
 and meet a refusal.
 
+**Pages in a recipe (V4.00).** *Graph ▸ Publish as a LabLink recipe…* on a page that reads
+other pages (it holds a Page Input) publishes the page TOGETHER with every page it reads,
+flattened into one ordinary graph: groups expanded, muted nodes left out, every Dock live (the
+remote machine has none of this one's checkpoints), node ids made readable. That is the format
+a hub installs, and the worker runs exactly what the editor composes for the page. A page that
+reads no other page is published as before. (A workspace file with `"page"` naming the page
+runs on the worker directly, its ids `<page>/<node>` — but a hub accepts only single graphs.)
+
 ### Half 2: sending work out — this machine as a node
 
 The **Send work** tab: enter a hub URL and token, press *Connect*, and it lists the recipes
@@ -3358,6 +3400,15 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **LabLink**: a preset applies but some knobs are missing | the recipe changed under it — a recipe has no version, so an operator can rename a knob or narrow a bound. The log names every knob that no longer fits rather than dropping it silently |
 | **LabLink**: *Promote to recipe…* says it cannot find the parent | promoting needs the parent recipe's **graph**, and a hub publishes a recipe's knobs but never its graph. Put the recipe directory in `~/.nd2studios/lablink-outbox/` and it will work |
 | **LabLink**: a generated recipe is refused for a knob name declared twice | two nodes with a 2D/3D lever both want to be called `dim`. The dialog disambiguates as a set (`dim`, `tophat_dim`); a hand-edited name can still collide |
+| **"Page Input is not bound to an upstream Output"** | its Source names no Output a page before it offers — the Output was renamed or deleted, its page was deleted, or the source page comes later in the order. Pick the source again in Properties; the Ready-to-run block lists every unbound Input |
+| **Adding, deleting or wiring a node is refused: "this page is linked to its master"** | the page is a linked copy and its graph follows the master. Make the change on the master (every linked page follows), or *Make unique* in the page switcher |
+| **The first plot takes several seconds** | matplotlib builds its font cache the first time it draws on a machine; later figures take a fraction of a second |
+| **A plot node refuses: needs matplotlib** | `pip install -r requirements.txt` — matplotlib is a core requirement since V4.00 |
+| **A plot refuses: "column … holds text"** | a text column (a Table Concat `condition`) cannot be drawn on X, Y or Value; use it as **Group by** |
+| **"the figure would be … Mpx"** | the size and resolution ask for more than 100 Mpx — usually a typo such as 6000 dpi; lower Width, Height or Resolution |
+| **Table Join refuses: "the join is ambiguous"** | the other table holds a key more than once — On `id` where ids repeat per frame, or a per-object table joined On `m_t`. Pick a finer On, or summarise the other table with Table Aggregate first |
+| **Table Concat refuses: "the inputs mix 2D (per-plane) and 3D tables"** | one input was segmented in 2D and another in 3D, so their `z` means different things; use the same 2D/3D lever on every branch |
+| **A recipe published from an Analysis page fails on the worker with an unbound Page Input** | it was published before V4.00 step 10, as the page alone. Publish it again: it now carries every page it reads, as one graph |
 
 ---
 

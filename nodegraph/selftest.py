@@ -26544,6 +26544,86 @@ def test_table_review() -> None:
         "names no tab")
 
 
+def test_publish_workspace_recipe() -> None:
+    """Publishing a page that reads other pages (V4.00 step 10): it is published FLATTENED —
+    the page with every page it reads as ONE single graph (format 2.0, readable ids, groups
+    expanded), the only format a LabLink hub installs, with no ``page``; the target is on the
+    page, or what feeds its first plot when the page only plots; an unset 2D/3D lever is
+    pinned, inside a group too; the recipe passes ``check_recipe`` and computes what the
+    composed page computes; a page that reads no other page publishes as before."""
+    import json as _json
+    import os as _os
+    import shutil
+    import tempfile
+    from nodegraph.memo import Memo
+    from nodegraph.serialize import FORMAT_VERSION, from_dict
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.lablink import recipe as RC
+    from nodelab_v2.lablink.worker import check_recipe_dir
+    ws, ds, env, ax = _ws_fixture()
+    p3 = ws.pages["pg3"].doc
+    p3.add_node("enhance.median", node_id="MG")             # a lever left unset ...
+    p3.connect("X", "out", "MG", "data")
+    p3.add_node("enhance.gamma", node_id="Y", params={"gamma": 1.0})
+    p3.connect("MG", "out", "Y", "data")
+    p3.make_group(["MG"], "Smooth")                         # ... inside a group
+    assert RC.page_reads_other_pages(p3)
+    assert not RC.page_reads_other_pages(ws.pages["pg1"].doc)
+    draft = RC.draft_from_workspace(ws, "pg3", name="ws-recipe")
+    m = draft.to_manifest()
+    assert "page" not in m and draft.graph_doc.get("format_version") == FORMAT_VERSION
+    nodes = draft.graph_doc["graph"]["nodes"]
+    ops_of = {n["id"]: n["op_key"] for n in nodes}
+    assert not any("/" in i or "%" in i for i in ops_of), sorted(ops_of)
+    assert {"io.load", "enhance.gaussian", "enhance.gamma", "enhance.median"} <= \
+        set(ops_of.values()), sorted(set(ops_of.values()))
+    assert "page.input" not in set(ops_of.values()), "inputs are spliced away"
+    assert all(n.get("modes", {}).get("dim") in ("2D", "3D")
+               for n in nodes if n["op_key"] == "enhance.median"), "lever pinned in a group"
+    assert ops_of[m["targets"]["primary"]] == "enhance.gamma", m["targets"]
+    assert [ops_of[i["node"]] for i in m["inputs"]] == ["io.load"]
+    tmp = tempfile.mkdtemp(prefix="nd2ws_pub_")
+    try:
+        directory = RC.write_recipe(draft, tmp)
+        ok, problems = check_recipe_dir(directory)
+        assert ok, problems
+        with open(_os.path.join(directory, RC.GRAPH_FILENAME), encoding="utf-8") as fh:
+            flat, _z, _g = from_dict(_json.load(fh))
+        loader = m["inputs"][0]["node"]
+        a = OPS.headless_engine(flat, seeds={loader: ds}, meta_seeds={loader: env},
+                                memo=Memo()).pull(
+            m["targets"]["primary"])
+        comp = ws.compose("pg3")
+        tgt = RC._guess_target(comp.graph, prefix="pg3/")
+        b = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds},
+                                meta_seeds=comp.meta_seeds, memo=Memo()).pull(tgt)
+        region = (0, 0, 0, 0, 0, 0, ax.y, 0, ax.x)
+        assert a.axes == b.axes == ax
+        assert np.array_equal(np.asarray(a.image.get_region(*region)),
+                              np.asarray(b.image.get_region(*region))), \
+            "the flattened recipe computes what the composed page computes"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # a page that only plots: the target is what feeds its first plot
+    an = ws.add_page("Plots", "analyze")
+    an.doc.add_node("page.input", node_id="IN", params={"source": "pg2:smooth"})
+    an.doc.add_node("plot.xy", node_id="PX")
+    an.doc.add_node("io.write_figure", node_id="WF")
+    an.doc.connect("IN", "out", "PX", "data")
+    an.doc.connect("PX", "out", "WF", "data")
+    pd = RC.draft_from_workspace(ws, an.id, name="plots")
+    pops = {n["id"]: n["op_key"] for n in pd.graph_doc["graph"]["nodes"]}
+    assert pops[pd.target] == "page.output", (pd.target, pops.get(pd.target))
+    single = RC.draft_from_document(ws.pages["pg1"].doc, name="input-only")
+    assert "page" not in single.to_manifest()
+    assert single.graph_doc.get("format_version") == FORMAT_VERSION
+    _ok("publish a workspace page: flattened into one 2.0 graph (readable ids, groups "
+        "expanded, Page Inputs spliced away, no `page`) a hub installs; target on the page or "
+        "what feeds its first plot; an unset lever pinned inside a group; check_recipe passes "
+        "and the recipe computes what the composed page computes; a page reading no other "
+        "page publishes as before")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -26656,6 +26736,7 @@ def main() -> int:
     test_table_declarations_total()
     test_page_condition_typed()
     test_table_review()
+    test_publish_workspace_recipe()
     test_measure_points()
     test_measure_stage_position()
     test_grow_points()

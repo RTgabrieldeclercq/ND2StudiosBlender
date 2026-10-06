@@ -651,6 +651,63 @@ def draft_from_document(doc: Any, *, name: str, target: str = "",
         conditional_metadata=tuple(conditional_metadata(renamed_graph)))
 
 
+def page_reads_other_pages(doc: Any) -> bool:
+    """Whether a page's document holds a Page Input — i.e. it cannot run on its own and must
+    be published with the pages it reads (:func:`draft_from_workspace`)."""
+    from nodelab_v2.ops import PAGE_INPUT_OP
+    return any(getattr(rec, "op_key", "") == PAGE_INPUT_OP
+               for rec in (getattr(doc, "nodes", None) or {}).values())
+
+
+def draft_from_workspace(ws: Any, page_id: str, *, name: str, target: str = "",
+                         take_suggested: bool = True) -> RecipeDraft:
+    """A :class:`RecipeDraft` for one PAGE of a workspace that reads other pages (V4.00).
+
+    The page is published FLATTENED: :meth:`~nodelab_v2.workspace.Workspace.compose` splices
+    it together with every page it reads into ONE run graph (groups expanded, muted nodes
+    bypassed, every Dock kept live — a remote machine has none of this one's checkpoints),
+    which is serialised as an ordinary single graph (format 2.0) with readable node ids. That
+    is the only graph format a LabLink hub installs, and the worker runs it exactly as the
+    editor composes the page. A workspace file named with ``"page"`` still runs on the worker
+    directly; a hub does not accept one.
+    """
+    from nodegraph.serialize import from_dict, to_dict
+    from nodelab_v2.ops import DOCK_OP, LOAD_OP, ensure_ops
+    from nodelab_v2.workspace import qualify
+
+    ensure_ops()
+    order = ws.dependency_closure(page_id, strict=False)
+    docks = frozenset(qualify(pid, nid) for pid in order
+                      for nid, rec in ws.pages[pid].doc.nodes.items() if rec.op_key == DOCK_OP)
+    composed = ws.compose(page_id, live_docks=docks)
+    titles = {qualify(pid, nid): str(rec.params.get("__title__") or "")
+              for pid in order for nid, rec in ws.pages[pid].doc.nodes.items()}
+    raw = to_dict(composed.graph)
+    mapping = readable_ids(raw, titles)
+    graph_doc = rename_nodes(raw, mapping)
+    renamed_graph, zones, _groups = from_dict(graph_doc)
+    _ensure_dim_levers(renamed_graph, graph_doc)
+
+    loaders = tuple(nid for nid, rec in sorted(renamed_graph.nodes.items())
+                    if rec.op_key == LOAD_OP)
+    picks = candidates(renamed_graph)
+    chosen: List[KnobDraft] = []
+    if take_suggested:
+        wanted = [c for c in picks if c.suggested or c.kind == "mode"]
+        names = assign_names(wanted)
+        for cand in wanted:
+            lo, hi = suggest_bounds(cand)
+            chosen.append(KnobDraft(candidate=cand, name=names[cand.key],
+                                    minimum=lo, maximum=hi, derive=cand.can_derive))
+    guess = target or _guess_target(composed.graph, prefix=f"{page_id}/")
+    return RecipeDraft(
+        name=name, title=name.replace("-", " ").strip().capitalize(),
+        target=mapping.get(guess, guess), knobs=chosen, allow_zones=bool(zones),
+        graph_doc=graph_doc, loaders=loaders,
+        requires_metadata=tuple(derive_required_metadata(renamed_graph)),
+        conditional_metadata=tuple(conditional_metadata(renamed_graph)))
+
+
 def _ensure_dim_levers(graph: Any, graph_doc: Dict[str, Any]) -> None:
     """Pin every 2D/3D lever explicitly in the published graph.
 
@@ -676,18 +733,25 @@ def _ensure_dim_levers(graph: Any, graph_doc: Dict[str, Any]) -> None:
             node.setdefault("modes", {})[lever.name] = value
 
 
-def _guess_target(graph: Any) -> str:
+def _guess_target(graph: Any, prefix: str = "") -> str:
     """The node a run should pull, when the caller did not say: the last in topological
-    order, which is the graph's own answer to "what is this pipeline for"."""
+    order, which is the graph's own answer to "what is this pipeline for". ``prefix``
+    (``"<page>/"``) keeps the guess on the published page of a composed workspace."""
     order = list(graph.topo_order())
+    if prefix and any(str(n).startswith(prefix) for n in order):
+        order = [n for n in order if str(n).startswith(prefix)]
     # a plot and its Export Figure make a picture, not a table: a draft whose last node is
     # one would run with an empty 'measurements' table — target what feeds them instead
     fig = [n for n in order if str(getattr(graph.nodes[n], "op_key", "")).startswith("plot.")
            or getattr(graph.nodes[n], "op_key", "") == "io.write_figure"]
     rest = [n for n in order if n not in fig]
     if rest:
-        order = rest
-    return order[-1] if order else ""
+        return rest[-1]
+    if fig:
+        # only figures (a page that plots what another page measured): what feeds the first
+        feeds = [e.src for e in getattr(graph, "edges", ()) if e.dst == fig[0]]
+        return feeds[0] if feeds else fig[-1]
+    return ""
 
 
 #: A socket's unit -> the calibration key needed to make sense of a number in it. This is
@@ -858,6 +922,7 @@ __all__ = [
     "RECIPE_FORMAT", "GRAPH_FILENAME", "MANIFEST_FILENAME",
     "KnobCandidate", "KnobDraft", "RecipeDraft",
     "candidates", "suggest_bounds", "readable_ids", "rename_nodes",
-    "draft_from_document", "derive_required_metadata", "write_recipe", "check_recipe",
+    "draft_from_document", "draft_from_workspace", "page_reads_other_pages",
+    "derive_required_metadata", "write_recipe", "check_recipe",
     "derived_from", "slugify",
 ]

@@ -455,11 +455,14 @@ class RecipeDialog(QDialog):
 
 def publish_document(parent: Optional[QWidget], doc: Any, *,
                      hub: Optional[HubClient] = None,
-                     suggested_name: str = "") -> Optional[str]:
+                     suggested_name: str = "", workspace: Any = None,
+                     page_id: str = "") -> Optional[str]:
     """Publish the editor's live graph as a recipe. Returns the directory written, if any.
 
     The graph half is serialized through the same ``nodegraph.serialize`` the editor writes,
-    so there is no second format and nothing to hand-author.
+    so there is no second format and nothing to hand-author. A page that reads other pages
+    (it holds a Page Input) is published WITH them, flattened into one graph (V4.00), because
+    the page alone would arrive with its inputs unbound.
     """
     if not getattr(doc, "nodes", None):
         QMessageBox.information(parent, "Publish as a recipe",
@@ -467,7 +470,10 @@ def publish_document(parent: Optional[QWidget], doc: Any, *,
         return None
     name = RC.slugify(suggested_name or _name_from(doc) or "my-recipe")
     try:
-        draft = RC.draft_from_document(doc, name=name)
+        if workspace is not None and page_id and RC.page_reads_other_pages(doc):
+            draft = RC.draft_from_workspace(workspace, page_id, name=name)
+        else:
+            draft = RC.draft_from_document(doc, name=name)
     except Exception as exc:                             # noqa: BLE001
         QMessageBox.warning(parent, "Cannot publish this graph",
                             f"{type(exc).__name__}: {exc}")

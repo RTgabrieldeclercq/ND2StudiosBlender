@@ -237,3 +237,28 @@ anchors: sym:nodelab_v2.runner.EngineRunner, file:nodelab_v2/ingest.py
 
 read next: `grep '"path":"nodelab_v2/ingest.py"' gen/modules.jsonl` (~200 tok) ·
 ENGINEERING_NOTES §12 "providers & storage layout" (~2.5k tok)
+
+---
+
+### WF-08 — a pull across pages
+anchors: sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.runner.EngineRunner, sym:nodelab_v2.workspace.split_run_id
+
+1. A pull names a node on a page — `MainWindow.pull_node` qualifies it with the page it came
+   from (`workspace.qualify`, the canvas or Viewer's page, else the active one) and hands the
+   runner the run id `<page>/<node>`; `EngineRunner.run_id` also takes a bare id to be on
+   the active page. Every runner signal carries qualified ids; the window splits them
+   (`split_run_id`) to route a result to the Viewer bound to that page and node.
+2. `EngineRunner._compose` asks the `Workspace` (the runner's `GraphSource`) for
+   `compose(page)`: the page and its dependency closure as ONE graph (CON-17), each page
+   materialised through its own document (`to_graph(for_run=True)`), resolved Page Inputs
+   rewired to the upstream Outputs, meta seeds qualified.
+3. One engine runs it on the runner's ONE persistent memo and tile cache. The recipe hash
+   carries no node id, and a root's `__source__` is its qualified run id, so a refinement
+   chain computed for one processing page is a memo hit for every other page that reads it,
+   and for a linked page what it reads through a Page Input, up to its first override
+   (CON-18) — a root on the linked page itself is its own.
+4. `ComposedGraph.revision` (and `Workspace.revision_of`) is the runner's identity for a page:
+   an edit on any page in the closure changes it and nothing else, so only the pages
+   downstream of an edit rebuild.
+
+read next: CON-17 (2 min) · `nodegraph.selftest.test_page_composition_memo_reuse` (grep, 3 min)
