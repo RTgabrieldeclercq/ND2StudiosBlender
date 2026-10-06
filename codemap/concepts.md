@@ -490,3 +490,32 @@ per-frame clock on payload and envelope alike. Renders are serialised process-wi
 (matplotlib's text layout is not thread-safe) and refused past 100 Mpx.
 
 see: CON-11 · [MANUAL §15 Plotting](../MANUAL.md)
+
+---
+
+### CON-20 — dock shell and layout memory
+anchors: sym:nodelab_v2.shell.DockShell, sym:nodelab_v2.shell.PanelDock.paintEvent, sym:nodelab_v2.layout_store.load_layout, sym:nodelab_v2.window.MainWindow._apply_default_sizes
+
+Every panel is a `PanelDock` (a `QDockWidget` with a custom `PanelTitleBar`: kind glyph, title,
+`+` on a multi kind, float/dock, ✕), registered by kind in the `DockShell` from the window's
+`PanelSpec`s. The main canvas is the window's centre; everything else floats, closes and tabs.
+**A dock with a custom title bar is painted by nobody** — `QDockWidget::paintEvent` returns
+without drawing — so a floating dock showed Qt's default light palette through its frame
+gutter until step 11: `PanelDock.paintEvent` fills the dock with `BG` and draws a 1 px `BORDER`
+edge when floating, the `QDockWidget` stylesheet rule carries a background and a 1 px border
+(the frame width is derived from it; `border:0` would hide the painted edge under the panel),
+the panel bodies set `WA_StyledBackground` (a QWidget SUBCLASS does not auto-paint its own
+stylesheet background), and `theme.palette()` is pushed as the application palette so
+dialogs, popups and empty viewports follow the theme. The ✕ is disabled when the window's
+`_allow_panel_close` would veto the close (`sync_close_buttons`), which is a pure predicate;
+the un-maximize that a closing mini-map canvas needs happens in `_prune_canvases`.
+
+**Layout memory.** `layout_store` keeps `~/.nd2studios/layout.json` — Qt's `saveState`
+bytes plus the multi docks' bindings — under `LAYOUT_FORMAT` / `LAYOUT_VERSION`
+(`nd2studios.layout/2` since step 11, when the Viewer became visible from launch); a file of
+another version is set aside as `layout.json.rejected` once and the default layout applies
+(`_apply_default_sizes` on the first show: Viewer `VIEWER_SHARE` of the canvas column, Nodes
+`PALETTE_W`, Properties `INSPECTOR_W`). `NODELAB_LAYOUT=0` disables the file (every probe),
+`NODELAB_LAYOUT_FILE` redirects it.
+
+see: [MANUAL §2 Panels](../MANUAL.md) · CON-17

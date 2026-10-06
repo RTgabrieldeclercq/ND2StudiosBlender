@@ -140,7 +140,7 @@ def _as_float(v) -> Optional[float]:
 #: works in first.
 VIEWER_SHARE = 0.45
 #: The default layout's side-column widths (px): Nodes on the left, Properties on the right.
-PALETTE_W, INSPECTOR_W = 280, 360
+PALETTE_W, INSPECTOR_W = 330, 376
 #: The panel kind of a Viewer dock (V4.00 step 4): several instances, ``viewer:<n>``.
 VIEWER_KIND = "viewer"
 #: The panel kind of a docked canvas (V4.00 step 5) — every canvas but the main one.
@@ -612,8 +612,11 @@ class MainWindow(QMainWindow):
                       default_area=right, raise_default=True),
             PanelSpec("sheet", "Spreadsheet", lambda: self.sheet, glyph="▦",
                       default_area=right, tabify_with="inspector"),
+            # inside a scroll area (`scroll`), like the Movie Editor: the Send tab's natural
+            # width (~590 px) would otherwise be the MINIMUM of the whole right tab column,
+            # holding it far wider than Properties and leaving a blank strip beside it
             PanelSpec("lablink", "LabLink", lambda: self.lablink, glyph="⇄",
-                      default_area=right, tabify_with="inspector"),
+                      default_area=right, tabify_with="inspector", scroll=True),
             PanelSpec("console", "Console", lambda: self.console, glyph="›",
                       default_area=bottom, allowed_areas=bottom | right,
                       default_hidden=True),

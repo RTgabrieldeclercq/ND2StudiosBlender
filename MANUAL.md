@@ -200,8 +200,10 @@ a closed one back where it was. Drag a panel by its title to another edge, or on
 panel's title to tab them together. The arrangement — what is where, what floats, what is
 closed, and the window size — is remembered between sessions in
 `~/.nd2studios/layout.json`; **View ▸ Reset layout** puts everything back as a fresh install
-has it. A layout file that is damaged, or was written by a newer version, is set aside as
-`layout.json.rejected` (the app opens on the default layout and writes a fresh one on quit);
+has it. A layout file that is damaged, or was written by another version of the layout format
+— an older build's, too: V4.00 changed the default layout — is set aside as
+`layout.json.rejected` once (the app opens on the default layout, says so in the status bar
+and writes a fresh one on quit);
 `NODELAB_LAYOUT=0` turns the memory off, and `NODELAB_LAYOUT_FILE` points it at another file.
 
 **Pages** (V4.00). A file holds several node graphs — **pages** — each of a kind: **Image
