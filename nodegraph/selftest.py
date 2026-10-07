@@ -24283,10 +24283,32 @@ def test_select_frame_split_t() -> None:
     assert parse_groups("every 4", 10) == [("", (0, 1, 2, 3)), ("", (4, 5, 6, 7)), ("", (8, 9))]
     assert parse_groups("every 4") is None, "without the axis length the shorthand is not expanded"
     doc.nodes["ST"].params["groups"] = "every 10"
+    doc.nodes["ST"].modes["grouping"] = "ranges"
     doc.touch("ST")
     assert [(s.name, s.label) for s in doc.output_specs("ST")[1:]] == [
         ("tg0", "0 · t 0-9 · 0.0–18.0 s"), ("tg1", "1 · t 10-19 · 20.0–38.0 s"),
         ("tg2", "2 · t 20-29 · 40.0–58.0 s")], [(s.name, s.label) for s in doc.output_specs("ST")]
+    # the same windows through the `every` strategy: the Mode plus the socket's own default
+    # (Split T ships `group_size` = 10, and a node's params hold only what the user changed)
+    doc.nodes["ST"].params.pop("groups", None)
+    doc.nodes["ST"].modes["grouping"] = "every"
+    doc.touch("ST")
+    assert "group_size" not in doc.nodes["ST"].params
+    assert [s.name for s in doc.output_specs("ST")] == ["out", "tg0", "tg1", "tg2"], \
+        [s.name for s in doc.output_specs("ST")]
+    assert OPS.split_group(doc.nodes["ST"], 1) == ("", tuple(range(10, 20))), "the run side uses the default too"
+    doc.nodes["ST"].params["group_size"] = 7
+    doc.touch("ST")
+    assert [s.label for s in doc.output_specs("ST")[1:]][-1] == "4 · t 28-29 · 56.0–58.0 s"
+    assert [s.name for s in NODES.get("util.split_t").active_inputs({"grouping": "every"})] == ["data", "group_size"]
+    assert [s.name for s in NODES.get("util.split_t").active_inputs({"grouping": "ranges"})] == ["data", "groups"]
+    assert [s.name for s in NODES.get("util.split_t").active_inputs({"grouping": "none"})] == ["data"]
+    for op in ("channel.split", "util.split_positions", "util.split_z", "util.split_t"):
+        sp = NODES.get(op)
+        gm = next(m for m in sp.modes if m.name == "grouping")
+        assert list(gm.choices) == ["none", "every", "ranges"] and gm.default == "none", op
+        assert sp.input("group_size").presentation and sp.input("groups").presentation, op
+    doc.nodes["ST"].modes["grouping"] = "ranges"
     doc.nodes["ST"].params["groups"] = "every 12"
     doc.touch("ST")
     assert [s.label for s in doc.output_specs("ST")[1:]][-1] == "2 · t 24-29 · 48.0–58.0 s", "the last chunk clips"
@@ -24310,7 +24332,9 @@ def test_select_frame_split_t() -> None:
         "a wired tK is one shared util.select_frame tap; the fan-out cap (24) grows no per-index "
         "sockets on a 30-frame series or a 40-plane stack; `every 10` gives tg groups labelled "
         "by span with the last chunk clipped, the run side emits the unclamped `t24-35` and "
-        "Crop's frames tap hands back the six frames that exist")
+        "Crop's frames tap hands back the six frames that exist; the `every` strategy "
+        "resolves from the Mode and the group_size socket's own default, and each strategy "
+        "shows only its own socket")
 
 
 def test_split_groups() -> None:
@@ -24378,6 +24402,7 @@ def test_split_groups() -> None:
     doc.add_node("util.split_z", node_id="SZ"); doc.connect("L", "image", "SZ", "data")
     assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
     doc.nodes["SZ"].params["groups"] = "top: 0-3; 4-7; 8-13"
+    doc.nodes["SZ"].modes["grouping"] = "ranges"
     doc.touch("SZ")
     outs = doc.output_specs("SZ")
     assert names(doc, "SZ") == ["out", "zg0", "zg1", "zg2"], names(doc, "SZ")
@@ -24402,16 +24427,19 @@ def test_split_groups() -> None:
     assert o1.metadata["z_step_um"] == 0.4 and abs(o1.metadata["origin_um"][0][0] - 1.6) < 1e-9
     assert o3.axes.z == Z
     doc.nodes["SZ"].params["groups"] = ""                   # blank: the per-plane sockets return
+    doc.nodes["SZ"].modes["grouping"] = "none"
     doc.touch("SZ")
     assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
 
     # ── Split Positions: wells 0-1 by range, C3 alone ────────────────────────────────
     doc.add_node("util.split_positions", node_id="SP"); doc.connect("L", "image", "SP", "data")
     doc.nodes["SP"].params["groups"] = "wells: 0-1; 2"
+    doc.nodes["SP"].modes["grouping"] = "ranges"
     doc.touch("SP")
     assert names(doc, "SP") == ["out", "posg0", "posg1"]
     assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · wells", "1 · C3"]
     doc.nodes["SP"].params["groups"] = "0-1; 2"
+    doc.nodes["SP"].modes["grouping"] = "ranges"
     doc.touch("SP")
     assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · A1–B2", "1 · C3"]
     doc.add_node("enhance.gaussian", node_id="G4"); doc.connect("SP", "posg0", "G4", "data")
@@ -24429,6 +24457,7 @@ def test_split_groups() -> None:
     doc.add_node("channel.split", node_id="CS"); doc.connect("L", "image", "CS", "data")
     assert names(doc, "CS") == ["out", "ch0", "ch1", "ch2"]
     doc.nodes["CS"].params["groups"] = "0,2; 1"
+    doc.nodes["CS"].modes["grouping"] = "ranges"
     doc.touch("CS")
     assert names(doc, "CS") == ["out", "chg0", "chg1"]
     assert [s.label for s in doc.output_specs("CS")[1:]] == ["0 · DAPI+Cy5", "1 · GFP"], \
@@ -24444,7 +24473,8 @@ def test_split_groups() -> None:
     assert names(doc, "L")[:1] == ["image"] and "chg0" not in names(doc, "L")
     # the split's own output ignores the text entirely (presentation-only)
     gsz = Graph(); gsz.add(NodeInstance("S", "io.sgseed"))
-    gsz.add(NodeInstance("N", "util.split_z", params={"groups": "0-3; 4-7"})); gsz.connect("S", "N")
+    gsz.add(NodeInstance("N", "util.split_z", params={"groups": "0-3; 4-7"},
+                         modes={"grouping": "ranges"})); gsz.connect("S", "N")
     whole = Engine(gsz, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0}).pull("N")
     assert whole.axes.z == Z
     _ok("split groups: `groups` text (`0-3; 4-7; 8-11`, `top: 0-3`, `;`/newline, total grammar, "
@@ -24453,7 +24483,7 @@ def test_split_groups() -> None:
         "members or span (and `(past the end)`); a wired group is one shared util.crop "
         "frames tap (z4-7 / m0-1) or channel.select list; the envelope and the pull carry "
         "exactly that subset with z_step, origin, position and emission lists following; "
-        "blank restores the per-index sockets")
+        "`none` restores the per-index sockets; the strategy is the card's `grouping` Mode")
 
 
 def test_shift_node() -> None:

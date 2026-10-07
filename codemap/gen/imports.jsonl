@@ -87,6 +87,7 @@
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.scope"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.scope"}
 {"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.scope"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.split_grouping"}
 {"dst":"nodegraph.catalog._shared.labels","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.table_ops"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.table_ops"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.table_ops"}
@@ -386,6 +387,7 @@
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.select"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.select"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.split"}
+{"dst":"nodegraph.catalog._shared.split_grouping","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.split"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.split"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.split"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.channel.split"}
@@ -906,14 +908,17 @@
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodegraph.catalog.util.select_position"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.util.select_position"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_positions"}
+{"dst":"nodegraph.catalog._shared.split_grouping","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_positions"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_positions"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_positions"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_positions"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_t"}
+{"dst":"nodegraph.catalog._shared.split_grouping","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_t"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_t"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_t"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_t"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_z"}
+{"dst":"nodegraph.catalog._shared.split_grouping","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_z"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_z"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_z"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.util.split_z"}

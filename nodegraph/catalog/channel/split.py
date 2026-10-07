@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, InString, OutDataset
+from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
 
 def _compute_split_channels(ctx: EvalContext) -> Dataset:
     """Split Channels — a domain-transparent pass-through of the full multi-channel
@@ -21,22 +22,10 @@ register_node(
     _compute_split_channels,
     op_key="channel.split", label="Split Channels", category="channel",
     inputs=[InDataset(),
-            InString("groups", "Groups", field=False, default="", presentation=True,
-                     description=
-                     "Split into RANGES instead of one output per channel: type the groups as "
-                     "0-based channel indices, inclusive ranges, `;` between groups — `0-3; "
-                     "4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: "
-                     "4-7`), or `every 10` for consecutive chunks of ten. The card then grows "
-                     "one output PER GROUP, each carrying exactly that subset of the channel "
-                     "axis, and the per-channel outputs are put away. Blank = one output per "
-                     "channel, up to 24 of them; past that the card offers only `out`, and "
-                     "this is how to split. A wired group materializes into a Select Channel "
-                     "with that list at run time, shared by every branch that reads it, so "
-                     "this never changes `out` or anything this node itself computes. A group "
-                     "reaching past the end is labelled so on the card; what lies past the end "
-                     "is dropped at the pull, and a group entirely past it is refused with the "
-                     "real channel length.")],
+            *grouping_sockets('channel', 'channel',
+                              'a Select Channel with that list', 2)],
     outputs=[OutDataset("out")],
+    modes=[grouping_mode('channel', 'channel')],
     granularity=Granularity.TILEABLE,
     description="Fan a multi-channel Dataset out into per-channel outputs (each a "
                 "single-channel Dataset) — or, with Groups set, into one output per "

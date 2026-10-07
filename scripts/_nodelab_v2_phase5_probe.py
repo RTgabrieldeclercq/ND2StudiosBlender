@@ -5991,9 +5991,21 @@ def main(argv) -> int:
         metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
     _sgdoc.add_node("util.split_z", node_id="SGS", x=300, y=1800)
     _sgdoc.connect("SGL", "image", "SGS", "data")
-    _sgdoc.set_param("SGS", "groups", "top: 0-1; 2-4") if hasattr(_sgdoc, "set_param") \
-        else (_sgdoc.nodes["SGS"].params.__setitem__("groups", "top: 0-1; 2-4"), _sgdoc.touch("SGS"))
+    # the strategy is a Mode on the card: `ranges` reveals the Ranges text, `every` the size,
+    # `none` neither — and the Properties panel offers the dropdown with all three
+    _sgdoc.nodes["SGS"].modes["grouping"] = "ranges"
+    _sgdoc.nodes["SGS"].params["groups"] = "top: 0-1; 2-4"
+    _sgdoc.touch("SGS")
     win.scene.sync(); app.processEvents()
+    assert [s.name for s in _sgdoc.input_specs("SGS")] == ["data", "groups"], \
+        [s.name for s in _sgdoc.input_specs("SGS")]
+    from nodelab_v2.inspector import InspectorPanel as _SGInsp
+    from nodelab_v2.node_item import NodeItem as _SGItem
+    from PySide6.QtWidgets import QComboBox as _SGCombo
+    _sgpanel = _SGInsp()
+    _sgpanel.set_node(_SGItem(_sgdoc.nodes["SGS"], _sgdoc)); app.processEvents()
+    _sgcombos = [[c.itemText(i) for i in range(c.count())] for c in _sgpanel.findChildren(_SGCombo)]
+    assert ["none", "every", "ranges"] in _sgcombos, _sgcombos
     _sgouts = [(s.name, s.label) for s in _sgdoc.output_specs("SGS")]
     assert _sgouts == [("out", ""), ("zg0", "0 · top · 0.00–0.40 µm"), ("zg1", "1 · z 2-4 · 0.80–1.60 µm")], _sgouts
     _sgdoc.add_node("view.viewer", node_id="SGV", x=600, y=1800)
@@ -6011,7 +6023,7 @@ def main(argv) -> int:
     for nid in ("SGV", "SGS", "SGL"):
         _sgdoc.remove_node(nid)
     win.scene.sync(); app.processEvents()
-    _ok("SG1 split groups: `top: 0-1; 2-4` on Split Z replaces z0..z4 with zg0/zg1 labelled by "
+    _ok("SG1 split groups: Grouping = ranges with `top: 0-1; 2-4` on Split Z replaces z0..z4 with zg0/zg1 labelled by "
         "name and height span, a wire from zg1 is drawable, the envelope downstream reads z=3, "
         "and the run graph carries a util.crop frames tap keeping z2-4")
 
@@ -6038,9 +6050,10 @@ def main(argv) -> int:
     _stdoc.touch("STL")
     win.scene.sync(); app.processEvents()
     assert [s.name for s in _stdoc.output_specs("STS")] == ["out"], "30 frames: the cap grows no sockets"
-    _stdoc.set_param("STS", "groups", "every 10") if hasattr(_stdoc, "set_param") \
-        else (_stdoc.nodes["STS"].params.__setitem__("groups", "every 10"), _stdoc.touch("STS"))
+    _stdoc.nodes["STS"].modes["grouping"] = "every"       # Split T ships group_size = 10
+    _stdoc.touch("STS")
     win.scene.sync(); app.processEvents()
+    assert [s.name for s in _stdoc.input_specs("STS")] == ["data", "group_size"]
     assert [s.name for s in _stdoc.output_specs("STS")] == ["out", "tg0", "tg1", "tg2"]
     _stdoc.add_node("view.viewer", node_id="STV", x=600, y=1900)
     _stdoc.connect("STS", "tg1", "STV", "data")
@@ -6053,8 +6066,8 @@ def main(argv) -> int:
         _stdoc.remove_node(nid)
     win.scene.sync(); app.processEvents()
     _ok("ST1 split t: a 6-frame source grows t0..t5 labelled with frame times and a wire from t3 "
-        "materializes a util.select_frame tap; 30 frames grow none (the fan-out cap) and `every "
-        "10` grows tg0..tg2, whose wire reads t=10 downstream and materializes a util.crop "
+        "materializes a util.select_frame tap; 30 frames grow none (the fan-out cap) and Grouping "
+        "= every (size 10) grows tg0..tg2, whose wire reads t=10 downstream and materializes a util.crop "
         "frames tap keeping t10-19")
 
     _probe_movie_editor(win, app)

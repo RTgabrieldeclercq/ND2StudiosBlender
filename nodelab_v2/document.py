@@ -1090,9 +1090,11 @@ class GraphDocument:
         return out
 
     def split_groups(self, node_id: str, axis: str) -> list:
-        """The RANGE groups a split card's `groups` text names on ``axis`` (``"c"`` / ``"m"`` /
-        ``"z"``), as ``[{"index", "name", "indices", "spec", "label"}, …]`` — ``[]`` when the
-        node has no `groups` socket or the text names none (2026-10-07).
+        """The groups a split card's GROUPING strategy (its `grouping` Mode: `every` with
+        `group_size`, `ranges` with the `groups` text) names on ``axis`` (``"c"`` / ``"m"`` /
+        ``"z"`` / ``"t"``), as ``[{"index", "name", "indices", "spec", "label"}, …]`` — ``[]``
+        when the node has no such Mode, the strategy is `none`, or it names no group
+        (2026-10-07).
 
         ``name`` is the typed name, else the group's members as the axis knows them — the
         channel names joined with ``+``, the first and last position names, ``z 4-7`` — so a
@@ -1100,21 +1102,24 @@ class GraphDocument:
         socket shows: ``"K · <name>"``, plus the planes' height span when the stack has a z
         step, and ``(past the end)`` when a group reaches beyond the axis — the card says so
         instead of clipping, and the tap refuses with the real length when pulled."""
-        from nodegraph.metadata import format_indices, parse_groups
+        from nodegraph.metadata import format_indices, split_plan
         rec = self.nodes.get(node_id)
         try:
             spec = rec.spec() if rec is not None else None
         except Exception:                      # noqa: BLE001 — an unknown op
             spec = None
-        if spec is None or spec.input("groups") is None:
+        if spec is None or not any(m.name == "grouping" for m in spec.modes):
             return []
+        mode = rec.state().get("grouping", "none")
         try:
             env = self.env(node_id)
         except Exception:                      # noqa: BLE001 — an un-propagated node
             env = None
         n = int(getattr(getattr(env, "axes", None), axis, 0) or 0) if env is not None else 0
-        # `every N` needs the axis length; an unknown axis means no groups yet
-        groups = parse_groups(rec.params.get("groups"), n or None)
+        # `every` needs the axis length; an unknown axis means no groups yet
+        size_sock = spec.input("group_size")
+        groups = split_plan(mode, rec.params, n or None,
+                            default_size=getattr(size_sock, "default", None))
         if not groups:
             return []
         if axis == "c":

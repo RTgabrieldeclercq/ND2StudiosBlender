@@ -6,9 +6,10 @@ from __future__ import annotations
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, InString, OutDataset
+from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
 
 
 def _compute_split_t(ctx: EvalContext) -> Dataset:
@@ -36,23 +37,10 @@ register_node(
                       "on the card (`t0…`, with the frame's time when the series has a frame "
                       "interval) while there are few enough to show; type Groups to split a "
                       "long series into ranges. `out` still carries the whole series."),
-            InString("groups", "Groups", field=False, default="", presentation=True,
-                     description=
-                     "Split into RANGES instead of one output per frame: type the groups as "
-                     "0-based frame indices, inclusive ranges, `;` between groups — `0-3; 4-7; "
-                     "8-11` — with an optional name in front of a group (`top: 0-3; mid: "
-                     "4-7`), or `every 10` for consecutive chunks of ten. The card then grows "
-                     "one output PER GROUP, each carrying exactly that subset of the T axis, "
-                     "and the per-frame outputs are put away. Blank = one output per frame, up "
-                     "to 24 of them; past that the card offers only `out`, and this is how to "
-                     "split. A time series is usually hundreds of frames, so `every 10` (or "
-                     "`0-99; 100-199`) is the normal way to split one. A wired group "
-                     "materializes into a Crop in frames mode keeping those frames at run "
-                     "time, shared by every branch that reads it, so this never changes `out` "
-                     "or anything this node itself computes. A group reaching past the end is "
-                     "labelled so on the card; what lies past the end is dropped at the pull, "
-                     "and a group entirely past it is refused with the real T length.")],
+            *grouping_sockets('frame', 'T',
+                              'a Crop in frames mode keeping those frames', 10)],
     outputs=[OutDataset("out")],
+    modes=[grouping_mode('frame', 'T')],
     granularity=Granularity.TILEABLE,
     description="Fan a time series out into one output per timepoint (each a single-frame "
                 "Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames "

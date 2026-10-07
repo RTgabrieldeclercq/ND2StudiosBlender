@@ -13590,7 +13590,52 @@
      "vocab": []
     },
     {
-     "available_in": null,
+     "available_in": {
+      "grouping": [
+       "every"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 2,
+     "derive": "",
+     "description": "How many consecutive channels each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per channel with no fan-out cap. Each group materializes into a Select Channel with that list at run time. Only read when Grouping is `every`.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Group size",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "group_size",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": true,
+     "type": "SocketType.INT",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "grouping": [
+       "ranges"
+      ]
+     },
      "choice_docs": {},
      "choices": [],
      "column_from": "",
@@ -13599,14 +13644,14 @@
      "column_join": [],
      "default": "",
      "derive": "",
-     "description": "Split into RANGES instead of one output per channel: type the groups as 0-based channel indices, inclusive ranges, `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the channel axis, and the per-channel outputs are put away. Blank = one output per channel, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Select Channel with that list at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real channel length.",
+     "description": "Which channels go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Select Channel with that list at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real channel length. Blank = no groups yet. Only read when Grouping is `ranges`.",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
      "grow_group": "",
      "is_field": false,
      "kernel_param": false,
-     "label": "Groups",
+     "label": "Ranges",
      "layer_from": "",
      "layer_in": null,
      "layer_in_mode": "",
@@ -13630,7 +13675,28 @@
    "kernel_axes": null,
    "label": "Split Channels",
    "meta_transform": null,
-   "modes": [],
+   "modes": [
+    {
+     "available_in": null,
+     "choice_docs": {
+      "every": "Consecutive groups of `Group size` channels, counted from 0: with a size of 10 on 95 channels you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
+      "none": "One output socket per channel, labelled with what it carries, while the axis has at most 24 members \u2014 past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-channel tap at run time. The family's original behaviour.",
+      "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named \u2014 `top: 0-3; mid: 4-7` \u2014 and groups may overlap or skip channels. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real channel length."
+     },
+     "choices": [
+      "none",
+      "every",
+      "ranges"
+     ],
+     "default": "none",
+     "derive": "",
+     "description": "How this card fans the channel axis out into outputs. `none` is one output per channel; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which channels go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
+     "label": "Grouping",
+     "name": "grouping",
+     "presentation": "body",
+     "role": ""
+    }
+   ],
    "op_key": "channel.split",
    "outputs": [
     {
@@ -40388,7 +40454,52 @@
      "vocab": []
     },
     {
-     "available_in": null,
+     "available_in": {
+      "grouping": [
+       "every"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 2,
+     "derive": "",
+     "description": "How many consecutive positions each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per position with no fan-out cap. Each group materializes into a Crop in frames mode keeping those positions at run time. Only read when Grouping is `every`.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Group size",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "group_size",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": true,
+     "type": "SocketType.INT",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "grouping": [
+       "ranges"
+      ]
+     },
      "choice_docs": {},
      "choices": [],
      "column_from": "",
@@ -40397,14 +40508,14 @@
      "column_join": [],
      "default": "",
      "derive": "",
-     "description": "Split into RANGES instead of one output per position: type the groups as 0-based position indices, inclusive ranges, `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the M (position) axis, and the per-position outputs are put away. Blank = one output per position, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Crop in frames mode keeping those positions at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real M (position) length.",
+     "description": "Which positions go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Crop in frames mode keeping those positions at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real M (position) length. Blank = no groups yet. Only read when Grouping is `ranges`.",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
      "grow_group": "",
      "is_field": false,
      "kernel_param": false,
-     "label": "Groups",
+     "label": "Ranges",
      "layer_from": "",
      "layer_in": null,
      "layer_in_mode": "",
@@ -40428,7 +40539,28 @@
    "kernel_axes": null,
    "label": "Split Positions",
    "meta_transform": null,
-   "modes": [],
+   "modes": [
+    {
+     "available_in": null,
+     "choice_docs": {
+      "every": "Consecutive groups of `Group size` positions, counted from 0: with a size of 10 on 95 positions you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
+      "none": "One output socket per position, labelled with what it carries, while the axis has at most 24 members \u2014 past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-position tap at run time. The family's original behaviour.",
+      "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named \u2014 `top: 0-3; mid: 4-7` \u2014 and groups may overlap or skip positions. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real M (position) length."
+     },
+     "choices": [
+      "none",
+      "every",
+      "ranges"
+     ],
+     "default": "none",
+     "derive": "",
+     "description": "How this card fans the M (position) axis out into outputs. `none` is one output per position; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which positions go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
+     "label": "Grouping",
+     "name": "grouping",
+     "presentation": "body",
+     "role": ""
+    }
+   ],
    "op_key": "util.split_positions",
    "outputs": [
     {
@@ -40525,7 +40657,52 @@
      "vocab": []
     },
     {
-     "available_in": null,
+     "available_in": {
+      "grouping": [
+       "every"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 10,
+     "derive": "",
+     "description": "How many consecutive frames each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per frame with no fan-out cap. Each group materializes into a Crop in frames mode keeping those frames at run time. Only read when Grouping is `every`.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Group size",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "group_size",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": true,
+     "type": "SocketType.INT",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "grouping": [
+       "ranges"
+      ]
+     },
      "choice_docs": {},
      "choices": [],
      "column_from": "",
@@ -40534,14 +40711,14 @@
      "column_join": [],
      "default": "",
      "derive": "",
-     "description": "Split into RANGES instead of one output per frame: type the groups as 0-based frame indices, inclusive ranges, `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the T axis, and the per-frame outputs are put away. Blank = one output per frame, up to 24 of them; past that the card offers only `out`, and this is how to split. A time series is usually hundreds of frames, so `every 10` (or `0-99; 100-199`) is the normal way to split one. A wired group materializes into a Crop in frames mode keeping those frames at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real T length.",
+     "description": "Which frames go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Crop in frames mode keeping those frames at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real T length. Blank = no groups yet. Only read when Grouping is `ranges`.",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
      "grow_group": "",
      "is_field": false,
      "kernel_param": false,
-     "label": "Groups",
+     "label": "Ranges",
      "layer_from": "",
      "layer_in": null,
      "layer_in_mode": "",
@@ -40565,7 +40742,28 @@
    "kernel_axes": null,
    "label": "Split T",
    "meta_transform": null,
-   "modes": [],
+   "modes": [
+    {
+     "available_in": null,
+     "choice_docs": {
+      "every": "Consecutive groups of `Group size` frames, counted from 0: with a size of 10 on 95 frames you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
+      "none": "One output socket per frame, labelled with what it carries, while the axis has at most 24 members \u2014 past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-frame tap at run time. The family's original behaviour.",
+      "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named \u2014 `top: 0-3; mid: 4-7` \u2014 and groups may overlap or skip frames. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real T length."
+     },
+     "choices": [
+      "none",
+      "every",
+      "ranges"
+     ],
+     "default": "none",
+     "derive": "",
+     "description": "How this card fans the T axis out into outputs. `none` is one output per frame; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which frames go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
+     "label": "Grouping",
+     "name": "grouping",
+     "presentation": "body",
+     "role": ""
+    }
+   ],
    "op_key": "util.split_t",
    "outputs": [
     {
@@ -40662,7 +40860,52 @@
      "vocab": []
     },
     {
-     "available_in": null,
+     "available_in": {
+      "grouping": [
+       "every"
+      ]
+     },
+     "choice_docs": {},
+     "choices": [],
+     "column_from": "",
+     "column_in": null,
+     "column_in_mode": "",
+     "column_join": [],
+     "default": 4,
+     "derive": "",
+     "description": "How many consecutive planes each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per plane with no fan-out cap. Each group materializes into a Crop in frames mode keeping those planes at run time. Only read when Grouping is `every`.",
+     "dims": 3,
+     "direction": "Direction.IN",
+     "domain": null,
+     "grow_group": "",
+     "is_field": false,
+     "kernel_param": false,
+     "label": "Group size",
+     "layer_from": "",
+     "layer_in": null,
+     "layer_in_mode": "",
+     "layer_out": [],
+     "multi": false,
+     "name": "group_size",
+     "passes_domains": true,
+     "path_filter": "",
+     "path_hint": "",
+     "path_kind": "",
+     "pick_bounds": [],
+     "pick_kind": "",
+     "pick_peer": "",
+     "presentation": true,
+     "type": "SocketType.INT",
+     "unit": "",
+     "view_source": false,
+     "vocab": []
+    },
+    {
+     "available_in": {
+      "grouping": [
+       "ranges"
+      ]
+     },
      "choice_docs": {},
      "choices": [],
      "column_from": "",
@@ -40671,14 +40914,14 @@
      "column_join": [],
      "default": "",
      "derive": "",
-     "description": "Split into RANGES instead of one output per plane: type the groups as 0-based plane indices, inclusive ranges, `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the Z axis, and the per-plane outputs are put away. Blank = one output per plane, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Crop in frames mode keeping those planes at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real Z length.",
+     "description": "Which planes go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups \u2014 `0-3; 4-7; 8-11` \u2014 each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Crop in frames mode keeping those planes at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real Z length. Blank = no groups yet. Only read when Grouping is `ranges`.",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
      "grow_group": "",
      "is_field": false,
      "kernel_param": false,
-     "label": "Groups",
+     "label": "Ranges",
      "layer_from": "",
      "layer_in": null,
      "layer_in_mode": "",
@@ -40702,7 +40945,28 @@
    "kernel_axes": null,
    "label": "Split Z",
    "meta_transform": null,
-   "modes": [],
+   "modes": [
+    {
+     "available_in": null,
+     "choice_docs": {
+      "every": "Consecutive groups of `Group size` planes, counted from 0: with a size of 10 on 95 planes you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
+      "none": "One output socket per plane, labelled with what it carries, while the axis has at most 24 members \u2014 past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-plane tap at run time. The family's original behaviour.",
+      "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named \u2014 `top: 0-3; mid: 4-7` \u2014 and groups may overlap or skip planes. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real Z length."
+     },
+     "choices": [
+      "none",
+      "every",
+      "ranges"
+     ],
+     "default": "none",
+     "derive": "",
+     "description": "How this card fans the Z axis out into outputs. `none` is one output per plane; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which planes go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
+     "label": "Grouping",
+     "name": "grouping",
+     "presentation": "body",
+     "role": ""
+    }
+   ],
    "op_key": "util.split_z",
    "outputs": [
     {

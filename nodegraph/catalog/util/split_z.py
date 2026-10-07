@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, InString, OutDataset
+from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
+from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
 
 
 def _compute_split_z(ctx: EvalContext) -> Dataset:
@@ -33,22 +34,10 @@ register_node(
                       "The z-stack to fan out. Its planes appear as one output socket each "
                       "on the card (`z0…`, with the plane's height when the stack has a z "
                       "step); `out` still carries the whole stack."),
-            InString("groups", "Groups", field=False, default="", presentation=True,
-                     description=
-                     "Split into RANGES instead of one output per plane: type the groups as "
-                     "0-based plane indices, inclusive ranges, `;` between groups — `0-3; 4-7; "
-                     "8-11` — with an optional name in front of a group (`top: 0-3; mid: "
-                     "4-7`), or `every 10` for consecutive chunks of ten. The card then grows "
-                     "one output PER GROUP, each carrying exactly that subset of the Z axis, "
-                     "and the per-plane outputs are put away. Blank = one output per plane, up "
-                     "to 24 of them; past that the card offers only `out`, and this is how to "
-                     "split. A wired group materializes into a Crop in frames mode keeping "
-                     "those planes at run time, shared by every branch that reads it, so this "
-                     "never changes `out` or anything this node itself computes. A group "
-                     "reaching past the end is labelled so on the card; what lies past the end "
-                     "is dropped at the pull, and a group entirely past it is refused with the "
-                     "real Z length.")],
+            *grouping_sockets('plane', 'Z',
+                              'a Crop in frames mode keeping those planes', 4)],
     outputs=[OutDataset("out")],
+    modes=[grouping_mode('plane', 'Z')],
     granularity=Granularity.TILEABLE,
     description="Fan a z-stack out into one output per plane (each a single-plane Dataset, "
                 "zK = plane K) — or, with Groups set, one output per RANGE of planes (a "
