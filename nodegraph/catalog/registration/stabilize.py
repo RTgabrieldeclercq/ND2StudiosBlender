@@ -53,6 +53,20 @@ def _region_roi(raw: Any, metadata, H: int, W: int) -> Optional[Dict[str, Any]]:
     shapes = shapes_in_frame(shapes, metadata)
     if not has_region(shapes):
         return None
+    # ONE added rectangle is the common case and gets the kernel's rect path: a sub-pixel
+    # crop for the translation model, a box mask for ECC. Anything else — several shapes, a
+    # cut, an ellipse, a brush stroke — rasterizes to a mask, and masked correlation is
+    # whole-pixel (the kernel contract says so); the bench measured the difference on the
+    # deforming body at 0.04 px (rect) against about 2 px (the same box as a mask).
+    drawable = [sh for sh in shapes if str(sh.get("type", "")) not in ("", "clear")]
+    if len(drawable) == 1 and str(drawable[0].get("type")) == "rect"             and str(drawable[0].get("op", "add")) == "add":
+        verts = drawable[0].get("vertices") or []
+        if len(verts) == 2:
+            (y0, x0), (y1, x1) = sorted((float(v[0]), float(v[1])) for v in verts)[0],                                  sorted((float(v[0]), float(v[1])) for v in verts)[1]
+            ya, yb = max(0, int(round(min(y0, y1)))), min(H, int(round(max(y0, y1))) + 1)
+            xa, xb = max(0, int(round(min(x0, x1)))), min(W, int(round(max(x0, x1))) + 1)
+            if yb - ya >= 8 and xb - xa >= 8:
+                return {"kind": "rect", "x": xa, "y": ya, "w": xb - xa, "h": yb - ya}
     mask = np.asarray(build_roi_mask(shapes, H, W), dtype=bool)
     if not mask.any():
         raise ValueError(

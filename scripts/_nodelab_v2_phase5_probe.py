@@ -8614,6 +8614,28 @@ def main(argv) -> int:
     # a slow node waits for Run instead of computing on open
     d5 = win.open_node_demo("enhance.zs_deconvnet")
     assert d5._run_btn.isVisible() and d5.last_result is None and d5._worker is not None
+    # Registration (2026-10-07): a multi-world demo. The Synthetic data dropdown switches
+    # the phantom (a new session and worker), a setting the user chose carries over, the
+    # lever re-derives from the new stack, and the status line reads out the per-frame shift.
+    d6 = win.open_node_demo("registration.stabilize")
+    assert d6._scenario_ctl is not None, "no Synthetic data dropdown on the registration demo"
+    assert _wait_demo(d6), "the registration demo did not compute"
+    assert "drift_y" in d6._status.text() and "drift_x" in d6._status.text(), d6._status.text()
+    _lp = d6.control("lowpass_sigma")
+    assert _lp is not None
+    _lp.set_value(1.5)
+    _lp._emit()
+    assert _wait_demo(d6)
+    _cap0 = d6._phantom_label.text()
+    d6._scenario_ctl.set_value("Beads drifting in z (a stack)")
+    d6._scenario_ctl._emit()
+    assert _wait_demo(d6, timeout=120.0), "the scenario switch did not compute"
+    assert d6._scenario == 7 and d6._session.phantom.axes.z == 12, d6._scenario
+    assert d6._phantom_label.text() != _cap0 and "stack" in d6._phantom_label.text()
+    _lp2 = d6.control("lowpass_sigma")
+    assert _lp2 is not None and float(_lp2.value()) == 1.5 and _lp2.touched,         "a chosen value must carry over a scenario switch"
+    assert d6._modes.get("dim") == "3D", d6._modes
+    assert "drift_z" in d6._status.text(), d6._status.text()
     # the palette's button: enabled on a node overview, routed to the same cache
     win.palette._show_node("enhance.gaussian")
     assert win.palette._demo_btn.isEnabled()
@@ -8623,7 +8645,7 @@ def main(argv) -> int:
     assert win.open_node_demo("enhance.gaussian") is dlg
     win.palette._show_legend()
     assert not win.palette._demo_btn.isEnabled()
-    for _d in (dlg, d2, d3, d4, d5):
+    for _d in (dlg, d2, d3, d4, d5, d6):
         _d.close()
     app.processEvents()
     assert "enhance.gaussian" not in win._demo_windows and not win._demo_windows
@@ -8632,7 +8654,10 @@ def main(argv) -> int:
         "recomputes to a different after image; Wipe compare; Draw Regions rasterizes its "
         "curated shapes to 3 regions with the shapes chip read-only and the presentation "
         "sockets hidden; Measure fills a table with an area column; zone.frame is a guide "
-        "with no worker; ZS-DeconvNet waits for Run; windows drop from the cache on close")
+        "with no worker; ZS-DeconvNet waits for Run; Registration offers eight synthetic "
+        "worlds — switching to the z-drifting stack rebuilds the session, keeps the chosen "
+        "Lowpass σ, re-derives the lever to 3D and reads out drift_z; windows drop from the "
+        "cache on close")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

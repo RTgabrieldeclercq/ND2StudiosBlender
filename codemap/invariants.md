@@ -290,3 +290,7 @@ cached object is the identity); the per-op curation only in `codemap/node_demos.
 `selftest.test_node_demos` validates against the live registry and then runs for EVERY op —
 a guide must carry curated features, a live recipe must produce the evidence its kind
 promises, a `live=false` one must say why. A node that cannot demonstrate itself does not pass.
+A recipe may offer several synthetic worlds (`scenarios`, 2026-10-07 — Registration's eight are
+the registration bench's worlds at demo size); the gate runs every one of them, and the
+Frame-domain values a node writes are read back at the viewed frame so the demo can be
+checked against the phantom's stated truth, not merely seen to run.

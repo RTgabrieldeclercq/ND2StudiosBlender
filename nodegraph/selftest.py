@@ -28697,9 +28697,23 @@ def test_phantoms() -> None:
     assert not np.array_equal(phantom("cells2d", seed=1).array, base)
     assert not np.array_equal(phantom("cells2d", shift_px=(6.0, -8.0)).array, base)
     assert phantom("cells2d", puncta=True).array.max() >= base.max()
+    # the registration worlds (2026-10-07): the bench's four at demo size, captions stating
+    # the true motion the node's readout is read against
+    assert phantom("star_field").axes == AxisSizes(m=1, t=6, z=1, c=1, y=160, x=160)
+    assert "drifting (+1.5, -2.0)" in phantom("star_field").caption
+    assert phantom("star_field", n_stars=12, faint=True).array.max() < phantom("star_field").array.max()
+    assert "turning 3°" in phantom("star_field", rotate_deg=3.0).caption
+    assert phantom("moving_mass").axes.t == 6 and "turning 4°" in phantom("moving_mass").caption
+    assert "shearing 0.012" in phantom("moving_mass", rotate_deg=0.0, shear=0.012).caption
+    assert phantom("deforming_mass").axes == AxisSizes(m=1, t=6, z=1, c=1, y=160, x=160)
+    assert "bulges" in phantom("deforming_mass").caption
+    assert phantom("star_volume").axes == AxisSizes(m=1, t=4, z=12, c=1, y=96, x=96)
+    assert "z_step_um" in phantom("star_volume").envelope.metadata
     _ok(f"phantoms: {len(PHANTOMS)} deterministic 12-bit synthetic datasets (nuclei, a "
-        f"z-stack, drift, moving cells, two channels, a speckle pair, a stage mosaic); same "
-        f"seed => identical array and cached object; calibration keys present")
+        f"z-stack, drift, moving cells, two channels, a speckle pair, a stage mosaic, and the "
+        f"registration bench's drifting / faint / turning beads, turning / shearing / deforming "
+        f"body and a bead stack drifting in z); same seed => identical array and cached "
+        f"object; calibration keys present")
 
 
 def test_node_demos() -> None:
@@ -28735,6 +28749,21 @@ def test_node_demos() -> None:
     assert all(is_catalog_op(op) or NODES.owner(op) == "nodelab_v2.ops" for op in ops)
     ran, guides, slow, needs = [], [], [], []
     slowest = (0.0, "")
+    scen = 0
+
+    def _evidence(kind: str, res: "DR.DemoResult") -> bool:
+        return {
+            "image": lambda: res.after_image is not None and res.after_image.size > 0,
+            "mask": lambda: res.mask_plane is not None and int(res.mask_plane.max()) >= 1,
+            "labels": lambda: res.label_plane is not None and int(res.label_plane.max()) >= 2,
+            "scalar": lambda: res.scalar_plane is not None,
+            "points": lambda: len(res.points) > 0,
+            "tracks": lambda: any(len(t[1]) >= 2 for t in res.tracks),
+            "field": lambda: res.vectors is not None and res.vectors.shape[0] > 0,
+            "mesh": lambda: len(res.mesh) > 0,
+            "table": lambda: bool(DR.demo_rows(res)[1]),
+            "plot": lambda: res.after_image is not None,
+        }[kind]()
     for op in ops:
         r = DR.recipe_for(op)
         assert r.kind in DR.KINDS, (op, r.kind)
@@ -28743,7 +28772,7 @@ def test_node_demos() -> None:
                                 f"codemap/node_demos.json")
             guides.append(op)
             continue
-        assert r.phantom in PHANTOMS, (op, r.phantom)
+        assert DR.scenario_recipe(r, 0).phantom in PHANTOMS, (op, r.phantom)   # or its first world
         s = DR.DemoSession(r)
         if s.missing_requirements():
             needs.append(op)
@@ -28763,23 +28792,19 @@ def test_node_demos() -> None:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 assert rng.lo <= float(v) <= rng.hi, (op, sock.name, v, rng)
         res = s.run(dict(r.gate_params), {})
-        got = {
-            "image": lambda: res.after_image is not None and res.after_image.size > 0,
-            "mask": lambda: res.mask_plane is not None and int(res.mask_plane.max()) >= 1,
-            "labels": lambda: res.label_plane is not None and int(res.label_plane.max()) >= 2,
-            "scalar": lambda: res.scalar_plane is not None,
-            "points": lambda: len(res.points) > 0,
-            "tracks": lambda: any(len(t[1]) >= 2 for t in res.tracks),
-            "field": lambda: res.vectors is not None and res.vectors.shape[0] > 0,
-            "mesh": lambda: len(res.mesh) > 0,
-            "table": lambda: bool(DR.demo_rows(res)[1]),
-            "plot": lambda: res.after_image is not None,
-        }[r.kind]()
-        assert got, f"{op}: the {r.kind} demo produced no evidence"
+        assert _evidence(r.kind, res), f"{op}: the {r.kind} demo produced no evidence"
         assert res.elapsed_s < 10.0, (op, res.elapsed_s)
         if res.elapsed_s > slowest[0]:
             slowest = (res.elapsed_s, op)
         ran.append(op)
+        # a multi-world demo (2026-10-07): every other scenario runs too, at the mode state
+        # the window would send — the lever derived from THAT phantom's depth
+        for i in range(1, len(r.scenarios)):
+            sc = DR.DemoSession(DR.scenario_recipe(r, i))
+            rs = sc.run(dict(r.gate_params), sc.default_state())
+            assert _evidence(r.kind, rs), (op, r.scenarios[i].label)
+            assert rs.elapsed_s < 10.0, (op, r.scenarios[i].label, rs.elapsed_s)
+            scen += 1
     # the control classification and the heuristic ranges
     draw = NODES.get("analysis.draw_regions")
     assert DR.control_kind(draw.input("shapes")) == "readonly"
@@ -28801,12 +28826,63 @@ def test_node_demos() -> None:
     assert not np.array_equal(g1, g2), "sigma = 2 um must differ from the default"
     html = DR.guide_html("analysis.draw_regions", features=("Press Draw",))
     assert "Draw the region" in html and "Key features" in html and "Press Draw" in html
+    # the registration demo (2026-10-07): eight synthetic worlds whose true motion is
+    # stated, and the per-frame shift read back for the viewed frame — the demo has to be
+    # TRUE, not merely run. World 0: beads drifting (+1.5, −2.0) px per frame, viewed at t=5,
+    # so the correction must read (−7.5, +10.0).
+    rg = DR.recipe_for("registration.stabilize")
+    assert len(rg.scenarios) == 8 and rg.phantom == "" and not rg.is_guide
+    assert len({sc.label for sc in rg.scenarios}) == 8
+    s0 = DR.DemoSession(rg)                                # resolves to the first world
+    assert s0.recipe.scenario_index == 0 and s0.recipe.phantom == "star_field"
+    r0 = s0.run({}, s0.default_state())
+    assert r0.view[0] == 5 and {"drift_y", "drift_x", "drift_confidence"} <= set(r0.frame_values)
+    assert abs(r0.frame_values["drift_y"] + 7.5) < 0.3 and \
+        abs(r0.frame_values["drift_x"] - 10.0) < 0.3, r0.frame_values
+    # the deforming body pulls the drift estimate; the drawn still-half region removes the pull
+    r5 = DR.DemoSession(DR.scenario_recipe(rg, 5)).run({}, {})
+    s6 = DR.DemoSession(DR.scenario_recipe(rg, 6))
+    assert "region" in s6.recipe.fixed_params and \
+        "region" not in DR.scenario_recipe(rg, 5).fixed_params
+    r6 = s6.run({}, {})
+    assert abs(r5.frame_values["drift_x"] + 1.5) > 0.5, r5.frame_values   # pulled by the bulge
+    assert abs(r6.frame_values["drift_x"] + 1.5) < 0.4 and \
+        abs(r6.frame_values["drift_y"] + 3.0) < 0.4, r6.frame_values
+    # the stack: the lever derives to 3D from the phantom's 12 planes and drift_z appears;
+    # forced to 2D the same world reports no axial shift
+    s7 = DR.DemoSession(DR.scenario_recipe(rg, 7))
+    st7 = s7.default_state()
+    assert st7.get("dim") == "3D" and s7.phantom.axes.z == 12, st7
+    r7 = s7.run({}, st7)
+    assert "drift_z" in r7.frame_values and abs(r7.frame_values["drift_z"] + 1.5) < 0.8, \
+        r7.frame_values
+    assert "drift_z" not in s7.run({}, {**st7, "dim": "2D"}).frame_values
+    # scenario_recipe clamps; a recipe without scenarios passes through untouched
+    assert DR.scenario_recipe(rg, 99).scenario_index == 7
+    gr = DR.recipe_for("enhance.gaussian")
+    assert DR.scenario_recipe(gr, 3) is gr and gr.scenarios == ()
+    # the validator refuses what the window could not show
+    msgs = " | ".join(DR.validate_curation({"ops": {"registration.stabilize": {
+        "kind": "image", "scenarios": [
+            {"label": "a", "phantom": "no_such"}, {"label": "a", "phantom": "star_field"},
+            {"label": "b", "phantom": "star_field", "fixed_params": {"nope": 1}}]}}}))
+    assert "unknown phantom" in msgs and "duplicates the label" in msgs \
+        and "unknown param" in msgs, msgs
+    assert "guide cannot have scenarios" in " | ".join(DR.validate_curation({"ops": {
+        "zone.frame": {"kind": "guide",
+                       "scenarios": [{"label": "x", "phantom": "star_field"}]}}}))
     _ok(f"node demos: {len(ran)} ops run live on a phantom with evidence of their kind "
-        f"(slowest {slowest[1]} {slowest[0]:.2f}s); {len(guides)} guides with features; "
+        f"(slowest {slowest[1]} {slowest[0]:.2f}s) plus {scen} further scenario world(s); "
+        f"{len(guides)} guides with features; "
         f"{len(slow)} slow (Run button): {', '.join(slow)}; "
         f"{len(needs)} need an optional package: {', '.join(needs) or '-'}; "
         f"curation validated against the registry; slider ranges finite and containing "
-        f"their start; Draw Regions -> 3 regions; sigma moves the result")
+        f"their start; Draw Regions -> 3 regions; sigma moves the result; Registration's "
+        f"eight worlds read back the true motion (drifting beads at t=5 -> drift_y -7.5, "
+        f"drift_x +10.0 within 0.3 px; the deforming body pulls drift_x by >0.5 px and the "
+        f"drawn still-half region brings it back within 0.4; the 12-plane stack derives the "
+        f"lever to 3D and reports drift_z), and the validator refuses an unknown phantom, "
+        f"a duplicate label, an unknown fixed param and scenarios on a guide")
 
 
 def test_registration_refinement() -> None:

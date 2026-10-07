@@ -29,6 +29,8 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+import math
+
 import numpy as np
 
 from nodegraph.dataset import AxisSizes, Dataset
@@ -38,6 +40,7 @@ from nodegraph.provider import ArrayProvider
 
 __all__ = ["Phantom", "PHANTOMS", "phantom", "intensity_range", "cells2d", "cells3d",
            "timelapse_drift", "moving_cells", "two_channel", "speckle_pair", "plate_mosaic",
+           "star_field", "moving_mass", "deforming_mass", "star_volume",
            "BIT_DEPTH", "FULL_SCALE", "PIXEL_SIZE_UM", "Z_STEP_UM", "DT_S"]
 
 #: every phantom is 12-bit, like most ND2s — so a ``bit_depth``-derived threshold lands mid-range
@@ -366,6 +369,224 @@ def plate_mosaic(*, seed: int = 0, tile: int = 96, grid: Tuple[int, int] = (2, 2
                    dict(seed=seed, tile=tile, grid=(rows, cols), overlap=overlap))
 
 
+# ── the registration worlds (2026-10-07) ───────────────────────────────────────
+#
+# ``scripts/registration_synthetic_bench.py`` measured the registration kernel against four
+# synthetic worlds with an EXACT known motion. These are the same worlds at demo size, so the
+# *What does this node do?* window shows Registration on the data its behaviour was
+# established on — and the caption states the true motion, so the per-frame shift the node
+# reports can be read against it.
+
+def _affine_yx(angle_deg: float, shift: Tuple[float, float], shear: float, scale: float,
+               centre: Tuple[float, float]) -> np.ndarray:
+    """3×3 forward map in (y, x): rotate about ``centre`` (positive = +x toward +y, clockwise
+    on screen), shear x by ``shear``·(y − cy), scale about the centre, then translate."""
+    th = math.radians(angle_deg)
+    c, s = math.cos(th), math.sin(th)
+    L = scale * (np.array([[c, s], [-s, c]]) @ np.array([[1.0, 0.0], [shear, 1.0]]))
+    cvec = np.asarray(centre, dtype=float)
+    M = np.eye(3)
+    M[:2, :2] = L
+    M[:2, 2] = cvec - L @ cvec + np.asarray(shift, dtype=float)
+    return M
+
+
+def _move_points(M: np.ndarray, pts_yx: np.ndarray) -> np.ndarray:
+    p = np.concatenate([pts_yx, np.ones((len(pts_yx), 1))], axis=1)
+    return (M @ p.T).T[:, :2]
+
+
+def _star_catalogue(rng: np.random.Generator, n_in_frame: int, size: int, margin: float,
+                    amp_range: Tuple[float, float]) -> Tuple[np.ndarray, np.ndarray]:
+    """``n_in_frame`` beads per frame on average, laid over the frame plus ``margin`` so
+    beads enter and leave as the field moves; log-uniform brightness."""
+    area = (size + 2 * margin) ** 2 / float(size * size)
+    n = int(round(n_in_frame * area))
+    pos = np.stack([rng.uniform(-margin, size + margin, n),
+                    rng.uniform(-margin, size + margin, n)], axis=1)
+    amp = np.exp(rng.uniform(math.log(amp_range[0]), math.log(amp_range[1]), n))
+    return pos, amp
+
+
+def _render_stars(pos_yx: np.ndarray, amp: np.ndarray, size: int, sigma: float = 1.5) -> np.ndarray:
+    """Gaussian beads at sub-pixel positions, rendered analytically (no resampling)."""
+    img = np.zeros((size, size), dtype=float)
+    r = int(math.ceil(4 * sigma))
+    for (py, px), a in zip(pos_yx, amp):
+        y0, x0 = int(math.floor(py)) - r, int(math.floor(px)) - r
+        ya, yb = max(0, y0), min(size, y0 + 2 * r + 1)
+        xa, xb = max(0, x0), min(size, x0 + 2 * r + 1)
+        if ya >= yb or xa >= xb:
+            continue
+        yy, xx = np.mgrid[ya:yb, xa:xb]
+        img[ya:yb, xa:xb] += a * np.exp(-((yy - py) ** 2 + (xx - px) ** 2) / (2 * sigma ** 2))
+    return img
+
+
+def star_field(*, seed: int = 0, size: int = 160, nt: int = 6, n_stars: int = 40,
+               drift_px: Tuple[float, float] = (1.5, -2.0), rotate_deg: float = 0.0,
+               faint: bool = False) -> Phantom:
+    """Fluorescent beads over ``nt`` frames under a known motion: frame ``t`` is drifted by
+    ``t × drift_px`` and turned by ``t × rotate_deg`` about the frame centre, on an uneven
+    background. ``faint`` drops the beads to a peak signal-to-noise of about 7 — the regime a
+    matched filter rescues. Sparse (``n_stars`` ≈ 12) or faint fields are where a
+    registration earns or loses its sub-pixel claim."""
+    rng = np.random.default_rng(seed)
+    margin = max(30.0, abs(drift_px[0]) * nt + 12.0, abs(drift_px[1]) * nt + 12.0,
+                 0.35 * size if rotate_deg else 0.0)
+    pos0, amp = _star_catalogue(rng, n_stars, size, margin,
+                                (120.0, 300.0) if faint else (600.0, 3400.0))
+    c = ((size - 1) / 2.0, (size - 1) / 2.0)
+    bg = _background(size)
+    out = np.zeros((1, nt, 1, 1, size, size), dtype=float)
+    for t in range(nt):
+        M = _affine_yx(rotate_deg * t, (drift_px[0] * t, drift_px[1] * t), 0.0, 1.0, c)
+        img = _render_stars(_move_points(M, pos0), amp, size) + bg
+        out[0, t, 0, 0] = _expose(img, np.random.default_rng(seed + 1000 + t), blur=0.0,
+                                  read_noise=26.0 if faint else 14.0)
+    cap = (f"{n_stars} beads over {nt} frames drifting ({drift_px[0]:+.1f}, {drift_px[1]:+.1f}) "
+           f"px per frame")
+    if rotate_deg:
+        cap += f" and turning {rotate_deg:g}° per frame about the centre"
+    if faint:
+        cap += ", faint (peak SNR ≈ 7)"
+    return _finish("star_field", out, _meta(dt_s=DT_S), cap,
+                   dict(seed=seed, size=size, nt=nt, n_stars=n_stars, drift_px=tuple(drift_px),
+                        rotate_deg=rotate_deg, faint=faint))
+
+
+def _textured_body(rng: np.random.Generator, size: int, radius: float, *,
+                   texture_sigma: float = 2.0, edge: float = 4.0,
+                   peak: float = 2200.0) -> np.ndarray:
+    """A soft-edged disk filled with speckle texture — a body with enough internal detail for
+    ECC to lock onto and no corners for a feature detector to lean on."""
+    from scipy.ndimage import gaussian_filter
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    cy = cx = (size - 1) / 2.0
+    r = np.hypot(yy - cy, xx - cx)
+    disk = 1.0 / (1.0 + np.exp(np.clip((r - radius) / edge, -60, 60)))
+    tex = gaussian_filter(rng.random((size, size)), texture_sigma)
+    tex = (tex - tex.min()) / max(1e-9, float(np.ptp(tex)))
+    return peak * disk * (0.35 + 0.65 * tex)
+
+
+def moving_mass(*, seed: int = 0, size: int = 160, nt: int = 6, rotate_deg: float = 4.0,
+                drift_px: Tuple[float, float] = (1.0, -0.5), shear: float = 0.0,
+                scale: float = 1.0, radius: float = 46.0) -> Phantom:
+    """A textured body under an EXACT affine motion per frame: turned by ``t × rotate_deg``
+    about the frame centre, drifted by ``t × drift_px``, sheared by ``t × shear`` (x grows
+    with y) and scaled by ``scale ** t``. What the euclidean / affine models are for, and
+    what the translation model cannot represent."""
+    from scipy.ndimage import affine_transform
+    rng = np.random.default_rng(seed)
+    base = _textured_body(rng, size, radius)
+    bg = _background(size)
+    c = ((size - 1) / 2.0, (size - 1) / 2.0)
+    out = np.zeros((1, nt, 1, 1, size, size), dtype=float)
+    for t in range(nt):
+        M = _affine_yx(rotate_deg * t, (drift_px[0] * t, drift_px[1] * t), shear * t,
+                       scale ** t, c)
+        inv = np.linalg.inv(M)
+        moved = base if t == 0 else affine_transform(base, inv[:2, :2], offset=inv[:2, 2],
+                                                     order=3, mode="constant", cval=0.0)
+        out[0, t, 0, 0] = _expose(np.clip(moved, 0.0, None) + bg,
+                                  np.random.default_rng(seed + 1000 + t), blur=0.0)
+    bits = []
+    if rotate_deg:
+        bits.append(f"turning {rotate_deg:g}° per frame")
+    if drift_px[0] or drift_px[1]:
+        bits.append(f"drifting ({drift_px[0]:+.1f}, {drift_px[1]:+.1f}) px per frame")
+    if shear:
+        bits.append(f"shearing {shear:g} per frame")
+    if scale != 1.0:
+        bits.append(f"growing ×{scale:g} per frame")
+    cap = f"a textured body over {nt} frames " + (", ".join(bits) if bits else "holding still")
+    return _finish("moving_mass", out, _meta(dt_s=DT_S), cap,
+                   dict(seed=seed, size=size, nt=nt, rotate_deg=rotate_deg,
+                        drift_px=tuple(drift_px), shear=shear, scale=scale, radius=radius))
+
+
+def deforming_mass(*, seed: int = 0, size: int = 160, nt: int = 6, bulge_px: float = 0.6,
+                   drift_px: Tuple[float, float] = (0.6, 0.3), radius: float = 46.0,
+                   bulge_sigma: float = 18.0) -> Phantom:
+    """A textured body whose right side bulges outward by ``t × bulge_px`` (a smooth,
+    NON-affine displacement) while the whole body drifts by ``t × drift_px``. No global
+    transform can register the bulge; the question a drift correction has to answer is
+    whether it recovers the drift anyway — and the bulge pulls on that estimate unless the
+    estimate is restricted to the half that holds still."""
+    from scipy.ndimage import map_coordinates
+    rng = np.random.default_rng(seed)
+    base = _textured_body(rng, size, radius)
+    bg = _background(size)
+    cy = cx = (size - 1) / 2.0
+    bc = np.array([cy, cx + 0.55 * radius])
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    g = np.stack([yy.ravel(), xx.ravel()], axis=1)
+    out = np.zeros((1, nt, 1, 1, size, size), dtype=float)
+    for t in range(nt):
+        a, d = bulge_px * t, np.asarray(drift_px, dtype=float) * t
+
+        def fwd(p: np.ndarray) -> np.ndarray:
+            r2 = ((p - bc) ** 2).sum(axis=1)
+            return (a * np.exp(-r2 / (2 * bulge_sigma ** 2)))[:, None] * np.array([[0.0, 1.0]]) + d
+        if t == 0:
+            moved = base
+        else:
+            q = g.copy()
+            for _ in range(10):                     # q + D(q) = p, solved by fixed point
+                q = g - fwd(q)
+            moved = map_coordinates(base, [q[:, 0].reshape(size, size),
+                                           q[:, 1].reshape(size, size)],
+                                    order=3, mode="constant", cval=0.0)
+        out[0, t, 0, 0] = _expose(np.clip(moved, 0.0, None) + bg,
+                                  np.random.default_rng(seed + 1000 + t), blur=0.0)
+    cap = (f"a textured body over {nt} frames: its right side bulges out {bulge_px:g} px per "
+           f"frame while the whole body drifts ({drift_px[0]:+.1f}, {drift_px[1]:+.1f}) px per "
+           f"frame")
+    return _finish("deforming_mass", out, _meta(dt_s=DT_S), cap,
+                   dict(seed=seed, size=size, nt=nt, bulge_px=bulge_px, drift_px=tuple(drift_px),
+                        radius=radius, bulge_sigma=bulge_sigma))
+
+
+def star_volume(*, seed: int = 0, size: int = 96, nz: int = 12, nt: int = 4, n_stars: int = 50,
+                drift_px: Tuple[float, float, float] = (0.5, 1.0, -0.6)) -> Phantom:
+    """Beads in a ``nz``-plane stack over ``nt`` frames drifting in all three axes by
+    ``t × drift_px`` (planes, px, px). A planar registration sees only the lateral part and
+    leaves the axial drift in place; the 3D lever recovers it."""
+    rng = np.random.default_rng(seed)
+    dz, dy, dx = (float(v) for v in drift_px)
+    mz = max(3.0, abs(dz) * nt + 2.0)
+    mxy = max(16.0, abs(dy) * nt + 8.0, abs(dx) * nt + 8.0)
+    n = int(round(n_stars * ((nz + 2 * mz) / nz) * ((size + 2 * mxy) ** 2 / float(size * size))))
+    pos0 = np.stack([rng.uniform(-mz, nz + mz, n), rng.uniform(-mxy, size + mxy, n),
+                     rng.uniform(-mxy, size + mxy, n)], axis=1)
+    amp = np.exp(rng.uniform(math.log(600.0), math.log(3400.0), n))
+    sig_z, sig_xy = 1.5, 1.5
+    rz, r = int(math.ceil(3 * sig_z)), int(math.ceil(3.5 * sig_xy))
+    bg = _background(size, level=260.0, ramp=120.0, blob=90.0)
+    out = np.zeros((1, nt, nz, 1, size, size), dtype=float)
+    for t in range(nt):
+        vol = np.zeros((nz, size, size), dtype=float)
+        for (pz, py, px), a in zip(pos0 + np.array([dz, dy, dx]) * t, amp):
+            z0, y0, x0 = int(math.floor(pz)) - rz, int(math.floor(py)) - r, int(math.floor(px)) - r
+            za, zb = max(0, z0), min(nz, z0 + 2 * rz + 1)
+            ya, yb = max(0, y0), min(size, y0 + 2 * r + 1)
+            xa, xb = max(0, x0), min(size, x0 + 2 * r + 1)
+            if za >= zb or ya >= yb or xa >= xb:
+                continue
+            zz, yy, xx = np.mgrid[za:zb, ya:yb, xa:xb]
+            vol[za:zb, ya:yb, xa:xb] += a * np.exp(
+                -((zz - pz) ** 2) / (2 * sig_z ** 2) - ((yy - py) ** 2 + (xx - px) ** 2) / (2 * sig_xy ** 2))
+        for z in range(nz):
+            out[0, t, z, 0] = _expose(vol[z] + bg, np.random.default_rng(seed + 1000 + 31 * t + z),
+                                      blur=0.0)
+    cap = (f"{n_stars} beads in a {nz}-plane stack over {nt} frames, drifting {dz:+.1f} planes "
+           f"and ({dy:+.1f}, {dx:+.1f}) px per frame")
+    return _finish("star_volume", out, _meta(dt_s=DT_S, z_step_um=Z_STEP_UM), cap,
+                   dict(seed=seed, size=size, nz=nz, nt=nt, n_stars=n_stars,
+                        drift_px=tuple(drift_px)))
+
+
 PHANTOMS: Dict[str, Callable[..., Phantom]] = {
     "cells2d": cells2d,
     "cells3d": cells3d,
@@ -374,6 +595,10 @@ PHANTOMS: Dict[str, Callable[..., Phantom]] = {
     "two_channel": two_channel,
     "speckle_pair": speckle_pair,
     "plate_mosaic": plate_mosaic,
+    "star_field": star_field,
+    "moving_mass": moving_mass,
+    "deforming_mass": deforming_mass,
+    "star_volume": star_volume,
 }
 
 
