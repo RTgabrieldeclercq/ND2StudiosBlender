@@ -49,7 +49,7 @@ from nodelab_v2.ops import (
     sanitize_output_name,
     BAT_SOCKET_RE, CH_SOCKET_RE, GRP_SOCKET_RE, ITEM_SOCKET_RE, PAGE_INPUT_OP,
     PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY, POS_SOCKET_RE, Z_SOCKET_RE,
-    CHG_SOCKET_RE, POSG_SOCKET_RE, ZG_SOCKET_RE,
+    CHG_SOCKET_RE, POSG_SOCKET_RE, ZG_SOCKET_RE, T_SOCKET_RE, TG_SOCKET_RE,
     PART_IMAGE, PART_SOCKET_RE, item_socket, part_socket, _real_dataset_out,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
@@ -160,6 +160,17 @@ POSITION_TAP_OPS = ("util.split_positions",)
 #: predicts exactly, and the label is the index plus the plane's height when the stack
 #: carries a z step — so nothing is captured into params.
 PLANE_TAP_OPS = ("util.split_z",)
+
+#: op_keys whose GUI card grows one synthetic per-FRAME output socket (``t0…``) per
+#: timepoint on the wire reaching it — materialized into ``util.select_frame`` taps at
+#: graph-build (2026-10-07), the T-axis member of the family.
+FRAME_TAP_OPS = ("util.split_t",)
+
+#: How many per-index sockets a split card will grow (2026-10-07). Past this the card
+#: offers only ``out`` and its `groups` text is the way to split — a time series is
+#: hundreds of frames and a stack can be sixty planes, and a card with sixty ports is not
+#: a card anyone can wire. One rule for every axis, so Split Z and Split T behave alike.
+FANOUT_CAP = 24
 
 
 
@@ -805,7 +816,7 @@ class GraphDocument:
                     base.append(OutDataset(f"chg{g['index']}", label=g["label"]))
             else:
                 descs = self.channel_descriptors(node_id)
-                if len(descs) >= 2:
+                if 2 <= len(descs) <= FANOUT_CAP:
                     for i, ch in enumerate(descs):
                         base.append(OutDataset(
                             f"ch{i}", label=f"{i} · {ch.get('name') or f'Ch{i}'}"))
@@ -833,7 +844,7 @@ class GraphDocument:
                 # Same floor again: one position is the whole Dataset, so a lone `pos0`
                 # would duplicate `out`.
                 positions = self.position_descriptors(node_id)
-                if len(positions) >= 2:
+                if 2 <= len(positions) <= FANOUT_CAP:
                     for i, pd in enumerate(positions):
                         base.append(OutDataset(f"pos{i}", label=pd["label"]))
         if rec.op_key in PLANE_TAP_OPS:
@@ -845,9 +856,19 @@ class GraphDocument:
                 # Same floor: one plane is the whole stack, so a lone `z0` would duplicate
                 # `out`.
                 planes = self.plane_descriptors(node_id)
-                if len(planes) >= 2:
+                if 2 <= len(planes) <= FANOUT_CAP:
                     for i, pd in enumerate(planes):
                         base.append(OutDataset(f"z{i}", label=pd["label"]))
+        if rec.op_key in FRAME_TAP_OPS:
+            groups = self.split_groups(node_id, "t")
+            if groups:
+                for g in groups:
+                    base.append(OutDataset(f"tg{g['index']}", label=g["label"]))
+            else:
+                frames = self.frame_descriptors(node_id)
+                if 2 <= len(frames) <= FANOUT_CAP:
+                    for i, fd in enumerate(frames):
+                        base.append(OutDataset(f"t{i}", label=fd["label"]))
         if rec.op_key == PAGE_INPUT_OP:
             # the items of a several-item Output, each on a socket of its own (step 11f)
             items = self._page_items(node_id)
@@ -959,6 +980,8 @@ class GraphDocument:
                                      (CHG_SOCKET_RE, lambda n: self.split_groups(n, "c"), "name"),
                                      (POSG_SOCKET_RE, lambda n: self.split_groups(n, "m"), "name"),
                                      (ZG_SOCKET_RE, lambda n: self.split_groups(n, "z"), "name"),
+                                     (T_SOCKET_RE, self.frame_descriptors, "name"),
+                                     (TG_SOCKET_RE, lambda n: self.split_groups(n, "t"), "name"),
                                      (GRP_SOCKET_RE, self.group_descriptors, "key"),
                                      (BAT_SOCKET_RE, self.batch_member_names, None)):
             m = regex.match(socket or "")
@@ -1041,6 +1064,31 @@ class GraphDocument:
             out.append({"index": i, "name": f"z{i}", "label": label})
         return out
 
+    def frame_descriptors(self, node_id: str) -> list:
+        """The timepoints on the wire reaching ``node_id``, from its edit-time envelope:
+        ``[{"index", "name", "label"}, …]`` — ``[]`` when the envelope does not know ``t`` or
+        has no frame. ``name`` is ``tK``; ``label`` is ``"3"``, or ``"3 · 36.0 s"`` when the
+        series carries a frame interval (2026-10-07)."""
+        try:
+            env = self.env(node_id)
+        except Exception:                      # noqa: BLE001 — an un-propagated node
+            return []
+        if "t" in getattr(env, "unknown_axes", frozenset()):
+            return []
+        t = int(env.axes.t)
+        if t <= 0:
+            return []
+        md = env.metadata or {}
+        try:
+            dt = float(md.get("dt_s") or 0.0)
+        except (TypeError, ValueError):
+            dt = 0.0
+        out = []
+        for i in range(t):
+            label = f"{i}" + (f" · {i * dt:.1f} s" if dt > 0 else "")
+            out.append({"index": i, "name": f"t{i}", "label": label})
+        return out
+
     def split_groups(self, node_id: str, axis: str) -> list:
         """The RANGE groups a split card's `groups` text names on ``axis`` (``"c"`` / ``"m"`` /
         ``"z"``), as ``[{"index", "name", "indices", "spec", "label"}, …]`` — ``[]`` when the
@@ -1060,14 +1108,15 @@ class GraphDocument:
             spec = None
         if spec is None or spec.input("groups") is None:
             return []
-        groups = parse_groups(rec.params.get("groups"))
-        if not groups:
-            return []
         try:
             env = self.env(node_id)
         except Exception:                      # noqa: BLE001 — an un-propagated node
             env = None
         n = int(getattr(getattr(env, "axes", None), axis, 0) or 0) if env is not None else 0
+        # `every N` needs the axis length; an unknown axis means no groups yet
+        groups = parse_groups(rec.params.get("groups"), n or None)
+        if not groups:
+            return []
         if axis == "c":
             names = [str(d.get("name") or f"Ch{i}")
                      for i, d in enumerate(self.channel_descriptors(node_id))]
@@ -1077,9 +1126,10 @@ class GraphDocument:
         else:
             names = []
         step = 0.0
-        if axis == "z" and env is not None:
+        if axis in ("z", "t") and env is not None:
             try:
-                step = float((env.metadata or {}).get("z_step_um") or 0.0)
+                step = float((env.metadata or {}).get(
+                    "z_step_um" if axis == "z" else "dt_s") or 0.0)
             except (TypeError, ValueError):
                 step = 0.0
         out = []
@@ -1099,6 +1149,8 @@ class GraphDocument:
             label = f"{i} · {name}"
             if axis == "z" and step > 0 and inside:
                 label += f" · {inside[0] * step:.2f}–{inside[-1] * step:.2f} µm"
+            elif axis == "t" and step > 0 and inside:
+                label += f" · {inside[0] * step:.1f}–{inside[-1] * step:.1f} s"
             if n and len(inside) < len(idx):
                 label += " (past the end)"
             out.append({"index": i, "name": name, "indices": idx, "spec": spec_txt,

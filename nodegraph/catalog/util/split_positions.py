@@ -39,14 +39,16 @@ register_node(
                      "Split into RANGES instead of one output per position: type the groups as "
                      "0-based position indices, inclusive ranges, `;` between groups — `0-3; "
                      "4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: "
-                     "4-7`). The card then grows one output PER GROUP, each carrying exactly "
-                     "that subset of the M (position) axis, and the per-position outputs are "
-                     "put away. Blank = one output per position, as before. A wired group "
-                     "materializes into a Crop in frames mode keeping those positions at run "
-                     "time, shared by every branch that reads it, so this never changes `out` "
-                     "or anything this node itself computes; a group that reaches past the end "
-                     "is labelled so on the card and refused with the real M (position) length "
-                     "when pulled.")],
+                     "4-7`), or `every 10` for consecutive chunks of ten. The card then grows "
+                     "one output PER GROUP, each carrying exactly that subset of the M "
+                     "(position) axis, and the per-position outputs are put away. Blank = one "
+                     "output per position, up to 24 of them; past that the card offers only "
+                     "`out`, and this is how to split. A wired group materializes into a Crop "
+                     "in frames mode keeping those positions at run time, shared by every "
+                     "branch that reads it, so this never changes `out` or anything this node "
+                     "itself computes. A group reaching past the end is labelled so on the "
+                     "card; what lies past the end is dropped at the pull, and a group "
+                     "entirely past it is refused with the real M (position) length.")],
     outputs=[OutDataset("out")],
     granularity=Granularity.TILEABLE,
     description="Fan a multipoint Dataset out into one output per stage position (each a "

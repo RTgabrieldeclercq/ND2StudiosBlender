@@ -207,7 +207,7 @@
       "features": [
         "Grows one output socket per channel so each can feed its own chain.",
         "Wiring an output inserts a Select Channel tap for you at run time.",
-        "Groups: type ranges — `0,2; 1` or `nuclei: 0; reporters: 1-2` — and the card grows one output per group (a Select Channel with that list at run time) instead of one per channel."
+        "Groups: type ranges — `0,2; 1` or `nuclei: 0; reporters: 1-2` — and the card grows one output per group (a Select Channel with that list at run time) instead of one per channel; `every 4` chunks the axis into consecutive fours, and past 24 members the card grows no per-index sockets at all — Groups is then the way to split."
       ]
     },
     "util.merge": {
@@ -259,7 +259,7 @@
       "phantom": "plate_mosaic",
       "features": [
         "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap.",
-        "Groups: `0-5; 6-11` (or `wells: 0-5; blanks: 6-11`) gives one output per range of positions instead of one per position — a Crop in frames mode at run time, every per-position list following."
+        "Groups: `0-5; 6-11` (or `wells: 0-5; blanks: 6-11`) gives one output per range of positions instead of one per position — a Crop in frames mode at run time, every per-position list following; `every 4` chunks the axis into consecutive fours, and past 24 members the card grows no per-index sockets at all — Groups is then the way to split."
       ]
     },
     "util.stitch": {
@@ -1398,7 +1398,7 @@
       "features": [
         "Grows one output socket per plane (z0…z6 here, labelled with the plane's height) so each plane can feed its own chain; wiring one inserts a Select Plane tap for you at run time. The whole stack still passes through out, which is what this view shows.",
         "Hand z3 to Registration and out to Shift to register a stack on one plane.",
-        "Groups: `0-3; 4-7; 8-11` (or `top: 0-3; mid: 4-7`) gives one sub-stack per range instead of a socket per plane — a Crop in frames mode at run time, with the z step and the plane heights following; a group past the end is labelled so on the card."
+        "Groups: `0-3; 4-7; 8-11` (or `top: 0-3; mid: 4-7`) gives one sub-stack per range instead of a socket per plane — a Crop in frames mode at run time, with the z step and the plane heights following; a group past the end is labelled so on the card; `every 4` chunks the axis into consecutive fours, and past 24 members the card grows no per-index sockets at all — Groups is then the way to split."
       ]
     },
     "align.shift": {
@@ -1453,6 +1453,29 @@
         "Sign convention: a layer value is the shift APPLIED to the content, positive toward a higher index — exactly what Registration stores, so its layers reproduce its own alignment bit for bit. Invert puts the measured motion back instead.",
         "The 2D lever applies the lateral shift plane by plane; 3D adds the axial shift when a Shift z layer is named (Registration's drift_z from its own 3D lever). Blank = no axial shift, which is what a single-plane estimate warrants.",
         "Masks and label rasters on the data move with the image (at nearest, so ids survive); a Dataset carrying structure tables is refused — put Shift before segmentation."
+      ]
+    },
+    "util.select_frame": {
+      "kind": "image",
+      "phantom": "star_field",
+      "fixed_params": {
+        "frame": 3
+      },
+      "view": {
+        "t": 0
+      },
+      "features": [
+        "Keeps ONE timepoint of the series: the before view is frame 0 of the input, the after view is the frame kept (here frame 3 — the beads have drifted (+4.5, −6.0) px). Drag Frame to walk through the series.",
+        "In the app, scrub Frame t in the Viewer to the timepoint you want and press Pick to take it; 0 (the default) is the first frame, the anchor Registration's `first` uses.",
+        "T narrows to 1 and the per-frame lists follow; the tap Split T's per-frame outputs materialize into this node."
+      ]
+    },
+    "util.split_t": {
+      "kind": "image",
+      "phantom": "star_field",
+      "features": [
+        "Grows one output socket per timepoint (t0…t5 here, labelled with the frame time) so each frame can feed its own chain; wiring one inserts a Select Frame tap for you at run time. The whole series still passes through out, which is what this view shows.",
+        "A real series is hundreds of frames, so the card stops growing per-frame sockets past 24 and Groups takes over: `every 10` gives one output per ten consecutive frames, `0-99; 100-199` names the ranges — a Crop in frames mode at run time, every per-frame list following."
       ]
     }
   }

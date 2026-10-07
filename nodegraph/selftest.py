@@ -24162,13 +24162,165 @@ def test_select_plane_split_z() -> None:
         "an instant pick off the viewer's z")
 
 
+def test_select_frame_split_t() -> None:
+    """``util.select_frame`` + ``util.split_t`` (2026-10-07): the T-axis tap family, mirroring
+    ``util.split_z`` → ``util.select_plane``, plus the fan-out cap and `every N` chunking that
+    make a long series splittable at all.
+
+    1. **Select Frame** keeps one timepoint by index: t → 1, pixels are that frame's, the per-T
+       lists follow (``frame_time_jd``), ``dt_s`` survives (Crop's frames-mode rule, so a Crop
+       keeping ``t3`` agrees), a Voxel mask and a Point table follow (rows on other frames
+       dropped, survivors re-addressed to t=0), envelope == payload, the stamp is t-only;
+       BLANK is frame 0; past the end is refused with the length; a single-frame input is the
+       identity.
+    2. **Split T** is a pass-through; its card grows ``t0…`` labelled with the frame time, a
+       wired ``tK`` becomes one shared ``util.select_frame`` tap and each branch pulls its frame.
+    3. **The cap**: a 30-frame series grows NO per-frame sockets (``FANOUT_CAP`` = 24), on T and
+       on Z alike; ``every 10`` then gives three ``tg`` groups (the last clipped in its label),
+       the materializer emits ``t20-29`` from the index alone, and the pull is ten frames.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.metadata import every_n, frame_pick, parse_groups
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import FANOUT_CAP, GraphDocument
+
+    define_node("io.stseed", "S", outputs=[OutDataset()])
+    M, T, Z, Y, X = 1, 6, 2, 6, 8
+    arr = np.zeros((M, T, Z, 1, Y, X), dtype=float)
+    for t in range(T):
+        arr[:, t] = 10.0 * (t + 1)
+    ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "dt_s": 30.0, "frame_time_jd": [2460000.0 + 0.001 * t for t in range(T)]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, Z, 1, Y, X), dtype=np.int64)
+    for t in range(T):
+        mask[:, t, :, :, t, t] = 1                        # one pixel per frame, on the diagonal
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.POINT, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 0, 0]), "t": np.array([0, 3, 5]),
+        "c": np.array([0, 0, 0]), "z": np.array([0, 1, 0]),
+        "y": np.array([0.0, 3.0, 5.0]), "x": np.array([0.0, 3.0, 5.0])}, layer="spots"))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def pull(op, params=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.stseed"))
+        g.add(NodeInstance("N", op, params=params or {}))
+        g.connect("S", "N")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0})
+        return e, e.pull("N")
+
+    def px(out, t=0):
+        return float(out.image.get_region(0, 0, t, 0, 0, 0, Y, 0, X)[0, 0])
+
+    # 1. by index, blank (= 0)
+    for want, k in ((3, 3), ("5", 5), (None, 0), ("auto", 0)):
+        e, out = pull("util.select_frame", {} if want is None else {"frame": want})
+        assert out.axes.t == 1 and px(out) == 10.0 * (k + 1), (want, out.axes, px(out))
+        assert out.metadata["dt_s"] == 30.0 and out.metadata["frame_time_jd"] == [meta["frame_time_jd"][k]]
+        lay = out.get(Domain.VOXEL, "mask").values
+        assert lay.shape[1] == 1 and lay[0, 0, 0, 0, k, k] == 1 and lay.sum() == Z, (k, lay.sum())
+        ids = list(out.get(Domain.POINT, "id", layer="spots").values)
+        ts = list(out.get(Domain.POINT, "t", layer="spots").values)
+        assert ids == ({0: [1], 3: [2], 5: [3]}.get(k, [])) and all(v == 0 for v in ts), (k, ids, ts)
+        assert e.env("N").axes == out.axes and e.env("N").metadata["frame_time_jd"] == out.metadata["frame_time_jd"]
+        assert f"t:select_frame[{k}]" in str(out.metadata.get(SAMPLING_KEY, "")), out.metadata.get(SAMPLING_KEY)
+    assert frame_pick(6, 6) is None and frame_pick(6, "2.5") is None and frame_pick(1, 4) == None
+    try:
+        pull("util.select_frame", {"frame": 9})
+        raise AssertionError("a frame past the end must be refused")
+    except ValueError as exc:
+        assert "no timepoint 9" in str(exc) and "0..5" in str(exc), str(exc)
+    one = Dataset(axes=_replace(ax, t=1), metadata={"pixel_size_um": 0.5}).with_image(ArrayProvider(arr[:, :1]))
+    g1 = Graph(); g1.add(NodeInstance("S", "io.stseed"))
+    g1.add(NodeInstance("N", "util.select_frame", params={"frame": 4})); g1.connect("S", "N")
+    assert Engine(g1, computes=COMPUTES, seeds={"S": one},
+                  meta_seeds={"S": MetaEnvelope(axes=one.axes, metadata=one.metadata)}).pull("N").axes.t == 1
+
+    # 2. the split and its taps
+    e2, out2 = pull("util.split_t")
+    assert out2.axes.t == T and e2.env("N").axes.t == T
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L"); doc.meta_seeds["L"] = env0
+    doc.add_node("util.split_t", node_id="ST")
+    assert [s.name for s in doc.output_specs("ST")] == ["out"]
+    doc.connect("L", "image", "ST", "data")
+    outs = doc.output_specs("ST")
+    assert [s.name for s in outs] == ["out"] + [f"t{i}" for i in range(T)], [s.name for s in outs]
+    assert [s.label for s in outs[1:3]] == ["0 · 0.0 s", "1 · 30.0 s"], [s.label for s in outs[1:]]
+    doc.add_node("enhance.gaussian", node_id="G1"); doc.add_node("enhance.gaussian", node_id="G2")
+    doc.add_node("enhance.gaussian", node_id="G3")
+    doc.connect("ST", "t3", "G1", "data"); doc.connect("ST", "t3", "G2", "data")
+    doc.connect("ST", "out", "G3", "data")
+    assert doc.env("G1").axes.t == 1 and doc.env("G3").axes.t == T
+    assert doc._tap_name("ST", "t3") == "t3"
+    g = doc.to_graph(for_run=True, materialize=True)
+    taps = [n for n in g.nodes.values() if n.op_key == "util.select_frame"]
+    assert len(taps) == 1 and taps[0].params == {"frame": 3}, [(n.id, n.params) for n in taps]
+    assert sum(1 for e in g.edges if e.src == taps[0].id) == 2
+    eng = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0})
+    o1, o3 = eng.pull("G1"), eng.pull("G3")
+    assert o1.axes.t == 1 and abs(px(o1) - 40.0) < 1e-6 and o3.axes.t == T
+
+    # 3. the cap and `every N`
+    assert FANOUT_CAP == 24
+    long_env = MetaEnvelope(axes=_replace(ax, t=30), metadata={"pixel_size_um": 0.5, "dt_s": 2.0})
+    doc.meta_seeds["L"] = long_env
+    doc.touch("L")
+    assert [s.name for s in doc.output_specs("ST")] == ["out"], "30 frames: no per-frame sockets"
+    doc.add_node("util.split_z", node_id="SZ"); doc.connect("L", "image", "SZ", "data")
+    doc.meta_seeds["L"] = MetaEnvelope(axes=_replace(ax, t=2, z=40), metadata={"pixel_size_um": 0.5})
+    doc.touch("L")
+    assert [s.name for s in doc.output_specs("SZ")] == ["out"], "40 planes: no per-plane sockets either"
+    doc.meta_seeds["L"] = long_env
+    doc.touch("L")
+    assert every_n("every 10") == 10 and every_n("/4") == 4 and every_n("0-3") is None and every_n("every 0") is None
+    assert parse_groups("every 4", 10) == [("", (0, 1, 2, 3)), ("", (4, 5, 6, 7)), ("", (8, 9))]
+    assert parse_groups("every 4") is None, "without the axis length the shorthand is not expanded"
+    doc.nodes["ST"].params["groups"] = "every 10"
+    doc.touch("ST")
+    assert [(s.name, s.label) for s in doc.output_specs("ST")[1:]] == [
+        ("tg0", "0 · t 0-9 · 0.0–18.0 s"), ("tg1", "1 · t 10-19 · 20.0–38.0 s"),
+        ("tg2", "2 · t 20-29 · 40.0–58.0 s")], [(s.name, s.label) for s in doc.output_specs("ST")]
+    doc.nodes["ST"].params["groups"] = "every 12"
+    doc.touch("ST")
+    assert [s.label for s in doc.output_specs("ST")[1:]][-1] == "2 · t 24-29 · 48.0–58.0 s", "the last chunk clips"
+    assert OPS.split_group(doc.nodes["ST"], 2) == ("", tuple(range(24, 36))), "the run side is unclamped"
+    long_arr = np.zeros((1, 30, Z, 1, Y, X), dtype=float)
+    for t in range(30):
+        long_arr[:, t] = float(t)
+    long_ds = Dataset(axes=long_env.axes, metadata=long_env.metadata).with_image(ArrayProvider(long_arr))
+    doc.add_node("enhance.gaussian", node_id="G4"); doc.connect("ST", "tg2", "G4", "data")
+    assert doc.env("G4").axes.t == 6
+    g = doc.to_graph(for_run=True, materialize=True)
+    tap = next(n for n in g.nodes.values() if n.op_key == "util.crop" and n.params == {"frames": "t24-35"})
+    assert tap.modes == {"region": "frames"}
+    o4 = Engine(g, computes=COMPUTES, seeds={"L": long_ds}, meta_seeds={"L": long_env}).pull("G4")
+    assert o4.axes.t == 6 and abs(px(o4, t=0) - 24.0) < 1e-6 and abs(px(o4, t=5) - 29.0) < 1e-6, \
+        (o4.axes, px(o4, t=0), px(o4, t=5))        # Crop drops 30-35: the chunk clipped itself
+    _ok("select frame / split t: Select Frame keeps one timepoint by index (t→1, pixels, per-T "
+        "lists, dt_s kept as Crop keeps it, Voxel layer and Point rows follow, envelope == "
+        "payload, t-only stamp; blank = frame 0; past the end refused with the length; a lone "
+        "frame is the identity); Split T passes through, grows `t0…` labelled with frame times, "
+        "a wired tK is one shared util.select_frame tap; the fan-out cap (24) grows no per-index "
+        "sockets on a 30-frame series or a 40-plane stack; `every 10` gives tg groups labelled "
+        "by span with the last chunk clipped, the run side emits the unclamped `t24-35` and "
+        "Crop's frames tap hands back the six frames that exist")
+
+
 def test_split_groups() -> None:
     """Range GROUPS on the split cards (2026-10-07): a `groups` text on Split Channels / Split
     Positions / Split Z turns the per-index outputs into one output per RANGE.
 
     * The grammar (:func:`metadata.parse_groups`): ``;`` or newline between groups, each a
       :func:`parse_indices` list/range, an optional ``name:`` / ``name =`` in front; blank,
-      junk and an empty group are total (skipped / ``None``); out-of-range indices are kept.
+      junk and an empty group are total (skipped / ``None``); out-of-range indices are kept
+      (labelled on the card; Crop drops them at the pull and refuses only an empty axis).
     * The socket is PRESENTATION-only: the split's own output is the whole set whatever the
       text says, so the value never reaches the recipe.
     * The card: with groups set, ``zg0…`` / ``posg0…`` / ``chg0…`` replace the per-index
@@ -29786,6 +29938,7 @@ def main() -> int:
     test_timeseries_clock_order()
     test_split_positions()
     test_select_plane_split_z()
+    test_select_frame_split_t()
     test_split_groups()
     test_shift_node()
     test_workspace_model()

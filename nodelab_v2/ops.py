@@ -91,6 +91,11 @@ POS_SOCKET_RE = re.compile(r"^pos(\d+)$")
 #: has no name, and ``zK`` means "the (K+1)-th plane of whatever is wired".
 Z_SOCKET_RE = re.compile(r"^z(\d+)$")
 
+#: the synthetic per-FRAME output sockets a ``util.split_t`` card grows (``t0…``) while the
+#: series is short enough to fan out, materialized into ``util.select_frame`` taps
+#: (2026-10-07) — the T-axis member of the family. The tap carries the frame's INDEX.
+T_SOCKET_RE = re.compile(r"^t(\d+)$")
+
 #: the synthetic per-GROUP output sockets a split card grows when its `groups` text is set
 #: (2026-10-07): ``chg0…`` on Split Channels, ``posg0…`` on Split Positions, ``zg0…`` on
 #: Split Z — one per RANGE the user typed, replacing the per-index sockets. A channel group
@@ -103,13 +108,21 @@ Z_SOCKET_RE = re.compile(r"^z(\d+)$")
 CHG_SOCKET_RE = re.compile(r"^chg(\d+)$")
 POSG_SOCKET_RE = re.compile(r"^posg(\d+)$")
 ZG_SOCKET_RE = re.compile(r"^zg(\d+)$")
+TG_SOCKET_RE = re.compile(r"^tg(\d+)$")
 
 
 def split_group(node: Any, k: int):
     """Group ``k`` of a split card's `groups` text: ``(name, indices)``, or ``None`` when the
     text has no such group (then the edge is left alone, like any unresolvable tap)."""
-    from nodegraph.metadata import parse_groups
-    groups = parse_groups(node.params.get("groups") if node is not None else None)
+    from nodegraph.metadata import every_n, parse_groups
+    raw = node.params.get("groups") if node is not None else None
+    step = every_n(raw)
+    if step is not None:
+        # `every N`: group k is k·N … k·N+N-1, unclamped — the axis length is not known
+        # here, and Crop's frames mode drops what lies past the end, so the last chunk
+        # clips itself to the axis
+        return ("", tuple(range(k * step, (k + 1) * step))) if k >= 0 else None
+    groups = parse_groups(raw)
     if not groups or not (0 <= k < len(groups)):
         return None
     return groups[k]
@@ -1244,7 +1257,7 @@ def prepare_run_graph(graph: Graph) -> Graph:
     :func:`headless_engine` does the same."""
     # Batch FIRST, then groups, then positions, then planes, then channels: each narrows a
     # different axis (B, then M twice — a group is a set of positions, a position one of
-    # them — then Z, then C) so they commute on the data, and running them
+    # them — then T, then Z, then C) so they commute on the data, and running them
     # outermost-axis-first keeps each tap closest to the node that asked for it — the
     # order the card reads in. A split card's RANGE groups (2026-10-07) sit beside their
     # per-index siblings on the same axis.
@@ -1257,11 +1270,12 @@ def prepare_run_graph(graph: Graph) -> Graph:
         materialize_input_items(
             materialize_channel_groups(materialize_channel_taps(
                 materialize_plane_groups(materialize_plane_taps(
-                    materialize_position_groups(materialize_position_taps(
-                        materialize_group_taps(
-                            materialize_batch_taps(cut_docked_inputs(
-                                materialize_outside_taps(
-                                    materialize_output_items(graph)))))))))))))
+                    materialize_frame_groups(materialize_frame_taps(
+                        materialize_position_groups(materialize_position_taps(
+                            materialize_group_taps(
+                                materialize_batch_taps(cut_docked_inputs(
+                                    materialize_outside_taps(
+                                        materialize_output_items(graph)))))))))))))))
 
 
 def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -1734,6 +1748,27 @@ def materialize_plane_taps(graph: Graph) -> Graph:
                              lambda node, k: {"plane": int(k)})
 
 
+def materialize_frame_taps(graph: Graph) -> Graph:
+    """Rewire every GUI-synthetic per-FRAME output edge (``tK``) on a ``util.split_t`` card
+    through a real ``util.select_frame`` tap — the T-axis twin of
+    :func:`materialize_plane_taps` (2026-10-07). The tap carries the frame's INDEX."""
+    return _materialize_taps(graph, T_SOCKET_RE, "util.select_frame", "t",
+                             lambda node, k: {"frame": int(k)})
+
+
+def materialize_frame_groups(graph: Graph) -> Graph:
+    """Rewire every ``tgK`` edge on a Split T card through a ``util.crop`` tap in frames mode
+    keeping group K's timepoints (``t0-9``) — the usual way to split a long series
+    (2026-10-07)."""
+    from nodegraph.metadata import format_indices
+
+    def params_for(node, k):
+        g = split_group(node, k)
+        return None if g is None else {"frames": "t" + format_indices(sorted(set(g[1])))}
+    return _materialize_taps(graph, TG_SOCKET_RE, "util.crop", "tg", params_for,
+                             modes={"region": "frames"})
+
+
 def materialize_channel_groups(graph: Graph) -> Graph:
     """Rewire every ``chgK`` edge on a Split Channels card through a ``channel.select`` tap
     carrying group K's channel LIST (2026-10-07)."""
@@ -1834,4 +1869,6 @@ __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "Z_SOCKET_RE", "materialize_plane_taps",
            "CHG_SOCKET_RE", "POSG_SOCKET_RE", "ZG_SOCKET_RE", "split_group",
            "materialize_channel_groups", "materialize_position_groups",
-           "materialize_plane_groups"]
+           "materialize_plane_groups",
+           "T_SOCKET_RE", "TG_SOCKET_RE", "materialize_frame_taps",
+           "materialize_frame_groups"]

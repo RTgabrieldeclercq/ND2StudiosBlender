@@ -57,8 +57,8 @@
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
       "pages": ["input"],
-      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
-      "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group", "util.split_positions", "util.select_position", "util.split_z", "util.select_plane", "data.part"]
+      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, timepoints, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
+      "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group", "util.split_positions", "util.select_position", "util.split_z", "util.select_plane", "util.split_t", "util.select_frame", "data.part"]
     },
     "image_restoration": {
       "label": "Image restoration",
@@ -219,6 +219,8 @@
     "page.output": ["input", "refine", "process"],
     "util.crop_region": ["refine", "process"],
     "util.select_plane": ["input", "refine", "process", "analyze"],
-    "util.split_z": ["input", "refine"]
+    "util.split_z": ["input", "refine"],
+    "util.select_frame": ["input", "refine", "process", "analyze"],
+    "util.split_t": ["input", "refine"]
   }
 }

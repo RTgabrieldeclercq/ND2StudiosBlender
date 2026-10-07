@@ -5946,6 +5946,48 @@ def main(argv) -> int:
         "name and height span, a wire from zg1 is drawable, the envelope downstream reads z=3, "
         "and the run graph carries a util.crop frames tap keeping z2-4")
 
+    # ── ST1 Split T (2026-10-07): a 6-frame source grows t0..t5 labelled with frame times and a
+    # wire from t3 materializes a util.select_frame tap; a 30-frame source grows none (the
+    # fan-out cap) and `every 10` grows tg0..tg2 whose wire materializes a util.crop frames tap ──
+    _stdoc = win.doc
+    _stdoc.add_node("io.load", node_id="STL", x=0, y=1900)
+    _stdoc.meta_seeds["STL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=6, z=1, c=1, y=64, x=64), metadata={"pixel_size_um": 0.5, "dt_s": 30.0})
+    _stdoc.add_node("util.split_t", node_id="STS", x=300, y=1900)
+    _stdoc.connect("STL", "image", "STS", "data")
+    _stdoc.add_node("view.viewer", node_id="STV", x=600, y=1900)
+    _stdoc.connect("STS", "t3", "STV", "data")
+    win.scene.sync(); app.processEvents()
+    _stouts = [(s.name, s.label) for s in _stdoc.output_specs("STS")]
+    assert _stouts[:3] == [("out", ""), ("t0", "0 · 0.0 s"), ("t1", "1 · 30.0 s")] and len(_stouts) == 7, _stouts
+    assert _stdoc.env("STV").axes.t == 1, "the viewer sees one frame through the tap"
+    _gt = _stdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.select_frame" and n.params == {"frame": 3} for n in _gt.nodes.values())
+    _stdoc.remove_node("STV")
+    _stdoc.meta_seeds["STL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=30, z=1, c=1, y=64, x=64), metadata={"pixel_size_um": 0.5, "dt_s": 2.0})
+    _stdoc.touch("STL")
+    win.scene.sync(); app.processEvents()
+    assert [s.name for s in _stdoc.output_specs("STS")] == ["out"], "30 frames: the cap grows no sockets"
+    _stdoc.set_param("STS", "groups", "every 10") if hasattr(_stdoc, "set_param") \
+        else (_stdoc.nodes["STS"].params.__setitem__("groups", "every 10"), _stdoc.touch("STS"))
+    win.scene.sync(); app.processEvents()
+    assert [s.name for s in _stdoc.output_specs("STS")] == ["out", "tg0", "tg1", "tg2"]
+    _stdoc.add_node("view.viewer", node_id="STV", x=600, y=1900)
+    _stdoc.connect("STS", "tg1", "STV", "data")
+    win.scene.sync(); app.processEvents()
+    assert _stdoc.env("STV").axes.t == 10
+    _gt = _stdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.crop" and n.params == {"frames": "t10-19"} and n.modes == {"region": "frames"}
+               for n in _gt.nodes.values()), [(n.id, n.op_key, n.params) for n in _gt.nodes.values()]
+    for nid in ("STV", "STS", "STL"):
+        _stdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("ST1 split t: a 6-frame source grows t0..t5 labelled with frame times and a wire from t3 "
+        "materializes a util.select_frame tap; 30 frames grow none (the fan-out cap) and `every "
+        "10` grows tg0..tg2, whose wire reads t=10 downstream and materializes a util.crop "
+        "frames tap keeping t10-19")
+
     _probe_movie_editor(win, app)
 
     # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────

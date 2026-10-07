@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 111,
+    "nodes": 113,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 774,
-    "outputs": 118,
+    "inputs": 778,
+    "outputs": 120,
     "gui_ops_included": true
   },
   "stages": {
@@ -94,10 +94,12 @@
         "util.batch",
         "util.merge",
         "util.select_batch",
+        "util.select_frame",
         "util.select_group",
         "util.select_plane",
         "util.select_position",
         "util.split_positions",
+        "util.split_t",
         "util.split_z",
         "util.timeseries",
         "util.unbatch"
@@ -287,8 +289,8 @@
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
-      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
-      "count": 13,
+      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, timepoints, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
+      "count": 15,
       "ops": [
         {
           "op": "channel.select",
@@ -321,6 +323,11 @@
           "summary": "Keep one file of a batch, by name. The tap Unbatch's per-file outputs materialize into, and usable on its own to pull a single member out."
         },
         {
+          "op": "util.select_frame",
+          "label": "Select Frame",
+          "summary": "Keep ONE timepoint of a series, chosen on the Viewer (default: the first frame): T narrows to 1 and everything indexed by t follows — the per-frame clock, per-frame masks, the detections on that frame. The tap Split T's per-frame outputs materialize into, and usable on its own."
+        },
+        {
           "op": "util.select_group",
           "label": "Select Group",
           "summary": "Keep only the multipoints of one specimen group — the 3x3 mosaic, the plate well — recovered from the stage coordinates or read from the acquisition. Lazy: no pixels move, and per-position metadata, layers and structure rows follow the selection."
@@ -339,6 +346,11 @@
           "op": "util.split_positions",
           "label": "Split Positions",
           "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels."
+        },
+        {
+          "op": "util.split_t",
+          "label": "Split T",
+          "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z."
         },
         {
           "op": "util.split_z",
@@ -1113,10 +1125,12 @@
       "util.merge",
       "util.resample",
       "util.select_batch",
+      "util.select_frame",
       "util.select_group",
       "util.select_plane",
       "util.select_position",
       "util.split_positions",
+      "util.split_t",
       "util.split_z",
       "util.stack",
       "util.stitch",
@@ -7307,7 +7321,7 @@
           "is_field": false,
           "default": "",
           "presentation": true,
-          "description": "Split into RANGES instead of one output per channel: type the groups as 0-based channel indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`). The card then grows one output PER GROUP, each carrying exactly that subset of the channel axis, and the per-channel outputs are put away. Blank = one output per channel, as before. A wired group materializes into a Select Channel with that list at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes; a group that reaches past the end is labelled so on the card and refused with the real channel length when pulled."
+          "description": "Split into RANGES instead of one output per channel: type the groups as 0-based channel indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the channel axis, and the per-channel outputs are put away. Blank = one output per channel, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Select Channel with that list at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real channel length."
         }
       ],
       "outputs": [
@@ -19893,6 +19907,77 @@
         "member"
       ]
     },
+    "util.select_frame": {
+      "op": "util.select_frame",
+      "label": "Select Frame",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/util/select_frame.py",
+      "gui_only": false,
+      "summary": "Keep ONE timepoint of a series, chosen on the Viewer (default: the first frame): T narrows to 1 and everything indexed by t follows — the per-frame clock, per-frame masks, the detections on that frame. The tap Split T's per-frame outputs materialize into, and usable on its own.",
+      "overview": "Keep exactly one timepoint of a series. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.select_frame\"``, category ``\"utility\"``, ``meta_transform=select_frame``. * **Data contract** ``Dataset → the same Dataset with t = 1``. The T half of ``util.crop``'s frames mode exactly: nothing spatial changes, the per-T lists (``frame_time_jd``, …) are subset with the axis (:func:`~nodegraph.metadata.time_subset`), ``dt_s`` survives (one frame keeps the source interval — :func:`respaced`), lattice layers follow and structure rows on other frames are dropped, the survivors re-addressed to ``t = 0`` — the shared helpers every frame subset uses. * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the corresponding input unit of the kept frame; the rest of the series is never read. * **Sockets** ``frame`` (0-based; default 0, the acquisition's first frame and the anchor Registration's ``first`` mode uses; ``pick_kind=\"frame\"`` adopts the timepoint the viewer is showing). No modes. * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider` with one timepoint. Resolution is shared with the edit-time transform (:func:`~nodegraph.metadata.frame_pick`) so the card and the pull agree. A value past the end is REFUSED with the series length — handing back some other frame's pixels under the index asked for is the failure a selector exists to prevent. A single-frame input is returned as is, whatever is asked.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "frame",
+          "label": "Frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "pick_kind": "frame",
+          "description": "WHICH TIMEPOINT to keep, 0-based. Scrub Frame t in the Viewer to the frame you want and press Pick to take the one on screen; 0 (the default) is the first frame, the anchor Registration's `first` mode uses. The output has one frame, so whatever follows works on exactly this timepoint — a segmentation of the starting state, a reference for Align To — and the rest of the series is never read. A value past the end is refused with the series length rather than falling back to another frame; on a single-frame input every value is the identity."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_select_frame",
+      "meta_transform": "select_frame",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "frame"
+      ]
+    },
     "util.select_group": {
       "op": "util.select_group",
       "label": "Select Group",
@@ -20155,7 +20240,7 @@
           "is_field": false,
           "default": "",
           "presentation": true,
-          "description": "Split into RANGES instead of one output per position: type the groups as 0-based position indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`). The card then grows one output PER GROUP, each carrying exactly that subset of the M (position) axis, and the per-position outputs are put away. Blank = one output per position, as before. A wired group materializes into a Crop in frames mode keeping those positions at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes; a group that reaches past the end is labelled so on the card and refused with the real M (position) length when pulled."
+          "description": "Split into RANGES instead of one output per position: type the groups as 0-based position indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the M (position) axis, and the per-position outputs are put away. Blank = one output per position, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Crop in frames mode keeping those positions at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real M (position) length."
         }
       ],
       "outputs": [
@@ -20168,6 +20253,73 @@
         }
       ],
       "compute": "_compute_split_positions",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": []
+    },
+    "util.split_t": {
+      "op": "util.split_t",
+      "label": "Split T",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine"
+      ],
+      "module": "nodegraph/catalog/util/split_t.py",
+      "gui_only": false,
+      "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z.",
+      "overview": "Split T — a domain-transparent pass-through of the full series, the T-axis twin of ``util.split_z`` (2026-10-07). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-frame output socket (``t0…tT-1``, labelled with the frame's index and, when the series carries a frame interval, its time) while the series is short enough to fan out (:data:`nodelab_v2.document.FANOUT_CAP`), and each wired per-frame tap is materialized into a real ``util.select_frame`` at graph-build time — the engine is one-payload-per-node, so distinct per-frame payloads come from real select taps, not from this node. A time series is usually hundreds of frames, which is what the ``groups`` text is for: ``every 10`` or ``0-99; 100-199`` gives one output per RANGE (a Crop in frames mode at run time). No calibration or axes change here (``TILEABLE``, no meta_transform).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": null,
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The time series to fan out. Its frames appear as one output socket each on the card (`t0…`, with the frame's time when the series has a frame interval) while there are few enough to show; type Groups to split a long series into ranges. `out` still carries the whole series."
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per frame: type the groups as 0-based frame indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the T axis, and the per-frame outputs are put away. Blank = one output per frame, up to 24 of them; past that the card offers only `out`, and this is how to split. A time series is usually hundreds of frames, so `every 10` (or `0-99; 100-199`) is the normal way to split one. A wired group materializes into a Crop in frames mode keeping those frames at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real T length."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_split_t",
       "meta_transform": null,
       "extra_layers": null,
       "adds_columns": false,
@@ -20222,7 +20374,7 @@
           "is_field": false,
           "default": "",
           "presentation": true,
-          "description": "Split into RANGES instead of one output per plane: type the groups as 0-based plane indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`). The card then grows one output PER GROUP, each carrying exactly that subset of the Z axis, and the per-plane outputs are put away. Blank = one output per plane, as before. A wired group materializes into a Crop in frames mode keeping those planes at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes; a group that reaches past the end is labelled so on the card and refused with the real Z length when pulled."
+          "description": "Split into RANGES instead of one output per plane: type the groups as 0-based plane indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the Z axis, and the per-plane outputs are put away. Blank = one output per plane, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Crop in frames mode keeping those planes at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real Z length."
         }
       ],
       "outputs": [

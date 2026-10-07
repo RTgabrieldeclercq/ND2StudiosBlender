@@ -198,6 +198,9 @@ MODULES: Tuple[str, ...] = (
     "util.select_plane",
     "util.split_z",
     "align.shift",
+    # the T twins of the two above (2026-10-07), appended for the same reason
+    "util.select_frame",
+    "util.split_t",
 )
 
 
