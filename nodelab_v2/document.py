@@ -47,7 +47,8 @@ from nodegraph.memo import digest
 from nodelab_v2.ops import (
     DEFAULT_OUTPUT_BASE, PAGE_NAME_KEY, PAGE_OUTPUT_OP, next_free_name,
     sanitize_output_name,
-    ITEM_SOCKET_RE, PAGE_INPUT_OP, PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY,
+    CH_SOCKET_RE, ITEM_SOCKET_RE, PAGE_INPUT_OP, PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY,
+    PAGE_SOURCE_KEY,
     PART_IMAGE, PART_SOCKET_RE, item_socket, part_socket, _real_dataset_out,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
@@ -86,6 +87,19 @@ BUNDLE_PATHS_KEY = "paths"
 #: (:attr:`GraphDocument.page_channels`); a ``chK`` edge on it materializes like any other,
 #: and the composer splices the tap onto the upstream Output with the Input itself.
 CHANNEL_TAP_OPS = ("io.load", "channel.split", "page.input")
+
+#: The Dataset socket names that say nothing but "the data" — ``data`` in, ``out`` (and a
+#: source's ``image``) out. A stream carrying a strict subset of the file's channels names
+#: itself on such a socket (``Cy5`` instead of ``data``, V4.00 step 11g); a socket with a
+#: name of its own (``raw``, ``reference``, ``areas``) keeps it and adds the channel
+#: (``raw · Cy5``), because that name says which role the wire plays on the node.
+GENERIC_DATASET_SOCKETS = frozenset({"data", "out", "image"})
+
+#: A SYNTHETIC output socket — a per-channel, per-group, per-position or per-member tap, a
+#: part, an item — whose label already says what it carries (``0 · DAPI``, ``mask only``,
+#: ``item · cells``). It keeps that label: the channel is printed on the ``out`` above it,
+#: and ``0 · DAPI · DAPI`` says nothing twice.
+_SYNTHETIC_SOCKET_RE = re.compile(r"^(?:ch|grp|pos|bat)\d+$|^(?:part|item):")
 
 #: op_keys whose GUI card grows one synthetic per-GROUP output socket (``grp0…``) per
 #: position group — materialized into ``util.select_group`` taps at graph-build.
@@ -382,9 +396,17 @@ class GraphDocument:
         self.page_feeders: Callable[[], list] = lambda: []
         #: ``(node_id) -> [{name, emission_nm, color}, ...]`` (V4.00 step 11d): the channels
         #: of the Output a ``page.input`` on this document reads — the file's real channel
-        #: names, which the envelope does not carry across the page boundary. ``[]`` outside
+        #: names with their native colours (the envelope carries the names since step 11g,
+        #: not the colours). ``[]`` outside
         #: a workspace or while the Input is unbound.
         self.page_channels: Callable[[str], list] = lambda _nid: []
+        #: ``(channel descriptors, the source FILE's channel total)`` of what a Page Input —
+        #: or one ITEM of the several-item Output it reads — carries, resolved by the
+        #: Workspace through the pages (V4.00 step 11g). ``([], 0)`` detached or unbound. The
+        #: total is what a later page needs to know that a one-channel stream is ONE OF three
+        #: and so to name it; its own roots are its Page Inputs, which know no file.
+        self.page_channel_scope: Callable[..., Tuple[list, int]] = (
+            lambda _nid, _item="": ([], 0))
         #: ``(node_id) -> [item name, ...]`` (V4.00 step 11f): the items of the Output a
         #: ``page.input`` on this document reads — its item sockets. ``[]`` outside a
         #: workspace, while unbound, or for a one-item Output.
@@ -829,20 +851,32 @@ class GraphDocument:
         return out
 
     def _item_default(self, src: str, socket: str) -> str:
+        """An item's name from its wire: a part's or an item's name; a channel socket's
+        CHANNEL (``cy5``, step 11g); a Page Input's variable; else the source node's title —
+        with the channel appended when the wire is one of the file's (``gaussian_cy5``), so
+        a variable says which channel it came from without anyone typing it."""
         m = PART_SOCKET_RE.match(socket or "") or ITEM_SOCKET_RE.match(socket or "")
         if m:
             return sanitize_output_name(m.group(1)) or "item"
         rec = self.nodes.get(src)
+        chans = self.channel_subset(src, socket, "out")
+        chan = str(chans[0].get("name") or "") if len(chans) == 1 else ""
+        if CH_SOCKET_RE.match(socket or "") and chan:
+            return sanitize_output_name(chan) or "item"
         if rec is not None and rec.op_key == PAGE_INPUT_OP:
             name = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").split(":", 1)[-1].strip()
             if name:
                 return sanitize_output_name(name) or "item"
-        slug = re.sub(r"[^0-9a-z]+", "_", self.title_of(src).lower()).strip("_")[:32]
-        base = slug or "item"
+
+        def _slug(s: str) -> str:
+            return re.sub(r"[^0-9a-z]+", "_", s.lower()).strip("_")
+
+        base = _slug(self.title_of(src))[:32] or "item"
         spec = rec.spec() if rec is not None else None
         main = next((s.name for s in (spec.outputs if spec else ())
                      if s.type is SocketType.DATASET), "out")
-        return base if socket in ("", main) else f"{base}_{socket}"
+        name = base if socket in ("", main) else f"{base}_{socket}"
+        return f"{name}_{_slug(chan)}" if chan and _slug(chan) else name
 
     def _page_items(self, node_id: str) -> List[str]:
         try:
@@ -971,11 +1005,14 @@ class GraphDocument:
         already correct).
 
         The inheritance step is what puts the file's real channel names on a Split's
-        per-channel sockets. ``channel_names`` is display metadata that rides the payload and
-        is deliberately kept OUT of the engine meta-seed (it is not in ``CALIBRATION_KEYS``),
-        so the envelope route can only ever fall back to ``Ch0``/``Ch1`` — which is how a
-        two-branch graph ended up with two sockets that both said "Ch0" and no way to tell
-        which physical channel each branch carried."""
+        per-channel sockets and — narrowing through a ``chK`` wire — on every card past a
+        tap. Since V4.00 step 11g ``channel_names`` rides the edit-time source envelope as
+        well (:func:`nodelab_v2.ingest.channel_display_seed`), narrowed by every
+        ``channel.select`` in lockstep with the axis, so the envelope route answers with the
+        file's names too. Before that it carried only the emission and could only ever fall
+        back to ``Ch0``/``Ch1`` — which is how a two-branch graph ended up with two sockets
+        that both said "Ch0" and no way to tell which physical channel each branch carried.
+        The captured list still wins when the counts agree: it carries the native colours."""
         rec = self.nodes.get(node_id)
         if rec is None:
             return []
@@ -1057,13 +1094,28 @@ class GraphDocument:
 
         Depth-capped rather than cycle-tracked: the walk only ever runs a handful of hops
         (Load → Split is the case it exists for) and a bounded walk cannot hang on the
-        zone back-edges the document legitimately holds."""
+        zone back-edges the document legitimately holds.
+
+        A ``chK`` wire NARROWS the walk to that one channel (V4.00 step 11g) instead of
+        ending it: the card past the tap then inherits the file's name and native colour for
+        channel K. Until then the walk stopped at the tap and the card fell back to its
+        envelope, which — before the names rode the seed — could only say ``Ch0``."""
         if _depth > 8:
             return []
         for src, ssock, dst, _dsock in self.edges:
-            if dst != node_id or (ssock.startswith("ch") and ssock[2:].isdigit()):
-                continue          # a chK tap is already ONE channel, not the source list
+            if dst != node_id:
+                continue
             rec = self.nodes.get(src)
+            m = CH_SOCKET_RE.match(ssock or "")
+            if m is not None:
+                k = int(m.group(1))
+                chans = rec.params.get(CHANNELS_KEY) if rec is not None else None
+                if not (isinstance(chans, list) and chans):
+                    chans = (self._page_channels(src)
+                             if rec is not None and rec.op_key == PAGE_INPUT_OP
+                             else self._inherited_channel_descriptors(src, _depth + 1))
+                return ([chans[k]] if isinstance(chans, list) and 0 <= k < len(chans)
+                        else [])
             chans = rec.params.get(CHANNELS_KEY) if rec is not None else None
             if isinstance(chans, list) and chans:
                 return chans
@@ -1128,6 +1180,96 @@ class GraphDocument:
                 return [descs[idx]] if 0 <= idx < len(descs) else []
             return descs
         return []
+
+    # ── which channel a socket carries (V4.00 step 11g) ──────────────────────
+    def socket_channels(self, node_id: str, socket: str, io: str = "out") -> list:
+        """The channel descriptors riding ONE Dataset socket — all of them, whether or not
+        they are a subset (``[]`` when unknown or unwired).
+
+        An output: a ``chK`` socket is channel K of the node's list; a Page Input's
+        ``item:<name>`` socket is what that item of the upstream Output carries
+        (:attr:`page_channel_scope`); any other output — ``out``, a part, a group or
+        position tap — is the node's own list (:meth:`channel_descriptors`), which the
+        envelope already narrowed if a ``channel.select`` sits upstream. An input is whatever
+        its wire's source socket carries. A node that makes a NEW Dataset (``fresh_output``, a
+        plot's picture) carries no channel of the file's: ``[]``."""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return []
+        if io == "in":
+            edge = self.edge_into(node_id, socket)
+            return self.socket_channels(edge[0], edge[1], "out") if edge is not None else []
+        m = CH_SOCKET_RE.match(socket or "")
+        if m is not None:
+            descs = self.channel_descriptors(node_id)
+            k = int(m.group(1))
+            return [descs[k]] if 0 <= k < len(descs) else []
+        m = ITEM_SOCKET_RE.match(socket or "")
+        if m is not None:
+            return list(self._page_scope(node_id, m.group(1))[0])
+        try:
+            spec = rec.spec()
+        except Exception:                            # noqa: BLE001 — an unknown op
+            spec = None
+        if spec is not None and getattr(spec, "fresh_output", False):
+            return []
+        return list(self.channel_descriptors(node_id))
+
+    def channel_subset(self, node_id: str, socket: str, io: str = "out") -> list:
+        """:meth:`socket_channels` when they are a STRICT subset of the source file's
+        channels — the stream is *one of* (or *some of*) the file's — else ``[]``.
+
+        The same rule the wire tint has always used (a full bundle is not tinted, because
+        "everything" is not a channel): the socket's text, its dot and its wire all read
+        from here, so they cannot disagree about which channel a stream is."""
+        descs = self.socket_channels(node_id, socket, io)
+        if not descs:
+            return []
+        try:
+            total = (self.source_channel_total(node_id) if io == "out"
+                     else self._upstream_channel_total(node_id, socket))
+        except Exception:                            # noqa: BLE001 — mid-edit
+            return []
+        return list(descs) if 1 <= len(descs) < total else []
+
+    def _upstream_channel_total(self, node_id: str, socket: str) -> int:
+        edge = self.edge_into(node_id, socket)
+        return self.source_channel_total(edge[0]) if edge is not None else 0
+
+    def channel_tag(self, node_id: str, socket: str, io: str = "out") -> str:
+        """The channel(s) a socket carries, as the card prints them: ``Cy5``; ``DAPI · GFP``;
+        ``DAPI +2`` for three or more. ``""`` when the stream is not a strict subset."""
+        names = [str(d.get("name") or "") for d in self.channel_subset(node_id, socket, io)]
+        names = [n for n in names if n]
+        if not names:
+            return ""
+        if len(names) <= 2:
+            return " · ".join(names)
+        return f"{names[0]} +{len(names) - 1}"
+
+    def socket_text(self, node_id: str, spec, io: str = "out") -> str:
+        """What a card prints beside one socket: a Dataset stream that is one (or some) of
+        the file's channels names the channel — on a generic socket in place of its name
+        (``Cy5`` for ``data`` / ``out``), on a named one after it (``raw · Cy5``,
+        :data:`GENERIC_DATASET_SOCKETS`); anything else, the socket's own text (an input its
+        name, an output its label or name). A synthetic output keeps its label
+        (:data:`_SYNTHETIC_SOCKET_RE`): ``0 · DAPI`` and ``mask only`` already say it."""
+        base = spec.name if io == "in" else (spec.label or spec.name)
+        if spec.type is not SocketType.DATASET or (
+                io == "out" and _SYNTHETIC_SOCKET_RE.match(spec.name or "")):
+            return base
+        tag = self.channel_tag(node_id, spec.name, io)
+        if not tag:
+            return base
+        return tag if spec.name in GENERIC_DATASET_SOCKETS else f"{base} · {tag}"
+
+    def _page_scope(self, node_id: str, item: str = "") -> Tuple[list, int]:
+        """:attr:`page_channel_scope`, never raising — it is asked while cards are laid out."""
+        try:
+            descs, total = self.page_channel_scope(node_id, item)
+        except Exception:                      # noqa: BLE001 — mid-edit upstream
+            return [], 0
+        return (list(descs) if isinstance(descs, (list, tuple)) else []), int(total or 0)
 
     def batch_member_names(self, node_id: str) -> list:
         """The member names of the batch reaching ``node_id`` — ``[]`` if none does.
@@ -1212,10 +1354,14 @@ class GraphDocument:
         return identity
 
     def source_channel_total(self, node_id: str) -> int:
-        """The total channel count of the source file(s) feeding ``node_id`` — used by
-        the wire tint to decide whether a wire carries a strict channel subset. Walks up
-        to the source roots and takes the max (a root ``io.load`` reports its captured
-        ``__channels__`` length, else its seeded envelope's ``c``)."""
+        """The total channel count of the source file(s) feeding ``node_id`` — what the
+        wire tint, the socket text and the socket dot use to decide whether a stream carries
+        a strict channel subset (:meth:`channel_subset`). Walks up to the source roots and
+        takes the max: a root ``io.load`` reports its captured ``__channels__`` length, else
+        its seeded envelope's ``c``; a root ``page.input`` asks the Workspace for the FILE's
+        total on the page it reads from (:attr:`page_channel_scope`, V4.00 step 11g), because
+        its own envelope is already the narrowed stream and would call one channel of three
+        "all of them"."""
         seen: set = set()
         stack = [node_id]
         totals = []
@@ -1230,8 +1376,12 @@ class GraphDocument:
             else:
                 rec = self.nodes.get(nid)
                 chans = rec.params.get(CHANNELS_KEY) if rec else None
-                totals.append(len(chans) if isinstance(chans, list) and chans
-                              else self.env(nid).axes.c)
+                if isinstance(chans, list) and chans:
+                    totals.append(len(chans))
+                    continue
+                up_total = (self._page_scope(nid)[1]
+                            if rec is not None and rec.op_key == PAGE_INPUT_OP else 0)
+                totals.append(up_total if up_total > 0 else self.env(nid).axes.c)
         return max(totals) if totals else self.env(node_id).axes.c
 
     def source_scope_totals(self, node_id: str) -> Tuple[int, int, int]:

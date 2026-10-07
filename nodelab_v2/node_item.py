@@ -68,6 +68,26 @@ from nodelab_v2.picker import PICK_ACTION, PICK_GLYPH, request_for
 #: a synthetic per-channel output socket name — ``ch0``, ``ch1``, …
 _CH_SOCKET_RE = re.compile(r"^ch(\d+)$")
 
+
+def desc_qcolor(desc) -> QColor:
+    """The display colour of one channel descriptor (``{name, emission_nm, color}``): its
+    native colour when the file carries one, else the colour of its emission wavelength
+    (a neutral grey when unknown — a TIFF, a transmitted-light channel). ONE function for
+    the socket dot, the wire and the per-channel sockets, so they cannot disagree."""
+    col = (desc or {}).get("color")
+    if isinstance(col, (list, tuple)) and len(col) == 3:
+        return QColor(int(col[0]), int(col[1]), int(col[2]))
+    return T.emission_qcolor((desc or {}).get("emission_nm"))
+
+
+def avg_qcolor(cols: Sequence[QColor]) -> QColor:
+    """The component-wise mean of several QColors — the aggregate tint of a stream carrying
+    a multi-channel subset."""
+    n = max(1, len(cols))
+    return QColor(round(sum(c.red() for c in cols) / n),
+                  round(sum(c.green() for c in cols) / n),
+                  round(sum(c.blue() for c in cols) / n))
+
 #: Hard-wrap column for tooltip prose. See :func:`socket_hover_text` for why the wrapping
 #: is done here rather than left to Qt.
 _TIP_COLS = 76
@@ -399,14 +419,14 @@ class SocketItem(QGraphicsItem):
         self.spec = spec
         self.io = io                       # "in" | "out"
         self.node_item = parent
-        self.channel_color: Optional[QColor] = None   # per-channel output tint (chK)
+        self.channel_color: Optional[QColor] = None   # the channel(s) this stream carries
         self.highlight: Optional[bool] = None   # None | True (valid) | False (invalid)
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CrossCursor)
         self._head = socket_identity(spec)
         self.setToolTip(socket_hover_text(spec, head=self._head))
 
-    def set_domain_tip(self, domains, missing=(), *, on_wire=()) -> None:
+    def set_domain_tip(self, domains, missing=(), *, on_wire=(), channel: str = "") -> None:
         """Append the domain-set this Dataset socket carries/requires (the rail's
         hover detail). No-op tail for value sockets (``domains`` empty).
 
@@ -425,6 +445,10 @@ class SocketItem(QGraphicsItem):
                                              if on_wire else "nothing wired"))
         if missing:
             extra.append("⚠ missing upstream: " + ", ".join(d.value for d in missing))
+        if channel:
+            # which of the file's channels this stream is (V4.00 step 11g) — the words
+            # behind the dot's tint and the row's name
+            extra.append("channel: " + channel)
         self.setToolTip(socket_hover_text(self.spec, extra, head=self._head))
 
     def boundingRect(self) -> QRectF:
@@ -767,11 +791,7 @@ class NodeItem(QGraphicsObject):
         when unknown — e.g. a TIFF or a transmitted-light channel)."""
         descs = self.doc.channel_descriptors(self.rec.id)
         if 0 <= index < len(descs):
-            ch = descs[index]
-            col = ch.get("color")
-            if col:
-                return QColor(int(col[0]), int(col[1]), int(col[2]))
-            return T.emission_qcolor(ch.get("emission_nm"))
+            return desc_qcolor(descs[index])
         return T.SOCKET[SocketType.DATASET]
 
     def set_viewed(self, on: bool) -> None:
@@ -941,14 +961,41 @@ class NodeItem(QGraphicsObject):
             except Exception:  # noqa: BLE001 — a hover must never break a relayout
                 on_wire = ()
             sock.set_domain_tip(self.reads_domains(), self.missing_domains(),
-                                on_wire=on_wire)
+                                on_wire=on_wire, channel=self._channel_phrase(s, "in"))
         else:
-            sock.set_domain_tip(self.out_domains())
+            sock.set_domain_tip(self.out_domains(), channel=self._channel_phrase(s, "out"))
 
-    def _tint_channel_socket(self, sock: "SocketItem", s) -> None:
-        idx = self.output_channel_index(s.name)
+    def _channel_phrase(self, s, io: str) -> str:
+        """``Cy5 — 1 of 3 channels``: the channel(s) a Dataset socket carries when they are a
+        strict subset of the file's (V4.00 step 11g); ``""`` otherwise."""
+        try:
+            descs = self.doc.channel_subset(self.rec.id, s.name, io)
+            if not descs:
+                return ""
+            total = self.doc.source_channel_total(self.rec.id)
+        except Exception:  # noqa: BLE001 — a hover must never break a relayout
+            return ""
+        names = " · ".join(str(d.get("name") or "?") for d in descs)
+        return f"{names} — {len(descs)} of {total} channels"
+
+    def _tint_channel_socket(self, sock: "SocketItem", s, io: str = "out") -> None:
+        """Tint a Dataset socket's dot by the channel(s) its stream carries: a ``chK`` output
+        by channel K; any other Dataset socket — an INPUT too (V4.00 step 11g) — by the
+        strict channel subset riding it, one colour or the mean of several, exactly as its
+        wire is. A full bundle keeps the plain Dataset dot."""
+        idx = self.output_channel_index(s.name) if io == "out" else None
         if idx is not None:
             sock.channel_color = self.channel_qcolor(idx)
+            return
+        if s.type is not SocketType.DATASET:
+            return
+        try:
+            descs = self.doc.channel_subset(self.rec.id, s.name, io)
+        except Exception:  # noqa: BLE001 — a relayout must never break on a tint
+            descs = []
+        if descs:
+            cols = [desc_qcolor(d) for d in descs]
+            sock.channel_color = cols[0] if len(cols) == 1 else avg_qcolor(cols)
 
     def _clear_sockets(self) -> None:
         for sock in self._sockets.values():
@@ -987,6 +1034,7 @@ class NodeItem(QGraphicsObject):
             sock = SocketItem(self, s, "in")
             sock.setPos(0, y + T.ROW_H / 2)
             self._apply_domain_tip(sock, s, "in")
+            self._tint_channel_socket(sock, s, "in")
             self._sockets[("in", s.name)] = sock
             self._rows.append(("in", s, y))
             y += T.ROW_H
@@ -1054,8 +1102,7 @@ class NodeItem(QGraphicsObject):
                     y = (size - span) / 2.0 + span * i / (n - 1)
                 sock.setPos(x, y)
                 self._apply_domain_tip(sock, s, io)
-                if io == "out":
-                    self._tint_channel_socket(sock, s)
+                self._tint_channel_socket(sock, s, io)
                 self._sockets[(io, s.name)] = sock
 
         place(ins, "in", 0.0)
@@ -1074,6 +1121,7 @@ class NodeItem(QGraphicsObject):
             sock = SocketItem(self, s, "in")
             sock.setPos(0, y0 + i * 12)
             self._apply_domain_tip(sock, s, "in")
+            self._tint_channel_socket(sock, s, "in")
             self._sockets[("in", s.name)] = sock
         for i, s in enumerate(outs):
             sock = SocketItem(self, s, "out")
@@ -1113,11 +1161,22 @@ class NodeItem(QGraphicsObject):
             # wiring change that leaves the socket set alone — connecting or unplugging an
             # auxiliary input, or an edit upstream that changes what a branch carries — left
             # every socket hovering the state it had when the card was last laid out.
+            # The channel tint is per-wire too (V4.00 step 11g): a card is laid out at the
+            # drop and its wire arrives after, so a tint set only in `_layout` would leave
+            # the plain dot beside a row that already names the channel. Reset, then re-tint,
+            # so a wire moved back to the bundle loses the colour as well. The LIVE specs
+            # (the document's, instance-aware) so the synthetic sockets are covered too.
+            live = {("in", s.name): s for s in self._active_inputs()}
+            live.update({("out", s.name): s for s in self._active_outputs()})
             for (io, name), sock in self._sockets.items():
-                spec = (self.spec.input(name) if io == "in"
-                        else self.spec.output(name)) if self.spec else None
+                spec = live.get((io, name)) or (
+                    (self.spec.input(name) if io == "in" else self.spec.output(name))
+                    if self.spec else None)
                 if spec is not None:
                     self._apply_domain_tip(sock, spec, io)
+                    sock.channel_color = None
+                    self._tint_channel_socket(sock, spec, io)
+                    sock.update()
         self.update()
 
     def resync_spec(self) -> bool:
@@ -1474,7 +1533,7 @@ class NodeItem(QGraphicsObject):
                 self._paint_value_pill(p, y, f"{val} ▾", None, False, obj=obj)
             elif kind == "out":
                 p.setFont(lf); p.setPen(T.INK)
-                text = obj.label or obj.name          # chK sockets show "K · name"
+                text = self._output_row_text(obj)    # "K · name" on chK; a channel on out
                 p.drawText(QRectF(T.NODE_W - 134, y, 120, T.ROW_H),
                            Qt.AlignVCenter | Qt.AlignRight, text)
                 # domain chips only on the combined output; per-channel rows read
@@ -1534,11 +1593,16 @@ class NodeItem(QGraphicsObject):
         return "" if val is None else str(val)
 
     def _input_row_text(self, s) -> str:
-        """An input row's text: the socket's name — except on a Page Output (V4.00 step 11f),
-        whose wired item slots read as their items' names once it holds several, and whose
-        empty slot reads ``+ item``."""
+        """An input row's text: the socket's name — or the CHANNEL its wire carries when that
+        is one (or some) of the file's channels (``Cy5`` on ``data``, ``raw · DAPI`` on a
+        named socket; V4.00 step 11g, :meth:`GraphDocument.socket_text`) — except on a Page
+        Output (step 11f), whose wired item slots read as their items' names once it holds
+        several, and whose empty slot reads ``+ item``."""
         if self.rec.op_key != PAGE_OUTPUT_OP or s.type is not SocketType.DATASET:
-            return s.name
+            try:
+                return self.doc.socket_text(self.rec.id, s, "in")
+            except Exception:                        # noqa: BLE001 — a bare document
+                return s.name
         try:
             items = dict(self.doc.output_items(self.rec.id))
         except Exception:                            # noqa: BLE001 — a bare document
@@ -1546,6 +1610,17 @@ class NodeItem(QGraphicsObject):
         if s.name not in items:
             return s.name if s.name == "data" else "+ item"
         return items[s.name] if len(items) >= 2 else s.name
+
+    def _output_row_text(self, s) -> str:
+        """An output row's text: a synthetic socket's label (``0 · GFP``, ``mask only``,
+        ``item · cells``); a plain ``out`` the channel its stream carries when that is one
+        (or some) of the file's (``Cy5``; V4.00 step 11g), else its name."""
+        if s.label:
+            return s.label
+        try:
+            return self.doc.socket_text(self.rec.id, s, "out")
+        except Exception:                            # noqa: BLE001 — a bare document
+            return s.name
 
     # ── a Page Input's Source (V4.00 step 11e) ───────────────────────────────
     def _is_source_pill(self, s) -> bool:

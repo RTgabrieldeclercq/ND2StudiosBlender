@@ -4693,6 +4693,43 @@ def main(argv) -> int:
         "strip follows the branch — the two payloads have identical axes, so a size-keyed "
         "strip showed the first branch's name, tint and LUT for the second")
 
+    # ── CP1: a stream names its channel (V4.00 step 11g) ────────────────────────
+    #
+    # "after we use a cy5 channel, into a node, it comes out as data. the wires are colored
+    # per channel, but why do we just call it data". On C1's graph: the Gaussian on ch0 reads
+    # DAPI on both sockets, the Measure reads DAPI on `data` and `raw · GFP` on `raw`, the
+    # Split's `out` (everything) stays `out`; the input DOTS are tinted like the wires; the
+    # hover says it in words; a Page Output on the branches names its items by channel.
+    from nodelab_v2.node_item import desc_qcolor as _dqc
+    _ni0, _nims, _nisp = (win.scene.node_items[k] for k in ("ce0", "cms", "csp"))
+
+    def _row(ni, name, io):
+        specs = ni._active_inputs() if io == "in" else ni._active_outputs()
+        s = next(s for s in specs if s.name == name)
+        return ni._input_row_text(s) if io == "in" else ni._output_row_text(s)
+
+    assert _row(_ni0, "data", "in") == "DAPI", _row(_ni0, "data", "in")
+    assert _row(_ni0, "out", "out") == "DAPI", _row(_ni0, "out", "out")
+    assert _row(_nims, "data", "in") == "DAPI" and _row(_nims, "raw", "in") == "raw · GFP", (
+        _row(_nims, "data", "in"), _row(_nims, "raw", "in"))
+    assert _row(_nims, "out", "out") == "DAPI"
+    assert _row(_nisp, "out", "out") == "out" and _row(_nisp, "ch0", "out") == "0 · DAPI"
+    _dapi, _gfp = _dqc({"color": [0, 0, 255]}), _dqc({"color": [0, 255, 0]})
+    assert _ni0._sockets[("in", "data")].channel_color == _dapi, "the input dot is tinted"
+    assert _ni0._sockets[("out", "out")].channel_color == _dapi
+    assert _nims._sockets[("in", "raw")].channel_color == _gfp
+    assert _nisp._sockets[("in", "data")].channel_color is None, "the bundle's dot is plain"
+    _e = next(e for e in win.scene.edge_items
+              if e.src.node_item.rec.id == "ce1" and e.dst.node_item.rec.id == "cms")
+    assert _e._channel_colors() == [_gfp], "the wire reads the same resolution"
+    assert "channel: DAPI — 1 of 2 channels" in _ni0._sockets[("in", "data")].toolTip()
+    # (the Page Output item naming is pinned Qt-free in `test_channel_provenance`; this
+    # section edits nothing, because a document edit here invalidates the runner and a late
+    # re-delivery of C1's viewed node would land inside C2's own `show_result`)
+    _ok("CP1 a stream names its channel (V4.00 step 11g): past a chK wire a card's data/out "
+        "read the channel (DAPI), a role socket adds it (raw · GFP), the bundle stays out; "
+        "input dots and wires take the same colour; the hover says '1 of 2 channels'")
+
     # ── C2: the Points overlay's Z gating + colour modes (2026-08-03 / 08-04) ──
     #
     # Two reports, one root cause. First "particle detection does not show points detected":

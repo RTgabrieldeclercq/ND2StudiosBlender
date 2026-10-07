@@ -322,6 +322,9 @@ def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
 _SYNTH_META = {
     "pixel_size_um": 0.1, "z_step_um": 0.3, "objective_na": 1.4,
     "objective_magnification": 60.0, "channel_emission_nm": [520.0, 640.0],
+    # the names ride the seed too (V4.00 step 11g, `ingest.channel_display_seed`); listed
+    # here so a probe that seeds a card from this dict agrees with the resolved envelope
+    "channel_names": ["Ch0", "Ch1"],
 }
 _SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)
 
@@ -4531,8 +4534,9 @@ class EngineRunner(QObject):
             full_m = int(env.axes.m)
             if job.pin is not None:
                 prov, env = _pin_frames(prov, env, job.pin)
-            # Display metadata (channel names/emission/colors) rides on the seed
-            # Dataset only — NOT the engine meta-seed (kept to the calibration schema).
+            # The FULL display dict (excitation, bit depth, the stage keys) rides on the seed
+            # Dataset only; the engine meta-seed keeps to the calibration schema plus the
+            # per-channel names/colours (`ingest.channel_display_seed`, V4.00 step 11g).
             disp = self._channel_display.get(self._node_source_key.get(nid), {})
             md = dict(env.metadata); md.update(disp)
             # ...and the display dict carries the per-M STAGE keys too (`ingest.STAGE_KEYS`
@@ -4816,14 +4820,15 @@ class EngineRunner(QObject):
                 provs.append(mprov)
                 envs.append(menv)
                 member_keys.append(mkey)
+            from nodelab_v2.ingest import with_channel_display
             labels = _unique_labels(paths)
             prov = MultiSourceProvider(provs, labels=labels)
-            env = bundle_envelope(prov.axes, envs, labels)
-            self._providers[key] = (prov, env)
             # The members share a grid, so they share their channel display; taking the
             # first is not a choice between disagreeing values.
-            self._channel_display[key] = dict(
-                self._channel_display.get(member_keys[0], {}))
+            disp = dict(self._channel_display.get(member_keys[0], {}))
+            env = with_channel_display(bundle_envelope(prov.axes, envs, labels), disp)
+            self._providers[key] = (prov, env)
+            self._channel_display[key] = disp
             return prov, env
 
     @staticmethod
@@ -4855,11 +4860,13 @@ class EngineRunner(QObject):
         # and calls `_effective_access` before building `key`, so an `auto` reaching here
         # would mean two callers disagreeing about what `key` even means.
         assert access != ACCESS_AUTO, "_ingest_locked() needs a RESOLVED access"
+        from nodelab_v2.ingest import with_channel_display
         if not path:
             prov = SyntheticProvider(_SYNTH_AXES, tile=128)
-            env = MetaEnvelope(axes=_SYNTH_AXES, metadata=dict(_SYNTH_META))
             disp = {"channel_names": [f"Ch{i}" for i in range(_SYNTH_AXES.c)],
                     "channel_emission_nm": list(_SYNTH_META["channel_emission_nm"])}
+            env = with_channel_display(
+                MetaEnvelope(axes=_SYNTH_AXES, metadata=dict(_SYNTH_META)), disp)
         else:
             from nodelab_v2.ingest import (
                 PYRAMID_LEVELS, ensure_store_levels, ingest_image, open_store,
@@ -4871,8 +4878,10 @@ class EngineRunner(QObject):
                 # torn store left behind by an ingest that was abandoned precisely because
                 # the file was too big to copy.
                 prov, env = self._open_direct(path)
+                disp = read_channel_display(path)
+                env = with_channel_display(env, disp)
                 self._providers[key] = (prov, env)
-                self._channel_display[key] = read_channel_display(path)
+                self._channel_display[key] = disp
                 return prov, env
             # Beside the source file by default. `NODEGRAPH_STORE_DIR` moves every store to
             # one directory instead, which matters when the data lives on slow media: a USB
@@ -4939,6 +4948,12 @@ class EngineRunner(QObject):
                 prov, env = ingest_image(path, store_path=store,
                                          levels=PYRAMID_LEVELS, progress=on_ingest)
             disp = read_channel_display(path)
+        # The channel NAMES (and native colours) ride the envelope itself, not only the
+        # payload's display dict (V4.00 step 11g): the edit-time pass narrows them with the
+        # axis at every `channel.select`, so a card past a `chK` wire knows which channel
+        # it carries. Stamped HERE, on the cached entry, so `_fresh_envs`' re-seed and the
+        # pull's envelope say the same thing the Load card was seeded with at file-pick.
+        env = with_channel_display(env, disp)
         self._providers[key] = (prov, env)
         self._channel_display[key] = disp
         return prov, env

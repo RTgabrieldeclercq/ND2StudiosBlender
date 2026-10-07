@@ -442,7 +442,8 @@ session state `_closed_pages`): the page stays, listed "tab closed" in the Pages
 any route that shows it again (the panel, the page menu, its kind tab) opens its tab again —
 a page on a canvas is always open. A `page.input` grows one synthetic `chK` output per channel
 like a Load card (`CHANNEL_TAP_OPS`), named from the upstream Output's descriptors
-(`Workspace.input_channels`, installed as `doc.page_channels`); a `chK` edge materializes into
+(`Workspace.input_channels`, installed as `doc.page_channels`; the file's channel TOTAL
+crosses the same way, `Workspace.input_channel_scope`, CON-23); a `chK` edge materializes into
 a `channel.select` tap that `compose` splices onto the upstream Output with the Input itself. A page's Input is seeded once per session (`_seeded_pages`), and its
 start card (`welcome.WelcomeCard.configure`) is worded for its kind and dismissible (`_publish_source`; a TIFF card starts on `ingest`, the only
 access mode that can read it). Page-op DEFAULTS have one choke point: `Workspace._attach`
@@ -642,3 +643,42 @@ node (`Workspace.resolve_item`). The cross-page signature walks the UNmaterializ
 every item wire still enters the Output, so editing any item's chain stales its readers.
 
 see: CON-17 · CON-12 · CON-15 · [MANUAL §4 One kind of data at a time, §2 Pages](../MANUAL.md)
+
+
+---
+
+### CON-23 — channel provenance
+anchors: sym:nodelab_v2.ingest.channel_display_seed, sym:nodelab_v2.ingest.with_channel_display, sym:nodelab_v2.document.GraphDocument.channel_subset, sym:nodelab_v2.document.GraphDocument.socket_text, sym:nodelab_v2.document.GraphDocument.source_channel_total, sym:nodelab_v2.workspace.Workspace.input_channel_scope
+
+**The names ride the data (V4.00 step 11g).** A source envelope — the Load card's seed at
+file-pick (`window._add_source_node` / `_add_bundle_node`) and the runner's resolved
+envelope (`_ingest_locked`, `_open_direct`, `_resolve_bundle`, cached in `_providers` so
+`_fresh_envs`' re-seed says the same) — carries `channel_names` and `channel_colors` through
+ONE function, `ingest.channel_display_seed` (`with_channel_display`): one spelling on both
+sides, because `set_meta_seed` re-seeds only on a CHANGED envelope and two spellings would
+cost a re-pull after every first pull. Both keys are in `metadata.PER_CHANNEL_KEYS`, so
+`channel_select` (the `chK` taps, `channel.select`) narrows them in lockstep with the axis.
+Until this the edit-time envelope carried only `channel_emission_nm`: past a `chK` wire a
+card could tint by emission but could only call its stream `Ch0`. The engine's "calibration
+schema" rule for the seed stands otherwise — `ctx.calib` still refuses a non-calibration key;
+these two are display lists the engine never reads.
+
+**One resolution, three readers.** `GraphDocument.socket_channels(node, socket, io)` — a
+`chK` output is channel K of `channel_descriptors`; a Page Input's `item:<name>` is what that
+item's wire carries (`page_channel_scope`); any other output the node's own list; an input its
+wire's source socket; a `fresh_output` node (a plot's picture) none. `channel_subset` keeps
+them only when `1 <= len < source_channel_total` — the wire tint's long-standing rule, now
+shared by the socket's text (`socket_text`: a generic `data`/`out` becomes `Cy5`, a named
+`raw` becomes `raw · DAPI`, a synthetic socket keeps its label), its dot
+(`NodeItem._tint_channel_socket`, inputs too, re-applied in `refresh`'s cheap branch because a
+wire arrives after the card is laid out) and its wire (`EdgeItem._channel_colors`), all
+coloured by `node_item.desc_qcolor` (native colour, else emission). `source_channel_total`
+crosses a page: a root `page.input` asks `Workspace.input_channel_scope` (hook
+`doc.page_channel_scope`) for the FILE's total on the page it reads from, recursively, so a
+one-channel stream three pages down still knows it is one of three.
+`_inherited_channel_descriptors` narrows through a `chK` wire instead of stopping at it, so a
+seed from before the names rode it (an older session's graph, until its first pull) still
+yields the file's name and native colour past a tap. A Page Output item wired from a channel
+is named by it (`_item_default`: `Cy5`; `gaussian_blur_cy5` for a node on that stream).
+
+see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream names its channel](../MANUAL.md)

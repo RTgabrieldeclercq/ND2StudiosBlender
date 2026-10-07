@@ -33,7 +33,7 @@ import: this module must remain importable — and its TIFF half usable — with
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -329,7 +329,10 @@ def read_channel_display(path: str) -> Dict[str, Any]:
     to answer "where on the stage is this pixel?" in the Viewer's hover readout, and to let
     ``view.overlay`` place one file's voxels inside another's field. A
     superset of the engine calibration; kept separate so the engine envelope stays the
-    locked calibration schema. TIFF carries no optics or stage log, so it degrades to
+    locked calibration schema — with one deliberate exception since V4.00 step 11g: the
+    per-channel NAMES and native colours also ride the source envelope
+    (:func:`channel_display_seed`), so a stream downstream of a channel tap can say which
+    channel it is. TIFF carries no optics or stage log, so it degrades to
     ``Ch0…`` names (emission absent → a neutral grey tint downstream) and cannot be
     placed at all — which the overlay node reports rather than guesses."""
     if _is_tiff(path):
@@ -522,11 +525,54 @@ def read_image(path: str, progress: Optional[ProgressFn] = None
             else read_nd2(path, progress))
 
 
+def channel_display_seed(display: Mapping[str, Any], c: int) -> Dict[str, Any]:
+    """The per-channel lists a SOURCE envelope carries so that every stream downstream knows
+    which channel it is (V4.00 step 11g): ``channel_names`` (one per channel, ``Ch{i}`` where
+    the file has none) and, when the file carries any, ``channel_colors`` (an ``[r, g, b]``
+    triple or ``None`` per channel — a packed int has an ambiguous byte order and is not
+    used).
+
+    Until this, the names lived on the Load card alone (its captured ``__channels__``) and on
+    the pulled payload; the edit-time envelope carried only ``channel_emission_nm``, so past a
+    ``chK`` wire a card could tint its wire by the emission but could only ever call the
+    stream ``Ch0``. Both lists are in :data:`nodegraph.metadata.PER_CHANNEL_KEYS`, so a
+    ``channel.select`` narrows them in lockstep with the axis — which is exactly what makes
+    them trustworthy downstream.
+
+    ONE function for the GUI's load-time seed and the runner's resolved envelope, because the
+    document re-seeds only when the envelope CHANGED (``set_meta_seed``) and two spellings of
+    the same list would cost a re-pull of everything after the first pull of every file."""
+    c = int(c or 0)
+    if c <= 0:
+        return {}
+    names = display.get("channel_names")
+    out: Dict[str, Any] = {"channel_names": [
+        (str(names[i]) if isinstance(names, (list, tuple)) and i < len(names)
+         and names[i] not in (None, "") else f"Ch{i}")
+        for i in range(c)]}
+    cols = display.get("channel_colors")
+    if isinstance(cols, (list, tuple)):
+        triples = [([int(v) for v in cols[i]]
+                    if i < len(cols) and isinstance(cols[i], (list, tuple))
+                    and len(cols[i]) == 3 else None)
+                   for i in range(c)]
+        if any(x is not None for x in triples):
+            out["channel_colors"] = triples
+    return out
+
+
+def with_channel_display(env: MetaEnvelope, display: Mapping[str, Any]) -> MetaEnvelope:
+    """``env`` carrying :func:`channel_display_seed` for its own channel count."""
+    seed = channel_display_seed(display or {}, int(getattr(env.axes, "c", 0) or 0))
+    return env.with_metadata(**seed) if seed else env
+
+
 def read_meta_only(path: str) -> Tuple[AxisSizes, Dict[str, Any], Dict[str, Any]]:
     """``(axes, calibration, channel_display)`` for ``path`` **without realizing pixels**
     — the cheap read the File-menu loader uses to seed a node's envelope + per-channel
     output sockets the instant a file is picked (the heavy ingest happens lazily on the
-    first pull). Works for ND2 and TIFF."""
+    first pull). Works for ND2 and TIFF. The seed takes the display's per-channel lists
+    through :func:`with_channel_display`, as the runner's resolved envelope does."""
     calib = read_calibration(path)
     disp = read_channel_display(path)
     if _is_tiff(path):

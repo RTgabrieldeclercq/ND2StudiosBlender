@@ -962,8 +962,11 @@ def group_picks(metadata: Mapping[str, Any], axes: Any, raw: Any,
 #:
 #: Only ``channel_emission_nm`` is calibration (:data:`~nodegraph.dataset.CALIBRATION_KEYS`);
 #: the rest are the Viewer's per-channel display lists, seeded onto the payload by
-#: :attr:`nodelab_v2.runner.EngineRunner._channel_display`. They travel together, so they
-#: are subset together.
+#: :attr:`nodelab_v2.runner.EngineRunner._channel_display` — and, since V4.00 step 11g,
+#: ``channel_names``/``channel_colors`` onto the edit-time SOURCE envelope as well
+#: (:func:`nodelab_v2.ingest.channel_display_seed`), which is what lets a card downstream
+#: of a channel tap name the channel it carries. They travel together, so they are subset
+#: together.
 PER_CHANNEL_KEYS: Tuple[str, ...] = (
     "channel_emission_nm", "channel_names",
     "channel_excitation_nm", "channel_colors",

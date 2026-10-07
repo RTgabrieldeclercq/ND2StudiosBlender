@@ -27820,6 +27820,156 @@ def test_page_output_items() -> None:
         "Output previews the first only); the outline lists them; saved and reopened")
 
 
+def test_channel_provenance() -> None:
+    """V4.00 step 11g: a stream names the channel it came from. The file's channel names
+    ride the source envelope (``ingest.channel_display_seed`` — one spelling for the
+    file-pick seed and the pull's envelope) and narrow with the axis at every
+    ``channel.select``; the document resolves the channels on ONE socket
+    (``socket_channels`` / ``channel_subset``: a strict subset of the file's, the wire tint's
+    rule) and prints them (``socket_text``: a generic ``data``/``out`` becomes ``Cy5``, a role
+    socket ``raw · DAPI``, two channels ``DAPI · GFP``, three or more ``DAPI +2``, the full
+    bundle and a synthetic socket unchanged). The file's total crosses a page boundary
+    (``Workspace.input_channel_scope``), a ``fresh_output`` node carries no channel, an older
+    seed without names still yields them past a ``chK`` tap (the inherited walk narrows), and
+    a Page Output item wired from a channel is named by it."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import CHANNELS_KEY, GraphDocument
+    from nodelab_v2.ingest import channel_display_seed, with_channel_display
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    CH = [{"name": "DAPI", "emission_nm": 461.0, "color": [0, 0, 255]},
+          {"name": "GFP", "emission_nm": 509.0, "color": None},
+          {"name": "Cy5", "emission_nm": 670.0, "color": None}]
+    DISP = {"channel_names": ["DAPI", "GFP", "Cy5"],
+            "channel_colors": [[0, 0, 255], None, None]}
+    ax = AxisSizes(m=1, t=1, z=1, c=3, y=32, x=32)
+    calib = {"pixel_size_um": 0.5, "channel_emission_nm": [461.0, 509.0, 670.0]}
+
+    # the seed: names per channel (Ch{i} where the file has none), colours only as triples,
+    # nothing for no channels; idempotent, so the two sides cannot drift
+    assert channel_display_seed(DISP, 3) == {"channel_names": ["DAPI", "GFP", "Cy5"],
+                                             "channel_colors": [[0, 0, 255], None, None]}
+    assert channel_display_seed({}, 2) == {"channel_names": ["Ch0", "Ch1"]}
+    assert channel_display_seed({"channel_names": ["A"], "channel_colors": [None]}, 2) == {
+        "channel_names": ["A", "Ch1"]}
+    assert channel_display_seed(DISP, 0) == {}
+    env = MetaEnvelope(axes=ax, metadata=dict(calib))
+    seeded = with_channel_display(env, DISP)
+    assert with_channel_display(seeded, DISP) == seeded
+    assert seeded.metadata["channel_names"] == ["DAPI", "GFP", "Cy5"]
+
+    def text(doc, nid, name, io):
+        specs = doc.input_specs(nid) if io == "in" else doc.output_specs(nid)
+        s = next(s for s in specs if s.name == name)
+        return doc.socket_text(nid, s, io)
+
+    def build(with_names: bool):
+        doc = GraphDocument()
+        doc.add_node("io.load", node_id="L", params={CHANNELS_KEY: CH})
+        doc.meta_seeds["L"] = seeded if with_names else env
+        doc.add_node("enhance.gaussian", node_id="G", params={"sigma": 1.0},
+                     modes={"dim": "2D"})
+        doc.add_node("analysis.threshold", node_id="T",
+                     params={"method": "fixed", "threshold": 1.0})
+        doc.add_node("enhance.median", node_id="M")
+        doc.add_node("analysis.measure", node_id="X")
+        doc.add_node("channel.select", node_id="S", params={"channels": "0,1"})
+        doc.add_node("enhance.gamma", node_id="Y")
+        doc.connect("L", "ch2", "G", "data")
+        doc.connect("G", "out", "T", "data")
+        doc.connect("L", "image", "M", "data")
+        doc.connect("T", "out", "X", "data")
+        doc.connect("L", "ch0", "X", "raw")
+        doc.connect("L", "image", "S", "data")
+        doc.connect("S", "out", "Y", "data")
+        return doc
+
+    doc = build(True)
+    # the envelope past a tap knows its channel, and the names narrow with the axis
+    assert doc.env("G").metadata.get("channel_names") == ["Cy5"]
+    assert doc.env("S").metadata.get("channel_names") == ["DAPI", "GFP"]
+    assert [d["name"] for d in doc.channel_descriptors("T")] == ["Cy5"]
+    assert doc.source_channel_total("T") == 3
+    # a generic socket takes the channel; a role socket adds it; the bundle stays data/out
+    assert text(doc, "G", "data", "in") == "Cy5" and text(doc, "G", "out", "out") == "Cy5"
+    assert text(doc, "X", "data", "in") == "Cy5"
+    assert text(doc, "X", "raw", "in") == "raw · DAPI", text(doc, "X", "raw", "in")
+    assert text(doc, "M", "data", "in") == "data" and text(doc, "M", "out", "out") == "out"
+    assert text(doc, "L", "image", "out") == "image"
+    assert doc.channel_subset("L", "image") == []
+    assert [d["name"] for d in doc.channel_subset("L", "ch2")] == ["Cy5"]
+    assert doc.channel_subset("G", "data", "in")[0]["color"] is None     # Cy5 has no native
+    assert doc.channel_subset("X", "raw", "in")[0]["color"] == [0, 0, 255]  # DAPI's, captured
+    # two of three: both named
+    assert text(doc, "Y", "data", "in") == "DAPI · GFP"
+    assert doc.channel_tag("S", "out") == "DAPI · GFP"
+    # a synthetic socket keeps its label — the channel is on the `out` above it
+    assert text(doc, "L", "ch0", "out") == "0 · DAPI"
+    assert [text(doc, "T", s.name, "out") for s in doc.output_specs("T")] == [
+        "Cy5", "image only", "mask only"]
+    # a NEW Dataset (a plot's picture) is no channel of the file's
+    doc.add_node("plot.xy", node_id="P")
+    doc.connect("X", "out", "P", "data")
+    assert doc.channel_subset("P", "out") == []
+    # a Page Output item wired from a channel is named by it; a node on that stream appends it
+    assert doc._item_default("L", "ch2") == "Cy5"
+    assert doc._item_default("G", "out") == "gaussian_blur_cy5", doc._item_default("G", "out")
+    assert doc._item_default("M", "out") == "median"
+    assert doc._item_default("T", "part:mask") == "mask"
+    # three or more: a count
+    four = GraphDocument()
+    four.add_node("io.load", node_id="L", params={CHANNELS_KEY: [
+        {"name": n, "emission_nm": None, "color": None} for n in "ABCD"]})
+    four.meta_seeds["L"] = with_channel_display(
+        MetaEnvelope(axes=AxisSizes(m=1, t=1, z=1, c=4, y=8, x=8),
+                     metadata={"pixel_size_um": 1.0}),
+        {"channel_names": list("ABCD")})
+    four.add_node("channel.select", node_id="S", params={"channels": "0,1,2"})
+    four.connect("L", "image", "S", "data")
+    assert four.channel_tag("S", "out") == "A +2", four.channel_tag("S", "out")
+
+    # a seed WITHOUT names (a graph from an older session, before its first pull): the
+    # inherited walk narrows through the tap, so the card past it still says Cy5 with the
+    # file's native colour; a select-by-param keeps the envelope's fallback until the re-seed
+    old = build(False)
+    assert old.env("G").metadata.get("channel_names") is None
+    assert [d["name"] for d in old.channel_descriptors("T")] == ["Cy5"]
+    assert text(old, "T", "out", "out") == "Cy5" and text(old, "X", "raw", "in") == "raw · DAPI"
+    assert [d["name"] for d in old.channel_descriptors("S")] == ["Ch0", "Ch1"]
+
+    # across pages: the Input's `out` is one of THREE, an item what its own wire carries
+    ws = Workspace()
+    I = ws.add_page("Input", "input")
+    R = ws.add_page("Refine", "refine")
+    I.doc.add_node("io.load", node_id="L", params={CHANNELS_KEY: CH})
+    I.doc.meta_seeds["L"] = seeded
+    I.doc.add_node("page.output", node_id="O", params={"name": "raw"})
+    I.doc.connect("L", "ch2", "O", "data")
+    I.doc.connect("L", "image", "O", "data_2")
+    items = I.doc.output_items("O")
+    assert items[0] == ("data", "Cy5") and items[1][0] == "data_2", items
+    R.doc.add_node("page.input", node_id="IN", params={"source": "pg1:raw"})
+    R.doc.add_node("enhance.gaussian", node_id="G", params={"sigma": 1.0}, modes={"dim": "2D"})
+    R.doc.add_node("enhance.median", node_id="M")
+    R.doc.connect("IN", "out", "G", "data")
+    R.doc.connect("IN", f"item:{items[1][1]}", "M", "data")
+    assert R.doc.source_channel_total("IN") == 3, R.doc.source_channel_total("IN")
+    assert text(R.doc, "IN", "out", "out") == "Cy5"
+    assert text(R.doc, "G", "data", "in") == "Cy5" and text(R.doc, "G", "out", "out") == "Cy5"
+    assert text(R.doc, "M", "data", "in") == "data"          # the bundle item: everything
+    assert R.doc.env("G").metadata.get("channel_names") == ["Cy5"]
+    assert ws.input_channel_scope("pg2", "IN") == ([CH[2]], 3)
+    descs, total = ws.input_channel_scope("pg2", "IN", items[1][1])
+    assert [d["name"] for d in descs] == ["DAPI", "GFP", "Cy5"] and total == 3
+    assert ws.input_channel_scope("pg2", "IN", "nope") == ([], 0)
+    assert GraphDocument().page_channel_scope("x") == ([], 0)    # detached: nothing
+    _ok("channel provenance (V4.00 step 11g): the file's channel names ride the source "
+        "envelope and narrow with the axis; a generic socket past a tap reads the channel "
+        "(Cy5), a role socket adds it (raw · DAPI), two read both, three a count, the bundle "
+        "and synthetic sockets unchanged; the total crosses pages; a new Dataset is no "
+        "channel; an un-named seed still names past a tap; items are named by channel")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -28008,6 +28158,7 @@ def main() -> int:
     test_page_outline()
     test_data_parts()
     test_page_output_items()
+    test_channel_provenance()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

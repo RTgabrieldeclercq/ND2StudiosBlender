@@ -194,6 +194,10 @@ anchors: sym:nodelab_v2.runner.EngineRunner, file:nodelab_v2/ingest.py
    `frame_datetime` (2026-10-02; the Viewer's timestamp overlay and the Timeseries Builder
    read it), `stage_layout_source`, `acquisition_start`, and the per-M `position_name` —
    each best-effort, and dropped whole rather than padded when the file carries it short.
+   The per-channel **names and native colours** ride the source envelope too
+   (`ingest.channel_display_seed`, V4.00 step 11g — the one function the file-pick seed and
+   the runner's resolved envelope both go through), so a stream downstream of a channel tap
+   can say which channel it is (CON-23).
 2b. **There are two routes, chosen by `io.load`'s `access` mode**, and the store is only
    one of them. Under `access="direct"` — **the default** (`ops.ACCESS_DEFAULT`), for a
    freshly placed card and for every graph saved before this mode existed alike — the

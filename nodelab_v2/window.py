@@ -5450,8 +5450,12 @@ class MainWindow(QMainWindow):
         # edit-time envelope and the pulled payload must agree about a positional list, and
         # `EngineRunner._resolve_source` stamps the identical value on the pull side. It is
         # what lets `util.timeseries` order separately loaded files by their names.
-        self.doc.set_meta_seed(rec.id, stamp_source_file(
-            MetaEnvelope(axes=axes, metadata=dict(calib)), path))
+        # ...and the channel names/colours ride it (V4.00 step 11g): the SAME
+        # `with_channel_display` the runner applies to its resolved envelope, so the two
+        # agree and the first pull re-seeds nothing.
+        from nodelab_v2.ingest import with_channel_display
+        self.doc.set_meta_seed(rec.id, stamp_source_file(with_channel_display(
+            MetaEnvelope(axes=axes, metadata=dict(calib)), disp), path))
         return rec, axes
 
     def _add_bundle_node(self, paths: list, x: float, y: float):
@@ -5533,9 +5537,11 @@ class MainWindow(QMainWindow):
         # The seed envelope must say the same thing the pull will (the edit-time envelope
         # and the payload agreeing is the standing rule for anything that changes axes):
         # M is the sum, and `source_file` names the file each position came from.
+        from nodelab_v2.ingest import channel_display_seed
         md = dict(calib0)
         md[SOURCE_FILE_KEY] = [labels[i] for i, h in enumerate(heads)
                                for _ in range(int(h[1].m))]
+        md.update(channel_display_seed(disp0, ax0.c))      # the names ride it (step 11g)
         self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))
         return rec, axes
 

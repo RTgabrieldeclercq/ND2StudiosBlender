@@ -648,6 +648,30 @@ These are a GUI convenience: at run time each `chK` wire is rewritten into a rea
 `channel.select` tap with `channels=[K]`, so the engine sees an ordinary node. The `out`
 socket carries the full multi-channel bundle.
 
+### A stream names its channel (V4.00 step 11g)
+
+Take the `2 · Cy5` socket into a Gaussian and the Gaussian's sockets no longer read `data`
+and `out`: they read **`Cy5`**, its dot is tinted Cy5's colour like the wire, and so is every
+card after it — the Threshold, the Label, the Measure, the Page Output, and the Page Input on
+the next page. A stream knows which of the file's channels it is wherever it goes:
+
+* on a **generic** socket (`data` in, `out` out) the channel REPLACES the name: `Cy5`;
+* on a socket with a **role** of its own (`raw`, `reference`, `areas`) it is added:
+  `raw · DAPI` — the name says what the wire is for, the channel says what it carries;
+* a stream carrying **two** of the channels reads `DAPI · GFP`; three or more `DAPI +2`;
+* the **full bundle** is not a channel — a card fed everything still reads `data` / `out`,
+  exactly as its wire is not tinted;
+* a **synthetic** socket keeps its own label (`0 · DAPI`, `mask only`, `item · cells`): the
+  channel is already on the `out` above it. Hover any Dataset socket for the words:
+  `channel: Cy5 — 1 of 3 channels`.
+
+A Page Output fed from a channel socket names its item after the channel (`Cy5`), and one
+fed from a node on a single-channel stream appends it (`gaussian_blur_cy5`), so a variable
+says where it came from without anyone typing it. The names travel on the data itself: the
+file's channel names ride the source envelope and every `channel.select` narrows them with
+the axis, so this holds through any depth of pages — and a graph saved by an older build gets
+them back on its first pull.
+
 ### One kind of data at a time — part sockets (V4.00 step 11f)
 
 A node's `out` carries everything it has: after a Threshold the image AND its mask, after
@@ -3567,6 +3591,7 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **A Refinement page is empty and I cannot get the image into it** | Load the image first (it is published on Image Input), then open the page — it gets a bound Page Input; or place a Page Input from the palette's **Pages** band, which binds to the nearest named Output. Nothing to bind to yet? *Go to Image Input* under its Source menu |
 | **The start card covers my page / will not go away** | Its **✕** (top right) or *Start empty* hides it for that page; File → New brings the cards back. On a Refinement, Processing or Analysis page it is a banner along the bottom edge, below the page's Page Input |
 | **I lose track of my pages** | Use the **tabs** along the top of the canvas — a row of page kinds, and under it the pages of the kind shown (drag to reorder, ✕ to close a tab you do not need on screen) — and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, each with its nodes in data-flow order and its Outputs highlighted by variable name |
+| **A wire is tinted by a channel but its sockets just say `data`** | Fixed (V4.00 step 11g): a stream carrying one (or some) of the file's channels names it on every Dataset socket downstream — `Cy5` on a generic socket, `raw · DAPI` on a named one (§4 *A stream names its channel*). A full bundle keeps `data` / `out`; a graph saved by an older build regains the names on its first pull |
 | **I only want a node's mask (or its labels, or its table), not the image with it** | Wire the card's part socket — `mask only`, `labels only`, … under `out` — instead of `out` (§4 *One kind of data at a time*). A mask arrives as a 0/1 image; `image only` drops every layer. The sockets appear when the output carries more than one kind of data |
 | **I want to hand several things to the next page under one name** | Wire them all into one Page Output (a slot appears under the last one wired) and name them in its **Items** field; the next page's Page Input offers each on its own `item · …` socket |
 | **A Page Input's `item · …` socket disappeared** | That item was unwired from the Output it reads, or renamed in the Output's **Items** field — a wire from the old socket no longer resolves. Rewire it from the socket the item has now |

@@ -195,6 +195,18 @@
   "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
+ "CON-23": {
+  "anchors": {
+   "sym:nodelab_v2.document.GraphDocument.channel_subset": "e5d1690efdbd3cdc1c9a7fdd23b286b6",
+   "sym:nodelab_v2.document.GraphDocument.socket_text": "361800f5aa1ca67aa5b43c366faaf6c8",
+   "sym:nodelab_v2.document.GraphDocument.source_channel_total": "4963c5a86ce36e278c5b3545939f2531",
+   "sym:nodelab_v2.ingest.channel_display_seed": "e1fc220d73fd6976998320a2b743de9d",
+   "sym:nodelab_v2.ingest.with_channel_display": "6849c0402597ebe909e595d7a0ca4ead",
+   "sym:nodelab_v2.workspace.Workspace.input_channel_scope": "c3a0b5b15ab848ca719f0df57451bb21"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
@@ -370,10 +382,10 @@
  },
  "WF-07": {
   "anchors": {
-   "file:nodelab_v2/ingest.py": "bc5ce16eb52c0da33079bd8715b13920",
+   "file:nodelab_v2/ingest.py": "67ac07263bf79ab44516eeaaea92b2f0",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-06",
   "file": "codemap/workflows.md"
  },
  "WF-08": {

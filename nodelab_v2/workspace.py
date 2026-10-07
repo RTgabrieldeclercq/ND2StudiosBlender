@@ -616,6 +616,8 @@ class Workspace:
         doc.page_sources = lambda pid=pid: self.available_sources(pid)
         doc.page_feeders = lambda pid=pid: self.feeder_pages(pid)
         doc.page_channels = lambda nid, pid=pid: self.input_channels(pid, nid)
+        doc.page_channel_scope = (lambda nid, item="", pid=pid:
+                                  self.input_channel_scope(pid, nid, item))
         doc.page_items = lambda nid, pid=pid: self.input_items(pid, nid)
         doc.node_defaults = lambda op, pid=pid: self.node_defaults(pid, op)
         doc.claim_output_name = (lambda nid, name, pid=pid:
@@ -651,6 +653,7 @@ class Workspace:
         doc.page_sources = lambda: []
         doc.page_feeders = lambda: []
         doc.page_channels = lambda _nid: []
+        doc.page_channel_scope = lambda _nid, _item="": ([], 0)
         doc.page_items = lambda _nid: []
         doc.node_defaults = lambda _op: {}
         doc.claim_output_name = doc._claim_output_name_here
@@ -1258,6 +1261,32 @@ class Workspace:
             return []
         up, out_nid = res
         return list(self.pages[up].doc.channel_descriptors(out_nid))
+
+    def input_channel_scope(self, page_id: str, node_id: str,
+                            item: str = "") -> Tuple[List[dict], int]:
+        """``(channel descriptors, the source file's channel total)`` of what the Page Input
+        ``node_id`` on ``page_id`` carries — or, with ``item``, of that ITEM of the
+        several-item Output it reads (the wire into that slot). The total is the upstream
+        page's :meth:`GraphDocument.source_channel_total`, which itself crosses further pages
+        through this hook, so a one-channel stream three pages down still knows it is one of
+        the file's three. ``([], 0)`` while unbound (V4.00 step 11g)."""
+        page = self.pages.get(page_id)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None or rec.op_key != PAGE_INPUT_OP:
+            return [], 0
+        res = self.resolve_source(page_id, rec.params.get(PAGE_SOURCE_KEY))
+        if res is None:
+            return [], 0
+        up, out_nid = res
+        doc = self.pages[up].doc
+        if not item:
+            return list(doc.channel_descriptors(out_nid)), int(doc.source_channel_total(out_nid))
+        sock = next((s for s, n in doc.output_items(out_nid) if n == item), None)
+        edge = doc.edge_into(out_nid, sock) if sock else None
+        if edge is None:
+            return [], 0
+        return (list(doc.socket_channels(edge[0], edge[1], "out")),
+                int(doc.source_channel_total(edge[0])))
 
     # ── a several-item Output (V4.00 step 11f) ─────────────────────────────────
     def input_items(self, page_id: str, node_id: str) -> List[str]:

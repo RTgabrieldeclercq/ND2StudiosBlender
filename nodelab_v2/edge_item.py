@@ -21,17 +21,7 @@ from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem
 
 from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
-from nodelab_v2.node_item import SocketItem
-
-
-def _avg_color(cols: list):
-    """The component-wise mean of a list of QColors (the aggregate channel tint for a
-    wire carrying a multi-channel subset)."""
-    n = len(cols)
-    from PySide6.QtGui import QColor
-    return QColor(round(sum(c.red() for c in cols) / n),
-                  round(sum(c.green() for c in cols) / n),
-                  round(sum(c.blue() for c in cols) / n))
+from nodelab_v2.node_item import SocketItem, avg_qcolor as _avg_color, desc_qcolor
 
 
 def wire_path(a, b) -> QPainterPath:
@@ -87,24 +77,16 @@ class EdgeItem(QGraphicsPathItem):
     def _channel_colors(self) -> list:
         """The per-channel colors this Dataset wire carries **when it carries a strict
         subset** of the source file's channels — else ``[]`` (a full multi-channel bundle
-        is not channel-tinted). A synthetic ``chK`` output carries exactly channel K; any
-        other Dataset output is judged by its propagated envelope (``c`` channels, tinted
-        by emission) against the upstream file total."""
+        is not channel-tinted). Read from the document's one resolution
+        (:meth:`GraphDocument.channel_subset`, V4.00 step 11g) — the same descriptors the
+        socket's text and dot use, so the wire, its ends and their names agree; a
+        descriptor's native colour when the file has one, else its emission's."""
         ni = self.src.node_item
-        idx = ni.output_channel_index(self.src.spec.name)
-        if idx is not None:
-            return [ni.channel_qcolor(idx)]
-        env = ni.env()
-        c = env.axes.c
-        if c <= 0 or "c" in env.unknown_axes:
+        try:
+            descs = ni.doc.channel_subset(ni.rec.id, self.src.spec.name, "out")
+        except Exception:  # noqa: BLE001 — a paint must never raise
             return []
-        total = ni.doc.source_channel_total(ni.rec.id)
-        if not (1 <= c < total):
-            return []
-        emis = env.metadata.get("channel_emission_nm")
-        return [T.emission_qcolor(emis[i] if isinstance(emis, (list, tuple))
-                                  and i < len(emis) else None)
-                for i in range(c)]
+        return [desc_qcolor(d) for d in descs]
 
     def _wire_colors(self) -> list:
         """The colors this wire is tinted by. A Dataset wire → one color per domain in
