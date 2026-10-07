@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from nodegraph import roles as R
-from nodegraph.registry import NODES
+from nodegraph.registry import DIM_MODE, NODES
 from nodegraph.sockets import SocketType
 from nodelab_v2 import demo_recipes as DR
 from nodelab_v2 import overlays as OV
@@ -370,6 +370,10 @@ class NodeDemoWindow(QDialog):
         self._debounce.setInterval(_DEBOUNCE_MS)
         self._debounce.timeout.connect(self._fire)
         self._missing: List[str] = []
+        #: which of the recipe's scenarios (synthetic worlds) is running; 0 when it has none
+        self._scenario = 0
+        self._scenario_ctl: Optional[_Control] = None
+        self._phantom_label: Optional[QLabel] = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -381,7 +385,7 @@ class NodeDemoWindow(QDialog):
             return
 
         try:
-            self._session = DR.DemoSession(self.recipe)
+            self._session = DR.DemoSession(self._active_recipe())
         except Exception as exc:                  # noqa: BLE001 — a bad recipe shows itself
             root.addWidget(self._guide_pane(error=str(exc)), 1)
             return
@@ -439,19 +443,29 @@ class NodeDemoWindow(QDialog):
         desc = QLabel(text)
         desc.setWordWrap(True)
         lay.addWidget(desc)
-        if not self.recipe.is_guide and self.recipe.phantom:
-            try:
-                cap = DR.phantom(self.recipe.phantom, **dict(self.recipe.phantom_kw)).caption
-            except Exception:                     # noqa: BLE001
-                cap = self.recipe.phantom
-            pre = " → ".join(NODES.get(s.op).label if NODES.get(s.op) else s.op
-                             for s in self.recipe.prelude)
-            what = f"Phantom: {cap}" + (f"  ·  upstream: {pre}" if pre else "")
-            ph = QLabel(what)
+        if not self.recipe.is_guide and (self.recipe.phantom or self.recipe.scenarios):
+            ph = QLabel(self._phantom_caption())
             ph.setProperty("role", "muted")
             ph.setWordWrap(True)
             lay.addWidget(ph)
+            self._phantom_label = ph
         return hd
+
+    def _active_recipe(self) -> DR.DemoRecipe:
+        """The recipe with the chosen scenario applied (the recipe itself when it has none)."""
+        return DR.scenario_recipe(self.recipe, self._scenario)
+
+    def _phantom_caption(self) -> str:
+        """The header's line on the synthetic data: the phantom's own caption, which states
+        the TRUE motion / layout so the node's result can be read against it."""
+        rec = self._active_recipe()
+        try:
+            cap = DR.phantom(rec.phantom, **dict(rec.phantom_kw)).caption
+        except Exception:                         # noqa: BLE001
+            cap = rec.phantom
+        pre = " → ".join(NODES.get(s.op).label if NODES.get(s.op) else s.op
+                         for s in rec.prelude)
+        return f"Phantom: {cap}" + (f"  ·  upstream: {pre}" if pre else "")
 
     def _controls_pane(self) -> QWidget:
         wrap = QWidget()
@@ -493,8 +507,27 @@ class NodeDemoWindow(QDialog):
                 w.deleteLater()
         self._controls.clear()
         self._mode_controls.clear()
-        spec, sess, rec = self.spec, self._session, self.recipe
+        spec, sess = self.spec, self._session
+        rec = sess.recipe                      # the active scenario's fixed values and view
         state = {**self._modes}
+        # the synthetic world, when the recipe offers more than one (2026-10-07): a dropdown
+        # above the modes, with the scenario's note on what to look for
+        self._scenario_ctl = None
+        if self.recipe.scenarios:
+            labels = [sc.label for sc in self.recipe.scenarios]
+            cur = self.recipe.scenarios[min(self._scenario, len(labels) - 1)]
+            self._ctl_lay.addWidget(self._eyebrow("Synthetic data"))
+            self._scenario_ctl = _ChoiceControl("__scenario", labels, cur.label)
+            self._scenario_ctl.setToolTip(
+                "Which synthetic world the node runs on. Each world's true motion is stated "
+                "in the caption under the title, so the result can be read against it.")
+            self._scenario_ctl.changed.connect(self._on_scenario_changed)
+            self._ctl_lay.addWidget(self._scenario_ctl)
+            if cur.note:
+                note = QLabel(cur.note)
+                note.setProperty("role", "muted")
+                note.setWordWrap(True)
+                self._ctl_lay.addWidget(note)
         grid_modes = QGridLayout()
         grid_modes.setContentsMargins(0, 0, 0, 0)
         grid_modes.setHorizontalSpacing(8)
@@ -708,6 +741,58 @@ class NodeDemoWindow(QDialog):
         self._run_btn.setVisible(self._is_slow())
         self._schedule()
 
+    def _on_scenario_changed(self) -> None:
+        """Switch the synthetic world. The worker is bound to a session and a session to a
+        phantom, so both are rebuilt; the user's settings carry over where the new world does
+        not fix them, except the 2D/3D lever, which re-derives from the new phantom's depth."""
+        if self._scenario_ctl is None or self._session is None:
+            return
+        labels = [sc.label for sc in self.recipe.scenarios]
+        label = str(self._scenario_ctl.value())
+        idx = labels.index(label) if label in labels else 0
+        if idx == self._scenario:
+            return
+        self._scenario = idx
+        self._debounce.stop()
+        if self._worker is not None:
+            self._worker.shutdown()
+            self._worker = None
+        self._session = DR.DemoSession(self._active_recipe())
+        rec = self._session.recipe
+        start = self._session.starting_values()
+        kept = {k: v for k, v in self._values.items()
+                if k in start and k not in rec.fixed_params and v != start[k]}
+        self._values = {**start, **kept}
+        fresh = self._session.default_state()
+        self._modes = {**fresh, **{k: v for k, v in self._modes.items()
+                                   if k in fresh and k not in rec.fixed_modes
+                                   and k != DIM_MODE}}
+        self._elapsed.clear()
+        self._auto_slow = False
+        self.last_result = None
+        self._frame = None
+        self._before_frame = None
+        if self._phantom_label is not None:
+            self._phantom_label.setText(self._phantom_caption())
+        self._build_controls()
+        for name, ctl in self._controls.items():
+            if name in kept and not isinstance(ctl, _ReadonlyControl):
+                ctl.touched = True              # a carried-over value is still a chosen one
+        self._missing = self._session.missing_requirements()
+        if self._missing:
+            self._set_status(f"needs the optional package(s) {', '.join(self._missing)} — "
+                             f"pip install {' '.join(self._missing)}", error=True)
+            self._run_btn.setEnabled(False)
+            return
+        self._run_btn.setEnabled(True)
+        self._worker = _DemoWorker(self._session)
+        self._worker.done.connect(self._on_done)
+        self._run_btn.setVisible(self._is_slow())
+        if self._is_slow():
+            self._set_status(f"press Run — {rec.slow_reason or 'this node is slow'}")
+        else:
+            self._fire()
+
     def _on_view_changed(self) -> None:
         if self._session is None:
             return
@@ -778,6 +863,10 @@ class NodeDemoWindow(QDialog):
         self._elapsed.append(res.elapsed_s)
         params, _m = self._collect()
         note = f"  ·  {res.note}" if res.note else ""
+        fv = getattr(res, "frame_values", None) or {}
+        if fv:                                     # the transform applied to the viewed frame
+            note += (f"  ·  frame {res.view[0]}: "
+                     + ", ".join(f"{k} {v:+.2f}" for k, v in fv.items()))
         self._set_status(f"{self._describe(params)}  ·  {res.elapsed_s * 1000:.0f} ms{note}")
         if (not self._auto_slow and self._session.recipe.live and len(self._elapsed) >= 2
                 and all(e > _SLOW_S for e in self._elapsed[-2:])):

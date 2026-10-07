@@ -60,10 +60,11 @@ from nodegraph.streaming import TileCache, realize
 from nodelab_v2.value_steps import value_decimals, value_step
 
 __all__ = [
-    "KINDS", "GUIDE", "SliderRange", "PreludeStep", "DemoRecipe", "DemoResult", "DemoSession",
-    "DEMOS_PATH", "ROLE_DEFAULTS", "PRELUDES", "load_curation", "validate_curation",
-    "recipe_for", "role_default", "all_demo_ops", "control_kind", "slider_range",
-    "derived_defaults", "derived_modes", "guide_html", "demo_rows",
+    "KINDS", "GUIDE", "SliderRange", "PreludeStep", "Scenario", "DemoRecipe", "DemoResult",
+    "DemoSession", "DEMOS_PATH", "ROLE_DEFAULTS", "PRELUDES", "load_curation",
+    "validate_curation", "recipe_for", "scenario_recipe", "role_default", "all_demo_ops",
+    "control_kind", "slider_range", "derived_defaults", "derived_modes", "guide_html",
+    "demo_rows",
 ]
 
 #: the curated overrides, beside the roles file they extend
@@ -100,11 +101,31 @@ class PreludeStep:
 
 
 @dataclass(frozen=True)
+class Scenario:
+    """One synthetic world a demo can be switched to (2026-10-07): a phantom with its
+    keywords, the plane to view, values the scenario fixes, and a one-line note on what to
+    look for. The first scenario is the demo's default."""
+    label: str
+    phantom: str
+    phantom_kw: Mapping[str, Any] = field(default_factory=dict)
+    view: Mapping[str, int] = field(default_factory=dict)
+    fixed_params: Mapping[str, Any] = field(default_factory=dict)
+    fixed_modes: Mapping[str, str] = field(default_factory=dict)
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class DemoRecipe:
     op: str
     kind: str
     phantom: str = ""
     phantom_kw: Mapping[str, Any] = field(default_factory=dict)
+    #: alternative synthetic worlds the window offers in a *Synthetic data* dropdown; the
+    #: entry-level ``phantom`` may be empty when scenarios exist — the first one is then the
+    #: default (see :func:`scenario_recipe`)
+    scenarios: Tuple["Scenario", ...] = ()
+    #: which scenario this recipe IS (``-1`` = the entry as curated, no scenario applied)
+    scenario_index: int = -1
     #: ``seed.image → pre0.data → … → demo``; each step wired ``out → data``
     prelude: Tuple[PreludeStep, ...] = ()
     #: where the demo node's PRIMARY input comes from: ``"tail"`` (the prelude's last node, or
@@ -137,7 +158,7 @@ class DemoRecipe:
 
     @property
     def is_guide(self) -> bool:
-        return self.kind == GUIDE or not self.phantom
+        return self.kind == GUIDE or not (self.phantom or self.scenarios)
 
 
 # ── named preludes and role defaults ──────────────────────────────────────────
@@ -323,10 +344,39 @@ def recipe_for(op_key: str) -> DemoRecipe:
         kw["view"] = {k: int(v) for k, v in (entry["view"] or {}).items()}
     if "features" in entry:
         kw["features"] = tuple(str(f) for f in (entry["features"] or ()))
+    if "scenarios" in entry:
+        kw["scenarios"] = tuple(_scenario_of(sc) for sc in (entry["scenarios"] or ()))
+        if "phantom" not in entry:
+            kw["phantom"] = ""            # the first scenario is the default world
+            kw["phantom_kw"] = {}
     rec = replace(base, **kw)
     if rec.kind == GUIDE:
-        rec = replace(rec, phantom="", prelude=())
+        rec = replace(rec, phantom="", prelude=(), scenarios=())
     return rec
+
+
+def _scenario_of(sc: Mapping[str, Any]) -> Scenario:
+    return Scenario(label=str(sc.get("label", "")), phantom=str(sc.get("phantom", "")),
+                    phantom_kw=dict(sc.get("phantom_kw") or {}),
+                    view={k: int(v) for k, v in (sc.get("view") or {}).items()},
+                    fixed_params=dict(sc.get("fixed_params") or {}),
+                    fixed_modes={k: str(v) for k, v in (sc.get("fixed_modes") or {}).items()},
+                    note=str(sc.get("note", "")))
+
+
+def scenario_recipe(rec: DemoRecipe, index: int) -> DemoRecipe:
+    """``rec`` with its ``index``-th scenario applied: that world's phantom, view and fixed
+    values laid over the entry's own. A recipe without scenarios is returned unchanged, so
+    callers need not branch; an index out of range clamps."""
+    if not rec.scenarios:
+        return rec
+    i = min(max(0, int(index)), len(rec.scenarios) - 1)
+    sc = rec.scenarios[i]
+    return replace(rec, phantom=sc.phantom, phantom_kw=dict(sc.phantom_kw),
+                   view=dict(sc.view) if sc.view else dict(rec.view),
+                   fixed_params={**rec.fixed_params, **sc.fixed_params},
+                   fixed_modes={**rec.fixed_modes, **sc.fixed_modes},
+                   scenario_index=i)
 
 
 def validate_curation(cur: Optional[Mapping[str, Any]] = None) -> List[str]:
@@ -422,6 +472,40 @@ def validate_curation(cur: Optional[Mapping[str, Any]] = None) -> List[str]:
             if v is not None and not (isinstance(v, dict)
                                       and set(v) <= {"t", "z", "c", "m"}):
                 problems.append(f"{op}: view must be an object with t/z/c/m keys")
+        scs = entry.get("scenarios")
+        if scs is not None:
+            if not (isinstance(scs, list) and scs and all(isinstance(s, dict) for s in scs)):
+                problems.append(f"{op}: scenarios must be a non-empty list of objects")
+            else:
+                seen: set = set()
+                for i, sc in enumerate(scs):
+                    label = str(sc.get("label", "")).strip()
+                    if not label:
+                        problems.append(f"{op}: scenarios[{i}] needs a label")
+                    elif label in seen:
+                        problems.append(f"{op}: scenarios[{i}] duplicates the label {label!r}")
+                    seen.add(label)
+                    if sc.get("phantom") not in PHANTOMS:
+                        problems.append(f"{op}: scenarios[{i}] unknown phantom "
+                                        f"{sc.get('phantom')!r}")
+                    for p in (sc.get("fixed_params") or {}):
+                        if spec.input(p) is None:
+                            problems.append(f"{op}: scenarios[{i}] fixes unknown param {p!r}")
+                    for mname, choice in (sc.get("fixed_modes") or {}).items():
+                        m = next((x for x in spec.modes if x.name == mname), None)
+                        if m is None:
+                            problems.append(f"{op}: scenarios[{i}] fixes unknown mode {mname!r}")
+                        elif str(choice) not in m.choices:
+                            problems.append(f"{op}: scenarios[{i}] mode {mname!r} has no "
+                                            f"choice {choice!r}")
+                    v = sc.get("view")
+                    if v is not None and not (isinstance(v, dict)
+                                              and set(v) <= {"t", "z", "c", "m"}):
+                        problems.append(f"{op}: scenarios[{i}] view must have t/z/c/m keys")
+                    if not isinstance(sc.get("note", ""), str):
+                        problems.append(f"{op}: scenarios[{i}] note must be a string")
+            if kind == GUIDE:
+                problems.append(f"{op}: a guide cannot have scenarios")
     return problems
 
 
@@ -510,6 +594,8 @@ def slider_range(s: Any, value: Any = None, *, env: Optional[MetaEnvelope] = Non
         lo, hi = 0.0, float(max(1, ax.c - 1))
     elif pk in ("frame", "frames") or name in ("reference_frame", "ref_t", "frame"):
         lo, hi = 0.0, float(max(1, ax.t - 1))
+    elif pk == "plane" or name == "plane":
+        lo, hi = 0.0, float(max(1, ax.z - 1))
     elif pk == "zrange" or name in ("z0", "z1"):
         lo, hi = 0.0, float(max(1, ax.z))
     elif pk == "rect" or name in ("y0", "y1", "x0", "x1"):
@@ -767,6 +853,10 @@ class DemoResult:
     view: Tuple[int, int, int] = (0, 0, 0)                 # the (t, z, c) shown
     elapsed_s: float = 0.0
     note: str = ""
+    #: Frame-domain layers the node wrote, read at the viewed ``(m, t)`` — a registration's
+    #: ``drift_y`` / ``drift_x`` / ``drift_confidence``, so the window can show the transform
+    #: it applied to the frame on screen next to the phantom's caption of the true motion
+    frame_values: Dict[str, float] = field(default_factory=dict)
 
 
 _VECTOR_COLUMNS = (("u", "v"), ("u_um", "v_um"), ("dy", "dx"), ("disp_y", "disp_x"))
@@ -786,6 +876,9 @@ class DemoSession:
             raise KeyError(f"{recipe.op!r} is not registered")
         if recipe.is_guide:
             raise ValueError(f"{recipe.op!r} is a guide-only demo; nothing to run")
+        if recipe.scenarios and (not recipe.phantom or recipe.scenario_index < 0):
+            recipe = scenario_recipe(recipe, 0)   # the first scenario is the default world
+            self.recipe = recipe
         self.phantom: Phantom = phantom(recipe.phantom, **dict(recipe.phantom_kw))
         self.memo = Memo(budget_bytes=memo_bytes)
         self.tiles = TileCache(tile_bytes)
@@ -969,11 +1062,27 @@ class DemoSession:
         res.mesh = self._mesh(ds, m, tt, zz, cc)
         from nodelab_v2.tables import structure_tables
         res.tables = structure_tables(ds)
+        res.frame_values = self._frame_values(ds, m, tt)
         if (ax1.m, ax1.t, ax1.z, ax1.c, ax1.y, ax1.x) != (
                 ph.axes.m, ph.axes.t, ph.axes.z, ph.axes.c, ph.axes.y, ph.axes.x):
             res.note = (f"axes (m,t,z,c,y,x): {ph.axes.m},{ph.axes.t},{ph.axes.z},{ph.axes.c},"
                         f"{ph.axes.y},{ph.axes.x} → {ax1.m},{ax1.t},{ax1.z},{ax1.c},{ax1.y},{ax1.x}")
         return res
+
+    @staticmethod
+    def _frame_values(ds: Dataset, m: int, t: int) -> Dict[str, float]:
+        """Every Frame-domain layer's value at ``(m, t)``, in the order the node wrote them."""
+        out: Dict[str, float] = {}
+        for attr in ds.layers_on(Domain.FRAME):
+            try:
+                v = np.asarray(attr.values)
+                if v.ndim >= 2 and v.shape[0] > m and v.shape[1] > t:
+                    val = v[m, t]
+                    if np.ndim(val) == 0 and np.isfinite(float(val)):
+                        out[str(attr.name)] = float(val)
+            except (TypeError, ValueError):
+                continue
+        return out
 
     @staticmethod
     def _voxel_layers(ds: Dataset) -> List[Tuple[str, np.ndarray]]:

@@ -24023,6 +24023,643 @@ def test_split_positions() -> None:
         "carrying K, and each branch pulls its own position")
 
 
+def test_select_plane_split_z() -> None:
+    """``util.select_plane`` + ``util.split_z`` (2026-10-07): the Z-axis tap family, mirroring
+    ``util.split_positions`` → ``util.select_position``, plus the ``plane`` instant pick.
+
+    1. **Select Plane** keeps one plane by index: z → 1, pixels are that plane's, ``origin_um``
+       moves to the plane's height at the SOURCE step, ``z_step_um`` survives, a Voxel mask and
+       a Label table follow (rows on other planes dropped, survivors re-addressed to z=0),
+       envelope == payload, the stamp is z-only and names the index; BLANK / ``auto`` is the
+       middle plane and agrees with the socket's ``derive``; past the end is refused with the
+       depth; a single-plane input is the identity whatever is asked.
+    2. **Split Z** is a pass-through of the whole stack.
+    3. **The document** grows ``z0…`` sockets on a Split Z card from the envelope, labelled
+       with the plane's height, ``to_graph(materialize=True)`` turns a wired ``zK`` into ONE
+       shared ``util.select_plane`` tap carrying ``K``, the envelope downstream reads z=1, and a
+       pull through that graph hands each branch its own plane while ``out`` keeps them all.
+    4. **The pick** ``plane`` is an INSTANT kind that adopts the viewer's z.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.metadata import envelope_symbols, eval_derive, plane_pick
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+
+    define_node("io.szseed", "S", outputs=[OutDataset()])
+    M, T, Z, Y, X = 1, 2, 5, 6, 8
+    arr = np.zeros((M, T, Z, 1, Y, X), dtype=float)
+    for z in range(Z):
+        arr[:, :, z] = 10.0 * (z + 1)
+    ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 0.4, "origin_um": [[1.0, 2.0, 3.0]]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, Z, 1, Y, X), dtype=np.int64)
+    for z in range(Z):
+        mask[:, :, z, :, z, z] = 1                       # one pixel per plane, on the diagonal
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.LABEL, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 0, 0]), "t": np.array([0, 0, 0]),
+        "c": np.array([0, 0, 0]), "area": np.array([1, 1, 1]), "z": np.array([0, 2, 4]),
+        "y": np.array([0.0, 2.0, 4.0]), "x": np.array([0.0, 2.0, 4.0])},
+        layer="mask", z_kind="plane_index"))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def pull(op, params=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.szseed"))
+        g.add(NodeInstance("N", op, params=params or {}))
+        g.connect("S", "N")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0})
+        return e, e.pull("N")
+
+    def px(out, z=0):
+        return float(out.image.get_region(0, 0, 0, z, 0, 0, Y, 0, X)[0, 0])
+
+    # 1. by index, blank (= middle), "auto"
+    for want, k in ((3, 3), ("1", 1), (None, 2), ("auto", 2), (4, 4)):
+        e, out = pull("util.select_plane", {} if want is None else {"plane": want})
+        assert out.axes.z == 1 and px(out) == 10.0 * (k + 1), (want, out.axes, px(out))
+        assert abs(out.metadata["origin_um"][0][0] - (1.0 + 0.4 * k)) < 1e-9, out.metadata["origin_um"]
+        assert out.metadata["origin_um"][0][1:] == [2.0, 3.0]
+        assert out.metadata["z_step_um"] == 0.4, "one plane keeps the source spacing"
+        lay = out.get(Domain.VOXEL, "mask").values
+        assert lay.shape[2] == 1 and lay[0, 0, 0, 0, k, k] == 1 and lay.sum() == T, (k, lay.sum())
+        ids = list(out.get(Domain.LABEL, "id", layer="mask").values)
+        zs = list(out.get(Domain.LABEL, "z", layer="mask").values)
+        assert ids == ([k // 2 + 1] if k % 2 == 0 else []) and all(v == 0 for v in zs), (k, ids, zs)
+        assert e.env("N").axes == out.axes, "envelope == payload (axes)"
+        assert e.env("N").metadata["origin_um"] == out.metadata["origin_um"], "envelope == payload (origin)"
+        assert f"z:select_plane[{k}]" in str(out.metadata.get(SAMPLING_KEY, "")), out.metadata.get(SAMPLING_KEY)
+    sp = NODES.get("util.select_plane")
+    for nz in (1, 5, 12):
+        envz = MetaEnvelope(axes=_replace(ax, z=nz), metadata=meta)
+        assert eval_derive(sp.input("plane").derive, envelope_symbols(envz)) == plane_pick(nz, None) == nz // 2
+    assert plane_pick(5, "2.5") is None and plane_pick(5, 5) is None and plane_pick(5, -1) is None
+    try:
+        pull("util.select_plane", {"plane": 7})
+        raise AssertionError("a plane past the end must be refused")
+    except ValueError as exc:
+        assert "no plane 7" in str(exc) and "0..4" in str(exc), str(exc)
+    one = Dataset(axes=_replace(ax, z=1), metadata={"pixel_size_um": 0.5}
+                  ).with_image(ArrayProvider(arr[:, :, :1]))
+    g1 = Graph(); g1.add(NodeInstance("S", "io.szseed"))
+    g1.add(NodeInstance("N", "util.select_plane", params={"plane": 3})); g1.connect("S", "N")
+    same = Engine(g1, computes=COMPUTES, seeds={"S": one},
+                  meta_seeds={"S": MetaEnvelope(axes=one.axes, metadata=one.metadata)}).pull("N")
+    assert same is one or same.axes.z == 1, "a single-plane input is the identity"
+
+    # 2. the split is a pass-through
+    e2, out2 = pull("util.split_z")
+    assert out2.axes.z == Z and [px(out2, z) for z in range(Z)] == [10.0, 20.0, 30.0, 40.0, 50.0]
+    assert e2.env("N").axes.z == Z
+
+    # 3. the document: sockets from the envelope, one shared tap, a pull per branch
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L")
+    doc.meta_seeds["L"] = env0
+    doc.add_node("util.split_z", node_id="SZ")
+    assert [s.name for s in doc.output_specs("SZ")] == ["out"], "unwired: no planes known"
+    doc.connect("L", "image", "SZ", "data")
+    outs = doc.output_specs("SZ")
+    assert [s.name for s in outs] == ["out", "z0", "z1", "z2", "z3", "z4"], [s.name for s in outs]
+    assert [s.label for s in outs[1:3]] == ["0 · 0.00 µm", "1 · 0.40 µm"], [s.label for s in outs[1:]]
+    doc.add_node("enhance.gaussian", node_id="G1"); doc.add_node("enhance.gaussian", node_id="G2")
+    doc.add_node("enhance.gaussian", node_id="G3")
+    doc.connect("SZ", "z3", "G1", "data")
+    doc.connect("SZ", "z3", "G2", "data")            # two consumers of one plane
+    doc.connect("SZ", "out", "G3", "data")
+    assert doc.env("G1").axes.z == 1 and doc.env("G3").axes.z == Z, "the envelope sees the tap"
+    assert doc._tap_name("SZ", "z3") == "z3"
+    g = doc.to_graph(for_run=True, materialize=True)
+    taps = [n for n in g.nodes.values() if n.op_key == "util.select_plane"]
+    assert len(taps) == 1 and taps[0].params == {"plane": 3}, [(n.id, n.params) for n in taps]
+    assert sum(1 for e in g.edges if e.src == taps[0].id) == 2, "one tap shared by both branches"
+    eng = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0})
+    o1, o3 = eng.pull("G1"), eng.pull("G3")
+    assert o1.axes.z == 1 and abs(px(o1) - 40.0) < 1e-6, (o1.axes, px(o1))
+    assert o3.axes.z == Z
+    doc.meta_seeds["L"] = MetaEnvelope(axes=_replace(ax, z=1), metadata={"pixel_size_um": 0.5})
+    doc.touch("L")
+    assert [s.name for s in doc.output_specs("SZ")] == ["out"], "a single-plane envelope grows no sockets"
+
+    # 4. the instant pick
+    from nodelab_v2.picker import INSTANT_KINDS, instant_values, request_for
+    assert "plane" in INSTANT_KINDS
+    req = request_for("N", sp.input("plane"))
+    assert req.surface == "instant"
+    assert instant_values(req, channel=0, frame=1, channels=[0], plane=4) == {"plane": 4}
+    _ok("select plane / split z: Select Plane keeps one plane by index (z→1, pixels, origin_um "
+        "at the plane's height, z_step kept, Voxel layer and Label rows follow, envelope == "
+        "payload, z-only stamp; blank/auto = the middle plane = the socket's derive; past the "
+        "end refused with the depth; a lone plane is the identity); Split Z passes the stack "
+        "through; the card grows `z0…` labelled with plane heights, a wired zK becomes one "
+        "shared util.select_plane tap carrying K, each branch pulls its own plane; `plane` is "
+        "an instant pick off the viewer's z")
+
+
+def test_select_frame_split_t() -> None:
+    """``util.select_frame`` + ``util.split_t`` (2026-10-07): the T-axis tap family, mirroring
+    ``util.split_z`` → ``util.select_plane``, plus the fan-out cap and `every N` chunking that
+    make a long series splittable at all.
+
+    1. **Select Frame** keeps one timepoint by index: t → 1, pixels are that frame's, the per-T
+       lists follow (``frame_time_jd``), ``dt_s`` survives (Crop's frames-mode rule, so a Crop
+       keeping ``t3`` agrees), a Voxel mask and a Point table follow (rows on other frames
+       dropped, survivors re-addressed to t=0), envelope == payload, the stamp is t-only;
+       BLANK is frame 0; past the end is refused with the length; a single-frame input is the
+       identity.
+    2. **Split T** is a pass-through; its card grows ``t0…`` labelled with the frame time, a
+       wired ``tK`` becomes one shared ``util.select_frame`` tap and each branch pulls its frame.
+    3. **The cap**: a 30-frame series grows NO per-frame sockets (``FANOUT_CAP`` = 24), on T and
+       on Z alike; ``every 10`` then gives three ``tg`` groups (the last clipped in its label),
+       the materializer emits ``t20-29`` from the index alone, and the pull is ten frames.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.metadata import every_n, frame_pick, parse_groups
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import FANOUT_CAP, GraphDocument
+
+    define_node("io.stseed", "S", outputs=[OutDataset()])
+    M, T, Z, Y, X = 1, 6, 2, 6, 8
+    arr = np.zeros((M, T, Z, 1, Y, X), dtype=float)
+    for t in range(T):
+        arr[:, t] = 10.0 * (t + 1)
+    ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "dt_s": 30.0, "frame_time_jd": [2460000.0 + 0.001 * t for t in range(T)]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, Z, 1, Y, X), dtype=np.int64)
+    for t in range(T):
+        mask[:, t, :, :, t, t] = 1                        # one pixel per frame, on the diagonal
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.POINT, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 0, 0]), "t": np.array([0, 3, 5]),
+        "c": np.array([0, 0, 0]), "z": np.array([0, 1, 0]),
+        "y": np.array([0.0, 3.0, 5.0]), "x": np.array([0.0, 3.0, 5.0])}, layer="spots"))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def pull(op, params=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.stseed"))
+        g.add(NodeInstance("N", op, params=params or {}))
+        g.connect("S", "N")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0})
+        return e, e.pull("N")
+
+    def px(out, t=0):
+        return float(out.image.get_region(0, 0, t, 0, 0, 0, Y, 0, X)[0, 0])
+
+    # 1. by index, blank (= 0)
+    for want, k in ((3, 3), ("5", 5), (None, 0), ("auto", 0)):
+        e, out = pull("util.select_frame", {} if want is None else {"frame": want})
+        assert out.axes.t == 1 and px(out) == 10.0 * (k + 1), (want, out.axes, px(out))
+        assert out.metadata["dt_s"] == 30.0 and out.metadata["frame_time_jd"] == [meta["frame_time_jd"][k]]
+        lay = out.get(Domain.VOXEL, "mask").values
+        assert lay.shape[1] == 1 and lay[0, 0, 0, 0, k, k] == 1 and lay.sum() == Z, (k, lay.sum())
+        ids = list(out.get(Domain.POINT, "id", layer="spots").values)
+        ts = list(out.get(Domain.POINT, "t", layer="spots").values)
+        assert ids == ({0: [1], 3: [2], 5: [3]}.get(k, [])) and all(v == 0 for v in ts), (k, ids, ts)
+        assert e.env("N").axes == out.axes and e.env("N").metadata["frame_time_jd"] == out.metadata["frame_time_jd"]
+        assert f"t:select_frame[{k}]" in str(out.metadata.get(SAMPLING_KEY, "")), out.metadata.get(SAMPLING_KEY)
+    assert frame_pick(6, 6) is None and frame_pick(6, "2.5") is None and frame_pick(1, 4) == None
+    try:
+        pull("util.select_frame", {"frame": 9})
+        raise AssertionError("a frame past the end must be refused")
+    except ValueError as exc:
+        assert "no timepoint 9" in str(exc) and "0..5" in str(exc), str(exc)
+    one = Dataset(axes=_replace(ax, t=1), metadata={"pixel_size_um": 0.5}).with_image(ArrayProvider(arr[:, :1]))
+    g1 = Graph(); g1.add(NodeInstance("S", "io.stseed"))
+    g1.add(NodeInstance("N", "util.select_frame", params={"frame": 4})); g1.connect("S", "N")
+    assert Engine(g1, computes=COMPUTES, seeds={"S": one},
+                  meta_seeds={"S": MetaEnvelope(axes=one.axes, metadata=one.metadata)}).pull("N").axes.t == 1
+
+    # 2. the split and its taps
+    e2, out2 = pull("util.split_t")
+    assert out2.axes.t == T and e2.env("N").axes.t == T
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L"); doc.meta_seeds["L"] = env0
+    doc.add_node("util.split_t", node_id="ST")
+    assert [s.name for s in doc.output_specs("ST")] == ["out"]
+    doc.connect("L", "image", "ST", "data")
+    outs = doc.output_specs("ST")
+    assert [s.name for s in outs] == ["out"] + [f"t{i}" for i in range(T)], [s.name for s in outs]
+    assert [s.label for s in outs[1:3]] == ["0 · 0.0 s", "1 · 30.0 s"], [s.label for s in outs[1:]]
+    doc.add_node("enhance.gaussian", node_id="G1"); doc.add_node("enhance.gaussian", node_id="G2")
+    doc.add_node("enhance.gaussian", node_id="G3")
+    doc.connect("ST", "t3", "G1", "data"); doc.connect("ST", "t3", "G2", "data")
+    doc.connect("ST", "out", "G3", "data")
+    assert doc.env("G1").axes.t == 1 and doc.env("G3").axes.t == T
+    assert doc._tap_name("ST", "t3") == "t3"
+    g = doc.to_graph(for_run=True, materialize=True)
+    taps = [n for n in g.nodes.values() if n.op_key == "util.select_frame"]
+    assert len(taps) == 1 and taps[0].params == {"frame": 3}, [(n.id, n.params) for n in taps]
+    assert sum(1 for e in g.edges if e.src == taps[0].id) == 2
+    eng = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0})
+    o1, o3 = eng.pull("G1"), eng.pull("G3")
+    assert o1.axes.t == 1 and abs(px(o1) - 40.0) < 1e-6 and o3.axes.t == T
+
+    # 3. the cap and `every N`
+    assert FANOUT_CAP == 24
+    long_env = MetaEnvelope(axes=_replace(ax, t=30), metadata={"pixel_size_um": 0.5, "dt_s": 2.0})
+    doc.meta_seeds["L"] = long_env
+    doc.touch("L")
+    assert [s.name for s in doc.output_specs("ST")] == ["out"], "30 frames: no per-frame sockets"
+    doc.add_node("util.split_z", node_id="SZ"); doc.connect("L", "image", "SZ", "data")
+    doc.meta_seeds["L"] = MetaEnvelope(axes=_replace(ax, t=2, z=40), metadata={"pixel_size_um": 0.5})
+    doc.touch("L")
+    assert [s.name for s in doc.output_specs("SZ")] == ["out"], "40 planes: no per-plane sockets either"
+    doc.meta_seeds["L"] = long_env
+    doc.touch("L")
+    assert every_n("every 10") == 10 and every_n("/4") == 4 and every_n("0-3") is None and every_n("every 0") is None
+    assert parse_groups("every 4", 10) == [("", (0, 1, 2, 3)), ("", (4, 5, 6, 7)), ("", (8, 9))]
+    assert parse_groups("every 4") is None, "without the axis length the shorthand is not expanded"
+    doc.nodes["ST"].params["groups"] = "every 10"
+    doc.touch("ST")
+    assert [(s.name, s.label) for s in doc.output_specs("ST")[1:]] == [
+        ("tg0", "0 · t 0-9 · 0.0–18.0 s"), ("tg1", "1 · t 10-19 · 20.0–38.0 s"),
+        ("tg2", "2 · t 20-29 · 40.0–58.0 s")], [(s.name, s.label) for s in doc.output_specs("ST")]
+    doc.nodes["ST"].params["groups"] = "every 12"
+    doc.touch("ST")
+    assert [s.label for s in doc.output_specs("ST")[1:]][-1] == "2 · t 24-29 · 48.0–58.0 s", "the last chunk clips"
+    assert OPS.split_group(doc.nodes["ST"], 2) == ("", tuple(range(24, 36))), "the run side is unclamped"
+    long_arr = np.zeros((1, 30, Z, 1, Y, X), dtype=float)
+    for t in range(30):
+        long_arr[:, t] = float(t)
+    long_ds = Dataset(axes=long_env.axes, metadata=long_env.metadata).with_image(ArrayProvider(long_arr))
+    doc.add_node("enhance.gaussian", node_id="G4"); doc.connect("ST", "tg2", "G4", "data")
+    assert doc.env("G4").axes.t == 6
+    g = doc.to_graph(for_run=True, materialize=True)
+    tap = next(n for n in g.nodes.values() if n.op_key == "util.crop" and n.params == {"frames": "t24-35"})
+    assert tap.modes == {"region": "frames"}
+    o4 = Engine(g, computes=COMPUTES, seeds={"L": long_ds}, meta_seeds={"L": long_env}).pull("G4")
+    assert o4.axes.t == 6 and abs(px(o4, t=0) - 24.0) < 1e-6 and abs(px(o4, t=5) - 29.0) < 1e-6, \
+        (o4.axes, px(o4, t=0), px(o4, t=5))        # Crop drops 30-35: the chunk clipped itself
+    _ok("select frame / split t: Select Frame keeps one timepoint by index (t→1, pixels, per-T "
+        "lists, dt_s kept as Crop keeps it, Voxel layer and Point rows follow, envelope == "
+        "payload, t-only stamp; blank = frame 0; past the end refused with the length; a lone "
+        "frame is the identity); Split T passes through, grows `t0…` labelled with frame times, "
+        "a wired tK is one shared util.select_frame tap; the fan-out cap (24) grows no per-index "
+        "sockets on a 30-frame series or a 40-plane stack; `every 10` gives tg groups labelled "
+        "by span with the last chunk clipped, the run side emits the unclamped `t24-35` and "
+        "Crop's frames tap hands back the six frames that exist")
+
+
+def test_split_groups() -> None:
+    """Range GROUPS on the split cards (2026-10-07): a `groups` text on Split Channels / Split
+    Positions / Split Z turns the per-index outputs into one output per RANGE.
+
+    * The grammar (:func:`metadata.parse_groups`): ``;`` or newline between groups, each a
+      :func:`parse_indices` list/range, an optional ``name:`` / ``name =`` in front; blank,
+      junk and an empty group are total (skipped / ``None``); out-of-range indices are kept
+      (labelled on the card; Crop drops them at the pull and refuses only an empty axis).
+    * The socket is PRESENTATION-only: the split's own output is the whole set whatever the
+      text says, so the value never reaches the recipe.
+    * The card: with groups set, ``zg0…`` / ``posg0…`` / ``chg0…`` replace the per-index
+      sockets, labelled with the typed name or the members' names (channel names joined,
+      first–last position, ``z 4-7`` with its height span), and a group past the end says so.
+    * The taps: a wired ``zgK`` / ``posgK`` materializes into ONE shared ``util.crop`` in
+      frames mode (``z4-7`` / ``m0-1``); a ``chgK`` into ``channel.select`` with the list; the
+      envelope downstream reads the subset and a pull hands back exactly those planes /
+      positions / channels, with the per-axis metadata following.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.metadata import parse_groups
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+
+    # the grammar
+    assert parse_groups("0-3; 4-7; 8-11") == [("", (0, 1, 2, 3)), ("", (4, 5, 6, 7)), ("", (8, 9, 10, 11))]
+    assert parse_groups("top: 0-3; mid = 4-7\n8-11") == [("top", (0, 1, 2, 3)), ("mid", (4, 5, 6, 7)), ("", (8, 9, 10, 11))]
+    assert parse_groups("GFP+DAPI: 0,2; 1") == [("GFP+DAPI", (0, 2)), ("", (1,))]
+    assert parse_groups("a:b: 0-1") == [("a:b", (0, 1))]
+    assert parse_groups("") is None and parse_groups(None) is None and parse_groups("abc") is None
+    assert parse_groups("0-1; nothing:; 5") == [("", (0, 1)), ("", (5,))], "an empty group is skipped"
+    assert parse_groups("8-13") == [("", (8, 9, 10, 11, 12, 13))], "out of range is kept, not clipped"
+    for op in ("channel.split", "util.split_positions", "util.split_z"):
+        sock = NODES.get(op).input("groups")
+        assert sock is not None and sock.presentation and sock.default == "", op
+
+    OPS.ensure_ops()
+    define_node("io.sgseed", "S", outputs=[OutDataset()])
+    M, T, Z, C, Y, X = 3, 2, 12, 3, 6, 8
+    arr = np.zeros((M, T, Z, C, Y, X), dtype=float)
+    for m in range(M):
+        for z in range(Z):
+            for c in range(C):
+                arr[m, :, z, c] = 1000.0 * m + 10.0 * z + c
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 0.4, "position_name": ["A1", "B2", "C3"],
+            "stage_xy_um": [[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]],
+            "channel_names": ["DAPI", "GFP", "Cy5"], "channel_emission_nm": [450.0, 510.0, 670.0],
+            "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 100.0], [0.0, 0.0, 200.0]]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def px(out, m=0, t=0, z=0, c=0):
+        return float(out.image.get_region(0, m, t, z, c, 0, Y, 0, X)[0, 0])
+
+    def names(doc, nid):
+        return [s.name for s in doc.output_specs(nid)]
+
+    # ── Split Z: planes 4-7 as a sub-stack ───────────────────────────────────────────
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L"); doc.meta_seeds["L"] = env0
+    doc.add_node("util.split_z", node_id="SZ"); doc.connect("L", "image", "SZ", "data")
+    assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
+    doc.nodes["SZ"].params["groups"] = "top: 0-3; 4-7; 8-13"
+    doc.touch("SZ")
+    outs = doc.output_specs("SZ")
+    assert names(doc, "SZ") == ["out", "zg0", "zg1", "zg2"], names(doc, "SZ")
+    assert [s.label for s in outs[1:]] == ["0 · top · 0.00–1.20 µm", "1 · z 4-7 · 1.60–2.80 µm",
+                                           "2 · z 8-13 · 3.20–4.40 µm (past the end)"], [s.label for s in outs[1:]]
+    assert doc._tap_name("SZ", "zg0") == "top" and doc._tap_name("SZ", "zg1") == "z 4-7"
+    doc.add_node("enhance.gaussian", node_id="G1"); doc.add_node("enhance.gaussian", node_id="G2")
+    doc.add_node("enhance.gaussian", node_id="G3")
+    doc.connect("SZ", "zg1", "G1", "data"); doc.connect("SZ", "zg1", "G2", "data")
+    doc.connect("SZ", "out", "G3", "data")
+    assert doc.env("G1").axes.z == 4 and doc.env("G3").axes.z == Z, "the envelope sees the group tap"
+    assert abs(doc.env("G1").metadata["origin_um"][0][0] - 1.6) < 1e-9, doc.env("G1").metadata["origin_um"]
+    g = doc.to_graph(for_run=True, materialize=True)
+    taps = [n for n in g.nodes.values() if n.op_key == "util.crop"]
+    assert len(taps) == 1 and taps[0].params == {"frames": "z4-7"} and taps[0].modes == {"region": "frames"}, \
+        [(n.id, n.params, n.modes) for n in taps]
+    assert sum(1 for e in g.edges if e.src == taps[0].id) == 2, "one tap shared by both branches"
+    eng = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0})
+    o1, o3 = eng.pull("G1"), eng.pull("G3")
+    assert o1.axes.z == 4 and np.allclose([px(o1, z=k) for k in range(4)], [40.0, 50.0, 60.0, 70.0]), \
+        (o1.axes, [px(o1, z=k) for k in range(4)])          # a Gaussian on a flat plane: flat
+    assert o1.metadata["z_step_um"] == 0.4 and abs(o1.metadata["origin_um"][0][0] - 1.6) < 1e-9
+    assert o3.axes.z == Z
+    doc.nodes["SZ"].params["groups"] = ""                   # blank: the per-plane sockets return
+    doc.touch("SZ")
+    assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
+
+    # ── Split Positions: wells 0-1 by range, C3 alone ────────────────────────────────
+    doc.add_node("util.split_positions", node_id="SP"); doc.connect("L", "image", "SP", "data")
+    doc.nodes["SP"].params["groups"] = "wells: 0-1; 2"
+    doc.touch("SP")
+    assert names(doc, "SP") == ["out", "posg0", "posg1"]
+    assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · wells", "1 · C3"]
+    doc.nodes["SP"].params["groups"] = "0-1; 2"
+    doc.touch("SP")
+    assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · A1–B2", "1 · C3"]
+    doc.add_node("enhance.gaussian", node_id="G4"); doc.connect("SP", "posg0", "G4", "data")
+    assert doc.env("G4").axes.m == 2
+    g = doc.to_graph(for_run=True, materialize=True)
+    tap = next(n for n in g.nodes.values() if n.op_key == "util.crop" and n.params == {"frames": "m0-1"})
+    assert tap.modes == {"region": "frames"}
+    o4 = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0}).pull("G4")
+    assert o4.axes.m == 2 and o4.metadata["position_name"] == ["A1", "B2"], \
+        (o4.axes, o4.metadata.get("position_name"))
+    assert abs(px(o4, m=1) - 1000.0) < 1e-6 and abs(px(o4, m=0)) < 1e-6, (px(o4, m=0), px(o4, m=1))
+    assert o4.metadata["stage_xy_um"] == [[0.0, 0.0], [100.0, 0.0]]
+
+    # ── Split Channels: DAPI+Cy5 together, GFP alone ─────────────────────────────────
+    doc.add_node("channel.split", node_id="CS"); doc.connect("L", "image", "CS", "data")
+    assert names(doc, "CS") == ["out", "ch0", "ch1", "ch2"]
+    doc.nodes["CS"].params["groups"] = "0,2; 1"
+    doc.touch("CS")
+    assert names(doc, "CS") == ["out", "chg0", "chg1"]
+    assert [s.label for s in doc.output_specs("CS")[1:]] == ["0 · DAPI+Cy5", "1 · GFP"], \
+        [s.label for s in doc.output_specs("CS")[1:]]
+    doc.add_node("enhance.gaussian", node_id="G5"); doc.connect("CS", "chg0", "G5", "data")
+    assert doc.env("G5").axes.c == 2
+    g = doc.to_graph(for_run=True, materialize=True)
+    tap = next(n for n in g.nodes.values() if n.op_key == "channel.select" and n.params == {"channels": [0, 2]})
+    o5 = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0}).pull("G5")
+    assert o5.axes.c == 2 and abs(px(o5, c=1) - 2.0) < 1e-6 \
+        and o5.metadata["channel_emission_nm"] == [450.0, 670.0], (o5.axes, px(o5, c=1))
+    # a Load card has no `groups`: untouched
+    assert names(doc, "L")[:1] == ["image"] and "chg0" not in names(doc, "L")
+    # the split's own output ignores the text entirely (presentation-only)
+    gsz = Graph(); gsz.add(NodeInstance("S", "io.sgseed"))
+    gsz.add(NodeInstance("N", "util.split_z", params={"groups": "0-3; 4-7"})); gsz.connect("S", "N")
+    whole = Engine(gsz, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0}).pull("N")
+    assert whole.axes.z == Z
+    _ok("split groups: `groups` text (`0-3; 4-7; 8-11`, `top: 0-3`, `;`/newline, total grammar, "
+        "out-of-range kept) on Split Z / Split Positions / Split Channels is presentation-only "
+        "and turns the per-index sockets into zg/posg/chg group sockets labelled by name, "
+        "members or span (and `(past the end)`); a wired group is one shared util.crop "
+        "frames tap (z4-7 / m0-1) or channel.select list; the envelope and the pull carry "
+        "exactly that subset with z_step, origin, position and emission lists following; "
+        "blank restores the per-index sockets")
+
+
+def test_shift_node() -> None:
+    """``align.shift`` (2026-10-07): the apply half of registration as a node of its own, reading
+    the per-frame shift as Frame layers from a SECOND input.
+
+    * Every plane, channel and position moves by its frame's ``(dy, dx)`` — exactly
+      ``apply_shift`` — in 2D; ``(dz, dy, dx)`` per volume in 3D with a named ``shift_z`` layer,
+      and a blank ``shift_z`` in 3D gives the 2D answer; 2D and 3D key distinct recipes.
+    * The lazy per-unit apply equals the eager bare-ctx reference bit for bit.
+    * A one-position shift source is applied to every position; a timepoint mismatch, a missing
+      layer and a Dataset carrying structure tables are refused with the real message.
+    * A Voxel mask moves with the image at order 0; a NaN (gated) frame does not move; the
+      applied shift is stored as ``shift_y``/``shift_x`` (+ ``shift_z``); ``invert`` negates;
+      ``origin_um`` is dropped; unwired ``shifts`` reads the data's own layers.
+    * **The contract with Registration:** ``Shift(raw, Registration(raw)) == Registration(raw)``
+      on every frame, bit for bit — the two apply through the same kernel call.
+    * **The workflow:** stack → Select Plane → Registration (2D) → Shift on the stack recovers
+      the true lateral drift of a 12-plane bead stack from its middle plane and applies the
+      same shift to the bottom and top planes.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.domains import Domain as D
+    from nodegraph.engine import EvalContext, ReadContext
+    from nodegraph.kernels.registration import apply_shift
+    from nodegraph.phantom import phantom
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import Granularity
+    from nodegraph.streaming import MapComputeProvider, VolumeComputeProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.drift_layers import _layers_shift
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+
+    def gather(out: Dataset) -> np.ndarray:
+        a = out.axes
+        return np.stack([[[[np.asarray(out.image.get_region(0, m, t, z, c, 0, a.y, 0, a.x))
+                            for c in range(a.c)] for z in range(a.z)]
+                          for t in range(a.t)] for m in range(a.m)])
+
+    def ref(a: np.ndarray, sh: np.ndarray) -> np.ndarray:
+        # the kernel's own rule: an all-zero shift returns the unit untouched (apply_frame
+        # does the same), so the reference must not resample by nothing either
+        return a if not np.any(sh) else apply_shift(a, sh, order=1)
+
+    define_node("io.shseed", "S", outputs=[OutDataset()])
+    define_node("io.shseed2", "S2", outputs=[OutDataset()])
+    M, T, Z, C, Y, X = 2, 4, 3, 2, 24, 32
+    yy, xx = np.mgrid[0:Y, 0:X]
+    arr = np.zeros((M, T, Z, C, Y, X), dtype=float)
+    for m in range(M):
+        for t in range(T):
+            for z in range(Z):
+                for c in range(C):
+                    cy, cx = 10 + 2 * m + z, 14 + 3 * c
+                    arr[m, t, z, c] = 100.0 + 900.0 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / 12.0) + 50 * t
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 0.6, "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 50.0]]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+    dy = np.array([[0.0, 1.0, 2.0, 3.0], [0.0, -0.5, -1.0, -1.5]])
+    dx = np.array([[0.0, -1.5, -3.0, -4.5], [0.0, 2.0, 4.0, 6.0]])
+    dz = np.array([[0.0, 0.5, 1.0, 1.0], [0.0, 0.0, -0.5, -1.0]])
+
+    def shifts_ds(dy_, dx_, dz_=None, t=T):
+        m_ = dy_.shape[0]
+        sd = Dataset(axes=AxisSizes(m=m_, t=t, z=1, c=1, y=4, x=4), metadata={})
+        sd = sd.with_image(ArrayProvider(np.zeros((m_, t, 1, 1, 4, 4))))
+        sd = sd.with_layer(Domain.FRAME, "drift_y", dy_).with_layer(Domain.FRAME, "drift_x", dx_)
+        if dz_ is not None:
+            sd = sd.with_layer(Domain.FRAME, "drift_z", dz_)
+        return sd
+
+    def run(data, shifts=None, params=None, modes=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.shseed"))
+        g.add(NodeInstance("H", "align.shift", params=dict(params or {}), modes=dict(modes or {})))
+        g.connect("S", "H")
+        seeds = {"S": data}
+        metas = {"S": MetaEnvelope(axes=data.axes, metadata=data.metadata)}
+        if shifts is not None:
+            g.add(NodeInstance("S2", "io.shseed2"))
+            g.connect("S2", "H", src_socket="out", dst_socket="shifts")
+            seeds["S2"] = shifts
+            metas["S2"] = MetaEnvelope(axes=shifts.axes, metadata=shifts.metadata)
+        e = Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas)
+        return e, e.pull("H")
+
+    def plane(out, m, t, z, c):
+        return np.asarray(out.image.get_region(0, m, t, z, c, 0, Y, 0, X), dtype=float)
+
+    # 2D: every plane/channel/position by its frame's (dy, dx)
+    e2, o2 = run(ds, shifts_ds(dy, dx), modes={"dim": "2D"})
+    assert isinstance(o2.image, MapComputeProvider) and o2.image.plane_unit
+    for m in range(M):
+        for t in range(T):
+            for z in range(Z):
+                for c in range(C):
+                    exp = ref(arr[m, t, z, c], np.array([dy[m, t], dx[m, t]]))
+                    assert np.array_equal(plane(o2, m, t, z, c), exp), (m, t, z, c)
+    assert np.array_equal(o2.get(D.FRAME, "shift_y").values, dy) and np.array_equal(o2.get(D.FRAME, "shift_x").values, dx)
+    assert o2.get(D.FRAME, "shift_z") is None and o2.metadata.get("origin_um") is None
+    assert "align.shift[2D" in str(o2.metadata.get(SAMPLING_KEY, ""))
+    # the eager bare-ctx reference agrees bit for bit
+    eager = COMPUTES["align.shift"](EvalContext(
+        node_id="H", op_key="align.shift", params={"__modes__": {"dim": "2D", "interp": "linear"}},
+        env=env0, granularity=Granularity.WHOLE_PLANE, kernel_axes=frozenset({"y", "x"}),
+        inputs=(ds,), by_name={"data": ds, "shifts": shifts_ds(dy, dx)},
+        reads=ReadContext(env0.metadata), spec=NODES.get("align.shift")))
+    assert isinstance(eager.image, ArrayProvider)
+    assert np.array_equal(gather(o2), gather(eager)), "lazy per-plane apply != eager reference"
+    # 3D with a named z layer: per volume by (dz, dy, dx); blank z layer = the 2D answer
+    e3, o3 = run(ds, shifts_ds(dy, dx, dz), params={"shift_z": "drift_z"}, modes={"dim": "3D"})
+    assert isinstance(o3.image, VolumeComputeProvider)
+    for m in range(M):
+        for t in range(T):
+            for c in range(C):
+                exp = ref(arr[m, t, :, c], np.array([dz[m, t], dy[m, t], dx[m, t]]))
+                got = np.stack([plane(o3, m, t, z, c) for z in range(Z)])
+                assert np.array_equal(got, exp), (m, t, c)
+    assert np.array_equal(o3.get(D.FRAME, "shift_z").values, dz)
+    e3b, o3b = run(ds, shifts_ds(dy, dx, dz), modes={"dim": "3D"})           # shift_z blank
+    assert o3b.get(D.FRAME, "shift_z") is None
+    assert np.array_equal(gather(o3b), gather(o2)), "3D with no z layer must equal 2D"
+    assert e2.entry("H").recipe_hash != e3.entry("H").recipe_hash != e3b.entry("H").recipe_hash
+    # one shift for every position; a NaN frame holds still; invert negates
+    dyn = dy[:1].copy(); dyn[0, 2] = np.nan
+    e4, o4 = run(ds, shifts_ds(dyn, dx[:1]), params={"invert": True}, modes={"dim": "2D"})
+    assert np.array_equal(o4.get(D.FRAME, "shift_y").values[1], -np.nan_to_num(dyn[0]))
+    assert np.array_equal(plane(o4, 1, 3, 0, 1), apply_shift(arr[1, 3, 0, 1], -np.array([dy[0, 3], dx[0, 3]]), order=1))
+    assert np.array_equal(plane(o4, 0, 2, 1, 0), apply_shift(arr[0, 2, 1, 0], np.array([0.0, -dx[0, 2]]), order=1))
+    # a Voxel mask moves with the image, at order 0
+    masked = ds.with_layer(Domain.VOXEL, "mask", (arr > 600).astype(np.uint8))
+    whole = shifts_ds(np.array([[0.0, 2.0, 0.0, 0.0]]), np.array([[0.0, 3.0, 0.0, 0.0]]))
+    _, o5 = run(masked, whole, modes={"dim": "2D", "interp": "cubic"})
+    mv = o5.get(Domain.VOXEL, "mask").values
+    src = (arr > 600).astype(np.uint8)
+    assert mv.dtype == np.uint8 and np.array_equal(mv[:, 0], src[:, 0]) and np.array_equal(mv[:, 2:], src[:, 2:])
+    assert np.array_equal(mv[0, 1, 0, 0, 2:, 3:], src[0, 1, 0, 0, :-2, :-3]) and mv[0, 1, 0, 0, :2].sum() == 0
+    # unwired shifts: the data's own layers
+    own = ds.with_layer(Domain.FRAME, "drift_y", dy).with_layer(Domain.FRAME, "drift_x", dx)
+    _, o6 = run(own, modes={"dim": "2D"})
+    assert np.array_equal(gather(o6), gather(o2))
+    # refusals
+    for data, shifts, params, needle in (
+            (ds, shifts_ds(dy[:, :3], dx[:, :3], t=3), {}, "3 timepoint(s) but the data has 4"),
+            (ds, shifts_ds(dy, dx), {"shift_x": "nope"},
+             "the Shifts input carries 2 candidates for Frame layer (['drift_x', 'drift_y'])"),
+            (ds, None, {}, "Shifts is not wired"),
+            (ds, shifts_ds(np.zeros((3, T)), np.zeros((3, T))), {}, "covers 3 position(s) but the data has 2"),
+            (ds.with_structure(StructureTable(Domain.POINT, {
+                "id": np.array([1]), "m": np.array([0]), "t": np.array([0]), "c": np.array([0]),
+                "z": np.array([0]), "y": np.array([10.0]), "x": np.array([14.0])}, layer="spots")),
+             shifts_ds(dy, dx), {}, "structure tables")):
+        try:
+            run(data, shifts, params, modes={"dim": "2D"})
+            raise AssertionError(f"expected a refusal mentioning {needle!r}")
+        except ValueError as exc:
+            assert needle in str(exc), str(exc)
+    assert _layers_shift({}, {"dim": "2D"}) == ((D.FRAME, "shift_y"), (D.FRAME, "shift_x"))
+    assert _layers_shift({"shift_z": "drift_z"}, {"dim": "3D"})[0] == (D.FRAME, "shift_z")
+    assert _layers_shift(None, None) == ((D.FRAME, "shift_y"), (D.FRAME, "shift_x"))
+
+    # the contract with Registration, on the bench's drifting beads: bit for bit
+    ph = phantom("star_field")
+    g = Graph()
+    g.add(NodeInstance("S", "io.shseed")); g.add(NodeInstance("R", "registration.stabilize"))
+    g.add(NodeInstance("H", "align.shift"))
+    g.connect("S", "R"); g.connect("S", "H"); g.connect("R", "H", src_socket="out", dst_socket="shifts")
+    e = Engine(g, computes=COMPUTES, seeds={"S": ph.dataset}, meta_seeds={"S": ph.envelope})
+    r, h = e.pull("R"), e.pull("H")
+    a = ph.dataset.axes
+    for t in range(a.t):
+        assert np.array_equal(np.asarray(r.image.get_region(0, 0, t, 0, 0, 0, a.y, 0, a.x)),
+                              np.asarray(h.image.get_region(0, 0, t, 0, 0, 0, a.y, 0, a.x))), t
+    assert np.array_equal(h.get(D.FRAME, "shift_y").values, r.get(D.FRAME, "drift_y").values)
+
+    # the workflow: stack → Select Plane → Registration (2D) → Shift on the stack
+    pv = phantom("star_volume")                        # drifts (+0.5 plane, +1.0, -0.6) px/frame
+    sa = pv.dataset.axes
+    g = Graph()
+    g.add(NodeInstance("S", "io.shseed"))
+    g.add(NodeInstance("P", "util.select_plane"))
+    g.add(NodeInstance("R", "registration.stabilize", modes={"model": "translation", "reference": "first"}))
+    g.add(NodeInstance("H", "align.shift"))
+    g.connect("S", "P"); g.connect("P", "R"); g.connect("S", "H")
+    g.connect("R", "H", src_socket="out", dst_socket="shifts")
+    e = Engine(g, computes=COMPUTES, seeds={"S": pv.dataset}, meta_seeds={"S": pv.envelope})
+    assert e.env("P").axes.z == 1 and e.env("R").axes.z == 1 and e.env("H").axes.z == sa.z
+    h = e.pull("H")
+    sy, sx = h.get(D.FRAME, "shift_y").values[0], h.get(D.FRAME, "shift_x").values[0]
+    for t in range(sa.t):
+        assert abs(sy[t] + 1.0 * t) < 0.1 and abs(sx[t] - 0.6 * t) < 0.1, (t, sy[t], sx[t])
+    for z in (0, sa.z // 2, sa.z - 1):                 # the SAME shift on every plane
+        raw = np.asarray(pv.dataset.image.get_region(0, 0, 3, z, 0, 0, sa.y, 0, sa.x), dtype=float)
+        got = np.asarray(h.image.get_region(0, 0, 3, z, 0, 0, sa.y, 0, sa.x), dtype=float)
+        assert np.array_equal(got, apply_shift(raw, np.array([sy[3], sx[3]]), order=1)), z
+    _ok("shift node: every plane/channel/position moves by its frame's (dy, dx) in 2D and "
+        "(dz, dy, dx) per volume in 3D (blank z layer = the 2D answer; distinct recipes); lazy "
+        "== eager bit for bit; one-position source broadcast, NaN frame held, invert negates, "
+        "a mask moves at order 0, unwired Shifts reads the data's own layers; T mismatch, a "
+        "missing layer, a position mismatch and structure tables refused; Shift(raw, "
+        "Registration(raw)) == Registration(raw) on 6 frames; stack → Select Plane → "
+        "Registration → Shift recovers (-1.0, +0.6)·t within 0.1 px from the middle plane "
+        "and applies it identically to planes 0, 6 and 11")
+
+
 def test_multiotsu_outputs() -> None:
     """``analysis.multiotsu`` ``output`` Mode (2026-10-02): ``merged`` (the class index, as
     before), ``per_class`` (one 0/1 mask per tier, a partition), ``selected`` (one mask of
@@ -28836,9 +29473,23 @@ def test_phantoms() -> None:
     assert not np.array_equal(phantom("cells2d", seed=1).array, base)
     assert not np.array_equal(phantom("cells2d", shift_px=(6.0, -8.0)).array, base)
     assert phantom("cells2d", puncta=True).array.max() >= base.max()
+    # the registration worlds (2026-10-07): the bench's four at demo size, captions stating
+    # the true motion the node's readout is read against
+    assert phantom("star_field").axes == AxisSizes(m=1, t=6, z=1, c=1, y=160, x=160)
+    assert "drifting (+1.5, -2.0)" in phantom("star_field").caption
+    assert phantom("star_field", n_stars=12, faint=True).array.max() < phantom("star_field").array.max()
+    assert "turning 3°" in phantom("star_field", rotate_deg=3.0).caption
+    assert phantom("moving_mass").axes.t == 6 and "turning 4°" in phantom("moving_mass").caption
+    assert "shearing 0.012" in phantom("moving_mass", rotate_deg=0.0, shear=0.012).caption
+    assert phantom("deforming_mass").axes == AxisSizes(m=1, t=6, z=1, c=1, y=160, x=160)
+    assert "bulges" in phantom("deforming_mass").caption
+    assert phantom("star_volume").axes == AxisSizes(m=1, t=4, z=12, c=1, y=96, x=96)
+    assert "z_step_um" in phantom("star_volume").envelope.metadata
     _ok(f"phantoms: {len(PHANTOMS)} deterministic 12-bit synthetic datasets (nuclei, a "
-        f"z-stack, drift, moving cells, two channels, a speckle pair, a stage mosaic); same "
-        f"seed => identical array and cached object; calibration keys present")
+        f"z-stack, drift, moving cells, two channels, a speckle pair, a stage mosaic, and the "
+        f"registration bench's drifting / faint / turning beads, turning / shearing / deforming "
+        f"body and a bead stack drifting in z); same seed => identical array and cached "
+        f"object; calibration keys present")
 
 
 def test_node_demos() -> None:
@@ -28874,6 +29525,21 @@ def test_node_demos() -> None:
     assert all(is_catalog_op(op) or NODES.owner(op) == "nodelab_v2.ops" for op in ops)
     ran, guides, slow, needs = [], [], [], []
     slowest = (0.0, "")
+    scen = 0
+
+    def _evidence(kind: str, res: "DR.DemoResult") -> bool:
+        return {
+            "image": lambda: res.after_image is not None and res.after_image.size > 0,
+            "mask": lambda: res.mask_plane is not None and int(res.mask_plane.max()) >= 1,
+            "labels": lambda: res.label_plane is not None and int(res.label_plane.max()) >= 2,
+            "scalar": lambda: res.scalar_plane is not None,
+            "points": lambda: len(res.points) > 0,
+            "tracks": lambda: any(len(t[1]) >= 2 for t in res.tracks),
+            "field": lambda: res.vectors is not None and res.vectors.shape[0] > 0,
+            "mesh": lambda: len(res.mesh) > 0,
+            "table": lambda: bool(DR.demo_rows(res)[1]),
+            "plot": lambda: res.after_image is not None,
+        }[kind]()
     for op in ops:
         r = DR.recipe_for(op)
         assert r.kind in DR.KINDS, (op, r.kind)
@@ -28882,7 +29548,7 @@ def test_node_demos() -> None:
                                 f"codemap/node_demos.json")
             guides.append(op)
             continue
-        assert r.phantom in PHANTOMS, (op, r.phantom)
+        assert DR.scenario_recipe(r, 0).phantom in PHANTOMS, (op, r.phantom)   # or its first world
         s = DR.DemoSession(r)
         if s.missing_requirements():
             needs.append(op)
@@ -28902,23 +29568,19 @@ def test_node_demos() -> None:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 assert rng.lo <= float(v) <= rng.hi, (op, sock.name, v, rng)
         res = s.run(dict(r.gate_params), {})
-        got = {
-            "image": lambda: res.after_image is not None and res.after_image.size > 0,
-            "mask": lambda: res.mask_plane is not None and int(res.mask_plane.max()) >= 1,
-            "labels": lambda: res.label_plane is not None and int(res.label_plane.max()) >= 2,
-            "scalar": lambda: res.scalar_plane is not None,
-            "points": lambda: len(res.points) > 0,
-            "tracks": lambda: any(len(t[1]) >= 2 for t in res.tracks),
-            "field": lambda: res.vectors is not None and res.vectors.shape[0] > 0,
-            "mesh": lambda: len(res.mesh) > 0,
-            "table": lambda: bool(DR.demo_rows(res)[1]),
-            "plot": lambda: res.after_image is not None,
-        }[r.kind]()
-        assert got, f"{op}: the {r.kind} demo produced no evidence"
+        assert _evidence(r.kind, res), f"{op}: the {r.kind} demo produced no evidence"
         assert res.elapsed_s < 10.0, (op, res.elapsed_s)
         if res.elapsed_s > slowest[0]:
             slowest = (res.elapsed_s, op)
         ran.append(op)
+        # a multi-world demo (2026-10-07): every other scenario runs too, at the mode state
+        # the window would send — the lever derived from THAT phantom's depth
+        for i in range(1, len(r.scenarios)):
+            sc = DR.DemoSession(DR.scenario_recipe(r, i))
+            rs = sc.run(dict(r.gate_params), sc.default_state())
+            assert _evidence(r.kind, rs), (op, r.scenarios[i].label)
+            assert rs.elapsed_s < 10.0, (op, r.scenarios[i].label, rs.elapsed_s)
+            scen += 1
     # the control classification and the heuristic ranges
     draw = NODES.get("analysis.draw_regions")
     assert DR.control_kind(draw.input("shapes")) == "readonly"
@@ -28940,12 +29602,395 @@ def test_node_demos() -> None:
     assert not np.array_equal(g1, g2), "sigma = 2 um must differ from the default"
     html = DR.guide_html("analysis.draw_regions", features=("Press Draw",))
     assert "Draw the region" in html and "Key features" in html and "Press Draw" in html
+    # the registration demo (2026-10-07): eight synthetic worlds whose true motion is
+    # stated, and the per-frame shift read back for the viewed frame — the demo has to be
+    # TRUE, not merely run. World 0: beads drifting (+1.5, −2.0) px per frame, viewed at t=5,
+    # so the correction must read (−7.5, +10.0).
+    rg = DR.recipe_for("registration.stabilize")
+    assert len(rg.scenarios) == 8 and rg.phantom == "" and not rg.is_guide
+    assert len({sc.label for sc in rg.scenarios}) == 8
+    s0 = DR.DemoSession(rg)                                # resolves to the first world
+    assert s0.recipe.scenario_index == 0 and s0.recipe.phantom == "star_field"
+    r0 = s0.run({}, s0.default_state())
+    assert r0.view[0] == 5 and {"drift_y", "drift_x", "drift_confidence"} <= set(r0.frame_values)
+    assert abs(r0.frame_values["drift_y"] + 7.5) < 0.3 and \
+        abs(r0.frame_values["drift_x"] - 10.0) < 0.3, r0.frame_values
+    # the deforming body pulls the drift estimate; the drawn still-half region removes the pull
+    r5 = DR.DemoSession(DR.scenario_recipe(rg, 5)).run({}, {})
+    s6 = DR.DemoSession(DR.scenario_recipe(rg, 6))
+    assert "region" in s6.recipe.fixed_params and \
+        "region" not in DR.scenario_recipe(rg, 5).fixed_params
+    r6 = s6.run({}, {})
+    assert abs(r5.frame_values["drift_x"] + 1.5) > 0.5, r5.frame_values   # pulled by the bulge
+    assert abs(r6.frame_values["drift_x"] + 1.5) < 0.4 and \
+        abs(r6.frame_values["drift_y"] + 3.0) < 0.4, r6.frame_values
+    # the stack: the lever derives to 3D from the phantom's 12 planes and drift_z appears;
+    # forced to 2D the same world reports no axial shift
+    s7 = DR.DemoSession(DR.scenario_recipe(rg, 7))
+    st7 = s7.default_state()
+    assert st7.get("dim") == "3D" and s7.phantom.axes.z == 12, st7
+    r7 = s7.run({}, st7)
+    assert "drift_z" in r7.frame_values and abs(r7.frame_values["drift_z"] + 1.5) < 0.8, \
+        r7.frame_values
+    assert "drift_z" not in s7.run({}, {**st7, "dim": "2D"}).frame_values
+    # the Shift demo (2026-10-07): the whole workflow on the bench's worlds — Select Plane →
+    # Registration upstream, the raw data on the main input, the shift read from the second —
+    # so its readout must equal Registration's own on the beads and recover the stack's lateral
+    # drift from the middle plane.
+    sh = DR.recipe_for("align.shift")
+    assert len(sh.scenarios) == 2 and sh.data_from == "src" and sh.extra_inputs == {"shifts": {"pre": 1}}
+    assert [st.op for st in sh.prelude] == ["util.select_plane", "registration.stabilize"]
+    h0 = DR.DemoSession(sh).run({}, {})
+    assert h0.view[0] == 5 and abs(h0.frame_values["shift_y"] + 7.5) < 0.3 and \
+        abs(h0.frame_values["shift_x"] - 10.0) < 0.3, h0.frame_values
+    s1 = DR.DemoSession(DR.scenario_recipe(sh, 1))
+    h1 = s1.run({}, s1.default_state())
+    assert h1.view[0] == 3 and s1.phantom.axes.z == 12 and "shift_z" not in h1.frame_values
+    assert abs(h1.frame_values["shift_y"] + 3.0) < 0.3 and \
+        abs(h1.frame_values["shift_x"] - 1.8) < 0.3, h1.frame_values
+    # scenario_recipe clamps; a recipe without scenarios passes through untouched
+    assert DR.scenario_recipe(rg, 99).scenario_index == 7
+    gr = DR.recipe_for("enhance.gaussian")
+    assert DR.scenario_recipe(gr, 3) is gr and gr.scenarios == ()
+    # the validator refuses what the window could not show
+    msgs = " | ".join(DR.validate_curation({"ops": {"registration.stabilize": {
+        "kind": "image", "scenarios": [
+            {"label": "a", "phantom": "no_such"}, {"label": "a", "phantom": "star_field"},
+            {"label": "b", "phantom": "star_field", "fixed_params": {"nope": 1}}]}}}))
+    assert "unknown phantom" in msgs and "duplicates the label" in msgs \
+        and "unknown param" in msgs, msgs
+    assert "guide cannot have scenarios" in " | ".join(DR.validate_curation({"ops": {
+        "zone.frame": {"kind": "guide",
+                       "scenarios": [{"label": "x", "phantom": "star_field"}]}}}))
     _ok(f"node demos: {len(ran)} ops run live on a phantom with evidence of their kind "
-        f"(slowest {slowest[1]} {slowest[0]:.2f}s); {len(guides)} guides with features; "
+        f"(slowest {slowest[1]} {slowest[0]:.2f}s) plus {scen} further scenario world(s); "
+        f"{len(guides)} guides with features; "
         f"{len(slow)} slow (Run button): {', '.join(slow)}; "
         f"{len(needs)} need an optional package: {', '.join(needs) or '-'}; "
         f"curation validated against the registry; slider ranges finite and containing "
-        f"their start; Draw Regions -> 3 regions; sigma moves the result")
+        f"their start; Draw Regions -> 3 regions; sigma moves the result; Registration's "
+        f"eight worlds read back the true motion (drifting beads at t=5 -> drift_y -7.5, "
+        f"drift_x +10.0 within 0.3 px; the deforming body pulls drift_x by >0.5 px and the "
+        f"drawn still-half region brings it back within 0.4; the 12-plane stack derives the "
+        f"lever to 3D and reports drift_z; Shift's two worlds read back the same beads "
+        f"correction and the stack's lateral drift from its middle plane), and the validator "
+        f"refuses an unknown phantom, "
+        f"a duplicate label, an unknown fixed param and scenarios on a guide")
+
+
+def test_registration_refinement() -> None:
+    """The 2026-10-07 registration refinements — the regression fence for what
+    ``scripts/registration_synthetic_bench.py`` measured (that script is the evidence; this
+    group pins the behaviours a future edit could silently undo).
+
+    1. **ECC seed sign.** ``ecc_align`` seeded the warp at ``+shift`` where the
+       reference→moving convention needs ``−shift``: ECC started at the mirror image of the
+       answer and, on a sparse field, stayed there (its non-convergence fallback IS the
+       seed), so ``euclidean``/``affine`` came back wrong by twice the drift. A sparse spot
+       lattice under a known drift must now register to 0.1 px with cc ≈ 1.
+    2. **Failed warps are gated, not applied.** A blank frame cannot be aligned; its warp
+       must be the held last-good one even at ``min_confidence=0``.
+    3. **Rotation past ECC's capture range in ``first`` mode.** A 25° turn is beyond what
+       ECC finds from a translation seed (it converges to a wrong optimum with a HIGH cc, so
+       no threshold catches it); the feature-seeded path must recover it to 0.3 px.
+    4. **Landmarks.** Exact correspondences plus a deterministic click jitter: ``auto`` must
+       name the right family (translation / euclidean / affine), flag an inconsistent set as
+       non-rigid, refuse an under-determined explicit request, and the typed form must
+       round-trip through ``parse_landmarks``.
+    5. **3-D translation.** A ``(T, Z, H, W)`` spot volume under a ``(dz, dy, dx)`` drift must
+       come back as a 3-component shift within 0.3, and ``apply_volume`` must undo it.
+    6. **The node's lever.** Through the Engine on a z-stack: 2D and 3D give distinct recipe
+       hashes; 3D streams a WHOLE_VOLUME unit, writes ``drift_z`` and ``drift_confidence``,
+       recovers the planted axial drift, and its lazy per-volume apply is BYTE-identical to
+       the eager bare-ctx reference; ``model=auto`` with landmarks resolves to the family the
+       clicks imply and records it in the metadata; a drawn ``region`` is honoured.
+    """
+    if not _HAVE_SKIMAGE:
+        _ok("registration refinement: skipped (no skimage)")
+        return
+    try:
+        import cv2  # noqa: F401
+    except Exception:  # noqa: BLE001
+        _ok("registration refinement: skipped (no cv2)")
+        return
+    import itertools
+    import math
+    from scipy.ndimage import affine_transform, gaussian_filter
+    from nodegraph.kernels import registration as R
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.streaming import MapComputeProvider, VolumeComputeProvider
+    from nodegraph.engine import EvalContext, ReadContext
+
+    H = W = 128
+    yy, xx = np.mgrid[0:H, 0:W].astype(float)
+
+    def spots(dy: float, dx: float, amp0: float = 600.0) -> np.ndarray:
+        """A 7×7 spot lattice with deterministic sub-pixel offsets (no RNG), moved by
+        ``(dy, dx)`` — rendered analytically, so the truth has no interpolation in it."""
+        img = np.full((H, W), 100.0)
+        for i in range(1, 8):
+            for j in range(1, 8):
+                py = i * 16 + 0.37 * ((i * 7 + j) % 5) + dy
+                px = j * 16 + 0.29 * ((i + j * 3) % 7) + dx
+                img += (amp0 + 150.0 * ((i * j) % 4)) * np.exp(
+                    -((yy - py) ** 2 + (xx - px) ** 2) / (2 * 1.5 ** 2))
+        return img.astype(np.float32)
+
+    # ── 1. ECC seed sign on a sparse field ─────────────────────────────────────────
+    series = np.stack([spots(2.1 * t, -1.3 * t) for t in range(4)])
+    tf = R.estimate_series(series, model="euclidean", reference="first", lowpass_sigma=1.0)
+    for t in range(1, 4):
+        w = tf["warps"][t]              # reference→moving (x, y): the content displacement
+        assert abs(w[0, 2] - (-1.3 * t)) < 0.1 and abs(w[1, 2] - (2.1 * t)) < 0.1, (t, w)
+        assert abs(math.degrees(math.atan2(w[1, 0], w[0, 0]))) < 0.2, w
+    assert float(tf["confidence"][1:].min()) > 0.9, tf["confidence"]
+    assert not tf["gated"].any()
+    # the mirrored seed (what shipped) is the counter-example: ECC from +shift does not
+    # recover a 6 px drift on this field, so the fix is load-bearing, not cosmetic
+    bad, cc_bad, _ = R.ecc_align(series[0], series[3], model="euclidean",
+                                 init_shift=-np.array([-6.3, 3.9]))
+    assert cc_bad == 0.0 or abs(bad[1, 2] - 6.3) > 1.0, (cc_bad, bad)
+    # the translation model on the same field: sub-pixel
+    tt = R.estimate_series(series, "translation", "first", lowpass_sigma=1.0)
+    assert np.allclose(-tt["shifts"][1:], [[2.1 * t, -1.3 * t] for t in range(1, 4)],
+                       atol=0.08), tt["shifts"]
+    # and the 2-D case of estimate_translation still returns a 2-vector
+    sh, ncc = R.estimate_translation(series[0], series[1], lowpass_sigma=1.0)
+    assert sh.shape == (2,) and ncc > 0.9
+
+    # ── 2. a failed warp estimate is gated whatever min_confidence says ────────────
+    blank = np.full((H, W), 100.0, dtype=np.float32)
+    _w, cc0, _ = R.ecc_align(series[0], blank, model="euclidean", init_shift=np.zeros(2))
+    assert cc0 == 0.0
+    tg = R.estimate_series(np.stack([series[0], blank, series[1]]), "euclidean", "first",
+                           min_confidence=0.0)
+    assert tg["gated"][1] and np.allclose(tg["warps"][1], np.eye(2, 3)), tg["warps"][1]
+    assert not tg["gated"][2]
+    # an implausible warp is refused by the sanity fence
+    assert not R._warp_is_sane(np.array([[2.5, 0, 0], [0, 1, 0]], dtype=np.float32), (H, W))
+    assert not R._warp_is_sane(np.array([[1, 0, 300.0], [0, 1, 0]], dtype=np.float32), (H, W))
+    assert R._warp_is_sane(np.eye(2, 3, dtype=np.float32), (H, W))
+
+    # ── 3. a 25° rotation in `first` mode, via the feature seed ────────────────────
+    def hashnoise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        v = np.sin(a * 12.9898 + b * 78.233) * 43758.5453
+        return v - np.floor(v)
+    cy = cx = (H - 1) / 2.0
+    rr = np.hypot(yy - cy, xx - cx)
+    disk = 1.0 / (1.0 + np.exp((rr - 40.0) / 3.0))
+    tex = gaussian_filter(hashnoise(yy, xx), 2.0)
+    tex = (tex - tex.min()) / np.ptp(tex)
+    base = (100.0 + 1200.0 * disk * (0.35 + 0.65 * tex)).astype(np.float32)
+
+    def rotated(deg: float) -> np.ndarray:
+        th = math.radians(deg)
+        Ryx = np.array([[math.cos(th), math.sin(th)], [-math.sin(th), math.cos(th)]])
+        inv = Ryx.T
+        c = np.array([cy, cx])
+        return affine_transform(base, inv, offset=c - inv @ c, order=3, mode="constant",
+                                cval=100.0).astype(np.float32)
+
+    rot = np.stack([base, rotated(25.0)])
+    tr = R.estimate_series(rot, "euclidean", "first")
+    w = tr["warps"][1]
+    est_deg = math.degrees(math.atan2(w[1, 0], w[0, 0]))
+    assert abs(est_deg - 25.0) < 0.3, (est_deg, tr["confidence"])
+    # endpoint error over the disk against the exact forward map
+    th = math.radians(25.0)
+    pts = np.stack([xx[disk > 0.5], yy[disk > 0.5]], axis=1)          # (x, y)
+    Rxy = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    true_xy = (pts - [cx, cy]) @ Rxy.T + [cx, cy]
+    est_xy = pts @ w[:, :2].T + w[:, 2]
+    epe = float(np.sqrt(((est_xy - true_xy) ** 2).sum(axis=1).mean()))
+    assert epe < 0.3, epe
+    assert not tr["gated"][1]
+    # without the feature seed the same frame is NOT recovered — the seed is what matters
+    tr0 = R.estimate_series(rot, "euclidean", "first", seed_from_features=False)
+    w0 = tr0["warps"][1]
+    est0 = math.degrees(math.atan2(w0[1, 0], w0[0, 0]))
+    unseeded_off = abs(est0 - 25.0) > 2.0 or tr0["gated"][1]
+
+    # ── 4. landmarks ──────────────────────────────────────────────────────────────
+    src = np.array([[30.0, 30.0], [30.0, 100.0], [100.0, 30.0], [100.0, 100.0], [64.0, 64.0],
+                    [45.0, 80.0]])
+    jit = np.array([[0.4, -0.3], [-0.5, 0.2], [0.3, 0.4], [-0.2, -0.4], [0.5, 0.1],
+                    [-0.3, 0.3]])                                        # a "click" error
+    Ryx = np.array([[math.cos(th), math.sin(th)], [-math.sin(th), math.cos(th)]])
+    dst_rot = (src - [cy, cx]) @ Ryx.T + [cy, cx] + [3.0, -2.0] + jit
+    lm = R.estimate_from_landmarks(src, dst_rot, model="auto")
+    assert lm["model"] == "euclidean" and not lm["nonrigid"], lm["summary"]
+    assert lm["residuals"]["translation"] > 5.0 > lm["residuals"]["euclidean"]
+    lm_t = R.estimate_from_landmarks(src, src + [3.0, -2.0] + jit, model="auto")
+    assert lm_t["model"] == "translation", lm_t["summary"]
+    sheared = src.copy()
+    sheared[:, 1] += 0.15 * (src[:, 0] - cy)                              # x += 0.15·(y−cy)
+    lm_a = R.estimate_from_landmarks(src, sheared + jit, model="auto")
+    assert lm_a["model"] in ("affine", "similarity") and not lm_a["nonrigid"], lm_a["summary"]
+    lm_n = R.estimate_from_landmarks(src, src + [[6, 0], [-6, 0], [0, 6], [0, -6], [4, 4], [-4, 4]],
+                                     model="auto")
+    assert lm_n["nonrigid"] and "NON-RIGID" in lm_n["summary"], lm_n["summary"]
+    try:
+        R.estimate_from_landmarks(src[:2], dst_rot[:2], model="affine")
+        raise AssertionError("affine from 2 pairs must refuse")
+    except ValueError as exc:
+        assert "at least 3" in str(exc), exc
+    parsed = R.parse_landmarks("t=3; 10.5,20 -> 12,21.5; 40,60 -> 41.2,60.9")
+    assert parsed == {"t": 3, "src": [[10.5, 20.0], [40.0, 60.0]],
+                      "dst": [[12.0, 21.5], [41.2, 60.9]]}, parsed
+    assert R.parse_landmarks("") is None and R.parse_landmarks(None) is None
+    assert R.parse_landmarks('{"t": 2, "pairs": [[[1, 2], [3, 4]]]}') == \
+        {"t": 2, "src": [[1.0, 2.0]], "dst": [[3.0, 4.0]]}
+    for bad_text in ("10,20 -> 12,21", "t=1; 10,20", "t=0; 1,2 -> 3,4"):
+        try:
+            R.parse_landmarks(bad_text)
+            raise AssertionError(f"{bad_text!r} must refuse")
+        except ValueError:
+            pass
+    # the landmark warp seeds the series: model=auto on the rotated pair, with clicks taken
+    # from the SAME rotation, resolves to euclidean and lands within 0.3 px
+    land = {"t": 1, "src": src.tolist(), "dst": ((src - [cy, cx]) @ Ryx.T + [cy, cx] + jit).tolist()}
+    ta = R.estimate_series(rot, "auto", "first", landmarks=land)
+    assert ta["model"] == "euclidean" and ta["landmarks"]["model"] == "euclidean"
+    wa = ta["warps"][1]
+    assert abs(math.degrees(math.atan2(wa[1, 0], wa[0, 0])) - 25.0) < 0.3, wa
+    half = R._interp_warp(wa, 0.5, (H, W))
+    assert abs(math.degrees(math.atan2(half[1, 0], half[0, 0])) - 12.5) < 0.3
+
+    # ── 5. 3-D translation on a spot volume ───────────────────────────────────────
+    Z, HV, WV = 12, 64, 64
+    zz3, yy3, xx3 = np.mgrid[0:Z, 0:HV, 0:WV].astype(float)
+
+    def spots3(dz: float, dy: float, dx: float) -> np.ndarray:
+        """27 spots at deterministic, IRREGULAR positions (a regular lattice has a
+        periodic correlation whose axial peak is poorly conditioned on 12 planes)."""
+        vol = np.full((Z, HV, WV), 100.0)
+        for i in range(1, 4):
+            for j in range(1, 4):
+                for k in range(1, 4):
+                    h = (i * 73 + j * 151 + k * 37) % 97 / 97.0
+                    pz = 2.0 + 8.0 * h + dz
+                    py = 10.0 + 44.0 * ((h * 7.3) % 1.0) + dy
+                    px = 10.0 + 44.0 * ((h * 11.7) % 1.0) + dx
+                    vol += 800.0 * np.exp(-((zz3 - pz) ** 2) / (2 * 1.2 ** 2)
+                                          - ((yy3 - py) ** 2 + (xx3 - px) ** 2) / (2 * 1.5 ** 2))
+        return vol.astype(np.float32)
+
+    vser = np.stack([spots3(0.5 * t, 1.5 * t, -1.0 * t) for t in range(3)])
+    tv = R.estimate_series(vser, "translation", "first", lowpass_sigma=1.0)
+    assert tv["shifts"].shape == (3, 3), tv["shifts"].shape
+    for t in (1, 2):
+        assert np.allclose(-tv["shifts"][t], [0.5 * t, 1.5 * t, -1.0 * t], atol=0.3), \
+            (t, tv["shifts"][t])
+    undone = R.apply_volume(vser[2], tv, 2)
+    core = (slice(3, Z - 3), slice(8, HV - 8), slice(8, WV - 8))
+    assert np.abs(undone[core] - vser[0][core]).mean() < 0.15 * np.abs(vser[2][core] - vser[0][core]).mean()
+    assert R.apply_frame(vser[2][Z // 2], tv, 2).shape == (HV, WV)       # planar part only
+
+    # ── 6. the node through the Engine: the 2D/3D lever ───────────────────────────
+    T = 3
+    raw = np.zeros((1, T, Z, 1, HV, WV), dtype=np.float32)
+    for t in range(T):
+        raw[0, t, :, 0] = vser[t]
+    axz = AxisSizes(m=1, t=T, z=Z, c=1, y=HV, x=WV)
+    ds = Dataset(axes=axz, metadata={"pixel_size_um": 0.3, "z_step_um": 1.0}
+                 ).with_image(ArrayProvider(raw))
+    env = MetaEnvelope(axes=axz, metadata={"pixel_size_um": 0.3, "z_step_um": 1.0})
+
+    def run(modes, params=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.load"))
+        g.add(NodeInstance("R", "registration.stabilize", params=dict(params or {}),
+                           modes=dict(modes)))
+        g.connect("S", "R")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull("R")
+
+    def gather(dset) -> np.ndarray:
+        p = dset.image
+        pa = p.axes
+        out = np.empty((pa.m, pa.t, pa.z, pa.c, pa.y, pa.x), dtype=float)
+        for m, t, z, c in itertools.product(range(pa.m), range(pa.t), range(pa.z),
+                                            range(pa.c)):
+            out[m, t, z, c] = p.get_region(0, m, t, z, c, 0, pa.y, 0, pa.x)
+        return out
+
+    e2, o2 = run({"dim": "2D", "model": "translation", "reference": "first"})
+    e3, o3 = run({"dim": "3D", "model": "translation", "reference": "first"})
+    assert e2.entry("R").recipe_hash != e3.entry("R").recipe_hash
+    assert isinstance(o2.image, MapComputeProvider) and o2.image.plane_unit
+    assert isinstance(o3.image, VolumeComputeProvider)
+    assert o2.get(D.FRAME, "drift_z") is None and o3.get(D.FRAME, "drift_z") is not None
+    for o in (o2, o3):
+        assert o.get(D.FRAME, "drift_confidence") is not None
+        assert o.axes == axz and o.metadata.get("registration_model") == "translation"
+    dz = o3.get(D.FRAME, "drift_z").values[0]
+    assert np.allclose(dz, [0.0, -0.5, -1.0], atol=0.3), dz.tolist()
+    dy2 = o2.get(D.FRAME, "drift_y").values[0]
+    assert np.allclose(dy2, [0.0, -1.5, -3.0], atol=0.3), dy2.tolist()
+    # the lazy per-volume apply ≡ the eager bare-ctx reference, in every BIT
+    eager = COMPUTES["registration.stabilize"](EvalContext(
+        node_id="R", op_key="registration.stabilize",
+        params={"__modes__": {"dim": "3D", "model": "translation", "reference": "first"}},
+        env=env, granularity=Granularity.WHOLE_SERIES,
+        kernel_axes=frozenset({"t", "z", "y", "x"}), inputs=(ds,),
+        reads=ReadContext(env.metadata), spec=NODES.get("registration.stabilize")))
+    assert isinstance(eager.image, ArrayProvider)
+    assert np.array_equal(gather(o3), gather(eager)), "3D lazy apply disagrees with eager"
+    # model=auto + landmarks on a planar pair: resolves to the clicked family, records it
+    rot6 = np.zeros((1, 2, 1, 1, H, W), dtype=np.float32)
+    rot6[0, :, 0, 0] = rot
+    axr = AxisSizes(m=1, t=2, z=1, c=1, y=H, x=W)
+    ds_r = Dataset(axes=axr, metadata={"pixel_size_um": 0.3}).with_image(ArrayProvider(rot6))
+    env_r = MetaEnvelope(axes=axr, metadata={"pixel_size_um": 0.3})
+    g = Graph()
+    g.add(NodeInstance("S", "io.load"))
+    g.add(NodeInstance("R", "registration.stabilize",
+                       params={"landmarks": "t=1; " + "; ".join(
+                           f"{a[0]:.2f},{a[1]:.2f} -> {b[0]:.2f},{b[1]:.2f}"
+                           for a, b in zip(land["src"], land["dst"]))},
+                       modes={"dim": "2D", "model": "auto", "reference": "first"}))
+    g.connect("S", "R")
+    oa = Engine(g, computes=COMPUTES, seeds={"S": ds_r}, meta_seeds={"S": env_r}).pull("R")
+    assert oa.metadata.get("registration_model") == "euclidean", oa.metadata
+    assert "euclidean chosen" in str(oa.metadata.get("registration_landmarks", "")), oa.metadata
+    # a drawn `region`: a rect over the lattice's left half still recovers the drift
+    g = Graph()
+    g.add(NodeInstance("S", "io.load"))
+    g.add(NodeInstance("R", "registration.stabilize",
+                       params={"region": '[{"type": "rect", "op": "add", "vertices": [[8, 8], [120, 64]]}]'},
+                       modes={"dim": "2D", "model": "translation", "reference": "first"}))
+    g.connect("S", "R")
+    sp6 = np.zeros((1, 3, 1, 1, H, W), dtype=np.float32)
+    sp6[0, :, 0, 0] = series[:3]
+    ds_s = Dataset(axes=AxisSizes(m=1, t=3, z=1, c=1, y=H, x=W)).with_image(ArrayProvider(sp6))
+    og = Engine(g, computes=COMPUTES, seeds={"S": ds_s}).pull("R")
+    dyr = og.get(D.FRAME, "drift_y").values[0]
+    assert np.allclose(dyr, [0.0, -2.1, -4.2], atol=0.3), dyr.tolist()
+    try:
+        g2 = Graph()
+        g2.add(NodeInstance("S", "io.load"))
+        g2.add(NodeInstance("R", "registration.stabilize", params={"region": "not json"},
+                            modes={"dim": "2D"}))
+        g2.connect("S", "R")
+        Engine(g2, computes=COMPUTES, seeds={"S": ds_s}).pull("R")
+        raise AssertionError("malformed region JSON must refuse")
+    except ValueError as exc:
+        assert "region" in str(exc)
+
+    _ok("registration refinement (2026-10-07): ECC seed sign fixed — euclidean/first on a "
+        "sparse spot lattice recovers a 2.1/-1.3 px-per-frame drift to 0.1 px at cc>0.9 "
+        "where the mirrored seed does not; a failed warp (blank frame) is gated at "
+        "min_confidence=0 and the sanity fence refuses a 2.5x / off-frame warp; a 25° "
+        f"rotation registers in `first` mode to {epe:.3f} px via the feature seed"
+        f"{' (unseeded ECC misses it)' if unseeded_off else ''}; landmarks: auto names "
+        "translation/euclidean/affine from 6 jittered clicks, flags an inconsistent set "
+        "NON-RIGID, refuses affine from 2 pairs, parses the typed form, and seeds the series "
+        "to the clicked family; 3-D: a (T,Z,H,W) spot volume's (dz,dy,dx) drift comes back "
+        "within 0.3 and apply_volume undoes it; node: 2D vs 3D distinct hashes, 3D streams a "
+        "WHOLE_VOLUME unit with drift_z + drift_confidence and equals the eager reference "
+        "bit-for-bit, model=auto records the clicked family, a drawn region is honoured and "
+        "malformed region JSON refuses")
 
 
 def main() -> int:
@@ -29031,6 +30076,10 @@ def main() -> int:
     test_readiness()
     test_timeseries_clock_order()
     test_split_positions()
+    test_select_plane_split_z()
+    test_select_frame_split_t()
+    test_split_groups()
+    test_shift_node()
     test_workspace_model()
     test_page_composition_memo_reuse()
     test_workspace_format_v3()
@@ -29101,6 +30150,7 @@ def main() -> int:
     test_overlay_zoom_detail()
     test_overlay_subtick_cache()
     test_align_to()
+    test_registration_refinement()
     test_origin_um_maintenance()
     test_transform()
     test_lablink()

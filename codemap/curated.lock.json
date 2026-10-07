@@ -274,10 +274,10 @@
  },
  "INV-08": {
   "anchors": {
-   "file:nodegraph/codemap.py": "c06b5bffb6978b80f72bfcabfb29ccdd",
+   "file:nodegraph/codemap.py": "bc381aa8d030bf41c29d151e8bd4b277",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-10-06",
+  "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
  "INV-09": {
@@ -290,14 +290,14 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "663fa4f142f39969a6a17b33db9ac905"
+   "file:nodegraph/kernels/README.md": "e6d0971275e5eb30d72505845eb730fb"
   },
   "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "663fa4f142f39969a6a17b33db9ac905"
+   "file:nodegraph/kernels/README.md": "e6d0971275e5eb30d72505845eb730fb"
   },
   "blessed": "2026-10-07",
   "file": "codemap/invariants.md"

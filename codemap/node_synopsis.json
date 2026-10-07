@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 109,
+    "nodes": 114,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 767,
-    "outputs": 116,
+    "inputs": 787,
+    "outputs": 121,
     "gui_ops_included": true
   },
   "stages": {
@@ -94,9 +94,13 @@
         "util.batch",
         "util.merge",
         "util.select_batch",
+        "util.select_frame",
         "util.select_group",
+        "util.select_plane",
         "util.select_position",
         "util.split_positions",
+        "util.split_t",
+        "util.split_z",
         "util.timeseries",
         "util.unbatch"
       ]
@@ -114,6 +118,7 @@
       ],
       "ops": [
         "align.drift",
+        "align.shift",
         "enhance.bilateral",
         "enhance.clahe",
         "enhance.deconvolve",
@@ -285,8 +290,8 @@
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
-      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
-      "count": 11,
+      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, timepoints, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
+      "count": 15,
       "ops": [
         {
           "op": "channel.select",
@@ -296,7 +301,7 @@
         {
           "op": "channel.split",
           "label": "Split Channels",
-          "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'."
+          "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with Groups set, into one output per RANGE of channels; the full bundle also passes through 'out'."
         },
         {
           "op": "data.part",
@@ -319,9 +324,19 @@
           "summary": "Keep one file of a batch, by name. The tap Unbatch's per-file outputs materialize into, and usable on its own to pull a single member out."
         },
         {
+          "op": "util.select_frame",
+          "label": "Select Frame",
+          "summary": "Keep ONE timepoint of a series, chosen on the Viewer (default: the first frame): T narrows to 1 and everything indexed by t follows — the per-frame clock, per-frame masks, the detections on that frame. The tap Split T's per-frame outputs materialize into, and usable on its own."
+        },
+        {
           "op": "util.select_group",
           "label": "Select Group",
           "summary": "Keep only the multipoints of one specimen group — the 3x3 mosaic, the plate well — recovered from the stage coordinates or read from the acquisition. Lazy: no pixels move, and per-position metadata, layers and structure rows follow the selection."
+        },
+        {
+          "op": "util.select_plane",
+          "label": "Select Plane",
+          "summary": "Keep ONE z plane of a stack, chosen on the Viewer (auto = the middle plane): Z narrows to 1 and everything indexed by z follows — the plane's physical z, per-plane masks, the detections on it. The tap Split Z's per-plane outputs materialize into, and the front half of 'estimate the drift on one plane, apply it to the whole stack' (Select Plane → Registration → Shift)."
         },
         {
           "op": "util.select_position",
@@ -331,7 +346,17 @@
         {
           "op": "util.split_positions",
           "label": "Split Positions",
-          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels."
+          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels."
+        },
+        {
+          "op": "util.split_t",
+          "label": "Split T",
+          "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z."
+        },
+        {
+          "op": "util.split_z",
+          "label": "Split Z",
+          "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K) — or, with Groups set, one output per RANGE of planes (a sub-stack each); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions."
         },
         {
           "op": "util.timeseries",
@@ -472,13 +497,18 @@
     "registration_and_alignment": {
       "label": "Registration & alignment",
       "stage": "prepare_image",
-      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another.",
-      "count": 3,
+      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another — and the apply half on its own: Shift moves any Dataset by a per-frame (z, y, x) shift read from a Registration output, so the drift can be estimated on one plane (Select Plane) and applied to the whole stack.",
+      "count": 4,
       "ops": [
         {
           "op": "align.drift",
           "label": "Drift Correction",
           "summary": "Rigid drift correction across Timepoints (phase cross-correlation on a reference plane); stores the per-frame shift as Frame attributes."
+        },
+        {
+          "op": "align.shift",
+          "label": "Shift",
+          "summary": "Move every plane, channel and position of a Dataset by a per-frame (z, y, x) shift read from a Registration or Drift Correction output's drift layers (or the data's own) — the apply half of registration as a node of its own, so the drift can be estimated on one plane (Select Plane → Registration) and applied to the whole stack. Masks and label rasters move with the image; stores the applied shift as Frame layers."
         },
         {
           "op": "registration.align_to",
@@ -488,7 +518,7 @@
         {
           "op": "registration.stabilize",
           "label": "Registration",
-          "summary": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature models, first/previous/mean/template anchor; stores per-frame shift (ported v1 kernel)."
+          "summary": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature/auto models, first/previous/mean/template anchor, 2D or 3D (axial drift), a drawn estimate region and hand-clicked landmarks; stores the per-frame shift and confidence as Frame attributes. Pair with Select Plane (estimate on one chosen plane) and Shift (apply the stored shift to the whole stack) when the estimate and the apply belong on different data."
         }
       ]
     },
@@ -1076,6 +1106,7 @@
     ],
     "registration": [
       "align.drift",
+      "align.shift",
       "registration.align_to",
       "registration.stabilize"
     ],
@@ -1101,9 +1132,13 @@
       "util.merge",
       "util.resample",
       "util.select_batch",
+      "util.select_frame",
       "util.select_group",
+      "util.select_plane",
       "util.select_position",
       "util.split_positions",
+      "util.split_t",
+      "util.split_z",
       "util.stack",
       "util.stitch",
       "util.timeseries",
@@ -1186,6 +1221,174 @@
       "trained_params": false,
       "kernel_doc": "",
       "params_read": []
+    },
+    "align.shift": {
+      "op": "align.shift",
+      "label": "Shift",
+      "category": "registration",
+      "role": "registration_and_alignment",
+      "stage": "prepare_image",
+      "pages": [
+        "refine"
+      ],
+      "module": "nodegraph/catalog/align/shift.py",
+      "gui_only": false,
+      "summary": "Move every plane, channel and position of a Dataset by a per-frame (z, y, x) shift read from a Registration or Drift Correction output's drift layers (or the data's own) — the apply half of registration as a node of its own, so the drift can be estimated on one plane (Select Plane → Registration) and applied to the whole stack. Masks and label rasters move with the image; stores the applied shift as Frame layers.",
+      "overview": "Apply a per-frame ``(dz, dy, dx)`` shift to every unit of the data. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** registration (apply) → ``op_key=\"align.shift\"``, category ``\"registration\"``. * **Data contract** axis-preserving. ``data`` → the same Dataset with its image moved; Voxel layers (a mask, a label raster) ride along — integer rasters at order 0 so ids survive — and a Dataset carrying STRUCTURE TABLES is refused, exactly as ``transform.rigid`` refuses it: a table stores ``y``/``x``/``z`` as columns, and moving the raster while the rows keep their old addresses reports every object where it used to be. Put Shift before the segmentation step, which is where a registration belongs. ``origin_um`` is dropped (a per-``(m,t)`` move has no single per-M corner), as ``registration.stabilize`` and ``align.drift`` drop it; ``bit_depth`` survives (resampling redistributes counts inside their range, §7c). * **The shift** comes from the ``shifts`` input's Frame layers when it is wired, else from ``data``'s own — ``layer_from=\"shifts\"`` makes the picker offer the right wire's layers. Shape ``(M', T)``: ``T`` must equal the data's (the shift is a function of time, so the two must be the same series), ``M'`` must equal the data's or be 1 (applied to every position). A non-finite value (a frame Registration gated) is no shift. ``invert`` negates. * **2D/3D** ``DimMode``. 2D applies ``(dy, dx)`` per plane; 3D applies ``(dz, dy, dx)`` per volume, with ``dz`` from the 3D-only ``shift_z`` socket — EMPTY (the default) means no axial shift, so a stack whose estimate came from one plane under Registration's 2D lever applies cleanly under either lever. * **Footprint** ``_DIM_GRAN_GLOBAL`` / ``_DIM_KAX``: a shift fills the vacated edge with zeros, so a tile would invent that border mid-image — whole planes, whole volumes. * **Lazy apply, as Registration's.** Frame ``t``'s output depends only on frame ``t``'s pixels and its shift, so the move is a per-plane / per-volume streaming provider and only the units pulled are computed; the shift vector itself is kilobytes, baked eagerly. It is folded into the provider fingerprint by content — it comes from a SECOND input, which the base provider's fingerprint knows nothing about, so without this two different shift sources over the same data would share tile entries. * **Backend** :func:`nodegraph.kernels.registration.apply_shift` (``scipy.ndimage.shift`` on float32, cast back) — the SAME call ``apply_frame`` makes for the translation model, which is what makes Shift(data, Registration(data)) == Registration(data). * **Stored** the applied shift, per frame, as Frame layers ``shift_y`` / ``shift_x`` (``shift_z`` when an axial shift was applied), so the window and a table can read what moved.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": {
+          "2D": "whole_plane",
+          "3D": "whole_volume"
+        },
+        "kernel_axes": {
+          "2D": [
+            "x",
+            "y"
+          ],
+          "3D": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "frame"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "frame"
+        ]
+      },
+      "modes": [
+        {
+          "name": "dim",
+          "label": "2D / 3D",
+          "choices": [
+            "2D",
+            "3D"
+          ],
+          "default": "2D",
+          "derive": "'3D' if (n_z or 1) > 1 else '2D'",
+          "role": "dim_lever",
+          "presentation": "header",
+          "description": "Whether this node treats each Z plane as its own 2D image or the Z stack as one 3D volume. It also decides which parameters are live (a Z-only radius or σ appears only on the 3D side) and how much data the scheduler reads per step. It folds into the memo key, so the 2D and the 3D result are cached separately instead of overwriting each other — flipping back is free.",
+          "choice_docs": {
+            "2D": "Apply each frame's (y, x) shift to every plane of that frame, plane by plane. The cheap path — one output plane costs one source plane — and the right one when the shift was estimated on a single plane (Select Plane → Registration) and is meant for the whole stack. An axial shift the Shifts input may carry is ignored here.",
+            "3D": "Apply each frame's (z, y, x) shift to the whole volume of that frame, so a stack that drifted in focus is moved back along z as well. Needs a Shift z layer (Registration's drift_z, written under its own 3D lever); leave it blank and only the lateral shift is applied — the same answer as 2D, computed per volume, so one viewed plane costs the whole stack."
+          }
+        },
+        {
+          "name": "interp",
+          "label": "Interpolation",
+          "choices": [
+            "linear",
+            "nearest",
+            "cubic"
+          ],
+          "default": "linear",
+          "description": "How pixel values are sampled when a shift lands between pixels. A sub-pixel shift must interpolate, so this is a genuine choice about what the moved pixels MEAN; a whole-pixel shift lands exactly and every option gives the same bytes. Masks and label rasters always move at nearest, whatever is chosen here, so their ids survive.",
+          "choice_docs": {
+            "linear": "Weighted average of the neighbouring pixels — the usual choice for intensity images: smooth, no overshoot, a slight blur that grows with each successive resample. The same order Registration uses, so its layers reproduce its output exactly.",
+            "nearest": "Copy the closest pixel's value, no averaging. Preserves the exact histogram at the cost of jagged edges and up to half a pixel of positional error; the right choice when the counts must stay raw.",
+            "cubic": "Third-order spline: the sharpest of the three and the best at preserving fine texture, but it can RING — overshoot at a hard edge, so a saturated boundary can gain a dark halo — and it is the slowest."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The data to move: every plane, channel and position of it is shifted by its frame's (z, y, x) shift, and its masks and label rasters move with it. When Shifts is not wired, the shift is read from this input's own Frame layers."
+        },
+        {
+          "name": "shifts",
+          "label": "Shifts",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "Where the per-frame shift comes from: a Registration or Drift Correction output, whose drift_y / drift_x (and drift_z) Frame layers are read. Nothing else of it is used and it passes nothing downstream. It must have the same number of timepoints as the data, and the same number of positions or exactly one. Unwired = read the layers off the data itself."
+        },
+        {
+          "name": "shift_y",
+          "label": "Shift y layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "drift_y",
+          "layer_in": "frame",
+          "layer_from": "shifts",
+          "description": "Which Frame layer holds each frame's shift along y (rows), in pixels — the shift APPLIED to the content, positive toward a higher index, which is the convention Registration and Drift Correction write (their drift layers are the correction, the negative of how far the content moved), so their layers reproduce their own alignment exactly. Offered from the Shifts input when it is wired, else from the data's own Frame layers. A frame whose value is NaN (a gated estimate) is left where it is."
+        },
+        {
+          "name": "shift_x",
+          "label": "Shift x layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "drift_x",
+          "layer_in": "frame",
+          "layer_from": "shifts",
+          "description": "Which Frame layer holds each frame's shift along x (columns), in pixels — the shift APPLIED to the content, positive toward a higher index, which is the convention Registration and Drift Correction write (their drift layers are the correction, the negative of how far the content moved), so their layers reproduce their own alignment exactly. Offered from the Shifts input when it is wired, else from the data's own Frame layers. A frame whose value is NaN (a gated estimate) is left where it is."
+        },
+        {
+          "name": "shift_z",
+          "label": "Shift z layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "dim": [
+              "3D"
+            ]
+          },
+          "layer_in": "frame",
+          "layer_from": "shifts",
+          "description": "Which Frame layer holds each frame's shift along z, in PLANES. BLANK (the default) applies no axial shift, which is right for a stack whose estimate came from one plane; Registration under its 3D lever writes drift_z, and naming it here moves the focus drift back too. Only read under the 3D lever — the shift APPLIED to the content, positive toward a higher index, which is the convention Registration and Drift Correction write (their drift layers are the correction, the negative of how far the content moved), so their layers reproduce their own alignment exactly. Offered from the Shifts input when it is wired, else from the data's own Frame layers. A frame whose value is NaN (a gated estimate) is left where it is."
+        },
+        {
+          "name": "invert",
+          "label": "Invert",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Apply the NEGATIVE of the layers' shift. The layers Registration writes are the correction, so applying them as they are reproduces its alignment; inverted, they put the measured motion back — to undo a correction, or to impose one series' drift on another. Off by default."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_shift",
+      "meta_transform": null,
+      "extra_layers": "_layers_shift",
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/registration.md",
+      "params_read": [
+        "__modes__",
+        "invert",
+        "shift_x",
+        "shift_y",
+        "shift_z"
+      ]
     },
     "analysis.accumulate_field": {
       "op": "analysis.accumulate_field",
@@ -6748,7 +6951,7 @@
       "extra_layers": null,
       "adds_columns": true,
       "trained_params": false,
-      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "kernel_doc": "nodegraph/kernels/track_field.md",
       "params_read": [
         "__modes__",
         "frame_interval",
@@ -7090,7 +7293,7 @@
       ],
       "module": "nodegraph/catalog/channel/split.py",
       "gui_only": false,
-      "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'.",
+      "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with Groups set, into one output per RANGE of channels; the full bundle also passes through 'out'.",
       "overview": "Split Channels — a domain-transparent pass-through of the full multi-channel bundle. Its single real ``out`` socket carries the input unchanged; the GUI adds one synthetic per-channel output socket (``ch0…chN-1``), and each wired per-channel tap is materialized into a ``channel.select`` at graph-build time (the engine is one-payload-per-node, so distinct per-channel payloads come from real select taps, not from this node). No calibration/axes change here (TILEABLE, no meta_transform).",
       "overview_source": "compute",
       "dimensionality": {
@@ -7116,6 +7319,16 @@
           "type": "dataset",
           "role": "dataset",
           "description": ""
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per channel: type the groups as 0-based channel indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the channel axis, and the per-channel outputs are put away. Blank = one output per channel, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Select Channel with that list at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real channel length."
         }
       ],
       "outputs": [
@@ -16360,8 +16573,8 @@
       ],
       "module": "nodegraph/catalog/registration/stabilize.py",
       "gui_only": false,
-      "summary": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature models, first/previous/mean/template anchor; stores per-frame shift (ported v1 kernel).",
-      "overview": "Full registration / drift-stabilization (ported v1 ``registration`` kernel): estimate a per-frame transform bundle on a **reference channel** (mid-z of the T series) and apply the *same* bundle to every channel and z — the register-once/ apply-to-all design that preserves colocalization. Axis-preserving; the per-frame ``(Δy, Δx)`` translation is stored as Frame attributes (``drift_y``/``drift_x``). Richer than :func:`_compute_drift` (``align.drift``): ``model`` ∈ translation (phase-corr) / euclidean·affine (ECC) / feature (ORB+RANSAC), and ``reference`` ∈ first / previous (cumulative) / mean / template. WHOLE_SERIES; pixel-space (no calibration — pure geometric registration, like ``align.drift``). Kernel: :mod:`nodegraph.kernels.registration` (numpy/scipy/skimage/cv2). **The estimate is eager, the apply is LAZY** — the same split ``align.drift`` uses, and for the same reason. Estimating is inherently whole-series (a global correlation per frame) but reads only ONE plane per (m, t): the reference channel at mid-z, so it costs m·t plane reads no matter how deep or how many-channelled the stack is. Applying is separable per plane (:func:`~nodegraph.kernels.registration.apply_frame` — frame t's output depends only on frame t's pixels and frame t's transform), so it is deferred to a per-plane :class:`~nodegraph.streaming.MapComputeProvider` and only the planes actually pulled are ever computed. This used to allocate ``(M,T,Z,C,Y,X)`` float64 up front and apply to every plane eagerly, which made the node scale linearly in Z for a viewer showing ONE plane. On a 16-position 10-plane 4-channel 2048² stack that is 20.0 GiB and 640 plane-warps against 2.0 GiB and 64 for the same stack z-projected — so resetting an upstream Z-Project to ``none`` turned a working pull into a ~10× slower, 20 GiB one, and the Viewer sat on the previous z==1 frame while it ran. The node that looked broken was Z-Project; the node that could not absorb the result was this one (2026-08-04). The footprint declaration is UNCHANGED (``WHOLE_SERIES`` + ``kernel_axes={t,y,x}``, the same pair ``align.drift`` declares) and that is correct, not an oversight: laziness changes when the work happens, never what the node reads. The estimate still needs every timepoint of a whole plane, so a scheduler that tiled this node or fed it one frame at a time would still be wrong.",
+      "summary": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature/auto models, first/previous/mean/template anchor, 2D or 3D (axial drift), a drawn estimate region and hand-clicked landmarks; stores the per-frame shift and confidence as Frame attributes. Pair with Select Plane (estimate on one chosen plane) and Shift (apply the stored shift to the whole stack) when the estimate and the apply belong on different data.",
+      "overview": "Full registration / drift-stabilization (ported v1 ``registration`` kernel): estimate a per-frame transform bundle on a **reference channel** and apply the *same* bundle to every channel and z — the register-once / apply-to-all design that preserves colocalization. Axis-preserving; the per-frame shift is stored as Frame attributes (``drift_y``/``drift_x``, plus ``drift_z`` in 3D) alongside the per-frame ``drift_confidence``. Richer than :func:`_compute_drift` (``align.drift``): ``model`` ∈ translation (cross-correlation) / euclidean·affine (ECC) / feature (ORB+RANSAC) / auto (chosen from the landmarks), and ``reference`` ∈ first / previous (cumulative) / mean / template. Pixel-space (no calibration — pure geometric registration, like ``align.drift``). Kernel: :mod:`nodegraph.kernels.registration` (numpy/scipy/skimage/cv2). Resolved spec of the 2026-10-07 refinement (``scripts/registration_synthetic_bench.py`` is the evidence; ``CodeLog/Updates/worklog/2026-10-07_registration-bench-and-fixes.md`` the record) -------------------------------------------------------------------------------------- * **2D/3D** ``DimMode``. 2D estimates on the MIDDLE z plane of the reference channel and applies the in-plane correction to every plane — what the node always did. To estimate on a CHOSEN plane the workflow is three nodes, not a plane socket here: ``util.select_plane`` → this node (2D) → ``align.shift`` on the full stack, which reads the ``drift_*`` layers this node writes (2026-10-07). 3D correlates the whole ``(Z, Y, X)`` volume per timepoint and corrects the axial drift too (``drift_z``); the warp models keep their planar warp from the middle plane and take only ``dz`` from the volume. The bench's star volume showed the 2D path leaving 100 % of an axial drift in place while its lateral estimate degraded as the mid-plane content changed under it; 3D recovers ``dz`` to ~0.4 plane on a 16-plane stack (the z error is set by stack depth vs the axial PSF, not by the algorithm). * **Footprint** ``WHOLE_SERIES`` in both dims; ``kernel_axes`` ``{t,y,x}`` / ``{t,z,y,x}``. The estimate needs every timepoint of a whole plane (or volume), so a scheduler that tiled this node or fed it one frame at a time would still be wrong. * **Sockets** ``lowpass_sigma`` (px) — the matched-filter half of the band-pass the correlation runs on; ``region`` — a drawn region the ESTIMATE is restricted to (applied full-frame), which is the standard remedy when the specimen deforms and the dish, beads or a stable neighbour do not; ``landmarks`` — clicked correspondences between frame 0 and frame ``t`` that pick the model (``auto``) and seed the warp estimate. All three are read on every branch. * **Confidence** stored per frame so a gated / weak frame is a row in a table, not a judgement by eye. * **Kernel defaults that changed under this node**: plain cross-correlation instead of phase whitening (3–15× more precise here, and it made ``highpass_sigma`` a live control — whitening had cancelled it), the ECC seed sign fixed, ECC seeded from the feature match when that fit is trusted (rotation beyond ~10° now registers in ``first`` mode), and a failed warp estimate gated rather than applied. **The estimate is eager, the apply is LAZY** — the same split ``align.drift`` uses, and for the same reason. Estimating is inherently whole-series (a global correlation per frame) but reads only ONE plane per (m, t) in 2D (the reference channel at mid-z), so it costs m·t plane reads no matter how deep or how many-channelled the stack is; 3D reads the reference channel's Z planes per (m, t), which is what an axial estimate honestly costs. Applying is separable per plane / per volume (:func:`~nodegraph.kernels.registration.apply_frame` / :func:`~nodegraph.kernels.registration.apply_volume` — frame t's output depends only on frame t's pixels and frame t's transform), so it is deferred to a per-unit streaming provider and only the units actually pulled are ever computed. This used to allocate ``(M,T,Z,C,Y,X)`` float64 up front and apply to every plane eagerly, which made the node scale linearly in Z for a viewer showing ONE plane. On a 16-position 10-plane 4-channel 2048² stack that is 20.0 GiB and 640 plane-warps against 2.0 GiB and 64 for the same stack z-projected — so resetting an upstream Z-Project to ``none`` turned a working pull into a ~10× slower, 20 GiB one, and the Viewer sat on the previous z==1 frame while it ran. The node that looked broken was Z-Project; the node that could not absorb the result was this one (2026-08-04).",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -16370,11 +16583,19 @@
       },
       "footprint": {
         "granularity": "whole_series",
-        "kernel_axes": [
-          "t",
-          "x",
-          "y"
-        ],
+        "kernel_axes": {
+          "2D": [
+            "t",
+            "x",
+            "y"
+          ],
+          "3D": [
+            "t",
+            "x",
+            "y",
+            "z"
+          ]
+        },
         "footprint_mode": "dim"
       },
       "domains": {
@@ -16388,21 +16609,40 @@
       },
       "modes": [
         {
+          "name": "dim",
+          "label": "2D / 3D",
+          "choices": [
+            "2D",
+            "3D"
+          ],
+          "default": "2D",
+          "derive": "'3D' if (n_z or 1) > 1 else '2D'",
+          "role": "dim_lever",
+          "presentation": "header",
+          "description": "Whether this node treats each Z plane as its own 2D image or the Z stack as one 3D volume. It also decides which parameters are live (a Z-only radius or σ appears only on the 3D side) and how much data the scheduler reads per step. It folds into the memo key, so the 2D and the 3D result are cached separately instead of overwriting each other — flipping back is free.",
+          "choice_docs": {
+            "2D": "Estimate on the MIDDLE z plane of the reference channel and apply the same in-plane correction to every plane. Right for single-plane data and for a stack whose focus did not move. On a z-stack it ignores axial drift entirely: a sample that drifted two planes stays two planes off, and the lateral estimate itself degrades as the mid-plane's content changes underneath it. To estimate on a plane of YOUR choosing, put Select Plane in front of this node and apply its drift layers to the full stack with Shift.",
+            "3D": "Correlate the whole (Z, Y, X) volume of the reference channel per timepoint and correct the axial drift as well as the lateral one, storing it as drift_z. A warp model (euclidean / affine / feature) still estimates its in-plane warp on the middle plane and takes only dz from the volume. Costs Z plane reads per timepoint for the estimate instead of one. The axial precision is set by how many planes the stack has against the axial spot size (about 0.4 plane on a 16-plane stack in the bench), so a very thin stack gains little."
+          }
+        },
+        {
           "name": "model",
           "label": "Model",
           "choices": [
             "translation",
             "euclidean",
             "affine",
-            "feature"
+            "feature",
+            "auto"
           ],
           "default": "translation",
           "description": "How much freedom the per-frame transform has. More degrees of freedom can correct more kinds of motion, and can also absorb REAL deformation into the registration — so use the least that fits your data. The transform is estimated on the reference channel and applied to every channel and z, so colocalization is preserved whichever model you pick.",
           "choice_docs": {
-            "translation": "Sub-pixel shift only, by phase correlation. Two parameters, so it is the fastest, the most robust, and incapable of distorting anything — the right choice for ordinary stage drift, and the default. It cannot correct any rotation.",
-            "euclidean": "Shift plus RIGID rotation (ECC, seeded from a phase-correlation shift). Handles a dish that was knocked or a sample that rotated, while still preserving distances and angles — so nothing you measure afterwards is stretched. Needs decent contrast to converge.",
-            "affine": "Shift, rotation, scale and shear (ECC). Corrects apparent stretch from focus or thermal changes, and is the first model that can silently absorb genuine deformation — if the specimen is what deforms, this removes the signal you were measuring. Slowest of the ECC models.",
-            "feature": "Detect ORB keypoints in each frame, match them and fit a transform with RANSAC. The only option that survives LARGE motion, where the correlation-based models have no overlap to lock onto — and the only one that can fail outright on smooth, featureless images, since it needs distinctive corners to match."
+            "translation": "Sub-pixel shift only, by cross-correlation of the band-passed images. Two parameters, so it is the fastest, the most robust, and incapable of distorting anything — the right choice for ordinary stage drift, and the default. It cannot correct any rotation, and on a specimen that deforms it measures the deformation's average pull as drift unless the estimate is restricted to a rigid region.",
+            "euclidean": "Shift plus RIGID rotation (ECC, seeded from the feature match when that is trusted, else from the correlation shift). Handles a dish that was knocked or a sample that rotated, while still preserving distances and angles — so nothing you measure afterwards is stretched. Needs decent texture to converge; on a sparse field of spots it is no better than translation.",
+            "affine": "Shift, rotation, scale and shear (ECC, seeded like euclidean). Corrects apparent stretch from focus or thermal changes, and is the first model that can silently absorb genuine deformation — if the specimen is what deforms, this removes the signal you were measuring. Slowest of the ECC models.",
+            "feature": "Detect ORB keypoints in each frame, match them and fit a transform with RANSAC. Survives LARGE motion and rotation where the correlation models have nothing to lock onto, at about 0.3–0.5 px precision rather than the ~0.03 px of ECC — which is why euclidean/affine now use it as a seed and then refine. Fails outright on smooth, featureless images and on sparse fields of round spots, since it needs distinctive corners.",
+            "auto": "Let the landmarks decide: the simplest family whose fit to the clicked pairs is within click precision becomes the model (translation, euclidean, or affine for a similarity/affine fit), and the per-family residuals are written to the output metadata. Without landmarks this is translation."
           }
         },
         {
@@ -16417,8 +16657,8 @@
           "default": "previous",
           "description": "What each frame is registered TO. This is the choice that decides whether errors accumulate over a long series and whether a bleaching or changing specimen can still be matched to its anchor — it matters more than the model on a long timelapse.",
           "choice_docs": {
-            "first": "Register every frame to frame 0. Errors never accumulate and the output is anchored to the acquisition's own start, which is what you want when positions must stay comparable to the first frame. It fails late in a series whose appearance has drifted far from frame 0 (bleaching, growth, a cell leaving).",
-            "previous": "Register each frame to the one before it and accumulate the shifts. Consecutive frames always look alike, so individual matches are the most reliable — but every small error is added to all later frames, producing slow cumulative drift over hundreds of timepoints. The default.",
+            "first": "Register every frame to frame 0. Errors never accumulate and the output is anchored to the acquisition's own start, which is what you want when positions must stay comparable to the first frame. It fails late in a series whose appearance has drifted far from frame 0 (bleaching, growth, a cell leaving) and when the cumulative motion leaves little overlap with frame 0.",
+            "previous": "Register each frame to the one before it and accumulate the shifts. Consecutive frames always look alike, so individual matches are the most reliable — but every small error is added to all later frames, producing slow cumulative drift over hundreds of timepoints (about 0.02 px per frame on a dense field, 0.05 px on a sparse one). The default.",
             "mean": "Register every frame to the average of the whole series. The anchor is less noisy than any single frame and no error accumulates; its weakness is that an UNREGISTERED average is blurred by the very drift being corrected, so it is a poor anchor when motion is large.",
             "template": "Two passes: roughly stabilize with a cheap translation-to-previous pass, average the result into a sharp template, then register every frame to that. Avoids both cumulative drift and the atypical-anchor problem, at roughly double the cost — the recommended choice for long or photobleaching series."
           }
@@ -16452,6 +16692,16 @@
           "description": "Sub-pixel precision factor for the cross-correlation peak: the shift is resolved to about 1/this of a pixel, so 20 gives roughly 0.05 px. HIGHER costs a little more time and buys nothing once you pass the noise floor of the data; LOWER quantizes the correction and leaves visible residual jitter. 1 disables sub-pixel refinement entirely."
         },
         {
+          "name": "lowpass_sigma",
+          "label": "Lowpass σ",
+          "type": "float",
+          "role": "parameter",
+          "is_field": true,
+          "unit": "px",
+          "default": 1.0,
+          "description": "Gaussian smoothing applied BEFORE correlating, in pixels — the matched filter for point-like features. Set it near the spot radius of the features that should drive the alignment (beads, nuclei, puncta: 1–1.5 px). It is what makes a sparse, noisy field registrable: on a field of faint beads at a peak signal-to-noise of 8 the error drops from about 2 px to 0.1 px. LARGER suppresses more noise and blurs fine texture that a dense specimen could have locked onto; 0 disables it. Must stay below Highpass σ or no band is left. Only the ESTIMATE is filtered — output pixels are never smoothed."
+        },
+        {
           "name": "highpass_sigma",
           "label": "Highpass σ",
           "type": "float",
@@ -16459,7 +16709,7 @@
           "is_field": true,
           "unit": "px",
           "default": 2.0,
-          "description": "Width of the high-pass filter applied BEFORE correlating, in pixels — it removes smooth illumination gradients that would otherwise dominate the correlation peak and pull the estimate toward zero shift. In PIXELS rather than µm because it acts on the correlation, not on physical structure. LARGER filters less; 0 disables it. Only the shift ESTIMATE is filtered — the output pixels are never high-passed."
+          "description": "Width of the high-pass filter applied BEFORE correlating, in pixels — it removes smooth illumination gradients, vignetting and bleaching trends that would otherwise dominate the correlation peak and pull the estimate toward zero shift. In PIXELS rather than µm because it acts on the correlation, not on physical structure. LARGER filters less; 0 disables it, and with it off a smooth textured specimen under a drifting illumination gradient registers 30× worse. Keep it above Lowpass σ. Only the shift ESTIMATE is filtered — the output pixels are never high-passed."
         },
         {
           "name": "min_confidence",
@@ -16468,7 +16718,36 @@
           "role": "parameter",
           "is_field": true,
           "default": 0.0,
-          "description": "Reject a frame's measured shift when the correlation peak is weaker than this, falling back rather than trusting it. 0 (the default) accepts every estimate. Raise it when some frames are blank, defocused or bleached: a spurious shift from a frame with no real structure would otherwise be applied as a genuine correction and physically displace that frame's data. The trade-off is that too high a value rejects valid shifts and leaves real drift uncorrected."
+          "description": "Reject a frame's measured transform when its confidence — the correlation after alignment for translation, the ECC coefficient for euclidean/affine, the RANSAC inlier fraction for feature — is below this, holding the last good transform (first/mean/template) or skipping the increment (previous) instead. 0 (the default) accepts every ESTIMATE, but an outright failure (a warp that did not converge or is not a plausible motion) is always rejected — there is nothing to apply. Raise it when some frames are blank, defocused or bleached: a spurious shift from a frame with no real structure would otherwise be applied as a genuine correction. Too high rejects valid shifts and leaves real drift uncorrected. Every frame's value is stored as drift_confidence, so look there before choosing."
+        },
+        {
+          "name": "region",
+          "label": "Estimate in region",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "pick_kind": "shapes",
+          "description": "Restrict the ESTIMATE to a drawn region; the correction is still applied to the whole frame. This is the remedy when the specimen itself deforms, grows or moves while the dish, beads or a neighbouring cell do not: draw around what should hold still and the deformation stops being absorbed into (or biasing) the drift. Empty = the whole frame. A rectangle keeps sub-pixel precision; a freeform region correlates at whole-pixel precision for the translation model (ECC and feature are unaffected)."
+        },
+        {
+          "name": "landmarks",
+          "label": "Landmarks",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Point pairs you identified by hand: the same physical places on frame 0 and on one later frame, as 't=5; row,col -> row,col; row,col -> row,col' (or the equivalent JSON). From them the node fits every transform family and reports the residual of each in the output metadata (registration_landmarks): with Model = auto the simplest family within about 1 px of click precision is chosen, and if even affine cannot fit the clicks the field is flagged NON-RIGID — no global transform will register it. For euclidean/affine the fitted warp also seeds the estimate of every frame (scaled to that frame's share of the motion), which is what lets a large rotation register when the automatic seed cannot find it. Five well-spread pairs are enough to tell the families apart; three cannot (affine fits any three exactly). Empty = no landmarks."
+        },
+        {
+          "name": "click_precision",
+          "label": "Click precision",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 1.0,
+          "description": "How far off each landmark click may be, in pixels — the yardstick for the NON-RIGID verdict only (which family fits best is decided from the clicks' own scatter and does not depend on this). A pure drift clicked at 2 px precision but judged at 1 px is flagged non-rigid; set it to what your clicks really achieve: about 0.3 px when zoomed onto a bead, 1 px by eye, 2 px on soft structure. Only read when Landmarks is filled."
         }
       ],
       "outputs": [
@@ -16482,15 +16761,19 @@
       ],
       "compute": "_compute_stabilize",
       "meta_transform": null,
-      "extra_layers": "_layers_drift",
+      "extra_layers": "_layers_stabilize",
       "adds_columns": false,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/registration.md",
       "params_read": [
         "__modes__",
+        "click_precision",
         "highpass_sigma",
+        "landmarks",
+        "lowpass_sigma",
         "min_confidence",
         "ref_channel",
+        "region",
         "upsample"
       ]
     },
@@ -19828,6 +20111,77 @@
         "member"
       ]
     },
+    "util.select_frame": {
+      "op": "util.select_frame",
+      "label": "Select Frame",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/util/select_frame.py",
+      "gui_only": false,
+      "summary": "Keep ONE timepoint of a series, chosen on the Viewer (default: the first frame): T narrows to 1 and everything indexed by t follows — the per-frame clock, per-frame masks, the detections on that frame. The tap Split T's per-frame outputs materialize into, and usable on its own.",
+      "overview": "Keep exactly one timepoint of a series. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.select_frame\"``, category ``\"utility\"``, ``meta_transform=select_frame``. * **Data contract** ``Dataset → the same Dataset with t = 1``. The T half of ``util.crop``'s frames mode exactly: nothing spatial changes, the per-T lists (``frame_time_jd``, …) are subset with the axis (:func:`~nodegraph.metadata.time_subset`), ``dt_s`` survives (one frame keeps the source interval — :func:`respaced`), lattice layers follow and structure rows on other frames are dropped, the survivors re-addressed to ``t = 0`` — the shared helpers every frame subset uses. * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the corresponding input unit of the kept frame; the rest of the series is never read. * **Sockets** ``frame`` (0-based; default 0, the acquisition's first frame and the anchor Registration's ``first`` mode uses; ``pick_kind=\"frame\"`` adopts the timepoint the viewer is showing). No modes. * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider` with one timepoint. Resolution is shared with the edit-time transform (:func:`~nodegraph.metadata.frame_pick`) so the card and the pull agree. A value past the end is REFUSED with the series length — handing back some other frame's pixels under the index asked for is the failure a selector exists to prevent. A single-frame input is returned as is, whatever is asked.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "frame",
+          "label": "Frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "pick_kind": "frame",
+          "description": "WHICH TIMEPOINT to keep, 0-based. Scrub Frame t in the Viewer to the frame you want and press Pick to take the one on screen; 0 (the default) is the first frame, the anchor Registration's `first` mode uses. The output has one frame, so whatever follows works on exactly this timepoint — a segmentation of the starting state, a reference for Align To — and the rest of the series is never read. A value past the end is refused with the series length rather than falling back to another frame; on a single-frame input every value is the identity."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_select_frame",
+      "meta_transform": "select_frame",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "frame"
+      ]
+    },
     "util.select_group": {
       "op": "util.select_group",
       "label": "Select Group",
@@ -19903,6 +20257,79 @@
       "params_read": [
         "gap_factor",
         "group"
+      ]
+    },
+    "util.select_plane": {
+      "op": "util.select_plane",
+      "label": "Select Plane",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/util/select_plane.py",
+      "gui_only": false,
+      "summary": "Keep ONE z plane of a stack, chosen on the Viewer (auto = the middle plane): Z narrows to 1 and everything indexed by z follows — the plane's physical z, per-plane masks, the detections on it. The tap Split Z's per-plane outputs materialize into, and the front half of 'estimate the drift on one plane, apply it to the whole stack' (Select Plane → Registration → Shift).",
+      "overview": "Keep exactly one z plane of a stack. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.select_plane\"``, category ``\"utility\"``, ``meta_transform=select_plane``. * **Data contract** ``Dataset → the same Dataset with z = 1``. The z half of ``util.crop``'s frames mode exactly: nothing lateral changes, ``z_step_um`` survives (one plane keeps the source spacing), ``z_home_index`` follows, and ``origin_um`` moves up by the planes cut off the bottom so the plane still sits at its physical z. Lattice layers (a mask, a per-plane statistic) are subset with the image and structure rows (Point / Label / Track) on other planes are dropped and the survivors re-addressed to ``z = 0`` — the same shared helpers ``util.crop`` and ``util.select_position`` use. * **2D/3D** no lever: index arithmetic only. The OUTPUT is single-plane, which is what makes a dim-lever node downstream derive to 2D on its own. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the corresponding input unit of the kept plane; the rest of the stack is never read. * **Sockets** ``plane`` (0-based; AUTO = the middle plane, ``derive=\"(n_z or 1) // 2\"``; ``pick_kind=\"plane\"`` adopts the plane the viewer is showing). No modes. * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider` with one plane. Resolution is shared with the edit-time transform (:func:`~nodegraph.metadata.plane_pick`) so the card and the pull agree, and the blank/auto case resolves to the SAME middle plane the socket's ``derive`` shows. A value past the end is REFUSED with the stack's depth — handing back some other plane's pixels under the index asked for is the failure a selector exists to prevent. A single-plane input is returned as is, whatever is asked: selecting the only plane there is, is the identity.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "plane",
+          "label": "Plane",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "plane",
+          "default": 0,
+          "derive": "(n_z or 1) // 2",
+          "pick_kind": "plane",
+          "description": "WHICH Z PLANE to keep, 0-based from the bottom of the stack. AUTO is the middle plane. Scrub Plane z in the Viewer to the plane with the clearest, most stable structure and press Pick to take the plane on screen. The output has one plane, so whatever follows works on exactly this plane — Registration estimates its drift here, a dim-lever node derives to 2D — and the rest of the stack is never read. A value past the end is refused with the stack's depth rather than falling back to another plane; on a single-plane input every value is the identity."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_select_plane",
+      "meta_transform": "select_plane",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "plane"
       ]
     },
     "util.select_position": {
@@ -19982,7 +20409,7 @@
       ],
       "module": "nodegraph/catalog/util/split_positions.py",
       "gui_only": false,
-      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
+      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
       "overview": "Split Positions — a domain-transparent pass-through of the full multipoint bundle, the M-axis twin of ``channel.split`` (2026-10-02). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-position output socket (``pos0…posM-1``, labelled with the acquisition's point name where the file carries one, else ``m0…``) once the wire carries two or more positions, and each wired per-position tap is materialized into a real ``util.select_position`` at graph-build time — the engine is one-payload-per-node, so distinct per-position payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a multipoint Load (or after a Timeseries Builder laid files onto M) to run a different branch per well, dish or field.",
       "overview_source": "compute",
       "dimensionality": {
@@ -20008,6 +20435,16 @@
           "type": "dataset",
           "role": "dataset",
           "description": "The multipoint Dataset to fan out. Its positions appear as one output socket each on the card, labelled with the file's point names when it has them; `out` still carries the whole set."
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per position: type the groups as 0-based position indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the M (position) axis, and the per-position outputs are put away. Blank = one output per position, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Crop in frames mode keeping those positions at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real M (position) length."
         }
       ],
       "outputs": [
@@ -20020,6 +20457,140 @@
         }
       ],
       "compute": "_compute_split_positions",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": []
+    },
+    "util.split_t": {
+      "op": "util.split_t",
+      "label": "Split T",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine"
+      ],
+      "module": "nodegraph/catalog/util/split_t.py",
+      "gui_only": false,
+      "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z.",
+      "overview": "Split T — a domain-transparent pass-through of the full series, the T-axis twin of ``util.split_z`` (2026-10-07). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-frame output socket (``t0…tT-1``, labelled with the frame's index and, when the series carries a frame interval, its time) while the series is short enough to fan out (:data:`nodelab_v2.document.FANOUT_CAP`), and each wired per-frame tap is materialized into a real ``util.select_frame`` at graph-build time — the engine is one-payload-per-node, so distinct per-frame payloads come from real select taps, not from this node. A time series is usually hundreds of frames, which is what the ``groups`` text is for: ``every 10`` or ``0-99; 100-199`` gives one output per RANGE (a Crop in frames mode at run time). No calibration or axes change here (``TILEABLE``, no meta_transform).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": null,
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The time series to fan out. Its frames appear as one output socket each on the card (`t0…`, with the frame's time when the series has a frame interval) while there are few enough to show; type Groups to split a long series into ranges. `out` still carries the whole series."
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per frame: type the groups as 0-based frame indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the T axis, and the per-frame outputs are put away. Blank = one output per frame, up to 24 of them; past that the card offers only `out`, and this is how to split. A time series is usually hundreds of frames, so `every 10` (or `0-99; 100-199`) is the normal way to split one. A wired group materializes into a Crop in frames mode keeping those frames at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real T length."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_split_t",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": []
+    },
+    "util.split_z": {
+      "op": "util.split_z",
+      "label": "Split Z",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine"
+      ],
+      "module": "nodegraph/catalog/util/split_z.py",
+      "gui_only": false,
+      "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K) — or, with Groups set, one output per RANGE of planes (a sub-stack each); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions.",
+      "overview": "Split Z — a domain-transparent pass-through of the full stack, the Z-axis twin of ``channel.split`` and ``util.split_positions`` (2026-10-07). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-plane output socket (``z0…zZ-1``, labelled with the plane's index and, when the stack carries a z step, its height above plane 0) once the wire carries two or more planes, and each wired per-plane tap is materialized into a real ``util.select_plane`` at graph-build time — the engine is one-payload-per-node, so distinct per-plane payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a Load to run a different branch per plane, or to hand ONE plane to Registration while the full stack goes on to Shift.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": null,
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The z-stack to fan out. Its planes appear as one output socket each on the card (`z0…`, with the plane's height when the stack has a z step); `out` still carries the whole stack."
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per plane: type the groups as 0-based plane indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`), or `every 10` for consecutive chunks of ten. The card then grows one output PER GROUP, each carrying exactly that subset of the Z axis, and the per-plane outputs are put away. Blank = one output per plane, up to 24 of them; past that the card offers only `out`, and this is how to split. A wired group materializes into a Crop in frames mode keeping those planes at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real Z length."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_split_z",
       "meta_transform": null,
       "extra_layers": null,
       "adds_columns": false,

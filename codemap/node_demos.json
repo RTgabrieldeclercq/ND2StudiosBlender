@@ -1,6 +1,6 @@
 {
   "schema": "nd2studios-node-demos/1",
-  "how_to_read": "Per-op overrides for the node demo window (nodelab_v2/demo_recipes.py). A node absent here demos itself from its ROLE (codemap/node_roles.json -> demo_recipes.ROLE_DEFAULTS). Keys per op: kind (image|mask|labels|scalar|points|tracks|field|mesh|table|plot|guide), phantom + phantom_kw (nodegraph/phantom.py), prelude (a name from 'preludes' or a list of {op, params, modes}), data_from (tail|src), extra_inputs {socket: {phantom, kw} | {pre: i}}, fixed_params, fixed_modes, sliders {param: [lo, hi]}, live (false -> a Run button), slow_modes {mode: [choices]}, slow_reason, gate_params (selftest only), view {t, z, c}, features (key features / how to use). Validated against the live registry by selftest.test_node_demos.",
+  "how_to_read": "Per-op overrides for the node demo window (nodelab_v2/demo_recipes.py). A node absent here demos itself from its ROLE (codemap/node_roles.json -> demo_recipes.ROLE_DEFAULTS). Keys per op: kind (image|mask|labels|scalar|points|tracks|field|mesh|table|plot|guide), phantom + phantom_kw (nodegraph/phantom.py), prelude (a name from 'preludes' or a list of {op, params, modes}), data_from (tail|src), extra_inputs {socket: {phantom, kw} | {pre: i}}, fixed_params, fixed_modes, sliders {param: [lo, hi]}, live (false -> a Run button), slow_modes {mode: [choices]}, slow_reason, gate_params (selftest only), view {t, z, c}, features (key features / how to use). Validated against the live registry by selftest.test_node_demos. scenarios [{label, phantom, phantom_kw, view, fixed_params, fixed_modes, note}] offers several synthetic worlds in a 'Synthetic data' dropdown; the first is the default and an entry with scenarios may omit its own phantom. A Frame-domain layer the node writes is shown at the viewed frame in the status line (a registration's drift_y / drift_x).",
   "preludes": {
     "spots2d": [
       {
@@ -206,7 +206,8 @@
       "phantom": "two_channel",
       "features": [
         "Grows one output socket per channel so each can feed its own chain.",
-        "Wiring an output inserts a Select Channel tap for you at run time."
+        "Wiring an output inserts a Select Channel tap for you at run time.",
+        "Groups: type ranges — `0,2; 1` or `nuclei: 0; reporters: 1-2` — and the card grows one output per group (a Select Channel with that list at run time) instead of one per channel; `every 4` chunks the axis into consecutive fours, and past 24 members the card grows no per-index sockets at all — Groups is then the way to split."
       ]
     },
     "util.merge": {
@@ -257,7 +258,8 @@
       "kind": "image",
       "phantom": "plate_mosaic",
       "features": [
-        "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap."
+        "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap.",
+        "Groups: `0-5; 6-11` (or `wells: 0-5; blanks: 6-11`) gives one output per range of positions instead of one per position — a Crop in frames mode at run time, every per-position list following; `every 4` chunks the axis into consecutive fours, and past 24 members the card grows no per-index sockets at all — Groups is then the way to split."
       ]
     },
     "util.stitch": {
@@ -360,24 +362,194 @@
     },
     "align.drift": {
       "kind": "image",
-      "phantom": "timelapse_drift",
-      "view": {
-        "t": 5
-      },
+      "scenarios": [
+        {
+          "label": "Drifting beads",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "drift_px": [
+              1.5,
+              -2.0
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Stage drift on a bead field: the status line shows the shift applied to the viewed frame, which should read drift_y −1.5·t, drift_x +2.0·t."
+        },
+        {
+          "label": "Sparse, faint beads",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "n_stars": 12,
+            "faint": true,
+            "drift_px": [
+              1.5,
+              -2.0
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Twelve dim beads at a peak SNR of about 7. This node has no band-pass and whitens the spectrum, so here it loses the beads in the noise; Registration with its Lowpass σ holds them."
+        },
+        {
+          "label": "Turning, drifting body",
+          "phantom": "moving_mass",
+          "phantom_kw": {
+            "rotate_deg": 4.0,
+            "drift_px": [
+              1.0,
+              -0.5
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "A rotation this node cannot represent — it only shifts. Registration's euclidean model is the next step."
+        }
+      ],
       "features": [
-        "Measures the global shift of every frame against a reference and shifts it back; the drift is written as a Frame layer.",
-        "Before: frame 5 of a drifting series. After: the same frame re-registered to frame 0."
+        "Measures the global shift of every frame against frame 0 by phase correlation and shifts it back; the shift is written as a Frame layer (drift_y / drift_x) and shown in the status line for the viewed frame.",
+        "The light option: no parameters, frame 0 as the anchor, phase-whitened correlation without a band-pass. For sparse or faint fields, rotation, axial drift or a deforming specimen use Registration, which is 3–15× more precise on the same synthetic worlds."
       ]
     },
     "registration.stabilize": {
       "kind": "image",
-      "phantom": "timelapse_drift",
-      "view": {
-        "t": 5
-      },
+      "scenarios": [
+        {
+          "label": "Drifting beads",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "drift_px": [
+              1.5,
+              -2.0
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Stage drift on a bead field. The status line shows the correction applied to the viewed frame: with the field moving (+1.5, −2.0) px per frame it should read drift_y −1.5·t, drift_x +2.0·t. Scrub Frame t and compare with Difference."
+        },
+        {
+          "label": "Sparse, faint beads",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "n_stars": 12,
+            "faint": true,
+            "drift_px": [
+              1.5,
+              -2.0
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Twelve dim beads at a peak SNR of about 7 — the regime that broke the old kernel. Drag Lowpass σ to 0 and watch the estimate fall apart; 1–1.5 px, the bead radius, is the matched filter that holds it."
+        },
+        {
+          "label": "Turning bead field",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "rotate_deg": 3.0,
+            "drift_px": [
+              0.8,
+              -0.5
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "A 15° turn by the last frame on top of drift. Translation cannot follow a rotation (the corners smear in Difference); switch Model to euclidean."
+        },
+        {
+          "label": "Turning, drifting body",
+          "phantom": "moving_mass",
+          "phantom_kw": {
+            "rotate_deg": 4.0,
+            "drift_px": [
+              1.0,
+              -0.5
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "A textured body with no corners, 20° by the last frame. Euclidean with Reference = first used to converge to a wrong answer past ~10°; it is now seeded from the feature match. Compare first with previous."
+        },
+        {
+          "label": "Shearing body",
+          "phantom": "moving_mass",
+          "phantom_kw": {
+            "rotate_deg": 0.0,
+            "shear": 0.012,
+            "drift_px": [
+              0.5,
+              0.3
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Shear is the first motion only affine can represent: euclidean leaves a residual that grows with t, affine takes it out — and would equally absorb a real deformation."
+        },
+        {
+          "label": "Deforming body",
+          "phantom": "deforming_mass",
+          "phantom_kw": {
+            "bulge_px": 0.6,
+            "drift_px": [
+              0.6,
+              0.3
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "One side bulges out while the body drifts (+0.6, +0.3) px per frame. No global transform undoes the bulge, and it pulls on the drift estimate: read drift_y / drift_x against −0.6·t / −0.3·t."
+        },
+        {
+          "label": "Deforming body, estimate on its still half",
+          "phantom": "deforming_mass",
+          "phantom_kw": {
+            "bulge_px": 0.6,
+            "drift_px": [
+              0.6,
+              0.3
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "fixed_params": {
+            "region": "[{\"type\": \"rect\", \"op\": \"add\", \"vertices\": [[8, 8], [152, 70]]}]"
+          },
+          "note": "The same body with the estimate restricted to a drawn region over the half that holds still (the remedy the region socket exists for): the reported drift now lands within a few hundredths of a pixel of the truth."
+        },
+        {
+          "label": "Beads drifting in z (a stack)",
+          "phantom": "star_volume",
+          "phantom_kw": {
+            "drift_px": [
+              0.5,
+              1.0,
+              -0.6
+            ]
+          },
+          "view": {
+            "t": 3
+          },
+          "note": "A 12-plane stack drifting half a plane per frame as well as laterally. In 2D the node registers the middle plane and leaves the axial drift in place; in 3D it reports drift_z too. Flip the lever and scrub Plane z."
+        }
+      ],
       "features": [
-        "Sub-pixel phase correlation per frame on one reference channel; the per-frame shifts become a Frame layer.",
-        "Before: frame 5 of a drifting series. After: stabilized."
+        "Pick a Synthetic data world: each is one of the registration bench's worlds (scripts/registration_synthetic_bench.py) at demo size, and its caption states the true motion so the correction the node reports can be read against it.",
+        "The status line shows drift_y / drift_x (and drift_z in 3D) for the viewed frame — the correction applied, the negative of how far the content moved — and drift_confidence: the correlation after alignment (translation), the ECC coefficient (euclidean / affine) or the RANSAC inlier fraction (feature).",
+        "Model: translation is the default and the most robust; euclidean adds a rigid rotation; affine adds scale and shear and will absorb genuine deformation; feature survives large motion at about 0.3–0.5 px and is what seeds the other two.",
+        "Reference: first never accumulates error but needs overlap with frame 0; previous follows anything frame to frame but drifts slowly; template is the choice for long or bleaching series.",
+        "Lowpass σ near the bead radius is what makes a faint, sparse field registrable; Highpass σ removes vignetting and bleaching trends. Both filter only the estimate — the output pixels are never touched.",
+        "A deforming specimen is registered only to its model's floor: draw the estimate region around something rigid (the seventh world shows the effect), or expect the reported drift to carry the deformation's pull.",
+        "Landmarks: type point pairs clicked on frame 0 and on frame t ('t=5; row,col -> row,col; …'), set Model = auto, and the fit names the family the motion needs — or flags the field NON-RIGID when none fits."
       ]
     },
     "registration.align_to": {
@@ -1221,6 +1393,104 @@
       "features": [
         "Arithmetic on the numbers a Dataset carries — a scalar, a table column, a per-plane layer — against another one or a constant, with units carried through.",
         "Shown: max_intensity ÷ mean_intensity per nucleus, as a new column peak_ratio."
+      ]
+    },
+    "util.select_plane": {
+      "kind": "image",
+      "phantom": "cells3d",
+      "view": {
+        "z": 0
+      },
+      "features": [
+        "Keeps ONE plane of the stack: auto is the middle one (plane 3 of 7 here). Drag Plane to walk through the stack; the before view is plane 0 of the input, the after view is the plane kept.",
+        "In the app, scrub Plane z in the Viewer to the plane with the clearest structure and press Pick to take it. Z narrows to 1 and the plane's physical height moves into origin_um.",
+        "The front half of 'estimate the drift on one plane, apply it to the whole stack': Select Plane → Registration (2D) → Shift. The tap Split Z's per-plane outputs materialize into this node."
+      ]
+    },
+    "util.split_z": {
+      "kind": "image",
+      "phantom": "cells3d",
+      "features": [
+        "Grows one output socket per plane (z0…z6 here, labelled with the plane's height) so each plane can feed its own chain; wiring one inserts a Select Plane tap for you at run time. The whole stack still passes through out, which is what this view shows.",
+        "Hand z3 to Registration and out to Shift to register a stack on one plane.",
+        "Groups: `0-3; 4-7; 8-11` (or `top: 0-3; mid: 4-7`) gives one sub-stack per range instead of a socket per plane — a Crop in frames mode at run time, with the z step and the plane heights following; a group past the end is labelled so on the card; `every 4` chunks the axis into consecutive fours, and past 24 members the card grows no per-index sockets at all — Groups is then the way to split."
+      ]
+    },
+    "align.shift": {
+      "kind": "image",
+      "data_from": "src",
+      "prelude": [
+        {
+          "op": "util.select_plane"
+        },
+        {
+          "op": "registration.stabilize"
+        }
+      ],
+      "extra_inputs": {
+        "shifts": {
+          "pre": 1
+        }
+      },
+      "scenarios": [
+        {
+          "label": "Drifting beads, shift from Registration",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "drift_px": [
+              1.5,
+              -2.0
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Registration runs upstream on the same beads and writes drift_y / drift_x per frame; Shift reads them from its Shifts input and moves the RAW data on its main input by them. The status line shows shift_y / shift_x for the viewed frame: with the field moving (+1.5, −2.0) px per frame it should read −1.5·t, +2.0·t — the same numbers Registration's own demo shows, because Shift reproduces its alignment exactly."
+        },
+        {
+          "label": "A stack registered on one plane",
+          "phantom": "star_volume",
+          "phantom_kw": {
+            "drift_px": [
+              0.5,
+              1.0,
+              -0.6
+            ]
+          },
+          "view": {
+            "t": 3
+          },
+          "note": "The intended workflow on a 12-plane stack: Select Plane hands Registration the middle plane only, Registration (2D) estimates (y, x) per frame on it, and Shift applies that one shift to all twelve planes of the raw stack. Scrub Plane z — every plane moved the same way. The axial drift (half a plane per frame) stays: that is Registration's 3D lever's job, and Shift z would then carry it."
+        }
+      ],
+      "features": [
+        "Applies the per-frame (y, x) shift it reads from the Shifts input — here a Registration run on the plane Select Plane handed it — to every plane and channel of the data on the main input, which is the raw stack. The status line shows shift_y / shift_x for the viewed frame; read them against the caption's true drift.",
+        "Sign convention: a layer value is the shift APPLIED to the content, positive toward a higher index — exactly what Registration stores, so its layers reproduce its own alignment bit for bit. Invert puts the measured motion back instead.",
+        "The 2D lever applies the lateral shift plane by plane; 3D adds the axial shift when a Shift z layer is named (Registration's drift_z from its own 3D lever). Blank = no axial shift, which is what a single-plane estimate warrants.",
+        "Masks and label rasters on the data move with the image (at nearest, so ids survive); a Dataset carrying structure tables is refused — put Shift before segmentation."
+      ]
+    },
+    "util.select_frame": {
+      "kind": "image",
+      "phantom": "star_field",
+      "fixed_params": {
+        "frame": 3
+      },
+      "view": {
+        "t": 0
+      },
+      "features": [
+        "Keeps ONE timepoint of the series: the before view is frame 0 of the input, the after view is the frame kept (here frame 3 — the beads have drifted (+4.5, −6.0) px). Drag Frame to walk through the series.",
+        "In the app, scrub Frame t in the Viewer to the timepoint you want and press Pick to take it; 0 (the default) is the first frame, the anchor Registration's `first` uses.",
+        "T narrows to 1 and the per-frame lists follow; the tap Split T's per-frame outputs materialize into this node."
+      ]
+    },
+    "util.split_t": {
+      "kind": "image",
+      "phantom": "star_field",
+      "features": [
+        "Grows one output socket per timepoint (t0…t5 here, labelled with the frame time) so each frame can feed its own chain; wiring one inserts a Select Frame tap for you at run time. The whole series still passes through out, which is what this view shows.",
+        "A real series is hundreds of frames, so the card stops growing per-frame sockets past 24 and Groups takes over: `every 10` gives one output per ten consecutive frames, `0-99; 100-199` names the ranges — a Crop in frames mode at run time, every per-frame list following."
       ]
     }
   }

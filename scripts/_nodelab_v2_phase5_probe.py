@@ -5937,6 +5937,126 @@ def main(argv) -> int:
         "file's point names, a wire from pos2 is drawable, the envelope downstream reads "
         "m=1, and the run graph carries a util.select_position tap with position '2'")
 
+    # ── SZ1 Split Z: the Z-axis member of the tap family (2026-10-07) — a 5-plane source grows
+    # z0..z4 on the card labelled with plane heights, a wire from z3 is drawable, the envelope
+    # downstream reads z=1, the run graph carries a util.select_plane tap with plane 3; and
+    # Select Plane's `plane` is an INSTANT pick that adopts the viewer's z ──────────────────
+    _szdoc = win.doc
+    _szdoc.add_node("io.load", node_id="SZL", x=0, y=1600)
+    _szdoc.meta_seeds["SZL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=2, z=5, c=1, y=64, x=64),
+        metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
+    _szdoc.add_node("util.split_z", node_id="SZS", x=300, y=1600)
+    _szdoc.connect("SZL", "image", "SZS", "data")
+    _szdoc.add_node("view.viewer", node_id="SZV", x=600, y=1600)
+    _szdoc.connect("SZS", "z3", "SZV", "data")
+    _szdoc.add_node("util.select_plane", node_id="SZP", x=600, y=1700)
+    _szdoc.connect("SZS", "out", "SZP", "data")
+    win.scene.sync(); app.processEvents()
+    _szitem = win.scene.node_items["SZS"]
+    _szouts = [s.name for s in _szdoc.output_specs("SZS")]
+    assert _szouts == ["out", "z0", "z1", "z2", "z3", "z4"], _szouts
+    assert [s.label for s in _szdoc.output_specs("SZS")][1:3] == ["0 · 0.00 µm", "1 · 0.40 µm"]
+    _zports = [getattr(p, "name", None) for p in getattr(_szitem, "_outs", {}).values()] \
+        if isinstance(getattr(_szitem, "_outs", None), dict) else None
+    if _zports is not None:
+        assert {"z0", "z3", "z4"} <= set(_zports), _zports
+    assert _szdoc.env("SZV").axes.z == 1, "the viewer sees one plane through the tap"
+    assert _szdoc.env("SZP").axes.z == 1, "Select Plane narrows the envelope to its plane"
+    _gz = _szdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.select_plane" and n.params == {"plane": 3}
+               for n in _gz.nodes.values()), [(n.id, n.op_key, n.params) for n in _gz.nodes.values()]
+    # the instant pick commits the viewer's z without arming a bar
+    _pspec = _szdoc.nodes["SZP"].spec()
+    assert _pspec.input("plane").pick_kind == "plane"
+    win._arm_pick(_rfor("SZP", _pspec.input("plane")))
+    assert not win.viewer.picking(), "an instant pick commits without a bar"
+    assert _szdoc.nodes["SZP"].params.get("plane") == int(win.viewer.coords()[2]), \
+        (_szdoc.nodes["SZP"].params, win.viewer.coords())
+    for nid in ("SZP", "SZV", "SZS", "SZL"):
+        _szdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("SZ1 split z: a 5-plane source grows z0..z4 on the card labelled with plane heights, "
+        "a wire from z3 is drawable, the envelope downstream reads z=1, the run graph carries "
+        "a util.select_plane tap with plane 3, and Select Plane's Plane is an instant pick "
+        "that adopts the viewer's z")
+
+    # ── SG1 range groups on a split card (2026-10-07): typing `top: 0-1; 2-4` into Split Z's
+    # Groups replaces z0..z4 with zg0/zg1 labelled by name / span, a wire from zg1 is drawable,
+    # the envelope downstream reads z=3, and the run graph carries a util.crop frames tap ──
+    _sgdoc = win.doc
+    _sgdoc.add_node("io.load", node_id="SGL", x=0, y=1800)
+    _sgdoc.meta_seeds["SGL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=2, z=5, c=1, y=64, x=64),
+        metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
+    _sgdoc.add_node("util.split_z", node_id="SGS", x=300, y=1800)
+    _sgdoc.connect("SGL", "image", "SGS", "data")
+    _sgdoc.set_param("SGS", "groups", "top: 0-1; 2-4") if hasattr(_sgdoc, "set_param") \
+        else (_sgdoc.nodes["SGS"].params.__setitem__("groups", "top: 0-1; 2-4"), _sgdoc.touch("SGS"))
+    win.scene.sync(); app.processEvents()
+    _sgouts = [(s.name, s.label) for s in _sgdoc.output_specs("SGS")]
+    assert _sgouts == [("out", ""), ("zg0", "0 · top · 0.00–0.40 µm"), ("zg1", "1 · z 2-4 · 0.80–1.60 µm")], _sgouts
+    _sgdoc.add_node("view.viewer", node_id="SGV", x=600, y=1800)
+    _sgdoc.connect("SGS", "zg1", "SGV", "data")
+    win.scene.sync(); app.processEvents()
+    assert _sgdoc.env("SGV").axes.z == 3, "the viewer sees the sub-stack through the group tap"
+    _gg = _sgdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.crop" and n.params == {"frames": "z2-4"} and n.modes == {"region": "frames"}
+               for n in _gg.nodes.values()), [(n.id, n.op_key, n.params) for n in _gg.nodes.values()]
+    _sgitem = win.scene.node_items["SGS"]
+    _sgports = [getattr(p, "name", None) for p in getattr(_sgitem, "_outs", {}).values()] \
+        if isinstance(getattr(_sgitem, "_outs", None), dict) else None
+    if _sgports is not None:
+        assert {"zg0", "zg1"} <= set(_sgports) and "z3" not in set(_sgports), _sgports
+    for nid in ("SGV", "SGS", "SGL"):
+        _sgdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("SG1 split groups: `top: 0-1; 2-4` on Split Z replaces z0..z4 with zg0/zg1 labelled by "
+        "name and height span, a wire from zg1 is drawable, the envelope downstream reads z=3, "
+        "and the run graph carries a util.crop frames tap keeping z2-4")
+
+    # ── ST1 Split T (2026-10-07): a 6-frame source grows t0..t5 labelled with frame times and a
+    # wire from t3 materializes a util.select_frame tap; a 30-frame source grows none (the
+    # fan-out cap) and `every 10` grows tg0..tg2 whose wire materializes a util.crop frames tap ──
+    _stdoc = win.doc
+    _stdoc.add_node("io.load", node_id="STL", x=0, y=1900)
+    _stdoc.meta_seeds["STL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=6, z=1, c=1, y=64, x=64), metadata={"pixel_size_um": 0.5, "dt_s": 30.0})
+    _stdoc.add_node("util.split_t", node_id="STS", x=300, y=1900)
+    _stdoc.connect("STL", "image", "STS", "data")
+    _stdoc.add_node("view.viewer", node_id="STV", x=600, y=1900)
+    _stdoc.connect("STS", "t3", "STV", "data")
+    win.scene.sync(); app.processEvents()
+    _stouts = [(s.name, s.label) for s in _stdoc.output_specs("STS")]
+    assert _stouts[:3] == [("out", ""), ("t0", "0 · 0.0 s"), ("t1", "1 · 30.0 s")] and len(_stouts) == 7, _stouts
+    assert _stdoc.env("STV").axes.t == 1, "the viewer sees one frame through the tap"
+    _gt = _stdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.select_frame" and n.params == {"frame": 3} for n in _gt.nodes.values())
+    _stdoc.remove_node("STV")
+    _stdoc.meta_seeds["STL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=30, z=1, c=1, y=64, x=64), metadata={"pixel_size_um": 0.5, "dt_s": 2.0})
+    _stdoc.touch("STL")
+    win.scene.sync(); app.processEvents()
+    assert [s.name for s in _stdoc.output_specs("STS")] == ["out"], "30 frames: the cap grows no sockets"
+    _stdoc.set_param("STS", "groups", "every 10") if hasattr(_stdoc, "set_param") \
+        else (_stdoc.nodes["STS"].params.__setitem__("groups", "every 10"), _stdoc.touch("STS"))
+    win.scene.sync(); app.processEvents()
+    assert [s.name for s in _stdoc.output_specs("STS")] == ["out", "tg0", "tg1", "tg2"]
+    _stdoc.add_node("view.viewer", node_id="STV", x=600, y=1900)
+    _stdoc.connect("STS", "tg1", "STV", "data")
+    win.scene.sync(); app.processEvents()
+    assert _stdoc.env("STV").axes.t == 10
+    _gt = _stdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.crop" and n.params == {"frames": "t10-19"} and n.modes == {"region": "frames"}
+               for n in _gt.nodes.values()), [(n.id, n.op_key, n.params) for n in _gt.nodes.values()]
+    for nid in ("STV", "STS", "STL"):
+        _stdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("ST1 split t: a 6-frame source grows t0..t5 labelled with frame times and a wire from t3 "
+        "materializes a util.select_frame tap; 30 frames grow none (the fan-out cap) and `every "
+        "10` grows tg0..tg2, whose wire reads t=10 downstream and materializes a util.crop "
+        "frames tap keeping t10-19")
+
     _probe_movie_editor(win, app)
 
     # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────
@@ -8692,6 +8812,28 @@ def main(argv) -> int:
     # a slow node waits for Run instead of computing on open
     d5 = win.open_node_demo("enhance.zs_deconvnet")
     assert d5._run_btn.isVisible() and d5.last_result is None and d5._worker is not None
+    # Registration (2026-10-07): a multi-world demo. The Synthetic data dropdown switches
+    # the phantom (a new session and worker), a setting the user chose carries over, the
+    # lever re-derives from the new stack, and the status line reads out the per-frame shift.
+    d6 = win.open_node_demo("registration.stabilize")
+    assert d6._scenario_ctl is not None, "no Synthetic data dropdown on the registration demo"
+    assert _wait_demo(d6), "the registration demo did not compute"
+    assert "drift_y" in d6._status.text() and "drift_x" in d6._status.text(), d6._status.text()
+    _lp = d6.control("lowpass_sigma")
+    assert _lp is not None
+    _lp.set_value(1.5)
+    _lp._emit()
+    assert _wait_demo(d6)
+    _cap0 = d6._phantom_label.text()
+    d6._scenario_ctl.set_value("Beads drifting in z (a stack)")
+    d6._scenario_ctl._emit()
+    assert _wait_demo(d6, timeout=120.0), "the scenario switch did not compute"
+    assert d6._scenario == 7 and d6._session.phantom.axes.z == 12, d6._scenario
+    assert d6._phantom_label.text() != _cap0 and "stack" in d6._phantom_label.text()
+    _lp2 = d6.control("lowpass_sigma")
+    assert _lp2 is not None and float(_lp2.value()) == 1.5 and _lp2.touched,         "a chosen value must carry over a scenario switch"
+    assert d6._modes.get("dim") == "3D", d6._modes
+    assert "drift_z" in d6._status.text(), d6._status.text()
     # the palette's button: enabled on a node overview, routed to the same cache
     win.palette._show_node("enhance.gaussian")
     assert win.palette._demo_btn.isEnabled()
@@ -8701,7 +8843,7 @@ def main(argv) -> int:
     assert win.open_node_demo("enhance.gaussian") is dlg
     win.palette._show_legend()
     assert not win.palette._demo_btn.isEnabled()
-    for _d in (dlg, d2, d3, d4, d5):
+    for _d in (dlg, d2, d3, d4, d5, d6):
         _d.close()
     app.processEvents()
     assert "enhance.gaussian" not in win._demo_windows and not win._demo_windows
@@ -8710,7 +8852,10 @@ def main(argv) -> int:
         "recomputes to a different after image; Wipe compare; Draw Regions rasterizes its "
         "curated shapes to 3 regions with the shapes chip read-only and the presentation "
         "sockets hidden; Measure fills a table with an area column; zone.frame is a guide "
-        "with no worker; ZS-DeconvNet waits for Run; windows drop from the cache on close")
+        "with no worker; ZS-DeconvNet waits for Run; Registration offers eight synthetic "
+        "worlds — switching to the z-drifting stack rebuilds the session, keeps the chosen "
+        "Lowpass σ, re-derives the lever to 3D and reads out drift_z; windows drop from the "
+        "cache on close")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

@@ -19,6 +19,8 @@ Qt-free; pure standard library + numpy-free.
 """
 from __future__ import annotations
 
+import re
+
 import math
 from dataclasses import dataclass, field, replace
 from typing import (Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence,
@@ -826,6 +828,74 @@ def parse_indices(raw) -> Optional[List[int]]:
     return sorted(set(out)) or None
 
 
+_EVERY_RE = re.compile(r"^\s*(?:every\s+|/)\s*(\d+)\s*$", re.IGNORECASE)
+
+
+def every_n(raw: Any) -> Optional[int]:
+    """The chunk size when a split card's ``groups`` text is the shorthand ``every N`` (or
+    ``/N``): consecutive groups of ``N`` along the axis from 0 — ``every 10`` on a 95-frame
+    series is ten groups, the last one of five. ``None`` for any other text, and for ``every 0``.
+    The shorthand stands alone; it does not mix with explicit ranges."""
+    if raw is None:
+        return None
+    m = _EVERY_RE.match(str(raw))
+    if m is None:
+        return None
+    n = int(m.group(1))
+    return n if n > 0 else None
+
+
+def parse_groups(raw: Any, n: Optional[int] = None) -> Optional[List[Tuple[str, Tuple[int, ...]]]]:
+    """The split nodes' ``groups`` text → ``[(name, indices), …]``, or ``None`` for "no
+    groups" (2026-10-07) — one output per index, as the split cards always had.
+
+    ``every N`` (:func:`every_n`) expands to consecutive chunks of ``N`` when the axis length
+    ``n`` is given (the card knows it from the envelope); without ``n`` it is ``None`` here and
+    the run-graph side computes group ``k`` as ``k·N … k·N+N-1`` directly
+    (:func:`nodelab_v2.ops.split_group`), unclamped — Crop's frames mode drops what lies past
+    the end, so the last chunk clips itself to the series.
+
+    The grammar is :func:`parse_indices` per group with ``;`` (or a newline) between groups
+    and an optional name in front of a group: ``"0-3; 4-7; 8-11"``, ``"top: 0-3; mid: 4-7"``,
+    ``"GFP+DAPI = 0,2; 1"``. Inclusive ranges, 0-based, as everywhere else on these axes.
+    A name is whatever sits before the LAST ``:`` (else the last ``=``) whose remainder parses
+    as indices, so ``"0-3"`` alone has no name and ``"a:b: 0-3"`` is named ``a:b``.
+
+    Total, like its parts: a group that parses to no index (half-typed, or a name with
+    nothing after it) is skipped rather than raising, so the card keeps its other sockets
+    while somebody is still typing; blank text, or text with no parseable group, is ``None``.
+    Out-of-range indices are KEPT — the card labels such a group as past the end and the tap
+    it materializes into refuses with the real axis length — because clipping them here would
+    make ``"8-11"`` on a 10-plane stack quietly mean ``"8-9"``. Groups are not checked for
+    overlap: two groups sharing a plane is a legitimate ask (a running window), not an error.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raw = str(raw)
+    step = every_n(raw)
+    if step is not None:
+        if n is None or n <= 0:
+            return None
+        return [("", tuple(range(s0, min(s0 + step, int(n))))) for s0 in range(0, int(n), step)]
+    out: List[Tuple[str, Tuple[int, ...]]] = []
+    for piece in raw.replace("\n", ";").split(";"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        name, spec = "", piece
+        for sep in (":", "="):
+            head, found, tail = piece.rpartition(sep)
+            if found and parse_indices(tail):
+                name, spec = head.strip(), tail
+                break
+        idx = parse_indices(spec)
+        if not idx:
+            continue
+        out.append((name, tuple(int(i) for i in idx)))
+    return out or None
+
+
 def format_indices(values: Sequence[int]) -> str:
     """Sorted indices → the shortest index-list string that means them: ``"0-3,7,10-12"``.
 
@@ -1312,6 +1382,100 @@ def select_position(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaE
         return env
     return (env.with_axes(replace(ax, m=1))
                .with_metadata(**position_subset(env.metadata, [k])))
+
+
+def plane_pick(z: int, raw: Any) -> Optional[int]:
+    """Resolve ``util.select_plane``'s ``plane`` to one index into ``z`` planes (2026-10-07)
+    — shared by its compute and :func:`select_plane` so the card and the pull cannot
+    disagree. ``None`` / blank / ``"auto"`` is the MIDDLE plane (``z // 2``: the same answer
+    as the socket's ``derive`` and the plane ``registration.stabilize`` estimates on); an
+    integer in range is itself; anything else — out of range, a fraction, not a number — is
+    ``None``, which the compute refuses with the depth and the transform holds the envelope
+    on (an unknown axis would grey the whole downstream graph behind a plausible card)."""
+    if z <= 0:
+        return None
+    text = str(raw if raw is not None else "").strip().lower()
+    if not text or text == "auto":
+        return int(z) // 2
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value != int(value):
+        return None
+    i = int(value)
+    return i if 0 <= i < int(z) else None
+
+
+def select_plane(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.select_plane``: narrow Z to ONE plane, by 0-based index (2026-10-07) — the
+    z-axis member of the tap family (:func:`select_position` for M, :func:`channel_select`
+    for C), and the tap ``util.split_z``'s per-plane outputs materialize into.
+
+    The z half of :func:`crop_frames` exactly: ``z_step_um`` survives (one plane keeps the
+    source spacing — :func:`respaced`), ``z_home_index`` follows (:func:`z_home_after`), and
+    ``origin_um`` moves up by the planes cut off the bottom at the SOURCE step. Nothing
+    lateral changes. Blank resolves to the middle plane (:func:`plane_pick`); an
+    out-of-range or unparseable value HOLDS the envelope and lets the payload raise the real
+    message; a single-plane input is the identity."""
+    ax = env.axes
+    k = plane_pick(int(ax.z), params.get("plane"))
+    if k is None or int(ax.z) <= 1:
+        return env
+    md = env.metadata
+    changes: Dict[str, Any] = {"z_step_um": respaced(md.get("z_step_um"), (k,))}
+    changes.update(z_home_after(md, (k,)))
+    out = env.with_axes(replace(ax, z=1)).with_metadata(**changes)
+    z_step = md.get("z_step_um")
+    if z_step and k:
+        try:
+            dz = float(z_step) * int(k)
+        except (TypeError, ValueError):
+            dz = 0.0
+        if dz:
+            out = out.with_metadata(**shift_origin_um(out, dz, 0.0, 0.0))
+    return out
+
+
+def frame_pick(t: int, raw: Any) -> Optional[int]:
+    """Resolve ``util.select_frame``'s ``frame`` to one index into ``t`` timepoints
+    (2026-10-07) — shared by its compute and :func:`select_frame`. ``None`` / blank /
+    ``"auto"`` is frame 0 (the acquisition's first frame, the anchor Registration's ``first``
+    uses); an integer in range is itself; anything else is ``None``, which the compute refuses
+    with the series length and the transform holds the envelope on."""
+    if t <= 0:
+        return None
+    text = str(raw if raw is not None else "").strip().lower()
+    if not text or text == "auto":
+        return 0
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value != int(value):
+        return None
+    i = int(value)
+    return i if 0 <= i < int(t) else None
+
+
+def select_frame(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.select_frame``: narrow T to ONE timepoint, by 0-based index (2026-10-07) — the
+    T-axis member of the tap family and the tap ``util.split_t``'s per-frame outputs
+    materialize into.
+
+    The T half of :func:`crop_frames` exactly: the per-T lists follow (:func:`time_subset`)
+    and ``dt_s`` survives (one frame keeps the source interval — :func:`respaced`), so this
+    and a Crop keeping ``t3`` describe the frame the same way. Blank resolves to frame 0; an
+    out-of-range or unparseable value HOLDS the envelope and lets the payload raise the real
+    message; a single-frame input is the identity."""
+    ax = env.axes
+    k = frame_pick(int(ax.t), params.get("frame"))
+    if k is None or int(ax.t) <= 1:
+        return env
+    md = env.metadata
+    changes: Dict[str, Any] = dict(time_subset(md, (k,)))
+    changes["dt_s"] = respaced(md.get("dt_s"), (k,))
+    return env.with_axes(replace(ax, t=1)).with_metadata(**changes)
 
 
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
@@ -2218,10 +2382,12 @@ __all__ = [
     "identity", "resample", "z_project", "stack_time", "frame_slice",
     "channel_select", "crop", "stitch", "value_rescaled", "bit_depth_after_sum",
     "propagate_meta", "envelope_symbols", "parse_channels",
-    "parse_indices", "format_indices", "crop_frames",
+    "parse_indices", "format_indices", "parse_groups", "every_n", "crop_frames",
+    "frame_pick", "select_frame",
     "FRAME_SPEC_AXES", "parse_frame_spec", "format_frame_spec", "frame_spec_picks",
     "PER_CHANNEL_KEYS", "channel_subset",
     "select_group", "group_picks", "position_group_plan",
+    "plane_pick", "select_plane",
     "POSITION_GROUP_KEY", "POSITION_NAME_KEY",
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
     "source_file_runs", "chain_grow", "chained_metadata",

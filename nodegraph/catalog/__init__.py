@@ -194,6 +194,16 @@ MODULES: Tuple[str, ...] = (
     # Appended last for the same reason, not slotted beside `detect.particles` / `detect.spots`
     # whose detection sibling it is: the slab-projected bead finder (2026-10-07).
     "detect.beads",
+    # 2026-10-07: the registration WORKFLOW as nodes rather than one node — Select Plane and
+    # Split Z choose the plane the estimate runs on, Shift applies a per-frame shift read from
+    # a Registration output to any Dataset (the whole stack). Appended, like everything since
+    # V2.20: this list's order is the link-drag search menu's order.
+    "util.select_plane",
+    "util.split_z",
+    "align.shift",
+    # the T twins of the two above (2026-10-07), appended for the same reason
+    "util.select_frame",
+    "util.split_t",
 )
 
 
