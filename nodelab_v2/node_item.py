@@ -1456,12 +1456,13 @@ class NodeItem(QGraphicsObject):
         for kind, obj, y in self._rows:
             if kind == "in":
                 p.setFont(lf); p.setPen(T.INK)
+                row_txt = self._input_row_text(obj)
                 p.drawText(QRectF(14, y, 120, T.ROW_H), Qt.AlignVCenter | Qt.AlignLeft,
-                           obj.name)
+                           row_txt)
                 if obj.type is not SocketType.DATASET:
                     self._paint_pill(p, obj, y)
                 else:
-                    nw = QFontMetricsF(lf).horizontalAdvance(obj.name)
+                    nw = QFontMetricsF(lf).horizontalAdvance(row_txt)
                     self._paint_domain_chips(p, 14 + nw + 10, y, self.reads_domains(),
                                              align_left=True,
                                              missing=self.missing_domains())
@@ -1531,6 +1532,20 @@ class NodeItem(QGraphicsObject):
             return self._source_pill_text()
         val = self.resolved(s)
         return "" if val is None else str(val)
+
+    def _input_row_text(self, s) -> str:
+        """An input row's text: the socket's name — except on a Page Output (V4.00 step 11f),
+        whose wired item slots read as their items' names once it holds several, and whose
+        empty slot reads ``+ item``."""
+        if self.rec.op_key != PAGE_OUTPUT_OP or s.type is not SocketType.DATASET:
+            return s.name
+        try:
+            items = dict(self.doc.output_items(self.rec.id))
+        except Exception:                            # noqa: BLE001 — a bare document
+            return s.name
+        if s.name not in items:
+            return s.name if s.name == "data" else "+ item"
+        return items[s.name] if len(items) >= 2 else s.name
 
     # ── a Page Input's Source (V4.00 step 11e) ───────────────────────────────
     def _is_source_pill(self, s) -> bool:
@@ -1823,7 +1838,12 @@ class NodeItem(QGraphicsObject):
         op = self.rec.op_key
         if op == PAGE_OUTPUT_OP:
             name = str(self.rec.params.get(PAGE_NAME_KEY, "") or "").strip()
-            return f"Output · {name}" if name else "Output · (unnamed)"
+            try:
+                n = len(self.doc.output_items(self.rec.id))
+            except Exception:                        # noqa: BLE001 — a bare document
+                n = 0
+            more = f" · {n} items" if n >= 2 else ""   # a several-item variable (11f)
+            return f"Output · {name}{more}" if name else f"Output · (unnamed){more}"
         if op == PAGE_INPUT_OP:
             src = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
             if not src:

@@ -8028,6 +8028,55 @@ def main(argv) -> int:
         "nest under it; Outputs tinted, the variable name in bold); a filter has an on/off "
         "switch, a Threshold none (its tooltip says why); unticking switches the node off "
         "(struck through), a node row shows that node on the canvas")
+    from nodegraph.domains import Domain as _DomainP16
+
+    # IP1 (V4.00 step 11f) parts and items on the canvas: the Threshold card offers its
+    # image and its mask on sockets of their own beside `out`; wiring the mask into the
+    # Page Output as a second item makes it a two-item variable (its title says so, its slots
+    # read as the items' names); the Processing page's Page Input then offers each item on
+    # its own socket, and a node wired to `item · mask` pulls exactly the mask
+    win._show_page(win._main_canvas, _ref13.id)
+    app.processEvents()
+    _tc16 = win.scene.node_items[_th13]
+    _outs16 = [s.spec.name for s in _tc16.sockets() if s.io == "out"]
+    assert _outs16 == ["out", "part:image", "part:mask"], _outs16
+    assert [s.spec.label for s in _tc16.sockets() if s.io == "out"][1:] == \
+        ["image only", "mask only"]
+    _ref13.doc.connect(_th13, "part:mask", _ou13, "data_2")
+    app.processEvents()
+    _oc16 = win.scene.node_items[_ou13]
+    assert _oc16._page_boundary_label() == "Output · mask · 2 items", \
+        _oc16._page_boundary_label()
+    _items16 = _ref13.doc.output_items(_ou13)
+    assert [n for _s, n in _items16] == ["threshold", "mask"], _items16
+    assert [s.spec.label for s in _oc16.sockets() if s.io == "in"][:3] == \
+        ["threshold", "mask", "Item 3"], "wired slots read as their items, one empty slot"
+    _pr16 = next(p for p in _ws13.pages.values() if p.kind == "process")
+    _pi16 = next(n for n, r in _pr16.doc.nodes.items() if r.op_key == "page.input")
+    win._show_page(win._main_canvas, _pr16.id)
+    app.processEvents()
+    _ic16 = win.scene.node_items[_pi16]
+    assert _ic16.socket("out", "item:mask") is not None and \
+        _ic16.socket("out", "item:threshold") is not None
+    _md16 = _pr16.doc.add_node("enhance.median", x=600.0, y=520.0)
+    _pr16.doc.connect(_pi16, "item:mask", _md16.id, "data")
+    app.processEvents()
+    assert _pr16.doc.env(_md16.id).layer_names == ((_DomainP16.VOXEL, "mask"),), \
+        _pr16.doc.env(_md16.id).layer_names
+    _pdone.clear()
+    win.pull_node(_md16.id)
+    _pwait(_pq(_pr16.id, _md16.id))
+    _row16 = next(r for r in win.pages_panel.node_items(_ref13.id).values()
+                  if r.data(0, _Qt12.UserRole + 3) == _ou13)
+    assert "[threshold · mask]" in _row16.text(0), _row16.text(0)
+    _pr16.doc.remove_node(_md16.id)
+    _ref13.doc.disconnect(_th13, "part:mask", _ou13, "data_2")
+    app.processEvents()
+    assert _ic16.scene() is None or _pr16.doc.output_specs(_pi16)[-1].name != "item:mask"
+    _ok("IP1 a Threshold card offers `image only` and `mask only` beside out; its mask wired "
+        "into the Page Output makes a two-item variable (`Output · mask · 2 items`, slots "
+        "named threshold / mask); the next page's Page Input offers item · mask and "
+        "item · threshold, and a node wired to item · mask gets the mask alone and pulls")
 
     # PT2 closing a page TAB keeps the page (V4.00 step 11d): ✕ takes it off the sub-tab row,
     # the canvas moves to the nearest open page of its kind, the Pages panel lists it "tab

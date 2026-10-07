@@ -504,6 +504,14 @@ class NodeSpec:
     #: payload no longer has) — ``passes_domains=False`` does this for an AUXILIARY input
     #: only, since the primary input's domains always pass.
     fresh_output: bool = False
+    #: The layers this node passes ON, by NAME (V4.00 step 11f): ``(params, modes) ->
+    #: frozenset | None``. ``None`` passes everything, as every catalog node does; a set keeps
+    #: only the input's layers of those names — a structure table and the raster of the same
+    #: name together — with their columns, and the structure domains drop to the ones they
+    #: live on (the acquisition lattice always stays: the axes are still there). An empty set
+    #: passes the image alone. The GUI's data-type taps (``data.part``) are the user: one
+    #: piece of a node's output on its own wire. MUST be total, like ``extra_layers``.
+    keep_layers: Optional[Callable[..., Any]] = None
     #: Layers this node creates that no ``layer_out`` socket can describe (V2.11):
     #: ``(params, modes) -> ((Domain, name), ...)``. Needed by the handful of producers
     #: that name a layer with NO socket at all (``align.drift``/``registration.stabilize``
@@ -1279,6 +1287,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                     Mapping[str, Mapping[str, FrozenSet[Domain]]]] = None,
                 adds_domains: FrozenSet[Domain] = frozenset(),
                 fresh_output: bool = False,
+                keep_layers: Optional[Callable[..., Any]] = None,
                 extra_layers: Optional[Callable[..., Any]] = None,
                 adds_columns: Optional[Callable[..., Any]] = None,
                 trained_params: Optional[Callable[..., Any]] = None,
@@ -1296,6 +1305,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                                for m, per in (reads_domains_by_mode or {}).items()},
         adds_domains=frozenset(adds_domains),
         fresh_output=bool(fresh_output),
+        keep_layers=keep_layers,
         extra_layers=extra_layers,
         adds_columns=adds_columns,
         trained_params=trained_params,

@@ -36,7 +36,8 @@ from nodegraph.checkpoint import (
 from nodegraph.engine import Engine, EvalContext
 from nodegraph.graph import Edge, Graph, NodeInstance
 from nodegraph.memo import digest
-from nodegraph.metadata import CONDITION_KEY, CONDITION_SET_KEY, propagate_meta
+from nodegraph.metadata import (CONDITION_KEY, CONDITION_SET_KEY, propagate_meta,
+                                value_rescaled)
 from nodegraph.nodes import COMPUTES, register_node
 from nodegraph.domains import Domain
 from nodegraph.registry import (
@@ -208,6 +209,64 @@ def next_free_name(base: str, taken) -> str:
     return f"{base}{n}"
 
 
+
+# ── one PART of a node's output on its own wire (V4.00 step 11f) ─────────────
+#: A node whose output carries more than one kind of data — an image and a mask, a label
+#: raster and its table, a point set — offers each PART on a synthetic output socket of its
+#: own (``part:image``, ``part:<layer name>``) beside ``out``, which still carries them all.
+#: A part edge is materialized into a hidden ``data.part`` tap (:func:`materialize_part_taps`)
+#: that keeps that piece alone: the image with no layers, or one named layer — a structure
+#: table and the raster of the same name together — whose raster becomes the wire's image
+#: (so a Viewer shows a mask, a filter can work on it); a table-only part carries no image.
+PART_OP = "data.part"
+PART_KEY = "part"
+PART_IMAGE = "image"
+PART_SOCKET_RE = re.compile(r"^part:(.+)$")
+
+
+def part_socket(name: str) -> str:
+    """The synthetic output socket that carries part ``name`` (``part:mask``)."""
+    return f"part:{name}"
+
+
+def part_of(attr: Any) -> str:
+    """The PART a stored attribute belongs to: a structure table's columns go by their
+    source LAYER (a label table is one part, however many columns it has), a lattice layer
+    by its own name (the ``mask`` raster)."""
+    from nodegraph.domains import is_structure
+    return str(attr.layer or attr.name) if is_structure(attr.domain) else str(attr.name)
+
+
+# ── a Page Output collecting several items (V4.00 step 11f) ──────────────────
+#: A Page Output takes up to eight wires — ``data`` and ``data_2`` … ``data_8``, one empty
+#: slot shown after the last wired one — each an ITEM of the variable, named by the
+#: comma-separated ``items`` param (blank entries take a name from the wire). A Page Input
+#: reading it offers each item on a synthetic ``item:<name>`` socket beside ``out`` (the
+#: first item). Both become real run-graph nodes: :func:`materialize_output_items` gives each
+#: extra item an Output node of its own (so pulling the Output previews its first item and
+#: computes nothing else), :func:`materialize_input_items` a Page Input tap per item read.
+PAGE_ITEMS_KEY = "items"
+PAGE_ITEM_SOCKETS = ("data",) + tuple(f"data_{i}" for i in range(2, 9))
+ITEM_SOCKET_RE = re.compile(r"^item:(.+)$")
+#: a materialized Page Input tap's item name (run graph only)
+PAGE_ITEM_KEY = "__item__"
+
+
+def item_socket(name: str) -> str:
+    """The synthetic Page Input socket that carries item ``name`` (``item:mask``)."""
+    return f"item:{name}"
+
+
+def output_item_node_id(output_id: str, socket: str) -> str:
+    """The run-graph node of a Page Output's item on ``socket``: the Output itself for the
+    first, ``__item__<output>__data_2`` … for the others."""
+    return output_id if socket == PAGE_ITEM_SOCKETS[0] else f"__item__{output_id}__{socket}"
+
+
+def input_item_tap_id(input_id: str, name: str) -> str:
+    """The run-graph tap that reads item ``name`` for Page Input ``input_id``."""
+    return f"__tap__{input_id}__item_{name}"
+
 #: What an unresolved ``page.input`` says when it is pulled.
 PAGE_UNBOUND_MESSAGE = "Page Input is not bound to an upstream Output"
 
@@ -217,6 +276,8 @@ PAGE_UNBOUND_MESSAGE = "Page Input is not bound to an upstream Output"
 #: rank producers without importing the scene (moved from scene.py 2026-10-02).
 HIDDEN_OP_PREFIXES = ("zone.", "group.", "test.", "io.seed", "io.stream_seed",
                       "rr.", "eng.", "io.nd2", "io.load",
+                      # a part tap is minted by the graph build for a card's part socket
+                      PART_OP,
                       # minted by nodegraph.iterate's feedback rewrite between two clones,
                       # never placed by hand — it exists only inside an unrolled graph
                       "flow.advance")
@@ -370,6 +431,54 @@ def _compute_page_output(ctx: EvalContext):
             return ds
         return ds.with_metadata(**{CONDITION_KEY: cond, CONDITION_SET_KEY: None})
     return ds.with_metadata(**{CONDITION_KEY: cond, CONDITION_SET_KEY: True})
+
+
+def _compute_part(ctx: EvalContext):
+    """``data.part`` — keep ONE part of the Dataset (V4.00 step 11f): ``image`` keeps the
+    image and drops every layer and table; any other name keeps that layer alone (its
+    structure table and its raster together), the raster becoming the image — a mask is a
+    0/1 image, a label raster an integer one — and a table-only part (points, tracks)
+    carrying no image. Lazy: arrays are shared, never copied. ``bit_depth`` is dropped for a
+    layer part: its values are not the camera's counts."""
+    from dataclasses import replace as _dc_replace
+    import numpy as _np
+    from nodegraph.provider import ArrayProvider
+    ds = ctx.inputs[0]
+    part = str(ctx.params.get(PART_KEY) or PART_IMAGE)
+    if part == PART_IMAGE:
+        if ds.image is None:
+            raise ValueError("this wire carries no image — take one of its layers instead")
+        return _dc_replace(ds, attributes={})
+    kept = {k: a for k, a in ds.attributes.items() if part_of(a) == part}
+    if not kept:
+        have = sorted({part_of(a) for a in ds.attributes.values()})
+        raise ValueError(f"there is no “{part}” on this wire any more — it carries "
+                         + (", ".join(["image"] + have) if have else "only its image")
+                         + "; wire the part you want")
+    raster = next((a for a in kept.values() if a.domain is Domain.VOXEL), None)
+    image = None
+    if raster is not None:
+        vals = raster.values if isinstance(raster.values, _np.memmap) else \
+            _np.asarray(raster.values)
+        if vals.dtype == _np.bool_:
+            vals = vals.view(_np.uint8)              # same bytes, a type a LUT can draw
+        image = ArrayProvider(vals)
+    md = dict(ds.metadata or {})
+    md.pop("bit_depth", None)
+    return _dc_replace(ds, image=image, attributes=kept, metadata=md)
+
+
+def _meta_part(env, params, modes):
+    """Edit-time twin of :func:`_compute_part`: a layer part drops ``bit_depth``; which
+    layers pass is ``keep_layers`` (:func:`_keep_part`)."""
+    if str(params.get(PART_KEY) or PART_IMAGE) == PART_IMAGE:
+        return env
+    return value_rescaled(env, params, modes)
+
+
+def _keep_part(params, modes):
+    part = str((params or {}).get(PART_KEY) or PART_IMAGE)
+    return frozenset() if part == PART_IMAGE else frozenset({part})
 
 
 def _meta_page_output(env, params, modes):
@@ -799,7 +908,11 @@ def ensure_ops() -> None:
 # `Engine.pull` never walks the chain behind it, never computes those nodes and never
 # memoizes their (full-raster) payloads. The node is the switch; the rewrite is the
 # mechanism.
-    if NODES.get(PAGE_OUTPUT_OP) is None:
+    _item_doc = ("Another ITEM of this variable: any Dataset — another branch, one part "
+                 "of a node, a position. A later page's Page Input reading this Output "
+                 "offers each item on its own socket, named in `Items`. The next empty "
+                 "slot appears once this one is wired.")
+    if NODES.get(PAGE_OUTPUT_OP) is None or NODES.get(PAGE_OUTPUT_OP).input("data_2") is None:
         register_node(
             _compute_page_output,
             op_key=PAGE_OUTPUT_OP, label="Page Output", category="page",
@@ -809,7 +922,12 @@ def ensure_ops() -> None:
                           "The Dataset this page hands on under the name below — an image, "
                           "a mask, a labelled set, a table-carrying Dataset, whatever the "
                           "chain in front of it produced. Pulling this node previews exactly "
-                          "what a later page's Page Input will receive."),
+                          "what a later page's Page Input will receive. More wires below "
+                          "make it a variable of several ITEMS (V4.00 step 11f); this is "
+                          "the first, which a Page Input's `out` carries."),
+                *[InDataset(s, label=f"Item {i}", grow_group="items", passes_domains=False,
+                            description=_item_doc)
+                  for i, s in enumerate(PAGE_ITEM_SOCKETS[1:], start=2)],
                 InString(PAGE_NAME_KEY, "Name", field=False, default="", presentation=True,
                          description=
                          "The variable name a later page picks this output by (its Page "
@@ -817,6 +935,13 @@ def ensure_ops() -> None:
                          "output on one page a different name, or a later page cannot tell "
                          "them apart. Renaming re-keys nothing: the Dataset is the same, so "
                          "every memoized result downstream is kept."),
+                InString(PAGE_ITEMS_KEY, "Items", field=False, default="", presentation=True,
+                         description=
+                         "The names of this variable's items, in wiring order, separated by "
+                         "commas (`smooth, mask, cells`). A blank entry takes a name from "
+                         "its wire — the part it carries or the node it comes from. A later "
+                         "page's Page Input offers each item on a socket of that name. "
+                         "Renaming re-runs nothing."),
                 InString(PAGE_CONDITION_KEY, "Condition", field=False, default="",
                          description=
                          "The experimental-condition label stamped into the Dataset's "
@@ -834,6 +959,30 @@ def ensure_ops() -> None:
             description="Name the Dataset wired in as a VARIABLE of this page, for a Page "
                         "Input on a later page to read. A pass-through: nothing is copied or "
                         "changed except an optional `condition` label in the metadata.")
+    if NODES.get(PART_OP) is None or NODES.get(PART_OP).keep_layers is None:
+        register_node(
+            _compute_part,
+            op_key=PART_OP, label="Part", category="page",
+            inputs=[
+                InDataset("data", label="Data",
+                          description="The Dataset one part is taken from — what the "
+                                      "card's `out` carries."),
+                InString(PART_KEY, "Part", field=False, default=PART_IMAGE,
+                         description=
+                         "Which piece to keep: `image` (the image, no layers or tables), "
+                         "or the name of one layer — a mask, a label set with its table, "
+                         "a point table. A raster layer becomes the image of the wire; a "
+                         "table-only one carries no image. Placed for you by wiring a "
+                         "part socket of a card; never placed by hand."),
+            ],
+            outputs=[OutDataset("out")],
+            granularity=Granularity.TILEABLE,
+            kernel_axes=frozenset(),
+            meta_transform=_meta_part,
+            keep_layers=_keep_part,
+            description="One part of a node's output on its own wire (V4.00 step 11f): the "
+                        "image alone, or one named layer with its table. Minted by the "
+                        "graph build for a wire leaving a card's part socket.")
     if NODES.get(PAGE_INPUT_OP) is None:
         register_node(
             _compute_page_input,
@@ -1056,10 +1205,16 @@ def prepare_run_graph(graph: Graph) -> Graph:
     # axis (B, then M twice — a group is a set of positions, a position one of them — then
     # C) so they commute on the data, and running them outermost-axis-first keeps each tap
     # closest to the node that asked for it — the order the card reads in.
-    return materialize_channel_taps(
-        materialize_position_taps(
-            materialize_group_taps(
-                materialize_batch_taps(cut_docked_inputs(graph)))))
+    # V4.00 step 11f: a Page Output's extra items become Outputs of their own FIRST (a dock
+    # cut then sees the real wires); a Page Input's item reads and a card's part sockets
+    # become taps LAST, outermost, like the channel taps they sit beside
+    return materialize_part_taps(
+        materialize_input_items(
+            materialize_channel_taps(
+                materialize_position_taps(
+                    materialize_group_taps(
+                        materialize_batch_taps(cut_docked_inputs(
+                            materialize_output_items(graph))))))))
 
 
 def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -1308,6 +1463,86 @@ def _materialize_taps(graph: Graph, pattern, op_key: str, tag: str, params_for) 
     return Graph(nodes=nodes, edges=new_edges)
 
 
+def materialize_output_items(graph: Graph) -> Graph:
+    """Give every extra ITEM of a Page Output (``data_2`` … ``data_8``) a Page Output node of
+    its own (V4.00 step 11f): ``__item__<output>__data_2`` with the Output's params and that
+    one wire in its ``data``. The Output keeps its first item — so pulling it previews that
+    and computes no other — and a Page Input's item tap reads the node its item became. The
+    input graph is not mutated; with no items the same object is returned."""
+    extra: Dict[str, NodeInstance] = {}
+    new_edges = []
+    for e in graph.edges:
+        node = graph.nodes.get(e.dst)
+        if node is None or node.op_key != PAGE_OUTPUT_OP or e.kind != "forward" \
+                or e.dst_socket not in PAGE_ITEM_SOCKETS[1:]:
+            new_edges.append(e)
+            continue
+        nid = output_item_node_id(e.dst, e.dst_socket)
+        if nid not in extra:
+            extra[nid] = NodeInstance(nid, PAGE_OUTPUT_OP, params=dict(node.params),
+                                      modes=dict(node.modes))
+        new_edges.append(Edge(e.src, nid, e.src_socket, "data", e.kind))
+    if not extra:
+        return graph
+    nodes = dict(graph.nodes)
+    nodes.update(extra)
+    return Graph(nodes=nodes, edges=new_edges)
+
+
+def materialize_input_items(graph: Graph) -> Graph:
+    """Rewire every wire leaving a Page Input's ``item:<name>`` socket through a Page Input
+    TAP of its own that reads that item (``__tap__<input>__item_<name>``, the item's name in
+    :data:`PAGE_ITEM_KEY`) — one per (input, item), shared by every wire leaving it. The
+    Workspace seeds and splices the tap like any Page Input (V4.00 step 11f)."""
+    taps: Dict[str, NodeInstance] = {}
+    new_edges = []
+    for e in graph.edges:
+        node = graph.nodes.get(e.src)
+        m = ITEM_SOCKET_RE.match(e.src_socket) \
+            if node is not None and node.op_key == PAGE_INPUT_OP and e.kind == "forward" \
+            else None
+        if m is None:
+            new_edges.append(e)
+            continue
+        name = m.group(1)
+        tid = input_item_tap_id(e.src, name)
+        if tid not in taps:
+            taps[tid] = NodeInstance(tid, PAGE_INPUT_OP, params={
+                PAGE_SOURCE_KEY: node.params.get(PAGE_SOURCE_KEY, ""), PAGE_ITEM_KEY: name})
+        new_edges.append(Edge(tid, e.dst, "out", e.dst_socket, e.kind))
+    if not taps:
+        return graph
+    nodes = dict(graph.nodes)
+    nodes.update(taps)
+    return Graph(nodes=nodes, edges=new_edges)
+
+
+def materialize_part_taps(graph: Graph) -> Graph:
+    """Rewire every wire leaving a ``part:<name>`` socket through a ``data.part`` tap
+    (``__tap__<node>__part_<name>``) fed by the node's real Dataset output — one per (node,
+    part), shared by every wire leaving it, so four branches reading one mask cost one tap
+    and one memo entry (V4.00 step 11f)."""
+    taps: Dict[str, NodeInstance] = {}
+    new_edges = []
+    for e in graph.edges:
+        m = PART_SOCKET_RE.match(e.src_socket) if e.kind == "forward" else None
+        if m is None or e.src not in graph.nodes:
+            new_edges.append(e)
+            continue
+        name = m.group(1)
+        tid = f"__tap__{e.src}__part_{name}"
+        if tid not in taps:
+            taps[tid] = NodeInstance(tid, PART_OP, params={PART_KEY: name})
+            new_edges.append(Edge(e.src, tid, _real_dataset_out(graph.nodes[e.src].op_key),
+                                  "data", "forward"))
+        new_edges.append(Edge(tid, e.dst, "out", e.dst_socket, e.kind))
+    if not taps:
+        return graph
+    nodes = dict(graph.nodes)
+    nodes.update(taps)
+    return Graph(nodes=nodes, edges=new_edges)
+
+
 def materialize_channel_taps(graph: Graph) -> Graph:
     """Return a runnable graph in which every GUI-synthetic per-channel output edge
     (``src_socket`` matching ``chK``) is rewired through a real ``channel.select`` tap.
@@ -1442,6 +1677,10 @@ __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "PAGE_INPUT_OP", "PAGE_OUTPUT_OP", "PAGE_OPS", "PAGE_SOURCE_KEY", "PAGE_NAME_KEY",
            "PAGE_CONDITION_KEY", "PAGE_CONDITION_AUTO_KEY", "PAGE_UNBOUND_MESSAGE",
            "DEFAULT_OUTPUT_BASE", "sanitize_output_name", "next_free_name",
+           "PART_OP", "PART_KEY", "PART_IMAGE", "PART_SOCKET_RE", "part_socket", "part_of",
+           "PAGE_ITEMS_KEY", "PAGE_ITEM_SOCKETS", "ITEM_SOCKET_RE", "PAGE_ITEM_KEY",
+           "item_socket", "output_item_node_id", "input_item_tap_id",
+           "materialize_output_items", "materialize_input_items", "materialize_part_taps",
            "materialize_group_taps", "GRP_SOCKET_RE", "GROUPS_KEY",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",

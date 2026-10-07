@@ -117,7 +117,8 @@ anchors: sym:nodegraph.catalog.module_order, sym:nodegraph.catalog._base.registe
    the node. That provenance is what `hotreload.is_catalog_op` uses to decide whether a node is
    shipped-catalog or GUI-layer, and therefore whether the catalog-wide gates cover it.
 5. `nodelab_v2.ops.ensure_ops()` separately registers the GUI-layer ops (`io.load`,
-   `view.viewer`, `io.dock`, and since V4.00 `page.input` / `page.output`). They are real
+   `view.viewer`, `io.dock`, and since V4.00 `page.input` / `page.output` and the hidden
+   `data.part` tap a card's part socket becomes, CON-22). They are real
    nodes but are not hot-reloadable and are outside the catalog gates — the map marks them
    `gui_only`.
 

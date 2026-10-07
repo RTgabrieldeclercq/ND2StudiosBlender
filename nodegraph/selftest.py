@@ -27642,6 +27642,184 @@ def test_page_outline() -> None:
         "nodes, and a page's own on/off, marked")
 
 
+def _parts_fixture():
+    """Image Input ``L → O "raw"`` (a 2-channel 32x32 square, 16-bit) and a Refinement page
+    ``IN → Gaussian G → Threshold T`` (fixed level, so the mask is the square)."""
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    ax = AxisSizes(m=1, t=1, z=1, c=2, y=32, x=32)
+    md = {"pixel_size_um": 0.5, "bit_depth": 16}
+    arr = np.zeros((1, 1, 1, 2, 32, 32), np.float32)
+    arr[0, 0, 0, :, 8:20, 8:20] = 1000.0
+    ds = Dataset(axes=ax, metadata=md).with_image(ArrayProvider(arr))
+    ws = Workspace()
+    I = ws.add_page("Input", "input")
+    R = ws.add_page("Refine", "refine")
+    I.doc.add_node("io.load", node_id="L")
+    I.doc.meta_seeds["L"] = MetaEnvelope(axes=ax, metadata=md)
+    I.doc.add_node("page.output", node_id="O", params={"name": "raw"})
+    I.doc.connect("L", "image", "O", "data")
+    R.doc.add_node("page.input", node_id="IN", params={"source": "pg1:raw"})
+    R.doc.add_node("enhance.gaussian", node_id="G", params={"sigma": 0.5}, modes={"dim": "2D"})
+    R.doc.add_node("analysis.threshold", node_id="T",
+                   params={"method": "fixed", "threshold": 300.0})
+    R.doc.connect("IN", "out", "G", "data")
+    R.doc.connect("G", "out", "T", "data")
+    return ws, ds
+
+
+def test_data_parts() -> None:
+    """V4.00 step 11f: a node whose output carries more than one kind of data offers each
+    PART on its own socket beside ``out`` (everything): ``part:image`` (the image, no layers
+    or tables) and ``part:<layer>`` (one mask; a label raster with its table under one name;
+    a point table). A part wire becomes a ``data.part`` tap: at edit time only that layer —
+    its columns, the structure domains it lives on — reaches downstream (the engine's
+    ``keep_layers``); at run time a raster part IS the wire's image (a mask a 0/1 uint8 image,
+    ``bit_depth`` dropped), shared, not copied. A part that is gone refuses by name; a node
+    switched off keeps a part wire pointing at its part."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.workspace import Workspace  # noqa: F401 — fixture import
+    ws, ds = _parts_fixture()
+    R = ws.pages["pg2"]
+    d = R.doc
+    assert d.data_parts("G") == [], "one kind of data: no part sockets"
+    assert d.data_parts("T") == ["image", "mask"]
+    names = [s.name for s in d.output_specs("T")]
+    assert names == ["out", "part:image", "part:mask"], names
+    d.add_node("analysis.label", node_id="LB")
+    d.connect("T", "out", "LB", "data")
+    assert d.data_parts("LB") == ["image", "mask", "labels"], d.data_parts("LB")
+    d.add_node("enhance.gamma", node_id="GI")
+    d.connect("T", "part:image", "GI", "data")
+    d.add_node("enhance.median", node_id="MM")
+    d.connect("T", "part:mask", "MM", "data")
+    d.add_node("enhance.gamma", node_id="LL")
+    d.connect("LB", "part:labels", "LL", "data")
+    assert d.env("GI").layer_names == () and d.env("MM").layer_names == \
+        ((Domain.VOXEL, "mask"),), d.env("MM").layer_names
+    assert {n for _d, n in d.env("LL").layer_names} == {"labels"}
+    assert Domain.LABEL in d.env("LL").domains and Domain.LABEL not in d.env("MM").domains
+    assert "bit_depth" not in d.env("MM").metadata and d.env("GI").metadata.get("bit_depth") == 16
+    g = d.to_graph(for_run=True, materialize=True)
+    assert {"__tap__T__part_image", "__tap__T__part_mask", "__tap__LB__part_labels"} <= \
+        set(g.nodes)
+    assert g.nodes["__tap__T__part_mask"].op_key == OPS.PART_OP
+    comp = ws.compose("pg2")
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    img = eng.pull("pg2/__tap__T__part_image")
+    assert img.image is not None and not img.attributes
+    mask = eng.pull("pg2/__tap__T__part_mask")
+    px = mask.image.read_region(0, 0, 0, 0, 0, 0, 32, 0, 32)
+    assert px.dtype == np.uint8 and set(np.unique(px)) <= {0, 1} and px.sum() > 0
+    assert {a.name for a in mask.attributes.values()} == {"mask"}
+    assert "bit_depth" not in mask.metadata
+    lab = eng.pull("pg2/__tap__LB__part_labels")
+    assert {(a.domain, a.layer or a.name) for a in lab.attributes.values()} >= \
+        {(Domain.VOXEL, "labels"), (Domain.LABEL, "labels")}
+    assert "mask" not in {a.name for a in lab.attributes.values()}
+    assert int(lab.image.read_region(0, 0, 0, 0, 0, 0, 32, 0, 32).max()) >= 1
+    assert eng.pull("pg2/MM").image is not None, "a filter takes the mask as an image"
+    # the compute: a part that is gone refuses by name; a table-only part has no image
+    from nodegraph.engine import EvalContext as _EC  # noqa: F401
+    ctx = type("Ctx", (), {"inputs": [img], "params": {OPS.PART_KEY: "mask"}})()
+    try:
+        OPS.COMPUTES[OPS.PART_OP](ctx) if hasattr(OPS, "COMPUTES") else \
+            __import__("nodegraph.nodes", fromlist=["COMPUTES"]).COMPUTES[OPS.PART_OP](ctx)
+        raise AssertionError("a part that is not on the wire must refuse")
+    except ValueError as exc:
+        assert "no “mask” on this wire" in str(exc), exc
+    # switched off, a node keeps a part wire a part wire
+    d.add_node("enhance.unsharp", node_id="U")
+    d.connect("T", "out", "U", "data")
+    d.add_node("enhance.gamma", node_id="UU")
+    d.connect("U", "part:mask", "UU", "data")
+    d.set_muted("U", True)
+    ge = {(e.src, e.src_socket, e.dst) for e in d.to_graph(for_run=True).edges}
+    assert ("T", "part:mask", "UU") in ge, ge
+    _ok("data parts: a card offers image / each layer beside out exactly when it carries more "
+        "than one; a part wire becomes a data.part tap — only that layer, its columns and its "
+        "structure domain downstream at edit time; pulled, a raster part is the image (a "
+        "mask 0/1 uint8, bit_depth dropped), a label part keeps its table; a missing part "
+        "refuses by name; a switched-off node keeps a part wire")
+
+
+def test_page_output_items() -> None:
+    """V4.00 step 11f: a Page Output collects several ITEMS — ``data``, ``data_2`` … — each
+    named by its ``items`` entry or after its wire, unique within the Output. A Page Input
+    reading it offers each on an ``item:<name>`` socket (``out`` stays the first); at edit
+    time each item socket carries that item's envelope; composed, the item is the Output
+    node its item became, so a pull reads exactly that item. One item is a plain Output; the
+    items survive a save and reopen."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.workspace import Workspace
+    ws, ds = _parts_fixture()
+    R = ws.pages["pg2"]
+    d = R.doc
+    d.add_node("page.output", node_id="W", params={"name": "work"})
+    d.connect("G", "out", "W", "data")
+    assert d.output_items("W") == [("data", "gaussian_blur")]
+    P = ws.add_page("Process", "process")
+    P.doc.add_node("page.input", node_id="IN", params={"source": "pg2:work"})
+    assert not any(s.name.startswith("item:") for s in P.doc.output_specs("IN")), \
+        "a one-item Output has no item sockets"
+    d.connect("T", "part:mask", "W", "data_2")
+    d.connect("T", "out", "W", "data_3")
+    assert d.output_items("W") == [("data", "gaussian_blur"), ("data_2", "mask"),
+                                   ("data_3", "threshold")], d.output_items("W")
+    d.nodes["W"].params["items"] = "smooth, , mask"
+    d.touch("W")
+    assert d.output_items("W") == [("data", "smooth"), ("data_2", "mask"), ("data_3", "mask2")], \
+        "an entry names its item, a blank takes the wire's, and names stay unique"
+    assert [s.label for s in d.input_specs("W")[:3]] == ["smooth", "mask", "mask2"]
+    P.doc.repropagate()
+    socks = [s.name for s in P.doc.output_specs("IN")]
+    assert {"item:smooth", "item:mask", "item:mask2"} <= set(socks), socks
+    assert ws.input_items("pg3", "IN") == ["smooth", "mask", "mask2"]
+    P.doc.add_node("analysis.label", node_id="LB")
+    P.doc.connect("IN", "item:mask", "LB", "data")
+    P.doc.add_node("enhance.median", node_id="MD")
+    P.doc.connect("IN", "item:smooth", "MD", "data")
+    P.doc.repropagate()
+    assert {n for _d, n in P.doc.env("LB").layer_names} == {"mask", "labels"}
+    assert P.doc.env("MD").layer_names == ()
+    assert ws.resolve_item("pg3", "pg2:work", "mask2") == ("pg2", "__item__W__data_3")
+    assert ws.resolve_item("pg3", "pg2:work", "smooth") == ("pg2", "W")
+    assert ws.resolve_item("pg3", "pg2:work", "nope") is None
+    comp = ws.compose("pg3")
+    assert "pg2/__item__W__data_2" in comp.graph.nodes and "pg3/IN" not in comp.graph.nodes
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    lb = eng.pull("pg3/LB")
+    assert {(a.domain, a.layer or a.name) for a in lb.attributes.values()} >= \
+        {(Domain.VOXEL, "mask"), (Domain.LABEL, "labels")}
+    assert not eng.pull("pg3/MD").attributes, "the smooth item carries the image alone"
+    # pulling the Output on its own page previews its FIRST item and computes no other
+    g2 = d.to_graph(for_run=True, materialize=True)
+    assert [e.src for e in g2.edges if e.dst == "W"] == ["G"]
+    # the outline lists the items
+    row = next(r for r in ws.page_outline("pg2") if r.node_id == "W")
+    assert row.detail.startswith("[smooth · mask · mask2]"), row.detail
+    # saved and reopened
+    ws2 = Workspace()
+    ws2.load_dict(ws.to_dict())
+    assert ws2.pages["pg2"].doc.output_items("W") == d.output_items("W")
+    assert ("IN", "item:mask", "LB", "data") in ws2.pages["pg3"].doc.edges
+    # an item that is unwired: its socket goes, a reader of it is left unresolved
+    d.nodes["W"].params["items"] = "smooth, , both"
+    d.touch("W")
+    d.disconnect("T", "part:mask", "W", "data_2")
+    assert d.output_items("W") == [("data", "smooth"), ("data_3", "both")]
+    assert "item:mask" not in [s.name for s in P.doc.output_specs("IN")]
+    assert ws.resolve_item("pg3", "pg2:work", "mask") is None
+    _ok("Page Output items: up to eight wires, each named (entry, else the wire's part / "
+        "node), unique; a Page Input offers item:<name> sockets beside out, each with its "
+        "item's envelope; composed, an item socket reads exactly that item (a pull of the "
+        "Output previews the first only); the outline lists them; saved and reopened")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -27828,6 +28006,8 @@ def main() -> int:
     test_linked_modified_structure()
     test_linked_send_to_master()
     test_page_outline()
+    test_data_parts()
+    test_page_output_items()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

@@ -303,7 +303,8 @@ existing one (the GUI offers a picker populated from the envelope's layer catalo
 expressed without a socket per possible layer.
 
 A layer a node creates that has no output socket must still be declared, via `extra_layers`,
-or the picker downstream will not offer it.
+or the picker downstream will not offer it. The opposite — a node that passes on only SOME of
+its input's layers (the GUI's `data.part` tap) — is declared with `keep_layers` (CON-22).
 
 `column_in` is the same idea one level down — the name of a COLUMN on a structure table
 rather than the table itself. See CON-15.
@@ -605,3 +606,39 @@ still be chosen. `Workspace.sources_for_kind` / `default_source_for_kind` answer
 that does not exist yet.
 
 see: CON-17 · CON-18 · [MANUAL §2 Pages](../MANUAL.md)
+
+---
+
+### CON-22 — data part and several-item Output
+anchors: sym:nodelab_v2.ops.materialize_part_taps, sym:nodelab_v2.ops.materialize_output_items, sym:nodelab_v2.ops.materialize_input_items, sym:nodelab_v2.document.GraphDocument.data_parts, sym:nodelab_v2.document.GraphDocument.output_items, sym:nodegraph.metadata._kept_only
+
+**Parts (V4.00 step 11f).** A node's `out` carries its whole Dataset — the image and every
+named layer (a mask raster; a label raster and its structure table, ONE part under one name,
+`ops.part_of`; a point or track table). `GraphDocument.data_parts` lists them from the
+node's envelope (`image` + each `layer_names` name) when there are two or more, and
+`output_specs` offers each on a synthetic `part:<name>` socket. Like the channel taps, a part
+wire is a GUI fiction: `prepare_run_graph` rewrites it (`materialize_part_taps`, last) through a
+hidden `data.part` node (`PART_OP`, a GUI-layer op beside `page.*`, hidden from the palette)
+fed by the node's real Dataset output — one tap per (node, part), shared. Its compute keeps
+that part alone: `image` → the image with no attributes; a layer → that layer's attributes,
+its VOXEL raster (same shape as the image on the voxel lattice, so no copy) becoming the
+image (bool viewed as uint8), `bit_depth` dropped; a table-only part has no image. At edit
+time the engine's `NodeSpec.keep_layers` (`metadata._kept_only`) keeps only that name's
+layers, their columns and the structure domains they live on — the general form, total like
+`extra_layers`. `_bypass_muted` keeps a part wire pointing at its part through a muted node.
+
+**Several items.** `page.output` declares `data` plus `data_2` … `data_8` in one
+`grow_group` (one empty slot shows) with `passes_domains=False`, and an `items` presentation
+param naming them; `GraphDocument.output_items` resolves `(socket, name)` per wired slot —
+the entry for that slot, else from the wire (a part's name, a Page Input's variable, the
+source node's title), unique within the Output. `materialize_output_items` (first) gives every
+extra item a `page.output` node of its own (`__item__<output>__data_2`), so the Output keeps
+item one only — a pull previews it and computes nothing else — and each item is a run node
+with the Output's condition stamp. A `page.input` reading a several-item Output gets
+`item:<name>` sockets (`doc.page_items` → `Workspace.input_items`); `materialize_input_items`
+turns each read into a `page.input` tap (`__tap__<input>__item_<name>`, `PAGE_ITEM_KEY`) that
+`Workspace._input_seeds` seeds with that item's envelope and `compose` splices onto the item's
+node (`Workspace.resolve_item`). The cross-page signature walks the UNmaterialized graph, where
+every item wire still enters the Output, so editing any item's chain stales its readers.
+
+see: CON-17 · CON-12 · CON-15 · [MANUAL §4 One kind of data at a time, §2 Pages](../MANUAL.md)

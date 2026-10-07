@@ -63,6 +63,7 @@ from nodelab_v2.linked_document import LinkedDocument, check_overrides, check_st
 from nodelab_v2.ops import (
     DEFAULT_OUTPUT_BASE, LOAD_OP, PAGE_CONDITION_AUTO_KEY, PAGE_CONDITION_KEY,
     PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
+    ITEM_SOCKET_RE, PAGE_ITEM_KEY, input_item_tap_id, output_item_node_id,
     is_frozen, next_free_name, sanitize_output_name, upstream_signature)
 from nodelab_v2.version import __version__
 
@@ -615,6 +616,7 @@ class Workspace:
         doc.page_sources = lambda pid=pid: self.available_sources(pid)
         doc.page_feeders = lambda pid=pid: self.feeder_pages(pid)
         doc.page_channels = lambda nid, pid=pid: self.input_channels(pid, nid)
+        doc.page_items = lambda nid, pid=pid: self.input_items(pid, nid)
         doc.node_defaults = lambda op, pid=pid: self.node_defaults(pid, op)
         doc.claim_output_name = (lambda nid, name, pid=pid:
                                  self.claim_output_name(pid, nid, name))
@@ -649,6 +651,7 @@ class Workspace:
         doc.page_sources = lambda: []
         doc.page_feeders = lambda: []
         doc.page_channels = lambda _nid: []
+        doc.page_items = lambda _nid: []
         doc.node_defaults = lambda _op: {}
         doc.claim_output_name = doc._claim_output_name_here
         doc.source_kind = lambda _v: ""
@@ -1105,6 +1108,9 @@ class Workspace:
                 readers = [n for _p, n in self.readers_of(page_id, name)] if name else []
                 detail = ("read by " + ", ".join(readers)) if readers else (
                     "read by no page yet" if name else "unnamed — no page can read it")
+                items = doc.output_items(nid)
+                if len(items) >= 2:            # a several-item variable (step 11f)
+                    detail = "[" + " · ".join(n for _s, n in items) + "]  " + detail
             elif op == LOAD_OP:
                 role = "source"
                 path = str(rec.params.get("path", "") or "")
@@ -1253,9 +1259,40 @@ class Workspace:
         up, out_nid = res
         return list(self.pages[up].doc.channel_descriptors(out_nid))
 
+    # ── a several-item Output (V4.00 step 11f) ─────────────────────────────────
+    def input_items(self, page_id: str, node_id: str) -> List[str]:
+        """The names of the ITEMS the Page Input ``node_id`` on ``page_id`` can read one by
+        one — its upstream Output's (:meth:`GraphDocument.output_items`) — or ``[]`` while it
+        is unbound or reads a one-item Output (``out`` is then the whole of it)."""
+        page = self.pages.get(page_id)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None or rec.op_key != PAGE_INPUT_OP:
+            return []
+        res = self.resolve_source(page_id, rec.params.get(PAGE_SOURCE_KEY))
+        if res is None:
+            return []
+        up, out_nid = res
+        items = self.pages[up].doc.output_items(out_nid)
+        return [name for _s, name in items] if len(items) >= 2 else []
+
+    def resolve_item(self, page_id: str, value: Any, item: str) -> Optional[Tuple[str, str]]:
+        """``(upstream page id, run-graph node)`` of item ``item`` of the Output a source
+        value names — the Output itself for its first item, ``__item__<output>__data_2`` …
+        for the others (:func:`~nodelab_v2.ops.materialize_output_items`); ``None`` when the
+        source or the item is gone."""
+        res = self.resolve_source(page_id, value)
+        if res is None:
+            return None
+        up, out_nid = res
+        for sock, name in self.pages[up].doc.output_items(out_nid):
+            if name == item:
+                return up, output_item_node_id(out_nid, sock)
+        return None
+
     def _input_seeds(self, page_id: str) -> Dict[str, MetaEnvelope]:
         """The seed hook: each resolved ``page.input`` of a page → its upstream Output's
-        current envelope."""
+        current envelope; each item it hands on separately (its ``item:<name>`` tap, V4.00
+        step 11f) → that item's."""
         page = self.pages.get(page_id)
         if page is None:
             return {}
@@ -1270,6 +1307,16 @@ class Workspace:
             env = self.pages[up].doc.envs.get(out_nid)
             if env is not None:
                 seeds[rec.id] = env
+        for (s, ss, _d, _ds) in page.doc.edges:
+            m = ITEM_SOCKET_RE.match(ss or "")
+            rec = page.doc.nodes.get(s)
+            if m is None or rec is None or rec.op_key != PAGE_INPUT_OP:
+                continue
+            got = self.resolve_item(page_id, rec.params.get(PAGE_SOURCE_KEY), m.group(1))
+            if got is not None:
+                env = self.pages[got[0]].doc.envs.get(got[1])
+                if env is not None:
+                    seeds[input_item_tap_id(s, m.group(1))] = env
         return seeds
 
     # ── identity for a run ────────────────────────────────────────────────────
@@ -1343,7 +1390,11 @@ class Workspace:
             replaced: Dict[str, str] = {}             # local input id -> upstream run id
             for nid, inst in sub.nodes.items():
                 if inst.op_key == PAGE_INPUT_OP:
-                    res = self.resolve_source(pid, inst.params.get(PAGE_SOURCE_KEY))
+                    item = inst.params.get(PAGE_ITEM_KEY)
+                    # an item tap (step 11f) reads one item of a several-item Output
+                    res = (self.resolve_item(pid, inst.params.get(PAGE_SOURCE_KEY), str(item))
+                           if item else
+                           self.resolve_source(pid, inst.params.get(PAGE_SOURCE_KEY)))
                     # only from a page ALREADY spliced in: a reference that would close a
                     # cycle (dropped from the tolerant closure) stays an unbound root
                     if res is not None and res[0] in done:

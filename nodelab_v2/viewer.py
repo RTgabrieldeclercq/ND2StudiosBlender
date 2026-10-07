@@ -179,6 +179,15 @@ class _Palette:
     tracks: Dict[Any, np.ndarray] = dc_field(default_factory=dict)   # track layer → LUT
 
 
+def _flat_window(lo: float, hi: float):
+    """A display window that can show a FLAT plane (V4.00 step 11f): when the percentiles
+    meet, a positive value is shown bright (``0 … value``) — an all-ones mask is white, not
+    black — and zero or below as the bottom of a unit window."""
+    if hi > lo:
+        return lo, hi
+    return (0.0, lo) if lo > 0 else (lo, lo + 1.0)
+
+
 def _autocontrast(plane: np.ndarray, lo_pct: float, hi_pct: float) -> np.ndarray:
     """A float plane percentile-normalized to [0, 1] (hot-pixel-safe)."""
     a = np.asarray(plane, dtype=float)
@@ -187,8 +196,7 @@ def _autocontrast(plane: np.ndarray, lo_pct: float, hi_pct: float) -> np.ndarray
         return np.zeros_like(a)
     lo = float(np.percentile(finite, lo_pct))
     hi = float(np.percentile(finite, hi_pct))
-    if hi <= lo:
-        hi = lo + 1.0
+    lo, hi = _flat_window(lo, hi)
     return np.clip((np.nan_to_num(a, nan=lo) - lo) / (hi - lo), 0.0, 1.0)
 
 
@@ -2473,9 +2481,7 @@ class ViewerPanel(QWidget):
             else:
                 lo = float(np.percentile(finite, 1.0))
                 hi = float(np.percentile(finite, 99.5))
-                if hi <= lo:
-                    hi = lo + 1.0
-                lohi = (lo, hi)
+                lohi = _flat_window(lo, hi)
                 self._drange[ckey] = self._display_range(plane)
             self._clim[ckey] = lohi
         return lohi
@@ -3067,7 +3073,7 @@ class ViewerPanel(QWidget):
             return (0.0, 1.0)
         lo = float(np.percentile(finite, 1.0))
         hi = float(np.percentile(finite, 99.5))
-        return (lo, hi if hi > lo else lo + 1.0)
+        return _flat_window(lo, hi)
 
     def _hist_tip(self, ch: int) -> str:
         ckey = self._lut_key(self._node_id, ch)

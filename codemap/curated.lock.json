@@ -2,9 +2,9 @@
  "CON-01": {
   "anchors": {
    "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
-   "sym:nodegraph.registry.define_node": "0fa2973c9d512f8484028bfc55ab8963"
+   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
  "CON-02": {
@@ -89,9 +89,9 @@
  "CON-12": {
   "anchors": {
    "sym:nodegraph.registry.SocketSpec": "e2b4360003ef3d619631e8bd0a633d3f",
-   "sym:nodegraph.registry.define_node": "0fa2973c9d512f8484028bfc55ab8963"
+   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
  "CON-13": {
@@ -183,6 +183,18 @@
   "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
+ "CON-22": {
+  "anchors": {
+   "sym:nodegraph.metadata._kept_only": "a87548f3b6d3398a21bee1e553464a76",
+   "sym:nodelab_v2.document.GraphDocument.data_parts": "5117c017fb47af4adbed9554063d9066",
+   "sym:nodelab_v2.document.GraphDocument.output_items": "d669ea1b9d0ba7ab3185538b31b89c3c",
+   "sym:nodelab_v2.ops.materialize_input_items": "93ab969de62ed2fd25be90c35d0ea424",
+   "sym:nodelab_v2.ops.materialize_output_items": "93ab969de62ed2fd25be90c35d0ea424",
+   "sym:nodelab_v2.ops.materialize_part_taps": "93ab969de62ed2fd25be90c35d0ea424"
+  },
+  "blessed": "2026-10-06",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
@@ -201,9 +213,9 @@
  },
  "INV-03": {
   "anchors": {
-   "sym:nodegraph.registry.define_node": "0fa2973c9d512f8484028bfc55ab8963"
+   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-06",
   "file": "codemap/invariants.md"
  },
  "INV-04": {
@@ -334,9 +346,9 @@
   "anchors": {
    "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
    "sym:nodegraph.catalog.module_order": "1ae7d144cb5031219d2c60724c714e67",
-   "sym:nodegraph.registry.define_node": "0fa2973c9d512f8484028bfc55ab8963"
+   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-06",
   "file": "codemap/workflows.md"
  },
  "WF-05": {

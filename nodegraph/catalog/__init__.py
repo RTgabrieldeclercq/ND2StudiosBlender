@@ -219,8 +219,14 @@ def module_order() -> Tuple[str, ...]:
     genuinely unknown — order is observable in the link-drag search menu, and inventing a
     position would be a guess presented as a fact. Add the module to :data:`MODULES` to place
     it deliberately."""
-    known = [m for m in MODULES if m in set(discover())]
-    extra = [m for m in discover() if m not in set(MODULES)]
+    # ONE walk of the folder (2026-10-06): the comprehension used to re-evaluate
+    # `set(discover())` for every listed module — ~100 walks of the catalog tree per call —
+    # and the Properties panel asks on every selection (`hotreload.module_of_op`), so each
+    # click on a card cost ~0.4 s
+    found = discover()
+    present, listed = set(found), set(MODULES)
+    known = [m for m in MODULES if m in present]
+    extra = [m for m in found if m not in listed]
     return tuple(known + extra)
 
 

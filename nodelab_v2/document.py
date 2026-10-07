@@ -20,6 +20,7 @@ Qt-free; standard library + nodegraph only (testable headless).
 from __future__ import annotations
 
 import itertools
+import re
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from nodegraph.domains import AXIS_ORDER, Domain
@@ -46,6 +47,8 @@ from nodegraph.memo import digest
 from nodelab_v2.ops import (
     DEFAULT_OUTPUT_BASE, PAGE_NAME_KEY, PAGE_OUTPUT_OP, next_free_name,
     sanitize_output_name,
+    ITEM_SOCKET_RE, PAGE_INPUT_OP, PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY,
+    PART_IMAGE, PART_SOCKET_RE, item_socket, part_socket, _real_dataset_out,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
     calib_overrides,
@@ -382,6 +385,10 @@ class GraphDocument:
         #: names, which the envelope does not carry across the page boundary. ``[]`` outside
         #: a workspace or while the Input is unbound.
         self.page_channels: Callable[[str], list] = lambda _nid: []
+        #: ``(node_id) -> [item name, ...]`` (V4.00 step 11f): the items of the Output a
+        #: ``page.input`` on this document reads — its item sockets. ``[]`` outside a
+        #: workspace, while unbound, or for a one-item Output.
+        self.page_items: Callable[[str], list] = lambda _nid: []
         #: ``(node_id, name) -> name`` (V4.00 step 11e): the name Page Output ``node_id`` may
         #: carry — ``name`` when no other Output has it, else ``name2``, ``name3``, … The
         #: Workspace checks every page (a variable name identifies ONE output); outside a
@@ -762,7 +769,86 @@ class GraphDocument:
             if len(positions) >= 2:
                 for i, pd in enumerate(positions):
                     base.append(OutDataset(f"pos{i}", label=pd["label"]))
+        if rec.op_key == PAGE_INPUT_OP:
+            # the items of a several-item Output, each on a socket of its own (step 11f)
+            items = self._page_items(node_id)
+            if len(items) >= 2:
+                for name in items:
+                    base.append(OutDataset(item_socket(name), label=f"item · {name}"))
+        if any(s.type is SocketType.DATASET for s in base):
+            # each PART of what `out` carries, on its own (step 11f): `image`, `mask`, …
+            for name in self.data_parts(node_id):
+                base.append(OutDataset(part_socket(name), label=f"{name} only"))
         return base
+
+    # ── parts and items (V4.00 step 11f) ──────────────────────────────────────
+    def data_parts(self, node_id: str) -> List[str]:
+        """The PARTS of a node's output: ``image`` and each named layer its envelope carries
+        (a mask; a label raster and its table, one part under one name; a point table), in
+        the order they arrived — ``[]`` when there is only one, so a card offers part
+        sockets exactly when its ``out`` carries more than one kind of data. A reroute, a
+        group instance or a node with no Dataset output has none."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key.startswith("rr.") or group_name_of(rec.op_key):
+            return []
+        try:
+            env = self.env(node_id)
+        except Exception:                            # noqa: BLE001 — an un-propagated node
+            return []
+        names: List[str] = []
+        for _d, n in getattr(env, "layer_names", ()) or ():
+            n = str(n)
+            if n and n != PART_IMAGE and n not in names:
+                names.append(n)
+        return [PART_IMAGE] + names if names else []
+
+    def output_items(self, node_id: str) -> List[Tuple[str, str]]:
+        """``[(socket, name), ...]`` — the ITEMS of Page Output ``node_id``: its wired item
+        sockets (``data``, ``data_2``, …) in order, each named by the ``items`` param's entry
+        for that socket, else after its wire — the part it carries (``mask``), the item or
+        variable a Page Input hands on, or the node it comes from (``gaussian_blur``) —
+        unique within the Output. One item is the plain single-Dataset Output."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key != PAGE_OUTPUT_OP:
+            return []
+        wired: Dict[str, Tuple[str, str]] = {}
+        for (s, ss, d, ds) in self.edges:
+            if d == node_id and ds in PAGE_ITEM_SOCKETS and ds not in wired:
+                wired[ds] = (s, ss)
+        given = [x.strip() for x in str(rec.params.get(PAGE_ITEMS_KEY, "") or "").split(",")]
+        out: List[Tuple[str, str]] = []
+        taken: set = set()
+        for k, sock in enumerate(PAGE_ITEM_SOCKETS):
+            if sock not in wired:
+                continue
+            name = sanitize_output_name(given[k] if k < len(given) else "") or \
+                self._item_default(*wired[sock])
+            name = next_free_name(name, taken)
+            taken.add(name.lower())
+            out.append((sock, name))
+        return out
+
+    def _item_default(self, src: str, socket: str) -> str:
+        m = PART_SOCKET_RE.match(socket or "") or ITEM_SOCKET_RE.match(socket or "")
+        if m:
+            return sanitize_output_name(m.group(1)) or "item"
+        rec = self.nodes.get(src)
+        if rec is not None and rec.op_key == PAGE_INPUT_OP:
+            name = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").split(":", 1)[-1].strip()
+            if name:
+                return sanitize_output_name(name) or "item"
+        slug = re.sub(r"[^0-9a-z]+", "_", self.title_of(src).lower()).strip("_")[:32]
+        base = slug or "item"
+        spec = rec.spec() if rec is not None else None
+        main = next((s.name for s in (spec.outputs if spec else ())
+                     if s.type is SocketType.DATASET), "out")
+        return base if socket in ("", main) else f"{base}_{socket}"
+
+    def _page_items(self, node_id: str) -> List[str]:
+        try:
+            return [str(n) for n in (self.page_items(node_id) or [])]
+        except Exception:                            # noqa: BLE001 — a workspace mid-change
+            return []
 
     def position_descriptors(self, node_id: str) -> list:
         """The multipoint positions on the wire reaching ``node_id``, from its edit-time
@@ -808,6 +894,13 @@ class GraphDocument:
         if spec is None:
             return []
         specs = self._grow_filter(node_id, list(spec.active_inputs(rec.state())))
+        if rec.op_key == PAGE_OUTPUT_OP:
+            # a several-item variable (step 11f): each wired slot reads as its item's name
+            items = dict(self.output_items(node_id))
+            if len(items) >= 2:
+                from dataclasses import replace as _replace
+                specs = [_replace(s, label=items[s.name]) if s.name in items else s
+                         for s in specs]
         return specs + self.mode_port_specs(node_id)
 
     def _grow_filter(self, node_id: str, specs: list) -> list:
@@ -1497,8 +1590,13 @@ class GraphDocument:
             outs = [e for e in edges if e[0] == rec.id and not is_driver_edge(self, e)]
             edges = [e for e in edges if e[0] != rec.id and e[2] != rec.id]
             if feed is not None:
-                for (_, _, d, ds) in outs:
-                    edges.append((feed[0], feed[1], d, ds))
+                for (_, ss_out, d, ds) in outs:
+                    # a PART wire stays a part wire (step 11f): a node that may be switched
+                    # off keeps the kind of data, so its input carries the same parts
+                    src_rec = self.nodes.get(feed[0])
+                    keep = PART_SOCKET_RE.match(ss_out or "") and src_rec is not None and \
+                        feed[1] == _real_dataset_out(src_rec.op_key)
+                    edges.append((feed[0], ss_out if keep else feed[1], d, ds))
         return edges
 
     # ── zone creation (Repeat) ─────────────────────────────────────────────────

@@ -1932,11 +1932,32 @@ def propagate_meta(graph: Graph,
         base = MetaEnvelope() if fresh else env_in
         env_out = env_out.with_layer_names(
             _layer_names_out(spec, node, base, env_out))
-        out[nid] = env_out.with_column_names(
+        env_out = env_out.with_column_names(
             _column_names_out(spec, node, base, env_out,
                               inputs=tuple((e.dst_socket, out.get(e.src, MetaEnvelope()))
                                            for e in dpreds)))
+        out[nid] = _kept_only(spec, node, env_out)
     return out
+
+
+def _kept_only(spec, node, env: MetaEnvelope) -> MetaEnvelope:
+    """Apply ``NodeSpec.keep_layers`` (V4.00 step 11f): only the layers of the kept NAMES
+    survive, with their columns; a structure domain survives only if a kept layer lives on
+    it, the acquisition lattice always. Total — a declaration that raises keeps everything."""
+    keep_fn = getattr(spec, "keep_layers", None) if spec is not None else None
+    if keep_fn is None:
+        return env
+    try:
+        keep = keep_fn(getattr(node, "params", {}) or {}, node.state(spec))
+    except Exception:                                    # pragma: no cover - defensive
+        return env
+    if keep is None:
+        return env
+    keep = frozenset(str(k) for k in keep)
+    names = tuple((d, n) for d, n in env.layer_names if n in keep)
+    cols = tuple((d, lyr, c) for d, lyr, c in env.column_names if lyr in keep)
+    doms = frozenset(d for d in env.domains if is_lattice(d)) | {d for d, _n in names}
+    return env.with_domains(doms).with_layer_names(names).with_column_names(cols)
 
 
 def _layer_names_out(spec, node, env_in: MetaEnvelope,

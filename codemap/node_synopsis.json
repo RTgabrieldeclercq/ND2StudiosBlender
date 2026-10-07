@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 103,
+    "nodes": 104,
     "categories": 15,
     "roles": 22,
     "stages": 5,
-    "inputs": 727,
-    "outputs": 110,
+    "inputs": 737,
+    "outputs": 111,
     "gui_ops_included": true
   },
   "stages": {
@@ -85,6 +85,7 @@
       "ops": [
         "channel.select",
         "channel.split",
+        "data.part",
         "io.dock",
         "io.load",
         "io.write_figure",
@@ -278,8 +279,8 @@
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
-      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions.",
-      "count": 10,
+      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
+      "count": 11,
       "ops": [
         {
           "op": "channel.select",
@@ -290,6 +291,11 @@
           "op": "channel.split",
           "label": "Split Channels",
           "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'."
+        },
+        {
+          "op": "data.part",
+          "label": "Part",
+          "summary": "One part of a node's output on its own wire (V4.00 step 11f): the image alone, or one named layer with its table. Minted by the graph build for a wire leaving a card's part socket."
         },
         {
           "op": "util.batch",
@@ -1013,6 +1019,7 @@
       "view.viewer"
     ],
     "page": [
+      "data.part",
       "page.input",
       "page.output"
     ],
@@ -7080,6 +7087,71 @@
       "adds_columns": false,
       "trained_params": false,
       "kernel_doc": "",
+      "params_read": []
+    },
+    "data.part": {
+      "op": "data.part",
+      "label": "Part",
+      "category": "page",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input"
+      ],
+      "module": "nodelab_v2/ops.py",
+      "gui_only": true,
+      "summary": "One part of a node's output on its own wire (V4.00 step 11f): the image alone, or one named layer with its table. Minted by the graph build for a wire leaving a card's part socket.",
+      "overview": "``data.part`` — keep ONE part of the Dataset (V4.00 step 11f): ``image`` keeps the image and drops every layer and table; any other name keeps that layer alone (its structure table and its raster together), the raster becoming the image — a mask is a 0/1 image, a label raster an integer one — and a table-only part (points, tracks) carrying no image. Lazy: arrays are shared, never copied. ``bit_depth`` is dropped for a layer part: its values are not the camera's counts.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "Data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset one part is taken from — what the card's `out` carries."
+        },
+        {
+          "name": "part",
+          "label": "Part",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "image",
+          "description": "Which piece to keep: `image` (the image, no layers or tables), or the name of one layer — a mask, a label set with its table, a point table. A raster layer becomes the image of the wire; a table-only one carries no image. Placed for you by wiring a part socket of a card; never placed by hand."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_part",
+      "meta_transform": "_meta_part",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": null,
       "params_read": []
     },
     "detect.particles": {
@@ -13375,7 +13447,70 @@
           "label": "Data",
           "type": "dataset",
           "role": "dataset",
-          "description": "The Dataset this page hands on under the name below — an image, a mask, a labelled set, a table-carrying Dataset, whatever the chain in front of it produced. Pulling this node previews exactly what a later page's Page Input will receive."
+          "description": "The Dataset this page hands on under the name below — an image, a mask, a labelled set, a table-carrying Dataset, whatever the chain in front of it produced. Pulling this node previews exactly what a later page's Page Input will receive. More wires below make it a variable of several ITEMS (V4.00 step 11f); this is the first, which a Page Input's `out` carries."
+        },
+        {
+          "name": "data_2",
+          "label": "Item 2",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "data_3",
+          "label": "Item 3",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "data_4",
+          "label": "Item 4",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "data_5",
+          "label": "Item 5",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "data_6",
+          "label": "Item 6",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "data_7",
+          "label": "Item 7",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "data_8",
+          "label": "Item 8",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "items",
+          "description": "Another ITEM of this variable: any Dataset — another branch, one part of a node, a position. A later page's Page Input reading this Output offers each item on its own socket, named in `Items`. The next empty slot appears once this one is wired."
         },
         {
           "name": "name",
@@ -13386,6 +13521,16 @@
           "default": "",
           "presentation": true,
           "description": "The variable name a later page picks this output by (its Page Input's Source menu lists `<this page> · <name>`). Give every output on one page a different name, or a later page cannot tell them apart. Renaming re-keys nothing: the Dataset is the same, so every memoized result downstream is kept."
+        },
+        {
+          "name": "items",
+          "label": "Items",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "The names of this variable's items, in wiring order, separated by commas (`smooth, mask, cells`). A blank entry takes a name from its wire — the part it carries or the node it comes from. A later page's Page Input offers each item on a socket of that name. Renaming re-runs nothing."
         },
         {
           "name": "condition",
