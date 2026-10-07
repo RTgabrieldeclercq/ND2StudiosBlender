@@ -313,6 +313,12 @@ class CanvasPanel(QWidget):
         self._menu = QMenu(self)
         self._menu.aboutToShow.connect(lambda: host.fill_page_menu(self._menu, self))
         self.view.page_button.setMenu(self._menu)
+        # the action pill (2026-10-07): its menu is built when it opens, from the selection
+        # of the page shown here (the window's `fill_action_menu`)
+        self.actions_menu = QMenu(self)
+        self.actions_menu.aboutToShow.connect(
+            lambda: host.fill_action_menu(self.actions_menu, self))
+        self.view.action_pill.setMenu(self.actions_menu)
         self.sync_title()
 
     # ── the page shown ─────────────────────────────────────────────────────────

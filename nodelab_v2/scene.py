@@ -1289,8 +1289,22 @@ class GraphView(QGraphicsView):
             "kind, and to add, duplicate, rename or delete one (Ctrl+PgUp / Ctrl+PgDn step "
             "through them).")
         self.page_button.hide()                     # until the window names a page
+        # the ACTION PILL (2026-10-07): top centre, says what is selected, and its menu —
+        # filled by the window when it opens — offers what makes sense for that
+        self.action_pill = QToolButton(self)
+        self.action_pill.setObjectName("actionPill")
+        self.action_pill.setPopupMode(QToolButton.InstantPopup)
+        self.action_pill.setCursor(Qt.PointingHandCursor)
+        self.action_pill.setFocusPolicy(Qt.NoFocus)
+        self.action_pill.setToolTip(
+            "What you can do here — draw a region, group the selected nodes or regions, "
+            "ungroup one, duplicate it as a linked tab, reorganize the graph. The offer "
+            "follows the selection.")
+        self.action_pill.setText("Graph")
+        self._pill_armed = False
         self._canvas_active = False
         self._style_page_button()
+        self._style_action_pill()
         self._place_corner_chrome()
 
     # ── corner chrome (maximize, fit to nodes, the troubleshooting badge) ──────
@@ -1304,6 +1318,11 @@ class GraphView(QGraphicsView):
             pb.adjustSize()
             pb.move(12, 12)
             pb.raise_()
+        ap = getattr(self, "action_pill", None)
+        if ap is not None:
+            ap.adjustSize()
+            ap.move(max(12, (self.width() - ap.width()) // 2), 12)
+            ap.raise_()
         self._place_ts_badge()
 
     # ── the page switcher (V4.00 step 5) ──────────────────────────────────────
@@ -1314,6 +1333,30 @@ class GraphView(QGraphicsView):
             self.page_button.setIcon(icon)
         self.page_button.show()
         self._place_corner_chrome()
+
+    def set_action_title(self, text: str, *, armed: bool = False) -> None:
+        """The action pill's text — what its menu will act on (2026-10-07) — lit while the
+        region box is armed."""
+        if text == self.action_pill.text() and armed == self._pill_armed:
+            return
+        self.action_pill.setText(text)
+        if armed != self._pill_armed:
+            self._pill_armed = armed
+            self._style_action_pill()
+        self._place_corner_chrome()
+
+    def _style_action_pill(self) -> None:
+        bg, ink, edge = ((T.ACCENT, T.ACCENT_INK, T.ACCENT) if self._pill_armed
+                         else (T.PANEL, T.INK, T.BORDER_HI))
+        hover = T.ACCENT_DIM if not self._pill_armed else T.ACCENT
+        self.action_pill.setStyleSheet(
+            f"QToolButton#actionPill {{ background:{bg.name()}; color:{ink.name()}; "
+            f"border:1px solid {edge.name()}; border-radius:11px; min-height:16px; "
+            f"padding:3px 22px 3px 14px; font-size:11px; font-weight:700; }}"
+            f"QToolButton#actionPill:hover {{ background:{hover.name()}; "
+            f"border-color:{T.ACCENT.name()}; }}"
+            f"QToolButton#actionPill::menu-indicator {{ subcontrol-position: right center; "
+            f"right: 8px; }}")
 
     def set_canvas_active(self, on: bool) -> None:
         """An accent on the switcher while this is the canvas the user works in — what
@@ -1460,6 +1503,7 @@ class GraphView(QGraphicsView):
         return self._max_btn.isChecked()
 
     def restyle(self) -> None:
+        self._style_action_pill()
         self._max_btn.update()
         self._style_ts_badge()          # amber + ink come from the theme tokens
         self._style_page_button()

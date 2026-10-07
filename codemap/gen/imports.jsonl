@@ -1149,9 +1149,11 @@
 {"dst":"nodegraph.units","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.zones","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.canvas_actions","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.demo_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.graph_layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.lablink","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.lablink.artifacts","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1214,6 +1216,7 @@
 {"dst":"nodelab_v2.scene","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2.welcome","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
+{"dst":"nodegraph.groups","k":"imp","lazy":false,"src":"nodelab_v2.canvas_actions"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.console"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.console"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.demo_recipes"}
@@ -1525,12 +1528,14 @@
 {"dst":"nodegraph.sockets","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.canvas_actions","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.console","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.demo_window","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.frame_item","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.framestrip","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.graph_layout","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.inspector","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.lablink.authoring","k":"imp","lazy":true,"src":"nodelab_v2.window"}

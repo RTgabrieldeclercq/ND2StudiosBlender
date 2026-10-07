@@ -711,6 +711,42 @@ class GraphDocument:
             fr.members = mem
         self._notify(())          # the frame is decoration here; a region tab re-mirrors
 
+    def merge_frames(self, frame_ids, extra=()) -> Optional[str]:
+        """*Group regions* (2026-10-07): one frame holding every member of ``frame_ids`` —
+        the FIRST keeps its id, title and colour and takes the others' members (then
+        ``extra`` nodes), the others go. One notify. Returns the kept frame's id, ``None``
+        when no named frame exists."""
+        fids = [f for f in dict.fromkeys(frame_ids) if f in self.frames]
+        if not fids:
+            return None
+        keep = self.frames[fids[0]]
+        mem = list(keep.members)
+        for f in fids[1:]:
+            mem += self.frames[f].members
+        mem += [n for n in extra if n in self.nodes]
+        keep.members = list(dict.fromkeys(m for m in mem if m in self.nodes))
+        for f in fids[1:]:
+            del self.frames[f]
+        self._notify(())
+        return keep.id
+
+    def remove_from_frames(self, node_ids) -> int:
+        """Take ``node_ids`` out of every frame they are in (2026-10-07); a frame left with
+        no member goes, as frames never persist empty. Returns how many memberships ended."""
+        drop = set(node_ids)
+        n = 0
+        for fid in list(self.frames):
+            fr = self.frames[fid]
+            keep = [m for m in fr.members if m not in drop]
+            n += len(fr.members) - len(keep)
+            if not keep:
+                del self.frames[fid]
+            else:
+                fr.members = keep
+        if n:
+            self._notify(())
+        return n
+
     # ── regions: a frame's crossing wires (2026-10-07) ─────────────────────────
     def region_ports(self, frame_id: str) -> Tuple[List[EdgeTuple], List[EdgeTuple]]:
         """The wires crossing frame ``frame_id``'s border — ``(ins, outs)``: the document

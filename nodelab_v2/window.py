@@ -27,7 +27,7 @@ import sys
 import weakref
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import nodegraph.nodes  # noqa: F401 — registers the node catalog into NODES
 from nodegraph import hotreload
@@ -62,6 +62,8 @@ from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
 from nodelab_v2.minimap import MiniMapOverlay
+from nodelab_v2 import canvas_actions as CA
+from nodelab_v2 import graph_layout as GL
 from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.node_item import NodeItem
 from nodelab_v2.ops import (MOVIE_OP, ACCESS_INGEST, ACCESS_MODE, CALIB_OVERRIDE_KEYS, DOCK_OP,
@@ -1111,9 +1113,11 @@ class MainWindow(QMainWindow):
         sc.topology_gate = self._scene_topology_gate
         sc.new_page_from_output.connect(part(self._new_page_from_output, page_id))
         sc.frame_action.connect(part(self._on_frame_action, page_id))
+        sc.selectionChanged.connect(part(self.sync_action_pills, page_id))
         sc.region_tab_names = part(self._region_tab_names, page_id)
         doc = self.workspace.page(page_id).doc
-        hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id)]
+        hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id),
+                 part(self.sync_action_pills, page_id)]     # the pill's words follow edits
         for fn in hooks:
             doc.on_change(fn)
         self._page_hooks[page_id] = (doc, hooks)
@@ -1160,6 +1164,8 @@ class MainWindow(QMainWindow):
         c.view.region_drawn.connect(
             lambda rect, c=c: (self._activate_canvas(c), self._on_region_drawn(rect)))
         c.view.region_mode_changed.connect(self._on_region_mode)
+        c.view.region_mode_changed.connect(lambda _on, c=c: self.sync_action_pill(c))
+        c.page_changed.connect(lambda c, _pid: self.sync_action_pill(c))
         c.view.maximize_toggled.connect(part(self._on_canvas_maximize, c))
         c.minimap.restore_requested.connect(lambda: self.set_maximized(False))
         # the welcome card: the canvas it sits on becomes the one worked in first (its
@@ -2267,6 +2273,11 @@ class MainWindow(QMainWindow):
             "values may differ — one workflow, as many tabs as conditions.")
         tab.triggered.connect(self.duplicate_region_selected)
         m_graph.addAction(tab)
+        reorg = QAction("Re&organize graph", self)
+        reorg.setToolTip("Arrange the active page's cards left to right by data flow, every "
+                         "region kept whole — also on the canvas's action pill, with Undo.")
+        reorg.triggered.connect(lambda: self.reorganize_graph())
+        m_graph.addAction(reorg)
         m_graph.addSeparator()
         grp = QAction("&Group selection…", self)
         grp.setShortcut("Ctrl+G")
@@ -3357,6 +3368,237 @@ class MainWindow(QMainWindow):
         """Graph → *Draw a region…*: arm the active canvas's region box (what R does)."""
         self.view.set_region_mode(True)
         self.view.setFocus()
+
+    # ── the action pill (2026-10-07) ───────────────────────────────────────────
+    def _pill_state(self, c: CanvasPanel):
+        """``(doc, selected node ids, selected frame ids, flags)`` for canvas ``c``."""
+        pid = c.page_id
+        page = self.workspace.pages.get(pid)
+        doc = page.doc if page is not None else None
+        sc = self._scenes.get(pid)
+        nodes: List[str] = []
+        frames: List[str] = []
+        if sc is not None:
+            try:
+                items = sc.selectedItems()
+            except RuntimeError:                # a scene torn down while closing
+                items = []
+            nodes = [i.node_id for i in items if isinstance(i, NodeItem)]
+            frames = [i.frame_id for i in items if isinstance(i, FrameItem)]
+        if doc is not None:
+            # Qt hands the selection back in no fixed order: put it in the page's own order,
+            # so "the first region" — the one a merge keeps — is always the OLDEST
+            nodes = [n for n in doc.nodes if n in set(nodes)]
+            frames = [f for f in doc.frames if f in set(frames)]
+        master = ""
+        if page is not None and page.master in self.workspace.pages:
+            master = self.workspace.pages[page.master].name
+        return doc, nodes, frames, {
+            "region_armed": c.view.region_mode,
+            "can_undo_layout": self._can_undo_layout(pid),
+            "master_name": master}
+
+    def canvas_actions(self, c: Optional[CanvasPanel] = None):
+        """``(pill text, [CanvasAction, …])`` for canvas ``c`` (default: the active one)."""
+        c = c or self._canvas
+        doc, nodes, frames, flags = self._pill_state(c)
+        if doc is None:
+            return "Graph", []
+        title = CA.pill_title(doc, nodes, frames, region_armed=flags["region_armed"])
+        return title, CA.canvas_actions(doc, nodes, frames, **flags)
+
+    def sync_action_pill(self, c: CanvasPanel) -> None:
+        try:
+            title, _acts = self.canvas_actions(c)
+            c.view.set_action_title(title, armed=c.view.region_mode)
+        except RuntimeError:                    # a canvas torn down while closing
+            pass
+
+    def sync_action_pills(self, page_id: Optional[str] = None) -> None:
+        """Re-word the pill of every canvas showing ``page_id`` (default: all)."""
+        for c in self.canvases():
+            if page_id is None or c.page_id == page_id:
+                self.sync_action_pill(c)
+
+    def fill_action_menu(self, menu, c: CanvasPanel) -> None:
+        """The pill's menu, built as it opens: the actions for what is selected on ``c``'s
+        page, in sections, each disabled one with its reason as the tooltip."""
+        menu.clear()
+        menu.setToolTipsVisible(True)
+        _title, acts = self.canvas_actions(c)
+        for k, (_sec, items) in enumerate(CA.sectioned(acts)):
+            if k:
+                menu.addSeparator()
+            for a in items:
+                act = menu.addAction(a.label)
+                act.setEnabled(a.enabled)
+                act.setToolTip(a.tip)
+                act.setData(a.key)
+                act.triggered.connect(lambda _=False, key=a.key, c=c:
+                                      self.run_canvas_action(key, c))
+
+    def run_canvas_action(self, key: str, c: Optional[CanvasPanel] = None) -> object:
+        """Run one of the pill's actions on canvas ``c`` (its page becomes the active one)."""
+        c = c or self._canvas
+        self._activate_canvas(c)
+        pid = c.page_id
+        doc, nodes, frames, _flags = self._pill_state(c)
+        out: object = None
+        if key == "draw_region":
+            self.draw_region()
+        elif key == "cancel_region":
+            c.view.set_region_mode(False)
+        elif key == "group_nodes":
+            out = self.group_into_region(nodes)
+        elif key.startswith("add_to_region:"):
+            out = self.add_to_region(key.split(":", 1)[1], nodes)
+        elif key == "remove_from_region":
+            out = self.remove_from_region(nodes)
+        elif key == "merge_regions":
+            out = self.merge_regions(frames, nodes)
+        elif key == "ungroup_regions":
+            out = self.ungroup_regions(frames)
+        elif key == "rename_region" and frames:
+            self._on_frame_action(pid, frames[0], "rename")
+        elif key == "region_tab" and frames:
+            out = self.duplicate_region(pid, frames[0], canvas=c)
+        elif key == "ungroup_nodegroup":
+            self.ungroup_selection()
+        elif key == "goto_region":
+            page = self.workspace.pages.get(pid)
+            if page is not None and page.master in self.workspace.pages:
+                self._show_page(c, page.master)
+                item = self.scene_for(page.master).frame_items.get(page.region or "")
+                if item is not None:
+                    item.scene().clearSelection()
+                    item.setSelected(True)
+        elif key == "reorganize":
+            out = self.reorganize_graph(c)
+        elif key == "undo_layout":
+            out = self.undo_reorganize(c)
+        elif key == "fit":
+            c.view.fit_all()
+        self.sync_action_pills()
+        return out
+
+    @_needs_shape
+    def group_into_region(self, nodes: Sequence[str]) -> Optional[str]:
+        """The selected cards into a new region (what a drawn box does)."""
+        nodes = [n for n in nodes if n in self.doc.nodes]
+        if not nodes:
+            return None
+        fr = self.doc.add_frame(self.scene.next_region_title(), nodes)
+        self._select_frame(fr.id)
+        self.statusBar().showMessage(
+            f"region “{fr.title}” round {len(nodes)} node(s) — the pill offers to duplicate "
+            f"it as a linked tab", 8000)
+        return fr.id
+
+    @_needs_shape
+    def add_to_region(self, frame_id: str, nodes: Sequence[str]) -> Optional[str]:
+        fr = self.doc.frames.get(frame_id)
+        if fr is None:
+            return None
+        self.doc.set_frame_members(frame_id, list(fr.members) + list(nodes))
+        self._select_frame(frame_id)
+        self.statusBar().showMessage(f"region “{fr.title}” now holds {len(fr.members)} node(s)",
+                                     6000)
+        return frame_id
+
+    @_needs_shape
+    def remove_from_region(self, nodes: Sequence[str]) -> int:
+        n = self.doc.remove_from_frames(nodes)
+        self.statusBar().showMessage(f"{n} node(s) taken out of their region", 6000)
+        return n
+
+    @_needs_shape
+    def merge_regions(self, frames: Sequence[str], nodes: Sequence[str] = ()) -> Optional[str]:
+        """*Group regions*: the selected regions (and loose cards) into the first one."""
+        loose = [n for n in nodes if not CA.frames_of(self.doc, n)]
+        fid = self.doc.merge_frames(frames, loose)
+        if fid is not None:
+            self._select_frame(fid)
+            fr = self.doc.frames[fid]
+            self.statusBar().showMessage(
+                f"{len(frames)} regions are one now: “{fr.title}”, {len(fr.members)} node(s)",
+                8000)
+        return fid
+
+    @_needs_shape
+    def ungroup_regions(self, frames: Sequence[str]) -> int:
+        """*Ungroup region*: the frames go, their cards stay (a tab keeps what it showed)."""
+        n = 0
+        for fid in frames:
+            if fid in self.doc.frames:
+                self.doc.remove_frame(fid)
+                n += 1
+        self.statusBar().showMessage(f"ungrouped {n} region(s) — the nodes stay", 6000)
+        return n
+
+    def _select_frame(self, frame_id: str) -> None:
+        item = self.scene.frame_items.get(frame_id)
+        if item is not None:
+            self.scene.clearSelection()
+            item.setSelected(True)
+
+    # ── reorganize (2026-10-07) ───────────────────────────────────────────────
+    def _can_undo_layout(self, page_id: str) -> bool:
+        """Is the last reorganize of ``page_id`` still on screen — no card moved since?"""
+        snap = getattr(self, "_layout_undo", {}).get(page_id)
+        page = self.workspace.pages.get(page_id)
+        if snap is None or page is None:
+            return False
+        _before, after = snap
+        nodes = page.doc.nodes
+        return all(n in nodes and (nodes[n].x, nodes[n].y) == p for n, p in after.items())
+
+    def reorganize_graph(self, c: Optional[CanvasPanel] = None) -> int:
+        """*Reorganize graph*: the page's cards laid out left to right by data flow, every
+        region kept whole (:func:`nodelab_v2.graph_layout.layout_document`), the view fitted.
+        Returns how many cards moved; *Undo reorganize* puts them back."""
+        c = c or self._canvas
+        pid = c.page_id
+        doc = self.workspace.pages[pid].doc
+        sc = self.scene_for(pid)
+        sizes = {nid: (it.card_rect().width(), it.card_rect().height())
+                 for nid, it in sc.node_items.items()}
+        res = GL.layout_document(doc, sizes)
+        before = {n: (r.x, r.y) for n, r in doc.nodes.items()}
+        moved = 0
+        for nid, (x, y) in res.positions.items():
+            if before.get(nid) != (x, y):
+                doc.set_pos(nid, x, y)
+                moved += 1
+        after = {n: (r.x, r.y) for n, r in doc.nodes.items()}
+        if moved:
+            if not hasattr(self, "_layout_undo"):
+                self._layout_undo = {}
+            self._layout_undo[pid] = (before, after)
+        sc.reroute()
+        c.view.fit_all()
+        note = (f" — {', '.join(doc.frames[f].title for f in res.loose if f in doc.frames)} "
+                f"laid out card by card (its wires leave it and come back)") if res.loose else ""
+        self.statusBar().showMessage(
+            (f"reorganized {moved} node(s) left to right" if moved
+             else "already organized — nothing moved") + note, 8000)
+        self.sync_action_pills(pid)
+        return moved
+
+    def undo_reorganize(self, c: Optional[CanvasPanel] = None) -> bool:
+        c = c or self._canvas
+        pid = c.page_id
+        if not self._can_undo_layout(pid):
+            return False
+        before, _after = self._layout_undo.pop(pid)
+        doc = self.workspace.pages[pid].doc
+        for nid, (x, y) in before.items():
+            if nid in doc.nodes:
+                doc.set_pos(nid, x, y)
+        self.scene_for(pid).reroute()
+        c.view.fit_all()
+        self.statusBar().showMessage("every card is back where it was", 6000)
+        self.sync_action_pills(pid)
+        return True
 
     def _on_region_mode(self, on: bool) -> None:
         if on:

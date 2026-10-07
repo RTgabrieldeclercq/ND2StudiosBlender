@@ -30409,6 +30409,166 @@ def test_region_tabs() -> None:
         "master are refused")
 
 
+def test_canvas_pill_and_reorganize() -> None:
+    """The canvas ACTION PILL and *Reorganize graph* (2026-10-07). ``graph_layout.layout``
+    lays cards out left to right — every wire runs rightward, no two cards overlap, a region
+    is one block no other card enters, a source sits beside its consumer, the old top-left is
+    kept, the result is deterministic — and a region whose wires leave and re-enter it goes
+    card by card (``loose``); on a region tab the region is frozen and anchored, so only the
+    tab's own Page Inputs and Outputs move. ``canvas_actions`` offers what the selection
+    allows (group, add to, remove from, merge, ungroup, rename, tab, node-group ungroup, draw
+    or cancel the box, reorganize, undo, fit), greys the region edits of a linked page out with
+    the reason, and names the context in ``pill_title``; ``merge_frames`` /
+    ``remove_from_frames`` do the region edits and a linked page refuses them."""
+    from nodelab_v2 import canvas_actions as CA
+    from nodelab_v2 import graph_layout as GL
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.linked_document import LinkedDocument, LinkedPageError
+    OPS.ensure_ops()
+    d = GraphDocument()
+    spots = [("L", "io.load", 500, 500), ("C", "channel.select", 30, 30),
+             ("G", "enhance.gaussian", 900, 10), ("T", "analysis.threshold", 100, 400),
+             ("B", "analysis.label", 700, 700), ("M", "analysis.measure", 0, 0),
+             ("D", "enhance.deconvolve", 300, 300), ("V", "view.viewer", 50, 800),
+             ("IT", "flow.iterate", 40, 40)]
+    for nid, op, x, y in spots:
+        d.add_node(op, node_id=nid, x=float(x), y=float(y))
+    for e in [("L", "image", "C", "data"), ("C", "out", "G", "data"), ("G", "out", "T", "data"),
+              ("T", "out", "B", "data"), ("B", "out", "M", "data"), ("C", "out", "D", "data"),
+              ("D", "out", "V", "data"), ("IT", "var0", "D", "iterations")]:
+        d.connect(*e)
+    fr = d.add_frame("R", members=["G", "T"])
+    sizes = {n: (214.0, 120.0 + 20.0 * k) for k, n in enumerate(d.nodes)}
+    res = GL.layout_document(d, sizes)
+    pos = res.positions
+    assert set(pos) == set(d.nodes) and res.loose == ()
+    assert GL.layout_document(d, sizes) == res, "deterministic"
+    for (s, _ss, t, _ts) in d.edges:
+        assert pos[t][0] > pos[s][0], ("every wire runs rightward", s, t, pos[s], pos[t])
+
+    def rect(n):
+        return (pos[n][0], pos[n][1], pos[n][0] + sizes[n][0], pos[n][1] + sizes[n][1])
+
+    def hit(a, b):
+        return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+    ids = list(d.nodes)
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            assert not hit(rect(a), rect(b)), ("cards overlap", a, b)
+    mr = [rect(m) for m in fr.members]
+    box = (min(r[0] for r in mr) - GL.FRAME_PAD,
+           min(r[1] for r in mr) - GL.FRAME_PAD - GL.FRAME_TITLE,
+           max(r[2] for r in mr) + GL.FRAME_PAD, max(r[3] for r in mr) + GL.FRAME_PAD)
+    for n in ids:
+        if n not in fr.members:
+            assert not hit(rect(n), box), ("a card inside a region it is not in", n)
+    assert pos["IT"][0] < pos["D"][0] and pos["IT"][0] > pos["L"][0], \
+        "a source sits one column before its consumer, not at the far left"
+    assert abs((pos["G"][1] + sizes["G"][1] / 2) - (pos["T"][1] + sizes["T"][1] / 2)) < 1e-6, \
+        "a chain of single wires comes out straight"
+    assert (min(p[0] for p in pos.values()), min(p[1] for p in pos.values())) == (0.0, 0.0), \
+        "the page keeps its top-left corner"
+    # a region its wires leave and come back into: laid out card by card, still no overlap
+    w = GraphDocument()
+    for nid, op in [("S", "io.load"), ("A", "enhance.gaussian"), ("X", "enhance.gamma"),
+                    ("Bm", "enhance.median")]:
+        w.add_node(op, node_id=nid)
+    for e in [("S", "image", "A", "data"), ("A", "out", "X", "data"), ("X", "out", "Bm", "data")]:
+        w.connect(*e)
+    wf = w.add_frame("Wrap", members=["A", "Bm"])
+    wl = GL.layout_document(w)
+    assert wl.loose == (wf.id,), wl.loose
+    assert wl.positions["S"][0] < wl.positions["A"][0] < wl.positions["X"][0] \
+        < wl.positions["Bm"][0]
+    # a region tab: the region frozen and anchored, the tab's ports placed round it
+    ws, _ds, _env, _ax = _ws_fixture()
+    rd = ws.pages["pg2"].doc
+    rd.add_node("enhance.gamma", node_id="X2", x=420.0, y=60.0)
+    rd.disconnect("G", "out", "O", "data")
+    rd.connect("G", "out", "X2", "data")
+    rd.connect("X2", "out", "O", "data")
+    rf = rd.add_frame("Reg", members=["G", "X2"])
+    tab = ws.duplicate_region("pg2", rf.id)
+    td = tab.doc
+    for nid in td.own_node_ids():                       # scramble the tab's own cards
+        td.set_pos(nid, 5000.0, -3000.0)
+    tl = GL.layout_document(td)
+    for m in ("G", "X2"):
+        assert tl.positions[m] == (td.nodes[m].x, td.nodes[m].y), "the region does not move"
+    left = min(td.nodes[m].x for m in ("G", "X2"))
+    right = max(td.nodes[m].x for m in ("G", "X2")) + GL.DEFAULT_SIZE[0]
+    for nid in td.own_node_ids():
+        if td.nodes[nid].op_key == "page.input":
+            assert tl.positions[nid][0] + GL.DEFAULT_SIZE[0] <= left - GL.FRAME_PAD
+        else:
+            assert tl.positions[nid][0] >= right + GL.FRAME_PAD
+    # ── the pill's offer ──────────────────────────────────────────────────────
+    def keys(doc, nodes=(), frames=(), **kw):
+        return [a.key for a in CA.canvas_actions(doc, nodes, frames, **kw)]
+
+    assert keys(d) == ["draw_region", "reorganize", "fit"] and CA.pill_title(d) == "Graph"
+    assert keys(d, ["L", "M"])[:1] == ["group_nodes"] and CA.pill_title(d, ["L", "M"]) == "2 nodes"
+    assert "remove_from_region" in keys(d, ["G"]) and "group_nodes" not in keys(d, ["G"])
+    mix = keys(d, ["G", "L"])
+    assert f"add_to_region:{fr.id}" in mix and "remove_from_region" in mix, mix
+    one = keys(d, [], [fr.id])
+    assert one[:3] == ["region_tab", "rename_region", "ungroup_regions"], one
+    assert CA.pill_title(d, [], [fr.id]) == "Region “R”"
+    assert f"add_to_region:{fr.id}" in keys(d, ["L"], [fr.id])
+    f2 = d.add_frame("R2", members=["D", "V"])
+    two = CA.canvas_actions(d, ["L"], [fr.id, f2.id])
+    assert [a.key for a in two][:2] == ["merge_regions", "ungroup_regions"]
+    assert "and 1 node" in two[0].label and two[1].label == "Ungroup 2 regions"
+    armed = keys(d, region_armed=True)
+    assert "cancel_region" in armed and "draw_region" not in armed
+    assert "Esc" in CA.pill_title(d, ["L"], region_armed=True)
+    assert "undo_layout" in keys(d, can_undo_layout=True) and "undo_layout" not in keys(d)
+    assert not CA.find(CA.canvas_actions(GraphDocument()), "reorganize").enabled
+    secs = [s for s, _a in CA.sectioned(CA.canvas_actions(d, ["L"], [fr.id]))]
+    assert secs == ["selection", "region", "graph"], secs
+    g = GraphDocument()
+    g.add_node("io.load", node_id="S")
+    g.add_node("enhance.gaussian", node_id="A")
+    g.add_node("enhance.gamma", node_id="Z")
+    g.connect("S", "image", "A", "data")
+    g.connect("A", "out", "Z", "data")
+    inst = g.make_group(["A"], "Blur")
+    assert "ungroup_nodegroup" in keys(g, [inst])
+    # a linked page: region edits greyed out with the reason; a region tab says where to go
+    lk = LinkedDocument(d)
+    acts = CA.canvas_actions(lk, ["L", "M"], master_name="Main")
+    grp = CA.find(acts, "group_nodes")
+    assert grp is not None and not grp.enabled and grp.tip == CA.LINKED_REGION_HINT
+    assert not CA.find(acts, "draw_region").enabled and CA.find(acts, "reorganize").enabled
+    assert "Main" in CA.find(acts, "reorganize").tip
+    tacts = CA.canvas_actions(td, master_name="Refine")
+    assert CA.find(tacts, "goto_region").label == "Go to the region on “Refine”"
+    assert CA.pill_title(td) == "Region tab · “Reg”"
+    # ── the region edits behind them ──────────────────────────────────────────
+    kept = d.merge_frames([fr.id, f2.id], extra=["L"])
+    assert kept == fr.id and f2.id not in d.frames
+    assert d.frames[fr.id].members == ["G", "T", "D", "V", "L"]
+    assert d.remove_from_frames(["G", "L"]) == 2 and d.frames[fr.id].members == ["T", "D", "V"]
+    assert d.remove_from_frames(["T", "D", "V"]) == 3 and fr.id not in d.frames
+    assert d.merge_frames(["nope"]) is None and d.remove_from_frames(["L"]) == 0
+    for bad in (lambda: lk.merge_frames(list(lk.frames)), lambda: lk.remove_from_frames(["L"]),
+                lambda: lk.set_frame_members("f1", ["L"])):
+        try:
+            bad()
+            raise AssertionError("a linked page's regions are its master's")
+        except LinkedPageError:
+            pass
+    _ok("action pill + reorganize: cards laid out left to right (every wire rightward, none "
+        "overlapping, a region one block no other card enters, a source beside its consumer, "
+        "the top-left kept, deterministic), a region its wires leave and re-enter goes card by "
+        "card, a region tab moves only its own ports; the pill offers group / add / remove / "
+        "merge / ungroup / rename / tab / node-group ungroup / draw or cancel / reorganize / "
+        "undo / fit by selection, greys a linked page's region edits with the reason, names "
+        "the context; merge_frames / remove_from_frames work and a linked page refuses them")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -30613,6 +30773,7 @@ def main() -> int:
     test_phantoms()
     test_node_demos()
     test_region_tabs()
+    test_canvas_pill_and_reorganize()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

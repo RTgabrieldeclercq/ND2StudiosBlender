@@ -9038,6 +9038,106 @@ def main(argv) -> int:
         "value is an override, a pull runs through the port, its own port deletes without "
         "a question and Make unique keeps the region's nodes")
 
+    # ── RG2: the canvas action pill — words, menu, region edits, reorganize + undo ───────
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _ap_c, _ap_sc, _ap_doc = win.canvas, win.scene, win.doc
+    _ap = _ap_c.view.action_pill
+    assert _ap.isVisible() and _ap.menu() is _ap_c.actions_menu
+    assert abs(_ap.geometry().center().x() - _ap_c.view.width() // 2) <= 2, "top centre"
+    assert _ap.geometry().top() == 12
+
+    def _ap_menu():
+        _m = _PMenu()
+        win.fill_action_menu(_m, _ap_c)
+        return [(a.text(), a.isEnabled(), a.data()) for a in _m.actions() if not a.isSeparator()]
+
+    _ap_sc.clearSelection()
+    app.processEvents()
+    assert _ap.text() == "Graph", _ap.text()
+    assert [k for _t, _e, k in _ap_menu()] == ["draw_region", "reorganize", "fit"]
+    for _nid in ("n3", "n4"):
+        _ap_sc.node_items[_nid].setSelected(True)
+    app.processEvents()
+    assert _ap.text() == "2 nodes", "the pill follows the selection"
+    assert _ap_menu()[0][2] == "group_nodes" and _ap_menu()[0][1]
+    _ap_f1 = win.run_canvas_action("group_nodes", _ap_c)
+    app.processEvents()
+    assert _ap_f1 in _ap_doc.frames and _ap.text() == "Region “Region”", _ap.text()
+    assert [k for _t, _e, k in _ap_menu()][:3] == ["region_tab", "rename_region",
+                                                    "ungroup_regions"]
+    _ap_sc.clearSelection()
+    for _nid in ("n7", "n8"):
+        _ap_sc.node_items[_nid].setSelected(True)
+    app.processEvents()
+    _ap_f2 = win.run_canvas_action("group_nodes", _ap_c)
+    app.processEvents()
+    _ap_sc.clearSelection()
+    _ap_sc.frame_items[_ap_f1].setSelected(True)
+    _ap_sc.frame_items[_ap_f2].setSelected(True)
+    app.processEvents()
+    assert _ap.text() == "2 regions" and _ap_menu()[0][2] == "merge_regions"
+    assert win.run_canvas_action("merge_regions", _ap_c) == _ap_f1
+    app.processEvents()
+    assert _ap_f2 not in _ap_doc.frames
+    assert set(_ap_doc.frames[_ap_f1].members) == {"n3", "n4", "n7", "n8"}
+    _ap_sc.clearSelection()
+    _ap_sc.node_items["n7"].setSelected(True)
+    app.processEvents()
+    assert "remove_from_region" in [k for _t, _e, k in _ap_menu()]
+    assert win.run_canvas_action("remove_from_region", _ap_c) == 1
+    assert "n7" not in _ap_doc.frames[_ap_f1].members
+    # reorganize: every card moves to a left-to-right layout; Undo puts them back
+    _ap_sc.clearSelection()
+    for _k, (_nid, _it) in enumerate(_ap_sc.node_items.items()):
+        _it.setPos((_k * 373) % 900, (_k * 211) % 600)
+    app.processEvents()
+    _ap_before = {n: (r.x, r.y) for n, r in _ap_doc.nodes.items()}
+    _ap_moved = win.run_canvas_action("reorganize", _ap_c)
+    app.processEvents()
+    assert _ap_moved == len(_ap_doc.nodes), _ap_moved
+    for (_s, _ss, _t, _ts) in _ap_doc.edges:
+        assert _ap_doc.nodes[_t].x > _ap_doc.nodes[_s].x, (_s, _t)
+    _ap_items = list(_ap_sc.node_items.values())
+    for _i, _a in enumerate(_ap_items):
+        _ra = _a.mapToScene(_a.card_rect()).boundingRect()
+        for _b in _ap_items[_i + 1:]:
+            assert not _ra.intersects(_b.mapToScene(_b.card_rect()).boundingRect()), \
+                (_a.node_id, _b.node_id)
+    _ap_fr = _ap_sc.frame_items[_ap_f1].mapToScene(
+        _ap_sc.frame_items[_ap_f1].shape().boundingRect()).boundingRect()
+    for _it in _ap_items:
+        if _it.node_id not in _ap_doc.frames[_ap_f1].members:
+            assert not _ap_fr.intersects(_it.mapToScene(_it.card_rect()).boundingRect()), \
+                ("a card inside a region it is not in", _it.node_id)
+    assert "undo_layout" in [k for _t, _e, k in _ap_menu()]
+    assert win.run_canvas_action("undo_layout", _ap_c) is True
+    app.processEvents()
+    assert {n: (r.x, r.y) for n, r in _ap_doc.nodes.items()} == _ap_before
+    assert "undo_layout" not in [k for _t, _e, k in _ap_menu()]
+    # the region box: armed from the pill, the pill says so (lit), Esc's twin puts it away
+    win.run_canvas_action("draw_region", _ap_c)
+    app.processEvents()
+    assert _ap_c.view.region_mode and "Esc" in _ap.text() and _ap_c.view._pill_armed
+    assert "cancel_region" in [k for _t, _e, k in _ap_menu()]
+    win.run_canvas_action("cancel_region", _ap_c)
+    app.processEvents()
+    assert not _ap_c.view.region_mode and _ap.text() == "Graph" and not _ap_c.view._pill_armed
+    # ungroup the region from the pill: the frame goes, the cards stay
+    _ap_sc.clearSelection()
+    _ap_sc.frame_items[_ap_f1].setSelected(True)
+    app.processEvents()
+    assert win.run_canvas_action("ungroup_regions", _ap_c) == 1
+    app.processEvents()
+    assert not _ap_doc.frames and {"n3", "n4", "n8"} <= set(_ap_doc.nodes)
+    _ok("RG2 the action pill sits at the top centre of the canvas and names the context (Graph, "
+        "2 nodes, a region, 2 regions, the armed box); its menu follows the selection: group "
+        "the selected nodes into a region, group two regions into one, remove a node from its "
+        "region, ungroup a region (cards stay), draw / put away the region box, reorganize — "
+        "every wire rightward, no card overlapping another or inside a region it is not in — "
+        "and Undo reorganize, offered until a card moves, puts every card back")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

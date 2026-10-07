@@ -2162,6 +2162,39 @@ Refused, with the reason: a box that encloses no card, a **value wire** across t
 port carries a Dataset — put both ends inside the region, or both outside) and a **zone**
 the border cuts through (enclose all of it or none of it).
 
+### The action pill and *Reorganize graph* (2026-10-07)
+
+A pill sits at the **top centre of every canvas**. Its text says what it would act on —
+*Graph*, *3 nodes*, *Region “Cells”*, *2 regions*, *Region tab · “Cells”* — and lights up
+while the region box is armed (*Drag a box around the nodes · Esc*). Click it for the
+actions that make sense right now:
+
+| Selected | The pill offers |
+|---|---|
+| nothing | *Draw a region…*, *Reorganize graph*, *Fit graph* |
+| loose nodes | *Group N nodes into a region* |
+| nodes in a region | *Remove N nodes from region “…”* (an emptied region goes) |
+| loose nodes and one region | *Add N nodes to region “…”* |
+| one region | *Duplicate region as a linked tab*, *Rename region…*, *Ungroup region* |
+| several regions | *Group N regions into one* (the oldest keeps its name), *Ungroup N regions* |
+| a node-group card | *Ungroup node group* |
+| a region tab | *Go to the region on “master”* |
+
+**Ungroup region** removes the frame and leaves the cards where they are; a tab of the region
+keeps the cards it showed. An action that cannot run here is still listed, greyed out, with
+the reason when you hover it — on a linked page the region edits are its master's.
+
+**Reorganize graph** (also Graph → *Reorganize graph*) lays the page's cards out **left to
+right by data flow**: a card's column is the longest chain of wires in front of it, a source
+sits one column before the card it feeds, a chain of single wires comes out straight, and no
+two cards overlap. **Every region stays whole** — laid out inside, then placed as one block
+with room for its title and port labels, so no other card ends up inside it. A region whose
+wires leave it and come back into it through outside cards cannot be one block; it is laid
+out card by card, and the status bar names it. On a linked page the layout is the master's,
+so the master moves too; on a **region tab** only the tab's own Page Inputs and Outputs move,
+round the region. **Undo reorganize** in the pill puts every card back, for as long as no card
+has moved since.
+
 ### Node groups — `Ctrl+G` / `Ctrl+Shift+G`
 
 **Graph → Group selection…** collapses a selected **linear** sub-chain (exactly one external

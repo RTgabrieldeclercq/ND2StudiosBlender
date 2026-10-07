@@ -810,6 +810,7 @@ class LinkedDocument(GraphDocument):
         raise LinkedPageError(SHAPE_HINT if self.edit_mode else TOPOLOGY_HINT)
 
     add_frame = remove_frame = rename_frame = _refuse_shape
+    set_frame_members = merge_frames = remove_from_frames = _refuse_shape
     set_iterate_target = wrap_repeat_zone = make_group = ungroup = _refuse_shape
     clear = load_dict = load_page = load_file = save_file = _refuse
     #: A linked page never renames an Output from a wire (V4.00 step 11h): its names are
