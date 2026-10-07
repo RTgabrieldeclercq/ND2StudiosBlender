@@ -70,7 +70,7 @@
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 771,
+    "inputs": 774,
     "outputs": 118,
     "gui_ops_included": true
   },
@@ -298,7 +298,7 @@
         {
           "op": "channel.split",
           "label": "Split Channels",
-          "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'."
+          "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with Groups set, into one output per RANGE of channels; the full bundle also passes through 'out'."
         },
         {
           "op": "data.part",
@@ -338,12 +338,12 @@
         {
           "op": "util.split_positions",
           "label": "Split Positions",
-          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels."
+          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels."
         },
         {
           "op": "util.split_z",
           "label": "Split Z",
-          "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions."
+          "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K) — or, with Groups set, one output per RANGE of planes (a sub-stack each); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions."
         },
         {
           "op": "util.timeseries",
@@ -7272,7 +7272,7 @@
       ],
       "module": "nodegraph/catalog/channel/split.py",
       "gui_only": false,
-      "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset); the full bundle also passes through 'out'.",
+      "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with Groups set, into one output per RANGE of channels; the full bundle also passes through 'out'.",
       "overview": "Split Channels — a domain-transparent pass-through of the full multi-channel bundle. Its single real ``out`` socket carries the input unchanged; the GUI adds one synthetic per-channel output socket (``ch0…chN-1``), and each wired per-channel tap is materialized into a ``channel.select`` at graph-build time (the engine is one-payload-per-node, so distinct per-channel payloads come from real select taps, not from this node). No calibration/axes change here (TILEABLE, no meta_transform).",
       "overview_source": "compute",
       "dimensionality": {
@@ -7298,6 +7298,16 @@
           "type": "dataset",
           "role": "dataset",
           "description": ""
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per channel: type the groups as 0-based channel indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`). The card then grows one output PER GROUP, each carrying exactly that subset of the channel axis, and the per-channel outputs are put away. Blank = one output per channel, as before. A wired group materializes into a Select Channel with that list at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes; a group that reaches past the end is labelled so on the card and refused with the real channel length when pulled."
         }
       ],
       "outputs": [
@@ -20110,7 +20120,7 @@
       ],
       "module": "nodegraph/catalog/util/split_positions.py",
       "gui_only": false,
-      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset); the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
+      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
       "overview": "Split Positions — a domain-transparent pass-through of the full multipoint bundle, the M-axis twin of ``channel.split`` (2026-10-02). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-position output socket (``pos0…posM-1``, labelled with the acquisition's point name where the file carries one, else ``m0…``) once the wire carries two or more positions, and each wired per-position tap is materialized into a real ``util.select_position`` at graph-build time — the engine is one-payload-per-node, so distinct per-position payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a multipoint Load (or after a Timeseries Builder laid files onto M) to run a different branch per well, dish or field.",
       "overview_source": "compute",
       "dimensionality": {
@@ -20136,6 +20146,16 @@
           "type": "dataset",
           "role": "dataset",
           "description": "The multipoint Dataset to fan out. Its positions appear as one output socket each on the card, labelled with the file's point names when it has them; `out` still carries the whole set."
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per position: type the groups as 0-based position indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`). The card then grows one output PER GROUP, each carrying exactly that subset of the M (position) axis, and the per-position outputs are put away. Blank = one output per position, as before. A wired group materializes into a Crop in frames mode keeping those positions at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes; a group that reaches past the end is labelled so on the card and refused with the real M (position) length when pulled."
         }
       ],
       "outputs": [
@@ -20167,7 +20187,7 @@
       ],
       "module": "nodegraph/catalog/util/split_z.py",
       "gui_only": false,
-      "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions.",
+      "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K) — or, with Groups set, one output per RANGE of planes (a sub-stack each); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions.",
       "overview": "Split Z — a domain-transparent pass-through of the full stack, the Z-axis twin of ``channel.split`` and ``util.split_positions`` (2026-10-07). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-plane output socket (``z0…zZ-1``, labelled with the plane's index and, when the stack carries a z step, its height above plane 0) once the wire carries two or more planes, and each wired per-plane tap is materialized into a real ``util.select_plane`` at graph-build time — the engine is one-payload-per-node, so distinct per-plane payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a Load to run a different branch per plane, or to hand ONE plane to Registration while the full stack goes on to Shift.",
       "overview_source": "compute",
       "dimensionality": {
@@ -20193,6 +20213,16 @@
           "type": "dataset",
           "role": "dataset",
           "description": "The z-stack to fan out. Its planes appear as one output socket each on the card (`z0…`, with the plane's height when the stack has a z step); `out` still carries the whole stack."
+        },
+        {
+          "name": "groups",
+          "label": "Groups",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "presentation": true,
+          "description": "Split into RANGES instead of one output per plane: type the groups as 0-based plane indices, inclusive ranges, `;` between groups — `0-3; 4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: 4-7`). The card then grows one output PER GROUP, each carrying exactly that subset of the Z axis, and the per-plane outputs are put away. Blank = one output per plane, as before. A wired group materializes into a Crop in frames mode keeping those planes at run time, shared by every branch that reads it, so this never changes `out` or anything this node itself computes; a group that reaches past the end is labelled so on the card and refused with the real Z length when pulled."
         }
       ],
       "outputs": [

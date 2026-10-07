@@ -826,6 +826,46 @@ def parse_indices(raw) -> Optional[List[int]]:
     return sorted(set(out)) or None
 
 
+def parse_groups(raw: Any) -> Optional[List[Tuple[str, Tuple[int, ...]]]]:
+    """The split nodes' ``groups`` text → ``[(name, indices), …]``, or ``None`` for "no
+    groups" (2026-10-07) — one output per index, as the split cards always had.
+
+    The grammar is :func:`parse_indices` per group with ``;`` (or a newline) between groups
+    and an optional name in front of a group: ``"0-3; 4-7; 8-11"``, ``"top: 0-3; mid: 4-7"``,
+    ``"GFP+DAPI = 0,2; 1"``. Inclusive ranges, 0-based, as everywhere else on these axes.
+    A name is whatever sits before the LAST ``:`` (else the last ``=``) whose remainder parses
+    as indices, so ``"0-3"`` alone has no name and ``"a:b: 0-3"`` is named ``a:b``.
+
+    Total, like its parts: a group that parses to no index (half-typed, or a name with
+    nothing after it) is skipped rather than raising, so the card keeps its other sockets
+    while somebody is still typing; blank text, or text with no parseable group, is ``None``.
+    Out-of-range indices are KEPT — the card labels such a group as past the end and the tap
+    it materializes into refuses with the real axis length — because clipping them here would
+    make ``"8-11"`` on a 10-plane stack quietly mean ``"8-9"``. Groups are not checked for
+    overlap: two groups sharing a plane is a legitimate ask (a running window), not an error.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raw = str(raw)
+    out: List[Tuple[str, Tuple[int, ...]]] = []
+    for piece in raw.replace("\n", ";").split(";"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        name, spec = "", piece
+        for sep in (":", "="):
+            head, found, tail = piece.rpartition(sep)
+            if found and parse_indices(tail):
+                name, spec = head.strip(), tail
+                break
+        idx = parse_indices(spec)
+        if not idx:
+            continue
+        out.append((name, tuple(int(i) for i in idx)))
+    return out or None
+
+
 def format_indices(values: Sequence[int]) -> str:
     """Sorted indices → the shortest index-list string that means them: ``"0-3,7,10-12"``.
 
@@ -2271,7 +2311,7 @@ __all__ = [
     "identity", "resample", "z_project", "stack_time", "frame_slice",
     "channel_select", "crop", "stitch", "value_rescaled", "bit_depth_after_sum",
     "propagate_meta", "envelope_symbols", "parse_channels",
-    "parse_indices", "format_indices", "crop_frames",
+    "parse_indices", "format_indices", "parse_groups", "crop_frames",
     "FRAME_SPEC_AXES", "parse_frame_spec", "format_frame_spec", "frame_spec_picks",
     "PER_CHANNEL_KEYS", "channel_subset",
     "select_group", "group_picks", "position_group_plan",

@@ -206,7 +206,8 @@
       "phantom": "two_channel",
       "features": [
         "Grows one output socket per channel so each can feed its own chain.",
-        "Wiring an output inserts a Select Channel tap for you at run time."
+        "Wiring an output inserts a Select Channel tap for you at run time.",
+        "Groups: type ranges — `0,2; 1` or `nuclei: 0; reporters: 1-2` — and the card grows one output per group (a Select Channel with that list at run time) instead of one per channel."
       ]
     },
     "util.merge": {
@@ -257,7 +258,8 @@
       "kind": "image",
       "phantom": "plate_mosaic",
       "features": [
-        "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap."
+        "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap.",
+        "Groups: `0-5; 6-11` (or `wells: 0-5; blanks: 6-11`) gives one output per range of positions instead of one per position — a Crop in frames mode at run time, every per-position list following."
       ]
     },
     "util.stitch": {
@@ -1395,7 +1397,8 @@
       "phantom": "cells3d",
       "features": [
         "Grows one output socket per plane (z0…z6 here, labelled with the plane's height) so each plane can feed its own chain; wiring one inserts a Select Plane tap for you at run time. The whole stack still passes through out, which is what this view shows.",
-        "Hand z3 to Registration and out to Shift to register a stack on one plane."
+        "Hand z3 to Registration and out to Shift to register a stack on one plane.",
+        "Groups: `0-3; 4-7; 8-11` (or `top: 0-3; mid: 4-7`) gives one sub-stack per range instead of a socket per plane — a Crop in frames mode at run time, with the z step and the plane heights following; a group past the end is labelled so on the card."
       ]
     },
     "align.shift": {

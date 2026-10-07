@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, OutDataset
+from nodegraph.registry import Granularity, InDataset, InString, OutDataset
 
 from nodegraph.catalog._base import register_node
 
@@ -33,10 +33,24 @@ register_node(
     inputs=[InDataset(description=
                       "The multipoint Dataset to fan out. Its positions appear as one "
                       "output socket each on the card, labelled with the file's point names "
-                      "when it has them; `out` still carries the whole set.")],
+                      "when it has them; `out` still carries the whole set."),
+            InString("groups", "Groups", field=False, default="", presentation=True,
+                     description=
+                     "Split into RANGES instead of one output per position: type the groups as "
+                     "0-based position indices, inclusive ranges, `;` between groups — `0-3; "
+                     "4-7; 8-11` — with an optional name in front of a group (`top: 0-3; mid: "
+                     "4-7`). The card then grows one output PER GROUP, each carrying exactly "
+                     "that subset of the M (position) axis, and the per-position outputs are "
+                     "put away. Blank = one output per position, as before. A wired group "
+                     "materializes into a Crop in frames mode keeping those positions at run "
+                     "time, shared by every branch that reads it, so this never changes `out` "
+                     "or anything this node itself computes; a group that reaches past the end "
+                     "is labelled so on the card and refused with the real M (position) length "
+                     "when pulled.")],
     outputs=[OutDataset("out")],
     granularity=Granularity.TILEABLE,
     description="Fan a multipoint Dataset out into one output per stage position (each a "
-                "single-position Dataset); the whole set also passes through 'out'. The "
-                "positions axis's twin of Split Channels.",
+                "single-position Dataset) — or, with Groups set, one output per RANGE of "
+                "positions; the whole set also passes through 'out'. The positions "
+                "axis's twin of Split Channels.",
 )

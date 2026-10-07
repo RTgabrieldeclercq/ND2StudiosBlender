@@ -24162,6 +24162,148 @@ def test_select_plane_split_z() -> None:
         "an instant pick off the viewer's z")
 
 
+def test_split_groups() -> None:
+    """Range GROUPS on the split cards (2026-10-07): a `groups` text on Split Channels / Split
+    Positions / Split Z turns the per-index outputs into one output per RANGE.
+
+    * The grammar (:func:`metadata.parse_groups`): ``;`` or newline between groups, each a
+      :func:`parse_indices` list/range, an optional ``name:`` / ``name =`` in front; blank,
+      junk and an empty group are total (skipped / ``None``); out-of-range indices are kept.
+    * The socket is PRESENTATION-only: the split's own output is the whole set whatever the
+      text says, so the value never reaches the recipe.
+    * The card: with groups set, ``zg0…`` / ``posg0…`` / ``chg0…`` replace the per-index
+      sockets, labelled with the typed name or the members' names (channel names joined,
+      first–last position, ``z 4-7`` with its height span), and a group past the end says so.
+    * The taps: a wired ``zgK`` / ``posgK`` materializes into ONE shared ``util.crop`` in
+      frames mode (``z4-7`` / ``m0-1``); a ``chgK`` into ``channel.select`` with the list; the
+      envelope downstream reads the subset and a pull hands back exactly those planes /
+      positions / channels, with the per-axis metadata following.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.metadata import parse_groups
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+
+    # the grammar
+    assert parse_groups("0-3; 4-7; 8-11") == [("", (0, 1, 2, 3)), ("", (4, 5, 6, 7)), ("", (8, 9, 10, 11))]
+    assert parse_groups("top: 0-3; mid = 4-7\n8-11") == [("top", (0, 1, 2, 3)), ("mid", (4, 5, 6, 7)), ("", (8, 9, 10, 11))]
+    assert parse_groups("GFP+DAPI: 0,2; 1") == [("GFP+DAPI", (0, 2)), ("", (1,))]
+    assert parse_groups("a:b: 0-1") == [("a:b", (0, 1))]
+    assert parse_groups("") is None and parse_groups(None) is None and parse_groups("abc") is None
+    assert parse_groups("0-1; nothing:; 5") == [("", (0, 1)), ("", (5,))], "an empty group is skipped"
+    assert parse_groups("8-13") == [("", (8, 9, 10, 11, 12, 13))], "out of range is kept, not clipped"
+    for op in ("channel.split", "util.split_positions", "util.split_z"):
+        sock = NODES.get(op).input("groups")
+        assert sock is not None and sock.presentation and sock.default == "", op
+
+    OPS.ensure_ops()
+    define_node("io.sgseed", "S", outputs=[OutDataset()])
+    M, T, Z, C, Y, X = 3, 2, 12, 3, 6, 8
+    arr = np.zeros((M, T, Z, C, Y, X), dtype=float)
+    for m in range(M):
+        for z in range(Z):
+            for c in range(C):
+                arr[m, :, z, c] = 1000.0 * m + 10.0 * z + c
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 0.4, "position_name": ["A1", "B2", "C3"],
+            "stage_xy_um": [[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]],
+            "channel_names": ["DAPI", "GFP", "Cy5"], "channel_emission_nm": [450.0, 510.0, 670.0],
+            "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 100.0], [0.0, 0.0, 200.0]]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def px(out, m=0, t=0, z=0, c=0):
+        return float(out.image.get_region(0, m, t, z, c, 0, Y, 0, X)[0, 0])
+
+    def names(doc, nid):
+        return [s.name for s in doc.output_specs(nid)]
+
+    # ── Split Z: planes 4-7 as a sub-stack ───────────────────────────────────────────
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L"); doc.meta_seeds["L"] = env0
+    doc.add_node("util.split_z", node_id="SZ"); doc.connect("L", "image", "SZ", "data")
+    assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
+    doc.nodes["SZ"].params["groups"] = "top: 0-3; 4-7; 8-13"
+    doc.touch("SZ")
+    outs = doc.output_specs("SZ")
+    assert names(doc, "SZ") == ["out", "zg0", "zg1", "zg2"], names(doc, "SZ")
+    assert [s.label for s in outs[1:]] == ["0 · top · 0.00–1.20 µm", "1 · z 4-7 · 1.60–2.80 µm",
+                                           "2 · z 8-13 · 3.20–4.40 µm (past the end)"], [s.label for s in outs[1:]]
+    assert doc._tap_name("SZ", "zg0") == "top" and doc._tap_name("SZ", "zg1") == "z 4-7"
+    doc.add_node("enhance.gaussian", node_id="G1"); doc.add_node("enhance.gaussian", node_id="G2")
+    doc.add_node("enhance.gaussian", node_id="G3")
+    doc.connect("SZ", "zg1", "G1", "data"); doc.connect("SZ", "zg1", "G2", "data")
+    doc.connect("SZ", "out", "G3", "data")
+    assert doc.env("G1").axes.z == 4 and doc.env("G3").axes.z == Z, "the envelope sees the group tap"
+    assert abs(doc.env("G1").metadata["origin_um"][0][0] - 1.6) < 1e-9, doc.env("G1").metadata["origin_um"]
+    g = doc.to_graph(for_run=True, materialize=True)
+    taps = [n for n in g.nodes.values() if n.op_key == "util.crop"]
+    assert len(taps) == 1 and taps[0].params == {"frames": "z4-7"} and taps[0].modes == {"region": "frames"}, \
+        [(n.id, n.params, n.modes) for n in taps]
+    assert sum(1 for e in g.edges if e.src == taps[0].id) == 2, "one tap shared by both branches"
+    eng = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0})
+    o1, o3 = eng.pull("G1"), eng.pull("G3")
+    assert o1.axes.z == 4 and np.allclose([px(o1, z=k) for k in range(4)], [40.0, 50.0, 60.0, 70.0]), \
+        (o1.axes, [px(o1, z=k) for k in range(4)])          # a Gaussian on a flat plane: flat
+    assert o1.metadata["z_step_um"] == 0.4 and abs(o1.metadata["origin_um"][0][0] - 1.6) < 1e-9
+    assert o3.axes.z == Z
+    doc.nodes["SZ"].params["groups"] = ""                   # blank: the per-plane sockets return
+    doc.touch("SZ")
+    assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
+
+    # ── Split Positions: wells 0-1 by range, C3 alone ────────────────────────────────
+    doc.add_node("util.split_positions", node_id="SP"); doc.connect("L", "image", "SP", "data")
+    doc.nodes["SP"].params["groups"] = "wells: 0-1; 2"
+    doc.touch("SP")
+    assert names(doc, "SP") == ["out", "posg0", "posg1"]
+    assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · wells", "1 · C3"]
+    doc.nodes["SP"].params["groups"] = "0-1; 2"
+    doc.touch("SP")
+    assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · A1–B2", "1 · C3"]
+    doc.add_node("enhance.gaussian", node_id="G4"); doc.connect("SP", "posg0", "G4", "data")
+    assert doc.env("G4").axes.m == 2
+    g = doc.to_graph(for_run=True, materialize=True)
+    tap = next(n for n in g.nodes.values() if n.op_key == "util.crop" and n.params == {"frames": "m0-1"})
+    assert tap.modes == {"region": "frames"}
+    o4 = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0}).pull("G4")
+    assert o4.axes.m == 2 and o4.metadata["position_name"] == ["A1", "B2"], \
+        (o4.axes, o4.metadata.get("position_name"))
+    assert abs(px(o4, m=1) - 1000.0) < 1e-6 and abs(px(o4, m=0)) < 1e-6, (px(o4, m=0), px(o4, m=1))
+    assert o4.metadata["stage_xy_um"] == [[0.0, 0.0], [100.0, 0.0]]
+
+    # ── Split Channels: DAPI+Cy5 together, GFP alone ─────────────────────────────────
+    doc.add_node("channel.split", node_id="CS"); doc.connect("L", "image", "CS", "data")
+    assert names(doc, "CS") == ["out", "ch0", "ch1", "ch2"]
+    doc.nodes["CS"].params["groups"] = "0,2; 1"
+    doc.touch("CS")
+    assert names(doc, "CS") == ["out", "chg0", "chg1"]
+    assert [s.label for s in doc.output_specs("CS")[1:]] == ["0 · DAPI+Cy5", "1 · GFP"], \
+        [s.label for s in doc.output_specs("CS")[1:]]
+    doc.add_node("enhance.gaussian", node_id="G5"); doc.connect("CS", "chg0", "G5", "data")
+    assert doc.env("G5").axes.c == 2
+    g = doc.to_graph(for_run=True, materialize=True)
+    tap = next(n for n in g.nodes.values() if n.op_key == "channel.select" and n.params == {"channels": [0, 2]})
+    o5 = Engine(g, computes=COMPUTES, seeds={"L": ds}, meta_seeds={"L": env0}).pull("G5")
+    assert o5.axes.c == 2 and abs(px(o5, c=1) - 2.0) < 1e-6 \
+        and o5.metadata["channel_emission_nm"] == [450.0, 670.0], (o5.axes, px(o5, c=1))
+    # a Load card has no `groups`: untouched
+    assert names(doc, "L")[:1] == ["image"] and "chg0" not in names(doc, "L")
+    # the split's own output ignores the text entirely (presentation-only)
+    gsz = Graph(); gsz.add(NodeInstance("S", "io.sgseed"))
+    gsz.add(NodeInstance("N", "util.split_z", params={"groups": "0-3; 4-7"})); gsz.connect("S", "N")
+    whole = Engine(gsz, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0}).pull("N")
+    assert whole.axes.z == Z
+    _ok("split groups: `groups` text (`0-3; 4-7; 8-11`, `top: 0-3`, `;`/newline, total grammar, "
+        "out-of-range kept) on Split Z / Split Positions / Split Channels is presentation-only "
+        "and turns the per-index sockets into zg/posg/chg group sockets labelled by name, "
+        "members or span (and `(past the end)`); a wired group is one shared util.crop "
+        "frames tap (z4-7 / m0-1) or channel.select list; the envelope and the pull carry "
+        "exactly that subset with z_step, origin, position and emission lists following; "
+        "blank restores the per-index sockets")
+
+
 def test_shift_node() -> None:
     """``align.shift`` (2026-10-07): the apply half of registration as a node of its own, reading
     the per-frame shift as Frame layers from a SECOND input.
@@ -29644,6 +29786,7 @@ def main() -> int:
     test_timeseries_clock_order()
     test_split_positions()
     test_select_plane_split_z()
+    test_split_groups()
     test_shift_node()
     test_workspace_model()
     test_page_composition_memo_reuse()

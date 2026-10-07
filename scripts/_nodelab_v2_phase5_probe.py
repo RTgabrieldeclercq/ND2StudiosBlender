@@ -5912,6 +5912,40 @@ def main(argv) -> int:
         "a util.select_plane tap with plane 3, and Select Plane's Plane is an instant pick "
         "that adopts the viewer's z")
 
+    # ── SG1 range groups on a split card (2026-10-07): typing `top: 0-1; 2-4` into Split Z's
+    # Groups replaces z0..z4 with zg0/zg1 labelled by name / span, a wire from zg1 is drawable,
+    # the envelope downstream reads z=3, and the run graph carries a util.crop frames tap ──
+    _sgdoc = win.doc
+    _sgdoc.add_node("io.load", node_id="SGL", x=0, y=1800)
+    _sgdoc.meta_seeds["SGL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=2, z=5, c=1, y=64, x=64),
+        metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
+    _sgdoc.add_node("util.split_z", node_id="SGS", x=300, y=1800)
+    _sgdoc.connect("SGL", "image", "SGS", "data")
+    _sgdoc.set_param("SGS", "groups", "top: 0-1; 2-4") if hasattr(_sgdoc, "set_param") \
+        else (_sgdoc.nodes["SGS"].params.__setitem__("groups", "top: 0-1; 2-4"), _sgdoc.touch("SGS"))
+    win.scene.sync(); app.processEvents()
+    _sgouts = [(s.name, s.label) for s in _sgdoc.output_specs("SGS")]
+    assert _sgouts == [("out", ""), ("zg0", "0 · top · 0.00–0.40 µm"), ("zg1", "1 · z 2-4 · 0.80–1.60 µm")], _sgouts
+    _sgdoc.add_node("view.viewer", node_id="SGV", x=600, y=1800)
+    _sgdoc.connect("SGS", "zg1", "SGV", "data")
+    win.scene.sync(); app.processEvents()
+    assert _sgdoc.env("SGV").axes.z == 3, "the viewer sees the sub-stack through the group tap"
+    _gg = _sgdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.crop" and n.params == {"frames": "z2-4"} and n.modes == {"region": "frames"}
+               for n in _gg.nodes.values()), [(n.id, n.op_key, n.params) for n in _gg.nodes.values()]
+    _sgitem = win.scene.node_items["SGS"]
+    _sgports = [getattr(p, "name", None) for p in getattr(_sgitem, "_outs", {}).values()] \
+        if isinstance(getattr(_sgitem, "_outs", None), dict) else None
+    if _sgports is not None:
+        assert {"zg0", "zg1"} <= set(_sgports) and "z3" not in set(_sgports), _sgports
+    for nid in ("SGV", "SGS", "SGL"):
+        _sgdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("SG1 split groups: `top: 0-1; 2-4` on Split Z replaces z0..z4 with zg0/zg1 labelled by "
+        "name and height span, a wire from zg1 is drawable, the envelope downstream reads z=3, "
+        "and the run graph carries a util.crop frames tap keeping z2-4")
+
     _probe_movie_editor(win, app)
 
     # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────

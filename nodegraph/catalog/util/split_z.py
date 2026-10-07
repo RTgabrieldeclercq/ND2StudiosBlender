@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, OutDataset
+from nodegraph.registry import Granularity, InDataset, InString, OutDataset
 
 from nodegraph.catalog._base import register_node
 
@@ -32,10 +32,23 @@ register_node(
     inputs=[InDataset(description=
                       "The z-stack to fan out. Its planes appear as one output socket each "
                       "on the card (`z0…`, with the plane's height when the stack has a z "
-                      "step); `out` still carries the whole stack.")],
+                      "step); `out` still carries the whole stack."),
+            InString("groups", "Groups", field=False, default="", presentation=True,
+                     description=
+                     "Split into RANGES instead of one output per plane: type the groups as "
+                     "0-based plane indices, inclusive ranges, `;` between groups — `0-3; 4-7; "
+                     "8-11` — with an optional name in front of a group (`top: 0-3; mid: "
+                     "4-7`). The card then grows one output PER GROUP, each carrying exactly "
+                     "that subset of the Z axis, and the per-plane outputs are put away. Blank "
+                     "= one output per plane, as before. A wired group materializes into a "
+                     "Crop in frames mode keeping those planes at run time, shared by every "
+                     "branch that reads it, so this never changes `out` or anything this node "
+                     "itself computes; a group that reaches past the end is labelled so on the "
+                     "card and refused with the real Z length when pulled.")],
     outputs=[OutDataset("out")],
     granularity=Granularity.TILEABLE,
     description="Fan a z-stack out into one output per plane (each a single-plane Dataset, "
-                "zK = plane K); the whole stack also passes through 'out'. The Z axis's "
-                "twin of Split Channels and Split Positions.",
+                "zK = plane K) — or, with Groups set, one output per RANGE of planes (a "
+                "sub-stack each); the whole stack also passes through 'out'. The Z "
+                "axis's twin of Split Channels and Split Positions.",
 )

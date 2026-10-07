@@ -49,6 +49,7 @@ from nodelab_v2.ops import (
     sanitize_output_name,
     BAT_SOCKET_RE, CH_SOCKET_RE, GRP_SOCKET_RE, ITEM_SOCKET_RE, PAGE_INPUT_OP,
     PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY, POS_SOCKET_RE, Z_SOCKET_RE,
+    CHG_SOCKET_RE, POSG_SOCKET_RE, ZG_SOCKET_RE,
     PART_IMAGE, PART_SOCKET_RE, item_socket, part_socket, _real_dataset_out,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
@@ -798,11 +799,16 @@ class GraphDocument:
             return []
         base = list(spec.active_outputs(rec.state()))
         if rec.op_key in CHANNEL_TAP_OPS:
-            descs = self.channel_descriptors(node_id)
-            if len(descs) >= 2:
-                for i, ch in enumerate(descs):
-                    base.append(OutDataset(f"ch{i}",
-                                           label=f"{i} · {ch.get('name') or f'Ch{i}'}"))
+            groups = self.split_groups(node_id, "c")
+            if groups:                       # RANGE groups replace the per-channel taps
+                for g in groups:
+                    base.append(OutDataset(f"chg{g['index']}", label=g["label"]))
+            else:
+                descs = self.channel_descriptors(node_id)
+                if len(descs) >= 2:
+                    for i, ch in enumerate(descs):
+                        base.append(OutDataset(
+                            f"ch{i}", label=f"{i} · {ch.get('name') or f'Ch{i}'}"))
         if rec.op_key in GROUP_TAP_OPS:
             groups = self.group_descriptors(node_id)
             # TWO or more, the same floor the channel taps use and for the same reason: a
@@ -819,19 +825,29 @@ class GraphDocument:
                 for i, name in enumerate(members):
                     base.append(OutDataset(f"bat{i}", label=f"{i} · {name}"))
         if rec.op_key in POSITION_TAP_OPS:
-            # Same floor again: one position is the whole Dataset, so a lone `pos0` would
-            # duplicate `out`.
-            positions = self.position_descriptors(node_id)
-            if len(positions) >= 2:
-                for i, pd in enumerate(positions):
-                    base.append(OutDataset(f"pos{i}", label=pd["label"]))
+            groups = self.split_groups(node_id, "m")
+            if groups:
+                for g in groups:
+                    base.append(OutDataset(f"posg{g['index']}", label=g["label"]))
+            else:
+                # Same floor again: one position is the whole Dataset, so a lone `pos0`
+                # would duplicate `out`.
+                positions = self.position_descriptors(node_id)
+                if len(positions) >= 2:
+                    for i, pd in enumerate(positions):
+                        base.append(OutDataset(f"pos{i}", label=pd["label"]))
         if rec.op_key in PLANE_TAP_OPS:
-            # Same floor: one plane is the whole stack, so a lone `z0` would duplicate
-            # `out`.
-            planes = self.plane_descriptors(node_id)
-            if len(planes) >= 2:
-                for i, pd in enumerate(planes):
-                    base.append(OutDataset(f"z{i}", label=pd["label"]))
+            groups = self.split_groups(node_id, "z")
+            if groups:
+                for g in groups:
+                    base.append(OutDataset(f"zg{g['index']}", label=g["label"]))
+            else:
+                # Same floor: one plane is the whole stack, so a lone `z0` would duplicate
+                # `out`.
+                planes = self.plane_descriptors(node_id)
+                if len(planes) >= 2:
+                    for i, pd in enumerate(planes):
+                        base.append(OutDataset(f"z{i}", label=pd["label"]))
         if rec.op_key == PAGE_INPUT_OP:
             # the items of a several-item Output, each on a socket of its own (step 11f)
             items = self._page_items(node_id)
@@ -940,6 +956,9 @@ class GraphDocument:
         for regex, lister, field in ((CH_SOCKET_RE, self.channel_descriptors, "name"),
                                      (POS_SOCKET_RE, self.position_descriptors, "name"),
                                      (Z_SOCKET_RE, self.plane_descriptors, "name"),
+                                     (CHG_SOCKET_RE, lambda n: self.split_groups(n, "c"), "name"),
+                                     (POSG_SOCKET_RE, lambda n: self.split_groups(n, "m"), "name"),
+                                     (ZG_SOCKET_RE, lambda n: self.split_groups(n, "z"), "name"),
                                      (GRP_SOCKET_RE, self.group_descriptors, "key"),
                                      (BAT_SOCKET_RE, self.batch_member_names, None)):
             m = regex.match(socket or "")
@@ -1020,6 +1039,70 @@ class GraphDocument:
         for i in range(z):
             label = f"{i}" + (f" · {i * step:.2f} µm" if step > 0 else "")
             out.append({"index": i, "name": f"z{i}", "label": label})
+        return out
+
+    def split_groups(self, node_id: str, axis: str) -> list:
+        """The RANGE groups a split card's `groups` text names on ``axis`` (``"c"`` / ``"m"`` /
+        ``"z"``), as ``[{"index", "name", "indices", "spec", "label"}, …]`` — ``[]`` when the
+        node has no `groups` socket or the text names none (2026-10-07).
+
+        ``name`` is the typed name, else the group's members as the axis knows them — the
+        channel names joined with ``+``, the first and last position names, ``z 4-7`` — so a
+        saved output named from the wire reads as what it carries. ``label`` is what the
+        socket shows: ``"K · <name>"``, plus the planes' height span when the stack has a z
+        step, and ``(past the end)`` when a group reaches beyond the axis — the card says so
+        instead of clipping, and the tap refuses with the real length when pulled."""
+        from nodegraph.metadata import format_indices, parse_groups
+        rec = self.nodes.get(node_id)
+        try:
+            spec = rec.spec() if rec is not None else None
+        except Exception:                      # noqa: BLE001 — an unknown op
+            spec = None
+        if spec is None or spec.input("groups") is None:
+            return []
+        groups = parse_groups(rec.params.get("groups"))
+        if not groups:
+            return []
+        try:
+            env = self.env(node_id)
+        except Exception:                      # noqa: BLE001 — an un-propagated node
+            env = None
+        n = int(getattr(getattr(env, "axes", None), axis, 0) or 0) if env is not None else 0
+        if axis == "c":
+            names = [str(d.get("name") or f"Ch{i}")
+                     for i, d in enumerate(self.channel_descriptors(node_id))]
+        elif axis == "m":
+            names = [str(d.get("name") or f"m{i}")
+                     for i, d in enumerate(self.position_descriptors(node_id))]
+        else:
+            names = []
+        step = 0.0
+        if axis == "z" and env is not None:
+            try:
+                step = float((env.metadata or {}).get("z_step_um") or 0.0)
+            except (TypeError, ValueError):
+                step = 0.0
+        out = []
+        for i, (typed, idx) in enumerate(groups):
+            idx = tuple(sorted(set(idx)))
+            spec_txt = format_indices(idx)
+            inside = [j for j in idx if 0 <= j < n] if n else list(idx)
+            if typed:
+                name = typed
+            elif axis == "c" and names and inside and all(j < len(names) for j in inside):
+                name = "+".join(names[j] for j in inside)
+            elif axis == "m" and names and inside and all(j < len(names) for j in inside):
+                name = names[inside[0]] if len(inside) == 1 \
+                    else f"{names[inside[0]]}–{names[inside[-1]]}"
+            else:
+                name = f"{axis} {spec_txt}"
+            label = f"{i} · {name}"
+            if axis == "z" and step > 0 and inside:
+                label += f" · {inside[0] * step:.2f}–{inside[-1] * step:.2f} µm"
+            if n and len(inside) < len(idx):
+                label += " (past the end)"
+            out.append({"index": i, "name": name, "indices": idx, "spec": spec_txt,
+                        "label": label})
         return out
 
     def input_specs(self, node_id: str) -> list:
