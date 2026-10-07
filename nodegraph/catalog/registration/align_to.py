@@ -122,7 +122,13 @@ def _compute_align_to(ctx: EvalContext) -> Dataset:
                     sig = max(1.0, hp_um / max(grid_ps, 1e-9))
                     win = _hann2d(a.shape)
                     fa, fb_ = _highpass(a, sig) * win, _highpass(b, sig) * win
-                    sh = phase_cross_correlation(fb_, fa, upsample_factor=10)[0]
+                    # Plain cross-correlation of the band-passed samples (2026-10-07):
+                    # skimage's default phase whitening cancels any filter applied to
+                    # both inputs, which had made `highpass_um` a dead control here, and
+                    # it is 3-15x less precise on noisy microscopy fields (see
+                    # nodegraph.kernels.registration.estimate_translation).
+                    sh = phase_cross_correlation(fb_, fa, upsample_factor=10,
+                                                 normalization=None)[0]
                     cand_y = float(sh[0]) * um_per_sample_y
                     cand_x = float(sh[1]) * um_per_sample_x
                     from scipy.ndimage import shift as ndi_shift

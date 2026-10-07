@@ -59,7 +59,7 @@ it returns a numpy result. That is the whole contract.
 | [`field_math`](field_math.md) | *(no node — shared maths)* | `build_grid(...)`, `compute_strain(...)`, `strain_from_gradient(...)`, `accumulate_incremental(...)`; owns `DVCResult` | in-repo (lifted from the ALDVC port) | numpy, scipy |
 | [`track_objects`](track_objects.md) | Track Objects | `link_objects(rows, ...)` — `link_objects_with_params(...)` µm-wrapper | in-repo (no tracking pkg) | numpy, scipy, numba, pandas, sklearn*, skimage* |
 | [`track_field`](track_field.md) | Track Field | `mls_displacement_gradient(coords, disp, ...)`, `linear_elastic_stress(strain, ...)`, `stress_invariants(...)` | in-repo (SerialTrack's `funCompDefGrad3` + isotropic linear elasticity) | numpy, scipy* |
-| [`registration`](registration.md) | Registration | `estimate_series(...)`, `apply_series(...)`, `apply_frame(...)` | in-repo (on scipy/skimage/cv2) | numpy, scikit-image, scipy, opencv-python |
+| [`registration`](registration.md) | Registration | `estimate_series(...)` (2-D or 3-D series), `apply_series(...)`, `apply_frame(...)`, `apply_volume(...)`, `estimate_from_landmarks(...)` | in-repo (on scipy/skimage/cv2) | numpy, scikit-image, scipy, opencv-python |
 | [`bead_detect`](bead_detect.md) | Bead Detection | `detect_beads(volume_zhw, voxel_size_um, params)` | in-repo (ParticleDetector) | numpy, scipy, numba, scikit-image* |
 | [`granule_cluster`](granule_cluster.md) | Granule Clustering | `cluster_granules(points_zyx, voxel_size_um, params)` | in-repo (fits via sklearn) | numpy, scikit-learn* |
 | [`granule_tessellate`](granule_tessellate.md) | Granule Tessellation | `tessellate_granules(points_zyx, labels, voxel_size_um, params)` | in-repo (scipy.spatial) | numpy, scipy |
@@ -259,7 +259,11 @@ per-file `from __future__ import annotations` into one at the top, and rewiring 
 cross-references; (b) renaming on genuine name collisions (none were needed in practice);
 (c) dropping members that were strictly **off the compute path** — Qt/GUI code, plugin
 `get_params()`/`ParamSpec` lists, `@Registry.register` decorators, and ABC registry bases.
-**No compute-path code was altered** — the algorithms are byte-identical to `Version-1.45`.
+**No compute-path code was altered** — the algorithms are byte-identical to `Version-1.45`,
+with one documented exception: **`registration` was refined on 2026-10-07** under a
+known-answer bench (`scripts/registration_synthetic_bench.py`; the departures and their
+measured effect are in its `.md` §12, the rule that allows it in `codemap/invariants.md`
+INV-11).
 A few kernels add a clearly-labelled *non-vendored convenience* (e.g. `histogram_threshold.make_config`
 forcing `bit_depth_strict=False`, `granule_volume_mask.tessellation_from_list`); these are
 documented in the respective `.md` and are additive only.

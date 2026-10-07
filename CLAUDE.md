@@ -89,8 +89,6 @@ running code  >  codemap/gen/*.jsonl  >  codemap/*.md  >  the skills
 - **`nodegraph/selftest.py` is ~17k lines.** Never read it whole; grep for the `test_*` name.
 - **Never trust a node count you find in prose.** [codemap/STATE.md](codemap/STATE.md) is the
   only place in this repo allowed to carry one.
-- `nodegraph/kernels/registration.py` defines `apply_frame` **twice**; the second shadows the
-  first. If you edit one, check you edited the live one.
 
 ## Footguns
 

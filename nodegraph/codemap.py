@@ -351,12 +351,24 @@ def _kernel_doc(owner: str) -> str:
         deps = dependency_closure(owner)
     except Exception:
         return ""
+    documented = []
     for dep in deps:
         if dep.startswith("nodegraph.kernels."):
-            cand = os.path.join(ROOT, "nodegraph", "kernels", dep.rsplit(".", 1)[1] + ".md")
+            short = dep.rsplit(".", 1)[1]
+            cand = os.path.join(ROOT, "nodegraph", "kernels", short + ".md")
             if os.path.exists(cand):
-                return _rel(cand)
-    return ""
+                documented.append((short, _rel(cand)))
+    if not documented:
+        return ""
+    # A node that borrows a helper from a second kernel (``registration.stabilize`` takes
+    # its ROI rasterizer from ``dic_mesh_region``) must still link to ITS kernel's contract:
+    # prefer the kernel that shares a name with the node's category or module, then fall
+    # back to closure order (2026-10-07 — the borrowed kernel's doc had won before).
+    parts = set(owner.split("."))
+    for short, rel in documented:
+        if short in parts:
+            return rel
+    return documented[0][1]
 
 
 def _registry_pass(by_module: Dict[str, Any]) -> Dict[str, Any]:

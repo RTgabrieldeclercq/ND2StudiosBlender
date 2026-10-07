@@ -172,6 +172,16 @@ equivalent guarantee is an explicit equivalence test rather than byte-identity �
 `track_objects.compute_strain_mls` and `selftest::test_track_field` pins the two together on
 a fixture, so the derivation cannot silently drift from the code it came from.
 
+**`registration` left verbatim status on 2026-10-07**, and is the worked example of the only
+way a kernel may: it is the lab's OWN v1 code (vendored from this project's predecessor, not
+from a paper, so there is no published result to stay comparable to), a known-answer bench
+(`scripts/registration_synthetic_bench.py`, with `--legacy` re-creating the old behaviour)
+measured the old code against exact synthetic truth, found a sign bug in the ECC seed and a
+3–15× precision loss from phase whitening, and the departures are listed with their numbers
+in `nodegraph/kernels/registration.md` §12 and pinned by
+`selftest::test_registration_refinement`. A departure without all three — in-house
+provenance, a bench that reproduces before and after, a selftest fence — is still forbidden.
+
 ---
 
 ### INV-12 — anything feeding the memo must be repeat-stable

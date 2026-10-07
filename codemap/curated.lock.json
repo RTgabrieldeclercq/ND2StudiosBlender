@@ -96,9 +96,9 @@
  },
  "CON-13": {
   "anchors": {
-   "file:.claude/skills/wire-node-v2/SKILL.md": "9b28e04d28d188c9e017b8356947fab8"
+   "file:.claude/skills/wire-node-v2/SKILL.md": "51b524fbb4e7fd87fcb0293574a50f42"
   },
-  "blessed": "2026-08-06",
+  "blessed": "2026-10-07",
   "file": "codemap/concepts.md"
  },
  "CON-14": {
@@ -183,10 +183,10 @@
  },
  "INV-08": {
   "anchors": {
-   "file:nodegraph/codemap.py": "4acf756e52b68e530381982b764aa49d",
+   "file:nodegraph/codemap.py": "bf95bf45dd3323ae5666e2de3074b8e1",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-08-05",
+  "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
  "INV-09": {
@@ -199,16 +199,16 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "0ec6a239bc96ea8c8ee6b6a4741db54a"
+   "file:nodegraph/kernels/README.md": "1b4c495ca10564f163e03ec3531f331e"
   },
-  "blessed": "2026-09-25",
+  "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "0ec6a239bc96ea8c8ee6b6a4741db54a"
+   "file:nodegraph/kernels/README.md": "1b4c495ca10564f163e03ec3531f331e"
   },
-  "blessed": "2026-09-25",
+  "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
  "INV-12": {
@@ -288,10 +288,10 @@
  },
  "WF-07": {
   "anchors": {
-   "file:nodelab_v2/ingest.py": "cc8fd6ff6b054a943ad34b68de1a4a60",
+   "file:nodelab_v2/ingest.py": "bc5ce16eb52c0da33079bd8715b13920",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-09-15",
+  "blessed": "2026-10-07",
   "file": "codemap/workflows.md"
  }
 }

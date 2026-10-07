@@ -581,10 +581,12 @@
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.catalog._shared.batch","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.catalog._shared.drift_layers","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
+{"dst":"nodegraph.catalog._shared.regions","k":"imp","lazy":true,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.catalog._shared.sampling","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
+{"dst":"nodegraph.kernels.dic_mesh_region","k":"imp","lazy":true,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.kernels.registration","k":"imp","lazy":true,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.registration.stabilize"}
@@ -927,6 +929,7 @@
 {"dst":"nodegraph.kernels.histogram_threshold","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels.mesh_raster","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels.piv_field","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.kernels.registration","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels.track_field","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels.track_objects","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels.zsdeconvnet","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1413,6 +1416,8 @@
 {"dst":"nodegraph.registry","k":"imp","lazy":true,"src":"scripts.dic_synthetic_bench"}
 {"dst":"nodegraph.structure","k":"imp","lazy":true,"src":"scripts.dic_synthetic_bench"}
 {"dst":"nodegraph.kernels.piv_field","k":"imp","lazy":false,"src":"scripts.piv_synthetic_bench"}
+{"dst":"nodegraph.kernels","k":"imp","lazy":false,"src":"scripts.registration_synthetic_bench"}
+{"dst":"nodegraph.kernels.registration","k":"imp","lazy":false,"src":"scripts.registration_synthetic_bench"}
 {"dst":"nodegraph","k":"imp","lazy":true,"src":"scripts.setup_cupy"}
 {"dst":"nodegraph.gpu","k":"imp","lazy":true,"src":"scripts.setup_cupy"}
 {"dst":"nodelab_v2.nd2_compat","k":"imp","lazy":true,"src":"scripts.zs_autoparams"}
