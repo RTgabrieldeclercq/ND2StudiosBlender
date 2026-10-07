@@ -455,22 +455,50 @@ Readiness (`readiness.problems`) states the fixes as `Suggestion.action` — `se
 (bind, name) and `append` (a Page Output after a terminal node or an unpublished loader, the
 `unpublished` hint, severity `hint`, never blocking `ready()`).
 
+**Variables, colours, the outline (step 11e).** A Page Output's name is unique ACROSS THE
+WORKSPACE: `GraphDocument._settle_output_name` (run by `add_node` and `touch`, the two ways a
+name arrives) asks `doc.claim_output_name`, which the Workspace installs as
+`Workspace.claim_output_name` — a taken name becomes `name2`, reported through
+`doc.renamed_output`; only the pages linked to one master share its names. A page copied, or
+made unique, renames its taken names (`dedupe_outputs`) and `_follow_renames` re-points every
+Page Input that read them. `doc.source_kind` (`Workspace.source_kind`) gives each Source-menu
+entry the colour of the page kind it reads. The Pages panel draws `Workspace.page_outline`:
+each page's nodes as `OutlineRow`s in data-flow order — entries first, a chain at one depth, a
+branch one level under the node it leaves, reroutes left out — with why a node cannot be
+switched off (`document.pass_through_reason`, CON-18).
+
 see: WF-08 · CON-18 · [MANUAL §2 Pages, §2b](../MANUAL.md)
 
 ---
 
 ### CON-18 — linked page
-anchors: sym:nodelab_v2.linked_document.LinkedDocument, sym:nodelab_v2.linked_document.LinkedDocument.touch
+anchors: sym:nodelab_v2.linked_document.LinkedDocument, sym:nodelab_v2.linked_document.LinkedDocument.touch, sym:nodelab_v2.linked_document.LinkedDocument.set_edit_mode, sym:nodelab_v2.linked_document.LinkedDocument.structure_dict, sym:nodelab_v2.linked_document.LinkedDocument.set_muted, sym:nodelab_v2.document.pass_through_reason
 
 A **linked page** is a page whose document is a `LinkedDocument`: a live mirror of its
 **master** page — the same nodes, wires, positions, frames, zones and groups, rebuilt IN PLACE
 on every master change so record identity survives and the canvas does not rebuild its cards.
 What it owns are **overrides** `{node id: {"params", "modes", "local"}}`: a param or mode set
 on the linked page differs from the master's and stays the page's own (sticky, even if the
-master later reaches the same value) until *Reset to master*. Its topology is locked —
-add/remove/connect and the like raise `LinkedPageError` with the hint the status bar shows —
-and *Make unique* turns it into a plain page. One level deep: a link to a linked page links to
-its master. A file stores a linked page as `master` + `overrides`, no `graph`.
+master later reaches the same value) until *Reset to master*. Whether a node is switched off
+is a value of the same kind since step 11e: `set_muted` records `"muted"` in its override.
+One level deep: a link to a linked page links to its master. A file stores a linked page as
+`master` + `overrides` (+ `structure`, below), no `graph`.
+
+**Its topology answers to `edit_mode` (step 11e).** Unset, add/remove/connect raise
+`LinkedPageError` — the window asks first (`MainWindow._topology_ok` → `ask_linked_edit`, the
+`linked_edit_dialog`) and sets the answer: *Make unique* swaps in a plain document;
+`EDIT_MODIFIED` (saved) keeps the edit on the page — the base `GraphDocument` op runs on the
+live mirror and `_record` diffs it against the master into the page's STRUCTURE (own nodes,
+ids `nL1`…; master nodes removed; wires added and removed; `structure_dict`), which `_mirror`
+lays back over the master on every master change, this page's wire winning a single input;
+`EDIT_MASTER` (this session only) makes the edit ON the master in a form that changes nothing
+it computes — an added node arrives there muted (and on here), a wire or a removal is allowed
+only if `_keeps_master` finds the master's bypassed run graph unchanged, a muted node's removal
+heals its chain. Frames, groups and zones stay the master's in every mode (`SHAPE_HINT`).
+Muting at all is bounded by `document.pass_through_reason`: only a node that keeps the kind of
+data (it adds no domain, named layer, extra layer, column or picture; not a boundary, Iterate
+control or reroute) may be switched off — the same rule makes a node eligible to go to the
+master switched off.
 
 The memo's recipe hash carries no node id, so a linked page shares with its master every
 cached result it READS through a Page Input from a shared upstream page, and every node it does

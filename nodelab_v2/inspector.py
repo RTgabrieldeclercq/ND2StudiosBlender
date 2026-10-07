@@ -1864,8 +1864,14 @@ class InspectorPanel(QScrollArea):
             box.addItem("— choose an upstream Output —", "")
         elif current not in values:
             box.addItem(f"{current}  (unbound — not offered any more)", current)
+        from nodelab_v2.canvas import kind_icon
         for value, label in choices:
-            box.addItem(label, value)
+            # the dot is the colour of the page kind it reads from (V4.00 step 11e)
+            try:
+                kind = node.doc.source_kind(value) or "free"
+            except Exception:                        # noqa: BLE001 — a bare document
+                kind = "free"
+            box.addItem(kind_icon(kind), label, value)
         idx = box.findData(current)
         box.setCurrentIndex(idx if idx >= 0 else 0)
         box.blockSignals(False)
@@ -2056,17 +2062,29 @@ class InspectorPanel(QScrollArea):
         master = doc.master_name() or "its master"
         n = doc.override_count()
         ov = doc.overrides.get(node.node_id) or {}
-        k = len(ov.get("params") or {}) + len(ov.get("modes") or {})
+        k = len(ov.get("params") or {}) + len(ov.get("modes") or {}) + (1 if "muted" in ov else 0)
         sec = self._section("Linked page",
                             f"{n} override{'' if n == 1 else 's'} · {k} on this node")
         self._linked_text = f"Linked to “{master}” · {n} override{'' if n == 1 else 's'}"
         head = QLabel(self._linked_text)
         hf = head.font(); hf.setBold(True); head.setFont(hf)
         sec._lay.addWidget(head)  # type: ignore[attr-defined]
-        msg = QLabel("Its nodes, wires and card positions are the master's — add, remove or "
-                     "rewire nodes there and every linked page follows. A value changed here "
-                     "is this page's own (marked by the bar on its row; right-click the row "
-                     "to reset it to the master's).")
+        mode = getattr(doc, "edit_mode", "")
+        own = node.node_id in (doc.own_node_ids() if hasattr(doc, "own_node_ids") else ())
+        if mode == "modified":
+            shape = ("A modified linked page: it keeps nodes and wires of its own over the "
+                     "master's, and every other edit of the master still arrives. "
+                     + ("This node is this page's own. " if own else ""))
+        elif mode == "master":
+            shape = ("This session, a change to its graph goes to the master — a node added "
+                     "here arrives there switched off. ")
+        else:
+            shape = ("Its nodes, wires and card positions are the master's — changing them "
+                     "asks whether to make this page unique, keep the change on this page, or "
+                     "add it to the master switched off. ")
+        msg = QLabel(shape + "A value changed here — or a node switched on or off — is this "
+                     "page's own (marked by the bar on its row; right-click the row to reset "
+                     "it to the master's).")
         msg.setWordWrap(True)
         msg.setProperty("role", "muted")
         mf = msg.font(); mf.setPointSize(9); msg.setFont(mf)

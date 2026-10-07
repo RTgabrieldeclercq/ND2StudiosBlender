@@ -36,7 +36,7 @@ from nodegraph.iterate import (
     var_mode_names as _var_mode_names, var_out_names as _var_out_names,
 )
 from nodegraph.metadata import MetaEnvelope, propagate_meta
-from nodegraph.registry import InDataset, InString, NODES, OutDataset
+from nodegraph.registry import InDataset, InString, NODES, OutDataset, layer_value
 from nodegraph.serialize import (
     from_dict as _ng_from_dict, page_from_dict as _ng_page_from_dict, to_dict as _ng_to_dict)
 from nodegraph.sockets import (
@@ -44,6 +44,8 @@ from nodegraph.sockets import (
 from nodegraph.zones import Zone, unroll as _unroll
 from nodegraph.memo import digest
 from nodelab_v2.ops import (
+    DEFAULT_OUTPUT_BASE, PAGE_NAME_KEY, PAGE_OUTPUT_OP, next_free_name,
+    sanitize_output_name,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
     calib_overrides,
@@ -161,6 +163,77 @@ def _group_socket_label(i: int, g) -> str:
     if shape:
         bits.append(shape.split(" ")[0])          # "3x3" — the order word does not fit
     return f"{key} · {', '.join(bits)}" if bits else key
+
+
+#: Ops never switched off (V4.00 step 11e): page, group and zone boundaries, the Iterate
+#: controls and reroutes are the graph's wiring, not steps of the analysis.
+NO_PASS_THROUGH_PREFIXES = ("page.", "group.", "zone.", "flow.", "rr.")
+#: what a domain a node ADDS is, in the words of the refusal the user reads
+_ADDED_WORDS = {"voxel": "a mask or raster layer", "label": "labelled objects",
+                "point": "points", "track": "tracks", "mesh": "a mesh",
+                "frame": "per-frame values", "timepoint": "per-timepoint values",
+                "plane": "per-plane values", "multipoint": "per-position values",
+                "batch": "per-file values", "global": "a summary value",
+                "channel": "per-channel values"}
+
+
+def pass_through_reason(spec, params: Optional[Mapping[str, Any]] = None,
+                        modes: Optional[Mapping[str, str]] = None) -> str:
+    """Why a node of ``spec`` with these values may NOT be switched off — ``""`` when it may
+    (V4.00 step 11e).
+
+    Switching a node off (mute) hands its first Dataset input straight to its consumers, so
+    it is only honest for a node that does not change the KIND of data: what flows out must
+    be what flowed in, modified. A filter, a crop, a projection, a resample, a channel pick
+    or a writer qualifies; a node that adds a mask, labels, points, tracks, a mesh, table
+    columns or a picture does not — switched off, everything downstream that reads what it
+    adds would get nothing, and the page would fail somewhere other than where the switch
+    is. Decided from the node's DECLARATIONS for its current values (``adds_domains``, an
+    active ``layer_out`` socket with a name, ``extra_layers``, ``adds_columns``,
+    ``fresh_output``), so it needs no pull and no wiring."""
+    if spec is None:
+        return "it is a group or an unknown node — ungroup it to switch its steps off"
+    if spec.op_key.startswith(NO_PASS_THROUGH_PREFIXES):
+        return "it is part of the graph's wiring (a page, group or zone boundary), not a step"
+    state = dict(spec.default_state())
+    state.update(modes or {})
+    params = dict(params or {})
+    ins, outs = spec.active_inputs(state), spec.active_outputs(state)
+    if not any(s.type is SocketType.DATASET for s in ins):
+        return "it has no data input to pass on — it is where its data starts"
+    if not any(s.type is SocketType.DATASET for s in outs):
+        return "it has no data output to pass its input on to"
+    if getattr(spec, "fresh_output", False):
+        return "it makes a new kind of data (a picture) rather than changing its input"
+    if spec.adds_domains:
+        what = sorted(_ADDED_WORDS.get(d.value, d.value) for d in spec.adds_domains)
+        what = what[0] if len(what) == 1 else ", ".join(what[:-1]) + " and " + what[-1]
+        return f"it adds {what} — switched off, whatever reads that downstream gets none"
+    for s in ins:
+        if getattr(s, "layer_out", None):
+            try:
+                v = layer_value(s, params)
+            except Exception:                         # noqa: BLE001 — a declaration that raises
+                v = ""
+            if v:
+                return f"it adds the layer “{v}”"
+    extra = getattr(spec, "extra_layers", None)
+    if extra is not None:
+        try:
+            if any(isinstance(nm, str) and nm for _d, nm in (extra(params, state) or ())):
+                return "it adds layers"
+        except Exception:                             # noqa: BLE001
+            return "it adds layers"
+    cols = getattr(spec, "adds_columns", None)
+    if cols is not None:
+        try:
+            got = (cols(params, state, (), ()) if getattr(cols, "wants_inputs", False)
+                   else cols(params, state, ()))
+        except Exception:                             # noqa: BLE001
+            got = True
+        if got:
+            return "it adds table columns"
+    return ""
 
 
 def is_driver_edge(doc: "GraphDocument", edge: EdgeTuple) -> bool:
@@ -309,6 +382,17 @@ class GraphDocument:
         #: names, which the envelope does not carry across the page boundary. ``[]`` outside
         #: a workspace or while the Input is unbound.
         self.page_channels: Callable[[str], list] = lambda _nid: []
+        #: ``(node_id, name) -> name`` (V4.00 step 11e): the name Page Output ``node_id`` may
+        #: carry — ``name`` when no other Output has it, else ``name2``, ``name3``, … The
+        #: Workspace checks every page (a variable name identifies ONE output); outside a
+        #: workspace this page's other Outputs are all there is.
+        self.claim_output_name: Callable[[str, str], str] = self._claim_output_name_here
+        #: ``(source value) -> page kind`` of the page a Page Input source names, ``""`` when
+        #: it names none — the colour of each entry of a Source menu (V4.00 step 11e).
+        self.source_kind: Callable[[str], str] = lambda _v: ""
+        #: the last Page Output name the document changed to keep names unique:
+        #: ``(node_id, asked, given)`` — the window says so in the status bar
+        self.renamed_output: Optional[Tuple[str, str, str]] = None
         #: set by the Workspace (V4.00 step 5): a digest of what ``node_id`` reads from OTHER
         #: pages through Page Inputs ("" when nothing) — part of a dock's signature — and the
         #: page's run identity, which moves when an upstream page is edited
@@ -399,6 +483,7 @@ class GraphDocument:
             params = merged
         rec = NodeRecord(nid, op_key, params=params, modes=modes, x=x, y=y)
         self.nodes[nid] = rec
+        self._settle_output_name(nid)            # an explicit name another Output carries
         # A brand-new id cannot be in any in-flight run's cone, so naming it here cancels
         # nothing — while still being honest about what changed (unlike an empty set).
         self._notify((nid,))
@@ -433,7 +518,62 @@ class GraphDocument:
         that node can affect, so nudging a threshold on one branch no longer cancels another
         branch's running segmentation. Omitting it keeps the conservative "cancel everything"
         behaviour, which is still correct — just wasteful."""
+        if node_id is not None:
+            self._settle_output_name(node_id)
         self._notify(None if node_id is None else (node_id,))
+
+    # ── Page Output names (V4.00 step 11e) ────────────────────────────────────
+    def _claim_output_name_here(self, node_id: str, name: str) -> str:
+        """:attr:`claim_output_name` outside a workspace: unique among THIS page's Outputs."""
+        base = sanitize_output_name(name) or DEFAULT_OUTPUT_BASE
+        taken = {str(r.params.get(PAGE_NAME_KEY, "") or "").strip().lower()
+                 for r in self.nodes.values()
+                 if r.op_key == PAGE_OUTPUT_OP and r.id != node_id} - {""}
+        return next_free_name(base, taken)
+
+    def _settle_output_name(self, node_id: str) -> None:
+        """Keep Page Output ``node_id``'s variable name unique — a name another Output
+        already carries becomes ``name2`` (:attr:`claim_output_name`), and one a Source
+        value cannot carry is cleaned (``a:b`` → ``a_b``). A blank name stays blank: the
+        readiness check asks for one. Called by :meth:`add_node` and :meth:`touch`, the two
+        ways a name arrives, so every editor (inspector, card, a script) gets it."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key != PAGE_OUTPUT_OP:
+            return
+        asked = str(rec.params.get(PAGE_NAME_KEY, "") or "")
+        if not asked.strip():
+            return
+        try:
+            given = self.claim_output_name(node_id, asked)
+        except Exception:                             # noqa: BLE001 — a workspace mid-change
+            return
+        if given and given != asked:
+            rec.params[PAGE_NAME_KEY] = given
+            self.renamed_output = (node_id, asked.strip(), given)
+
+    # ── switching a node off (V4.00 step 11e) ─────────────────────────────────
+    def pass_through_reason(self, node_id: str) -> str:
+        """Why ``node_id`` may NOT be switched off (:func:`pass_through_reason`), ``""``
+        when it may. An unknown id answers why not, so a caller never mutes nothing."""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return "no such node"
+        return pass_through_reason(NODES.get(rec.op_key), rec.params, rec.modes)
+
+    def can_pass_through(self, node_id: str) -> bool:
+        return not self.pass_through_reason(node_id)
+
+    def title_of(self, node_id: str) -> str:
+        """What a node is called where the user reads it: its own title when it has one,
+        else its node type's label (the op key for an unknown type)."""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return node_id
+        own = str(rec.params.get(TITLE_KEY, "") or "").strip()
+        if own:
+            return own
+        spec = NODES.get(rec.op_key)
+        return spec.label if spec is not None else rec.op_key
 
     def clear(self) -> None:
         """Empty the document (File → New)."""
@@ -555,8 +695,16 @@ class GraphDocument:
     def set_muted(self, node_id: str, muted: bool) -> None:
         """Mute/unmute a node (G3 pass-through). A REAL graph change — the run graph bypasses
         a muted node — so it is scoped to that node: runs whose cone contains it are
-        cancelled, everything else keeps going."""
+        cancelled, everything else keeps going.
+
+        Switching OFF is refused (``ValueError`` naming why) for a node that changes the kind
+        of data (:func:`pass_through_reason`, V4.00 step 11e); switching back ON never is — a
+        file saved before the rule may hold such a node muted, and it must be recoverable."""
         rec = self.nodes.get(node_id)
+        if rec is not None and muted and not rec.muted:
+            why = self.pass_through_reason(node_id)
+            if why:
+                raise ValueError(f"{self.title_of(node_id)} cannot be switched off: {why}")
         if rec is not None and rec.muted != muted:
             rec.muted = muted
             self._notify((node_id,))
@@ -1331,11 +1479,14 @@ class GraphDocument:
             g = _iterate_unroll(g, envs=self.envs, sweep_all=sweep_all)
         return prepare_run_graph(g)
 
-    def _bypass_muted(self, edges: List[EdgeTuple]) -> List[EdgeTuple]:
+    def _bypass_muted(self, edges: List[EdgeTuple],
+                      muted: Optional[frozenset] = None) -> List[EdgeTuple]:
         """Mute-with-passthrough (G3): rewire around each muted node via its first
-        connected Dataset input; a muted SOURCE simply drops its out-edges."""
+        connected Dataset input; a muted SOURCE simply drops its out-edges. ``muted`` names
+        the switched-off nodes instead of their records' flags — how a linked page asks what
+        an edit WOULD do to its master before making it (V4.00 step 11e)."""
         for rec in self.nodes.values():
-            if not rec.muted:
+            if not (rec.muted if muted is None else rec.id in muted):
                 continue
             ds_ins = [s.name for s in self.input_specs(rec.id)
                       if s.type is SocketType.DATASET]
@@ -2196,4 +2347,5 @@ class GraphDocument:
         self.load_dict(d)
 
 
-__all__ = ["GraphDocument", "NodeRecord", "FrameRecord", "LOCKED_KEY"]
+__all__ = ["GraphDocument", "NodeRecord", "FrameRecord", "LOCKED_KEY",
+           "pass_through_reason", "NO_PASS_THROUGH_PREFIXES"]

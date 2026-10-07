@@ -48,8 +48,8 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional,
-                    Protocol, Tuple)
+from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple,
+                    Optional, Protocol, Tuple)
 
 from nodegraph import roles as R
 from nodegraph.graph import Graph, NodeInstance
@@ -58,12 +58,12 @@ from nodegraph.memo import digest
 from nodegraph.metadata import MetaEnvelope
 from nodegraph.serialize import (
     is_workspace_dict, page_from_dict, to_workspace_dict, workspace_pages)
-from nodelab_v2.document import GraphDocument, NodeRecord
-from nodelab_v2.linked_document import LinkedDocument, check_overrides
+from nodelab_v2.document import GraphDocument, NodeRecord, is_driver_edge
+from nodelab_v2.linked_document import LinkedDocument, check_overrides, check_structure
 from nodelab_v2.ops import (
-    PAGE_CONDITION_AUTO_KEY, PAGE_CONDITION_KEY, PAGE_INPUT_OP, PAGE_NAME_KEY,
-    PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
-    is_frozen, upstream_signature)
+    DEFAULT_OUTPUT_BASE, LOAD_OP, PAGE_CONDITION_AUTO_KEY, PAGE_CONDITION_KEY,
+    PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP, PAGE_SOURCE_KEY,
+    is_frozen, next_free_name, sanitize_output_name, upstream_signature)
 from nodelab_v2.version import __version__
 
 #: Separates the page id from the node id in a RUN id: ``pg1/n3``. Not ``#``, ``@`` or ``%``,
@@ -76,12 +76,6 @@ FREE = R.FREE_PAGE
 #: Default name of a one-page workspace (:meth:`Workspace.single`; a pre-V4 file with no
 #: path opens under it).
 DEFAULT_PAGE_NAME = "Graph"
-#: The name a hand-placed Page Output starts with (``out``, ``out2``, …).
-DEFAULT_OUTPUT_BASE = "out"
-#: Characters a Page Output name may not carry: ``:`` splits a Source value
-#: (:meth:`Workspace.parse_source`), ``/`` is :data:`RUN_SEP`.
-_OUTPUT_NAME_BAD = re.compile(r"[:/\\]+")
-_WHITESPACE = re.compile(r"\s+")
 
 
 def standard_kinds() -> Tuple[str, ...]:
@@ -89,14 +83,6 @@ def standard_kinds() -> Tuple[str, ...]:
     ``analyze`` — read from the roles file, never a literal, so the catalog's page taxonomy
     stays the single source (V4.00 step 11)."""
     return tuple(k for k, _meta in R.pages())
-
-
-def sanitize_output_name(name: Any, limit: int = 48) -> str:
-    """A Page Output name a Source value can carry: ``:`` ``/`` ``\\`` → ``_``, whitespace
-    collapsed, at most ``limit`` characters; ``""`` when nothing is left."""
-    s = _OUTPUT_NAME_BAD.sub("_", str(name or ""))
-    s = _WHITESPACE.sub(" ", s).strip()
-    return s[:limit].strip()
 
 
 def qualify(page_id: str, node_id: str) -> str:
@@ -162,6 +148,34 @@ class Page:
     #: Offered first (★) as a master to link a new page to (V4.00 step 11); any plain page
     #: may still be chosen. Never set on a linked page. In the file only when True.
     is_master: bool = False
+
+
+class OutlineRow(NamedTuple):
+    """One node of a page as the Pages panel lists it (V4.00 step 11e) — Qt-free, so the
+    selftest checks the hierarchy the panel draws.
+
+    ``depth`` is the row's nesting: a chain continues at its depth, and where a node feeds
+    SEVERAL others each branch nests one level under it. ``role`` is ``"input"`` (a Page
+    Input), ``"output"`` (a Page Output — ``name`` is its variable), ``"source"`` (where data
+    starts on the page: a Load card) or ``"node"``. ``kind`` is the page kind that colours
+    the row: the kind of the page an Input READS, an Output's own page's kind. ``why_not`` is
+    why the node cannot be switched off (``""`` = it can, the panel shows a switch)."""
+
+    node_id: str
+    depth: int
+    role: str
+    title: str
+    detail: str
+    kind: str
+    name: str
+    muted: bool
+    why_not: str
+    own: bool
+    overridden: bool
+
+
+#: a reroute is a dot on a wire, not a step: the outline lists what it carries, not it
+REROUTE_OP = "rr.reroute"
 
 
 @dataclass(frozen=True)
@@ -419,8 +433,10 @@ class Workspace:
         if dependent:
             root_id = src.master or page_id
             root = self.pages[root_id]
-            doc = LinkedDocument(root.doc, overrides=(src.doc.overrides_dict()
-                                                      if src.master else None))
+            linked_src = src.master and isinstance(src.doc, LinkedDocument)
+            doc = LinkedDocument(root.doc,
+                                 overrides=(src.doc.overrides_dict() if linked_src else None),
+                                 structure=(src.doc.structure_dict() if linked_src else None))
             doc.path = self.path
             page = self.add_page(name or f"{src.name} (linked)", src.kind, doc=doc,
                                  index=order.index(page_id) + 1)
@@ -432,6 +448,7 @@ class Workspace:
         page = self.add_page(name or f"{src.name} copy", src.kind,
                              index=order.index(page_id) + 1)
         self.load_page_body(page.id, src.doc.to_page_dict(), meta_seeds=src.doc.meta_seeds)
+        self.dedupe_outputs(page.id)         # a copy's variables are names of their own
         return page
 
     def dependents_of(self, page_id: str) -> List[str]:
@@ -450,6 +467,9 @@ class Workspace:
         page.master, page.overrides = None, {}
         self._attach(page)
         page.doc.repropagate()              # with the Page Input seeds now installed
+        # out of its master's family: a variable the master also has is renamed, and every
+        # page reading it follows (V4.00 step 11e)
+        self._follow_renames(page_id, self.dedupe_outputs(page_id))
         # the same graph and values under a new document: what reads it is unchanged, but
         # its run identity moves (a new document uid) — say which nodes, not "everything"
         self._notify({qualify(page_id, n) for n in page.doc.nodes})
@@ -596,6 +616,9 @@ class Workspace:
         doc.page_feeders = lambda pid=pid: self.feeder_pages(pid)
         doc.page_channels = lambda nid, pid=pid: self.input_channels(pid, nid)
         doc.node_defaults = lambda op, pid=pid: self.node_defaults(pid, op)
+        doc.claim_output_name = (lambda nid, name, pid=pid:
+                                 self.claim_output_name(pid, nid, name))
+        doc.source_kind = self.source_kind
         doc.cross_page_signature = lambda nid, pid=pid: self.cross_page_signature(pid, nid)
         doc.workspace_revision = lambda pid=pid: self.revision_of(pid)
         if isinstance(doc, LinkedDocument):
@@ -627,6 +650,8 @@ class Workspace:
         doc.page_feeders = lambda: []
         doc.page_channels = lambda _nid: []
         doc.node_defaults = lambda _op: {}
+        doc.claim_output_name = doc._claim_output_name_here
+        doc.source_kind = lambda _v: ""
         doc.cross_page_signature = lambda _nid: ""
         doc.workspace_revision = lambda: ""
         doc.store_tag = ""
@@ -878,19 +903,219 @@ class Workspace:
             return None
         return page.doc.add_node(PAGE_INPUT_OP, x=40.0, y=120.0).id
 
+
+    # ── Output names are unique across the workspace (V4.00 step 11e) ────────────
+    def _link_family(self, page_id: str) -> FrozenSet[str]:
+        """``page_id``'s master and every page linked to it (just ``page_id`` for a page
+        nothing is linked to)."""
+        page = self.pages.get(page_id)
+        root = (page.master or page_id) if page is not None else page_id
+        return frozenset({root} | {p.id for p in self.pages.values() if p.master == root})
+
+    def _names_elsewhere(self, page_id: str) -> set:
+        """The Output names (lower-cased) of every OTHER page — except the pages linked to the
+        same master as ``page_id``, which share the master's variables by design (one
+        workflow per condition; their Source values still differ by page)."""
+        fam = self._link_family(page_id)
+        taken = set()
+        for p in self.pages.values():
+            if p.id == page_id or p.id in fam:
+                continue
+            for rec in p.doc.nodes.values():
+                if rec.op_key == PAGE_OUTPUT_OP:
+                    n = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+                    if n:
+                        taken.add(n.lower())
+        return taken
+
+    def _taken_output_names(self, page_id: str, node_id: Optional[str] = None) -> set:
+        """Every Output name (lower-cased) a Page Output on ``page_id`` may NOT take: the
+        other Outputs' on this page and :meth:`_names_elsewhere`."""
+        taken = self._names_elsewhere(page_id)
+        page = self.pages.get(page_id)
+        for rec in (page.doc.nodes.values() if page is not None else ()):
+            if rec.op_key == PAGE_OUTPUT_OP and rec.id != node_id:
+                n = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+                if n:
+                    taken.add(n.lower())
+        return taken
+
     def unique_output_name(self, page_id: str, base: str = DEFAULT_OUTPUT_BASE) -> str:
-        """``base``, else ``base2``, ``base3``, … — a name no other Output on ``page_id``
-        carries (case-insensitive, like page names). ``base`` is sanitised first
+        """``base``, else ``base2``, ``base3``, … — a name no other Output carries, on this
+        page or any other (case-insensitive, like page names; linked copies of one master
+        share its names — :meth:`_taken_output_names`). ``base`` is sanitised first
         (:func:`sanitize_output_name`); an empty result falls back to
         :data:`DEFAULT_OUTPUT_BASE`."""
         base = sanitize_output_name(base) or DEFAULT_OUTPUT_BASE
-        taken = {n.lower() for n, _nid in self.outputs_of(page_id)}
-        if base.lower() not in taken:
-            return base
-        n = 2
-        while f"{base}{n}".lower() in taken:
-            n += 1
-        return f"{base}{n}"
+        return next_free_name(base, self._taken_output_names(page_id))
+
+    def claim_output_name(self, page_id: str, node_id: str, name: str) -> str:
+        """The name Page Output ``node_id`` on ``page_id`` gets when it asks for ``name``:
+        ``name`` itself unless another Output has it (then ``name2``…). Installed on every
+        page document as ``doc.claim_output_name``; the document calls it whenever a name
+        arrives (:meth:`GraphDocument._settle_output_name`)."""
+        base = sanitize_output_name(name) or DEFAULT_OUTPUT_BASE
+        return next_free_name(base, self._taken_output_names(page_id, node_id))
+
+    def dedupe_outputs(self, page_id: str) -> Dict[str, str]:
+        """Rename every Output on ``page_id`` whose name is taken — by another page (a copy, a
+        page made unique, a page recipe placed twice) or by an EARLIER Output of the same page
+        (the first keeps its name) — ``{old: new}``. Each rename goes through ``touch``, so on
+        a linked page it is an override like any edit."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return {}
+        elsewhere = self._names_elsewhere(page_id)
+        seen: set = set()
+        renamed: Dict[str, str] = {}
+        for rec in list(page.doc.nodes.values()):
+            if rec.op_key != PAGE_OUTPUT_OP:
+                continue
+            old = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+            if not old:
+                continue
+            new = next_free_name(sanitize_output_name(old) or DEFAULT_OUTPUT_BASE,
+                                 elsewhere | seen)
+            seen.add(new.lower())
+            if new != old:
+                rec.params[PAGE_NAME_KEY] = new
+                page.doc.touch(rec.id)
+                renamed[old] = new
+        return renamed
+
+    def _follow_renames(self, page_id: str, renamed: Mapping[str, str]) -> None:
+        """Point every Page Input reading ``page_id:<old>`` at ``page_id:<new>`` — plain pages
+        first, so a linked reader whose master was re-pointed follows it rather than
+        recording an override."""
+        if not renamed:
+            return
+        pages = sorted(self.pages.values(), key=lambda p: bool(p.master))
+        for p in pages:
+            for rec in list(p.doc.nodes.values()):
+                if rec.op_key != PAGE_INPUT_OP:
+                    continue
+                src, name = self.parse_source(rec.params.get(PAGE_SOURCE_KEY))
+                if src == page_id and name in renamed:
+                    rec.params[PAGE_SOURCE_KEY] = f"{page_id}:{renamed[name]}"
+                    p.doc.touch(rec.id)
+
+    def source_kind(self, value: Any) -> str:
+        """The kind of the page a Page Input source value names (``""`` when none) — the
+        colour of its entry in the Source menus (V4.00 step 11e)."""
+        pid, _name = self.parse_source(value)
+        page = self.pages.get(pid)
+        return page.kind if page is not None else ""
+
+    def readers_of(self, page_id: str, name: str) -> List[Tuple[str, str]]:
+        """``[(page id, page name), ...]`` — the pages with a Page Input reading
+        ``page_id``'s Output ``name``, in page order."""
+        out = []
+        for p in self.pages.values():
+            if p.id == page_id or not self._may_feed(page_id, p.id):
+                continue
+            if any(rec.op_key == PAGE_INPUT_OP
+                   and self.parse_source(rec.params.get(PAGE_SOURCE_KEY)) == (page_id, name)
+                   for rec in p.doc.nodes.values()):
+                out.append((p.id, p.name))
+        return out
+
+    # ── the page outline (V4.00 step 11e) ────────────────────────────────────────
+    def page_outline(self, page_id: str) -> List[OutlineRow]:
+        """``page_id``'s nodes as a HIERARCHY of its data flow, for the Pages panel: where data
+        enters the page first (its Page Inputs, then its Load cards, then any other node with
+        nothing wired in, top to bottom), and from each the chain it feeds. A chain continues at
+        its depth; where a node feeds several, each branch nests one level under it; a node fed
+        by several is listed once, after the last of them. Reroutes are left out (a wire
+        through one is a wire), driver wires order nothing."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return []
+        doc = page.doc
+        nodes = {nid: rec for nid, rec in doc.nodes.items() if rec.op_key != REROUTE_OP}
+
+        def real_src(nid: str) -> Optional[str]:
+            seen = set()
+            while nid in doc.nodes and doc.nodes[nid].op_key == REROUTE_OP and nid not in seen:
+                seen.add(nid)
+                e = next((e for e in doc.edges if e[2] == nid), None)
+                if e is None:
+                    return None
+                nid = e[0]
+            return nid if nid in nodes else None
+
+        feeds: Dict[str, List[str]] = {nid: [] for nid in nodes}
+        outs: Dict[str, List[str]] = {nid: [] for nid in nodes}
+        for e in doc.edges:
+            if e[2] not in nodes or is_driver_edge(doc, e):
+                continue
+            s = real_src(e[0])
+            if s is None or s == e[2] or s in feeds[e[2]]:
+                continue
+            feeds[e[2]].append(s)
+            outs[s].append(e[2])
+
+        def pos(nid: str) -> Tuple[float, float]:
+            return (nodes[nid].y, nodes[nid].x)
+
+        def entry_rank(nid: str) -> int:
+            op = nodes[nid].op_key
+            return 0 if op == PAGE_INPUT_OP else (1 if op == LOAD_OP else 2)
+
+        order: List[Tuple[str, int]] = []
+        placed: set = set()
+
+        def walk(nid: str, depth: int) -> None:
+            while True:
+                placed.add(nid)
+                order.append((nid, depth))
+                kids = [c for c in sorted(outs[nid], key=pos)
+                        if c not in placed and all(f in placed for f in feeds[c])]
+                if len(kids) != 1:
+                    for c in kids:
+                        if c not in placed:
+                            walk(c, depth + 1)
+                    return
+                nid = kids[0]
+
+        for root in sorted((n for n in nodes if not feeds[n]),
+                           key=lambda n: (entry_rank(n), pos(n))):
+            if root not in placed:
+                walk(root, 0)
+        for nid in sorted(nodes, key=pos):          # fed only around a loop: listed last
+            if nid not in placed:
+                walk(nid, 0)
+
+        linked = isinstance(doc, LinkedDocument)
+        own = set(doc.own_node_ids()) if linked else set()
+        labels = dict(self.available_sources(page_id))
+        rows: List[OutlineRow] = []
+        for nid, depth in order:
+            rec = nodes[nid]
+            op = rec.op_key
+            title, detail, kind, name = doc.title_of(nid), "", page.kind, ""
+            if op == PAGE_INPUT_OP:
+                role = "input"
+                src = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+                label = labels.get(src)
+                detail = label or (f"{src} (unbound)" if src else "(unbound)")
+                kind = self.source_kind(src) if label else ""
+            elif op == PAGE_OUTPUT_OP:
+                role = "output"
+                name = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+                readers = [n for _p, n in self.readers_of(page_id, name)] if name else []
+                detail = ("read by " + ", ".join(readers)) if readers else (
+                    "read by no page yet" if name else "unnamed — no page can read it")
+            elif op == LOAD_OP:
+                role = "source"
+                path = str(rec.params.get("path", "") or "")
+                detail = os.path.basename(path) if path else "demo image"
+            else:
+                role = "node"
+            rows.append(OutlineRow(
+                nid, depth, role, title, detail, kind, name, bool(rec.muted),
+                doc.pass_through_reason(nid), nid in own,
+                bool(linked and doc.is_overridden(nid, "muted"))))
+        return rows
 
     def _outputs_in_order(self, page_id: str) -> List[Tuple[str, str]]:
         """:meth:`outputs_of` in NODE order — the order the Outputs were added — so "the
@@ -1167,6 +1392,9 @@ class Workspace:
                 rec["overrides"] = (p.doc.overrides_dict()
                                     if isinstance(p.doc, LinkedDocument) else
                                     {k: dict(v) for k, v in p.overrides.items()})
+                st = (p.doc.structure_dict() if isinstance(p.doc, LinkedDocument) else None)
+                if st is not None:
+                    rec["structure"] = st   # a MODIFIED linked page's own nodes and wires
             else:
                 rec.update(p.doc.to_page_dict())
             recs.append(rec)
@@ -1206,6 +1434,8 @@ class Workspace:
                         f"plain page of this file")
                 check_overrides(rec.get("overrides") or {},
                                 where=f"page {rec['id']!r} overrides")
+                check_structure(rec.get("structure"),
+                                where=f"page {rec['id']!r} structure")
                 continue                       # its graph is its master's
             parsed[rec["id"]] = page_from_dict(rec)
             bad = sorted(n for n in parsed[rec["id"]][0].nodes if RUN_SEP in n)
@@ -1245,7 +1475,8 @@ class Workspace:
             # then the LINKED pages, over their loaded masters, in file order
             for rec in [r for r in recs if r.get("master")]:
                 doc = LinkedDocument(self.pages[rec["master"]].doc,
-                                     overrides=dict(rec.get("overrides") or {}))
+                                     overrides=dict(rec.get("overrides") or {}),
+                                     structure=rec.get("structure"))
                 doc.path = self.path
                 page = Page(rec["id"], rec.get("name") or rec["id"],
                             rec.get("kind") or FREE, doc, master=rec["master"])
@@ -1311,7 +1542,8 @@ Page.editable_topology_doc = _editable      # a plain page's document can be reu
 
 __all__ = ["RUN_SEP", "FREE", "DEFAULT_PAGE_NAME", "qualify", "split_run_id", "doc_id_of",
            "local_ids", "kind_label", "Page", "ComposedGraph", "GraphSource", "Workspace",
-           "DEFAULT_OUTPUT_BASE", "standard_kinds", "sanitize_output_name", "build_example"]
+           "DEFAULT_OUTPUT_BASE", "standard_kinds", "sanitize_output_name", "build_example",
+           "OutlineRow", "REROUTE_OP"]
 
 
 # ── the example workspace (V4.00 step 11) ────────────────────────────────────

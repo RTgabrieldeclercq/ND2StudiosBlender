@@ -181,6 +181,33 @@ PAGE_CONDITION_KEY = CONDITION_KEY
 #: Set by ``Workspace.compose`` on an Output whose condition it FILLED from the page's name
 #: (the run graph only): such a stamp gives way to a condition TYPED further upstream.
 PAGE_CONDITION_AUTO_KEY = "__condition_auto__"
+#: The name a hand-placed Page Output starts with (``out``, ``out2``, …).
+DEFAULT_OUTPUT_BASE = "out"
+#: Characters a Page Output name may not carry: ``:`` splits a Source value
+#: (:meth:`Workspace.parse_source`), ``/`` is the run-id separator.
+_OUTPUT_NAME_BAD = re.compile(r"[:/\\]+")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def sanitize_output_name(name: Any, limit: int = 48) -> str:
+    """A Page Output name a Source value can carry: ``:`` ``/`` ``\\`` → ``_``, whitespace
+    collapsed, at most ``limit`` characters; ``""`` when nothing is left."""
+    s = _OUTPUT_NAME_BAD.sub("_", str(name or ""))
+    s = _WHITESPACE.sub(" ", s).strip()
+    return s[:limit].strip()
+
+
+def next_free_name(base: str, taken) -> str:
+    """``base``, else ``base2``, ``base3``, … — the first not in ``taken`` (lower-cased
+    names: Page Output names are unique case-insensitively, like page names)."""
+    if base.lower() not in taken:
+        return base
+    n = 2
+    while f"{base}{n}".lower() in taken:
+        n += 1
+    return f"{base}{n}"
+
+
 #: What an unresolved ``page.input`` says when it is pulled.
 PAGE_UNBOUND_MESSAGE = "Page Input is not bound to an upstream Output"
 
@@ -1414,6 +1441,7 @@ def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
 __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "PAGE_INPUT_OP", "PAGE_OUTPUT_OP", "PAGE_OPS", "PAGE_SOURCE_KEY", "PAGE_NAME_KEY",
            "PAGE_CONDITION_KEY", "PAGE_CONDITION_AUTO_KEY", "PAGE_UNBOUND_MESSAGE",
+           "DEFAULT_OUTPUT_BASE", "sanitize_output_name", "next_free_name",
            "materialize_group_taps", "GRP_SOCKET_RE", "GROUPS_KEY",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",

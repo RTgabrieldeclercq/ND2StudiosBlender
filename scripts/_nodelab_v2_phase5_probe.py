@@ -829,12 +829,20 @@ def main(argv) -> int:
         "from the last folder); cancel is a no-op; non-path strings unchanged")
 
     # ── G3: mute pass-through in the run graph ──────────────────────────────────
-    doc.set_muted("n4", True)
+    doc.set_muted("n3", True)
     g = doc.to_graph(for_run=True)
-    assert "n4" not in {e.dst for e in g.edges} and "n4" not in {e.src for e in g.edges}
-    assert any(e.src == "n3" and e.dst == "n5" for e in g.edges)   # bypassed around
-    doc.set_muted("n4", False)
-    _ok("G3: muted node is bypassed (n3 → n5) in the run graph")
+    assert "n3" not in {e.dst for e in g.edges} and "n3" not in {e.src for e in g.edges}
+    assert any(e.src == "n2" and e.dst == "n4" for e in g.edges)   # bypassed around
+    doc.set_muted("n3", False)
+    # only a node that keeps the kind of data may be switched off (V4.00 step 11e): a
+    # Threshold adds a mask, so muting it would starve everything that reads the mask
+    try:
+        doc.set_muted("n4", True)
+        raise AssertionError("muting a Threshold must be refused")
+    except ValueError as _g3:
+        assert "cannot be switched off" in str(_g3) and not doc.nodes["n4"].muted
+    _ok("G3: a muted node is bypassed (n2 → n4) in the run graph; a node that changes the "
+        "kind of data (Threshold adds a mask) cannot be muted")
 
     # ── G6: save / load round-trip incl. canvas positions ──────────────────────
     tmp = os.path.join(tempfile.mkdtemp(prefix="nd2graph_"), "t.nd2graph.json")
@@ -6313,19 +6321,24 @@ def main(argv) -> int:
     assert {"Go to master page", "Make unique"} <= set(_t6), _t6
     assert any(t.startswith(win.workspace.page(_lp).name) and "(linked · " in t
                for t in _t6), _t6
-    # every structural gesture is refused with the hint, and nothing changes
+    # every structural gesture ASKS how to apply it (V4.00 step 11e) — answered Cancel here
+    # (the dialog's own section is LE1), so nothing changes and the hint says why
+    _asked6: list = []
+    win.ask_linked_edit = lambda pid, shape=False, push_note="": (_asked6.append(pid) or "")
     _n6 = set(_lk.nodes)
     win.statusBar().clearMessage()
     win._on_op_dropped("enhance.gamma", QPointF(300.0, 300.0))
     assert win.statusBar().currentMessage() == _LkHint and set(_lk.nodes) == _n6
+    assert _asked6 == [_lp], _asked6
     win.statusBar().clearMessage()
     assert win.scene.delete_nodes(["n3"]) is None and "n3" in _lk.nodes
     assert win.statusBar().currentMessage() == _LkHint
     _cm = _PMenu()
     win.scene._fill_node_menu(_cm, win.scene.node_items["n3"])
     win.scene._lock_structural(_cm)
+    from nodelab_v2.linked_document import ASK_HINT as _LkAsk
     _del = next(a for a in _cm.actions() if a.text().startswith("Delete"))
-    assert not _del.isEnabled() and _del.toolTip() == _LkHint, "greyed out, saying why"
+    assert _del.isEnabled() and _del.toolTip() == _LkAsk, "it asks — and says it will"
     win.statusBar().clearMessage()
     _LkTimer.singleShot(0, lambda: _lk.add_node("enhance.gamma"))    # no guard: the backstop
     _t0 = time.time()
@@ -6364,10 +6377,10 @@ def main(argv) -> int:
     win.pull_node("n3")
     _pwait(_pq(_lp, "n3"))
     _ok("LK1 Duplicate as linked page shows the master's cards on a page of its own; adding, "
-        "deleting or rewiring nodes is refused with the hint (the context menu greys them "
-        "out, and a refusal from anywhere reaches the status bar); a value changed there is "
-        "an override, marked in Properties and reset to the master's; master edits and card "
-        "moves reach it; it pulls")
+        "deleting or rewiring nodes asks how to apply it — cancelled, nothing changes and the "
+        "hint says why (the context menu's entries say they will ask; a refusal from "
+        "anywhere reaches the status bar); a value changed there is an override, marked in "
+        "Properties and reset to the master's; master edits and card moves reach it; it pulls")
 
     # LK2 the file keeps the link; Make unique; deleting a master frees its linked pages
     _lk.nodes["n3"].params["sigma"] = 2.5
@@ -6436,9 +6449,126 @@ def main(argv) -> int:
     app.processEvents()
     assert [i.node_id for i in win.scene.selectedItems() if isinstance(i, _NodeItem)] == ["n5"]
     assert win.inspector._node is not None and win.inspector._node.node_id == "n5"
-    _ok("LK3 Edit > Dissolve and Edit > Delete on a linked page are refused with the hint and "
-        "never reach the master (Dissolve acts on the page shown); Make unique keeps the "
+    _ok("LK3 Edit > Dissolve and Edit > Delete on a linked page, cancelled, change nothing and say why ("
+        "the hint) and never reach the master (Dissolve acts on the page shown); Make unique keeps the "
         "selection and Properties")
+
+    # LE1 (V4.00 step 11e) the three answers to a structural edit on a LINKED page — the
+    # question is asked once per page; Keep the change on this page makes a MODIFIED linked
+    # page (its own node, the master's other edits still arriving); Add it to the master
+    # sends a node there switched off (on here, off on the master and its other pages) and
+    # refuses a change the master would compute differently; Make unique swaps the page's
+    # document and the gesture runs on its new scene; frames ask with only Make unique
+    from nodelab_v2.linked_edit_dialog import LinkedEditDialog as _LED14
+    from PySide6.QtWidgets import QMenu as _QM14
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _m14 = win.workspace.active
+    _md14 = win.doc
+    _ans14 = ["modified"]
+    _asked14: list = []
+    win.ask_linked_edit = lambda pid, shape=False, push_note="": (
+        _asked14.append((pid, shape, push_note)) or _ans14[0])
+    # (a) keep the change on this page
+    _l14 = win.duplicate_page(_m14, linked=True)
+    app.processEvents()
+    _d14 = win.doc
+    _b14 = set(_md14.nodes)
+    win._on_op_dropped("enhance.gamma", QPointF(2600.0, 900.0))       # clear of every wire
+    app.processEvents()
+    _own14 = set(_d14.nodes) - _b14
+    assert len(_own14) == 1 and set(_md14.nodes) == _b14 and _d14.edit_mode == "modified"
+    assert _asked14 == [(_l14, False, "")], _asked14
+    _o14 = next(iter(_own14))
+    win.scene.delete_nodes(["n7"])                                    # asks no more
+    app.processEvents()
+    assert len(_asked14) == 1 and "n7" not in _d14.nodes and "n7" in _md14.nodes
+    assert "modified" in win.page_title(_l14)[0], win.page_title(_l14)
+    _md14.nodes["n3"].params["sigma"] = 1.7                           # the master still arrives
+    _md14.touch("n3")
+    app.processEvents()
+    assert _d14.nodes["n3"].params["sigma"] == 1.7 and _o14 in _d14.nodes
+    _st14 = win.workspace.to_dict()
+    _rec14 = next(r for r in _st14["workspace"]["pages"] if r["id"] == _l14)
+    assert _rec14["structure"]["removed"] == ["n7"] and _o14 in _rec14["structure"]["nodes"]
+    _pr14 = win.pages_panel.node_items(_l14)
+    assert _pr14[_o14].text(0).startswith("+ "), _pr14[_o14].text(0)
+    # (b) add it to the master, switched off
+    _l14b = win.duplicate_page(_m14, linked=True)
+    app.processEvents()
+    _ans14[0] = "master"
+    _b14 = set(_md14.nodes)
+    win._on_op_dropped("enhance.unsharp", QPointF(2600.0, 1150.0))
+    app.processEvents()
+    _push14 = set(_md14.nodes) - _b14
+    assert len(_push14) == 1, _push14
+    _p14 = next(iter(_push14))
+    assert _md14.nodes[_p14].muted and not win.doc.nodes[_p14].muted, "off there, on here"
+    assert _d14.nodes[_p14].muted, "…and off on the master's other linked pages"
+    assert win.doc.edit_mode == "master" and "edits → master" in win.page_title(_l14b)[0]
+    assert win.scene.splice_onto(_p14, ("n3", "out", "n4", "data")), "dropped onto a wire"
+    assert ("n3", "out", _p14, "data") in _md14.edges and (_p14, "out", "n4", "data") in         _md14.edges, "the splice reached the master"
+    assert any(e.src == "n3" and e.dst == "n4" for e in _md14.to_graph(for_run=True).edges),         "…which still computes n3 → n4"
+    win.statusBar().clearMessage()
+    win.scene.delete_nodes(["n3"])                                    # on in the master
+    app.processEvents()
+    assert "n3" in _md14.nodes and "would change what the master computes" in \
+        win.statusBar().currentMessage(), win.statusBar().currentMessage()
+    win.statusBar().clearMessage()
+    _b14 = set(_md14.nodes)
+    win._on_op_dropped("analysis.label", QPointF(2600.0, 1400.0))     # cannot be switched off
+    app.processEvents()
+    assert set(_md14.nodes) == _b14 and "cannot go to the master switched off" in \
+        win.statusBar().currentMessage(), win.statusBar().currentMessage()
+    # (c) make unique — the gesture runs on the page's new scene
+    _l14c = win.duplicate_page(_m14, linked=True)
+    app.processEvents()
+    _ans14[0] = "unique"
+    _sc14 = win.scene
+    _sc14.delete_nodes(["n5"])
+    app.processEvents()
+    _pg14 = win.workspace.page(_l14c)
+    assert _pg14.master is None and "n5" not in _pg14.doc.nodes and "n5" in _md14.nodes
+    assert win.scene is not _sc14 and win.scene.doc is _pg14.doc
+    # (d) a frame: only Make unique is possible, so Keep-on-this-page changes nothing
+    _l14d = win.duplicate_page(_m14, linked=True)
+    app.processEvents()
+    _ans14[0] = "modified"
+    win.scene.clearSelection()
+    win.scene.node_items["n3"].setSelected(True)
+    win.frame_selection()
+    app.processEvents()
+    assert _asked14[-1] == (_l14d, True, ""), _asked14[-1]
+    assert not win.doc.frames and win.doc.edit_mode == ""
+    # (e) the dialog: a frame greys both linked answers, a load greys the master one
+    _dl14 = _LED14(win, "P (linked)", "P", shape=True)
+    assert _dl14.buttons["unique"].isEnabled() and not _dl14.buttons["modified"].isEnabled() \
+        and not _dl14.buttons["master"].isEnabled()
+    _dl14 = _LED14(win, "P (linked)", "P", push_note="a Load card is where data starts")
+    assert _dl14.buttons["modified"].isEnabled() and not _dl14.buttons["master"].isEnabled()
+    assert "a Load card is where data starts" in _dl14.buttons["master"].text_label.text()
+    _dl14.buttons["modified"].click()
+    assert _dl14.choice == "modified" and _dl14.result() == _LED14.Accepted
+    # (f) the canvas menu's Muted follows the switch-off rule, and works on a linked page
+    _cm14 = _QM14()
+    win.scene._fill_node_menu(_cm14, win.scene.node_items["n4"])      # Threshold
+    _mu14 = next(a for a in _cm14.actions() if a.text().startswith("Muted"))
+    assert not _mu14.isEnabled() and _mu14.toolTip().startswith("Cannot be switched off"), \
+        _mu14.toolTip()
+    win.scene.clearSelection()
+    win.scene.node_items["n3"].setSelected(True)
+    win.scene._mute_selection()                                       # M, on a linked page
+    app.processEvents()
+    assert win.doc.nodes["n3"].muted and not _md14.nodes["n3"].muted
+    assert win.doc.is_overridden("n3", "muted") and len(_asked14) == 4, _asked14
+    del win.ask_linked_edit
+    _ok("LE1 a structural edit on a linked page asks once: Keep the change on this page makes "
+        "a modified linked page (its own node and removal saved, the master's edits still "
+        "arriving, `+` in the Pages panel); Add it to the master sends a node there switched "
+        "off and refuses a delete or a node that would change what the master computes; Make "
+        "unique runs the gesture on the page's new scene; a frame offers only Make unique; "
+        "the canvas menu's Muted is greyed for a Threshold and M works per page")
 
     # PL1 (V4.00 step 7) Plot XY on the example graph's measured table: its envelope is ONE
     # RGB picture with no table on it; pulled, the viewer shows it in TRUE colour — R, G and
@@ -7788,7 +7918,8 @@ def main(argv) -> int:
     app.processEvents()
     _rows12 = {win.workspace.page(r.data(0, _Qt12.UserRole)).kind: r for r in _pp12.page_items()}
     _det12 = [_rows12["refine"].child(j).text(0) for j in range(_rows12["refine"].childCount())]
-    assert _det12 == ["reads  Image Input · raw", "publishes  mask"], _det12
+    assert _det12 == ["⇤ Image Input · raw", "Gaussian Blur", "Threshold",
+                      "⇥ mask    read by Image Processing"], _det12
     _ppid12 = _rows12["process"].data(0, _Qt12.UserRole)
     _pp12.tree.itemClicked.emit(_rows12["process"], 0)
     app.processEvents()
@@ -7799,6 +7930,104 @@ def main(argv) -> int:
         p for p in win.workspace.pages if win.workspace.pages[p].kind == "process"]
     _ok("PP1 the Pages panel (left, above Nodes) lists the pages by kind in pipeline order "
         "with what each reads and publishes; a click shows the page on the active canvas")
+
+    # SP1 (V4.00 step 11e) a Page Input's Source on its CARD is a menu of every Output it may
+    # read — `<page> · <variable>`, a dot in the colour of that page's kind — and the pill
+    # names what it reads, edged in that colour; the inspector's Source menu wears the same
+    # dots; an Output given a name another Output has is renamed, and the status bar says so
+    import nodelab_v2.node_item as _NI13
+    from PySide6.QtWidgets import QComboBox as _QCB13, QMenu as _QMenu13
+    from nodelab_v2.canvas import PAGE_KIND_COLORS as _PKC13
+    _ws13 = win.workspace
+    _ref13 = next(p for p in _ws13.pages.values() if p.kind == "refine")
+    _inp13 = next(p for p in _ws13.pages.values() if p.kind == "input")
+    win._show_page(win._main_canvas, _ref13.id)
+    app.processEvents()
+    _in13 = next(n for n, r in _ref13.doc.nodes.items() if r.op_key == "page.input")
+    _ci13 = win.scene.node_items[_in13]
+    _sc13 = next(c for c in _ci13.controls() if c.kind == "value" and c.obj.name == "source")
+    assert _ci13._pill_text(_sc13.obj) == "Image Input · raw ▾", _ci13._pill_text(_sc13.obj)
+    assert _ci13._source_kind_color().name() == _PKC13["input"]
+    _ld13 = next(n for n, r in _inp13.doc.nodes.items() if r.op_key == "io.load")
+    _o13 = _inp13.doc.add_node("page.output", x=600.0, y=400.0, params={"name": "raw"})
+    app.processEvents()
+    assert _o13.params["name"] == "raw2", "a name another Output has is made unique"
+    assert "already named “raw”" in win.statusBar().currentMessage(), \
+        win.statusBar().currentMessage()
+    _inp13.doc.connect(_ld13, "image", _o13.id, "data")
+    _seen13: list = []
+
+    class _SrcMenu13(_QMenu13):
+        def exec(self, *a, **k):               # look, then pick `raw2`
+            _seen13.append([(x.text(), x.data(), not x.icon().isNull())
+                            for x in self.actions()])
+            return next((x for x in self.actions() if x.data() == f"{_inp13.id}:raw2"), None)
+
+    _NI13.QMenu = _SrcMenu13
+    try:
+        _ci13._open_source_menu(_sc13)
+    finally:
+        _NI13.QMenu = _QMenu13
+    assert _seen13 and all(icon for _t, _d, icon in _seen13[0]), _seen13
+    assert [d for _t, d, _i in _seen13[0]] == [f"{_inp13.id}:raw", f"{_inp13.id}:raw2"], _seen13
+    assert _seen13[0][0][0].endswith("✓"), "the one it reads is marked"
+    assert _ref13.doc.nodes[_in13].params["source"] == f"{_inp13.id}:raw2"
+    win.scene.clearSelection()
+    _ci13.setSelected(True)
+    app.processEvents()
+    _cb13 = next(b for b in win.inspector.findChildren(_QCB13)
+                 if any(str(b.itemData(i) or "").startswith(_inp13.id + ":")
+                        for i in range(b.count())))
+    assert all(not _cb13.itemIcon(i).isNull() for i in range(_cb13.count())
+               if str(_cb13.itemData(i) or "")), "every Source entry has its kind's dot"
+    _ref13.doc.nodes[_in13].params["source"] = f"{_inp13.id}:raw"
+    _ref13.doc.touch(_in13)
+    _inp13.doc.remove_node(_o13.id)
+    app.processEvents()
+    _ok("SP1 a Page Input's Source on its card is a menu of every Output it may read, each "
+        "with a dot in its page kind's colour and the one it reads ticked; the pill reads "
+        "`Image Input · raw ▾` edged in that colour; the inspector's menu has the dots too; "
+        "an Output named like another becomes `raw2`, said on the status bar")
+
+    # PO1 (V4.00 step 11e) the Pages panel lists each page's graph as a hierarchy: a branch
+    # nests under the node it leaves, an Output is tinted with its variable in bold; a node
+    # that keeps the kind of data has an on/off switch (a Threshold has none, saying why);
+    # unticking it switches the node off, and clicking a node shows it on the canvas
+    _pp13 = win.pages_panel
+    _nr13 = _pp13.node_items(_ref13.id)
+    _bl13 = next(n for n, r in _ref13.doc.nodes.items() if r.op_key == "enhance.gaussian")
+    _th13 = next(n for n, r in _ref13.doc.nodes.items() if r.op_key == "analysis.threshold")
+    _ou13 = next(n for n, r in _ref13.doc.nodes.items() if r.op_key == "page.output")
+    assert _nr13[_bl13].checkState(1) == _Qt12.Checked
+    assert not (_nr13[_th13].flags() & _Qt12.ItemIsUserCheckable)
+    assert _nr13[_th13].toolTip(1).startswith("always on:"), _nr13[_th13].toolTip(1)
+    assert _nr13[_ou13].font(0).bold() and _nr13[_ou13].text(0).startswith("⇥ mask")
+    assert _nr13[_ou13].background(0).color() != _TH.PANEL
+    _an13 = next(p for p in _ws13.pages.values() if p.kind == "analyze")
+    _ar13 = _pp13.node_items(_an13.id)
+    _ai13 = next(n for n, r in _an13.doc.nodes.items() if r.op_key == "page.input")
+    assert {_ar13[_ai13].child(j).data(0, _Qt12.UserRole + 3)
+            for j in range(_ar13[_ai13].childCount())} == \
+        {n for n, r in _an13.doc.nodes.items() if r.op_key in ("plot.xy", "view.viewer")}, \
+        "the Input's two branches nest under it"
+    _nr13[_bl13].setCheckState(1, _Qt12.Unchecked)
+    for _ in range(3):
+        app.processEvents()
+    assert _ref13.doc.nodes[_bl13].muted and "switched off" in win.statusBar().currentMessage()
+    assert _pp13.node_items(_ref13.id)[_bl13].font(0).strikeOut()
+    win._show_page(win._main_canvas, _an13.id)
+    app.processEvents()
+    _pp13.tree.itemClicked.emit(_pp13.node_items(_ref13.id)[_th13], 0)
+    for _ in range(3):
+        app.processEvents()
+    assert _ws13.active == _ref13.id and win.scene.node_items[_th13].isSelected()
+    assert win.set_node_muted(_ref13.id, _bl13, False) and not _ref13.doc.nodes[_bl13].muted
+    assert not win.set_node_muted(_ref13.id, _th13, True), "refused: it adds a mask"
+    app.processEvents()
+    _ok("PO1 the Pages panel shows each page's graph as a hierarchy (an Input's two branches "
+        "nest under it; Outputs tinted, the variable name in bold); a filter has an on/off "
+        "switch, a Threshold none (its tooltip says why); unticking switches the node off "
+        "(struck through), a node row shows that node on the canvas")
 
     # PT2 closing a page TAB keeps the page (V4.00 step 11d): ✕ takes it off the sub-tab row,
     # the canvas moves to the nearest open page of its kind, the Pages panel lists it "tab

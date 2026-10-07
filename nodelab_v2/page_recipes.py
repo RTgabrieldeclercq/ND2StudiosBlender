@@ -205,24 +205,11 @@ def bind_inputs(ws: Workspace, page_id: str, source: str, *, only_unbound: bool 
 
 
 def unique_output_names(ws: Workspace, page_id: str) -> int:
-    """Give the page's Page Outputs distinct names (a guard for a hand-edited recipe: the
-    second ``mask`` becomes ``mask2``). Returns how many were renamed."""
-    page = ws.pages[page_id]
-    seen: set = set()
-    n = 0
-    for rec in list(page.doc.nodes.values()):
-        if rec.op_key != PAGE_OUTPUT_OP:
-            continue
-        name = str(rec.params.get(PAGE_NAME_KEY) or "").strip()
-        if not name:
-            continue
-        if name.lower() in seen:
-            name = ws.unique_output_name(page_id, name)
-            rec.params[PAGE_NAME_KEY] = name
-            page.doc.touch(rec.id)
-            n += 1
-        seen.add(name.lower())
-    return n
+    """Give the page's Page Outputs names no other Output has — on this page (a hand-edited
+    recipe's second ``mask`` becomes ``mask2``) or, since V4.00 step 11e, on any other page (a
+    recipe placed twice publishes ``mask`` and ``mask2``): :meth:`Workspace.dedupe_outputs`.
+    Returns how many were renamed."""
+    return len(ws.dedupe_outputs(page_id))
 
 
 def only_seed(page: Page) -> bool:

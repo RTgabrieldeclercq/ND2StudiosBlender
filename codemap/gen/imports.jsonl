@@ -1134,6 +1134,7 @@
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
+{"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
@@ -1194,8 +1195,13 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"nodelab_v2.lablink.worker"}
 {"dst":"nodelab_v2.tables","k":"imp","lazy":true,"src":"nodelab_v2.lablink.worker"}
 {"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"nodelab_v2.lablink.worker"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.linked_document"}
+{"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.linked_document"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.linked_document"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.linked_document"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.linked_edit_dialog"}
+{"dst":"nodelab_v2.linked_document","k":"imp","lazy":false,"src":"nodelab_v2.linked_edit_dialog"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.linked_edit_dialog"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.minimap"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.minimap"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.mode_switch"}
@@ -1231,6 +1237,7 @@
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
+{"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
@@ -1379,6 +1386,7 @@
 {"dst":"nodelab_v2.lablink.panel","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.layout_store","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.linked_document","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.linked_edit_dialog","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.minimap","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.mode_switch","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.movie_editor","k":"imp","lazy":true,"src":"nodelab_v2.window"}
@@ -1491,6 +1499,7 @@
 {"dst":"nodegraph.structure","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.zones","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.frame_item","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
@@ -1503,6 +1512,7 @@
 {"dst":"nodelab_v2.lablink.recipe","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.layout_store","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.linked_document","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.linked_edit_dialog","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.mode_switch","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.new_page_dialog","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

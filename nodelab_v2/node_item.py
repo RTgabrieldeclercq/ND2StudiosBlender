@@ -1527,8 +1527,80 @@ class NodeItem(QGraphicsObject):
         return cls._UNIT_TEXT.get(s.unit, s.unit)
 
     def _pill_text(self, s) -> str:
+        if self._is_source_pill(s):
+            return self._source_pill_text()
         val = self.resolved(s)
         return "" if val is None else str(val)
+
+    # ── a Page Input's Source (V4.00 step 11e) ───────────────────────────────
+    def _is_source_pill(self, s) -> bool:
+        return self.rec.op_key == PAGE_INPUT_OP and getattr(s, "name", "") == PAGE_SOURCE_KEY
+
+    def _source_pill_text(self) -> str:
+        """What a Page Input reads, as the menu names it — ``Image Input · raw ▾`` — never
+        the stored ``pg1:raw``; ``choose… ▾`` while it reads nothing."""
+        src = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+        if not src:
+            return "choose… ▾"
+        try:
+            label = dict(self.doc.source_choices(self.rec.id)).get(src)
+        except Exception:                            # noqa: BLE001 — a bare document
+            label = None
+        return f"{label} ▾" if label else f"{src.split(':', 1)[-1]} (unbound) ▾"
+
+    def _source_kind_color(self) -> Optional[QColor]:
+        """The colour of the page kind a Page Input reads from (``None`` when unbound)."""
+        src = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+        try:
+            if not src or src not in {v for v, _l in self.doc.source_choices(self.rec.id)}:
+                return None
+            kind = self.doc.source_kind(src)
+        except Exception:                            # noqa: BLE001
+            return None
+        from nodelab_v2.canvas import PAGE_KIND_COLORS
+        return QColor(PAGE_KIND_COLORS.get(kind, PAGE_KIND_COLORS["free"])) if kind else None
+
+    def _open_source_menu(self, ctl: Ctl) -> None:
+        """A Page Input's Source as a MENU of every Output it may read (V4.00 step 11e): one
+        entry per named Output of each page that may feed this one — ``<page> · <variable>``
+        — with a dot in the colour of that page's KIND (the colours of the page tabs and the
+        Pages panel), the one it reads in bold with a tick. Nothing to type: an earlier
+        page's Output is the only thing a Page Input can read."""
+        from nodelab_v2.canvas import kind_icon
+        view, r = self._view_and_rect(ctl)
+        if view is None:
+            return
+        try:
+            choices = list(self.doc.source_choices(self.rec.id))
+        except Exception:                            # never let a picker eat a click
+            choices = []
+        current = str(self.rec.params.get(PAGE_SOURCE_KEY, "") or "")
+        menu = QMenu()
+        menu.setStyleSheet(T.menu_qss())
+        menu.setToolTipsVisible(True)
+        if not choices:
+            none = menu.addAction("No earlier page has a named Page Output yet")
+            none.setEnabled(False)
+        bold = QFont(menu.font())
+        bold.setBold(True)
+        for value, label in choices:
+            try:
+                kind = self.doc.source_kind(value)
+            except Exception:                        # noqa: BLE001
+                kind = ""
+            act = menu.addAction(kind_icon(kind or "free"),
+                                 f"{label}   ✓" if value == current else label)
+            act.setData(value)
+            act.setToolTip(f"read the Output “{value.split(':', 1)[-1]}” of the page "
+                           f"“{label.rsplit(' · ', 1)[0]}”")
+            if value == current:
+                act.setFont(bold)
+        chosen = menu.exec(view.viewport().mapToGlobal(
+            QPoint(int(r.left()), int(r.bottom() + 2))))
+        if chosen is None or not chosen.data():
+            return
+        if str(chosen.data()) != current:
+            self._write_param(PAGE_SOURCE_KEY, str(chosen.data()))
 
     @staticmethod
     def _pill_rect(y: float, txt: str, unit: str, derived: bool) -> QRectF:
@@ -1648,6 +1720,12 @@ class NodeItem(QGraphicsObject):
                             hot=self._hot_ctl is not None
                             and self._hot_ctl.kind in ("value", "pin")
                             and self._hot_ctl.obj is s)
+        if self._is_source_pill(s):
+            col = self._source_kind_color()
+            if col is not None:                  # edged in the colour of the page it reads
+                p.setPen(QPen(col, 1.6))
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(pill, 5, 5)
         if getattr(s, "pick_kind", ""):
             self._paint_pick_glyph(p, self._glyph_rect(pill), s)
 
@@ -2081,6 +2159,8 @@ class NodeItem(QGraphicsObject):
             s = ctl.obj
             if s.type is SocketType.BOOL:
                 self._write_param(s.name, not bool(self.resolved(s)))
+            elif self._is_source_pill(s):
+                self._open_source_menu(ctl)
             elif s.type is SocketType.STRING and getattr(s, "choices", ()):
                 self._open_menu(ctl, list(s.choices), str(self.resolved(s) or ""))
             elif s.type is SocketType.STRING and (s.layer_in or s.layer_in_mode):

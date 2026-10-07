@@ -160,24 +160,53 @@ PROGRESS_TICK_MS = 60
 TRANSIENT_RUN_STATES = ("queued", "running", "decoding")
 
 
-def _needs_topology(fn):
-    """A gesture that changes the graph's SHAPE: refused on a linked page (V4.00 step 6),
-    whose graph is its master's — the scene says why (``topology_refused``) and does
-    nothing, rather than half-starting a drag the document will then refuse."""
+def _needs_topology(fn=None, *, restart: bool = False):
+    """A gesture that changes the graph's SHAPE. On a plain page it simply runs. On a linked
+    page (V4.00 step 6; asking since step 11e) the window's gate
+    (:attr:`GraphScene.topology_gate`) asks how the change applies — unless the user already
+    answered for this page — and the gesture then runs on whatever the page has become: this
+    scene (the change kept on the page, or sent to the master) or, made unique, the page's NEW
+    scene. A gesture begun by a mouse press (``restart`` — a wire drag) is not resumed after a
+    question, since the press went to the dialog: the status bar says to do it again. With no
+    gate (a scene outside the window) it is refused with the hint, as before 11e."""
     import functools
 
-    @functools.wraps(fn)
-    def guarded(self, *a, **k):
-        if getattr(self.doc, "editable_topology", True):
-            return fn(self, *a, **k)
-        from nodelab_v2.linked_document import TOPOLOGY_HINT
-        self.topology_refused.emit(TOPOLOGY_HINT)
+    def deco(fn):
+        @functools.wraps(fn)
+        def guarded(self, *a, **k):
+            doc = self.doc
+            if getattr(doc, "editable_topology", True) or getattr(doc, "edit_mode", ""):
+                return _refusable(self, fn, a, k)
+            gate = getattr(self, "topology_gate", None)
+            if gate is None:
+                from nodelab_v2.linked_document import TOPOLOGY_HINT
+                self.topology_refused.emit(TOPOLOGY_HINT)
+                return None
+            target = gate(self, restart)
+            if target is None:
+                return None
+            if target is self:
+                return _refusable(self, fn, a, k)
+            return getattr(target, fn.__name__)(*a, **k)
+        return guarded
+    return deco(fn) if fn is not None else deco
+
+
+def _refusable(scene, fn, a, k):
+    """Run a structural gesture; a linked page that refuses it part-way (one sending its
+    edits to the master, asked for a change the master would compute differently — V4.00
+    step 11e) says why on the status bar instead of raising out of the gesture."""
+    from nodelab_v2.linked_document import LinkedPageError
+    try:
+        return fn(scene, *a, **k)
+    except LinkedPageError as exc:
+        scene.topology_refused.emit(str(exc))
         return None
-    return guarded
 
 
-#: the context-menu entries a linked page greys out (their labels' first words)
-_STRUCTURAL_MENU = ("Muted", "Delete", "Dissolve", "Fan out", "Insert reroute")
+#: the context-menu entries that change a linked page's graph — on a page whose edits are not
+#: settled yet they say that choosing them asks how (their labels' first words)
+_STRUCTURAL_MENU = ("Delete", "Dissolve", "Fan out", "Insert reroute")
 
 
 class GraphScene(QGraphicsScene):
@@ -203,6 +232,9 @@ class GraphScene(QGraphicsScene):
     #: a structural gesture was refused — the page is LINKED to a master (V4.00 step 6):
     #: the hint, for the window's status bar
     topology_refused = Signal(str)
+    #: set by the window (V4.00 step 11e): ``(scene, restart) -> scene | None`` — asks how a
+    #: structural edit on a linked page applies and returns the scene to run it on
+    topology_gate = None
     #: a Page Output's *New page from this output…* (V4.00 step 11): the node id — the window
     #: opens the New page dialog pre-set to read it
     new_page_from_output = Signal(str)
@@ -622,18 +654,25 @@ class GraphScene(QGraphicsScene):
         ok_b, _ = self.doc.can_connect(node_id, do, d, ds)
         if not (ok_a and ok_b):
             return False
-        self.doc.disconnect(s, ss, d, ds)
+        # the new wires FIRST, the old one last: a single input is replaced by the second
+        # connect, so at no step is the chain cut — which a linked page sending its edits to
+        # the master needs (each step must leave the master computing the same, V4.00 11e)
         try:
             self.doc.connect(s, ss, node_id, di)
+        except ValueError:
+            return False
+        try:
             self.doc.connect(node_id, do, d, ds)
         except ValueError:
-            # extremely unlikely after the pre-check, but never leave a dropped wire
-            self.doc.connect(s, ss, d, ds)
+            # extremely unlikely after the pre-check, but never leave a half splice
+            self.doc.disconnect(s, ss, node_id, di)
             return False
+        if (s, ss, d, ds) in self.doc.edges:          # a multi input keeps it: drop it
+            self.doc.disconnect(s, ss, d, ds)
         return True
 
     # ── wire dragging (G1) ────────────────────────────────────────────────────
-    @_needs_topology
+    @_needs_topology(restart=True)
     def begin_wire(self, socket: SocketItem, scene_pos: QPointF) -> None:
         fixed = socket
         if socket.io == "in":
@@ -809,21 +848,39 @@ class GraphScene(QGraphicsScene):
         super().mouseDoubleClickEvent(e)
 
     # ── context menu (the discoverable delete) ────────────────────────────────
-    @_needs_topology
     def _mute_selection(self) -> None:
-        for it in self.selectedItems():
-            if isinstance(it, NodeItem):
-                self.doc.set_muted(it.node_id, not it.rec.muted)
+        """M: switch the selected nodes off — or back on."""
+        self.toggle_muted([it.node_id for it in self.selectedItems()
+                           if isinstance(it, NodeItem)])
+
+    def toggle_muted(self, node_ids) -> None:
+        """Switch each node off, or back on (V4.00 step 11e). Only a node that keeps the kind
+        of data can be switched off (:func:`~nodelab_v2.document.pass_through_reason`) — the
+        others stay on and the status bar says why. On a linked page this is the page's own
+        setting, like a value, so it never asks how to apply."""
+        refused = []
+        for nid in node_ids:
+            rec = self.doc.nodes.get(nid)
+            if rec is None:
+                continue
+            try:
+                self.doc.set_muted(nid, not rec.muted)
+            except ValueError as exc:
+                refused.append(str(exc))
+        if refused:
+            more = f" (and {len(refused) - 1} more)" if len(refused) > 1 else ""
+            self.topology_refused.emit(refused[0] + more)
 
     def _lock_structural(self, menu: QMenu) -> None:
-        """On a linked page the menu's structural entries are greyed out, saying why."""
-        if getattr(self.doc, "editable_topology", True):
+        """On a linked page whose edits are not settled yet, the menu's structural entries say
+        what choosing them does: ask how the change applies (V4.00 step 11e; they were greyed
+        out before)."""
+        if getattr(self.doc, "editable_topology", True) or getattr(self.doc, "edit_mode", ""):
             return
-        from nodelab_v2.linked_document import TOPOLOGY_HINT
+        from nodelab_v2.linked_document import ASK_HINT
         for act in menu.actions():
             if act.text().startswith(_STRUCTURAL_MENU):
-                act.setEnabled(False)
-                act.setToolTip(TOPOLOGY_HINT)
+                act.setToolTip(ASK_HINT)
 
     def contextMenuEvent(self, e) -> None:
         node = next((it for it in self.items(e.scenePos())
@@ -892,9 +949,12 @@ class GraphScene(QGraphicsScene):
         mute = menu.addAction("Muted (pass through)\tM")
         mute.setCheckable(True)
         mute.setChecked(bool(rec.muted) if rec is not None else False)
-        mute.triggered.connect(
-            lambda: [self.doc.set_muted(i, not self.doc.nodes[i].muted)
-                     for i in sel if i in self.doc.nodes])
+        # only a node that keeps the kind of data can be switched off (V4.00 step 11e)
+        why = "" if rec is None or rec.muted else self.doc.pass_through_reason(nid)
+        if why:
+            mute.setEnabled(False)
+            mute.setToolTip(f"Cannot be switched off: {why}")
+        mute.triggered.connect(lambda: self.toggle_muted([i for i in sel if i in self.doc.nodes]))
         coll = menu.addAction("Collapsed\tC")
         coll.setCheckable(True)
         coll.setChecked(bool(rec.collapsed) if rec is not None else False)
@@ -997,7 +1057,7 @@ class GraphScene(QGraphicsScene):
             made.append(rec.id)
         return made
 
-    @_needs_topology
+    @_needs_topology(restart=True)
     def _reroute_on(self, edge: EdgeItem, pos: QPointF) -> None:
         r = T.RR_SIZE / 2.0
         rec = self.doc.add_node("rr.reroute", x=pos.x() - r, y=pos.y() - r)

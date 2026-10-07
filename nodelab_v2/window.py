@@ -50,7 +50,10 @@ from nodelab_v2.canvas import CanvasPanel, kind_icon
 from nodelab_v2.workspace import (FREE as FREE_KIND, Workspace, build_example, kind_label,
                                   local_ids, qualify, split_run_id)
 from nodelab_v2.document import GraphDocument
-from nodelab_v2.linked_document import TOPOLOGY_HINT, LinkedDocument, LinkedPageError
+from nodelab_v2.linked_document import (
+    EDIT_MASTER, EDIT_MODIFIED, EDIT_UNIQUE, SHAPE_HINT, TOPOLOGY_HINT, LinkedDocument,
+    LinkedPageError)
+from nodelab_v2.linked_edit_dialog import LinkedEditDialog
 from nodelab_v2 import page_recipes as PR
 from nodelab_v2.new_page_dialog import NewPageDialog, SavePageRecipeDialog
 from nodelab_v2.mode_switch import ModeSwitch
@@ -214,11 +217,28 @@ FILE_FILTER = "nd2graph (*.nd2graph.json);;All files (*)"
 
 
 def _needs_topology(fn):
-    """A window action that changes the active page's graph SHAPE: refused on a linked page
-    (V4.00 step 6) with the hint in the status bar, before any dialog opens."""
+    """A window action that changes the active page's graph SHAPE. On a linked page whose
+    edits are not settled it asks how the change applies (V4.00 step 11e,
+    :meth:`MainWindow._topology_ok`) before any other dialog opens; cancelled, nothing
+    happens and the status bar says why."""
     @functools.wraps(fn)
     def guarded(self, *a, **k):
         if not self._topology_ok():
+            return None
+        try:
+            return fn(self, *a, **k)
+        except LinkedPageError as exc:   # refused part-way by a page sending to its master
+            self.statusBar().showMessage(str(exc), 8000)
+            return None
+    return guarded
+
+
+def _needs_shape(fn):
+    """A window action that makes a FRAME, GROUP or ZONE: those of a linked page are its
+    master's in every mode, so a linked page can only be made unique for them (asked)."""
+    @functools.wraps(fn)
+    def guarded(self, *a, **k):
+        if not self._topology_ok(shape=True):
             return None
         return fn(self, *a, **k)
     return guarded
@@ -236,6 +256,9 @@ def _needs_source_page(fn):
         return fn(self, *a, **k)
     return guarded
 
+
+#: why a LOAD can never go to a linked page's master switched off (V4.00 step 11e)
+_LOAD_PUSH_NOTE = "a Load card is where data starts, so it cannot be switched off"
 
 #: the windows the LinkedPageError backstop reports to (weakly held — a closed one goes)
 _LINKED_HOOK_WINDOWS: "weakref.WeakSet" = weakref.WeakSet()
@@ -408,6 +431,8 @@ class MainWindow(QMainWindow):
         self.pages_panel.page_requested.connect(
             lambda pid: self._show_page(self._canvas, pid))
         self.pages_panel.rename_requested.connect(self.rename_page)
+        self.pages_panel.node_requested.connect(self.show_node)
+        self.pages_panel.mute_requested.connect(self.set_node_muted)
         self.pages_panel.menu_requested.connect(self._pages_menu)
         self.pages_panel.new_page_requested.connect(
             lambda: self.new_page_dialog(kind=self.next_page_kind(self.workspace.active),
@@ -1076,6 +1101,7 @@ class MainWindow(QMainWindow):
         sc.pick_requested.connect(self._arm_pick)
         sc.dock_action.connect(self._on_dock_action)
         sc.topology_refused.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
+        sc.topology_gate = self._scene_topology_gate
         sc.new_page_from_output.connect(part(self._new_page_from_output, page_id))
         doc = self.workspace.page(page_id).doc
         hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id)]
@@ -1099,6 +1125,16 @@ class MainWindow(QMainWindow):
         derived values (G8 — it shows a node of the active page, which may read this one)."""
         self._sync_welcome()
         self.inspector.refresh_derived()
+        page = self.workspace.pages.get(page_id)
+        renamed = getattr(page.doc, "renamed_output", None) if page is not None else None
+        if renamed:
+            # a variable name another Output already has was made unique (V4.00 step 11e)
+            page.doc.renamed_output = None
+            _nid, asked, given = renamed
+            self.statusBar().showMessage(
+                f"another Page Output is already named “{asked}” — this one is “{given}” "
+                f"(variable names are unique across the pages)", 8000)
+            self.inspector.rebuild()
 
     def _make_canvas(self) -> CanvasPanel:
         """A new docked canvas, on the active page — the factory of the ``canvas`` kind."""
@@ -1203,6 +1239,16 @@ class MainWindow(QMainWindow):
                 lambda _=False, c=c, m=shown.master: self._show_page(c, m))
             menu.addAction("Make unique").triggered.connect(
                 lambda _=False, c=c: self.make_unique(c.page_id))
+            ldoc = shown.doc
+            if isinstance(ldoc, LinkedDocument) and ldoc.is_modified:
+                rv = menu.addAction("Drop this page's own changes")
+                rv.setToolTip("Remove the nodes and wiring this modified linked page keeps of "
+                              "its own: back to the master's graph (its values stay).")
+                rv.triggered.connect(lambda _=False, d=ldoc: d.revert_structure())
+            elif isinstance(ldoc, LinkedDocument) and ldoc.edit_mode == EDIT_MASTER:
+                st = menu.addAction("Stop sending edits to the master")
+                st.setToolTip("The next change to this page's graph asks again how to apply.")
+                st.triggered.connect(lambda _=False, d=ldoc: d.set_edit_mode(""))
         menu.addAction("Open in a new canvas").triggered.connect(
             lambda _=False, c=c: self.open_canvas(c.page_id))
         menu.addAction("Rename page…").triggered.connect(
@@ -1342,7 +1388,8 @@ class MainWindow(QMainWindow):
                 reads, pubs = ws.page_summary(p.id)
                 master = ws.pages[p.master].name if p.master in ws.pages else ""
                 rows.append((p.id, self._page_label(p), p.kind, master, tuple(reads),
-                             tuple(pubs), p.id not in self._closed_pages))
+                             tuple(pubs), p.id not in self._closed_pages,
+                             tuple(ws.page_outline(p.id)), self._linked_state(p)))
             panel.refresh([(k, kind_label(k)) for k in R.page_kinds()], rows, ws.active or "")
         for c in self.canvases():
             c.sync_tabs()
@@ -1417,12 +1464,68 @@ class MainWindow(QMainWindow):
         return int(doc.override_count()) if isinstance(doc, LinkedDocument) else 0
 
     def _page_label(self, page) -> str:
-        """``★ name`` for a master page; ``name  (linked · N overrides)`` for a linked one."""
+        """``★ name`` for a master page; ``name  (linked · N overrides)`` for a linked one —
+        ``(linked · modified · N overrides)`` once it keeps changes of its own, ``(linked ·
+        edits → master · …)`` while it sends them to its master (V4.00 step 11e)."""
         text = ("★ " if getattr(page, "is_master", False) else "") + page.name
         if page.master:
             n = self._override_count(page)
-            text += f"  (linked · {n} override{'' if n == 1 else 's'})"
+            mode = getattr(page.doc, "edit_mode", "")
+            how = {EDIT_MODIFIED: "modified · ", EDIT_MASTER: "edits → master · "}.get(mode, "")
+            text += f"  (linked · {how}{n} override{'' if n == 1 else 's'})"
         return text
+
+    @staticmethod
+    def _linked_state(page) -> str:
+        """What a linked page keeps of its own STRUCTURE, for the Pages panel (V4.00 step
+        11e): ``"modified · 2 own nodes, 1 removed, 3 wires"``, ``"edits go to the master"``,
+        or ``""``."""
+        doc = page.doc
+        if not isinstance(doc, LinkedDocument):
+            return ""
+        if doc.edit_mode == EDIT_MASTER:
+            return "edits go to the master (switched off there)"
+        if not doc.is_modified:
+            return ""
+        own, gone, wires = doc.structure_counts()
+        bits = [f"{own} own node{'' if own == 1 else 's'}"] if own else []
+        bits += [f"{gone} removed"] if gone else []
+        bits += [f"{wires} wire{'' if wires == 1 else 's'}"] if wires else []
+        return "modified" + (" · " + ", ".join(bits) if bits else "")
+
+    # ── the Pages panel's nodes (V4.00 step 11e) ──────────────────────────────
+    def show_node(self, page_id: str, node_id: str) -> None:
+        """Show ``page_id`` on the active canvas with ``node_id`` selected and in view."""
+        c = self._canvas
+        if c.page_id != page_id:
+            self._show_page(c, page_id)
+        sc = self._scenes.get(page_id)
+        item = sc.node_items.get(node_id) if sc is not None else None
+        if item is None:
+            return
+        sc.clearSelection()
+        item.setSelected(True)
+        c.view.centerOn(item)
+
+    def set_node_muted(self, page_id: str, node_id: str, off: bool) -> bool:
+        """Switch a node of ``page_id`` off (or on) — the Pages panel's switch. Refused, the
+        status bar says why and the switch flips back."""
+        page = self.workspace.pages.get(page_id)
+        if page is None or node_id not in page.doc.nodes:
+            return False
+        try:
+            page.doc.set_muted(node_id, bool(off))
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 8000)
+            self.pages_panel._sig = None
+            self._refresh_page_views()
+            return False
+        what = page.doc.title_of(node_id)
+        self.statusBar().showMessage(
+            f"{what} on “{page.name}” switched {'off — its input passes straight through' if off else 'on'}"
+            + (" (this page only)" if isinstance(page.doc, LinkedDocument)
+               and page.doc.is_overridden(node_id, "muted") else ""), 6000)
+        return True
 
     def new_page_dialog(self, *, kind: str, canvas: Optional[CanvasPanel] = None,
                         source: Optional[str] = None, start: str = PR.START_EMPTY,
@@ -1533,10 +1636,10 @@ class MainWindow(QMainWindow):
         linked Input page refuses (hint on the status bar); a missing one will be made plain."""
         pid = self._input_page(create=False)
         if pid is None:
-            return self._topology_ok()
+            return self._topology_ok(push_note=_LOAD_PUSH_NOTE)
         if not pid:
             return True
-        return self._topology_ok(self.workspace.pages[pid].doc)
+        return self._topology_ok(self.workspace.pages[pid].doc, push_note=_LOAD_PUSH_NOTE)
 
     def _begin_source_load(self) -> Optional[bool]:
         """Route a load to the Image Input page: switch the canvas there BEFORE any card is
@@ -1545,8 +1648,8 @@ class MainWindow(QMainWindow):
         V4.00), None when the target page is linked and refuses a card (hint shown)."""
         pid = self._input_page()
         if pid is None:
-            return False if self._topology_ok() else None
-        if not self._topology_ok(self.workspace.pages[pid].doc):
+            return False if self._topology_ok(push_note=_LOAD_PUSH_NOTE) else None
+        if not self._topology_ok(self.workspace.pages[pid].doc, push_note=_LOAD_PUSH_NOTE):
             return None
         if pid != self.workspace.active:
             self._show_page(self._canvas, pid)
@@ -1637,14 +1740,67 @@ class MainWindow(QMainWindow):
             f"“{page.name}” is a page of its own now — its master's edits no longer reach it")
         return True
 
-    def _topology_ok(self, doc=None) -> bool:
-        """May the graph of ``doc`` (default: the active page's) change shape? Not on a
-        linked page: its graph is its master's — say so and refuse."""
+    def _topology_ok(self, doc=None, *, shape: bool = False, push_note: str = "") -> bool:
+        """May the graph of ``doc`` (default: the active page's) change shape? A plain page:
+        yes. A linked page (V4.00 step 11e) whose user already said how its edits apply — kept
+        on the page, or sent to the master — yes, except for a frame, group or zone
+        (``shape``). Otherwise ASK (:meth:`ask_linked_edit`): *Make unique* swaps the page's
+        document, *Keep the change on this page* makes it a modified linked page, *Add it to
+        the master, switched off* sends this session's edits there (refused for ``shape``, and
+        greyed out with ``push_note`` saying why). Cancelled: no, with the hint."""
         doc = doc if doc is not None else self.doc
         if getattr(doc, "editable_topology", True):
             return True
-        self.statusBar().showMessage(TOPOLOGY_HINT, 8000)
+        if isinstance(doc, LinkedDocument) and doc.edit_mode and not shape:
+            return True
+        pid = next((p.id for p in self.workspace.pages.values() if p.doc is doc), None)
+        if pid is None or not isinstance(doc, LinkedDocument):
+            self.statusBar().showMessage(TOPOLOGY_HINT, 8000)
+            return False
+        choice = self.ask_linked_edit(pid, shape=shape, push_note=push_note)
+        page = self.workspace.pages[pid]
+        master = self.workspace.pages[page.master].name \
+            if page.master in self.workspace.pages else "its master"
+        if choice == EDIT_UNIQUE:
+            return self.make_unique(pid)
+        if choice in (EDIT_MODIFIED, EDIT_MASTER) and not shape and \
+                not (choice == EDIT_MASTER and push_note):
+            doc.set_edit_mode(choice)
+            self.statusBar().showMessage(
+                f"“{page.name}” keeps its own changes now — “{master}”'s other edits still "
+                f"arrive" if choice == EDIT_MODIFIED else
+                f"“{page.name}” sends its edits to “{master}” this session: a node added here "
+                f"arrives there switched off", 8000)
+            return True
+        self.statusBar().showMessage(SHAPE_HINT if shape else TOPOLOGY_HINT, 8000)
         return False
+
+    def ask_linked_edit(self, page_id: str, *, shape: bool = False,
+                        push_note: str = "") -> str:
+        """How should a structural edit on linked page ``page_id`` apply? The dialog
+        (:class:`~nodelab_v2.linked_edit_dialog.LinkedEditDialog`): one of
+        :data:`EDIT_UNIQUE` / :data:`EDIT_MODIFIED` / :data:`EDIT_MASTER`, ``""`` when
+        cancelled. A probe replaces this method on its window (a modal dialog waits for a
+        click no offscreen run will make)."""
+        page = self.workspace.pages[page_id]
+        master = self.workspace.pages.get(page.master)
+        dlg = LinkedEditDialog(self, page.name, master.name if master else "its master",
+                               shape=shape, push_note=push_note)
+        dlg.exec()
+        return dlg.choice
+
+    def _scene_topology_gate(self, scene, restart: bool):
+        """:attr:`GraphScene.topology_gate`: ask for ``scene``'s linked page, and return the
+        scene the gesture should run on — this one, or the page's new one once made unique —
+        or ``None`` (cancelled, or a ``restart`` gesture whose press the dialog took)."""
+        pid = next((p for p, sc in self._scenes.items() if sc is scene), None)
+        if pid is None or not self._topology_ok(scene.doc):
+            return None
+        if restart:
+            msg = self.statusBar().currentMessage()
+            self.statusBar().showMessage((msg + " — " if msg else "") + "drag again", 8000)
+            return None
+        return self._scenes.get(pid)
 
     def _on_linked_action(self, action: str, node_id: str) -> None:
         """The inspector's Linked page banner, for a node of the ACTIVE page."""
@@ -1831,7 +1987,8 @@ class MainWindow(QMainWindow):
             self._sync_active_page_ui()
         # ★ and "(linked · N overrides)" ride the switcher's label (V4.00 step 11) — kept out
         # of `sig`, which would rebuild the Properties panel on every value edit of a linked page
-        tsig = tuple((p.id, p.is_master, self._override_count(p)) for p in ws.pages.values())
+        tsig = tuple((p.id, p.is_master, self._override_count(p),
+                      getattr(p.doc, "edit_mode", "")) for p in ws.pages.values())
         if tsig != getattr(self, "_title_sig", None):
             self._title_sig = tsig
             for c in self.canvases():
@@ -3096,7 +3253,7 @@ class MainWindow(QMainWindow):
         c = self.view.mapToScene(self.view.viewport().rect().center())
         self.doc.add_node(op_key, x=c.x() - 100, y=c.y() - 40)
 
-    @_needs_topology
+    @_needs_shape
     def wrap_repeat(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
         if not sel:
@@ -3114,7 +3271,7 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"wrapped {len(sel)} node(s) in a Repeat×{n} zone")
 
-    @_needs_topology
+    @_needs_shape
     def group_selection(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
         if not sel:
@@ -3137,7 +3294,7 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
         self.statusBar().showMessage(f"grouped {len(sel)} node(s) into '{name or 'Group'}'")
 
-    @_needs_topology
+    @_needs_shape
     def ungroup_selection(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems()
                if isinstance(i, NodeItem) and i._is_group]
@@ -3149,7 +3306,7 @@ class MainWindow(QMainWindow):
         n = sum(1 for nid in sel if self.doc.ungroup(nid))
         self.statusBar().showMessage(f"ungrouped {n} group(s)")
 
-    @_needs_topology
+    @_needs_shape
     def frame_selection(self) -> None:
         sel = [i.node_id for i in self.scene.selectedItems() if isinstance(i, NodeItem)]
         if not sel:

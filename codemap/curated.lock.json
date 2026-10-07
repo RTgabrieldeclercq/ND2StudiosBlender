@@ -142,7 +142,11 @@
  },
  "CON-18": {
   "anchors": {
+   "sym:nodelab_v2.document.pass_through_reason": "648e308a38b79b508dca26699133e71d",
    "sym:nodelab_v2.linked_document.LinkedDocument": "1b009cdc81d1e9fe6d23e19384964c60",
+   "sym:nodelab_v2.linked_document.LinkedDocument.set_edit_mode": "ef2391cc387d996c91b0cd118401adec",
+   "sym:nodelab_v2.linked_document.LinkedDocument.set_muted": "01b40236b27849033b7aa114edb0720d",
+   "sym:nodelab_v2.linked_document.LinkedDocument.structure_dict": "6a05654c2528ad222beed75ae4f1f098",
    "sym:nodelab_v2.linked_document.LinkedDocument.touch": "4478d61e33e3a231c1ccf001c8bbea8e"
   },
   "blessed": "2026-10-06",

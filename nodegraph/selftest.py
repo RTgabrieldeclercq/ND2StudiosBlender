@@ -24201,6 +24201,8 @@ def test_workspace_model() -> None:
     assert [p.kind for p in RD.problems(Rf.doc, "BAD")] == ["unbound"]
     Rf.doc.remove_node("BAD")
     Rf.doc.add_node("page.output", node_id="O2", params={"name": "smooth"})
+    assert Rf.doc.nodes["O2"].params["name"] == "smooth2", "names arrive unique (step 11e)"
+    Rf.doc.nodes["O2"].params["name"] = "smooth"        # a file from before the rule
     kinds = [p.kind for p in RD.problems(Rf.doc, "O2")]
     assert kinds == ["duplicate_output", "unwired"], kinds
     Rf.doc.remove_node("O2")
@@ -25128,7 +25130,7 @@ def test_linked_document_mirrors_master() -> None:
     for bad in (lambda: lk.add_node("enhance.gamma"), lambda: lk.remove_node("X"),
                 lambda: lk.connect("G", "out", "X", "data"),
                 lambda: lk.disconnect("T", "out", "X", "data"),
-                lambda: lk.set_muted("G", True), lambda: lk.add_frame("f", members=["G"]),
+                lambda: lk.add_frame("f", members=["G"]),
                 lambda: lk.clear(), lambda: lk.make_group(["G", "T"])):
         try:
             bad()
@@ -26814,6 +26816,8 @@ def test_readiness_fixes() -> None:
     p1.touch(o.id)
     assert RD.problems(p1, L.id) == [] and RD.problems(p1, o.id) == []
     dup = p1.add_node("page.output", params={"name": "raw"})
+    assert dup.params["name"] == "raw2" and p1.renamed_output == (dup.id, "raw", "raw2"),         "a name another Output carries is made unique as it arrives (V4.00 step 11e)"
+    dup.params["name"] = "raw"                  # …but a file saved before that may hold one
     pr = RD.problems(p1, dup.id)
     assert pr[0].kind == "duplicate_output" and pr[0].suggestions[0].value == "out", pr
     i = p2.add_node("page.input", params={"source": ""})
@@ -27009,7 +27013,9 @@ def test_page_recipe_roundtrip() -> None:
         assert rp.doc.nodes["IN"].params["source"] == "pg1:raw"
         assert (rp.doc.nodes["G"].x, rp.doc.nodes["G"].y) == (123.0, 45.0)
         assert ("G", "out", "O", "data") in rp.doc.edges and ("IN", "out", "G", "data") in rp.doc.edges
-        assert ws.outputs_of(rp.id) == [("smooth", "O")]
+        # the page it was saved from still publishes `smooth`: names are unique across the
+        # workspace (V4.00 step 11e), so the new page's is `smooth2`
+        assert ws.outputs_of(rp.id) == [("smooth2", "O")], ws.outputs_of(rp.id)
         os.environ[PR.ENV_ENABLED] = "0"
         assert PR.user_dir() is None and all(x.builtin for x in PR.list_recipes())
         try:
@@ -27287,6 +27293,355 @@ def test_refine_ops_all_channels() -> None:
         f"through a Page Input, change both channels — none works on the first one only")
 
 
+def test_pass_through_rule() -> None:
+    """V4.00 step 11e: a node may be switched off (muted — its first Dataset input passed
+    through) only when it keeps the KIND of data: every image filter, crop, projection,
+    resample and writer may; a node that adds a mask, labels, points, tracks, table columns or
+    a picture may not, nor a page/group/zone boundary, an Iterate control or a reroute.
+    ``set_muted`` refuses switching such a node OFF, never switching it back ON."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument, pass_through_reason
+    OPS.ensure_ops()
+    may = {s.op_key for s in NODES.all() if not pass_through_reason(s)}
+    must_pass = {"enhance.gaussian", "enhance.median", "enhance.deconvolve", "enhance.clahe",
+                 "util.zproject", "util.crop", "util.resample", "channel.select",
+                 "io.write_tiff", "registration.align_to"}
+    must_not = {"analysis.threshold", "analysis.label", "analysis.measure", "detect.spots",
+                "track.objects", "table.aggregate", "plot.xy", "plot.distribution",
+                "io.load", "view.viewer", "page.input", "page.output", "rr.reroute",
+                "flow.iterate"}
+    assert must_pass <= may, sorted(must_pass - may)
+    assert not (must_not & may), sorted(must_not & may)
+    assert all(k.startswith("enhance.") is False or k in may
+               for k in (s.op_key for s in NODES.all())), \
+        "every image enhancement keeps the kind of data"
+    assert "mask" in pass_through_reason(NODES.get("analysis.threshold"))
+    assert "picture" in pass_through_reason(NODES.get("plot.xy"))
+    d = GraphDocument()
+    g = d.add_node("enhance.gaussian")
+    t = d.add_node("analysis.threshold")
+    d.connect(g.id, "out", t.id, "data")
+    assert d.can_pass_through(g.id) and not d.can_pass_through(t.id)
+    assert d.pass_through_reason("nope") == "no such node"
+    d.set_muted(g.id, True)
+    assert g.muted
+    try:
+        d.set_muted(t.id, True)
+        raise AssertionError("switching a Threshold off must be refused")
+    except ValueError as exc:
+        assert "Threshold cannot be switched off" in str(exc), exc
+    assert not t.muted
+    t.muted = True                                   # a file saved before the rule
+    d.set_muted(t.id, False)
+    assert not t.muted, "switching back on is never refused"
+    _ok("switch-off rule: filters, crops, projections, resampling and writers may be muted; "
+        "nodes adding masks, labels, points, tracks, columns or pictures, and the graph's "
+        "wiring, may not (set_muted refuses, saying why); switching back on always works")
+
+
+def test_output_names_unique() -> None:
+    """V4.00 step 11e: a Page Output's variable name is unique across the workspace —
+    except between the pages linked to one master, which share its variables by design. A
+    name arriving taken (add_node, an edit + touch) becomes ``name2`` and is reported
+    (``renamed_output``); copying a page or making a linked page unique renames its taken
+    names, and every Page Input that read the old name follows."""
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.linked_document import LinkedDocument
+    ws, _ds, _env, _ax = _ws_fixture()
+    I, Rf, P1 = ws.pages["pg1"], ws.pages["pg2"], ws.pages["pg3"]
+    o = Rf.doc.add_node("page.output", params={"name": "raw"})
+    assert o.params["name"] == "raw2" and Rf.doc.renamed_output == (o.id, "raw", "raw2")
+    o.params["name"] = "RAW"
+    Rf.doc.touch(o.id)
+    assert o.params["name"] == "RAW2", "case-insensitive, like page names"
+    o.params["name"] = "a:b/c"
+    Rf.doc.touch(o.id)
+    assert o.params["name"] == "a_b_c", "cleaned so a Source value can carry it"
+    o.params["name"] = ""
+    Rf.doc.touch(o.id)
+    assert o.params["name"] == "", "a blank name stays blank (readiness asks for one)"
+    Rf.doc.remove_node(o.id)
+    assert ws.unique_output_name("pg2", "raw") == "raw2" and \
+        ws.unique_output_name("pg2", "smooth") == "smooth2"
+    assert ws.source_kind("pg1:raw") == "input" and ws.source_kind("pg9:x") == ""
+    assert Rf.doc.source_kind("pg1:raw") == "input"
+    # outside a workspace: this page's other Outputs are all there is
+    bare = GraphDocument()
+    bare.add_node("page.output", params={"name": "raw"})
+    b2 = bare.add_node("page.output", params={"name": "raw"})
+    assert b2.params["name"] == "raw2"
+    # a linked copy shares its master's names; made unique, its names move and readers follow
+    lk = ws.duplicate_page("pg2", dependent=True)
+    assert isinstance(lk.doc, LinkedDocument) and lk.doc.nodes["O"].params["name"] == "smooth"
+    P1.doc.nodes["IN"].params["source"] = f"{lk.id}:smooth"
+    P1.doc.touch("IN")
+    assert ws.resolve_source("pg3", f"{lk.id}:smooth") == (lk.id, "O")
+    ws.make_unique(lk.id)
+    assert lk.doc.nodes["O"].params["name"] == "smooth2", lk.doc.nodes["O"].params
+    assert P1.doc.nodes["IN"].params["source"] == f"{lk.id}:smooth2", "the reader follows"
+    assert ws.resolve_source("pg3", f"{lk.id}:smooth2") == (lk.id, "O")
+    cp = ws.duplicate_page("pg1")
+    assert cp.doc.nodes["O"].params["name"] == "raw2", "a plain copy's names are its own"
+    from nodelab_v2 import page_recipes as PR
+    st = next(r for r in PR.list_recipes("refine") if r.name == "Smooth & threshold")
+    twice = [PR.instantiate(ws, st, source="pg1:raw") for _ in range(2)]
+    names = [[r.params["name"] for r in p.doc.nodes.values() if r.op_key == "page.output"]
+             for p in twice]
+    assert names == [["mask"], ["mask2"]], f"a page recipe placed twice: {names}"
+    # a linked page renaming a mirrored Output away from its master's name is an override
+    lk2 = ws.duplicate_page("pg2", dependent=True)
+    lk2.doc.nodes["O"].params["name"] = "raw"
+    lk2.doc.touch("O")
+    assert lk2.doc.nodes["O"].params["name"] == "raw3" and lk2.doc.is_overridden("O", "name")
+    _ok("unique Output names: taken names become name2 (case-insensitive, cleaned, blank kept) "
+        "on add and on edit, workspace-wide; a linked copy shares its master's; a copy or a "
+        "page made unique renames its taken names and every reader follows")
+
+
+def test_linked_on_off() -> None:
+    """V4.00 step 11e: on a linked page, switching a node off (or on) is that page's OWN
+    setting — an override (``"muted"``) counted, kept through master edits, saved and reset
+    like a value — and the switch-off rule holds there too."""
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.linked_document import LinkedDocument, check_overrides
+    from nodelab_v2 import ops as OPS
+    OPS.ensure_ops()
+    m = GraphDocument()
+    m.add_node("enhance.gaussian", node_id="G")
+    m.add_node("analysis.threshold", node_id="T")
+    m.connect("G", "out", "T", "data")
+    lk = LinkedDocument(m)
+    lk.set_muted("G", True)
+    assert lk.nodes["G"].muted and not m.nodes["G"].muted
+    assert lk.is_overridden("G", "muted") and lk.override_count() == 1
+    assert lk.master_value("G", "muted") is False
+    g = lk.to_graph(for_run=True)
+    assert not any(e.src == "G" or e.dst == "G" for e in g.edges), "bypassed on this page"
+    try:
+        lk.set_muted("T", True)
+        raise AssertionError("a Threshold cannot be switched off on a linked page either")
+    except ValueError:
+        pass
+    m.nodes["G"].params["sigma"] = 2.0
+    m.touch("G")
+    assert lk.nodes["G"].muted, "a master edit keeps this page's switch"
+    lk.nodes["G"].params["sigma"] = 3.0
+    lk.touch("G")
+    assert lk.overrides["G"]["muted"] is True and lk.overrides["G"]["params"]["sigma"] == 3.0
+    back = LinkedDocument(m, overrides=lk.overrides_dict())
+    assert back.nodes["G"].muted and back.nodes["G"].params["sigma"] == 3.0
+    m.set_muted("G", True)                       # the master switches it off as well:
+    assert not lk.is_overridden("G", "muted") or lk.nodes["G"].muted
+    m.set_muted("G", False)
+    lk.reset_override("G", "muted")
+    assert not lk.nodes["G"].muted and lk.nodes["G"].params["sigma"] == 3.0
+    lk.set_muted("G", True)
+    lk.set_muted("G", False)                     # back to the master's: no override left
+    assert not lk.is_overridden("G", "muted")
+    for bad in ({"G": {"muted": "yes"}}, {"G": {"muted": True, "colour": 1}}):
+        try:
+            check_overrides(bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    _ok("linked on/off: switching a node off on a linked page is its own override (counted, "
+        "kept through master edits, saved, reset to the master's), bypassed in its run "
+        "graph; the switch-off rule holds there; a damaged 'muted' is refused")
+
+
+def test_linked_modified_structure() -> None:
+    """V4.00 step 11e: a MODIFIED linked page keeps nodes and wiring of its own laid over its
+    master — own nodes (``nL1``…), master nodes it removed, wires it added and removed — while
+    every other master edit keeps arriving; where both wire one single input, this page wins.
+    The structure is saved with the page, copied with a linked copy, dropped by
+    ``revert_structure`` and kept by Make unique; frames/groups/zones stay the master's."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.linked_document import (
+        EDIT_MASTER, EDIT_MODIFIED, LinkedPageError, check_structure)
+    ws, ds, _env, _ax = _ws_fixture()
+    Rf = ws.pages["pg2"]
+    lk = ws.duplicate_page("pg2", dependent=True)
+    d = lk.doc
+    try:
+        d.add_node("enhance.gamma")
+        raise AssertionError("an unanswered linked page refuses")
+    except LinkedPageError:
+        pass
+    d.set_edit_mode(EDIT_MODIFIED)
+    assert d.edit_mode == EDIT_MODIFIED and d.is_modified
+    x = d.add_node("enhance.gamma", params={"gamma": 2.0})
+    assert x.id == "nL1" and "nL1" not in Rf.doc.nodes
+    d.connect("IN", "out", x.id, "data")
+    d.connect(x.id, "out", "G", "data")
+    st = d.structure_dict()
+    assert st["edges_removed"] == [["IN", "out", "G", "data"]] and st["removed"] == []
+    assert sorted(st["edges_added"]) == [["IN", "out", "nL1", "data"], ["nL1", "out", "G", "data"]]
+    # the master's other edits arrive; its own wire into G's single input loses to this page's
+    Rf.doc.nodes["G"].params["sigma"] = 1.5
+    Rf.doc.touch("G")
+    assert d.nodes["G"].params["sigma"] == 1.5
+    Rf.doc.add_node("enhance.clahe", node_id="C")
+    Rf.doc.connect("IN", "out", "C", "data")
+    Rf.doc.connect("C", "out", "G", "data")
+    assert (x.id, "out", "G", "data") in d.edges and ("C", "out", "G", "data") not in d.edges
+    assert "C" in d.nodes
+    # the run graph is this page's: the Input → own gamma → Gaussian
+    comp = ws.compose(lk.id)
+    assert f"{lk.id}/{x.id}" in comp.graph.nodes
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    assert eng.pull(f"{lk.id}/G").axes.y == 32
+    # remove a master node on this page only
+    d.remove_node("C")
+    assert "C" not in d.nodes and "C" in Rf.doc.nodes and d.structure_dict()["removed"] == ["C"]
+    # saved and reloaded; a linked copy of it starts from its structure
+    blob = ws.to_dict()
+    rec = next(r for r in blob["workspace"]["pages"] if r["id"] == lk.id)
+    assert rec["structure"]["nodes"]["nL1"]["op_key"] == "enhance.gamma"
+    plain = next(r for r in blob["workspace"]["pages"] if r["id"] == "pg2")
+    assert "structure" not in plain
+    from nodelab_v2.workspace import Workspace
+    ws2 = Workspace()
+    ws2.load_dict(blob)
+    d2 = ws2.pages[lk.id].doc
+    assert d2.is_modified and set(d2.nodes) == set(d.nodes) and sorted(d2.edges) == sorted(d.edges)
+    assert d2.nodes["nL1"].params["gamma"] == 2.0
+    cp = ws.duplicate_page(lk.id, dependent=True)
+    assert cp.doc.is_modified and "nL1" in cp.doc.nodes and cp.doc.master is Rf.doc
+    # the master taking an id one of its own nodes has: the own node moves aside
+    Rf.doc.add_node("enhance.median", node_id="nL1")
+    assert d.nodes["nL1"].op_key == "enhance.median" and x.id != "nL1" and x.id in d.nodes
+    assert (x.id, "out", "G", "data") in d.edges
+    # frames and zones stay the master's; sending to the master is not for a modified page
+    for bad in (lambda: d.add_frame("f", members=["G"]),
+                lambda: d.set_edit_mode(EDIT_MASTER)):
+        try:
+            bad()
+            raise AssertionError("refused")
+        except LinkedPageError:
+            pass
+    # Make unique keeps what it shows; revert drops the page's own structure
+    keep = set(cp.doc.nodes)
+    uniq = ws.make_unique(cp.id)
+    assert set(uniq.doc.nodes) == keep and uniq.master is None
+    d.revert_structure()
+    assert not d.is_modified and set(d.nodes) == set(Rf.doc.nodes) and d.edges == [
+        tuple(e) for e in Rf.doc.edges]
+    for bad in ({"nodes": []}, {"nodes": {"a/b": {"op_key": "x"}}}, {"removed": "n1"},
+                {"edges_added": [["a", "b", "c"]]}, {"extra": 1}):
+        try:
+            check_structure(bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    _ok("modified linked page: own nodes (nL1…) and wiring laid over the master, which keeps "
+        "arriving (this page wins a single input), composed and pulled; removals on this page "
+        "only; saved, reloaded and copied with the page; an id the master takes moves aside; "
+        "frames and send-to-master refused; Make unique keeps it, revert drops it")
+
+
+def test_linked_send_to_master() -> None:
+    """V4.00 step 11e: a linked page that SENDS its edits to the master: a node it adds lands
+    on the master switched off (so the master and its other linked pages compute exactly as
+    before) and is switched on here; wiring it in goes to the master too; anything that would
+    change what the master computes is refused, as is a node that cannot be switched off;
+    removing a node that is off on the master heals the chain. The mode is this session's only
+    (never saved) and a fresh linked page asks again."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.linked_document import EDIT_MASTER, LinkedPageError
+    ws, ds, _env, _ax = _ws_fixture()
+    Rf = ws.pages["pg2"]
+    a = ws.duplicate_page("pg2", dependent=True)
+    b = ws.duplicate_page("pg2", dependent=True)
+    a.doc.set_edit_mode(EDIT_MASTER)
+    before = sorted((e.src, e.dst) for e in Rf.doc.to_graph(for_run=True).edges)
+    y = a.doc.add_node("enhance.unsharp", x=200.0)
+    assert y.id in Rf.doc.nodes and Rf.doc.nodes[y.id].muted and not a.doc.nodes[y.id].muted
+    assert b.doc.nodes[y.id].muted, "the master's other linked pages get it switched off"
+    a.doc.connect("IN", "out", y.id, "data")
+    a.doc.connect(y.id, "out", "G", "data")
+    assert (y.id, "out", "G", "data") in Rf.doc.edges
+    after = sorted((e.src, e.dst) for e in Rf.doc.to_graph(for_run=True).edges)
+    assert after == before, "the master computes exactly what it did"
+    assert ("IN", "G") in {(e.src, e.dst) for e in b.doc.to_graph(for_run=True).edges}
+    assert (y.id, "G") in {(e.src, e.dst) for e in a.doc.to_graph(for_run=True).edges}
+    assert a.doc.can_connect("IN", "out", "O", "data")[0], "a valid wire…"
+    for bad in (lambda: a.doc.connect("IN", "out", "O", "data"),   # …that would change it
+                lambda: a.doc.remove_node("G"), lambda: a.doc.add_node("analysis.threshold"),
+                lambda: a.doc.disconnect("G", "out", "O", "data")):
+        try:
+            bad()
+            raise AssertionError("refused")
+        except LinkedPageError:
+            pass
+    comp = ws.compose(a.id)
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    assert eng.pull(f"{a.id}/G").axes.x == 32
+    blob = ws.to_dict()
+    assert all("structure" not in r for r in blob["workspace"]["pages"]), "never saved"
+    a.doc.remove_node(y.id)                     # off on the master: removed, chain healed
+    assert y.id not in Rf.doc.nodes and ("IN", "out", "G", "data") in Rf.doc.edges
+    a.doc.set_edit_mode("")
+    try:
+        a.doc.add_node("enhance.gamma")
+        raise AssertionError("asks again")
+    except LinkedPageError:
+        pass
+    _ok("send to the master: an added node lands there switched off (on here, off on the "
+        "other linked pages), wiring it in leaves the master's run graph unchanged; a delete, "
+        "a rewire or a node that would change the master is refused; removing it heals the "
+        "chain; the mode is never saved")
+
+
+def test_page_outline() -> None:
+    """V4.00 step 11e: ``Workspace.page_outline`` — what the Pages panel draws: each page's
+    nodes in data-flow order, entries first (Page Inputs, then Load cards), a chain at one
+    depth, branches one level under the node they leave, reroutes left out; Inputs coloured
+    by the page they read, Outputs carrying their variable and readers; why a node cannot be
+    switched off; a modified linked page's own nodes marked."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.linked_document import EDIT_MODIFIED
+    from nodelab_v2.workspace import Workspace, build_example
+    OPS.ensure_ops()
+    ws = Workspace.standard(GraphDocument())
+    ids = build_example(ws)
+    rows = ws.page_outline(ids["refine"])
+    assert [(r.role, r.depth) for r in rows] == [("input", 0), ("node", 0), ("node", 0),
+                                                  ("output", 0)], rows
+    assert rows[0].detail == "Image Input · raw" and rows[0].kind == "input"
+    assert rows[-1].name == "mask" and rows[-1].detail == "read by Image Processing"
+    assert rows[1].why_not == "" and "mask" in rows[2].why_not
+    an = ws.page_outline(ids["analyze"])
+    assert [(r.role, r.depth) for r in an] == [("input", 0), ("node", 1), ("node", 1)], an
+    src = ws.page_outline(ids["input"])
+    assert [r.role for r in src] == ["source", "output"] and src[0].detail == "demo image"
+    # a reroute is a dot on a wire, not a row
+    doc = ws.pages[ids["refine"]].doc
+    blur = next(n for n, r in doc.nodes.items() if r.op_key == "enhance.gaussian")
+    thr = next(n for n, r in doc.nodes.items() if r.op_key == "analysis.threshold")
+    rr = doc.add_node("rr.reroute")
+    doc.connect(blur, "out", rr.id, "data")
+    doc.connect(rr.id, "out", thr, "data")
+    rows = ws.page_outline(ids["refine"])
+    assert [r.node_id for r in rows] == [r.node_id for r in rows if r.node_id != rr.id]
+    assert [r.role for r in rows] == ["input", "node", "node", "output"]
+    doc.set_muted(blur, True)
+    assert ws.page_outline(ids["refine"])[1].muted
+    lk = ws.duplicate_page(ids["refine"], dependent=True)
+    lk.doc.set_edit_mode(EDIT_MODIFIED)
+    own = lk.doc.add_node("enhance.gamma")
+    mine = {r.node_id: r for r in ws.page_outline(lk.id)}
+    assert mine[own.id].own and not mine[blur].own and mine[blur].muted
+    lk.doc.set_muted(blur, False)
+    assert ws.page_outline(lk.id)[1].overridden
+    _ok("page outline: entries first, a chain at one depth, branches nested under the node "
+        "they leave, reroutes left out; Inputs coloured by the page they read, Outputs with "
+        "their variable and readers; why a node cannot be switched off; switched-off and own "
+        "nodes, and a page's own on/off, marked")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -27467,6 +27822,12 @@ def main() -> int:
     test_page_order_and_summary()
     test_page_input_channel_taps()
     test_refine_ops_all_channels()
+    test_pass_through_rule()
+    test_output_names_unique()
+    test_linked_on_off()
+    test_linked_modified_structure()
+    test_linked_send_to_master()
+    test_page_outline()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

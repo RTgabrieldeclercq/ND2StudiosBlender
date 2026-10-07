@@ -240,10 +240,17 @@ page…* of that kind, and **✕ to close the tab**. Closing a tab **keeps the p
 tab row and nothing else — the Pages panel still lists it (in italics, *tab closed*), and
 clicking it there, or the kind's tab when every page of that kind is closed, shows the page and
 brings its tab back (the page menu has *Close tab* too; the last open tab has no ✕). The
-**Pages** panel lists every page grouped by kind in pipeline order, each with
-what its Page Inputs **read** and which Outputs it **publishes** (a master page carries ★, a
-linked one names its master) — click to show, double-click to rename, right-click for the
-menu. A new page is placed after the last page of its kind (or an earlier one), so the pages
+**Pages** panel lists every page grouped by kind in pipeline order, and under each page **its
+graph as a hierarchy** (V4.00 step 11e): where data enters first — its Page Inputs (`⇤ Image
+Input · raw`, with a dot in the colour of the page kind they read), then its Load cards — and
+from each the chain it feeds, a branch nesting one level under the node it leaves. The page's
+**Outputs** stand out: a row tinted in the page kind's colour, the **variable name** in bold
+(`⇥ mask`) and which pages read it. Every node that can be switched off has an **on/off switch**
+in the right-hand column (untick to mute it — its input is passed straight through; a node
+switched off is struck through); a Threshold, a Label or a plot has none, and its tooltip
+says why (see *Mute* in §5). A master page carries ★, a linked one names its master and what
+it keeps of its own (*modified*, its own nodes marked `+`). Click a page to show it, a node to
+show it selected on the canvas; double-click a page to rename, right-click for the menu. A new page is placed after the last page of its kind (or an earlier one), so the pages
 stay in pipeline order however they were added. `Ctrl+PgDn` /
 `Ctrl+PgUp` step through the pages. The **palette, the link-drag search and the Ready-to-run
 suggestions offer the nodes of the page's kind** (a chip above the palette's search says
@@ -260,8 +267,13 @@ kind's **page recipes** as buttons, *More recipes…*, *Link to a master…* and
 or *Go to Image Input* while there is nothing to read. **✕** or *Start empty* hides it for
 that page; File → New brings the cards back. A **Page Output** names
 a Dataset as a variable of its page (its card reads `Output · raw`; placed by hand it is named
-`out`, `out2`, …), and a **Page Input** on a later page reads one (`Input · Image Input ·
-raw`; placed by hand it binds to the nearest Output, and its **Source** menu lists the rest) —
+`out`, `out2`, …). **Variable names are unique across the pages** (V4.00 step 11e): a name
+another Output already has becomes `raw2` as it arrives, and the status bar says so — only the
+linked copies of one master share its names, by design. A **Page Input** on a later page reads
+one (`Input · Image Input · raw`; placed by hand it binds to the nearest Output). Its
+**Source** is a menu — click the pill on the card, or use Properties — listing every Output it
+may read as `<page> · <variable>`, each with a dot in the colour of its page's **kind** (the
+colours of the page tabs), the one it reads ticked; the pill is edged in that colour too —
 an Input page feeds Refinement, Refinement feeds Processing, and so on, while a Free page may
 feed or read any page. The palette leads with a **Pages** band holding both nodes, and dragging
 a wire into empty canvas offers *Page Output* first. A boundary that cannot work says so on its
@@ -290,10 +302,28 @@ change a parameter or a mode there and it becomes that page's **override**, mark
 on its row in Properties (hover for the master's value; right-click → *Reset to master*);
 every value it does not override follows the master. That is how one workflow is tuned per
 position or condition without copying it — and a linked page re-uses everything its master
-computed up to the first node it overrides. Its graph cannot change shape: adding, deleting,
-rewiring or muting nodes is refused with a hint in the status bar (make the change on the
-master, and every linked page follows), while moving or folding a card moves it on both
-pages. Properties shows a **Linked page** banner (`Linked to "Refinement" · 2 overrides`)
+computed up to the first node it overrides. **Switching a node on or off** (M, the menu, the
+Pages panel) is a value of the same kind: that page's own, the master untouched. **Changing its
+graph asks first** (V4.00 step 11e) — the first time you add, delete or rewire a node there, a
+dialog offers three answers:
+
+* **Make unique** — the page gets a graph of its own, holding what it has now; the master's
+  edits stop reaching it.
+* **Keep the change on this page** — a **modified** linked page: this change and every later
+  one stay on it (its own nodes are marked `+` in the Pages panel, its title says *modified*),
+  while every other edit of the master keeps arriving. Where both wire the same single input,
+  this page's wire wins. The file keeps it; the switcher's *Drop this page's own changes*
+  returns to the master's graph.
+* **Add it to the master, switched off** — the master gets the change with the node it adds
+  **switched off**, so it and its other linked pages compute exactly as before; on this page
+  the node is on (switch it on elsewhere from the Pages panel). Wiring that node in or out goes
+  to the master too; anything that would change what the master computes — deleting or
+  rewiring a node that is on there — is refused with a hint, and so is a node that cannot be
+  switched off. It lasts until the app closes (*Stop sending edits to the master* in the
+  switcher asks again).
+
+Cancel changes nothing. Frames, groups and zones stay the master's (only *Make unique* is
+offered for them). Moving or folding a card moves it on both pages. Properties shows a **Linked page** banner (`Linked to "Refinement" · 2 overrides`)
 with **Go to master** and **Make unique**; *Make unique* (also in the switcher) turns it into
 a page of its own, keeping its graph and values. Deleting a master asks first, then turns its
 linked pages into pages of their own. A file stores a linked page as its master and its
@@ -733,7 +763,13 @@ dropped. `Bound = mask` is the fix when the area layer marks extent rather than 
 | Select all nodes | `Ctrl+A` |
 | Insert a reroute dot on a wire | **double-click the wire** |
 
-Muted nodes dim and are bypassed at run time — the engine never sees them.
+Muted nodes dim and are bypassed at run time — the engine never sees them. **Only a node that
+keeps the kind of data can be muted** (V4.00 step 11e): a filter, a crop, a projection, a
+resample, a channel pick or a writer. A node that adds a mask, labels, points, tracks, table
+columns or a picture cannot — muted, whatever reads that downstream would get nothing — so
+right-click → *Muted* is greyed for it (hover for why), `M` leaves it on and says why, and the
+Pages panel shows no switch. A node muted in a file from before keeps working and can always
+be switched back on.
 
 ---
 
@@ -2515,8 +2551,8 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | **Select Group** | `util.select_group` | `Group` (which specimen — `G2`, `2`, `G1,G3`, or a name from the sidecar), `Group gap` (field widths) | Keeps only the multipoints of ONE specimen. A multipoint file is frequently not one flat list of fields: the lab's `Channel640_Seq0001.nd2` holds 54 positions that are really **six separate 3×3 mosaics** a millimetre apart, and every node that reads M as flat gets that wrong in the same quiet way — **Stitch** fuses all 54 into one canvas with four enormous holes in it, a `scope="dataset"` threshold pools six unrelated samples into one histogram, and a per-position table reports 54 rows for a six-sample experiment. This is the missing “which specimen?” selector, and the usual chain is **Select Group → Stitch**: nine tiles at 50 % overlap become one mosaic of one sample. The groups come from the acquisition if it stored them, otherwise they are **recovered from the stage coordinates** — single-linkage clustering that starts a new group wherever two fields are more than one field width apart, which is a statement about what a mosaic IS (tiles must overlap to be stitchable) rather than a tuned number. It infers each group's grid too, so the card says `G2 — 9 positions, 3×3 serpentine`. **Nothing is assumed about group SIZE**: six groups of nine and a run with one position skipped (8 + 9) both come out right, which a fixed “16 per group” could not. Lazy — a pure index view, no pixels copied, no re-spacing, and a kept position is bit-for-bit what it was — but the M axis really shrinks and everything indexed by it follows, exactly as **Crop**'s `frames` mode does: per-position stage/origin/alignment records, lattice layers, and structure rows (a row on a dropped position is removed and the survivors renumbered, so the row COUNT downstream changes). Empty = keep everything, so an unconfigured node is a true no-op. **Refuses rather than guessing** in both directions: a group name that does not exist is refused with the ones that do listed, and a Dataset with no usable stage geometry is refused outright — the plausible guess (“they are all one specimen”) produces a result indistinguishable from a correct one. To override the detection, write a `.groups.json` sidecar beside the file — see [§15.2](#152-position-groups-and-the-groupsjson-sidecar) |
 | **Split Positions** | `util.split_positions` | one `Image` in; `out` (the whole set) plus one synthetic output **per stage position** (`pos0…`, labelled `K · <point name>` — the acquisition's point names when the file carries them, else `mK` — with the specimen group key appended when known), shown once the wire carries two or more positions | The **M-axis twin of Split Channels**: drop it after a multipoint Load (or after a Timeseries Builder that laid files onto M) to run a different branch per well, dish or field, or to put each position on its own Viewer. A pure pass-through: each wired `posK` is materialized at run time into a **Select Position** tap carrying that index, shared by every branch leaving the socket, so four consumers of one position cost one tap and one memo entry. The socket means "the (K+1)-th position of whatever is wired", exactly as `chK` means the channel — rewire onto a smaller file and the tap refuses with the positions listed |
 | **Select Position** | `util.select_position` | `Position` (0-based index or the acquisition's point name); empty ⇒ pass everything | Keep **one** stage position: M narrows to 1 and everything indexed by it follows — stage coordinates and `origin_um`, per-position masks, labels and measurement rows (filtered and renumbered). The tap Split Positions' outputs become, and usable on its own. A value that names no position is refused with the real positions listed, never silently replaced by another; a single-position input passes through unchanged. Lazy (no pixels copied), `TILEABLE`; the stamp `m:select_position[K]` records which position so two selections compare |
-| **Page Output** | `page.output` | `Data` in; `Name` (the variable a later page picks this by); `Condition` (blank = the page's own name, unless a condition was TYPED on an Output further upstream, which a blank one keeps); `out` | V4.00: names the Dataset wired in as a **variable of its page**, for a Page Input on a later page. A pass-through — the only thing it adds is a `condition` label in the metadata, which Table Concat writes as a column; pulling it previews exactly what the next page receives. The name is presentation: renaming re-runs nothing. Two Outputs on one page with the same name are flagged in the Ready-to-run block |
-| **Page Input** | `page.input` | `Source` (`<page> · <name>` from the menu — pages of an earlier kind, or Free pages; stored as `<page id>:<name>`); `out`, and one output **per channel** (`0 · GFP`, `1 · R-B`, …) as on the Load card | V4.00: start a page from a named output of an earlier page. `out` carries every channel — every node on the page works on all of them; a channel output (step 11d) carries that one channel, named as on the Load card the data came from, through any number of pages. At edit time it carries the upstream output's envelope (axes, calibration, layers), so every derived default on the page is right before a pull; at run time the upstream page is spliced in and the node disappears, so a result the upstream page already computed is a memo hit rather than a recomputation. The panel marks it **unbound** (red) when its source names nothing an earlier page offers; pulled unbound, it refuses with "Page Input is not bound to an upstream Output" |
+| **Page Output** | `page.output` | `Data` in; `Name` (the variable a later page picks this by); `Condition` (blank = the page's own name, unless a condition was TYPED on an Output further upstream, which a blank one keeps); `out` | V4.00: names the Dataset wired in as a **variable of its page**, for a Page Input on a later page. A pass-through — the only thing it adds is a `condition` label in the metadata, which Table Concat writes as a column; pulling it previews exactly what the next page receives. The name is presentation: renaming re-runs nothing. Names are unique across the workspace (V4.00 step 11e): a name another Output has becomes `name2` as it arrives, said on the status bar (linked copies of one master share its names); two alike from an older file are flagged in the Ready-to-run block |
+| **Page Input** | `page.input` | `Source` (`<page> · <name>` from the menu — on the card's pill or in Properties, each entry with a dot in its page kind's colour; pages of an earlier kind, or Free pages; stored as `<page id>:<name>`); `out`, and one output **per channel** (`0 · GFP`, `1 · R-B`, …) as on the Load card | V4.00: start a page from a named output of an earlier page. `out` carries every channel — every node on the page works on all of them; a channel output (step 11d) carries that one channel, named as on the Load card the data came from, through any number of pages. At edit time it carries the upstream output's envelope (axes, calibration, layers), so every derived default on the page is right before a pull; at run time the upstream page is spliced in and the node disappears, so a result the upstream page already computed is a memo hit rather than a recomputation. The panel marks it **unbound** (red) when its source names nothing an earlier page offers; pulled unbound, it refuses with "Page Input is not bound to an upstream Output" |
 | Resample | `util.resample` | `scale_xy`, `scale_z` | pixel size scales inversely; lever |
 | Stack (T→1) | `util.stack` | method `mean/median/sigma_clip/trimmed_mean/max/sum` | SNR stacking; drops `dt_s`; `sum` widens `bit_depth` |
 | Stitch (M→1) | `util.stitch` | layout `stage/stage+refine/grid`, blend `feather/max/mean/overwrite`, `flip_x`/`flip_y`, `refine_*`, `grid_cols` | M→1 mosaic from the file's stage log; Y/X **grow to an extent the header reports UNKNOWN** (it depends on the position log, which rides the payload); one canvas plane streamed at a time; refuses a missing/short stage log, an M axis of repeat visits, and any Dataset carrying a structure table |
@@ -3500,7 +3536,11 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **I loaded an image and the canvas jumped to another page** | By design (V4.00): a loaded image always lands on the **Image Input** page — the canvas switches there — and is published as a Page Output named after the file. Go back to the page you were on: a new downstream page starts with a Page Input reading it, and an existing empty page gets one the first time you open it |
 | **A Refinement page is empty and I cannot get the image into it** | Load the image first (it is published on Image Input), then open the page — it gets a bound Page Input; or place a Page Input from the palette's **Pages** band, which binds to the nearest named Output. Nothing to bind to yet? *Go to Image Input* under its Source menu |
 | **The start card covers my page / will not go away** | Its **✕** (top right) or *Start empty* hides it for that page; File → New brings the cards back. On a Refinement, Processing or Analysis page it is a banner along the bottom edge, below the page's Page Input |
-| **I lose track of my pages** | Use the **tabs** along the top of the canvas — a row of page kinds, and under it the pages of the kind shown (drag to reorder, ✕ to close a tab you do not need on screen) — and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, with what it reads and publishes |
+| **I lose track of my pages** | Use the **tabs** along the top of the canvas — a row of page kinds, and under it the pages of the kind shown (drag to reorder, ✕ to close a tab you do not need on screen) — and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, each with its nodes in data-flow order and its Outputs highlighted by variable name |
+| **Muted is greyed out, or `M` leaves a node on** | That node changes the kind of data — it adds a mask, labels, points, tracks, table columns or a picture — so muted, whatever reads that downstream would get nothing (V4.00 step 11e). Hover *Muted* for the reason; mute a filter instead, or delete the node |
+| **My Page Output's name changed to `raw2`** | Another Output in the workspace already has that name — variable names are unique across the pages, so a Page Input's Source menu never lists two alike. Rename either Output |
+| **Changing a linked page asks me a question** | Its graph is its master's: *Make unique*, *Keep the change on this page* (a modified linked page that still follows the master's other edits) or *Add it to the master, switched off*. Cancel changes nothing (§2 *Linked pages*) |
+| **A node I added on a linked page is switched off on the master** | You chose *Add it to the master, switched off*: the master and its other linked pages compute as before. Switch it on for another page from the Pages panel |
 | **I closed a page tab and the page is gone** | It is not: closing a tab keeps the page. It is in the **Pages** panel (*tab closed*, in italics) — click it to show it and bring its tab back; or click its kind's tab when every page of that kind is closed |
 | **NodeLab closes by itself right after starting** (the terminal shows nothing, or only *Could not parse stylesheet of object QLabel*) | Fixed in V4.00 step 11d. Restoring a panel layout saved by an earlier build — one without the Playback and Channels panels — crashed inside Qt on Windows; the new panels are now placed after the rest of the layout is restored. The stylesheet line was a separate, harmless warning from a label on the LabLink tab, also fixed. If a launch still closes, run `.venv\Scripts\python.exe -X faulthandler run.py` and send the trace it prints |
 | **The Viewer's M/T/Z strips or the histograms are gone** | Since V4.00 step 11d they are panels of their own — **Playback** and **Channels** — under the Viewer by default. A closed one comes back from View ▸ Panels; View ▸ Reset layout puts both back under the Viewer |
