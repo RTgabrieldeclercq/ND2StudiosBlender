@@ -1,0 +1,67 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-B"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 649.0,
+                    "name": "Nile Blue"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": null,
+                    "name": "TD"
+                  }
+                ],
+                "__title__": "ChannelGFP,R-B,Nile Blue,TD_Seq0000.nd2",
+                "path": "D:/GELS Experimental/20260715_115850_227/ChannelGFP,R-B,Nile Blue,TD_Seq0000.nd2",
+                "pixel_size_um": 1.7182777601481225,
+                "z_step_um": 40.0
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "Graph",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": -264.0,
+              "y": 311.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

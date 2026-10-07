@@ -9,7 +9,7 @@
   "targets": {"primary": "measure"},
   "inputs": [
     {"role": "image", "node": "load", "required": false,
-     "match": ["*.nd2", "*.tif", "*.tiff"]}
+     "match": ["*.nd2", "*.nd3", "*.tif", "*.tiff"]}
   ],
   "knobs": [
     {"name": "channel", "node": "pick", "param": "channels", "kind": "param",
