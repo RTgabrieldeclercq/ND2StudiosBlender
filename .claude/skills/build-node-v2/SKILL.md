@@ -334,6 +334,13 @@ Build the test image with a deterministic pattern (avoid RNG); guard the group w
       `selftest::test_codemap`: that section is the curated judgement layer and is
       deliberately not generated, so a new node needs prose written by hand. Say what it is
       *for* and what will bite — the machine facts are already in `codemap/gen/nodes.jsonl`.
+- [ ] **The node demos itself.** `selftest::test_node_demos` runs EVERY op on a phantom
+      (`nodegraph/phantom.py`) and asserts the evidence its kind promises. A node whose role
+      default fits (an image filter on `cells2d`, a segmenter, a measurement after
+      threshold → label) needs nothing; one that needs a second input, a fixed column, a
+      time series or a 3-D stack, or that cannot run live, gets an entry in
+      `codemap/node_demos.json` (the file's `how_to_read` lists the keys). A guide-only op
+      MUST carry `features`.
 - [ ] §4 green: `nodegraph.selftest` (with new coverage) and the driven GUI probe,
       force-import, `scripts/_catalog_snapshot.py save` if the catalog change is intended.
 

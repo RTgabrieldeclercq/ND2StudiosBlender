@@ -51,6 +51,7 @@ The engine is [`nodegraph/`](nodegraph/) (Qt-free); the editor is
 8. [The Inspector — parameters, units, auto/pinned](#8-the-inspector--parameters-units-autopinned)
    - [Picking parameters off the image](#8b-picking-parameters-off-the-image-v216)
    - [Zooming into a big image — detail on demand](#8c-zooming-into-a-big-image--detail-on-demand)
+   - [What does this node do? — the demo window](#8e-what-does-this-node-do--the-demo-window)
 9. [The 2D/3D lever](#9-the-2d3d-lever)
 10. [Domains, layers and the layer picker](#10-domains-layers-and-the-layer-picker)
 11. [Spreadsheet & export](#11-spreadsheet--export)
@@ -1814,6 +1815,59 @@ says what decides their footprint rather than going quiet: a filter's footprint 
 [2D/3D lever](#9-the-2d3d-lever), Z Project's from its reducer, Overlay's from its output mode.
 Hover the card for the line. Threshold's pill also disappears under `method = fixed` — an
 absolute cut reads no histogram, so there is no population to pick.
+
+## 8e. What does this node do? — the demo window
+
+Every node can show itself. Press the **?** beside the node's title at the top of the
+Properties panel, or **What does this node do?** under the palette's Overview, and a window
+opens that runs that node *type* on a small synthetic image — a **phantom** — with the result
+beside the input and one control per parameter. Move a slider and the result recomputes.
+
+**What you see.** The header names the node's stage and role, what it does, which phantom it
+runs on (nuclei on an uneven background, a Z-stack, a drifting or moving time series, two
+channels, a speckle pair, a stage mosaic) and what runs upstream of it for the demo — a
+Measure demo is fed by a threshold and Connected Components, a tracker by a segmentation of a
+moving field. **Before** is the phantom; **After** is the node's output. Both zoom and pan
+like the Viewer. The status line names the values in play and how long the run took, and
+**How it works** unfolds the node's key features, its sockets with the gesture each one
+offers off the image, its modes and the compute's own description.
+
+**Controls.** A number gets a slider and a spin box; the slider's span comes from the
+parameter's unit and its default (a µm radius spans a few microns, a level the phantom's own
+intensities, an iteration count 1–50), the box types any value at all. A choice is a
+dropdown, an on/off a tick, a mode a dropdown that hides and shows the parameters it governs,
+exactly as the Inspector does. A parameter marked *auto* starts at the value the phantom's
+calibration derives, as its Inspector box would. A value the demo fixes — a layer name, a
+table column, a drawn shape list — is a grey chip. Settings that only affect display (a
+drawing tool, a brush size) are not shown: the compute never reads them.
+
+**Live, latest wins.** Every change is computed off the GUI thread; the After view dims while
+a run is in flight and is never blanked, and a result for a superseded value is dropped. The
+upstream chain is cached, so only the node you are moving recomputes. A node whose method
+loads a network (Segmentation with StarDist or CellSAM, ZS-DeconvNet), the DIC / DVC solvers
+and mesh rasterization show a **Run** button instead; a node that measures slow twice in a
+row switches itself to Run and says so.
+
+**What After shows** depends on the node: an image (with a **Compare** dropdown — Wipe, with
+a divider slider; Checkerboard; Difference — for an image-to-image node), a mask or a
+distance / flow field as a heat map, label outlines, detected points, tracks (with a
+**Frame t** slider on a time series, **Plane z** on a stack), displacement arrows, mesh
+vertices, the table a measurement wrote, or the figure a plot drew. Nodes that change the
+axes — a crop, a projection, a stitch, a channel merge — say so in the status line.
+
+**Guides.** A node that does not transform pixels — a loader, a writer, a dock, a page
+boundary, a zone, a group boundary, a reroute, the sweep and simulation controls, the Viewer
+tap — opens the same window without a run: its key features and how to use it, then its
+sockets, modes and how it works. Draw Regions is not one of them: its demo rasterizes a
+rectangle with a cut-out, a circle and a polygon from a built-in shape list, so you see what
+Apply produces, while its guide walks the Draw → Tool → Operation → Apply flow.
+
+The window is a sandbox: nothing in it reads or changes the node on the canvas. One window
+opens per node type and stays open while you select other nodes, so two types can be compared
+side by side. A node whose compute needs an optional package that is not installed (PIV needs
+`openpiv`) says so instead of running. The phantoms live in `nodegraph/phantom.py`, each
+node's recipe in `codemap/node_demos.json`, and the self-test runs every node's demo once so a
+node that cannot demonstrate itself cannot ship.
 
 ## 9. The 2D/3D lever
 

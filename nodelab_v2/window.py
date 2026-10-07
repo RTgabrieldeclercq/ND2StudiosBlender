@@ -438,6 +438,7 @@ class MainWindow(QMainWindow):
             lambda: self.new_page_dialog(kind=self.next_page_kind(self.workspace.active),
                                          canvas=self._canvas))
         self.palette.refresh_requested.connect(self.refresh_node_list)
+        self.palette.demo_requested.connect(self.open_node_demo)
         self.inspector = InspectorPanel()
         self.sheet = SpreadsheetPanel()
         # LabLink: whether this machine is serving the lab, and how to send work out to
@@ -605,6 +606,11 @@ class MainWindow(QMainWindow):
         self.inspector.iterate_action.connect(self._on_iterate_action)
         self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
+        # *What does this node do?* (2026-10-07): one live demo window per op type, from the
+        # inspector's ? and the palette's button alike. The window owns the cache so the
+        # dialogs outlive a selection change and are shut down with the app.
+        self._demo_windows = {}
+        self.inspector.demo_requested.connect(self.open_node_demo)
         self.inspector.add_requested.connect(self._on_add_requested)
         self.inspector.append_requested.connect(self._on_append_requested)
         self.inspector.page_requested.connect(
@@ -3786,6 +3792,11 @@ class MainWindow(QMainWindow):
             self.movie_editor.shutdown()     # its render thread, for the same reason
         except Exception:                                    # noqa: BLE001 — see above
             pass
+        for dlg in list(getattr(self, "_demo_windows", {}).values()):
+            try:
+                dlg.shutdown()                   # each demo's worker thread, likewise
+            except Exception:                    # noqa: BLE001 — closing must not fail
+                pass
         super().closeEvent(event)
 
     def _autoreload_tick(self) -> None:
@@ -3880,6 +3891,25 @@ class MainWindow(QMainWindow):
             f"Node list refreshed: {', '.join(bits)}" if bits else
             f"Node list refreshed — {len(visible_specs())} nodes, all up to date", 6000)
         return True
+
+    def open_node_demo(self, op_key: str):
+        """*What does this node do?* — show the live demo window for ``op_key``
+        (:class:`nodelab_v2.demo_window.NodeDemoWindow`), creating it on first use.
+
+        One window per op TYPE, not per node: the demo runs the type on a phantom and never
+        reads the selected node, so two cards of one type share a window and two types can
+        be compared side by side. A closed window leaves the cache (its worker thread is
+        joined in its ``closeEvent``) and is rebuilt on the next ask."""
+        from nodelab_v2.demo_window import NodeDemoWindow
+        dlg = self._demo_windows.get(op_key)
+        if dlg is None:
+            dlg = NodeDemoWindow(op_key, self)
+            dlg.closed.connect(lambda op=op_key: self._demo_windows.pop(op, None))
+            self._demo_windows[op_key] = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        return dlg
 
     def reload_node_type(self, op_key: str) -> bool:
         """Re-read ONE node type's module from disk — the inspector's ⟳ button.

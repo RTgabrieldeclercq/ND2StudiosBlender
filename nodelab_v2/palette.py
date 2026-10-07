@@ -22,7 +22,7 @@ from PySide6.QtCore import QMimeData, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QSplitter, QStyledItemDelegate, QTextBrowser,
-    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QPushButton,
 )
 
 from nodegraph import roles as R
@@ -185,6 +185,9 @@ class PalettePanel(QWidget):
     #: The panel only asks; the window owns the reloader, the runner (which must be idle) and
     #: the canvas that has to be relaid out afterwards.
     refresh_requested = Signal()
+    #: *What does this node do?* under the Overview was pressed: ``op_key``. The window
+    #: opens the live demo (one window per op type, :mod:`nodelab_v2.demo_window`).
+    demo_requested = Signal(str)
 
     def __init__(self, on_add: Callable[[str], None]) -> None:
         super().__init__()
@@ -239,6 +242,18 @@ class PalettePanel(QWidget):
         lay.addWidget(self._kind_chip)
         lay.addLayout(top)
         lay.addWidget(self._split, 1)
+        # the demo (2026-10-07): the Overview says what a node is; this shows it, on a
+        # synthetic image with live sliders — before the node is even on the canvas
+        self._demo_btn = QPushButton("What does this node do?")
+        self._demo_btn.setCursor(Qt.PointingHandCursor)
+        self._demo_btn.setEnabled(False)
+        self._demo_btn.setToolTip(
+            "Open a window that runs the selected node on a synthetic image, with a slider "
+            "for every parameter and a before / after to compare. A node that does not "
+            "transform pixels shows its key features and how to use it.")
+        self._demo_btn.clicked.connect(
+            lambda: self._current_op and self.demo_requested.emit(self._current_op))
+        lay.addWidget(self._demo_btn)
         self._search.textChanged.connect(self.refill)
         self._tree.itemDoubleClicked.connect(self._add_current)
         self._tree.currentItemChanged.connect(self._on_current)
@@ -434,6 +449,7 @@ class PalettePanel(QWidget):
 
     def _show_legend(self) -> None:
         self._current_op = None
+        self._demo_btn.setEnabled(False)
         dom = " ".join(f"{self._dot(T.domain_qcolor(d))}&nbsp;{d.value}" for d in Domain)
         typ = " ".join(f"{self._dot(T.SOCKET[t])}&nbsp;{t.value}" for t in SocketType)
         self._overview.setHtml(
@@ -449,6 +465,7 @@ class PalettePanel(QWidget):
 
     def _show_stage(self, sk: str) -> None:
         self._current_op = None
+        self._demo_btn.setEnabled(False)
         meta = R.stage_meta(sk)
         roles = "".join(
             f"<li><b>{html.escape(str(r.get('label', rk)))}</b> — "
@@ -461,6 +478,7 @@ class PalettePanel(QWidget):
 
     def _show_role(self, rk: str) -> None:
         self._current_op = None
+        self._demo_btn.setEnabled(False)
         meta = R.role_meta(rk)
         smeta = R.stage_meta(meta.get("stage", R.OTHER_STAGE))
         ops = "".join(f"<li>{html.escape(op)}</li>" for op in sorted(meta.get("ops", ())))
@@ -471,83 +489,25 @@ class PalettePanel(QWidget):
             f"<div class='sec'>Nodes</div><ul>{ops}</ul>")
 
     def _show_node(self, op: str) -> None:
+        """The node's overview — built by :func:`nodelab_v2.demo_window.overview_html`, the
+        same builder the demo window's guide uses (one source, so the two never drift): what
+        it is for, its stage and role, the curated key features, every socket with its type,
+        unit, default and the pick gesture it offers, its modes, footprint and how it works
+        (the compute's docstring, else the module's)."""
         from nodegraph.registry import NODES
+        from nodelab_v2 import demo_recipes as DR
+        from nodelab_v2.demo_window import overview_html
         spec = NODES.get(op)
         if spec is None:
             self._show_legend()
             return
         self._current_op = op
-        rk, sk = R.role_of(op)
-        rmeta, smeta = R.role_meta(rk), R.stage_meta(sk)
-        state = spec.default_state()
-        e = html.escape
-
-        def sock_row(s, direction: str) -> str:
-            if s.type is SocketType.DATASET:
-                doms = (sorted(d.value for d in spec.reads_domains) if direction == "in"
-                        else sorted(d.value for d in spec.adds_domains))
-                col = T.SOCKET[SocketType.DATASET]
-                what = "Dataset" + (f" · {'reads' if direction == 'in' else 'adds'} "
-                                    + ", ".join(doms) if doms else "")
-                return (f"<tr><td>{self._dot(col)}</td><td><b>{e(s.label or s.name)}</b></td>"
-                        f"<td class='k'>{e(what)}</td></tr>")
-            extra = []
-            if s.unit:
-                extra.append(e(s.unit))
-            if s.default is not None and direction == "in":
-                extra.append(f"default {e(str(s.default))}")
-            if getattr(s, "layer_in", None) is not None:
-                extra.append(f"picks a {s.layer_in.value} layer")
-            if getattr(s, "layer_out", ()):
-                extra.append("names a layer it writes")
-            return (f"<tr><td>{self._dot(T.SOCKET[s.type])}</td>"
-                    f"<td><b>{e(s.label or s.name)}</b> <span class='k'>{e(s.type.value)}"
-                    f"</span></td><td class='k'>{' · '.join(extra)}</td></tr>")
-
-        ins = "".join(sock_row(s, "in") for s in spec.active_inputs(state))
-        outs = "".join(sock_row(s, "out") for s in spec.outputs)
-        modes = "".join(
-            f"<li><b>{e(m.label or m.name)}</b>: {e(', '.join(m.choices))} "
-            f"<span class='k'>(default {e(m.resolved_default())})</span></li>"
-            for m in spec.modes if m.active_in(state))
-        gran = spec.granularity
-        if isinstance(gran, dict):
-            gran_s = ", ".join(f"{k}: {getattr(v, 'value', v)}" for k, v in gran.items())
-        else:
-            gran_s = getattr(gran, "value", str(gran)) if gran is not None else "—"
-        dims = []
-        if spec.supports_2d:
-            dims.append("2D")
-        if spec.supports_true_3d:
-            dims.append("true 3D")
-        elif spec.three_d_fallback:
-            dims.append(f"3D as {spec.three_d_fallback.replace('_', ' ')}")
-        # the long-form prose: the compute's docstring, else the owning module's (a shared
-        # forwarder compute or a node with no compute documents itself at module level —
-        # the same fallback scripts/_node_synopsis.py applies)
+        self._demo_btn.setEnabled(True)
         try:
-            import sys
-            from nodegraph.nodes import COMPUTES
-            long = _squash(getattr(COMPUTES.get(op), "__doc__", "") or "")
-            if not long:
-                owner = NODES.owner(op) or ""
-                long = _squash(getattr(sys.modules.get(owner), "__doc__", "") or "")
+            features = DR.recipe_for(op).features
         except Exception:                                   # pragma: no cover - defensive
-            long = ""
-        if len(long) > 1600:
-            long = long[:1600].rsplit(" ", 1)[0] + " …"
-        self._overview.setHtml(
-            self._css()
-            + f"<h3>{e(spec.label)}</h3><div class='op'>{e(op)}</div>"
-            f"<div class='k'>{e(str(smeta.get('label', '')))} › "
-            f"<b>{e(str(rmeta.get('label', rk)))}</b></div>"
-            f"<div style='margin-top:4px'>{e(_squash(spec.description))}</div>"
-            f"<div class='sec'>In</div><table>{ins or '<tr><td class=k>— (source)</td></tr>'}</table>"
-            f"<div class='sec'>Out</div><table>{outs}</table>"
-            + (f"<div class='sec'>Modes</div><ul>{modes}</ul>" if modes else "")
-            + f"<div class='sec'>Footprint</div><div class='k'>{e(gran_s)}"
-            + (f" · {e(' / '.join(dims))}" if dims else "") + "</div>"
-            + (f"<div class='sec'>How it works</div><div>{e(long)}</div>" if long else ""))
+            features = ()
+        self._overview.setHtml(overview_html(op, features=features))
 
 
 __all__ = ["PalettePanel"]

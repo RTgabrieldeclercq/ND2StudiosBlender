@@ -339,6 +339,15 @@
   "blessed": "2026-10-06",
   "file": "codemap/invariants.md"
  },
+ "INV-17": {
+  "anchors": {
+   "sym:nodegraph.phantom.phantom": "52db47a05f16d15a9d8cc38a0641c45b",
+   "sym:nodelab_v2.demo_recipes.DemoSession": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodelab_v2.demo_recipes.validate_curation": "1de445813eb1ced60508496e05d9326d"
+  },
+  "blessed": "2026-10-07",
+  "file": "codemap/invariants.md"
+ },
  "WF-01": {
   "anchors": {
    "sym:nodegraph.engine.Engine.pull": "31fa493846971ee6627efabd17cb70ad",
@@ -407,6 +416,15 @@
    "sym:nodelab_v2.workspace.split_run_id": "ce46de0dd6c9675f4da681bcc74a3668"
   },
   "blessed": "2026-10-06",
+  "file": "codemap/workflows.md"
+ },
+ "WF-09": {
+  "anchors": {
+   "sym:nodelab_v2.demo_recipes.DemoSession.run": "f732609956aa7df19a3e985b98f28041",
+   "sym:nodelab_v2.demo_window.NodeDemoWindow": "8bc068dae465d5d4976d1da341396593",
+   "sym:nodelab_v2.window.MainWindow.open_node_demo": "42777cef46c2846392318f182fae5d42"
+  },
+  "blessed": "2026-10-07",
   "file": "codemap/workflows.md"
  }
 }

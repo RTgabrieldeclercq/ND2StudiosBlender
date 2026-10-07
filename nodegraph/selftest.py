@@ -28662,6 +28662,153 @@ def test_crop_region() -> None:
         "the card's `outside` socket builds a keep=outside sibling fed by the crop's wires")
 
 
+def test_phantoms() -> None:
+    """``nodegraph.phantom`` (2026-10-07) — the deterministic synthetic datasets the node
+    demo window runs every node on.
+
+    1. Every phantom is a 6-D uint16 ``(m,t,z,c,y,x)`` array at 12-bit full scale, wrapped
+       as a Dataset whose axes match and a MetaEnvelope carrying the calibration keys a
+       ``derive`` reads (pixel size, bit depth, emission, frame interval).
+    2. **Deterministic**: the same name and keywords give a bit-identical array, and the
+       cached object; a different seed, or a shifted copy, gives different pixels.
+    3. The axes are what the recipes rely on: one plane, a 7-plane stack, six frames, two
+       channels, four stage tiles, a 5-plane speckle volume."""
+    from nodegraph.phantom import FULL_SCALE, PHANTOMS, intensity_range, phantom
+    for name in PHANTOMS:
+        ph = phantom(name)
+        a = ph.array
+        assert a.dtype == np.uint16 and a.ndim == 6 and int(a.max()) <= FULL_SCALE, name
+        assert tuple(ph.dataset.axes.shape_for(D.VOXEL)) == a.shape, name
+        md = ph.envelope.metadata
+        for key in ("pixel_size_um", "bit_depth", "channel_emission_nm", "dt_s"):
+            assert key in md, (name, key)
+        assert phantom(name) is ph, "cached"
+        assert np.array_equal(a, PHANTOMS[name]().array), f"{name}: not deterministic"
+        lo, p1, p99, hi = intensity_range(ph)
+        assert lo <= p1 <= p99 <= hi and hi > lo, name
+        assert ph.caption
+    assert phantom("cells2d").axes == AxisSizes(m=1, t=1, z=1, c=1, y=160, x=160)
+    assert phantom("cells3d").axes.z == 7 and phantom("timelapse_drift").axes.t == 6
+    assert phantom("moving_cells").axes.t == 6 and phantom("two_channel").axes.c == 2
+    assert phantom("plate_mosaic").axes.m == 4 and phantom("speckle_pair").axes.t == 2
+    assert phantom("speckle_pair", three_d=True).axes.z == 5
+    assert len(phantom("plate_mosaic").envelope.metadata["stage_xy_um"]) == 4
+    base = phantom("cells2d").array
+    assert not np.array_equal(phantom("cells2d", seed=1).array, base)
+    assert not np.array_equal(phantom("cells2d", shift_px=(6.0, -8.0)).array, base)
+    assert phantom("cells2d", puncta=True).array.max() >= base.max()
+    _ok(f"phantoms: {len(PHANTOMS)} deterministic 12-bit synthetic datasets (nuclei, a "
+        f"z-stack, drift, moving cells, two channels, a speckle pair, a stage mosaic); same "
+        f"seed => identical array and cached object; calibration keys present")
+
+
+def test_node_demos() -> None:
+    """``nodelab_v2.demo_recipes`` + ``codemap/node_demos.json`` (2026-10-07) — the Qt-free
+    half of *What does this node do?*, through the sanctioned GUI seam.
+
+    1. The curated file agrees with the live registry (every op, phantom, prelude, socket,
+       mode and slider it names exists), so a renamed socket fails here, not in a window.
+    2. **Every registered op has a demo**: a guide (with curated features) or a recipe
+       that, run once on its phantom at the gate's defaults, produces the evidence its kind
+       promises — an image, a mask, >= 2 labels, points, tracks with >= 2 frames, vectors,
+       mesh elements, a non-empty table or a figure — in bounded time. A recipe marked
+       ``live=false`` carries a reason and is not run; one that needs an optional package
+       is skipped when that package is missing.
+    3. Every slider gets a finite range that contains its starting value; the control
+       classification hides presentation sockets and shows a drawn shape list read-only.
+    4. The Draw Regions demo rasterizes its curated shapes to exactly three regions; a
+       Gaussian at sigma = 2 um differs from one at the default; the guide HTML names a pick
+       socket's gesture."""
+    import nodelab_v2.ops as _ops
+    from nodelab_v2 import demo_recipes as DR
+    from nodegraph.hotreload import is_catalog_op
+    from nodegraph.phantom import PHANTOMS
+    _ops.ensure_ops()
+    probs = DR.validate_curation()
+    assert not probs, "codemap/node_demos.json needs attention: " + " | ".join(probs)
+    ops = DR.all_demo_ops()
+    # shipped ops only: the catalog plus the GUI-layer ops — a fixture an earlier test
+    # define_node'd into the process-global registry must not walk into this sweep
+    assert set(ops) <= set(NODES.keys())
+    assert {"io.load", "view.viewer", "io.dock", "page.input", "page.output",
+            "enhance.gaussian", "analysis.draw_regions"} <= set(ops)
+    assert all(is_catalog_op(op) or NODES.owner(op) == "nodelab_v2.ops" for op in ops)
+    ran, guides, slow, needs = [], [], [], []
+    slowest = (0.0, "")
+    for op in ops:
+        r = DR.recipe_for(op)
+        assert r.kind in DR.KINDS, (op, r.kind)
+        if r.is_guide:
+            assert r.features, (f"{op}: a guide-only demo needs curated 'features' in "
+                                f"codemap/node_demos.json")
+            guides.append(op)
+            continue
+        assert r.phantom in PHANTOMS, (op, r.phantom)
+        s = DR.DemoSession(r)
+        if s.missing_requirements():
+            needs.append(op)
+            continue
+        if not r.live:
+            assert r.slow_reason, op
+            slow.append(op)
+            continue
+        start = s.starting_values()
+        state = s.default_state()
+        for sock in s.spec.active_inputs(state):
+            if DR.control_kind(sock) != "slider":
+                continue
+            rng = s.range_for(sock, start.get(sock.name))
+            assert rng.hi > rng.lo and rng.step > 0, (op, sock.name, rng)
+            v = start.get(sock.name)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                assert rng.lo <= float(v) <= rng.hi, (op, sock.name, v, rng)
+        res = s.run(dict(r.gate_params), {})
+        got = {
+            "image": lambda: res.after_image is not None and res.after_image.size > 0,
+            "mask": lambda: res.mask_plane is not None and int(res.mask_plane.max()) >= 1,
+            "labels": lambda: res.label_plane is not None and int(res.label_plane.max()) >= 2,
+            "scalar": lambda: res.scalar_plane is not None,
+            "points": lambda: len(res.points) > 0,
+            "tracks": lambda: any(len(t[1]) >= 2 for t in res.tracks),
+            "field": lambda: res.vectors is not None and res.vectors.shape[0] > 0,
+            "mesh": lambda: len(res.mesh) > 0,
+            "table": lambda: bool(DR.demo_rows(res)[1]),
+            "plot": lambda: res.after_image is not None,
+        }[r.kind]()
+        assert got, f"{op}: the {r.kind} demo produced no evidence"
+        assert res.elapsed_s < 10.0, (op, res.elapsed_s)
+        if res.elapsed_s > slowest[0]:
+            slowest = (res.elapsed_s, op)
+        ran.append(op)
+    # the control classification and the heuristic ranges
+    draw = NODES.get("analysis.draw_regions")
+    assert DR.control_kind(draw.input("shapes")) == "readonly"
+    assert DR.control_kind(draw.input("tool")) == "hidden"            # presentation=True
+    assert DR.control_kind(NODES.get("enhance.gaussian").input("sigma")) == "slider"
+    assert DR.control_kind(NODES.get("analysis.segment").input("fill_holes")) == "check"
+    gs = DR.DemoSession(DR.recipe_for("enhance.gaussian"))
+    rng = gs.range_for(gs.spec.input("sigma"), 0.5)
+    assert rng.lo == 0.0 and 5.0 <= rng.hi <= 10.0 and rng.step == 0.01, rng
+    ts = DR.DemoSession(DR.recipe_for("analysis.threshold"))
+    lvl = ts.range_for(ts.spec.input("threshold"), ts.starting_values()["threshold"])
+    assert lvl.lo == float(ts.phantom.array.min()) and lvl.hi == float(ts.phantom.array.max())
+    assert ts.starting_values()["threshold"] == 2047.5, "derived from bit_depth=12"
+    # the specific demos
+    dr = DR.DemoSession(DR.recipe_for("analysis.draw_regions")).run({}, {})
+    assert dr.label_plane is not None and int(dr.label_plane.max()) == 3
+    g1 = gs.run({}, {}).after_image
+    g2 = gs.run({"sigma": 2.0}, {}).after_image
+    assert not np.array_equal(g1, g2), "sigma = 2 um must differ from the default"
+    html = DR.guide_html("analysis.draw_regions", features=("Press Draw",))
+    assert "Draw the region" in html and "Key features" in html and "Press Draw" in html
+    _ok(f"node demos: {len(ran)} ops run live on a phantom with evidence of their kind "
+        f"(slowest {slowest[1]} {slowest[0]:.2f}s); {len(guides)} guides with features; "
+        f"{len(slow)} slow (Run button): {', '.join(slow)}; "
+        f"{len(needs)} need an optional package: {', '.join(needs) or '-'}; "
+        f"curation validated against the registry; slider ranges finite and containing "
+        f"their start; Draw Regions -> 3 regions; sigma moves the result")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -28855,6 +29002,8 @@ def main() -> int:
     test_units()
     test_math_nodes()
     test_crop_region()
+    test_phantoms()
+    test_node_demos()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

@@ -1,0 +1,1212 @@
+{
+  "schema": "nd2studios-node-demos/1",
+  "how_to_read": "Per-op overrides for the node demo window (nodelab_v2/demo_recipes.py). A node absent here demos itself from its ROLE (codemap/node_roles.json -> demo_recipes.ROLE_DEFAULTS). Keys per op: kind (image|mask|labels|scalar|points|tracks|field|mesh|table|plot|guide), phantom + phantom_kw (nodegraph/phantom.py), prelude (a name from 'preludes' or a list of {op, params, modes}), data_from (tail|src), extra_inputs {socket: {phantom, kw} | {pre: i}}, fixed_params, fixed_modes, sliders {param: [lo, hi]}, live (false -> a Run button), slow_modes {mode: [choices]}, slow_reason, gate_params (selftest only), view {t, z, c}, features (key features / how to use). Validated against the live registry by selftest.test_node_demos.",
+  "preludes": {
+    "spots2d": [
+      {
+        "op": "detect.spots"
+      }
+    ],
+    "piv2d": [
+      {
+        "op": "analysis.piv"
+      }
+    ],
+    "metrics2d": [
+      "tracked_measured2d",
+      {
+        "op": "analysis.object_metrics"
+      }
+    ],
+    "tracked_measured2d": [
+      "measured2d",
+      {
+        "op": "track.objects"
+      }
+    ]
+  },
+  "ops": {
+    "io.load": {
+      "kind": "guide",
+      "features": [
+        "Browse… picks an ND2 or TIFF; the pixel size and Z step are read from the file and shown so you can correct them.",
+        "An empty path runs the built-in synthetic stack, so a graph is testable with no file at all.",
+        "Grouping = auto grows one output per specimen when the stage log clusters into mosaics.",
+        "Access decides whether pixels are read directly or ingested once to a fast on-disk store."
+      ]
+    },
+    "io.dock": {
+      "kind": "guide",
+      "features": [
+        "A checkpoint: bake everything upstream to disk once, then re-serve it instead of recomputing.",
+        "Live / Held / Docked / Frozen are the four states — the inspector's Dock section switches them.",
+        "A docked chain is cut at the dock when the graph runs, so hours of upstream work are never redone."
+      ]
+    },
+    "io.write_tiff": {
+      "kind": "guide",
+      "features": [
+        "Writes the Dataset's image (or a named Voxel layer such as a label raster) as a TIFF.",
+        "Choose the pyramid level to export a reduced copy; the calibration travels in the file's tags.",
+        "Pulling the node is what writes — it is a sink, so it sits at the end of a chain."
+      ]
+    },
+    "io.write_movie": {
+      "kind": "guide",
+      "features": [
+        "Renders a time series (or a Z sweep) to an MP4 / GIF with overlays, a scale bar, a timestamp and channel names.",
+        "Up to three sources side by side; the Movie editor in the inspector previews every segment before writing.",
+        "Contrast, gamma, fps and the annotation corner are all parameters, so the movie is reproducible from the graph."
+      ]
+    },
+    "io.write_figure": {
+      "kind": "guide",
+      "features": [
+        "Saves a plot node's figure (or any raster) to PNG / PDF / SVG at a chosen dpi.",
+        "Wire a plot.* node into it; the frame param picks which timepoint of a time series to save."
+      ]
+    },
+    "view.viewer": {
+      "kind": "guide",
+      "features": [
+        "A tap that shows whatever is wired into it in the Viewer — up to six sources, switchable.",
+        "Scale bar and timestamp overlays are its parameters (size, corner, colour).",
+        "Double-click any node, or press F5, to pull it into the Viewer; this node just makes that explicit."
+      ]
+    },
+    "data.part": {
+      "kind": "guide",
+      "features": [
+        "Splits a stream into its parts (image, labels, points, tracks, …) so a page can hand each one on separately.",
+        "The part socket names which kind of data comes out; the stream keeps its identity across pages."
+      ]
+    },
+    "page.input": {
+      "kind": "guide",
+      "features": [
+        "Where a page's data comes in: the source menu lists the outputs of the pages before it.",
+        "A linked page mirrors its master; edit answers here say whether a change stays local or goes back."
+      ]
+    },
+    "page.output": {
+      "kind": "guide",
+      "features": [
+        "Where a page's results leave: give the output a name and the next page's Input offers it.",
+        "Several items can be collected into one output; the optional condition gates when it is published."
+      ]
+    },
+    "group.input": {
+      "kind": "guide",
+      "features": [
+        "The boundary of a collapsed subgraph: what the group receives from the outside.",
+        "Select nodes and use Graph → Group (Ctrl+G); Ungroup (Ctrl+Shift+G) opens it again."
+      ]
+    },
+    "group.output": {
+      "kind": "guide",
+      "features": [
+        "The other boundary of a group: what the subgraph hands back out.",
+        "A group instance runs the whole subgraph when pulled."
+      ]
+    },
+    "rr.reroute": {
+      "kind": "guide",
+      "features": [
+        "A dot on a wire: pass-through, no computation. Use it to tidy long wires or fan one output out.",
+        "Drag from the socket and drop on empty canvas to insert one."
+      ]
+    },
+    "zone.frame": {
+      "kind": "guide",
+      "features": [
+        "Marks a region of the canvas: nodes inside it are evaluated per frame of the series.",
+        "Pair with Repeat In / Repeat Out to loop a sub-chain over t."
+      ]
+    },
+    "zone.repeat_in": {
+      "kind": "guide",
+      "features": [
+        "The entrance to a repeated zone: everything between this and Repeat Out runs once per iteration.",
+        "The zone is unrolled before the engine runs it, so the memo caches each iteration separately."
+      ]
+    },
+    "zone.repeat_out": {
+      "kind": "guide",
+      "features": [
+        "The exit of a repeated zone: collects every iteration's result back onto one wire."
+      ]
+    },
+    "zone.sim_in": {
+      "kind": "guide",
+      "features": [
+        "The entrance to a simulation zone: a sub-chain that is stepped forward, each step fed the last.",
+        "Use with Advance to drive the step count."
+      ]
+    },
+    "zone.sim_out": {
+      "kind": "guide",
+      "features": [
+        "The exit of a simulation zone: the final state after all steps."
+      ]
+    },
+    "flow.iterate": {
+      "kind": "guide",
+      "features": [
+        "Sweeps up to four sockets of a downstream node over lists, ranges or a percentage around their live defaults.",
+        "The metric socket picks the scalar to optimise; the target and tolerance say when to stop.",
+        "Each iteration is a separate run in the memo; the var outputs expose the swept values as text."
+      ]
+    },
+    "flow.advance": {
+      "kind": "guide",
+      "features": [
+        "Steps a simulation zone forward: the probes socket reads a value each step and the node emits it.",
+        "Pulls the zone again until the step count is reached."
+      ]
+    },
+    "util.batch": {
+      "kind": "guide",
+      "features": [
+        "Stacks several files onto the batch (b) axis so one graph processes all of them identically.",
+        "Every node downstream runs per member; Unbatch or Select Batch Member peels them apart again."
+      ]
+    },
+    "util.unbatch": {
+      "kind": "guide",
+      "features": [
+        "Splits a batch back into its members, one output per file."
+      ]
+    },
+    "util.select_batch": {
+      "kind": "guide",
+      "features": [
+        "Picks one member of a batch by index or name."
+      ]
+    },
+    "util.timeseries": {
+      "kind": "guide",
+      "features": [
+        "Chains several files end to end on the time axis — an acquisition saved as one file per hour.",
+        "Up to twelve files; the frame interval is carried across the joins."
+      ]
+    },
+    "channel.select": {
+      "kind": "image",
+      "phantom": "two_channel",
+      "fixed_params": {
+        "channels": "1"
+      },
+      "features": [
+        "Keeps the listed channels (here Ch1, the GFP cytoplasm) and drops the rest; the before view shows Ch0.",
+        "Pick channels off the Viewer's channel strip with the Pick button."
+      ]
+    },
+    "channel.split": {
+      "kind": "image",
+      "phantom": "two_channel",
+      "features": [
+        "Grows one output socket per channel so each can feed its own chain.",
+        "Wiring an output inserts a Select Channel tap for you at run time."
+      ]
+    },
+    "util.merge": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "extra_inputs": {
+        "data": {
+          "phantom": "cells2d",
+          "kw": {
+            "puncta": true,
+            "seed": 3
+          }
+        }
+      },
+      "features": [
+        "Joins several datasets along one axis — channels by default, or time, position or Z.",
+        "Both inputs here are 1-channel fields; the merged output has two channels.",
+        "Datasets that do not line up are refused unless you choose align by index.",
+        "Two synthetic fields carry no stage position, so this demo aligns them by index; real files are placed by their stage log."
+      ],
+      "fixed_modes": {
+        "unplaceable": "align_by_index"
+      }
+    },
+    "util.select_group": {
+      "kind": "image",
+      "phantom": "plate_mosaic",
+      "fixed_params": {
+        "group": "1"
+      },
+      "features": [
+        "Keeps the positions of one specimen (a mosaic) from a multipoint file, found by clustering the stage log.",
+        "gap_factor decides how far apart two fields must be to count as different specimens."
+      ]
+    },
+    "util.select_position": {
+      "kind": "image",
+      "phantom": "plate_mosaic",
+      "fixed_params": {
+        "position": "2"
+      },
+      "features": [
+        "Keeps one position (M index) of a multipoint file; the index is the position's identity.",
+        "Shown: tile B1 (index 2) of a 2×2 stage raster."
+      ]
+    },
+    "util.split_positions": {
+      "kind": "image",
+      "phantom": "plate_mosaic",
+      "features": [
+        "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap."
+      ]
+    },
+    "util.stitch": {
+      "kind": "image",
+      "phantom": "plate_mosaic",
+      "view": {},
+      "features": [
+        "Places every position's tile from the file's stage log (or an explicit grid) and blends the overlaps into one mosaic.",
+        "stage+refine phase-correlates each overlapping pair to correct small stage errors.",
+        "The output is one position with a larger Y/X extent."
+      ]
+    },
+    "util.stack": {
+      "kind": "image",
+      "phantom": "timelapse_drift",
+      "features": [
+        "Collapses the series' frames into one stacked volume so a 3-D node can act across time."
+      ]
+    },
+    "util.zproject": {
+      "kind": "image",
+      "phantom": "cells3d",
+      "features": [
+        "Collapses Z into one plane — max, mean, sum, min or median — so a stack can be viewed or segmented flat.",
+        "Before: the middle plane of a 7-plane stack. After: the projection."
+      ]
+    },
+    "util.crop": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "fixed_params": {
+        "y0": 30,
+        "y1": 130,
+        "x0": 40,
+        "x1": 150
+      },
+      "sliders": {
+        "y0": [
+          0,
+          160
+        ],
+        "y1": [
+          0,
+          160
+        ],
+        "x0": [
+          0,
+          160
+        ],
+        "x1": [
+          0,
+          160
+        ]
+      },
+      "features": [
+        "Keeps a Y/X window (and optionally a Z range and frame list); drag the rectangle on the image with Pick.",
+        "The output's axes shrink; every downstream measurement is in the cropped frame."
+      ]
+    },
+    "util.crop_to": {
+      "kind": "image",
+      "phantom": "plate_mosaic",
+      "data_from": "src",
+      "prelude": [
+        {
+          "op": "util.select_position",
+          "params": {
+            "position": "2"
+          }
+        }
+      ],
+      "extra_inputs": {
+        "region": {
+          "pre": 0
+        }
+      },
+      "features": [
+        "Crops the data to the stage rectangle another file (the region input) occupies — in absolute microns, so the two files need stage positions.",
+        "Shown: a 2×2 stage raster cropped to the field tile B1 covers."
+      ]
+    },
+    "util.resample": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Rescales Y/X (and Z) by a factor; the calibration is restamped so µm stay µm."
+      ]
+    },
+    "transform.rigid": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "fixed_params": {
+        "shift_y": 6.0,
+        "shift_x": -9.0,
+        "angle": 8.0
+      },
+      "features": [
+        "Shifts and rotates the image by fixed amounts — the manual counterpart of drift correction."
+      ]
+    },
+    "align.drift": {
+      "kind": "image",
+      "phantom": "timelapse_drift",
+      "view": {
+        "t": 5
+      },
+      "features": [
+        "Measures the global shift of every frame against a reference and shifts it back; the drift is written as a Frame layer.",
+        "Before: frame 5 of a drifting series. After: the same frame re-registered to frame 0."
+      ]
+    },
+    "registration.stabilize": {
+      "kind": "image",
+      "phantom": "timelapse_drift",
+      "view": {
+        "t": 5
+      },
+      "features": [
+        "Sub-pixel phase correlation per frame on one reference channel; the per-frame shifts become a Frame layer.",
+        "Before: frame 5 of a drifting series. After: stabilized."
+      ]
+    },
+    "registration.align_to": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "shift_px": [
+          6.0,
+          -8.0
+        ]
+      },
+      "extra_inputs": {
+        "reference": {
+          "phantom": "cells2d"
+        }
+      },
+      "features": [
+        "Aligns the data to a second dataset (the reference) by phase correlation, within max_shift.",
+        "Before: the field shifted by (6, −8) px. After: brought back onto the reference."
+      ]
+    },
+    "view.canvas": {
+      "kind": "image",
+      "phantom": "plate_mosaic",
+      "features": [
+        "Lays every wired file's fields out at their true stage positions on one blank canvas in µm — the primary to chain Overlays onto.",
+        "Shown: the canvas spanning a 2×2 stage raster."
+      ]
+    },
+    "view.overlay": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "extra_inputs": {
+        "secondary": {
+          "phantom": "cells2d",
+          "kw": {
+            "shift_px": [
+              4.0,
+              3.0
+            ]
+          }
+        }
+      },
+      "features": [
+        "Composites a second dataset over the first for comparison: add, over, difference, checkerboard, wipe or flicker.",
+        "The offset nudges line the two up; Align by two clicks picks the nudge off the image.",
+        "Two synthetic fields carry no stage position, so this demo aligns their centres; real files are placed by stage position, pixel size and focus."
+      ],
+      "fixed_modes": {
+        "unplaceable": "align_centres"
+      }
+    },
+    "analysis.threshold": {
+      "kind": "mask",
+      "phantom": "cells2d",
+      "features": [
+        "One intensity cut → a 0/1 mask layer named by Output layer; Connected Components turns it into labels.",
+        "fixed uses the level you set (eyedropper it off the image); otsu/li/yen/triangle/mean derive it from the histogram.",
+        "scope decides which pixels form that histogram: a plane, the volume, the series, the dataset, or each label / ROI."
+      ]
+    },
+    "analysis.threshold_local": {
+      "kind": "mask",
+      "phantom": "cells2d",
+      "features": [
+        "An adaptive cut: each pixel is compared to the mean of its block, minus an offset — robust to the uneven background."
+      ]
+    },
+    "analysis.multiotsu": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "features": [
+        "Splits the histogram into N classes (background, dim, bright…) and keeps the ones you ask for."
+      ]
+    },
+    "analysis.label": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "prelude": "threshold2d",
+      "features": [
+        "Connected components of a mask layer: every touching blob becomes one numbered label.",
+        "The two touching nuclei come out as ONE label — that is what Segmentation's watershed fixes."
+      ]
+    },
+    "analysis.segment": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "slow_modes": {
+        "method": [
+          "stardist",
+          "cellsam"
+        ]
+      },
+      "slow_reason": "StarDist and CellSAM load a neural network; run them with the button",
+      "features": [
+        "One node, four methods: a threshold, a watershed that splits touching objects, StarDist, or CellSAM.",
+        "Size floors and ceilings (µm²) drop debris and clumps; fill_holes closes nuclei with dark centres.",
+        "Writes a label raster AND a label table (id, area, centroid) under one name."
+      ]
+    },
+    "analysis.histogram_threshold": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "features": [
+        "A threshold expressed on the histogram — percentiles, fractions of full scale, or a window — with clean-up morphology and size limits built in.",
+        "The second input (raw) lets you cut on the raw intensities while labelling a processed image."
+      ]
+    },
+    "analysis.draw_regions": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "fixed_modes": {
+        "scope": "all_frames"
+      },
+      "fixed_params": {
+        "shapes": "[{\"type\": \"rect\", \"op\": \"add\", \"vertices\": [[18, 14], [70, 62]]}, {\"type\": \"circle\", \"op\": \"add\", \"center\": [112, 48], \"radius\": 24}, {\"type\": \"polygon\", \"op\": \"add\", \"vertices\": [[96, 96], [150, 104], [140, 150], [100, 140]]}, {\"type\": \"rect\", \"op\": \"cut\", \"vertices\": [[30, 26], [46, 42]]}]"
+      },
+      "features": [
+        "Press Draw in the node's panel, choose a Tool (rectangle, ellipse, circle, polygon, brush) and an Operation (add / cut), set the brush size, drag on the image, then Apply.",
+        "Every shape becomes a numbered region (a label raster plus a table) pinned to the frame it was drawn on; cut carves out of what was drawn before.",
+        "Shown: a rectangle with a cut-out, a circle and a polygon, drawn for every frame.",
+        "Feed the regions to Measure, to Subtract Background (as a sample of background) or to Crop To."
+      ]
+    },
+    "analysis.roi_mask": {
+      "kind": "mask",
+      "phantom": "cells2d",
+      "fixed_params": {
+        "shapes": "[{\"type\": \"rect\", \"op\": \"add\", \"vertices\": [[18, 14], [70, 62]]}, {\"type\": \"circle\", \"op\": \"add\", \"center\": [112, 48], \"radius\": 24}, {\"type\": \"polygon\", \"op\": \"add\", \"vertices\": [[96, 96], [150, 104], [140, 150], [100, 140]]}]"
+      },
+      "features": [
+        "The same drawing tools as Draw Regions, producing one 0/1 mask instead of numbered regions.",
+        "Use it to restrict a threshold (scope = per_roi) or a measurement to a hand-drawn area."
+      ]
+    },
+    "transform.grow_points": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "puncta": true
+      },
+      "prelude": "spots2d",
+      "features": [
+        "Turns each detected point into a disc (or a distance-bounded region) and labels it — a segmentation seeded by a detector.",
+        "radius in µm, or per point from a column such as a fitted sigma."
+      ]
+    },
+    "detect.spots": {
+      "kind": "points",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "puncta": true
+      },
+      "features": [
+        "A Laplacian-of-Gaussian blob detector between min and max radius (µm); threshold is on the normalized response.",
+        "Each detection is a Point row (y, x, sigma, intensity). Points, not pixels — nothing is segmented."
+      ]
+    },
+    "detect.particles": {
+      "kind": "points",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "puncta": true
+      },
+      "features": [
+        "Local maxima at least min_distance apart above a threshold, with optional sub-pixel refinement.",
+        "Fast and simple — the choice when particles are well separated."
+      ]
+    },
+    "analysis.edt": {
+      "kind": "scalar",
+      "phantom": "cells2d",
+      "prelude": "threshold2d",
+      "features": [
+        "The Euclidean distance transform of a mask: every foreground pixel's distance to the nearest background pixel, in µm.",
+        "Shown as a heat map over the image; the watershed uses it to split touching objects."
+      ]
+    },
+    "analysis.boundary_band": {
+      "kind": "mask",
+      "phantom": "cells2d",
+      "prelude": "labels2d",
+      "features": [
+        "A band of given width along each label's boundary — for measuring the periphery, or a ring around the nucleus."
+      ]
+    },
+    "analysis.extract_boundary": {
+      "kind": "points",
+      "phantom": "cells2d",
+      "prelude": "labels2d",
+      "features": [
+        "Every label's outline as ordered boundary points — a contour you can measure, plot or rasterize."
+      ]
+    },
+    "analysis.voronoi": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "puncta": true
+      },
+      "prelude": "spots2d",
+      "fixed_modes": {
+        "bound": "frame"
+      },
+      "features": [
+        "Partitions the plane among the detected points: every pixel joins its nearest point's cell, up to max_distance.",
+        "bound limits the cells to a mask, to each region, or (here) to the whole frame."
+      ]
+    },
+    "analysis.tessellate": {
+      "kind": "mesh",
+      "phantom": "cells3d",
+      "prelude": [
+        {
+          "op": "analysis.threshold",
+          "modes": {
+            "method": "otsu",
+            "scope": "volume"
+          }
+        },
+        {
+          "op": "analysis.label",
+          "modes": {
+            "dim": "3D"
+          }
+        }
+      ],
+      "fixed_modes": {
+        "boundary": "label_surface"
+      },
+      "features": [
+        "Builds a mesh: one closed surface per label by marching cubes (label_surface), or a hull / alpha shape / Voronoi cell around each cluster of points.",
+        "A surface is volumetric, so the input must be a Z-stack; shown here on 3-D-labelled nuclei.",
+        "The mesh overlay draws the vertices that lie near the viewed plane."
+      ]
+    },
+    "transform.label_to_points": {
+      "kind": "points",
+      "phantom": "cells2d",
+      "prelude": "labels2d",
+      "features": [
+        "One point per label at its centroid, carrying the label's measurements — the bridge from regions to a point cloud."
+      ]
+    },
+    "transform.rasterize_field": {
+      "kind": "scalar",
+      "phantom": "speckle_pair",
+      "prelude": "piv2d",
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "Interpolates a point field's columns (u, v, strain…) onto the pixel grid as Voxel layers.",
+        "Shown: the PIV displacement of a warped speckle pair, rasterized and colour-mapped."
+      ],
+      "requires": [
+        "openpiv"
+      ]
+    },
+    "transform.rasterize_mesh": {
+      "kind": "labels",
+      "phantom": "cells3d",
+      "prelude": [
+        {
+          "op": "analysis.threshold",
+          "modes": {
+            "method": "otsu",
+            "scope": "volume"
+          }
+        },
+        {
+          "op": "analysis.label",
+          "modes": {
+            "dim": "3D"
+          }
+        },
+        {
+          "op": "analysis.tessellate",
+          "modes": {
+            "boundary": "label_surface"
+          }
+        }
+      ],
+      "live": false,
+      "slow_reason": "meshing a 3-D label volume then voxelising it takes seconds",
+      "features": [
+        "Fills each mesh element back into a label raster — the inverse of Tessellate's label surface."
+      ]
+    },
+    "transform.transfer_domain": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "features": [
+        "Moves an attribute between domains: a per-label value onto its voxels, a per-frame value onto its labels, and so on."
+      ]
+    },
+    "transform.transfer_structure": {
+      "kind": "table",
+      "phantom": "moving_cells",
+      "prelude": "tracked_measured2d",
+      "fixed_params": {
+        "attr": "area",
+        "source_layer": "labels",
+        "target_layer": "tracks"
+      },
+      "features": [
+        "Moves an attribute across the structure spine — Voxel ↔ Label ↔ Point ↔ Track, or any of them onto Frame — reducing when it coarsens.",
+        "Shown: each nucleus' measured area carried onto the track it belongs to (mean over the track's members)."
+      ]
+    },
+    "analysis.measure": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "labels2d",
+      "features": [
+        "Per-label statistics (area, centroid, intensity mean / min / max / std, shape descriptors) as a Label table.",
+        "The raw input lets you measure intensities on the unprocessed image while using processed labels.",
+        "target = point measures around detected points instead."
+      ]
+    },
+    "analysis.object_metrics": {
+      "kind": "table",
+      "phantom": "moving_cells",
+      "prelude": "tracked_measured2d",
+      "view": {
+        "t": 3
+      },
+      "features": [
+        "Per-object derived metrics: velocity and speed (µm/s) from the object's track, K-nearest-neighbour distances (µm), local divergence / curl, and intensity fold changes.",
+        "Speed needs a correspondence between frames, so a tracker runs upstream; the frame interval comes from the file."
+      ]
+    },
+    "analysis.object_field": {
+      "kind": "table",
+      "phantom": "moving_cells",
+      "prelude": "tracked_measured2d",
+      "view": {
+        "t": 3
+      },
+      "features": [
+        "Interpolates per-object quantities (density, speed, divergence, mean area, intensity) onto a regular grid of points — a continuous field from discrete objects.",
+        "Motion fields need tracks upstream; density and intensity do not."
+      ]
+    },
+    "analysis.reduce_scalar": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "source": "area"
+      },
+      "fixed_modes": {
+        "domain": "label",
+        "reducer": "mean"
+      },
+      "features": [
+        "Reduces one column of a table to a single number per series (mean, sum, count, …) — the scalar a sweep optimises."
+      ]
+    },
+    "analysis.cluster_points": {
+      "kind": "points",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "puncta": true
+      },
+      "prelude": "spots2d",
+      "features": [
+        "Groups points into n_clusters by k-means; each point gets a cluster id to colour by."
+      ]
+    },
+    "analysis.accumulate_field": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "analysis.dvc_field",
+          "modes": {
+            "reference_mode": "previous_frame"
+          }
+        }
+      ],
+      "live": false,
+      "slow_reason": "a DVC increment series takes many seconds",
+      "features": [
+        "Sums frame-to-frame displacement increments into a cumulative field."
+      ]
+    },
+    "analysis.filter_labels": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "column": "area"
+      },
+      "features": [
+        "Keeps or drops whole labels by one measured column: a fixed cut, a percentile, or a cut derived from the population.",
+        "Ids are preserved (label 5 stays label 5), so tables measured upstream still join."
+      ]
+    },
+    "analysis.if_else": {
+      "kind": "labels",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "column1": "area",
+        "op1": ">",
+        "value1": 250.0
+      },
+      "sliders": {
+        "value1": [
+          0,
+          800
+        ]
+      },
+      "features": [
+        "Routes each label (or point) to a pass or a fail layer by up to four column conditions.",
+        "Shown: nuclei with area > 250 px² pass; move the slider to see the split."
+      ]
+    },
+    "table.aggregate": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "value": "area",
+        "reducers": "mean,count"
+      },
+      "features": [
+        "Groups a table's rows (by frame, by position, by a column) and reduces a value column with one or more reducers."
+      ]
+    },
+    "table.concat": {
+      "kind": "table",
+      "phantom": "moving_cells",
+      "prelude": "metrics2d",
+      "features": [
+        "Stacks several tables with matching columns into one — frames of a series, or the same measurement on several files."
+      ]
+    },
+    "table.join": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "extra_inputs": {
+        "other": {
+          "pre": 1
+        }
+      },
+      "features": [
+        "Joins the other dataset's table onto this one by id (and frame), prefixing its columns.",
+        "Shown: the measured nuclei joined with the plain label table of the same field."
+      ]
+    },
+    "track.objects": {
+      "kind": "tracks",
+      "phantom": "moving_cells",
+      "prelude": "labels2d",
+      "view": {
+        "t": 3
+      },
+      "features": [
+        "Links labels (or points) frame to frame into tracks: nearest centroid, overlap, topology, fingerprint or SerialTrack.",
+        "max_distance bounds a step; max_frame_gap lets a track survive a missed frame.",
+        "Shown at frame 3: each nucleus' path so far."
+      ]
+    },
+    "track.link": {
+      "kind": "tracks",
+      "phantom": "moving_cells",
+      "prelude": "labels2d",
+      "view": {
+        "t": 3
+      },
+      "features": [
+        "A simple linker: nearest neighbour within max_distance, or best IoU overlap."
+      ]
+    },
+    "analysis.track_field": {
+      "kind": "field",
+      "phantom": "moving_cells",
+      "prelude": "tracks2d",
+      "view": {
+        "t": 3
+      },
+      "fixed_modes": {
+        "target": "label"
+      },
+      "features": [
+        "Per-track velocity and, from neighbouring tracks, a local strain — the deformation of a moving sheet of cells."
+      ]
+    },
+    "analysis.piv": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "Particle image velocimetry: cross-correlates windows of each frame with the previous (or a fixed) frame to get a displacement per window.",
+        "Shown at t = 1: arrows for the sinusoidal warp between the two speckle frames."
+      ],
+      "requires": [
+        "openpiv"
+      ]
+    },
+    "analysis.dic_correlate": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the ALDIC solver takes seconds per frame",
+      "features": [
+        "Digital image correlation (pyALDIC): a dense displacement and strain field between a reference and each frame."
+      ]
+    },
+    "analysis.dvc_field": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "3-D volume correlation takes many seconds",
+      "features": [
+        "Digital volume correlation (ALDVC): the 3-D counterpart of DIC, on subsets of a volume."
+      ]
+    },
+    "analysis.optical_flow": {
+      "kind": "scalar",
+      "phantom": "moving_cells",
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "Dense optical flow (TV-L1) between consecutive frames: a displacement per pixel, written as Voxel layers.",
+        "Shown: the flow magnitude at t = 1."
+      ]
+    },
+    "plot.xy": {
+      "kind": "plot",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "x": "area",
+        "y": "mean_intensity"
+      },
+      "features": [
+        "A scatter / line plot of two table columns, grouped by a third; the figure is a raster Dataset you can view or write."
+      ]
+    },
+    "plot.distribution": {
+      "kind": "plot",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "value": "area"
+      },
+      "features": [
+        "A histogram / distribution of one column, optionally per group."
+      ]
+    },
+    "plot.timeseries": {
+      "kind": "plot",
+      "phantom": "moving_cells",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "value": "area"
+      },
+      "features": [
+        "One column over time, one line per object or per group."
+      ]
+    },
+    "plot.heatmap": {
+      "kind": "plot",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "row": "id",
+        "column": "t",
+        "value": "area"
+      },
+      "features": [
+        "A grid of one value column indexed by two others — objects × frames, for instance."
+      ]
+    },
+    "enhance.deconvolve": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "gate_params": {
+        "iterations": 3
+      },
+      "sliders": {
+        "iterations": [
+          1,
+          50
+        ]
+      },
+      "features": [
+        "Richardson–Lucy deconvolution with a PSF built from the objective NA, the emission wavelength and the Z step — all read from the file.",
+        "More iterations sharpen further but amplify noise."
+      ]
+    },
+    "enhance.zs_deconvnet": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "live": false,
+      "slow_reason": "trains a zero-shot network on the image first",
+      "features": [
+        "Zero-shot deconvolution: trains a small network on this image alone, then applies it; no clean reference needed."
+      ]
+    },
+    "enhance.subtract_background": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Estimates the background surface (rolling ball, opening, Gaussian, polynomial, percentile…) and subtracts or divides it out.",
+        "The regions input (a drawn region) can instead sample what counts as background and zero it."
+      ]
+    },
+    "enhance.temporal_gain": {
+      "kind": "image",
+      "phantom": "timelapse_drift",
+      "view": {
+        "t": 3
+      },
+      "features": [
+        "Equalises the brightness of every frame of a series against a sliding window — bleaching and lamp flicker removed."
+      ]
+    },
+    "enhance.normalize": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Rescales intensities to a window: by percentiles of the histogram, or by absolute low / high values."
+      ]
+    },
+    "enhance.gamma": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "A power-law transfer: gamma < 1 lifts the dim, > 1 compresses it. Display-like, but it changes the data."
+      ]
+    },
+    "enhance.clahe": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Contrast-limited adaptive histogram equalisation on a grid of tiles; clip_limit caps the local amplification."
+      ]
+    },
+    "enhance.gaussian": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "A Gaussian blur with σ in microns — the same µm give the same smoothing on any objective.",
+        "Around 0.5 µm denoises lightly; 2 µm flattens the nuclei."
+      ]
+    },
+    "enhance.tophat": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "White top-hat: the image minus its opening, keeping only features smaller than the radius — the uneven background falls away."
+      ]
+    },
+    "enhance.dog": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Difference of Gaussians: a band-pass that keeps structures between the two σ — spots of one size class."
+      ]
+    },
+    "enhance.remove_blobs": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "phantom_kw": {
+        "puncta": true
+      },
+      "features": [
+        "Detects bright blobs in a radius band and paints them out with the surrounding intensity — removes puncta or debris before segmenting."
+      ]
+    },
+    "enhance.flatten_field": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Divides by a heavily blurred copy of the series to remove illumination falloff; bg_floor avoids amplifying the dark corners."
+      ]
+    },
+    "enhance.median": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "A median filter: removes salt-and-pepper noise while keeping edges."
+      ]
+    },
+    "enhance.bilateral": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Edge-preserving smoothing: averages neighbours that are close in space AND in intensity."
+      ]
+    },
+    "enhance.nlm": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Non-local means: averages patches that look alike wherever they are; h sets how different two patches may be."
+      ]
+    },
+    "enhance.tv_denoise": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Total-variation denoising: smooths noise while keeping sharp edges; weight trades noise against detail."
+      ]
+    },
+    "enhance.wavelet_denoise": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Shrinks wavelet coefficients to remove noise at every scale; the mode picks the shrinkage rule."
+      ]
+    },
+    "enhance.unsharp": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Unsharp masking: adds amount × (image − blur) to sharpen edges."
+      ]
+    },
+    "enhance.morphology": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Grey-level erosion, dilation, opening or closing with a disc of the given radius."
+      ]
+    },
+    "enhance.morphological_gradient": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "features": [
+        "Dilation minus erosion: an edge map whose thickness is the radius."
+      ]
+    },
+    "util.crop_region": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "prelude": "labels2d",
+      "features": [
+        "Crops to a mask, drawn regions or a label raster instead of a rectangle: keep the frame and blank outside (frame), shrink to the box around the regions (fit), or one window per object (each).",
+        "Shown: the field blanked outside the segmented nuclei."
+      ],
+      "fixed_params": {
+        "region": "labels"
+      }
+    },
+    "math.image": {
+      "kind": "image",
+      "phantom": "cells2d",
+      "extra_inputs": {
+        "other": {
+          "phantom": "cells2d",
+          "kw": {
+            "shift_px": [
+              4.0,
+              3.0
+            ]
+          }
+        }
+      },
+      "features": [
+        "Pixel arithmetic between this image and another branch's image (or a constant when Other is unwired): add, subtract, multiply, divide, min, max, difference, mean.",
+        "Shown: the field minus a copy of itself shifted by (4, 3) px — the edges light up."
+      ]
+    },
+    "math.mask": {
+      "kind": "mask",
+      "phantom": "cells2d",
+      "prelude": [
+        {
+          "op": "analysis.threshold",
+          "modes": {
+            "method": "otsu"
+          }
+        },
+        {
+          "op": "analysis.threshold_local",
+          "params": {
+            "name": "local"
+          }
+        }
+      ],
+      "fixed_params": {
+        "a": "mask",
+        "b": "local"
+      },
+      "features": [
+        "Set algebra on masks: subtract, union, intersect, xor or invert, between two Voxel layers on this wire or one from a second branch.",
+        "Shown: the Otsu mask minus the local-threshold mask of the same field."
+      ]
+    },
+    "math.values": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_modes": {
+        "domain": "label",
+        "op": "divide"
+      },
+      "fixed_params": {
+        "a": "max_intensity",
+        "b": "mean_intensity",
+        "table": "labels",
+        "name": "peak_ratio"
+      },
+      "features": [
+        "Arithmetic on the numbers a Dataset carries — a scalar, a table column, a per-plane layer — against another one or a constant, with units carried through.",
+        "Shown: max_intensity ÷ mean_intensity per nucleus, as a new column peak_ratio."
+      ]
+    }
+  }
+}

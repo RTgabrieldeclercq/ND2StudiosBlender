@@ -8553,6 +8553,87 @@ def main(argv) -> int:
             _tm.stop()
         _h.stop_tasks()
 
+
+    # ── What does this node do? (2026-10-07) — the ? beside the node title and the
+    #    palette's button open one live demo window per op type ──────────────────────
+    from PySide6.QtWidgets import QToolButton as _QTB_demo
+
+    def _wait_demo(dlg, timeout=90.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            app.processEvents()
+            if dlg._worker is None:
+                return True
+            if (not dlg._worker.busy and dlg._done_gen == dlg._gen
+                    and dlg.last_result is not None and not dlg._debounce.isActive()):
+                return True
+            time.sleep(0.01)
+        return False
+
+    # the header carries a ? beside the reload button for any registered node
+    win.scene.clearSelection()
+    _any_item = next(iter(win.scene.node_items.values()))
+    _any_item.setSelected(True)
+    app.processEvents()
+    assert any(b.text() == "?" for b in win.inspector.findChildren(_QTB_demo)), \
+        "no ? button in the inspector header"
+    # Gaussian: computes on open; a sigma move recomputes and changes the after image
+    dlg = win.open_node_demo("enhance.gaussian")
+    assert dlg.isVisible() and dlg._worker is not None
+    assert _wait_demo(dlg), "the gaussian demo did not compute"
+    _r0 = dlg.last_result
+    assert _r0 is not None and _r0.after_image is not None and _r0.before.shape == (160, 160)
+    _after0 = _r0.after_image.copy()
+    _sig = dlg.control("sigma")
+    assert _sig is not None and dlg.control("tool") is None
+    _sig.set_value(2.0)
+    _sig._emit()                        # what a slider release does: touched + changed
+    assert _wait_demo(dlg) and dlg._gen >= 2, "the sigma move did not recompute"
+    assert not np.array_equal(_after0, dlg.last_result.after_image), \
+        "sigma = 2 um left the after image unchanged"
+    assert "sigma = 2" in dlg._status.text() and "ms" in dlg._status.text()
+    dlg._compare.set_value("Wipe")
+    dlg._compare._emit()
+    app.processEvents()
+    assert not dlg._before.isVisible() and "Wipe" in dlg._cap_after.text()
+    # Draw Regions: the curated shapes rasterize to three regions; the shapes socket is a
+    # read-only chip, the presentation-only tool/op/brush sockets are not controls
+    d2 = win.open_node_demo("analysis.draw_regions")
+    assert _wait_demo(d2) and d2.last_result.label_plane is not None
+    assert int(d2.last_result.label_plane.max()) == 3
+    assert d2.control("shapes") is not None and d2.control("brush_px") is None
+    assert d2._frame is not None and d2._frame.label_plane is not None
+    # Measure: a table demo shows the table, not a second image
+    d3 = win.open_node_demo("analysis.measure")
+    assert _wait_demo(d3) and d3._table.isVisible() and d3._table.rowCount() > 0
+    assert "area" in [d3._table.horizontalHeaderItem(j).text()
+                      for j in range(d3._table.columnCount())]
+    # a guide-only node: no session, no worker
+    d4 = win.open_node_demo("zone.frame")
+    assert d4._worker is None and d4._session is None
+    # a slow node waits for Run instead of computing on open
+    d5 = win.open_node_demo("enhance.zs_deconvnet")
+    assert d5._run_btn.isVisible() and d5.last_result is None and d5._worker is not None
+    # the palette's button: enabled on a node overview, routed to the same cache
+    win.palette._show_node("enhance.gaussian")
+    assert win.palette._demo_btn.isEnabled()
+    win.palette._demo_btn.click()
+    app.processEvents()
+    assert win._demo_windows["enhance.gaussian"] is dlg, "one window per op type"
+    assert win.open_node_demo("enhance.gaussian") is dlg
+    win.palette._show_legend()
+    assert not win.palette._demo_btn.isEnabled()
+    for _d in (dlg, d2, d3, d4, d5):
+        _d.close()
+    app.processEvents()
+    assert "enhance.gaussian" not in win._demo_windows and not win._demo_windows
+    _ok("node demo window (2026-10-07): ? beside the node title and the palette's button "
+        "open one live demo per op type; Gaussian computes on open and a sigma move "
+        "recomputes to a different after image; Wipe compare; Draw Regions rasterizes its "
+        "curated shapes to 3 regions with the shapes chip read-only and the presentation "
+        "sockets hidden; Measure fills a table with an area column; zone.frame is a guide "
+        "with no worker; ZS-DeconvNet waits for Run; windows drop from the cache on close")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

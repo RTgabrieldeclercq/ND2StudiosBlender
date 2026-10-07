@@ -263,3 +263,20 @@ their own (an unbound Input refuses by design). The selftest's catalog sweeps
 LabLink page tests cover them. They ARE in the catalog snapshot baseline and the synopsis
 (both call `ensure_ops`, role `page_boundary`): a change to their sockets or descriptions
 needs `_catalog_snapshot.py save` and `_node_synopsis.py write` like any node's.
+
+---
+
+### INV-17 — a node demo defines no op, touches no live runner, and every op has one
+anchors: sym:nodelab_v2.demo_recipes.DemoSession, sym:nodegraph.phantom.phantom, sym:nodelab_v2.demo_recipes.validate_curation
+
+The *What does this node do?* window runs a node on a phantom through a **throwaway engine**:
+`DemoSession.build_graph` seeds an `io.load` with the phantom's Dataset and MetaEnvelope
+exactly as the runner seeds one, and `headless_engine` runs `src -> prelude -> demo` on the
+session's own `Memo` and `TileCache` (shared across rebuilt engines, the cache rule in
+`Engine.__init__`). Nothing calls `define_node` (INV-03), nothing reads the runner's providers,
+and a param the user has not touched is **absent** from the node so the engine derives it
+itself. Synthetic datasets live only in `nodegraph/phantom.py` (deterministic by seed; the
+cached object is the identity); the per-op curation only in `codemap/node_demos.json`, which
+`selftest.test_node_demos` validates against the live registry and then runs for EVERY op —
+a guide must carry curated features, a live recipe must produce the evidence its kind
+promises, a `live=false` one must say why. A node that cannot demonstrate itself does not pass.

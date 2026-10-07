@@ -267,3 +267,26 @@ anchors: sym:nodelab_v2.workspace.Workspace.compose, sym:nodelab_v2.runner.Engin
    downstream of an edit rebuild.
 
 read next: CON-17 (2 min) · `nodegraph.selftest.test_page_composition_memo_reuse` (grep, 3 min)
+
+### WF-09 — a demo pull (What does this node do?)
+anchors: sym:nodelab_v2.window.MainWindow.open_node_demo, sym:nodelab_v2.demo_window.NodeDemoWindow, sym:nodelab_v2.demo_recipes.DemoSession.run
+
+1. The inspector's `?` (or the palette's button) emits `demo_requested(op_key)`;
+   `MainWindow.open_node_demo` shows the one `NodeDemoWindow` per op type, creating it from
+   `demo_recipes.recipe_for(op)` — the role default from `node_roles.json` merged with the
+   `codemap/node_demos.json` entry (phantom, prelude, fixed values, slider spans, kind).
+2. `DemoSession.build_graph` makes a fresh `Graph`: `src` (an `io.load` seeded with the
+   phantom, as the runner seeds a file) -> `pre0..preN` -> `demo`, plus any extra Dataset
+   inputs (a second phantom, a prelude node). Only touched params are sent; modes are the
+   full state, so `active_inputs` gates the sliders the way it gates the inspector.
+3. `_DemoWorker` (one Python thread, latest request wins, 80 ms debounce) calls
+   `DemoSession.run`: `headless_engine(memo, tiles)` -> `pull("demo")` -> `realize` ->
+   a `DemoResult` reduced to the viewed `(t, z, c)` plane: the before and after planes, the
+   label / mask / scalar plane, points, tracks, vectors, mesh vertices, structure tables.
+4. On the GUI thread a stale generation is dropped; otherwise both planes go through
+   `composite_with_clim` (the before's window shared when the after lives in the same range)
+   onto two `_ImageView`s and the kind's overlay is painted by the Viewer's `OverlayRenderer`
+   through `overlay_cb` with an `OverlayFrame`. Slow recipes (or two runs over 1.5 s) switch
+   to a Run button.
+
+read next: INV-17 (1 min) · `nodegraph.selftest.test_node_demos` (grep, 3 min) · MANUAL §8e

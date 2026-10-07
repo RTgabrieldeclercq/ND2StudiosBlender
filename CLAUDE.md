@@ -53,6 +53,7 @@ Grep first; open a source file only after a record names it.
 | a concept, precisely | [codemap/concepts.md](codemap/concepts.md) — `CON-01`… |
 | rules you must not break | [codemap/invariants.md](codemap/invariants.md) — `INV-01`… |
 | a kernel's integration contract | [nodegraph/kernels/README.md](nodegraph/kernels/README.md) indexes one `.md` per kernel |
+| what a node's **demo** shows (phantom, upstream chain, sliders, guide text) | [codemap/node_demos.json](codemap/node_demos.json), read by `nodelab_v2/demo_recipes.py`; a node absent there demos by its role. `selftest.test_node_demos` runs every op's demo |
 | **to build or modify a node** | invoke the **`build-node-v2`** skill. It cites the concepts you need |
 | user-facing behaviour, symptoms, recipes | [MANUAL.md](MANUAL.md) — §18 troubleshooting, §16 worked workflows |
 | the record shapes above | [codemap/_schema.md](codemap/_schema.md) |

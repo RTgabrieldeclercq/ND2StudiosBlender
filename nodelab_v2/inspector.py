@@ -297,6 +297,10 @@ class InspectorPanel(QScrollArea):
     #: window owns the reloader, the runner (which must be idle) and the canvas that has to
     #: be relaid out afterwards.
     reload_requested = Signal(str)
+    #: the ? beside the node title was pressed: ``op_key``. Open *What does this node do?*
+    #: — the live demo of that node type on a phantom (2026-10-07). The panel asks; the
+    #: window owns the one-window-per-op cache and the dialogs' worker threads.
+    demo_requested = Signal(str)
     #: a *Ready to run* suggestion was taken: ``(node_id, op_key, wire_to)`` — add a node
     #: of ``op_key`` and wire its output into this node's ``wire_to`` input. Same division
     #: of labour as the signals above: the panel asks, the window owns the document and
@@ -454,6 +458,33 @@ class InspectorPanel(QScrollArea):
                 f"a subgraph rather than a node type. Restart to pick up changes to those.")
         return btn
 
+    def _demo_button(self, node: NodeItem) -> QWidget:
+        """The ? beside the node's title: open *What does this node do?* for this node TYPE.
+
+        A window (:mod:`nodelab_v2.demo_window`) that runs the node on a synthetic image
+        with a slider for every parameter and a before / after to compare — or, for a node
+        that does not transform pixels, its key features and how to use it. It is a
+        sandbox: nothing it does reaches this node or the canvas. Sits beside ⟳ because the
+        header is where a user asks what a node is before they ask what its code says."""
+        btn = QToolButton()
+        btn.setText("?")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedSize(24, 24)
+        btn.setStyleSheet(
+            f"QToolButton {{ color:{_h(T.MUTED)}; background:transparent; border:1px solid "
+            f"{_h(T.BORDER)}; border-radius:5px; font-size:13px; font-weight:bold; }}"
+            f"QToolButton:hover {{ color:{_h(T.INK)}; background:{_h(T.PANEL_HI)}; }}"
+            f"QToolButton:disabled {{ color:{_h(T.alpha(T.MUTED, 90))}; "
+            f"border-color:{_h(T.alpha(T.BORDER, 90))}; }}")
+        btn.setToolTip(
+            "What does this node do?\n\n"
+            "Opens a window that runs this node type on a synthetic image, with a slider "
+            "for every parameter and a before / after you can wipe, checker or difference. "
+            "A node that does not transform pixels shows its key features and how to use "
+            "it instead.\n\nA sandbox: nothing there changes this node.")
+        btn.clicked.connect(lambda: self.demo_requested.emit(node.op_key))
+        return btn
+
     def _eyebrow(self, text: str, color=None) -> QLabel:
         lab = QLabel(text.upper()); lab.setProperty("role", "eyebrow")
         if color is not None:
@@ -508,6 +539,7 @@ class InspectorPanel(QScrollArea):
         row = QHBoxLayout()
         title = QLabel(spec.label); tf = title.font(); tf.setPointSize(13); tf.setBold(True)
         title.setFont(tf); row.addWidget(title); row.addStretch(1)
+        row.addWidget(self._demo_button(node))
         row.addWidget(self._reload_button(node))
         if spec.has_dim_lever():
             sw = SwitchWidget(node.dim)
