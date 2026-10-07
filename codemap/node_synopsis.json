@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 114,
+    "nodes": 115,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 787,
-    "outputs": 121,
+    "inputs": 789,
+    "outputs": 122,
     "gui_ops_included": true
   },
   "stages": {
@@ -148,6 +148,7 @@
         "util.resample",
         "util.stack",
         "util.stitch",
+        "util.time_shift",
         "util.zproject"
       ]
     },
@@ -497,8 +498,8 @@
     "registration_and_alignment": {
       "label": "Registration & alignment",
       "stage": "prepare_image",
-      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another — and the apply half on its own: Shift moves any Dataset by a per-frame (z, y, x) shift read from a Registration output, so the drift can be estimated on one plane (Select Plane) and applied to the whole stack.",
-      "count": 4,
+      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another — and the apply half on its own: Shift moves any Dataset by a per-frame (z, y, x) shift read from a Registration output, so the drift can be estimated on one plane (Select Plane) and applied to the whole stack — and Time Shift moves a stream along its own time axis by whole frames, later or earlier, so two streams of one acquisition line up when one lags the other.",
+      "count": 5,
       "ops": [
         {
           "op": "align.drift",
@@ -519,6 +520,11 @@
           "op": "registration.stabilize",
           "label": "Registration",
           "summary": "Register-once (on a reference channel) / apply-to-all-channels stabilization; translation/euclidean/affine/feature/auto models, first/previous/mean/template anchor, 2D or 3D (axial drift), a drawn estimate region and hand-clicked landmarks; stores the per-frame shift and confidence as Frame attributes. Pair with Select Plane (estimate on one chosen plane) and Shift (apply the stored shift to the whole stack) when the estimate and the apply belong on different data."
+        },
+        {
+          "op": "util.time_shift",
+          "label": "Time Shift",
+          "summary": "Move a stream along its own time axis by a whole number of frames, later or earlier: frame k of the output is frame k − Delta of the input. T, the frame interval and the per-frame clock stay — the grid is the same, the content moved on it — so two streams of one acquisition can be lined up for a Merge or a comparison when one lags the other. Masks and detections move with the image. The T twin of Shift."
         }
       ]
     },
@@ -1141,6 +1147,7 @@
       "util.split_z",
       "util.stack",
       "util.stitch",
+      "util.time_shift",
       "util.timeseries",
       "util.unbatch",
       "util.zproject"
@@ -20872,6 +20879,104 @@
         "refine_highpass",
         "refine_max_shift",
         "refine_min_ncc"
+      ]
+    },
+    "util.time_shift": {
+      "op": "util.time_shift",
+      "label": "Time Shift",
+      "category": "utility",
+      "role": "registration_and_alignment",
+      "stage": "prepare_image",
+      "pages": [
+        "refine",
+        "process"
+      ],
+      "module": "nodegraph/catalog/util/time_shift.py",
+      "gui_only": false,
+      "summary": "Move a stream along its own time axis by a whole number of frames, later or earlier: frame k of the output is frame k − Delta of the input. T, the frame interval and the per-frame clock stay — the grid is the same, the content moved on it — so two streams of one acquisition can be lined up for a Merge or a comparison when one lags the other. Masks and detections move with the image. The T twin of Shift.",
+      "overview": "Move the stream along T by a whole number of frames. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** utility, axis-PRESERVING → ``op_key=\"util.time_shift\"``, category ``\"utility\"``; no ``meta_transform`` — the axes and every metadata key are unchanged, because the time grid (T, ``dt_s``, the per-frame clock) is the same and only the content moved on it. * **Data contract** ``Dataset → the same Dataset re-indexed on T``: output frame ``k`` is input frame ``k − Δ`` (``direction`` = ``later`` ⇒ Δ > 0, the content appears Δ frames later; ``earlier`` ⇒ Δ < 0). Frames that fall off the end are gone; frames with no source repeat the nearest edge frame (``edges`` = ``hold``) or are zero (``blank``). Lattice layers (a mask, a label raster) move with the image frame for frame; Point / Label / Track rows move their ``t`` and rows shifted off either end are dropped (a mesh that would lose rows is dropped whole, as every frame subset does). * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly one input unit (of another frame); nothing else of the series is read. * **Sockets** ``delta`` (whole frames, ≥ 0; the sign is the ``direction`` Mode, because the card's numeric controls are non-negative). Modes ``direction`` (later / earlier), ``edges`` (hold / blank). * **Backend** none — :class:`~nodegraph.provider.FrameRemapProvider`, a lazy index remap. Δ = 0 and a single-frame input are the identity. A Δ beyond the series length is allowed: every frame then reads an edge frame (``hold``) or is blank.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "direction",
+          "label": "Direction",
+          "choices": [
+            "later",
+            "earlier"
+          ],
+          "default": "later",
+          "description": "Which way the content moves along time. The card's numbers are magnitudes, so the sign of the shift lives here: `later` delays the stream (what was at frame k is now at frame k + Delta), `earlier` advances it (what was at frame k is now at frame k − Delta). Pick by what you are lining up with: a stream that LAGS a reference needs `earlier`; one that LEADS it needs `later`.",
+          "choice_docs": {
+            "later": "Delay: output frame k reads input frame k − Delta, so every event appears Delta frames later than it did. The first Delta frames have no source and follow the Edges mode; the last Delta input frames fall off the end and are gone. Use it on a stream that runs AHEAD of the one you are comparing it with.",
+            "earlier": "Advance: output frame k reads input frame k + Delta, so every event appears Delta frames sooner. The first Delta input frames are gone; the last Delta output frames have no source and follow the Edges mode. Use it on a stream that LAGS the one you are comparing it with — the common case when a second camera or channel starts late."
+          }
+        },
+        {
+          "name": "edges",
+          "label": "Edges",
+          "choices": [
+            "hold",
+            "blank"
+          ],
+          "default": "hold",
+          "description": "What the frames with NO SOURCE show — the Delta frames at the near end (later) or far end (earlier) that the shift opened up. T is kept either way, so the stream still lines up frame for frame with whatever it is combined with; this only decides what those frames contain.",
+          "choice_docs": {
+            "hold": "Repeat the nearest real frame: the opened frames at the start show the first input frame, those at the end the last. Masks and rasters repeat with it, so a segmentation stays visible there; detections are NOT duplicated (a row exists once). Reads naturally when scrubbing and is the right choice when the frames are padding rather than data.",
+            "blank": "Leave the opened frames empty: zero pixels, zero masks, no detections. Honest about the missing data — a measurement on those frames reads nothing rather than a repeated frame's objects — at the cost of dark frames when scrubbing. Choose it when downstream counts or intensities on every frame matter more than a continuous-looking series."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream to move in time. Every position, plane and channel of it is re-indexed along T the same way; its masks, label rasters and detections move with it. T and the frame interval do not change."
+        },
+        {
+          "name": "delta",
+          "label": "Delta",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1,
+          "description": "HOW MANY FRAMES the content moves, as a count ≥ 0 — the Direction mode says which way. 1 frame is one `dt_s` of the series (the frame labels on a Split T card show the time each index stands for). LARGER moves the stream further: with `later`, frame k of the output shows what frame k − Delta of the input showed, so events appear Delta frames later; frames shifted off the far end are gone, and the frames at the near end with nothing to show follow the Edges mode. 0 is the identity. A count beyond the series length leaves every frame reading an edge frame (hold) or blank. A fraction is refused: this node moves whole frames and never interpolates in time."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_time_shift",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "delta"
       ]
     },
     "util.timeseries": {

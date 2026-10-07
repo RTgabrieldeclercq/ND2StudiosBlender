@@ -1081,6 +1081,57 @@ class FrameSliceProvider(FrameSubsetProvider):
         return (self._ms[0], self._ts[0])
 
 
+class FrameRemapProvider(TileProvider):
+    """A lazy RE-INDEX of another provider's T axis (2026-10-07): output frame ``k`` reads
+    the base's frame ``sources[k]``, which may REPEAT (a held edge frame) or be ``None`` (a
+    blank frame, read as zeros of the base's dtype). The output has ``len(sources)`` frames;
+    ``m``, ``z``, ``c``, the spatial extent and the pyramid pass through untouched, and the
+    cost flags are inherited exactly as :class:`FrameSubsetProvider` inherits them.
+
+    Written for ``util.time_shift``. :class:`FrameSubsetProvider` cannot express it on
+    purpose — its picks are sorted and de-duplicated because a subset is a *sampling* of the
+    acquisition; this is a *re-timing*, where frame 0 may legitimately appear three times.
+    The map folds into :meth:`fingerprint`, so two different shifts of one series never alias
+    in the memo, and the same shift is a plain memo hit."""
+
+    _TAG = "frame-remap"
+
+    def __init__(self, base: TileProvider, sources) -> None:
+        self._base = base
+        ax = base.axes
+        hi = max(0, int(ax.t) - 1)
+        self._ts = tuple(None if s is None else min(max(0, int(s)), hi) for s in sources)
+        if not self._ts:
+            raise ValueError("FrameRemapProvider needs at least one output frame")
+        self.axes = replace(ax, t=len(self._ts))
+        self.tile = base.tile
+        self.levels = base.levels
+        self.depth = getattr(base, "depth", 0)
+        self.cum_halo = getattr(base, "cum_halo", 0)
+        self.plane_unit = bool(getattr(base, "plane_unit", False))
+        self.volume_unit = bool(getattr(base, "volume_unit", False))
+
+    @property
+    def sources(self) -> tuple:
+        """Per output frame, the BASE frame it reads — ``None`` for a blank frame."""
+        return self._ts
+
+    def level_axes(self, level: int) -> AxisSizes:
+        return replace(self._base.level_axes(level), t=len(self._ts))
+
+    def read_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b: int = 0) -> np.ndarray:
+        bt = self._ts[min(max(0, int(t)), len(self._ts) - 1)]
+        if bt is None:
+            # a blank frame: zeros in the base's own dtype and shape — learned from a real
+            # frame's read, because a provider declares no dtype of its own
+            real = next((s for s in self._ts if s is not None), 0)
+            return np.zeros_like(self._base.read_region(level, m, real, z, c, y0, y1, x0, x1, b=b))
+        return self._base.read_region(level, m, bt, z, c, y0, y1, x0, x1, b=b)
+
+    def fingerprint(self) -> tuple:
+        return (self._TAG, self._base.fingerprint(), self._ts)
+
+
 class ArrayProvider(TileProvider):
     """A provider backed by an in-memory ``(B,M,T,Z,C,Y,X)`` array — how a *realizing*
     node (e.g. deconvolve) wraps its computed volume back into ``Dataset.image``.
@@ -1684,6 +1735,7 @@ class AxisRespreadProvider(TileProvider):
 
 __all__ = ["TileProvider", "SyntheticProvider", "B2ndProvider", "ArrayProvider",
            "ChannelMergeProvider", "FrameSubsetProvider", "FrameSliceProvider",
+           "FrameRemapProvider",
            "MultiSourceProvider", "AxisConcatProvider", "AxisRespreadProvider",
            "BatchProvider", "BatchSliceProvider", "CONCAT_AXES", "RESPREAD_AXES",
            "subset_index"]

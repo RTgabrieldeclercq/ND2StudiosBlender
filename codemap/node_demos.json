@@ -1492,6 +1492,21 @@
         "Grows one output socket per timepoint (t0…t5 here, labelled with the frame time) so each frame can feed its own chain; wiring one inserts a Select Frame tap for you at run time. The whole series still passes through out, which is what this view shows.",
         "A real series is hundreds of frames, so the card stops growing per-frame sockets past 24; the Properties panel still lists every frame with a checkbox, and Group every N (10, say) writes one output per that many consecutive frames — a Crop in frames mode at run time, every per-frame list following; Group selected names a window by hand."
       ]
+    },
+    "util.time_shift": {
+      "kind": "image",
+      "phantom": "star_field",
+      "fixed_params": {
+        "delta": 2
+      },
+      "view": {
+        "t": 3
+      },
+      "features": [
+        "Delays the series by two frames: the before view is frame 3 of the input, the after view shows what frame 1 looked like — the beads are back where they were two frames earlier (the field drifts (+1.5, −2.0) px a frame). Drag Delta to change the lag; Direction `earlier` pulls later frames forward instead.",
+        "T, the frame interval and the per-frame clock do not change: the content moved on the same grid, which is what lets two streams of one acquisition be lined up for a Merge or a comparison when one lags the other.",
+        "Frames with no source repeat the nearest edge frame (`hold`) or are blank (`blank`); per-frame masks and detections move with the image, and rows shifted off either end are dropped. The T twin of Shift."
+      ]
     }
   }
 }

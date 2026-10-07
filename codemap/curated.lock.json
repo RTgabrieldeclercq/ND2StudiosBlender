@@ -80,10 +80,10 @@
  },
  "CON-11": {
   "anchors": {
-   "file:nodegraph/provider.py": "bb00221068ebd24e973c891e9c8b6752",
+   "file:nodegraph/provider.py": "81c3332eb3ea2164630580d298178ff5",
    "sym:nodegraph.streaming.TileCache": "e2b4360003ef3d619631e8bd0a633d3f"
   },
-  "blessed": "2026-10-05",
+  "blessed": "2026-10-07",
   "file": "codemap/concepts.md"
  },
  "CON-12": {

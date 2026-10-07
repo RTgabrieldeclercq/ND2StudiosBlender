@@ -236,6 +236,14 @@ thousands of pixels a side — the blank primary that several files are overlaid
 no pixels. Its fingerprint is structural (geometry + value): two canvases of one geometry
 are the same pixels.
 
+Two index remaps of ONE provider's frame axes are deliberately different types.
+`FrameSubsetProvider` picks sorted, de-duplicated `m`/`t`/`z` indices — a *sampling* of the
+acquisition (the run-scope, `util.crop`'s frames mode, the Select taps). `FrameRemapProvider`
+(`util.time_shift`, 2026-10-07) is its *re-timing* twin: output frame `k` reads any source
+frame, repeats and blanks (zeros) allowed, so a stream moved two frames later shows frame 0
+three times. Kept apart because a subset must never be able to express a held edge frame, and
+both fold their map into the fingerprint so two shifts of one series never alias in the memo.
+
 `AxisRespreadProvider` (`util.timeseries`, formerly `util.chain`, V3.02) is the one that erases the difference between
 the two shapes above. It takes **`(provider, m start, position count)` triples — one per
 source FILE** — and lays them end to end on `t`, `z`, `c` or `m`, by the same exclusive

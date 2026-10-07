@@ -24327,6 +24327,132 @@ def test_select_frame_split_t() -> None:
         "same windows out explicitly, and the split cards carry one `groups` socket and no Mode")
 
 
+def test_time_shift() -> None:
+    """``util.time_shift`` (2026-10-07): the T twin of Shift — frame k of the output is frame
+    k − Δ of the input, the grid (T, ``dt_s``, the per-frame clock) untouched.
+
+    Pinned: `later` delays and `earlier` advances, by the sign ``signed_delta`` gives the
+    ``direction`` Mode; `hold` repeats the edge frame and `blank` zeroes it, in the image AND in
+    a Voxel layer; Point rows move their t and rows shifted off either end are dropped, never
+    duplicated; metadata is byte-for-byte the input's; envelope == payload (no meta_transform);
+    the stamp is t-only; Δ = 0 and a single frame are the identity; a Δ past the length holds
+    the edge everywhere; the four mode states hash apart; a fraction and a missing image are
+    refused; the provider's map folds into the fingerprint."""
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider, FrameRemapProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    from nodegraph.catalog.util.time_shift import signed_delta, time_shift_sources
+
+    assert time_shift_sources(5, 2, "hold") == [0, 0, 0, 1, 2]
+    assert time_shift_sources(5, 2, "blank") == [None, None, 0, 1, 2]
+    assert time_shift_sources(5, -2, "hold") == [2, 3, 4, 4, 4]
+    assert time_shift_sources(5, -2, "blank") == [2, 3, 4, None, None]
+    assert time_shift_sources(3, 7, "hold") == [0, 0, 0] and time_shift_sources(3, 0, "hold") == [0, 1, 2]
+    assert signed_delta(3, {}) == 3 and signed_delta(3, {"direction": "earlier"}) == -3
+    assert signed_delta(None, {"direction": "later"}) == 1
+    for bad in ("1.5", -2, "x"):
+        try:
+            signed_delta(bad, {})
+            raise AssertionError(bad)
+        except ValueError as exc:
+            assert "whole number" in str(exc), str(exc)
+
+    define_node("io.tshseed", "S", outputs=[OutDataset()])
+    M, T, Z, Y, X = 1, 6, 2, 6, 8
+    arr = np.zeros((M, T, Z, 1, Y, X), dtype=float)
+    for t in range(T):
+        arr[:, t] = 10.0 * (t + 1)
+    ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "dt_s": 30.0, "frame_time_jd": [2460000.0 + 0.001 * t for t in range(T)]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, Z, 1, Y, X), dtype=np.int64)
+    for t in range(T):
+        mask[:, t, :, :, t, t] = 1                        # one pixel per frame, on the diagonal
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.POINT, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 0, 0]), "t": np.array([0, 3, 5]),
+        "c": np.array([0, 0, 0]), "z": np.array([0, 1, 0]),
+        "y": np.array([0.0, 3.0, 5.0]), "x": np.array([0.0, 3.0, 5.0])}, layer="spots"))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def pull(params=None, modes=None, seed=ds, env=env0):
+        g = Graph()
+        g.add(NodeInstance("S", "io.tshseed"))
+        g.add(NodeInstance("N", "util.time_shift", params=params or {}, modes=modes or {}))
+        g.connect("S", "N")
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": env})
+        return e, e.pull("N")
+
+    def px(out, t):
+        return float(out.image.get_region(0, 0, t, 0, 0, 0, Y, 0, X)[0, 0])
+
+    def rows(out):
+        return (list(out.get(Domain.POINT, "id", layer="spots").values),
+                list(out.get(Domain.POINT, "t", layer="spots").values))
+
+    # later by 2, hold: frames 0,1,2 show frame 0; 3..5 show 1..3; the mask and the rows follow
+    e, out = pull({"delta": 2})
+    assert out.axes == ax and [px(out, t) for t in range(T)] == [10.0, 10.0, 10.0, 20.0, 30.0, 40.0]
+    lay = out.get(Domain.VOXEL, "mask").values
+    assert [int(lay[0, t, 0, 0].argmax() // X) for t in range(T)] == [0, 0, 0, 1, 2, 3] and lay.sum() == Z * T
+    assert rows(out) == ([1, 2], [2, 5]), rows(out)                 # id 3 (t=5) fell off the end
+    assert out.metadata["dt_s"] == 30.0 and out.metadata["frame_time_jd"] == meta["frame_time_jd"]
+    assert {k: v for k, v in out.metadata.items() if k in meta} == meta, out.metadata
+    assert all(k in meta or k.startswith("__") for k in out.metadata), sorted(out.metadata)
+    assert e.env("N").axes == out.axes and e.env("N").metadata.get("frame_time_jd") == meta["frame_time_jd"]
+    assert "t:time_shift[+2]" in str(out.metadata.get(SAMPLING_KEY, "")), out.metadata.get(SAMPLING_KEY)
+    hash_later_hold = e.entry("N").recipe_hash
+    # later by 2, blank: the two opened frames are zero in the image and the layer
+    e, out = pull({"delta": 2}, {"edges": "blank"})
+    assert [px(out, t) for t in range(T)] == [0.0, 0.0, 10.0, 20.0, 30.0, 40.0]
+    lay = out.get(Domain.VOXEL, "mask").values
+    assert lay[0, 0].sum() == 0 and lay[0, 1].sum() == 0 and lay.sum() == Z * (T - 2)
+    assert rows(out) == ([1, 2], [2, 5])
+    assert e.entry("N").recipe_hash != hash_later_hold, "edges folds into the recipe"
+    # earlier by 2, hold / blank: frames 0..3 show 2..5, the last two hold frame 5 / are blank
+    e, out = pull({"delta": 2}, {"direction": "earlier"})
+    assert [px(out, t) for t in range(T)] == [30.0, 40.0, 50.0, 60.0, 60.0, 60.0]
+    assert rows(out) == ([2, 3], [1, 3]), rows(out)                  # id 1 (t=0) fell off the start
+    assert "t:time_shift[-2]" in str(out.metadata.get(SAMPLING_KEY, ""))
+    assert e.entry("N").recipe_hash != hash_later_hold, "direction folds into the recipe"
+    e, out = pull({"delta": 2}, {"direction": "earlier", "edges": "blank"})
+    assert [px(out, t) for t in range(T)] == [30.0, 40.0, 50.0, 60.0, 0.0, 0.0]
+    # identities and the far edge
+    for params, modes in (({"delta": 0}, {}), ({"delta": 0}, {"direction": "earlier"})):
+        e, out = pull(params, modes)
+        assert [px(out, t) for t in range(T)] == [10.0 * (t + 1) for t in range(T)] and rows(out) == ([1, 2, 3], [0, 3, 5])
+        assert SAMPLING_KEY not in out.metadata
+    e, out = pull({"delta": 9})
+    assert [px(out, t) for t in range(T)] == [10.0] * T and rows(out) == ([], [])
+    one = Dataset(axes=_replace(ax, t=1), metadata={"pixel_size_um": 0.5}).with_image(ArrayProvider(arr[:, :1]))
+    e, out = pull({"delta": 3}, seed=one, env=MetaEnvelope(axes=one.axes, metadata=one.metadata))
+    assert out.axes.t == 1 and px(out, 0) == 10.0
+    # refusals
+    try:
+        pull({"delta": 1.5})
+        raise AssertionError("a fractional delta must be refused")
+    except ValueError as exc:
+        assert "whole number" in str(exc), str(exc)
+    # the provider: repeats and blanks, the map in the fingerprint
+    base = ArrayProvider(arr)
+    v = FrameRemapProvider(base, [0, 0, 1, None])
+    assert v.axes.t == 4 and v.sources == (0, 0, 1, None)
+    assert float(v.read_region(0, 0, 2, 0, 0, 0, Y, 0, X)[0, 0]) == 20.0
+    blank = v.read_region(0, 0, 3, 0, 0, 0, Y, 0, X)
+    assert blank.shape == (Y, X) and blank.dtype == arr.dtype and not blank.any()
+    assert v.fingerprint() != FrameRemapProvider(base, [0, 1, 1, None]).fingerprint()
+    _ok("time shift: frame k of the output is frame k − Δ of the input — `later` delays (10,10,10,"
+        "20,30,40 on a 10·(t+1) series, Δ=2) and `earlier` advances (30..60,60,60), `hold` repeats "
+        "the edge frame and `blank` zeroes it in the image and the Voxel layer alike; Point rows "
+        "move their t and rows off either end are dropped, never duplicated; metadata is the "
+        "input's, envelope == payload, the stamp is t-only (`t:time_shift[+2]`); Δ=0 and one "
+        "frame are the identity, Δ past the length holds the edge everywhere; the four mode "
+        "states hash apart; a fraction is refused; FrameRemapProvider repeats, blanks and "
+        "fingerprints its map")
+
+
 def test_split_groups() -> None:
     """Range GROUPS on the split cards (2026-10-07): a `groups` text on Split Channels / Split
     Positions / Split Z turns the per-index outputs into one output per RANGE.
@@ -30216,6 +30342,7 @@ def main() -> int:
     test_split_positions()
     test_select_plane_split_z()
     test_select_frame_split_t()
+    test_time_shift()
     test_split_groups()
     test_split_pick_group()
     test_shift_node()

@@ -943,6 +943,13 @@
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodegraph.catalog.util.stitch"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.util.stitch"}
 {"dst":"nodegraph.streaming","k":"imp","lazy":false,"src":"nodegraph.catalog.util.stitch"}
+{"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
+{"dst":"nodegraph.catalog._shared.frame_subset","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
+{"dst":"nodegraph.catalog._shared.sampling","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
+{"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
+{"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.util.time_shift"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.util.timeseries"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.util.timeseries"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.util.timeseries"}
@@ -1094,6 +1101,7 @@
 {"dst":"nodegraph.catalog.io.write_tiff","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.util.batch","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.util.crop_to","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.catalog.util.time_shift","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.checkpoint","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.codemap","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.selftest"}

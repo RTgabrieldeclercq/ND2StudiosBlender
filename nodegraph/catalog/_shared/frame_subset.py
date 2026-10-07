@@ -151,3 +151,70 @@ def subset_structure_rows(ds: Dataset, keep: Picks) -> Dataset:
 
 __all__ = ["FRAME_AXES", "AXIS_NOUN", "Picks",
            "subset_lattice_layers", "subset_structure_rows"]
+
+
+def remap_lattice_layers(ds: Dataset, axis: str, sources) -> Dataset:
+    """Re-index every lattice layer along ``axis`` onto ``sources`` — output index ``k`` takes
+    the layer's slice ``sources[k]``, repeats allowed, ``None`` a ZERO slice — with the axes
+    unchanged (2026-10-07, for ``util.time_shift``). The companion of
+    :class:`~nodegraph.provider.FrameRemapProvider`: a mask has to move frame for frame with
+    the image it was computed on, or a segmentation ends up two frames out of step with its
+    pixels. A layer whose shape already disagrees with the Dataset is left alone, as
+    :func:`subset_lattice_layers` leaves it."""
+    idx = [0 if s is None else int(s) for s in sources]
+    blanks = [k for k, s in enumerate(sources) if s is None]
+    out = ds
+    for attr in list(ds.attributes.values()):
+        if not is_lattice(attr.domain):
+            continue
+        arr = np.asarray(attr.values)
+        if tuple(arr.shape) != ds.axes.shape_for(attr.domain):
+            continue
+        axes_in = ds.axes.axis_list(attr.domain)
+        if axis not in axes_in:
+            continue
+        pos = axes_in.index(axis)
+        moved = np.take(arr, idx, axis=pos)
+        if blanks:
+            sl: list = [slice(None)] * moved.ndim
+            sl[pos] = blanks
+            moved[tuple(sl)] = 0
+        out = out.with_layer(attr.domain, attr.name, moved, attr.layer)
+    return out
+
+
+def shift_structure_rows(ds: Dataset, axis: str, delta: int, size: int) -> Dataset:
+    """Move every structure row's ``axis`` address by ``delta`` (2026-10-07, for
+    ``util.time_shift``): a row landing outside ``[0, size)`` is DROPPED — the shifted stream
+    has no frame for it — and the survivors keep their other columns. Rows are never
+    duplicated onto a held edge frame: an object exists once. A mesh that would lose a row
+    is dropped whole, for the reason :func:`subset_structure_rows` gives; one that keeps
+    every row is only re-addressed. A sub-pixel fraction of the address is kept."""
+    if int(delta) == 0:
+        return ds
+    groups: Dict[Tuple[Domain, Optional[str]], Dict[str, Any]] = {}
+    for attr in ds.attributes.values():
+        if not is_lattice(attr.domain):
+            groups.setdefault((attr.domain, attr.layer), {})[attr.name] = attr
+    out = ds
+    for (domain, layer), cols in groups.items():
+        col = cols.get(axis)
+        if col is None:
+            continue
+        shapes = {np.asarray(a.values).shape for a in cols.values()}
+        if len(shapes) != 1 or len(next(iter(shapes))) != 1:
+            continue           # not one row per element: nothing to move
+        vals = np.asarray(col.values)
+        moved = vals.astype(float) + float(delta)
+        plane = np.rint(moved).astype(np.int64)
+        mask = (plane >= 0) & (plane < int(size))
+        if domain is Domain.MESH and not mask.all():
+            for name in cols:
+                out = out.without(domain, name, layer)
+            continue
+        out = out.with_layer(domain, col.name, moved[mask].astype(vals.dtype), layer)
+        if not mask.all():
+            for name, c in cols.items():
+                if name != axis:
+                    out = out.with_layer(domain, name, np.asarray(c.values)[mask], layer)
+    return out

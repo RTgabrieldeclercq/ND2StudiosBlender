@@ -204,6 +204,8 @@ MODULES: Tuple[str, ...] = (
     # the T twins of the two above (2026-10-07), appended for the same reason
     "util.select_frame",
     "util.split_t",
+    # the T twin of Shift (2026-10-07): move a stream along its own time axis by whole frames
+    "util.time_shift",
 )
 
 

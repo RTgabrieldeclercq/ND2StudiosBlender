@@ -85,8 +85,8 @@
       "label": "Registration & alignment",
       "stage": "prepare_image",
       "pages": ["refine"],
-      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another — and the apply half on its own: Shift moves any Dataset by a per-frame (z, y, x) shift read from a Registration output, so the drift can be estimated on one plane (Select Plane) and applied to the whole stack.",
-      "ops": ["align.drift", "registration.stabilize", "registration.align_to", "align.shift"]
+      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another — and the apply half on its own: Shift moves any Dataset by a per-frame (z, y, x) shift read from a Registration output, so the drift can be estimated on one plane (Select Plane) and applied to the whole stack — and Time Shift moves a stream along its own time axis by whole frames, later or earlier, so two streams of one acquisition line up when one lags the other.",
+      "ops": ["align.drift", "registration.stabilize", "registration.align_to", "align.shift", "util.time_shift"]
     },
     "geometric_transformation": {
       "label": "Geometric transformation",
@@ -221,6 +221,7 @@
     "util.select_plane": ["input", "refine", "process", "analyze"],
     "util.split_z": ["input", "refine"],
     "util.select_frame": ["input", "refine", "process", "analyze"],
-    "util.split_t": ["input", "refine"]
+    "util.split_t": ["input", "refine"],
+    "util.time_shift": ["refine", "process"]
   }
 }
