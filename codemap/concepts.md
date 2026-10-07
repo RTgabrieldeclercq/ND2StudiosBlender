@@ -704,3 +704,69 @@ never over a typed name; a reader already bound to the old name follows through 
 `AUTO_NAMES_OUTPUTS = False`: its names are its master's.
 
 see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream knows where it came from](../MANUAL.md)
+
+---
+
+### CON-24 — units, math and the region crop
+anchors: sym:nodegraph.units.conversion_factor, sym:nodegraph.units.unit_of, sym:nodegraph.catalog.math.values._compute_math_values, sym:nodegraph.catalog.util.crop_region._compute_crop_region, sym:nodelab_v2.ops.materialize_outside_taps, sym:nodegraph.metadata.crop_region
+
+**Units (V4.00 step 12).** A number a Dataset carries — a Global scalar, a structure-table
+column, a lattice layer — has a UNIT, read by `nodegraph.units.unit_of` in two steps: the
+record a producer wrote under `ds.metadata["units"]` (key `<domain>:<layer>:<name>`, written
+by `with_unit`; the Math nodes and `analysis.reduce_scalar` record what they produce), else the
+catalog's NAMING convention (`unit_of_column`: `area` is `px2` on a 2D table and `vox` on a 3D
+one by the table's `z_kind`, `x`/`y` are `px`, `z` a plane step, `t` a `frame`, `*_um` is
+`um`, `*_intensity` is `counts`, Object Metrics' velocities `um/s`; `n_*`, ids and fractions
+dimensionless). Unknown is `None` and STAYS unknown through arithmetic — never silently
+dimensionless. A unit is a dict `{base: exponent}` over `um px zpx s frame counts rad` (+
+scaled spellings `nm mm ms min h deg`; `vox` = `px²·zpx`), with one canonical spelling
+(`format_unit`, pretty `µm²`, slug `um_per_s`). `conversion_factor` converts: a fixed factor
+between scaled spellings, the CALIBRATION between a pixel and a micron (`pixel_size_um`
+laterally, `z_step_um` axially — hence `vox → um3`), between a frame and a second (`dt_s`);
+a conversion that needs a key the data lacks is refused BY NAME, different dimensions as
+such. Why metadata + convention rather than a field on `AttributeLayer`/`StructureTable`: the
+catalog already encodes units in names and no engine type changes; the record covers what a
+name cannot say, and both travel with the payload through every node that keeps the numbers.
+
+**The Math nodes (category `math`, role `arithmetic`, every page).** `math.mask` — set
+algebra on Voxel rasters (any raster is a mask, nonzero = inside): `subtract/union/intersect/
+xor/invert`; an EMPTY A is the whole frame, so `subtract` with B = the mask is the background;
+B from `other` broadcasts over m/t/z/c where it is size 1 (`_shared.rasters.broadcast_raster`);
+writes a uint8 mask recorded dimensionless. `math.image` — pixel arithmetic with another image
+or a constant, LAZY per plane (its own `MapComputeProvider`, fp folding the other provider's
+fingerprint), `other` may be a projection / one timepoint / one channel of the same field
+(broadcast; sampling provenance compared on the axes it does not collapse); the
+`metadata.image_math` transform widens `bit_depth` by a bit for `add`, drops it for
+`multiply`/`divide`, keeps it otherwise, and the payload syncs through `ctx.calib`.
+`math.values` — arithmetic on a domain lever's attributes (`reduce_scalar`'s shape): A on
+`data`; B a layer/column on `other` or `data`, a Global scalar (broadcast), or a constant with
+`value_unit`; same-unit ops convert B into A's unit, products/ratios compose, `power`/`sqrt`/
+`log10` follow dimensional analysis, `to_physical`/`to_pixels` convert A; the result is a new
+column beside A (table rebuilt through `with_structure`) or a layer/scalar, auto-named from the
+operands (`_out_name`, shared by `extra_layers`/`adds_columns` so the edit-time catalog predicts
+the pull), unit recorded.
+
+**Crop by Region (`util.crop_region`).** Crop to a raster, not a rectangle: the region is any
+Voxel layer on `data` or on the `regions` wire. `extent = frame` masks in place (identity
+axes, no stamp); `fit` windows to the box around everything inside (+ `margin` on y/x), per
+position, padded to a common size; `each` makes every OBJECT a position — connected components
+of the footprint over all frames (8-conn on the Z-collapsed plane in 2D, 26-conn in 3D) or one
+per label id — each in a common-size window at its own corner, named `obj1…`/`<pos>_obj1…`
+with `position_index` retired. One `widx6` raster (which window owns each kept voxel) serves
+the pixel fill, the Voxel-layer windowing and the row test alike; Label/Point rows outside are
+dropped and the rest shifted onto their window and position. `origin_um` is restated per
+window from `placement.field_box` + `sub_field_box` (z by the Z step when planes were cut) and
+the stage keys retired, so placement reads the Dataset and stays exact; `metadata.crop_region`
+says Y/X (fit; +Z in 3D; +M for each) are UNKNOWN and drops the geometry keys at edit time.
+`keep = outside` is the complement at the frame's extent whatever the extent mode.
+
+**The `outside` socket.** The card carries a second Dataset output, `outside`
+(`GraphDocument.output_specs` for `CROP_REGION_OP`; a synthetic socket, so it keeps its label
+in `socket_text`). The engine is one-payload-per-node, so `ops.materialize_outside_taps` —
+first among the tap passes in `prepare_run_graph`, so the wires it copies are then tapped like
+the original's — turns a wire from it into a SIBLING node `__tap__<node>__outside`: the same
+op, params and modes with `keep` flipped, fed by copies of every wire the crop node receives.
+The sibling is an ordinary node to the engine, the memo and `propagate_meta`, which is why the
+consumer's envelope is the frame-sized identity while the inside's is the unknown box.
+
+see: CON-22 · CON-23 · [MANUAL §10b Math with units, and cropping by a region](../MANUAL.md)

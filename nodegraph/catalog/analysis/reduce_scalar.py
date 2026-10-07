@@ -11,6 +11,7 @@ from nodegraph.domains import Domain, domain_docs
 from nodegraph.engine import EvalContext
 from nodegraph.reducers import reduce as _reduce, reducer_docs
 from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDataset
+from nodegraph.units import unit_of, with_unit
 
 from nodegraph.catalog._base import register_node
 
@@ -64,7 +65,8 @@ def _compute_reduce_scalar(ctx: EvalContext) -> Dataset:
                 f"reduce_scalar: no {domain.value} attribute {src!r} on the input — it has "
                 f"{sorted({a.name for a in present})}")
         empty = 0.0 if reducer in ("count", "sum") else float("nan")
-        return ds.with_layer(Domain.GLOBAL, ctx.layer("name"), np.asarray(empty))
+        return with_unit(ds.with_layer(Domain.GLOBAL, ctx.layer("name"), np.asarray(empty)),
+                         Domain.GLOBAL, ctx.layer("name"), "" if reducer == "count" else None)
     if len(matches) > 1:
         # One name filed under several structure TABLES (`with_structure` keys each column
         # as (domain, table, name)), so the name alone is ambiguous — say which tables.
@@ -78,7 +80,12 @@ def _compute_reduce_scalar(ctx: EvalContext) -> Dataset:
         matches = narrowed
     arr = np.asarray(matches[0].values, dtype=float)
     value = float(np.asarray(_reduce(arr, tuple(range(arr.ndim)), reducer)).reshape(-1)[0])
-    return ds.with_layer(Domain.GLOBAL, ctx.layer("name"), np.asarray(value))
+    out = ds.with_layer(Domain.GLOBAL, ctx.layer("name"), np.asarray(value))
+    # the scalar's UNIT (V4.00 step 12): a count is a plain number; every other reducer is in
+    # the attribute's own unit, as its producer recorded it or as its name says
+    # (`nodegraph.units.unit_of`) — so a Math card downstream knows what it was handed
+    unit = "" if reducer == "count" else unit_of(ds, domain, src, matches[0].layer)
+    return with_unit(out, Domain.GLOBAL, ctx.layer("name"), unit)
 register_node(
     _compute_reduce_scalar, op_key="analysis.reduce_scalar", label="Reduce → Scalar",
     category="analysis",

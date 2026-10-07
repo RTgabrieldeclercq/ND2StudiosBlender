@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 104,
-    "categories": 15,
-    "roles": 22,
+    "nodes": 108,
+    "categories": 16,
+    "roles": 23,
     "stages": 5,
-    "inputs": 737,
-    "outputs": 111,
+    "inputs": 758,
+    "outputs": 115,
     "gui_ops_included": true
   },
   "stages": {
@@ -138,6 +138,7 @@
         "registration.stabilize",
         "transform.rigid",
         "util.crop",
+        "util.crop_region",
         "util.crop_to",
         "util.resample",
         "util.stack",
@@ -183,6 +184,7 @@
       "description": "Measure, select, follow and compare objects and fields over time. Output is tables, scalars and derived fields.",
       "roles": [
         "measurement_and_statistics",
+        "arithmetic",
         "object_filtering_and_selection",
         "table_synthesis",
         "tracking",
@@ -202,6 +204,9 @@
         "analysis.piv",
         "analysis.reduce_scalar",
         "analysis.track_field",
+        "math.image",
+        "math.mask",
+        "math.values",
         "table.aggregate",
         "table.concat",
         "table.join",
@@ -489,8 +494,8 @@
     "geometric_transformation": {
       "label": "Geometric transformation",
       "stage": "prepare_image",
-      "description": "Move, cut or rescale the pixel lattice while the calibration follows: translate and rotate inside a fixed frame, crop by region or by frame selection, crop to another file's field, resample by a factor.",
-      "count": 4,
+      "description": "Move, cut or rescale the pixel lattice while the calibration follows: translate and rotate inside a fixed frame, crop by rectangle or by frame selection, crop to a mask or drawn regions (the frame blanked, the box around them, or one position per object), crop to another file's field, resample by a factor.",
+      "count": 5,
       "ops": [
         {
           "op": "transform.rigid",
@@ -501,6 +506,11 @@
           "op": "util.crop",
           "label": "Crop",
           "summary": "Crop Y,X (and Z in 3D mode), or keep only chosen M/T/Z frames; pixel size preserved (origin deferred)."
+        },
+        {
+          "op": "util.crop_region",
+          "label": "Crop by Region",
+          "summary": "Crop an image to a MASK, drawn regions or a label raster instead of a rectangle: keep the frame and blank outside, shrink to the box around everything inside, or cut every object out into a position of its own that keeps its place in the field; the card's `outside` socket is the inverse. Masks, rows and per-position metadata follow the pixels."
         },
         {
           "op": "util.crop_to",
@@ -704,6 +714,29 @@
           "op": "analysis.reduce_scalar",
           "label": "Reduce → Scalar",
           "summary": "Collapse any attribute layer or structure column to ONE number on the Global domain — object count, mean area, total mask volume. The scalar a sweep compares, and the only node in the catalog that writes Global."
+        }
+      ]
+    },
+    "arithmetic": {
+      "label": "Math & units",
+      "stage": "quantify",
+      "description": "Arithmetic that keeps units (V4.00 step 12): set algebra on masks (the frame minus the masks is the background), pixel arithmetic between images or with a constant, and arithmetic on the numbers a Dataset carries - a Global scalar, a table column, a lattice layer - with the result's unit worked out and recorded, incompatible units refused, and pixels converted to microns by the calibration. Offered on every page: math is done wherever the numbers are.",
+      "count": 3,
+      "ops": [
+        {
+          "op": "math.image",
+          "label": "Image Math",
+          "summary": "Pixel arithmetic between this image and another branch's image, or a constant: add, subtract, multiply, divide, min, max, absolute difference, mean. Lazy per plane, float output; the second image may be a projection or a single channel of the same field, never a different field."
+        },
+        {
+          "op": "math.mask",
+          "label": "Mask Math",
+          "summary": "Set algebra on masks — subtract, union, intersect, xor, invert — between a Voxel layer and another (from this wire or a second branch); an EMPTY A is the whole frame, so frame minus masks is the background. Writes one new mask layer; the image is untouched."
+        },
+        {
+          "op": "math.values",
+          "label": "Math",
+          "summary": "Arithmetic on the numbers a Dataset carries — a Global scalar, a table column, a per-plane layer — against another one (this wire or another branch) or a constant, with the unit of the result worked out, incompatible units refused, and pixel quantities converted to microns by the calibration. The result is recorded with its unit for the next card."
         }
       ]
     },
@@ -1018,6 +1051,11 @@
       "io.write_tiff",
       "view.viewer"
     ],
+    "math": [
+      "math.image",
+      "math.mask",
+      "math.values"
+    ],
     "page": [
       "data.part",
       "page.input",
@@ -1051,6 +1089,7 @@
     "utility": [
       "util.batch",
       "util.crop",
+      "util.crop_region",
       "util.crop_to",
       "util.merge",
       "util.resample",
@@ -13349,6 +13388,583 @@
         "split_positions"
       ]
     },
+    "math.image": {
+      "op": "math.image",
+      "label": "Image Math",
+      "category": "math",
+      "role": "arithmetic",
+      "stage": "quantify",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/math/image.py",
+      "gui_only": false,
+      "summary": "Pixel arithmetic between this image and another branch's image, or a constant: add, subtract, multiply, divide, min, max, absolute difference, mean. Lazy per plane, float output; the second image may be a projection or a single channel of the same field, never a different field.",
+      "overview": "Combine this image with another image or a constant, pixel by pixel. Resolved spec (build-node-v2 §0, V4.00 step 12) ----------------------------------------------- * **Kind** math → ``op_key=\"math.image\"``, category ``\"math\"``. Image→image; the Dataset's layers and tables pass through untouched. * **Operands.** ``data``'s image, and either ``other``'s image (when wired — :func:`_check_other` says what it may be) or the constant ``value``. * **2D/3D** none: pointwise. **Footprint** ``WHOLE_PLANE`` over y,x — the second image is read as a whole plane at the same ``(m,t,z,c)`` (broadcast where it is size 1), so the unit is a plane. Lazy (:class:`~nodegraph.streaming.MapComputeProvider`), float output; eager when there is no tile cache. * **Value scale.** ``metadata.image_math`` predicts it (a sum widens ``bit_depth`` by one bit; a product or a ratio drops it; the rest keep it) and the payload is SYNCED to that envelope through ``ctx.calib(\"bit_depth\")``, never re-derived here.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_plane",
+        "kernel_axes": [
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "op",
+          "label": "Operation",
+          "choices": [
+            "add",
+            "subtract",
+            "multiply",
+            "divide",
+            "min",
+            "max",
+            "difference",
+            "mean"
+          ],
+          "default": "subtract",
+          "description": "What is done to each pixel of A with the matching pixel of B (or the constant). It also decides what the numbers MEAN afterwards: a sum can exceed the camera's range and widens the declared depth by a bit; a product or a ratio is no longer counts and drops it, so a fixed threshold downstream reads the data's own scale; the rest keep it.",
+          "choice_docs": {
+            "add": "A + B. Sum two images — two exposures, two channels. The result can exceed the camera's range, so the declared bit depth widens by one bit; a fixed threshold downstream sees that.",
+            "subtract": "A − B. Remove a background image estimated on another branch, or difference two timepoints. Negative values are kept (float output); clip with `max` against 0 if you need none.",
+            "multiply": "A × B. Weight an image by another (a mask as 0/1, a flat-field gain). The product is not camera counts any more, so the bit depth is dropped and consumers read the data's own scale.",
+            "divide": "A ÷ B. Ratio two channels, or flat-field by a reference. Where B is 0 the result is NaN (no information), never 0 or an error. Dimensionless: the bit depth is dropped.",
+            "min": "The smaller of A and B at each pixel. Clamps an image from above by another or by a constant; keeps the counts scale.",
+            "max": "The larger of A and B at each pixel. Clamps from below — `max` against 0 removes negatives after a subtraction — or merges two channels by the brightest; keeps the counts scale.",
+            "difference": "|A − B|, the absolute difference. Change between two frames or disagreement between two processings, always ≥ 0; keeps the counts scale.",
+            "mean": "(A + B) ÷ 2. Average two images without leaving the camera's range — the way to combine two exposures when `add` would clip downstream."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The image on the left of the operation (A). Its layers, tables and calibration pass through; only the pixels change."
+        },
+        {
+          "name": "other",
+          "label": "Other",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "Optional: the image on the right (B) from another branch — a background estimate, the other channel, a reference frame. It must cover the same pixels: y/x equal, and each of m/t/z/c either equal to the data's or 1 (a projection, a single timepoint or a single channel is applied to all). Unwired, `Value` is B. Only its pixels are read; its layers do not pass downstream."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1.0,
+          "description": "The constant B when `Other` is unwired, in the image's own units (camera counts, or 0–1 after a Normalize): `add` 100 lifts every pixel by 100 counts, `multiply` 0.5 halves them, `divide` by the exposure time turns counts into a rate. Ignored while `Other` is wired."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_image_math",
+      "meta_transform": "image_math",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "value"
+      ]
+    },
+    "math.mask": {
+      "op": "math.mask",
+      "label": "Mask Math",
+      "category": "math",
+      "role": "arithmetic",
+      "stage": "quantify",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/math/mask.py",
+      "gui_only": false,
+      "summary": "Set algebra on masks — subtract, union, intersect, xor, invert — between a Voxel layer and another (from this wire or a second branch); an EMPTY A is the whole frame, so frame minus masks is the background. Writes one new mask layer; the image is untouched.",
+      "overview": "Combine two masks into one Voxel mask layer. Resolved spec (build-node-v2 §0, V4.00 step 12) ----------------------------------------------- * **Kind** math → ``op_key=\"math.mask\"``, category ``\"math\"``. Dataset in, the same Dataset out plus one Voxel layer; the image is untouched. Any Voxel raster is a mask here (nonzero = inside), so a label raster or a distance field qualifies as well. * **Operands.** ``A`` is a Voxel layer on ``data``, or — EMPTY — the whole frame, every voxel. ``B`` is a Voxel layer on ``other`` when that is wired, else on ``data``; empty B is the only raster on its wire (other than A), refused when there are several. * **Broadcast.** B may be narrower than the data on m/t/z/c (size 1 stretches); y/x must match (:func:`~nodegraph.catalog._shared.rasters.broadcast_raster`). * **2D/3D** none: voxel-wise logic. **Footprint** ``WHOLE_PLANE`` over y,x like ROI Mask: the layers are whole arrays, and nothing is read from the image. * **Output** ``uint8`` 0/1, recorded dimensionless (:func:`nodegraph.units.with_unit`).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_plane",
+        "kernel_axes": [
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": [
+          "voxel"
+        ]
+      },
+      "modes": [
+        {
+          "name": "op",
+          "label": "Operation",
+          "choices": [
+            "subtract",
+            "union",
+            "intersect",
+            "xor",
+            "invert"
+          ],
+          "default": "subtract",
+          "description": "How the two masks combine, voxel by voxel. The choice folds into the memo key; the image is never changed, only the new layer.",
+          "choice_docs": {
+            "subtract": "A minus B: inside A and NOT inside B. With A empty (the whole frame) this is everything that is not in B — the BACKGROUND of a segmentation, the usual reason to reach for this node.",
+            "union": "A or B: inside either. Joins masks made per channel or per threshold into one; where the two overlap the result is simply inside once.",
+            "intersect": "A and B: inside both. The overlap of two masks — a nucleus mask restricted to the cell mask, or a drawn ROI applied to a thresholded mask.",
+            "xor": "A xor B: inside exactly one of them. The disagreement between two masks — what one threshold found and the other did not — useful for comparing methods.",
+            "invert": "The frame minus A: outside A becomes inside and inside becomes outside; B and `Other` are not read. With A empty the result is empty (nothing is outside the whole frame)."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The data the result is added to, and the wire mask A (and B, when `Other` is unwired) are read from. Its image passes through untouched; only the new mask layer is added."
+        },
+        {
+          "name": "other",
+          "label": "Other",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "Optional: a second branch carrying mask B — a mask made on another channel, or on a page of its own. Unwired, B is read off `data`. Only B's layer is read from it: its image and other layers do not pass downstream, so its geometry must match the data on y/x and may be narrower (size 1) on m/t/z/c."
+        },
+        {
+          "name": "a",
+          "label": "A",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "voxel",
+          "description": "The first mask, a Voxel layer on `data` (any raster counts: a mask, a label raster, a distance field — nonzero is inside). LEAVE IT EMPTY FOR THE WHOLE FRAME — every voxel of the image — which with `subtract` and B = your masks gives the background mask; with `intersect` it is just B."
+        },
+        {
+          "name": "b",
+          "label": "B",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "op": [
+              "intersect",
+              "subtract",
+              "union",
+              "xor"
+            ]
+          },
+          "layer_in": "voxel",
+          "layer_from": "other",
+          "description": "The second mask: a Voxel layer on `Other` when that is wired, else on `data`. Empty takes the only raster on that wire (other than A) and refuses when there are several, listing them. Hidden under `invert`, which has no B."
+        },
+        {
+          "name": "name",
+          "label": "Output layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "mask_math",
+          "layer_out": [
+            "voxel"
+          ],
+          "description": "Name of the Voxel mask this node writes (1 inside, 0 outside). Anything that takes a mask accepts it: Connected Components, Crop by Region, Threshold's `per_roi` scope, the mask overlay. Call it what it is — `background`, `cells_not_nuclei` — so later pickers read clearly."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_mask_math",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "a",
+        "b",
+        "name"
+      ]
+    },
+    "math.values": {
+      "op": "math.values",
+      "label": "Math",
+      "category": "math",
+      "role": "arithmetic",
+      "stage": "quantify",
+      "pages": [
+        "input",
+        "refine",
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/math/values.py",
+      "gui_only": false,
+      "summary": "Arithmetic on the numbers a Dataset carries — a Global scalar, a table column, a per-plane layer — against another one (this wire or another branch) or a constant, with the unit of the result worked out, incompatible units refused, and pixel quantities converted to microns by the calibration. The result is recorded with its unit for the next card.",
+      "overview": "Arithmetic on an attribute of the chosen domain, with units. Resolved spec (build-node-v2 §0, V4.00 step 12) ----------------------------------------------- * **Kind** math → ``op_key=\"math.values\"``, category ``\"math\"``. Dataset in, the same Dataset out plus one attribute on the lever's domain: a Global scalar, a new column on a structure table, or a lattice layer. The image is untouched. * **Domain lever** (``domain``) re-targets the pickers as ``analysis.reduce_scalar``'s does; ``reads_domains``/``adds_domains`` stay empty because both are per-instance (the output layer is announced through ``extra_layers`` / ``adds_columns``). * **Operands** ``A`` on ``data``; ``B`` a layer on ``other`` or ``data``, a Global scalar, or the constant ``value`` in ``value_unit`` (:func:`_read_b`). * **Units** composed by :mod:`nodegraph.units`: same-unit operations convert B into A's unit by the calibration (``pixel_size_um`` / ``z_step_um`` / ``dt_s``, read through ``ctx.calib`` so the memo fences on them) and refuse different dimensions; products and ratios compose; ``power``/``sqrt``/``log10`` follow the rules of dimensional analysis; ``to_physical``/``to_pixels`` convert A. An UNKNOWN unit stays unknown — it is never silently called dimensionless. The result is recorded (:func:`nodegraph.units.with_unit`). * **2D/3D** none. **Footprint** ``WHOLE_SERIES``, no kernel axes: it reads attributes that are already computed, over every axis.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "On",
+          "choices": [
+            "global",
+            "label",
+            "point",
+            "track",
+            "voxel",
+            "plane",
+            "frame",
+            "timepoint",
+            "multipoint",
+            "channel"
+          ],
+          "default": "global",
+          "description": "Where the numbers live. Filters the A and B pickers to that domain's attributes — a table's columns for Label / Point / Track, the layers for a lattice domain, the scalars for Global — so set it FIRST. The result lands on the same domain: a new column beside A, or a new layer / scalar.",
+          "choice_docs": {
+            "global": "One single number for the entire dataset — across every file of a batch, not one of them. The score an Iterate sweep compares, and the coarsest possible domain: every axis, batch included, has been reduced away. For a per-file number use Batch instead.",
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live.",
+            "voxel": "Per voxel — one value for every (b,m,t,z,c,y,x) position, i.e. an image-shaped layer. The finest domain there is: masks, intensity images and rasterized fields all live here, and everything else is a coarsening of it.",
+            "plane": "Per (Y,X) plane — one value for each (m,t,z). The domain of per-plane summaries: a focus score, a plane's background level, a per-slice mean.",
+            "frame": "Per frame — one value for each (m,t), i.e. one number per position per timepoint, pooling z. The natural domain for \"how many cells in this frame\" and for a per-frame drift or exposure correction.",
+            "timepoint": "Per timepoint — one value for each t, pooling every position. A time course: one number per frame index shared across the whole plate or tile set.",
+            "multipoint": "Per position — one value for each m, pooling time. One number per well, tile or stage point, which is what a per-position summary or calibration belongs on.",
+            "channel": "Per channel — one value for each c. Orthogonal to the spatial/temporal chain, so use it for anything that is a property of the STAIN (a per-channel gain, background or bleed-through factor) rather than of a place or a time."
+          }
+        },
+        {
+          "name": "op",
+          "label": "Operation",
+          "choices": [
+            "add",
+            "subtract",
+            "multiply",
+            "divide",
+            "power",
+            "min",
+            "max",
+            "abs",
+            "sqrt",
+            "log10",
+            "to_physical",
+            "to_pixels"
+          ],
+          "default": "add",
+          "description": "What is computed from A (and B). Units follow: like units for the sums and extremes (B converted into A's unit by the calibration when they differ, refused when they measure different things), composed for products and ratios, and the conversions change A's unit by the pixel size, Z step and frame interval of this data.",
+          "choice_docs": {
+            "add": "A + B, element by element. B must be in A's dimension: px² + µm² converts B by the pixel size first; px² + µm is refused. A Global B adds the same number to every row.",
+            "subtract": "A − B. Same unit rule as `add`: a difference of areas in µm², a count minus a count, a column minus a constant stated in its own unit.",
+            "multiply": "A × B; the units multiply (µm × µm = µm², px² × counts = counts·px²). The way to weight a column by another or scale a scalar; convert afterwards with `to_physical` if pixels and microns got mixed.",
+            "divide": "A ÷ B; the units divide (counts ÷ px² is an intensity density, µm ÷ s a velocity, a count ÷ a count a plain ratio). Division by zero gives NaN, never 0.",
+            "power": "A to the power B (a constant or a dimensionless column). A unit is raised with it — µm² to the 0.5 is µm — and a power that would leave a fractional exponent, or a per-row exponent on a quantity with a unit, is refused.",
+            "min": "The smaller of A and B element by element, in A's unit (B converted first). Clamps a column from above, or picks the smaller of two measurements.",
+            "max": "The larger of A and B element by element, in A's unit. Clamps from below — `max` against 0 removes negatives — or picks the larger of two measurements.",
+            "abs": "|A|, the absolute value; the unit is unchanged. B is not read.",
+            "sqrt": "√A; the unit's exponents halve (µm² → µm, px² → px), and a unit that cannot be halved (µm) is refused. B is not read.",
+            "log10": "log₁₀ A, defined only for a dimensionless A (a ratio, a count); a quantity in µm or counts is refused — divide by a reference value first. Non-positive values give NaN.",
+            "to_physical": "A in physical units: px → µm by the pixel size, voxels → µm³ by pixel size² × Z step, frames → s by the frame interval, px/frame → µm/s. Refused, naming the key, when the data lacks the calibration it needs, or when A's unit is unknown (set `Unit of A`).",
+            "to_pixels": "The inverse: µm → px (lateral), µm² → px², s → frames, by the same calibration. For comparing a physical quantity against something measured in pixels."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The data carrying A — and B too, unless `Other` is wired. The result is added to it (a new scalar, column or layer); the image and everything else pass through."
+        },
+        {
+          "name": "other",
+          "label": "Other",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "Optional: the branch carrying B when it is not on this wire — a scalar from another page, a column measured on the other channel. Only B is read from it; its layers do not pass downstream. Two tables are paired row by row and must list the same objects (same `id`s)."
+        },
+        {
+          "name": "a",
+          "label": "A",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "The attribute on the left: a column of the table (for Label / Point / Track), or a layer of the domain (a Global scalar from Reduce → Scalar, a per-plane focus score, a Voxel mask). Empty takes the only attribute of the domain on the wire; a table column must be named."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "domain": [
+              "label",
+              "point",
+              "track"
+            ]
+          },
+          "description": "Which structure table A (and B, when on this wire) belong to. Only needed when two tables of the domain are on the wire (two segmentations both with an `area`); leave it empty otherwise and the only table is used."
+        },
+        {
+          "name": "b",
+          "label": "B",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "op": [
+              "add",
+              "divide",
+              "max",
+              "min",
+              "multiply",
+              "power",
+              "subtract"
+            ]
+          },
+          "layer_in_mode": "domain",
+          "layer_from": "other",
+          "description": "The attribute on the right: a column or layer of the same domain on `Other` (if wired) or on this wire, or the NAME OF A GLOBAL SCALAR, which applies to every row. EMPTY with `Other` unwired uses the constant `Value` instead. Hidden under the one-operand operations."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1.0,
+          "available_in": {
+            "op": [
+              "add",
+              "divide",
+              "max",
+              "min",
+              "multiply",
+              "power",
+              "subtract"
+            ]
+          },
+          "description": "The constant B when `B` is empty and `Other` unwired: the number to add, multiply by, divide by, or raise to. Its unit is `Value unit`, so `area` minus 50 µm² converts 50 into A's unit first; an exponent must be dimensionless."
+        },
+        {
+          "name": "value_unit",
+          "label": "Value unit",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "none",
+          "available_in": {
+            "op": [
+              "add",
+              "divide",
+              "max",
+              "min",
+              "multiply",
+              "power",
+              "subtract"
+            ]
+          },
+          "choices": [
+            "none",
+            "px",
+            "px2",
+            "vox",
+            "um",
+            "um2",
+            "um3",
+            "nm",
+            "s",
+            "ms",
+            "min",
+            "frame",
+            "um/s",
+            "px/frame",
+            "1/s",
+            "counts",
+            "rad",
+            "deg"
+          ],
+          "choice_docs": {
+            "1/s": "A rate per second — the unit of a divergence or curl, or of a count divided by a time in seconds.",
+            "counts": "Camera intensity (ADU) — the unit of every `*_intensity` column and of the image's pixel values; a threshold level is in counts.",
+            "deg": "An angle in degrees — for a constant stated in degrees; converts to radians by a fixed factor.",
+            "frame": "A timepoint index of THIS series. Converts to seconds by the Dataset's frame interval; a constant in frames scales with the acquisition rate.",
+            "min": "A minute (60 s) — for a constant stated in minutes, such as a treatment time; converts to seconds by a fixed factor.",
+            "ms": "A millisecond (10⁻³ s) — for a constant stated in ms, an exposure or a short interval; converts to seconds by a fixed factor.",
+            "nm": "A nanometre (10⁻³ µm) — for a constant stated in nm, an emission wavelength or a bead size; converts to µm by a fixed factor.",
+            "none": "Dimensionless — a plain number: a ratio, a count, an exponent, a scale factor. Multiplying by it leaves the other operand's unit unchanged.",
+            "px": "A lateral pixel of THIS image. Converts to µm by the Dataset's pixel size; a constant in px scales with the camera, not with the specimen.",
+            "px/frame": "A velocity in pixels per frame — what a displacement between consecutive frames is in before any calibration; converts to µm/s by pixel size over frame interval.",
+            "px2": "A pixel area (px²) — the unit of `area` on a 2D label table, which counts pixels. Converts to µm² by the pixel size squared.",
+            "rad": "An angle in radians — the unit of `orientation`; converts to degrees by a fixed factor.",
+            "s": "A second — physical time, independent of the frame rate. The unit `dt_s` and every `_s` column are in.",
+            "um": "A micron — a physical lateral or axial length, independent of the camera. The unit Measure's `perimeter`, `axis_major` and every `_um` column are in.",
+            "um/s": "A velocity in microns per second — the unit Object Metrics' `speed`, `vx`, `vy` and Track Field's velocities are in.",
+            "um2": "A square micron — a physical area. What `area` becomes after `to physical`, and the unit to give a constant you subtract from a µm² column.",
+            "um3": "A cubic micron — a physical volume, what a 3D `area` (voxels) becomes after `to physical` using pixel size² × Z step.",
+            "vox": "A voxel (px²·zpx) — the unit of `area` on a 3D label table, which counts voxels. Converts to µm³ by pixel size² × Z step."
+          },
+          "description": "What `Value` is in. `none` is a plain number (a factor, an exponent). Give a unit when the constant is a physical quantity — 50 µm², 10 s — and the node converts it to A's unit (or composes it: `area` × 0.25 µm is µm·px² until you convert) before computing."
+        },
+        {
+          "name": "a_unit",
+          "label": "Unit of A",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "auto",
+          "choices": [
+            "auto",
+            "none",
+            "px",
+            "px2",
+            "vox",
+            "um",
+            "um2",
+            "um3",
+            "nm",
+            "s",
+            "ms",
+            "min",
+            "frame",
+            "um/s",
+            "px/frame",
+            "1/s",
+            "counts",
+            "rad",
+            "deg"
+          ],
+          "choice_docs": {
+            "1/s": "A rate per second — the unit of a divergence or curl, or of a count divided by a time in seconds.",
+            "auto": "Take A's unit as its producer recorded it, else as the catalog's naming convention says (`area` is px² or voxels by the table's dimensionality, `*_um` is µm, `*_intensity` is counts); unknown if neither knows.",
+            "counts": "Camera intensity (ADU) — the unit of every `*_intensity` column and of the image's pixel values; a threshold level is in counts.",
+            "deg": "An angle in degrees — for a constant stated in degrees; converts to radians by a fixed factor.",
+            "frame": "A timepoint index of THIS series. Converts to seconds by the Dataset's frame interval; a constant in frames scales with the acquisition rate.",
+            "min": "A minute (60 s) — for a constant stated in minutes, such as a treatment time; converts to seconds by a fixed factor.",
+            "ms": "A millisecond (10⁻³ s) — for a constant stated in ms, an exposure or a short interval; converts to seconds by a fixed factor.",
+            "nm": "A nanometre (10⁻³ µm) — for a constant stated in nm, an emission wavelength or a bead size; converts to µm by a fixed factor.",
+            "none": "Dimensionless — a plain number: a ratio, a count, an exponent, a scale factor. Multiplying by it leaves the other operand's unit unchanged.",
+            "px": "A lateral pixel of THIS image. Converts to µm by the Dataset's pixel size; a constant in px scales with the camera, not with the specimen.",
+            "px/frame": "A velocity in pixels per frame — what a displacement between consecutive frames is in before any calibration; converts to µm/s by pixel size over frame interval.",
+            "px2": "A pixel area (px²) — the unit of `area` on a 2D label table, which counts pixels. Converts to µm² by the pixel size squared.",
+            "rad": "An angle in radians — the unit of `orientation`; converts to degrees by a fixed factor.",
+            "s": "A second — physical time, independent of the frame rate. The unit `dt_s` and every `_s` column are in.",
+            "um": "A micron — a physical lateral or axial length, independent of the camera. The unit Measure's `perimeter`, `axis_major` and every `_um` column are in.",
+            "um/s": "A velocity in microns per second — the unit Object Metrics' `speed`, `vx`, `vy` and Track Field's velocities are in.",
+            "um2": "A square micron — a physical area. What `area` becomes after `to physical`, and the unit to give a constant you subtract from a µm² column.",
+            "um3": "A cubic micron — a physical volume, what a 3D `area` (voxels) becomes after `to physical` using pixel size² × Z step.",
+            "vox": "A voxel (px²·zpx) — the unit of `area` on a 3D label table, which counts voxels. Converts to µm³ by pixel size² × Z step."
+          },
+          "description": "Override what A is in. `auto` reads the unit its producer recorded, else the naming convention. Set it when A's unit is UNKNOWN (a column with a name the convention does not know) and the operation needs one — `to_physical` refuses an unknown unit rather than guess — or when the convention is wrong for this column."
+        },
+        {
+          "name": "name",
+          "label": "Output name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "What to call the result. Empty builds one from the operands — `total_intensity_per_area`, `area_times_0p25`, `sqrt_area`, `area_physical` — and the unit is recorded whatever the name. Naming an existing column replaces it."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_math_values",
+      "meta_transform": null,
+      "extra_layers": "_layers_math_values",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "a",
+        "a_unit",
+        "b",
+        "name",
+        "table",
+        "value",
+        "value_unit"
+      ]
+    },
     "page.input": {
       "op": "page.input",
       "label": "Page Input",
@@ -18211,6 +18827,183 @@
         "y1",
         "z0",
         "z1"
+      ]
+    },
+    "util.crop_region": {
+      "op": "util.crop_region",
+      "label": "Crop by Region",
+      "category": "utility",
+      "role": "geometric_transformation",
+      "stage": "prepare_image",
+      "pages": [
+        "refine",
+        "process"
+      ],
+      "module": "nodegraph/catalog/util/crop_region.py",
+      "gui_only": false,
+      "summary": "Crop an image to a MASK, drawn regions or a label raster instead of a rectangle: keep the frame and blank outside, shrink to the box around everything inside, or cut every object out into a position of its own that keeps its place in the field; the card's `outside` socket is the inverse. Masks, rows and per-position metadata follow the pixels.",
+      "overview": "Crop to a region: keep the frame, fit the box, or cut each object out. Resolved spec (build-node-v2 §0, V4.00 step 12) ----------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.crop_region\"``, category ``\"utility\"``, ``meta_transform=crop_region`` (frame/outside: identity; fit: y/x unknown, z too in 3D; each: m unknown as well; the field's corner and stage keys are dropped at edit time and RESTATED by the payload, the ``util.crop_to`` rule). * **Region** any Voxel raster (nonzero = inside) on the ``regions`` wire if wired, else on ``data``; the only one is inferred, several are refused by name. From another wire it may be narrower on m/t/z/c (:func:`broadcast_raster`). * **Modes** ``extent`` frame/fit/each; ``objects`` components/labels (each only); ``keep`` inside/outside (outside is always at the frame's extent); ``fill`` zero/nan (nan forces float32); the dim lever: in 3D the Z range shrinks too and objects are 3D components, in 2D every object is a column of the stack and Z is kept whole. * **Footprint** ``WHOLE_SERIES``, no kernel axes: a window depends on every frame of the region, so nothing here is tileable; eager, realized through ``dense_output``. * **What follows the pixels.** Voxel layers are windowed and blanked like the image; per-position layers are reindexed to the output positions; Label and Point rows outside the kept pixels are dropped and the rest shifted into their window (and, under ``each``, moved to their object's position); per-M metadata follows the source position of each window, ``origin_um`` is restated per window from the field box, and under ``each`` the positions are named ``obj1…`` (``B03_obj1`` on a multipoint).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "dim",
+          "label": "2D / 3D",
+          "choices": [
+            "2D",
+            "3D"
+          ],
+          "default": "2D",
+          "derive": "'3D' if (n_z or 1) > 1 else '2D'",
+          "role": "dim_lever",
+          "presentation": "header",
+          "description": "Whether this node treats each Z plane as its own 2D image or the Z stack as one 3D volume. It also decides which parameters are live (a Z-only radius or σ appears only on the 3D side) and how much data the scheduler reads per step. It folds into the memo key, so the 2D and the 3D result are cached separately instead of overwriting each other — flipping back is free.",
+          "choice_docs": {
+            "2D": "Plane by plane. The operation runs independently on every (Y,X) plane of every z, timepoint, channel and position, so nothing crosses a plane boundary: a feature spanning three planes is seen as three unrelated 2D features. Cheapest, tiles, ignores the Z spacing entirely, and the only sane choice for data that is a single plane or has very coarse Z steps.",
+            "3D": "The whole (Z,Y,X) volume at once, using the file's real Z spacing, so a feature spanning planes stays ONE feature and measurements come out as volumes rather than per-slice areas. Needs the volume resident and is the slower, more memory-hungry side; it greys out when the incoming data has z == 1."
+          }
+        },
+        {
+          "name": "extent",
+          "label": "Extent",
+          "choices": [
+            "frame",
+            "fit",
+            "each"
+          ],
+          "default": "frame",
+          "description": "How big the result is. The region decides WHICH pixels survive; this decides the frame they survive in — the whole image, the box around them, or one window per object. The card's `outside` socket is always at the frame's extent, whatever is chosen here.",
+          "choice_docs": {
+            "frame": "Keep the image's full extent and fill every pixel outside the region. Nothing moves: coordinates, positions and calibration are unchanged, so a measurement downstream lands where it would have. This is masking — the choice when the crop must stay comparable to the uncropped image.",
+            "fit": "Shrink to the bounding box of everything inside the region, plus `Margin`; pixels inside the box but outside the region are still filled. The field's corner moves and the payload says where (`origin_um`), so Stitch, Overlay and Canvas place it back. Several positions are each boxed and padded to a common size. A position with nothing inside is dropped.",
+            "each": "Cut every object out into a POSITION of its own: the output's M axis is the objects (`Objects` says what an object is), each in a window of the common size anchored at its own corner, with its `origin_um` and a `position_name` (`obj1`, `obj2`, … or `B03_obj1` on a multipoint). Split Positions then fans them out, and every card downstream reads which object it is on. Pixels of a neighbouring object that fall inside a window are filled, so each window holds exactly one object."
+          }
+        },
+        {
+          "name": "objects",
+          "label": "Objects",
+          "choices": [
+            "components",
+            "labels"
+          ],
+          "default": "components",
+          "available_in": {
+            "extent": [
+              "each"
+            ]
+          },
+          "description": "What counts as one object under `each`. Folds into the memo key.",
+          "choice_docs": {
+            "components": "A connected region of the region's FOOTPRINT over every frame — in 2D, 8-connected on the Z-collapsed plane so an object is one column of the stack across all timepoints; in 3D, 26-connected in the volume. A cell that moves over time is one object whose window covers everywhere it went; two cells that touch are one object.",
+            "labels": "One object per distinct nonzero VALUE of the raster — a segmentation's ids, Draw Regions' numbered patches. Touching objects stay separate. Note that most producers number per frame, so on a series a cell gets a different id on every frame and each becomes its own object; use `components` for a series, `labels` for a single frame or a tracked raster."
+          }
+        },
+        {
+          "name": "keep",
+          "label": "Keep",
+          "choices": [
+            "inside",
+            "outside"
+          ],
+          "default": "inside",
+          "description": "Which side of the region this node's `out` carries. The card's `outside` socket is the other side regardless, so one card gives both.",
+          "choice_docs": {
+            "inside": "Keep the pixels inside the region and fill the rest, at the extent chosen above. The crop.",
+            "outside": "Keep the pixels OUTSIDE the region and fill the inside, always at the frame's full extent (the complement of a box is not a box). The inverse — the background around the objects, the field with the cells removed. What the `outside` socket carries."
+          }
+        },
+        {
+          "name": "fill",
+          "label": "Fill",
+          "choices": [
+            "zero",
+            "nan"
+          ],
+          "default": "zero",
+          "description": "The value written where a pixel is not kept. It decides what a measurement downstream sees in the blanked area, so choose by what reads it next.",
+          "choice_docs": {
+            "zero": "Write 0. The output keeps the image's own dtype (a uint16 stays uint16), and every downstream node accepts it; but a mean over a window that includes blanked pixels is pulled toward 0, and a threshold sees them as background.",
+            "nan": "Write NaN, which no statistic can mistake for a measurement — a NaN-aware mean ignores the blanked pixels. Forces a float32 output, so a node that needs integer counts downstream (Histogram Threshold) will refuse it."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The image to crop. Its masks are windowed and blanked with it, its Label and Point rows follow (rows outside are dropped, the rest shifted into the window), its per-position metadata follows each window's source position, and the field's corner is restated so the crop can be placed back."
+        },
+        {
+          "name": "regions",
+          "label": "Regions",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "Optional: a second branch carrying the region — a mask thresholded on another channel, Draw Regions' patches, a segmentation. Unwired, the region is read off `data`. Only the raster is read from it; its image and other layers do not pass downstream. It may be narrower than the data on m/t/z/c (size 1 applies to all) but must match on y/x."
+        },
+        {
+          "name": "region",
+          "label": "Region layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "voxel",
+          "layer_from": "regions",
+          "description": "Which Voxel raster is the region: nonzero is inside. A Threshold mask, an ROI Mask, Draw Regions' label raster, Connected Components' ids — any of them. Empty takes the only raster on the wire it reads (`Regions` if wired, else `data`) and refuses when there are several, listing them. Regions need not be rectangular or connected: `fit` boxes them all, `each` cuts every one out."
+        },
+        {
+          "name": "margin",
+          "label": "Margin",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "available_in": {
+            "extent": [
+              "each",
+              "fit"
+            ]
+          },
+          "description": "Pixels of context added on every side of a window (y and x; Z is never padded) under `fit` and `each`, clamped at the frame edge. The pixels in the margin that are outside the region are still filled — the margin changes the window, not what is kept — so a filter downstream has room for its halo without reading a neighbour's pixels. 0 is the tight box."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_crop_region",
+      "meta_transform": "crop_region",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "margin",
+        "region"
       ]
     },
     "util.crop_to": {

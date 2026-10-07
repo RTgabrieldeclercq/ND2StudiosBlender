@@ -207,6 +207,18 @@
   "blessed": "2026-10-06",
   "file": "codemap/concepts.md"
  },
+ "CON-24": {
+  "anchors": {
+   "sym:nodegraph.catalog.math.values._compute_math_values": "2297b73594ece1b9aff2699e5f7de25f",
+   "sym:nodegraph.catalog.util.crop_region._compute_crop_region": "2297b73594ece1b9aff2699e5f7de25f",
+   "sym:nodegraph.metadata.crop_region": "26a062af6fd81547625673d273f3fe69",
+   "sym:nodegraph.units.conversion_factor": "f7973f2e443b89875c84a5f191ac4ac4",
+   "sym:nodegraph.units.unit_of": "1293338b2d6906de50f37987e1862d1e",
+   "sym:nodelab_v2.ops.materialize_outside_taps": "93ab969de62ed2fd25be90c35d0ea424"
+  },
+  "blessed": "2026-10-07",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",

@@ -1903,6 +1903,77 @@ Three behaviours worth knowing:
 * Some producers write layers no socket names (drift's `drift_y`/`drift_x`, extract-boundary's
   `<labels>_boundary`, measure's columns on the label table). Those appear in the picker too.
 
+
+## 10b. Math with units, and cropping by a region (V4.00 step 12)
+
+Three **Math** cards and one crop, offered on **every page** — math is done wherever the
+numbers are. Every one of them knows what its numbers measure.
+
+**Units.** A number on the wire — a Global scalar from *Reduce → Scalar*, a column of a
+Label/Point/Track table, a per-plane layer — now carries a **unit**: the one its producer
+recorded (the Math cards and Reduce → Scalar record what they write), or failing that the one
+the catalog's naming convention says (`area` is px² on a 2D table and voxels on a 3D one,
+`x`/`y` are px, `t` is a frame, `*_um` is µm, `*_intensity` is counts, Object Metrics'
+velocities are µm/s). A name the convention does not know is **unknown**, and stays unknown
+through arithmetic rather than being silently called dimensionless; set *Unit of A* on the
+Math card to say what it is. Units compose (µm × µm = µm², counts ÷ px² is a density), a sum
+of different *dimensions* is refused (px² + µm), and a sum of different *units* of one
+dimension converts the second operand into the first's by the calibration first (px² + 1 µm²
+adds 4 px² at 0.5 µm/px). `to_physical` converts pixels to microns, voxels to µm³ (pixel size²
+× Z step) and frames to seconds; `to_pixels` goes back. A conversion that needs a calibration
+the data does not carry is **refused, naming the key** — never guessed at 1:1.
+
+* **Mask Math** (`math.mask`) — set algebra on masks: `subtract` (A − B), `union`,
+  `intersect`, `xor`, `invert`. **Leave A empty and it is the whole frame**, so `subtract`
+  with B = your mask is the **background mask** in one card ("the area of the image minus
+  the masks"). B may come from a second wire (`Other`) — a mask made on another channel or
+  another page — and may be narrower on m/t/z/c (a one-channel mask applies to every
+  channel); y/x must match. Any raster counts as a mask (a label raster, a distance field:
+  nonzero is inside). Writes one new Voxel mask; the image is untouched.
+* **Image Math** (`math.image`) — pixel arithmetic between this image and another branch's
+  (`Other`) or a constant: add, subtract, multiply, divide, min, max, absolute difference,
+  mean. Lazy per plane, float output. The second image may be a projection, one timepoint or
+  one channel of the **same field** (it broadcasts), never a different field. The value scale
+  follows: `add` widens the declared bit depth by a bit, `multiply`/`divide` drop it (the
+  result is not counts), the rest keep it; division by zero is NaN.
+* **Math** (`math.values`) — arithmetic on the numbers a Dataset carries, on the domain the
+  **On** lever names: a column (Label/Point/Track), a per-plane/per-frame layer, a Voxel
+  raster or a Global scalar; against another such number on this wire or on `Other`, a Global
+  scalar (applied to every row), or a constant with a unit. `add`, `subtract`, `multiply`,
+  `divide`, `power`, `min`, `max`, `abs`, `sqrt`, `log10`, `to_physical`, `to_pixels`. The
+  result is a new column beside A (or a new layer/scalar), named from the operands
+  (`total_intensity_per_area`, `area_physical`, `sqrt_area`) unless you type one, with its unit
+  recorded; the next card's column picker offers it. Recipes: `area` → `to_physical` = µm²;
+  `total_intensity` ÷ `area` = counts/px²; `n_cells` (Reduce → Scalar, count) ÷ `field_area`
+  (another scalar) = cells per µm²; `speed` × 60 s = µm per minute.
+* **Crop by Region** (`util.crop_region`) — crop to a **mask, drawn regions or a label
+  raster** instead of a rectangle. The region is any Voxel raster on the wire or on the
+  `Regions` wire (a Threshold mask, an ROI Mask, Draw Regions' patches, a segmentation), and it
+  need not be rectangular or connected. **Extent**: `frame` keeps the image's extent and
+  fills everything outside (masking — nothing moves); `fit` shrinks to the box around
+  everything inside (+ `Margin`), and the field's corner moves with it (`origin_um`), so
+  Stitch, Overlay and Canvas place it back; `each` cuts **every object out into a position of
+  its own** — the output's M axis is the objects, each in a window of the common size at its
+  own corner, with its `origin_um` and a `position_name` (`obj1`, `obj2`, …; `B03_obj1` on a
+  multipoint) — so *Split Positions* fans them out and every card downstream reads which
+  object it is on. **Objects** are the connected regions of the region's footprint over every
+  frame (a cell that moves is one object; two that touch are one) or, under `labels`, one per
+  distinct raster value. **Keep** `inside`/`outside`; the card's second socket, **`outside`**,
+  carries the inverse of `out` at the frame's extent whatever `Extent` says, so one card gives
+  both. **Fill** `zero` (the image's own dtype) or `nan` (float32; a NaN-aware mean ignores the
+  blanked pixels). Masks are windowed and blanked with the image, Label/Point rows outside are
+  dropped and the rest shifted into their window (and, under `each`, moved onto their object's
+  position), per-position metadata follows each window's source position. In 3D the Z range
+  shrinks too and objects are 3D components; in 2D an object is a column of the stack.
+
+What will bite: a wire carrying **two rasters** (a `mask` and a `labels`) makes the region
+and mask pickers refuse until you pick one — name it in the dropdown. `each` with `labels` on a
+**series** gives one object per id per frame (most producers number per frame); use
+`components` for a series. `fit`/`each` make Y/X (and M) **unknown** at edit time — the card
+cannot know the box before it has the mask — so a µm-derived default downstream re-derives on
+the first pull. Image Math on a branch that was cropped or drift-corrected differently from the
+data is refused rather than combining pixels from different places.
+
 ---
 
 ## 11. Spreadsheet & export
@@ -2612,7 +2683,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Registration | `registration.stabilize` | model `translation/euclidean/affine/feature`, reference `first/previous/mean/template`, `ref_channel`, `upsample`, `highpass_sigma` px, `min_confidence` | **register once on a reference channel, apply to all** — preserves colocalisation |
 | **Align To** | `registration.align_to` | `reference` Dataset, `max_shift_um` µm, `min_ncc`, `highpass_um` µm, `ref_t`, `ref_c` | Measures how far this input's **stage log** sits from a reference's, per field, by phase-correlating their physical overlap in µm space — and **records** the correction rather than applying it to pixels. Pixels, axes, pixel size and `origin_um` pass through untouched and no sampling provenance is stamped, so an **Overlay** downstream still places (the engine's registration rule: registration stores its transform). No lever — one reference plane per field, lateral correction, exactly as `align.drift` and `util.stitch` do it. **Declines rather than guessing**, in all four ways that matter: a field that does not sit ≥50 % inside one reference field, a shift beyond `max_shift_um`, a correlation under `min_ncc`, or no `reference` wired each leave the stage log standing — an uncorrected log beats a confident wrong shift. Measured: a planted 6/−4 µm log error recovered to 0.3 µm, and an already-correct log measures zero at ncc 1.0 |
 
-### Transform & utility (12)
+### Transform & utility (13)
 
 | Node | `op_key` | Key controls | Notes |
 |---|---|---|---|
@@ -2620,6 +2691,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 | Z-Project | `util.zproject` | method `max/mean/sum/min/median/none` | Z→1; drops `z_step_um`, marks `z_collapsed`; `sum` widens `bit_depth`. **`none` is the reset** — the node becomes a pass-through and the full Z stack comes back with `z_step_um` intact, `z_collapsed` unstamped and the pixels untouched, so a downstream lever can go back to 3D without rewiring the graph (it also stamps no sampling provenance and costs nothing — the footprint drops to `tileable`). Streams as a tree-reduce (no plane is ever realized) and forwards the source's display pyramid, so it scrubs on a stitched mosaic; on screen a coarse level of `max`/`min`/`median` is very slightly smoothed (~1% of the display range, measured), while level 0 — everything a node reads, measures or exports — is exact |
 | **Crop** | `util.crop` | **What to crop `spatial/frames`**. `spatial`: `y0/y1/x0/x1` px — **drag one rectangle** ([§8b](#8b-picking-parameters-off-the-image-v216)) (+ `z0/z1` from the Z strip in 3D). `frames`: one `frames` selector — **use the selected frames** | Two questions, two modes. **`spatial`** cuts a window out of every image: fewer pixels per image, the same number of images, pixel size preserved and `origin_um` moved to the cut corner; lever (Z is cut only in 3D). **`frames`** keeps only the M / T / Z indices you name — full extent, fewer images — as **one** selection: `"m0-2,t3,z1-4"`. An axis you do not name is kept whole, so `"t3"` is timepoint 3 of every position and **`"m0,t3"` is a single frame**; each axis may be **sparse** (`"t0,3,7"`), which a start/end pair could not say; ranges are inclusive at both ends; a bare list with no letter is read as timepoints. Empty = keep everything; naming an axis and keeping nothing on it is refused rather than shipped as an empty axis. Lazy either way (a pure index view — no pixels are copied). Everything indexed by a cut axis follows the selection: per-position stage/origin/alignment records, per-frame acquisition times, lattice layers (a mask **survives** a frames crop instead of being dropped), and structure rows — a Point/Label/Track row on a dropped frame is removed and the rest renumbered, so the row COUNT downstream changes. The axis spacings answer honestly: keeping every Nth frame or plane multiplies `dt_s` / `z_step_um` by the stride, and an unevenly spaced selection **drops** the key rather than reporting an interval true of no pair; cutting planes off the bottom moves `origin_um` and re-addresses `z_home_index`. A **Mesh** is dropped rather than half-filtered (its element/vertex/face buckets are joined by CSR ranges) unless nothing about it moves |
 | **Crop To File** | `util.crop_to` | second Dataset on `region`; `What defines the region` `union/position` (+ `ref_position`); `margin` µm (+ `margin_z` µm-axial in 3D); µm `Nudge Y/X` (+ `Nudge Z` in 3D); `Flip X`/`Flip Y`; lever | **Crop an overview to where another acquisition was taken**, using the absolute stage coordinates the two files share — its recorded position plus its field-of-view size. This is the question a pixel window cannot answer: two files at 0.287 and 1.718 µm/px are *both* 1024² and describe a 294 µm and a 1760 µm field, so `y0:y1` means nothing across them. Wire the overview (or the stitched mosaic) into `data` and the high-mag file into `region`, and you get exactly its footprint back, lazily — no pixels are copied. `margin` adds context in microns; a **negative** margin trims the reference's own vignetted border instead. **`region` supplies placement only — no pixels are ever read from it**, so it can be the raw acquisition rather than any processed branch, and it is deliberately not drawn in the viewer. It needs `pixel_size_um` and a stage position (`origin_um`, or `stage_xy_um`); a TIFF usually has neither and is refused, naming which key is missing. **What will bite, in order.** (1) **`Flip X` is on by default** — it is the camera's mounting handedness, which no file records. Wrong, it does not shrink the crop, it *mirrors where the crop is taken from*: you get plausible data from the wrong place. The tell is a crop that misses by about one field width, or a "does not touch the data at all" refusal on two files you know overlap. It is ignored (with a note) when `data` is an already-stitched canvas, which is already in stage coordinates. (2) **M collapses to 1.** A crop is one window, so it can only come from one position; the node takes the one with the largest overlap and stamps a `__crop_to__` note naming the coverage and the positions it therefore left out — put **Stitch** upstream if the region straddles tiles and you want all of it. Structure rows on a dropped position go, and the survivors are renumbered. (3) A box hanging off the edge is **clamped**, not refused, and the note records requested-vs-delivered; only a complete miss raises. (4) Like **Crop**, a Y/X window **drops** any lattice layer that no longer fits (a Voxel mask), while layers with no Y/X (a Plane statistic) survive; structure rows keep their original Y/X. (5) `origin_um` is restamped to the cut corner so the result can still be placed, stitched or merged — but the *edit-time* envelope marks Y/X (and Z in 3D) **UNKNOWN** and drops the origin, because this pass is handed only the first input's metadata and cannot see the reference at all. The consequence: a **Crop** placed directly downstream leaves the origin unshifted. The per-position stage logs retire, as after a Stitch. (6) In **3D** the lever also trims planes to the reference's focus span, with half a Z step of slack; it keeps every plane, and says so in the note, when either file has no focus log — which is the normal widefield-montage state, and is also why a reference whose `origin_um` carries the ingest's filler `z = 0.0` is treated as axially unplaced rather than as "in focus at zero" |
+| **Crop by Region** | `util.crop_region` | `region` (any Voxel raster; from `Regions` wire if wired, else `data`) · extent `frame/fit/each` · objects `components/labels` (each) · keep `inside/outside` · fill `zero/nan` · `margin` px · lever | V4.00 step 12: crop to a **mask / drawn regions / label raster**, not a rectangle. `frame` blanks outside and moves nothing; `fit` boxes everything inside (+ margin), corner restated in `origin_um`; `each` → one **position per object** (`obj1…`, `B03_obj1`), windows of a common size at their own corners, so Split Positions fans them out and Stitch/Canvas put them back. The card's second socket **`outside`** is the inverse at the frame's extent (a `keep=outside` sibling at graph build). Masks, Label/Point rows and per-M metadata follow the pixels. Edit-time: `fit` → Y/X unknown, `each` → M too. See [§10b](#10b-math-with-units-and-cropping-by-a-region-v400-step-12) |
 | **Select Group** | `util.select_group` | `Group` (which specimen — `G2`, `2`, `G1,G3`, or a name from the sidecar), `Group gap` (field widths) | Keeps only the multipoints of ONE specimen. A multipoint file is frequently not one flat list of fields: the lab's `Channel640_Seq0001.nd2` holds 54 positions that are really **six separate 3×3 mosaics** a millimetre apart, and every node that reads M as flat gets that wrong in the same quiet way — **Stitch** fuses all 54 into one canvas with four enormous holes in it, a `scope="dataset"` threshold pools six unrelated samples into one histogram, and a per-position table reports 54 rows for a six-sample experiment. This is the missing “which specimen?” selector, and the usual chain is **Select Group → Stitch**: nine tiles at 50 % overlap become one mosaic of one sample. The groups come from the acquisition if it stored them, otherwise they are **recovered from the stage coordinates** — single-linkage clustering that starts a new group wherever two fields are more than one field width apart, which is a statement about what a mosaic IS (tiles must overlap to be stitchable) rather than a tuned number. It infers each group's grid too, so the card says `G2 — 9 positions, 3×3 serpentine`. **Nothing is assumed about group SIZE**: six groups of nine and a run with one position skipped (8 + 9) both come out right, which a fixed “16 per group” could not. Lazy — a pure index view, no pixels copied, no re-spacing, and a kept position is bit-for-bit what it was — but the M axis really shrinks and everything indexed by it follows, exactly as **Crop**'s `frames` mode does: per-position stage/origin/alignment records, lattice layers, and structure rows (a row on a dropped position is removed and the survivors renumbered, so the row COUNT downstream changes). Empty = keep everything, so an unconfigured node is a true no-op. **Refuses rather than guessing** in both directions: a group name that does not exist is refused with the ones that do listed, and a Dataset with no usable stage geometry is refused outright — the plausible guess (“they are all one specimen”) produces a result indistinguishable from a correct one. To override the detection, write a `.groups.json` sidecar beside the file — see [§15.2](#152-position-groups-and-the-groupsjson-sidecar) |
 | **Split Positions** | `util.split_positions` | one `Image` in; `out` (the whole set) plus one synthetic output **per stage position** (`pos0…`, labelled `K · <point name>` — the acquisition's point names when the file carries them, else `mK` — with the specimen group key appended when known), shown once the wire carries two or more positions | The **M-axis twin of Split Channels**: drop it after a multipoint Load (or after a Timeseries Builder that laid files onto M) to run a different branch per well, dish or field, or to put each position on its own Viewer. A pure pass-through: each wired `posK` is materialized at run time into a **Select Position** tap carrying that index, shared by every branch leaving the socket, so four consumers of one position cost one tap and one memo entry. The socket means "the (K+1)-th position of whatever is wired", exactly as `chK` means the channel — rewire onto a smaller file and the tap refuses with the positions listed |
 | **Select Position** | `util.select_position` | `Position` (0-based index or the acquisition's point name); empty ⇒ pass everything | Keep **one** stage position: M narrows to 1 and everything indexed by it follows — stage coordinates and `origin_um`, per-position masks, labels and measurement rows (filtered and renumbered). The tap Split Positions' outputs become, and usable on its own. A value that names no position is refused with the real positions listed, never silently replaced by another; a single-position input passes through unchanged. Lazy (no pixels copied), `TILEABLE`; the stamp `m:select_position[K]` records which position so two selections compare |
@@ -2674,6 +2746,14 @@ hand, hidden from the palette).
 
 Text columns (a `condition`) are text in every table: a plot refuses one as X, Y or Value and
 takes it as Group by; CSV export writes it as it is.
+
+### Math & units (3) — V4.00 step 12
+
+| Node | `op_key` | Key controls | Notes |
+|---|---|---|---|
+| **Mask Math** | `math.mask` | `a` (Voxel layer; **empty = the whole frame**) · `b` (Voxel layer on `Other` if wired, else `data`; empty = the only other raster) · op `subtract/union/intersect/xor/invert` · `name` (default `mask_math`) | Set algebra on masks; `subtract` with A empty is the **background**. B broadcasts over m/t/z/c where it is size 1; y/x must match. Any raster is a mask (nonzero = inside). Writes a uint8 mask recorded dimensionless; image untouched |
+| **Image Math** | `math.image` | `Other` (optional second image) · `value` (the constant when `Other` is unwired) · op `add/subtract/multiply/divide/min/max/difference/mean` | Pixel arithmetic, lazy per plane, float. `Other` may be a projection / one timepoint / one channel of the same field (broadcasts), never a different field or a differently cropped branch (refused). `add` widens `bit_depth` by one bit, `multiply`/`divide` drop it, the rest keep it; ÷0 is NaN |
+| **Math** | `math.values` | `On` lever (global / label / point / track / voxel / plane / frame / timepoint / multipoint / channel) · `a` · `table` (structure domains, when ambiguous) · `b` (same domain on `Other` or `data`, or a Global scalar) · `value` + `value_unit` (the constant) · `a_unit` (override / unknown) · op `add/subtract/multiply/divide/power/min/max/abs/sqrt/log10/to_physical/to_pixels` · `name` | Arithmetic **with units** (`nodegraph.units`): like units for sums and extremes (B converted into A's unit by the calibration; different dimensions refused), composed for products and ratios, `to_physical`/`to_pixels` by pixel size / Z step / frame interval (refused by name without them). Result is a column beside A, or a layer/scalar, auto-named (`total_intensity_per_area`, `area_physical`) and **recorded with its unit**; the next card's picker offers it. Reduce → Scalar records its scalar's unit too |
 
 ### 15.1 Particle detection on a noisy stack
 
@@ -3562,6 +3642,12 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | A node shows a **red domain chip** | it requires a domain nothing upstream produced (e.g. Measure on `Members = label` needs `LABEL` — add Connected Components; on `Members = point` it needs `PT`, from Spot / Particle Detection or Label to Points) |
 | The **3D switch is greyed out** | the incoming `z` is known to be 1. Z-project or a `z==1` file will do that. If a Z-Project upstream is the cause, set its method to **`none`** — the stack (and the 3D switch) come back without deleting the node or rewiring |
 | Red validation badge on a card | the graph is locked to 3D but `z == 1` |
+| **Math / Crop by Region refuses: "carries 2 candidates for Voxel layer"** | the wire holds two rasters (a `mask` and a `labels`), and the node will not guess which one you mean — pick it in the `A`/`B`/`Region layer` dropdown |
+| **Math refuses: "A is in px² and B in µm — cannot convert"** | the two operands measure different things; convert one first (`to_physical` on the px² column, or state the constant in `px2`). A px² + µm² sum is fine: B is converted by the pixel size |
+| **Math refuses: "needs the calibration pixel_size_um"** | the file carries no pixel size, so pixels cannot become microns; type it into the Load card's `Pixel size` box (or `Z step` for a voxel volume, or the frame interval for `dt_s`) — nothing downstream will guess it |
+| **Math: the unit of A is not known** | the column's name is not one the convention knows and its producer recorded none; set `Unit of A` on the card to what it is in |
+| **Crop by Region `each` gave one object per frame** | with `objects = labels` on a series every frame numbers its regions afresh, so each id is its own object; use `components` (one object = one connected footprint over all frames) |
+| **After Crop by Region the card shows `?` for Y/X (or M)** | by design under `fit`/`each`: the box depends on the mask, which the edit-time pass cannot see; the sizes resolve on the first pull. Under `frame` or on the `outside` socket nothing is unknown |
 | A **mask vanished** after Crop/Resample/Z-Project | the layer catalog is not monotone: an axis change drops lattice layers whose shape no longer matches. Re-derive the mask after the geometry change |
 | `analysis.histogram_threshold` refuses the input | it needs raw integer counts; something upstream (Normalize, CLAHE) produced `[0,1]` floats and honestly dropped `bit_depth` |
 | Raw-input geometry error on Measure | the optional `raw` Dataset must match voxel-for-voxel; both shapes are named in the message |

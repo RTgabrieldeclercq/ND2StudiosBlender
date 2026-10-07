@@ -185,6 +185,64 @@ def value_rescaled(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEn
     return env.with_metadata(bit_depth=None)
 
 
+def image_math(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``math.image``: what pixel arithmetic does to the MEANING of the numbers (V4.00 step
+    12). A sum of two images can exceed the camera's range, so ``add`` widens ``bit_depth``
+    by one bit (:func:`bit_depth_after_sum` with ``n=2``); a product or a ratio is no longer
+    counts at all, so ``multiply``/``divide`` DROP the key exactly as :func:`value_rescaled`
+    does (a fixed threshold downstream then reads the data's own scale); ``subtract``,
+    ``min``, ``max``, ``difference`` and ``mean`` stay inside the input range and keep it.
+    Axis-preserving. The compute syncs its payload to this envelope through
+    ``ctx.calib("bit_depth")`` rather than re-deriving the rule."""
+    op = str((modes or {}).get("op") or "add")
+    if op in ("multiply", "divide"):
+        return env.with_metadata(bit_depth=None)
+    if op == "add":
+        return env.with_metadata(**bit_depth_after_sum(env, 2))
+    return env
+
+
+#: Per-M keys that say WHERE a field is. A region crop moves the corner by an amount this
+#: pass cannot see, so they are retired at edit time and the payload restates ``origin_um``
+#: per window (``util.crop_region``).
+_CROP_REGION_GEOMETRY_KEYS: Tuple[str, ...] = (
+    "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc")
+
+
+def crop_region(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.crop_region``: crop to a mask / drawn regions / labels (V4.00 step 12).
+
+    What it can and cannot claim, by mode — the ``crop_to_field`` discipline (unknown, never
+    a guess):
+
+    * ``keep = outside``, or ``extent = frame``: the image keeps its extent and nothing
+      moves — identity.
+    * ``extent = fit``: Y/X shrink to the box around the region, which this pixel-free pass
+      cannot see → UNKNOWN (Z too under the 3D lever). The corner moves, so ``origin_um``
+      and the stage keys are dropped; the payload restates ``origin_um`` per window from the
+      field box, so placement downstream — which reads the Dataset — stays exact.
+    * ``extent = each``: every object becomes a position, so M is UNKNOWN as well, and the
+      per-M names are dropped (the payload names the objects ``obj1…``).
+
+    ``pixel_size_um``, ``dt_s``, ``z_step_um`` and ``bit_depth`` survive: nothing is
+    resampled, re-spaced or rescaled (a NaN fill changes dtype, not the scale)."""
+    md = modes or {}
+    extent = str(md.get("extent") or "frame")
+    if str(md.get("keep") or "inside") == "outside" or extent == "frame":
+        return env
+    unknown = set(env.unknown_axes) | {"y", "x"}
+    if str(md.get("dim") or "2D") == "3D":
+        unknown.add("z")
+    changes: Dict[str, Any] = {k: None for k in _CROP_REGION_GEOMETRY_KEYS
+                               if env.metadata.get(k) is not None}
+    if extent == "each":
+        unknown.add("m")
+        for k in ("position_name", "position_index"):
+            if env.metadata.get(k) is not None:
+                changes[k] = None
+    return env.with_axes(env.axes, unknown=frozenset(unknown)).with_metadata(**changes)
+
+
 def flatten_field(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """``enhance.flatten_field``: only the ``ratio`` method leaves the count scale behind.
 
@@ -1890,6 +1948,7 @@ META_TRANSFORMS: Dict[str, MetaTransform] = {
     "select_group": select_group,
     "value_rescaled": value_rescaled, "flatten_field": flatten_field,
     "zs_deconvnet": zs_deconvnet, "subtract_background": subtract_background,
+    "image_math": image_math, "crop_region": crop_region,
 }
 
 

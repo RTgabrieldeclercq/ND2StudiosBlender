@@ -92,8 +92,8 @@
       "label": "Geometric transformation",
       "stage": "prepare_image",
       "pages": ["refine"],
-      "description": "Move, cut or rescale the pixel lattice while the calibration follows: translate and rotate inside a fixed frame, crop by region or by frame selection, crop to another file's field, resample by a factor.",
-      "ops": ["transform.rigid", "util.crop", "util.crop_to", "util.resample"]
+      "description": "Move, cut or rescale the pixel lattice while the calibration follows: translate and rotate inside a fixed frame, crop by rectangle or by frame selection, crop to a mask or drawn regions (the frame blanked, the box around them, or one position per object), crop to another file's field, resample by a factor.",
+      "ops": ["transform.rigid", "util.crop", "util.crop_region", "util.crop_to", "util.resample"]
     },
     "projection_and_stitching": {
       "label": "Projection & stitching",
@@ -136,6 +136,13 @@
       "pages": ["process"],
       "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, point clustering, and reduction of any layer or column to one Global scalar.",
       "ops": ["analysis.measure", "analysis.object_metrics", "analysis.object_field", "analysis.cluster_points", "analysis.reduce_scalar"]
+    },
+    "arithmetic": {
+      "label": "Math & units",
+      "stage": "quantify",
+      "pages": ["input", "refine", "process", "analyze"],
+      "description": "Arithmetic that keeps units (V4.00 step 12): set algebra on masks (the frame minus the masks is the background), pixel arithmetic between images or with a constant, and arithmetic on the numbers a Dataset carries - a Global scalar, a table column, a lattice layer - with the result's unit worked out and recorded, incompatible units refused, and pixels converted to microns by the calibration. Offered on every page: math is done wherever the numbers are.",
+      "ops": ["math.mask", "math.image", "math.values"]
     },
     "object_filtering_and_selection": {
       "label": "Object filtering & selection",
@@ -209,6 +216,7 @@
     "io.write_figure": ["analyze"],
     "channel.select": ["input", "refine", "process", "analyze"],
     "page.input": ["refine", "process", "analyze"],
-    "page.output": ["input", "refine", "process"]
+    "page.output": ["input", "refine", "process"],
+    "util.crop_region": ["refine", "process"]
   }
 }

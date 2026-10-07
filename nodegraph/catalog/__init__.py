@@ -184,6 +184,13 @@ MODULES: Tuple[str, ...] = (
     "table.concat",
     "table.join",
     "table.aggregate",
+    # Appended last, like everything since V2.20 (the list's order is the link-drag search
+    # menu's order). V4.00 step 12: arithmetic with units — on masks, on images, on the numbers
+    # a Dataset carries — and the region crop that consumes the masks.
+    "math.mask",
+    "math.image",
+    "math.values",
+    "util.crop_region",
 )
 
 

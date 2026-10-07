@@ -56,6 +56,7 @@ from nodelab_v2.ops import (
     dock_status as _dock_status,
     batch_member_identity,
     dormant_nodes, is_docked, is_frozen, prepare_run_graph, upstream_signature)
+from nodelab_v2.ops import CROP_REGION_OP, OUTSIDE_SOCKET
 
 #: params key holding the sticky pinned-override list (serialized per V2.03; stripped
 #: from the params handed to the ENGINE — it is a UI annotation, not a compute input).
@@ -99,7 +100,7 @@ GENERIC_DATASET_SOCKETS = frozenset({"data", "out", "image"})
 #: part, an item — whose label already says what it carries (``0 · DAPI``, ``mask only``,
 #: ``item · cells``). It keeps that label: the channel is printed on the ``out`` above it,
 #: and ``0 · DAPI · DAPI`` says nothing twice.
-_SYNTHETIC_SOCKET_RE = re.compile(r"^(?:ch|grp|pos|bat)\d+$|^(?:part|item):")
+_SYNTHETIC_SOCKET_RE = re.compile(r"^(?:ch|grp|pos|bat)\d+$|^(?:part|item):|^outside$")
 
 #: A Page Output's name while nobody has named it: ``out``, ``out2``, … (what
 #: ``Workspace.node_defaults`` hands a fresh card). Such a name — or a blank one — is
@@ -822,6 +823,10 @@ class GraphDocument:
             if len(items) >= 2:
                 for name in items:
                     base.append(OutDataset(item_socket(name), label=f"item · {name}"))
+        if rec.op_key == CROP_REGION_OP:
+            # the inverse of a region crop (step 12): a wire from it materializes into a
+            # sibling with `keep = outside` (ops.materialize_outside_taps)
+            base.append(OutDataset(OUTSIDE_SOCKET, label="outside"))
         if any(s.type is SocketType.DATASET for s in base):
             # each PART of what `out` carries, on its own (step 11f): `image`, `mask`, …
             for name in self.data_parts(node_id):

@@ -223,6 +223,18 @@ PART_KEY = "part"
 PART_IMAGE = "image"
 PART_SOCKET_RE = re.compile(r"^part:(.+)$")
 
+# ── the INVERSE of a region crop on its own socket (V4.00 step 12) ───────────
+#: ``util.crop_region``'s card carries a second Dataset output, ``outside``: everything the
+#: region did NOT keep, at the frame's extent. The engine is one-payload-per-node, so a wire
+#: leaving it is materialized into a SIBLING of the crop node — the same op, params and
+#: modes with ``keep`` flipped to ``outside``, fed by the same wires — one per crop node,
+#: shared by every wire leaving the socket (:func:`materialize_outside_taps`). Import-free
+#: constants (the node module imports the engine; this module must stay cheap to import).
+CROP_REGION_OP = "util.crop_region"
+OUTSIDE_SOCKET = "outside"
+CROP_KEEP_MODE = "keep"
+CROP_KEEP_OUTSIDE = "outside"
+
 
 def part_socket(name: str) -> str:
     """The synthetic output socket that carries part ``name`` (``part:mask``)."""
@@ -1208,13 +1220,16 @@ def prepare_run_graph(graph: Graph) -> Graph:
     # V4.00 step 11f: a Page Output's extra items become Outputs of their own FIRST (a dock
     # cut then sees the real wires); a Page Input's item reads and a card's part sockets
     # become taps LAST, outermost, like the channel taps they sit beside
+    # V4.00 step 12: a Crop by Region's `outside` wire becomes a sibling node first, so the
+    # wires copied onto it are then tapped like the original's.
     return materialize_part_taps(
         materialize_input_items(
             materialize_channel_taps(
                 materialize_position_taps(
                     materialize_group_taps(
                         materialize_batch_taps(cut_docked_inputs(
-                            materialize_output_items(graph))))))))
+                            materialize_outside_taps(
+                                materialize_output_items(graph)))))))))
 
 
 def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -1517,6 +1532,45 @@ def materialize_input_items(graph: Graph) -> Graph:
     return Graph(nodes=nodes, edges=new_edges)
 
 
+def outside_tap_id(node_id: str) -> str:
+    """The sibling a wire leaving a Crop by Region's ``outside`` socket is served by."""
+    return f"__tap__{node_id}__outside"
+
+
+def materialize_outside_taps(graph: Graph) -> Graph:
+    """Rewire every wire leaving a ``util.crop_region`` card's ``outside`` socket through a
+    SIBLING of that node (``__tap__<node>__outside``): the same op, params and modes with
+    ``keep = outside``, fed by copies of every wire the crop node itself receives — so the
+    inverse is computed from the same inputs, independently memoized, and shared by every
+    wire that leaves the socket (V4.00 step 12). Runs FIRST among the tap passes, so a copied
+    incoming ``chK``/``posK`` edge is materialized afterwards like the original. The input
+    graph is not mutated; with no such wires the same object is returned."""
+    taps: Dict[str, NodeInstance] = {}
+    new_edges = []
+    incoming: Dict[str, list] = {}
+    for e in graph.edges:
+        incoming.setdefault(e.dst, []).append(e)
+    for e in graph.edges:
+        node = graph.nodes.get(e.src)
+        if node is None or node.op_key != CROP_REGION_OP or e.kind != "forward" \
+                or e.src_socket != OUTSIDE_SOCKET:
+            new_edges.append(e)
+            continue
+        tid = outside_tap_id(e.src)
+        if tid not in taps:
+            taps[tid] = NodeInstance(tid, CROP_REGION_OP, params=dict(node.params),
+                                     modes={**dict(node.modes),
+                                            CROP_KEEP_MODE: CROP_KEEP_OUTSIDE})
+            for p in incoming.get(e.src, ()):
+                new_edges.append(Edge(p.src, tid, p.src_socket, p.dst_socket, p.kind))
+        new_edges.append(Edge(tid, e.dst, "out", e.dst_socket, e.kind))
+    if not taps:
+        return graph
+    nodes = dict(graph.nodes)
+    nodes.update(taps)
+    return Graph(nodes=nodes, edges=new_edges)
+
+
 def materialize_part_taps(graph: Graph) -> Graph:
     """Rewire every wire leaving a ``part:<name>`` socket through a ``data.part`` tap
     (``__tap__<node>__part_<name>``) fed by the node's real Dataset output — one per (node,
@@ -1681,6 +1735,7 @@ __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "PAGE_ITEMS_KEY", "PAGE_ITEM_SOCKETS", "ITEM_SOCKET_RE", "PAGE_ITEM_KEY",
            "item_socket", "output_item_node_id", "input_item_tap_id",
            "materialize_output_items", "materialize_input_items", "materialize_part_taps",
+           "CROP_REGION_OP", "OUTSIDE_SOCKET", "outside_tap_id", "materialize_outside_taps",
            "materialize_group_taps", "GRP_SOCKET_RE", "GROUPS_KEY",
            "prepare_run_graph", "cut_docked_inputs", "dock_seeds", "dock_status",
            "dormant_nodes", "docked_nodes", "upstream_signature", "dock_state_of",

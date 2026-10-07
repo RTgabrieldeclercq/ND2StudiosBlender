@@ -28164,6 +28164,504 @@ def test_stream_identity() -> None:
         "payload alike")
 
 
+def _step12_fixture():
+    """A one-position, two-timepoint, two-channel image with two round blobs on a flat
+    field, plus the threshold → label → measure chain every step-12 test builds on.
+    Deterministic; the blobs' pixel counts (49 and 29) are what `area` must report."""
+    from nodegraph.provider import ArrayProvider
+    if NODES.get("io.s12") is None:
+        define_node("io.s12", "S", outputs=[OutDataset()])
+    Y, X, T, C = 32, 40, 2, 2
+    ax = AxisSizes(m=1, t=T, z=1, c=C, y=Y, x=X)
+    img = np.full((1, T, 1, C, Y, X), 100.0, np.float32)
+    yy, xx = np.mgrid[0:Y, 0:X]
+    blob1 = (yy - 8) ** 2 + (xx - 10) ** 2 <= 16
+    blob2 = (yy - 22) ** 2 + (xx - 30) ** 2 <= 9
+    for t in range(T):
+        for c in range(C):
+            img[0, t, 0, c][blob1] = 1000.0 + c
+            img[0, t, 0, c][blob2] = 2000.0 + c
+    md = {"pixel_size_um": 0.5, "dt_s": 2.0, "bit_depth": 12, "origin_um": [[0.0, 10.0, 20.0]]}
+    ds = Dataset(axes=ax, metadata=dict(md)).with_image(ArrayProvider(img))
+    env = MetaEnvelope(axes=ax, metadata=dict(md))
+    return ds, env, ax, img, blob1, blob2
+
+
+def _step12_engine(ds, env, *nodes, edges):
+    from nodegraph.nodes import COMPUTES
+    g = Graph()
+    g.add(NodeInstance("S", "io.s12"))
+    for n in nodes:
+        g.add(n)
+    for e in edges:
+        g.connect(*e[:2], **(e[2] if len(e) > 2 else {}))
+    return Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}, memo=Memo())
+
+
+def _step12_chain():
+    return (NodeInstance("TH", "analysis.threshold", params={"threshold": 500.0},
+                         modes={"method": "fixed"}),
+            NodeInstance("LB", "analysis.label", modes={"dim": "2D"}),
+            NodeInstance("ME", "analysis.measure", params={"stats": "mean,sum"}))
+
+
+def _plane(payload, m=0, t=0, z=0, c=0):
+    a = payload.axes
+    return np.asarray(payload.image.get_region(0, m, t, z, c, 0, a.y, 0, a.x))
+
+
+def test_units() -> None:
+    """``nodegraph.units`` (V4.00 step 12): the unit algebra every Math card uses.
+
+    1. Every spelling a user or a column name uses parses to one dict and prints back as
+       one canonical ASCII form (plus a pretty one and a name slug).
+    2. Composition: products and ratios compose, powers and roots keep exponents integral
+       or refuse, dimensionless takes anything.
+    3. Conversion: a fixed factor between scaled spellings; the CALIBRATION between a pixel
+       and a micron (lateral, axial, voxel) and between a frame and a second; a missing
+       calibration is refused BY NAME; different dimensions are refused as such.
+    4. The naming convention reads the catalog's columns right, incl. `area` by z_kind.
+    5. A unit recorded on a Dataset wins over the convention; Reduce → Scalar records the
+       unit of what it reduced (a count is dimensionless).
+    """
+    from nodegraph.units import (UNITS_KEY, UnitError, conversion_factor, describe_unit,
+                                 div_units, format_unit, mul_units, parse_unit, physical_unit,
+                                 pixel_unit, pow_unit, root_unit, unit_of, unit_of_column,
+                                 unit_slug, with_unit)
+    assert parse_unit("um2") == parse_unit("µm²") == parse_unit("um^2") == {"um": 2}
+    assert parse_unit("um/s") == {"um": 1, "s": -1} and parse_unit("1/s") == {"s": -1}
+    assert parse_unit("vox") == {"px": 2, "zpx": 1} and parse_unit("none") == {} \
+        and parse_unit("") == {}
+    assert format_unit({"px": 2, "zpx": 1}) == "vox" and format_unit("um/s") == "um/s"
+    assert format_unit("um2", pretty=True) == "µm²" and describe_unit("") == "dimensionless" \
+        and describe_unit(None) == "unknown"
+    assert unit_slug("um/s") == "um_per_s" and unit_slug("1/s") == "per_s" \
+        and unit_slug("px2") == "px2" and unit_slug("") == ""
+    for bad in ("furlongs", "um/"):
+        try:
+            parse_unit(bad)
+            if bad == "furlongs":
+                raise AssertionError("an unknown token must be refused")
+        except UnitError:
+            pass
+    assert mul_units("um", "um") == {"um": 2} and div_units("um2", "um") == {"um": 1} \
+        and div_units("um", "um") == {} and pow_unit("um2", 0.5) == {"um": 1} \
+        and root_unit("um2") == {"um": 1} and pow_unit({}, 2.7) == {}
+    try:
+        root_unit("um")
+        raise AssertionError("µm^½ is not a unit")
+    except UnitError:
+        pass
+    assert conversion_factor("nm", "um") == 1e-3 and conversion_factor("um", "um") == 1.0
+    assert abs(conversion_factor("px2", "um2", pixel_size_um=0.5) - 0.25) < 1e-12
+    assert abs(conversion_factor("vox", "um3", pixel_size_um=0.5, z_step_um=2.0) - 0.5) < 1e-12
+    assert abs(conversion_factor("um", "px", pixel_size_um=0.5) - 2.0) < 1e-12
+    assert abs(conversion_factor("px/frame", "um/s", pixel_size_um=0.5, dt_s=2.0) - 0.25) < 1e-12
+    try:
+        conversion_factor("px", "um")
+        raise AssertionError("a missing calibration must be refused")
+    except UnitError as exc:
+        assert "pixel_size_um" in str(exc), exc
+    try:
+        conversion_factor("um2", "um", pixel_size_um=1.0)
+        raise AssertionError("different dimensions must be refused")
+    except UnitError as exc:
+        assert "different things" in str(exc), exc
+    assert physical_unit("vox") == {"um": 3} and physical_unit("px/frame") == {"um": 1, "s": -1} \
+        and pixel_unit("um2") == {"px": 2} and pixel_unit("s") == {"frame": 1}
+    assert unit_of_column("area") == "px2" and unit_of_column("area", z_kind="subpixel") == "vox"
+    assert unit_of_column("mean_intensity") == "counts" and unit_of_column("x_um") == "um" \
+        and unit_of_column("t") == "frame" and unit_of_column("id") == "" \
+        and unit_of_column("speed") == "um/s" and unit_of_column("n_cells") == "" \
+        and unit_of_column("stage_x_um") == "um" and unit_of_column("weird") is None
+    # recorded beats convention; None removes the record
+    ds, env, ax, *_ = _step12_fixture()
+    d2 = with_unit(ds, D.GLOBAL, "score", "um2")
+    assert unit_of(d2, D.GLOBAL, "score") == "um2" and UNITS_KEY in d2.metadata
+    assert unit_of(with_unit(d2, D.GLOBAL, "score", None), D.GLOBAL, "score") is None
+    assert unit_of(ds, D.VOXEL, "mask") is None, "a layer with no record is unknown"
+    # Reduce → Scalar records
+    TH, LB, ME = _step12_chain()
+    RS = NodeInstance("RS", "analysis.reduce_scalar", params={"source": "area", "name": "total"},
+                      modes={"domain": "label", "reducer": "sum"})
+    RC = NodeInstance("RC", "analysis.reduce_scalar", params={"source": "area", "name": "n"},
+                      modes={"domain": "label", "reducer": "count"})
+    e = _step12_engine(ds, env, TH, LB, RS, RC,
+                       edges=[("S", "TH"), ("TH", "LB"), ("LB", "RS"), ("RS", "RC")])
+    out = e.pull("RC")
+    assert unit_of(out, D.GLOBAL, "total") == "px2" and unit_of(out, D.GLOBAL, "n") == ""
+    assert float(out.get(D.GLOBAL, "total").values) == (49 + 29) * 2 * 2   # 2 t × 2 c rows
+    _ok("units (V4.00 step 12): one canonical spelling per unit; products/ratios/powers "
+        "compose; px↔µm, vox↔µm³ and frame↔s convert by the calibration and a missing key "
+        "is refused by name; the column convention reads area/x/t/_um/_intensity/speed; a "
+        "recorded unit wins; Reduce → Scalar records its scalar's unit")
+
+
+def test_math_nodes() -> None:
+    """``math.mask`` / ``math.image`` / ``math.values`` (V4.00 step 12).
+
+    * **Mask Math**: A empty is the frame, so `subtract` with B = the mask is its complement;
+      union/intersect/xor/invert by truth table; B from `other` with c = 1 broadcasts over
+      the data's channels; a y/x mismatch and an ambiguous B are refused; ops hash apart.
+    * **Image Math**: a constant subtract is a lazy plane provider with the pixels right;
+      `add` widens `bit_depth`, `multiply` drops it, `subtract` keeps it — env and payload
+      agree; `other` wired subtracts to zero; ÷0 is NaN; a different y/x is refused.
+    * **Math**: `area` → `to_physical` is µm² by the pixel size, recorded, and the result's
+      name is predicted by the edit-time column catalog; `total_intensity ÷ area` is
+      counts/px²; px² + 1 µm² converts the constant; px² + 1 µm is refused; `sqrt` halves the
+      unit; `log10` of a µm quantity is refused; a Global scalar converts; an unknown-unit
+      column refuses `to_physical` until `Unit of A` says what it is; B from `other`.
+    """
+    from nodegraph.units import unit_of
+    ds, env, ax, img, blob1, blob2 = _step12_fixture()
+    TH, LB, ME = _step12_chain()
+    chain = [("S", "TH"), ("TH", "LB"), ("LB", "ME")]
+    inside = blob1 | blob2
+    mask_hashes = []
+
+    # ── Mask Math ──────────────────────────────────────────────────────────────
+    def mask_math(op, a="", b="mask", name="r"):
+        MM = NodeInstance("MM", "math.mask", params={"a": a, "b": b, "name": name},
+                          modes={"op": op})
+        e = _step12_engine(ds, env, TH, LB, ME, MM, edges=chain + [("ME", "MM")])
+        out = e.pull("MM")
+        mask_hashes.append(e.entry("MM").recipe_hash)
+        return out, out.get(D.VOXEL, name).values.astype(bool)
+    out, bg = mask_math("subtract")
+    assert bg.shape == (1, 2, 1, 2, 32, 40) and bg.dtype == bool
+    assert (bg[0, 0, 0, 0] == ~inside).all(), "frame minus mask is the background"
+    assert out.get(D.VOXEL, "r").values.dtype == np.uint8 and unit_of(out, D.VOXEL, "r") == ""
+    _, u = mask_math("union", a="mask", b="labels")
+    assert (u[0, 0, 0, 0] == inside).all()
+    _, i = mask_math("intersect", a="mask", b="labels")
+    assert (i[0, 0, 0, 0] == inside).all()
+    _, x = mask_math("xor", a="mask", b="labels")
+    assert not x.any()
+    _, inv = mask_math("invert", a="mask")
+    assert (inv[0, 0, 0, 0] == ~inside).all()
+    # B on `other`, c = 1 → broadcast over the data's two channels
+    CS = NodeInstance("CS", "channel.select", params={"channels": [0]})
+    TH2 = NodeInstance("TH2", "analysis.threshold", params={"threshold": 1500.0, "name": "big"},
+                       modes={"method": "fixed"})
+    MM = NodeInstance("MM", "math.mask", params={"a": "mask", "b": "big", "name": "r"},
+                      modes={"op": "subtract"})
+    e = _step12_engine(ds, env, TH, LB, ME, MM, CS, TH2,
+                       edges=chain + [("ME", "MM"), ("S", "CS"), ("CS", "TH2"),
+                                      ("TH2", "MM", {"dst_socket": "other"})])
+    r = e.pull("MM").get(D.VOXEL, "r").values.astype(bool)
+    assert (r[0, 0, 0, 1] == blob1).all(), "mask minus the bright blob (from a 1-channel branch)"
+    # refusals: ambiguous B; y/x mismatch
+    try:
+        mask_math("subtract", b="")
+        raise AssertionError("two rasters and no name must be refused")
+    except ValueError as exc:
+        assert "2 candidates" in str(exc), exc
+    CR0 = NodeInstance("CR0", "util.crop", params={"y0": 0, "y1": 16, "x0": 0, "x1": 40})
+    TH3 = NodeInstance("TH3", "analysis.threshold", params={"threshold": 500.0, "name": "half"},
+                       modes={"method": "fixed"})
+    MM2 = NodeInstance("MM2", "math.mask", params={"a": "mask", "b": "half", "name": "r"},
+                       modes={"op": "union"})
+    e = _step12_engine(ds, env, TH, LB, ME, MM2, CR0, TH3,
+                       edges=chain + [("ME", "MM2"), ("S", "CR0"), ("CR0", "TH3"),
+                                      ("TH3", "MM2", {"dst_socket": "other"})])
+    try:
+        e.pull("MM2")
+        raise AssertionError("a y/x mismatch must be refused")
+    except ValueError as exc:
+        assert "['y']" in str(exc) or "y" in str(exc), exc
+    assert len(set(mask_hashes)) == 5, "the five operations key the memo apart"
+
+    # ── Image Math ─────────────────────────────────────────────────────────────
+    def image_math(op, value=None, other=False):
+        IM = NodeInstance("IM", "math.image", params={} if value is None else {"value": value},
+                          modes={"op": op})
+        edges = [("S", "IM")]
+        nodes = [IM]
+        if other:
+            CS2 = NodeInstance("CS2", "channel.select", params={"channels": [0]})
+            nodes.append(CS2)
+            edges += [("S", "CS2"), ("CS2", "IM", {"dst_socket": "other"})]
+        e = _step12_engine(ds, env, *nodes, edges=edges)
+        return e, e.pull("IM")
+    e, o = image_math("subtract", 50.0)
+    assert type(o.image).__name__ == "MapComputeProvider", "lazy per plane"
+    p = _plane(o)
+    assert p[0, 0] == 50.0 and p[8, 10] == 950.0
+    assert o.metadata.get("bit_depth") == 12 == e.env("IM").metadata.get("bit_depth")
+    e, o = image_math("add", 50.0)
+    assert o.metadata.get("bit_depth") == 13 == e.env("IM").metadata.get("bit_depth")
+    e, o = image_math("multiply", 2.0)
+    assert o.metadata.get("bit_depth") is None and e.env("IM").metadata.get("bit_depth") is None
+    e, o = image_math("subtract", other=True)
+    assert np.abs(_plane(o, c=0)).max() == 0.0 and _plane(o, c=1).max() == 1.0, \
+        "A − other (channel 0 broadcast over c): channel 0 cancels, channel 1 is +1"
+    e, o = image_math("divide", 0.0)
+    assert np.isnan(_plane(o)).all(), "÷0 is NaN"
+    IM = NodeInstance("IM", "math.image", modes={"op": "add"})
+    e = _step12_engine(ds, env, IM, CR0, edges=[("S", "IM"), ("S", "CR0"),
+                                                 ("CR0", "IM", {"dst_socket": "other"})])
+    try:
+        e.pull("IM")
+        raise AssertionError("a differently sized `other` must be refused")
+    except ValueError as exc:
+        assert "16×40" in str(exc), exc
+
+    # ── Math on values ─────────────────────────────────────────────────────────
+    def values(params, modes, extra_nodes=(), extra_edges=(), pull="MV"):
+        MV = NodeInstance("MV", "math.values", params=params, modes=modes)
+        e = _step12_engine(ds, env, TH, LB, ME, MV, *extra_nodes,
+                           edges=chain + [("ME", "MV")] + list(extra_edges))
+        return e, e.pull(pull)
+    e, o = values({"a": "area"}, {"domain": "label", "op": "to_physical"})
+    col = lambda ds_, name: np.asarray(ds_.get(D.LABEL, name, layer="labels").values)
+    assert np.allclose(col(o, "area_physical"), col(o, "area") * 0.25)
+    assert unit_of(o, D.LABEL, "area_physical", "labels") == "um2"
+    assert (D.LABEL, "labels", "area_physical") in e.env("MV").column_names, \
+        "the result's name is predicted at edit time"
+    e, o = values({"a": "total_intensity", "b": "area"}, {"domain": "label", "op": "divide"})
+    assert unit_of(o, D.LABEL, "total_intensity_per_area", "labels") == "counts/px2"
+    assert np.allclose(col(o, "total_intensity_per_area"), col(o, "total_intensity") / col(o, "area"))
+    e, o = values({"a": "area", "value": 1.0, "value_unit": "um2", "name": "a_plus"},
+                  {"domain": "label", "op": "add"})
+    assert np.allclose(col(o, "a_plus"), col(o, "area") + 4.0), "1 µm² is 4 px² at 0.5 µm/px"
+    assert unit_of(o, D.LABEL, "a_plus", "labels") == "px2"
+    try:
+        values({"a": "area", "value": 1.0, "value_unit": "um"}, {"domain": "label", "op": "add"})
+        raise AssertionError("px² + µm must be refused")
+    except ValueError as exc:
+        assert "different things" in str(exc), exc
+    e, o = values({"a": "area"}, {"domain": "label", "op": "sqrt"})
+    assert unit_of(o, D.LABEL, "sqrt_area", "labels") == "px"
+    try:
+        values({"a": "x_um"}, {"domain": "label", "op": "log10"})
+        raise AssertionError("log10 of µm must be refused")
+    except ValueError as exc:
+        assert "log10" in str(exc), exc
+    e, o = values({"a": "area", "value": 2.0}, {"domain": "label", "op": "power"})
+    assert unit_of(o, D.LABEL, "area_pow_2", "labels") == "px^4" or \
+        unit_of(o, D.LABEL, "area_pow_2", "labels") == "px4"
+    # a Global scalar converts; B from `other` (a scalar on another branch)
+    RS = NodeInstance("RS", "analysis.reduce_scalar", params={"source": "area", "name": "total"},
+                      modes={"domain": "label", "reducer": "sum"})
+    MV = NodeInstance("MV", "math.values", params={"a": "total"},
+                      modes={"domain": "global", "op": "to_physical"})
+    e = _step12_engine(ds, env, TH, LB, ME, RS, MV, edges=chain + [("ME", "RS"), ("RS", "MV")])
+    o = e.pull("MV")
+    assert float(o.get(D.GLOBAL, "total_physical").values) == (49 + 29) * 4 * 0.25
+    assert unit_of(o, D.GLOBAL, "total_physical") == "um2"
+    RS2 = NodeInstance("RS2", "analysis.reduce_scalar", params={"source": "area", "name": "n"},
+                       modes={"domain": "label", "reducer": "count"})
+    MV = NodeInstance("MV", "math.values", params={"a": "total", "b": "n"},
+                      modes={"domain": "global", "op": "divide"})
+    e = _step12_engine(ds, env, TH, LB, ME, RS, RS2, MV,
+                       edges=chain + [("ME", "RS"), ("ME", "RS2"), ("RS", "MV"),
+                                      ("RS2", "MV", {"dst_socket": "other"})])
+    o = e.pull("MV")
+    assert float(o.get(D.GLOBAL, "total_per_n").values) == (49 + 29) * 4 / 8 \
+        and unit_of(o, D.GLOBAL, "total_per_n") == "px2"
+    # an unknown unit stays unknown; `Unit of A` resolves it
+    from nodegraph.structure import StructureTable
+    tbl = StructureTable(D.LABEL, {"id": np.array([1, 2]), "m": np.zeros(2, int),
+                                   "t": np.zeros(2, int), "c": np.zeros(2, int),
+                                   "z": np.zeros(2, int), "y": np.array([8.0, 22.0]),
+                                   "x": np.array([10.0, 30.0]), "weird": np.array([3.0, 5.0])},
+                         layer="objs", z_kind="plane_index")
+    ds2 = ds.with_structure(tbl)
+    MV = NodeInstance("MV", "math.values", params={"a": "weird", "value": 2.0},
+                      modes={"domain": "label", "op": "multiply"})
+    e = _step12_engine(ds2, env, MV, edges=[("S", "MV")])
+    o = e.pull("MV")
+    assert unit_of(o, D.LABEL, "weird_times_2", "objs") is None, "unknown × 2 is unknown"
+    MV = NodeInstance("MV", "math.values", params={"a": "weird"},
+                      modes={"domain": "label", "op": "to_physical"})
+    e = _step12_engine(ds2, env, MV, edges=[("S", "MV")])
+    try:
+        e.pull("MV")
+        raise AssertionError("to_physical of an unknown unit must be refused")
+    except ValueError as exc:
+        assert "Unit of A" in str(exc), exc
+    MV = NodeInstance("MV", "math.values", params={"a": "weird", "a_unit": "px"},
+                      modes={"domain": "label", "op": "to_physical"})
+    e = _step12_engine(ds2, env, MV, edges=[("S", "MV")])
+    o = e.pull("MV")
+    assert np.allclose(np.asarray(o.get(D.LABEL, "weird_physical", layer="objs").values), [1.5, 2.5]) \
+        and unit_of(o, D.LABEL, "weird_physical", "objs") == "um"
+    _ok("math nodes (V4.00 step 12): Mask Math — frame minus mask is the background, "
+        "union/intersect/xor/invert, B from a 1-channel branch broadcasts, ambiguity and a "
+        "y/x mismatch refused, ops hash apart; Image Math — lazy planes, add widens / "
+        "multiply drops / subtract keeps bit_depth (env = payload), other broadcasts, ÷0 NaN, "
+        "size mismatch refused; Math — area→µm² recorded and predicted, counts/px², a µm² "
+        "constant converts into px², px²+µm refused, sqrt halves, log10 of µm refused, a "
+        "Global scalar converts, B from another branch, unknown stays unknown until Unit of A")
+
+
+def test_crop_region() -> None:
+    """``util.crop_region`` (V4.00 step 12) + its `outside` socket on the card.
+
+    1. ``frame``: same axes, pixels outside blanked, masks blanked, rows kept, no stamp.
+    2. ``fit`` + margin: the box around both blobs; `origin_um` moves to the box corner;
+       masks windowed; rows shifted; env says Y/X unknown and drops the corner; stamped.
+    3. ``each``: one position per connected object (`obj1`, `obj2`), each at its own corner
+       with its origin; rows onto their object; `labels` on this per-frame-numbered series
+       gives one object per id (8); env says M unknown too; `position_index` retired.
+    4. ``outside``: frame extent, the complement; the (all-inside) rows are dropped.
+    5. ``nan`` fill is float32 with NaN outside; a 3D fit shrinks Z and shifts the origin's
+       z by the Z step, a 2D fit keeps Z; the region may come from a `regions` wire with
+       c = 1; two rasters and no name are refused; a region that keeps nothing is refused;
+       extents and keeps hash apart.
+    6. GUI seam: a Crop by Region card offers `outside`; a wire from it builds a `keep =
+       outside` sibling fed by the crop's own wires; the consumers' envelopes and pulls are
+       the inside box and the frame-sized complement.
+    """
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    ds, env, ax, img, blob1, blob2 = _step12_fixture()
+    TH, LB, ME = _step12_chain()
+    chain = [("S", "TH"), ("TH", "LB"), ("LB", "ME")]
+    n_in = int(blob1.sum() + blob2.sum())                  # 78
+    crop_hashes = []
+
+    def crop(params=None, modes=None, extra_nodes=(), extra_edges=(), dataset=None, envelope=None):
+        CR = NodeInstance("CR", "util.crop_region",
+                          params={"region": "mask", **(params or {})}, modes=dict(modes or {}))
+        e = _step12_engine(dataset or ds, envelope or env, TH, LB, ME, CR, *extra_nodes,
+                           edges=chain + [("ME", "CR")] + list(extra_edges))
+        out = e.pull("CR")
+        crop_hashes.append(e.entry("CR").recipe_hash)
+        return e, out
+
+    def rows(o):
+        return {k[2]: np.asarray(o.attributes[k].values) for k in o.attributes if k[0] is D.LABEL}
+
+    # 1. frame
+    e, o = crop(modes={"extent": "frame"})
+    assert o.axes == ax and SAMPLING_KEY not in o.metadata
+    p = _plane(o)
+    assert int((p != 0).sum()) == n_in and p[8, 10] == 1000.0 and p[0, 0] == 0
+    assert o.get(D.VOXEL, "labels").values[0, 0, 0, 0][~(blob1 | blob2)].max() == 0
+    assert len(rows(o)["id"]) == 8 and o.metadata.get("origin_um") == [[0.0, 10.0, 20.0]]
+    assert not e.env("CR").unknown_axes
+
+    # 2. fit + margin
+    e, o = crop(params={"margin": 1}, modes={"extent": "fit"})
+    assert (o.axes.y, o.axes.x, o.axes.m) == (24, 30, 1), o.axes
+    assert o.metadata.get("origin_um") == [[0.0, 11.5, 22.5]], o.metadata.get("origin_um")
+    assert "stage_xy_um" not in o.metadata
+    p = _plane(o)
+    assert int((p != 0).sum()) == n_in and p[8 - 3, 10 - 5] == 1000.0
+    mk = o.get(D.VOXEL, "mask").values
+    assert mk.shape == (1, 2, 1, 2, 24, 30) and int((mk[0, 0, 0, 0] != 0).sum()) == n_in
+    r = rows(o)
+    assert sorted(set(r["y"].tolist())) == [5.0, 19.0] and sorted(set(r["x"].tolist())) == [5.0, 25.0]
+    ev = e.env("CR")
+    assert {"y", "x"} <= set(ev.unknown_axes) and "m" not in ev.unknown_axes \
+        and "origin_um" not in ev.metadata
+    assert any("crop_region[fit" in s for s in o.metadata.get(SAMPLING_KEY, ()))
+
+    # 3. each
+    e, o = crop(params={"margin": 1}, modes={"extent": "each"})
+    assert (o.axes.m, o.axes.y, o.axes.x) == (2, 11, 11), o.axes
+    assert o.metadata.get("position_name") == ["obj1", "obj2"]
+    assert "position_index" not in o.metadata
+    assert o.metadata.get("origin_um") == [[0.0, 11.5, 22.5], [0.0, 19.0, 33.0]]
+    assert int((_plane(o, m=0) != 0).sum()) == int(blob1.sum()) \
+        and int((_plane(o, m=1) != 0).sum()) == int(blob2.sum())
+    assert _plane(o, m=1)[4, 4] == 2000.0
+    r = rows(o)
+    assert sorted(r["m"].tolist()) == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert all((r["y"][r["m"] == 0] == 5.0) & (r["x"][r["m"] == 0] == 5.0))
+    assert all((r["y"][r["m"] == 1] == 4.0) & (r["x"][r["m"] == 1] == 4.0))
+    assert {"m", "y", "x"} <= set(e.env("CR").unknown_axes)
+    e, o = crop(params={"region": "labels"}, modes={"extent": "each", "objects": "labels"})
+    assert o.axes.m == 8, "per-frame ids: one object per id on a 2 t × 2 c series"
+
+    # 4. outside
+    e, o = crop(modes={"extent": "fit", "keep": "outside"})
+    assert o.axes == ax and int((_plane(o) != 0).sum()) == 32 * 40 - n_in
+    assert not rows(o), "every labelled row sat inside the region"
+    assert not e.env("CR").unknown_axes
+
+    # 5. fill / 3D / regions wire / refusals / hashes
+    e, o = crop(modes={"extent": "frame", "fill": "nan"})
+    p = _plane(o)
+    assert p.dtype == np.float32 and np.isnan(p[0, 0]) and p[8, 10] == 1000.0
+    Z = 4
+    ax3 = AxisSizes(m=1, t=1, z=Z, c=1, y=32, x=40)
+    img3 = np.full((1, 1, Z, 1, 32, 40), 100.0, np.float32)
+    for z in (1, 2):
+        img3[0, 0, z, 0][blob1] = 1000.0
+    md3 = {"pixel_size_um": 0.5, "z_step_um": 2.0, "origin_um": [[5.0, 10.0, 20.0]]}
+    ds3 = Dataset(axes=ax3, metadata=dict(md3)).with_image(ArrayProvider(img3))
+    env3 = MetaEnvelope(axes=ax3, metadata=dict(md3))
+    e, o = crop(modes={"extent": "fit", "dim": "3D"}, dataset=ds3, envelope=env3)
+    assert (o.axes.z, o.axes.y, o.axes.x) == (2, 9, 9), o.axes
+    assert o.metadata.get("origin_um") == [[5.0 + 2.0 * 1, 10.0 + 4 * 0.5, 20.0 + 6 * 0.5]]
+    assert "z" in e.env("CR").unknown_axes
+    e, o = crop(modes={"extent": "fit", "dim": "2D"}, dataset=ds3, envelope=env3)
+    assert o.axes.z == Z and "z" not in e.env("CR").unknown_axes
+    CS = NodeInstance("CS", "channel.select", params={"channels": [0]})
+    TH2 = NodeInstance("TH2", "analysis.threshold", params={"threshold": 1500.0, "name": "big"},
+                       modes={"method": "fixed"})
+    e, o = crop(params={"region": "big"}, modes={"extent": "fit"}, extra_nodes=(CS, TH2),
+                extra_edges=(("S", "CS"), ("CS", "TH2"), ("TH2", "CR", {"dst_socket": "regions"})))
+    assert (o.axes.y, o.axes.x) == (7, 7) and int((_plane(o, c=1) != 0).sum()) == int(blob2.sum())
+    try:
+        crop(params={"region": ""}, modes={"extent": "fit"})
+        raise AssertionError("two rasters and no name must be refused")
+    except ValueError as exc:
+        assert "2 candidates" in str(exc), exc
+    TH4 = NodeInstance("TH4", "analysis.threshold", params={"threshold": 5000.0, "name": "none"},
+                       modes={"method": "fixed"})
+    CRn = NodeInstance("CRn", "util.crop_region", params={"region": "none"}, modes={"extent": "fit"})
+    e = _step12_engine(ds, env, TH4, CRn, edges=[("S", "TH4"), ("TH4", "CRn")])
+    try:
+        e.pull("CRn")
+        raise AssertionError("an empty region must be refused")
+    except ValueError as exc:
+        assert "nothing is kept" in str(exc), exc
+    assert len(set(crop_hashes)) == len(crop_hashes), \
+        "every extent / keep / fill / lever / region combination keys the memo apart"
+
+    # 6. the GUI seam: `outside` on the card → a sibling at graph build
+    from nodegraph.memo import Memo as _Memo
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L")
+    doc.meta_seeds["L"] = env
+    doc.add_node("analysis.threshold", node_id="TH", params={"threshold": 500.0},
+                 modes={"method": "fixed"})
+    doc.add_node("util.crop_region", node_id="CR", params={"region": "mask"}, modes={"extent": "fit"})
+    doc.add_node("enhance.gamma", node_id="GI")
+    doc.add_node("enhance.gamma", node_id="GO")
+    doc.connect("L", "image", "TH", "data")
+    doc.connect("TH", "out", "CR", "data")
+    doc.connect("CR", "out", "GI", "data")
+    assert "outside" in [s.name for s in doc.output_specs("CR")]
+    doc.connect("CR", "outside", "GO", "data")
+    assert {"y", "x"} <= set(doc.env("GI").unknown_axes) and not doc.env("GO").unknown_axes
+    sp = [s for s in doc.output_specs("CR") if s.name == "outside"][0]
+    assert doc.socket_text("CR", sp, "out") == "outside"
+    g = doc.to_graph(materialize=True)
+    tap = g.nodes[OPS.outside_tap_id("CR")]
+    assert tap.op_key == "util.crop_region" and tap.modes.get("keep") == "outside" \
+        and tap.modes.get("extent") == "fit" and tap.params.get("region") == "mask"
+    assert [(p.src, p.src_socket) for p in g.preds(tap.id)] == [("TH", "out")]
+    eng = OPS.headless_engine(g, seeds={"L": ds}, meta_seeds={"L": env}, memo=_Memo())
+    gi, go = eng.pull("GI"), eng.pull("GO")
+    assert (gi.axes.y, gi.axes.x) == (22, 28) and (go.axes.y, go.axes.x) == (32, 40)
+    assert int((_plane(go) != 0).sum()) == 32 * 40 - n_in
+    _ok("crop by region (V4.00 step 12): frame blanks and moves nothing; fit boxes the region "
+        "(+margin) with origin_um at the corner, masks windowed, rows shifted, Y/X unknown at "
+        "edit time, stamped; each → one position per object (obj1, obj2) at its own corner "
+        "with rows on it, M unknown, per-frame label ids → one object each; outside is the "
+        "frame-sized complement; nan fill is float32; 3D fit shrinks Z and shifts z; a "
+        "regions wire with c=1 broadcasts; ambiguity and an empty region refused; every run "
+        "keys apart; "
+        "the card's `outside` socket builds a keep=outside sibling fed by the crop's wires")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -28354,6 +28852,9 @@ def main() -> int:
     test_page_output_items()
     test_channel_provenance()
     test_stream_identity()
+    test_units()
+    test_math_nodes()
+    test_crop_region()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
