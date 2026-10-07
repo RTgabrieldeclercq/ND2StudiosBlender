@@ -594,6 +594,8 @@ def slider_range(s: Any, value: Any = None, *, env: Optional[MetaEnvelope] = Non
         lo, hi = 0.0, float(max(1, ax.c - 1))
     elif pk in ("frame", "frames") or name in ("reference_frame", "ref_t", "frame"):
         lo, hi = 0.0, float(max(1, ax.t - 1))
+    elif pk == "plane" or name == "plane":
+        lo, hi = 0.0, float(max(1, ax.z - 1))
     elif pk == "zrange" or name in ("z0", "z1"):
         lo, hi = 0.0, float(max(1, ax.z))
     elif pk == "rect" or name in ("y0", "y1", "x0", "x1"):

@@ -48,7 +48,7 @@ from nodelab_v2.ops import (
     DEFAULT_OUTPUT_BASE, PAGE_NAME_KEY, PAGE_OUTPUT_OP, next_free_name,
     sanitize_output_name,
     BAT_SOCKET_RE, CH_SOCKET_RE, GRP_SOCKET_RE, ITEM_SOCKET_RE, PAGE_INPUT_OP,
-    PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY, POS_SOCKET_RE,
+    PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY, POS_SOCKET_RE, Z_SOCKET_RE,
     PART_IMAGE, PART_SOCKET_RE, item_socket, part_socket, _real_dataset_out,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
@@ -151,6 +151,14 @@ BATCH_TAP_OPS = (UNBATCH_OP,)
 #: envelope pass predicts exactly, and the names are the per-M ``position_name`` list the
 #: loader stamps — so neither is captured into params.
 POSITION_TAP_OPS = ("util.split_positions",)
+
+#: op_keys whose GUI card grows one synthetic per-PLANE output socket (``z0…``) per z plane
+#: on the wire reaching it — materialized into ``util.select_plane`` taps at graph-build
+#: (2026-10-07), the Z-axis member of the same family. Resolved from the edit-time envelope
+#: (:meth:`GraphDocument.plane_descriptors`): the plane count is an axis the envelope pass
+#: predicts exactly, and the label is the index plus the plane's height when the stack
+#: carries a z step — so nothing is captured into params.
+PLANE_TAP_OPS = ("util.split_z",)
 
 
 
@@ -817,6 +825,13 @@ class GraphDocument:
             if len(positions) >= 2:
                 for i, pd in enumerate(positions):
                     base.append(OutDataset(f"pos{i}", label=pd["label"]))
+        if rec.op_key in PLANE_TAP_OPS:
+            # Same floor: one plane is the whole stack, so a lone `z0` would duplicate
+            # `out`.
+            planes = self.plane_descriptors(node_id)
+            if len(planes) >= 2:
+                for i, pd in enumerate(planes):
+                    base.append(OutDataset(f"z{i}", label=pd["label"]))
         if rec.op_key == PAGE_INPUT_OP:
             # the items of a several-item Output, each on a socket of its own (step 11f)
             items = self._page_items(node_id)
@@ -924,6 +939,7 @@ class GraphDocument:
         other socket or an index the node does not have (V4.00 step 11h)."""
         for regex, lister, field in ((CH_SOCKET_RE, self.channel_descriptors, "name"),
                                      (POS_SOCKET_RE, self.position_descriptors, "name"),
+                                     (Z_SOCKET_RE, self.plane_descriptors, "name"),
                                      (GRP_SOCKET_RE, self.group_descriptors, "key"),
                                      (BAT_SOCKET_RE, self.batch_member_names, None)):
             m = regex.match(socket or "")
@@ -977,6 +993,33 @@ class GraphDocument:
         for i in range(m):
             label = f"{i} · {names[i]}" + (f" · {groups[i]}" if groups[i] else "")
             out.append({"index": i, "name": names[i], "group": groups[i], "label": label})
+        return out
+
+    def plane_descriptors(self, node_id: str) -> list:
+        """The z planes on the wire reaching ``node_id``, from its edit-time envelope:
+        ``[{"index", "name", "label"}, …]`` — ``[]`` when the envelope does not know ``z``
+        (an unresolved source) or has no plane. ``name`` is ``zK``; ``label`` is what the
+        socket shows: ``"3"``, or ``"3 · 1.50 µm"`` above plane 0 when the stack carries a
+        z step. Read live from the envelope, like the position taps: the count is an axis
+        the envelope predicts exactly, so a rewire moves the sockets with it (2026-10-07)."""
+        try:
+            env = self.env(node_id)
+        except Exception:                      # noqa: BLE001 — an un-propagated node
+            return []
+        if "z" in getattr(env, "unknown_axes", frozenset()):
+            return []
+        z = int(env.axes.z)
+        if z <= 0:
+            return []
+        md = env.metadata or {}
+        try:
+            step = float(md.get("z_step_um") or 0.0)
+        except (TypeError, ValueError):
+            step = 0.0
+        out = []
+        for i in range(z):
+            label = f"{i}" + (f" · {i * step:.2f} µm" if step > 0 else "")
+            out.append({"index": i, "name": f"z{i}", "label": label})
         return out
 
     def input_specs(self, node_id: str) -> list:

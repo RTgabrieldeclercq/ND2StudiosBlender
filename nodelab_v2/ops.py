@@ -85,6 +85,12 @@ BAT_SOCKET_RE = re.compile(r"^bat(\d+)$")
 #: (``pos0…``), materialized into ``util.select_position`` taps (2026-10-02)
 POS_SOCKET_RE = re.compile(r"^pos(\d+)$")
 
+#: the synthetic per-PLANE output sockets a ``util.split_z`` card grows (``z0…``),
+#: materialized into ``util.select_plane`` taps (2026-10-07) — the Z-axis member of the
+#: family. The tap carries the plane's INDEX, like a channel's and a position's: a plane
+#: has no name, and ``zK`` means "the (K+1)-th plane of whatever is wired".
+Z_SOCKET_RE = re.compile(r"^z(\d+)$")
+
 
 def batch_member_identity(node: Any, node_id: str) -> str:
     """A batch member's identity: the base name of the file its source node carries.
@@ -1213,10 +1219,11 @@ def prepare_run_graph(graph: Graph) -> Graph:
     envelope pass too, where unrolling would delete the node ids the inspector looks up.
     :func:`nodelab_v2.document.GraphDocument.to_graph` unrolls first, under its own flag;
     :func:`headless_engine` does the same."""
-    # Batch FIRST, then groups, then positions, then channels: each narrows a different
-    # axis (B, then M twice — a group is a set of positions, a position one of them — then
-    # C) so they commute on the data, and running them outermost-axis-first keeps each tap
-    # closest to the node that asked for it — the order the card reads in.
+    # Batch FIRST, then groups, then positions, then planes, then channels: each narrows a
+    # different axis (B, then M twice — a group is a set of positions, a position one of
+    # them — then Z, then C) so they commute on the data, and running them
+    # outermost-axis-first keeps each tap closest to the node that asked for it — the
+    # order the card reads in.
     # V4.00 step 11f: a Page Output's extra items become Outputs of their own FIRST (a dock
     # cut then sees the real wires); a Page Input's item reads and a card's part sockets
     # become taps LAST, outermost, like the channel taps they sit beside
@@ -1225,11 +1232,12 @@ def prepare_run_graph(graph: Graph) -> Graph:
     return materialize_part_taps(
         materialize_input_items(
             materialize_channel_taps(
-                materialize_position_taps(
-                    materialize_group_taps(
-                        materialize_batch_taps(cut_docked_inputs(
-                            materialize_outside_taps(
-                                materialize_output_items(graph)))))))))
+                materialize_plane_taps(
+                    materialize_position_taps(
+                        materialize_group_taps(
+                            materialize_batch_taps(cut_docked_inputs(
+                                materialize_outside_taps(
+                                    materialize_output_items(graph))))))))))
 
 
 def dock_seeds(graph: Graph, *, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -1686,6 +1694,20 @@ def materialize_position_taps(graph: Graph) -> Graph:
                              lambda node, k: {"position": str(k)})
 
 
+def materialize_plane_taps(graph: Graph) -> Graph:
+    """Rewire every GUI-synthetic per-PLANE output edge (``zK``) on a ``util.split_z``
+    card through a real ``util.select_plane`` tap — the Z-axis twin of
+    :func:`materialize_position_taps` (2026-10-07).
+
+    The tap carries the plane's INDEX: a plane has no name, and ``zK`` means "the (K+1)-th
+    plane of whatever is wired", exactly as ``chK`` means the (K+1)-th channel.
+    ``util.select_plane`` refuses an index past the end with the stack's depth, so a split
+    rewired onto a shallower stack says so rather than silently serving another plane.
+    """
+    return _materialize_taps(graph, Z_SOCKET_RE, "util.select_plane", "z",
+                             lambda node, k: {"plane": int(k)})
+
+
 def headless_engine(graph: Graph, *, seeds: Mapping[str, Any],
                     meta_seeds: Optional[Mapping[str, Any]] = None,
                     sweep_all: Any = (),
@@ -1745,4 +1767,6 @@ __all__ = ["ensure_ops", "headless_engine", "materialize_channel_taps",
            "LOAD_OP", "ACCESS_MODE", "ACCESS_AUTO", "ACCESS_INGEST", "ACCESS_DIRECT",
            "ACCESS_DEFAULT", "source_access_of",
            "BAT_SOCKET_RE", "batch_member_identity", "batch_member_names_of",
-           "materialize_batch_taps"]
+           "materialize_batch_taps",
+           "POS_SOCKET_RE", "materialize_position_taps",
+           "Z_SOCKET_RE", "materialize_plane_taps"]

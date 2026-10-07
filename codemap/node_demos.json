@@ -1377,6 +1377,80 @@
         "Arithmetic on the numbers a Dataset carries — a scalar, a table column, a per-plane layer — against another one or a constant, with units carried through.",
         "Shown: max_intensity ÷ mean_intensity per nucleus, as a new column peak_ratio."
       ]
+    },
+    "util.select_plane": {
+      "kind": "image",
+      "phantom": "cells3d",
+      "view": {
+        "z": 0
+      },
+      "features": [
+        "Keeps ONE plane of the stack: auto is the middle one (plane 3 of 7 here). Drag Plane to walk through the stack; the before view is plane 0 of the input, the after view is the plane kept.",
+        "In the app, scrub Plane z in the Viewer to the plane with the clearest structure and press Pick to take it. Z narrows to 1 and the plane's physical height moves into origin_um.",
+        "The front half of 'estimate the drift on one plane, apply it to the whole stack': Select Plane → Registration (2D) → Shift. The tap Split Z's per-plane outputs materialize into this node."
+      ]
+    },
+    "util.split_z": {
+      "kind": "image",
+      "phantom": "cells3d",
+      "features": [
+        "Grows one output socket per plane (z0…z6 here, labelled with the plane's height) so each plane can feed its own chain; wiring one inserts a Select Plane tap for you at run time. The whole stack still passes through out, which is what this view shows.",
+        "Hand z3 to Registration and out to Shift to register a stack on one plane."
+      ]
+    },
+    "align.shift": {
+      "kind": "image",
+      "data_from": "src",
+      "prelude": [
+        {
+          "op": "util.select_plane"
+        },
+        {
+          "op": "registration.stabilize"
+        }
+      ],
+      "extra_inputs": {
+        "shifts": {
+          "pre": 1
+        }
+      },
+      "scenarios": [
+        {
+          "label": "Drifting beads, shift from Registration",
+          "phantom": "star_field",
+          "phantom_kw": {
+            "drift_px": [
+              1.5,
+              -2.0
+            ]
+          },
+          "view": {
+            "t": 5
+          },
+          "note": "Registration runs upstream on the same beads and writes drift_y / drift_x per frame; Shift reads them from its Shifts input and moves the RAW data on its main input by them. The status line shows shift_y / shift_x for the viewed frame: with the field moving (+1.5, −2.0) px per frame it should read −1.5·t, +2.0·t — the same numbers Registration's own demo shows, because Shift reproduces its alignment exactly."
+        },
+        {
+          "label": "A stack registered on one plane",
+          "phantom": "star_volume",
+          "phantom_kw": {
+            "drift_px": [
+              0.5,
+              1.0,
+              -0.6
+            ]
+          },
+          "view": {
+            "t": 3
+          },
+          "note": "The intended workflow on a 12-plane stack: Select Plane hands Registration the middle plane only, Registration (2D) estimates (y, x) per frame on it, and Shift applies that one shift to all twelve planes of the raw stack. Scrub Plane z — every plane moved the same way. The axial drift (half a plane per frame) stays: that is Registration's 3D lever's job, and Shift z would then carry it."
+        }
+      ],
+      "features": [
+        "Applies the per-frame (y, x) shift it reads from the Shifts input — here a Registration run on the plane Select Plane handed it — to every plane and channel of the data on the main input, which is the raw stack. The status line shows shift_y / shift_x for the viewed frame; read them against the caption's true drift.",
+        "Sign convention: a layer value is the shift APPLIED to the content, positive toward a higher index — exactly what Registration stores, so its layers reproduce its own alignment bit for bit. Invert puts the measured motion back instead.",
+        "The 2D lever applies the lateral shift plane by plane; 3D adds the axial shift when a Shift z layer is named (Registration's drift_z from its own 3D lever). Blank = no axial shift, which is what a single-plane estimate warrants.",
+        "Masks and label rasters on the data move with the image (at nearest, so ids survive); a Dataset carrying structure tables is refused — put Shift before segmentation."
+      ]
     }
   }
 }

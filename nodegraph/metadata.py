@@ -1314,6 +1314,59 @@ def select_position(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaE
                .with_metadata(**position_subset(env.metadata, [k])))
 
 
+def plane_pick(z: int, raw: Any) -> Optional[int]:
+    """Resolve ``util.select_plane``'s ``plane`` to one index into ``z`` planes (2026-10-07)
+    — shared by its compute and :func:`select_plane` so the card and the pull cannot
+    disagree. ``None`` / blank / ``"auto"`` is the MIDDLE plane (``z // 2``: the same answer
+    as the socket's ``derive`` and the plane ``registration.stabilize`` estimates on); an
+    integer in range is itself; anything else — out of range, a fraction, not a number — is
+    ``None``, which the compute refuses with the depth and the transform holds the envelope
+    on (an unknown axis would grey the whole downstream graph behind a plausible card)."""
+    if z <= 0:
+        return None
+    text = str(raw if raw is not None else "").strip().lower()
+    if not text or text == "auto":
+        return int(z) // 2
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value != int(value):
+        return None
+    i = int(value)
+    return i if 0 <= i < int(z) else None
+
+
+def select_plane(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
+    """``util.select_plane``: narrow Z to ONE plane, by 0-based index (2026-10-07) — the
+    z-axis member of the tap family (:func:`select_position` for M, :func:`channel_select`
+    for C), and the tap ``util.split_z``'s per-plane outputs materialize into.
+
+    The z half of :func:`crop_frames` exactly: ``z_step_um`` survives (one plane keeps the
+    source spacing — :func:`respaced`), ``z_home_index`` follows (:func:`z_home_after`), and
+    ``origin_um`` moves up by the planes cut off the bottom at the SOURCE step. Nothing
+    lateral changes. Blank resolves to the middle plane (:func:`plane_pick`); an
+    out-of-range or unparseable value HOLDS the envelope and lets the payload raise the real
+    message; a single-plane input is the identity."""
+    ax = env.axes
+    k = plane_pick(int(ax.z), params.get("plane"))
+    if k is None or int(ax.z) <= 1:
+        return env
+    md = env.metadata
+    changes: Dict[str, Any] = {"z_step_um": respaced(md.get("z_step_um"), (k,))}
+    changes.update(z_home_after(md, (k,)))
+    out = env.with_axes(replace(ax, z=1)).with_metadata(**changes)
+    z_step = md.get("z_step_um")
+    if z_step and k:
+        try:
+            dz = float(z_step) * int(k)
+        except (TypeError, ValueError):
+            dz = 0.0
+        if dz:
+            out = out.with_metadata(**shift_origin_um(out, dz, 0.0, 0.0))
+    return out
+
+
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
     """Tile stitch: M→1, Y/X grow. The output extent is UNKNOWN unless supplied
     (it depends on estimated registration) — never a silent guess (V2.03 §2 A3)."""
@@ -2222,6 +2275,7 @@ __all__ = [
     "FRAME_SPEC_AXES", "parse_frame_spec", "format_frame_spec", "frame_spec_picks",
     "PER_CHANNEL_KEYS", "channel_subset",
     "select_group", "group_picks", "position_group_plan",
+    "plane_pick", "select_plane",
     "POSITION_GROUP_KEY", "POSITION_NAME_KEY",
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
     "source_file_runs", "chain_grow", "chained_metadata",

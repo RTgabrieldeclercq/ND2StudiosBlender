@@ -57,8 +57,8 @@
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
       "pages": ["input"],
-      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
-      "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group", "util.split_positions", "util.select_position", "data.part"]
+      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
+      "ops": ["channel.select", "channel.split", "util.batch", "util.unbatch", "util.select_batch", "util.timeseries", "util.merge", "util.select_group", "util.split_positions", "util.select_position", "util.split_z", "util.select_plane", "data.part"]
     },
     "image_restoration": {
       "label": "Image restoration",
@@ -85,8 +85,8 @@
       "label": "Registration & alignment",
       "stage": "prepare_image",
       "pages": ["refine"],
-      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another.",
-      "ops": ["align.drift", "registration.stabilize", "registration.align_to"]
+      "description": "Estimate and apply (or record) the transform that lines frames or files up: rigid drift correction over T, register-once/apply-to-all stabilization with several motion models, and stage-coordinate alignment of one file to another — and the apply half on its own: Shift moves any Dataset by a per-frame (z, y, x) shift read from a Registration output, so the drift can be estimated on one plane (Select Plane) and applied to the whole stack.",
+      "ops": ["align.drift", "registration.stabilize", "registration.align_to", "align.shift"]
     },
     "geometric_transformation": {
       "label": "Geometric transformation",
@@ -217,6 +217,8 @@
     "channel.select": ["input", "refine", "process", "analyze"],
     "page.input": ["refine", "process", "analyze"],
     "page.output": ["input", "refine", "process"],
-    "util.crop_region": ["refine", "process"]
+    "util.crop_region": ["refine", "process"],
+    "util.select_plane": ["input", "refine", "process", "analyze"],
+    "util.split_z": ["input", "refine"]
   }
 }

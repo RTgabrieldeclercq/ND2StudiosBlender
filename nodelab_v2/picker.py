@@ -31,7 +31,7 @@ from nodegraph.registry import PICK_KINDS
 #: Kinds resolved from the viewer's CURRENT state with no gesture at all — "use the channel
 #: I am looking at", "use this timepoint". They commit the moment they are armed, because
 #: there is nothing to aim: the answer is already on screen.
-INSTANT_KINDS = frozenset({"channel", "frame", "channels", "zrange", "frames"})
+INSTANT_KINDS = frozenset({"channel", "frame", "plane", "channels", "zrange", "frames"})
 
 #: Kinds committed off the intensity histogram rather than the image. The user is already
 #: dragging these handles to make the image readable; the pick is the missing path from
@@ -66,6 +66,7 @@ PICK_HELP: Dict[str, str] = {
     "channel": "Taking the channel the viewer is showing.",
     "channels": "Taking the channels the viewer has switched on.",
     "frame": "Taking the timepoint the viewer is showing.",
+    "plane": "Taking the Z plane the viewer is showing.",
     "zrange": "Taking the Z planes picked on the Z strip (all of them if none are picked).",
     "frames": "Taking the M / T / Z boxes ticked on the strips — or, for an axis with "
               "nothing ticked, the frame you are looking at.",
@@ -95,6 +96,7 @@ PICK_ACTION: Dict[str, str] = {
     "channel": "Use the viewed channel",
     "channels": "Use the viewer's channels",
     "frame": "Use the current frame",
+    "plane": "Use the viewed plane",
     "zrange": "Use the picked Z planes",
     "frames": "Use the selected frames",
     "percentile": "Take the histogram window",
@@ -760,6 +762,8 @@ def instant_values(req: PickRequest, *, channel: int, frame: int,
         return {req.socket: int(channel)}
     if req.kind == "frame":
         return {req.socket: int(frame)}
+    if req.kind == "plane":
+        return {req.socket: int(plane)}
     if req.kind == "channels":
         return {req.socket: ",".join(str(int(c)) for c in channels)}
     if req.kind == "zrange":

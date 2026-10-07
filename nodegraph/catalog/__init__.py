@@ -191,6 +191,13 @@ MODULES: Tuple[str, ...] = (
     "math.image",
     "math.values",
     "util.crop_region",
+    # 2026-10-07: the registration WORKFLOW as nodes rather than one node — Select Plane and
+    # Split Z choose the plane the estimate runs on, Shift applies a per-frame shift read from
+    # a Registration output to any Dataset (the whole stack). Appended, like everything since
+    # V2.20: this list's order is the link-drag search menu's order.
+    "util.select_plane",
+    "util.split_z",
+    "align.shift",
 )
 
 

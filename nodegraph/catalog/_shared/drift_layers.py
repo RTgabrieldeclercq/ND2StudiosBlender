@@ -21,3 +21,15 @@ def _layers_stabilize(params, modes):
         layers.insert(0, (Domain.FRAME, "drift_z"))
     layers.append((Domain.FRAME, "drift_confidence"))
     return tuple(layers)
+
+
+def _layers_shift(params, modes):
+    """``align.shift`` stores the per-frame shift it APPLIED as ``shift_y`` / ``shift_x``
+    (plus ``shift_z`` under the 3D lever when a z layer is named) — the literal names the
+    demo window and a table read back, so the apply half of registration is as inspectable
+    as the estimate half (2026-10-07). Total: a blank or absent ``shift_z`` is simply no
+    axial layer."""
+    layers = [(Domain.FRAME, "shift_y"), (Domain.FRAME, "shift_x")]
+    if (modes or {}).get("dim") == "3D" and str((params or {}).get("shift_z") or "").strip():
+        layers.insert(0, (Domain.FRAME, "shift_z"))
+    return tuple(layers)

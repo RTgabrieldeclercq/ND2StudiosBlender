@@ -290,14 +290,14 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "1b4c495ca10564f163e03ec3531f331e"
+   "file:nodegraph/kernels/README.md": "86c086f21fd1b5f9a356114d704351da"
   },
   "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "1b4c495ca10564f163e03ec3531f331e"
+   "file:nodegraph/kernels/README.md": "86c086f21fd1b5f9a356114d704351da"
   },
   "blessed": "2026-10-07",
   "file": "codemap/invariants.md"

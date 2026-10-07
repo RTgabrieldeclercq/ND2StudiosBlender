@@ -72,6 +72,7 @@ PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 #: * ``channel``    — adopt the channel the viewer is showing
 #: * ``channels``   — tick the channels to keep, by their real names
 #: * ``frame``      — adopt the timepoint the viewer is showing
+#: * ``plane``      — adopt the Z plane the viewer is showing (Select Plane)
 #: * ``zrange``     — adopt the Z planes picked on the viewer's Z strip
 #: * ``frames``     — adopt the M/T/Z selection from the strips (the frame the cursor is on,
 #:                    for an axis with nothing ticked) as one ``"m0-2,t3"`` spec
@@ -86,7 +87,7 @@ PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 #: from "this param was never annotated".
 PICK_KINDS: FrozenSet[str] = frozenset({
     "shapes", "area", "level", "radius", "distance", "grid", "rect",
-    "channel", "channels", "frame", "zrange", "frames", "percentile", "gamma",
+    "channel", "channels", "frame", "plane", "zrange", "frames", "percentile", "gamma",
     "nudge_xy",
 })
 
@@ -114,6 +115,7 @@ _PICK_SOCKET_TYPES: Dict[str, Tuple[SocketType, ...]] = {
     "frames": (SocketType.STRING,),
     "channel": (SocketType.INT,),
     "frame": (SocketType.INT,),
+    "plane": (SocketType.INT,),
     "rect": (SocketType.INT,),
     "zrange": (SocketType.INT,),
     "grid": (SocketType.INT, SocketType.FLOAT),

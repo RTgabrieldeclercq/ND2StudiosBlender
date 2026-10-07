@@ -324,6 +324,12 @@ print(lm["model"], lm["summary"])     # translation …
 - **Downstream:** the aligned Dataset carries `drift_y`/`drift_x` (+ `drift_z`) and
   `drift_confidence` as Frame layers and `registration_model` / `registration_landmarks` as
   metadata; `common_translation_crop` can trim the shared border for export.
+- **The apply as a node of its own (2026-10-07):** `align.shift` reads those `drift_*`
+  layers from a Registration output on its `shifts` input and applies them to ANY Dataset
+  through the same `apply_shift` call `apply_frame` makes for the translation model, so
+  `Shift(data, Registration(data)) == Registration(data)` bit for bit. The intended wiring
+  for a z-stack is `util.select_plane` (one chosen plane) → this kernel's 2-D estimate →
+  `align.shift` on the full stack: the estimate and the apply on different data.
 
 ---
 

@@ -96,7 +96,10 @@ def _compute_stabilize(ctx: EvalContext) -> Dataset:
     the record)
     --------------------------------------------------------------------------------------
     * **2D/3D** ``DimMode``. 2D estimates on the MIDDLE z plane of the reference channel
-      and applies the in-plane correction to every plane — what the node always did. 3D
+      and applies the in-plane correction to every plane — what the node always did. To
+      estimate on a CHOSEN plane the workflow is three nodes, not a plane socket here:
+      ``util.select_plane`` → this node (2D) → ``align.shift`` on the full stack, which
+      reads the ``drift_*`` layers this node writes (2026-10-07). 3D
       correlates the whole ``(Z, Y, X)`` volume per timepoint and corrects the axial drift
       too (``drift_z``); the warp models keep their planar warp from the middle plane and
       take only ``dz`` from the volume. The bench's star volume showed the 2D path leaving
@@ -250,7 +253,9 @@ _DIM_DOCS = {
           "in-plane correction to every plane. Right for single-plane data and for a stack "
           "whose focus did not move. On a z-stack it ignores axial drift entirely: a sample "
           "that drifted two planes stays two planes off, and the lateral estimate itself "
-          "degrades as the mid-plane's content changes underneath it.",
+          "degrades as the mid-plane's content changes underneath it. To estimate on a "
+          "plane of YOUR choosing, put Select Plane in front of this node and apply its "
+          "drift layers to the full stack with Shift.",
     "3D": "Correlate the whole (Z, Y, X) volume of the reference channel per timepoint and "
           "correct the axial drift as well as the lateral one, storing it as drift_z. A warp "
           "model (euclidean / affine / feature) still estimates its in-plane warp on the "
@@ -434,4 +439,6 @@ register_node(
                 "stabilization; translation/euclidean/affine/feature/auto models, "
                 "first/previous/mean/template anchor, 2D or 3D (axial drift), a drawn "
                 "estimate region and hand-clicked landmarks; stores the per-frame shift and "
-                "confidence as Frame attributes.")
+                "confidence as Frame attributes. Pair with Select Plane (estimate on one "
+                "chosen plane) and Shift (apply the stored shift to the whole stack) when "
+                "the estimate and the apply belong on different data.")

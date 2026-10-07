@@ -5868,6 +5868,50 @@ def main(argv) -> int:
         "file's point names, a wire from pos2 is drawable, the envelope downstream reads "
         "m=1, and the run graph carries a util.select_position tap with position '2'")
 
+    # ── SZ1 Split Z: the Z-axis member of the tap family (2026-10-07) — a 5-plane source grows
+    # z0..z4 on the card labelled with plane heights, a wire from z3 is drawable, the envelope
+    # downstream reads z=1, the run graph carries a util.select_plane tap with plane 3; and
+    # Select Plane's `plane` is an INSTANT pick that adopts the viewer's z ──────────────────
+    _szdoc = win.doc
+    _szdoc.add_node("io.load", node_id="SZL", x=0, y=1600)
+    _szdoc.meta_seeds["SZL"] = MetaEnvelope(
+        axes=AxisSizes(m=1, t=2, z=5, c=1, y=64, x=64),
+        metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
+    _szdoc.add_node("util.split_z", node_id="SZS", x=300, y=1600)
+    _szdoc.connect("SZL", "image", "SZS", "data")
+    _szdoc.add_node("view.viewer", node_id="SZV", x=600, y=1600)
+    _szdoc.connect("SZS", "z3", "SZV", "data")
+    _szdoc.add_node("util.select_plane", node_id="SZP", x=600, y=1700)
+    _szdoc.connect("SZS", "out", "SZP", "data")
+    win.scene.sync(); app.processEvents()
+    _szitem = win.scene.node_items["SZS"]
+    _szouts = [s.name for s in _szdoc.output_specs("SZS")]
+    assert _szouts == ["out", "z0", "z1", "z2", "z3", "z4"], _szouts
+    assert [s.label for s in _szdoc.output_specs("SZS")][1:3] == ["0 · 0.00 µm", "1 · 0.40 µm"]
+    _zports = [getattr(p, "name", None) for p in getattr(_szitem, "_outs", {}).values()] \
+        if isinstance(getattr(_szitem, "_outs", None), dict) else None
+    if _zports is not None:
+        assert {"z0", "z3", "z4"} <= set(_zports), _zports
+    assert _szdoc.env("SZV").axes.z == 1, "the viewer sees one plane through the tap"
+    assert _szdoc.env("SZP").axes.z == 1, "Select Plane narrows the envelope to its plane"
+    _gz = _szdoc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.select_plane" and n.params == {"plane": 3}
+               for n in _gz.nodes.values()), [(n.id, n.op_key, n.params) for n in _gz.nodes.values()]
+    # the instant pick commits the viewer's z without arming a bar
+    _pspec = _szdoc.nodes["SZP"].spec()
+    assert _pspec.input("plane").pick_kind == "plane"
+    win._arm_pick(_rfor("SZP", _pspec.input("plane")))
+    assert not win.viewer.picking(), "an instant pick commits without a bar"
+    assert _szdoc.nodes["SZP"].params.get("plane") == int(win.viewer.coords()[2]), \
+        (_szdoc.nodes["SZP"].params, win.viewer.coords())
+    for nid in ("SZP", "SZV", "SZS", "SZL"):
+        _szdoc.remove_node(nid)
+    win.scene.sync(); app.processEvents()
+    _ok("SZ1 split z: a 5-plane source grows z0..z4 on the card labelled with plane heights, "
+        "a wire from z3 is drawable, the envelope downstream reads z=1, the run graph carries "
+        "a util.select_plane tap with plane 3, and Select Plane's Plane is an instant pick "
+        "that adopts the viewer's z")
+
     _probe_movie_editor(win, app)
 
     # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────
