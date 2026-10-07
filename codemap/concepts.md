@@ -658,7 +658,10 @@ ONE function, `ingest.channel_display_seed` (`with_channel_display`): one spelli
 sides, because `set_meta_seed` re-seeds only on a CHANGED envelope and two spellings would
 cost a re-pull after every first pull. Both keys are in `metadata.PER_CHANNEL_KEYS`, so
 `channel_select` (the `chK` taps, `channel.select`) narrows them in lockstep with the axis;
-`position_name` is in `PER_POSITION_KEYS` and the position taps narrow it the same way.
+`position_name` is in `PER_POSITION_KEYS` and the position taps narrow it the same way —
+and `position_subset` INVENTS `position_index` on the first narrowing (the indices it kept;
+step 11i), so a position with no point name is named by its index in the FILE (`m1`), not in
+the one-long stream it has become (`m0`, which is what every single position used to read).
 Until this the edit-time envelope carried only `channel_emission_nm`: past a `chK` wire a
 card could tint by emission but could only call its stream `Ch0`. The engine's "calibration
 schema" rule for the seed stands otherwise — `ctx.calib` still refuses a non-calibration key;

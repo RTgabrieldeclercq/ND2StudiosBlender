@@ -28112,12 +28112,56 @@ def test_stream_identity() -> None:
     db = d.add_node("page.output")
     d.connect("L", "ch1", db.id, "data")
     assert (da.params["name"], db.params["name"]) == ("GFP", "GFP2"), (da.params, db.params)
+
+    # a file WITHOUT point names (step 11i): a position is named by its index IN THE FILE —
+    # `m1` three nodes and a page past the tap, not `m0`, its index in a one-long stream.
+    # The first narrowing of M records which positions it kept (`position_index`, a member
+    # of PER_POSITION_KEYS); the envelope and the pulled payload agree.
+    from nodegraph.metadata import position_subset
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.ops import headless_engine
+    from nodegraph.memo import Memo
+    assert position_subset({}, [1]) == {"position_index": [1]}
+    assert position_subset({"position_index": [5, 6, 7], "position_name": ["a", "b", "c"]},
+                           [2, 0]) == {"position_index": [7, 5], "position_name": ["c", "a"]}
+    ws3 = Workspace.standard()
+    pg3 = {p.kind: p for p in ws3.pages.values()}
+    I3, R3 = pg3["input"], pg3["refine"]
+    ax3 = AxisSizes(m=3, t=1, z=1, c=1, y=8, x=8)
+    md3 = {"pixel_size_um": 0.5}
+    arr3 = np.zeros((3, 1, 1, 1, 8, 8), np.float32)
+    for mi in range(3):
+        arr3[mi] = 100.0 * (mi + 1)
+    I3.doc.add_node("io.load", node_id="L")
+    I3.doc.meta_seeds["L"] = MetaEnvelope(axes=ax3, metadata=dict(md3))
+    I3.doc.add_node("util.split_positions", node_id="SPO")
+    I3.doc.connect("L", "image", "SPO", "data")
+    assert [s.label for s in I3.doc.output_specs("SPO") if s.name.startswith("pos")] == [
+        "0 · m0", "1 · m1", "2 · m2"]
+    o31 = I3.doc.add_node("page.output")
+    I3.doc.connect("SPO", "pos1", o31.id, "data")
+    assert o31.params["name"] == "m1", o31.params
+    assert I3.doc.env(o31.id).metadata.get("position_index") == [1]
+    in3 = R3.doc.add_node("page.input", params={"source": f"{I3.id}:m1"})
+    R3.doc.add_node("enhance.gamma", node_id="G")
+    R3.doc.connect(in3.id, "out", "G", "data")
+    assert R3.doc.socket_positions(in3.id, "out") == ["m1"]
+    assert text(R3.doc, in3.id, "out", "out") == "m1" and text(R3.doc, "G", "out", "out") == "m1"
+    comp3 = ws3.compose(R3.id)
+    eng3 = headless_engine(comp3.graph, meta_seeds=comp3.meta_seeds, memo=Memo(), seeds={
+        f"{I3.id}/L": Dataset(axes=ax3, metadata=dict(md3)).with_image(ArrayProvider(arr3))})
+    got3 = eng3.pull(f"{R3.id}/G")
+    assert got3.axes.m == 1 and got3.metadata.get("position_index") == [1], got3.metadata
+    plane3 = np.asarray(got3.image.get_region(0, 0, 0, 0, 0, 0, 8, 0, 8))
+    assert float(plane3.ravel()[0]) == 200.0, "the pixels downstream ARE position 1's"
     _ok("stream identity (V4.00 step 11h): one position of several labels a stream like a "
         "channel (B03, B03 · Cy5), across pages; the name given at a Page Output is the "
         "stream's name on the next page, plus the position/channel it does not say "
         "(control · B03 · Cy5, mask_cy5 · B03); a placeholder-named Output takes its first "
         "wire's name (B03, C07, A01, DAPI, select_channel_b03_cy5; unique; a typed name "
-        "kept; a reader follows); a position tap names its item")
+        "kept; a reader follows); a position tap names its item; a file without point names "
+        "names a position by its index IN the file (m1, via position_index), envelope and "
+        "payload alike")
 
 
 def main() -> int:

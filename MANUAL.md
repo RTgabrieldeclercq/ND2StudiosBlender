@@ -663,7 +663,8 @@ the ones that hold:
   `DAPI +2`; the dot is tinted like the wire;
 * **the position(s)** it is of the file's — past `1 · B03` on a Split Positions card the
   cards read `B03` (and `B03 · Cy5` with a channel tap too), before and after any page
-  boundary;
+  boundary; a file without point names reads `m1` — the position's index **in the file**,
+  which the stream remembers however far it travels (V4.00 step 11i);
 * **the name you gave it** at the Page Output it last came through — the variable
   (`control`) or the item (`mask_cy5`) — on every card of the next page, with the position
   and the channel added only where the name does not already say them: `control · B03 · Cy5`,
@@ -3611,6 +3612,7 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **I lose track of my pages** | Use the **tabs** along the top of the canvas — a row of page kinds, and under it the pages of the kind shown (drag to reorder, ✕ to close a tab you do not need on screen) — and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, each with its nodes in data-flow order and its Outputs highlighted by variable name |
 | **A wire is tinted by a channel but its sockets just say `data`** | Fixed (V4.00 step 11g): a stream carrying one (or some) of the file's channels names it on every Dataset socket downstream — `Cy5` on a generic socket, `raw · DAPI` on a named one (§4 *A stream knows where it came from*). A full bundle keeps `data` / `out`; a graph saved by an older build regains the names on its first pull |
 | **Masks for each channel went through one Page Output and every stream on the next page says the same channel** | Fixed (V4.00 step 11h): each item of a several-item Output is its own wire's channel on the next page — on the cards' `out` too, not only their input rows |
+| **Downstream of my `m1` position the cards say `m0`** | Fixed (V4.00 step 11i): a one-position stream used to be named by its index in itself — always 0. It now carries the index it had in the file (`position_index`, written when M is first narrowed), so it reads `m1` on every later page |
 | **I made an Output per position and they are all `out`, `out2`, …** | A Page Output takes its first wire's name while it is still that placeholder (V4.00 step 11h): wire `1 · B03` in and it reads `B03`; the next page's cards read `B03` too. Type a name in its Name field to call it anything else — your name is kept, and later pages follow a rename |
 | **I only want a node's mask (or its labels, or its table), not the image with it** | Wire the card's part socket — `mask only`, `labels only`, … under `out` — instead of `out` (§4 *One kind of data at a time*). A mask arrives as a 0/1 image; `image only` drops every layer. The sockets appear when the output carries more than one kind of data |
 | **I want to hand several things to the next page under one name** | Wire them all into one Page Output (a slot appears under the last one wired) and name them in its **Items** field; the next page's Page Input offers each on its own `item · …` socket |

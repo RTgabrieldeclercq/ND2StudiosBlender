@@ -315,10 +315,19 @@ def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
 #:   experiment rather than a pixel. Membership here is what makes ``util.select_group``'s
 #:   output describe the positions it actually kept.
 #:
+#: * ``position_index`` (V4.00 step 11i) — WHICH POSITION OF THE FILE ``m`` was, as an
+#:   integer, one per M. Absent on a source: until something narrows M, a stream's index
+#:   IS the file's. :func:`position_subset` writes it on the FIRST narrowing (the indices it
+#:   kept) and reindexes it on every later one, so a one-position stream three nodes and
+#:   two pages past a Split Positions still knows it was ``m1`` — which is what the card
+#:   downstream prints when the file carries no point names, and what it could not know
+#:   before (it printed ``m0``, its LOCAL index, for every single position). Provenance,
+#:   not geometry, like ``source_file``; nothing computes from it; not a table column.
+#:
 #: ``frame_time_jd`` is deliberately ABSENT: it is indexed by T, not M.
 PER_POSITION_KEYS: Tuple[str, ...] = (
     "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc",
-    "source_file", "position_group", "position_name",
+    "source_file", "position_group", "position_name", "position_index",
 )
 
 #: The per-M metadata key naming each position's GROUP — the specimen/mosaic it belongs to
@@ -373,6 +382,11 @@ def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[st
     SHORT to cover an index in ``keep`` is dropped whole rather than silently shortened —
     the same rule :func:`read_origin_um` applies, because a partial positional list reports
     some other field's coordinate instead of admitting it does not know.
+
+    The one key INVENTED here is ``position_index`` (V4.00 step 11i): absent on a source,
+    where a stream's index is the file's, the FIRST narrowing records the indices it kept —
+    ``keep`` itself — and every later one reindexes that list like any other member. It is
+    how a single position remembers which one it was.
     """
     changes: Dict[str, Any] = {}
     for key in PER_POSITION_KEYS:
@@ -381,6 +395,8 @@ def position_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[st
             continue
         changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
                         else None)
+    if "position_index" not in changes:
+        changes["position_index"] = [int(i) for i in keep]
     return changes
 
 

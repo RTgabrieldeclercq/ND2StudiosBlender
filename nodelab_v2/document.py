@@ -964,7 +964,7 @@ class GraphDocument:
         md = env.metadata or {}
         names = md.get("position_name")
         names = [str(v) for v in names] if isinstance(names, (list, tuple)) \
-            and len(names) == m else [f"m{i}" for i in range(m)]
+            and len(names) == m else self._position_fallback_names(md, m)
         groups = md.get("position_group")
         groups = [str(v) if v is not None else "" for v in groups] \
             if isinstance(groups, (list, tuple)) and len(groups) == m else [""] * m
@@ -1326,10 +1326,26 @@ class GraphDocument:
 
     # ── which POSITION a socket carries, and whose NAME (V4.00 step 11h) ──────
     @staticmethod
-    def _env_position_names(env: MetaEnvelope) -> List[str]:
+    def _position_fallback_names(md: Mapping[str, Any], m: int) -> List[str]:
+        """``m{K}`` per position when the file carries no point names — K the position's
+        index IN THE FILE (``position_index``, written by the first narrowing of M, V4.00
+        step 11i), so one position of three reads ``m1`` three pages down rather than
+        ``m0``, its index in a stream that is one long. Only on a source, where nothing has
+        narrowed M yet, is the local index the file's."""
+        idx = md.get("position_index")
+        if isinstance(idx, (list, tuple)) and len(idx) == m:
+            try:
+                return [f"m{int(v)}" for v in idx]
+            except (TypeError, ValueError):
+                pass
+        return [f"m{i}" for i in range(m)]
+
+    @classmethod
+    def _env_position_names(cls, env: MetaEnvelope) -> List[str]:
         """The names of the positions a stream carries, off its envelope: the file's point
         labels (``position_name``, narrowed with M by every position tap) when the list has
-        the right length, else ``m{i}``; ``[]`` while M is unknown."""
+        the right length, else ``m{K}`` by the index in the file
+        (:meth:`_position_fallback_names`); ``[]`` while M is unknown."""
         if "m" in getattr(env, "unknown_axes", frozenset()):
             return []
         m = int(getattr(env.axes, "m", 0) or 0)
@@ -1338,7 +1354,7 @@ class GraphDocument:
         names = env.metadata.get("position_name")
         if isinstance(names, (list, tuple)) and len(names) == m:
             return [str(v) for v in names]
-        return [f"m{i}" for i in range(m)]
+        return cls._position_fallback_names(env.metadata, m)
 
     def _env_m(self, node_id: str) -> int:
         try:
