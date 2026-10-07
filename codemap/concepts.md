@@ -647,8 +647,8 @@ see: CON-17 · CON-12 · CON-15 · [MANUAL §4 One kind of data at a time, §2 P
 
 ---
 
-### CON-23 — channel provenance
-anchors: sym:nodelab_v2.ingest.channel_display_seed, sym:nodelab_v2.ingest.with_channel_display, sym:nodelab_v2.document.GraphDocument.channel_subset, sym:nodelab_v2.document.GraphDocument.socket_text, sym:nodelab_v2.document.GraphDocument.source_channel_total, sym:nodelab_v2.workspace.Workspace.input_channel_scope
+### CON-23 — stream identity: channel, position, the name it was given
+anchors: sym:nodelab_v2.ingest.channel_display_seed, sym:nodelab_v2.document.GraphDocument.channel_subset, sym:nodelab_v2.document.GraphDocument.stream_identity, sym:nodelab_v2.document.GraphDocument._name_output_from_wire, sym:nodelab_v2.document.GraphDocument.source_channel_total, sym:nodelab_v2.workspace.Workspace.input_channel_scope
 
 **The names ride the data (V4.00 step 11g).** A source envelope — the Load card's seed at
 file-pick (`window._add_source_node` / `_add_bundle_node`) and the runner's resolved
@@ -657,28 +657,47 @@ envelope (`_ingest_locked`, `_open_direct`, `_resolve_bundle`, cached in `_provi
 ONE function, `ingest.channel_display_seed` (`with_channel_display`): one spelling on both
 sides, because `set_meta_seed` re-seeds only on a CHANGED envelope and two spellings would
 cost a re-pull after every first pull. Both keys are in `metadata.PER_CHANNEL_KEYS`, so
-`channel_select` (the `chK` taps, `channel.select`) narrows them in lockstep with the axis.
+`channel_select` (the `chK` taps, `channel.select`) narrows them in lockstep with the axis;
+`position_name` is in `PER_POSITION_KEYS` and the position taps narrow it the same way.
 Until this the edit-time envelope carried only `channel_emission_nm`: past a `chK` wire a
 card could tint by emission but could only call its stream `Ch0`. The engine's "calibration
 schema" rule for the seed stands otherwise — `ctx.calib` still refuses a non-calibration key;
-these two are display lists the engine never reads.
+these are display lists the engine never reads.
 
 **One resolution, three readers.** `GraphDocument.socket_channels(node, socket, io)` — a
 `chK` output is channel K of `channel_descriptors`; a Page Input's `item:<name>` is what that
 item's wire carries (`page_channel_scope`); any other output the node's own list; an input its
-wire's source socket; a `fresh_output` node (a plot's picture) none. `channel_subset` keeps
-them only when `1 <= len < source_channel_total` — the wire tint's long-standing rule, now
-shared by the socket's text (`socket_text`: a generic `data`/`out` becomes `Cy5`, a named
-`raw` becomes `raw · DAPI`, a synthetic socket keeps its label), its dot
-(`NodeItem._tint_channel_socket`, inputs too, re-applied in `refresh`'s cheap branch because a
-wire arrives after the card is laid out) and its wire (`EdgeItem._channel_colors`), all
-coloured by `node_item.desc_qcolor` (native colour, else emission). `source_channel_total`
-crosses a page: a root `page.input` asks `Workspace.input_channel_scope` (hook
-`doc.page_channel_scope`) for the FILE's total on the page it reads from, recursively, so a
-one-channel stream three pages down still knows it is one of three.
-`_inherited_channel_descriptors` narrows through a `chK` wire instead of stopping at it, so a
-seed from before the names rode it (an older session's graph, until its first pull) still
-yields the file's name and native colour past a tap. A Page Output item wired from a channel
-is named by it (`_item_default`: `Cy5`; `gaussian_blur_cy5` for a node on that stream).
+wire's source socket. `channel_subset` keeps them only when `1 <= len <
+source_channel_total` — the wire tint's long-standing rule — and a `fresh_output` node (a
+plot's picture) has none of the file's. `socket_positions` / `position_subset` /
+`source_position_total` are the same three for M (step 11h; a stream's position names off
+its envelope, `_env_position_names`). `stream_name` is the name a stream was given at the
+Page Output it last came through — the Page Input's variable, or the item for an
+`item:<name>` socket — followed back along the PRIMARY Dataset wire (the first Dataset input,
+the one the envelope follows) through any node. `stream_identity` composes them: the name,
+then the positions and channels the name does not already mention, each joined as `a · b` or
+`a +N`. `socket_text` prints it — a generic `data`/`out` becomes the identity, a named `raw`
+becomes `raw · <identity>`, a synthetic socket keeps its label (`_SYNTHETIC_SOCKET_RE`) —
+and the dot (`NodeItem._tint_channel_socket`, inputs too, re-applied in `refresh`'s cheap
+branch because a wire arrives after the card is laid out), the wire
+(`EdgeItem._channel_colors`) and the hover (`NodeItem._stream_facts`) read the same
+resolution, coloured by `node_item.desc_qcolor` (native colour, else emission). The totals
+cross a page: a root `page.input` asks `Workspace.input_channel_scope` /
+`input_position_scope` (hooks `doc.page_channel_scope` / `page_position_scope`) for the
+FILE's totals on the page it reads from, recursively, so a one-channel, one-position stream
+three pages down still knows it is one of three. `_inherited_channel_descriptors` narrows
+through a `chK` wire instead of stopping at it (an older seed without names still yields the
+file's name past a tap) and crosses a page by the ITEM's wire, never the Output's — whose
+list is its first item's, which is how three masks of a split all came through as "GFP".
 
-see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream names its channel](../MANUAL.md)
+**An Output names what it carries.** `_item_default` names an item from its wire: a part or
+item name; a tap socket's channel, position, group key or batch member (`_tap_name`); a Page
+Input's variable; else the source title, with the one position and one channel it does not
+say appended (`gaussian_blur_b03_cy5`). `connect` hands a Page Output the same answer for its
+VARIABLE while its name is still the placeholder (`_PLACEHOLDER_NAME_RE`: `out`, `out2`) or
+blank — `_name_output_from_wire`, first slot only, settled unique by `_settle_output_name`,
+never over a typed name; a reader already bound to the old name follows through the
+`output_renamed` hook (`Workspace._follow_renames`). A `LinkedDocument` sets
+`AUTO_NAMES_OUTPUTS = False`: its names are its master's.
+
+see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream knows where it came from](../MANUAL.md)

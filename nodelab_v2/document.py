@@ -47,8 +47,8 @@ from nodegraph.memo import digest
 from nodelab_v2.ops import (
     DEFAULT_OUTPUT_BASE, PAGE_NAME_KEY, PAGE_OUTPUT_OP, next_free_name,
     sanitize_output_name,
-    CH_SOCKET_RE, ITEM_SOCKET_RE, PAGE_INPUT_OP, PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY,
-    PAGE_SOURCE_KEY,
+    BAT_SOCKET_RE, CH_SOCKET_RE, GRP_SOCKET_RE, ITEM_SOCKET_RE, PAGE_INPUT_OP,
+    PAGE_ITEM_SOCKETS, PAGE_ITEMS_KEY, PAGE_SOURCE_KEY, POS_SOCKET_RE,
     PART_IMAGE, PART_SOCKET_RE, item_socket, part_socket, _real_dataset_out,
     BAKE_KEY, DOCK_DOCKED, DOCK_HELD, DOCK_LIVE, DOCK_OP, GROUPING_AUTO,
     GROUPING_DEFAULT, GROUPING_MODE, GROUPING_OFF, GROUPS_KEY, LOAD_OP,
@@ -100,6 +100,23 @@ GENERIC_DATASET_SOCKETS = frozenset({"data", "out", "image"})
 #: ``item · cells``). It keeps that label: the channel is printed on the ``out`` above it,
 #: and ``0 · DAPI · DAPI`` says nothing twice.
 _SYNTHETIC_SOCKET_RE = re.compile(r"^(?:ch|grp|pos|bat)\d+$|^(?:part|item):")
+
+#: A Page Output's name while nobody has named it: ``out``, ``out2``, … (what
+#: ``Workspace.node_defaults`` hands a fresh card). Such a name — or a blank one — is
+#: replaced by the first wire's (:meth:`GraphDocument._name_output_from_wire`, V4.00 step
+#: 11h); a name the user typed never is.
+_PLACEHOLDER_NAME_RE = re.compile(rf"^{re.escape(DEFAULT_OUTPUT_BASE)}\d*$")
+
+
+def _join_names(names) -> str:
+    """How a card prints a few names: ``Cy5``; ``DAPI · GFP``; ``DAPI +2`` for three or
+    more (positions and channels alike)."""
+    names = [str(n) for n in names if str(n)]
+    if not names:
+        return ""
+    if len(names) <= 2:
+        return " · ".join(names)
+    return f"{names[0]} +{len(names) - 1}"
 
 #: op_keys whose GUI card grows one synthetic per-GROUP output socket (``grp0…``) per
 #: position group — materialized into ``util.select_group`` taps at graph-build.
@@ -407,6 +424,14 @@ class GraphDocument:
         #: and so to name it; its own roots are its Page Inputs, which know no file.
         self.page_channel_scope: Callable[..., Tuple[list, int]] = (
             lambda _nid, _item="": ([], 0))
+        #: The same for POSITIONS: ``(position names, the source file's position total)`` of
+        #: what a Page Input — or one item of its Output — carries (V4.00 step 11h).
+        self.page_position_scope: Callable[..., Tuple[list, int]] = (
+            lambda _nid, _item="": ([], 0))
+        #: ``(old, new)``: a Page Output on this document was renamed by its first wire
+        #: (:meth:`_name_output_from_wire`); the Workspace points every reader of
+        #: ``<page>:old`` at ``new`` (V4.00 step 11h). A no-op outside a workspace.
+        self.output_renamed: Callable[[str, str], None] = lambda _old, _new: None
         #: ``(node_id) -> [item name, ...]`` (V4.00 step 11f): the items of the Output a
         #: ``page.input`` on this document reads — its item sockets. ``[]`` outside a
         #: workspace, while unbound, or for a one-item Output.
@@ -851,18 +876,20 @@ class GraphDocument:
         return out
 
     def _item_default(self, src: str, socket: str) -> str:
-        """An item's name from its wire: a part's or an item's name; a channel socket's
-        CHANNEL (``cy5``, step 11g); a Page Input's variable; else the source node's title —
-        with the channel appended when the wire is one of the file's (``gaussian_cy5``), so
-        a variable says which channel it came from without anyone typing it."""
+        """An item's name from its wire: a part's or an item's name; a tap socket's CHANNEL
+        (``Cy5``), POSITION (``B03``), group key or batch member (steps 11g–11h); a Page
+        Input's variable; else the source node's title — with the position and the channel
+        appended when the wire is one of the file's and the title does not say it
+        (``gaussian_blur_b03_cy5``), so a variable says where it came from without anyone
+        typing it. A Page Output with a placeholder name takes the same answer
+        (:meth:`_name_output_from_wire`)."""
         m = PART_SOCKET_RE.match(socket or "") or ITEM_SOCKET_RE.match(socket or "")
         if m:
             return sanitize_output_name(m.group(1)) or "item"
         rec = self.nodes.get(src)
-        chans = self.channel_subset(src, socket, "out")
-        chan = str(chans[0].get("name") or "") if len(chans) == 1 else ""
-        if CH_SOCKET_RE.match(socket or "") and chan:
-            return sanitize_output_name(chan) or "item"
+        tap = self._tap_name(src, socket)
+        if tap:
+            return sanitize_output_name(tap) or "item"
         if rec is not None and rec.op_key == PAGE_INPUT_OP:
             name = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").split(":", 1)[-1].strip()
             if name:
@@ -876,7 +903,37 @@ class GraphDocument:
         main = next((s.name for s in (spec.outputs if spec else ())
                      if s.type is SocketType.DATASET), "out")
         name = base if socket in ("", main) else f"{base}_{socket}"
-        return f"{name}_{_slug(chan)}" if chan and _slug(chan) else name
+        # the stream's identity where the title does not say it: ONE position, ONE channel
+        pos = self.position_subset(src, socket, "out")
+        chans = self.channel_subset(src, socket, "out")
+        for extra in (pos[0] if len(pos) == 1 else "",
+                      str(chans[0].get("name") or "") if len(chans) == 1 else ""):
+            s = _slug(extra)
+            if s and s not in name:
+                name = f"{name}_{s}"
+        return name
+
+    def _tap_name(self, node_id: str, socket: str) -> str:
+        """What a synthetic tap socket carries, by name: channel K's (``chK``), position K's
+        (``posK``), group K's key (``grpK``), batch member K's (``batK``); ``""`` for any
+        other socket or an index the node does not have (V4.00 step 11h)."""
+        for regex, lister, field in ((CH_SOCKET_RE, self.channel_descriptors, "name"),
+                                     (POS_SOCKET_RE, self.position_descriptors, "name"),
+                                     (GRP_SOCKET_RE, self.group_descriptors, "key"),
+                                     (BAT_SOCKET_RE, self.batch_member_names, None)):
+            m = regex.match(socket or "")
+            if m is None:
+                continue
+            k = int(m.group(1))
+            try:
+                items = lister(node_id)
+            except Exception:                        # noqa: BLE001 — mid-edit upstream
+                return ""
+            if not (0 <= k < len(items)):
+                return ""
+            got = items[k] if field is None else (items[k] or {}).get(field)
+            return str(got or "")
+        return ""
 
     def _page_items(self, node_id: str) -> List[str]:
         try:
@@ -1120,6 +1177,12 @@ class GraphDocument:
             if isinstance(chans, list) and chans:
                 return chans
             if rec is not None and rec.op_key == "page.input":
+                im = ITEM_SOCKET_RE.match(ssock or "")
+                if im is not None:
+                    # one ITEM of a several-item Output: ITS wire's channels. The Output's own
+                    # list is its FIRST item's, which is how every mask of a three-channel
+                    # split came through calling itself by the first one's channel.
+                    return self._page_scope(src, im.group(1))[0]
                 return self._page_channels(src)     # the walk crosses the page boundary
             spec = rec.spec() if rec is not None else None
             if spec is not None and getattr(spec, "fresh_output", False):
@@ -1165,20 +1228,15 @@ class GraphDocument:
         ``channel.select`` those are the ones it kept, and the picker needs the ones it can
         still choose from. Wired from a synthetic ``chK`` tap the incoming stream is that one
         channel, so the list narrows to it — otherwise the tick list would offer channels
-        that a single-channel tap already dropped."""
+        that a single-channel tap already dropped; from a Page Input's ``item:<name>`` it is
+        that item's (:meth:`socket_channels`, V4.00 step 11g)."""
         rec = self.nodes.get(node_id)
         if rec is None:
             return []
         for src, ssock, dst, _dsock in self.edges:
             if dst != node_id:
                 continue
-            descs = self.channel_descriptors(src)
-            idx = None
-            if ssock.startswith("ch") and ssock[2:].isdigit():
-                idx = int(ssock[2:])
-            if idx is not None:
-                return [descs[idx]] if 0 <= idx < len(descs) else []
-            return descs
+            return self.socket_channels(src, ssock, "out")
         return []
 
     # ── which channel a socket carries (V4.00 step 11g) ──────────────────────
@@ -1191,8 +1249,8 @@ class GraphDocument:
         (:attr:`page_channel_scope`); any other output — ``out``, a part, a group or
         position tap — is the node's own list (:meth:`channel_descriptors`), which the
         envelope already narrowed if a ``channel.select`` sits upstream. An input is whatever
-        its wire's source socket carries. A node that makes a NEW Dataset (``fresh_output``, a
-        plot's picture) carries no channel of the file's: ``[]``."""
+        its wire's source socket carries. A plot's picture answers R/G/B here (the picker
+        needs them); that it is no channel of the FILE's is :meth:`channel_subset`'s call."""
         rec = self.nodes.get(node_id)
         if rec is None:
             return []
@@ -1207,12 +1265,6 @@ class GraphDocument:
         m = ITEM_SOCKET_RE.match(socket or "")
         if m is not None:
             return list(self._page_scope(node_id, m.group(1))[0])
-        try:
-            spec = rec.spec()
-        except Exception:                            # noqa: BLE001 — an unknown op
-            spec = None
-        if spec is not None and getattr(spec, "fresh_output", False):
-            return []
         return list(self.channel_descriptors(node_id))
 
     def channel_subset(self, node_id: str, socket: str, io: str = "out") -> list:
@@ -1222,43 +1274,44 @@ class GraphDocument:
         The same rule the wire tint has always used (a full bundle is not tinted, because
         "everything" is not a channel): the socket's text, its dot and its wire all read
         from here, so they cannot disagree about which channel a stream is."""
-        descs = self.socket_channels(node_id, socket, io)
+        if io == "in":
+            edge = self.edge_into(node_id, socket)
+            return self.channel_subset(edge[0], edge[1], "out") if edge is not None else []
+        rec = self.nodes.get(node_id)
+        try:
+            spec = rec.spec() if rec is not None else None
+        except Exception:                            # noqa: BLE001 — an unknown op
+            spec = None
+        if spec is not None and getattr(spec, "fresh_output", False):
+            return []                 # a NEW Dataset (a plot's picture): no channel of the file's
+        descs = self.socket_channels(node_id, socket, "out")
         if not descs:
             return []
         try:
-            total = (self.source_channel_total(node_id) if io == "out"
-                     else self._upstream_channel_total(node_id, socket))
+            total = self.source_channel_total(node_id)
         except Exception:                            # noqa: BLE001 — mid-edit
             return []
         return list(descs) if 1 <= len(descs) < total else []
 
-    def _upstream_channel_total(self, node_id: str, socket: str) -> int:
-        edge = self.edge_into(node_id, socket)
-        return self.source_channel_total(edge[0]) if edge is not None else 0
-
     def channel_tag(self, node_id: str, socket: str, io: str = "out") -> str:
         """The channel(s) a socket carries, as the card prints them: ``Cy5``; ``DAPI · GFP``;
         ``DAPI +2`` for three or more. ``""`` when the stream is not a strict subset."""
-        names = [str(d.get("name") or "") for d in self.channel_subset(node_id, socket, io)]
-        names = [n for n in names if n]
-        if not names:
-            return ""
-        if len(names) <= 2:
-            return " · ".join(names)
-        return f"{names[0]} +{len(names) - 1}"
+        return _join_names(str(d.get("name") or "")
+                           for d in self.channel_subset(node_id, socket, io))
 
     def socket_text(self, node_id: str, spec, io: str = "out") -> str:
-        """What a card prints beside one socket: a Dataset stream that is one (or some) of
-        the file's channels names the channel — on a generic socket in place of its name
-        (``Cy5`` for ``data`` / ``out``), on a named one after it (``raw · Cy5``,
-        :data:`GENERIC_DATASET_SOCKETS`); anything else, the socket's own text (an input its
-        name, an output its label or name). A synthetic output keeps its label
-        (:data:`_SYNTHETIC_SOCKET_RE`): ``0 · DAPI`` and ``mask only`` already say it."""
+        """What a card prints beside one socket: a Dataset stream's IDENTITY
+        (:meth:`stream_identity` — the name it was given, the position and the channel it is
+        of the file's) — on a generic socket in place of its name (``Cy5`` for ``data`` /
+        ``out``), on a named one after it (``raw · Cy5``, :data:`GENERIC_DATASET_SOCKETS`);
+        anything else, the socket's own text (an input its name, an output its label or
+        name). A synthetic output keeps its label (:data:`_SYNTHETIC_SOCKET_RE`):
+        ``0 · DAPI`` and ``mask only`` already say it."""
         base = spec.name if io == "in" else (spec.label or spec.name)
         if spec.type is not SocketType.DATASET or (
                 io == "out" and _SYNTHETIC_SOCKET_RE.match(spec.name or "")):
             return base
-        tag = self.channel_tag(node_id, spec.name, io)
+        tag = self.stream_identity(node_id, spec.name, io)
         if not tag:
             return base
         return tag if spec.name in GENERIC_DATASET_SOCKETS else f"{base} · {tag}"
@@ -1270,6 +1323,166 @@ class GraphDocument:
         except Exception:                      # noqa: BLE001 — mid-edit upstream
             return [], 0
         return (list(descs) if isinstance(descs, (list, tuple)) else []), int(total or 0)
+
+    # ── which POSITION a socket carries, and whose NAME (V4.00 step 11h) ──────
+    @staticmethod
+    def _env_position_names(env: MetaEnvelope) -> List[str]:
+        """The names of the positions a stream carries, off its envelope: the file's point
+        labels (``position_name``, narrowed with M by every position tap) when the list has
+        the right length, else ``m{i}``; ``[]`` while M is unknown."""
+        if "m" in getattr(env, "unknown_axes", frozenset()):
+            return []
+        m = int(getattr(env.axes, "m", 0) or 0)
+        if m <= 0:
+            return []
+        names = env.metadata.get("position_name")
+        if isinstance(names, (list, tuple)) and len(names) == m:
+            return [str(v) for v in names]
+        return [f"m{i}" for i in range(m)]
+
+    def _env_m(self, node_id: str) -> int:
+        try:
+            env = self.env(node_id)
+        except Exception:                            # noqa: BLE001 — an un-propagated node
+            return 0
+        return 0 if "m" in env.unknown_axes else int(env.axes.m or 0)
+
+    def source_position_total(self, node_id: str) -> int:
+        """The position count of the source file(s) feeding ``node_id`` — the M that a
+        stream carrying one position is one OF (:meth:`position_subset`). The twin of
+        :meth:`source_channel_total`: the roots' seeded ``m`` (a bundle's is the sum); a root
+        ``page.input`` asks the Workspace for the file's total on the page it reads from
+        (:attr:`page_position_scope`)."""
+        seen: set = set()
+        stack = [node_id]
+        totals: List[int] = []
+        while stack:
+            nid = stack.pop()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            preds = [e for e in self.edges if e[2] == nid]
+            if preds:
+                stack.extend(e[0] for e in preds)
+                continue
+            rec = self.nodes.get(nid)
+            up = (self._page_position_scope(nid)[1]
+                  if rec is not None and rec.op_key == PAGE_INPUT_OP else 0)
+            totals.append(up if up > 0 else self._env_m(nid))
+        return max(totals) if totals else self._env_m(node_id)
+
+    def socket_positions(self, node_id: str, socket: str, io: str = "out") -> List[str]:
+        """The position names riding ONE Dataset socket — all of them (``[]`` when unknown
+        or unwired). A ``posK`` socket is position K of the node's list; a Page Input's
+        ``item:<name>`` what that item carries (:attr:`page_position_scope`); any other
+        output the node's own envelope; an input its wire's source socket."""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return []
+        if io == "in":
+            edge = self.edge_into(node_id, socket)
+            return self.socket_positions(edge[0], edge[1], "out") if edge is not None else []
+        m = POS_SOCKET_RE.match(socket or "")
+        if m is not None:
+            descs = self.position_descriptors(node_id)
+            k = int(m.group(1))
+            return [str(descs[k]["name"])] if 0 <= k < len(descs) else []
+        m = ITEM_SOCKET_RE.match(socket or "")
+        if m is not None:
+            return list(self._page_position_scope(node_id, m.group(1))[0])
+        try:
+            env = self.env(node_id)
+        except Exception:                            # noqa: BLE001 — an un-propagated node
+            return []
+        return self._env_position_names(env)
+
+    def position_subset(self, node_id: str, socket: str, io: str = "out") -> List[str]:
+        """:meth:`socket_positions` when they are a STRICT subset of the source file's
+        positions — the stream is *one of* (or *some of*) its fields — else ``[]``. The
+        rule :meth:`channel_subset` uses, for M; a new Dataset (a plot's picture) is none."""
+        if io == "in":
+            edge = self.edge_into(node_id, socket)
+            return self.position_subset(edge[0], edge[1], "out") if edge is not None else []
+        rec = self.nodes.get(node_id)
+        try:
+            spec = rec.spec() if rec is not None else None
+        except Exception:                            # noqa: BLE001 — an unknown op
+            spec = None
+        if spec is not None and getattr(spec, "fresh_output", False):
+            return []
+        names = self.socket_positions(node_id, socket, "out")
+        if not names:
+            return []
+        try:
+            total = self.source_position_total(node_id)
+        except Exception:                            # noqa: BLE001 — mid-edit
+            return []
+        return list(names) if 1 <= len(names) < total else []
+
+    def position_tag(self, node_id: str, socket: str, io: str = "out") -> str:
+        """``B03``; ``B03 · C07``; ``A01 +2``; ``""`` when the stream is not a strict subset
+        of the file's positions."""
+        return _join_names(self.position_subset(node_id, socket, io))
+
+    def stream_name(self, node_id: str, socket: str, io: str = "out", _depth: int = 0) -> str:
+        """The name the user gave a stream at the Page Output it last came through — the
+        variable (``control``) or, for one item of a several-item Output, the item
+        (``mask_cy5``) — read off the Page Input it enters by and followed along the PRIMARY
+        Dataset wire (the first Dataset input, the one the envelope follows) through any
+        node after it. ``""`` on the page the data entered on (nothing has named it yet),
+        while the Page Input is unbound, and on a Page Output (it has no stream out)."""
+        if _depth > 256:
+            return ""
+        rec = self.nodes.get(node_id)
+        if rec is None:
+            return ""
+        if io == "in":
+            edge = self.edge_into(node_id, socket)
+            return (self.stream_name(edge[0], edge[1], "out", _depth + 1)
+                    if edge is not None else "")
+        if rec.op_key == PAGE_INPUT_OP:
+            m = ITEM_SOCKET_RE.match(socket or "")
+            if m is not None:
+                return m.group(1)
+            value = str(rec.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+            return value.split(":", 1)[-1].strip() if value else ""
+        if rec.op_key == PAGE_OUTPUT_OP:
+            return ""
+        primary = next((s.name for s in self.input_specs(node_id)
+                        if s.type is SocketType.DATASET), None)
+        if primary is None:
+            return ""
+        edge = self.edge_into(node_id, primary)
+        return (self.stream_name(edge[0], edge[1], "out", _depth + 1)
+                if edge is not None else "")
+
+    def stream_identity(self, node_id: str, socket: str, io: str = "out") -> str:
+        """What a stream IS, as a card prints it: the name it was given (:meth:`stream_name`),
+        then the position(s) and the channel(s) it is of the file's — each only where the
+        name does not already say it (``control · B03 · Cy5``, but ``mask_cy5 · B03`` and
+        just ``mask_cy5`` on a one-field file). ``""`` when there is nothing to say: the full
+        bundle on the page it entered on."""
+        name = self.stream_name(node_id, socket, io)
+        low = name.lower()
+
+        def unsaid(xs) -> List[str]:
+            return [x for x in xs if x and (not low or x.lower() not in low)]
+
+        parts = [name] if name else []
+        for group in (unsaid(self.position_subset(node_id, socket, io)),
+                      unsaid(str(d.get("name") or "")
+                             for d in self.channel_subset(node_id, socket, io))):
+            if group:
+                parts.append(_join_names(group))
+        return " · ".join(parts)
+
+    def _page_position_scope(self, node_id: str, item: str = "") -> Tuple[list, int]:
+        """:attr:`page_position_scope`, never raising."""
+        try:
+            names, total = self.page_position_scope(node_id, item)
+        except Exception:                      # noqa: BLE001 — mid-edit upstream
+            return [], 0
+        return ([str(n) for n in names] if isinstance(names, (list, tuple)) else []), int(total or 0)
 
     def batch_member_names(self, node_id: str) -> list:
         """The member names of the batch reaching ``node_id`` — ``[]`` if none does.
@@ -1515,8 +1728,46 @@ class GraphDocument:
         edge = (src, src_socket, dst, dst_socket)
         if edge not in self.edges:
             self.edges.append(edge)
+        self._name_output_from_wire(dst, dst_socket, src, src_socket)
         self._notify()
         return removed
+
+    #: Whether a Page Output on this document takes its name from its first wire. A linked
+    #: page says no (its names are its master's; see ``LinkedDocument``).
+    AUTO_NAMES_OUTPUTS = True
+
+    def _name_output_from_wire(self, dst: str, dst_socket: str, src: str,
+                               src_socket: str) -> None:
+        """A Page Output whose name is still the placeholder (``out``, ``out2``) or blank
+        takes its name from the first wire into its first slot (V4.00 step 11h): the
+        position (``B03``) or channel (``Cy5``) a tap socket carries, a part's name
+        (``mask``), the node's title (``gaussian_blur``) — the same answer an ITEM gets
+        (:meth:`_item_default`), made unique like any name. Only a placeholder is replaced:
+        a name the user typed is theirs. A Page Input already reading the old name follows
+        it (:attr:`output_renamed`), so wiring an Output a new page was auto-bound to does
+        not unbind that page."""
+        if not getattr(self, "AUTO_NAMES_OUTPUTS", True):
+            return
+        rec = self.nodes.get(dst)
+        if rec is None or rec.op_key != PAGE_OUTPUT_OP or dst_socket != PAGE_ITEM_SOCKETS[0]:
+            return
+        old = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+        if old and not _PLACEHOLDER_NAME_RE.match(old):
+            return
+        try:
+            base = sanitize_output_name(self._item_default(src, src_socket))
+        except Exception:                            # noqa: BLE001 — mid-edit upstream
+            return
+        if not base or _PLACEHOLDER_NAME_RE.match(base):
+            return
+        rec.params[PAGE_NAME_KEY] = base
+        self._settle_output_name(dst)
+        new = str(rec.params.get(PAGE_NAME_KEY, "") or "").strip()
+        if old and new and new != old:
+            try:
+                self.output_renamed(old, new)
+            except Exception:                        # noqa: BLE001 — a workspace mid-change
+                pass
 
     def disconnect(self, src: str, src_socket: str, dst: str, dst_socket: str) -> None:
         e = (src, src_socket, dst, dst_socket)

@@ -747,6 +747,10 @@ class LinkedDocument(GraphDocument):
     add_frame = remove_frame = rename_frame = _refuse_shape
     set_iterate_target = wrap_repeat_zone = make_group = ungroup = _refuse_shape
     clear = load_dict = load_page = load_file = save_file = _refuse
+    #: A linked page never renames an Output from a wire (V4.00 step 11h): its names are
+    #: its master's, and a rename would be an override nobody asked for. In ``EDIT_MASTER``
+    #: the wire lands on the master, which names as any plain page does.
+    AUTO_NAMES_OUTPUTS = False
 
     # ── leaving the master ─────────────────────────────────────────────────────
     def make_unique(self) -> GraphDocument:

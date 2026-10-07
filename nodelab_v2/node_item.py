@@ -426,7 +426,8 @@ class SocketItem(QGraphicsItem):
         self._head = socket_identity(spec)
         self.setToolTip(socket_hover_text(spec, head=self._head))
 
-    def set_domain_tip(self, domains, missing=(), *, on_wire=(), channel: str = "") -> None:
+    def set_domain_tip(self, domains, missing=(), *, on_wire=(),
+                       facts: Sequence[str] = ()) -> None:
         """Append the domain-set this Dataset socket carries/requires (the rail's
         hover detail). No-op tail for value sockets (``domains`` empty).
 
@@ -445,10 +446,9 @@ class SocketItem(QGraphicsItem):
                                              if on_wire else "nothing wired"))
         if missing:
             extra.append("⚠ missing upstream: " + ", ".join(d.value for d in missing))
-        if channel:
-            # which of the file's channels this stream is (V4.00 step 11g) — the words
-            # behind the dot's tint and the row's name
-            extra.append("channel: " + channel)
+        # what this stream IS (V4.00 steps 11g–11h) — the words behind the dot's tint and
+        # the row's name: its channel, its position, the name it was given
+        extra.extend(str(f) for f in facts if f)
         self.setToolTip(socket_hover_text(self.spec, extra, head=self._head))
 
     def boundingRect(self) -> QRectF:
@@ -961,22 +961,33 @@ class NodeItem(QGraphicsObject):
             except Exception:  # noqa: BLE001 — a hover must never break a relayout
                 on_wire = ()
             sock.set_domain_tip(self.reads_domains(), self.missing_domains(),
-                                on_wire=on_wire, channel=self._channel_phrase(s, "in"))
+                                on_wire=on_wire, facts=self._stream_facts(s, "in"))
         else:
-            sock.set_domain_tip(self.out_domains(), channel=self._channel_phrase(s, "out"))
+            sock.set_domain_tip(self.out_domains(), facts=self._stream_facts(s, "out"))
 
-    def _channel_phrase(self, s, io: str) -> str:
-        """``Cy5 — 1 of 3 channels``: the channel(s) a Dataset socket carries when they are a
-        strict subset of the file's (V4.00 step 11g); ``""`` otherwise."""
+    def _stream_facts(self, s, io: str) -> List[str]:
+        """The hover's lines on what a Dataset socket's stream IS (V4.00 steps 11g–11h):
+        ``channel: Cy5 — 1 of 3 channels``, ``position: B03 — 1 of 4 positions``,
+        ``named: control — by the Page Output it came through``; each only when it holds."""
+        facts: List[str] = []
+        if s.type is not SocketType.DATASET:
+            return facts
         try:
             descs = self.doc.channel_subset(self.rec.id, s.name, io)
-            if not descs:
-                return ""
-            total = self.doc.source_channel_total(self.rec.id)
+            if descs:
+                total = self.doc.source_channel_total(self.rec.id)
+                names = " · ".join(str(d.get("name") or "?") for d in descs)
+                facts.append(f"channel: {names} — {len(descs)} of {total} channels")
+            poss = self.doc.position_subset(self.rec.id, s.name, io)
+            if poss:
+                total = self.doc.source_position_total(self.rec.id)
+                facts.append(f"position: {' · '.join(poss)} — {len(poss)} of {total} positions")
+            name = self.doc.stream_name(self.rec.id, s.name, io)
+            if name:
+                facts.append(f"named: {name} — by the Page Output it came through")
         except Exception:  # noqa: BLE001 — a hover must never break a relayout
-            return ""
-        names = " · ".join(str(d.get("name") or "?") for d in descs)
-        return f"{names} — {len(descs)} of {total} channels"
+            pass
+        return facts
 
     def _tint_channel_socket(self, sock: "SocketItem", s, io: str = "out") -> None:
         """Tint a Dataset socket's dot by the channel(s) its stream carries: a ``chK`` output

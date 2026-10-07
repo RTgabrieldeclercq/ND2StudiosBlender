@@ -7580,7 +7580,8 @@ def main(argv) -> int:
     _btn11.click()
     app.processEvents()
     _nouts11 = [r for r in win.doc.nodes.values() if r.op_key == "page.output"]
-    assert len(_nouts11) == 1 and _nouts11[0].params.get("name") == "out", _nouts11
+    # the appended Output takes its first wire's name (V4.00 step 11h): the Gaussian's
+    assert len(_nouts11) == 1 and _nouts11[0].params.get("name") == "gaussian_blur", _nouts11
     assert (_g11.id, "out", _nouts11[0].id, "data") in set(win.doc.edges)
     assert _RD11.problems(win.doc, _g11.id) == []
     win.doc.nodes[_pin11.id].params["source"] = ""
@@ -8114,6 +8115,40 @@ def main(argv) -> int:
         "into the Page Output makes a two-item variable (`Output · mask · 2 items`, slots "
         "named threshold / mask); the next page's Page Input offers item · mask and "
         "item · threshold, and a node wired to item · mask gets the mask alone and pulls")
+
+    # ── CP2: a stream carries the name it was given (V4.00 step 11h) ──────────────
+    #
+    # On IP1's workspace: the Processing page's Input reads `mask`, so its `out` — and the
+    # card wired to it — read `mask`, not `out`/`data`; a Page Output dropped after a Median
+    # is `out` until its first wire, then `median`. Everything added is removed again: PT2
+    # reuses this workspace.
+    _ic17 = win.scene.node_items[_pi16]
+
+    def _row17(ni, name, io):
+        specs = ni._active_inputs() if io == "in" else ni._active_outputs()
+        s = next(s for s in specs if s.name == name)
+        return ni._input_row_text(s) if io == "in" else ni._output_row_text(s)
+
+    assert _row17(_ic17, "out", "out") == "mask", _row17(_ic17, "out", "out")
+    _md17 = _pr16.doc.add_node("enhance.median", x=600.0, y=520.0)
+    _pr16.doc.connect(_pi16, "out", _md17.id, "data")
+    app.processEvents()
+    assert _row17(win.scene.node_items[_md17.id], "data", "in") == "mask"
+    assert _row17(win.scene.node_items[_md17.id], "out", "out") == "mask"
+    assert "named: mask — by the Page Output it came through" in \
+        win.scene.node_items[_md17.id]._sockets[("in", "data")].toolTip()
+    _po17 = _pr16.doc.add_node("page.output", x=860.0, y=520.0)
+    assert _po17.params.get("name") == "out", _po17.params
+    _pr16.doc.connect(_md17.id, "out", _po17.id, "data")
+    app.processEvents()
+    assert _po17.params.get("name") == "median", _po17.params
+    assert win.scene.node_items[_po17.id]._page_boundary_label() == "Output · median"
+    _pr16.doc.remove_node(_po17.id)
+    _pr16.doc.remove_node(_md17.id)
+    app.processEvents()
+    _ok("CP2 a stream carries the name it was given (V4.00 step 11h): the next page's Input "
+        "and the card wired to it read `mask`, the hover names the Page Output it came "
+        "through, and a Page Output takes its first wire's name (`median`)")
 
     # PT2 closing a page TAB keeps the page (V4.00 step 11d): ✕ takes it off the sub-tab row,
     # the canvas moves to the nearest open page of its kind, the Pages panel lists it "tab

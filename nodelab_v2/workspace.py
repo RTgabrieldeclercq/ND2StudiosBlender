@@ -618,6 +618,10 @@ class Workspace:
         doc.page_channels = lambda nid, pid=pid: self.input_channels(pid, nid)
         doc.page_channel_scope = (lambda nid, item="", pid=pid:
                                   self.input_channel_scope(pid, nid, item))
+        doc.page_position_scope = (lambda nid, item="", pid=pid:
+                                   self.input_position_scope(pid, nid, item))
+        doc.output_renamed = (lambda old, new, pid=pid:
+                              self._follow_renames(pid, {old: new}))
         doc.page_items = lambda nid, pid=pid: self.input_items(pid, nid)
         doc.node_defaults = lambda op, pid=pid: self.node_defaults(pid, op)
         doc.claim_output_name = (lambda nid, name, pid=pid:
@@ -654,6 +658,8 @@ class Workspace:
         doc.page_feeders = lambda: []
         doc.page_channels = lambda _nid: []
         doc.page_channel_scope = lambda _nid, _item="": ([], 0)
+        doc.page_position_scope = lambda _nid, _item="": ([], 0)
+        doc.output_renamed = lambda _old, _new: None
         doc.page_items = lambda _nid: []
         doc.node_defaults = lambda _op: {}
         doc.claim_output_name = doc._claim_output_name_here
@@ -1287,6 +1293,31 @@ class Workspace:
             return [], 0
         return (list(doc.socket_channels(edge[0], edge[1], "out")),
                 int(doc.source_channel_total(edge[0])))
+
+    def input_position_scope(self, page_id: str, node_id: str,
+                             item: str = "") -> Tuple[List[str], int]:
+        """:meth:`input_channel_scope` for POSITIONS (V4.00 step 11h): ``(position names,
+        the source file's position total)`` of what the Page Input carries — or, with
+        ``item``, of that item's wire. ``([], 0)`` while unbound."""
+        page = self.pages.get(page_id)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None or rec.op_key != PAGE_INPUT_OP:
+            return [], 0
+        res = self.resolve_source(page_id, rec.params.get(PAGE_SOURCE_KEY))
+        if res is None:
+            return [], 0
+        up, out_nid = res
+        doc = self.pages[up].doc
+        if not item:
+            env = doc.envs.get(out_nid)
+            names = doc._env_position_names(env) if env is not None else []
+            return list(names), int(doc.source_position_total(out_nid))
+        sock = next((s for s, n in doc.output_items(out_nid) if n == item), None)
+        edge = doc.edge_into(out_nid, sock) if sock else None
+        if edge is None:
+            return [], 0
+        return (list(doc.socket_positions(edge[0], edge[1], "out")),
+                int(doc.source_position_total(edge[0])))
 
     # ── a several-item Output (V4.00 step 11f) ─────────────────────────────────
     def input_items(self, page_id: str, node_id: str) -> List[str]:

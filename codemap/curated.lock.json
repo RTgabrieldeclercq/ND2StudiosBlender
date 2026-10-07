@@ -197,11 +197,11 @@
  },
  "CON-23": {
   "anchors": {
+   "sym:nodelab_v2.document.GraphDocument._name_output_from_wire": "965ceb989c4f8011a23cb932728501a0",
    "sym:nodelab_v2.document.GraphDocument.channel_subset": "e5d1690efdbd3cdc1c9a7fdd23b286b6",
-   "sym:nodelab_v2.document.GraphDocument.socket_text": "361800f5aa1ca67aa5b43c366faaf6c8",
    "sym:nodelab_v2.document.GraphDocument.source_channel_total": "4963c5a86ce36e278c5b3545939f2531",
+   "sym:nodelab_v2.document.GraphDocument.stream_identity": "cb11852007d2fac9eb19f0a50787384c",
    "sym:nodelab_v2.ingest.channel_display_seed": "e1fc220d73fd6976998320a2b743de9d",
-   "sym:nodelab_v2.ingest.with_channel_display": "6849c0402597ebe909e595d7a0ca4ead",
    "sym:nodelab_v2.workspace.Workspace.input_channel_scope": "c3a0b5b15ab848ca719f0df57451bb21"
   },
   "blessed": "2026-10-06",

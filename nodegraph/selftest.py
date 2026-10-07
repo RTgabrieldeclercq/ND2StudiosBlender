@@ -27954,20 +27954,170 @@ def test_channel_provenance() -> None:
     R.doc.connect("IN", "out", "G", "data")
     R.doc.connect("IN", f"item:{items[1][1]}", "M", "data")
     assert R.doc.source_channel_total("IN") == 3, R.doc.source_channel_total("IN")
-    assert text(R.doc, "IN", "out", "out") == "Cy5"
-    assert text(R.doc, "G", "data", "in") == "Cy5" and text(R.doc, "G", "out", "out") == "Cy5"
-    assert text(R.doc, "M", "data", "in") == "data"          # the bundle item: everything
+    # ...and across a page the stream also carries the NAME it was given (step 11h): the
+    # variable `raw` on the Input's `out` and on every card after it; an item its own name
+    assert text(R.doc, "IN", "out", "out") == "raw · Cy5", text(R.doc, "IN", "out", "out")
+    assert text(R.doc, "G", "data", "in") == "raw · Cy5"
+    assert text(R.doc, "G", "out", "out") == "raw · Cy5"
+    assert text(R.doc, "M", "data", "in") == items[1][1]     # the bundle item: its name alone
     assert R.doc.env("G").metadata.get("channel_names") == ["Cy5"]
     assert ws.input_channel_scope("pg2", "IN") == ([CH[2]], 3)
     descs, total = ws.input_channel_scope("pg2", "IN", items[1][1])
     assert [d["name"] for d in descs] == ["DAPI", "GFP", "Cy5"] and total == 3
     assert ws.input_channel_scope("pg2", "IN", "nope") == ([], 0)
     assert GraphDocument().page_channel_scope("x") == ([], 0)    # detached: nothing
+
+    # masks per channel through ONE several-item Output (the way the user built it): each
+    # item's stream is ITS channel — on the next page's nodes' own `out` too. The inherited
+    # walk crosses the page by the ITEM's wire; asking the Output gave its FIRST item's
+    # channel, which is how three masks all came through calling themselves "GFP".
+    ws2 = Workspace.standard()
+    pg2 = {p.kind: p for p in ws2.pages.values()}
+    I2, R2, P2 = pg2["input"], pg2["refine"], pg2["process"]
+    I2.doc.add_node("io.load", node_id="L", params={CHANNELS_KEY: CH})
+    I2.doc.meta_seeds["L"] = seeded
+    I2.doc.add_node("page.output", node_id="O", params={"name": "raw"})
+    I2.doc.connect("L", "image", "O", "data")
+    R2.doc.add_node("page.input", node_id="IN", params={"source": f"{I2.id}:raw"})
+    R2.doc.add_node("channel.split", node_id="SP")
+    R2.doc.connect("IN", "out", "SP", "data")
+    R2.doc.add_node("page.output", node_id="OM", params={"name": "masks"})
+    for k in range(3):
+        R2.doc.add_node("analysis.threshold", node_id=f"T{k}",
+                        params={"method": "fixed", "threshold": 1.0})
+        R2.doc.connect("SP", f"ch{k}", f"T{k}", "data")
+        R2.doc.connect(f"T{k}", "part:mask", "OM", ["data", "data_2", "data_3"][k])
+    names2 = [n for _s, n in R2.doc.output_items("OM")]
+    P2.doc.add_node("page.input", node_id="PIN", params={"source": f"{R2.id}:masks"})
+    for i, n in enumerate(names2):
+        P2.doc.add_node("enhance.median", node_id=f"M{i}")
+        P2.doc.connect("PIN", f"item:{n}" if i else "out", f"M{i}", "data")
+    assert [[d["name"] for d in P2.doc.channel_descriptors(f"M{i}")] for i in range(3)] == [
+        ["DAPI"], ["GFP"], ["Cy5"]], "each item's stream is ITS channel on the node's own out"
+    want2 = [f"masks · DAPI", f"{names2[1]} · GFP", f"{names2[2]} · Cy5"]   # name + channel
+    assert [text(P2.doc, f"M{i}", "data", "in") for i in range(3)] == want2, [
+        text(P2.doc, f"M{i}", "data", "in") for i in range(3)]
+    assert [text(P2.doc, f"M{i}", "out", "out") for i in range(3)] == want2
+    assert [d["name"] for d in P2.doc.upstream_channel_descriptors("M2")] == ["Cy5"]
     _ok("channel provenance (V4.00 step 11g): the file's channel names ride the source "
         "envelope and narrow with the axis; a generic socket past a tap reads the channel "
         "(Cy5), a role socket adds it (raw · DAPI), two read both, three a count, the bundle "
         "and synthetic sockets unchanged; the total crosses pages; a new Dataset is no "
-        "channel; an un-named seed still names past a tap; items are named by channel")
+        "channel; an un-named seed still names past a tap; items are named by channel; "
+        "each item of a several-item Output is ITS channel on the next page")
+
+
+def test_stream_identity() -> None:
+    """V4.00 step 11h: a stream carries its whole identity. One position of several labels
+    a stream as a channel does (``B03``, ``B03 · Cy5``), before and after a page boundary
+    (``source_position_total`` crosses it, ``Workspace.input_position_scope``). The name a
+    stream was given at the Page Output it last came through (the variable, or the item) is
+    its name on the next page, with the position and the channel added only where the name
+    does not already say them (``control · B03 · Cy5``, ``mask_cy5 · B03``, ``DAPI``). A Page
+    Output whose name is still the placeholder (``out``, ``out2``) or blank takes its first
+    wire's name — the position, the channel, a node's title made unique — never a typed one;
+    a reader already bound to the placeholder follows. A tap socket names an item by what it
+    carries (``B03``)."""
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import CHANNELS_KEY, GraphDocument
+    from nodelab_v2.ingest import with_channel_display
+    from nodelab_v2.workspace import Workspace
+    OPS.ensure_ops()
+    CH = [{"name": "DAPI", "emission_nm": 461.0, "color": None},
+          {"name": "GFP", "emission_nm": 509.0, "color": None},
+          {"name": "Cy5", "emission_nm": 670.0, "color": None}]
+    ax = AxisSizes(m=3, t=1, z=1, c=3, y=32, x=32)
+    seed = with_channel_display(MetaEnvelope(axes=ax, metadata={
+        "pixel_size_um": 0.5, "channel_emission_nm": [461.0, 509.0, 670.0],
+        "position_name": ["A01", "B03", "C07"]}), {"channel_names": ["DAPI", "GFP", "Cy5"]})
+
+    def text(doc, nid, name, io):
+        specs = doc.input_specs(nid) if io == "in" else doc.output_specs(nid)
+        s = next(s for s in specs if s.name == name)
+        return doc.socket_text(nid, s, io)
+
+    ws = Workspace.standard()
+    pg = {p.kind: p for p in ws.pages.values()}
+    I, R, P = pg["input"], pg["refine"], pg["process"]
+    I.doc.add_node("io.load", node_id="L", params={CHANNELS_KEY: CH})
+    I.doc.meta_seeds["L"] = seed
+    I.doc.add_node("util.split_positions", node_id="SPO")
+    I.doc.connect("L", "image", "SPO", "data")
+    assert [s.label for s in I.doc.output_specs("SPO") if s.name.startswith("pos")] == [
+        "0 · A01", "1 · B03", "2 · C07"]
+    # one position of three labels the stream; all three do not; a channel tap adds its own
+    I.doc.add_node("enhance.gaussian", node_id="G", params={"sigma": 1.0}, modes={"dim": "2D"})
+    I.doc.connect("SPO", "pos1", "G", "data")
+    assert text(I.doc, "G", "data", "in") == "B03" and text(I.doc, "G", "out", "out") == "B03"
+    assert text(I.doc, "SPO", "out", "out") == "out" and I.doc.position_tag("SPO", "pos1") == "B03"
+    assert I.doc.position_subset("SPO", "out") == [] and I.doc.source_position_total("G") == 3
+    I.doc.add_node("channel.select", node_id="S", params={"channels": "2"})
+    I.doc.connect("G", "out", "S", "data")
+    assert text(I.doc, "S", "out", "out") == "B03 · Cy5", text(I.doc, "S", "out", "out")
+    # items: a position tap names its item; a node on that stream says both
+    assert I.doc._item_default("SPO", "pos1") == "B03"
+    assert I.doc._item_default("S", "out") == "select_channel_b03_cy5", I.doc._item_default("S", "out")
+    # a Page Output takes its first wire's name while its name is still the placeholder
+    o1 = I.doc.add_node("page.output")
+    assert o1.params["name"] == "out"
+    I.doc.connect("SPO", "pos1", o1.id, "data")
+    assert o1.params["name"] == "B03", o1.params
+    o2 = I.doc.add_node("page.output")
+    I.doc.connect("SPO", "pos2", o2.id, "data")
+    o3 = I.doc.add_node("page.output", params={"name": ""})
+    I.doc.connect("SPO", "pos0", o3.id, "data")
+    assert (o2.params["name"], o3.params["name"]) == ("C07", "A01"), (o2.params, o3.params)
+    o4 = I.doc.add_node("page.output", params={"name": "control"})
+    I.doc.connect("SPO", "pos1", o4.id, "data")
+    assert o4.params["name"] == "control", "a typed name is the user's"
+    o5 = I.doc.add_node("page.output")
+    I.doc.connect("SPO", "pos1", o5.id, "data")
+    assert o5.params["name"] == "B032", "unique, like any name"
+    o7 = I.doc.add_node("page.output")
+    I.doc.connect("S", "out", o7.id, "data")
+    assert o7.params["name"] == "select_channel_b03_cy5", o7.params
+    # ...and a reader already bound to the placeholder follows the rename
+    o6 = I.doc.add_node("page.output")
+    assert o6.params["name"] == "out"
+    in0 = R.doc.add_node("page.input", params={"source": f"{I.id}:out"})
+    I.doc.connect("L", "ch0", o6.id, "data")
+    assert o6.params["name"] == "DAPI" and in0.params["source"] == f"{I.id}:DAPI", (
+        o6.params, in0.params)
+    # the name crosses the page, with the facts it does not already say
+    R.doc.add_node("enhance.gaussian", node_id="RG", params={"sigma": 1.0}, modes={"dim": "2D"})
+    R.doc.connect(in0.id, "out", "RG", "data")
+    assert text(R.doc, in0.id, "out", "out") == "DAPI" and text(R.doc, "RG", "out", "out") == "DAPI"
+    in1 = R.doc.add_node("page.input", params={"source": f"{I.id}:control"})
+    R.doc.add_node("channel.select", node_id="RS", params={"channels": "2"})
+    R.doc.connect(in1.id, "out", "RS", "data")
+    assert text(R.doc, in1.id, "out", "out") == "control · B03", text(R.doc, in1.id, "out", "out")
+    assert text(R.doc, "RS", "out", "out") == "control · B03 · Cy5", text(R.doc, "RS", "out", "out")
+    assert R.doc.stream_name("RS", "out") == "control" and R.doc.stream_name("RS", "data", "in") == "control"
+    assert ws.input_position_scope(R.id, in1.id) == (["B03"], 3)
+    ro = R.doc.add_node("page.output", params={"name": "mask_cy5"})
+    R.doc.connect("RS", "out", ro.id, "data")
+    pin = P.doc.add_node("page.input", params={"source": f"{R.id}:mask_cy5"})
+    P.doc.add_node("enhance.median", node_id="PM")
+    P.doc.connect(pin.id, "out", "PM", "data")
+    assert text(P.doc, pin.id, "out", "out") == "mask_cy5 · B03", text(P.doc, pin.id, "out", "out")
+    assert text(P.doc, "PM", "data", "in") == "mask_cy5 · B03"
+    assert P.doc.source_position_total("PM") == 3 and P.doc.source_channel_total("PM") == 3
+    assert GraphDocument().page_position_scope("x") == ([], 0)
+    # a detached document names by its own Outputs
+    d = GraphDocument()
+    d.add_node("io.load", node_id="L", params={CHANNELS_KEY: CH})
+    d.meta_seeds["L"] = seed
+    da = d.add_node("page.output")
+    d.connect("L", "ch1", da.id, "data")
+    db = d.add_node("page.output")
+    d.connect("L", "ch1", db.id, "data")
+    assert (da.params["name"], db.params["name"]) == ("GFP", "GFP2"), (da.params, db.params)
+    _ok("stream identity (V4.00 step 11h): one position of several labels a stream like a "
+        "channel (B03, B03 · Cy5), across pages; the name given at a Page Output is the "
+        "stream's name on the next page, plus the position/channel it does not say "
+        "(control · B03 · Cy5, mask_cy5 · B03); a placeholder-named Output takes its first "
+        "wire's name (B03, C07, A01, DAPI, select_channel_b03_cy5; unique; a typed name "
+        "kept; a reader follows); a position tap names its item")
 
 
 def main() -> int:
@@ -28159,6 +28309,7 @@ def main() -> int:
     test_data_parts()
     test_page_output_items()
     test_channel_provenance()
+    test_stream_identity()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
