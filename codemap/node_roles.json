@@ -113,8 +113,8 @@
       "label": "Object detection (points)",
       "stage": "find_structure",
       "pages": ["refine", "process"],
-      "description": "Find small bright or dark objects as sub-voxel Points rather than regions: LoG/DoG spot detection sized from the diffraction limit, and particle detection by local maxima or component centroids.",
-      "ops": ["detect.spots", "detect.particles"]
+      "description": "Find small bright or dark objects as sub-voxel Points rather than regions: LoG/DoG spot detection sized from the diffraction limit, particle detection by local maxima or component centroids, and the bead finder, which cuts a Z-stack into projected slabs and keeps only what is bead-shaped.",
+      "ops": ["detect.spots", "detect.particles", "detect.beads"]
     },
     "shape_and_distance_geometry": {
       "label": "Shape & distance geometry",

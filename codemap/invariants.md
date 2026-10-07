@@ -131,7 +131,12 @@ across the per-kernel `.md` contracts, which is why it is here rather than only 
 One kernel takes no voxel size at all: `track_field` requires its `coords` and `disp` to
 arrive in ONE physical length unit already, so its gradient is dimensionless with no
 anisotropy factor left to apply. That is the same invariant reached from the other side, and
-the caller (`analysis.track_field`) is where the `(dz, dy, dx)` scaling happens.
+the caller (`analysis.track_field`) is where the `(dz, dy, dx)` scaling happens. `bead_slabs`
+(2026-10-07) is the other variant: it takes `voxel_size_um` slowest-first but only REPORTS it
+— every size it works with arrives already in voxels (`sigma_xy_px`, `sigma_z_px`,
+`slab_px`), converted by the node (`detect.beads`) from µm with `to_pixels_v2`, and its
+output positions are voxels the node leaves as voxels (the µm columns it adds are the fitted
+sigmas, scaled once by `pixel_size_um` and `z_step_um`).
 
 The invariant is the KERNEL's boundary, not the upstream package's. `aldvc_field` wraps
 pyALDVC, whose `DVCPara` triples are `(x, y, z)`, and `dic_correlate` wraps pyALDIC, which
@@ -156,7 +161,9 @@ anything.
 
 Not every kernel is vendored, and this rule says nothing about the ones that are not:
 `cellsam_segment`, `piv_field` and `aldvc_field` (rewritten 2026-09-25) are adapters around
-third-party packages, and `track_field` (2026-09-17) is new in-repo math. `field_math`
+third-party packages, and `track_field` (2026-09-17) and `bead_slabs` (2026-10-07, the
+slab-projected bead finder behind `detect.beads`, scored against planted truth by
+`scripts/_bead_finder_validate.py`) are new in-repo math. `field_math`
 (2026-09-25) is a third case: it is byte-verbatim code that was *lifted out of* a vendored
 kernel when the official pyALDVC package replaced the in-repo ALDVC port, so the verbatim
 rule still governs it — it just no longer lives where it was vendored to.

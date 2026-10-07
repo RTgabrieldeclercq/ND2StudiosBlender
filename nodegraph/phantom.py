@@ -14,7 +14,11 @@ has something to split and a watershed something to prove; ``puncta=True`` sprin
 spots for the detectors. The time-lapse variants re-render the same layout shifted (drift)
 or with each cell carrying its own velocity (tracking); the 3-D variant renders ellipsoids as
 per-plane cross-sections with axial blur; the speckle pair is a reference frame and a smoothly
-warped copy for DIC / PIV / DVC; the plate mosaic cuts one field into overlapping stage tiles.
+warped copy for DIC / PIV / DVC; the plate mosaic cuts one field into overlapping stage tiles;
+the bead field (``beads3d``) is a confocal z-stack of fluorescent spheres at a chosen density,
+imaged through a skewed confocal axial PSF, with non-bead artefacts planted for a detector to
+refuse — and it carries its **ground truth** (:attr:`Phantom.truth`) so a validation can score
+recall, precision and localisation error against the planted positions.
 
 **Determinism is a contract, not a hope.** Same name, same keywords ⇒ bit-identical array:
 the layout comes from ``default_rng(seed)`` and every frame's noise from ``default_rng(seed +
@@ -38,7 +42,9 @@ from nodegraph.provider import ArrayProvider
 
 __all__ = ["Phantom", "PHANTOMS", "phantom", "intensity_range", "cells2d", "cells3d",
            "timelapse_drift", "moving_cells", "two_channel", "speckle_pair", "plate_mosaic",
-           "BIT_DEPTH", "FULL_SCALE", "PIXEL_SIZE_UM", "Z_STEP_UM", "DT_S"]
+           "beads3d", "confocal_axial_kernel",
+           "BIT_DEPTH", "FULL_SCALE", "PIXEL_SIZE_UM", "Z_STEP_UM", "DT_S",
+           "BEAD_Z_STEP_UM", "BEAD_EMISSION_NM", "BEAD_AXIAL_SKEW"]
 
 #: every phantom is 12-bit, like most ND2s — so a ``bit_depth``-derived threshold lands mid-range
 BIT_DEPTH = 12
@@ -70,6 +76,9 @@ class Phantom(NamedTuple):
     envelope: MetaEnvelope
     caption: str
     kw: Tuple[Tuple[str, Any], ...]
+    #: ground truth where the phantom has one (``beads3d``: the planted positions and what
+    #: each artefact was) — ``None`` for the phantoms that only need to look right
+    truth: Any = None
 
     @property
     def axes(self) -> AxisSizes:
@@ -166,7 +175,7 @@ def _expose(signal: np.ndarray, rng: np.random.Generator, *, read_noise: float =
 
 
 def _finish(name: str, arr: np.ndarray, meta: Dict[str, Any], caption: str,
-            kw: Dict[str, Any]) -> Phantom:
+            kw: Dict[str, Any], truth: Any = None) -> Phantom:
     a = np.ascontiguousarray(np.clip(np.rint(np.asarray(arr, dtype=float)), 0, FULL_SCALE)
                              .astype(np.uint16))
     if a.ndim != 6:
@@ -176,7 +185,7 @@ def _finish(name: str, arr: np.ndarray, meta: Dict[str, Any], caption: str,
     md = dict(meta)
     ds = Dataset(axes=ax, metadata=dict(md)).with_image(ArrayProvider(a, tile=512))
     env = MetaEnvelope(axes=ax, metadata=dict(md), domains=frozenset({Domain.VOXEL}))
-    return Phantom(name, a, ds, env, caption, tuple(sorted(kw.items())))
+    return Phantom(name, a, ds, env, caption, tuple(sorted(kw.items())), truth)
 
 
 def _meta(**extra: Any) -> Dict[str, Any]:
@@ -366,6 +375,228 @@ def plate_mosaic(*, seed: int = 0, tile: int = 96, grid: Tuple[int, int] = (2, 2
                    dict(seed=seed, tile=tile, grid=(rows, cols), overlap=overlap))
 
 
+#: the bead stack is sampled finer than the nuclei stack — a 1 µm bead has to span planes
+BEAD_Z_STEP_UM = 0.4
+#: green beads (FITC-like) under the same 60×/1.4 objective as every other phantom
+BEAD_EMISSION_NM = 520
+#: how much wider the axial profile is on the far side of focus than on the near side —
+#: the spherical-aberration skew a real confocal stack carries (index mismatch)
+BEAD_AXIAL_SKEW = 0.5
+
+
+def confocal_axial_kernel(z_step_um: float, fwhm_um: float, *, skew: float = BEAD_AXIAL_SKEW,
+                          pinhole_leak: float = 0.15) -> np.ndarray:
+    """The axial PSF of a confocal microscope, sampled at the plane spacing and summing
+    to one, with its **peak exactly at the centre sample**.
+
+    Confocal detection multiplies the illumination and the detection responses, so for a
+    point emitter the ideal axial profile is ``sinc^4`` (the square of the widefield
+    ``sinc^2``), with sidelobes of ~0.2 %. A real pinhole is not infinitesimal, which lets
+    some widefield character through: ``pinhole_leak`` mixes that ``sinc^2`` back in. The
+    ``sinc^4`` core's FWHM is ``0.638 · zeta`` for ``sinc(z / zeta)``, so ``zeta`` is set from
+    ``fwhm_um``. Finally the far side of focus is stretched by ``(1 + skew)``: refractive-
+    index mismatch between immersion medium and sample broadens the profile asymmetrically,
+    and that asymmetry is exactly what a symmetric Gaussian fit in z gets wrong. Warping
+    about zero leaves the peak at zero, so the planted bead centre IS the brightest plane."""
+    zeta = max(1e-6, float(fwhm_um)) / 0.638
+    half = int(np.ceil(4.0 * float(fwhm_um) * (1.0 + max(0.0, skew)) / float(z_step_um))) + 2
+    z = np.arange(-half, half + 1, dtype=float) * float(z_step_um)
+    zw = np.where(z > 0, z / (1.0 + max(0.0, skew)), z)
+    s = np.sinc(zw / zeta)                       # numpy's sinc is sin(pi x)/(pi x)
+    k = (1.0 - pinhole_leak) * s ** 4 + pinhole_leak * s ** 2
+    return k / k.sum()
+
+
+def _ball(stack: np.ndarray, centre_zyx: Tuple[float, float, float],
+          radii_um: Tuple[float, float, float], vox_um: Tuple[float, float, float],
+          amp: float, *, edge_um: float = 0.08) -> None:
+    """Add a soft-edged solid ellipsoid (radii in µm per axis) to ``stack`` in place."""
+    nz, ny, nx = stack.shape
+    cz, cy, cx = centre_zyx
+    rz, ry, rx = radii_um
+    dz, dy, dx = vox_um
+    z0, z1 = max(0, int(np.floor(cz - rz / dz)) - 2), min(nz, int(np.ceil(cz + rz / dz)) + 3)
+    y0, y1 = max(0, int(np.floor(cy - ry / dy)) - 2), min(ny, int(np.ceil(cy + ry / dy)) + 3)
+    x0, x1 = max(0, int(np.floor(cx - rx / dx)) - 2), min(nx, int(np.ceil(cx + rx / dx)) + 3)
+    if z1 <= z0 or y1 <= y0 or x1 <= x0:
+        return
+    zz, yy, xx = np.mgrid[z0:z1, y0:y1, x0:x1].astype(float)
+    # normalised radius: 1 on the surface, scaled back to µm for a size-independent edge
+    rn = np.sqrt(((zz - cz) * dz / rz) ** 2 + ((yy - cy) * dy / ry) ** 2
+                 + ((xx - cx) * dx / rx) ** 2)
+    r_um = rn * min(rz, ry, rx)
+    body = 1.0 / (1.0 + np.exp(np.clip((r_um - min(rz, ry, rx)) / edge_um, -60, 60)))
+    stack[z0:z1, y0:y1, x0:x1] += amp * body
+
+
+def _rod(stack: np.ndarray, centre_zyx: Tuple[float, float, float], length_um: float,
+         angle: float, radius_um: float, vox_um: Tuple[float, float, float], amp: float
+         ) -> None:
+    """Add a fibre: a soft cylinder of ``length_um`` in the plane at ``angle``, in place."""
+    nz, ny, nx = stack.shape
+    cz, cy, cx = centre_zyx
+    dz, dy, dx = vox_um
+    uy, ux = np.sin(angle), np.cos(angle)
+    half = 0.5 * length_um
+    pad = radius_um * 3
+    y0 = max(0, int(np.floor(cy - (half * abs(uy) + pad) / dy)))
+    y1 = min(ny, int(np.ceil(cy + (half * abs(uy) + pad) / dy)) + 1)
+    x0 = max(0, int(np.floor(cx - (half * abs(ux) + pad) / dx)))
+    x1 = min(nx, int(np.ceil(cx + (half * abs(ux) + pad) / dx)) + 1)
+    z0 = max(0, int(np.floor(cz - pad / dz)))
+    z1 = min(nz, int(np.ceil(cz + pad / dz)) + 1)
+    if z1 <= z0 or y1 <= y0 or x1 <= x0:
+        return
+    zz, yy, xx = np.mgrid[z0:z1, y0:y1, x0:x1].astype(float)
+    py, px = (yy - cy) * dy, (xx - cx) * dx
+    along = np.clip(py * uy + px * ux, -half, half)
+    perp2 = (py - along * uy) ** 2 + (px - along * ux) ** 2 + ((zz - cz) * dz) ** 2
+    r = np.sqrt(perp2)
+    stack[z0:z1, y0:y1, x0:x1] += amp / (1.0 + np.exp(np.clip((r - radius_um) / 0.06, -60, 60)))
+
+
+def beads3d(*, seed: int = 0, size: int = 128, nz: int = 24, n_beads: int = 60,
+            diameter_um: float = 1.0, artifacts: bool = True,
+            gradient: bool = False) -> Phantom:
+    """A confocal z-stack of ``n_beads`` fluorescent spheres of ``diameter_um`` at random
+    positions (and random brightness, 0.4–1.0 of nominal), imaged through a confocal PSF —
+    an Airy-like lateral blur and the skewed ``sinc^4`` axial profile of
+    :func:`confocal_axial_kernel` — over an uneven background that dims with depth, with
+    shot and read noise. ``gradient=True`` places beads with a left-to-right density ramp
+    so one field spans sparse and dense.
+
+    ``artifacts=True`` plants the things a bead finder must refuse: three large bright
+    aggregates, two fibres, one bright scan line on a single plane, a diffuse
+    autofluorescent haze, 25 hot voxels (added after the optics, before the noise — a
+    detector event, not an object), and four beads whose centres lie **outside** the stack
+    so only an axial tail is visible.
+
+    :attr:`Phantom.truth` records every planted bead's ``(z, y, x)`` voxel centre and
+    brightness, the beads outside the stack, the PSF parameters and the artefact counts,
+    so a validation can score the finder rather than eyeball it."""
+    rng = np.random.default_rng(seed)
+    dz, dy, dx = BEAD_Z_STEP_UM, PIXEL_SIZE_UM, PIXEL_SIZE_UM
+    vox = (dz, dy, dx)
+    na, n_imm, lam_um = 1.4, 1.515, BEAD_EMISSION_NM / 1000.0
+    fwhm_z_um = 0.88 * lam_um / (n_imm - np.sqrt(n_imm ** 2 - na ** 2))     # ≈ 0.49 µm
+    sigma_xy_um = 0.21 * lam_um / na                                        # ≈ 0.078 µm
+    radius_um = 0.5 * float(diameter_um)
+    peak = 2200.0                               # nominal bead peak, counts above background
+
+    # layout — the bead body must lie inside the stack, so the truth is detectable
+    margin_xy = radius_um / dx + 3.0
+    z_lo, z_hi = radius_um / dz + 1.5, nz - 1 - radius_um / dz - 1.5
+    n = max(0, int(n_beads))
+    cy = rng.uniform(margin_xy, size - margin_xy, n)
+    if gradient:
+        cx = margin_xy + (size - 2 * margin_xy) * np.sqrt(rng.uniform(0.0, 1.0, n))
+    else:
+        cx = rng.uniform(margin_xy, size - margin_xy, n)
+    cz = rng.uniform(z_lo, z_hi, n) if z_hi > z_lo else np.full(n, 0.5 * (nz - 1))
+    amp = rng.uniform(0.4, 1.0, n)
+    # render on a Z grid padded above and below the stack: an object just outside the
+    # acquired range still throws its axial tail into the first or last planes, and the
+    # convolution has to see it to reproduce that (the padding is cut off at the end)
+    pad = (int(np.ceil(4.0 * fwhm_z_um * (1.0 + BEAD_AXIAL_SKEW) / dz))
+           + int(np.ceil(radius_um / dz)) + 2)
+    sig = np.zeros((nz + 2 * pad, size, size), dtype=float)
+    for i in range(n):
+        _ball(sig, (cz[i] + pad, cy[i], cx[i]), (radius_um,) * 3, vox, peak * amp[i])
+
+    counts: Dict[str, int] = {}
+    where: Dict[str, Any] = {}       # where each artefact was put, for a validation to score
+    outside = np.zeros((0, 3), dtype=float)
+    hot: List[Tuple[int, int, int]] = []
+    if artifacts:
+        arng = np.random.default_rng(seed + 77)
+        # aggregates / debris: big, bright per voxel but not as bright as a bead's core
+        aggs = []
+        for _ in range(3):
+            c = (arng.uniform(3, nz - 4), arng.uniform(12, size - 12),
+                 arng.uniform(12, size - 12))
+            r = (arng.uniform(0.9, 1.4), arng.uniform(1.4, 2.4), arng.uniform(1.4, 2.4))
+            _ball(sig, (c[0] + pad, c[1], c[2]), r, vox, peak * 0.6)
+            aggs.append((*c, *r))
+        counts["aggregate"] = 3
+        where["aggregate"] = np.asarray(aggs, dtype=float)          # (z, y, x, rz, ry, rx µm)
+        rods = []
+        for _ in range(2):
+            c = (arng.uniform(3, nz - 4), arng.uniform(16, size - 16),
+                 arng.uniform(16, size - 16))
+            length, ang = arng.uniform(6.0, 10.0), arng.uniform(0, np.pi)
+            _rod(sig, (c[0] + pad, c[1], c[2]), length, ang, 0.25, vox, peak * 0.9)
+            rods.append((*c, length, ang))
+        counts["fibre"] = 2
+        where["fibre"] = np.asarray(rods, dtype=float)              # (z, y, x, length µm, angle)
+        zline, yline = int(arng.integers(2, nz - 2)), int(arng.integers(8, size - 8))
+        sig[zline + pad, yline, :] += peak * 0.8
+        counts["scan_line"] = 1
+        where["scan_line"] = (zline, yline)
+        zz, yy, xx = np.mgrid[0:nz, 0:size, 0:size].astype(float)
+        hc = (arng.uniform(6, nz - 7), arng.uniform(24, size - 24), arng.uniform(24, size - 24))
+        sig[pad:pad + nz] += peak * 0.35 * np.exp(
+            -(((zz - hc[0]) * dz) ** 2 / (2 * 2.0 ** 2)
+              + ((yy - hc[1]) * dy) ** 2 / (2 * 5.0 ** 2)
+              + ((xx - hc[2]) * dx) ** 2 / (2 * 5.0 ** 2)))
+        counts["haze"] = 1
+        where["haze"] = tuple(float(v) for v in hc)
+        out_rows = []
+        for k in range(4):
+            # centre 0.6 plane beyond the first / last acquired plane: the bead's body
+            # reaches into the stack and its axial tail is bright on the end plane, but its
+            # brightest plane was never acquired — the finder must not place it inside
+            czo = -0.6 if k % 2 == 0 else nz - 1 + 0.6
+            c = (czo, arng.uniform(margin_xy, size - margin_xy),
+                 arng.uniform(margin_xy, size - margin_xy))
+            _ball(sig, (czo + pad, c[1], c[2]), (radius_um,) * 3, vox, peak * 0.9)
+            out_rows.append(c)
+        outside = np.asarray(out_rows, dtype=float)
+        counts["outside_bead"] = 4
+        for _ in range(25):
+            hot.append((int(arng.integers(0, nz)), int(arng.integers(0, size)),
+                        int(arng.integers(0, size))))
+        counts["hot_voxel"] = 25
+        where["hot_voxel"] = np.asarray(hot, dtype=float)
+        where["outside_bead"] = outside
+
+    # the optics: lateral Airy-like blur per plane, then the skewed confocal axial profile
+    from scipy.ndimage import convolve1d, gaussian_filter
+    sig = gaussian_filter(sig, (0.0, sigma_xy_um / dy, sigma_xy_um / dx))
+    kz = confocal_axial_kernel(dz, fwhm_z_um)
+    sig = convolve1d(sig, kz, axis=0, mode="constant", cval=0.0)[pad:pad + nz]
+    # depth attenuation, an uneven background, detector events, and the camera
+    depth = 1.0 - 0.25 * np.arange(nz, dtype=float)[:, None, None] / max(1, nz - 1)
+    bg = _background(size, level=180.0, ramp=120.0, blob=90.0)
+    out = np.zeros((1, 1, nz, 1, size, size), dtype=float)
+    for z in range(nz):
+        plane = sig[z] * depth[z, 0, 0] + bg
+        for (hz, hy, hx) in hot:
+            if hz == z:
+                plane = plane.copy()
+                plane[hy, hx] += peak * 3.0
+        out[0, 0, z, 0] = _expose(plane, np.random.default_rng(seed + 1000 + z),
+                                  read_noise=10.0, blur=0.0)
+    truth = {
+        "beads": np.stack([cz, cy, cx], axis=1) if n else np.zeros((0, 3)),
+        "amp": amp, "diameter_um": float(diameter_um), "outside": outside,
+        "artifacts": counts, "artifact_positions": where,
+        "voxel_size_um": vox, "axial_fwhm_um": float(fwhm_z_um),
+        "axial_skew": BEAD_AXIAL_SKEW, "psf_sigma_xy_um": float(sigma_xy_um),
+        "n_beads": n,
+    }
+    vol_um3 = nz * dz * size * dy * size * dx
+    cap = (f"{n} fluorescent {diameter_um:g} µm beads ({n / vol_um3 * 1000:.1f} per 1000 µm³"
+           f"{', denser to the right' if gradient else ''}) over {nz} planes {dz} µm apart; "
+           f"confocal PSF (axial FWHM {fwhm_z_um:.2f} µm, far side {1 + BEAD_AXIAL_SKEW:g}× "
+           f"wider), depth dimming, shot noise"
+           + (f"; artefacts: {', '.join(f'{v} {k}' for k, v in counts.items())}"
+              if counts else ""))
+    return _finish("beads3d", out, _meta(z_step_um=dz, channel_emission_nm=[BEAD_EMISSION_NM],
+                                          channel_names=["beads"]), cap,
+                   dict(seed=seed, size=size, nz=nz, n_beads=n_beads, diameter_um=diameter_um,
+                        artifacts=artifacts, gradient=gradient), truth)
+
+
 PHANTOMS: Dict[str, Callable[..., Phantom]] = {
     "cells2d": cells2d,
     "cells3d": cells3d,
@@ -374,6 +605,7 @@ PHANTOMS: Dict[str, Callable[..., Phantom]] = {
     "two_channel": two_channel,
     "speckle_pair": speckle_pair,
     "plate_mosaic": plate_mosaic,
+    "beads3d": beads3d,
 }
 
 

@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 108,
+    "nodes": 109,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 758,
-    "outputs": 115,
+    "inputs": 767,
+    "outputs": 116,
     "gui_ops_included": true
   },
   "stages": {
@@ -169,6 +169,7 @@
         "analysis.threshold",
         "analysis.threshold_local",
         "analysis.voronoi",
+        "detect.beads",
         "detect.particles",
         "detect.spots",
         "transform.grow_points",
@@ -603,9 +604,14 @@
     "object_detection": {
       "label": "Object detection (points)",
       "stage": "find_structure",
-      "description": "Find small bright or dark objects as sub-voxel Points rather than regions: LoG/DoG spot detection sized from the diffraction limit, and particle detection by local maxima or component centroids.",
-      "count": 2,
+      "description": "Find small bright or dark objects as sub-voxel Points rather than regions: LoG/DoG spot detection sized from the diffraction limit, particle detection by local maxima or component centroids, and the bead finder, which cuts a Z-stack into projected slabs and keeps only what is bead-shaped.",
+      "count": 3,
       "ops": [
+        {
+          "op": "detect.beads",
+          "label": "Bead Finder",
+          "summary": "Fluorescent-bead centroids in a Z-stack → Points, by slab projection: Z sub-stacks flattened (max/mean/min), 2-D LoG detection per slab, then a split-Gaussian z fit and a 2-D Gaussian (y, x) fit on the raw stack; size, roundness and axial-extent filters keep only beads. 3-D only."
+        },
         {
           "op": "detect.particles",
           "label": "Particle Detection",
@@ -1001,6 +1007,7 @@
       "analysis.threshold_local",
       "analysis.track_field",
       "analysis.voronoi",
+      "detect.beads",
       "detect.particles",
       "detect.spots",
       "track.link",
@@ -7192,6 +7199,203 @@
       "trained_params": false,
       "kernel_doc": null,
       "params_read": []
+    },
+    "detect.beads": {
+      "op": "detect.beads",
+      "label": "Bead Finder",
+      "category": "analysis",
+      "role": "object_detection",
+      "stage": "find_structure",
+      "pages": [
+        "refine",
+        "process"
+      ],
+      "module": "nodegraph/catalog/detect/beads.py",
+      "gui_only": false,
+      "summary": "Fluorescent-bead centroids in a Z-stack → Points, by slab projection: Z sub-stacks flattened (max/mean/min), 2-D LoG detection per slab, then a split-Gaussian z fit and a 2-D Gaussian (y, x) fit on the raw stack; size, roundness and axial-extent filters keep only beads. 3-D only.",
+      "overview": "Fluorescent-bead centroids in a Z-stack → a Point structure, by slab projection. The volume is cut into Z slabs (thickness ``S``, overlap ``G``), each slab is flattened (max / mean; ``min`` for dark beads), beads are found in 2-D on every flattened image (scale-normalised LoG at the bead's expected apparent size, peaks above ``min_snr`` robust noise sigmas), and each hit is then refined on the RAW stack: a matched-filter z-profile under the hit, searched near the slab that found it, fitted with a split Gaussian (one sigma each side of the peak — the confocal axial profile is skewed); the planes around that z averaged and fitted with a 2-D Gaussian for the sub-pixel (y, x) and the apparent sigmas, with pixels nearer to a neighbouring hit left out so touching beads do not widen each other. What survives is what looks like a bead: a blob rather than a ridge (Hessian anisotropy of the projection), a fitted lateral sigma inside ``size_tolerance`` of the expected one, a fitted aspect under ``max_aspect``, an axial sigma inside twice the tolerance, a peak not on the first or last plane. The same bead found in two overlapping slabs is merged (brightest wins, sigma-normalised distance). ``slabs=auto`` derives ``S`` from the bead density: a whole-stack projection counts the beads, then ``S`` is set so at most ~10 % of beads share a projected footprint with another, between about two axial sigmas and half the stack, re-estimated once or twice. ``slabs=manual`` takes ``slab_thickness`` / ``slab_overlap`` in microns along Z. Resolved spec: category analysis; op ``detect.beads``; **Point** output with the invariant schema plus :data:`BEAD_COLUMNS`; 3-D only (``WHOLE_VOLUME``, no dim lever — a slab has nothing to project on one plane, so ``z < 3`` is refused); ``diameter`` µm and the axial PSF FWHM (``um_axial``, derived from λ, NA and an inferred immersion index) become expected sigmas via :func:`~nodegraph.kernels.bead_slabs.expected_sigmas_px` (a least-squares Gaussian on a solid sphere: ``0.272 d`` lateral, ``0.28 d`` axial, PSF added in quadrature); ``voxel_size_um = (z_step_um, pixel_size_um, pixel_size_um)``. Kernel: :func:`nodegraph.kernels.bead_slabs.find_beads` (numpy/scipy).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_volume",
+        "kernel_axes": [
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "slabs",
+          "label": "Slabs",
+          "choices": [
+            "auto",
+            "manual"
+          ],
+          "default": "auto",
+          "description": "Where the Z sub-stack thickness comes from. Both cut the stack into overlapping slabs and flatten each; they differ in who decides how thick, which is the knob that trades dense-field separation against speed.",
+          "choice_docs": {
+            "auto": "Derive the slab thickness from the data: a whole-stack projection counts the beads, and the thickness is set so that at most about one bead in ten shares a projected footprint with another — between about two axial sigmas and half the stack — then re-estimated once or twice as the count firms up. Right for an unknown sample; costs one or two extra passes.",
+            "manual": "Use Slab thickness and Slab overlap as given, in microns along Z. One pass, reproducible across stacks of different density, and the only way to go thinner than the automatic choice when beads stack closely in Z or when artefacts occupy many planes."
+          }
+        },
+        {
+          "name": "projection",
+          "label": "Projection",
+          "choices": [
+            "max",
+            "mean",
+            "min"
+          ],
+          "default": "max",
+          "description": "How each slab is flattened before the 2-D search. The projection is only used to FIND candidates; every position and size is then refined on the raw stack, so this changes which beads are found, not where they are placed.",
+          "choice_docs": {
+            "max": "Brightest voxel through the slab. Keeps every bead at its own peak brightness however thick the slab, so it finds dim beads; also keeps every hot voxel and the brightest plane of every artefact, which the size tests then have to refuse. The default for bright beads on a dark background.",
+            "mean": "Average through the slab. Suppresses single-voxel noise and makes the noise floor the detection threshold measures itself against quieter, but dilutes a bead by the ratio of slab thickness to bead extent — so use it with thin slabs, or dim beads vanish.",
+            "min": "Darkest voxel through the slab, for DARK beads on a bright background (transmitted light, negative staining). The whole volume is inverted first, so a dark bead reads as a bright one and every other control keeps its meaning; `amplitude` is then the depth of the dip."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "diameter",
+          "label": "Bead diameter",
+          "type": "float",
+          "role": "parameter",
+          "is_field": true,
+          "unit": "um",
+          "default": 1.0,
+          "pick_kind": "distance",
+          "description": "The physical diameter of the beads you are looking for, in microns. It sets the scale of everything downstream: the detection filter is tuned to the apparent size of a sphere this big seen through the current optics (the PSF is added in quadrature, so a 0.2 µm bead is searched at the diffraction limit, not at 0.2 µm), and Size tolerance is a band AROUND that apparent size. Too SMALL and real beads are refused as too big while noise peaks pass; too LARGE and beads are refused as too small while aggregates and debris of that size are accepted. Set it to the bead supplier's nominal diameter; the fitted `sigma_xy_um` column tells you what the data actually shows."
+        },
+        {
+          "name": "axial_fwhm",
+          "label": "Axial PSF FWHM",
+          "type": "float",
+          "role": "parameter",
+          "is_field": true,
+          "unit": "um_axial",
+          "default": 0.5,
+          "derive": "0.88*((emission_nm or 520)/1000)/((1.515 if (na or 1.4) > 1.0 else (1.33 if (na or 1.4) > 0.8 else 1.0)) - sqrt((1.515 if (na or 1.4) > 1.0 else (1.33 if (na or 1.4) > 0.8 else 1.0))**2 - min((na or 1.4), 0.98*(1.515 if (na or 1.4) > 1.0 else (1.33 if (na or 1.4) > 0.8 else 1.0)))**2))",
+          "description": "How far a point source smears along Z in this microscope, as the full width at half maximum of the axial PSF, in microns. It only matters for the EXPECTED axial size of a bead (the sphere's own extent is added in quadrature) and so for the axial size band and the z-fit window; it does not move any position. Auto derives the confocal value 0.88·λ/(n − √(n² − NA²)) from the channel's emission λ and the objective NA, inferring the immersion index from the NA (oil above 1.0, water 0.8–1.0, air below) — about 0.5 µm at 1.4 NA, 4 µm at 0.45 NA. A real stack with index mismatch is broader than that; if beads are being refused as `size_z`, raise it toward what the fitted `sigma_z_um` column reports (×2.355)."
+        },
+        {
+          "name": "min_snr",
+          "label": "Min SNR",
+          "type": "float",
+          "role": "parameter",
+          "is_field": true,
+          "default": 5.0,
+          "description": "How far above the noise a bead's detection-filter response has to stand, in robust standard deviations of that slab's response, to become a candidate. LOWER finds dimmer beads and admits more noise peaks (which the size test then has to refuse, so the run gets slower before it gets wronger); HIGHER keeps only bright beads. 5 is a conservative start — on Gaussian noise it admits well under one false peak per million pixels. It is relative to each slab's own noise, so it does not change with bit depth or exposure; it is the first thing to lower if dim beads are missing and the per-bead `snr` column shows the found ones far above it."
+        },
+        {
+          "name": "size_tolerance",
+          "label": "Size tolerance",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.5,
+          "description": "How far a fitted bead's lateral width may deviate from the EXPECTED width for Bead diameter, as a fraction: 0.5 accepts fitted sigmas between half and one-and-a-half times the expectation. The axial width is allowed twice this. This is the filter that turns \"bright spots\" into \"beads\": a hot voxel is far too narrow, an aggregate or a haze far too wide, and both are refused here. TIGHTER refuses more non-beads but also real beads when the diameter, the pixel size or the optics are slightly off; LOOSER accepts more of everything. It changes how many beads are reported, so every downstream count and track moves with it."
+        },
+        {
+          "name": "max_aspect",
+          "label": "Max aspect",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1.5,
+          "description": "The largest ratio of a fitted bead's long to short lateral width that still counts as round. A bead is a sphere, so its image is round; a fibre, a scan line, two merged beads or a bead smeared by stage motion is not, and is refused above this. 1.5 is generous for a clean stack (beads fit at ~1.1); tighten toward 1.3 to refuse marginally merged pairs at the price of refusing beads at the lateral border, whose fit is one-sided. Ridges (fibres, lines) are also caught earlier by a curvature test that this value does not control."
+        },
+        {
+          "name": "slab_thickness",
+          "label": "Slab thickness",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um_axial",
+          "default": 2.0,
+          "available_in": {
+            "slabs": [
+              "manual"
+            ]
+          },
+          "description": "How thick each Z sub-stack is before it is flattened, in microns along Z. THINNER slabs keep beads at different depths from landing on top of each other in the projection — the dense-field problem — at the cost of more projections to search and a dimmer mean projection; THICKER slabs are fewer and brighter but merge beads that overlap in (x, y). A slab thinner than a bead's axial extent (about 2× Axial PSF FWHM plus the diameter) buys nothing. Only read when Slabs is `manual`; `auto` derives it from the measured bead density."
+        },
+        {
+          "name": "slab_overlap",
+          "label": "Slab overlap",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um_axial",
+          "default": 0.8,
+          "available_in": {
+            "slabs": [
+              "manual"
+            ]
+          },
+          "description": "How much consecutive slabs share, in microns along Z. A bead centred on a slab boundary is split between two projections; overlap by about a bead's axial extent and it appears whole in at least one of them (the same bead found twice is merged afterwards, brightest wins). MORE overlap costs more projections and more duplicates to merge; zero is fine for a max projection of bright beads and loses dim ones on the boundaries of a mean projection. Must be smaller than Slab thickness. Only read when Slabs is `manual`."
+        },
+        {
+          "name": "name",
+          "label": "Output layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "beads",
+          "layer_out": [
+            "point"
+          ],
+          "description": "Name of the Point table this node writes: one row per bead with its sub-voxel position and the fit columns `amplitude`, `snr`, `sigma_xy_um`, `sigma_z_um`, `skew_z` (how much wider the axial profile is above the bead than below, −1…1) and `slab` (which projection found it). Ids are unique across the whole detection. Downstream nodes — Track Linking, Track Objects, Cluster Points, Measure — select it by this name."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_beads",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/bead_slabs.md",
+      "params_read": [
+        "__modes__",
+        "axial_fwhm",
+        "diameter",
+        "max_aspect",
+        "min_snr",
+        "name",
+        "size_tolerance",
+        "slab_overlap",
+        "slab_thickness"
+      ]
     },
     "detect.particles": {
       "op": "detect.particles",

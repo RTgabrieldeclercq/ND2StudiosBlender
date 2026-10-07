@@ -191,6 +191,9 @@ MODULES: Tuple[str, ...] = (
     "math.image",
     "math.values",
     "util.crop_region",
+    # Appended last for the same reason, not slotted beside `detect.particles` / `detect.spots`
+    # whose detection sibling it is: the slab-projected bead finder (2026-10-07).
+    "detect.beads",
 )
 
 

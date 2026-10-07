@@ -28662,6 +28662,129 @@ def test_crop_region() -> None:
         "the card's `outside` socket builds a keep=outside sibling fed by the crop's wires")
 
 
+def test_detect_beads() -> None:
+    """``detect.beads`` (2026-10-07) — the slab-projected Bead Finder, end-to-end through the
+    Engine on the ``beads3d`` phantom (a confocal z-stack of 1 µm spheres through a skewed
+    sinc⁴ axial PSF, with aggregates, fibres, a scan line, a haze, 25 hot voxels and four
+    out-of-stack beads planted).
+
+    1. On the 60-bead field at the defaults it reports ONLY beads: every point lies within
+       0.6 µm of a planted bead (precision 1.0), at least 90 % of the planted beads are
+       found, none of the four beads whose brightest plane lies outside the stack is
+       reported, the lateral error is under 50 nm and the axial under 150 nm (median).
+    2. The Point table carries the invariant schema plus the six fit columns, declared in
+       the column catalog; ``z_kind`` is ``subpixel``; the fitted lateral sigma matches the
+       expectation for a 1 µm sphere (0.27 d ⊕ PSF ≈ 0.28–0.33 µm); the skew sign is the
+       phantom's (wider above).
+    3. The compute is memo-fenced on the calibration it reads — pixel size, z step, NA,
+       emission — and the `slabs` / `projection` modes and the manual slab sizes re-key it.
+    4. Manual 2 µm slabs find the beads too; ``projection=min`` on the INVERTED field
+       (dark beads on a bright background) finds the same beads; a 2-plane stack is
+       refused with a message naming the fix."""
+    import nodegraph.nodes  # noqa: F401 — registers the catalog
+    from nodegraph.catalog._base import COMPUTES
+    from nodegraph.phantom import FULL_SCALE, phantom
+    from nodegraph.provider import ArrayProvider
+    from scipy.spatial import cKDTree
+
+    define_node("io.beadseed", "S", outputs=[OutDataset()])
+
+    def eng(ds, env, params=None, modes=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.beadseed"))
+        g.add(NodeInstance("B", "detect.beads", params=params or {}, modes=modes or {}))
+        g.connect("S", "B")
+        return Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def points(out, layer="beads"):
+        col = lambda k: np.asarray(out.get(D.POINT, k, layer=layer).values)  # noqa: E731
+        return np.stack([col("z"), col("y"), col("x")], axis=1), col
+
+    def match(pts, truth, vox, tol=0.6):
+        d, j = cKDTree(truth * vox).query(pts * vox, distance_upper_bound=tol)
+        return d, j
+
+    ph = phantom("beads3d", n_beads=60)
+    tr = ph.truth
+    vox = np.asarray(tr["voxel_size_um"], dtype=float)
+    truth = tr["beads"]
+
+    # 1. only beads, most beads, placed right
+    e = eng(ph.dataset, ph.envelope)
+    out = e.pull("B")
+    pts, col = points(out)
+    assert len(pts) >= 54, f"found {len(pts)} of 60 planted beads"
+    d, j = match(pts, truth, vox)
+    assert np.all(np.isfinite(d)), \
+        f"{int(np.sum(~np.isfinite(d)))} reported points are not within 0.6 µm of any bead"
+    assert len(set(j.tolist())) >= 54, "a bead was reported twice (duplicates not merged)"
+    dxy = np.hypot((pts[:, 1] - truth[j, 1]) * vox[1], (pts[:, 2] - truth[j, 2]) * vox[2])
+    dz = (pts[:, 0] - truth[j, 0]) * vox[0]
+    assert float(np.median(dxy)) < 0.05, f"lateral error {np.median(dxy):.3f} µm"
+    assert float(np.median(np.abs(dz))) < 0.15, f"axial error {np.median(np.abs(dz)):.3f} µm"
+    for (oz, oy, ox) in tr["outside"]:
+        near = np.hypot((pts[:, 1] - oy) * vox[1], (pts[:, 2] - ox) * vox[2]) < 1.0
+        edge = np.abs(pts[:, 0] - oz) < 2.5
+        assert not np.any(near & edge), \
+            f"a bead centred outside the stack (z={oz:+.1f}) was reported inside it"
+
+    # 2. the table: schema + fit columns, catalog, z_kind, sizes
+    extra = ("amplitude", "snr", "sigma_xy_um", "sigma_z_um", "skew_z", "slab")
+    have = {k for (dom, lyr, k) in out.attributes if dom is D.POINT and lyr == "beads"}
+    assert {"id", "m", "t", "c", "z", "y", "x", *extra} <= have, have
+    assert out.structure_zkind(D.POINT, "beads") == "subpixel"
+    spec = NODES.get("detect.beads")
+    declared = {c for (_d, _l, c) in spec.adds_columns({"name": "beads"}, {}, ())}
+    assert set(extra) <= declared, declared
+    sxy = float(np.median(col("sigma_xy_um")))
+    assert 0.26 <= sxy <= 0.36, f"fitted lateral sigma {sxy:.3f} µm for a 1 µm bead"
+    assert np.nanmedian(col("skew_z")) > -0.05, "axial skew sign disagrees with the PSF"
+    assert np.all(np.asarray(col("id")) == np.arange(len(pts)))
+
+    # 3. memo fence + re-keying
+    reads = {k for k, _ in e.entry("B").reads}
+    assert {"pixel_size_um", "z_step_um", "objective_na", "channel_emission_nm"} <= reads, reads
+    h0 = e.entry("B").recipe_hash
+    e_man = eng(ph.dataset, ph.envelope, params={"slab_thickness": 2.0, "slab_overlap": 0.8},
+                modes={"slabs": "manual"})
+    out_man = e_man.pull("B")
+    assert e_man.entry("B").recipe_hash != h0
+    e_mean = eng(ph.dataset, ph.envelope, modes={"projection": "mean"})
+    e_mean.pull("B")
+    assert e_mean.entry("B").recipe_hash not in (h0, e_man.entry("B").recipe_hash)
+
+    # 4. manual slabs, dark beads, the 2-plane refusal
+    p_man, _ = points(out_man)
+    d_man, j_man = match(p_man, truth, vox)
+    assert np.all(np.isfinite(d_man)) and len(set(j_man.tolist())) >= 54, \
+        f"manual slabs: {len(p_man)} points, {int(np.sum(~np.isfinite(d_man)))} off-bead"
+    inv = (FULL_SCALE - ph.array.astype(np.int64)).astype(np.uint16)
+    md = dict(ph.envelope.metadata)
+    ds_inv = Dataset(axes=ph.axes, metadata=dict(md)).with_image(ArrayProvider(inv, tile=512))
+    env_inv = MetaEnvelope(axes=ph.axes, metadata=dict(md), domains=frozenset({D.VOXEL}))
+    e_dark = eng(ds_inv, env_inv, modes={"projection": "min"})
+    p_dark, _ = points(e_dark.pull("B"))
+    d_dark, j_dark = match(p_dark, truth, vox)
+    assert np.all(np.isfinite(d_dark)) and len(set(j_dark.tolist())) >= 54, \
+        f"dark beads: {len(p_dark)} points, {int(np.sum(~np.isfinite(d_dark)))} off-bead"
+    thin = ph.array[:, :, :2]
+    ax2 = AxisSizes(m=1, t=1, z=2, c=1, y=ph.axes.y, x=ph.axes.x)
+    ds2 = Dataset(axes=ax2, metadata=dict(md)).with_image(ArrayProvider(thin, tile=512))
+    env2 = MetaEnvelope(axes=ax2, metadata=dict(md), domains=frozenset({D.VOXEL}))
+    try:
+        eng(ds2, env2).pull("B")
+        raise AssertionError("a 2-plane stack must be refused")
+    except ValueError as exc:
+        assert "3 planes" in str(exc) and "Spot Detection" in str(exc), exc
+
+    _ok(f"detect.beads: {len(pts)}/60 planted beads found on the confocal phantom, every "
+        f"point on a bead (none of the artefacts or the 4 out-of-stack beads reported), "
+        f"median error {np.median(dxy) * 1000:.0f} nm lateral / "
+        f"{np.median(np.abs(dz)) * 1000:.0f} nm axial; fit columns declared and written, "
+        f"σxy {sxy:.3f} µm; px/z/NA/λ fenced; slabs + projection re-key; manual slabs and "
+        f"dark-bead `min` projection find them too; z=2 refused")
+
+
 def test_phantoms() -> None:
     """``nodegraph.phantom`` (2026-10-07) — the deterministic synthetic datasets the node
     demo window runs every node on.
@@ -29002,6 +29125,7 @@ def main() -> int:
     test_units()
     test_math_nodes()
     test_crop_region()
+    test_detect_beads()
     test_phantoms()
     test_node_demos()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")

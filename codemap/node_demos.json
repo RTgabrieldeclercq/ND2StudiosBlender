@@ -547,6 +547,21 @@
         "Fast and simple — the choice when particles are well separated."
       ]
     },
+    "detect.beads": {
+      "kind": "points",
+      "phantom": "beads3d",
+      "phantom_kw": {
+        "n_beads": 40
+      },
+      "view": {
+        "z": 12
+      },
+      "features": [
+        "Cuts the Z-stack into overlapping slabs, flattens each (max/mean/min), finds bright spots in 2-D per slab, then fits every hit on the raw stack: a split Gaussian in z (a confocal axial profile is skewed) and a 2-D Gaussian in x,y for the sub-voxel centroid and the apparent size.",
+        "Keeps only what is bead-shaped for the given diameter: hot voxels, aggregates, fibres, the scan line and the haze planted in this phantom are all refused, as are the beads whose brightest plane lies outside the stack.",
+        "Auto slabs get thinner as the field gets denser; drag Bead diameter away from 1 µm and watch the size filter refuse the real beads."
+      ]
+    },
     "analysis.edt": {
       "kind": "scalar",
       "phantom": "cells2d",

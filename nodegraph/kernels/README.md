@@ -1,11 +1,12 @@
 # `pure_analysis/` — portable analysis math-kernels
 
-Eighteen self-contained analysis **math-kernels**. Thirteen were vendored (byte-verbatim)
+Nineteen self-contained analysis **math-kernels**. Thirteen were vendored (byte-verbatim)
 out of the ND2Studios app (branch `Version-1.45`) so they can be ported into a *different*
 software's new node system without dragging along the ND2Studios GUI, its plugin
 registry, or its pipeline runtime; three (`cellsam_segment`, V2.12, `piv_field`, V3 W5-P2,
 and `aldvc_field`, rewritten 2026-09-25) are adapters of the same shape around third-party
-packages; and two are in-repo math — `track_field` (2026-09-17), the post-processing half of
+packages; and three are in-repo math — `bead_slabs` (2026-10-07), the slab-projected bead
+finder behind `detect.beads`, `track_field` (2026-09-17), the post-processing half of
 SerialTrack, derived from `track_objects`' own gauge and pinned to it by selftest, and
 `field_math` (2026-09-25), the dimension-agnostic strain/accumulation maths lifted out of the
 ALDVC port when the official pyALDVC package replaced it.
@@ -61,6 +62,7 @@ it returns a numpy result. That is the whole contract.
 | [`track_field`](track_field.md) | Track Field | `mls_displacement_gradient(coords, disp, ...)`, `linear_elastic_stress(strain, ...)`, `stress_invariants(...)` | in-repo (SerialTrack's `funCompDefGrad3` + isotropic linear elasticity) | numpy, scipy* |
 | [`registration`](registration.md) | Registration | `estimate_series(...)`, `apply_series(...)`, `apply_frame(...)` | in-repo (on scipy/skimage/cv2) | numpy, scikit-image, scipy, opencv-python |
 | [`bead_detect`](bead_detect.md) | Bead Detection | `detect_beads(volume_zhw, voxel_size_um, params)` | in-repo (ParticleDetector) | numpy, scipy, numba, scikit-image* |
+| [`bead_slabs`](bead_slabs.md) | Bead Finder — **3D only** | `find_beads(volume_zyx, voxel_size_um, params)` (+ `expected_sigmas_px`, `auto_slab_thickness`) | in-repo (slab projection + LoG + split-Gaussian / 2-D Gaussian fits, 2026-10-07) | numpy, scipy* |
 | [`granule_cluster`](granule_cluster.md) | Granule Clustering | `cluster_granules(points_zyx, voxel_size_um, params)` | in-repo (fits via sklearn) | numpy, scikit-learn* |
 | [`granule_tessellate`](granule_tessellate.md) | Granule Tessellation | `tessellate_granules(points_zyx, labels, voxel_size_um, params)` | in-repo (scipy.spatial) | numpy, scipy |
 | [`granule_volume_mask`](granule_volume_mask.md) | Granule Volume Mask | `build_granule_masks(tess, shape_zhw, voxel_size_um, params)` — `tessellation_from_list(...)` adapter | in-repo | numpy, scipy |
