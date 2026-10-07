@@ -1,5 +1,5 @@
 """Split T (``util.split_t``) — Fan a time series out into one output per timepoint (each a
-single-frame Dataset) or, with Groups set, per RANGE of frames; the whole series also passes
+single-frame Dataset) or, with groups made from the card's checkboxes, per RANGE of frames; the whole series also passes
 through ``out``."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
+from nodegraph.catalog._shared.split_grouping import grouping_sockets
 
 
 def _compute_split_t(ctx: EvalContext) -> Dataset:
@@ -38,12 +38,11 @@ register_node(
                       "interval) while there are few enough to show; type Groups to split a "
                       "long series into ranges. `out` still carries the whole series."),
             *grouping_sockets('frame', 'T',
-                              'a Crop in frames mode keeping those frames', 10)],
+                              'a Crop in frames mode keeping those frames')],
     outputs=[OutDataset("out")],
-    modes=[grouping_mode('frame', 'T')],
     granularity=Granularity.TILEABLE,
     description="Fan a time series out into one output per timepoint (each a single-frame "
-                "Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames "
+                "Dataset, tK = frame K) — or, with groups made from the card's checkboxes, one output per RANGE of frames "
                 "(`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. "
                 "The T axis's twin of Split Z.",
 )

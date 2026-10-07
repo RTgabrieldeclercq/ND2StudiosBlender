@@ -9,7 +9,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
+from nodegraph.catalog._shared.split_grouping import grouping_sockets
 
 
 def _compute_split_positions(ctx: EvalContext) -> Dataset:
@@ -36,12 +36,11 @@ register_node(
                       "output socket each on the card, labelled with the file's point names "
                       "when it has them; `out` still carries the whole set."),
             *grouping_sockets('position', 'M (position)',
-                              'a Crop in frames mode keeping those positions', 2)],
+                              'a Crop in frames mode keeping those positions')],
     outputs=[OutDataset("out")],
-    modes=[grouping_mode('position', 'M (position)')],
     granularity=Granularity.TILEABLE,
     description="Fan a multipoint Dataset out into one output per stage position (each a "
-                "single-position Dataset) — or, with Groups set, one output per RANGE of "
+                "single-position Dataset) — or, with groups made from the card's checkboxes, one output per RANGE of "
                 "positions; the whole set also passes through 'out'. The positions "
                 "axis's twin of Split Channels.",
 )

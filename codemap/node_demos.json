@@ -207,7 +207,7 @@
       "features": [
         "Grows one output socket per channel so each can feed its own chain.",
         "Wiring an output inserts a Select Channel tap for you at run time.",
-        "Grouping, a mode on the card: `none` is one output per channel; `every` cuts the channel axis into groups of `Group size`; `ranges` takes `0,2; 1` or `nuclei: 0; reporters: 1-2` typed into `Ranges` — one output per group, a Select Channel with that list at run time."
+        "Grouping by selection: a checkbox beside every channel output; tick DAPI and Cy5 and press Group selected for one output carrying both (a Select Channel with that list at run time) beside GFP on its own; tick the group and press Ungroup to undo. The Properties panel has the same list and buttons, and the `groups` text (`0,2; 1`, `nuclei: 0`) for typing."
       ]
     },
     "util.merge": {
@@ -259,7 +259,7 @@
       "phantom": "plate_mosaic",
       "features": [
         "Grows one output per position of a multipoint file; wiring one inserts a Select Position tap.",
-        "Grouping, a mode on the card: `none` is one output per position (up to 24); `every` cuts the positions into groups of `Group size`; `ranges` takes `0-5; 6-11` or `wells: 0-5; blanks: 6-11` — one output per group, a Crop in frames mode at run time, every per-position list following."
+        "Grouping by selection: a checkbox beside every position output (up to 24); tick the wells that belong together and press Group selected for one output carrying them (a Crop in frames mode at run time, every per-position list following), sitting where the first was. Group every N in the panel chunks a long plate; Ungroup dissolves a group."
       ]
     },
     "util.stitch": {
@@ -1413,7 +1413,7 @@
       "features": [
         "Grows one output socket per plane (z0…z6 here, labelled with the plane's height) so each plane can feed its own chain; wiring one inserts a Select Plane tap for you at run time. The whole stack still passes through out, which is what this view shows.",
         "Hand z3 to Registration and out to Shift to register a stack on one plane.",
-        "Grouping, a mode on the card: `none` is one output per plane (up to 24); `every` cuts the stack into sub-stacks of `Group size` planes (4 by default); `ranges` takes `0-3; 4-7; 8-11` or `top: 0-3; mid: 4-7` — one output per group, a Crop in frames mode at run time with the z step and plane heights following; a group past the end is labelled so on the card."
+        "Grouping by selection: a checkbox beside every plane output (up to 24); tick planes 4-7 and press Group selected for one sub-stack output (a Crop in frames mode at run time, z step and plane heights following) beside z0-3 and z8-11; tick the group and press Ungroup to undo. Group every 4 in the panel cuts the stack into slabs; a group past the end is labelled so."
       ]
     },
     "align.shift": {
@@ -1490,7 +1490,7 @@
       "phantom": "star_field",
       "features": [
         "Grows one output socket per timepoint (t0…t5 here, labelled with the frame time) so each frame can feed its own chain; wiring one inserts a Select Frame tap for you at run time. The whole series still passes through out, which is what this view shows.",
-        "A real series is hundreds of frames, so the card stops growing per-frame sockets past 24 and the Grouping mode takes over: `every` with a `Group size` (10 by default) gives one output per that many consecutive frames, `ranges` with `0-99; 100-199` names the windows — a Crop in frames mode at run time, every per-frame list following."
+        "A real series is hundreds of frames, so the card stops growing per-frame sockets past 24; the Properties panel still lists every frame with a checkbox, and Group every N (10, say) writes one output per that many consecutive frames — a Crop in frames mode at run time, every per-frame list following; Group selected names a window by hand."
       ]
     }
   }

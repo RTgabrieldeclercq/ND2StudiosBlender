@@ -24283,32 +24283,23 @@ def test_select_frame_split_t() -> None:
     assert parse_groups("every 4", 10) == [("", (0, 1, 2, 3)), ("", (4, 5, 6, 7)), ("", (8, 9))]
     assert parse_groups("every 4") is None, "without the axis length the shorthand is not expanded"
     doc.nodes["ST"].params["groups"] = "every 10"
-    doc.nodes["ST"].modes["grouping"] = "ranges"
     doc.touch("ST")
     assert [(s.name, s.label) for s in doc.output_specs("ST")[1:]] == [
         ("tg0", "0 · t 0-9 · 0.0–18.0 s"), ("tg1", "1 · t 10-19 · 20.0–38.0 s"),
         ("tg2", "2 · t 20-29 · 40.0–58.0 s")], [(s.name, s.label) for s in doc.output_specs("ST")]
-    # the same windows through the `every` strategy: the Mode plus the socket's own default
-    # (Split T ships `group_size` = 10, and a node's params hold only what the user changed)
-    doc.nodes["ST"].params.pop("groups", None)
-    doc.nodes["ST"].modes["grouping"] = "every"
-    doc.touch("ST")
-    assert "group_size" not in doc.nodes["ST"].params
+    # the same windows through GROUP EVERY (the panel's bulk action, 2026-10-07): the
+    # groups are written out explicitly, so the run side needs no shorthand
+    assert doc.split_group_every("ST", 10) == 3
+    assert doc.nodes["ST"].params["groups"] == "0-9; 10-19; 20-29", doc.nodes["ST"].params["groups"]
     assert [s.name for s in doc.output_specs("ST")] == ["out", "tg0", "tg1", "tg2"], \
         [s.name for s in doc.output_specs("ST")]
-    assert OPS.split_group(doc.nodes["ST"], 1) == ("", tuple(range(10, 20))), "the run side uses the default too"
-    doc.nodes["ST"].params["group_size"] = 7
-    doc.touch("ST")
+    assert OPS.split_group(doc.nodes["ST"], 1) == ("", tuple(range(10, 20)))
+    assert doc.split_group_every("ST", 7) == 5
     assert [s.label for s in doc.output_specs("ST")[1:]][-1] == "4 · t 28-29 · 56.0–58.0 s"
-    assert [s.name for s in NODES.get("util.split_t").active_inputs({"grouping": "every"})] == ["data", "group_size"]
-    assert [s.name for s in NODES.get("util.split_t").active_inputs({"grouping": "ranges"})] == ["data", "groups"]
-    assert [s.name for s in NODES.get("util.split_t").active_inputs({"grouping": "none"})] == ["data"]
     for op in ("channel.split", "util.split_positions", "util.split_z", "util.split_t"):
         sp = NODES.get(op)
-        gm = next(m for m in sp.modes if m.name == "grouping")
-        assert list(gm.choices) == ["none", "every", "ranges"] and gm.default == "none", op
-        assert sp.input("group_size").presentation and sp.input("groups").presentation, op
-    doc.nodes["ST"].modes["grouping"] = "ranges"
+        assert not sp.modes and [x.name for x in sp.inputs] == ["data", "groups"], op
+        assert sp.input("groups").presentation and sp.input("groups").default == "", op
     doc.nodes["ST"].params["groups"] = "every 12"
     doc.touch("ST")
     assert [s.label for s in doc.output_specs("ST")[1:]][-1] == "2 · t 24-29 · 48.0–58.0 s", "the last chunk clips"
@@ -24332,9 +24323,8 @@ def test_select_frame_split_t() -> None:
         "a wired tK is one shared util.select_frame tap; the fan-out cap (24) grows no per-index "
         "sockets on a 30-frame series or a 40-plane stack; `every 10` gives tg groups labelled "
         "by span with the last chunk clipped, the run side emits the unclamped `t24-35` and "
-        "Crop's frames tap hands back the six frames that exist; the `every` strategy "
-        "resolves from the Mode and the group_size socket's own default, and each strategy "
-        "shows only its own socket")
+        "Crop's frames tap hands back the six frames that exist; Group every N writes the "
+        "same windows out explicitly, and the split cards carry one `groups` socket and no Mode")
 
 
 def test_split_groups() -> None:
@@ -24402,7 +24392,6 @@ def test_split_groups() -> None:
     doc.add_node("util.split_z", node_id="SZ"); doc.connect("L", "image", "SZ", "data")
     assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
     doc.nodes["SZ"].params["groups"] = "top: 0-3; 4-7; 8-13"
-    doc.nodes["SZ"].modes["grouping"] = "ranges"
     doc.touch("SZ")
     outs = doc.output_specs("SZ")
     assert names(doc, "SZ") == ["out", "zg0", "zg1", "zg2"], names(doc, "SZ")
@@ -24427,19 +24416,16 @@ def test_split_groups() -> None:
     assert o1.metadata["z_step_um"] == 0.4 and abs(o1.metadata["origin_um"][0][0] - 1.6) < 1e-9
     assert o3.axes.z == Z
     doc.nodes["SZ"].params["groups"] = ""                   # blank: the per-plane sockets return
-    doc.nodes["SZ"].modes["grouping"] = "none"
     doc.touch("SZ")
     assert names(doc, "SZ") == ["out"] + [f"z{i}" for i in range(Z)]
 
     # ── Split Positions: wells 0-1 by range, C3 alone ────────────────────────────────
     doc.add_node("util.split_positions", node_id="SP"); doc.connect("L", "image", "SP", "data")
     doc.nodes["SP"].params["groups"] = "wells: 0-1; 2"
-    doc.nodes["SP"].modes["grouping"] = "ranges"
     doc.touch("SP")
     assert names(doc, "SP") == ["out", "posg0", "posg1"]
     assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · wells", "1 · C3"]
     doc.nodes["SP"].params["groups"] = "0-1; 2"
-    doc.nodes["SP"].modes["grouping"] = "ranges"
     doc.touch("SP")
     assert [s.label for s in doc.output_specs("SP")[1:]] == ["0 · A1–B2", "1 · C3"]
     doc.add_node("enhance.gaussian", node_id="G4"); doc.connect("SP", "posg0", "G4", "data")
@@ -24457,7 +24443,6 @@ def test_split_groups() -> None:
     doc.add_node("channel.split", node_id="CS"); doc.connect("L", "image", "CS", "data")
     assert names(doc, "CS") == ["out", "ch0", "ch1", "ch2"]
     doc.nodes["CS"].params["groups"] = "0,2; 1"
-    doc.nodes["CS"].modes["grouping"] = "ranges"
     doc.touch("CS")
     assert names(doc, "CS") == ["out", "chg0", "chg1"]
     assert [s.label for s in doc.output_specs("CS")[1:]] == ["0 · DAPI+Cy5", "1 · GFP"], \
@@ -24473,8 +24458,7 @@ def test_split_groups() -> None:
     assert names(doc, "L")[:1] == ["image"] and "chg0" not in names(doc, "L")
     # the split's own output ignores the text entirely (presentation-only)
     gsz = Graph(); gsz.add(NodeInstance("S", "io.sgseed"))
-    gsz.add(NodeInstance("N", "util.split_z", params={"groups": "0-3; 4-7"},
-                         modes={"grouping": "ranges"})); gsz.connect("S", "N")
+    gsz.add(NodeInstance("N", "util.split_z", params={"groups": "0-3; 4-7"})); gsz.connect("S", "N")
     whole = Engine(gsz, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env0}).pull("N")
     assert whole.axes.z == Z
     _ok("split groups: `groups` text (`0-3; 4-7; 8-11`, `top: 0-3`, `;`/newline, total grammar, "
@@ -24483,7 +24467,131 @@ def test_split_groups() -> None:
         "members or span (and `(past the end)`); a wired group is one shared util.crop "
         "frames tap (z4-7 / m0-1) or channel.select list; the envelope and the pull carry "
         "exactly that subset with z_step, origin, position and emission lists following; "
-        "`none` restores the per-index sockets; the strategy is the card's `grouping` Mode")
+        "blank text restores the per-index sockets")
+
+
+def test_split_pick_group() -> None:
+    """Grouping by SELECTION on a split card (2026-10-07): the document's pick set, Group
+    selected, Ungroup and Group every N, with the wires following their members — the model
+    behind the card's checkboxes and the panel's buttons.
+
+    What is pinned: the four split cards carry one `groups` socket and no Mode; `split_items`
+    lists groups and ungrouped members in axis order (members past the fan-out cap too,
+    socket-less); a tick is not an edit; Group selected merges ticked members AND ticked
+    groups into one group written to the text in canonical form (`format_groups`, which
+    round-trips through `parse_groups`), the ticked sockets vanish and their wires move to the
+    new socket; the card then shows groups BESIDE the remaining per-index sockets, a group
+    where its first member was; Ungroup renumbers the groups after it and moves a wire that
+    left the dissolved group to its first member's socket; Group every N replaces the groups
+    and wires follow into the chunk holding them; the run side reads group k from the text."""
+    from dataclasses import replace as _replace
+    from nodelab_v2.document import FANOUT_CAP, GraphDocument
+    from nodelab_v2 import ops as OPS
+    from nodegraph.metadata import format_groups, parse_groups
+    assert format_groups([("top", (3, 0, 1, 2)), ("", (4, 5, 7)), ("a;b", ())]) == "top: 0-3; 4-5,7"
+    for text in ("top: 0-3; 4-5,7", "0-1; mid: 4-8", "0-3; 4-7; 8-11"):
+        assert format_groups(parse_groups(text)) == text, text
+    for op in ("channel.split", "util.split_positions", "util.split_z", "util.split_t"):
+        sp = NODES.get(op)
+        assert not sp.modes and [x.name for x in sp.inputs] == ["data", "groups"], op
+
+    OPS.ensure_ops()
+    ax = AxisSizes(m=1, t=2, z=12, c=1, y=16, x=16)
+    env0 = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="L"); doc.meta_seeds["L"] = env0
+    doc.add_node("util.split_z", node_id="S"); doc.connect("L", "image", "S", "data")
+    doc.add_node("enhance.gaussian", node_id="G"); doc.connect("S", "z5", "G", "data")
+
+    def names():
+        return [x.name for x in doc.output_specs("S")]
+
+    assert doc.split_axis("S") == "z" and doc.split_axis("L") is None and doc.split_axis("G") is None
+    assert doc.split_items("L") == [] and doc.split_group_selected("L") is None
+    items = doc.split_items("S")
+    assert [it["key"] for it in items] == [f"z{i}" for i in range(12)]
+    assert all(it["kind"] == "index" and it["socket"] and not it["picked"] for it in items)
+    assert items[3]["label"] == "3 · 1.20 µm", items[3]["label"]
+    # ticks: toggle / set / pruned to what exists; never an edit
+    rev = doc.revision
+    assert doc.split_pick("S", "z4") is True and doc.split_pick("S", "z4") is False
+    for k in ("z4", "z5", "z6", "z7"):
+        assert doc.split_pick("S", k, True) is True
+    doc.split_pick("S", "z99", True)
+    assert doc.split_picked("S") == {"z4", "z5", "z6", "z7"} and doc.revision == rev
+    assert sum(1 for it in doc.split_items("S") if it["picked"]) == 4
+    # GROUP SELECTED: one socket where z4 was, its wire moved, the rest untouched
+    assert doc.split_group_selected("S") == "zg0"
+    assert names() == ["out", "z0", "z1", "z2", "z3", "zg0", "z8", "z9", "z10", "z11"], names()
+    assert doc.nodes["S"].params["groups"] == "4-7"
+    assert ("S", "zg0", "G", "data") in doc.edges and not any(e[1] == "z5" for e in doc.edges), doc.edges
+    assert doc.env("G").axes.z == 4 and doc.split_picked("S") == set()
+    g = doc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "util.crop" and n.params == {"frames": "z4-7"} for n in g.nodes.values())
+    items = doc.split_items("S")
+    assert [it["key"] for it in items] == ["z0", "z1", "z2", "z3", "zg0", "z8", "z9", "z10", "z11"]
+    assert items[4]["kind"] == "group" and items[4]["group"] == 0 and items[4]["name"] == "" \
+        and items[4]["label"] == "0 · z 4-7 · 1.60–2.80 µm", items[4]
+    # merging a ticked GROUP with a member, named
+    doc.split_pick("S", "zg0", True); doc.split_pick("S", "z8", True)
+    assert doc.split_group_selected("S", "mid") == "zg0"
+    assert doc.nodes["S"].params["groups"] == "mid: 4-8" and ("S", "zg0", "G", "data") in doc.edges
+    assert doc.split_items("S")[4]["name"] == "mid"
+    # a second group; dissolving the first renumbers the second and its wire with it
+    doc.split_pick("S", "z0", True); doc.split_pick("S", "z1", True)
+    assert doc.split_group_selected("S") == "zg1" and doc.nodes["S"].params["groups"] == "mid: 4-8; 0-1"
+    assert names() == ["out", "zg1", "z2", "z3", "zg0", "z9", "z10", "z11"], names()
+    doc.add_node("enhance.gaussian", node_id="G2"); doc.connect("S", "zg1", "G2", "data")
+    assert doc.split_ungroup("S", ["z2"]) == 0, "a member is not a group"
+    doc.split_pick("S", "zg0", True)
+    assert doc.split_ungroup("S") == 1
+    assert doc.nodes["S"].params["groups"] == "0-1"
+    assert ("S", "zg0", "G2", "data") in doc.edges, "the wire on zg1 is on zg0 now"
+    assert ("S", "z4", "G", "data") in doc.edges, "a dissolved group's wire moves to its first member"
+    assert names() == ["out", "zg0", "z2", "z3", "z4", "z5", "z6", "z7", "z8", "z9", "z10", "z11"], names()
+    # GROUP EVERY 4: explicit chunks, the wires follow into the chunk holding them
+    assert doc.split_group_every("S", 0) == 0 and doc.split_group_every("S", 4) == 3
+    assert names() == ["out", "zg0", "zg1", "zg2"] and doc.nodes["S"].params["groups"] == "0-3; 4-7; 8-11"
+    assert ("S", "zg1", "G", "data") in doc.edges and ("S", "zg0", "G2", "data") in doc.edges, doc.edges
+    assert OPS.split_group(doc.nodes["S"], 1) == ("", (4, 5, 6, 7)) and OPS.split_group(doc.nodes["S"], 3) is None
+    # ungroup them all: the param goes, the sockets return, the wires land on first members
+    for k in ("zg0", "zg1", "zg2"):
+        doc.split_pick("S", k, True)
+    assert doc.split_ungroup("S") == 3 and "groups" not in doc.nodes["S"].params
+    assert names() == ["out"] + [f"z{i}" for i in range(12)]
+    assert ("S", "z4", "G", "data") in doc.edges and ("S", "z0", "G2", "data") in doc.edges
+    # past the cap: listed without sockets; a group gives the one socket there is
+    doc.add_node("util.split_t", node_id="T"); doc.connect("L", "image", "T", "data")
+    doc.meta_seeds["L"] = MetaEnvelope(axes=_replace(ax, t=30), metadata={"pixel_size_um": 0.5, "dt_s": 2.0})
+    doc.touch("L")
+    its = doc.split_items("T")
+    assert len(its) == 30 > FANOUT_CAP and not its[0]["socket"]
+    assert [x.name for x in doc.output_specs("T")] == ["out"]
+    for i in range(10):
+        doc.split_pick("T", f"t{i}", True)
+    assert doc.split_group_selected("T") == "tg0" and [x.name for x in doc.output_specs("T")] == ["out", "tg0"]
+    assert doc.split_items("T")[0]["socket"] and not doc.split_items("T")[1]["socket"]
+    assert doc.split_group_every("T", 10) == 3
+    assert [x.name for x in doc.output_specs("T")] == ["out", "tg0", "tg1", "tg2"]
+    assert OPS.split_group(doc.nodes["T"], 2) == ("", tuple(range(20, 30)))
+    # channels: a group's name is its members' names, and the tap is a channel list
+    doc.meta_seeds["L"] = MetaEnvelope(axes=_replace(ax, c=3), metadata={
+        "pixel_size_um": 0.5, "channel_names": ["DAPI", "GFP", "Cy5"]})
+    doc.touch("L")
+    doc.add_node("channel.split", node_id="C"); doc.connect("L", "image", "C", "data")
+    doc.split_pick("C", "ch0", True); doc.split_pick("C", "ch2", True)
+    assert doc.split_group_selected("C") == "chg0"
+    assert [(x.name, x.label) for x in doc.output_specs("C")] == [("out", ""), ("chg0", "0 · DAPI+Cy5"), ("ch1", "1 · GFP")]
+    doc.add_node("enhance.gaussian", node_id="G3"); doc.connect("C", "chg0", "G3", "data")
+    g = doc.to_graph(for_run=True, materialize=True)
+    assert any(n.op_key == "channel.select" and n.params == {"channels": [0, 2]} for n in g.nodes.values())
+    _ok("split pick/group: a split card's outputs are ticked (never an edit) and Group selected "
+        "writes ONE canonical group to `groups` (format_groups round-trips parse_groups), the "
+        "ticked sockets vanish with their wires moved to the new socket, which sits where its "
+        "first member was beside the remaining per-index sockets; a ticked group merges; Ungroup "
+        "renumbers the groups after it and lands a wire on the first member; Group every N writes "
+        "explicit chunks the wires follow into; members past the fan-out cap are listed to tick; "
+        "the run side reads group k from the text (crop z4-7, channel.select [0, 2])")
 
 
 def test_shift_node() -> None:
@@ -30109,6 +30217,7 @@ def main() -> int:
     test_select_plane_split_z()
     test_select_frame_split_t()
     test_split_groups()
+    test_split_pick_group()
     test_shift_node()
     test_workspace_model()
     test_page_composition_memo_reuse()

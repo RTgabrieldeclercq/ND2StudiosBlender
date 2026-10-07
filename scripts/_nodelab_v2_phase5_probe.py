@@ -5991,21 +5991,52 @@ def main(argv) -> int:
         metadata={"pixel_size_um": 0.5, "z_step_um": 0.4})
     _sgdoc.add_node("util.split_z", node_id="SGS", x=300, y=1800)
     _sgdoc.connect("SGL", "image", "SGS", "data")
-    # the strategy is a Mode on the card: `ranges` reveals the Ranges text, `every` the size,
-    # `none` neither — and the Properties panel offers the dropdown with all three
-    _sgdoc.nodes["SGS"].modes["grouping"] = "ranges"
+    # grouping by SELECTION (2026-10-07): a checkbox beside every plane output on the card;
+    # tick z0 and z1, press Group selected — one socket where z0 was, the rest untouched
+    win.scene.sync(); app.processEvents()
+    _sgitem = win.scene.node_items["SGS"]
+    _sgchecks = {c.obj.name: c for c in _sgitem.controls() if c.kind == "check"}
+    assert set(_sgchecks) == {f"z{i}" for i in range(5)}, sorted(_sgchecks)
+    assert any(c.kind == "group" for c in _sgitem.controls()) \
+        and not any(c.kind == "ungroup" for c in _sgitem.controls())
+    _sgitem.mousePressEvent(_FakePress(_sgchecks["z0"].rect.center()))
+    _sgitem.mousePressEvent(_FakePress(_sgchecks["z1"].rect.center()))
+    assert _sgdoc.split_picked("SGS") == {"z0", "z1"}
+    _sgitem.mousePressEvent(_FakePress(next(c for c in _sgitem.controls() if c.kind == "group").rect.center()))
+    app.processEvents()
+    assert [s.name for s in _sgdoc.output_specs("SGS")] == ["out", "zg0", "z2", "z3", "z4"], \
+        [s.name for s in _sgdoc.output_specs("SGS")]
+    assert _sgdoc.nodes["SGS"].params["groups"] == "0-1"
+    assert [k[1] for k in _sgitem._sockets if k[0] == "out"] == ["out", "zg0", "z2", "z3", "z4"], "the card relaid out"
+    assert [s.name for s in _sgdoc.input_specs("SGS")] == ["data", "groups"]
+    # a ticked group offers Ungroup on the card
+    _sgchecks = {c.obj.name: c for c in _sgitem.controls() if c.kind == "check"}
+    _sgitem.mousePressEvent(_FakePress(_sgchecks["zg0"].rect.center()))
+    assert any(c.kind == "ungroup" for c in _sgitem.controls())
+    _sgitem.mousePressEvent(_FakePress(_sgchecks["zg0"].rect.center()))     # untick
+    assert not any(c.kind == "ungroup" for c in _sgitem.controls())
+    # the Properties panel: the same list with checkboxes, Group selected waits until a tick,
+    # and names the group through its name box
+    from nodelab_v2.inspector import InspectorPanel as _SGInsp
+    from PySide6.QtWidgets import QCheckBox as _SGCheck, QLineEdit as _SGEdit, QPushButton as _SGBtn
+    _sgpanel = _SGInsp()
+    _sgpanel.set_node(_sgitem); app.processEvents()
+    _sgboxes = {c.property("splitKey"): c for c in _sgpanel.findChildren(_SGCheck) if c.property("splitKey")}
+    assert set(_sgboxes) == {"zg0", "z2", "z3", "z4"}, sorted(_sgboxes)
+    _sgbtn = next(b for b in _sgpanel.findChildren(_SGBtn) if b.text() == "Group selected")
+    assert not _sgbtn.isEnabled(), "nothing ticked: the button waits"
+    for k in ("z2", "z3", "z4"):
+        _sgboxes[k].setChecked(True)
+    app.processEvents()
+    assert _sgbtn.isEnabled() and _sgdoc.split_picked("SGS") == {"z2", "z3", "z4"}
+    next(e for e in _sgpanel.findChildren(_SGEdit) if e.placeholderText().startswith("name")).setText("top")
+    _sgbtn.click(); app.processEvents()
+    assert _sgdoc.nodes["SGS"].params["groups"] == "0-1; top: 2-4", _sgdoc.nodes["SGS"].params["groups"]
+    assert [s.name for s in _sgdoc.output_specs("SGS")] == ["out", "zg0", "zg1"]
+    # the rest of the probe reads the groups as `top: 0-1; 2-4`
     _sgdoc.nodes["SGS"].params["groups"] = "top: 0-1; 2-4"
     _sgdoc.touch("SGS")
     win.scene.sync(); app.processEvents()
-    assert [s.name for s in _sgdoc.input_specs("SGS")] == ["data", "groups"], \
-        [s.name for s in _sgdoc.input_specs("SGS")]
-    from nodelab_v2.inspector import InspectorPanel as _SGInsp
-    from nodelab_v2.node_item import NodeItem as _SGItem
-    from PySide6.QtWidgets import QComboBox as _SGCombo
-    _sgpanel = _SGInsp()
-    _sgpanel.set_node(_SGItem(_sgdoc.nodes["SGS"], _sgdoc)); app.processEvents()
-    _sgcombos = [[c.itemText(i) for i in range(c.count())] for c in _sgpanel.findChildren(_SGCombo)]
-    assert ["none", "every", "ranges"] in _sgcombos, _sgcombos
     _sgouts = [(s.name, s.label) for s in _sgdoc.output_specs("SGS")]
     assert _sgouts == [("out", ""), ("zg0", "0 · top · 0.00–0.40 µm"), ("zg1", "1 · z 2-4 · 0.80–1.60 µm")], _sgouts
     _sgdoc.add_node("view.viewer", node_id="SGV", x=600, y=1800)
@@ -6023,7 +6054,8 @@ def main(argv) -> int:
     for nid in ("SGV", "SGS", "SGL"):
         _sgdoc.remove_node(nid)
     win.scene.sync(); app.processEvents()
-    _ok("SG1 split groups: Grouping = ranges with `top: 0-1; 2-4` on Split Z replaces z0..z4 with zg0/zg1 labelled by "
+    _ok("SG1 split groups: ticking z0+z1 on the card and pressing Group selected makes zg0 beside z2..z4 "
+        "(the panel lists the same with checkboxes, waits until a tick, names through its box); `top: 0-1; 2-4` gives zg0/zg1 labelled by "
         "name and height span, a wire from zg1 is drawable, the envelope downstream reads z=3, "
         "and the run graph carries a util.crop frames tap keeping z2-4")
 
@@ -6050,10 +6082,13 @@ def main(argv) -> int:
     _stdoc.touch("STL")
     win.scene.sync(); app.processEvents()
     assert [s.name for s in _stdoc.output_specs("STS")] == ["out"], "30 frames: the cap grows no sockets"
-    _stdoc.nodes["STS"].modes["grouping"] = "every"       # Split T ships group_size = 10
-    _stdoc.touch("STS")
+    # 30 frames: no per-frame sockets, but every frame is listed to tick, and GROUP EVERY 10
+    # (the panel's bulk action) writes three explicit windows
+    assert len(_stdoc.split_items("STS")) == 30 and not _stdoc.split_items("STS")[0]["socket"]
+    assert _stdoc.split_group_every("STS", 10) == 3
     win.scene.sync(); app.processEvents()
-    assert [s.name for s in _stdoc.input_specs("STS")] == ["data", "group_size"]
+    assert [s.name for s in _stdoc.input_specs("STS")] == ["data", "groups"]
+    assert not [c for c in win.scene.node_items["STS"].controls() if c.kind == "check" and not c.obj.name.startswith("tg")]
     assert [s.name for s in _stdoc.output_specs("STS")] == ["out", "tg0", "tg1", "tg2"]
     _stdoc.add_node("view.viewer", node_id="STV", x=600, y=1900)
     _stdoc.connect("STS", "tg1", "STV", "data")
@@ -6066,8 +6101,8 @@ def main(argv) -> int:
         _stdoc.remove_node(nid)
     win.scene.sync(); app.processEvents()
     _ok("ST1 split t: a 6-frame source grows t0..t5 labelled with frame times and a wire from t3 "
-        "materializes a util.select_frame tap; 30 frames grow none (the fan-out cap) and Grouping "
-        "= every (size 10) grows tg0..tg2, whose wire reads t=10 downstream and materializes a util.crop "
+        "materializes a util.select_frame tap; 30 frames grow none (the fan-out cap) and Group "
+        "every 10 grows tg0..tg2, whose wire reads t=10 downstream and materializes a util.crop "
         "frames tap keeping t10-19")
 
     _probe_movie_editor(win, app)

@@ -70,7 +70,7 @@
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 791,
+    "inputs": 787,
     "outputs": 121,
     "gui_ops_included": true
   },
@@ -301,7 +301,7 @@
         {
           "op": "channel.split",
           "label": "Split Channels",
-          "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with Groups set, into one output per RANGE of channels; the full bundle also passes through 'out'."
+          "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with groups made from the card's checkboxes, into one output per RANGE of channels; the full bundle also passes through 'out'."
         },
         {
           "op": "data.part",
@@ -346,17 +346,17 @@
         {
           "op": "util.split_positions",
           "label": "Split Positions",
-          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels."
+          "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with groups made from the card's checkboxes, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels."
         },
         {
           "op": "util.split_t",
           "label": "Split T",
-          "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z."
+          "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with groups made from the card's checkboxes, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z."
         },
         {
           "op": "util.split_z",
           "label": "Split Z",
-          "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K) — or, with Groups set, one output per RANGE of planes (a sub-stack each); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions."
+          "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K); tick several planes' checkboxes and press Group selected for one output carrying that sub-stack instead; the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions."
         },
         {
           "op": "util.timeseries",
@@ -7293,7 +7293,7 @@
       ],
       "module": "nodegraph/catalog/channel/split.py",
       "gui_only": false,
-      "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with Groups set, into one output per RANGE of channels; the full bundle also passes through 'out'.",
+      "summary": "Fan a multi-channel Dataset out into per-channel outputs (each a single-channel Dataset) — or, with groups made from the card's checkboxes, into one output per RANGE of channels; the full bundle also passes through 'out'.",
       "overview": "Split Channels — a domain-transparent pass-through of the full multi-channel bundle. Its single real ``out`` socket carries the input unchanged; the GUI adds one synthetic per-channel output socket (``ch0…chN-1``), and each wired per-channel tap is materialized into a ``channel.select`` at graph-build time (the engine is one-payload-per-node, so distinct per-channel payloads come from real select taps, not from this node). No calibration/axes change here (TILEABLE, no meta_transform).",
       "overview_source": "compute",
       "dimensionality": {
@@ -7311,24 +7311,7 @@
         "reads_by_mode": {},
         "adds": []
       },
-      "modes": [
-        {
-          "name": "grouping",
-          "label": "Grouping",
-          "choices": [
-            "none",
-            "every",
-            "ranges"
-          ],
-          "default": "none",
-          "description": "How this card fans the channel axis out into outputs. `none` is one output per channel; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which channels go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
-          "choice_docs": {
-            "none": "One output socket per channel, labelled with what it carries, while the axis has at most 24 members — past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-channel tap at run time. The family's original behaviour.",
-            "every": "Consecutive groups of `Group size` channels, counted from 0: with a size of 10 on 95 channels you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
-            "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named — `top: 0-3; mid: 4-7` — and groups may overlap or skip channels. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real channel length."
-          }
-        }
-      ],
+      "modes": [],
       "inputs": [
         {
           "name": "data",
@@ -7338,34 +7321,14 @@
           "description": ""
         },
         {
-          "name": "group_size",
-          "label": "Group size",
-          "type": "int",
-          "role": "parameter",
-          "is_field": false,
-          "default": 2,
-          "available_in": {
-            "grouping": [
-              "every"
-            ]
-          },
-          "presentation": true,
-          "description": "How many consecutive channels each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per channel with no fan-out cap. Each group materializes into a Select Channel with that list at run time. Only read when Grouping is `every`."
-        },
-        {
           "name": "groups",
-          "label": "Ranges",
+          "label": "Groups",
           "type": "string",
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "available_in": {
-            "grouping": [
-              "ranges"
-            ]
-          },
           "presentation": true,
-          "description": "Which channels go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups — `0-3; 4-7; 8-11` — each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Select Channel with that list at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real channel length. Blank = no groups yet. Only read when Grouping is `ranges`."
+          "description": "Which channels are gathered into one output. On the card, tick the checkbox beside each channel output and press GROUP SELECTED: the ticked channels become one group socket carrying that subset (each materializes into a Select Channel with that list at run time); tick a group and press Ungroup to dissolve it. This text is where the groups are kept — 0-based indices and inclusive ranges, `;` between groups, each optionally named: `top: 0-3; 4-7` — and may be typed too. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real channel length. Blank = no groups: one output per channel. Never read by the node's own result."
         }
       ],
       "outputs": [
@@ -20446,7 +20409,7 @@
       ],
       "module": "nodegraph/catalog/util/split_positions.py",
       "gui_only": false,
-      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with Groups set, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
+      "summary": "Fan a multipoint Dataset out into one output per stage position (each a single-position Dataset) — or, with groups made from the card's checkboxes, one output per RANGE of positions; the whole set also passes through 'out'. The positions axis's twin of Split Channels.",
       "overview": "Split Positions — a domain-transparent pass-through of the full multipoint bundle, the M-axis twin of ``channel.split`` (2026-10-02). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-position output socket (``pos0…posM-1``, labelled with the acquisition's point name where the file carries one, else ``m0…``) once the wire carries two or more positions, and each wired per-position tap is materialized into a real ``util.select_position`` at graph-build time — the engine is one-payload-per-node, so distinct per-position payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a multipoint Load (or after a Timeseries Builder laid files onto M) to run a different branch per well, dish or field.",
       "overview_source": "compute",
       "dimensionality": {
@@ -20464,24 +20427,7 @@
         "reads_by_mode": {},
         "adds": []
       },
-      "modes": [
-        {
-          "name": "grouping",
-          "label": "Grouping",
-          "choices": [
-            "none",
-            "every",
-            "ranges"
-          ],
-          "default": "none",
-          "description": "How this card fans the M (position) axis out into outputs. `none` is one output per position; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which positions go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
-          "choice_docs": {
-            "none": "One output socket per position, labelled with what it carries, while the axis has at most 24 members — past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-position tap at run time. The family's original behaviour.",
-            "every": "Consecutive groups of `Group size` positions, counted from 0: with a size of 10 on 95 positions you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
-            "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named — `top: 0-3; mid: 4-7` — and groups may overlap or skip positions. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real M (position) length."
-          }
-        }
-      ],
+      "modes": [],
       "inputs": [
         {
           "name": "data",
@@ -20491,34 +20437,14 @@
           "description": "The multipoint Dataset to fan out. Its positions appear as one output socket each on the card, labelled with the file's point names when it has them; `out` still carries the whole set."
         },
         {
-          "name": "group_size",
-          "label": "Group size",
-          "type": "int",
-          "role": "parameter",
-          "is_field": false,
-          "default": 2,
-          "available_in": {
-            "grouping": [
-              "every"
-            ]
-          },
-          "presentation": true,
-          "description": "How many consecutive positions each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per position with no fan-out cap. Each group materializes into a Crop in frames mode keeping those positions at run time. Only read when Grouping is `every`."
-        },
-        {
           "name": "groups",
-          "label": "Ranges",
+          "label": "Groups",
           "type": "string",
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "available_in": {
-            "grouping": [
-              "ranges"
-            ]
-          },
           "presentation": true,
-          "description": "Which positions go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups — `0-3; 4-7; 8-11` — each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Crop in frames mode keeping those positions at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real M (position) length. Blank = no groups yet. Only read when Grouping is `ranges`."
+          "description": "Which positions are gathered into one output. On the card, tick the checkbox beside each position output and press GROUP SELECTED: the ticked positions become one group socket carrying that subset (each materializes into a Crop in frames mode keeping those positions at run time); tick a group and press Ungroup to dissolve it. This text is where the groups are kept — 0-based indices and inclusive ranges, `;` between groups, each optionally named: `top: 0-3; 4-7` — and may be typed too. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real M (position) length. Blank = no groups: one output per position. Never read by the node's own result."
         }
       ],
       "outputs": [
@@ -20550,7 +20476,7 @@
       ],
       "module": "nodegraph/catalog/util/split_t.py",
       "gui_only": false,
-      "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with Groups set, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z.",
+      "summary": "Fan a time series out into one output per timepoint (each a single-frame Dataset, tK = frame K) — or, with groups made from the card's checkboxes, one output per RANGE of frames (`every 10`, `0-99; 100-199`); the whole series also passes through 'out'. The T axis's twin of Split Z.",
       "overview": "Split T — a domain-transparent pass-through of the full series, the T-axis twin of ``util.split_z`` (2026-10-07). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-frame output socket (``t0…tT-1``, labelled with the frame's index and, when the series carries a frame interval, its time) while the series is short enough to fan out (:data:`nodelab_v2.document.FANOUT_CAP`), and each wired per-frame tap is materialized into a real ``util.select_frame`` at graph-build time — the engine is one-payload-per-node, so distinct per-frame payloads come from real select taps, not from this node. A time series is usually hundreds of frames, which is what the ``groups`` text is for: ``every 10`` or ``0-99; 100-199`` gives one output per RANGE (a Crop in frames mode at run time). No calibration or axes change here (``TILEABLE``, no meta_transform).",
       "overview_source": "compute",
       "dimensionality": {
@@ -20568,24 +20494,7 @@
         "reads_by_mode": {},
         "adds": []
       },
-      "modes": [
-        {
-          "name": "grouping",
-          "label": "Grouping",
-          "choices": [
-            "none",
-            "every",
-            "ranges"
-          ],
-          "default": "none",
-          "description": "How this card fans the T axis out into outputs. `none` is one output per frame; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which frames go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
-          "choice_docs": {
-            "none": "One output socket per frame, labelled with what it carries, while the axis has at most 24 members — past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-frame tap at run time. The family's original behaviour.",
-            "every": "Consecutive groups of `Group size` frames, counted from 0: with a size of 10 on 95 frames you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
-            "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named — `top: 0-3; mid: 4-7` — and groups may overlap or skip frames. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real T length."
-          }
-        }
-      ],
+      "modes": [],
       "inputs": [
         {
           "name": "data",
@@ -20595,34 +20504,14 @@
           "description": "The time series to fan out. Its frames appear as one output socket each on the card (`t0…`, with the frame's time when the series has a frame interval) while there are few enough to show; type Groups to split a long series into ranges. `out` still carries the whole series."
         },
         {
-          "name": "group_size",
-          "label": "Group size",
-          "type": "int",
-          "role": "parameter",
-          "is_field": false,
-          "default": 10,
-          "available_in": {
-            "grouping": [
-              "every"
-            ]
-          },
-          "presentation": true,
-          "description": "How many consecutive frames each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per frame with no fan-out cap. Each group materializes into a Crop in frames mode keeping those frames at run time. Only read when Grouping is `every`."
-        },
-        {
           "name": "groups",
-          "label": "Ranges",
+          "label": "Groups",
           "type": "string",
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "available_in": {
-            "grouping": [
-              "ranges"
-            ]
-          },
           "presentation": true,
-          "description": "Which frames go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups — `0-3; 4-7; 8-11` — each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Crop in frames mode keeping those frames at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real T length. Blank = no groups yet. Only read when Grouping is `ranges`."
+          "description": "Which frames are gathered into one output. On the card, tick the checkbox beside each frame output and press GROUP SELECTED: the ticked frames become one group socket carrying that subset (each materializes into a Crop in frames mode keeping those frames at run time); tick a group and press Ungroup to dissolve it. This text is where the groups are kept — 0-based indices and inclusive ranges, `;` between groups, each optionally named: `top: 0-3; 4-7` — and may be typed too. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real T length. Blank = no groups: one output per frame. Never read by the node's own result."
         }
       ],
       "outputs": [
@@ -20654,7 +20543,7 @@
       ],
       "module": "nodegraph/catalog/util/split_z.py",
       "gui_only": false,
-      "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K) — or, with Groups set, one output per RANGE of planes (a sub-stack each); the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions.",
+      "summary": "Fan a z-stack out into one output per plane (each a single-plane Dataset, zK = plane K); tick several planes' checkboxes and press Group selected for one output carrying that sub-stack instead; the whole stack also passes through 'out'. The Z axis's twin of Split Channels and Split Positions.",
       "overview": "Split Z — a domain-transparent pass-through of the full stack, the Z-axis twin of ``channel.split`` and ``util.split_positions`` (2026-10-07). Its single real ``out`` socket carries the input unchanged. The GUI adds one synthetic per-plane output socket (``z0…zZ-1``, labelled with the plane's index and, when the stack carries a z step, its height above plane 0) once the wire carries two or more planes, and each wired per-plane tap is materialized into a real ``util.select_plane`` at graph-build time — the engine is one-payload-per-node, so distinct per-plane payloads come from real select taps, not from this node. No calibration or axes change here (``TILEABLE``, no meta_transform). Drop it after a Load to run a different branch per plane, or to hand ONE plane to Registration while the full stack goes on to Shift.",
       "overview_source": "compute",
       "dimensionality": {
@@ -20672,24 +20561,7 @@
         "reads_by_mode": {},
         "adds": []
       },
-      "modes": [
-        {
-          "name": "grouping",
-          "label": "Grouping",
-          "choices": [
-            "none",
-            "every",
-            "ranges"
-          ],
-          "default": "none",
-          "description": "How this card fans the Z axis out into outputs. `none` is one output per plane; `every` cuts the axis into consecutive groups of a size you set; `ranges` lets you type exactly which planes go together, with names. Each output carries its subset of the data; `out` always carries everything. This shapes the card and the taps it materializes into, never the node's own result.",
-          "choice_docs": {
-            "none": "One output socket per plane, labelled with what it carries, while the axis has at most 24 members — past that the card offers only `out` and one of the other two strategies is the way to split. Each wired socket becomes a single-plane tap at run time. The family's original behaviour.",
-            "every": "Consecutive groups of `Group size` planes, counted from 0: with a size of 10 on 95 planes you get ten outputs, the last one holding five. The usual way to cut a long axis into windows without typing them; each output is a Crop (or a Select Channel) keeping that run at run time.",
-            "ranges": "Exactly the groups you type into `Ranges`: `0-3; 4-7; 8-11` (inclusive, 0-based, `;` between groups), optionally named — `top: 0-3; mid: 4-7` — and groups may overlap or skip planes. A group reaching past the end is labelled so; what lies past the end is dropped at the pull and a group entirely past it is refused with the real Z length."
-          }
-        }
-      ],
+      "modes": [],
       "inputs": [
         {
           "name": "data",
@@ -20699,34 +20571,14 @@
           "description": "The z-stack to fan out. Its planes appear as one output socket each on the card (`z0…`, with the plane's height when the stack has a z step); `out` still carries the whole stack."
         },
         {
-          "name": "group_size",
-          "label": "Group size",
-          "type": "int",
-          "role": "parameter",
-          "is_field": false,
-          "default": 4,
-          "available_in": {
-            "grouping": [
-              "every"
-            ]
-          },
-          "presentation": true,
-          "description": "How many consecutive planes each group holds under `every`, counted from index 0; the last group is whatever remains. SMALLER means more outputs, each carrying less; LARGER means fewer, wider windows. 1 is one output per plane with no fan-out cap. Each group materializes into a Crop in frames mode keeping those planes at run time. Only read when Grouping is `every`."
-        },
-        {
           "name": "groups",
-          "label": "Ranges",
+          "label": "Groups",
           "type": "string",
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "available_in": {
-            "grouping": [
-              "ranges"
-            ]
-          },
           "presentation": true,
-          "description": "Which planes go together under `ranges`, as 0-based indices and inclusive ranges with `;` between groups — `0-3; 4-7; 8-11` — each optionally named (`top: 0-3; mid: 4-7`); `every 4` is accepted here too. The card grows one output PER GROUP, labelled with the name or the members, and each materializes into a Crop in frames mode keeping those planes at run time. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real Z length. Blank = no groups yet. Only read when Grouping is `ranges`."
+          "description": "Which planes are gathered into one output. On the card, tick the checkbox beside each plane output and press GROUP SELECTED: the ticked planes become one group socket carrying that subset (each materializes into a Crop in frames mode keeping those planes at run time); tick a group and press Ungroup to dissolve it. This text is where the groups are kept — 0-based indices and inclusive ranges, `;` between groups, each optionally named: `top: 0-3; 4-7` — and may be typed too. A group reaching past the end is labelled so on the card; what lies past the end is dropped at the pull, and a group entirely past it is refused with the real Z length. Blank = no groups: one output per plane. Never read by the node's own result."
         }
       ],
       "outputs": [

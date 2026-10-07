@@ -36,8 +36,8 @@ from typing import List, Mapping, Optional, Sequence
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu,
-    QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QMenu, QPushButton, QScrollArea, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 from nodegraph.sockets import SocketType
@@ -641,6 +641,11 @@ class InspectorPanel(QScrollArea):
                     lab.setStyleSheet(f"color:{_h(T.OK if hasattr(T, 'OK') else T.ACCENT)};")
                 sec._lay.addWidget(lab)     # type: ignore[attr-defined]
             for s in params:
+                if s.name == "groups" and self._split_axis(node):
+                    # a split card's grouping (2026-10-07): the outputs with checkboxes
+                    # and the Group selected / Ungroup buttons, not a bare text box
+                    sec._lay.addWidget(self._split_grouping_box(node, s))  # type: ignore[attr-defined]
+                    continue
                 sec._lay.addWidget(self._param_row(node, s))  # type: ignore[attr-defined]
             self._v.addWidget(sec)
             self._v.addWidget(self._sep())
@@ -2196,6 +2201,130 @@ class InspectorPanel(QScrollArea):
         lf = lab.font(); lf.setPointSize(10); lab.setFont(lf)
         lay.addWidget(lab); lay.addStretch(1)
         return row
+
+    # ── grouping by selection on a split card (2026-10-07) ────────────────────
+    @staticmethod
+    def _split_axis(node: NodeItem) -> Optional[str]:
+        fn = getattr(node.doc, "split_axis", None)
+        try:
+            return fn(node.node_id) if callable(fn) else None
+        except Exception:                            # noqa: BLE001 — a bare document
+            return None
+
+    def _split_grouping_box(self, node: NodeItem, s) -> QWidget:
+        """The grouping control of a split card: every output the card can group, each
+        with a checkbox (the same ticks as the card's), **Group selected** with an optional
+        name, **Ungroup selected**, **Group every N** for a long axis, and the `groups`
+        text itself underneath for whoever would rather type. Members past the fan-out
+        cap are listed too — the card has no socket for them, so this is where a
+        300-frame series gets grouped."""
+        doc = node.doc
+        nid = node.node_id
+        items = doc.split_items(nid)
+        box = QWidget()
+        v = QVBoxLayout(box); v.setContentsMargins(0, 2, 0, 2); v.setSpacing(4)
+        head = QLabel(f"{s.label or s.name}  ·  tick outputs, then Group selected")
+        head.setProperty("role", "muted"); head.setToolTip(socket_hover_text(s))
+        hf = head.font(); hf.setPointSize(9); head.setFont(hf)
+        v.addWidget(head)
+
+        def _repaint() -> None:
+            try:
+                node.update()
+            except RuntimeError:                     # the card is gone
+                pass
+
+        def _after() -> None:
+            # the socket set changed: the card relayouts, the wires re-route, the form
+            # is rebuilt on the next turn (never tear down the button mid-click)
+            try:
+                node.refresh()
+                sc = node.scene()
+                if sc is not None and hasattr(sc, "reroute"):
+                    sc.reroute()
+            except RuntimeError:
+                pass
+            QTimer.singleShot(0, self._rebuild)
+
+        for it in items:
+            row = QWidget()
+            h = QHBoxLayout(row); h.setContentsMargins(4, 0, 0, 0); h.setSpacing(6)
+            cb = QCheckBox(("group · " if it["kind"] == "group" else "") + str(it["label"]))
+            cb.setChecked(bool(it["picked"]))
+            cb.setProperty("splitKey", it["key"])
+            if not it["socket"]:
+                cb.setToolTip("Past the card's fan-out cap: no socket of its own until it "
+                              "is grouped")
+            cb.toggled.connect(lambda on, k=it["key"]: (doc.split_pick(nid, k, bool(on)),
+                                                        _repaint(), self._split_sync_buttons()))
+            h.addWidget(cb, 1)
+            if it["kind"] == "group":
+                ub = QToolButton(); ub.setText("Ungroup")
+                ub.setToolTip("Dissolve this group back into its members' own sockets")
+                ub.clicked.connect(lambda _c, k=it["key"]: (doc.split_ungroup(nid, [k]), _after()))
+                h.addWidget(ub)
+            v.addWidget(row)
+        if not items:
+            none = QLabel("Nothing to group yet — the axis is not known until the card is wired.")
+            none.setProperty("role", "muted"); none.setWordWrap(True); v.addWidget(none)
+
+        act = QWidget()
+        ah = QHBoxLayout(act); ah.setContentsMargins(0, 2, 0, 0); ah.setSpacing(6)
+        name = QLineEdit(); name.setPlaceholderText("name (optional)")
+        name.setToolTip("A name for the group Group selected makes — shown on its socket")
+        gb = QPushButton("Group selected")
+        gb.setToolTip("Make ONE output carrying every ticked member; their wires move to it")
+        gb.clicked.connect(lambda _c: (doc.split_group_selected(nid, name.text()) is not None
+                                       and _after()))
+        ugb = QPushButton("Ungroup selected")
+        ugb.setToolTip("Dissolve the ticked groups back into their members")
+        ugb.clicked.connect(lambda _c: (doc.split_ungroup(nid) and _after()))
+        ah.addWidget(name, 1); ah.addWidget(gb); ah.addWidget(ugb)
+        v.addWidget(act)
+        self._split_buttons = (node, gb, ugb)
+        self._split_sync_buttons()
+
+        every = QWidget()
+        eh = QHBoxLayout(every); eh.setContentsMargins(0, 0, 0, 0); eh.setSpacing(6)
+        el = QLabel("Group every"); el.setProperty("role", "muted")
+        n = len(items) if items else 0
+        total = sum(len(it["indices"]) for it in items)
+        spin = QSpinBox(); spin.setRange(1, max(1, total))
+        spin.setValue(min(max(1, total), 10 if self._split_axis(node) == "t" else 4))
+        spin.setToolTip("Regroup the whole axis into consecutive groups of this many, the "
+                        "last one holding what remains — replaces the groups there are")
+        eb = QPushButton("Apply")
+        eb.setEnabled(total > 0)
+        eb.clicked.connect(lambda _c: (doc.split_group_every(nid, spin.value()) and _after()))
+        eh.addWidget(el); eh.addWidget(spin); eh.addWidget(eb); eh.addStretch(1)
+        v.addWidget(every)
+
+        txt = QWidget()
+        th = QHBoxLayout(txt); th.setContentsMargins(0, 0, 0, 0); th.setSpacing(6)
+        tl = QLabel("as text"); tl.setProperty("role", "muted"); tl.setToolTip(socket_hover_text(s))
+        line = QLineEdit(str(node.params.get(s.name, s.default or "")))
+        line.setPlaceholderText("0-3; 4-7  or  top: 0-3; mid: 4-7")
+        line.setToolTip(socket_hover_text(s))
+        line.editingFinished.connect(
+            lambda b=line, nm=s.name: (self._set_param(node, nm, b.text()), _after()))
+        th.addWidget(tl); th.addWidget(line, 1)
+        v.addWidget(txt)
+        return box
+
+    def _split_sync_buttons(self) -> None:
+        """Group selected is live while something is ticked; Ungroup selected while a
+        ticked output is a group."""
+        got = getattr(self, "_split_buttons", None)
+        if not got:
+            return
+        node, gb, ugb = got
+        try:
+            items = node.doc.split_items(node.node_id)
+            picked = {it["key"] for it in items if it["picked"]}
+            gb.setEnabled(bool(picked))
+            ugb.setVisible(any(it["kind"] == "group" and it["picked"] for it in items))
+        except RuntimeError:                         # widgets torn down mid-rebuild
+            self._split_buttons = None
 
     def _commit_text(self, node: NodeItem, name: str, box, is_path: bool) -> None:
         """Commit a QLineEdit string param. For a path field (any socket declaring

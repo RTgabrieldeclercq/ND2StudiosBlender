@@ -118,13 +118,26 @@ from nodelab_v2.value_steps import (  # noqa: E402,F401 — re-exports
     NUM_MAX_INT, _magnitude, float_editor_precision, value_decimals, value_step)
 
 
+#: the sockets a split card's checkboxes sit beside (2026-10-07): a per-index tap
+#: (``ch3``, ``pos1``, ``z4``, ``t12``) or a group (``chg0``, ``posg0``, ``zg0``, ``tg0``)
+_SPLIT_CHECK_RE = re.compile(r"^(?:ch|pos|z|t)g?\d+$")
+_SPLIT_GROUP_RE = re.compile(r"^(?:ch|pos|z|t)g\d+$")
+_CHECK_W = 12.0
+_SPLIT_NOTE_W = 86.0          # the grouping row's left-hand note, before the buttons
+_GROUP_TXT = "Group selected"
+_UNGROUP_TXT = "Ungroup"
+
+
 class Ctl(NamedTuple):
     """One hit-testable control on a card: where it is, what it does, what it edits.
 
     ``kind`` is ``"value"`` (a param pill), ``"mode"`` (a mode pill), ``"pick"`` (the ◎
-    glyph), ``"pin"`` (the ƒmd badge) or ``"scope"`` (the population pill in the granularity
-    band — V2.27, the only control not derived from a row's y). ``obj`` is the ``SocketSpec``
-    or ``ModeSpec`` behind it."""
+    glyph), ``"pin"`` (the ƒmd badge), ``"scope"`` (the population pill in the granularity
+    band — V2.27, the only control not derived from a row's y), or — on a split card
+    (2026-10-07) — ``"check"`` (the checkbox beside a data output; ``obj`` that output's
+    spec), ``"group"`` (the Group selected button) and ``"ungroup"`` (the Ungroup button;
+    ``obj`` is ``None`` for both buttons). ``obj`` is otherwise the ``SocketSpec`` or
+    ``ModeSpec`` behind it."""
 
     rect: QRectF
     kind: str
@@ -677,6 +690,17 @@ class NodeItem(QGraphicsObject):
     def _active_inputs(self):
         return self.doc.input_specs(self.rec.id)
 
+    def _card_inputs(self):
+        """The input rows the CARD shows: the active inputs minus a split card's `groups`
+        text (2026-10-07) — on the card the checkboxes beside the outputs ARE the grouping
+        control, and a text pill saying `4-7` next to them would be the same value twice;
+        the Properties panel still offers the text. `groups` is `field=False`, so no wire
+        can land on it and hiding its row loses no anchor."""
+        ins = self._active_inputs()
+        if self._split_axis() is None:
+            return ins
+        return [s for s in ins if s.name != "groups"]
+
     def _active_outputs(self):
         # instance-aware: a source/split card grows one synthetic ``chK`` output per
         # channel (the document owns the resolution + the channel descriptors).
@@ -926,6 +950,68 @@ class NodeItem(QGraphicsObject):
                 self.scene().removeItem(sock)
         self._sockets.clear()
 
+    # ── grouping by selection on a split card (2026-10-07) ─────────────────────
+    def _split_axis(self) -> Optional[str]:
+        fn = getattr(self.doc, "split_axis", None)
+        try:
+            return fn(self.rec.id) if callable(fn) else None
+        except Exception:                      # noqa: BLE001 — a paint must never break
+            return None
+
+    def _split_key(self, s) -> Optional[str]:
+        """The checkbox key of output ``s`` — its socket name when it is one of a split
+        card's per-index or group sockets, else ``None`` (`out` and the part sockets have
+        no checkbox: there is nothing to group them with)."""
+        if self._split_axis() is None or s.type is not SocketType.DATASET:
+            return None
+        return s.name if _SPLIT_CHECK_RE.match(s.name or "") else None
+
+    def _split_checkable(self) -> bool:
+        """Whether this card shows the grouping row: a split card with at least one
+        checkable output. One socket is still checkable (a lone group can be dissolved)."""
+        if self._is_dot or self.rec.collapsed or self._split_axis() is None:
+            return False
+        return any(self._split_key(s) for s in self._active_outputs())
+
+    def _split_picked(self) -> set:
+        fn = getattr(self.doc, "split_picked", None)
+        try:
+            return set(fn(self.rec.id)) if callable(fn) else set()
+        except Exception:                      # noqa: BLE001
+            return set()
+
+    def _split_picked_group(self) -> bool:
+        """Whether a ticked output is a GROUP — what makes Ungroup worth offering."""
+        return any(_SPLIT_GROUP_RE.match(k) for k in self._split_picked())
+
+    @staticmethod
+    def _check_rect(y: float) -> QRectF:
+        """The checkbox beside an output row, at the card's left edge — the outputs'
+        text is right-aligned to the socket, so the left is free."""
+        return QRectF(14, y + (T.ROW_H - _CHECK_W) / 2, _CHECK_W, _CHECK_W)
+
+    def _split_button_rects(self, y: float) -> Tuple[QRectF, Optional[QRectF]]:
+        """``(Group selected, Ungroup | None)`` — Ungroup only while a group is ticked."""
+        fm = QFontMetricsF(QFont(T.MONO, 8))
+        room = T.NODE_W - 12 - _SPLIT_NOTE_W          # right of the "N ticked" note
+        gw = min(fm.horizontalAdvance(_GROUP_TXT) + 16, room)
+        if not self._split_picked_group():
+            return QRectF(T.NODE_W - 12 - gw, y + 4, gw, T.ROW_H - 8), None
+        room = T.NODE_W - 24                           # both buttons: the note gives way
+        uw = min(fm.horizontalAdvance(_UNGROUP_TXT) + 16, room / 2)
+        gw = min(gw, room - uw - 6)
+        return (QRectF(T.NODE_W - 12 - uw - 6 - gw, y + 4, gw, T.ROW_H - 8),
+                QRectF(T.NODE_W - 12 - uw, y + 4, uw, T.ROW_H - 8))
+
+    def _after_split_edit(self) -> None:
+        """A grouping gesture changes the socket set: relayout, re-route the wires, tell
+        the inspector. The document already touched the node."""
+        self._hot_ctl = None
+        self._layout()
+        if self.scene() is not None and hasattr(self.scene(), "reroute"):
+            self.scene().reroute()
+        self.changed.emit(self)
+
     def _modes_on_rows(self, m) -> bool:
         """Whether Mode ``m`` gets a BODY ROW, i.e. its own pill under the sockets.
 
@@ -952,7 +1038,7 @@ class NodeItem(QGraphicsObject):
             self._layout_collapsed()
             return
         y = T.HEADER_H + T.GRAN_H
-        for s in self._active_inputs():
+        for s in self._card_inputs():
             sock = SocketItem(self, s, "in")
             sock.setPos(0, y + T.ROW_H / 2)
             self._apply_domain_tip(sock, s, "in")
@@ -972,6 +1058,10 @@ class NodeItem(QGraphicsObject):
             self._tint_channel_socket(sock, s)
             self._sockets[("out", s.name)] = sock
             self._rows.append(("out", s, y))
+            y += T.ROW_H
+        if self._split_checkable():
+            # the grouping row (2026-10-07): Group selected (+ Ungroup) under the outputs
+            self._rows.append(("split", None, y))
             y += T.ROW_H
         self._height = y + T.PAD_BOTTOM
         if self._switch is not None:
@@ -1036,7 +1126,7 @@ class NodeItem(QGraphicsObject):
     def _layout_collapsed(self) -> None:
         """Compact: header only, ALL active sockets kept (so wires stay valid) but
         stacked at the card edges (Blender-style collapse)."""
-        ins, outs = list(self._active_inputs()), list(self._active_outputs())
+        ins, outs = list(self._card_inputs()), list(self._active_outputs())
         band = max(len(ins), len(outs))
         y0 = T.HEADER_H + 8
         for i, s in enumerate(ins):
@@ -1063,12 +1153,14 @@ class NodeItem(QGraphicsObject):
         unless the active socket set OR the collapsed state changed."""
         # the active MODE list is part of the layout too (V2.12): a method switch that
         # gates a Mode away without changing any socket name must still relayout.
-        want = ([s.name for s in self._active_inputs()],
+        want = ([s.name for s in self._card_inputs()],
                 [s.name for s in self._active_outputs()],
-                [m.name for m in self._active_modes() if self._modes_on_rows(m)])
+                [m.name for m in self._active_modes() if self._modes_on_rows(m)],
+                self._split_checkable())
         have = ([k[1] for k in self._sockets if k[0] == "in"],
                 [k[1] for k in self._sockets if k[0] == "out"],
-                [r[1].name for r in self._rows if r[0] == "mode"])
+                [r[1].name for r in self._rows if r[0] == "mode"],
+                any(r[0] == "split" for r in self._rows))
         collapse_changed = getattr(self, "_shown_collapsed", None) != self.rec.collapsed
         if want != have or collapse_changed:
             self._shown_collapsed = self.rec.collapsed
@@ -1453,18 +1545,74 @@ class NodeItem(QGraphicsObject):
                            obj.name)
                 val = self.rec.modes.get(obj.name, obj.resolved_default())
                 self._paint_value_pill(p, y, f"{val} ▾", None, False, obj=obj)
+            elif kind == "split":
+                self._paint_split_row(p, y)
             elif kind == "out":
                 p.setFont(lf); p.setPen(T.INK)
                 text = self._output_row_text(obj)    # "K · name" on chK; a channel on out
-                p.drawText(QRectF(T.NODE_W - 134, y, 120, T.ROW_H),
-                           Qt.AlignVCenter | Qt.AlignRight, text)
+                if self._split_key(obj):
+                    # a group's label (`0 · bottom · 1.60–2.80 µm (past the end)`) is long:
+                    # the row from the checkbox to the socket, elided in the middle
+                    x0 = 14 + _CHECK_W + 8
+                    text = QFontMetricsF(lf).elidedText(text, Qt.ElideMiddle, T.NODE_W - 14 - x0)
+                    p.drawText(QRectF(x0, y, T.NODE_W - 14 - x0, T.ROW_H),
+                               Qt.AlignVCenter | Qt.AlignRight, text)
+                else:
+                    p.drawText(QRectF(T.NODE_W - 134, y, 120, T.ROW_H),
+                               Qt.AlignVCenter | Qt.AlignRight, text)
+                if self._split_key(obj):
+                    self._paint_check(p, self._check_rect(y), obj.name in self._split_picked(),
+                                      hot=(self._hot_ctl is not None
+                                           and self._hot_ctl.kind == "check"
+                                           and self._hot_ctl.obj is obj))
                 # domain chips only on the combined output; per-channel rows read
-                # cleaner with just the channel-tinted socket dot + its name.
+                # cleaner with just the channel-tinted socket dot + its name — and so do
+                # a split card's per-index and group rows, whose checkbox the chips would
+                # otherwise run into under a long label (2026-10-07)
                 if obj.type is SocketType.DATASET and self.output_channel_index(
-                        obj.name) is None:
+                        obj.name) is None and not self._split_key(obj):
                     nw = QFontMetricsF(lf).horizontalAdvance(text)
                     self._paint_domain_chips(p, T.NODE_W - 14 - nw - 10, y,
                                              self.out_domains(), align_left=False)
+
+    def _paint_check(self, p: QPainter, r: QRectF, on: bool, *, hot: bool = False) -> None:
+        """One checkbox (2026-10-07): an outlined square, filled in the accent with a tick
+        when on. Drawn from the same rect :meth:`controls` hit-tests."""
+        p.setRenderHint(QPainter.Antialiasing, True)
+        edge = T.ACCENT if (on or hot) else T.MUTED
+        p.setPen(QPen(edge, 1.4 if hot else 1))
+        p.setBrush(T.alpha(T.ACCENT, 200) if on else (T.mix(T.BODY, T.PANEL_HI, 0.6) if hot else T.BODY))
+        p.drawRoundedRect(r, 2.5, 2.5)
+        if on:
+            p.setPen(QPen(T.ACCENT_INK, 1.8))
+            x0, y0 = r.left(), r.top()
+            w = r.width()
+            p.drawPolyline([QPointF(x0 + 0.25 * w, y0 + 0.52 * w),
+                            QPointF(x0 + 0.44 * w, y0 + 0.72 * w),
+                            QPointF(x0 + 0.78 * w, y0 + 0.30 * w)])
+
+    def _paint_split_row(self, p: QPainter, y: float) -> None:
+        """The grouping row (2026-10-07): a muted count of what is ticked on the left and
+        the Group selected pill (plus Ungroup while a group is ticked) on the right. The
+        pill is drawn dimmed while nothing is ticked, so it reads as waiting rather than
+        broken."""
+        picked = self._split_picked()
+        g_rect, u_rect = self._split_button_rects(y)
+        if u_rect is None:                 # with Ungroup beside it the note gives way
+            p.setFont(QFont(T.SANS, 8)); p.setPen(T.MUTED)
+            p.drawText(QRectF(14, y, _SPLIT_NOTE_W - 10, T.ROW_H),
+                       Qt.AlignVCenter | Qt.AlignLeft,
+                       f"{len(picked)} ticked" if picked else "tick to group")
+        hot_kind = self._hot_ctl.kind if self._hot_ctl is not None else ""
+        if picked:
+            self._paint_pill_at(p, g_rect, _GROUP_TXT, "", False, hot=(hot_kind == "group"))
+        else:
+            p.setPen(QPen(T.alpha(T.BORDER, 150), 1)); p.setBrush(T.alpha(T.BODY, 120))
+            p.drawRoundedRect(g_rect, 5, 5)
+            p.setFont(QFont(T.MONO, 8)); p.setPen(T.alpha(T.MUTED, 170))
+            p.drawText(g_rect, Qt.AlignCenter, _GROUP_TXT)
+        if u_rect is not None:
+            self._paint_pill_at(p, u_rect, _UNGROUP_TXT, "", False, hot=(hot_kind == "ungroup"))
 
     def _paint_domain_chips(self, p: QPainter, x: float, y: float, domains,
                             *, align_left: bool, missing=frozenset()) -> None:
@@ -1696,6 +1844,14 @@ class NodeItem(QGraphicsObject):
             if kind == "mode":
                 val = self.rec.modes.get(obj.name, obj.resolved_default())
                 out.append(Ctl(self._pill_rect(y, f"{val} ▾", "", False), "mode", obj))
+            elif kind == "out":
+                if self._split_key(obj):
+                    out.append(Ctl(self._check_rect(y), "check", obj))
+            elif kind == "split":
+                g_rect, u_rect = self._split_button_rects(y)
+                out.append(Ctl(g_rect, "group", None))
+                if u_rect is not None:
+                    out.append(Ctl(u_rect, "ungroup", None))
             elif kind == "in" and obj.type is not SocketType.DATASET:
                 derived = self.is_derived(obj)
                 pill = self._pill_rect(y, self._pill_text(obj),
@@ -2162,7 +2318,18 @@ class NodeItem(QGraphicsObject):
                 sc.clearSelection()
             self.setSelected(True)
         self._scrub = None
-        if ctl.kind == "pin":
+        if ctl.kind == "check":
+            # a tick is not an edit: nothing re-propagates; the card and the panel repaint
+            self.doc.split_pick(self.rec.id, ctl.obj.name)
+            self.update()
+            self.changed.emit(self)
+        elif ctl.kind == "group":
+            if self.doc.split_group_selected(self.rec.id) is not None:
+                self._after_split_edit()
+        elif ctl.kind == "ungroup":
+            if self.doc.split_ungroup(self.rec.id):
+                self._after_split_edit()
+        elif ctl.kind == "pin":
             self._toggle_pin(ctl.obj)
         elif ctl.kind == "pick":
             peer = self.spec.input(ctl.obj.pick_peer) if ctl.obj.pick_peer else None

@@ -8,7 +8,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
+from nodegraph.catalog._shared.split_grouping import grouping_sockets
 
 
 def _compute_split_z(ctx: EvalContext) -> Dataset:
@@ -35,12 +35,11 @@ register_node(
                       "on the card (`z0…`, with the plane's height when the stack has a z "
                       "step); `out` still carries the whole stack."),
             *grouping_sockets('plane', 'Z',
-                              'a Crop in frames mode keeping those planes', 4)],
+                              'a Crop in frames mode keeping those planes')],
     outputs=[OutDataset("out")],
-    modes=[grouping_mode('plane', 'Z')],
     granularity=Granularity.TILEABLE,
     description="Fan a z-stack out into one output per plane (each a single-plane Dataset, "
-                "zK = plane K) — or, with Groups set, one output per RANGE of planes (a "
-                "sub-stack each); the whole stack also passes through 'out'. The Z "
-                "axis's twin of Split Channels and Split Positions.",
+                "zK = plane K); tick several planes' checkboxes and press Group selected for "
+                "one output carrying that sub-stack instead; the whole stack also passes "
+                "through 'out'. The Z axis's twin of Split Channels and Split Positions.",
 )

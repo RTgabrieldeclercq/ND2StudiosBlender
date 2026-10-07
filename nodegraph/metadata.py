@@ -896,65 +896,23 @@ def parse_groups(raw: Any, n: Optional[int] = None) -> Optional[List[Tuple[str, 
     return out or None
 
 
-def split_plan(mode: Any, params: Mapping[str, Any], n: Optional[int] = None,
-               default_size: Optional[int] = None
-               ) -> Optional[List[Tuple[str, Tuple[int, ...]]]]:
-    """A split card's GROUPING strategy resolved to groups (2026-10-07): ``[(name, indices),
-    …]``, or ``None`` for "one output per index". ``mode`` is the card's ``grouping`` Mode
-    value; ``params`` its params; ``n`` the axis length when the caller knows it (the card
-    does, from the envelope — the run-graph build does not, see :func:`split_plan_group`).
-
-    * ``every`` — consecutive groups of ``group_size`` from 0 (needs ``n`` to enumerate);
-    * ``ranges`` — the ``groups`` text through :func:`parse_groups` (``every N`` accepted);
-    * anything else — ``None``.
-
-    The card and the run graph call the same two functions, so a socket the card shows and
-    the tap it materializes into can never disagree about which indices a group holds.
-    ``default_size`` is the ``group_size`` socket's declared default, used when the param is
-    unset — a node's params hold only what the user changed."""
-    mode = str(mode or "none")
-    params = params or {}
-    if mode == "every":
-        size = _group_size(params, default_size)
-        return parse_groups(f"every {size}", n) if size > 0 else None
-    if mode == "ranges":
-        return parse_groups(params.get("groups"), n)
-    return None
-
-
-def _group_size(params: Mapping[str, Any], default_size: Optional[int]) -> int:
-    raw = params.get("group_size")
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        raw = default_size
-    try:
-        return int(raw or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def split_plan_group(mode: Any, params: Mapping[str, Any], k: int,
-                     default_size: Optional[int] = None
-                     ) -> Optional[Tuple[str, Tuple[int, ...]]]:
-    """Group ``k`` of :func:`split_plan` WITHOUT the axis length — the run-graph side. An
-    ``every``-style group is ``k·N … k·N+N-1`` unclamped (Crop's frames mode drops what lies
-    past the end, so the last chunk clips itself); an explicit range is the ``k``-th typed
-    group. ``None`` when the strategy names no such group, so the edge is left alone like any
-    unresolvable tap."""
-    mode = str(mode or "none")
-    params = params or {}
-    if k < 0:
-        return None
-    if mode == "every":
-        size = _group_size(params, default_size)
-        return ("", tuple(range(k * size, (k + 1) * size))) if size > 0 else None
-    if mode == "ranges":
-        raw = params.get("groups")
-        step = every_n(raw)
-        if step is not None:
-            return ("", tuple(range(k * step, (k + 1) * step)))
-        groups = parse_groups(raw)
-        return groups[k] if groups and k < len(groups) else None
-    return None
+def format_groups(groups: Sequence[Tuple[str, Sequence[int]]]) -> str:
+    """``[(name, indices), …]`` → the split cards' ``groups`` text, canonically:
+    ``"top: 0-3; 4-7"`` (2026-10-07). The inverse of :func:`parse_groups`, and it must
+    round-trip through it exactly — the card's checkboxes write this text, and what they
+    write has to be indistinguishable from what a user would type. A name loses the two
+    characters the grammar reserves (``;`` and a newline) and its surrounding space; a group
+    with no index is dropped; indices are sorted and de-duplicated through
+    :func:`format_indices`."""
+    parts: List[str] = []
+    for name, idx in groups or ():
+        members = sorted({int(i) for i in idx})
+        if not members:
+            continue
+        spec = format_indices(members)
+        clean = str(name or "").replace(";", " ").replace("\n", " ").strip()
+        parts.append(f"{clean}: {spec}" if clean else spec)
+    return "; ".join(parts)
 
 
 def format_indices(values: Sequence[int]) -> str:
@@ -2443,8 +2401,8 @@ __all__ = [
     "identity", "resample", "z_project", "stack_time", "frame_slice",
     "channel_select", "crop", "stitch", "value_rescaled", "bit_depth_after_sum",
     "propagate_meta", "envelope_symbols", "parse_channels",
-    "parse_indices", "format_indices", "parse_groups", "every_n", "split_plan",
-    "split_plan_group", "crop_frames",
+    "parse_indices", "format_indices", "parse_groups", "every_n", "format_groups",
+    "crop_frames",
     "frame_pick", "select_frame",
     "FRAME_SPEC_AXES", "parse_frame_spec", "format_frame_spec", "frame_spec_picks",
     "PER_CHANNEL_KEYS", "channel_subset",

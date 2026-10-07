@@ -8,7 +8,7 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import Granularity, InDataset, OutDataset
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.split_grouping import grouping_mode, grouping_sockets
+from nodegraph.catalog._shared.split_grouping import grouping_sockets
 
 def _compute_split_channels(ctx: EvalContext) -> Dataset:
     """Split Channels — a domain-transparent pass-through of the full multi-channel
@@ -23,11 +23,10 @@ register_node(
     op_key="channel.split", label="Split Channels", category="channel",
     inputs=[InDataset(),
             *grouping_sockets('channel', 'channel',
-                              'a Select Channel with that list', 2)],
+                              'a Select Channel with that list')],
     outputs=[OutDataset("out")],
-    modes=[grouping_mode('channel', 'channel')],
     granularity=Granularity.TILEABLE,
     description="Fan a multi-channel Dataset out into per-channel outputs (each a "
-                "single-channel Dataset) — or, with Groups set, into one output per "
+                "single-channel Dataset) — or, with groups made from the card's checkboxes, into one output per "
                 "RANGE of channels; the full bundle also passes through 'out'.",
 )

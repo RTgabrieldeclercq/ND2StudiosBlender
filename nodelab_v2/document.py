@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from nodegraph.domains import AXIS_ORDER, Domain
 from nodegraph.graph import Edge, Graph, NodeInstance
@@ -373,6 +373,9 @@ class GraphDocument:
         self.envs: Dict[str, MetaEnvelope] = {}
         self.path: Optional[str] = None           # last save/load file
         self.revision = 0                          # bumped on every edit
+        #: a split card's TICKED outputs, by socket name — the selection Group selected acts
+        #: on (2026-10-07). Transient GUI state: never saved, never in the run graph.
+        self._split_picks: Dict[str, set] = {}
         #: unique per document INSTANCE, process-wide (V4.00 step 2). A page's run identity
         #: digests it beside the revision: two document objects can share a revision number
         #: — every fresh page a File → Open builds starts again at 0 — and an identity that
@@ -810,16 +813,12 @@ class GraphDocument:
             return []
         base = list(spec.active_outputs(rec.state()))
         if rec.op_key in CHANNEL_TAP_OPS:
-            groups = self.split_groups(node_id, "c")
-            if groups:                       # RANGE groups replace the per-channel taps
-                for g in groups:
-                    base.append(OutDataset(f"chg{g['index']}", label=g["label"]))
-            else:
-                descs = self.channel_descriptors(node_id)
-                if 2 <= len(descs) <= FANOUT_CAP:
-                    for i, ch in enumerate(descs):
-                        base.append(OutDataset(
-                            f"ch{i}", label=f"{i} · {ch.get('name') or f'Ch{i}'}"))
+            # the groups the card's checkboxes made (Split Channels only) beside the channels
+            # left ungrouped, in channel order — a Load card has no `groups` and lists all
+            base.extend(self._split_outputs(
+                "ch", "chg", self.split_groups(node_id, "c"),
+                [f"{i} · {ch.get('name') or f'Ch{i}'}"
+                 for i, ch in enumerate(self.channel_descriptors(node_id))]))
         if rec.op_key in GROUP_TAP_OPS:
             groups = self.group_descriptors(node_id)
             # TWO or more, the same floor the channel taps use and for the same reason: a
@@ -836,39 +835,20 @@ class GraphDocument:
                 for i, name in enumerate(members):
                     base.append(OutDataset(f"bat{i}", label=f"{i} · {name}"))
         if rec.op_key in POSITION_TAP_OPS:
-            groups = self.split_groups(node_id, "m")
-            if groups:
-                for g in groups:
-                    base.append(OutDataset(f"posg{g['index']}", label=g["label"]))
-            else:
-                # Same floor again: one position is the whole Dataset, so a lone `pos0`
-                # would duplicate `out`.
-                positions = self.position_descriptors(node_id)
-                if 2 <= len(positions) <= FANOUT_CAP:
-                    for i, pd in enumerate(positions):
-                        base.append(OutDataset(f"pos{i}", label=pd["label"]))
+            # Same floor again: one position is the whole Dataset, so a lone `pos0` would
+            # duplicate `out`.
+            base.extend(self._split_outputs(
+                "pos", "posg", self.split_groups(node_id, "m"),
+                [pd["label"] for pd in self.position_descriptors(node_id)]))
         if rec.op_key in PLANE_TAP_OPS:
-            groups = self.split_groups(node_id, "z")
-            if groups:
-                for g in groups:
-                    base.append(OutDataset(f"zg{g['index']}", label=g["label"]))
-            else:
-                # Same floor: one plane is the whole stack, so a lone `z0` would duplicate
-                # `out`.
-                planes = self.plane_descriptors(node_id)
-                if 2 <= len(planes) <= FANOUT_CAP:
-                    for i, pd in enumerate(planes):
-                        base.append(OutDataset(f"z{i}", label=pd["label"]))
+            # Same floor: one plane is the whole stack, so a lone `z0` would duplicate `out`.
+            base.extend(self._split_outputs(
+                "z", "zg", self.split_groups(node_id, "z"),
+                [pd["label"] for pd in self.plane_descriptors(node_id)]))
         if rec.op_key in FRAME_TAP_OPS:
-            groups = self.split_groups(node_id, "t")
-            if groups:
-                for g in groups:
-                    base.append(OutDataset(f"tg{g['index']}", label=g["label"]))
-            else:
-                frames = self.frame_descriptors(node_id)
-                if 2 <= len(frames) <= FANOUT_CAP:
-                    for i, fd in enumerate(frames):
-                        base.append(OutDataset(f"t{i}", label=fd["label"]))
+            base.extend(self._split_outputs(
+                "t", "tg", self.split_groups(node_id, "t"),
+                [fd["label"] for fd in self.frame_descriptors(node_id)]))
         if rec.op_key == PAGE_INPUT_OP:
             # the items of a several-item Output, each on a socket of its own (step 11f)
             items = self._page_items(node_id)
@@ -1090,11 +1070,10 @@ class GraphDocument:
         return out
 
     def split_groups(self, node_id: str, axis: str) -> list:
-        """The groups a split card's GROUPING strategy (its `grouping` Mode: `every` with
-        `group_size`, `ranges` with the `groups` text) names on ``axis`` (``"c"`` / ``"m"`` /
-        ``"z"`` / ``"t"``), as ``[{"index", "name", "indices", "spec", "label"}, …]`` — ``[]``
-        when the node has no such Mode, the strategy is `none`, or it names no group
-        (2026-10-07).
+        """The groups a split card's `groups` text names on ``axis`` (``"c"`` / ``"m"`` /
+        ``"z"`` / ``"t"``) — what its checkboxes wrote through :meth:`split_group_selected`,
+        or what was typed — as ``[{"index", "name", "indices", "spec", "label"}, …]``; ``[]``
+        when the node has no `groups` socket or the text names none (2026-10-07).
 
         ``name`` is the typed name, else the group's members as the axis knows them — the
         channel names joined with ``+``, the first and last position names, ``z 4-7`` — so a
@@ -1102,24 +1081,21 @@ class GraphDocument:
         socket shows: ``"K · <name>"``, plus the planes' height span when the stack has a z
         step, and ``(past the end)`` when a group reaches beyond the axis — the card says so
         instead of clipping, and the tap refuses with the real length when pulled."""
-        from nodegraph.metadata import format_indices, split_plan
+        from nodegraph.metadata import format_indices, parse_groups
         rec = self.nodes.get(node_id)
         try:
             spec = rec.spec() if rec is not None else None
         except Exception:                      # noqa: BLE001 — an unknown op
             spec = None
-        if spec is None or not any(m.name == "grouping" for m in spec.modes):
+        if spec is None or spec.input("groups") is None:
             return []
-        mode = rec.state().get("grouping", "none")
         try:
             env = self.env(node_id)
         except Exception:                      # noqa: BLE001 — an un-propagated node
             env = None
         n = int(getattr(getattr(env, "axes", None), axis, 0) or 0) if env is not None else 0
-        # `every` needs the axis length; an unknown axis means no groups yet
-        size_sock = spec.input("group_size")
-        groups = split_plan(mode, rec.params, n or None,
-                            default_size=getattr(size_sock, "default", None))
+        # `every N` needs the axis length; an unknown axis means no groups yet
+        groups = parse_groups(rec.params.get("groups"), n or None)
         if not groups:
             return []
         if axis == "c":
@@ -1161,6 +1137,254 @@ class GraphDocument:
             out.append({"index": i, "name": name, "indices": idx, "spec": spec_txt,
                         "label": label})
         return out
+
+    @staticmethod
+    def _split_outputs(prefix: str, gprefix: str, groups: list, labels: list) -> list:
+        """A split card's synthetic outputs on one axis (2026-10-07): one ``<gprefix>K`` per
+        group the text names, and one ``<prefix>K`` per index NOT in any group while the axis
+        fans out (two or more members, at most :data:`FANOUT_CAP`) — in axis order, a group
+        sitting where its first member would. So grouping planes 4-7 on a 12-plane stack
+        reads ``z0 z1 z2 z3 zg0 z8 … z11``: the gesture gathers four sockets into one and
+        leaves the rest exactly where they were."""
+        rows: list = []
+        grouped: set = set()
+        for g in groups or ():
+            idx = tuple(g.get("indices") or ())
+            grouped.update(idx)
+            rows.append((min(idx) if idx else 10 ** 9, 1,
+                         OutDataset(f"{gprefix}{g['index']}", label=g["label"])))
+        if 2 <= len(labels) <= FANOUT_CAP:
+            for i, label in enumerate(labels):
+                if i not in grouped:
+                    rows.append((i, 0, OutDataset(f"{prefix}{i}", label=label)))
+        rows.sort(key=lambda r: (r[0], r[1]))
+        return [r[2] for r in rows]
+
+    # ── grouping by selection on a split card (2026-10-07) ────────────────────
+    #: axis letter, per-index socket prefix and group socket prefix, per split op
+    _SPLIT_AXES = {"channel.split": ("c", "ch", "chg"), "util.split_positions": ("m", "pos", "posg"),
+                   "util.split_z": ("z", "z", "zg"), "util.split_t": ("t", "t", "tg")}
+
+    def split_axis(self, node_id: str) -> Optional[str]:
+        """The axis a split card fans out — ``"c"`` / ``"m"`` / ``"z"`` / ``"t"`` — or ``None``
+        for any other node. The predicate behind the checkboxes: a card with an axis gets one
+        beside every data output."""
+        rec = self.nodes.get(node_id)
+        if rec is None or rec.op_key not in self._SPLIT_AXES:
+            return None
+        try:
+            spec = rec.spec()
+        except Exception:                      # noqa: BLE001 — an unknown op
+            return None
+        return self._SPLIT_AXES[rec.op_key][0] if spec is not None \
+            and spec.input("groups") is not None else None
+
+    def _split_labels(self, node_id: str, axis: str) -> List[str]:
+        if axis == "c":
+            return [f"{i} · {ch.get('name') or f'Ch{i}'}"
+                    for i, ch in enumerate(self.channel_descriptors(node_id))]
+        lister = {"m": self.position_descriptors, "z": self.plane_descriptors,
+                  "t": self.frame_descriptors}[axis]
+        return [d["label"] for d in lister(node_id)]
+
+    def split_items(self, node_id: str) -> list:
+        """Everything a split card's grouping can act on, in axis order (2026-10-07):
+        ``[{"key", "kind", "indices", "label", "socket", "picked", "group", "name"}, …]``.
+        A ``kind`` of ``"group"`` is a group the text names (``key`` its ``zgK`` socket,
+        ``group`` its index in the text, ``name`` the typed name); ``"index"`` is a member
+        in no group (``key`` its ``zK`` socket). ``socket`` says whether the card shows that
+        socket — a member past the fan-out cap is listed here, so the Properties panel can
+        tick it, but has no socket on the card. ``[]`` for a node that is not a split."""
+        axis = self.split_axis(node_id)
+        if axis is None:
+            return []
+        from nodegraph.metadata import parse_groups
+        _ax, prefix, gprefix = self._SPLIT_AXES[self.nodes[node_id].op_key]
+        labels = self._split_labels(node_id, axis)
+        groups = self.split_groups(node_id, axis)
+        typed = parse_groups(self.nodes[node_id].params.get("groups")) or []
+        picked = self._split_picks.get(node_id, set())
+        fan = 2 <= len(labels) <= FANOUT_CAP
+        rows: list = []
+        grouped: set = set()
+        for g in groups:
+            idx = tuple(g["indices"])
+            grouped.update(idx)
+            key = f"{gprefix}{g['index']}"
+            rows.append((min(idx) if idx else 10 ** 9, 1, {
+                "key": key, "kind": "group", "indices": idx, "label": g["label"],
+                "socket": True, "picked": key in picked, "group": g["index"],
+                "name": typed[g["index"]][0] if g["index"] < len(typed) else ""}))
+        for i, label in enumerate(labels):
+            if i in grouped:
+                continue
+            key = f"{prefix}{i}"
+            rows.append((i, 0, {"key": key, "kind": "index", "indices": (i,), "label": label,
+                                "socket": fan, "picked": key in picked, "group": None,
+                                "name": ""}))
+        rows.sort(key=lambda r: (r[0], r[1]))
+        return [r[2] for r in rows]
+
+    def split_picked(self, node_id: str) -> set:
+        """The ticked keys of a split card, pruned to what the card currently lists."""
+        live = {it["key"] for it in self.split_items(node_id)}
+        picks = self._split_picks.get(node_id, set()) & live
+        if picks:
+            self._split_picks[node_id] = set(picks)
+        else:
+            self._split_picks.pop(node_id, None)
+        return set(picks)
+
+    def split_pick(self, node_id: str, key: str, on: Optional[bool] = None) -> bool:
+        """Tick (``on=True``), untick (``False``) or toggle (``None``) one output's checkbox.
+        Returns the new state. A tick is not an edit: nothing is re-propagated and no
+        listener fires — the card and the panel repaint themselves."""
+        picks = self.split_picked(node_id)
+        now = (key not in picks) if on is None else bool(on)
+        if now:
+            picks.add(key)
+        else:
+            picks.discard(key)
+        if picks:
+            self._split_picks[node_id] = picks
+        else:
+            self._split_picks.pop(node_id, None)
+        return now
+
+    def split_clear_picks(self, node_id: str) -> None:
+        self._split_picks.pop(node_id, None)
+
+    def split_group_selected(self, node_id: str, name: str = "") -> Optional[str]:
+        """GROUP SELECTED (2026-10-07): the ticked outputs become ONE group socket carrying
+        every member they held — ticked members join, a ticked group is merged into the new
+        one — written to the `groups` text; the ticked sockets vanish from the card and
+        every wire that left one of them now leaves the new group socket. Returns the new
+        socket's name, or ``None`` when nothing was ticked. ``name`` names the group; blank
+        keeps the one name among the merged groups, if there was exactly one."""
+        axis = self.split_axis(node_id)
+        picks = self.split_picked(node_id)
+        if axis is None or not picks:
+            return None
+        from nodegraph.metadata import parse_groups
+        items = {it["key"]: it for it in self.split_items(node_id)}
+        old = parse_groups(self.nodes[node_id].params.get("groups")) or []
+        merged: set = set()
+        dropped: set = set()
+        names: List[str] = []
+        for key in picks:
+            it = items.get(key)
+            if it is None:
+                continue
+            merged.update(int(i) for i in it["indices"])
+            if it["kind"] == "group":
+                dropped.add(it["group"])
+                if it["name"]:
+                    names.append(it["name"])
+        if not merged:
+            return None
+        label = str(name or "").strip() or (names[0] if len(names) == 1 else "")
+        new = [g for i, g in enumerate(old) if i not in dropped] + [(label, tuple(sorted(merged)))]
+        self._split_rewrite(node_id, old, new)
+        return f"{self._SPLIT_AXES[self.nodes[node_id].op_key][2]}{len(new) - 1}"
+
+    def split_ungroup(self, node_id: str, keys: Optional[Sequence[str]] = None) -> int:
+        """UNGROUP (2026-10-07): dissolve the groups among ``keys`` (default: the ticked
+        ones) back into their members' own sockets. A wire that left a dissolved group moves
+        to its first member's socket when the card shows one, else it is dropped — a group's
+        one wire cannot become four. Returns how many groups were dissolved."""
+        axis = self.split_axis(node_id)
+        if axis is None:
+            return 0
+        from nodegraph.metadata import parse_groups
+        keys = set(self.split_picked(node_id) if keys is None else keys)
+        items = {it["key"]: it for it in self.split_items(node_id)}
+        dropped = {items[k]["group"] for k in keys if k in items and items[k]["kind"] == "group"}
+        if not dropped:
+            return 0
+        old = parse_groups(self.nodes[node_id].params.get("groups")) or []
+        new = [g for i, g in enumerate(old) if i not in dropped]
+        self._split_rewrite(node_id, old, new)
+        return len(dropped)
+
+    def split_group_every(self, node_id: str, size: int) -> int:
+        """GROUP EVERY N (2026-10-07): regroup the whole axis into consecutive groups of
+        ``size`` — ``0-9; 10-19; …`` written out explicitly, the last one holding what
+        remains — replacing any groups there were; wires follow their members into the group
+        that now holds them. Returns the number of groups, ``0`` when the axis length is not
+        known or ``size`` is not positive."""
+        axis = self.split_axis(node_id)
+        if axis is None or int(size) <= 0:
+            return 0
+        from nodegraph.metadata import parse_groups
+        n = len(self._split_labels(node_id, axis))
+        if n <= 0:
+            return 0
+        size = int(size)
+        new = [("", tuple(range(s0, min(s0 + size, n)))) for s0 in range(0, n, size)]
+        old = parse_groups(self.nodes[node_id].params.get("groups")) or []
+        self._split_rewrite(node_id, old, new)
+        return len(new)
+
+    def _split_rewrite(self, node_id: str, old: list, new: list) -> None:
+        """Write ``new`` groups to the text and move every wire leaving this card's synthetic
+        sockets to the socket that now carries what it carried: the group holding exactly or
+        wholly those members, else the member's own socket when the card shows it, else
+        nowhere (the wire is dropped). Group sockets are numbered by position in the text, so
+        a dissolved group renumbers those after it — this is where ``zg2`` becomes ``zg1`` for
+        the wire that was on it. Clears the ticks and touches the node."""
+        from nodegraph.metadata import format_groups
+        rec = self.nodes[node_id]
+        _ax, prefix, gprefix = self._SPLIT_AXES[rec.op_key]
+        axis = self._SPLIT_AXES[rec.op_key][0]
+        n = len(self._split_labels(node_id, axis))
+        fan = 2 <= n <= FANOUT_CAP
+        new_sets = [set(int(i) for i in idx) for _nm, idx in new]
+        grouped_now: set = set().union(*new_sets) if new_sets else set()
+        g_re = re.compile(rf"^{gprefix}(\d+)$")
+        i_re = re.compile(rf"^{prefix}(\d+)$")
+
+        def target(sock: str) -> Optional[str]:
+            m = g_re.match(sock)
+            if m is not None:
+                k = int(m.group(1))
+                if not (0 <= k < len(old)):
+                    return sock
+                carried = set(int(i) for i in old[k][1])
+            else:
+                m = i_re.match(sock)
+                if m is None:
+                    return sock
+                carried = {int(m.group(1))}
+            for j, members in enumerate(new_sets):
+                if members == carried:
+                    return f"{gprefix}{j}"
+            for j, members in enumerate(new_sets):
+                if carried and carried <= members:
+                    return f"{gprefix}{j}"
+            first = min(carried) if carried else None
+            if first is not None and fan and first not in grouped_now:
+                return f"{prefix}{first}"
+            return None
+
+        edges: List[EdgeTuple] = []
+        for e in self.edges:
+            if e[0] != node_id:
+                edges.append(e)
+                continue
+            to = target(e[1])
+            if to is None:
+                continue
+            moved = (e[0], to, e[2], e[3])
+            if moved not in edges:
+                edges.append(moved)
+        self.edges = edges
+        text = format_groups(new)
+        if text:
+            rec.params["groups"] = text
+        else:
+            rec.params.pop("groups", None)
+        self._split_picks.pop(node_id, None)
+        self.touch(node_id)
 
     def input_specs(self, node_id: str) -> list:
         """The live INPUT socket specs of one node instance, plus — once the document

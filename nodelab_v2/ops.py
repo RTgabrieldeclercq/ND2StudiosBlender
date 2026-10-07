@@ -112,25 +112,24 @@ TG_SOCKET_RE = re.compile(r"^tg(\d+)$")
 
 
 def split_group(node: Any, k: int):
-    """Group ``k`` of a split card's GROUPING strategy — its `grouping` Mode (`every` with
-    `group_size`, or `ranges` with the `groups` text) — as ``(name, indices)``, or ``None``
-    when the strategy names no such group (then the edge is left alone, like any
-    unresolvable tap). Resolved by :func:`nodegraph.metadata.split_plan_group`, the same
-    plan the card's sockets come from, without the axis length: an `every` group is
-    unclamped, and Crop's frames mode drops what lies past the end."""
-    from nodegraph.metadata import split_plan_group
-    if node is None:
+    """Group ``k`` of a split card's `groups` text — what its checkboxes wrote, or what was
+    typed — as ``(name, indices)``, or ``None`` when the text names no such group (then the
+    edge is left alone, like any unresolvable tap). Read through
+    :func:`nodegraph.metadata.parse_groups`, the same grammar the card's sockets come from.
+    The ``every N`` shorthand is resolved without the axis length, which this side does not
+    have: group ``k`` is ``k·N … k·N+N-1`` unclamped, and Crop's frames mode drops what lies
+    past the end, so the last chunk clips itself."""
+    from nodegraph.metadata import every_n, parse_groups
+    raw = node.params.get("groups") if node is not None else None
+    if k < 0:
         return None
-    spec = node.spec()
-    if spec is None:
+    step = every_n(raw)
+    if step is not None:
+        return ("", tuple(range(k * step, (k + 1) * step)))
+    groups = parse_groups(raw)
+    if not groups or k >= len(groups):
         return None
-    sock = spec.input("group_size")
-    try:                                   # a run-graph NodeInstance resolves against its spec…
-        state = node.state(spec)
-    except TypeError:                      # …a document NodeRecord knows its own
-        state = node.state()
-    return split_plan_group(state.get("grouping", "none"), node.params, int(k),
-                            default_size=getattr(sock, "default", None))
+    return groups[k]
 
 
 def batch_member_identity(node: Any, node_id: str) -> str:
