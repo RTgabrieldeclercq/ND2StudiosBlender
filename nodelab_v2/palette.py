@@ -1,6 +1,7 @@
 """Registry-driven node palette (G2) — searchable, grouped by pipeline STAGE and functional
 ROLE (the taxonomy in ``codemap/node_roles.json``, read through :mod:`nodegraph.roles`);
-double-click adds at the view center, or drag a row onto the canvas (mime
+one click on a stage or role heading opens or closes it; double-click on a node row adds
+it at the view center, or drag a row onto the canvas (mime
 ``application/x-nd2studios-op``, accepted by :class:`~nodelab_v2.scene.GraphView`).
 
 Each node row carries coloured DOTS: on the left, what flows IN — one dot per attribute
@@ -208,6 +209,21 @@ class _PaletteTree(QTreeWidget):
         hdr.setSectionResizeMode(1, QHeaderView.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.setRootIsDecorated(False)
+        # ONE click opens or closes a section (2026-10-07, asked for): a stage band, the
+        # Pages / More nodes bands and a role row all toggle on a single left click. The
+        # rows draw no branch arrow (root decoration is off), so Qt's own double-click
+        # expand was the only way in, and nothing on the row said so. Qt's double-click
+        # expand is switched OFF, or a quick double-click would open the section on the
+        # first click and shut it again on the second. Double-click on a NODE row is
+        # untouched: it still adds the node to the canvas.
+        self.setExpandsOnDoubleClick(False)
+        self.itemClicked.connect(self._toggle_section)
+
+    def _toggle_section(self, item: QTreeWidgetItem, _col: int = 0) -> None:
+        """Open a closed section, close an open one; a node row (no children) is left
+        alone, so its click still only selects it and shows its overview."""
+        if item is not None and item.childCount() > 0:
+            item.setExpanded(not item.isExpanded())
 
     def startDrag(self, _actions) -> None:
         it = self.currentItem()
@@ -592,8 +608,9 @@ class PalettePanel(QWidget):
             self._css() + "<h3>Nodes</h3>"
             "<div class='k'>Grouped by pipeline stage, then by what the node does. The "
             "nodes usual on this page's kind come first; every other node is under "
-            "<b>More nodes</b> — any node can go on any page. Click a node for its "
-            "overview; double-click or drag to add it.</div>"
+            "<b>More nodes</b> — any node can go on any page. Click a section heading to "
+            "open or close it; click a node for its overview; double-click or drag to add "
+            "it.</div>"
             "<div class='sec'>Dots</div>"
             "<div><b>Left</b> = what flows in: the attribute domains the node reads from "
             "its Dataset, then its parameter types. <b>Right</b> = what flows out: the "

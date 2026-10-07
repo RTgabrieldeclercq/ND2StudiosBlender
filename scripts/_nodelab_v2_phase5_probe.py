@@ -1163,6 +1163,50 @@ def main(argv) -> int:
     assert _inner and all(h.data(0, _Qt.UserRole + 1) == "stage" for h in _inner), \
         "More nests stage bands → roles → nodes like the top"
     assert all(not h.isExpanded() for h in _inner), "nested bands start collapsed too"
+    # ONE click opens a section, another closes it (2026-10-07) — driven through the
+    # viewport with real mouse events, so Qt's own click / double-click routing is what is
+    # tested; a right click leaves it alone; a quick double-click toggles ONCE (Qt's own
+    # double-click expand is off); double-click on a node row still adds the node
+    from PySide6.QtTest import QTest as _PQT
+    win.palette.show(); app.processEvents()
+    _vp = tree.viewport()
+
+    def _pclick(item, button=_Qt.LeftButton):
+        tree.scrollToItem(item); app.processEvents()
+        _PQT.mouseClick(_vp, button, _Qt.NoModifier, tree.visualItemRect(item).center())
+        app.processEvents()
+
+    _band = _top[1]
+    _pclick(_band)
+    assert _band.isExpanded(), "one click opens a band"
+    _role = _band.child(0)
+    assert _role.data(0, _Qt.UserRole + 1) == "role" and _role.isExpanded()
+    _pclick(_role)
+    assert not _role.isExpanded(), "one click closes a role"
+    _pclick(_role)
+    assert _role.isExpanded(), "and opens it again"
+    _pclick(_band, _Qt.RightButton)
+    assert _band.isExpanded(), "a right click does not fold"
+    _pclick(_band)
+    assert not _band.isExpanded(), "one click closes a band"
+    # a double-click is press-release (a click) then the double-click event: the click
+    # opens the closed band and the double-click must not shut it again
+    _pclick(_band)
+    _PQT.mouseDClick(_vp, _Qt.LeftButton, _Qt.NoModifier, tree.visualItemRect(_band).center())
+    app.processEvents()
+    assert _band.isExpanded(), "a double-click toggles once, not twice"
+    _node_row = _band.child(0).child(0)
+    assert _node_row.childCount() == 0 and _node_row.data(0, _Qt.UserRole)
+    _n_before = len(win.doc.nodes)
+    _pclick(_node_row)
+    _PQT.mouseDClick(_vp, _Qt.LeftButton, _Qt.NoModifier, tree.visualItemRect(_node_row).center())
+    app.processEvents()
+    assert len(win.doc.nodes) == _n_before + 1, "double-click on a node still adds it"
+    _added = [nid for nid, r in win.doc.nodes.items() if r.op_key == _node_row.data(0, _Qt.UserRole)]
+    win.doc.remove_node(_added[-1]); win.scene.sync(); app.processEvents()
+    win.palette.collapse_all()
+    _top = _top_items(); _more = _top[-1]
+    _inner = [_more.child(j) for j in range(_more.childCount())]
     # Expand all opens everything and sticks across a refill; Collapse all shuts the bands
     win.palette.expand_all()
     assert all(h.isExpanded() for h in _top + _inner)
@@ -1190,7 +1234,9 @@ def main(argv) -> int:
     _ok("G2b: a page kind ORDERS the palette — its usual nodes in the bands at the top, "
         "every other node under one 'More nodes' band — instead of filtering it; split / "
         "merge / stitch / stack / project lead on Image Input; every band starts "
-        "collapsed, Expand all / Collapse all fold the tree, a search opens its hits")
+        "collapsed, ONE click opens or closes a band or role (a right click does not, a "
+        "double-click toggles once, a node's double-click still adds it), Expand all / "
+        "Collapse all fold the tree, a search opens its hits")
 
     # ── review regressions (Phase-5 impl review, 2026-07-22) ──────────────────
     from nodegraph.graph import Edge, Graph, NodeInstance

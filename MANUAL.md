@@ -195,8 +195,9 @@ in the theme's colour.
   column for the words. **Click any row** and the bottom third of the panel shows the
   **overview**: what the node is for, its stage and role, every socket with type, unit and
   default, its modes, its footprint and 2D/3D support, and how it works — all read live
-  from the registry. Click a stage or role header for that group's description. Double-click a row to place the node at
-  the view centre, or drag it onto the canvas.
+  from the registry. **One click on a stage or role header opens or closes that section** and
+  shows the group's description. Double-click a node row to place the node at the view
+  centre, or drag it onto the canvas.
 * **Node canvas** — pan by dragging empty space, zoom with the wheel, `Home` fits the graph.
   The `⛶` button in the top-right (or `Ctrl+Space`) maximises it; the button beside it **fits
   the view to the nodes**, as `Home` does.
@@ -263,8 +264,9 @@ which) **and offer every other node after them** — in the palette under a coll
 nodes** band at the bottom, grouped by stage and role like the rest. Any node can go on any
 page; an Image Input page leads with the loaders and organisers — Split Channels, Split
 Positions, Merge, Stitch (M→1), Stack (T→1), Z Project — a Free page lists every node at the
-top. Every band of the palette starts **collapsed**; **Expand all** / **Collapse all** beside
-the chip fold the whole list, and a search opens whatever it finds.
+top. Every band of the palette starts **collapsed** — **one click** on a band or role heading
+opens it, another closes it; **Expand all** / **Collapse all** beside the chip fold the whole
+list, and a search opens whatever it finds.
 
 Pages hand data on **by name — and the app does the naming for you.** **Loading an image puts
 its card on the Image Input page** (the canvas switches there, whatever page you were on) **and
