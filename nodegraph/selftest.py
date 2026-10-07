@@ -28809,6 +28809,321 @@ def test_node_demos() -> None:
         f"their start; Draw Regions -> 3 regions; sigma moves the result")
 
 
+def test_registration_refinement() -> None:
+    """The 2026-10-07 registration refinements — the regression fence for what
+    ``scripts/registration_synthetic_bench.py`` measured (that script is the evidence; this
+    group pins the behaviours a future edit could silently undo).
+
+    1. **ECC seed sign.** ``ecc_align`` seeded the warp at ``+shift`` where the
+       reference→moving convention needs ``−shift``: ECC started at the mirror image of the
+       answer and, on a sparse field, stayed there (its non-convergence fallback IS the
+       seed), so ``euclidean``/``affine`` came back wrong by twice the drift. A sparse spot
+       lattice under a known drift must now register to 0.1 px with cc ≈ 1.
+    2. **Failed warps are gated, not applied.** A blank frame cannot be aligned; its warp
+       must be the held last-good one even at ``min_confidence=0``.
+    3. **Rotation past ECC's capture range in ``first`` mode.** A 25° turn is beyond what
+       ECC finds from a translation seed (it converges to a wrong optimum with a HIGH cc, so
+       no threshold catches it); the feature-seeded path must recover it to 0.3 px.
+    4. **Landmarks.** Exact correspondences plus a deterministic click jitter: ``auto`` must
+       name the right family (translation / euclidean / affine), flag an inconsistent set as
+       non-rigid, refuse an under-determined explicit request, and the typed form must
+       round-trip through ``parse_landmarks``.
+    5. **3-D translation.** A ``(T, Z, H, W)`` spot volume under a ``(dz, dy, dx)`` drift must
+       come back as a 3-component shift within 0.3, and ``apply_volume`` must undo it.
+    6. **The node's lever.** Through the Engine on a z-stack: 2D and 3D give distinct recipe
+       hashes; 3D streams a WHOLE_VOLUME unit, writes ``drift_z`` and ``drift_confidence``,
+       recovers the planted axial drift, and its lazy per-volume apply is BYTE-identical to
+       the eager bare-ctx reference; ``model=auto`` with landmarks resolves to the family the
+       clicks imply and records it in the metadata; a drawn ``region`` is honoured.
+    """
+    if not _HAVE_SKIMAGE:
+        _ok("registration refinement: skipped (no skimage)")
+        return
+    try:
+        import cv2  # noqa: F401
+    except Exception:  # noqa: BLE001
+        _ok("registration refinement: skipped (no cv2)")
+        return
+    import itertools
+    import math
+    from scipy.ndimage import affine_transform, gaussian_filter
+    from nodegraph.kernels import registration as R
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.streaming import MapComputeProvider, VolumeComputeProvider
+    from nodegraph.engine import EvalContext, ReadContext
+
+    H = W = 128
+    yy, xx = np.mgrid[0:H, 0:W].astype(float)
+
+    def spots(dy: float, dx: float, amp0: float = 600.0) -> np.ndarray:
+        """A 7×7 spot lattice with deterministic sub-pixel offsets (no RNG), moved by
+        ``(dy, dx)`` — rendered analytically, so the truth has no interpolation in it."""
+        img = np.full((H, W), 100.0)
+        for i in range(1, 8):
+            for j in range(1, 8):
+                py = i * 16 + 0.37 * ((i * 7 + j) % 5) + dy
+                px = j * 16 + 0.29 * ((i + j * 3) % 7) + dx
+                img += (amp0 + 150.0 * ((i * j) % 4)) * np.exp(
+                    -((yy - py) ** 2 + (xx - px) ** 2) / (2 * 1.5 ** 2))
+        return img.astype(np.float32)
+
+    # ── 1. ECC seed sign on a sparse field ─────────────────────────────────────────
+    series = np.stack([spots(2.1 * t, -1.3 * t) for t in range(4)])
+    tf = R.estimate_series(series, model="euclidean", reference="first", lowpass_sigma=1.0)
+    for t in range(1, 4):
+        w = tf["warps"][t]              # reference→moving (x, y): the content displacement
+        assert abs(w[0, 2] - (-1.3 * t)) < 0.1 and abs(w[1, 2] - (2.1 * t)) < 0.1, (t, w)
+        assert abs(math.degrees(math.atan2(w[1, 0], w[0, 0]))) < 0.2, w
+    assert float(tf["confidence"][1:].min()) > 0.9, tf["confidence"]
+    assert not tf["gated"].any()
+    # the mirrored seed (what shipped) is the counter-example: ECC from +shift does not
+    # recover a 6 px drift on this field, so the fix is load-bearing, not cosmetic
+    bad, cc_bad, _ = R.ecc_align(series[0], series[3], model="euclidean",
+                                 init_shift=-np.array([-6.3, 3.9]))
+    assert cc_bad == 0.0 or abs(bad[1, 2] - 6.3) > 1.0, (cc_bad, bad)
+    # the translation model on the same field: sub-pixel
+    tt = R.estimate_series(series, "translation", "first", lowpass_sigma=1.0)
+    assert np.allclose(-tt["shifts"][1:], [[2.1 * t, -1.3 * t] for t in range(1, 4)],
+                       atol=0.08), tt["shifts"]
+    # and the 2-D case of estimate_translation still returns a 2-vector
+    sh, ncc = R.estimate_translation(series[0], series[1], lowpass_sigma=1.0)
+    assert sh.shape == (2,) and ncc > 0.9
+
+    # ── 2. a failed warp estimate is gated whatever min_confidence says ────────────
+    blank = np.full((H, W), 100.0, dtype=np.float32)
+    _w, cc0, _ = R.ecc_align(series[0], blank, model="euclidean", init_shift=np.zeros(2))
+    assert cc0 == 0.0
+    tg = R.estimate_series(np.stack([series[0], blank, series[1]]), "euclidean", "first",
+                           min_confidence=0.0)
+    assert tg["gated"][1] and np.allclose(tg["warps"][1], np.eye(2, 3)), tg["warps"][1]
+    assert not tg["gated"][2]
+    # an implausible warp is refused by the sanity fence
+    assert not R._warp_is_sane(np.array([[2.5, 0, 0], [0, 1, 0]], dtype=np.float32), (H, W))
+    assert not R._warp_is_sane(np.array([[1, 0, 300.0], [0, 1, 0]], dtype=np.float32), (H, W))
+    assert R._warp_is_sane(np.eye(2, 3, dtype=np.float32), (H, W))
+
+    # ── 3. a 25° rotation in `first` mode, via the feature seed ────────────────────
+    def hashnoise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        v = np.sin(a * 12.9898 + b * 78.233) * 43758.5453
+        return v - np.floor(v)
+    cy = cx = (H - 1) / 2.0
+    rr = np.hypot(yy - cy, xx - cx)
+    disk = 1.0 / (1.0 + np.exp((rr - 40.0) / 3.0))
+    tex = gaussian_filter(hashnoise(yy, xx), 2.0)
+    tex = (tex - tex.min()) / np.ptp(tex)
+    base = (100.0 + 1200.0 * disk * (0.35 + 0.65 * tex)).astype(np.float32)
+
+    def rotated(deg: float) -> np.ndarray:
+        th = math.radians(deg)
+        Ryx = np.array([[math.cos(th), math.sin(th)], [-math.sin(th), math.cos(th)]])
+        inv = Ryx.T
+        c = np.array([cy, cx])
+        return affine_transform(base, inv, offset=c - inv @ c, order=3, mode="constant",
+                                cval=100.0).astype(np.float32)
+
+    rot = np.stack([base, rotated(25.0)])
+    tr = R.estimate_series(rot, "euclidean", "first")
+    w = tr["warps"][1]
+    est_deg = math.degrees(math.atan2(w[1, 0], w[0, 0]))
+    assert abs(est_deg - 25.0) < 0.3, (est_deg, tr["confidence"])
+    # endpoint error over the disk against the exact forward map
+    th = math.radians(25.0)
+    pts = np.stack([xx[disk > 0.5], yy[disk > 0.5]], axis=1)          # (x, y)
+    Rxy = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    true_xy = (pts - [cx, cy]) @ Rxy.T + [cx, cy]
+    est_xy = pts @ w[:, :2].T + w[:, 2]
+    epe = float(np.sqrt(((est_xy - true_xy) ** 2).sum(axis=1).mean()))
+    assert epe < 0.3, epe
+    assert not tr["gated"][1]
+    # without the feature seed the same frame is NOT recovered — the seed is what matters
+    tr0 = R.estimate_series(rot, "euclidean", "first", seed_from_features=False)
+    w0 = tr0["warps"][1]
+    est0 = math.degrees(math.atan2(w0[1, 0], w0[0, 0]))
+    unseeded_off = abs(est0 - 25.0) > 2.0 or tr0["gated"][1]
+
+    # ── 4. landmarks ──────────────────────────────────────────────────────────────
+    src = np.array([[30.0, 30.0], [30.0, 100.0], [100.0, 30.0], [100.0, 100.0], [64.0, 64.0],
+                    [45.0, 80.0]])
+    jit = np.array([[0.4, -0.3], [-0.5, 0.2], [0.3, 0.4], [-0.2, -0.4], [0.5, 0.1],
+                    [-0.3, 0.3]])                                        # a "click" error
+    Ryx = np.array([[math.cos(th), math.sin(th)], [-math.sin(th), math.cos(th)]])
+    dst_rot = (src - [cy, cx]) @ Ryx.T + [cy, cx] + [3.0, -2.0] + jit
+    lm = R.estimate_from_landmarks(src, dst_rot, model="auto")
+    assert lm["model"] == "euclidean" and not lm["nonrigid"], lm["summary"]
+    assert lm["residuals"]["translation"] > 5.0 > lm["residuals"]["euclidean"]
+    lm_t = R.estimate_from_landmarks(src, src + [3.0, -2.0] + jit, model="auto")
+    assert lm_t["model"] == "translation", lm_t["summary"]
+    sheared = src.copy()
+    sheared[:, 1] += 0.15 * (src[:, 0] - cy)                              # x += 0.15·(y−cy)
+    lm_a = R.estimate_from_landmarks(src, sheared + jit, model="auto")
+    assert lm_a["model"] in ("affine", "similarity") and not lm_a["nonrigid"], lm_a["summary"]
+    lm_n = R.estimate_from_landmarks(src, src + [[6, 0], [-6, 0], [0, 6], [0, -6], [4, 4], [-4, 4]],
+                                     model="auto")
+    assert lm_n["nonrigid"] and "NON-RIGID" in lm_n["summary"], lm_n["summary"]
+    try:
+        R.estimate_from_landmarks(src[:2], dst_rot[:2], model="affine")
+        raise AssertionError("affine from 2 pairs must refuse")
+    except ValueError as exc:
+        assert "at least 3" in str(exc), exc
+    parsed = R.parse_landmarks("t=3; 10.5,20 -> 12,21.5; 40,60 -> 41.2,60.9")
+    assert parsed == {"t": 3, "src": [[10.5, 20.0], [40.0, 60.0]],
+                      "dst": [[12.0, 21.5], [41.2, 60.9]]}, parsed
+    assert R.parse_landmarks("") is None and R.parse_landmarks(None) is None
+    assert R.parse_landmarks('{"t": 2, "pairs": [[[1, 2], [3, 4]]]}') == \
+        {"t": 2, "src": [[1.0, 2.0]], "dst": [[3.0, 4.0]]}
+    for bad_text in ("10,20 -> 12,21", "t=1; 10,20", "t=0; 1,2 -> 3,4"):
+        try:
+            R.parse_landmarks(bad_text)
+            raise AssertionError(f"{bad_text!r} must refuse")
+        except ValueError:
+            pass
+    # the landmark warp seeds the series: model=auto on the rotated pair, with clicks taken
+    # from the SAME rotation, resolves to euclidean and lands within 0.3 px
+    land = {"t": 1, "src": src.tolist(), "dst": ((src - [cy, cx]) @ Ryx.T + [cy, cx] + jit).tolist()}
+    ta = R.estimate_series(rot, "auto", "first", landmarks=land)
+    assert ta["model"] == "euclidean" and ta["landmarks"]["model"] == "euclidean"
+    wa = ta["warps"][1]
+    assert abs(math.degrees(math.atan2(wa[1, 0], wa[0, 0])) - 25.0) < 0.3, wa
+    half = R._interp_warp(wa, 0.5, (H, W))
+    assert abs(math.degrees(math.atan2(half[1, 0], half[0, 0])) - 12.5) < 0.3
+
+    # ── 5. 3-D translation on a spot volume ───────────────────────────────────────
+    Z, HV, WV = 12, 64, 64
+    zz3, yy3, xx3 = np.mgrid[0:Z, 0:HV, 0:WV].astype(float)
+
+    def spots3(dz: float, dy: float, dx: float) -> np.ndarray:
+        """27 spots at deterministic, IRREGULAR positions (a regular lattice has a
+        periodic correlation whose axial peak is poorly conditioned on 12 planes)."""
+        vol = np.full((Z, HV, WV), 100.0)
+        for i in range(1, 4):
+            for j in range(1, 4):
+                for k in range(1, 4):
+                    h = (i * 73 + j * 151 + k * 37) % 97 / 97.0
+                    pz = 2.0 + 8.0 * h + dz
+                    py = 10.0 + 44.0 * ((h * 7.3) % 1.0) + dy
+                    px = 10.0 + 44.0 * ((h * 11.7) % 1.0) + dx
+                    vol += 800.0 * np.exp(-((zz3 - pz) ** 2) / (2 * 1.2 ** 2)
+                                          - ((yy3 - py) ** 2 + (xx3 - px) ** 2) / (2 * 1.5 ** 2))
+        return vol.astype(np.float32)
+
+    vser = np.stack([spots3(0.5 * t, 1.5 * t, -1.0 * t) for t in range(3)])
+    tv = R.estimate_series(vser, "translation", "first", lowpass_sigma=1.0)
+    assert tv["shifts"].shape == (3, 3), tv["shifts"].shape
+    for t in (1, 2):
+        assert np.allclose(-tv["shifts"][t], [0.5 * t, 1.5 * t, -1.0 * t], atol=0.3), \
+            (t, tv["shifts"][t])
+    undone = R.apply_volume(vser[2], tv, 2)
+    core = (slice(3, Z - 3), slice(8, HV - 8), slice(8, WV - 8))
+    assert np.abs(undone[core] - vser[0][core]).mean() < 0.15 * np.abs(vser[2][core] - vser[0][core]).mean()
+    assert R.apply_frame(vser[2][Z // 2], tv, 2).shape == (HV, WV)       # planar part only
+
+    # ── 6. the node through the Engine: the 2D/3D lever ───────────────────────────
+    T = 3
+    raw = np.zeros((1, T, Z, 1, HV, WV), dtype=np.float32)
+    for t in range(T):
+        raw[0, t, :, 0] = vser[t]
+    axz = AxisSizes(m=1, t=T, z=Z, c=1, y=HV, x=WV)
+    ds = Dataset(axes=axz, metadata={"pixel_size_um": 0.3, "z_step_um": 1.0}
+                 ).with_image(ArrayProvider(raw))
+    env = MetaEnvelope(axes=axz, metadata={"pixel_size_um": 0.3, "z_step_um": 1.0})
+
+    def run(modes, params=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.load"))
+        g.add(NodeInstance("R", "registration.stabilize", params=dict(params or {}),
+                           modes=dict(modes)))
+        g.connect("S", "R")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull("R")
+
+    def gather(dset) -> np.ndarray:
+        p = dset.image
+        pa = p.axes
+        out = np.empty((pa.m, pa.t, pa.z, pa.c, pa.y, pa.x), dtype=float)
+        for m, t, z, c in itertools.product(range(pa.m), range(pa.t), range(pa.z),
+                                            range(pa.c)):
+            out[m, t, z, c] = p.get_region(0, m, t, z, c, 0, pa.y, 0, pa.x)
+        return out
+
+    e2, o2 = run({"dim": "2D", "model": "translation", "reference": "first"})
+    e3, o3 = run({"dim": "3D", "model": "translation", "reference": "first"})
+    assert e2.entry("R").recipe_hash != e3.entry("R").recipe_hash
+    assert isinstance(o2.image, MapComputeProvider) and o2.image.plane_unit
+    assert isinstance(o3.image, VolumeComputeProvider)
+    assert o2.get(D.FRAME, "drift_z") is None and o3.get(D.FRAME, "drift_z") is not None
+    for o in (o2, o3):
+        assert o.get(D.FRAME, "drift_confidence") is not None
+        assert o.axes == axz and o.metadata.get("registration_model") == "translation"
+    dz = o3.get(D.FRAME, "drift_z").values[0]
+    assert np.allclose(dz, [0.0, -0.5, -1.0], atol=0.3), dz.tolist()
+    dy2 = o2.get(D.FRAME, "drift_y").values[0]
+    assert np.allclose(dy2, [0.0, -1.5, -3.0], atol=0.3), dy2.tolist()
+    # the lazy per-volume apply ≡ the eager bare-ctx reference, in every BIT
+    eager = COMPUTES["registration.stabilize"](EvalContext(
+        node_id="R", op_key="registration.stabilize",
+        params={"__modes__": {"dim": "3D", "model": "translation", "reference": "first"}},
+        env=env, granularity=Granularity.WHOLE_SERIES,
+        kernel_axes=frozenset({"t", "z", "y", "x"}), inputs=(ds,),
+        reads=ReadContext(env.metadata), spec=NODES.get("registration.stabilize")))
+    assert isinstance(eager.image, ArrayProvider)
+    assert np.array_equal(gather(o3), gather(eager)), "3D lazy apply disagrees with eager"
+    # model=auto + landmarks on a planar pair: resolves to the clicked family, records it
+    rot6 = np.zeros((1, 2, 1, 1, H, W), dtype=np.float32)
+    rot6[0, :, 0, 0] = rot
+    axr = AxisSizes(m=1, t=2, z=1, c=1, y=H, x=W)
+    ds_r = Dataset(axes=axr, metadata={"pixel_size_um": 0.3}).with_image(ArrayProvider(rot6))
+    env_r = MetaEnvelope(axes=axr, metadata={"pixel_size_um": 0.3})
+    g = Graph()
+    g.add(NodeInstance("S", "io.load"))
+    g.add(NodeInstance("R", "registration.stabilize",
+                       params={"landmarks": "t=1; " + "; ".join(
+                           f"{a[0]:.2f},{a[1]:.2f} -> {b[0]:.2f},{b[1]:.2f}"
+                           for a, b in zip(land["src"], land["dst"]))},
+                       modes={"dim": "2D", "model": "auto", "reference": "first"}))
+    g.connect("S", "R")
+    oa = Engine(g, computes=COMPUTES, seeds={"S": ds_r}, meta_seeds={"S": env_r}).pull("R")
+    assert oa.metadata.get("registration_model") == "euclidean", oa.metadata
+    assert "euclidean chosen" in str(oa.metadata.get("registration_landmarks", "")), oa.metadata
+    # a drawn `region`: a rect over the lattice's left half still recovers the drift
+    g = Graph()
+    g.add(NodeInstance("S", "io.load"))
+    g.add(NodeInstance("R", "registration.stabilize",
+                       params={"region": '[{"type": "rect", "op": "add", "vertices": [[8, 8], [120, 64]]}]'},
+                       modes={"dim": "2D", "model": "translation", "reference": "first"}))
+    g.connect("S", "R")
+    sp6 = np.zeros((1, 3, 1, 1, H, W), dtype=np.float32)
+    sp6[0, :, 0, 0] = series[:3]
+    ds_s = Dataset(axes=AxisSizes(m=1, t=3, z=1, c=1, y=H, x=W)).with_image(ArrayProvider(sp6))
+    og = Engine(g, computes=COMPUTES, seeds={"S": ds_s}).pull("R")
+    dyr = og.get(D.FRAME, "drift_y").values[0]
+    assert np.allclose(dyr, [0.0, -2.1, -4.2], atol=0.3), dyr.tolist()
+    try:
+        g2 = Graph()
+        g2.add(NodeInstance("S", "io.load"))
+        g2.add(NodeInstance("R", "registration.stabilize", params={"region": "not json"},
+                            modes={"dim": "2D"}))
+        g2.connect("S", "R")
+        Engine(g2, computes=COMPUTES, seeds={"S": ds_s}).pull("R")
+        raise AssertionError("malformed region JSON must refuse")
+    except ValueError as exc:
+        assert "region" in str(exc)
+
+    _ok("registration refinement (2026-10-07): ECC seed sign fixed — euclidean/first on a "
+        "sparse spot lattice recovers a 2.1/-1.3 px-per-frame drift to 0.1 px at cc>0.9 "
+        "where the mirrored seed does not; a failed warp (blank frame) is gated at "
+        "min_confidence=0 and the sanity fence refuses a 2.5x / off-frame warp; a 25° "
+        f"rotation registers in `first` mode to {epe:.3f} px via the feature seed"
+        f"{' (unseeded ECC misses it)' if unseeded_off else ''}; landmarks: auto names "
+        "translation/euclidean/affine from 6 jittered clicks, flags an inconsistent set "
+        "NON-RIGID, refuses affine from 2 pairs, parses the typed form, and seeds the series "
+        "to the clicked family; 3-D: a (T,Z,H,W) spot volume's (dz,dy,dx) drift comes back "
+        "within 0.3 and apply_volume undoes it; node: 2D vs 3D distinct hashes, 3D streams a "
+        "WHOLE_VOLUME unit with drift_z + drift_confidence and equals the eager reference "
+        "bit-for-bit, model=auto records the clicked family, a drawn region is honoured and "
+        "malformed region JSON refuses")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -28962,6 +29277,7 @@ def main() -> int:
     test_overlay_zoom_detail()
     test_overlay_subtick_cache()
     test_align_to()
+    test_registration_refinement()
     test_origin_um_maintenance()
     test_transform()
     test_lablink()
