@@ -254,6 +254,10 @@ class GraphScene(QGraphicsScene):
     #: a Page Output's *New page from this output…* (V4.00 step 11): the node id — the window
     #: opens the New page dialog pre-set to read it
     new_page_from_output = Signal(str)
+    #: a frame's menu (2026-10-07): ``(frame id, action)`` — ``"tab"`` duplicates the region
+    #: as a linked tab, ``"rename"`` renames it; the window acts (it owns the dialogs and
+    #: the workspace)
+    frame_action = Signal(str, str)
 
     def __init__(self, document: GraphDocument) -> None:
         super().__init__()
@@ -261,6 +265,9 @@ class GraphScene(QGraphicsScene):
         self.node_items: Dict[str, NodeItem] = {}
         self.frame_items: Dict[str, FrameItem] = {}
         self.edge_items: List[EdgeItem] = []
+        #: set by the window: the names of a frame's REGION TABS (2026-10-07), for the
+        #: frame's title bar — a scene outside a window has none
+        self.region_tab_names: Callable[[str], List[str]] = lambda _fid: []
         #: the node whose output the Viewer / mini-map is showing (marked on its card)
         self.viewed_id: Optional[str] = None
         self._drag_fixed: Optional[SocketItem] = None
@@ -371,6 +378,41 @@ class GraphScene(QGraphicsScene):
                 e.update_path()
         for fitem in self.frame_items.values():   # frames follow their members' bounds
             fitem.reflow()
+
+    # ── regions (2026-10-07) ───────────────────────────────────────────────────
+    def nodes_in_rect(self, rect: QRectF) -> List[str]:
+        """The ids of the cards a drawn box encloses — every card whose CENTRE lies in
+        ``rect`` (scene coordinates), in placement order. The centre, not any overlap, so
+        a box drawn around a group never grabs a neighbour it merely clips."""
+        out = []
+        for nid, it in self.node_items.items():
+            if it.scene() is None:
+                continue
+            c = it.mapToScene(it.card_rect()).boundingRect().center()
+            if rect.contains(c):
+                out.append(nid)
+        return out
+
+    def next_region_title(self) -> str:
+        """``Region``, ``Region 2``, … — the first title no frame of this page carries."""
+        taken = {fr.title for fr in self.doc.frames.values()}
+        if "Region" not in taken:
+            return "Region"
+        i = 2
+        while f"Region {i}" in taken:
+            i += 1
+        return f"Region {i}"
+
+    def frame_from_rect(self, rect: QRectF, title: str = "") -> Optional[str]:
+        """A drawn box becomes a frame around the cards inside it — a REGION with a port
+        for every wire crossing it. Returns the frame id, or ``None`` when the box encloses
+        no card (nothing is made). The window calls this behind its shape gate, so a linked
+        page is asked first."""
+        ids = self.nodes_in_rect(rect)
+        if not ids:
+            return None
+        fr = self.doc.add_frame(title or self.next_region_title(), ids)
+        return fr.id
 
     def resync_specs(self) -> List[str]:
         """Re-resolve every card against the registry after a live node reload
@@ -916,6 +958,16 @@ class GraphScene(QGraphicsScene):
             act = menu.addAction("Fit graph")
             act.triggered.connect(lambda: [v.fit_all() for v in self.views()
                                            if hasattr(v, "fit_all")])
+            draw = menu.addAction("Draw a region…\tR")
+            draw.setToolTip("Drag a box around a set of nodes: they become a frame with a "
+                            "port for every wire crossing it, ready to duplicate as a "
+                            "linked tab. Or hold Alt and drag.")
+            vp = e.widget()
+            view = vp.parent() if vp is not None else None
+            if isinstance(view, GraphView):
+                draw.triggered.connect(lambda _=False, v=view: v.set_region_mode(True))
+            else:
+                draw.setEnabled(False)
         self._lock_structural(menu)
         menu.exec(e.screenPos())
         e.accept()
@@ -1028,10 +1080,20 @@ class GraphScene(QGraphicsScene):
             lambda: self.doc.disconnect(s, ss, d, ds))
 
     def _fill_frame_menu(self, menu: QMenu, frame: FrameItem) -> None:
-        title = menu.addAction(f"frame · {frame.rec.title}")
+        title = menu.addAction(f"region · {frame.title_text()}")
         title.setEnabled(False)
         menu.addSeparator()
-        menu.addAction("Delete frame (keeps the nodes)\tDel").triggered.connect(
+        tab = menu.addAction("Duplicate region as a linked tab")
+        tab.setToolTip("A new Free page of this region alone: its nodes follow the region "
+                       "here, a Page Input or Output of its own stands at every port, and "
+                       "its values may differ — one workflow, many tabs.")
+        tab.triggered.connect(lambda: self.frame_action.emit(frame.frame_id, "tab"))
+        menu.addAction("Rename region…").triggered.connect(
+            lambda: self.frame_action.emit(frame.frame_id, "rename"))
+        n_tabs = len(frame._tabs)
+        menu.addAction("Delete frame (keeps the nodes"
+                       + (f"; its {n_tabs} tab{'' if n_tabs == 1 else 's'} keep theirs"
+                          if n_tabs else "") + ")\tDel").triggered.connect(
             lambda: self.doc.remove_frame(frame.frame_id))
 
     @_needs_topology
@@ -1153,6 +1215,10 @@ class GraphView(QGraphicsView):
     #: a press on the canvas (or a drop onto it): the user is working in THIS canvas — the
     #: window makes its page the active one before the press does anything (V4.00 step 5)
     pressed = Signal()
+    #: a region box was drawn (2026-10-07): its scene rect — the window makes the frame
+    region_drawn = Signal(QRectF)
+    #: the region box was armed (True — R, the menus) or put away (False — drawn, or Esc)
+    region_mode_changed = Signal(bool)
 
     #: troubleshooting frame: stroke width, and the inset its rounded rect sits at.
     TS_BORDER = 3
@@ -1178,6 +1244,12 @@ class GraphView(QGraphicsView):
         self._panning = False
         self._pan_moved = False
         self._pan_last = QPointF()
+        # the region box (2026-10-07): armed by R, the Graph menu or the canvas menu — or
+        # held by Alt — the next left-drag draws a box instead of panning or rubber-band
+        # selecting, and the box becomes a frame with ports (`region_drawn`)
+        self._region_mode = False
+        self._region_start: Optional[QPointF] = None
+        self._region_rect: Optional[QRectF] = None
         # troubleshooting HUD: an amber badge in the canvas's top-left corner, twinned
         # with the frame drawn in `drawForeground`. A child of the VIEW (like the maximize
         # button) so it never scrolls with the scene. Built FIRST: `childEvent` installs a
@@ -1403,6 +1475,15 @@ class GraphView(QGraphicsView):
         Reset transform (the viewer's overlay idiom): the frame belongs to the canvas
         widget, not to the scene, so it must not pan, zoom or scale with the nodes."""
         super().drawForeground(p, rect)
+        if self._region_rect is not None:
+            # the box being drawn, in SCENE coordinates (it encloses cards), its stroke
+            # kept one screen pixel wide whatever the zoom
+            p.save()
+            k = self.transform().m11() or 1.0
+            p.setPen(QPen(T.ACCENT, 1.5 / k, Qt.DashLine))
+            p.setBrush(T.alpha(T.ACCENT, 28))
+            p.drawRoundedRect(self._region_rect, 6 / k, 6 / k)
+            p.restore()
         if not self._ts_on:
             return
         p.save()
@@ -1420,6 +1501,20 @@ class GraphView(QGraphicsView):
         p.restore()
 
     def keyPressEvent(self, e) -> None:
+        # the region box (2026-10-07): R arms it (again: puts it away), Esc cancels it
+        if e.key() == Qt.Key_Escape and (self._region_mode or self._region_start is not None):
+            self._region_start = self._region_rect = None
+            self.set_region_mode(False)
+            self.viewport().update()
+            e.accept()
+            return
+        if (e.key() == Qt.Key_R
+                and not (e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier
+                                          | Qt.AltModifier | Qt.MetaModifier))
+                and getattr(self.scene(), "_drag_fixed", None) is None):
+            self.set_region_mode(not self._region_mode)
+            e.accept()
+            return
         # Esc leaves maximized mode — but never out from under a live wire drag, which
         # owns Escape (the scene cancels the drag with it).
         if (e.key() == Qt.Key_Escape and self._max_btn.isChecked()
@@ -1429,11 +1524,58 @@ class GraphView(QGraphicsView):
             return
         super().keyPressEvent(e)
 
+    # ── the region box (2026-10-07) ───────────────────────────────────────────
+    @property
+    def region_mode(self) -> bool:
+        """Is the region box armed — will the next left-drag draw one?"""
+        return self._region_mode
+
+    def set_region_mode(self, on: bool) -> None:
+        """Arm (or put away) the region box: while armed the next left-drag on the canvas —
+        starting anywhere, a card included — draws it instead of panning or selecting, and
+        the cursor says so. Drawn or cancelled (Esc), the box disarms itself; Alt+drag draws
+        one without arming."""
+        on = bool(on)
+        if on == self._region_mode:
+            return
+        self._region_mode = on
+        if on:
+            self.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self.viewport().unsetCursor()
+            self._region_start = self._region_rect = None
+        self.region_mode_changed.emit(on)
+        self.viewport().update()
+
+    def _region_press(self, e) -> bool:
+        if e.button() != Qt.LeftButton:
+            return False
+        if not (self._region_mode or (e.modifiers() & Qt.AltModifier)):
+            return False
+        self._region_start = self.mapToScene(e.position().toPoint())
+        self._region_rect = QRectF(self._region_start, self._region_start)
+        self.viewport().setCursor(Qt.CrossCursor)
+        return True
+
+    def _region_release(self, e) -> None:
+        rect = QRectF(self._region_start, self.mapToScene(e.position().toPoint())).normalized()
+        self._region_start = self._region_rect = None
+        self.set_region_mode(False)         # one box per arming; Alt draws again
+        self.viewport().unsetCursor()
+        self.viewport().update()
+        # a click, not a box (under 6 view pixels either way): nothing drawn
+        vr = self.mapFromScene(rect).boundingRect()
+        if vr.width() >= 6 and vr.height() >= 6:
+            self.region_drawn.emit(rect)
+
     # canvas panning (G1): left-drag on EMPTY canvas pans the view; Ctrl/Shift+drag
     # keeps the rubber-band marquee, and a drag that starts on a node/socket/edge
     # falls through to the default handling (move node / start wire).
     def mousePressEvent(self, e) -> None:
         self.pressed.emit()                 # this canvas becomes the one worked in, first
+        if self._region_press(e):
+            e.accept()
+            return
         if (e.button() == Qt.LeftButton
                 and self.itemAt(e.position().toPoint()) is None
                 and not (e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier))):
@@ -1446,6 +1588,12 @@ class GraphView(QGraphicsView):
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e) -> None:
+        if self._region_start is not None:
+            self._region_rect = QRectF(
+                self._region_start, self.mapToScene(e.position().toPoint())).normalized()
+            self.viewport().update()
+            e.accept()
+            return
         if self._panning:
             d = e.position() - self._pan_last
             self._pan_last = e.position()
@@ -1473,6 +1621,10 @@ class GraphView(QGraphicsView):
             sc.setSceneRect(united)
 
     def mouseReleaseEvent(self, e) -> None:
+        if self._region_start is not None and e.button() == Qt.LeftButton:
+            self._region_release(e)
+            e.accept()
+            return
         if self._panning and e.button() == Qt.LeftButton:
             self._panning = False
             self.viewport().unsetCursor()

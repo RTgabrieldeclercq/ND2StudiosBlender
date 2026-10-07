@@ -8951,6 +8951,93 @@ def main(argv) -> int:
         "Lowpass σ, re-derives the lever to 3D and reads out drift_z; windows drop from the "
         "cache on close")
 
+    # ── RG1: regions — draw a box, ports on the frame, duplicate as a linked tab ─────────
+    from nodelab_v2.frame_item import FrameItem as _RgFrame
+    win.file_new()
+    win.build_demo()
+    app.processEvents()
+    _rg_pid = win.workspace.active
+    _rg_doc, _rg_sc = win.doc, win.scene
+    _rg_box = None
+    for _nid in ("n3", "n4"):                       # a box around Gaussian + Threshold
+        _it = _rg_sc.node_items[_nid]
+        _r = _it.mapToScene(_it.card_rect()).boundingRect()
+        _rg_box = _r if _rg_box is None else _rg_box.united(_r)
+    _rg_box = _rg_box.adjusted(-15, -15, 15, 15)
+    win.statusBar().clearMessage()
+    win.draw_region()                               # Graph → Draw a region… (R)
+    assert win.view.region_mode and "drag a box" in win.statusBar().currentMessage()
+    win.view.set_region_mode(False)
+    assert not win.view.region_mode
+    assert sorted(_rg_sc.nodes_in_rect(_rg_box)) == ["n3", "n4"], _rg_sc.nodes_in_rect(_rg_box)
+    win.view.region_drawn.emit(_rg_box)             # what releasing the drag emits
+    app.processEvents()
+    assert len(_rg_doc.frames) == 1
+    _rg_fid = next(iter(_rg_doc.frames))
+    assert _rg_doc.frames[_rg_fid].title == "Region"
+    assert set(_rg_doc.frames[_rg_fid].members) == {"n3", "n4"}
+    _rg_fi = _rg_sc.frame_items[_rg_fid]
+    assert isinstance(_rg_fi, _RgFrame) and _rg_fi.isSelected()
+    assert [io for io, _l in _rg_fi.ports()] == ["in", "out"], _rg_fi.ports()
+    assert all(l.endswith("· out") for _io, l in _rg_fi.ports()), _rg_fi.ports()
+    assert "1 in · 1 out" in _rg_fi.title_text() and "tab" not in _rg_fi.title_text()
+    assert "1 in · 1 out" in win.statusBar().currentMessage()
+    _rg_m = _PMenu()
+    _rg_sc._fill_frame_menu(_rg_m, _rg_fi)
+    _rg_t = [a.text() for a in _rg_m.actions()]
+    assert "Duplicate region as a linked tab" in _rg_t and "Rename region…" in _rg_t, _rg_t
+    # the tab: a Free page linked to the region alone, shown on the main canvas
+    _rg_tab = win.duplicate_region(_rg_pid, _rg_fid)
+    app.processEvents()
+    assert _rg_tab and win.workspace.active == _rg_tab
+    _rg_page = win.workspace.page(_rg_tab)
+    assert _rg_page.kind == "free" and _rg_page.master == _rg_pid and _rg_page.region == _rg_fid
+    _rg_td = win.doc
+    assert set(_rg_td.nodes) - set(_rg_td.own_node_ids()) == {"n3", "n4"}
+    _rg_own = _rg_td.own_node_ids()
+    assert sorted(_rg_td.nodes[n].op_key for n in _rg_own) == ["page.input", "page.output"]
+    assert set(win.scene.node_items) == set(_rg_td.nodes), "the tab's canvas: region + ports"
+    assert _rg_fid in win.scene.frame_items, "the region's frame shows on the tab too"
+    _rg_port = [r for r in _rg_doc.nodes.values() if r.op_key == "page.output"]
+    assert len(_rg_port) == 1 and ("n2", "out", _rg_port[0].id, "data") in _rg_doc.edges
+    _rg_mfi = win.scene_for(_rg_pid).frame_items[_rg_fid]
+    _rg_mfi.reflow()
+    assert "1 tab" in _rg_mfi.title_text(), _rg_mfi.title_text()
+    _rg_m2 = _PMenu()
+    win.fill_page_menu(_rg_m2, win.canvas)
+    assert any("(linked · region · 0 overrides)" in a.text() for a in _rg_m2.actions()), \
+        [a.text() for a in _rg_m2.actions()]
+    win.scene.clearSelection()
+    win.scene.node_items["n3"].setSelected(True)
+    app.processEvents()
+    assert "region “Region”" in win.inspector._linked_text, win.inspector._linked_text
+    # a value changed on the tab is its own; the tab pulls through the port
+    win.inspector._set_param(win.scene.node_items["n3"], "sigma", 2.75)
+    app.processEvents()
+    assert _rg_td.is_overridden("n3", "sigma")
+    assert _rg_doc.nodes["n3"].params.get("sigma") != 2.75
+    _rg_fails = len(_seen_fail)
+    _pdone.clear()
+    win.pull_node("n4")
+    _pwait(f"{_rg_tab}/n4")
+    assert len(_seen_fail) == _rg_fails, _seen_fail[_rg_fails:]
+    # the tab's own Page Input goes without a question (its own); Make unique keeps the rest
+    _rg_in = next(n for n in _rg_own if _rg_td.nodes[n].op_key == "page.input")
+    win.scene.delete_nodes([_rg_in])
+    app.processEvents()
+    assert _rg_in not in _rg_td.nodes and {"n3", "n4"} <= set(_rg_td.nodes)
+    assert win.make_unique(_rg_tab)
+    app.processEvents()
+    assert win.workspace.page(_rg_tab).region is None and {"n3", "n4"} <= set(win.doc.nodes)
+    _ok("RG1 Draw a region arms the box (status hint, Esc/again disarms); the box becomes a "
+        "frame around the cards inside it with a port per crossing wire (counted in its "
+        "title bar and the status bar); its menu offers Duplicate region as a linked tab, "
+        "which makes a Free page of the region alone — the master's Page Output at the "
+        "input port, the tab's own Page Input / Output, the frame shown on both and "
+        "counting its tab, the page menu and the inspector naming the region — where a "
+        "value is an override, a pull runs through the port, its own port deletes without "
+        "a question and Make unique keeps the region's nodes")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

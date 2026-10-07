@@ -32,6 +32,16 @@ Frames, groups and zones stay the master's in every mode. Moving and folding a c
 master owns is forwarded to the master (the cards move on both); this page's own cards move
 alone.
 
+**A region tab (2026-10-07)** is a linked page that mirrors only ONE FRAME of its master —
+:attr:`~LinkedDocument.region` names the frame — the region the user drew on the master's
+canvas. Its nodes are the frame's members and follow the master exactly as above (the frame
+grows, the tab grows); the wires crossing the frame's border are the region's PORTS, and the
+tab stands a Page Input or Output of its own at each one — its structure from birth (a
+modified page), so every tab of one region may read different sources, publish under
+different names, add or drop a port, while the nodes inside stay one graph with values of
+their own per tab. A tab never sends edits to the master (:data:`REGION_EDIT_HINT`): the
+region is edited on the master page, inside its frame.
+
 The mirror is rebuilt IN PLACE: a node keeps its :class:`NodeRecord` object — and its ``params``
 and ``modes`` dicts — for as long as the master keeps that node with the same type, so the
 canvas updates its cards rather than rebuilding them on every master keystroke, and the
@@ -74,6 +84,11 @@ ASK_HINT = ("this page is linked to its master — you will be asked whether to 
 #: frames, groups and zones are the master's in every mode
 SHAPE_HINT = ("frames, groups and zones of a linked page are its master's — change them on "
               "the master, or make this page unique")
+
+#: a region tab's edits never go to the master (2026-10-07): the region is edited on the
+#: master page, inside its frame; the tab keeps its own Page Inputs and Outputs
+REGION_EDIT_HINT = ("a region tab keeps its own changes — edit the region's nodes on the "
+                    "master page, inside the frame, and every tab of the region follows")
 
 #: an override that REMOVES a parameter the master sets: the linked page uses the node's
 #: default (or its metadata-derived value) where the master pins one. A plain JSON value, so
@@ -183,12 +198,20 @@ class LinkedDocument(GraphDocument):
 
     def __init__(self, master: GraphDocument,
                  overrides: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
-                 structure: Optional[Dict[str, Any]] = None) -> None:
+                 structure: Optional[Dict[str, Any]] = None,
+                 region: Optional[str] = None) -> None:
         super().__init__()
         # one level deep: a page linked to a LINKED page links to that page's master
         while isinstance(master, LinkedDocument):
             master = master.master
         self.master: GraphDocument = master
+        #: the master's FRAME this page mirrors — a REGION TAB (2026-10-07): only the frame's
+        #: member nodes, and the wires among them, follow the master; the tab's Page Inputs
+        #: and Outputs at the region's ports are its own structure. ``None``: the whole page.
+        self.region: Optional[str] = region
+        #: the region's members as last seen on the master — kept if the master drops the
+        #: frame, so the tab stays on the nodes it showed instead of emptying
+        self._region_members: List[str] = []
         check_overrides(overrides or {})
         check_structure(structure)
         self.overrides: Dict[str, Dict[str, Dict[str, Any]]] = copy.deepcopy(overrides or {})
@@ -217,16 +240,41 @@ class LinkedDocument(GraphDocument):
         self.propagate()
 
     # ── the mirror ─────────────────────────────────────────────────────────────
+    def _master_nodes(self) -> Dict[str, NodeRecord]:
+        """The master's nodes this page mirrors: all of them — or, a region tab, the members
+        of the master's frame :attr:`region`. The member list is remembered: a frame the
+        master deletes leaves the tab on the nodes it last showed, never empty."""
+        m = self.master
+        if self.region is None:
+            return m.nodes
+        fr = m.frames.get(self.region)
+        if fr is not None:
+            self._region_members = [n for n in fr.members if n in m.nodes]
+        else:
+            self._region_members = [n for n in self._region_members if n in m.nodes]
+        return {n: m.nodes[n] for n in self._region_members}
+
+    def region_members(self) -> List[str]:
+        """The master nodes a region tab mirrors (``[]`` for a page linked whole)."""
+        return list(self._region_members) if self.region is not None else []
+
+    def region_title(self) -> str:
+        """The region frame's title on the master, ``""`` when the frame is gone or this
+        page is linked whole."""
+        fr = self.master.frames.get(self.region) if self.region is not None else None
+        return fr.title if fr is not None else ""
+
     def _mirror(self) -> None:
         """Rebuild this page from the master, in place, then lay the overrides — and this
         page's own structure — over it."""
         m = self.master
+        msub = self._master_nodes()
         # the master may have taken an id one of this page's own nodes carries
         for nid in [n for n in self._own if n in m.nodes]:
             self._reid_own(nid)
         removed = set(self._removed)
         kept: Dict[str, NodeRecord] = {}
-        for nid, mrec in m.nodes.items():
+        for nid, mrec in msub.items():
             if nid in removed:
                 continue
             rec = self.nodes.get(nid)
@@ -282,11 +330,16 @@ class LinkedDocument(GraphDocument):
         self.nodes.clear()
         self.nodes.update(kept)
         medges = [tuple(e) for e in m.edges]
+        if self.region is not None:
+            # a region tab: only the wires AMONG the region's nodes are the master's; a wire
+            # crossing the region's border is a port, which the tab's own Page Input or
+            # Output stands in for
+            medges = [e for e in medges if e[0] in msub and e[2] in msub]
         if self._modified:
             # what this page changed, pruned to what still means something: a wire to a node
             # the master deleted goes, a removal the master already made is no longer one
             mset = set(medges)
-            self._removed = [n for n in self._removed if n in m.nodes]
+            self._removed = [n for n in self._removed if n in msub]
             self._edges_added = [e for e in self._edges_added
                                  if e[0] in kept and e[2] in kept and e not in mset]
             self._edges_removed = [e for e in self._edges_removed if e in mset]
@@ -304,9 +357,17 @@ class LinkedDocument(GraphDocument):
             members = [n for n in fr.members if n in kept]
             if members:
                 self.frames[fid] = FrameRecord(fr.id, fr.title, members, fr.color)
-        self._zones = copy.deepcopy(m._zones)
+        if self.region is None:
+            self._zones = copy.deepcopy(m._zones)
+            self._back_edges = list(m._back_edges)
+        else:
+            # a zone is the region's only when the frame encloses all of it (the tab is
+            # refused at birth otherwise; a later frame edit that cuts one leaves the zone
+            # on the master alone)
+            self._zones = copy.deepcopy([z for z in m._zones if set(z.members) <= set(msub)])
+            self._back_edges = [e for e in m._back_edges
+                                if e.src in msub and e.dst in msub]
         self._groups = copy.deepcopy(m._groups)
-        self._back_edges = list(m._back_edges)
 
     def _is_multi(self, dst: str, dst_socket: str) -> bool:
         spec = self._socket_spec(dst, "in", dst_socket)
@@ -494,6 +555,8 @@ class LinkedDocument(GraphDocument):
                 self._modified, self._session_mode = True, ""
                 self._notify(())
         elif mode == EDIT_MASTER:
+            if self.region is not None:
+                raise LinkedPageError(REGION_EDIT_HINT)
             if self._modified:
                 raise LinkedPageError("this page keeps its changes on itself (a modified "
                                       "linked page) — its edits do not go to the master")
@@ -544,7 +607,7 @@ class LinkedDocument(GraphDocument):
         """After an edit on a MODIFIED page: what of the live graph is this page's own."""
         m = self.master
         self._own = {nid: rec for nid, rec in self.nodes.items() if nid not in m.nodes}
-        self._removed = [nid for nid in m.nodes if nid not in self.nodes]
+        self._removed = [nid for nid in self._master_nodes() if nid not in self.nodes]
         medges = {tuple(e) for e in m.edges}
         live = {tuple(e) for e in self.edges}
         self._edges_added = [tuple(e) for e in self.edges if tuple(e) not in medges]
@@ -656,6 +719,8 @@ class LinkedDocument(GraphDocument):
     def _push_add(self, op_key: str, *, x: float = 0.0, y: float = 0.0,
                   node_id: Optional[str] = None, params: Optional[dict] = None,
                   modes: Optional[dict] = None) -> NodeRecord:
+        if self.region is not None:               # a node outside the frame would never mirror
+            raise LinkedPageError(REGION_EDIT_HINT)
         spec = NODES.get(op_key)
         why = pass_through_reason(spec, params, modes)
         if why:
@@ -771,4 +836,4 @@ class LinkedDocument(GraphDocument):
 __all__ = ["LinkedDocument", "LinkedPageError", "TOPOLOGY_HINT", "UNSET",
            "DOCK_LOCAL_PARAMS", "DOCK_LOCAL_MODES", "check_overrides", "check_structure",
            "EDIT_UNIQUE", "EDIT_MODIFIED", "EDIT_MASTER", "MASTER_CHANGE_HINT", "SHAPE_HINT",
-           "ASK_HINT"]
+           "ASK_HINT", "REGION_EDIT_HINT"]

@@ -697,6 +697,52 @@ class GraphDocument:
             fr.title = str(title)
             self._notify(())      # GUI-only, like add_frame
 
+    def set_frame_members(self, frame_id: str, members) -> None:
+        """Re-draw frame ``frame_id`` around ``members`` (unknown ids dropped; an empty
+        result removes the frame, as frames never persist empty). A REGION tab linked to
+        the frame follows it (2026-10-07), so this is how a region grows or shrinks."""
+        fr = self.frames.get(frame_id)
+        if fr is None:
+            return
+        mem = [n for n in members if n in self.nodes]
+        if not mem:
+            del self.frames[frame_id]
+        else:
+            fr.members = mem
+        self._notify(())          # the frame is decoration here; a region tab re-mirrors
+
+    # ── regions: a frame's crossing wires (2026-10-07) ─────────────────────────
+    def region_ports(self, frame_id: str) -> Tuple[List[EdgeTuple], List[EdgeTuple]]:
+        """The wires crossing frame ``frame_id``'s border — ``(ins, outs)``: the document
+        edges whose destination is a member and whose source is not, and the reverse, each
+        in edge order. These are the frame's PORTS on the canvas, and what a region tab
+        turns into Page Inputs and Outputs. A frame that does not exist has none."""
+        fr = self.frames.get(frame_id)
+        if fr is None:
+            return [], []
+        mem = set(fr.members)
+        ins = [e for e in self.edges if e[2] in mem and e[0] not in mem]
+        outs = [e for e in self.edges if e[0] in mem and e[2] not in mem]
+        return ins, outs
+
+    def region_interface(self, frame_id: str
+                         ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """What a region takes in and hands out, one entry per SIGNAL: its inputs are the
+        distinct external output sockets ``(node, socket)`` wired into a member, in the
+        order their wires appear; its outputs the distinct member output sockets a wire
+        leaves the region from. A source wired into three members is ONE input (one port,
+        one Page Input on a tab), fanned out inside."""
+        ins, outs = self.region_ports(frame_id)
+        seen_in: List[Tuple[str, str]] = []
+        for (s, ss, _d, _ds) in ins:
+            if (s, ss) not in seen_in:
+                seen_in.append((s, ss))
+        seen_out: List[Tuple[str, str]] = []
+        for (s, ss, _d, _ds) in outs:
+            if (s, ss) not in seen_out:
+                seen_out.append((s, ss))
+        return seen_in, seen_out
+
     def downstream_of(self, node_ids: Iterable[str]) -> frozenset:
         """``node_ids`` plus every node they transitively FEED.
 

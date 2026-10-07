@@ -485,7 +485,7 @@ see: WF-08 · CON-18 · [MANUAL §2 Pages, §2b](../MANUAL.md)
 ---
 
 ### CON-18 — linked page
-anchors: sym:nodelab_v2.linked_document.LinkedDocument, sym:nodelab_v2.linked_document.LinkedDocument.touch, sym:nodelab_v2.linked_document.LinkedDocument.set_edit_mode, sym:nodelab_v2.linked_document.LinkedDocument.structure_dict, sym:nodelab_v2.linked_document.LinkedDocument.set_muted, sym:nodelab_v2.document.pass_through_reason
+anchors: sym:nodelab_v2.linked_document.LinkedDocument, sym:nodelab_v2.linked_document.LinkedDocument.set_edit_mode, sym:nodelab_v2.linked_document.LinkedDocument.structure_dict, sym:nodelab_v2.document.pass_through_reason, sym:nodelab_v2.workspace.Workspace.duplicate_region, sym:nodelab_v2.document.GraphDocument.region_ports
 
 A **linked page** is a page whose document is a `LinkedDocument`: a live mirror of its
 **master** page — the same nodes, wires, positions, frames, zones and groups, rebuilt IN PLACE
@@ -525,6 +525,25 @@ override — `source` is an ordinary param, so a copy reads a different Output t
 without touching the master (CON-21).
 
 see: CON-17 · CON-09 · CON-21 · [MANUAL §2 Linked pages](../MANUAL.md)
+
+**A region tab (2026-10-07)** is a `LinkedDocument` whose `region` names ONE FRAME of its master:
+`_master_nodes` is the frame's member list (remembered, so a frame the master deletes leaves the
+tab its nodes), `_mirror` keeps only the master wires among them, and a zone only when the
+frame encloses all of it. The frame's crossing wires are its PORTS — `GraphDocument.region_ports`
+(every crossing edge) and `region_interface` (one entry per signal: a source socket feeding
+three members is one input) — drawn on the `FrameItem` as dots on the border with the count
+in its title bar. `Workspace.duplicate_region(page, frame)` makes the tab: a FREE page (the
+only kind that may read its own master's page) whose STRUCTURE from birth is a `page.input`
+per input signal, bound to a `page.output` the master gains at that socket (`<title> in k`;
+a named one already wired there is reused), and a `page.output` per output signal (`<title>
+out k`), all `nL…` own nodes — so the tab may re-point, rename, add or drop its ports while the
+nodes inside take overrides like any linked page. A tab never sends edits to the master
+(`REGION_EDIT_HINT`; `EDIT_MASTER` and `_push_add` refuse). The page record carries
+`region` beside `master`; `duplicate_page(dependent=True)` of a tab keeps it; `make_unique`
+clears it. Canvas: `GraphView.set_region_mode` (R, Alt+drag, the menus) draws the box and
+emits `region_drawn`; `GraphScene.frame_from_rect` frames the cards whose centre is inside;
+the window's `duplicate_region` shows the tab; `GraphScene.region_tab_names` feeds the frame's
+tab count. Tests: `selftest.test_region_tabs`, probe RG1.
 
 ---
 

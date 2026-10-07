@@ -30257,6 +30257,158 @@ def test_registration_refinement() -> None:
         "malformed region JSON refuses")
 
 
+def test_region_tabs() -> None:
+    """REGION TABS (2026-10-07): a frame is a region whose crossing wires are PORTS
+    (``region_ports`` / ``region_interface``, one per signal); ``Workspace.duplicate_region``
+    makes a Free page linked to the frame's nodes alone, with a Page Output at each input
+    port on the master (reused by the next tab) and a Page Input / Output of the tab's own at
+    every port — its structure, free to change — while the nodes inside follow the master,
+    grow with the frame, take overrides, compose and pull through the port; a tab is saved
+    as ``master`` + ``region``, a linked copy of a tab is a tab, Make unique keeps what it
+    shows, the master dropping the frame leaves the tab its nodes; refused: no such frame, a
+    value wire or a zone cut by the border, edits sent to the master."""
+    import copy
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.linked_document import EDIT_MASTER, LinkedDocument, LinkedPageError
+    from nodelab_v2.workspace import Workspace
+    ws, ds, _env, _ax = _ws_fixture()
+    Rf = ws.pages["pg2"]                      # IN → G → O "smooth"
+    d = Rf.doc
+    d.disconnect("G", "out", "O", "data")
+    d.add_node("enhance.gamma", node_id="X", params={"gamma": 1.0}, x=300.0)
+    d.add_node("enhance.median", node_id="M", x=100.0, y=200.0)
+    d.add_node("page.output", node_id="O2", params={"name": "med"}, x=600.0, y=200.0)
+    for e in (("G", "out", "X", "data"), ("X", "out", "O", "data"),
+              ("IN", "out", "M", "data"), ("M", "out", "O2", "data")):
+        d.connect(*e)
+    fr = d.add_frame("Region", members=["G", "X", "M"])
+    ins, outs = d.region_ports(fr.id)
+    assert sorted(ins) == [("IN", "out", "G", "data"), ("IN", "out", "M", "data")], ins
+    assert sorted(outs) == [("M", "out", "O2", "data"), ("X", "out", "O", "data")], outs
+    i_keys, o_keys = d.region_interface(fr.id)
+    assert i_keys == [("IN", "out")] and sorted(o_keys) == [("M", "out"), ("X", "out")]
+    assert d.region_ports("nope") == ([], [])
+    tab = ws.duplicate_region("pg2", fr.id)
+    td = tab.doc
+    assert tab.kind == "free" and tab.master == "pg2" and tab.region == fr.id
+    assert isinstance(td, LinkedDocument) and td.region == fr.id and td.is_modified
+    assert td.region_title() == "Region" and set(td.region_members()) == {"G", "X", "M"}
+    assert list(ws.pages).index(tab.id) == list(ws.pages).index("pg2") + 1
+    own = td.own_node_ids()
+    assert set(td.nodes) - set(own) == {"G", "X", "M"}, "only the region's nodes follow"
+    pins = [n for n in own if td.nodes[n].op_key == "page.input"]
+    pouts = [n for n in own if td.nodes[n].op_key == "page.output"]
+    assert len(pins) == 1 and len(pouts) == 2, (pins, pouts)
+    port = [r for r in d.nodes.values() if r.op_key == "page.output"
+            and ("IN", "out", r.id, "data") in d.edges]
+    assert len(port) == 1 and port[0].params["name"] == "Region in 1", port
+    assert td.nodes[pins[0]].params["source"] == f"pg2:{port[0].params['name']}"
+    assert (pins[0], "out", "G", "data") in td.edges and (pins[0], "out", "M", "data") in td.edges
+    assert "IN" not in td.nodes and "O" not in td.nodes and ("G", "out", "X", "data") in td.edges
+    assert sorted(td.nodes[n].params["name"] for n in pouts) == ["Region out 1", "Region out 2"]
+    assert ws.region_tabs("pg2", fr.id) == [tab.id] and ws.region_tabs(tab.id, fr.id) == [tab.id]
+    # composed and pulled: the tab's chain reads the master's Input through the port
+    comp = ws.compose(tab.id)
+    assert f"{tab.id}/G" in comp.graph.nodes and f"pg2/{port[0].id}" in comp.graph.nodes
+    assert f"{tab.id}/{pins[0]}" not in comp.graph.nodes, "a resolved Input is spliced away"
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    assert eng.pull(f"{tab.id}/X").axes.y == 32
+    # values: an override on the tab, the master untouched; a master edit reaches the tab
+    td.nodes["G"].params["sigma"] = 3.0
+    td.touch("G")
+    assert td.is_overridden("G", "sigma") and d.nodes["G"].params["sigma"] == 1.0
+    d.nodes["X"].params["gamma"] = 2.0
+    d.touch("X")
+    assert td.nodes["X"].params["gamma"] == 2.0
+    # the region follows the FRAME: a node the master adds to it appears on the tab
+    d.add_node("enhance.clahe", node_id="C", x=450.0)
+    d.connect("X", "out", "C", "data")
+    assert "C" not in td.nodes
+    d.set_frame_members(fr.id, ["G", "X", "M", "C"])
+    assert "C" in td.nodes and ("X", "out", "C", "data") in td.edges
+    # the tab's ports are its own: re-point, drop, add — no question asked
+    td.nodes[pins[0]].params["source"] = "pg1:raw"
+    td.touch(pins[0])
+    assert ws.resolve_source(tab.id, "pg1:raw") == ("pg1", "O")
+    td.remove_node(pouts[1])
+    assert pouts[1] not in td.nodes and pouts[1] not in td.own_node_ids()
+    extra = td.add_node("page.input", params={"source": "pg1:raw"})
+    td.connect(extra.id, "out", "C", "data")
+    assert (extra.id, "out", "C", "data") in td.edges and ("X", "out", "C", "data") not in td.edges
+    # a second tab reuses the master's port; a linked copy of a tab is a tab
+    n_out = sum(1 for r in d.nodes.values() if r.op_key == "page.output")
+    tab2 = ws.duplicate_region("pg2", fr.id)
+    assert sum(1 for r in d.nodes.values() if r.op_key == "page.output") == n_out
+    assert tab2.region == fr.id and tab2.name == "Region 3"
+    assert set(ws.region_tabs("pg2", fr.id)) == {tab.id, tab2.id}
+    tab3 = ws.duplicate_page(tab2.id, dependent=True)
+    assert tab3.region == fr.id and tab3.master == "pg2" and tab3.doc.region == fr.id
+    # saved and reloaded: master + region, no graph; a region on a plain page is refused
+    blob = ws.to_dict()
+    rec = next(r for r in blob["workspace"]["pages"] if r["id"] == tab.id)
+    assert rec["region"] == fr.id and rec["master"] == "pg2" and "graph" not in rec
+    assert "region" not in next(r for r in blob["workspace"]["pages"] if r["id"] == "pg2")
+    ws2 = Workspace()
+    ws2.load_dict(blob)
+    t2 = ws2.pages[tab.id]
+    assert t2.region == fr.id and t2.doc.region == fr.id
+    assert set(t2.doc.nodes) == set(td.nodes) and sorted(t2.doc.edges) == sorted(td.edges)
+    assert t2.doc.nodes["G"].params["sigma"] == 3.0
+    bad = copy.deepcopy(blob)
+    next(r for r in bad["workspace"]["pages"] if r["id"] == "pg1")["region"] = fr.id
+    try:
+        Workspace().load_dict(bad)
+        raise AssertionError("a region without a master must be refused")
+    except ValueError:
+        pass
+    # the master drops the frame: the tab keeps the nodes it showed
+    d.remove_frame(fr.id)
+    assert {"G", "X", "M", "C"} <= set(td.nodes) and td.region_title() == ""
+    # Make unique keeps what the tab shows
+    keep = set(td.nodes)
+    u = ws.make_unique(tab.id)
+    assert set(u.doc.nodes) == keep and u.master is None and u.region is None
+    # refused, nothing changed: no such frame; a value wire crossing the border; a zone cut
+    # by it; a tab sending its edits to the master
+    try:
+        ws.duplicate_region("pg2", "nope")
+        raise AssertionError("no such frame")
+    except ValueError:
+        pass
+    d.add_node("flow.iterate", node_id="IT", x=-200.0, y=-200.0)
+    d.connect("IT", "var0", "G", "sigma")
+    fr2 = d.add_frame("Cut", members=["G"])
+    n_pages, n_nodes = len(ws.pages), len(d.nodes)
+    try:
+        ws.duplicate_region("pg2", fr2.id)
+        raise AssertionError("a value wire across the border")
+    except ValueError as exc:
+        assert "value wire" in str(exc), exc
+    assert (len(ws.pages), len(d.nodes)) == (n_pages, n_nodes)
+    d.disconnect("IT", "var0", "G", "sigma")
+    d.remove_node("IT")
+    d.wrap_repeat_zone(["M"], iterations=2)
+    try:
+        ws.duplicate_region("pg2", d.add_frame("Half", members=["M"]).id)
+        raise AssertionError("a zone cut by the border")
+    except ValueError as exc:
+        assert "zone" in str(exc), exc
+    try:
+        tab2.doc.set_edit_mode(EDIT_MASTER)
+        raise AssertionError("a region tab never sends edits to the master")
+    except LinkedPageError:
+        pass
+    _ok("region tabs: a frame's crossing wires are ports (one per signal); Duplicate region "
+        "makes a Free page linked to the frame's nodes alone — a Page Output per input port "
+        "on the master (reused by the next tab), a Page Input / Output of the tab's own at "
+        "every port — composed and pulled through the port; overrides, master edits and "
+        "frame growth reach it; its ports re-point, drop and add freely; saved as master + "
+        "region, reloaded, copied as a tab; the frame gone leaves it its nodes; Make unique "
+        "keeps it; no frame, a value wire or a zone across the border, and edits to the "
+        "master are refused")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -30460,6 +30612,7 @@ def main() -> int:
     test_detect_beads()
     test_phantoms()
     test_node_demos()
+    test_region_tabs()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

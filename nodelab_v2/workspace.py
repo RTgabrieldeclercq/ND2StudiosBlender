@@ -37,7 +37,9 @@ File format
 -----------
 :meth:`Workspace.to_dict` writes :data:`nodegraph.serialize.WORKSPACE_FORMAT_VERSION` (3.0):
 ``{format_version, app_version, workspace: {active, next_page_seq, pages: [...]}}``, one
-single-graph body per page (``graph``/``zones``/``groups``/``ui`` + ``id``/``name``/``kind``).
+single-graph body per page (``graph``/``zones``/``groups``/``ui`` + ``id``/``name``/``kind``);
+a linked page carries ``master`` + ``overrides`` (+ ``structure``, + ``region`` for a region tab,
+2026-10-07) instead of a body.
 :meth:`Workspace.load_dict` reads that and a 2.0 single-graph document (one ``free`` page). Page
 ids are ``pg1, pg2, …`` from a persisted counter and are never re-minted, so a stale Input
 reference can never silently rebind to a new page.
@@ -58,6 +60,7 @@ from nodegraph.memo import digest
 from nodegraph.metadata import MetaEnvelope
 from nodegraph.serialize import (
     is_workspace_dict, page_from_dict, to_workspace_dict, workspace_pages)
+from nodegraph.sockets import SocketType
 from nodelab_v2.document import GraphDocument, NodeRecord, is_driver_edge
 from nodelab_v2.linked_document import LinkedDocument, check_overrides, check_structure
 from nodelab_v2.ops import (
@@ -149,6 +152,10 @@ class Page:
     #: Offered first (★) as a master to link a new page to (V4.00 step 11); any plain page
     #: may still be chosen. Never set on a linked page. In the file only when True.
     is_master: bool = False
+    #: A REGION TAB (2026-10-07): the id of the master's frame this linked page mirrors —
+    #: only that frame's nodes follow the master, and the tab owns the Page Inputs and
+    #: Outputs at the frame's ports. ``None`` for a page linked whole, and for a plain page.
+    region: Optional[str] = None
 
 
 class OutlineRow(NamedTuple):
@@ -437,11 +444,13 @@ class Workspace:
             linked_src = src.master and isinstance(src.doc, LinkedDocument)
             doc = LinkedDocument(root.doc,
                                  overrides=(src.doc.overrides_dict() if linked_src else None),
-                                 structure=(src.doc.structure_dict() if linked_src else None))
+                                 structure=(src.doc.structure_dict() if linked_src else None),
+                                 region=(src.region if linked_src else None))
             doc.path = self.path
             page = self.add_page(name or f"{src.name} (linked)", src.kind, doc=doc,
                                  index=order.index(page_id) + 1)
             page.master = root_id
+            page.region = src.region if linked_src else None   # a tab's copy is a tab
             self._out_ids[page.id] = self._output_ids(page.id)
             page.doc.repropagate()          # now its Page Inputs see the upstream Outputs
             self._notify(())                # a new page: read by nothing yet
@@ -456,6 +465,130 @@ class Workspace:
         """The pages LINKED to ``page_id`` (its dependents), in page order."""
         return [p.id for p in self.pages.values() if p.master == page_id]
 
+    # ── region tabs (2026-10-07) ───────────────────────────────────────────────
+    def region_tabs(self, page_id: str, frame_id: str) -> List[str]:
+        """The REGION TABS of frame ``frame_id`` on ``page_id``'s master document (the page
+        itself when plain), in page order."""
+        page = self.pages.get(page_id)
+        if page is None:
+            return []
+        root = page.master or page_id
+        return [p.id for p in self.pages.values()
+                if p.master == root and p.region == frame_id]
+
+    def duplicate_region(self, page_id: str, frame_id: str, *,
+                         name: Optional[str] = None) -> Page:
+        """A REGION TAB (2026-10-07): a new Free page LINKED to the master document of
+        ``page_id`` but mirroring only frame ``frame_id`` — the region drawn around a set of
+        nodes — placed right after ``page_id``.
+
+        The frame's crossing wires are the region's ports (:meth:`GraphDocument.region_ports`),
+        one per SIGNAL (:meth:`GraphDocument.region_interface`). For each signal entering the
+        region the master gets a ``page.output`` wired from that socket (an existing named
+        one wired from it is reused, so a second tab adds nothing), and the tab a
+        ``page.input`` of its own bound to it, fanned out to every member the signal fed;
+        for each signal leaving, the tab a ``page.output`` of its own named after the
+        region. Those boundary nodes and their wires are the tab's STRUCTURE — a modified
+        linked page from birth — so each tab may re-point, rename, add or drop its inputs and
+        outputs freely, while the nodes inside follow the master and take overrides like any
+        linked page. Free, because the tab reads its master's page, which only a Free page
+        of the same kind may do; a later page reads the tab's outputs like any other.
+
+        Refused with :class:`ValueError`, nothing changed: no such frame, a frame with no
+        node, a frame cutting a zone, or a VALUE wire crossing the border (a port carries a
+        Dataset — put both ends of a value wire inside the region, or both outside)."""
+        src = self.pages[page_id]
+        root_id = src.master or page_id
+        root = self.pages[root_id]
+        rdoc = root.doc
+        fr = rdoc.frames.get(frame_id)
+        if fr is None:
+            raise ValueError(f"page {root.name!r} has no frame {frame_id!r}")
+        members = [n for n in fr.members if n in rdoc.nodes]
+        if not members:
+            raise ValueError("the region encloses no node")
+        mem = set(members)
+        for z in rdoc._zones:
+            zm = set(z.members)
+            if zm & mem and not zm <= mem:
+                raise ValueError("the region cuts through a zone — enclose the whole zone "
+                                 "(its In and Out markers and body) or none of it")
+        ins, outs = rdoc.region_ports(frame_id)
+        for (s, ss, d, ds) in ins + outs:
+            spec = rdoc._socket_spec(s, "out", ss)
+            if spec is None or spec.type is not SocketType.DATASET \
+                    or is_driver_edge(rdoc, (s, ss, d, ds)):
+                raise ValueError(
+                    f"a value wire crosses the region ({rdoc.title_of(s)} · {ss} → "
+                    f"{rdoc.title_of(d)} · {ds}): a port carries a Dataset, so put both "
+                    f"ends inside the region, or both outside")
+        in_keys, out_keys = rdoc.region_interface(frame_id)
+        # the ports on the master: a Page Output per signal entering the region, reused
+        # when a named one is already wired from that socket
+        in_names: Dict[Tuple[str, str], str] = {}
+        for k, (s, ss) in enumerate(in_keys, 1):
+            have = next((r for r in rdoc.nodes.values()
+                         if r.op_key == PAGE_OUTPUT_OP
+                         and str(r.params.get(PAGE_NAME_KEY) or "").strip()
+                         and (s, ss, r.id, "data") in rdoc.edges), None)
+            if have is not None:
+                in_names[(s, ss)] = str(have.params[PAGE_NAME_KEY]).strip()
+                continue
+            nm = self.unique_output_name(root_id, f"{fr.title} in {k}")
+            srec = rdoc.nodes[s]
+            rec = rdoc.add_node(PAGE_OUTPUT_OP, params={PAGE_NAME_KEY: nm},
+                                x=srec.x, y=srec.y + 150.0)
+            rdoc.connect(s, ss, rec.id, "data")
+            in_names[(s, ss)] = str(rec.params.get(PAGE_NAME_KEY) or nm)
+        # the tab's own boundary nodes: ids the master never mints (``nL…``)
+        taken = {str(r.params.get(PAGE_NAME_KEY) or "").strip().lower()
+                 for p in self.pages.values() for r in p.doc.nodes.values()
+                 if r.op_key == PAGE_OUTPUT_OP} - {""}
+        st: Dict[str, Any] = {"nodes": {}, "removed": [], "edges_added": [],
+                              "edges_removed": []}
+        seq = [0]
+
+        def fresh() -> str:
+            while True:
+                seq[0] += 1
+                nid = f"nL{seq[0]}"
+                if nid not in rdoc.nodes and nid not in st["nodes"]:
+                    return nid
+
+        def own(op_key: str, params: Dict[str, Any], x: float, y: float) -> str:
+            nid = fresh()
+            st["nodes"][nid] = {"op_key": op_key, "params": params, "modes": {},
+                                "x": float(x), "y": float(y), "muted": False,
+                                "collapsed": False}
+            return nid
+
+        left = min(rdoc.nodes[n].x for n in members) - 280.0
+        right = max(rdoc.nodes[n].x for n in members) + 300.0
+        for (s, ss) in in_keys:
+            fed = [e for e in ins if (e[0], e[1]) == (s, ss)]
+            nid = own(PAGE_INPUT_OP, {PAGE_SOURCE_KEY: f"{root_id}:{in_names[(s, ss)]}"},
+                      left, rdoc.nodes[fed[0][2]].y)
+            for (_s, _ss, d, ds) in fed:
+                st["edges_added"].append([nid, "out", d, ds])
+        for j, (s, ss) in enumerate(out_keys, 1):
+            nm = next_free_name(sanitize_output_name(f"{fr.title} out {j}")
+                                or DEFAULT_OUTPUT_BASE, taken)
+            taken.add(nm.lower())
+            nid = own(PAGE_OUTPUT_OP, {PAGE_NAME_KEY: nm}, right, rdoc.nodes[s].y)
+            st["edges_added"].append([s, ss, nid, "data"])
+        doc = LinkedDocument(rdoc, structure=st, region=frame_id)
+        doc.path = self.path
+        order = list(self.pages)
+        n = len(self.region_tabs(root_id, frame_id)) + 2
+        page = self.add_page(name or f"{fr.title} {n}", FREE, doc=doc,
+                             index=order.index(page_id) + 1)
+        page.master = root_id
+        page.region = frame_id
+        self._out_ids[page.id] = self._output_ids(page.id)
+        page.doc.repropagate()              # its Page Inputs see the master's new Outputs
+        self._notify(())                    # a new page: read by nothing yet
+        return page
+
     def make_unique(self, page_id: str) -> Page:
         """Turn a linked page into a plain one holding its current graph and values; master
         edits no longer reach it (V4 step 6). A plain page is returned unchanged."""
@@ -465,7 +598,7 @@ class Workspace:
         old = page.doc
         self._detach(page)
         page.doc = old.make_unique()
-        page.master, page.overrides = None, {}
+        page.master, page.overrides, page.region = None, {}, None
         self._attach(page)
         page.doc.repropagate()              # with the Page Input seeds now installed
         # out of its master's family: a variable the master also has is renamed, and every
@@ -1499,6 +1632,8 @@ class Workspace:
                                    "master": p.master}
             if p.is_master:
                 rec["is_master"] = True     # only when set: older files stay byte-identical
+            if p.region:
+                rec["region"] = p.region    # a region tab: the master's frame it mirrors
             if p.master:
                 rec["overrides"] = (p.doc.overrides_dict()
                                     if isinstance(p.doc, LinkedDocument) else
@@ -1537,6 +1672,11 @@ class Workspace:
                                  f"(kinds: {', '.join(R.page_kinds())})")
             if rec.get("master") and rec.get("is_master"):
                 raise ValueError(f"page {rec['id']!r} is linked to a master and cannot be one")
+            region = rec.get("region")
+            if region is not None and (not isinstance(region, str) or not region):
+                raise ValueError(f"page {rec['id']!r} 'region' must be a frame id")
+            if region and not rec.get("master"):
+                raise ValueError(f"page {rec['id']!r} names a region but no master")
             if rec.get("master"):
                 m = next((r for r in recs if r["id"] == rec["master"]), None)
                 if m is None or m.get("master"):
@@ -1587,10 +1727,12 @@ class Workspace:
             for rec in [r for r in recs if r.get("master")]:
                 doc = LinkedDocument(self.pages[rec["master"]].doc,
                                      overrides=dict(rec.get("overrides") or {}),
-                                     structure=rec.get("structure"))
+                                     structure=rec.get("structure"),
+                                     region=rec.get("region") or None)
                 doc.path = self.path
                 page = Page(rec["id"], rec.get("name") or rec["id"],
-                            rec.get("kind") or FREE, doc, master=rec["master"])
+                            rec.get("kind") or FREE, doc, master=rec["master"],
+                            region=rec.get("region") or None)
                 self.pages[page.id] = page
                 self._attach(page)
             # …and the file's page ORDER, which the linked pages were appended out of

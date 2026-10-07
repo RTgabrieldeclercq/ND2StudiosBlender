@@ -2100,15 +2100,26 @@ class InspectorPanel(QScrollArea):
         n = doc.override_count()
         ov = doc.overrides.get(node.node_id) or {}
         k = len(ov.get("params") or {}) + len(ov.get("modes") or {}) + (1 if "muted" in ov else 0)
-        sec = self._section("Linked page",
+        # a REGION TAB (2026-10-07): linked to one frame of the master, not the whole page
+        region = getattr(doc, "region", None)
+        rtitle = (doc.region_title() or str(region)) if region else ""
+        sec = self._section("Region tab" if region else "Linked page",
                             f"{n} override{'' if n == 1 else 's'} · {k} on this node")
-        self._linked_text = f"Linked to “{master}” · {n} override{'' if n == 1 else 's'}"
+        self._linked_text = (f"Linked to “{master}” · "
+                             + (f"region “{rtitle}” · " if region else "")
+                             + f"{n} override{'' if n == 1 else 's'}")
         head = QLabel(self._linked_text)
         hf = head.font(); hf.setBold(True); head.setFont(hf)
         sec._lay.addWidget(head)  # type: ignore[attr-defined]
         mode = getattr(doc, "edit_mode", "")
         own = node.node_id in (doc.own_node_ids() if hasattr(doc, "own_node_ids") else ())
-        if mode == "modified":
+        if region:
+            shape = (f"A tab of the region “{rtitle}” on “{master}”: the nodes inside "
+                     f"follow the region there (grow the frame on the master and this tab "
+                     f"grows). The Page Inputs and Outputs at its ports are this tab's own "
+                     f"— re-point, rename, add or remove them freely"
+                     + (" — this node is one of them. " if own else ". "))
+        elif mode == "modified":
             shape = ("A modified linked page: it keeps nodes and wires of its own over the "
                      "master's, and every other edit of the master still arrives. "
                      + ("This node is this page's own. " if own else ""))

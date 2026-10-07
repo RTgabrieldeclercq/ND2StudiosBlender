@@ -62,6 +62,7 @@ from nodelab_v2.framestrip import compact_list
 from nodelab_v2.inspector import InspectorPanel
 from nodelab_v2.lablink.panel import LabLinkPanel
 from nodelab_v2.minimap import MiniMapOverlay
+from nodelab_v2.frame_item import FrameItem
 from nodelab_v2.node_item import NodeItem
 from nodelab_v2.ops import (MOVIE_OP, ACCESS_INGEST, ACCESS_MODE, CALIB_OVERRIDE_KEYS, DOCK_OP,
                             LOAD_OP, PAGE_INPUT_OP,
@@ -1109,6 +1110,8 @@ class MainWindow(QMainWindow):
         sc.topology_refused.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         sc.topology_gate = self._scene_topology_gate
         sc.new_page_from_output.connect(part(self._new_page_from_output, page_id))
+        sc.frame_action.connect(part(self._on_frame_action, page_id))
+        sc.region_tab_names = part(self._region_tab_names, page_id)
         doc = self.workspace.page(page_id).doc
         hooks = [part(self._on_doc_changed, page_id), part(self._on_page_doc_edit, page_id)]
         for fn in hooks:
@@ -1154,6 +1157,9 @@ class MainWindow(QMainWindow):
         c.page_changed.connect(self._on_canvas_page_changed)
         c.view.op_dropped.connect(self._on_op_dropped)
         c.view.files_dropped.connect(self._on_files_dropped)
+        c.view.region_drawn.connect(
+            lambda rect, c=c: (self._activate_canvas(c), self._on_region_drawn(rect)))
+        c.view.region_mode_changed.connect(self._on_region_mode)
         c.view.maximize_toggled.connect(part(self._on_canvas_maximize, c))
         c.minimap.restore_requested.connect(lambda: self.set_maximized(False))
         # the welcome card: the canvas it sits on becomes the one worked in first (its
@@ -1478,6 +1484,8 @@ class MainWindow(QMainWindow):
             n = self._override_count(page)
             mode = getattr(page.doc, "edit_mode", "")
             how = {EDIT_MODIFIED: "modified · ", EDIT_MASTER: "edits → master · "}.get(mode, "")
+            if getattr(page, "region", None):
+                how = "region · "       # a region tab is modified from birth: its ports
             text += f"  (linked · {how}{n} override{'' if n == 1 else 's'})"
         return text
 
@@ -1491,12 +1499,16 @@ class MainWindow(QMainWindow):
             return ""
         if doc.edit_mode == EDIT_MASTER:
             return "edits go to the master (switched off there)"
-        if not doc.is_modified:
+        region = getattr(doc, "region", None)
+        if not doc.is_modified and region is None:
             return ""
         own, gone, wires = doc.structure_counts()
         bits = [f"{own} own node{'' if own == 1 else 's'}"] if own else []
         bits += [f"{gone} removed"] if gone else []
         bits += [f"{wires} wire{'' if wires == 1 else 's'}"] if wires else []
+        if region is not None:          # a tab of one region: its ports are its own nodes
+            head = "region tab" + (f" “{doc.region_title()}”" if doc.region_title() else "")
+            return head + (" · " + ", ".join(bits) if bits else "")
         return "modified" + (" · " + ", ".join(bits) if bits else "")
 
     # ── the Pages panel's nodes (V4.00 step 11e) ──────────────────────────────
@@ -2240,6 +2252,21 @@ class MainWindow(QMainWindow):
         frame.setShortcut("Ctrl+J")
         frame.triggered.connect(self.frame_selection)
         m_graph.addAction(frame)
+        region = QAction("Draw a &region…\tR", self)
+        region.setToolTip(
+            "Drag a box around a set of nodes on the canvas: they become a frame with a "
+            "port for every wire crossing its border — a REGION — ready to duplicate as a "
+            "linked tab. R on the canvas arms the box; holding Alt while dragging draws one "
+            "straight away.")
+        region.triggered.connect(self.draw_region)
+        m_graph.addAction(region)
+        tab = QAction("Duplicate region as a linked &tab", self)
+        tab.setToolTip(
+            "A new Free page of the selected region alone: its nodes follow the region on "
+            "this page, a Page Input or Output of its own stands at every port, and its "
+            "values may differ — one workflow, as many tabs as conditions.")
+        tab.triggered.connect(self.duplicate_region_selected)
+        m_graph.addAction(tab)
         m_graph.addSeparator()
         grp = QAction("&Group selection…", self)
         grp.setShortcut("Ctrl+G")
@@ -3324,6 +3351,94 @@ class MainWindow(QMainWindow):
             return
         self.doc.add_frame(title or "Frame", sel)
         self.statusBar().showMessage(f"framed {len(sel)} node(s)")
+
+    # ── regions and their tabs (2026-10-07) ───────────────────────────────────
+    def draw_region(self) -> None:
+        """Graph → *Draw a region…*: arm the active canvas's region box (what R does)."""
+        self.view.set_region_mode(True)
+        self.view.setFocus()
+
+    def _on_region_mode(self, on: bool) -> None:
+        if on:
+            self.statusBar().showMessage(
+                "drag a box around the nodes to group — they become a region with a port "
+                "for every wire crossing it; Esc puts the box away", 8000)
+
+    @_needs_shape
+    def _on_region_drawn(self, rect) -> None:
+        """A box drawn on the active canvas: the cards inside become a frame — a REGION with
+        ports — selected, the next step on the status bar. Behind the shape gate: on a
+        linked page the frame would be the master's, so the page is asked first."""
+        fid = self.scene.frame_from_rect(rect)
+        if fid is None:
+            self.statusBar().showMessage(
+                "the box encloses no node — drag it around the cards to group", 6000)
+            return
+        item = self.scene.frame_items.get(fid)
+        if item is not None:
+            self.scene.clearSelection()
+            item.setSelected(True)
+        ports = item.ports() if item is not None else []
+        n_in = sum(1 for io, _l in ports if io == "in")
+        fr = self.doc.frames[fid]
+        self.statusBar().showMessage(
+            f"region “{fr.title}”: {len(fr.members)} node(s), {n_in} in · "
+            f"{len(ports) - n_in} out — right-click it to duplicate as a linked tab, or "
+            f"Graph → Duplicate region as a linked tab", 10000)
+
+    def _region_tab_names(self, page_id: str, frame_id: str) -> List[str]:
+        ws = self.workspace
+        return [ws.pages[t].name for t in ws.region_tabs(page_id, frame_id) if t in ws.pages]
+
+    def _on_frame_action(self, page_id: str, frame_id: str, action: str) -> None:
+        """A frame's context menu: *Duplicate region as a linked tab* / *Rename region…*."""
+        if action == "tab":
+            self.duplicate_region(page_id, frame_id)
+        elif action == "rename":
+            if not self._topology_ok(shape=True):
+                return
+            doc = self.workspace.pages[page_id].doc
+            fr = doc.frames.get(frame_id)
+            if fr is None:
+                return
+            title, ok = QInputDialog.getText(self, "Region", "Region label:", text=fr.title)
+            if ok and title.strip():
+                doc.rename_frame(frame_id, title.strip())
+
+    def duplicate_region(self, page_id: str, frame_id: str, *,
+                         canvas: Optional[CanvasPanel] = None) -> Optional[str]:
+        """*Duplicate region as a linked tab* (2026-10-07): a new Free page LINKED to the
+        region alone (:meth:`~nodelab_v2.workspace.Workspace.duplicate_region`), shown on
+        ``canvas``. Returns its id, or ``None`` when refused (the reason in a box)."""
+        try:
+            page = self.workspace.duplicate_region(page_id, frame_id)
+        except (ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Can't make a region tab", str(exc))
+            return None
+        self._show_page(canvas or self._canvas, page.id)
+        master = self.workspace.pages[page.master].name
+        self.statusBar().showMessage(
+            f"“{page.name}” is a tab of the region on “{master}”: its nodes follow the "
+            f"region there; its Page Inputs and Outputs, and its values, are its own", 10000)
+        return page.id
+
+    def duplicate_region_selected(self) -> Optional[str]:
+        """Graph → *Duplicate region as a linked tab*: the selected frame — else the region
+        the active tab is of, else the page's only frame."""
+        sel = [it.frame_id for it in self.scene.selectedItems() if isinstance(it, FrameItem)]
+        if not sel:
+            page = self.workspace.pages[self.workspace.active]
+            if getattr(page, "region", None):
+                sel = [page.region]
+            elif len(self.doc.frames) == 1:
+                sel = list(self.doc.frames)
+        if len(sel) != 1:
+            QMessageBox.information(
+                self, "Duplicate region",
+                "Select one region (a frame) first — draw one with Graph → Draw a region… "
+                "(R on the canvas), or Ctrl+J around selected nodes.")
+            return None
+        return self.duplicate_region(self.workspace.active, sel[0])
 
     @_needs_topology
     def _on_op_dropped(self, op_key: str, pos: QPointF) -> None:

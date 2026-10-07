@@ -318,6 +318,11 @@ and a loaded image is the one thing routed to the Image Input page. The welcome 
 four pages — load → `raw`; blur → threshold → `mask`; label → measure → `cells`; a plot and a
 Viewer — every boundary already named and bound.
 
+**Region tabs** (2026-10-07) are linked pages of ONE FRAME of a page rather than the whole
+page: draw a box around a set of nodes (`R`) and *Duplicate region as a linked tab* — each tab
+has the region's nodes, its own Page Inputs and Outputs at the region's ports, and its own
+values. See §12 *Regions*.
+
 **Linked pages** (V4.00). The switcher's *Duplicate as linked page* makes a page that follows
 another — its **master** — card for card: the same nodes, wires and positions, and every
 later change to the master's graph arrives on it. What it keeps of its own are **values**:
@@ -2125,6 +2130,37 @@ dropping the wire).
 It auto-sizes to enclose them, reflows when a member moves, and dragging the frame moves all
 members. Frames are **GUI-only** — they never enter the run graph. A frame always has ≥1
 member (emptying it removes it); deleting a frame keeps its nodes.
+
+### Regions — draw a box, get ports, duplicate as a tab (2026-10-07)
+
+A frame is also a **region**. **Graph → Draw a region…** (or press **`R`** on the canvas,
+or hold **Alt** and drag) arms a box: drag it around a set of nodes and they become a frame
+titled *Region*, *Region 2*, … — the cards whose centre lies in the box, so a box that merely
+clips a neighbour never grabs it. Every wire crossing the frame's border gets a **port** on
+the edge: an input port on the left for each signal entering (one per source socket, however
+many cards it feeds inside), an output port on the right for each socket a wire leaves from.
+The title bar counts them (*2 in · 1 out*), each port is labelled outside the frame with the
+socket it carries, and `Ctrl+J` frames are regions too.
+
+**Duplicate region as a linked tab** (the frame's right-click menu, or Graph → *Duplicate
+region as a linked tab* with the frame selected) makes a new **Free page** of the region
+alone — a tab beside this page — that is **linked to the region**: the nodes inside follow
+this page card for card (grow the frame here and the tab grows), and their values are
+overrides there like any linked page (§2 *Linked pages*). What the tab owns are its
+**ports**: at each input port the tab gets a **Page Input** of its own, bound to a **Page
+Output** this page gains at that socket (named *Region in 1*, …; a second tab reuses it), and
+at each output port a **Page Output** of its own (*Region out 1*, …). Those are the tab's own
+nodes — re-point a Page Input at another page's output, rename a Page Output, add or delete
+one — so every tab of one region can take different inputs, publish different outputs and
+hold different values while the graph inside stays one. The frame's title bar counts its
+tabs; the Pages panel lists a tab as *region tab*; a tab's edits never go to the master
+(edit the region on this page, inside the frame). *Duplicate as linked page* on a tab makes
+another tab of the same region; *Make unique* turns a tab into a plain page holding what it
+shows. Deleting the frame here leaves its tabs on the nodes they last showed.
+
+Refused, with the reason: a box that encloses no card, a **value wire** across the border (a
+port carries a Dataset — put both ends inside the region, or both outside) and a **zone**
+the border cuts through (enclose all of it or none of it).
 
 ### Node groups — `Ctrl+G` / `Ctrl+Shift+G`
 
