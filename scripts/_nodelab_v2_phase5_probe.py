@@ -1123,6 +1123,75 @@ def main(argv) -> int:
         "with domain-aware tooltips, an overview that follows the click, and a search "
         "that filters without leaving empty groups")
 
+    # ── G2b: primary / secondary sets, folded by default (2026-10-07) ────────────
+    # A page kind ORDERS the palette, it no longer filters it: the kind's usual nodes fill
+    # the bands at the top, every other node sits under one "More nodes" band grouped the
+    # same way, every band starts collapsed, and Expand all / Collapse all fold the tree.
+    from nodelab_v2.scene import primary_specs as _prim, secondary_specs as _sec
+    from nodelab_v2.palette import MORE_BAND as _MORE, PAGES_BAND as _PAGES
+    _kind_before = win.palette.page_kind()
+    win.palette.set_page_kind("input", "Image Input")
+    app.processEvents()
+
+    def _top_items():
+        return [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+
+    def _ops_under(item):
+        out, stack = [], [item]
+        while stack:
+            it = stack.pop()
+            if it.data(0, _Qt.UserRole):
+                out.append(it.data(0, _Qt.UserRole))
+            stack.extend(it.child(j) for j in range(it.childCount()))
+        return out
+
+    _top = _top_items()
+    _keys = [h.data(0, _Qt.UserRole + 2) for h in _top]
+    assert _keys[0] == _PAGES and _keys[-1] == _MORE, _keys
+    assert all(not h.isExpanded() for h in _top), "every band starts collapsed"
+    _more = _top[-1]
+    _prim_ops = sum((_ops_under(h) for h in _top[:-1]), [])
+    _sec_ops = _ops_under(_more)
+    assert set(_prim_ops) == {s.op_key for s in _prim("input")}, "primary set at the top"
+    assert _sec_ops and set(_sec_ops) == {s.op_key for s in _sec("input")}, "the rest under More"
+    assert set(_prim_ops) | set(_sec_ops) == {s.op_key for s in visible_specs()}, "nothing hidden"
+    assert {"util.stitch", "util.stack", "util.zproject", "util.merge", "channel.split",
+            "util.split_positions"} <= set(_prim_ops), \
+        "split / merge / stitch M / stack T / project Z lead on Image Input"
+    assert "enhance.gaussian" in _sec_ops and "analysis.label" in _sec_ops, _sec_ops
+    _inner = [_more.child(j) for j in range(_more.childCount())]
+    assert _inner and all(h.data(0, _Qt.UserRole + 1) == "stage" for h in _inner), \
+        "More nests stage bands → roles → nodes like the top"
+    assert all(not h.isExpanded() for h in _inner), "nested bands start collapsed too"
+    # Expand all opens everything and sticks across a refill; Collapse all shuts the bands
+    win.palette.expand_all()
+    assert all(h.isExpanded() for h in _top + _inner)
+    win.palette.refill("")
+    assert all(h.isExpanded() for h in _top_items()), "Expand all sticks across a refill"
+    win.palette.collapse_all()
+    assert not any(h.isExpanded() for h in _top_items())
+    # a search opens what it finds — a hit in the secondary set is reachable with no click
+    win.palette.refill("gauss")
+    _top2 = _top_items()
+    assert _top2 and all(h.isExpanded() for h in _top2), "a search opens its hits"
+    assert _top2[-1].data(0, _Qt.UserRole + 2) == _MORE \
+        and "enhance.gaussian" in _ops_under(_top2[-1]), [h.text(0) for h in _top2]
+    win.palette.refill("")
+    assert not any(h.isExpanded() for h in _top_items()), "clearing the search folds again"
+    assert "nodes first" in win.palette._kind_chip.text(), win.palette._kind_chip.text()
+    # a Free page: everything primary, no Pages band, no More band
+    win.palette.set_page_kind(None)
+    app.processEvents()
+    _keys0 = [h.data(0, _Qt.UserRole + 2) for h in _top_items()]
+    assert _MORE not in _keys0 and _PAGES not in _keys0, _keys0
+    assert win.palette._kind_chip.text() == "All nodes"
+    win.palette.set_page_kind(_kind_before)
+    win.palette.collapse_all()
+    _ok("G2b: a page kind ORDERS the palette — its usual nodes in the bands at the top, "
+        "every other node under one 'More nodes' band — instead of filtering it; split / "
+        "merge / stitch / stack / project lead on Image Input; every band starts "
+        "collapsed, Expand all / Collapse all fold the tree, a search opens its hits")
+
     # ── review regressions (Phase-5 impl review, 2026-07-22) ──────────────────
     from nodegraph.graph import Edge, Graph, NodeInstance
     from nodegraph.zones import Zone
@@ -5876,6 +5945,7 @@ def main(argv) -> int:
     from PySide6.QtWidgets import QMenu as _PMenu
     from nodelab_v2.inspector import _NoWheelCombo as _PCombo
     from nodelab_v2.scene import compatible_ops as _pcompat, visible_specs as _pvis
+    from nodelab_v2.scene import primary_specs as _pprim
     from nodelab_v2.workspace import qualify as _pq
     win.set_solo_frame(False)
     win._follow_act.setChecked(False)
@@ -5925,19 +5995,27 @@ def main(argv) -> int:
     assert win.workspace.active == _p2 and win.canvas is _main and _main.page_id == _p2
     assert not win.doc.nodes and win.welcome.isVisible()
     _ref = _palette_ops()
-    assert _ref == {s.op_key for s in _pvis("refine")} and _ref < _all, (len(_ref), len(_all))
-    assert "io.load" not in _ref and "enhance.gaussian" in _ref and "page.input" in _ref
+    # 2026-10-07: the kind ORDERS the palette, it no longer filters it — every node is on
+    # the page, the refinement ones in the bands at the top, the rest under More nodes
+    assert _ref == {s.op_key for s in _pvis("refine")} == _all, (len(_ref), len(_all))
+    _ref_primary = {s.op_key for s in _pprim("refine")}
+    assert _ref_primary < _all and "enhance.gaussian" in _ref_primary \
+        and "page.input" in _ref_primary, len(_ref_primary)
+    assert "io.load" not in _ref and "util.timeseries" in _ref \
+        and "util.timeseries" not in _ref_primary
     assert "Refinement" in win.palette._kind_chip.text(), win.palette._kind_chip.text()
     assert "Refinement" in win.windowTitle(), win.windowTitle()
     assert _main.view.page_button.isVisible() and \
         _main.view.page_button.text().strip() == win.workspace.page(_p2).name
     _gspec = next(s for s in _pvis(None) if s.op_key == "enhance.gaussian")
-    assert all(op in _ref for op in {s.op_key for s, _n in
-                                      _pcompat(_gspec.outputs[0], "out", "refine")}), \
-        "the link search offers only the page's nodes"
+    _compat = [s.op_key for s, _n in _pcompat(_gspec.outputs[0], "out", "refine")]
+    _lead = [op in _ref_primary for op in _compat]
+    assert any(_lead) and not all(_lead) and _lead == sorted(_lead, reverse=True), \
+        "the link search lists the page's usual nodes first, then every other one"
     _ok("PG1 New page ▸ Refinement: the canvas shows the new, empty page (welcome card up); "
-        "the palette, the link search and the readiness suggestions offer only the "
-        "refinement nodes; the switcher and the window title name the page and its kind")
+        "the palette, the link search and the readiness suggestions LEAD with the "
+        "refinement nodes and offer every other node after them; the switcher and the "
+        "window title name the page and its kind")
 
     # PG7 a named Page Output on page 1, read on the Refinement page through the inspector's
     # Source menu: the card says what it reads, the envelope crosses, a pull runs through it

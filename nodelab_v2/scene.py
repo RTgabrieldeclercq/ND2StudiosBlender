@@ -62,11 +62,27 @@ from nodelab_v2.ops import (DOCK_OP, HIDDEN_OP_PREFIXES, LOAD_OP, PAGE_NAME_KEY,
 
 
 def visible_specs(kind: Optional[str] = None):
-    """The node types the palette and the link search offer. On a page of ``kind``, only
-    those the roles file assigns to that kind (V4.00 step 5) — ``None`` or ``free`` offers
-    every one."""
+    """The node types the palette and the link search offer: EVERY non-hidden one, on every
+    page. ``kind`` only orders them — the page kind's PRIMARY set first (the roles file's
+    ``pages``), then its SECONDARY set — so a kind-aware list leads with the usual nodes
+    without hiding the rest (2026-10-07; V4.00 step 5 filtered to the primary set).
+    ``None`` or ``free`` has no secondary set."""
+    return primary_specs(kind) + secondary_specs(kind)
+
+
+def primary_specs(kind: Optional[str] = None):
+    """The visible node types a page of ``kind`` leads with (all of them for ``free``)."""
     return [s for s in NODES.all()
             if not s.op_key.startswith(HIDDEN_OP_PREFIXES) and R.op_in_page(s.op_key, kind)]
+
+
+def secondary_specs(kind: Optional[str] = None):
+    """The visible node types a page of ``kind`` offers AFTER its primary set — the roles
+    file does not list them for that kind, but they are placeable all the same. Empty for
+    ``free``/``None``."""
+    return [s for s in NODES.all()
+            if not s.op_key.startswith(HIDDEN_OP_PREFIXES)
+            and not R.op_in_page(s.op_key, kind)]
 
 
 def compatible_ops(fixed_spec, fixed_io: str,
@@ -1571,4 +1587,4 @@ class GraphView(QGraphicsView):
 
 
 __all__ = ["GraphScene", "GraphView", "LinkSearchPopup", "compatible_ops",
-           "visible_specs", "HIDDEN_OP_PREFIXES"]
+           "visible_specs", "primary_specs", "secondary_specs", "HIDDEN_OP_PREFIXES"]

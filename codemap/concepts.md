@@ -415,7 +415,10 @@ anchors: sym:nodelab_v2.workspace.Workspace, sym:nodelab_v2.workspace.Workspace.
 A V4.00 file holds a **workspace**: ordered **pages**, each a node graph (`GraphDocument`) of a
 **kind** — `input` < `refine` < `process` < `analyze`, plus `free` (any node, any wiring; a
 pre-V4 file opens as one Free page). The kind decides what the palette and the link search
-OFFER (`nodegraph.roles.ops_for_page`); it locks nothing. Pages hand data on BY NAME: a
+LEAD WITH — its PRIMARY set, `nodegraph.roles.ops_for_page`; every other op is its SECONDARY
+set, `secondary_ops`, offered after it (the palette's collapsed *More nodes* band,
+`scene.visible_specs` = `primary_specs` + `secondary_specs`, 2026-10-07; step 5 had hidden
+it). The kind locks nothing and hides nothing. Pages hand data on BY NAME: a
 `page.output` node names its input as a variable of its page, and a `page.input` on a page of
 a strictly later kind (or across a Free page, while acyclic) reads it — its `source` param is
 `"<page id>:<name>"`. Page ids (`pg1`, ...) come from a counter stored in the file and are

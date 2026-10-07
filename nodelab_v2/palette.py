@@ -12,6 +12,13 @@ means the same thing as a wire there. The bottom third of the panel is the OVERV
 any row and it explains the node — what it is for, its data contract, sockets with types and
 units, footprint, modes — read live from the registry, never from prose that could drift.
 (2026-10-02: previously grouped by the registry ``category``, with no dots and no overview.)
+
+A page's KIND orders the tree, it does not filter it (2026-10-07): the kind's PRIMARY set —
+the roles file's ``pages`` for it — fills the stage bands at the top, and every other node
+follows under one collapsed **More nodes** band, grouped the same way, so any node can go on
+any page and the usual ones are still the first thing in reach. Every band starts
+collapsed; *Expand all* / *Collapse all* above the search fold the whole tree, and a search
+opens whatever it finds. (V4.00 step 5 hid the secondary set altogether.)
 """
 from __future__ import annotations
 
@@ -21,21 +28,23 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from PySide6.QtCore import QMimeData, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QSplitter, QStyledItemDelegate, QTextBrowser,
-    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QPushButton,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QSizePolicy, QSplitter, QStyledItemDelegate,
+    QTextBrowser, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QPushButton,
 )
 
 from nodegraph import roles as R
 from nodegraph.domains import Domain
 from nodegraph.sockets import SocketType
 from nodelab_v2 import theme as T
-from nodelab_v2.scene import visible_specs
+from nodelab_v2.scene import primary_specs, secondary_specs
 
 #: the role whose nodes hand data between pages (``codemap/node_roles.json``) — on a
 #: typed page it leads the tree as the "Pages" band (V4.00 step 11)
 PAGE_ROLE = "page_boundary"
 #: the pinned band's key in the tree (not a stage of the taxonomy)
 PAGES_BAND = "pages"
+#: the SECONDARY set's band: every node the page kind does not lead with (2026-10-07)
+MORE_BAND = "more"
 
 #: item-data slots
 _OP = Qt.UserRole            # a node row: its op_key
@@ -119,6 +128,40 @@ def _dots_icon(colors: Sequence[Tuple[QColor, str]], align_right: bool = False) 
         p.drawText(x + 5 * (_DOT + _GAP), 2 + _DOT - 1, "+")
     p.end()
     return QIcon(pm)
+
+
+# ── the chip ──────────────────────────────────────────────────────────────────
+
+class _ElidedLabel(QLabel):
+    """A label that elides its text to the width it is given instead of demanding more.
+
+    The page-kind chip shares its row with the Expand all / Collapse all buttons, and a
+    plain QLabel's minimum width is its text width: with a long kind label the row would
+    widen the whole dock past :data:`nodelab_v2.window.PALETTE_W`, which the layout gate
+    pins. :meth:`text` returns the FULL text whatever is painted, so callers never see the
+    ellipsis."""
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(80)      # always a few words, however narrow the dock
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 — Qt's name
+        self._full = str(text or "")
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, e) -> None:  # noqa: N802 — Qt's name
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self) -> None:
+        fm = self.fontMetrics()
+        super().setText(fm.elidedText(self._full, Qt.ElideRight, max(10, self.width() - 2)))
 
 
 # ── the tree ──────────────────────────────────────────────────────────────────
@@ -219,13 +262,42 @@ class PalettePanel(QWidget):
         top.setSpacing(6)
         top.addWidget(self._search, 1)
         top.addWidget(self._refresh)
-        # which nodes this is: the active page's kind decides (V4.00 step 5)
-        self._kind_chip = QLabel("All nodes")
+        # which nodes come first: the active page's kind decides (V4.00 step 5; since
+        # 2026-10-07 it orders rather than filters — the rest sit under "More nodes")
+        self._kind_chip = _ElidedLabel("All nodes")
         self._kind_chip.setObjectName("kindChip")
         self._kind_chip.setToolTip(
-            "The palette offers the nodes of the active page's kind — an Input page the "
-            "loaders and organisers, a Refinement page image preparation and segmentation, "
-            "and so on. A Free page offers every node.")
+            "The palette leads with the nodes usual on the active page's kind — an Image "
+            "Input page the loaders, organisers, merge / stitch / stack / project, a "
+            "Refinement page image preparation and segmentation, and so on — and offers "
+            "every other node under 'More nodes' below. Any node can go on any page. A "
+            "Free page lists every node at the top.")
+        # fold the whole tree: every band starts collapsed (2026-10-07)
+        self._expanded_all = False
+        self._expand_btn = QToolButton()
+        self._expand_btn.setObjectName("paletteFold")
+        self._expand_btn.setText("Expand all")
+        self._expand_btn.setCursor(Qt.PointingHandCursor)
+        self._expand_btn.setToolTip("Open every section of the node list.")
+        self._expand_btn.clicked.connect(self.expand_all)
+        self._collapse_btn = QToolButton()
+        self._collapse_btn.setObjectName("paletteFold")
+        self._collapse_btn.setText("Collapse all")
+        self._collapse_btn.setCursor(Qt.PointingHandCursor)
+        self._collapse_btn.setToolTip(
+            "Close every section, leaving the section headings to pick from.")
+        self._collapse_btn.clicked.connect(self.collapse_all)
+        for btn in (self._expand_btn, self._collapse_btn):
+            # natural width when there is room, shrinkable when the dock is narrow — a
+            # QToolButton's minimum is otherwise its full text, which would widen the dock
+            btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+            btn.setMinimumWidth(24)
+        chip_row = QHBoxLayout()
+        chip_row.setContentsMargins(0, 0, 0, 0)
+        chip_row.setSpacing(4)
+        chip_row.addWidget(self._kind_chip, 1)
+        chip_row.addWidget(self._expand_btn)
+        chip_row.addWidget(self._collapse_btn)
         self._tree = _PaletteTree()
         # the OVERVIEW: the bottom third of the panel, a scrolling rich-text card
         self._overview = QTextBrowser()
@@ -239,7 +311,7 @@ class PalettePanel(QWidget):
         self._split.setStretchFactor(1, 1)
         self._split.setChildrenCollapsible(False)
         self._split.setSizes([600, 300])
-        lay.addWidget(self._kind_chip)
+        lay.addLayout(chip_row)
         lay.addLayout(top)
         lay.addWidget(self._split, 1)
         # the demo (2026-10-07): the Overview says what a node is; this shows it, on a
@@ -271,11 +343,11 @@ class PalettePanel(QWidget):
         self.refill(self._search.text())
 
     def set_page_kind(self, kind: Optional[str], label: str = "") -> None:
-        """Offer the nodes of a page of ``kind`` (``None``/``free``: every node), and say
-        so on the chip above the search."""
+        """Lead with the nodes of a page of ``kind`` (``None``/``free``: every node at the
+        top, no secondary set), and say so on the chip above the search."""
         kind = kind or None
         free = kind is None or kind == R.FREE_PAGE
-        self._kind_chip.setText("All nodes" if free else f"{label or kind} nodes")
+        self._kind_chip.setText("All nodes" if free else f"{label or kind} nodes first")
         if kind == self._page_kind:
             return
         self._page_kind = kind
@@ -288,6 +360,37 @@ class PalettePanel(QWidget):
         """Select the search box (the welcome card's 'Browse nodes' lands here)."""
         self._search.setFocus(Qt.OtherFocusReason)
         self._search.selectAll()
+
+    # ── folding ───────────────────────────────────────────────────────────────
+
+    def expand_all(self) -> None:
+        """Open every band and role, and keep the tree open across refills until
+        :meth:`collapse_all`."""
+        self._expanded_all = True
+        self._tree.expandAll()
+
+    def collapse_all(self) -> None:
+        """Close every band (the default). Role rows stay open inside their band, so one
+        click on a band shows its nodes; a search still opens whatever it finds."""
+        self._expanded_all = False
+        self._apply_fold(force_open=bool(self._search.text()))
+
+    def _apply_fold(self, force_open: bool = False) -> None:
+        if force_open or self._expanded_all:
+            self._tree.expandAll()
+            return
+        self._tree.collapseAll()
+        # bands shut, roles open: QTreeWidget.collapseAll closes every level, so the role
+        # rows are reopened here (they are only visible once their band is opened)
+        stack = [self._tree.topLevelItem(i) for i in range(self._tree.topLevelItemCount())]
+        while stack:
+            it = stack.pop()
+            if it.data(0, _KIND) == "role":
+                it.setExpanded(True)
+            stack.extend(it.child(j) for j in range(it.childCount()))
+
+    def is_expanded_all(self) -> bool:
+        return self._expanded_all
 
     def restyle(self) -> None:
         self.setStyleSheet(f"""
@@ -303,6 +406,7 @@ class PalettePanel(QWidget):
             QToolButton {{ color:{T.MUTED.name()}; background:transparent;
                 border:1px solid {T.BORDER.name()}; border-radius:5px; font-size:14px; }}
             QToolButton:hover {{ color:{T.INK.name()}; background:{T.PANEL_HI.name()}; }}
+            QToolButton#paletteFold {{ font-size:11px; padding:1px 6px; }}
         """ + T.controls_qss())
         if getattr(self, "_tree", None) is not None:
             self.refill(self._search.text())      # dots are rendered in theme colours
@@ -316,13 +420,13 @@ class PalettePanel(QWidget):
     def refill(self, text: str = "") -> None:
         t = (text or "").lower()
         self._tree.clear()
-        specs = {s.op_key: s for s in visible_specs(self._page_kind)
-                 if not t or t in s.label.lower() or t in s.op_key.lower()}
-        # stage -> role -> [spec], in the taxonomy's own order; unclassified ops last
-        buckets: Dict[str, Dict[str, List]] = {}
-        for op, spec in specs.items():
-            rk, sk = R.role_of(op)
-            buckets.setdefault(sk, {}).setdefault(rk, []).append(spec)
+
+        def hit(s) -> bool:
+            return not t or t in s.label.lower() or t in s.op_key.lower()
+
+        primary = [s for s in primary_specs(self._page_kind) if hit(s)]
+        secondary = [s for s in secondary_specs(self._page_kind) if hit(s)]
+        buckets = self._buckets(primary)
         # V4.00 step 11: on a typed page the page boundary — Page Input / Page Output — is
         # the first thing to reach for, so it leads the tree as its own "Pages" band; a Free
         # page keeps it inside Control & present like any other role
@@ -338,7 +442,32 @@ class PalettePanel(QWidget):
                 "Hand data from page to page: a Page Output names what this page produces; "
                 "a Page Input reads a named Output of an earlier page.")
             self._add_role_rows(head, PAGE_ROLE, pinned)
-            head.setExpanded(True)
+        self._add_stage_bands(buckets)
+        # the SECONDARY set (2026-10-07): every node the kind does not lead with, under one
+        # band, grouped stage → role exactly like the set above it
+        if secondary:
+            label = R.page_meta(self._page_kind).get("label", self._page_kind) \
+                if self._page_kind else ""
+            more = self._stage_head(
+                "More nodes", MORE_BAND,
+                f"Every other node — not the usual on an {label} page, but any node can go "
+                "on any page. Grouped by stage and role like the list above.")
+            self._add_stage_bands(self._buckets(secondary), parent=more)
+        self._apply_fold(force_open=bool(t))
+
+    @staticmethod
+    def _buckets(specs) -> Dict[str, Dict[str, List]]:
+        """stage -> role -> [spec], in the taxonomy's own order; unclassified ops last."""
+        buckets: Dict[str, Dict[str, List]] = {}
+        for spec in specs:
+            rk, sk = R.role_of(spec.op_key)
+            buckets.setdefault(sk, {}).setdefault(rk, []).append(spec)
+        return buckets
+
+    def _add_stage_bands(self, buckets: Dict[str, Dict[str, List]],
+                         parent: Optional[QTreeWidgetItem] = None) -> None:
+        """One band per stage that has nodes in ``buckets``, its roles under it — at the top
+        level, or nested under ``parent`` (the *More nodes* band)."""
         order = [sk for sk, _ in R.stages()] + [R.OTHER_STAGE]
         for sk in order:
             roles = buckets.get(sk)
@@ -346,16 +475,16 @@ class PalettePanel(QWidget):
                 continue
             smeta = R.stage_meta(sk)
             head = self._stage_head(str(smeta.get("label", sk)), sk,
-                                    _squash(smeta.get("description")))
+                                    _squash(smeta.get("description")), parent=parent)
             role_order = [rk for rk, _ in R.roles_in(sk)] + [R.OTHER_ROLE]
             for rk in role_order:
                 group = roles.get(rk)
                 if not group:
                     continue
                 self._add_role_rows(head, rk, group)
-            head.setExpanded(True)
 
-    def _stage_head(self, label: str, key: str, tip: str) -> QTreeWidgetItem:
+    def _stage_head(self, label: str, key: str, tip: str,
+                    parent: Optional[QTreeWidgetItem] = None) -> QTreeWidgetItem:
         """A stage BAND: its text sits in column 0 and spans the row, so it starts at the
         panel's left edge instead of after the dots column, and it gets a filled background
         so the stages read as sections at a glance. (The first cut put the label in the
@@ -373,7 +502,10 @@ class PalettePanel(QWidget):
         f.setBold(True)
         head.setFont(0, f)
         head.setSizeHint(0, QSize(0, 24))
-        self._tree.addTopLevelItem(head)
+        if parent is not None:
+            parent.addChild(head)
+        else:
+            self._tree.addTopLevelItem(head)
         head.setFirstColumnSpanned(True)      # only takes effect once it is in the tree
         return head
 
@@ -416,7 +548,11 @@ class PalettePanel(QWidget):
         elif kind == "role":
             self._show_role(item.data(0, _KEY))
         elif kind == "stage":
-            self._show_stage(item.data(0, _KEY))
+            key = item.data(0, _KEY)
+            if key in (PAGES_BAND, MORE_BAND):
+                self._show_band(key)
+            else:
+                self._show_stage(key)
 
     def _add_current(self, item: Optional[QTreeWidgetItem] = None, _col: int = 0) -> None:
         it = item or self._tree.currentItem()
@@ -454,14 +590,37 @@ class PalettePanel(QWidget):
         typ = " ".join(f"{self._dot(T.SOCKET[t])}&nbsp;{t.value}" for t in SocketType)
         self._overview.setHtml(
             self._css() + "<h3>Nodes</h3>"
-            "<div class='k'>Grouped by pipeline stage, then by what the node does. Click a "
-            "node for its overview; double-click or drag to add it.</div>"
+            "<div class='k'>Grouped by pipeline stage, then by what the node does. The "
+            "nodes usual on this page's kind come first; every other node is under "
+            "<b>More nodes</b> — any node can go on any page. Click a node for its "
+            "overview; double-click or drag to add it.</div>"
             "<div class='sec'>Dots</div>"
             "<div><b>Left</b> = what flows in: the attribute domains the node reads from "
             "its Dataset, then its parameter types. <b>Right</b> = what flows out: the "
             "domains it adds, then value outputs.</div>"
             f"<div style='margin-top:4px'>{dom}</div>"
             f"<div style='margin-top:2px'>{typ}</div>")
+
+    def _show_band(self, key: str) -> None:
+        """The two bands that are not taxonomy stages: Pages and More nodes."""
+        self._current_op = None
+        self._demo_btn.setEnabled(False)
+        if key == PAGES_BAND:
+            self._overview.setHtml(
+                self._css() + "<h3>Pages</h3>"
+                "<div>Hand data from page to page. A <b>Page Output</b> names what this "
+                "page produces; a <b>Page Input</b> reads a named Output of an earlier "
+                "page.</div>")
+            return
+        label = R.page_meta(self._page_kind).get("label", self._page_kind) \
+            if self._page_kind else "this"
+        self._overview.setHtml(
+            self._css() + "<h3>More nodes</h3>"
+            f"<div>Every node that is not the usual on an <b>{html.escape(str(label))}</b> "
+            "page. Any node can go on any page — these are only listed after the ones "
+            "the page's kind leads with, grouped by stage and role the same way.</div>"
+            "<div class='k' style='margin-top:4px'>Which nodes lead on which kind of "
+            "page is written in codemap/node_roles.json.</div>")
 
     def _show_stage(self, sk: str) -> None:
         self._current_op = None

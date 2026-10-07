@@ -121,18 +121,19 @@ def _visible(op_key: str) -> bool:
 
 
 def producers_of(domain: Domain, kind: Optional[str] = None) -> List[Any]:
-    """Visible node specs whose output adds ``domain``, preferred ones first — on a page of
-    ``kind``, only those that page offers (V4.00 step 5)."""
+    """Visible node specs whose output adds ``domain``, preferred ones first. On a page of
+    ``kind`` the kind's PRIMARY producers lead and its SECONDARY ones follow — nothing is
+    left out (2026-10-07; V4.00 step 5 offered the primary set only)."""
     pref = PREFERRED.get(domain, ())
     specs = [s for s in NODES.all()
-             if domain in getattr(s, "adds_domains", frozenset()) and _visible(s.op_key)
-             and R.op_in_page(s.op_key, kind)]
+             if domain in getattr(s, "adds_domains", frozenset()) and _visible(s.op_key)]
 
     def rank(s):
+        primary = 0 if R.op_in_page(s.op_key, kind) else 1
         try:
-            return (0, pref.index(s.op_key), s.label)
+            return (primary, 0, pref.index(s.op_key), s.label)
         except ValueError:
-            return (1, 0, s.label)
+            return (primary, 1, 0, s.label)
     return sorted(specs, key=rank)
 
 

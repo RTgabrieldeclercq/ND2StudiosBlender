@@ -20034,6 +20034,7 @@
       "role": "projection_and_stitching",
       "stage": "prepare_image",
       "pages": [
+        "input",
         "refine"
       ],
       "module": "nodegraph/catalog/util/stack.py",
@@ -20117,6 +20118,7 @@
       "role": "projection_and_stitching",
       "stage": "prepare_image",
       "pages": [
+        "input",
         "refine"
       ],
       "module": "nodegraph/catalog/util/stitch.py",
@@ -20545,6 +20547,7 @@
       "role": "projection_and_stitching",
       "stage": "prepare_image",
       "pages": [
+        "input",
         "refine"
       ],
       "module": "nodegraph/catalog/util/zproject.py",

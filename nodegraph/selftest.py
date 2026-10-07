@@ -24480,12 +24480,23 @@ def test_page_kind_catalog() -> None:
     assert set(R.ops_for_page("free")) == set(every) and len(R.ops_for_page("input")) < len(every)
     assert set(R.ops_for_page("refine")) == {op for op in every if "refine" in R.pages_of(op)}
     assert {rk for rk, _r in R.roles_in_page("input")} >= {"input_output", "page_boundary"}
+    # 2026-10-07: a kind LIMITS nothing — `pages` is the kind's PRIMARY set, every other
+    # op its SECONDARY set, and the two together are the whole catalog
+    assert R.pages_of("util.stitch") == R.pages_of("util.stack") == R.pages_of("util.zproject") \
+        == ("input", "refine"), "stitch M / stack T / project Z lead on Image Input too"
+    sec = R.secondary_ops("input")
+    assert set(sec) == {op for op in every if "input" not in R.pages_of(op)} and sec
+    assert "enhance.gaussian" in sec and "util.stitch" not in sec and "io.dock" not in sec
+    assert set(R.ops_for_page("input")) | set(sec) == set(every) \
+        and not set(R.ops_for_page("input")) & set(sec)
+    assert R.secondary_ops("free") == [] == R.secondary_ops(None) == R.secondary_ops("x")
     for op in ("page.input", "page.output"):
         assert NODES.get(op) is not None and not _is_catalog_op(op), op
     assert not any(op.startswith(HIDDEN_OP_PREFIXES) for op in ("page.input", "page.output")), \
         "page boundaries are placed by hand, never hidden"
     _ok("page kinds: four ordered kinds + free; every op on ≥1 kind; op_pages widens (io.dock) "
-        "and narrows (io.write_tiff) a role; page.* are GUI-layer, visible, on their kinds")
+        "and narrows (io.write_tiff) a role; page.* are GUI-layer, visible, on their kinds; "
+        "primary ∪ secondary = every op, disjoint; stitch/stack/project primary on input")
 
 
 def test_lablink_page_select() -> None:
@@ -24999,8 +25010,9 @@ def test_viewer_routing() -> None:
 
 def test_pages_seam() -> None:
     """V4.00 step 5, the Qt-free half of pages in the GUI: a page's KIND decides which nodes
-    its readiness suggestions offer (a later page's missing source is a Page Input, not a
-    file); a dock fed through a Page Input goes stale when the upstream page changes, while a
+    its readiness suggestions LEAD with — since 2026-10-07 it orders them and hides none (a
+    later page's missing source is a Page Input, not a file); a dock fed through a Page
+    Input goes stale when the upstream page changes, while a
     dock whose chain stays on its page keeps exactly the signature its bake recorded; and an
     edit drops the display caches only on the pages it can reach."""
     from types import SimpleNamespace
@@ -25013,12 +25025,16 @@ def test_pages_seam() -> None:
     I, Rf, P1, P2 = (ws.pages[p] for p in ("pg1", "pg2", "pg3", "pg4"))
 
     # readiness: producers by kind, and the source a page of that kind starts from
-    every = {s.op_key for s in RD.producers_of(Domain.LABEL)}
-    refine = {s.op_key for s in RD.producers_of(Domain.LABEL, "refine")}
-    inp = {s.op_key for s in RD.producers_of(Domain.LABEL, "input")}
-    assert refine and refine <= every and inp <= every, (refine, inp)
-    assert all(R.op_in_page(op, "refine") for op in refine)
-    assert all(R.op_in_page(op, "input") for op in inp) and inp != every
+    every = [s.op_key for s in RD.producers_of(Domain.LABEL)]
+    refine = [s.op_key for s in RD.producers_of(Domain.LABEL, "refine")]
+    inp = [s.op_key for s in RD.producers_of(Domain.LABEL, "input")]
+    # the kind ORDERS the producers (2026-10-07): its primary ones lead, the rest follow,
+    # and nothing is left out — V4.00 step 5 offered the primary set only
+    assert every and set(refine) == set(every) == set(inp), (refine, inp)
+    prim_r = [R.op_in_page(op, "refine") for op in refine]
+    assert any(prim_r) and prim_r == sorted(prim_r, reverse=True), refine
+    prim_i = [R.op_in_page(op, "input") for op in inp]
+    assert not all(prim_i) and prim_i == sorted(prim_i, reverse=True), inp
     Rf.doc.add_node("enhance.median", node_id="LONE")          # nothing wired into it
     Rf.doc.remove_node("IN")                                  # …and no source on the page
     probs = [p for p in RD.problems(Rf.doc, "LONE") if p.kind == "unwired"]

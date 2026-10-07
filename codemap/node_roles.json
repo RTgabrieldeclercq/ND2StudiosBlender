@@ -1,6 +1,6 @@
 {
   "schema": "nd2studios-node-roles/2",
-  "about": "Curated, hand-written. Every shipped node has exactly one functional ROLE (what it does to the data), and every role belongs to one pipeline STAGE (where it sits in acquire -> prepare -> find -> quantify -> present). `scripts/_node_synopsis.py` merges this into codemap/node_synopsis.json and its check fails if a node is unassigned, assigned twice, or no longer exists. The registry `category` field is the palette grouping the GUI shows; a role is a finer, purpose-based cut (the 20 `enhancement` nodes split three ways here, the 12 `utility` nodes four ways). V4.00 (2026-10-05) adds PAGES: `pages` declares the typed page kinds of a Workspace in pipeline order, each role lists the kinds whose palette offers its nodes (`pages`), and `op_pages` overrides that per op; the GUI, the Workspace and the synopsis all read these through nodegraph.roles. The `free` kind (every node) is deliberately not listed: it is the absence of a filter.",
+  "about": "Curated, hand-written. Every shipped node has exactly one functional ROLE (what it does to the data), and every role belongs to one pipeline STAGE (where it sits in acquire -> prepare -> find -> quantify -> present). `scripts/_node_synopsis.py` merges this into codemap/node_synopsis.json and its check fails if a node is unassigned, assigned twice, or no longer exists. The registry `category` field is the palette grouping the GUI shows; a role is a finer, purpose-based cut (the 20 `enhancement` nodes split three ways here, the 12 `utility` nodes four ways). V4.00 (2026-10-05) adds PAGES: `pages` declares the typed page kinds of a Workspace in pipeline order, each role lists the kinds whose palette offers its nodes (`pages`), and `op_pages` overrides that per op; the GUI, the Workspace and the synopsis all read these through nodegraph.roles. Since 2026-10-07 a kind LIMITS nothing: `pages` names a page kind's PRIMARY set (what the palette, the link search and the readiness suggestions lead with), and every other shipped op is that kind's SECONDARY set, offered under a collapsed `More nodes` band below (nodegraph.roles.secondary_ops). The `free` kind (every node primary) is deliberately not listed: it is the absence of an assignment.",
   "stages": {
     "acquire_and_organize": {
       "label": "Acquire & organize",
@@ -27,7 +27,7 @@
     "input": {
       "label": "Image Input",
       "order": 0,
-      "description": "Bring files on, lay them along an axis, split or select positions and channels, and name an experimental condition as an output. No pixel values change."
+      "description": "Bring files on, lay them along an axis, split or select positions and channels, merge Datasets, stitch M, stack T and project Z, and name an experimental condition as an output. Pixel values are only ever combined here, never filtered."
     },
     "refine": {
       "label": "Image Refinement",
@@ -98,7 +98,7 @@
     "projection_and_stitching": {
       "label": "Projection & stitching",
       "stage": "prepare_image",
-      "pages": ["refine"],
+      "pages": ["input", "refine"],
       "description": "Collapse or join an axis: Z-projection to a single plane, T-stacking to one frame with a robust combiner, and M-stitching of multipoint tiles into one mosaic.",
       "ops": ["util.zproject", "util.stack", "util.stitch"]
     },

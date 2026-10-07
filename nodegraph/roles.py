@@ -2,8 +2,9 @@
 ND2Studios V4.00 (2026-10-05) — the typed PAGE KINDS each role's nodes are offered on, all
 read from the hand-curated ``codemap/node_roles.json``.
 
-Qt-free. The GUI's palette groups nodes by stage and role through this module and filters
-them by the active page's kind; the Workspace orders pages by kind through it; and
+Qt-free. The GUI's palette groups nodes by stage and role through this module and leads
+with the active page kind's PRIMARY set (the rest follow as its SECONDARY set — a kind
+limits nothing, 2026-10-07); the Workspace orders pages by kind through it; and
 ``scripts/_node_synopsis.py`` validates the same file against the live registry (every
 shipped op in exactly one role, every role on at least one page kind). One file, one
 reader, so the palette, the Workspace and the synopsis can never disagree about where a
@@ -18,10 +19,12 @@ Page kinds
 ----------
 ``pages`` in the file declares the typed kinds with a pipeline ``order`` (``input`` 0 →
 ``refine`` 1 → ``process`` 2 → ``analyze`` 3). A role's ``pages`` lists the kinds whose
-palette offers its ops; ``op_pages`` overrides that per op (``io.dock`` is useful on every
-page, ``io.write_tiff`` only on the Analysis page). :data:`FREE_PAGE` is the kind that
-applies no filter and is deliberately NOT in the file: it is the absence of an assignment,
-the kind a pre-V4 single-graph file opens as.
+palette LEADS with its ops — the kind's PRIMARY set; ``op_pages`` overrides that per op
+(``io.dock`` is primary on every page, ``io.write_tiff`` only on the Analysis page). Every
+other shipped op is the kind's SECONDARY set (:func:`secondary_ops`): still placeable,
+offered after the primary set. :data:`FREE_PAGE` is the kind whose primary set is every
+op and is deliberately NOT in the file: it is the absence of an assignment, the kind a
+pre-V4 single-graph file opens as.
 """
 from __future__ import annotations
 
@@ -157,22 +160,25 @@ def _page_index() -> Dict[str, Tuple[str, ...]]:
 
 
 def pages_of(op_key: str) -> Tuple[str, ...]:
-    """The typed page kinds whose palette offers ``op_key``: its ``op_pages`` entry, else its
-    role's ``pages``, else EVERY kind — an unassigned op stays placeable everywhere, and the
+    """The typed page kinds on which ``op_key`` is PRIMARY: its ``op_pages`` entry, else its
+    role's ``pages``, else EVERY kind — an unassigned op is primary everywhere, and the
     synopsis check is what fails."""
     ps = _page_index().get(op_key)
     return ps if ps is not None else tuple(k for k, _ in pages())
 
 
 def op_in_page(op_key: str, kind: Optional[str]) -> bool:
-    """Does a page of ``kind`` offer ``op_key``? ``free`` (or no kind) offers everything."""
+    """Is ``op_key`` in the PRIMARY set of a page of ``kind``? ``free`` (or no kind) makes
+    everything primary. Not a lock: every op is placeable on every page (2026-10-07) —
+    this decides what the palette leads with, and which page-boundary op a kind reaches
+    for (``page.input`` reads an earlier page, so an Input page never leads with it)."""
     if not kind or kind == FREE_PAGE:
         return True
     return kind in pages_of(op_key)
 
 
 def ops_for_page(kind: Optional[str]) -> List[str]:
-    """Every op the roles file assigns to ``kind``, in file order; ``free``/unknown → all."""
+    """The PRIMARY ops of ``kind`` in file order; ``free``/unknown → every assigned op."""
     data = load()
     ops = [op for r in data["roles"].values() for op in r.get("ops", ())]
     if not kind or kind == FREE_PAGE or kind not in data["pages"]:
@@ -181,14 +187,25 @@ def ops_for_page(kind: Optional[str]) -> List[str]:
 
 
 def roles_in_page(kind: Optional[str]) -> List[Tuple[str, Dict]]:
-    """The roles with at least one op offered on ``kind`` (file order); all for ``free``."""
+    """The roles with at least one PRIMARY op on ``kind`` (file order); all for ``free``."""
     if not kind or kind == FREE_PAGE:
         return list(load()["roles"].items())
     return [(k, r) for k, r in load()["roles"].items()
             if any(kind in pages_of(op) for op in r.get("ops", ()))]
 
 
+def secondary_ops(kind: Optional[str]) -> List[str]:
+    """The SECONDARY set of ``kind``: every assigned op that is not primary there, in file
+    order — what the palette offers under its collapsed *More nodes* band. Empty for
+    ``free``/no kind (everything is primary) and for an unknown kind."""
+    data = load()
+    if not kind or kind == FREE_PAGE or kind not in data["pages"]:
+        return []
+    return [op for r in data["roles"].values() for op in r.get("ops", ())
+            if kind not in pages_of(op)]
+
+
 __all__ = ["ROLES_PATH", "OTHER_ROLE", "OTHER_STAGE", "FREE_PAGE", "load", "reload",
            "stages", "roles_in", "role_of", "role_meta", "stage_meta",
            "pages", "page_kinds", "is_page_kind", "page_meta", "page_order", "pages_of",
-           "op_in_page", "ops_for_page", "roles_in_page"]
+           "op_in_page", "ops_for_page", "roles_in_page", "secondary_ops"]

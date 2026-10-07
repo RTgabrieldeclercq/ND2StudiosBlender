@@ -184,7 +184,11 @@ in the theme's colour.
 
 * **Palette** — searchable, grouped by **pipeline stage → role** (Acquire & organize,
   Prepare the image, Find structure, Quantify, Control & present; roles such as
-  Image restoration, Segmentation & labeling, Tracking). Every node row carries **dots**:
+  Image restoration, Segmentation & labeling, Tracking). The nodes usual on the active
+  page's kind fill the bands at the top; every other node sits under one **More nodes**
+  band at the bottom, grouped the same way (any node can go on any page). Every band
+  starts **collapsed** — click one to open it, or **Expand all** / **Collapse all** beside
+  the page-kind chip; a search opens whatever it finds. Every node row carries **dots**:
   on the left what flows *in* (the attribute domains it reads from its Dataset, then its
   parameter types), on the right what flows *out* (the domains it adds, then value
   outputs), in the same colours the canvas uses for wires and domain rails; hover a dot
@@ -254,8 +258,13 @@ it keeps of its own (*modified*, its own nodes marked `+`). Click a page to show
 show it selected on the canvas; double-click a page to rename, right-click for the menu. A new page is placed after the last page of its kind (or an earlier one), so the pages
 stay in pipeline order however they were added. `Ctrl+PgDn` /
 `Ctrl+PgUp` step through the pages. The **palette, the link-drag search and the Ready-to-run
-suggestions offer the nodes of the page's kind** (a chip above the palette's search says
-which); a Free page offers every node.
+suggestions lead with the nodes of the page's kind** (a chip above the palette's search says
+which) **and offer every other node after them** — in the palette under a collapsed **More
+nodes** band at the bottom, grouped by stage and role like the rest. Any node can go on any
+page; an Image Input page leads with the loaders and organisers — Split Channels, Split
+Positions, Merge, Stitch (M→1), Stack (T→1), Z Project — a Free page lists every node at the
+top. Every band of the palette starts **collapsed**; **Expand all** / **Collapse all** beside
+the chip fold the whole list, and a search opens whatever it finds.
 
 Pages hand data on **by name — and the app does the naming for you.** **Loading an image puts
 its card on the Image Input page** (the canvas switches there, whatever page you were on) **and
@@ -301,9 +310,9 @@ canvas always stays in the window's centre. Work started on one page stays with 
 click another canvas: a pick armed on a node is applied to that page's node, the Movie Editor
 keeps editing the Export Movie of the page it was opened on (its title names the page), and
 **Shift+F5** pulls again whatever the active Viewer shows, on its own page. A page's kind
-decides what the menus *offer*; it is not a lock — a node dragged from the palette onto a
-canvas lands on that canvas's page whatever its kind; a loaded image is the one thing routed
-to the Image Input page. The welcome card's **Example graph** builds one analysis across the
+decides what the menus *lead with*; it is not a lock — every node is offered on every page,
+a node dragged from the palette onto a canvas lands on that canvas's page whatever its kind,
+and a loaded image is the one thing routed to the Image Input page. The welcome card's **Example graph** builds one analysis across the
 four pages — load → `raw`; blur → threshold → `mask`; label → measure → `cells`; a plot and a
 Viewer — every boundary already named and bound.
 
