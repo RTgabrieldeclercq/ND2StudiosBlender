@@ -459,7 +459,10 @@ def beads3d(*, seed: int = 0, size: int = 128, nz: int = 24, n_beads: int = 60,
             diameter_um: float = 1.0, artifacts: bool = True,
             gradient: bool = False) -> Phantom:
     """A confocal z-stack of ``n_beads`` fluorescent spheres of ``diameter_um`` at random
-    positions (and random brightness, 0.4–1.0 of nominal), imaged through a confocal PSF —
+    positions — **hard spheres**: two centres are never closer than one diameter, touching
+    allowed, so the field is one rigid beads could form (a request the volume cannot hold
+    stops short; ``truth["n_beads"]`` says how many were placed) — with random brightness
+    (0.4–1.0 of nominal), imaged through a confocal PSF —
     an Airy-like lateral blur and the skewed ``sinc^4`` axial profile of
     :func:`confocal_axial_kernel` — over an uneven background that dims with depth, with
     shot and read noise. ``gradient=True`` places beads with a left-to-right density ramp
@@ -487,12 +490,31 @@ def beads3d(*, seed: int = 0, size: int = 128, nz: int = 24, n_beads: int = 60,
     margin_xy = radius_um / dx + 3.0
     z_lo, z_hi = radius_um / dz + 1.5, nz - 1 - radius_um / dz - 1.5
     n = max(0, int(n_beads))
-    cy = rng.uniform(margin_xy, size - margin_xy, n)
-    if gradient:
-        cx = margin_xy + (size - 2 * margin_xy) * np.sqrt(rng.uniform(0.0, 1.0, n))
-    else:
-        cx = rng.uniform(margin_xy, size - margin_xy, n)
-    cz = rng.uniform(z_lo, z_hi, n) if z_hi > z_lo else np.full(n, 0.5 * (nz - 1))
+    # hard spheres: beads are rigid, so two centres are never closer than one diameter
+    # (touching is allowed). Rejection sampling, in µm, against every bead placed so far;
+    # a field too crowded to hold the request stops short and the truth says how many.
+    placed: List[Tuple[float, float, float]] = []
+    tries = 0
+    while len(placed) < n and tries < 200 * max(1, n):
+        tries += 1
+        y = float(rng.uniform(margin_xy, size - margin_xy))
+        if gradient:
+            x = float(margin_xy + (size - 2 * margin_xy) * np.sqrt(rng.uniform(0.0, 1.0)))
+        else:
+            x = float(rng.uniform(margin_xy, size - margin_xy))
+        z = float(rng.uniform(z_lo, z_hi)) if z_hi > z_lo else 0.5 * (nz - 1)
+        ok = True
+        for (pz, py, px_) in placed:
+            if (((z - pz) * dz) ** 2 + ((y - py) * dy) ** 2
+                    + ((x - px_) * dx) ** 2) < float(diameter_um) ** 2:
+                ok = False
+                break
+        if ok:
+            placed.append((z, y, x))
+    n = len(placed)
+    cz = np.array([q[0] for q in placed], dtype=float)
+    cy = np.array([q[1] for q in placed], dtype=float)
+    cx = np.array([q[2] for q in placed], dtype=float)
     amp = rng.uniform(0.4, 1.0, n)
     # render on a Z grid padded above and below the stack: an object just outside the
     # acquired range still throws its axial tail into the first or last planes, and the

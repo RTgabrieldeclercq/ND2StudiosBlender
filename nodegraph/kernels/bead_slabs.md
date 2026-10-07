@@ -49,6 +49,10 @@ Everything else (`_despike`, `_detect_2d`, `_z_profile`, `_fit_z`, `_fit_xy`, `_
 | `size_tolerance` | float | `0.5` | `0..1` | Accept a fitted lateral sigma within `±tol` of `sigma_xy_px` (geometric mean of σy, σx). The axial band is `±min(0.95, 2 tol)`. |
 | `max_aspect` | float | `1.5` | `>= 1` | Reject a fitted bead whose `max(σy,σx)/min(σy,σx)` exceeds this. |
 | `target_overlap` | float | `0.10` | `0..1` | Auto-slab only: the tolerated expected fraction of beads with another bead inside their projected footprint (§6). |
+| `diameter_px` | float | `0` | `>= 0` (0 = unknown) | The bead diameter in **pixels**. Beads are rigid spheres: two deblended beads must be at least `0.75 ×` this apart, and two fits closer than `0.5 ×` this are merged as one bead. Unknown → the floors fall back to one sigma. |
+| `diameter_zpx` | float | `0` | `>= 0` | The same diameter in **planes** (the merge radius along z). |
+| `multi_peak` | bool | `True` | — | One (y, x) hit may hold several beads stacked in z: every prominent peak of its z-profile is fitted (§6). `False` keeps only the tallest. |
+| `deblend` | bool | `True` | — | Offer a too-wide compact blob the two-bead model (§6). `False` refuses it as `size_xy` / `aspect`. |
 
 ## 5. Output
 
@@ -68,6 +72,7 @@ points:
 | `sigma_z_px` | float | planes | Fitted axial sigma, `(σ_lo + σ_hi) / 2`; **NaN** when the split-Gaussian fit fell back to a parabola (short window, non-convergence). |
 | `skew_z` | float | — | `(σ_hi − σ_lo) / (σ_hi + σ_lo)` ∈ (−1, 1): positive = wider above the bead (larger z) than below. NaN with `sigma_z_px`. |
 | `slab` | int64 | — | Index of the slab whose projection found it (after merging, the brightest duplicate's). |
+| `flags` | int64 | — | Bit 1: one of a deblended pair (the two-bead model split one blob). Bit 2: its column held more than one z peak (stacked beads). The positions that rest on a model choice rather than an isolated peak. |
 
 **`info`** — `dict`: `slab_px`, `overlap_px`, `n_slabs` (the final pass), `n_candidates`,
 `rejected` (`{edge_z, other_slab, fit_failed, dim, size_xy, aspect, size_z, duplicate}`
@@ -110,8 +115,24 @@ validation asking what happened to a planted bead), `passes` (one summary per pa
   the Gaussian-smoothed projection at the peak (`sqrt(|λ_strong|/|λ_weak|)`, infinite on
   a ridge). 99 % of true beads read below 2.25 even when a fifth of them touch; fibres and
   scan lines read ≥ 5. Both this and the fitted-aspect refusal count under `aspect`.
-- **Duplicates across slabs** are merged greedily, brightest first, inside a radius of
-  2 in sigma-normalised `(z/σz, y/σxy, x/σxy)` distance — anisotropy-aware.
+- **Several beads per column.** Every prominent peak of a candidate's z-profile (prominence
+  ≥ 3 profile-noise sigmas and ≥ 10 % of its height, height ≥ 15 % of the window's tallest,
+  ≥ 2 planes apart) is fitted as its own bead, on its own peak plane; its axial fit is
+  bounded by the valleys to neighbouring peaks, or joint (two Gaussians, one shared sigma,
+  `skew_z` NaN) with a neighbour closer than 4 σz. Beads stacked in z under one (y, x) are
+  the second-largest loss in a dense field after touching pairs; this recovers most of them.
+- **The two-bead deblend** runs only when the single fit failed the width or aspect test on
+  a compact blob (`sqrt(σy σx) ≤ 2.5 σxy`). It is accepted when: the shared sigma lies inside
+  HALF the size tolerance; both amplitudes clear the raw-noise floor; the separation is at
+  least `max(σxy, 0.75 · diameter_px)` (rigid spheres); and its SSE is at most 0.6 × the better
+  of the single axis-aligned Gaussian and the best rotated elongated Gaussian on the same
+  pixels — the latter being what a fibre segment at any angle looks like, which two round
+  blobs can otherwise impersonate inside a masked crop. A deblended pair whose masking
+  neighbours were all refused is dropped outright (no unmasked re-fit can vouch for a pair).
+- **Duplicates across slabs** are merged greedily, brightest first, within half a bead
+  diameter per axis (`0.5 · diameter_zpx` planes, `0.5 · diameter_px` pixels; one sigma when
+  the diameter is unknown) — two beads cannot be closer than one diameter, so anything
+  closer is one bead seen twice; and two deblended beads ≥ 0.75 diameter apart both survive.
 - **Determinism:** no random numbers anywhere; identical input ⇒ identical output.
 - **The z bias is the PSF's, not the fitter's.** On the bead phantom (a skewed `sinc⁴`
   axial PSF whose peak is at the bead centre) the fitted z sits `+0.06 µm` (0.15 plane)
@@ -178,8 +199,12 @@ pts, cols, info = find_beads(vol, (0.4, 0.325, 0.325),
 ## 11. Validation
 
 `scripts/_bead_finder_validate.py` runs the finder on the `beads3d` phantom
-(`nodegraph/phantom.py`: a confocal z-stack of 1 µm spheres through a skewed `sinc⁴`
-axial PSF, with aggregates, fibres, a scan line, haze, hot voxels and out-of-stack beads
-planted) across a density sweep and a left-to-right density gradient, scoring recall,
-precision and localisation error against the planted truth, and lists what happened to
-every missed bead. `selftest::test_detect_beads` pins the headline numbers.
+(`nodegraph/phantom.py`: a confocal z-stack of 1 µm **hard spheres** — never closer than
+one diameter, as rigid beads are — through a skewed `sinc⁴` axial PSF, with aggregates,
+fibres, a scan line, haze, hot voxels and out-of-stack beads planted) across a density
+sweep and a left-to-right density gradient, scoring recall, precision and localisation
+error against the planted truth, and lists what happened to every missed bead.
+`selftest::test_detect_beads` pins the headline numbers. Measured 2026-10-07 on that
+phantom, the multi-peak profile and the deblend together lift recall from 0.925 to 0.970
+at 400 beads and from 0.851 to 0.958 at 800 (a fifth of them touching), precision
+unchanged (1.000, and 0.999 at 800 — one fibre point beside a bead).

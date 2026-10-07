@@ -23,7 +23,8 @@ from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.units import to_pixels_v2
 
 #: The per-bead columns this node writes beside the invariant Point schema.
-BEAD_COLUMNS = ("amplitude", "snr", "sigma_xy_um", "sigma_z_um", "skew_z", "slab")
+BEAD_COLUMNS = ("amplitude", "snr", "sigma_xy_um", "sigma_z_um", "skew_z", "slab",
+                "deblended", "stacked")
 
 # The immersion index is not in any file's metadata, so the axial-PSF derive infers it from
 # the NA: above 1.0 only oil (1.515) reaches it, 0.8–1.0 is a water dipping lens (1.33),
@@ -45,11 +46,16 @@ def _compute_beads(ctx: EvalContext) -> Dataset:
     Gaussian (one sigma each side of the peak — the confocal axial profile is skewed); the
     planes around that z averaged and fitted with a 2-D Gaussian for the sub-pixel (y, x)
     and the apparent sigmas, with pixels nearer to a neighbouring hit left out so touching
-    beads do not widen each other. What survives is what looks like a bead: a blob rather
-    than a ridge (Hessian anisotropy of the projection), a fitted lateral sigma inside
-    ``size_tolerance`` of the expected one, a fitted aspect under ``max_aspect``, an axial
-    sigma inside twice the tolerance, a peak not on the first or last plane. The same bead
-    found in two overlapping slabs is merged (brightest wins, sigma-normalised distance).
+    beads do not widen each other. A column whose profile holds several prominent peaks
+    yields one bead per peak (beads stacked in z), each fitted on its own plane; a compact
+    blob too wide for one bead is offered the two-bead model and split only when both halves
+    are bead-sized, at least three quarters of a diameter apart and explain the pixels
+    markedly better than one bead or one elongated object. What survives is what looks like
+    a bead: a blob rather than a ridge (Hessian anisotropy of the projection), a fitted
+    lateral sigma inside ``size_tolerance`` of the expected one, a fitted aspect under
+    ``max_aspect``, an axial sigma inside twice the tolerance, a peak not on the first or
+    last plane. The same bead found in two overlapping slabs is merged within half a
+    diameter (rigid spheres cannot be closer than one), brightest wins.
 
     ``slabs=auto`` derives ``S`` from the bead density: a whole-stack projection counts the
     beads, then ``S`` is set so at most ~10 % of beads share a projected footprint with
@@ -89,6 +95,10 @@ def _compute_beads(ctx: EvalContext) -> Dataset:
         "size_tolerance": float(ctx.params.get("size_tolerance", 0.5)),
         "max_aspect": float(ctx.params.get("max_aspect", 1.5)),
         "slab_px": 0, "overlap_px": -1,
+        # rigid spheres: two centres are never closer than a diameter, and anything closer
+        # than half of one is the same bead seen twice — the kernel's deblend floor and
+        # merge radius, in voxels along each axis
+        "diameter_px": d_um / px, "diameter_zpx": d_um / zs,
     }
     if modes.get("slabs", "auto") == "manual":
         kp["slab_px"] = max(1, int(round(to_pixels_v2(
@@ -121,6 +131,9 @@ def _compute_beads(ctx: EvalContext) -> Dataset:
         merged["sigma_z_um"] = np.asarray(cols["sigma_z_px"], dtype=float) * zs
         merged["skew_z"] = np.asarray(cols["skew_z"], dtype=float)
         merged["slab"] = np.asarray(cols["slab"], dtype=np.int64)
+        flags = np.asarray(cols["flags"], dtype=np.int64)
+        merged["deblended"] = flags & 1           # one of a pair the LoG saw as one blob
+        merged["stacked"] = (flags >> 1) & 1      # its column held more than one z peak
         tables.append(merged)
         rej = info["rejected"]
         ctx.progress(i + 1, len(units),
@@ -158,9 +171,11 @@ register_node(
                 "diffraction limit, not at 0.2 µm), and Size tolerance is a band AROUND "
                 "that apparent size. Too SMALL and real beads are refused as too big while "
                 "noise peaks pass; too LARGE and beads are refused as too small while "
-                "aggregates and debris of that size are accepted. Set it to the bead "
-                "supplier's nominal diameter; the fitted `sigma_xy_um` column tells you "
-                "what the data actually shows."),
+                "aggregates and debris of that size are accepted. It is also the physical "
+                "floor: beads are rigid spheres, so two reported beads are never closer "
+                "than three quarters of it, and two fits closer than half of it are merged "
+                "as one bead. Set it to the bead supplier's nominal diameter; the fitted "
+                "`sigma_xy_um` column tells you what the data actually shows."),
         InFloat("axial_fwhm", "Axial PSF FWHM", unit="um_axial", field=True, default=0.5,
                 derive=_AXIAL_FWHM_DERIVE,
                 description=
@@ -235,7 +250,12 @@ register_node(
                  "Name of the Point table this node writes: one row per bead with its "
                  "sub-voxel position and the fit columns `amplitude`, `snr`, `sigma_xy_um`, "
                  "`sigma_z_um`, `skew_z` (how much wider the axial profile is above the "
-                 "bead than below, −1…1) and `slab` (which projection found it). Ids are "
+                 "bead than below, −1…1), `slab` (which projection found it), `deblended` "
+                 "(1 when it is one of two touching beads the detector saw as a single blob "
+                 "and split with the two-bead model) and `stacked` (1 when its column held "
+                 "another bead above or below it) — the last two mark the positions that "
+                 "rest on a model choice rather than an isolated peak, so a strict analysis "
+                 "can drop them with If / Else. Ids are "
                  "unique across the whole detection. Downstream nodes — Track Linking, "
                  "Track Objects, Cluster Points, Measure — select it by this name."),
     ],
