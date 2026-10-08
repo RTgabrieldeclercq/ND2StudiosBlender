@@ -145,7 +145,37 @@ def auto_slab_thickness(n_beads: int, shape_zyx: Sequence[int], sigma_xy_px: flo
 
 
 def _auto_overlap(slab: int, sigma_z_px: float) -> int:
-    return int(np.clip(int(round(2.0 * sigma_z_px)), 0, max(0, slab - 1)))
+    """Planes shared by consecutive slabs: about two axial sigmas, so a bead centred on a
+    slab boundary is whole in one of the two projections — but never more than HALF the
+    slab. Without that cap a low-NA stack (``sigma_z`` of 8 planes, slabs of 16) overlaps
+    by 15 of its 16 planes and steps one plane at a time: 39 near-identical projections of
+    a 54-plane stack, every bead fitted and refused as a duplicate 15 times over
+    (measured 2026-10-08 on a 0.45 NA bead gel)."""
+    return int(np.clip(int(round(2.0 * sigma_z_px)), 0, max(0, slab // 2)))
+
+
+def _probe_bead_count(vol: np.ndarray, s_min: int, p: Dict[str, Any]) -> int:
+    """A cheap estimate of how many beads the whole stack holds, for the auto slab: LoG
+    peak counts (no fits) on up to three ``s_min``-plane projections — top, middle and
+    bottom of the stack — the largest scaled to the stack's depth.
+
+    Why not count the beads a whole-stack pass accepts, as the first version did: in a
+    dense field a projection of the whole stack piles beads on top of one another, the
+    size and roundness tests then refuse nearly all of them, and the tiny count argues for
+    the THICKEST slab — the undercount justifies the projection that caused it (a 0.45 NA
+    gel with thousands of beads per field reported 4, and kept half-stack slabs). A
+    projection as thin as a bead merges the fewest beads, and a raw peak count needs no
+    fit to be an estimate; it over-counts noise peaks and artefacts, which only argues for
+    a thinner slab, and the slab floor ``s_min`` bounds that."""
+    nz = vol.shape[0]
+    s = int(np.clip(s_min, 1, nz))
+    starts = sorted({0, max(0, (nz - s) // 2), max(0, nz - s)})
+    best = 0
+    for a in starts:
+        proj = _project(vol, a, a + s, str(p["projection"]))
+        _ys, _xs, _snr, ridge = _detect_2d(proj, float(p["sigma_xy_px"]), float(p["min_snr"]))
+        best = max(best, int(np.count_nonzero(ridge <= _RIDGE_ASPECT)))
+    return int(round(best * nz / s))
 
 
 def _slab_ranges(nz: int, slab: int, overlap: int) -> List[Tuple[int, int]]:
@@ -277,17 +307,24 @@ def _z_profile(vol: np.ndarray, y: float, x: float, sigma_xy: float
     return prof, (y0, y1, x0, x1), float(math.sqrt((w ** 2).sum()))
 
 
-def _z_peaks(prof: np.ndarray, lo: int, hi: int, noise_prof: float) -> List[int]:
+def _z_peaks(prof: np.ndarray, lo: int, hi: int, noise_prof: float, min_sep: int = 2
+             ) -> List[int]:
     """Every bead-like peak of the profile inside the window ``[lo, hi)``: interior local
     maxima whose prominence over the deeper of the two flanking valleys is at least 3
     profile-noise sigmas and 15 % of their own height, at least a quarter as high as the
-    window's maximum, and at least 2 planes apart. Two beads stacked in z under one (y, x)
-    are two peaks here, where a single ``argmax`` saw only the brighter one."""
+    window's maximum, and at least ``min_sep`` planes apart. Two beads stacked in z under
+    one (y, x) are two peaks here, where a single ``argmax`` saw only the brighter one.
+
+    ``min_sep`` is one axial sigma (never under 2 planes): two maxima closer than that on
+    a profile whose every bead is ``sigma_z`` wide are one bead's noisy top, not two beads
+    — the PSF cannot resolve them, and offering such a pair to the two-bead axial fit
+    refused three quarters of a dense low-NA field (sigma_z 8 planes, 2026-10-08)."""
     seg = prof[lo:hi]
     if len(seg) < 3:
         return []
     from scipy.signal import find_peaks
-    idx, props = find_peaks(seg, prominence=max(3.0 * noise_prof, 1e-9), distance=2)
+    idx, props = find_peaks(seg, prominence=max(3.0 * noise_prof, 1e-9),
+                            distance=max(2, int(min_sep)))
     if len(idx) == 0:
         return []
     top = float(seg.max())
@@ -355,11 +392,16 @@ def _fit_z(prof: np.ndarray, z_peak: int, sigma_z: float, lo_bound: int = 0,
     above or below this one does not enter its fit. With 6+ planes the model is the split
     Gaussian (one sigma each side of the peak); with 4–5 a symmetric Gaussian (``split``
     False, the two sigmas equal); fewer falls back to a 3-point parabola (``fitted``
-    False, sigmas NaN). A fit that does not converge, or that wanders more than 1.5 planes
-    from the peak it started on, also falls back."""
+    False, sigmas NaN). A fit that does not converge, or that wanders more than one
+    ``sigma_z`` (at least 1.5 planes) from the peak it started on, also falls back — the
+    bound scales with the profile's width because on a broad profile (a 0.45 NA stack puts
+    sigma_z at 8 planes) the discrete argmax of a noisy 19-plane bump legitimately sits
+    several planes from the fitted centre: a fixed 1.5 refused half of all converged fits
+    there (2026-10-08)."""
     nz = len(prof)
     hi_bound = nz if hi_bound is None else hi_bound
     w = max(2, int(math.ceil(3.0 * sigma_z)))
+    wander = max(1.5, float(sigma_z))
     a, b = max(0, z_peak - w, lo_bound), min(nz, z_peak + w + 1, hi_bound)
     zz = np.arange(a, b, dtype=float)
     pp = prof[a:b]
@@ -385,7 +427,7 @@ def _fit_z(prof: np.ndarray, z_peak: int, sigma_z: float, lo_bound: int = 0,
         if popt is not None:
             amp, z0, s_lo, s_hi, _base = popt
             s_lo, s_hi = abs(s_lo), abs(s_hi)
-            if (np.isfinite(z0) and amp > 0 and abs(z0 - z_peak) <= 1.5
+            if (np.isfinite(z0) and amp > 0 and abs(z0 - z_peak) <= wander
                     and 0.2 <= s_lo <= s_max and 0.2 <= s_hi <= s_max):
                 return z0, amp, s_lo, s_hi, True, True
     popt = _curve_fit(_gauss1d, zz, pp, [amp0, float(z_peak), sigma_z, float(pp.min())],
@@ -393,7 +435,7 @@ def _fit_z(prof: np.ndarray, z_peak: int, sigma_z: float, lo_bound: int = 0,
     if popt is not None:
         amp, z0, s, _base = popt
         s = abs(s)
-        if np.isfinite(z0) and amp > 0 and abs(z0 - z_peak) <= 1.5 and 0.2 <= s <= s_max:
+        if np.isfinite(z0) and amp > 0 and abs(z0 - z_peak) <= wander and 0.2 <= s <= s_max:
             return z0, amp, s, s, True, False
     return parabola()
 
@@ -415,9 +457,10 @@ def _fit_two_z(prof: np.ndarray, k1: int, k2: int, sigma_z: float
         return float(k1), 0.0, float("nan"), False
     a1, z1, a2, z2, s, _base = popt
     s = abs(s)
+    wander = max(1.5, float(sigma_z))          # as in _fit_z: one sigma, at least 1.5 planes
     if not (np.isfinite(z1) and np.isfinite(z2) and a1 > 0 and a2 > 0
-            and abs(z1 - k1) <= 1.5 and abs(z2 - k2) <= 1.5 and 0.2 <= s <= 6.0 * sigma_z + 2
-            and abs(z1 - z2) >= 1.0):
+            and abs(z1 - k1) <= wander and abs(z2 - k2) <= wander
+            and 0.2 <= s <= 6.0 * sigma_z + 2 and abs(z1 - z2) >= 1.0):
         return float(k1), 0.0, float("nan"), False
     return z1, a1, s, True
 
@@ -654,6 +697,7 @@ def _one_pass(vol: np.ndarray, slab: int, overlap: int, p: Dict[str, Any]
     dropped: List[Tuple[float, float, float, str, Dict[str, float]]] = []   # diagnostics
     half_z_core = max(1, int(round(s_z)))
     z_margin = max(1, int(math.ceil(1.5 * s_z)))
+    peak_sep = max(2, int(round(s_z)))          # two z peaks closer than a sigma are one
     half = int(math.ceil(3.0 * s_xy)) + 1
     tol_z = min(0.95, 2.0 * tol)
     n_deblended = 0
@@ -695,26 +739,32 @@ def _one_pass(vol: np.ndarray, slab: int, overlap: int, p: Dict[str, Any]
               ) -> Tuple[str, float, float, float, bool]:
         """The axial stage for one lateral position → ``(verdict, z0, sigma_z, skew, ok)``,
         verdict ``""`` when accepted. Re-profiles at the refined (y, x), finds the peak
-        nearest the one this component came from, and fits it bounded by the valleys to
-        its neighbouring peaks — or jointly with a neighbour closer than 4 sigma."""
+        nearest the one this component came from — within one sigma_z (at least 2
+        planes): the argmax of a broad noisy profile moves by that much for a half-pixel
+        lateral shift — and fits it bounded by the valleys to its neighbouring peaks, or
+        jointly with a neighbour closer than 4 sigma."""
         prof, _b, wn = _z_profile(vol, y0, x0, s_xy)
-        peaks = _z_peaks(prof, lo, hi, noise_raw * wn)
+        peaks = _z_peaks(prof, lo, hi, noise_raw * wn, peak_sep)
         if not peaks:
             return window_verdict(prof, lo, hi), float(z_peak), float("nan"), float("nan"), False
         zp = min(peaks, key=lambda k: abs(k - z_peak))
-        if abs(zp - z_peak) > 2:
+        if abs(zp - z_peak) > max(2, int(math.ceil(s_z))):
             return "fit_failed", float(zp), float("nan"), float("nan"), False
         if zp <= 0 or zp >= nz - 1:
             return "edge_z", float(zp), float("nan"), float("nan"), False
         left = [k for k in peaks if k < zp]
         right = [k for k in peaks if k > zp]
         near_nb = [k for k in left + right if abs(k - zp) <= 4.0 * s_z]
+        ok = False
         if near_nb:
             nb = min(near_nb, key=lambda k: abs(k - zp))
             z0, amp_z, s_fit_z, ok = _fit_two_z(prof, zp, nb, s_z)
             s_lo = s_hi = s_fit_z
             split = False
-        else:
+        if not ok:
+            # no close neighbour — or the joint model did not hold (the "neighbour" was a
+            # shoulder, not a bead): fit this peak alone inside the valleys toward its
+            # neighbours. Still a Gaussian fit that can fail, never a parabola.
             lo_b = (max(left) + int(np.argmin(prof[max(left):zp + 1]))) if left else 0
             hi_b = (zp + int(np.argmin(prof[zp:min(right) + 1])) + 1) if right else nz
             z0, amp_z, s_lo, s_hi, ok, split = _fit_z(prof, zp, s_z, lo_b, hi_b)
@@ -750,7 +800,7 @@ def _one_pass(vol: np.ndarray, slab: int, overlap: int, p: Dict[str, Any]
                 drop("aspect", a, yi, xi, ridge=float(min(ridge[k], 99.0)), snr=q)
                 continue
             prof, _bounds, wn = _z_profile(vol, float(yi), float(xi), s_xy)
-            peaks = _z_peaks(prof, lo_z, hi_z, noise_raw * wn)
+            peaks = _z_peaks(prof, lo_z, hi_z, noise_raw * wn, peak_sep)
             if peaks and not p.get("multi_peak", True):
                 peaks = [max(peaks, key=lambda k: prof[k])]
             if not peaks:
@@ -768,6 +818,14 @@ def _one_pass(vol: np.ndarray, slab: int, overlap: int, p: Dict[str, Any]
             for z_peak in peaks:
                 if z_peak <= 0 or z_peak >= nz - 1:
                     drop("edge_z", z_peak, yi, xi)
+                    continue
+                if not (a <= z_peak < b):
+                    # the peak plane lies in the margin beyond this slab: the slab that
+                    # holds it sees the bead at full brightness and owns the fit; this one
+                    # saw only the axial tail. Fitting it here too only manufactured a
+                    # duplicate to merge — with a 2-sigma_z margin on a low-NA stack every
+                    # bead was fitted in three slabs and the field took three times as long
+                    drop("other_slab", z_peak, yi, xi, snr=q)
                     continue
                 # lateral sub-pixel + size on the planes around THIS peak, with the pixels
                 # that belong to a neighbouring candidate left out
@@ -936,19 +994,26 @@ def find_beads(volume_zyx: np.ndarray, voxel_size_um: Sequence[float],
         pts, cols, info = _one_pass(v, slab, ov, p)
         passes.append(summary(info, len(pts)))
     else:
-        # pass 0: the whole stack as one projection — the density estimate the slab
-        # thickness is derived from (and the sparse-field detector, were it not capped)
-        slab = nz
-        pts, cols, info = _one_pass(v, slab, 0, p)
+        # the density the slab thickness is derived from: a raw peak count on slabs as
+        # thin as a bead (no fits — see _probe_bead_count for why not a whole-stack pass),
+        # then one full pass; a re-run only when the beads that pass ARGUE FOR A THINNER
+        # slab still (stacked beads a 2-D count cannot see) — never for a thicker one,
+        # since a pass that refuses beads as crowded must not be allowed to vote for the
+        # projection that crowded them
+        s_min = max(1, int(round(2.0 * s_z)))
+        n_probe = _probe_bead_count(v, s_min, p)
+        slab = auto_slab_thickness(n_probe, v.shape, s_xy, s_z, target_overlap=target)
+        pts, cols, info = _one_pass(v, slab, _auto_overlap(slab, s_z), p)
         passes.append(summary(info, len(pts)))
         for _ in range(2):
-            want = auto_slab_thickness(len(pts), v.shape, s_xy, s_z, target_overlap=target)
+            want = auto_slab_thickness(max(n_probe, len(pts)), v.shape, s_xy, s_z,
+                                       target_overlap=target)
             if want >= slab or abs(want - slab) <= max(1, int(0.25 * slab)):
                 break
             slab = want
-            ov = _auto_overlap(slab, s_z)
-            pts, cols, info = _one_pass(v, slab, ov, p)
+            pts, cols, info = _one_pass(v, slab, _auto_overlap(slab, s_z), p)
             passes.append(summary(info, len(pts)))
+        info["probe_beads"] = int(n_probe)
     info["passes"] = passes
     info["despiked_voxels"] = int(n_spikes)
     info["voxel_size_um"] = tuple(float(x) for x in voxel_size_um)

@@ -57,10 +57,14 @@ def _compute_beads(ctx: EvalContext) -> Dataset:
     last plane. The same bead found in two overlapping slabs is merged within half a
     diameter (rigid spheres cannot be closer than one), brightest wins.
 
-    ``slabs=auto`` derives ``S`` from the bead density: a whole-stack projection counts the
-    beads, then ``S`` is set so at most ~10 % of beads share a projected footprint with
-    another, between about two axial sigmas and half the stack, re-estimated once or twice.
-    ``slabs=manual`` takes ``slab_thickness`` / ``slab_overlap`` in microns along Z.
+    ``slabs=auto`` derives ``S`` from the bead density: a raw peak count on projections as
+    thin as a bead estimates it (a whole-stack count undercounts a dense field and so
+    argues for the very projection that crowded it), then ``S`` is set so at most ~10 % of
+    beads share a projected footprint with another, between about two axial sigmas and
+    half the stack, re-estimated once or twice but only ever thinner. ``slabs=manual``
+    takes ``slab_thickness`` / ``slab_overlap`` in microns along Z. Every axial tolerance
+    scales with the expected axial sigma, so a low-NA stack whose beads span twenty planes
+    is fitted as readily as a 1.4 NA one whose beads span three.
 
     Resolved spec: category analysis; op ``detect.beads``; **Point** output with the
     invariant schema plus :data:`BEAD_COLUMNS`; 3-D only (``WHOLE_VOLUME``, no dim lever —
@@ -200,7 +204,11 @@ register_node(
                 "Gaussian noise it admits well under one false peak per million pixels. It "
                 "is relative to each slab's own noise, so it does not change with bit depth "
                 "or exposure; it is the first thing to lower if dim beads are missing and "
-                "the per-bead `snr` column shows the found ones far above it."),
+                "the per-bead `snr` column shows the found ones far above it. In a PACKED "
+                "field the noise it measures against is the projection's own clutter — "
+                "the haze of out-of-focus beads — not the camera's, so a 5 keeps only the "
+                "brightest few percent there; 3 is the right start for a dense bead gel "
+                "(a 0.45 NA field went from 19 to 780 beads per 73 µm square)."),
         InFloat("size_tolerance", "Size tolerance", unit="", field=False, default=0.5,
                 description=
                 "How far a fitted bead's lateral width may deviate from the EXPECTED width "
@@ -268,12 +276,14 @@ register_node(
              "which is the knob that trades dense-field separation against speed.",
              choice_docs={
                  "auto":
-                     "Derive the slab thickness from the data: a whole-stack projection "
-                     "counts the beads, and the thickness is set so that at most about one "
-                     "bead in ten shares a projected footprint with another — between about "
-                     "two axial sigmas and half the stack — then re-estimated once or twice "
-                     "as the count firms up. Right for an unknown sample; costs one or two "
-                     "extra passes.",
+                     "Derive the slab thickness from the data: a raw peak count on "
+                     "projections as thin as a bead estimates the bead density, and the "
+                     "thickness is set so that at most about one bead in ten shares a "
+                     "projected footprint with another — between about two axial sigmas "
+                     "and half the stack — then re-estimated once or twice as the beads "
+                     "that pass firm the count up, only ever toward thinner slabs. Right "
+                     "for an unknown sample; a packed field lands on the thinnest slab, a "
+                     "sparse one on half the stack.",
                  "manual":
                      "Use Slab thickness and Slab overlap as given, in microns along Z. "
                      "One pass, reproducible across stacks of different density, and the "

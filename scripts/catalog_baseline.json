@@ -13950,7 +13950,7 @@
      "column_join": [],
      "default": 5.0,
      "derive": "",
-     "description": "How far above the noise a bead's detection-filter response has to stand, in robust standard deviations of that slab's response, to become a candidate. LOWER finds dimmer beads and admits more noise peaks (which the size test then has to refuse, so the run gets slower before it gets wronger); HIGHER keeps only bright beads. 5 is a conservative start \u2014 on Gaussian noise it admits well under one false peak per million pixels. It is relative to each slab's own noise, so it does not change with bit depth or exposure; it is the first thing to lower if dim beads are missing and the per-bead `snr` column shows the found ones far above it.",
+     "description": "How far above the noise a bead's detection-filter response has to stand, in robust standard deviations of that slab's response, to become a candidate. LOWER finds dimmer beads and admits more noise peaks (which the size test then has to refuse, so the run gets slower before it gets wronger); HIGHER keeps only bright beads. 5 is a conservative start \u2014 on Gaussian noise it admits well under one false peak per million pixels. It is relative to each slab's own noise, so it does not change with bit depth or exposure; it is the first thing to lower if dim beads are missing and the per-bead `snr` column shows the found ones far above it. In a PACKED field the noise it measures against is the projection's own clutter \u2014 the haze of out-of-focus beads \u2014 not the camera's, so a 5 keeps only the brightest few percent there; 3 is the right start for a dense bead gel (a 0.45 NA field went from 19 to 780 beads per 73 \u00b5m square).",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
@@ -14184,7 +14184,7 @@
     {
      "available_in": null,
      "choice_docs": {
-      "auto": "Derive the slab thickness from the data: a whole-stack projection counts the beads, and the thickness is set so that at most about one bead in ten shares a projected footprint with another \u2014 between about two axial sigmas and half the stack \u2014 then re-estimated once or twice as the count firms up. Right for an unknown sample; costs one or two extra passes.",
+      "auto": "Derive the slab thickness from the data: a raw peak count on projections as thin as a bead estimates the bead density, and the thickness is set so that at most about one bead in ten shares a projected footprint with another \u2014 between about two axial sigmas and half the stack \u2014 then re-estimated once or twice as the beads that pass firm the count up, only ever toward thinner slabs. Right for an unknown sample; a packed field lands on the thinnest slab, a sparse one on half the stack.",
       "manual": "Use Slab thickness and Slab overlap as given, in microns along Z. One pass, reproducible across stacks of different density, and the only way to go thinner than the automatic choice when beads stack closely in Z or when artefacts occupy many planes."
      },
      "choices": [

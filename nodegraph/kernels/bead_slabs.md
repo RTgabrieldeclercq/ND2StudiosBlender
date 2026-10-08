@@ -79,8 +79,9 @@ points:
 counts),
 `dropped` (list of `(z, y, x, reason, detail_dict)` per refused candidate — for a
 validation asking what happened to a planted bead), `passes` (one summary per pass:
-`slab_px`, `overlap_px`, `n_slabs`, `n`), `despiked_voxels`, `voxel_size_um`,
-`projection`, `sigma_xy_px`, `sigma_z_px`.
+`slab_px`, `overlap_px`, `n_slabs`, `n`), `probe_beads` (auto slabs only: the raw peak
+count the slab thickness was derived from, scaled to the whole stack), `despiked_voxels`,
+`voxel_size_um`, `projection`, `sigma_xy_px`, `sigma_z_px`.
 
 ## 6. Conventions & GOTCHAS (the real integration risk)
 
@@ -94,18 +95,39 @@ validation asking what happened to a planted bead), `passes` (one summary per pa
   volume median whose 26-neighbour MEDIAN holds < 15 % of its excess is replaced by that
   median. Skipped when `sigma_xy_px < 0.75`. Without it a spike beside a bead swallows the
   bead's LoG peak and the bead is lost.
-- **The auto slab is density-driven and capped at half the stack.** Pass 0 projects the
-  whole stack; with `n` beads found, `rho = n / (Z·Y·X)`, `a = π (2.355 σxy)²`,
-  `S = target_overlap / (rho · a)` planes, clamped to `[round(2 σz), ceil(Z/2)]`;
-  re-run while the choice moves by more than 25 % (at most two re-runs, three passes
-  total). The cap is deliberate: a whole-stack projection lets one fibre or aggregate
-  hide every bead beneath it.
-- **A candidate's z is searched near its slab**: `argmax` of the matched-filter profile
-  over `[a − ceil(1.5 σz), b + ceil(1.5 σz))`. A peak on plane `0` or `Z−1` is refused
-  (`edge_z`) — a bead whose brightest plane was never acquired cannot be localised. A
-  peak on the **window's** edge with the profile still rising beyond it is refused as
-  `other_slab`: this slab only saw the bead's axial tail, and fitting the tail would plant
-  a ghost two or three planes from the real bead that the neighbouring slab finds.
+- **The auto slab is density-driven and capped at half the stack.** The density comes
+  from a raw LoG peak count (no fits) on up to three projections as thin as a bead
+  (`round(2 σz)` planes — top, middle, bottom of the stack), the largest scaled to the
+  stack's depth (`info["probe_beads"]`); with that `n`, `rho = n / (Z·Y·X)`,
+  `a = π (2.355 σxy)²`, `S = target_overlap / (rho · a)` planes, clamped to
+  `[round(2 σz), ceil(Z/2)]`; one full pass, then a re-run only when the beads that pass
+  argue for a slab thinner by more than 25 % (at most two re-runs). It never re-runs
+  THICKER: the first version counted the beads a whole-stack pass accepted, and in a dense
+  field that pass piles beads onto one another, refuses nearly all of them, and the tiny
+  count argued for the thickest slab — the undercount justifying the projection that
+  caused it (a 0.45 NA gel with thousands of beads per field reported 4 and kept half-stack
+  slabs, 2026-10-08). The cap is deliberate: a whole-stack projection lets one fibre or
+  aggregate hide every bead beneath it. The overlap is `round(2 σz)` planes but never
+  more than half the slab — at the slab floor the uncapped rule stepped one plane at a
+  time (39 projections of a 54-plane stack).
+- **A candidate's z is searched near its slab, and the slab that holds the peak owns
+  it**: peaks of the matched-filter profile over `[a − ceil(1.5 σz), b + ceil(1.5 σz))`,
+  but only a peak on a plane inside `[a, b)` is fitted from this slab; one in the margin
+  is left to the slab that holds it (`other_slab`) — that slab sees the bead at full
+  brightness, this one saw its tail, and fitting it here too only manufactured a
+  duplicate to merge (three fits per bead on a low-NA stack). A peak on plane `0` or
+  `Z−1` is refused (`edge_z`) — a bead whose brightest plane was never acquired cannot be
+  localised. A window whose `argmax` sits on its edge with the profile still rising beyond
+  it is `other_slab` too.
+- **Every axial tolerance scales with `σz`.** The re-profiled peak at the refined (y, x)
+  must lie within `max(2, ceil σz)` planes of the one the component came from; a fitted
+  centre may wander `max(1.5, σz)` planes from its argmax before the fit is distrusted;
+  two z peaks closer than `max(2, round σz)` planes are one peak. At 1.4 NA (σz ≈ 1.5
+  planes) these are the fixed 2 / 1.5 / 2 the kernel shipped with; at 0.45 NA (σz 8
+  planes, a 19-plane-wide profile) the fixed values refused half of all converged axial
+  fits and offered the other half's noise shoulders to the two-bead model, which refused
+  them too — 19 beads found where 780 are (2026-10-08). A two-peak joint fit that does not
+  hold falls back to the single valley-bounded fit; it is still a Gaussian that can fail.
 - **Neighbour masking + the unmasked re-fit rule.** The 2-D fit leaves out pixels nearer
   to another LoG candidate of the same slab (Voronoi), so touching beads do not widen each
   other. A fibre's own chain of candidates would cut its END into a bead-sized cell too —
@@ -117,7 +139,7 @@ validation asking what happened to a planted bead), `passes` (one summary per pa
   scan lines read ≥ 5. Both this and the fitted-aspect refusal count under `aspect`.
 - **Several beads per column.** Every prominent peak of a candidate's z-profile (prominence
   ≥ 3 profile-noise sigmas and ≥ 10 % of its height, height ≥ 15 % of the window's tallest,
-  ≥ 2 planes apart) is fitted as its own bead, on its own peak plane; its axial fit is
+  ≥ `max(2, round σz)` planes apart) is fitted as its own bead, on its own peak plane; its axial fit is
   bounded by the valleys to neighbouring peaks, or joint (two Gaussians, one shared sigma,
   `skew_z` NaN) with a neighbour closer than 4 σz. Beads stacked in z under one (y, x) are
   the second-largest loss in a dense field after touching pairs; this recovers most of them.
@@ -183,7 +205,7 @@ pts, cols, info = find_beads(vol, (0.4, 0.325, 0.325),
                              {"sigma_xy_px": s_xy, "sigma_z_px": s_z})
 # pts.shape == (3, 3), (z, y, x) voxels, each within ~0.1 voxel of the planted centre
 # cols["sigma_xy_px"] ≈ 0.9, cols["skew_z"] ≈ 0 (a symmetric synthetic profile)
-# info["passes"][0]["slab_px"] == 20 (pass 0, whole stack), then the auto choice
+# info["passes"][0]["slab_px"] == the auto choice (from info["probe_beads"]), at most 10 here
 ```
 
 ## 10. Pipeline wiring
