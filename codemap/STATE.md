@@ -11,9 +11,9 @@
 | indexed symbols | 5062 |
 | first-party import edges | 1770 |
 | LOC — `nodegraph/` | 109,746 |
-| LOC — `nodelab_v2/` | 58,272 |
+| LOC — `nodelab_v2/` | 58,276 |
 | LOC — `scripts/` | 21,517 |
-| map fingerprint | `f1e9abe0373e53c079a22bfe23ee8ff8` |
+| map fingerprint | `c6eca08c8e1d45d89de08e0a0e892d4b` |
 | gates last verified green | **2026-10-07** |
 
 `gates last verified green` moves only when a human or agent passes

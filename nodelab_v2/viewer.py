@@ -5036,7 +5036,11 @@ class ViewerPanel(QWidget):
     #: in preference order. `u`/`v` is what the DVC/DIC kernels emit; the `_um` pair is what
     #: a calibrated field carries; `dy`/`dx` covers a hand-built table. Matched as a PAIR so
     #: a table with only one half is skipped rather than drawn as a half-field.
-    _VECTOR_COLUMNS = (("u", "v"), ("u_um", "v_um"), ("dy", "dx"))
+    # the displacement pairs a Point table may carry, first match wins: PIV/DIC's (u, v),
+    # their µm twins, tracking's (dy, dx) — and DVC's (disp_y, disp_x) in µm, which the
+    # demo recipes already knew about and the Viewer did not (2026-10-08): a pulled DVC
+    # field drew no arrows at all
+    _VECTOR_COLUMNS = (("u", "v"), ("u_um", "v_um"), ("dy", "dx"), ("disp_y", "disp_x"))
 
     def _vector_field(self) -> Optional[np.ndarray]:
         """Point-domain displacement vectors on the viewed frame → ``(N, 4)`` ``y,x,u,v``.
