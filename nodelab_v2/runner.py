@@ -71,7 +71,7 @@ from nodegraph.metadata import (
     MetaEnvelope, PER_POSITION_KEYS, SOURCE_FILE_KEY, position_subset,
     shift_origin_um, stamp_source_file)
 from nodegraph.parallel import (
-    cpu_budget, memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
+    memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
 from nodegraph.provider import (
     FrameSliceProvider, FrameSubsetProvider, MultiSourceProvider, SyntheticProvider,
     _picked, subset_index)
@@ -114,7 +114,32 @@ def ingest_workers() -> int:
             return max(1, int(n))
         except ValueError:
             pass
-    return max(1, min(4, cpu_budget() // 4))
+    # sized from the CORES, not from `cpu_budget()`: that budget is now capped at a
+    # handful of threads for the GUI's sake (`parallel.DEFAULT_WORKER_CAP`), and an
+    # ingest is mostly blosc2 + IO that release the GIL — four of them on a big box is
+    # exactly what this lane was measured for
+    return max(1, min(4, ((os.cpu_count() or 2) - 2) // 4))
+
+
+def display_workers() -> int:
+    """How many display jobs (plane decode, prefetch, preload, viewport detail) may run at
+    once on the runner's shared pool.
+
+    ``QThreadPool.globalInstance()`` sizes itself to the core count — 80 threads on an
+    80-core workstation — and :meth:`EngineRunner.preload_series` fans a warm-up out to
+    ``maxThreadCount - 1`` jobs. Every one of those is a Python thread contending with the
+    GUI thread for the GIL (the decode is numpy, but each job's glue is Python), so on a
+    many-core machine a scrub or a playback warm-up is a GIL convoy and the cursor lags
+    behind the strip — the same convoy :data:`nodegraph.parallel.DEFAULT_WORKER_CAP` caps on
+    the engine side. A handful of decoders already saturates the disk and the blosc2
+    threads (which release the GIL themselves). ``NODELAB_DISPLAY_WORKERS`` overrides."""
+    n = os.environ.get("NODELAB_DISPLAY_WORKERS", "").strip()
+    if n:
+        try:
+            return max(1, int(n))
+        except ValueError:
+            pass
+    return max(1, min(8, (os.cpu_count() or 2) - 2))
 
 
 def _clean_source_path(path: Any) -> str:
@@ -1520,8 +1545,12 @@ class EngineRunner(QObject):
         self._source: GraphSource = (Workspace.single(source)
                                      if isinstance(source, GraphDocument) else source)
         #: the shared pool, for the jobs that only READ providers (display decode, prefetch,
-        #: viewport detail). Deliberately NOT the pull: see :class:`_PullThread`.
+        #: viewport detail). Deliberately NOT the pull: see :class:`_PullThread`. Capped
+        #: at :func:`display_workers` — the global pool's own default is one thread per
+        #: core, and a core count's worth of Python decoders starves the GUI thread of the
+        #: GIL on a big machine.
         self._pool = QThreadPool.globalInstance()
+        self._pool.setMaxThreadCount(display_workers())
         #: the single Python-owned thread every node compute runs on (:class:`_PullThread`).
         self._pull_thread = _PullThread()
         # Persists across engine rebuilds — so it's the memory hazard V2.04 flagged: an

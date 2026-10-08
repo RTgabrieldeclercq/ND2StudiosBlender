@@ -1378,9 +1378,10 @@ def main(argv) -> int:
     pt_idx = next(i for i in range(win.sheet._pick.count())
                   if win.sheet._pick.itemData(i) == ("point", "spots"))
     win.sheet._pick.setCurrentIndex(pt_idx)
-    assert win.sheet._table.rowCount() == 2               # 2 points
-    hdrs = [win.sheet._table.horizontalHeaderItem(i).text()
-            for i in range(win.sheet._table.columnCount())]
+    from PySide6.QtCore import Qt as _Qt
+    _sm = win.sheet._table.model()                        # a virtual model (2026-10-08)
+    assert _sm.rowCount() == 2                            # 2 points
+    hdrs = [_sm.headerData(i, _Qt.Horizontal) for i in range(_sm.columnCount())]
     assert hdrs[0] == "id" and "intensity" in hdrs        # coord columns first
     _ok(f"G5: spreadsheet groups {len(tables)} structure tables (point+label), "
         f"coord columns first")
@@ -5537,11 +5538,13 @@ def main(argv) -> int:
     _ttabs = [_panel._files.tabText(i) for i in range(_panel._files.count())]
     assert _ttabs == ["All (3 files)", "A.nd2", "B.nd2", "C.nd2"], _ttabs
 
+    from PySide6.QtCore import Qt as _Qt
+    _tm = _panel._table.model()                               # virtual model (2026-10-08)
+
     def _areas():
-        _c = [n for n in range(_panel._table.columnCount())
-              if _panel._table.horizontalHeaderItem(n).text() == "area"][0]
-        return [_panel._table.item(r, _c).text()
-                for r in range(_panel._table.rowCount())]
+        _c = [n for n in range(_tm.columnCount())
+              if _tm.headerData(n, _Qt.Horizontal) == "area"][0]
+        return [_tm.text(r, _c) for r in range(_tm.rowCount())]
 
     assert len(_areas()) == 6, _areas()                       # All
     for _i, _want in ((1, ["10", "11"]), (2, ["20", "21"]), (3, ["30", "31"])):
@@ -5549,7 +5552,7 @@ def main(argv) -> int:
         assert _areas() == _want, (_i, _areas())
         # the row header keeps the ORIGINAL row number, so a filtered row is still
         # findable in the unfiltered CSV the export writes
-        assert _panel._table.verticalHeaderItem(0).text() == str((_i - 1) * 2)
+        assert _tm.headerData(0, _Qt.Vertical) == str((_i - 1) * 2)
     _panel._files.setCurrentIndex(0)
     assert len(_areas()) == 6, _areas()
     # a SINGLE-file table grows no tabs — one tab beside `All` would offer the same rows

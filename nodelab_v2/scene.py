@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QPainter, QPen, QTransform
+from PySide6.QtGui import QBrush, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QApplication, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QToolButton, QVBoxLayout, QWidget,
@@ -1680,18 +1680,42 @@ class GraphView(QGraphicsView):
 
     def drawBackground(self, p: QPainter, rect) -> None:
         super().drawBackground(p, rect)
-        step = self.STEP
-        left = int(rect.left()) - (int(rect.left()) % step)
-        top = int(rect.top()) - (int(rect.top()) % step)
+        # ONE textured fill, not one `drawEllipse` per dot (2026-10-08). The loop drew a
+        # dot per STEP×STEP cell of the exposed rect — hundreds at 1:1 on a big monitor,
+        # tens of thousands zoomed out — and every one of those calls is a trip out of
+        # Python and back: PySide releases the GIL around a painter call, so while a pull
+        # has the engine's worker threads busy each dot waits its turn for the GIL again.
+        # Measured: 5 000 dots paint in 5 ms on an idle machine and did not finish in five
+        # MINUTES beside eight CPU-bound Python threads. The tile is drawn in scene units
+        # and the painter's transform scales it with the zoom, exactly as the ellipses
+        # scaled, and a texture brush anchors to the logical origin, so the dots sit on
+        # the same multiples of STEP they always did.
         p.setPen(Qt.NoPen)
-        p.setBrush(T.GRID_DOT)
-        y = float(top)
-        while y < rect.bottom():
-            x = float(left)
-            while x < rect.right():
-                p.drawEllipse(QPointF(x, y), 1.0, 1.0)
-                x += step
-            y += step
+        p.setBrushOrigin(QPointF(-1.0, -1.0))       # the dot is centred at (1, 1) in its tile
+        p.setBrush(self._grid_brush())
+        p.drawRect(rect)
+        p.setBrushOrigin(QPointF(0.0, 0.0))
+
+    def _grid_brush(self) -> QBrush:
+        """The dot-grid texture: a STEP×STEP tile with one dot, rendered at the view's
+        device pixel ratio so it stays crisp on a HiDPI screen. Cached per ratio."""
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        cached = getattr(self, "_grid_brush_cache", None)
+        if cached is not None and cached[0] == dpr:
+            return cached[1]
+        step = int(self.STEP)
+        tile = QPixmap(int(round(step * dpr)), int(round(step * dpr)))
+        tile.setDevicePixelRatio(dpr)
+        tile.fill(Qt.transparent)
+        tp = QPainter(tile)
+        tp.setRenderHint(QPainter.Antialiasing, True)
+        tp.setPen(Qt.NoPen)
+        tp.setBrush(T.GRID_DOT)
+        tp.drawEllipse(QPointF(1.0, 1.0), 1.0, 1.0)
+        tp.end()
+        brush = QBrush(tile)
+        self._grid_brush_cache = (dpr, brush)
+        return brush
 
     def wheelEvent(self, e) -> None:
         factor = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15

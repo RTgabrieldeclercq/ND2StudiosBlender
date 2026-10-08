@@ -1064,7 +1064,7 @@ for a headless run, a smaller box, or a bisect.
 | Variable | Default | What it does |
 |---|---|---|
 | `NODEGRAPH_PARALLEL` | `auto` | `auto` / `thread` / `process` / **`off`** (the old single-threaded engine) |
-| `NODEGRAPH_WORKERS` | `cpu_count-2` | Max concurrent units |
+| `NODEGRAPH_WORKERS` | `min(cpu_count-2, 8)` | Max concurrent units. Capped at 8 because the workers are Python threads in the GUI's own process: on an 80-core box 78 of them made no pull faster and froze the interface for half a minute at a time (they starve the GUI thread of the GIL). Set it higher yourself if a run genuinely scales |
 | `NODEGRAPH_PROC_WORKERS` | `min(workers, 8)` | Process-pool size (per-frame CNN inference) |
 | `NODEGRAPH_CACHE_BYTES` | 20% of RAM, ≤64 GiB | Tile/unit cache — **also the lazy-vs-eager gate**, see below |
 | `NODEGRAPH_MEMO_BYTES` | 12% of RAM, ≤32 GiB | Persistent memo across edits |
@@ -1072,7 +1072,8 @@ for a headless run, a smaller box, or a bisect.
 | `NODEGRAPH_FLOAT32` | off | Stream in float32 — faster and half the memory, **but changes numerics** |
 | `NODEGRAPH_GPU` | `off` | `auto` / `on` enable CUDA dispatch for the ndimage filters (needs CuPy) |
 | `NODEGRAPH_STORE_DIR` | beside the file | Put every `.b2nd_store` in one directory |
-| `NODELAB_INGEST_WORKERS` | `min(4, workers/4)` | How many source files may ingest at once (§4) |
+| `NODELAB_INGEST_WORKERS` | `min(4, (cpu_count-2)/4)` | How many source files may ingest at once (§4) |
+| `NODELAB_DISPLAY_WORKERS` | `min(8, cpu_count-2)` | How many display jobs (plane decode, prefetch, playback warm-up, viewport detail) run at once. Capped for the same reason as `NODEGRAPH_WORKERS`: a core count's worth of decoders made scrubbing lag on a many-core machine |
 
 Budgets accept a suffix: `NODEGRAPH_CACHE_BYTES=48g`.
 
@@ -3829,6 +3830,8 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | First pull on a big ND2 is slow | Access on that card is set to **Auto** or **Ingest**, either of which copies the file to a `.b2nd` store before serving it (later pulls reopen the store lazily). The default, **Direct**, skips this entirely — it opens in seconds regardless of file size ([§4](#loading-a-file--the-access-mode)). Switch the card's Access back to Direct if you would rather not pay for the copy |
 | **"The following file is too large to open"**, or an ingest that runs for hours and then fails | Access set to **Ingest** (or **Auto**, which decided to ingest) on a file that does not fit the drive. Auto checks free space before starting, so this means either the card was forced to Ingest by hand, or free space dropped after Auto already committed. Either way: an ingest writes a second copy — roughly 0.6–0.8× the source — and it has to fit. A 453 GB series needs ~340 GB of free space; on a 931 GB drive already holding the file, it cannot. The symptom of running out is a **torn store**: the next open refuses it ("was never finished writing") and starts the whole copy again. Set the card's **Access** to **Direct** — the default, and what a fresh card would already be using ([§4](#loading-a-file--the-access-mode)) — it reads the ND2 in place, needs no free space, and opens a 453 GB file in ~3 s. Delete the abandoned `<file>.b2nd_store` folder to get the space back |
 | Tuning a parameter on a long series is painfully slow | press `F9` — pulls then analyse only the frames you picked, or the one you are on ([§6](#troubleshooting-mode-analyse-the-frames-you-pick--f9)), typically T× faster |
+| Under `F9` every cursor move still takes seconds, and the Viewer is what freezes | the frame itself computes in a fraction of a second; the time went into colouring the result. A noisy threshold labels tens of thousands of specks, and the Viewer's palette (one colour per object, neighbours kept apart) was built on the GUI thread per delivery. Since 2026-10-08 that pass is ~4× faster and is skipped above 10 000 objects, so the stall is bounded at about a quarter of a second — and a threshold that produces that many objects wants a higher level or a size filter anyway |
+| The whole interface lags or freezes while a pull runs, worst on a big workstation | the engine's workers are Python threads inside the GUI process and every one of them competes with the interface for the GIL. On an 80-core machine the old default (`cpu_count-2` = 78 workers) froze the window for half a minute at a time without making the pull any faster; the default is now capped at 8 (`NODEGRAPH_WORKERS`), and the display decoders likewise (`NODELAB_DISPLAY_WORKERS`). If you had set `NODEGRAPH_WORKERS` high yourself, lower it |
 | Tracks/time reductions look empty or trivial, and the canvas has an amber frame / `TROUBLESHOOTING MODE` badge | troubleshooting mode is on and only one frame is scoped. Ctrl+click a few T boxes so the tracker has a series, or `F9` to leave the mode |
 | A tracker under `F9` links across the wrong gaps | the picked frames are the whole series as far as the graph is concerned — unpicked ones are absent, not empty. Pick a contiguous run (ctrl+drag), or leave the mode for real numbers |
 | A table's `t` column reads 0 for a frame you know is 57 | same — under `F9` the payload holds that one frame and numbers it from 0. The status bar names the real frame |

@@ -41,7 +41,7 @@ different box (or a bisect) needs no code edit:
 
 ===============================  =====================================================
 ``NODEGRAPH_PARALLEL``           ``auto`` (default) / ``thread`` / ``process`` / ``off``
-``NODEGRAPH_WORKERS``            max workers (default ``cpu_count-2``, floor 1)
+``NODEGRAPH_WORKERS``            max workers (default ``min(cpu_count-2, 8)``, floor 1)
 ``NODEGRAPH_PROC_WORKERS``       process-pool size (default ``min(workers, 8)``)
 ``NODEGRAPH_CACHE_BYTES``        engine TileCache budget (default: RAM-derived)
 ``NODEGRAPH_MEMO_BYTES``         persistent Memo budget (default: RAM-derived)
@@ -104,17 +104,30 @@ def _env_flag(key: str, default: bool = False) -> bool:
 
 # ── machine sizing ─────────────────────────────────────────────────────────────
 
+#: Ceiling on the default worker count. The unit pool is a THREAD pool in the GUI's own
+#: process, and every worker runs Python glue between its numpy calls, so each one is a
+#: contender for the GIL against the GUI thread. Measured 2026-10-08 on an 80-core box
+#: (Threshold over a 66-position ND2, direct access): 78 workers 53.6 s with the GUI frozen
+#: for 31.6 s at a stretch; 16 workers 69 s; 8 workers 49.7 s with the longest GUI stall
+#: 0.3 s. Past a handful of threads the GIL is the bottleneck, so more workers only make
+#: the convoy worse — the run gets no faster and every click waits behind it.
+#: ``NODEGRAPH_WORKERS`` still sets any number, above or below.
+DEFAULT_WORKER_CAP = 8
+
+
 def cpu_budget() -> int:
     """How many workers to run at once.
 
     ``cpu_count - 2`` rather than ``cpu_count``: the GUI thread and the Qt worker that
     drives the pull both need to stay responsive, and the point of parallelising is a
-    smoother run, not a pegged machine. Floor 1 (never zero — a zero-worker pool
-    deadlocks). ``NODEGRAPH_WORKERS`` overrides."""
+    smoother run, not a pegged machine — and never more than :data:`DEFAULT_WORKER_CAP`,
+    because on a many-core machine the extra threads fight the GUI for the GIL instead of
+    shortening the run. Floor 1 (never zero — a zero-worker pool deadlocks).
+    ``NODEGRAPH_WORKERS`` overrides, in either direction."""
     n = _env_int("NODEGRAPH_WORKERS", None)
     if n is not None:
         return max(1, int(n))
-    return max(1, (os.cpu_count() or 2) - 2)
+    return max(1, min((os.cpu_count() or 2) - 2, DEFAULT_WORKER_CAP))
 
 
 def proc_budget() -> int:

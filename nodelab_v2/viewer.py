@@ -159,11 +159,16 @@ _HOVER_HINT = "hover the image to read a pixel"
 #: graph for a bounded cost, whether the movie is 20 frames or 2000.
 MAX_NEIGHBOR_FRAMES = 64
 
-#: Above this many distinct objects the neighbour de-confliction is skipped (measured at
-#: ~40 µs each, and this runs on the GUI thread). Every object still keeps ONE colour for
-#: the whole series — only the nudging-apart is dropped. Announced once on stderr rather
-#: than silently capped.
-MAX_PALETTE_OBJECTS = 40_000
+#: Above this many distinct objects the neighbour de-confliction is skipped. It runs on the
+#: GUI thread, once per delivered payload — under the troubleshooting scope that is once
+#: per cursor move — and it is a Python loop over every object (~25 µs each after the
+#: 2026-10-08 rewrite of :func:`~nodegraph.catalog._shared.label_paint.deconflict_slots`;
+#: ~90 µs before, when the old 40 000 cap let a noisy threshold's 40k specks freeze the
+#: Viewer for 5 s on every frame). The cap bounds that stall at roughly a quarter of a
+#: second. Every object still keeps ONE colour for the whole series — only the
+#: nudging-apart is dropped, and above a few thousand objects no eye compares neighbouring
+#: hues anyway. Announced once on stderr rather than silently capped.
+MAX_PALETTE_OBJECTS = 10_000
 
 
 @dataclass(frozen=True)
