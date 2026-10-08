@@ -71,6 +71,8 @@ it returns a numpy result. That is the whole contract.
 | [`cellsam_segment`](cellsam_segment.md) | Segmentation (method=cellsam) | `segment_plane(image, ...)` (+ `get_cellsam_model`, `relabel_contiguous`, `cellsam_available`) | **external** (SAM ViT + CellFinder Anchor-DETR) | numpy, cellSAM*, torch*, dask-image* |
 | [`dic_correlate`](dic_correlate.md) | DIC (pyALDIC) | `run_pyaldic_pair(...)`, `run_pyaldic_series(...)` | **external** (al-dic IC-GN + ADMM) | numpy, scipy, scikit-image, al-dic* |
 | [`piv_field`](piv_field.md) | PIV (OpenPIV) | `run_piv_pair(frame_a, frame_b, voxel_size_um, params, ...)`, `run_piv_series(images, params, ...)` | **external** (openpiv multipass window-deformation FFT correlation) | numpy, scipy, openpiv* |
+| [`flow_viewer`](flow_viewer.md) | Export Flow Viewer (3D HTML) | `build_geometry(U, V, s=..., px_per_cell=..., plane_names=[...])`, `render_html(geometry, report, ...)` (+ `assemble_grid`, `w_regularized`, `streamlines`, `isosurface`, `detect_grains_3d`) | in-repo (port of the lab's granular_flow_viewer pipeline) | numpy, scipy, scikit-image |
+| [`scene_viewer`](scene_viewer.md) | Export Scene Viewer (3D HTML) + `scene.*` | `volume_layer(...)`, `vectors_layer(...)`, `objects_layer(...)`, `tracks_layer(...)`, `series_layer(...)`, `pack(layers, ...)`, `render_html(scene, ...)` | in-repo | numpy, scipy, scikit-image |
 | [`checkpoint`](checkpoint.md) | Checkpoint | `save_checkpoints(...)`, `load_checkpoints(...)`, `checkpoints_dir_for(...)` | **none — serialization only** | numpy |
 
 `*` = lazy / optional dependency (see matrix). "in-repo" = the algorithm is native
@@ -233,6 +235,8 @@ degrades gracefully / falls back if absent). Blank = not used.
 | cellsam_segment | IT | | | | | | L·opt | | | | | |
 | dic_correlate | IT | L | L | | | | | | | | | L·opt |
 | piv_field | IT | L | | | | | | | | | | |
+| flow_viewer | IT | L | L | | | | | | | | | |
+| scene_viewer | IT | L | L | | | | | | | | | |
 | checkpoint | IT | | | | | | | | | | | |
 
 Notes:
@@ -285,6 +289,8 @@ Each kernel was smoke-tested: `import` check plus a synthetic call where all dep
 | cellsam_segment | ok | **partial** | glue ran against a stubbed `cellSAM` (singleton reuse, kwarg forwarding, the `(3,H,W)` no-cells quirk, contiguous relabel); the real SAM+CellFinder net **not run** (package not installed, weights need a DeepCell token) |
 | dic_correlate | ok | **partial** | in-repo adapters ran (axis swap verified); external al-dic solver **not run** (not installed) |
 | piv_field | ok | ran | full known-answer bench (`scripts/piv_synthetic_bench.py`, openpiv 0.25.4 installed): planted shifts/rotation/shear to 0.03–0.05 px, driver bit-identical to `windef.simple_multipass` |
+| flow_viewer | ok | ran | selftest fixture (two stage-placed positions × 3 planes) + the alia-chip page (36 × 11, 790 streamlines, 3240 grains) checked in headless Chrome: no JS errors, WebGL2 live |
+| scene_viewer | ok | ran | selftest fixture (2-position dynamic volume + DVC-style field, cells + tracks + series on a second stream) exported through the Engine; the page checked in headless Chrome (no JS errors, 240 frames, slices/cloud/time switching, config API) |
 | checkpoint | ok | ran | save/load round-trip; store rebuild verified |
 
 The two **partial** rows are dependency-availability gaps, not extraction defects: both the

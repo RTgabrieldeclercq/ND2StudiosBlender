@@ -160,6 +160,9 @@ third-party packages, and `track_field` (2026-09-17) is new in-repo math. `field
 (2026-09-25) is a third case: it is byte-verbatim code that was *lifted out of* a vendored
 kernel when the official pyALDVC package replaced the in-repo ALDVC port, so the verbatim
 rule still governs it — it just no longer lives where it was vendored to.
+`flow_viewer` (2026-10-08) is an in-repo port of the lab's own granular-flow pipeline and
+`scene_viewer` (2026-10-08) is new in-repo geometry code; neither is vendored, so both are
+governed by their selftests and headless-browser checks rather than by byte-identity.
 
 An adapter is not exempt from the spirit of this entry. Its own risk is not editing the
 maths — it cannot, the maths is in the package — but silently reordering, negating or

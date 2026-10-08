@@ -20740,6 +20740,159 @@ def test_trained_params() -> None:
         "reason instead of silently showing defaults (reported 2026-08-05)")
 
 
+def test_write_flow_viewer() -> None:
+    """``io.write_flow_viewer`` — the 3-D WebGL flow viewer export (2026-10-08): a PIV point
+    field across positions / planes → one self-contained HTML page, Dataset handed through.
+
+    Asserts the structural spec, then pulls a deterministic fixture — two stage-placed
+    positions, three planes, a rotational in-plane field whose magnitude grows with z, a
+    few bright disks as grains — and checks: the page is written (atomically, no ``.part``),
+    its ``GEOM`` carries streamlines and grains, no placeholder survives, the report lands
+    in the metadata; grains from a MASK work and an unnamed mask is refused; the three
+    ``w_mode`` choices re-hash the memo (and 'off' reports ``|w|/|u| = 0``); a field with no
+    velocity columns and an ``existing='refuse'`` collision are refused; calibration reads
+    are fenced; a single-plane field still exports (flat, ``s = 1``)."""
+    if not _HAVE_SKIMAGE:
+        _ok("io.write_flow_viewer: SKIPPED (scipy/skimage absent)")
+        return
+    import os
+    import shutil
+    import tempfile
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    s = NODES.get("io.write_flow_viewer")
+    assert s.category == "io"
+    assert D.POINT in s.reads_domains and D.VOXEL in s.resolve_reads_domains({"grains": "mask"})
+    assert s.granularity is Granularity.MULTI_VIEW
+    assert {"data", "path", "source", "grain_mask", "grain_channel", "flip_x",
+            "flip_y"} <= {i.name for i in s.inputs}
+    _modes = {mm.name: set(mm.choices) for mm in s.modes}
+    assert _modes.get("w_mode") == {"regularized", "trapezoid", "off"}, _modes
+    assert _modes.get("grains") == {"image", "mask", "off"}, _modes
+
+    M, Z, Y, X, PITCH = 2, 3, 64, 64, 8
+    img = np.zeros((M, 1, Z, 1, Y, X), np.float32)
+    yy, xx = np.mgrid[0:Y, 0:X]
+    for m in range(M):
+        for z in range(Z):
+            for (cy, cx) in ((16, 16), (44, 40), (20, 50)):
+                img[m, 0, z, 0] += 1000.0 * ((yy - cy) ** 2 + (xx - cx) ** 2 < 36)
+    rows = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x", "vx", "vy", "qfactor")}
+    rid = 0
+    for m in range(M):
+        for z in range(Z):
+            for gy in range(4, Y, PITCH):
+                for gx in range(4, X, PITCH):
+                    cy, cx = (gy - Y / 2) / (Y / 2), (gx - X / 2) / (X / 2)
+                    amp = 2.0 + z                                     # grows with depth
+                    src = 0.4 * (z + 1)                               # a z-varying source
+                    rows["id"].append(rid); rid += 1
+                    rows["m"].append(m); rows["t"].append(0); rows["c"].append(0)
+                    rows["z"].append(z); rows["y"].append(float(gy)); rows["x"].append(float(gx))
+                    rows["vx"].append(-amp * cy + 1.0 + src * cx)
+                    rows["vy"].append(amp * cx + src * cy)
+                    rows["qfactor"].append(2.0 if (gy + gx) % 16 else 1.1)
+    cols = {k: np.asarray(v, float if k not in ("id", "m", "t", "c", "z") else int)
+            for k, v in rows.items()}
+    table = StructureTable(D.POINT, cols, layer="piv", z_kind="plane_index")
+    ax = AxisSizes(m=M, t=1, z=Z, c=1, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 10.0,
+            "stage_xy_um": [(100.0, 50.0), (100.0 + X * 0.5, 50.0)]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img)).with_structure(table)
+    mask6 = (img > 500).astype(np.uint8)
+    ds_mask = ds.with_layer(D.VOXEL, "granules", mask6)
+    define_node("io.fvseed", "S", outputs=[OutDataset()])
+    tmp = tempfile.mkdtemp(prefix="nd2_fv_")
+    try:
+        def _run(params, modes=None, seed=None, env_meta=None):
+            g = Graph()
+            g.add(NodeInstance("S", "io.fvseed"))
+            g.add(NodeInstance("W", "io.write_flow_viewer",
+                               params={"max_lines": 60, "seed_stride": 3, "z_upsample": 2,
+                                       "grain_min_diameter": 4.0, **params},
+                               modes=modes or {}))
+            g.connect("S", "W", dst_socket="data")
+            sd = seed if seed is not None else ds
+            return Engine(g, computes=COMPUTES, seeds={"S": sd},
+                          meta_seeds={"S": MetaEnvelope(axes=sd.axes,
+                                                        metadata=env_meta or meta)})
+
+        p1 = os.path.join(tmp, "flow_a")                      # extension added
+        e = _run({"path": p1})
+        out = e.pull("W")
+        assert os.path.exists(p1 + ".html") and not os.path.exists(p1 + ".html.part")
+        html = open(p1 + ".html", encoding="utf-8").read()
+        assert "const GEOM = {" in html and "__DATA__" not in html and "__TITLE__" not in html
+        rep = out.metadata.get("flow_viewer_report")
+        assert rep and rep["n_lines"] > 0 and rep["n_grains"] > 0, rep
+        assert rep["units"] == "µm/s" and abs(rep["cell_um"] - 4.0) < 1e-9, rep
+        assert abs(rep["s_used"] - 2.5) < 1e-9, rep              # 10 µm / (8 px × 0.5 µm)
+        assert out.axes == ds.axes and out.image is ds.image     # a tap
+        assert '"nz": 3' in html and '"n_grains":' in html
+        reads = dict(e.entry("W").reads)
+        assert "pixel_size_um" in reads and "z_step_um" in reads, sorted(reads)
+
+        # grains from a mask; an unnamed mask refused
+        e_m = _run({"path": os.path.join(tmp, "flow_m.html"), "grain_mask": "granules"},
+                   modes={"grains": "mask"}, seed=ds_mask)
+        assert e_m.pull("W").metadata["flow_viewer_report"]["n_grains"] > 0
+        raised = ""
+        try:
+            _run({"path": os.path.join(tmp, "flow_x.html")}, modes={"grains": "mask"},
+                 seed=ds_mask).pull("W")
+        except ValueError as ex:
+            raised = str(ex)
+        assert "grain_mask" in raised, raised
+
+        # w_mode folds into the recipe hash; 'off' reports no out-of-plane velocity
+        e_t = _run({"path": os.path.join(tmp, "flow_t.html")}, modes={"w_mode": "trapezoid"})
+        e_o = _run({"path": os.path.join(tmp, "flow_o.html")}, modes={"w_mode": "off"})
+        e_t.pull("W"); o_o = e_o.pull("W")
+        assert len({e.entry("W").recipe_hash, e_t.entry("W").recipe_hash,
+                    e_o.entry("W").recipe_hash}) == 3
+        assert o_o.metadata["flow_viewer_report"]["w_over_u"] == 0.0
+        assert rep["w_over_u"] > 0.0, rep                        # the source term yields w
+
+        # no velocity columns → refused by name
+        bare = {k: v for k, v in cols.items() if k not in ("vx", "vy")}
+        ds_bare = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img)).with_structure(
+            StructureTable(D.POINT, bare, layer="piv", z_kind="plane_index"))
+        raised = ""
+        try:
+            _run({"path": os.path.join(tmp, "flow_b.html")}, seed=ds_bare).pull("W")
+        except ValueError as ex:
+            raised = str(ex)
+        assert "vx" in raised, raised
+
+        # existing = refuse
+        raised = ""
+        try:
+            _run({"path": p1 + ".html", "title": "again"}, modes={"existing": "refuse"}).pull("W")
+        except ValueError as ex:
+            raised = str(ex)
+        assert "refuse" in raised, raised
+
+        # a single plane exports flat (s = 1, w = 0) with no z step at all
+        sel = cols["z"] == 1
+        one = {k: v[sel] for k, v in cols.items()}
+        one["z"] = np.zeros(int(sel.sum()), int)
+        ax1 = AxisSizes(m=M, t=1, z=1, c=1, y=Y, x=X)
+        meta1 = {"pixel_size_um": 0.5, "stage_xy_um": meta["stage_xy_um"]}
+        ds1 = Dataset(axes=ax1, metadata=meta1).with_image(ArrayProvider(img[:, :, 1:2])) \
+            .with_structure(StructureTable(D.POINT, one, layer="piv", z_kind="plane_index"))
+        o1 = _run({"path": os.path.join(tmp, "flow_1.html")}, seed=ds1, env_meta=meta1).pull("W")
+        r1 = o1.metadata["flow_viewer_report"]
+        assert r1["s_used"] == 1.0 and r1["w_over_u"] == 0.0 and r1["n_lines"] > 0, r1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("io.write_flow_viewer: wired 3-D flow viewer export (MULTI_VIEW tap) — two stage-"
+        "placed positions × 3 planes → one HTML page with streamlines + grains (image or "
+        "mask), report in metadata, w_mode rehashes + 'off' zeroes w, no-velocity / unnamed "
+        "mask / existing=refuse refused, calibration fenced, single plane exports flat")
+
+
 def test_write_tiff() -> None:
     """``io.write_tiff`` — the pipeline's write end: stream a Dataset to a TIFF, carrying
     the calibration envelope out verbatim, and hand the Dataset through untouched.
@@ -21262,6 +21415,213 @@ def test_movie_timeline() -> None:
         "(passes_domains=False), a timeline edit re-keys the memo, an unwired source is "
         "refused by name, and the flat sweeps still run with B wired")
 
+
+def test_scene_viewer() -> None:
+    """The composable scene viewer (V4.10): six `scene.*` taps on two streams into
+    `io.write_scene_viewer`, end to end through the Engine on synthetic data."""
+    import os
+    import tempfile
+
+    from nodegraph.catalog._shared.scene import SCENE_FRAME_KEY, SCENE_LAYERS_KEY
+    from nodegraph.dataset import AxisSizes, Dataset
+    from nodegraph.domains import Domain
+    from nodegraph.engine import Engine
+    from nodegraph.graph import Graph, NodeInstance
+    from nodegraph.metadata import MetaEnvelope, propagate_meta
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import OutDataset, define_node
+    from nodegraph.structure import StructureTable, TrackMembership
+
+    M, T, Z, Y, X = 2, 3, 3, 40, 48
+    zz, yy, xx = np.mgrid[0:Z, 0:Y, 0:X]
+    img = np.zeros((M, T, Z, 1, Y, X), np.uint16)
+    for m in range(M):
+        for t in range(T):
+            img[m, t, :, 0] = (4000 * np.exp(-((xx - 24 - 3 * t) ** 2 + (yy - 20) ** 2) / 60.0)
+                               + 100 * zz).astype(np.uint16)
+    gy, gx = np.mgrid[4:Y:8, 4:X:8]
+    rows = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x", "disp_z", "disp_y", "disp_x", "qfactor")}
+    rid = 0
+    for m in range(M):
+        for t in range(T):
+            for z in range(Z):
+                n = gy.size
+                rows["id"].append(np.arange(rid, rid + n)); rid += n
+                rows["m"].append(np.full(n, m)); rows["t"].append(np.full(n, t))
+                rows["c"].append(np.zeros(n, int)); rows["z"].append(np.full(n, z))
+                rows["y"].append(gy.ravel()); rows["x"].append(gx.ravel())
+                rows["disp_x"].append(np.full(n, 1.5 * (t + 1)))
+                rows["disp_y"].append(0.2 * np.sin(gx.ravel() / 5.0))
+                rows["disp_z"].append(np.full(n, 0.3)); rows["qfactor"].append(np.full(n, 2.0))
+    rows = {k: np.concatenate(v) for k, v in rows.items()}
+    TB = 4
+    cells = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x", "area", "mean_intensity")}
+    tr_id, tr_t, tr_mem = [], [], []
+    cid = 0
+    for t in range(TB):
+        for k in range(5):
+            cells["id"].append(cid); cells["m"].append(0); cells["t"].append(t); cells["c"].append(0)
+            cells["z"].append(0); cells["y"].append(10 + 5 * k + t); cells["x"].append(8 + 6 * k + 2 * t)
+            cells["area"].append(30 + 4 * k); cells["mean_intensity"].append(100 + 10 * t + k)
+            tr_id.append(k); tr_t.append(t); tr_mem.append(cid); cid += 1
+    cells = {k: np.asarray(v) for k, v in cells.items()}
+    mem = TrackMembership(track_id=np.asarray(tr_id), t=np.asarray(tr_t), member_id=np.asarray(tr_mem))
+
+    def make_a(with_dt=True, with_z=True, with_field=True):
+        md = {"pixel_size_um": 0.5, "stage_xy_um": [(0.0, 0.0), (24.0, 0.0)], "channel_names": ["beads"]}
+        if with_dt:
+            md["dt_s"] = 10.0
+        if with_z:
+            md["z_step_um"] = 2.0
+        ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+        ds = Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+        if with_field:
+            ds = ds.with_structure(StructureTable(Domain.POINT, rows, layer="dvc", z_kind="plane_index"))
+        return ds, ax, md
+
+    def make_b():
+        md = {"pixel_size_um": 0.5, "dt_s": 10.0}
+        ax = AxisSizes(m=1, t=TB, z=1, c=1, y=Y, x=X)
+        ds = (Dataset(axes=ax, metadata=md)
+              .with_structure(StructureTable(Domain.POINT, cells, layer="cells", z_kind="plane_index"))
+              .with_structure(mem.to_table(layer="tracks")))
+        return ds, ax, md
+
+    define_node("test.scene_seed_a", "A", outputs=[OutDataset()])
+    define_node("test.scene_seed_b", "B", outputs=[OutDataset()])
+    tmp = tempfile.mkdtemp(prefix="nd2_scene_")
+
+    def build(out, *, render="mip", layout="stage", a_kw=None, a_layers=True,
+              existing="overwrite", objects_params=None, series_params=None, vectors_params=None):
+        dsA, axA, mdA = make_a(**(a_kw or {}))
+        dsB, axB, mdB = make_b()
+        g = Graph()
+        g.add(NodeInstance("A", "test.scene_seed_a")); g.add(NodeInstance("B", "test.scene_seed_b"))
+        g.add(NodeInstance("P", "scene.place", params={"offset_z": 5.0}, modes={"layout": layout}))
+        g.connect("A", "P", dst_socket="data")
+        last_a = "P"
+        if a_layers:
+            g.add(NodeInstance("V", "scene.volume",
+                               params={"channel": 0, "voxel_budget": 20000, "max_frames": 3},
+                               modes={"render": render, "colormap": "gray"}))
+            g.add(NodeInstance("F", "scene.vectors",
+                               params=dict({"source": "", "min_sn": 1.0}, **(vectors_params or {})),
+                               modes={"color_by": "magnitude", "colormap": "turbo", "lines": "on"}))
+            g.connect("P", "V", dst_socket="data"); g.connect("V", "F", dst_socket="data")
+            last_a = "F"
+        g.add(NodeInstance("O", "scene.objects",
+                           params=dict({"point_layer": "cells", "value_column": "mean_intensity"},
+                                       **(objects_params or {})),
+                           modes={"table": "point", "color_by": "value", "colormap": "viridis"}))
+        g.add(NodeInstance("K", "scene.tracks", params={"source": "tracks", "point_layer": "cells"},
+                           modes={"members": "point", "color_by": "speed", "colormap": "turbo"}))
+        g.add(NodeInstance("S", "scene.series",
+                           params=dict({"point_layer": "cells", "column": "mean_intensity"},
+                                       **(series_params or {})),
+                           modes={"table": "point", "reducer": "mean"}))
+        g.connect("B", "O", dst_socket="data"); g.connect("O", "K", dst_socket="data")
+        g.connect("K", "S", dst_socket="data")
+        g.add(NodeInstance("W", "io.write_scene_viewer",
+                           params={"path": out, "title": "scene", "subtitle": "synthetic"},
+                           modes={"existing": existing}))
+        g.connect(last_a, "W", dst_socket="scene"); g.connect("S", "W", dst_socket="scene_2")
+        seeds = {"A": dsA, "B": dsB}
+        meta = {"A": MetaEnvelope(axes=axA, metadata=mdA), "B": MetaEnvelope(axes=axB, metadata=mdB)}
+        return g, Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=meta), meta
+
+    # ── the full scene ───────────────────────────────────────────────────────
+    out = os.path.join(tmp, "scene.html")
+    g, e, meta = build(out)
+    envs = propagate_meta(g, meta)
+    edit_a = [s["kind"] for s in envs["F"].metadata[SCENE_LAYERS_KEY]]
+    edit_b = [s["kind"] for s in envs["S"].metadata[SCENE_LAYERS_KEY]]
+    assert edit_a == ["volume", "vectors"] and edit_b == ["objects", "tracks", "series"], (edit_a, edit_b)
+    assert envs["F"].metadata[SCENE_FRAME_KEY]["offset_um"] == [0.0, 0.0, 5.0]
+    res = e.pull("W")
+    rep = res.metadata["scene_viewer_report"]
+    tap = e.pull("F")
+    pay_a = [s["kind"] for s in tap.metadata[SCENE_LAYERS_KEY]]
+    assert pay_a == edit_a, (pay_a, edit_a)                       # edit-time == payload
+    assert tap.image is res.image and res.axes == tap.axes          # a tap
+    kinds = [L["kind"] for L in rep["layers"]]
+    assert kinds == ["volume", "vectors", "objects", "tracks", "series"], kinds
+    vol = rep["layers"][0]                                         # ONE brick: both tiles on the stage canvas
+    assert vol["dims"] == [Z, Y, 2 * X] and vol["n_frames"] == T and vol["spacing_um"] == [2.0, 0.5, 0.5], vol
+    assert rep["layers"][1]["n_vectors"] == M * T * Z * gy.size and rep["layers"][1]["n_lines"] > 0, rep["layers"][1]
+    assert rep["layers"][2]["n_objects"] == TB * 5 and rep["layers"][2]["n_frames"] == TB
+    assert rep["layers"][3]["n_tracks"] == 5 and rep["layers"][4]["n_curves"] == 1
+    assert rep["time_unit"] == "s" and rep["dynamic"] and rep["n_times"] == TB and rep["n_inputs"] == 2, rep
+    lo, hi = rep["bounds_um"]
+    assert 47 < hi[0] < 51 and 10.5 < hi[2] < 13, rep["bounds_um"]    # two 24 µm tiles; z offset 5 + 3 × 2
+    assert os.path.getsize(out) == rep["bytes"] > 0
+    with open(out, encoding="utf-8") as fh:
+        page = fh.read()
+    assert '"kind":"tracks"' in page and "__SCENE__" not in page and "<title>scene</title>" in page
+    assert "pixel_size_um" in dict(e.entry("W").reads), "calibration must be fenced"
+    h_mip = e.entry("V").recipe_hash
+
+    # ── mode state hashes apart; origin layout stacks the positions ─────────
+    out2 = os.path.join(tmp, "scene_iso.html")
+    g2, e2, _ = build(out2, render="iso", layout="origin")
+    rep2 = e2.pull("W").metadata["scene_viewer_report"]
+    assert e2.entry("V").recipe_hash != h_mip
+    assert rep2["layers"][0]["render"] == "iso" and rep2["layers"][0]["n_triangles"] > 0
+    assert rep2["layers"][0]["dims"] == [Z, Y, X], rep2["layers"][0]   # one tile wide: stacked
+    assert rep2["bounds_um"][1][0] < 30, rep2["bounds_um"]            # both positions at the origin
+
+    # ── frame time when a dynamic input lacks dt_s; default volume with no layer node ──
+    out3 = os.path.join(tmp, "scene_frames.html")
+    g3, e3, _ = build(out3, a_kw={"with_dt": False}, a_layers=False)
+    rep3 = e3.pull("W").metadata["scene_viewer_report"]
+    assert rep3["time_unit"] == "frame" and rep3["layers"][0]["kind"] == "volume", rep3
+
+    # ── refusals ─────────────────────────────────────────────────────────────
+    def refused(builder, needle):
+        try:
+            _, en, _ = builder()
+            en.pull("W")
+        except Exception as exc:                                   # noqa: BLE001
+            assert needle in str(exc), (needle, str(exc)[:300])
+            return
+        raise AssertionError(f"expected a refusal mentioning {needle!r}")
+
+    refused(lambda: build(os.path.join(tmp, "r1.html"), a_kw={"with_z": False}), "z_step_um")
+    refused(lambda: build(out, existing="refuse"), "already exists")
+    refused(lambda: build(os.path.join(tmp, "r3.html"), a_kw={"with_field": False}), "Point table")
+    refused(lambda: build(os.path.join(tmp, "r4.html"), objects_params={"value_column": "nope"}), "no column 'nope'")
+    refused(lambda: build(os.path.join(tmp, "r5.html"), series_params={"column": "nope"}), "no column 'nope'")
+    # a vectors tap on a table with no velocity columns (an explicit name that is not on the
+    # wire with ONE candidate is inferred, not refused — _resolve_layer's contract)
+    g6 = Graph()
+    g6.add(NodeInstance("B", "test.scene_seed_b"))
+    g6.add(NodeInstance("F", "scene.vectors", params={"source": "cells"}, modes={"lines": "off"}))
+    g6.connect("B", "F", dst_socket="data")
+    dsB6, axB6, mdB6 = make_b()
+    try:
+        Engine(g6, computes=COMPUTES, seeds={"B": dsB6},
+               meta_seeds={"B": MetaEnvelope(axes=axB6, metadata=mdB6)}).pull("F")
+        raise AssertionError("a vectors tap on a velocity-free table must be refused")
+    except Exception as exc:                                       # noqa: BLE001
+        assert "carries no vectors" in str(exc), str(exc)[:300]
+    # a stream with neither a layer node nor an image is refused by slot number
+    g7 = Graph()
+    g7.add(NodeInstance("B", "test.scene_seed_b"))
+    g7.add(NodeInstance("W", "io.write_scene_viewer", params={"path": os.path.join(tmp, "r7.html")}))
+    g7.connect("B", "W", dst_socket="scene")
+    dsB, axB, mdB = make_b()
+    try:
+        Engine(g7, computes=COMPUTES, seeds={"B": dsB},
+               meta_seeds={"B": MetaEnvelope(axes=axB, metadata=mdB)}).pull("W")
+        raise AssertionError("a stream with no layer and no image must be refused")
+    except Exception as exc:                                       # noqa: BLE001
+        assert "scene input 1 carries no scene layer" in str(exc), str(exc)[:300]
+    _ok("scene viewer (V4.10): six scene.* taps on two streams (2-position dynamic volume + "
+        "DVC-style field with streamlines; cells + tracks + a mean-intensity series) → one "
+        "page through io.write_scene_viewer; edit-time specs == payload, a tap, the positions "
+        "composited onto ONE stage canvas brick, counts and µm bounds right, render mode "
+        "rehashes, 'origin' stacks positions, frame time "
+        "without dt_s, default volume without a layer node, calibration fenced, 7 refusals")
 
 def test_write_movie() -> None:
     """``io.write_movie`` — the pipeline's PRESENTATION write end: render a Dataset to an
@@ -24080,6 +24440,8 @@ def main() -> int:
     test_zs_deconvnet()
     test_trained_params()
     test_write_tiff()
+    test_write_flow_viewer()
+    test_scene_viewer()
     test_write_movie()
     test_movie_timeline()
     test_file_bundle_provider()

@@ -170,6 +170,19 @@ MODULES: Tuple[str, ...] = (
     # primary's field; this makes a primary whose field is EVERY file's, so files that share
     # no field can still be overlaid into one view.
     "view.canvas",
+    # Appended last, beside nothing: this list's order is the link-drag search menu's
+    # order. The presentation sibling of `io.write_movie` — a PIV / DIC point field written
+    # as the lab's self-contained 3-D WebGL flow viewer page.
+    "io.write_flow_viewer",
+    # Appended last, together: the composable scene viewer (V4.10). The layer taps in
+    # their pipeline order (place, then what is drawn), then the sink that writes them.
+    "scene.place",
+    "scene.volume",
+    "scene.vectors",
+    "scene.objects",
+    "scene.tracks",
+    "scene.series",
+    "io.write_scene_viewer",
 )
 
 

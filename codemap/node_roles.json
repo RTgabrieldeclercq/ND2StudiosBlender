@@ -27,8 +27,8 @@
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie or image sequence.",
-      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie"]
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or an interactive 3-D flow viewer page, or as a self-contained 3-D HTML page (the flow viewer, the composable scene viewer).",
+      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_flow_viewer", "io.write_scene_viewer"]
     },
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
@@ -137,6 +137,12 @@
       "stage": "control_and_present",
       "description": "Look at results: the Viewer display sink, Overlay, which composites a second Dataset into this one's field on the microscope's own stage coordinates, and Experiment Canvas, the blank stage-spanning field that Overlays are chained onto when the files share no field.",
       "ops": ["view.viewer", "view.overlay", "view.canvas"]
+    },
+    "scene_composition": {
+      "label": "Scene composition",
+      "stage": "control_and_present",
+      "description": "Taps that describe how a stream is drawn in the 3-D scene viewer - placement in the um frame, a volume, a vector field, objects, tracks, a chart - as a spec riding the Dataset's metadata to `io.write_scene_viewer`; none of them touches the data.",
+      "ops": ["scene.place", "scene.volume", "scene.vectors", "scene.objects", "scene.tracks", "scene.series"]
     }
   }
 }

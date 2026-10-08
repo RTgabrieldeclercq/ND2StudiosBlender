@@ -1,0 +1,485 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "speed_map",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "dense",
+              "src_socket": "out"
+            },
+            {
+              "dst": "speed_tif",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "dense",
+              "src_socket": "out"
+            },
+            {
+              "dst": "pore",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "granules",
+              "src_socket": "out"
+            },
+            {
+              "dst": "viewer",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "granules_mask",
+              "src_socket": "out"
+            },
+            {
+              "dst": "dense",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "piv",
+              "src_socket": "out"
+            },
+            {
+              "dst": "granules_mask",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "piv",
+              "src_socket": "out"
+            },
+            {
+              "dst": "piv",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "pore",
+              "src_socket": "out"
+            },
+            {
+              "dst": "granules",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "rb",
+              "src_socket": "image"
+            },
+            {
+              "dst": "pore",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "series",
+              "src_socket": "out"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "src1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_10",
+              "kind": "forward",
+              "src": "src10",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_2",
+              "kind": "forward",
+              "src": "src2",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_3",
+              "kind": "forward",
+              "src": "src3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_4",
+              "kind": "forward",
+              "src": "src4",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_5",
+              "kind": "forward",
+              "src": "src5",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_6",
+              "kind": "forward",
+              "src": "src6",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_7",
+              "kind": "forward",
+              "src": "src7",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_8",
+              "kind": "forward",
+              "src": "src8",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_9",
+              "kind": "forward",
+              "src": "src9",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "dense",
+              "modes": {},
+              "op_key": "transform.rasterize_field",
+              "params": {
+                "prefix": "flow",
+                "source": "piv"
+              }
+            },
+            {
+              "id": "granules",
+              "modes": {
+                "method": "otsu",
+                "scope": "plane"
+              },
+              "op_key": "analysis.threshold",
+              "params": {
+                "name": "granules"
+              }
+            },
+            {
+              "id": "granules_mask",
+              "modes": {
+                "op": "subtract"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "a": "",
+                "b": "pore",
+                "name": "granules"
+              }
+            },
+            {
+              "id": "piv",
+              "modes": {
+                "correlation": "circular",
+                "reference_mode": "ensemble"
+              },
+              "op_key": "analysis.piv",
+              "params": {
+                "channel": 0,
+                "frame_interval": 0.2014,
+                "name": "piv",
+                "overlap": 0.5,
+                "passes": 2,
+                "replace": true,
+                "roi": "pore",
+                "s2n_threshold": 1.3,
+                "velocity": true,
+                "window_size": 32
+              }
+            },
+            {
+              "id": "pore",
+              "modes": {
+                "op": "subtract"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "a": "",
+                "b": "granules",
+                "name": "pore"
+              }
+            },
+            {
+              "id": "rb",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/ChannelR-B_Seq0000.nd2"
+              }
+            },
+            {
+              "id": "series",
+              "modes": {
+                "chain_axis": "T",
+                "chain_order": "time"
+              },
+              "op_key": "util.timeseries",
+              "params": {}
+            },
+            {
+              "id": "speed_map",
+              "modes": {
+                "colormap": "viridis",
+                "source": "voxel"
+              },
+              "op_key": "plot.heatmap",
+              "params": {
+                "table": "flow_speed",
+                "title": "bead speed (um/s), ensemble PIV",
+                "x_label": "x (px)",
+                "y_label": "y (px)"
+              }
+            },
+            {
+              "id": "speed_tif",
+              "modes": {
+                "existing": "overwrite"
+              },
+              "op_key": "io.write_tiff",
+              "params": {
+                "layer": "flow_speed",
+                "path": "S:/alia chip flow data/piv_results/flow_speed_map.ome.tif"
+              }
+            },
+            {
+              "id": "src1",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00000_ChannelFITC_Seq0001.nd2"
+              }
+            },
+            {
+              "id": "src10",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00009_ChannelFITC_Seq0010.nd2"
+              }
+            },
+            {
+              "id": "src2",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00001_ChannelFITC_Seq0002.nd2"
+              }
+            },
+            {
+              "id": "src3",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00002_ChannelFITC_Seq0003.nd2"
+              }
+            },
+            {
+              "id": "src4",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00003_ChannelFITC_Seq0004.nd2"
+              }
+            },
+            {
+              "id": "src5",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00004_ChannelFITC_Seq0005.nd2"
+              }
+            },
+            {
+              "id": "src6",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00005_ChannelFITC_Seq0006.nd2"
+              }
+            },
+            {
+              "id": "src7",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00006_ChannelFITC_Seq0007.nd2"
+              }
+            },
+            {
+              "id": "src8",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00007_ChannelFITC_Seq0008.nd2"
+              }
+            },
+            {
+              "id": "src9",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00008_ChannelFITC_Seq0009.nd2"
+              }
+            },
+            {
+              "id": "viewer",
+              "modes": {
+                "existing": "overwrite",
+                "grains": "mask",
+                "w_mode": "regularized"
+              },
+              "op_key": "io.write_flow_viewer",
+              "params": {
+                "grain_mask": "granules",
+                "grain_min_diameter": 30.0,
+                "min_sn": 1.3,
+                "path": "S:/alia chip flow data/piv_results/flow_viewer3d_app.html",
+                "source": "piv",
+                "title": "Alia chip \u2014 bead flow through the granular pack"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "PIV bead flow",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "dense": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 600.0
+            },
+            "granules": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 1000.0
+            },
+            "granules_mask": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 900.0
+            },
+            "piv": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 600.0
+            },
+            "pore": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": 600.0
+            },
+            "rb": {
+              "collapsed": false,
+              "muted": false,
+              "x": 320.0,
+              "y": 1000.0
+            },
+            "series": {
+              "collapsed": false,
+              "muted": false,
+              "x": 320.0,
+              "y": 360.0
+            },
+            "speed_map": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": 480.0
+            },
+            "speed_tif": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": 720.0
+            },
+            "src1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 0.0
+            },
+            "src10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 810.0
+            },
+            "src2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 90.0
+            },
+            "src3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 180.0
+            },
+            "src4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 270.0
+            },
+            "src5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 360.0
+            },
+            "src6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 450.0
+            },
+            "src7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 540.0
+            },
+            "src8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 630.0
+            },
+            "src9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 720.0
+            },
+            "viewer": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": 900.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

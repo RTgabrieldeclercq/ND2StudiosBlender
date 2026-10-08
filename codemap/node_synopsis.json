@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 91,
-    "categories": 12,
-    "roles": 19,
+    "nodes": 99,
+    "categories": 13,
+    "roles": 20,
     "stages": 5,
-    "inputs": 622,
-    "outputs": 98,
+    "inputs": 700,
+    "outputs": 106,
     "gui_ops_included": true
   },
   "stages": {
@@ -87,7 +87,9 @@
         "channel.split",
         "io.dock",
         "io.load",
+        "io.write_flow_viewer",
         "io.write_movie",
+        "io.write_scene_viewer",
         "io.write_tiff",
         "util.batch",
         "util.merge",
@@ -207,7 +209,8 @@
       "roles": [
         "control_flow",
         "graph_structure",
-        "visualization"
+        "visualization",
+        "scene_composition"
       ],
       "ops": [
         "flow.advance",
@@ -215,6 +218,12 @@
         "group.input",
         "group.output",
         "rr.reroute",
+        "scene.objects",
+        "scene.place",
+        "scene.series",
+        "scene.tracks",
+        "scene.vectors",
+        "scene.volume",
         "view.canvas",
         "view.overlay",
         "view.viewer",
@@ -230,8 +239,8 @@
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie or image sequence.",
-      "count": 4,
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or an interactive 3-D flow viewer page, or as a self-contained 3-D HTML page (the flow viewer, the composable scene viewer).",
+      "count": 6,
       "ops": [
         {
           "op": "io.dock",
@@ -244,9 +253,19 @@
           "summary": "Open an ND2 or TIFF as the pipeline source. Access defaults to Direct — read the ND2 in place, no copy; switch to Auto to build a compressed b2nd store when it clearly pays off, or to Ingest to always build one. Empty path = synthetic demo. Exposes one output per channel + a combined 'All channels' output."
         },
         {
+          "op": "io.write_flow_viewer",
+          "label": "Export Flow Viewer (3D HTML)",
+          "summary": "Write a PIV / DIC point velocity field as the lab's self-contained 3-D WebGL flow viewer (one HTML file: streamlines, flow particles, channel iso-surface, grains, vessels, DTI-style bundles; positions laid out by stage, w from continuity at the calibrated plane spacing) and hand the Dataset through unchanged."
+        },
+        {
           "op": "io.write_movie",
           "label": "Export Movie",
           "summary": "Render the Dataset on this wire to an H.264 MP4, an animated GIF or a numbered PNG/JPEG sequence — the presentation counterpart to Export TIFF. Channels composite by their emission tints, the display window is measured once and held so a timelapse does not pulse, and the acquisition's own calibration is burned into the corners: the frame counter, the elapsed experiment time interpolated from the file's frame interval, a round-number scale bar from the pixel size, and the channel names. With Sweep = 'timeline' it plays the Movie Editor's layout instead: clips from up to three sources in sequence, grids of positions/channels/z/timepoints, z sweeps cut in between timepoints, and label rasters drawn with their ids. Hands the Dataset through unchanged, so it can sit mid-chain."
+        },
+        {
+          "op": "io.write_scene_viewer",
+          "label": "Export Scene Viewer (3D HTML)",
+          "summary": "Write the scene layers of up to eight streams (volumes, vector fields, objects, tracks, charts — each placed in one µm frame by its own calibration and stage log) as one self-contained 3-D WebGL page with a timeline, and hand the first Dataset through unchanged."
         },
         {
           "op": "io.write_tiff",
@@ -833,6 +852,44 @@
           "summary": "Display sink — shows the primary image stream, and any extra streams wired into the slots that appear as you fill them, merged or tiled, with an optional scale bar. No output: what it shows goes nowhere downstream (V2.00 §10; sources, layout and scale bar 2026-10-02)."
         }
       ]
+    },
+    "scene_composition": {
+      "label": "Scene composition",
+      "stage": "control_and_present",
+      "description": "Taps that describe how a stream is drawn in the 3-D scene viewer - placement in the um frame, a volume, a vector field, objects, tracks, a chart - as a spec riding the Dataset's metadata to `io.write_scene_viewer`; none of them touches the data.",
+      "count": 6,
+      "ops": [
+        {
+          "op": "scene.objects",
+          "label": "Scene: Objects",
+          "summary": "Add the objects of a Point or Label table to the scene viewer as spheres sized by radius or area and coloured by a column, one frame per timepoint. A tap: the Dataset passes through, the layer spec rides its metadata."
+        },
+        {
+          "op": "scene.place",
+          "label": "Scene: Place",
+          "summary": "Place this stream in the scene viewer's world frame: positions by stage log or at the origin, Stitch's handedness flags, and a µm offset. A tap — the Dataset passes through unchanged."
+        },
+        {
+          "op": "scene.series",
+          "label": "Scene: Series",
+          "summary": "Chart a table column against time in the scene viewer's panel (one value per timepoint by a reducer, optionally per position), with a cursor tied to the timeline. A tap: the Dataset passes through, the spec rides its metadata."
+        },
+        {
+          "op": "scene.tracks",
+          "label": "Scene: Tracks",
+          "summary": "Add a Track table to the scene viewer as polylines revealed along the timeline with a comet tail, coloured by track, time or speed. A tap: the Dataset passes through, the layer spec rides its metadata."
+        },
+        {
+          "op": "scene.vectors",
+          "label": "Scene: Vectors",
+          "summary": "Add a PIV / DIC / DVC point field to the scene viewer as vector glyphs (one frame per timepoint, coloured by magnitude), optionally with streamlines. A tap: the Dataset passes through, the layer spec rides its metadata."
+        },
+        {
+          "op": "scene.volume",
+          "label": "Scene: Volume",
+          "summary": "Add an image channel to the scene viewer as a volume layer (MIP, cloud, slices or iso-surface; one brick per timepoint under a voxel budget). A tap: the Dataset passes through, the layer spec rides its metadata."
+        }
+      ]
     }
   },
   "categories": {
@@ -908,7 +965,9 @@
     "io": [
       "io.dock",
       "io.load",
+      "io.write_flow_viewer",
       "io.write_movie",
+      "io.write_scene_viewer",
       "io.write_tiff",
       "view.viewer"
     ],
@@ -916,6 +975,14 @@
       "align.drift",
       "registration.align_to",
       "registration.stabilize"
+    ],
+    "scene": [
+      "scene.objects",
+      "scene.place",
+      "scene.series",
+      "scene.tracks",
+      "scene.vectors",
+      "scene.volume"
     ],
     "transform": [
       "transform.grow_points",
@@ -12091,6 +12158,336 @@
       "kernel_doc": null,
       "params_read": []
     },
+    "io.write_flow_viewer": {
+      "op": "io.write_flow_viewer",
+      "label": "Export Flow Viewer (3D HTML)",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "module": "nodegraph/catalog/io/write_flow_viewer.py",
+      "gui_only": false,
+      "summary": "Write a PIV / DIC point velocity field as the lab's self-contained 3-D WebGL flow viewer (one HTML file: streamlines, flow particles, channel iso-surface, grains, vessels, DTI-style bundles; positions laid out by stage, w from continuity at the calibrated plane spacing) and hand the Dataset through unchanged.",
+      "overview": "Write the 3-D flow viewer of a point velocity field and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** io / side effect → ``op_key=\"io.write_flow_viewer\"``, category ``io`` — the presentation sibling of Export TIFF / Export Movie, and like them a TAP: the Dataset passes through byte-identical so a Viewer after it still shows the field. * **Data contract** reads ONE Point field (``source``, a PIV / DIC output: rows on the interrogation-window grid with ``vx``/``vy`` in µm/s, or ``disp_x``/``disp_y`` in µm when no velocity was computed) across every position, timepoint and plane, plus — for the grain pack — a Voxel mask (nonzero = grain) or the image's own channel. Writes one HTML file; adds nothing to the wire, so no ``meta_transform``. * **How it is built** (the lab's deployed granular-flow pipeline, ported to :mod:`nodegraph.kernels.flow_viewer`): the per-plane vectors are placed on ONE regular grid whose cell is the window pitch — positions laid out by their stage coordinates like Stitch (``flip_x``/``flip_y`` are its handedness flags) — timepoints averaged per cell; the out-of-plane velocity ``w`` is estimated from continuity (``dw/dz = -(du/dx + dv/dy)``, regularised least squares or plain integration) at the plane spacing the calibration gives (``s = z_step_um / cell_um``, so no guessed z-stretch); the volume is PCHIP-interpolated in z; streamlines, the high-speed iso-surface, 3-D grains (per-plane watershed, linked across planes), DTI-style bundles and the vessel skeleton are precomputed and embedded as base64 buffers in the page. Velocities keep their units (the page labels them); coordinates are grid cells. * **2D/3D** no lever: a single plane exports a flat field (``w = 0``, ``s = 1``); a z-stack exports a volume. Derived from the data, never asked. * **Footprint** ``MULTI_VIEW`` / ``{m, t, z, y, x}``: the point rows of every position, timepoint and plane are read at once (they are one table), and the grain planes are read one ``(m, 0, z, c)`` plane at a time through ``get_region``, so the image is never materialised. * **Backend** numpy + scipy (sparse CG for ``w``, PCHIP, RK4 streamlines, EDT), scikit-image (marching cubes, watershed, 3-D skeletonize); no numba — the hot paths are vectorised or compiled library calls. * **Params read** ``path``, ``title``, ``source``, ``min_sn``, ``flip_x``, ``flip_y``, ``grain_mask`` (mask branch), ``grain_channel`` (image branch), ``grain_min_diameter`` (both grain branches), ``smooth``, ``lambda_z``/``lambda_xy`` (regularised branch), ``z_upsample``, ``iso_percentile``, ``vessel_percentile``, ``seed_stride``, ``max_lines``, ``seed_min_fraction``; modes ``w_mode``, ``grains``, ``existing``. * **Caveat carried into the page** ``w`` is a structural estimate: all measured 2-D divergence is attributed to out-of-plane flow, and a granular pack also compacts; the page's stats panel shows ``|w|/|u|`` and the high-speed volume fraction so the reader can judge it. Written atomically through ``<path>.part``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "multi_view",
+        "kernel_axes": [
+          "m",
+          "t",
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {
+          "grains": {
+            "mask": [
+              "voxel"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "w_mode",
+          "label": "W mode",
+          "choices": [
+            "regularized",
+            "trapezoid",
+            "off"
+          ],
+          "default": "regularized",
+          "description": "How the out-of-plane velocity `w` is estimated from the in-plane field via mass continuity. It is a structural estimate either way: all measured 2-D divergence is attributed to flow through the planes, and a granular pack also compacts and dilates.",
+          "choice_docs": {
+            "regularized": "Regularised 3-D least squares (vertical + in-plane smoothness, confidence-weighted by speed) solved by conjugate gradient — spatially coherent and noise-tolerant; the deployed pipeline's choice. Costs seconds to a minute on a large grid.",
+            "trapezoid": "Plain per-column trapezoidal integration of −div from the first plane upward: transparent and instant, but every noisy vector's divergence accumulates upward, so use it to cross-check the regularised answer rather than to publish.",
+            "off": "No out-of-plane velocity: streamlines stay in their planes and the page's |w|/|u| reads 0. For a single plane, or when you want to show exactly what was measured."
+          }
+        },
+        {
+          "name": "grains",
+          "label": "Grains",
+          "choices": [
+            "image",
+            "mask",
+            "off"
+          ],
+          "default": "image",
+          "description": "Where the grain pack drawn around the flow comes from.",
+          "choice_docs": {
+            "image": "Detect grains on the image channel `Grain channel` (bright objects, Otsu + watershed on a 4× downsampled plane) — what the deployed pipeline did on a brightfield mosaic; needs the image.",
+            "mask": "Take grains from the Voxel mask `Grain mask` (nonzero = grain) — the honest choice when a Threshold / Mask Math already defined them for the PIV ROI; needs that layer on this wire.",
+            "off": "Draw no grains: flow geometry only. The fastest export, and the only option on a Dataset with neither an image nor a mask."
+          }
+        },
+        {
+          "name": "existing",
+          "label": "Existing",
+          "choices": [
+            "overwrite",
+            "refuse"
+          ],
+          "default": "overwrite",
+          "description": "What to do when a file is already at the path.",
+          "choice_docs": {
+            "overwrite": "Replace it (written to `.part` first, so an interrupted export never leaves a truncated page under the real name).",
+            "refuse": "Raise instead of touching an existing file, so a page already published is never silently replaced."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset carrying the point velocity field (a PIV or DIC output) — and, for the grain pack, a Voxel mask or the image. It is handed on unchanged."
+        },
+        {
+          "name": "path",
+          "label": "File",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "path_kind": "save_file",
+          "path_filter": "HTML (*.html);;All files (*)",
+          "path_hint": "Browse… to choose where the viewer page is written",
+          "description": "Where the self-contained viewer is written (one `.html` file, a few MB, opens in any browser with no server). There is no default and an empty value is refused; `.html` is added when missing."
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The heading shown in the page's control panel and browser tab. Empty uses the file name. Cosmetic: nothing in the data changes."
+        },
+        {
+          "name": "source",
+          "label": "Point layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "piv",
+          "layer_in": "point",
+          "description": "Which Point field to draw — a PIV output (one row per interrogation window with `vx`/`vy` in µm/s, or `disp_x`/`disp_y` in µm when Velocity was off) or a DIC field. With one point table on the wire the name is inferred; two need the name."
+        },
+        {
+          "name": "min_sn",
+          "label": "Min S/N",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Drop vectors whose correlation signal-to-noise (`qfactor`) is below this before the field is gridded; the hole is inpainted from its neighbours or, with nothing near, read as solid. 0 keeps every vector. Inert on a field without a `qfactor` column (DIC). RAISING it removes junk from featureless windows but thins sparse regions."
+        },
+        {
+          "name": "flip_x",
+          "label": "Flip X",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Whether a position's image +x runs along stage −x when several positions are laid out on one canvas by their stage coordinates (the same flag as Stitch, same default — this lab's scopes). Wrong = tiles mirrored and the field torn at every seam. Inert for a single position."
+        },
+        {
+          "name": "flip_y",
+          "label": "Flip Y",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "As Flip X, for the Y axis: image +y along stage −y when ON. Default OFF matches Stitch and this lab's scopes. Inert for a single position."
+        },
+        {
+          "name": "grain_mask",
+          "label": "Grain mask",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "grains": [
+              "mask"
+            ]
+          },
+          "layer_in": "voxel",
+          "description": "The Voxel mask whose nonzero voxels are GRAINS (a Threshold of the granule channel, or Mask Math's inversion of the PIV pore ROI). Its t = 0 plane per position is used. Only read when Grains is 'mask'; empty is then refused."
+        },
+        {
+          "name": "grain_channel",
+          "label": "Grain channel",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "grains": [
+              "image"
+            ]
+          },
+          "pick_kind": "channel",
+          "description": "Which image channel (0-based) shows the grains as BRIGHT objects — they are found by Otsu threshold + watershed on a 4× downsampled plane, as the deployed pipeline did on brightfield. Only read when Grains is 'image'."
+        },
+        {
+          "name": "grain_min_diameter",
+          "label": "Min grain size",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "available_in": {
+            "grains": [
+              "image",
+              "mask"
+            ]
+          },
+          "description": "The smallest object drawn as a grain, as a diameter: it sets the watershed's minimum area and how close two grain centres may be before they count as one. 0 = auto (three grid cells). LOWER keeps small fragments and splits big grains into pieces; HIGHER merges touching grains and drops fragments. Only read when Grains is 'image' or 'mask'. Display only."
+        },
+        {
+          "name": "smooth",
+          "label": "Smoothing",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "Gaussian smoothing of the velocity planes before the divergence is taken and holes are inpainted. 0 = auto (1.5 grid cells, the deployed pipeline's value). LARGER suppresses vector noise in `w` and straightens streamlines but erases real gradients narrower than it; it never changes the exported velocities' units, only their smoothness."
+        },
+        {
+          "name": "lambda_z",
+          "label": "λ vertical",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.2,
+          "available_in": {
+            "w_mode": [
+              "regularized"
+            ]
+          },
+          "description": "Weight of the vertical-smoothness penalty in the regularised `w` solve. LARGER makes `w` vary more gently between planes (and under-fit a real jump); 0 trusts continuity alone. Only read when W mode is 'regularized'; 0.2 is the deployed value."
+        },
+        {
+          "name": "lambda_xy",
+          "label": "λ in-plane",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.1,
+          "available_in": {
+            "w_mode": [
+              "regularized"
+            ]
+          },
+          "description": "Weight of the in-plane-smoothness penalty on `w`. LARGER spreads `w` sideways into broader patches; 0 lets it follow the divergence cell by cell. Only read when W mode is 'regularized'; 0.1 is the deployed value."
+        },
+        {
+          "name": "z_upsample",
+          "label": "Z upsample",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 8,
+          "description": "Interpolated planes inserted between each pair of measured planes (PCHIP) before streamlines, iso-surface and vessels are computed. MORE gives smoother geometry at roughly linear cost in memory and time; 0 keeps the measured planes only. Inert on a single plane."
+        },
+        {
+          "name": "iso_percentile",
+          "label": "Channel percentile",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 90.0,
+          "description": "The speed percentile of the whole volume that the translucent 'channel' iso-surface encloses. LOWER wraps more of the pore space, HIGHER keeps only the fastest cores. Display only."
+        },
+        {
+          "name": "vessel_percentile",
+          "label": "Vessel percentile",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 70.0,
+          "description": "The speed percentile above which the volume counts as vessel lumen for the vasculature skeleton. LOWER grows a denser, finer tree; HIGHER keeps the main trunks. A visual analogy, not a model."
+        },
+        {
+          "name": "seed_stride",
+          "label": "Seed spacing",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 11,
+          "description": "Streamline seed spacing in grid cells (one cell = one PIV window pitch), at three depths. SMALLER seeds more lines, denser and slower; the total is capped by Max lines."
+        },
+        {
+          "name": "max_lines",
+          "label": "Max lines",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1400,
+          "description": "Upper bound on streamlines kept, after slow seeds are skipped. The page's size and frame rate scale with it; 1400 is the deployed value (~4 MB)."
+        },
+        {
+          "name": "seed_min_fraction",
+          "label": "Min seed speed",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.1,
+          "description": "Seeds whose in-plane speed is below this FRACTION of the field's 95th-percentile speed are skipped, so lines start in moving fluid rather than inside grains or dead zones. 0 seeds everywhere; 0.1 is a quiet default. Display only."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_write_flow_viewer",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/flow_viewer.md",
+      "params_read": [
+        "__modes__",
+        "flip_x",
+        "flip_y",
+        "grain_channel",
+        "grain_mask",
+        "grain_min_diameter",
+        "iso_percentile",
+        "lambda_xy",
+        "lambda_z",
+        "max_lines",
+        "min_sn",
+        "path",
+        "seed_min_fraction",
+        "seed_stride",
+        "smooth",
+        "source",
+        "title",
+        "vessel_percentile",
+        "z_upsample"
+      ]
+    },
     "io.write_movie": {
       "op": "io.write_movie",
       "label": "Export Movie",
@@ -12651,6 +13048,179 @@
         "white"
       ]
     },
+    "io.write_scene_viewer": {
+      "op": "io.write_scene_viewer",
+      "label": "Export Scene Viewer (3D HTML)",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "module": "nodegraph/catalog/io/write_scene_viewer.py",
+      "gui_only": false,
+      "summary": "Write the scene layers of up to eight streams (volumes, vector fields, objects, tracks, charts — each placed in one µm frame by its own calibration and stage log) as one self-contained 3-D WebGL page with a timeline, and hand the first Dataset through unchanged.",
+      "overview": "Write every wired stream's scene layers as one 3-D WebGL page and hand the first Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** io / side effect → ``op_key=\"io.write_scene_viewer\"``, category ``io`` — the composable sibling of ``io.write_flow_viewer``, and like it a TAP: input 1 passes through byte-identical plus a ``scene_viewer_report``. * **Data contract** up to eight Datasets through a grow group. Each carries the specs its ``scene.*`` nodes appended to ``scene_layers`` (a stream with no spec but an image gets a default MIP volume; one with neither is refused by slot number) and its ``scene_frame`` placement. Every layer is converted to world geometry in µm with that input's own calibration: ``pixel_size_um`` (required), ``z_step_um`` (required for more than one plane — never a guessed z-stretch), positions by ``stage_xy_um`` (Stitch's mapping) unless Scene: Place says otherwise. Time is seconds when every dynamic input carries ``dt_s``, else the frame index for all. Input 1's calibration is read through ``ctx.calib`` so the memo fences on it; the others ride their payloads, whose revisions already fold into the recipe hash. * **What is read** volumes one ``(m, t, c)`` plane at a time through ``get_region``, mean-pooled to the layer's voxel budget as they stream in; structure tables whole. * **Footprint** ``MULTI_VIEW`` / every axis. * **Backend** :mod:`nodegraph.kernels.scene_viewer` (numpy, scipy map_coordinates for streamlines, scikit-image marching cubes); the page is ``scene_viewer_template.html`` (WebGL2, no dependencies). * **Params read** ``path``, ``title``, ``subtitle``; mode ``existing``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "multi_view",
+        "kernel_axes": [
+          "c",
+          "m",
+          "t",
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "existing",
+          "label": "Existing",
+          "choices": [
+            "overwrite",
+            "refuse"
+          ],
+          "default": "overwrite",
+          "description": "What to do when a file is already at the path.",
+          "choice_docs": {
+            "overwrite": "Replace it (written to `.part` first, so an interrupted export never leaves a truncated page under the real name).",
+            "refuse": "Raise instead of touching an existing file, so a page already published is never silently replaced."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "scene",
+          "label": "Scene 1",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The first stream whose `scene.*` layers go on the page; it is the Dataset handed through (plus the `scene_viewer_report`). Its calibration is read through the memo fence."
+        },
+        {
+          "name": "scene_2",
+          "label": "Scene 2",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "scene_3",
+          "label": "Scene 3",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "scene_4",
+          "label": "Scene 4",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "scene_5",
+          "label": "Scene 5",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "scene_6",
+          "label": "Scene 6",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "scene_7",
+          "label": "Scene 7",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "scene_8",
+          "label": "Scene 8",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "grow_group": "scenes",
+          "description": "Another stream whose `scene.*` layers join the same page, in the same µm frame (placed by its own calibration, stage log and Scene: Place). Slots appear one at a time as you fill them. A stream with no layer node but an image gets a default volume layer."
+        },
+        {
+          "name": "path",
+          "label": "File",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "path_kind": "save_file",
+          "path_filter": "HTML (*.html);;All files (*)",
+          "path_hint": "Browse… to choose where the scene page is written",
+          "description": "Where the self-contained page is written (one `.html`, opens in any browser with no server). No default; empty is refused; `.html` is added when missing."
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The heading in the page's panel and browser tab. Empty uses the file name. Cosmetic."
+        },
+        {
+          "name": "subtitle",
+          "label": "Subtitle",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "One line under the title — the experiment, the date, what the layers are. Cosmetic."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_write_scene_viewer",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/scene_viewer.md",
+      "params_read": [
+        "__modes__",
+        "path",
+        "subtitle",
+        "title"
+      ]
+    },
     "io.write_tiff": {
       "op": "io.write_tiff",
       "label": "Export TIFF",
@@ -13131,6 +13701,1110 @@
       "trained_params": false,
       "kernel_doc": "",
       "params_read": []
+    },
+    "scene.objects": {
+      "op": "scene.objects",
+      "label": "Scene: Objects",
+      "category": "scene",
+      "role": "scene_composition",
+      "stage": "control_and_present",
+      "module": "nodegraph/catalog/scene/objects.py",
+      "gui_only": false,
+      "summary": "Add the objects of a Point or Label table to the scene viewer as spheres sized by radius or area and coloured by a column, one frame per timepoint. A tap: the Dataset passes through, the layer spec rides its metadata.",
+      "overview": "Add the objects of a Point or Label table to the scene as spheres and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** scene → ``op_key=\"scene.objects\"``, category ``scene``. * **Data contract** a TAP on one structure table: a Point table (detections, particles, beads) or a Label table (segmented + measured cells), chosen by the ``table`` mode and its gated layer socket (``reads_domains_by_mode``). The sphere radius comes from ``radius`` (µm) when set, else from the table's ``area`` column (equivalent circle for a per-plane table, equivalent sphere for a 3-D one), else 1 µm; the colour from ``value_column`` through the colourmap when Colour by is 'value'. One frame per timepoint, so a measured timelapse is a dynamic layer. Rows are read by ``io.write_scene_viewer``; the table name is resolved here so it fails on this card. Edit-time and pull-time halves share :func:`_objects_spec`. * **2D/3D** none — the table's ``z_kind`` decides the radius formula. * **Footprint** ``TILEABLE`` — only the layer catalog is read here. * **Params read** ``name``, ``point_layer`` (table=point), ``label_layer`` (table=label), ``radius``, ``size_scale``, ``max_objects``, ``color``, ``value_column`` (color_by=value); modes ``table``, ``color_by``, ``colormap``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "table": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "table",
+          "label": "Table",
+          "choices": [
+            "point",
+            "label"
+          ],
+          "default": "point",
+          "description": "Which kind of structure table holds the objects.",
+          "choice_docs": {
+            "point": "A Point table: one row per detection with sub-pixel `z, y, x` (spots, particles, beads, PIV grid points); needs the Point domain on the wire.",
+            "label": "A Label table: one row per segmented region with its centroid, `area` and Measure's columns, so the radius can follow the real size; needs the Label domain on the wire."
+          }
+        },
+        {
+          "name": "color_by",
+          "label": "Colour by",
+          "choices": [
+            "uniform",
+            "value",
+            "z"
+          ],
+          "default": "uniform",
+          "description": "What the sphere colour encodes.",
+          "choice_docs": {
+            "uniform": "One colour (`color`) for every object; the colourmap is unused.",
+            "value": "A table column (`value_column`) through the colourmap between the page's range sliders — intensity, area, speed, anything Measure produced.",
+            "z": "Depth in the scene through the colourmap: tells the layers of a stack apart in a top view."
+          }
+        },
+        {
+          "name": "colormap",
+          "label": "Colourmap",
+          "choices": [
+            "viridis",
+            "turbo",
+            "inferno",
+            "magma",
+            "plasma",
+            "cool",
+            "gray"
+          ],
+          "default": "viridis",
+          "description": "The scalar → colour map for value and depth colouring.",
+          "choice_docs": {
+            "viridis": "Perceptually uniform purple → green → yellow; the safe default for a measured quantity such as intensity or area.",
+            "turbo": "Rainbow-like with an even luminance ramp: the most hue steps per unit, separates close values, reads badly for a mass-like quantity.",
+            "inferno": "Black → red → yellow: the brightest objects blaze, the dim tail fades toward the dark page.",
+            "magma": "Like inferno with a softer, pinker top end; dim objects stay a little more visible.",
+            "plasma": "Blue → magenta → yellow with no near-black end, so low values stay legible on a dark page.",
+            "cool": "Blue → cyan → magenta, no dark end; for sparse objects on a dark page.",
+            "gray": "Black to white: the value as luminance, for a figure that reserves colour for another layer."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream carrying the objects' table; handed on unchanged with the layer spec appended."
+        },
+        {
+          "name": "point_layer",
+          "label": "Point layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "table": [
+              "point"
+            ]
+          },
+          "layer_in": "point",
+          "description": "Which Point table (detections, particles, beads) to draw. Empty = the only one on the wire; two need the name. Only read when Table is 'point'."
+        },
+        {
+          "name": "label_layer",
+          "label": "Label layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "table": [
+              "label"
+            ]
+          },
+          "layer_in": "label",
+          "description": "Which Label table (segmented objects with `area`, centroid and any Measure columns) to draw. Empty = the only one on the wire. Only read when Table is 'label'."
+        },
+        {
+          "name": "name",
+          "label": "Layer name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The label in the page's layer panel. Empty uses the table's name. Cosmetic."
+        },
+        {
+          "name": "radius",
+          "label": "Radius",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "Sphere radius in µm for every object. 0 = from each row's `area` (equivalent circle per plane, equivalent sphere for a 3-D table) and 1 µm when there is no area column. Display only."
+        },
+        {
+          "name": "size_scale",
+          "label": "Size ×",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1.0,
+          "description": "Multiplier on the radius as drawn (the page's Size slider changes it live). >1 exaggerates small objects so they read from afar; it moves no measurement."
+        },
+        {
+          "name": "value_column",
+          "label": "Value column",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "color_by": [
+              "value"
+            ]
+          },
+          "description": "The table column that colours the spheres through the colourmap (e.g. `mean_intensity`, `area`, `speed`). Refused when empty or absent. Only read when Colour by is 'value'."
+        },
+        {
+          "name": "color",
+          "label": "Colour",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "#ffd43b",
+          "description": "The uniform sphere colour (`#rrggbb` or a name) used when Colour by is 'uniform'. Cosmetic."
+        },
+        {
+          "name": "max_objects",
+          "label": "Max objects per frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 200000,
+          "description": "Objects kept per timepoint (a random subset beyond this, fixed seed). The page's size and frame rate scale with it."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_scene_objects",
+      "meta_transform": "scene_objects",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "color",
+        "label_layer",
+        "max_objects",
+        "name",
+        "point_layer",
+        "radius",
+        "size_scale",
+        "value_column"
+      ]
+    },
+    "scene.place": {
+      "op": "scene.place",
+      "label": "Scene: Place",
+      "category": "scene",
+      "role": "scene_composition",
+      "stage": "control_and_present",
+      "module": "nodegraph/catalog/scene/place.py",
+      "gui_only": false,
+      "summary": "Place this stream in the scene viewer's world frame: positions by stage log or at the origin, Stitch's handedness flags, and a µm offset. A tap — the Dataset passes through unchanged.",
+      "overview": "Set the stream's placement for the scene viewer and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** scene (presentation bookkeeping, no pixels touched) → ``op_key=\"scene.place\"``. * **Data contract** a TAP: the Dataset passes through byte-identical plus one metadata key, ``scene_frame`` = ``{layout, flip_x, flip_y, offset_um}``. Every ``scene.*`` layer downstream on this stream is placed by it in ``io.write_scene_viewer``: positions laid out by the stage log (Stitch's mapping, the flags are its handedness) or stacked at the origin, then the whole stream shifted by the offsets. Edit-time and pull-time halves share :func:`_place_frame`, so the inspector's prediction and the payload agree. * **2D/3D** no lever. **Footprint** ``TILEABLE`` — nothing is read. * **Params read** ``flip_x``, ``flip_y``, ``offset_x``, ``offset_y``, ``offset_z``; mode ``layout``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "layout",
+          "label": "Layout",
+          "choices": [
+            "stage",
+            "origin"
+          ],
+          "default": "stage",
+          "description": "How this stream's positions are laid out in the scene.",
+          "choice_docs": {
+            "stage": "Each position at its stage coordinates (`stage_xy_um`, mirrored per the flip flags), one at the origin — the honest layout for a multi-position file; refused when the stage log is missing.",
+            "origin": "Every position at (0, 0): a one-position file, or positions that really are the same place at different times. Overlapping tiles are drawn on top of each other."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream to place. Handed on unchanged; only the `scene_frame` metadata the scene exporter reads is set."
+        },
+        {
+          "name": "offset_x",
+          "label": "Offset X",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "Shift everything on this stream along world x (µm) in the scene — to register a second acquisition that was taken at a different stage origin, or to set two one-position files side by side. 0 leaves the stage/origin placement as it is. Display only."
+        },
+        {
+          "name": "offset_y",
+          "label": "Offset Y",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "As Offset X, along world y (image +y, which the page draws pointing away from the viewer in its default view). Display only."
+        },
+        {
+          "name": "offset_z",
+          "label": "Offset Z",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "Shift along z (µm): the plane spacing is the file's `z_step_um`, so this is where a stack's first plane sits — e.g. the height of a cell layer above a bead volume acquired separately. Display only."
+        },
+        {
+          "name": "flip_x",
+          "label": "Flip X",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Whether a position's image +x runs along stage −x when several positions are laid out by their stage coordinates (the same flag and default as Stitch — this lab's scopes). Wrong = tiles mirrored left-right. Inert for one position and for layout 'origin'."
+        },
+        {
+          "name": "flip_y",
+          "label": "Flip Y",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "As Flip X for the y axis: image +y along stage −y when ON. Default OFF matches Stitch. Inert for one position and for layout 'origin'."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_scene_place",
+      "meta_transform": "scene_place",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "flip_x",
+        "flip_y",
+        "offset_x",
+        "offset_y",
+        "offset_z"
+      ]
+    },
+    "scene.series": {
+      "op": "scene.series",
+      "label": "Scene: Series",
+      "category": "scene",
+      "role": "scene_composition",
+      "stage": "control_and_present",
+      "module": "nodegraph/catalog/scene/series.py",
+      "gui_only": false,
+      "summary": "Chart a table column against time in the scene viewer's panel (one value per timepoint by a reducer, optionally per position), with a cursor tied to the timeline. A tap: the Dataset passes through, the spec rides its metadata.",
+      "overview": "Add a table column, reduced per timepoint, to the scene's chart panel and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** scene → ``op_key=\"scene.series\"``, category ``scene``. * **Data contract** a TAP on one structure table (Point or Label by the ``table`` mode, ``reads_domains_by_mode``): ``column`` is reduced over the rows of each timepoint (``reducer``), as one curve, or one curve per position. The chart's x axis is time in the scene's unit, and its cursor follows the page's timeline — e.g. the mean ELISA-bead intensity against the cell dynamics drawn above it. Names are checked here; rows are read by ``io.write_scene_viewer``. Edit-time and pull-time halves share :func:`_series_spec`. * **Footprint** ``TILEABLE`` — only the layer catalog is read here. * **Params read** ``name``, ``point_layer`` (table=point), ``label_layer`` (table=label), ``column``, ``per_position``, ``color``; modes ``table``, ``reducer``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "table": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "table",
+          "label": "Table",
+          "choices": [
+            "point",
+            "label"
+          ],
+          "default": "point",
+          "description": "Which kind of structure table holds the column.",
+          "choice_docs": {
+            "point": "A Point table (detections such as beads or spots, with the columns Measure added); needs the Point domain on the wire.",
+            "label": "A Label table (segmented regions with `area` and Measure's columns); needs the Label domain on the wire."
+          }
+        },
+        {
+          "name": "reducer",
+          "label": "Reducer",
+          "choices": [
+            "mean",
+            "median",
+            "sum",
+            "count",
+            "max",
+            "min"
+          ],
+          "default": "mean",
+          "description": "How the rows of one timepoint collapse to one chart value.",
+          "choice_docs": {
+            "mean": "Arithmetic mean over the rows at that timepoint — the usual readout for an intensity; sensitive to a few bright outliers.",
+            "median": "Median over the rows: robust to outliers and dropouts, slightly lower than the mean on a skewed bead population.",
+            "sum": "Total over the rows: scales with how many objects were found, so detection count and per-object value are mixed.",
+            "count": "Number of rows at that timepoint, ignoring the column's value: cell density or bead count against time.",
+            "max": "The largest value among the rows: the brightest bead / biggest cell per timepoint.",
+            "min": "The smallest value among the rows: the dimmest bead / smallest cell per timepoint, a floor that drops when a dropout or a dark object appears."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream carrying the table whose column is charted; handed on unchanged with the layer spec appended."
+        },
+        {
+          "name": "point_layer",
+          "label": "Point layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "table": [
+              "point"
+            ]
+          },
+          "layer_in": "point",
+          "description": "Which Point table holds the column (e.g. detected ELISA beads with `mean_intensity` from Measure). Empty = the only one on the wire. Only read when Table is 'point'."
+        },
+        {
+          "name": "label_layer",
+          "label": "Label layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "table": [
+              "label"
+            ]
+          },
+          "layer_in": "label",
+          "description": "Which Label table holds the column (segmented objects with Measure's columns). Empty = the only one on the wire. Only read when Table is 'label'."
+        },
+        {
+          "name": "column",
+          "label": "Column",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "mean_intensity",
+          "description": "The table column to chart against time: `mean_intensity`, `area`, `speed`, any Measure output. Refused when the table has no such column."
+        },
+        {
+          "name": "per_position",
+          "label": "One curve per position",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "ON draws one curve per multipoint position (the reducer over that position's rows at each timepoint); OFF pools every position into one curve."
+        },
+        {
+          "name": "name",
+          "label": "Layer name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The chart's title in the page. Empty uses `column (table)`. Cosmetic."
+        },
+        {
+          "name": "color",
+          "label": "Colour",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "#31d0c6",
+          "description": "Curve colour (`#rrggbb` or a name) when the chart shows a single curve; several curves cycle hues. Cosmetic."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_scene_series",
+      "meta_transform": "scene_series",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "color",
+        "column",
+        "label_layer",
+        "name",
+        "per_position",
+        "point_layer"
+      ]
+    },
+    "scene.tracks": {
+      "op": "scene.tracks",
+      "label": "Scene: Tracks",
+      "category": "scene",
+      "role": "scene_composition",
+      "stage": "control_and_present",
+      "module": "nodegraph/catalog/scene/tracks.py",
+      "gui_only": false,
+      "summary": "Add a Track table to the scene viewer as polylines revealed along the timeline with a comet tail, coloured by track, time or speed. A tap: the Dataset passes through, the layer spec rides its metadata.",
+      "overview": "Add a Track table to the scene as polylines and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** scene → ``op_key=\"scene.tracks\"``, category ``scene``. * **Data contract** a TAP on a Track table (``reads_domains = {TRACK}``: rows of ``track_id, t, member_id``) joined to the member table that holds the positions — a Point table (``track.link`` on detections) or a Label table (``track.objects`` on segmented cells), chosen by ``members`` and its gated layer socket (``reads_domains_by_mode``). Each track becomes one polyline in µm with a speed per vertex; the page reveals it up to the time cursor with a comet tail of ``tail`` time units. Names are resolved here; rows are read by ``io.write_scene_viewer``. Edit-time and pull-time halves share :func:`_tracks_spec`. * **2D/3D** none — the member table's ``z_kind`` decides whether z is a plane or sub-pixel. * **Footprint** ``TILEABLE`` — only the layer catalog is read here. * **Params read** ``name``, ``source``, ``point_layer`` (members=point), ``label_layer`` (members=label), ``tail``, ``max_tracks``, ``color``; modes ``members``, ``color_by``, ``colormap``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "track"
+        ],
+        "reads_by_mode": {
+          "members": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "members",
+          "label": "Members",
+          "choices": [
+            "point",
+            "label"
+          ],
+          "default": "point",
+          "description": "Which kind of table the track members live in.",
+          "choice_docs": {
+            "point": "A Point table of detections (`track.link` on spots / particles / beads): positions are the sub-pixel detection centres; needs the Point domain on the wire.",
+            "label": "A Label table of segmented objects (`track.objects`): positions are the region centroids; needs the Label domain on the wire."
+          }
+        },
+        {
+          "name": "color_by",
+          "label": "Colour by",
+          "choices": [
+            "track",
+            "time",
+            "speed",
+            "uniform"
+          ],
+          "default": "track",
+          "description": "What the polyline colour encodes.",
+          "choice_docs": {
+            "track": "One hue per track id (hashed, so neighbouring ids differ): the easiest way to follow one cell through a crowd.",
+            "time": "Time along each track through the colourmap, early to late: shows direction of travel at a glance in a still frame.",
+            "speed": "Instantaneous speed (µm per time unit, forward difference) through the colourmap: where cells run and where they stall.",
+            "uniform": "One colour (`color`) for every track; reserve the colourmap for another layer."
+          }
+        },
+        {
+          "name": "colormap",
+          "label": "Colourmap",
+          "choices": [
+            "turbo",
+            "viridis",
+            "inferno",
+            "magma",
+            "plasma",
+            "cool",
+            "gray"
+          ],
+          "default": "turbo",
+          "description": "The scalar → colour map for track, time and speed colouring.",
+          "choice_docs": {
+            "turbo": "Rainbow-like with an even luminance ramp: many distinct hues, so neighbouring tracks (or speeds) tell apart — the default.",
+            "viridis": "Perceptually uniform purple → green → yellow; the safe choice for a figure colouring by time or speed.",
+            "inferno": "Black → red → yellow: the fast / late end blazes, the slow / early end fades toward the dark page.",
+            "magma": "Like inferno with a softer, pinker top end, so the slow / early segments stay a little more visible against the dark page.",
+            "plasma": "Blue → magenta → yellow with no near-black end, so early or slow segments stay legible on a dark page.",
+            "cool": "Blue → cyan → magenta, no dark end; for few tracks on a dark page.",
+            "gray": "Black to white: the scalar as luminance, for a figure that reserves colour for another layer."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream carrying the Track table and the table its members come from; handed on unchanged with the layer spec appended."
+        },
+        {
+          "name": "source",
+          "label": "Track layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "track",
+          "description": "Which Track table (`track_id, t, member_id` rows) to draw. Empty = the only one on the wire; two need the name."
+        },
+        {
+          "name": "point_layer",
+          "label": "Member points",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "members": [
+              "point"
+            ]
+          },
+          "layer_in": "point",
+          "description": "The Point table the track members index (the detections that were linked). Empty = the only one on the wire. Only read when Members is 'point'."
+        },
+        {
+          "name": "label_layer",
+          "label": "Member labels",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "members": [
+              "label"
+            ]
+          },
+          "layer_in": "label",
+          "description": "The Label table the track members index (the segmented objects that were linked). Empty = the only one on the wire. Only read when Members is 'label'."
+        },
+        {
+          "name": "name",
+          "label": "Layer name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The label in the page's layer panel. Empty uses the track table's name. Cosmetic."
+        },
+        {
+          "name": "tail",
+          "label": "Tail",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Comet length behind the time cursor, in the scene's time unit (seconds when the file has a frame interval, else frames). 0 = the whole track up to the cursor. The page's Tail slider changes it live. Display only."
+        },
+        {
+          "name": "max_tracks",
+          "label": "Max tracks",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 5000,
+          "description": "Tracks kept, in table order, beyond which the rest are dropped. The page's size scales with the total vertex count."
+        },
+        {
+          "name": "color",
+          "label": "Colour",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "#e599f7",
+          "description": "The uniform track colour (`#rrggbb` or a name) used when Colour by is 'uniform'. Cosmetic."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_scene_tracks",
+      "meta_transform": "scene_tracks",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "color",
+        "label_layer",
+        "max_tracks",
+        "name",
+        "point_layer",
+        "source",
+        "tail"
+      ]
+    },
+    "scene.vectors": {
+      "op": "scene.vectors",
+      "label": "Scene: Vectors",
+      "category": "scene",
+      "role": "scene_composition",
+      "stage": "control_and_present",
+      "module": "nodegraph/catalog/scene/vectors.py",
+      "gui_only": false,
+      "summary": "Add a PIV / DIC / DVC point field to the scene viewer as vector glyphs (one frame per timepoint, coloured by magnitude), optionally with streamlines. A tap: the Dataset passes through, the layer spec rides its metadata.",
+      "overview": "Add a point velocity / displacement field to the scene as glyphs and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** scene → ``op_key=\"scene.vectors\"``, category ``scene``. * **Data contract** a TAP on a Point table (``reads_domains = {POINT}``): the table ``source`` must carry ``vx``/``vy`` (µm/s, PIV with Velocity on) or ``disp_x``/``disp_y`` (µm: PIV without velocity, DIC, DVC — whose ``disp_z`` makes the glyphs three-dimensional). Resolved here so a wrong name fails on this card, not three nodes later in the exporter; the rows are read by ``io.write_scene_viewer``, one frame per timepoint, placed by the stream's ``scene_frame``. Edit-time and pull-time halves share :func:`_vectors_spec`. * **How it will be drawn** one tapered ribbon per vector from its grid point, length = field value × ``scale`` (0 = auto: the median glyph spans one grid pitch), coloured by magnitude / vertical component / uniform; optional streamlines through the first frame's field (RK2 on the binned grid). * **2D/3D** none — derived from the columns. * **Footprint** ``TILEABLE`` — only the layer catalog is read here. * **Params read** ``name``, ``source``, ``min_sn``, ``scale``, ``max_vectors``, ``color``, ``max_lines`` (lines on); modes ``color_by``, ``colormap``, ``lines``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "color_by",
+          "label": "Colour by",
+          "choices": [
+            "magnitude",
+            "vertical",
+            "uniform"
+          ],
+          "default": "magnitude",
+          "description": "What the glyph colour encodes.",
+          "choice_docs": {
+            "magnitude": "Speed / displacement magnitude through the colourmap between the page's range sliders (1st–99th percentile to start).",
+            "vertical": "The vertical (z) component as a fraction of the magnitude, mid-map = in-plane: shows where a DVC field moves up or down.",
+            "uniform": "One colour (`color`) for every glyph; reserve the colourmap for another layer."
+          }
+        },
+        {
+          "name": "colormap",
+          "label": "Colourmap",
+          "choices": [
+            "turbo",
+            "viridis",
+            "inferno",
+            "magma",
+            "plasma",
+            "cool",
+            "gray"
+          ],
+          "default": "turbo",
+          "description": "The scalar → colour map for magnitude and vertical colouring.",
+          "choice_docs": {
+            "turbo": "Rainbow-like with an even luminance ramp: the most hue steps per unit of speed, so close speeds separate — the flow-viewer default.",
+            "viridis": "Perceptually uniform purple → green → yellow; the safe choice for a figure and for colour-blind readers.",
+            "inferno": "Black → red → yellow: fast vectors blaze, the slow tail fades to near-black on the dark page (use a white page with care).",
+            "magma": "Like inferno with a softer, pinker top end; slow vectors stay a little more visible.",
+            "plasma": "Blue → magenta → yellow with no near-black end, so slow vectors remain legible on a dark page.",
+            "cool": "Blue → cyan → magenta, no dark end; for a sparse field on a dark page.",
+            "gray": "Black to white: the magnitude as plain luminance, for a figure that reserves colour for another layer."
+          }
+        },
+        {
+          "name": "lines",
+          "label": "Streamlines",
+          "choices": [
+            "off",
+            "on"
+          ],
+          "default": "off",
+          "description": "Whether streamlines are integrated through the field as well.",
+          "choice_docs": {
+            "off": "Glyphs only — the cheapest layer, and every drawn vector is a measurement.",
+            "on": "Also integrate streamlines (RK2 on the first frame's field binned to its grid) and draw them as ribbons: shows the flow's topology at the cost of page size and a second of compute; they are an interpolation, not data."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream carrying the point field (a PIV, DIC or DVC output); handed on unchanged with the layer spec appended."
+        },
+        {
+          "name": "source",
+          "label": "Point layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "Which Point table holds the vectors: one row per interrogation window with `vx`/`vy` (µm/s) or `disp_x`/`disp_y`[/`disp_z`] (µm). Empty = the only point table on the wire; two need the name."
+        },
+        {
+          "name": "name",
+          "label": "Layer name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The label in the page's layer panel. Empty uses the table's name. Cosmetic."
+        },
+        {
+          "name": "min_sn",
+          "label": "Min S/N",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Drop vectors whose correlation signal-to-noise (`qfactor`) is below this. 0 keeps every vector; inert on a table without a `qfactor` column. RAISING it removes junk from featureless windows but thins sparse regions."
+        },
+        {
+          "name": "scale",
+          "label": "Glyph scale",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "Drawn length in µm per unit of the field (per µm/s, or per µm of displacement). 0 = auto: the median vector spans one grid pitch. The page's Length slider multiplies this live. Display only."
+        },
+        {
+          "name": "max_vectors",
+          "label": "Max vectors per frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 200000,
+          "description": "Vectors kept per timepoint (a random subset beyond this, fixed seed). The page's size and frame rate scale with it."
+        },
+        {
+          "name": "color",
+          "label": "Colour",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "#31d0c6",
+          "description": "The uniform glyph colour (`#rrggbb` or a name) used when Colour by is 'uniform'; otherwise the colourmap applies. Cosmetic."
+        },
+        {
+          "name": "max_lines",
+          "label": "Max streamlines",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 800,
+          "available_in": {
+            "lines": [
+              "on"
+            ]
+          },
+          "description": "Upper bound on streamlines integrated through the first frame's field. MORE is denser and slower. Only read when Streamlines is on."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_scene_vectors",
+      "meta_transform": "scene_vectors",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "color",
+        "max_lines",
+        "max_vectors",
+        "min_sn",
+        "name",
+        "scale",
+        "source"
+      ]
+    },
+    "scene.volume": {
+      "op": "scene.volume",
+      "label": "Scene: Volume",
+      "category": "scene",
+      "role": "scene_composition",
+      "stage": "control_and_present",
+      "module": "nodegraph/catalog/scene/volume.py",
+      "gui_only": false,
+      "summary": "Add an image channel to the scene viewer as a volume layer (MIP, cloud, slices or iso-surface; one brick per timepoint under a voxel budget). A tap: the Dataset passes through, the layer spec rides its metadata.",
+      "overview": "Add an image channel to the scene as a volume layer and hand the Dataset through. Resolved spec (`build-node-v2` §0, 2026-10-08) ---------------------------------------------- * **Kind** scene → ``op_key=\"scene.volume\"``, category ``scene``. * **Data contract** a TAP that needs the image on the wire (``reads_domains = {VOXEL}``): it appends ``{kind: \"volume\", channel, render, …}`` to the ``scene_layers`` metadata and changes nothing else. The pixels are read later, by ``io.write_scene_viewer``, one ``(m, t, c)`` volume at a time through ``get_region`` and pooled to the voxel budget; this node only has to know the channel exists. Edit-time and pull-time halves share :func:`_volume_spec`. * **How it will be drawn** ``mip`` / ``cloud`` / ``slices`` share one uint8 brick per timepoint (a WebGL2 3-D texture, intensity windowed by two percentiles over every frame so brightness is comparable along the timeline); ``iso`` is a marching-cubes mesh at a speed… intensity percentile. Positions are laid out by the stream's ``scene_frame``. * **2D/3D** none: a single plane is a one-plane brick (MIP = the image). * **Footprint** ``TILEABLE`` — the compute reads no pixels. * **Params read** ``name``, ``channel``, ``color``, ``opacity``, ``window_low``, ``window_high``, ``voxel_budget``, ``max_frames``, ``iso_level`` (iso only); modes ``render``, ``colormap``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "render",
+          "label": "Render",
+          "choices": [
+            "mip",
+            "cloud",
+            "slices",
+            "iso"
+          ],
+          "default": "mip",
+          "description": "How the page draws this volume.",
+          "choice_docs": {
+            "mip": "Maximum-intensity projection along each view ray, additive on the page: the classic fluorescence look, bright structure visible from any angle, no depth cue beyond the fog.",
+            "cloud": "Emission–absorption ray march: denser voxels occlude what is behind them, so the volume reads as a solid with depth; the page's Density slider sets how quickly it turns opaque.",
+            "slices": "Three orthogonal planes through the brick, each movable on the page: the exact voxel values, best for reading positions against a vector or object layer.",
+            "iso": "A marching-cubes surface at `iso_level`, lit and tinted with `color`: the smallest page per frame (triangles, not voxels) and the clearest shape; loses everything dimmer than the level."
+          }
+        },
+        {
+          "name": "colormap",
+          "label": "Colourmap",
+          "choices": [
+            "gray",
+            "viridis",
+            "inferno",
+            "magma",
+            "plasma",
+            "turbo",
+            "cool"
+          ],
+          "default": "gray",
+          "description": "The intensity → colour map for mip, cloud and slices (the iso surface uses `color`).",
+          "choice_docs": {
+            "gray": "Black to white — the plain microscope look; reads intensity most faithfully and takes any tint from the layer colour on the page.",
+            "viridis": "Perceptually uniform purple → green → yellow; the safe default for a quantitative scalar and for colour-blind readers.",
+            "inferno": "Black → red → yellow: bright structure on a dark field pops, the dim tail is nearly invisible — good for a sparse bead field.",
+            "magma": "Like inferno with a softer, pinker top end; dim structure stays a little more visible than inferno's.",
+            "plasma": "Blue → magenta → yellow; high contrast through the mid-range, no near-black end, so a dense volume stays legible.",
+            "turbo": "Rainbow-like with an even luminance ramp; the most hue steps per unit, which separates close values but reads badly for a mass-like quantity.",
+            "cool": "Blue → cyan → magenta, no dark end: for a faint field drawn on a dark page where a map with a black end would vanish."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The stream whose image becomes a volume layer; handed on unchanged with the layer spec appended."
+        },
+        {
+          "name": "name",
+          "label": "Layer name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The label in the page's layer panel. Empty uses the channel's name from the file (else `channel N`). Cosmetic."
+        },
+        {
+          "name": "channel",
+          "label": "Channel",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "pick_kind": "channel",
+          "description": "Which image channel (0-based) is drawn. Out of range is refused."
+        },
+        {
+          "name": "color",
+          "label": "Colour",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "#ffffff",
+          "description": "Tint of the layer as `#rrggbb` or a name (white, cyan, red, …): the iso-surface's colour, and the top end the gray colourmap blends toward. Cosmetic."
+        },
+        {
+          "name": "opacity",
+          "label": "Opacity",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.8,
+          "description": "Starting opacity of the layer in the page (0–1); the panel's slider changes it live. LOWER lets layers behind show through. Display only."
+        },
+        {
+          "name": "window_low",
+          "label": "Window low (percentile)",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.5,
+          "description": "Intensity percentile mapped to black, taken over every exported frame so brightness is comparable along the timeline. HIGHER suppresses background haze in MIP/cloud renders. Display only — the viewer's window sliders move within this range."
+        },
+        {
+          "name": "window_high",
+          "label": "Window high (percentile)",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 99.8,
+          "description": "Intensity percentile mapped to full brightness. LOWER saturates bright beads so dimmer structure shows; 100 keeps the brightest voxel unsaturated. Display only."
+        },
+        {
+          "name": "iso_level",
+          "label": "Iso level (percentile)",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 90.0,
+          "available_in": {
+            "render": [
+              "iso"
+            ]
+          },
+          "description": "The intensity percentile the iso-surface encloses. LOWER wraps more of the volume (bigger, blobbier surface), HIGHER keeps only the brightest cores. Only read when Render is 'iso'."
+        },
+        {
+          "name": "voxel_budget",
+          "label": "Voxel budget",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 2500000,
+          "description": "Most voxels one frame of this layer may hold across all positions; the volume is mean-pooled by integer blocks (near-isotropic in µm) until it fits. 2.5 M ≈ 3 MB of page per frame. LOWER = smaller, faster page, coarser volume; the report lists the block size used."
+        },
+        {
+          "name": "max_frames",
+          "label": "Max frames",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 24,
+          "description": "Most timepoints exported for this layer (evenly spaced over T when the series is longer). Each frame costs one voxel budget of page size, so 24 frames at the default budget is ~75 MB. 1 = the first timepoint only (a static volume)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_scene_volume",
+      "meta_transform": "scene_volume",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "channel",
+        "color",
+        "iso_level",
+        "max_frames",
+        "name",
+        "opacity",
+        "voxel_budget",
+        "window_high",
+        "window_low"
+      ]
     },
     "track.link": {
       "op": "track.link",

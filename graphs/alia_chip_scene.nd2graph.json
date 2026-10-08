@@ -1,0 +1,448 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "pore",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "granules",
+              "src_socket": "out"
+            },
+            {
+              "dst": "scene_vec",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "piv",
+              "src_socket": "out"
+            },
+            {
+              "dst": "piv",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "pore",
+              "src_socket": "out"
+            },
+            {
+              "dst": "granules",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "rb",
+              "src_socket": "image"
+            },
+            {
+              "dst": "scene_vol",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "rb",
+              "src_socket": "image"
+            },
+            {
+              "dst": "scene_out",
+              "dst_socket": "scene",
+              "kind": "forward",
+              "src": "scene_vec",
+              "src_socket": "out"
+            },
+            {
+              "dst": "scene_out",
+              "dst_socket": "scene_2",
+              "kind": "forward",
+              "src": "scene_vol",
+              "src_socket": "out"
+            },
+            {
+              "dst": "pore",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "series",
+              "src_socket": "out"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "src1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_10",
+              "kind": "forward",
+              "src": "src10",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_2",
+              "kind": "forward",
+              "src": "src2",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_3",
+              "kind": "forward",
+              "src": "src3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_4",
+              "kind": "forward",
+              "src": "src4",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_5",
+              "kind": "forward",
+              "src": "src5",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_6",
+              "kind": "forward",
+              "src": "src6",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_7",
+              "kind": "forward",
+              "src": "src7",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_8",
+              "kind": "forward",
+              "src": "src8",
+              "src_socket": "image"
+            },
+            {
+              "dst": "series",
+              "dst_socket": "file_9",
+              "kind": "forward",
+              "src": "src9",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "granules",
+              "modes": {
+                "method": "otsu",
+                "scope": "plane"
+              },
+              "op_key": "analysis.threshold",
+              "params": {
+                "name": "granules"
+              }
+            },
+            {
+              "id": "piv",
+              "modes": {
+                "correlation": "circular",
+                "reference_mode": "ensemble"
+              },
+              "op_key": "analysis.piv",
+              "params": {
+                "channel": 0,
+                "frame_interval": 0.2014,
+                "name": "piv",
+                "overlap": 0.5,
+                "passes": 2,
+                "replace": true,
+                "roi": "pore",
+                "s2n_threshold": 1.3,
+                "velocity": true,
+                "window_size": 32
+              }
+            },
+            {
+              "id": "pore",
+              "modes": {
+                "op": "subtract"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "a": "",
+                "b": "granules",
+                "name": "pore"
+              }
+            },
+            {
+              "id": "rb",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/ChannelR-B_Seq0000.nd2"
+              }
+            },
+            {
+              "id": "scene_out",
+              "modes": {
+                "existing": "overwrite"
+              },
+              "op_key": "io.write_scene_viewer",
+              "params": {
+                "path": "S:/alia chip flow data/piv_results/scene_viewer3d_app.html",
+                "subtitle": "ensemble PIV (36 positions \u00d7 11 planes, dt 0.2 s) over the rhodamine granule channel.",
+                "title": "Alia chip \u2014 bead flow through the granular pack"
+              }
+            },
+            {
+              "id": "scene_vec",
+              "modes": {
+                "color_by": "magnitude",
+                "colormap": "turbo",
+                "lines": "on"
+              },
+              "op_key": "scene.vectors",
+              "params": {
+                "max_lines": 1200,
+                "min_sn": 1.3,
+                "name": "bead velocity (ensemble PIV)",
+                "source": "piv"
+              }
+            },
+            {
+              "id": "scene_vol",
+              "modes": {
+                "colormap": "magma",
+                "render": "mip"
+              },
+              "op_key": "scene.volume",
+              "params": {
+                "channel": 0,
+                "color": "#d9a66b",
+                "max_frames": 1,
+                "name": "granules (rhodamine B)",
+                "opacity": 0.55,
+                "voxel_budget": 3000000,
+                "window_high": 99.5,
+                "window_low": 50.0
+              }
+            },
+            {
+              "id": "series",
+              "modes": {
+                "chain_axis": "T",
+                "chain_order": "time"
+              },
+              "op_key": "util.timeseries",
+              "params": {}
+            },
+            {
+              "id": "src1",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00000_ChannelFITC_Seq0001.nd2"
+              }
+            },
+            {
+              "id": "src10",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00009_ChannelFITC_Seq0010.nd2"
+              }
+            },
+            {
+              "id": "src2",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00001_ChannelFITC_Seq0002.nd2"
+              }
+            },
+            {
+              "id": "src3",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00002_ChannelFITC_Seq0003.nd2"
+              }
+            },
+            {
+              "id": "src4",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00003_ChannelFITC_Seq0004.nd2"
+              }
+            },
+            {
+              "id": "src5",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00004_ChannelFITC_Seq0005.nd2"
+              }
+            },
+            {
+              "id": "src6",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00005_ChannelFITC_Seq0006.nd2"
+              }
+            },
+            {
+              "id": "src7",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00006_ChannelFITC_Seq0007.nd2"
+              }
+            },
+            {
+              "id": "src8",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00007_ChannelFITC_Seq0008.nd2"
+              }
+            },
+            {
+              "id": "src9",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/alia chip flow data/Count00008_ChannelFITC_Seq0009.nd2"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "Alia chip scene",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "granules": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 1000.0
+            },
+            "piv": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 600.0
+            },
+            "pore": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": 600.0
+            },
+            "rb": {
+              "collapsed": false,
+              "muted": false,
+              "x": 320.0,
+              "y": 1000.0
+            },
+            "scene_out": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1850.0,
+              "y": 800.0
+            },
+            "scene_vec": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 600.0
+            },
+            "scene_vol": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 1200.0
+            },
+            "series": {
+              "collapsed": false,
+              "muted": false,
+              "x": 320.0,
+              "y": 360.0
+            },
+            "src1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 0.0
+            },
+            "src10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 810.0
+            },
+            "src2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 90.0
+            },
+            "src3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 180.0
+            },
+            "src4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 270.0
+            },
+            "src5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 360.0
+            },
+            "src6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 450.0
+            },
+            "src7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 540.0
+            },
+            "src8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 630.0
+            },
+            "src9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 720.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

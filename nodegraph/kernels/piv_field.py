@@ -196,6 +196,28 @@ def _roi_on_grid(roi_mask: Optional[np.ndarray], x, y) -> np.ndarray:
     return inside < 0.5
 
 
+def _predictor_field(field) -> np.ndarray:
+    """A pass's displacement field as the next pass's predictor: masked AND non-finite
+    cells become 0 (no shift).
+
+    ``replace_outliers`` leaves a flagged vector NaN when every neighbour within its kernel
+    is flagged too (a flagged island inside a large excluded ROI, e.g. a granular pore
+    space at a 16-px window). ``np.ma.filled(u, 0.0)`` only fills the MASK, so that NaN
+    reached ``RectBivariateSpline``, whose coefficients then go NaN everywhere, the whole
+    deformation field became NaN and ``scipy.ndimage.map_coordinates`` — which casts each
+    coordinate to an integer index without a finiteness check — faulted the interpreter
+    (exit 139, no traceback; seen 2026-10-08 on the alia-chip chip data, position 17 z=9).
+    Zero is the honest predictor for a vector nothing was measured near."""
+    return np.nan_to_num(np.ma.filled(field, 0.0), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _finite_deformation(ut, vt):
+    """Belt and braces for :func:`_predictor_field`: a non-finite pixel shift is no shift,
+    so ``map_coordinates`` can never see a NaN coordinate (its hard fault, see above)."""
+    return (np.nan_to_num(ut, nan=0.0, posinf=0.0, neginf=0.0),
+            np.nan_to_num(vt, nan=0.0, posinf=0.0, neginf=0.0))
+
+
 def _deform_pass(frame_a, frame_b, i, x_old, y_old, u_old, v_old, s,
                  roi_mask, pyprocess, windef):
     """One window-deformation pass — ``windef.multipass_img_deform`` re-implemented
@@ -210,14 +232,15 @@ def _deform_pass(frame_a, frame_b, i, x_old, y_old, u_old, v_old, s,
     overlap = s.overlap[i]
     x, y = pyprocess.get_rect_coordinates(frame_a.shape, window_size, overlap)
 
-    ip_u = RectBivariateSpline(y_old[:, 0], x_old[0, :], np.ma.filled(u_old, 0.0))
-    ip_v = RectBivariateSpline(y_old[:, 0], x_old[0, :], np.ma.filled(v_old, 0.0))
+    ip_u = RectBivariateSpline(y_old[:, 0], x_old[0, :], _predictor_field(u_old))
+    ip_v = RectBivariateSpline(y_old[:, 0], x_old[0, :], _predictor_field(v_old))
     u_pre = ip_u(y[:, 0], x[0, :])
     v_pre = ip_v(y[:, 0], x[0, :])
 
     if s.deformation_method == "symmetric":
         x_new, y_new, ut, vt = windef.create_deformation_field(
             frame_a, x, y, u_pre, v_pre, interpolation_order=s.interpolation_order)
+        ut, vt = _finite_deformation(ut, vt)
         fa = map_coordinates(frame_a, ((y_new - vt / 2, x_new - ut / 2)),
                              order=s.interpolation_order, mode="nearest")
         fb = map_coordinates(frame_b, ((y_new + vt / 2, x_new + ut / 2)),
@@ -616,8 +639,8 @@ def run_piv_ensemble(
         for i in range(1, n_passes):
             window_size, overlap = s.windowsizes[i], s.overlap[i]
             x_new, y_new = pyprocess.get_rect_coordinates(shape, window_size, overlap)
-            ip_u = RectBivariateSpline(y[:, 0], x[0, :], np.ma.filled(u, 0.0))
-            ip_v = RectBivariateSpline(y[:, 0], x[0, :], np.ma.filled(v, 0.0))
+            ip_u = RectBivariateSpline(y[:, 0], x[0, :], _predictor_field(u))
+            ip_v = RectBivariateSpline(y[:, 0], x[0, :], _predictor_field(v))
             u_pre = ip_u(y_new[:, 0], x_new[0, :])
             v_pre = ip_v(y_new[:, 0], x_new[0, :])
             # the deformation coordinates depend only on the ENSEMBLE predictor, so
@@ -625,6 +648,7 @@ def run_piv_ensemble(
             xg, yg, ut, vt = windef.create_deformation_field(
                 head, x_new, y_new, u_pre, v_pre,
                 interpolation_order=s.interpolation_order)
+            ut, vt = _finite_deformation(ut, vt)
             coords = ((yg - vt / 2, xg - ut / 2), (yg + vt / 2, xg + ut / 2))
             n_rows, n_cols = pyprocess.get_field_shape(shape, window_size, overlap)
             du, dv, s2n = _peaks(_mean_corr(window_size, overlap, coords),

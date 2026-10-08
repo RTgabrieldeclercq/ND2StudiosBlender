@@ -1,0 +1,653 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+  :root{ --bg:#070b12; --panel:rgba(14,21,32,.9); --line:rgba(120,150,180,.16);
+    --text:#dce6f0; --muted:#8ba0b6; --accent:#31d0c6;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;font-family:var(--sans);color:var(--text);}
+  canvas#cv{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;}
+  #axlab{position:fixed;inset:0;pointer-events:none;z-index:3;font-family:var(--mono);}
+  .axl{position:absolute;font-size:11.5px;transform:translate(-50%,-50%);white-space:nowrap;}
+  .panel{position:fixed;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);box-shadow:0 10px 40px rgba(0,0,0,.55);}
+  #hud{top:14px;left:14px;width:318px;max-height:calc(100vh - 28px);overflow-y:auto;padding:14px 15px;z-index:6;}
+  #hud::-webkit-scrollbar{width:8px;} #hud::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px;}
+  #hud h1{font-size:15px;margin:0 0 2px;font-weight:640;letter-spacing:-.01em;}
+  #hud .sub{font-size:11.5px;color:var(--muted);margin:0 0 10px;line-height:1.4;}
+  details{border-top:1px solid var(--line);margin-top:8px;}
+  summary{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);
+    cursor:pointer;padding:8px 0 6px;font-family:var(--mono);list-style:none;display:flex;align-items:center;gap:8px;}
+  summary::-webkit-details-marker{display:none;}
+  summary:before{content:"▸";} details[open] summary:before{content:"▾";}
+  summary .kind{color:var(--muted);letter-spacing:0;text-transform:none;font-size:10.5px;margin-left:auto;}
+  summary input[type=checkbox]{accent-color:var(--accent);margin:0;}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0;}
+  .row label{font-size:11.5px;color:var(--text);flex:1;}
+  input[type=range]{width:118px;accent-color:var(--accent);height:16px;}
+  select{background:#0c1521;color:var(--text);border:1px solid var(--line);border-radius:6px;
+    font-family:var(--mono);font-size:11px;padding:3px 5px;}
+  .val{font-family:var(--mono);font-size:10.5px;color:var(--accent);min-width:40px;text-align:right;}
+  .tg{font-family:var(--mono);font-size:10.5px;padding:4px 9px;border-radius:999px;cursor:pointer;
+    border:1px solid var(--line);background:transparent;color:var(--muted);user-select:none;}
+  .tg.on{color:#04121a;background:var(--accent);border-color:var(--accent);font-weight:600;}
+  .toggles{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0;}
+  .btns{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 2px;}
+  .btn{font-family:var(--mono);font-size:10.5px;padding:5px 10px;border-radius:7px;cursor:pointer;
+    border:1px solid var(--line);background:transparent;color:var(--text);user-select:none;}
+  .btn:hover{border-color:var(--accent);color:var(--accent);}
+  .lbar{height:7px;border-radius:4px;margin:4px 0 2px;}
+  .lends{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted);}
+  /* view buttons */
+  #views{top:14px;right:14px;display:flex;gap:6px;padding:8px 10px;flex-wrap:wrap;justify-content:flex-end;z-index:5;max-width:40vw;}
+  /* timeline */
+  #tl{bottom:14px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:10px;padding:9px 14px;z-index:5;
+    font-family:var(--mono);font-size:11px;min-width:min(560px,80vw);}
+  #tl input[type=range]{flex:1;width:auto;min-width:160px;}
+  #tl .tv{color:var(--accent);min-width:92px;text-align:right;}
+  /* chart */
+  #chart{bottom:72px;right:14px;width:380px;padding:10px 12px;z-index:5;}
+  #chart canvas{width:100%;height:190px;display:block;}
+  #chart .ttl{font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:4px;display:flex;justify-content:space-between;}
+  #stats{bottom:14px;right:14px;padding:9px 12px;font-family:var(--mono);font-size:10.5px;color:var(--muted);z-index:5;max-width:300px;}
+  #stats b{color:var(--text);}
+  #hudToggle{position:fixed;top:12px;left:12px;z-index:8;display:none;font-family:var(--mono);
+    font-size:12.5px;padding:9px 13px;border-radius:10px;border:1px solid var(--line);
+    background:var(--panel);color:var(--text);cursor:pointer;user-select:none;}
+  html.embed #hud,html.embed #views,html.embed #hudToggle,html.embed #stats{display:none !important;}
+  html.embed #cv{pointer-events:none;}
+  @media (max-width:820px){
+    #hudToggle{display:block;}
+    #hud{display:none;top:56px;left:10px;width:min(86vw,330px);max-height:calc(100vh - 160px);}
+    #hud.open{display:block;}
+    #views{transform:scale(.8);transform-origin:top right;max-width:60vw;}
+    #chart{width:min(86vw,330px);bottom:70px;left:10px;right:auto;}
+    #stats{display:none;}
+    #tl{min-width:0;left:10px;right:10px;transform:none;}
+    .axl{font-size:10px;}
+  }
+</style>
+
+<canvas id="cv"></canvas>
+<div id="axlab"></div>
+<div id="hudToggle">☰ Layers</div>
+
+<div class="panel" id="hud">
+  <h1>__TITLE__</h1>
+  <p class="sub">__SUBTITLE__ Drag = orbit · right-drag / shift-drag = pan · scroll = zoom.</p>
+  <div class="toggles">
+    <span class="tg on" data-k="axes">Axes (µm)</span>
+    <span class="tg" data-k="white">White</span>
+    <span class="tg" data-k="spin">Auto-spin</span>
+    <span class="tg on" data-k="chart">Chart</span>
+  </div>
+  <div id="layers"></div>
+  <details><summary>Scene</summary>
+    <div class="row"><label>z-stretch</label><input id="zs" type="range" min="0.25" max="20" step="0.25" value="1"><span class="val" id="zsv">1.0</span></div>
+    <div class="row"><label>Fog</label><input id="fog" type="range" min="0" max="1" step="0.05" value="0.35"><span class="val" id="fogv">0.35</span></div>
+    <div class="row"><label>Spin speed</label><input id="sps" type="range" min="0" max="3" step="0.1" value="1"><span class="val" id="spsv">1.0</span></div>
+  </details>
+  <div class="btns">
+    <span class="btn" id="reset">Reset view</span><span class="btn" id="snap">Snapshot (PNG)</span>
+  </div>
+</div>
+
+<div class="panel" id="views">
+  <span class="btn" data-view="1,1,1">Iso</span><span class="btn" data-view="0,0,1">Top</span>
+  <span class="btn" data-view="0,-1,0">Front</span><span class="btn" data-view="1,0,0">Side</span>
+  <span class="btn" id="home">⌂</span>
+</div>
+
+<div class="panel" id="tl" style="display:none">
+  <span class="btn" id="play">▶</span>
+  <input id="tslider" type="range" min="0" max="0" step="1" value="0">
+  <span class="tv" id="tval"></span>
+  <select id="tspeed"><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+</div>
+
+<div class="panel" id="chart" style="display:none"><div class="ttl"><span id="chartTitle"></span><span id="chartVal"></span></div><canvas id="chartcv"></canvas></div>
+<div class="panel" id="stats"></div>
+
+<script>
+const SCENE = __SCENE__;
+const META = SCENE.meta;
+function dec(b64, T){const s = atob(b64); const u = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return new T(u.buffer);}
+const B = META.bounds, LO = B[0], HI = B[1];
+const SPAN = [HI[0]-LO[0], HI[1]-LO[1], HI[2]-LO[2]];
+const CENTER = [(LO[0]+HI[0])/2, (LO[1]+HI[1])/2, (LO[2]+HI[2])/2];
+const RAD = Math.max(SPAN[0], SPAN[1], SPAN[2]*0.5) * 0.62;
+const TIMES = META.times.length ? META.times : [0];
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+if (EMBED) document.documentElement.classList.add('embed');
+
+// ---------- state ----------
+const st = {axes: true, white: false, spin: false, chart: true};
+const P = {zs: 1, fog: 0.35, sps: 1};
+let zScale = 1, tIndex = 0, playing = false, playSpeed = 1, lastTick = 0;
+const THEME = {
+  dark: {fog: [0.05, 0.08, 0.13], grid: [0.42, 0.5, 0.6], gridA: 0.32, label: '#cfe0ee', bg0: [0.015, 0.015, 0.015], bg1: [0.05, 0.09, 0.14]},
+  white: {fog: [0.96, 0.97, 0.98], grid: [0.45, 0.5, 0.55], gridA: 0.55, label: '#222a33', bg0: [0.985, 0.988, 0.992], bg1: [0.94, 0.95, 0.965]}};
+function theme(){return st.white ? THEME.white : THEME.dark;}
+function curTime(){return TIMES[Math.min(tIndex, TIMES.length-1)];}
+function frameAt(frames, t){let lo = 0, hi = frames.length - 1, best = 0;
+  while (lo <= hi){const m = (lo + hi) >> 1; if (frames[m].t <= t + 1e-9){best = m; lo = m + 1;} else hi = m - 1;}
+  return best;}
+
+// ---------- gl ----------
+const cv = document.getElementById('cv');
+const gl = cv.getContext('webgl2', {antialias: true, alpha: false, preserveDrawingBuffer: true});
+if (!gl) document.getElementById('hud').innerHTML = '<h1>WebGL2 required</h1>';
+function sh(t, s){const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
+  if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o) + "\n" + s; return o;}
+function prog(v, f){const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, v));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, f)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p); return p;}
+const CMAP = `uniform float uCmap;
+vec3 turbo(float t){t=clamp(t,0.,1.);vec3 a=vec3(0.13,0.07,0.23),b=vec3(0.25,0.27,0.67),
+ c=vec3(0.12,0.63,0.53),d=vec3(0.63,0.78,0.14),e=vec3(0.98,0.82,0.23),f=vec3(0.82,0.19,0.02);
+ if(t<0.2)return mix(a,b,t/0.2);if(t<0.4)return mix(b,c,(t-0.2)/0.2);
+ if(t<0.6)return mix(c,d,(t-0.4)/0.2);if(t<0.8)return mix(d,e,(t-0.6)/0.2);return mix(e,f,(t-0.8)/0.2);}
+vec3 poly(float t,vec3 c0,vec3 c1,vec3 c2,vec3 c3,vec3 c4,vec3 c5,vec3 c6){
+ return clamp(c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6))))),0.,1.);}
+vec3 viridis(float t){return poly(t,vec3(0.2778,0.0054,0.3341),vec3(0.1051,1.4046,1.3846),
+ vec3(-0.3309,0.2148,0.0951),vec3(-4.6342,-5.7991,-19.3324),vec3(6.2283,14.1799,56.6906),
+ vec3(4.7764,-13.7451,-65.3530),vec3(-5.4355,4.6459,26.3124));}
+vec3 inferno(float t){return poly(t,vec3(0.0002,0.0017,-0.0195),vec3(0.1065,0.5639,3.9327),
+ vec3(11.6025,-3.9729,-15.9424),vec3(-41.7040,17.4364,44.3541),vec3(77.1629,-33.4024,-81.8073),
+ vec3(-71.3194,32.6261,73.2095),vec3(25.1311,-12.2427,-23.0703));}
+vec3 plasma(float t){return poly(t,vec3(0.0587,0.0233,0.5433),vec3(2.1765,0.2384,0.7540),
+ vec3(-2.6895,-7.4559,3.1108),vec3(6.1303,42.3462,-28.5189),vec3(-11.1074,-82.6663,60.1398),
+ vec3(10.0231,71.4136,-54.0722),vec3(-3.6587,-22.9315,18.1919));}
+vec3 magma(float t){return poly(t,vec3(-0.0021,-0.0007,-0.0054),vec3(0.2517,0.6775,2.4940),
+ vec3(8.3537,-3.5777,0.3145),vec3(-27.6687,14.2647,-13.6492),vec3(52.1761,-27.9436,12.9442),
+ vec3(-50.7685,29.0466,4.2342),vec3(18.6557,-11.4898,-5.6020));}
+vec3 cool(float t){return vec3(t,0.35+0.4*t,1.0-0.4*t);}
+vec3 cmap(float t){int m=int(uCmap+0.5);t=clamp(t,0.,1.);
+ if(m==0)return turbo(t);if(m==1)return viridis(t);if(m==2)return inferno(t);
+ if(m==3)return plasma(t);if(m==4)return magma(t);if(m==6)return cool(t);return vec3(t);}`;
+const FOG = `uniform float uFogN,uFogF,uFogAmt;uniform vec3 uFogC;
+float fogf(vec4 mv){return clamp((-mv.z-uFogN)/(uFogF-uFogN),0.,1.)*uFogAmt;}`;
+const WORLD = `uniform vec3 uCenter;uniform float uZS;
+vec3 world(vec3 p){return vec3(p.x,p.y,uCenter.z+(p.z-uCenter.z)*uZS);}`;
+
+const pBg = gl && prog(`#version 300 es
+ const vec2 v[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));out vec2 uv;
+ void main(){uv=v[gl_VertexID];gl_Position=vec4(v[gl_VertexID],0.,1.);}`,
+ `#version 300 es
+ precision highp float;in vec2 uv;out vec4 o;uniform vec3 uC0,uC1;
+ void main(){float t=(uv.y+1.)*.5;o=vec4(mix(uC0,uC1,t),1.);}`);
+const pGrid = gl && prog(`#version 300 es
+ layout(location=0)in vec3 aPos;uniform mat4 uMVP;${WORLD}
+ void main(){gl_Position=uMVP*vec4(world(aPos),1.);}`,
+ `#version 300 es
+ precision highp float;out vec4 o;uniform vec4 uColor;void main(){o=uColor;}`);
+// ribbon lines (streamlines, tracks): screen-space width, scalar colour, time gating
+const pRib = gl && prog(`#version 300 es
+ layout(location=0)in vec3 aPos;layout(location=1)in vec3 aDir;layout(location=2)in float aVal;
+ layout(location=3)in float aSide;layout(location=4)in float aT;
+ uniform mat4 uMVP,uMV;uniform float uVpH,uAspect,uWidth,uLo,uHi,uTime,uTail,uTimeMode;${WORLD}${FOG}
+ out float vT,vF,vA;
+ void main(){vec3 pA=world(aPos),pB=world(aPos+aDir);
+  vec4 cA=uMVP*vec4(pA,1.),cB=uMVP*vec4(pB,1.);
+  vec2 nA=cA.xy/cA.w,nB=cB.xy/cB.w;
+  vec2 dir=normalize((nB-nA)*vec2(uAspect,1.)+vec2(1e-6,0.));
+  vec2 perp=vec2(-dir.y,dir.x)/vec2(uAspect,1.);
+  cA.xy+=perp*aSide*(uWidth/uVpH)*cA.w;gl_Position=cA;
+  vT=clamp((aVal-uLo)/max(uHi-uLo,1e-6),0.,1.);vF=fogf(uMV*vec4(pA,1.));
+  vA=1.0;
+  if(uTimeMode>0.5){if(aT>uTime+1e-6)vA=0.0;else if(uTail>0.0){vA=clamp(1.0-(uTime-aT)/uTail,0.0,1.0);}}}`,
+ `#version 300 es
+ precision highp float;in float vT,vF,vA;out vec4 o;uniform float uAlpha,uMode;uniform vec3 uColor;${FOG}${CMAP}
+ void main(){if(vA<=0.001)discard;vec3 c=uMode>0.5?cmap(vT):uColor;c=mix(c,uFogC,vF);
+  float a=uAlpha*vA;o=vec4(c*a,a);}`);
+// instanced vector glyphs: a ribbon from p to p + v*scale, tapered
+const pGlyph = gl && prog(`#version 300 es
+ layout(location=0)in float aEnd;layout(location=1)in float aSide;
+ layout(location=2)in vec3 iP;layout(location=3)in vec3 iV;layout(location=4)in float iM;
+ uniform mat4 uMVP,uMV;uniform float uVpH,uAspect,uWidth,uScale,uLo,uHi,uMode;${WORLD}${FOG}
+ out float vT,vF;
+ void main(){vec3 p0=world(iP),p1=world(iP+iV*uScale);
+  vec4 c0=uMVP*vec4(p0,1.),c1=uMVP*vec4(p1,1.);
+  vec2 n0=c0.xy/c0.w,n1=c1.xy/c1.w;
+  vec2 dir=normalize((n1-n0)*vec2(uAspect,1.)+vec2(1e-6,0.));
+  vec2 perp=vec2(-dir.y,dir.x)/vec2(uAspect,1.);
+  vec4 c=aEnd>0.5?c1:c0;float w=uWidth*(1.0-0.75*aEnd);
+  c.xy+=perp*aSide*(w/uVpH)*c.w;gl_Position=c;
+  float t=uMode<1.5?iM:(0.5+0.5*iV.z/max(length(iV),1e-9));
+  vT=clamp((t-uLo)/max(uHi-uLo,1e-6),0.,1.);if(uMode>1.5)vT=clamp(t,0.,1.);
+  vF=fogf(uMV*vec4(p0,1.));}`,
+ `#version 300 es
+ precision highp float;in float vT,vF;out vec4 o;uniform float uAlpha,uMode;uniform vec3 uColor;${FOG}${CMAP}
+ void main(){vec3 c=uMode>2.5?uColor:cmap(vT);c=mix(c,uFogC,vF);o=vec4(c*uAlpha,uAlpha);}`);
+// instanced spheres (objects)
+const pSph = gl && prog(`#version 300 es
+ layout(location=0)in vec3 aPos;layout(location=1)in vec3 aNrm;
+ layout(location=2)in vec3 iC;layout(location=3)in float iR;layout(location=4)in float iVal;
+ uniform mat4 uMVP,uMV;uniform float uSize,uLo,uHi,uMode,uZ0,uZ1;${WORLD}${FOG}
+ out vec3 vN;out float vT,vF;
+ void main(){vec3 c=world(iC);vec3 W=c+aPos*iR*uSize;gl_Position=uMVP*vec4(W,1.);
+  vN=normalize(mat3(uMV)*aNrm);
+  float t=uMode<1.5?iVal:clamp((iC.z-uZ0)/max(uZ1-uZ0,1e-6),0.,1.);
+  vT=uMode<1.5?clamp((t-uLo)/max(uHi-uLo,1e-6),0.,1.):t;vF=fogf(uMV*vec4(W,1.));}`,
+ `#version 300 es
+ precision highp float;in vec3 vN;in float vT,vF;out vec4 o;uniform float uAlpha,uMode;uniform vec3 uColor;${FOG}${CMAP}
+ void main(){vec3 N=normalize(vN);vec3 L=normalize(vec3(0.4,0.55,0.75));
+  float df=max(dot(N,L),0.);float rim=pow(1.-abs(N.z),2.);
+  vec3 base=uMode<0.5?uColor:cmap(vT);
+  vec3 c=base*(0.3+0.7*df)+vec3(0.6,0.7,0.85)*rim*0.2;c=mix(c,uFogC,vF*0.7);o=vec4(c,uAlpha);}`);
+// iso mesh
+const pIso = gl && prog(`#version 300 es
+ layout(location=0)in vec3 aPos;layout(location=1)in vec3 aN;
+ uniform mat4 uMVP,uMV;uniform vec3 uOrigin;${WORLD}${FOG}out vec3 vN;out float vF;
+ void main(){vec3 W=world(uOrigin+aPos);gl_Position=uMVP*vec4(W,1.);
+  vN=normalize(mat3(uMV)*vec3(aN.x,aN.y,aN.z/uZS));vF=fogf(uMV*vec4(W,1.));}`,
+ `#version 300 es
+ precision highp float;in vec3 vN;in float vF;out vec4 o;uniform float uAlpha;uniform vec3 uColor;${FOG}
+ void main(){vec3 N=normalize(vN);vec3 L=normalize(vec3(0.4,0.55,0.75));
+  float df=abs(dot(N,L));float rim=pow(1.-abs(N.z),2.);
+  vec3 c=uColor*(0.28+0.72*df)+vec3(0.7,0.8,0.95)*rim*0.25;c=mix(c,uFogC,vF*0.6);o=vec4(c*uAlpha,uAlpha);}`);
+// volume: ray-march a 3D texture inside its box (MIP or emission/absorption)
+const pVol = gl && prog(`#version 300 es
+ layout(location=0)in vec3 aUnit;uniform mat4 uMVP;uniform vec3 uOrigin,uSize;${WORLD}out vec3 vW;
+ void main(){vec3 p=uOrigin+aUnit*uSize;vW=world(p);gl_Position=uMVP*vec4(vW,1.);}`,
+ `#version 300 es
+ precision highp float;precision highp sampler3D;in vec3 vW;out vec4 o;
+ uniform sampler3D uTex;uniform vec3 uEye,uOrigin,uSize,uColor;uniform float uLo,uHi,uMode,uSteps,uAlpha,uDensity;
+ ${WORLD}${CMAP}
+ vec3 toLocal(vec3 w){vec3 p=vec3(w.x,w.y,uCenter.z+(w.z-uCenter.z)/uZS);return (p-uOrigin)/uSize;}
+ float win(float v){return clamp((v-uLo)/max(uHi-uLo,1e-6),0.,1.);}
+ void main(){vec3 ro=toLocal(uEye);vec3 rd=normalize(toLocal(vW)-ro);
+  vec3 inv=1.0/(rd+vec3(1e-9));vec3 t0=(vec3(0.)-ro)*inv,t1=(vec3(1.)-ro)*inv;
+  vec3 tmin=min(t0,t1),tmax=max(t0,t1);float tn=max(max(tmin.x,tmin.y),tmin.z),tf=min(min(tmax.x,tmax.y),tmax.z);
+  tn=max(tn,0.0);if(tf<=tn)discard;
+  float n=uSteps;float dt=(tf-tn)/n;float mx=0.0;vec3 col=vec3(0.);float A=0.0;
+  for(float i=0.0;i<512.0;i+=1.0){if(i>=n)break;vec3 p=ro+rd*(tn+(i+0.5)*dt);
+   float v=win(texture(uTex,p).r);
+   if(uMode<0.5){mx=max(mx,v);}
+   else{float a=v*v*uDensity*dt*8.0;a=clamp(a,0.,1.);vec3 c=uCmap>=0.0?cmap(v):uColor;
+    col+=(1.0-A)*a*c;A+=(1.0-A)*a;if(A>0.97)break;}}
+  if(uMode<0.5){if(mx<=0.003)discard;vec3 c=cmap(mx);o=vec4(c*mx*uAlpha,mx*uAlpha);}
+  else{if(A<=0.003)discard;o=vec4(col*uAlpha,A*uAlpha);}}`);
+// slices: a quad through the box, sampled from the 3D texture
+const pSlice = gl && prog(`#version 300 es
+ layout(location=0)in vec3 aUnit;uniform mat4 uMVP;uniform vec3 uOrigin,uSize;${WORLD}out vec3 vL;
+ void main(){vL=aUnit;vec3 p=uOrigin+aUnit*uSize;gl_Position=uMVP*vec4(world(p),1.);}`,
+ `#version 300 es
+ precision highp float;precision highp sampler3D;in vec3 vL;out vec4 o;
+ uniform sampler3D uTex;uniform float uLo,uHi,uAlpha;${CMAP}
+ void main(){float v=clamp((texture(uTex,vL).r-uLo)/max(uHi-uLo,1e-6),0.,1.);o=vec4(cmap(v)*uAlpha,uAlpha);}`);
+
+function buf(d, dyn){const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, d, dyn ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW); return b;}
+function ibuf(d){const b = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, b);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, d, gl.STATIC_DRAW); return b;}
+function A(loc, b, sz, div){gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, sz, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(loc, div || 0);}
+function U(p, n){return gl.getUniformLocation(p, n);}
+
+// ribbons from polylines: pos (P*3), val (P), t (P or null), ranges (L*2) → strips
+function makeRibbons(pos, val, tt, ranges){const NL = ranges.length / 2, NP = pos.length / 3;
+  const rp = new Float32Array(NP*6), rd = new Float32Array(NP*6), rv = new Float32Array(NP*2), rk = new Float32Array(NP*2), rt = new Float32Array(NP*2);
+  const rr = new Uint32Array(NL*2); let v = 0;
+  for (let l = 0; l < NL; l++){const s0 = ranges[l*2], ct = ranges[l*2+1]; rr[l*2] = v; rr[l*2+1] = ct*2;
+    for (let i = 0; i < ct; i++){const gi = s0+i, a = Math.max(s0, gi-1), b = Math.min(s0+ct-1, gi+1);
+      const dx = pos[b*3]-pos[a*3], dy = pos[b*3+1]-pos[a*3+1], dz = pos[b*3+2]-pos[a*3+2];
+      for (let s = 0; s < 2; s++){rp[v*3] = pos[gi*3]; rp[v*3+1] = pos[gi*3+1]; rp[v*3+2] = pos[gi*3+2];
+        rd[v*3] = dx; rd[v*3+1] = dy; rd[v*3+2] = dz; rv[v] = val[gi]; rt[v] = tt ? tt[gi] : 0; rk[v] = s === 0 ? -1 : 1; v++;}}}
+  return {pos: buf(rp), dir: buf(rd), val: buf(rv), side: buf(rk), t: buf(rt), ranges: rr, n: NL};}
+function makeSphere(){const nu = 18, nv = 12, pos = [], nm = [];
+  const V = []; for (let j = 0; j <= nv; j++){V[j] = []; for (let i = 0; i <= nu; i++){
+    const u = -Math.PI + 2*Math.PI*i/nu, v = -Math.PI/2 + Math.PI*j/nv;
+    V[j][i] = [Math.cos(v)*Math.cos(u), Math.cos(v)*Math.sin(u), Math.sin(v)];}}
+  const tri = (a, b, c) => {for (const p of [a, b, c]){pos.push(p[0], p[1], p[2]); nm.push(p[0], p[1], p[2]);}};
+  for (let j = 0; j < nv; j++) for (let i = 0; i < nu; i++){const a = V[j][i], b = V[j][i+1], c = V[j+1][i+1], d = V[j+1][i]; tri(a, b, c); tri(a, c, d);}
+  return {pos: new Float32Array(pos), nrm: new Float32Array(nm)};}
+const SPH = gl && makeSphere(), sphP = gl && buf(SPH.pos), sphN = gl && buf(SPH.nrm), SPH_N = gl ? SPH.pos.length/3 : 0;
+const GLYPH_END = gl && buf(new Float32Array([0, 0, 1, 1])), GLYPH_SIDE = gl && buf(new Float32Array([-1, 1, -1, 1]));
+// unit cube (36 verts) and three unit quads (slices) in box-local coords
+const CUBE = gl && buf(new Float32Array([0,0,0, 1,0,0, 1,1,0, 0,0,0, 1,1,0, 0,1,0,  0,0,1, 1,1,1, 1,0,1, 0,0,1, 0,1,1, 1,1,1,
+  0,0,0, 0,1,0, 0,1,1, 0,0,0, 0,1,1, 0,0,1,  1,0,0, 1,1,1, 1,1,0, 1,0,0, 1,0,1, 1,1,1,
+  0,0,0, 0,0,1, 1,0,1, 0,0,0, 1,0,1, 1,0,0,  0,1,0, 1,1,1, 0,1,1, 0,1,0, 1,1,0, 1,1,1]));
+const SLICEQ = gl && buf(new Float32Array(18*3)), sliceArr = new Float32Array(18*3);
+
+// ---------- layer resources ----------
+const LAYERS = SCENE.layers.map((L, i) => {const R = {L, i, on: true, alpha: 1, ui: {}};
+  if (!gl) return R;
+  if (L.kind === 'volume'){
+    R.alpha = L.opacity; R.cmap = L.colormap; R.render = L.render; R.lo = 0; R.hi = 1; R.density = 1; R.steps = 160;
+    R.slice = [0.5, 0.5, 0.5]; R.size = [L.dims[2]*L.spacing[2], L.dims[1]*L.spacing[1], L.dims[0]*L.spacing[0]];
+    if (L.render === 'iso'){R.frames = L.frames.map(f => ({t: f.t, pos: buf(dec(f.pos, Float32Array)), nrm: buf(dec(f.nrm, Float32Array)),
+        idx: ibuf(dec(f.idx, Uint32Array)), n: dec(f.idx, Uint32Array).length})); R.color = L.color;}
+    else {R.frames = L.frames.map(f => ({t: f.t, data: dec(f.data, Uint8Array)}));
+      R.tex = gl.createTexture(); R.texFrame = -1;
+      gl.bindTexture(gl.TEXTURE_3D, R.tex);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);}
+  } else if (L.kind === 'vectors'){
+    R.cmap = L.colormap; R.mode = {magnitude: 1, vertical: 2, uniform: 3}[L.color_by] || 1; R.scale = 1; R.width = 3; R.alpha = 0.9;
+    R.lo = L.mag_range[0]; R.hi = L.mag_range[1]; R.lines = !!L.lines; R.lineAlpha = 0.45;
+    R.frames = L.frames.map(f => ({t: f.t, n: f.n, p: buf(dec(f.pos, Float32Array)), v: buf(dec(f.vec, Float32Array)), m: buf(dec(f.mag, Float32Array))}));
+    if (L.lines && L.lines.n) R.rib = makeRibbons(dec(L.lines.pos, Float32Array), dec(L.lines.spd, Float32Array), null, dec(L.lines.ranges, Uint32Array));
+  } else if (L.kind === 'objects'){
+    R.cmap = L.colormap; R.mode = {uniform: 0, value: 1, z: 2}[L.color_by] || 0; R.size = L.size_scale; R.alpha = 1;
+    R.lo = L.value_range[0]; R.hi = L.value_range[1];
+    R.frames = L.frames.map(f => ({t: f.t, n: f.n, c: buf(dec(f.pos, Float32Array)), r: buf(dec(f.rad, Float32Array)), v: buf(dec(f.val, Float32Array))}));
+  } else if (L.kind === 'tracks'){
+    R.cmap = L.colormap; R.mode = {track: 1, time: 2, speed: 3, uniform: 0}[L.color_by]; R.width = 3; R.alpha = 0.9; R.tail = L.tail;
+    if (L.n_points){const pos = dec(L.pos, Float32Array), tt = dec(L.t, Float32Array), spd = dec(L.spd, Float32Array), rg = dec(L.ranges, Uint32Array), ids = dec(L.ids, Uint32Array);
+      let val = spd, lo = L.speed_range[0], hi = L.speed_range[1];
+      if (R.mode === 1){val = new Float32Array(pos.length/3); for (let l = 0; l < rg.length/2; l++){const h = ((ids[l]*2654435761) >>> 0) % 997 / 997; for (let k = 0; k < rg[l*2+1]; k++) val[rg[l*2]+k] = h;} lo = 0; hi = 1;}
+      else if (R.mode === 2){val = tt; lo = L.time_range[0]; hi = L.time_range[1];}
+      R.lo = lo; R.hi = hi; R.rib = makeRibbons(pos, val, tt, rg);}
+  } else if (L.kind === 'series'){R.curves = L.curves.map(c => ({label: c.label, x: dec(c.x, Float32Array), y: dec(c.y, Float32Array)}));}
+  return R;});
+
+// ---------- UI ----------
+const CMAP_STOPS = {0: ['#30123b','#4145ab','#1fa088','#a1c724','#f9d13a','#d23105'], 1: ['#440154','#3b528b','#21908d','#5dc963','#fde725'],
+  2: ['#000004','#57106e','#bc3754','#f98e09','#fcffa4'], 3: ['#0d0887','#7e03a8','#cc4778','#f89540','#f0f921'],
+  4: ['#000004','#51127c','#b73779','#fc8961','#fcfdbf'], 5: ['#000000','#ffffff'], 6: ['#00b3ff','#59c2b3','#ff59ff']};
+const CMAP_NAMES = ['Turbo','Viridis','Inferno','Plasma','Magma','Gray','Cool'];
+function cssGrad(m){return 'linear-gradient(90deg,' + CMAP_STOPS[m].join(',') + ')';}
+function fmt(x){const a = Math.abs(x); return a >= 100 ? x.toFixed(0) : a >= 10 ? x.toFixed(1) : a >= 1 ? x.toFixed(2) : x.toFixed(3);}
+function el(tag, cls, html){const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e;}
+function rowSlider(parent, label, min, max, step, val, f, cb){const r = el('div', 'row'); r.innerHTML = '<label>' + label + '</label>';
+  const inp = el('input'); inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step; inp.value = val;
+  const v = el('span', 'val', f(val)); inp.oninput = () => {const x = parseFloat(inp.value); v.textContent = f(x); cb(x);};
+  r.appendChild(inp); r.appendChild(v); parent.appendChild(r); return {inp, v, set: x => {inp.value = x; v.textContent = f(x);}};}
+function rowSelect(parent, label, opts, val, cb){const r = el('div', 'row'); r.innerHTML = '<label>' + label + '</label>';
+  const s = el('select'); opts.forEach(([k, n]) => {const o = el('option'); o.value = k; o.textContent = n; s.appendChild(o);});
+  s.value = val; s.onchange = () => cb(s.value); r.appendChild(s); parent.appendChild(r); return s;}
+function legend(parent, R){const bar = el('div', 'lbar'), ends = el('div', 'lends'); parent.appendChild(bar); parent.appendChild(ends);
+  R.legend = () => {bar.style.background = cssGrad(R.cmap); ends.innerHTML = '<span>' + fmt(R.legendLo ? R.legendLo() : R.lo) + '</span><span>' + (R.L.units || R.L.value_label || '') + '</span><span>' + fmt(R.legendHi ? R.legendHi() : R.hi) + '</span>';};
+  R.legend();}
+const layersDiv = document.getElementById('layers');
+LAYERS.forEach(R => {const L = R.L, d = el('details'); d.open = true;
+  const s = el('summary'); const cb = el('input'); cb.type = 'checkbox'; cb.checked = true; cb.onclick = e => {e.stopPropagation(); R.on = cb.checked;};
+  s.appendChild(cb); s.appendChild(el('span', '', L.name)); s.appendChild(el('span', 'kind', L.kind)); d.appendChild(s);
+  R.ui.cb = cb;
+  if (L.kind === 'series'){d.appendChild(el('div', 'row', '<label style="color:var(--muted)">' + L.n_curves + ' curve' + (L.n_curves === 1 ? '' : 's') + ' · shown in the chart panel</label>')); layersDiv.appendChild(d); return;}
+  R.ui.alpha = rowSlider(d, 'Opacity', 0, 1, 0.02, R.alpha, x => x.toFixed(2), x => R.alpha = x);
+  if (L.kind === 'volume'){
+    if (L.render !== 'iso'){R.ui.render = rowSelect(d, 'Render', [['mip','Max projection'],['cloud','Cloud (absorb)'],['slices','Slices']], R.render, v => R.render = v);
+      R.ui.cmap = rowSelect(d, 'Colourmap', CMAP_NAMES.map((n, i) => [i, n]), R.cmap, v => {R.cmap = +v; R.legend();});
+      R.ui.lo = rowSlider(d, 'Window low', 0, 1, 0.005, 0, x => fmt(L.window[0] + x*(L.window[1]-L.window[0])), x => {R.lo = x; R.legend();});
+      R.ui.hi = rowSlider(d, 'Window high', 0, 1, 0.005, 1, x => fmt(L.window[0] + x*(L.window[1]-L.window[0])), x => {R.hi = x; R.legend();});
+      R.ui.den = rowSlider(d, 'Density (cloud)', 0.1, 6, 0.1, 1, x => x.toFixed(1), x => R.density = x);
+      R.ui.sx = rowSlider(d, 'Slice x', 0, 1, 0.005, 0.5, x => fmt(L.origin[0] + x*R.size[0]), x => R.slice[0] = x);
+      R.ui.sy = rowSlider(d, 'Slice y', 0, 1, 0.005, 0.5, x => fmt(L.origin[1] + x*R.size[1]), x => R.slice[1] = x);
+      R.ui.sz = rowSlider(d, 'Slice z', 0, 1, 0.005, 0.5, x => fmt(L.origin[2] + x*R.size[2]), x => R.slice[2] = x);
+      R.legendLo = () => L.window[0] + R.lo*(L.window[1]-L.window[0]); R.legendHi = () => L.window[0] + R.hi*(L.window[1]-L.window[0]);
+      legend(d, R);}
+    else d.appendChild(el('div', 'row', '<label style="color:var(--muted)">iso-surface at ' + fmt(L.iso_level) + ' · ' + L.n_triangles + ' triangles</label>'));
+  } else if (L.kind === 'vectors'){
+    R.ui.scale = rowSlider(d, 'Length ×', -1, 1.5, 0.05, 0, x => Math.pow(10, x).toFixed(2), x => R.scale = Math.pow(10, x));
+    R.ui.width = rowSlider(d, 'Width', 0.5, 12, 0.5, 3, x => x.toFixed(1), x => R.width = x);
+    R.ui.mode = rowSelect(d, 'Colour by', [[1,'Magnitude'],[2,'Vertical component'],[3,'Uniform']], R.mode, v => R.mode = +v);
+    R.ui.cmap = rowSelect(d, 'Colourmap', CMAP_NAMES.map((n, i) => [i, n]), R.cmap, v => {R.cmap = +v; R.legend();});
+    R.ui.lo = rowSlider(d, 'Range min', 0, L.mag_range[1], L.mag_range[1]/200, R.lo, fmt, x => {R.lo = x; R.legend();});
+    R.ui.hi = rowSlider(d, 'Range max', 0, L.mag_range[1], L.mag_range[1]/200, R.hi, fmt, x => {R.hi = x; R.legend();});
+    if (L.lines) R.ui.lines = rowSlider(d, 'Streamlines', 0, 1, 0.02, R.lineAlpha, x => x.toFixed(2), x => R.lineAlpha = x);
+    legend(d, R);
+  } else if (L.kind === 'objects'){
+    R.ui.size = rowSlider(d, 'Size ×', 0.1, 4, 0.05, R.size, x => x.toFixed(2), x => R.size = x);
+    R.ui.mode = rowSelect(d, 'Colour by', [[0,'Uniform'],[1,'Value' + (L.value_label ? ' (' + L.value_label + ')' : '')],[2,'Depth (z)']], R.mode, v => R.mode = +v);
+    R.ui.cmap = rowSelect(d, 'Colourmap', CMAP_NAMES.map((n, i) => [i, n]), R.cmap, v => {R.cmap = +v; R.legend();});
+    const span = Math.max(L.value_range[1] - L.value_range[0], 1e-9);
+    R.ui.lo = rowSlider(d, 'Range min', L.value_range[0], L.value_range[1], span/200, R.lo, fmt, x => {R.lo = x; R.legend();});
+    R.ui.hi = rowSlider(d, 'Range max', L.value_range[0], L.value_range[1], span/200, R.hi, fmt, x => {R.hi = x; R.legend();});
+    legend(d, R);
+  } else if (L.kind === 'tracks'){
+    R.ui.width = rowSlider(d, 'Width', 0.5, 12, 0.5, 3, x => x.toFixed(1), x => R.width = x);
+    const tspan = Math.max(L.time_range[1] - L.time_range[0], 1e-9);
+    R.ui.tail = rowSlider(d, 'Tail (0 = whole)', 0, tspan, tspan/100, R.tail, fmt, x => R.tail = x);
+    R.ui.cmap = rowSelect(d, 'Colourmap', CMAP_NAMES.map((n, i) => [i, n]), R.cmap, v => {R.cmap = +v; R.legend();});
+    legend(d, R);
+  }
+  layersDiv.appendChild(d);});
+const textToggles = [];
+document.querySelectorAll('.tg').forEach(t => t.onclick = () => {const k = t.dataset.k; st[k] = !st[k]; t.classList.toggle('on', st[k]);
+  if (k === 'chart') updateChartVisibility();});
+function slider(id, key, f){const e = document.getElementById(id), v = document.getElementById(id + 'v'); v.textContent = f(P[key]); e.value = P[key];
+  e.oninput = () => {P[key] = parseFloat(e.value); v.textContent = f(P[key]); if (key === 'zs') zScale = P.zs;};}
+slider('zs', 'zs', x => x.toFixed(2)); slider('fog', 'fog', x => x.toFixed(2)); slider('sps', 'sps', x => x.toFixed(1));
+document.getElementById('hudToggle').onclick = () => document.getElementById('hud').classList.toggle('open');
+
+// timeline
+const tl = document.getElementById('tl'), tslider = document.getElementById('tslider'), tval = document.getElementById('tval');
+if (META.dynamic && TIMES.length > 1){tl.style.display = 'flex'; tslider.max = TIMES.length - 1;}
+function tLabel(){const t = curTime(); return (META.time_unit === 's' ? fmt(t) + ' s' : 'frame ' + t) + ' (' + (tIndex+1) + '/' + TIMES.length + ')';}
+function setT(i){tIndex = Math.max(0, Math.min(TIMES.length - 1, i|0)); tslider.value = tIndex; tval.textContent = tLabel(); drawChart();}
+tslider.oninput = () => setT(parseInt(tslider.value));
+document.getElementById('play').onclick = () => {playing = !playing; document.getElementById('play').textContent = playing ? '❚❚' : '▶'; lastTick = performance.now();};
+document.getElementById('tspeed').onchange = e => playSpeed = parseFloat(e.target.value);
+
+// ---------- chart ----------
+const chartBox = document.getElementById('chart'), chartcv = document.getElementById('chartcv');
+const SERIES = LAYERS.filter(R => R.L.kind === 'series');
+function updateChartVisibility(){chartBox.style.display = (st.chart && SERIES.some(R => R.on)) ? 'block' : 'none';}
+function drawChart(){if (!SERIES.length) return; updateChartVisibility(); if (chartBox.style.display === 'none') return;
+  const dpr = Math.min(devicePixelRatio || 1, 2); const W = chartcv.clientWidth || 356, H = 190; chartcv.width = W*dpr; chartcv.height = H*dpr;
+  const c = chartcv.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, W, H);
+  const act = SERIES.filter(R => R.on); if (!act.length) return;
+  let x0 = 1e30, x1 = -1e30, y0 = 1e30, y1 = -1e30;
+  for (const R of act) for (const cu of R.curves) for (let i = 0; i < cu.x.length; i++){x0 = Math.min(x0, cu.x[i]); x1 = Math.max(x1, cu.x[i]); y0 = Math.min(y0, cu.y[i]); y1 = Math.max(y1, cu.y[i]);}
+  if (!(x1 > x0)) x1 = x0 + 1; if (!(y1 > y0)) y1 = y0 + 1; const py = (y1 - y0) * 0.08; y0 -= py; y1 += py;
+  const m = {l: 44, r: 10, t: 8, b: 22}; const sx = x => m.l + (x - x0)/(x1 - x0)*(W - m.l - m.r), sy = y => H - m.b - (y - y0)/(y1 - y0)*(H - m.t - m.b);
+  const col = theme().label; c.strokeStyle = 'rgba(128,150,170,.35)'; c.lineWidth = 1; c.beginPath(); c.moveTo(m.l, m.t); c.lineTo(m.l, H - m.b); c.lineTo(W - m.r, H - m.b); c.stroke();
+  c.fillStyle = col; c.font = '10px ui-monospace,Menlo,Consolas,monospace'; c.textAlign = 'right'; c.textBaseline = 'middle';
+  c.fillText(fmt(y1 - py), m.l - 4, m.t + 4); c.fillText(fmt(y0 + py), m.l - 4, H - m.b - 4);
+  c.textAlign = 'center'; c.textBaseline = 'top'; c.fillText(fmt(x0), m.l, H - m.b + 4); c.fillText(fmt(x1), W - m.r, H - m.b + 4);
+  const L0 = act[0].L; c.fillText(L0.x_label || '', (m.l + W - m.r)/2, H - m.b + 4);
+  let k = 0, lastVal = '';
+  for (const R of act) for (const cu of R.curves){const hue = (k*67) % 360; k++;
+    c.strokeStyle = act.length === 1 && R.curves.length === 1 ? 'rgb(' + R.L.color.map(v => Math.round(v*255)).join(',') + ')' : 'hsl(' + hue + ',70%,60%)'; c.lineWidth = 1.6; c.beginPath();
+    for (let i = 0; i < cu.x.length; i++){const X = sx(cu.x[i]), Y = sy(cu.y[i]); if (i) c.lineTo(X, Y); else c.moveTo(X, Y);} c.stroke();
+    if (R.L.x_is_time){const t = curTime(); let j = -1; for (let i = 0; i < cu.x.length; i++) if (cu.x[i] <= t + 1e-9) j = i;
+      if (j >= 0){c.fillStyle = c.strokeStyle; c.beginPath(); c.arc(sx(cu.x[j]), sy(cu.y[j]), 3, 0, 7); c.fill(); lastVal = cu.label + ': ' + fmt(cu.y[j]);}}}
+  if (act.some(R => R.L.x_is_time)){const X = sx(curTime()); c.strokeStyle = 'rgba(49,208,198,.8)'; c.setLineDash([3, 3]); c.beginPath(); c.moveTo(X, m.t); c.lineTo(X, H - m.b); c.stroke(); c.setLineDash([]);}
+  document.getElementById('chartTitle').textContent = act.map(R => R.L.name + (R.L.y_label ? ' — ' + R.L.y_label : '')).join(' · ');
+  document.getElementById('chartVal').textContent = lastVal;}
+
+setT(0);
+
+// ---------- axes / grid ----------
+function niceTicks(a, b, n){const span = b - a; if (!(span > 0)) return [a]; const raw = span/n; const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw/p; const stp = (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10)*p; const out = []; for (let v = Math.ceil(a/stp)*stp; v <= b + 1e-9; v += stp) out.push(+v.toFixed(6)); return out;}
+const XT = niceTicks(LO[0], HI[0], 6), YT = niceTicks(LO[1], HI[1], 6), ZT = niceTicks(LO[2], HI[2], 4);
+let gridRanges = {};
+const gridBuf = gl && (function(){const v = []; const push = (a, b) => {v.push(a[0], a[1], a[2], b[0], b[1], b[2]);};
+  const X0 = LO[0], X1 = HI[0], Y0 = LO[1], Y1 = HI[1], Z0 = LO[2], Z1 = HI[2];
+  const panes = {
+    xy0: () => {for (const x of XT) push([x, Y0, Z0], [x, Y1, Z0]); for (const y of YT) push([X0, y, Z0], [X1, y, Z0]);},
+    xy1: () => {for (const x of XT) push([x, Y0, Z1], [x, Y1, Z1]); for (const y of YT) push([X0, y, Z1], [X1, y, Z1]);},
+    xz0: () => {for (const x of XT) push([x, Y0, Z0], [x, Y0, Z1]); for (const z of ZT) push([X0, Y0, z], [X1, Y0, z]);},
+    xz1: () => {for (const x of XT) push([x, Y1, Z0], [x, Y1, Z1]); for (const z of ZT) push([X0, Y1, z], [X1, Y1, z]);},
+    yz0: () => {for (const y of YT) push([X0, y, Z0], [X0, y, Z1]); for (const z of ZT) push([X0, Y0, z], [X0, Y1, z]);},
+    yz1: () => {for (const y of YT) push([X1, y, Z0], [X1, y, Z1]); for (const z of ZT) push([X1, Y0, z], [X1, Y1, z]);}};
+  for (const k in panes){const s = v.length/3; panes[k](); gridRanges[k] = [s, v.length/3 - s];}
+  const s = v.length/3; const c = [[X0,Y0,Z0],[X1,Y0,Z0],[X1,Y1,Z0],[X0,Y1,Z0],[X0,Y0,Z1],[X1,Y0,Z1],[X1,Y1,Z1],[X0,Y1,Z1]];
+  [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]].forEach(e => push(c[e[0]], c[e[1]]));
+  gridRanges.box = [s, v.length/3 - s]; return buf(new Float32Array(v));})();
+
+// ---------- camera ----------
+let dist = RAD*2.6, target = CENTER.slice();
+function nrm(v){const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l];}
+function qMul(a, b){return [a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3], a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2], a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1], a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]];}
+function qConj(a){return [a[0], -a[1], -a[2], -a[3]];}
+function qAA(ax, th){const s = Math.sin(th/2), l = Math.hypot(ax[0], ax[1], ax[2]) || 1; return [Math.cos(th/2), ax[0]/l*s, ax[1]/l*s, ax[2]/l*s];}
+function qNormz(a){const l = Math.hypot(a[0], a[1], a[2], a[3]) || 1; return a.map(v => v/l);}
+function qToM3(Q){const w = Q[0], x = Q[1], y = Q[2], z = Q[3]; return [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y), 2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x), 2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)];}
+function m3ToQ(m){const t = m[0]+m[4]+m[8]; let w, x, y, z;
+  if (t > 0){const s = Math.sqrt(t+1)*2; w = s/4; x = (m[7]-m[5])/s; y = (m[2]-m[6])/s; z = (m[3]-m[1])/s;}
+  else if (m[0] > m[4] && m[0] > m[8]){const s = Math.sqrt(1+m[0]-m[4]-m[8])*2; w = (m[7]-m[5])/s; x = s/4; y = (m[1]+m[3])/s; z = (m[2]+m[6])/s;}
+  else if (m[4] > m[8]){const s = Math.sqrt(1+m[4]-m[0]-m[8])*2; w = (m[2]-m[6])/s; x = (m[1]+m[3])/s; y = s/4; z = (m[5]+m[7])/s;}
+  else {const s = Math.sqrt(1+m[8]-m[0]-m[4])*2; w = (m[3]-m[1])/s; x = (m[2]+m[6])/s; y = (m[5]+m[7])/s; z = s/4;}
+  return qNormz([w, x, y, z]);}
+function qSlerp(a, b, t){let d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]; let bb = b; if (d < 0){d = -d; bb = b.map(v => -v);}
+  if (d > 0.9995) return qNormz(a.map((v, i) => v + (bb[i]-v)*t)); const th = Math.acos(Math.min(1, d)), s = Math.sin(th);
+  const f0 = Math.sin((1-t)*th)/s, f1 = Math.sin(t*th)/s; return qNormz(a.map((v, i) => v*f0 + bb[i]*f1));}
+function sub(a, b){return [a[0]-b[0], a[1]-b[1], a[2]-b[2]];}
+function cross(a, b){return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];}
+function dot(a, b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function qFromZUp(z, up){z = nrm(z); let x = cross(up, z); if (Math.hypot(x[0], x[1], x[2]) < 1e-4) x = cross([0, 0, 1], z); x = nrm(x); const y = cross(z, x);
+  return m3ToQ([x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]]);}
+const HOME = qFromZUp(nrm([1, -1, 0.9]), [0, 0, 1]);
+let q = HOME.slice(), snapA = null;
+function camR(){return qToM3(q);}
+function eye(){const R = camR(); return [target[0]+dist*R[6], target[1]+dist*R[7], target[2]+dist*R[8]];}
+function camUp(){const R = camR(); return [R[3], R[4], R[5]];}
+function orbit(ax, th){q = qNormz(qMul(q, qConj(qAA(ax, th))));}
+function snapTo(dir){dir = nrm(dir); const up = Math.abs(dir[2]) > 0.95 ? [0, 1, 0] : [0, 0, 1]; snapA = {a: q.slice(), b: qFromZUp(dir, up), t0: performance.now(), dur: 420};}
+function snapQ(qb){snapA = {a: q.slice(), b: qb.slice(), t0: performance.now(), dur: 420};}
+const m4 = {persp: (f, a, n, F) => {const t = 1/Math.tan(f/2); return [t/a, 0, 0, 0, 0, t, 0, 0, 0, 0, (F+n)/(n-F), -1, 0, 0, 2*F*n/(n-F), 0];},
+  mul: (A, B) => {const C = new Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++){let s = 0; for (let k = 0; k < 4; k++) s += A[k*4+j]*B[i*4+k]; C[i*4+j] = s;} return C;},
+  look: (e, c, u) => {const z = nrm(sub(e, c)), x = nrm(cross(u, z)), y = cross(z, x); return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, e), -dot(y, e), -dot(z, e), 1];}};
+document.querySelectorAll('#views .btn[data-view]').forEach(b => b.onclick = () => snapTo(b.dataset.view.split(',').map(Number)));
+document.getElementById('home').onclick = () => {dist = RAD*2.6; target = CENTER.slice(); snapQ(HOME);};
+document.getElementById('reset').onclick = () => {dist = RAD*2.6; target = CENTER.slice(); snapQ(HOME);};
+const ptrs = new Map(); let drag = false, pan = false, px = 0, py = 0, pinchD0 = 0, pinchDist0 = 0;
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('pointerdown', e => {try {cv.setPointerCapture(e.pointerId);} catch (_){} ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (ptrs.size === 1){drag = true; pan = e.button === 2 || e.button === 1 || e.shiftKey; px = e.clientX; py = e.clientY;}
+  else if (ptrs.size === 2){drag = false; const p = [...ptrs.values()]; pinchD0 = Math.hypot(p[0][0]-p[1][0], p[0][1]-p[1][1]); pinchDist0 = dist;}});
+function endPtr(e){ptrs.delete(e.pointerId); pinchD0 = 0; if (ptrs.size === 1){const p = [...ptrs.values()][0]; drag = true; px = p[0]; py = p[1];} else if (ptrs.size === 0) drag = false;}
+cv.addEventListener('pointerup', endPtr); cv.addEventListener('pointercancel', endPtr);
+cv.addEventListener('pointermove', e => {if (!ptrs.has(e.pointerId)) return; ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (ptrs.size === 2 && pinchD0 > 0){const p = [...ptrs.values()]; const d = Math.hypot(p[0][0]-p[1][0], p[0][1]-p[1][1]); dist = Math.max(RAD*0.3, Math.min(RAD*9, pinchDist0*pinchD0/Math.max(d, 20))); return;}
+  if (!drag) return; const dx = e.clientX - px, dy = e.clientY - py;
+  if (pan){const R = camR(); const k = dist*0.0016; target = [target[0] - (R[0]*dx - R[3]*dy)*k, target[1] - (R[1]*dx - R[4]*dy)*k, target[2] - (R[2]*dx - R[5]*dy)*k];}
+  else {orbit([0, 0, 1], dx*0.006); const R = camR(); orbit([R[0], R[1], R[2]], -dy*0.006);}
+  px = e.clientX; py = e.clientY;});
+cv.addEventListener('wheel', e => {e.preventDefault(); dist *= (1 + Math.sign(e.deltaY)*0.08); dist = Math.max(RAD*0.3, Math.min(RAD*9, dist));}, {passive: false});
+
+// ---------- axis labels ----------
+const axlab = document.getElementById('axlab'); const tickLabels = []; let MVPcur = null, DPR = 1;
+function labPool(n){while (tickLabels.length < n){const e = document.createElement('div'); e.className = 'axl'; axlab.appendChild(e); tickLabels.push({el: e, vis: false});}}
+function worldZ(z){return CENTER[2] + (z - CENTER[2])*zScale;}
+function project(w){const m = MVPcur; const x = w[0], y = w[1], z = worldZ(w[2]);
+  const cx = m[0]*x+m[4]*y+m[8]*z+m[12], cy = m[1]*x+m[5]*y+m[9]*z+m[13], cw = m[3]*x+m[7]*y+m[11]*z+m[15];
+  if (cw <= 0) return null; return [(cx/cw*0.5+0.5)*innerWidth, (1-(cy/cw*0.5+0.5))*innerHeight];}
+function updateAxisLabels(){if (!st.axes || !MVPcur){for (const L of tickLabels){L.vis = false; L.el.style.display = 'none';} return;}
+  const R = camR(); const xFar = R[6] > 0 ? LO[0] : HI[0], yFar = R[7] > 0 ? LO[1] : HI[1], zFar = R[8] > 0 ? LO[2] : HI[2];
+  const off = Math.max(SPAN[0], SPAN[1])*0.04; const yOff = yFar === LO[1] ? -off : off, xOff = xFar === LO[0] ? -off : off;
+  const items = [];
+  XT.forEach(x => items.push({t: fmt(x), w: [x, yFar + yOff, zFar]})); items.push({t: 'x (µm)', w: [(LO[0]+HI[0])/2, yFar + yOff*2.4, zFar]});
+  YT.forEach(y => items.push({t: fmt(HI[1] + LO[1] - y), w: [xFar + xOff, y, zFar]})); items.push({t: 'y (µm)', w: [xFar + xOff*2.6, (LO[1]+HI[1])/2, zFar]});
+  ZT.forEach(z => items.push({t: fmt(z), w: [xFar + xOff, yFar + yOff, z]})); items.push({t: 'z (µm' + (zScale !== 1 ? ' ×' + zScale.toFixed(1) : '') + ')', w: [xFar + xOff*2.6, yFar + yOff*2.2, (LO[2]+HI[2])/2]});
+  labPool(items.length); const col = theme().label;
+  tickLabels.forEach((L, i) => {if (i >= items.length){L.vis = false; L.el.style.display = 'none'; return;} const p = project(items[i].w);
+    if (!p){L.vis = false; L.el.style.display = 'none'; return;} L.vis = true; L.text = items[i].t; L.x = p[0]; L.y = p[1];
+    L.el.style.display = 'block'; L.el.style.left = p[0] + 'px'; L.el.style.top = p[1] + 'px'; L.el.style.color = col; L.el.textContent = items[i].t;});}
+
+// ---------- render ----------
+function resize(){DPR = Math.min(devicePixelRatio || 1, innerWidth < 820 ? 1.5 : 2); cv.width = innerWidth*DPR; cv.height = innerHeight*DPR;}
+addEventListener('resize', resize); if (gl) resize();
+function common(p, MVP, MV, fN, fF){gl.uniformMatrix4fv(U(p, 'uMVP'), false, MVP); gl.uniformMatrix4fv(U(p, 'uMV'), false, MV);
+  gl.uniform3f(U(p, 'uCenter'), CENTER[0], CENTER[1], CENTER[2]); gl.uniform1f(U(p, 'uZS'), zScale);
+  gl.uniform1f(U(p, 'uFogN'), fN); gl.uniform1f(U(p, 'uFogF'), fF); gl.uniform1f(U(p, 'uFogAmt'), P.fog);
+  const fc = theme().fog; gl.uniform3f(U(p, 'uFogC'), fc[0], fc[1], fc[2]);}
+function blendAdd(){if (st.white) gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); else gl.blendFunc(gl.ONE, gl.ONE);}
+function blendOver(){gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);}
+function sliceQuads(R){const s = R.slice; let k = 0; const put = (a, b, c, d) => {for (const p of [a, b, c, a, c, d]){sliceArr[k++] = p[0]; sliceArr[k++] = p[1]; sliceArr[k++] = p[2];}};
+  put([s[0], 0, 0], [s[0], 1, 0], [s[0], 1, 1], [s[0], 0, 1]); put([0, s[1], 0], [1, s[1], 0], [1, s[1], 1], [0, s[1], 1]); put([0, 0, s[2]], [1, 0, s[2]], [1, 1, s[2]], [0, 1, s[2]]);
+  gl.bindBuffer(gl.ARRAY_BUFFER, SLICEQ); gl.bufferData(gl.ARRAY_BUFFER, sliceArr, gl.DYNAMIC_DRAW);}
+function uploadVolume(R, fi){if (R.texFrame === fi) return; const L = R.L; gl.bindTexture(gl.TEXTURE_3D, R.tex);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, L.dims[2], L.dims[1], L.dims[0], 0, gl.RED, gl.UNSIGNED_BYTE, R.frames[fi].data); R.texFrame = fi;}
+let running = true, frames = 0;
+function frame(now){if (!gl || !running) return;
+  if (snapA){const t = Math.min(1, (performance.now()-snapA.t0)/snapA.dur); const e2 = t*t*(3-2*t); q = qSlerp(snapA.a, snapA.b, e2); if (t >= 1) snapA = null;}
+  if (st.spin) orbit([0, 0, 1], 0.0022*P.sps);
+  if (playing && TIMES.length > 1){const dtms = now - lastTick; if (dtms > 700/playSpeed){lastTick = now; setT((tIndex + 1) % TIMES.length);}}
+  const t = curTime();
+  const aspect = cv.width/cv.height; gl.viewport(0, 0, cv.width, cv.height);
+  const Pm = m4.persp(0.9, aspect, RAD*0.05, dist + RAD*6), Vv = m4.look(eye(), target, camUp()), MVP = m4.mul(Pm, Vv); MVPcur = MVP;
+  const fN = dist - RAD*1.4, fF = dist + RAD*1.7, E = eye();
+  const th = theme();
+  gl.depthMask(true); gl.clear(gl.DEPTH_BUFFER_BIT); gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  gl.useProgram(pBg); const c0 = th.bg0, c1 = th.bg1; gl.uniform3f(U(pBg, 'uC0'), c0[0], c0[1], c0[2]); gl.uniform3f(U(pBg, 'uC1'), c1[0], c1[1], c1[2]); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // opaque-ish geometry first: spheres, iso meshes
+  gl.enable(gl.DEPTH_TEST);
+  for (const R of LAYERS){if (!R.on) continue; const L = R.L;
+    if (L.kind === 'objects' && R.frames.length){const f = R.frames[frameAt(R.frames, t)]; if (!f.n) continue;
+      gl.useProgram(pSph); A(0, sphP, 3, 0); A(1, sphN, 3, 0); A(2, f.c, 3, 1); A(3, f.r, 1, 1); A(4, f.v, 1, 1); common(pSph, MVP, Vv, fN, fF);
+      gl.uniform1f(U(pSph, 'uSize'), R.size); gl.uniform1f(U(pSph, 'uLo'), R.lo); gl.uniform1f(U(pSph, 'uHi'), R.hi); gl.uniform1f(U(pSph, 'uMode'), R.mode);
+      gl.uniform1f(U(pSph, 'uZ0'), LO[2]); gl.uniform1f(U(pSph, 'uZ1'), HI[2]); gl.uniform1f(U(pSph, 'uCmap'), R.cmap); gl.uniform3f(U(pSph, 'uColor'), L.color[0], L.color[1], L.color[2]);
+      if (R.alpha >= 0.999){gl.depthMask(true); gl.disable(gl.BLEND); gl.uniform1f(U(pSph, 'uAlpha'), 1);} else {gl.depthMask(false); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.uniform1f(U(pSph, 'uAlpha'), R.alpha);}
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, SPH_N, f.n); for (let l = 2; l <= 4; l++) gl.vertexAttribDivisor(l, 0);}
+    if (L.kind === 'volume' && L.render === 'iso' && R.frames.length){const f = R.frames[frameAt(R.frames, t)]; if (!f.n) continue;
+      gl.useProgram(pIso); A(0, f.pos, 3, 0); A(1, f.nrm, 3, 0); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, f.idx); common(pIso, MVP, Vv, fN, fF);
+      gl.uniform3f(U(pIso, 'uOrigin'), L.origin[0], L.origin[1], L.origin[2]); gl.uniform3f(U(pIso, 'uColor'), L.color[0], L.color[1], L.color[2]);
+      gl.depthMask(R.alpha >= 0.999); gl.enable(gl.BLEND); blendOver(); gl.uniform1f(U(pIso, 'uAlpha'), R.alpha); gl.drawElements(gl.TRIANGLES, f.n, gl.UNSIGNED_INT, 0);}}
+  // grid
+  if (st.axes){gl.useProgram(pGrid); gl.enable(gl.DEPTH_TEST); gl.depthMask(false); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    A(0, gridBuf, 3, 0); gl.uniformMatrix4fv(U(pGrid, 'uMVP'), false, MVP); gl.uniform3f(U(pGrid, 'uCenter'), CENTER[0], CENTER[1], CENTER[2]); gl.uniform1f(U(pGrid, 'uZS'), zScale);
+    const g = th.grid; gl.uniform4f(U(pGrid, 'uColor'), g[0], g[1], g[2], th.gridA); const R = camR();
+    for (const p of [R[8] > 0 ? 'xy0' : 'xy1', R[7] > 0 ? 'xz0' : 'xz1', R[6] > 0 ? 'yz0' : 'yz1']){const r = gridRanges[p]; gl.drawArrays(gl.LINES, r[0], r[1]);}
+    gl.uniform4f(U(pGrid, 'uColor'), g[0], g[1], g[2], Math.min(1, th.gridA + 0.25)); const rb = gridRanges.box; gl.drawArrays(gl.LINES, rb[0], rb[1]);}
+  // translucent: slices, ribbons, glyphs, then volumes
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(false); gl.enable(gl.BLEND);
+  for (const R of LAYERS){if (!R.on) continue; const L = R.L;
+    if (L.kind === 'volume' && L.render !== 'iso' && R.render === 'slices' && R.frames.length){uploadVolume(R, frameAt(R.frames, t)); sliceQuads(R);
+      gl.useProgram(pSlice); A(0, SLICEQ, 3, 0); gl.uniformMatrix4fv(U(pSlice, 'uMVP'), false, MVP); gl.uniform3f(U(pSlice, 'uCenter'), CENTER[0], CENTER[1], CENTER[2]); gl.uniform1f(U(pSlice, 'uZS'), zScale);
+      gl.uniform3f(U(pSlice, 'uOrigin'), L.origin[0], L.origin[1], L.origin[2]); gl.uniform3f(U(pSlice, 'uSize'), R.size[0], R.size[1], R.size[2]);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, R.tex); gl.uniform1i(U(pSlice, 'uTex'), 0);
+      gl.uniform1f(U(pSlice, 'uLo'), R.lo); gl.uniform1f(U(pSlice, 'uHi'), R.hi); gl.uniform1f(U(pSlice, 'uCmap'), R.cmap); gl.uniform1f(U(pSlice, 'uAlpha'), R.alpha);
+      blendOver(); gl.disable(gl.CULL_FACE); gl.drawArrays(gl.TRIANGLES, 0, 18);}
+    if (L.kind === 'tracks' && R.rib){gl.useProgram(pRib); const rb = R.rib; A(0, rb.pos, 3, 0); A(1, rb.dir, 3, 0); A(2, rb.val, 1, 0); A(3, rb.side, 1, 0); A(4, rb.t, 1, 0); common(pRib, MVP, Vv, fN, fF);
+      gl.uniform1f(U(pRib, 'uVpH'), cv.height); gl.uniform1f(U(pRib, 'uAspect'), aspect); gl.uniform1f(U(pRib, 'uWidth'), R.width*DPR); gl.uniform1f(U(pRib, 'uLo'), R.lo); gl.uniform1f(U(pRib, 'uHi'), R.hi);
+      gl.uniform1f(U(pRib, 'uTime'), t); gl.uniform1f(U(pRib, 'uTail'), R.tail); gl.uniform1f(U(pRib, 'uTimeMode'), META.dynamic ? 1 : 0); gl.uniform1f(U(pRib, 'uMode'), R.mode === 0 ? 0 : 1);
+      gl.uniform1f(U(pRib, 'uCmap'), R.cmap); gl.uniform3f(U(pRib, 'uColor'), L.color[0], L.color[1], L.color[2]); gl.uniform1f(U(pRib, 'uAlpha'), R.alpha); blendOver();
+      for (let i = 0; i < rb.n; i++) gl.drawArrays(gl.TRIANGLE_STRIP, rb.ranges[i*2], rb.ranges[i*2+1]);}
+    if (L.kind === 'vectors'){if (R.rib && R.lineAlpha > 0.001){gl.useProgram(pRib); const rb = R.rib; A(0, rb.pos, 3, 0); A(1, rb.dir, 3, 0); A(2, rb.val, 1, 0); A(3, rb.side, 1, 0); A(4, rb.t, 1, 0); common(pRib, MVP, Vv, fN, fF);
+        gl.uniform1f(U(pRib, 'uVpH'), cv.height); gl.uniform1f(U(pRib, 'uAspect'), aspect); gl.uniform1f(U(pRib, 'uWidth'), R.width*DPR*1.2); gl.uniform1f(U(pRib, 'uLo'), R.lo); gl.uniform1f(U(pRib, 'uHi'), R.hi);
+        gl.uniform1f(U(pRib, 'uTimeMode'), 0); gl.uniform1f(U(pRib, 'uMode'), R.mode === 3 ? 0 : 1); gl.uniform1f(U(pRib, 'uCmap'), R.cmap); gl.uniform3f(U(pRib, 'uColor'), L.color[0], L.color[1], L.color[2]);
+        gl.uniform1f(U(pRib, 'uAlpha'), R.lineAlpha*R.alpha); blendAdd(); for (let i = 0; i < rb.n; i++) gl.drawArrays(gl.TRIANGLE_STRIP, rb.ranges[i*2], rb.ranges[i*2+1]);}
+      if (R.frames.length){const f = R.frames[frameAt(R.frames, t)]; if (f.n){gl.useProgram(pGlyph); A(0, GLYPH_END, 1, 0); A(1, GLYPH_SIDE, 1, 0); A(2, f.p, 3, 1); A(3, f.v, 3, 1); A(4, f.m, 1, 1); common(pGlyph, MVP, Vv, fN, fF);
+        gl.uniform1f(U(pGlyph, 'uVpH'), cv.height); gl.uniform1f(U(pGlyph, 'uAspect'), aspect); gl.uniform1f(U(pGlyph, 'uWidth'), R.width*DPR); gl.uniform1f(U(pGlyph, 'uScale'), L.scale*R.scale);
+        gl.uniform1f(U(pGlyph, 'uLo'), R.lo); gl.uniform1f(U(pGlyph, 'uHi'), R.hi); gl.uniform1f(U(pGlyph, 'uMode'), R.mode); gl.uniform1f(U(pGlyph, 'uCmap'), R.cmap); gl.uniform3f(U(pGlyph, 'uColor'), L.color[0], L.color[1], L.color[2]);
+        gl.uniform1f(U(pGlyph, 'uAlpha'), R.alpha); blendOver(); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, f.n); for (let l = 2; l <= 4; l++) gl.vertexAttribDivisor(l, 0);}}}}
+  for (const R of LAYERS){if (!R.on) continue; const L = R.L;
+    if (L.kind === 'volume' && L.render !== 'iso' && R.render !== 'slices' && R.frames.length){uploadVolume(R, frameAt(R.frames, t));
+      gl.useProgram(pVol); A(0, CUBE, 3, 0); gl.uniformMatrix4fv(U(pVol, 'uMVP'), false, MVP); gl.uniform3f(U(pVol, 'uCenter'), CENTER[0], CENTER[1], CENTER[2]); gl.uniform1f(U(pVol, 'uZS'), zScale);
+      gl.uniform3f(U(pVol, 'uOrigin'), L.origin[0], L.origin[1], L.origin[2]); gl.uniform3f(U(pVol, 'uSize'), R.size[0], R.size[1], R.size[2]); gl.uniform3f(U(pVol, 'uEye'), E[0], E[1], E[2]);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, R.tex); gl.uniform1i(U(pVol, 'uTex'), 0);
+      gl.uniform1f(U(pVol, 'uLo'), R.lo); gl.uniform1f(U(pVol, 'uHi'), R.hi); gl.uniform1f(U(pVol, 'uMode'), R.render === 'cloud' ? 1 : 0); gl.uniform1f(U(pVol, 'uSteps'), R.steps);
+      gl.uniform1f(U(pVol, 'uAlpha'), R.alpha); gl.uniform1f(U(pVol, 'uDensity'), R.density); gl.uniform1f(U(pVol, 'uCmap'), R.cmap); gl.uniform3f(U(pVol, 'uColor'), L.color[0], L.color[1], L.color[2]);
+      gl.disable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.cullFace(gl.FRONT); if (R.render === 'cloud') blendOver(); else blendAdd();
+      gl.drawArrays(gl.TRIANGLES, 0, 36); gl.disable(gl.CULL_FACE); gl.enable(gl.DEPTH_TEST);}}
+  updateAxisLabels(); frames++;
+  if (running) requestAnimationFrame(frame);}
+if (gl) requestAnimationFrame(frame);
+document.getElementById('stats').innerHTML = '<b>' + META.n_layers + '</b> layers · ' + META.layers.map(l => l.kind).join(', ') + (META.dynamic ? ' · <b>' + TIMES.length + '</b> timepoints' : ' · static');
+drawChart();
+
+// ---------- snapshot + config API ----------
+function bakeSnapshot(){const w = cv.width, h = cv.height; const oc = document.createElement('canvas'); oc.width = w; oc.height = h;
+  const ctx = oc.getContext('2d'); ctx.drawImage(cv, 0, 0); const col = theme().label;
+  if (st.axes){ctx.font = (11.5*DPR) + 'px ui-monospace,Menlo,Consolas,monospace'; ctx.fillStyle = col; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (const L of tickLabels) if (L.vis) ctx.fillText(L.text, L.x*DPR, L.y*DPR);}
+  return oc;}
+document.getElementById('snap').onclick = () => {const a = document.createElement('a'); a.download = __SNAPNAME__; a.href = bakeSnapshot().toDataURL('image/png'); a.click();};
+window.__snapshotBlob = () => new Promise((res, rej) => bakeSnapshot().toBlob(b => b ? res(b) : rej(new Error('snapshot failed')), 'image/png'));
+window.__getConfig = () => ({v: 1, st: {...st}, P: {...P}, t: tIndex, layers: LAYERS.map(R => ({on: R.on, alpha: R.alpha, render: R.render, cmap: R.cmap, lo: R.lo, hi: R.hi, scale: R.scale, width: R.width, size: R.size, mode: R.mode, tail: R.tail, slice: R.slice, density: R.density, lineAlpha: R.lineAlpha})),
+  camera: {q: q.slice(), dist: dist, target: target.slice()}});
+window.__applyConfig = cfg => {if (!cfg) return;
+  if (cfg.st) for (const k in st) if (k in cfg.st) st[k] = !!cfg.st[k];
+  if (cfg.P) for (const k in P) if (k in cfg.P) P[k] = +cfg.P[k]; zScale = P.zs;
+  if (cfg.layers) cfg.layers.forEach((c, i) => {const R = LAYERS[i]; if (!R || !c) return; for (const k of ['on','alpha','render','cmap','lo','hi','scale','width','size','mode','tail','slice','density','lineAlpha']) if (k in c && c[k] != null) R[k] = c[k];
+    if (R.ui.cb) R.ui.cb.checked = R.on; if (R.legend) R.legend();});
+  if (cfg.t != null) setT(+cfg.t);
+  document.querySelectorAll('.tg').forEach(t => {const k = t.dataset.k; if (k != null) t.classList.toggle('on', !!st[k]);});
+  const c = cfg.camera; if (c){if (c.q && c.q.length === 4) q = qNormz(c.q.map(Number)); if (+c.dist > 0) dist = +c.dist; if (c.target && c.target.length === 3) target = c.target.map(Number); snapA = null;}};
+window.__setRunning = on => {const was = running; running = !!on; if (gl && !was && running) requestAnimationFrame(frame);};
+window.__setTime = i => setT(i);
+document.addEventListener('visibilitychange', () => window.__setRunning(!document.hidden));
+function readHashConfig(){const m = location.hash.match(/[#&]cfg=([^&]+)/); if (!m) return null; try {return JSON.parse(atob(decodeURIComponent(m[1])));} catch (_){return null;}}
+{const hc = readHashConfig(); if (hc) window.__applyConfig(hc);}
+addEventListener('hashchange', () => {const hc = readHashConfig(); if (hc) window.__applyConfig(hc);});
+</script>

@@ -98,6 +98,10 @@ CATEGORY = {
     # the drawing) and from every processing colour, because reading a graph means seeing at
     # a glance where the fan-out is.
     "flow": c("#6fbf73"),
+    # scene (V4.10): the layer taps of the 3-D scene viewer. Like `view` they touch no
+    # data — a spec rides the wire to the exporter — so a hue of their own, a sea green
+    # apart from view's amber, keeps a scene chain readable as presentation, not analysis.
+    "scene": c("#4fa38e"),
 }
 
 
