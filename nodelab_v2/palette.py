@@ -551,6 +551,16 @@ class PalettePanel(QWidget):
             row.setToolTip(2, "OUT: " + ", ".join(w for _, w in outs))
             row.setToolTip(1, f"{spec.op_key}\n{_squash(spec.description)}")
             rrow.addChild(row)
+        # node BUNDLES of this role (2026-10-08): one row that places several pre-wired
+        # cards — listed after the nodes, with a ⧉ so it reads as "several" at a glance
+        from nodegraph.bundles import BUNDLES
+        for b in sorted((b for b in BUNDLES.values() if b.role == rk), key=lambda b: b.label):
+            row = QTreeWidgetItem(["", f"⧉ {b.label}", ""])
+            row.setData(0, _OP, b.key)
+            row.setData(0, _KIND, "bundle")
+            row.setToolTip(1, f"{b.key} — places {len(b.nodes)} wired nodes in a region\n"
+                              f"{_squash(b.description)}")
+            rrow.addChild(row)
         rrow.setExpanded(True)
 
     # ── selection → overview ──────────────────────────────────────────────────
@@ -561,6 +571,8 @@ class PalettePanel(QWidget):
         kind = item.data(0, _KIND)
         if kind == "node":
             self._show_node(item.data(0, _OP))
+        elif kind == "bundle":
+            self._show_bundle(item.data(0, _OP))
         elif kind == "role":
             self._show_role(item.data(0, _KEY))
         elif kind == "stage":
@@ -663,6 +675,33 @@ class PalettePanel(QWidget):
             f"<div class='k'>{html.escape(str(smeta.get('label', '')))}</div>"
             f"<div>{html.escape(_squash(meta.get('description')))}</div>"
             f"<div class='sec'>Nodes</div><ul>{ops}</ul>")
+
+    def _show_bundle(self, key: str) -> None:
+        """A bundle's overview: what it places, in order, and what each member is for —
+        the member nodes' own one-line descriptions, so the two cannot drift."""
+        from nodegraph.bundles import BUNDLES
+        from nodegraph.registry import NODES
+        b = BUNDLES.get(key)
+        if b is None:
+            self._show_legend()
+            return
+        self._current_op = None
+        self._demo_btn.setEnabled(False)
+        items = []
+        for n in b.nodes:
+            spec = NODES.get(n.op_key)
+            label = spec.label if spec is not None else n.op_key
+            desc = _squash(spec.description) if spec is not None else ""
+            items.append(f"<li><b>{html.escape(label)}</b> <span class='k'>"
+                         f"{html.escape(n.op_key)}</span><br>{html.escape(desc)}</li>")
+        self._overview.setHtml(
+            self._css() + f"<h3>⧉ {html.escape(b.label)}</h3>"
+            f"<div class='k'>{html.escape(b.key)} · places {len(b.nodes)} wired nodes in a "
+            f"region</div><div>{html.escape(_squash(b.description))}</div>"
+            f"<div class='sec'>Nodes, in order</div><ol>{''.join(items)}</ol>"
+            "<div>Double-click or drag it onto the canvas; drop it on a wire to splice the "
+            "whole chain into that wire. Afterwards they are ordinary nodes — pull any one "
+            "of them.</div>")
 
     def _show_node(self, op: str) -> None:
         """The node's overview — built by :func:`nodelab_v2.demo_window.overview_html`, the

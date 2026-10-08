@@ -3294,7 +3294,12 @@ class MainWindow(QMainWindow):
 
     @_needs_topology
     def _add_at_center(self, op_key: str) -> None:
+        from nodegraph.bundles import is_bundle_key
         c = self.view.mapToScene(self.view.viewport().rect().center())
+        if is_bundle_key(op_key):
+            # a bundle (2026-10-08) lays its members out to the right of the drop point
+            self.doc.place_bundle(op_key, x=c.x() - 100, y=c.y() - 40)
+            return
         self.doc.add_node(op_key, x=c.x() - 100, y=c.y() - 40)
 
     @_needs_shape
@@ -3687,6 +3692,12 @@ class MainWindow(QMainWindow):
         # splice-on-wire: if the node is dropped on a link, insert it into that wire
         e = self.scene.edge_at(pos)
         edge_tuple = e.model_edge if e is not None else None
+        from nodegraph.bundles import is_bundle_key
+        if is_bundle_key(op_key):
+            # a bundle (2026-10-08): its members are placed and wired, and the whole chain
+            # is spliced into the wire it was dropped on
+            self.doc.place_bundle(op_key, x=pos.x() - 20, y=pos.y() - 20, splice=edge_tuple)
+            return
         rec = self.doc.add_node(op_key, x=pos.x() - 20, y=pos.y() - 20)
         if edge_tuple is not None:
             self.scene.splice_onto(rec.id, edge_tuple)

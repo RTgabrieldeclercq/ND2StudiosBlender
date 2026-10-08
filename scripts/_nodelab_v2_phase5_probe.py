@@ -1074,7 +1074,9 @@ def main(argv) -> int:
                 if kind == "role":
                     out.append(role)
                 for k in range(role.childCount()):
-                    if kind == "node":
+                    # a role's children are node rows AND, since 2026-10-08, bundle rows
+                    # (one row that places several nodes) — told apart by their kind data
+                    if role.child(k).data(0, _Qt.UserRole + 1) == kind:
                         out.append(role.child(k))
         return out
 
@@ -1095,6 +1097,31 @@ def main(argv) -> int:
         (len(_rows("role")), len(roles_with_visible))   # graph-structure ops are hidden
     nodes = _rows("node")
     assert len(nodes) == len(visible_specs()), (len(nodes), len(visible_specs()))
+    # a node BUNDLE (2026-10-08) is one palette row under its role that places several
+    # wired nodes in a frame: the DVC stages. Double-click = place at the view centre.
+    from nodegraph.bundles import BUNDLES as _BUNDLES
+    bundle_rows = _rows("bundle")
+    assert {r.data(0, _Qt.UserRole) for r in bundle_rows} == set(_BUNDLES), \
+        ([r.data(0, _Qt.UserRole) for r in bundle_rows], sorted(_BUNDLES))
+    dvc_row = next(r for r in bundle_rows if r.data(0, _Qt.UserRole) == "bundle:dvc")
+    assert dvc_row.text(1).endswith(_BUNDLES["bundle:dvc"].label), dvc_row.text(1)
+    tree.setCurrentItem(dvc_row)
+    assert "places 5 wired nodes" in win.palette.overview_html(), "bundle overview"
+    n_before, f_before = len(win.doc.nodes), len(win.doc.frames)
+    win.palette._add_current(dvc_row)
+    app.processEvents()
+    assert len(win.doc.nodes) == n_before + 5 and len(win.doc.frames) == f_before + 1, \
+        (len(win.doc.nodes) - n_before, len(win.doc.frames) - f_before)
+    placed = [nid for nid, rec in win.doc.nodes.items() if rec.op_key.startswith("dvc.")]
+    assert len(placed) == 5, placed
+    fr = next(f for f in win.doc.frames.values() if set(f.members) == set(placed))
+    assert fr.title == "DVC (pyALDVC)", fr.title
+    for nid in placed:
+        win.doc.remove_node(nid)
+    app.processEvents()
+    assert len(win.doc.nodes) == n_before and len(win.doc.frames) == f_before, "bundle undo"
+    _ok("G2: the bundle:dvc palette row places 5 wired DVC stage nodes in a 'DVC (pyALDVC)' "
+        "frame; its overview names them; removing them empties the frame")
     gauss = next(r for r in nodes if r.data(0, _Qt.UserRole) == "enhance.gaussian")
     label = next(r for r in nodes if r.data(0, _Qt.UserRole) == "analysis.label")
     for r in (gauss, label):
@@ -1140,7 +1167,8 @@ def main(argv) -> int:
         out, stack = [], [item]
         while stack:
             it = stack.pop()
-            if it.data(0, _Qt.UserRole):
+            # ops only: a bundle row (2026-10-08) carries a `bundle:` key, not an op
+            if it.data(0, _Qt.UserRole) and it.data(0, _Qt.UserRole + 1) == "node":
                 out.append(it.data(0, _Qt.UserRole))
             stack.extend(it.child(j) for j in range(it.childCount()))
         return out
@@ -6197,7 +6225,8 @@ def main(argv) -> int:
         while stack:
             it = stack.pop()
             op = it.data(0, _PQt.UserRole)
-            if op:
+            # ops only: a bundle row (2026-10-08) carries a `bundle:` key under its role
+            if op and it.data(0, _PQt.UserRole + 1) == "node":
                 out.add(op)
             stack.extend(it.child(i) for i in range(it.childCount()))
         return out

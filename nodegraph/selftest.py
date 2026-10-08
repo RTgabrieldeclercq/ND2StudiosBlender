@@ -30569,6 +30569,194 @@ def test_canvas_pill_and_reorganize() -> None:
         "the context; merge_frames / remove_from_frames work and a linked page refuses them")
 
 
+def test_dvc_stages() -> None:
+    """The staged DVC (2026-10-08): pyALDVC's sections as five nodes — ``dvc.grid`` →
+    ``dvc.initial_guess`` → ``dvc.local_match`` → ``dvc.global_step`` → ``dvc.strain`` — and
+    the ``bundle:dvc`` node bundle that places them.
+
+    1. Through the Engine on the ``test_catalog_dvc`` fixture (28×44×44, a known 3-D shift)
+       the chain recovers the shift in µm; every stage adds its columns on the SAME rows of
+       the grid layer (ids untouched, row count constant); the grid carries the ``dvc_*``
+       provenance and every later stage inherits it (no re-asked grid/reference control);
+       the final field equals ``analysis.dvc_field``'s to 1e-6 on displacement, strain and
+       qfactor — the same solver, section for section.
+    2. The memo: each stage's recipe hash fences on the calibration it reads; a strain
+       measure change re-keys only the strain stage.
+    3. A stage fed a table without the grid provenance refuses by name; a stage before its
+       predecessor (local match without a seed) refuses by name.
+    4. The bundle: registered, structurally sound against the live registry; placed on a
+       Qt-free ``GraphDocument`` it yields five nodes in bundle order, four wires, one frame
+       holding exactly those nodes; dropped onto a wire it splices the whole chain in
+       (the original wire gone, both new wires present); the document round-trips through
+       ``to_dict``/``load_dict`` as plain nodes (no bundle record).
+    Needs scipy/skimage + al-dvc for parts 1-3 (dep-gated like the single node)."""
+    import json as _json
+    from nodegraph.bundles import BUNDLES, validate_bundle
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+
+    # ── 4. the bundle, Qt-free ────────────────────────────────────────────────────
+    b = BUNDLES.get("bundle:dvc")
+    assert b is not None, "bundle:dvc is not registered"
+    assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
+    assert b.op_keys == ("dvc.grid", "dvc.initial_guess", "dvc.local_match",
+                         "dvc.global_step", "dvc.strain"), b.op_keys
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="src", x=0, y=0)
+    doc.add_node("transform.rasterize_field", node_id="ras", x=900, y=0)
+    doc.connect("src", "image", "ras", "data")
+    ids, fid = doc.place_bundle("bundle:dvc", x=100, y=0, splice=("src", "image", "ras", "data"))
+    assert len(ids) == 5 and [doc.nodes[i].op_key for i in ids] == list(b.op_keys), ids
+    assert fid in doc.frames and set(doc.frames[fid].members) == set(ids), doc.frames
+    edges = {(e.src, e.src_socket, e.dst, e.dst_socket) for e in doc.to_graph(for_run=False).edges}
+    assert ("src", "image", "ras", "data") not in edges, "the spliced wire survived"
+    assert ("src", "image", ids[0], "data") in edges, edges
+    assert (ids[-1], "out", "ras", "data") in edges, edges
+    for a, c in zip(ids, ids[1:]):
+        assert (a, "out", c, "data") in edges, (a, c, edges)
+    d = doc.to_dict()
+    assert "bundle:" not in _json.dumps(d), "a bundle record leaked into the saved file"
+    doc2 = GraphDocument()
+    doc2.load_dict(d)
+    assert set(doc2.nodes) == set(doc.nodes) and len(doc2.frames) == 1, (doc2.nodes, doc2.frames)
+
+    if not _HAVE_SKIMAGE:
+        _ok("dvc stages: bundle placed/spliced/round-tripped; solver parts SKIPPED (scipy absent)")
+        return
+    from nodegraph.kernels.aldvc_field import al_dvc_available
+    if not al_dvc_available():
+        _ok("dvc stages: bundle placed/spliced/round-tripped; solver parts SKIPPED (al-dvc absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+
+    define_node("io.dvcstageseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(3)
+    vol = gaussian_filter(rng.random((28, 44, 44)).astype(float), 1.2)
+    SHIFT = (1.0, 1.0, 1.5)
+    img = np.zeros((1, 2, 28, 1, 44, 44))
+    img[0, 0, :, 0] = vol
+    img[0, 1, :, 0] = ndshift(vol, SHIFT, order=3, mode="nearest")
+    px, zs = 0.2, 0.5
+    meta = {"pixel_size_um": px, "z_step_um": zs}
+    ax = AxisSizes(m=1, t=2, z=28, c=1, y=44, x=44)
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    P = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10, "subset_spacing_z": 4}
+
+    def chain(strain_modes=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.dvcstageseed"))
+        g.add(NodeInstance("G", "dvc.grid", params=dict(P)))
+        g.add(NodeInstance("I", "dvc.initial_guess", params={"search_radius": 3},
+                           modes={"init_guess": "ncc"}))
+        g.add(NodeInstance("L", "dvc.local_match", params={"n_threads": 2}))
+        g.add(NodeInstance("A", "dvc.global_step", params={"admm_iterations": 2}))
+        g.add(NodeInstance("E", "dvc.strain", modes=strain_modes or {}))
+        for a, c in (("S", "G"), ("G", "I"), ("I", "L"), ("L", "A"), ("A", "E")):
+            g.connect(a, c)
+        return Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def tab(out):
+        return {name: np.asarray(a.values) for (dom, lyr, name), a in out.attributes.items()
+                if dom is D.POINT and lyr == "dvc"}
+
+    e = chain()
+    g_ = tab(e.pull("G"))
+    assert set(g_) == {"id", "m", "t", "c", "z", "y", "x"}, sorted(g_)
+    n_rows, ids0 = len(g_["id"]), g_["id"].copy()
+    assert n_rows == 2 * 27, n_rows                      # 3×3×3 nodes × 2 frames
+    md_g = e.pull("G").metadata
+    for k in ("dvc_subset_size", "dvc_subset_spacing", "dvc_channel", "dvc_reference_mode",
+              "dvc_reference_frame", "dvc_grid_shape"):
+        assert k in md_g, k
+    assert tuple(md_g["dvc_grid_shape"]) == (3, 3, 3), md_g["dvc_grid_shape"]
+    i_ = tab(e.pull("I"))
+    sel = i_["t"] == 1
+    assert {"disp_z", "disp_y", "disp_x", "seed_cc", "seed_ok"} <= set(i_), sorted(i_)
+    assert len(i_["id"]) == n_rows and np.array_equal(i_["id"], ids0), "the seed re-emitted rows"
+    l_ = tab(e.pull("L"))
+    assert {"grad_zz", "grad_xx", "qfactor", "status", "n_iter", "bad", "valid",
+            "disp_std_x"} <= set(l_), sorted(l_)
+    assert np.all(l_["status"][sel] == 0), np.bincount(l_["status"][sel])
+    a_ = tab(e.pull("A"))
+    assert "outlier" in a_ and len(a_["id"]) == n_rows
+    s_ = tab(e.pull("E"))
+    assert {f"strain_{i}{j}" for i in "zyx" for j in "zyx"} | {"strain_valid"} <= set(s_), sorted(s_)
+    want = np.array(SHIFT) * np.array([zs, px, px])
+    got = np.array([np.median(s_[f"disp_{a}"][sel]) for a in "zyx"])
+    assert np.allclose(got, want, atol=0.02), (got, want)
+    md = e.pull("E").metadata
+    assert md["dvc_stage"] == "strain" and md["dvc_strain_type"] == "infinitesimal", md
+    # the single node, same solver, same answer
+    g2 = Graph()
+    g2.add(NodeInstance("S", "io.dvcstageseed"))
+    g2.add(NodeInstance("M", "analysis.dvc_field",
+                        params=dict(P, admm_iterations=2, search_radius=3, n_threads=2),
+                        modes={"init_guess": "ncc"}))
+    g2.connect("S", "M")
+    m_ = tab(Engine(g2, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("M"))
+    sel2 = m_["t"] == 1
+    for col in ("disp_z", "disp_y", "disp_x", "strain_xx", "strain_zy", "qfactor"):
+        dmax = float(np.nanmax(np.abs(np.asarray(s_[col][sel], float)
+                                      - np.asarray(m_[col][sel2], float))))
+        assert dmax < 1e-6, f"{col}: staged differs from the single node by {dmax:.2e}"
+
+    # ── 2. memo ───────────────────────────────────────────────────────────────────
+    for nid in ("G", "I", "L", "A"):
+        reads = {k for k, _ in e.entry(nid).reads}
+        assert {"pixel_size_um", "z_step_um"} <= reads, (nid, reads)
+    # two strain measures on ONE global step: distinct strain keys, and the second pull
+    # computes exactly one node — the correlation is not re-run for a strain change
+    g5 = Graph()
+    g5.add(NodeInstance("S", "io.dvcstageseed"))
+    g5.add(NodeInstance("G", "dvc.grid", params=dict(P)))
+    g5.add(NodeInstance("I", "dvc.initial_guess", params={"search_radius": 3},
+                        modes={"init_guess": "ncc"}))
+    g5.add(NodeInstance("L", "dvc.local_match", params={"n_threads": 2}))
+    g5.add(NodeInstance("A", "dvc.global_step", params={"admm_iterations": 2}))
+    g5.add(NodeInstance("E1", "dvc.strain"))
+    g5.add(NodeInstance("E2", "dvc.strain", modes={"strain_type": "green_lagrange"}))
+    for a, c in (("S", "G"), ("G", "I"), ("I", "L"), ("L", "A"), ("A", "E1"), ("A", "E2")):
+        g5.connect(a, c)
+    e5 = Engine(g5, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+    e5.pull("E1")
+    n1 = e5.compute_count
+    e5.pull("E2")
+    assert e5.compute_count - n1 == 1, "a strain-measure change re-ran more than the strain stage"
+    assert e5.entry("E1").recipe_hash != e5.entry("E2").recipe_hash
+
+    # ── 3. refusals ───────────────────────────────────────────────────────────────
+    g3 = Graph()
+    g3.add(NodeInstance("S", "io.dvcstageseed"))
+    g3.add(NodeInstance("L", "dvc.local_match"))
+    g3.connect("S", "L")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("L")
+        raise AssertionError("a local match with no grid upstream must be refused")
+    except ValueError as exc:
+        assert "DVC Grid" in str(exc), exc
+    g4 = Graph()
+    g4.add(NodeInstance("S", "io.dvcstageseed"))
+    g4.add(NodeInstance("G", "dvc.grid", params=dict(P)))
+    g4.add(NodeInstance("L", "dvc.local_match"))
+    g4.connect("S", "G")
+    g4.connect("G", "L")
+    try:
+        Engine(g4, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("L")
+        raise AssertionError("a local match with no seed must be refused")
+    except ValueError as exc:
+        assert "Initial Guess" in str(exc), exc
+
+    _ok(f"dvc stages: grid → seed → local → global → strain through the Engine recovers "
+        f"({', '.join(f'{v:.3f}' for v in got)}) µm for the planted shift, every stage on the "
+        f"same {n_rows} rows, provenance inherited, within 1e-6 of the single node; strain "
+        f"measure re-keys only its stage; missing grid / seed refused by name; bundle:dvc "
+        f"places 5 wired nodes in a frame, splices into a wire and round-trips as nodes")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -30633,6 +30821,7 @@ def main() -> int:
     test_gpu_platform()
     test_catalog_kernels()
     test_catalog_dvc()
+    test_dvc_stages()
     test_catalog_dic()
     test_catalog_piv()
     test_catalog_optical_flow()

@@ -672,6 +672,40 @@ class GraphDocument:
             i += 1
         return f"f{i}"
 
+    def place_bundle(self, key: str, *, x: float = 0.0, y: float = 0.0,
+                     splice: Optional[tuple] = None) -> Tuple[List[str], str]:
+        """Place a node BUNDLE (:mod:`nodegraph.bundles`, 2026-10-08): add every member
+        node at its relative position from ``(x, y)`` with fresh ids, wire the members as
+        the bundle says, and frame them as a region titled after the bundle → the new
+        node ids (in bundle order) and the frame id. ``splice`` is a wire ``(s, ss, d, ds)``
+        the bundle was dropped onto: its source is re-pointed at the bundle's input socket
+        and the bundle's output feeds its destination, the original wire removed — the
+        multi-node form of :meth:`GraphScene.splice_onto`, transactional in the same way
+        (both ends are checked before the wire is touched). What the document holds
+        afterwards is ordinary nodes; the bundle itself is not recorded."""
+        from nodegraph.bundles import bundle_of
+        b = bundle_of(key)
+        ids: Dict[str, str] = {}
+        for bn in b.nodes:
+            nid = self.new_id(bn.id.rstrip("0123456789") or "n")
+            rec = self.add_node(bn.op_key, x=x + bn.x, y=y + bn.y, node_id=nid,
+                                params=dict(bn.params), modes=dict(bn.modes))
+            ids[bn.id] = rec.id
+        for e in b.edges:
+            self.connect(ids[e.src], e.src_socket, ids[e.dst], e.dst_socket)
+        if splice is not None:
+            s, ss, d, ds = splice
+            in_id, in_sock = ids[b.input[0]], b.input[1]
+            out_id, out_sock = ids[b.output[0]], b.output[1]
+            ok_a, _ = self.can_connect(s, ss, in_id, in_sock)
+            ok_b, _ = self.can_connect(out_id, out_sock, d, ds)
+            if ok_a and ok_b:
+                self.disconnect(s, ss, d, ds)
+                self.connect(s, ss, in_id, in_sock)
+                self.connect(out_id, out_sock, d, ds)
+        fr = self.add_frame(b.frame_title or b.label, members=list(ids.values()))
+        return [ids[bn.id] for bn in b.nodes], fr.id
+
     def add_frame(self, title: str = "Frame", members=(), color=None,
                   frame_id: Optional[str] = None) -> FrameRecord:
         """Create a labelled frame around ``members`` (only the ids that exist are

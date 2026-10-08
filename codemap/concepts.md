@@ -737,6 +737,25 @@ see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream knows where it came from
 
 ---
 
+### CON-25 — node bundle
+anchors: sym:nodegraph.bundles.Bundle, sym:nodegraph.bundles.register_bundle, sym:nodelab_v2.document.GraphDocument.place_bundle
+
+A **node bundle** (2026-10-08) is a palette entry that places SEVERAL pre-wired nodes at
+once: a named recipe of member nodes with relative positions, the wires between them, an
+input and an output socket for splice-on-wire, and a frame title. Placing it — double-click,
+or a drag onto the canvas — adds the members with fresh ids, wires them, splices the chain
+into the wire it was dropped on, and wraps them in a *frame* (a canvas region: border ports,
+a linked tab on demand). What the document holds afterwards is ordinary nodes; the bundle is
+not recorded in the file and the engine never sees it. It exists so a complex analysis that
+is really several *sections* — DVC is the first: `bundle:dvc` places `dvc.grid` →
+`dvc.initial_guess` → `dvc.local_match` → `dvc.global_step` → `dvc.strain` — can be run and
+re-tuned section by section, each card its own memo entry, instead of as one opaque node.
+It is deliberately not a `nodegraph.groups` group (one card, one Dataset in, one out, run as
+a unit) and not a page recipe (a whole page). Keys are `bundle:<name>`; a bundle's palette
+section is its `role` (bundles are not ops, so `node_roles.json` does not list them); the
+selftest proves every registered bundle against the live registry and places it on a
+Qt-free `GraphDocument`.
+
 ### CON-24 — units, math and the region crop
 anchors: sym:nodegraph.units.conversion_factor, sym:nodegraph.units.unit_of, sym:nodegraph.catalog.math.values._compute_math_values, sym:nodegraph.catalog.util.crop_region._compute_crop_region, sym:nodelab_v2.ops.materialize_outside_taps, sym:nodegraph.metadata.crop_region
 

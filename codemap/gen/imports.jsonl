@@ -171,6 +171,17 @@
 {"dst":"nodegraph.kernels.aldvc_field","k":"imp","lazy":true,"src":"nodegraph.catalog.analysis.dvc_field"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_field"}
 {"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_field"}
+{"dst":"nodegraph.bundles","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.catalog._shared.columns","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.catalog._shared.labels","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.catalog._shared.progress","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.kernels.aldvc_field","k":"imp","lazy":true,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
+{"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.dvc_stages"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.edt"}
 {"dst":"nodegraph.catalog._shared.dim_footprint","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.edt"}
 {"dst":"nodegraph.catalog._shared.labels","k":"imp","lazy":false,"src":"nodegraph.catalog.analysis.edt"}
@@ -1077,6 +1088,7 @@
 {"dst":"nodegraph","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.boundary","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.bridges","k":"imp","lazy":false,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.bundles","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1247,6 +1259,7 @@
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.demo_window"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.demo_window"}
 {"dst":"nodelab_v2.viewer","k":"imp","lazy":false,"src":"nodelab_v2.demo_window"}
+{"dst":"nodegraph.bundles","k":"imp","lazy":true,"src":"nodelab_v2.document"}
 {"dst":"nodegraph.checkpoint","k":"imp","lazy":true,"src":"nodelab_v2.document"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.document"}
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodelab_v2.document"}
@@ -1420,6 +1433,7 @@
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":false,"src":"nodelab_v2.pages_panel"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.pages_panel"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
+{"dst":"nodegraph.bundles","k":"imp","lazy":true,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.registry","k":"imp","lazy":true,"src":"nodelab_v2.palette"}
 {"dst":"nodegraph.roles","k":"imp","lazy":false,"src":"nodelab_v2.palette"}
@@ -1517,6 +1531,7 @@
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.welcome"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.welcome"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodegraph.bundles","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.hotreload","k":"imp","lazy":false,"src":"nodelab_v2.window"}
@@ -1647,6 +1662,7 @@
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"scripts._node_synopsis"}
 {"dst":"nodelab_v2.window","k":"imp","lazy":true,"src":"scripts._nodelab_v2_gl_float_probe"}
 {"dst":"nodegraph","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodegraph.bundles","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.catalog._shared","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.checkpoint","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

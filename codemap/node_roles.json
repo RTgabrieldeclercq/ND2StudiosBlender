@@ -170,7 +170,7 @@
       "stage": "quantify",
       "pages": ["process"],
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
-      "ops": ["analysis.dic_correlate", "analysis.dvc_field", "analysis.piv", "analysis.optical_flow", "analysis.accumulate_field"]
+      "ops": ["analysis.dic_correlate", "analysis.dvc_field", "dvc.grid", "dvc.initial_guess", "dvc.local_match", "dvc.global_step", "dvc.strain", "analysis.piv", "analysis.optical_flow", "analysis.accumulate_field"]
     },
     "control_flow": {
       "label": "Control flow",

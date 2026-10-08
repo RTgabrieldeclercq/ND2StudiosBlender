@@ -79,6 +79,7 @@ MODULES: Tuple[str, ...] = (
     "analysis.roi_mask",
     "analysis.draw_regions",
     "analysis.dvc_field",
+    "analysis.dvc_stages",          # the same solver as five cards + the `bundle:dvc` recipe
     "transform.rasterize_field",
     "analysis.accumulate_field",
     "analysis.dic_correlate",

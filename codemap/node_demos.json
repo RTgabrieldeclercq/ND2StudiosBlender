@@ -1101,6 +1101,121 @@
         "Digital volume correlation (ALDVC): the 3-D counterpart of DIC, on subsets of a volume."
       ]
     },
+    "dvc.grid": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the grid is instant, but the demo chain it heads is a 3-D correlation",
+      "features": [
+        "pyALDVC section 2 as its own card: the correlation node grid as a Point table, plus the channel and reference policy every later stage inherits.",
+        "Placed by the `bundle:dvc` palette entry together with Initial Guess, Local Match, Global Step and Strain, wired in order inside one region."
+      ]
+    },
+    "dvc.initial_guess": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "a 3-D NCC seed search takes seconds",
+      "features": [
+        "pyALDVC section 3 as its own card: the whole-volume shift plus the pyramid/NCC integer seed of every grid node, written as disp_* before any refinement.",
+        "Pull it first: arrows pointing the wrong way here mean the search radius does not bracket the motion."
+      ]
+    },
+    "dvc.local_match": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        },
+        {
+          "op": "dvc.initial_guess"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the 12-DOF IC-GN match of every subset takes many seconds",
+      "features": [
+        "pyALDVC section 4 as its own card: the 12-DOF IC-GN subset match from the seed — the cost centre — writing sub-voxel disp_*, grad_*, qfactor, status and disp_std_*."
+      ]
+    },
+    "dvc.global_step": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        },
+        {
+          "op": "dvc.initial_guess"
+        },
+        {
+          "op": "dvc.local_match"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the ADMM iterations re-solve every subset several times",
+      "features": [
+        "pyALDVC sections 5-6 as its own card: the global compatibility step and the ADMM iterations that reconcile the matched subsets into one compatible field, with β auto-tuned per reference."
+      ]
+    },
+    "dvc.strain": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        },
+        {
+          "op": "dvc.initial_guess"
+        },
+        {
+          "op": "dvc.local_match"
+        },
+        {
+          "op": "dvc.global_step"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "its upstream chain is a 3-D correlation",
+      "features": [
+        "pyALDVC section 8 as its own card: strain from the grid's displacement field under the chosen measure, without reading a voxel — change the measure and it re-runs in a second."
+      ]
+    },
     "analysis.optical_flow": {
       "kind": "scalar",
       "phantom": "moving_cells",

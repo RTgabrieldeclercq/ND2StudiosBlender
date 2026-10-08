@@ -219,6 +219,15 @@
   "blessed": "2026-10-07",
   "file": "codemap/concepts.md"
  },
+ "CON-25": {
+  "anchors": {
+   "sym:nodegraph.bundles.Bundle": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.bundles.register_bundle": "36b0258616fa6b4249751a76ce8d2e57",
+   "sym:nodelab_v2.document.GraphDocument.place_bundle": "d823c9439be064bb49cfaad0355d191c"
+  },
+  "blessed": "2026-10-08",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",

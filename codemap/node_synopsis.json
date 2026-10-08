@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 115,
+    "nodes": 120,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 789,
-    "outputs": 122,
+    "inputs": 819,
+    "outputs": 127,
     "gui_ops_included": true
   },
   "stages": {
@@ -211,6 +211,11 @@
         "analysis.piv",
         "analysis.reduce_scalar",
         "analysis.track_field",
+        "dvc.global_step",
+        "dvc.grid",
+        "dvc.initial_guess",
+        "dvc.local_match",
+        "dvc.strain",
         "math.image",
         "math.mask",
         "math.values",
@@ -850,7 +855,7 @@
       "label": "Motion & deformation fields",
       "stage": "quantify",
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
-      "count": 5,
+      "count": 10,
       "ops": [
         {
           "op": "analysis.accumulate_field",
@@ -876,6 +881,31 @@
           "op": "analysis.piv",
           "label": "PIV (OpenPIV)",
           "summary": "2D particle image velocimetry (OpenPIV: multipass FFT correlation with window deformation, universal outlier detection, per-vector S/N) → a Point displacement field per frame pair; previous/fixed self-reference, ENSEMBLE correlation averaging (one time-averaged field — the micro-PIV method for sparse seeding), or an external reference Dataset + optional ROI mask; optional vy/vx/speed µm/s via the file's dt_s and optional per-vector unc_y/unc_x µm (Sciacchitano image-matching, dep: pivuq). The FLOW sibling of DIC — independent windows, far faster, per-vector confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError at run time until installed)."
+        },
+        {
+          "op": "dvc.global_step",
+          "label": "DVC Global Step",
+          "summary": "pyALDVC §5-6 as a node: the global compatibility step + ADMM iterations that reconcile the matched subsets into one kinematically compatible field. Overwrites disp_*/grad_*, writes outlier; β auto-tuned per reference."
+        },
+        {
+          "op": "dvc.grid",
+          "label": "DVC Grid",
+          "summary": "pyALDVC §2 as a node: the correlation node grid (subset size / spacing) as a Point table + the channel and reference policy every later DVC stage inherits. Instant — nothing is correlated. First card of the staged DVC bundle."
+        },
+        {
+          "op": "dvc.initial_guess",
+          "label": "DVC Initial Guess",
+          "summary": "pyALDVC §3 as a node: the starting displacement of every grid node (global shift + pyramid/NCC search) written as disp_* on the grid rows, with seed_cc / seed_ok. Pull it first: a wrong seed is never recovered by the refinement."
+        },
+        {
+          "op": "dvc.local_match",
+          "label": "DVC Local Match",
+          "summary": "pyALDVC §4 as a node: the 12-DOF IC-GN match of every subset from the seed — the cost centre. Writes sub-voxel disp_*, grad_*, qfactor (ZNCC), status, n_iter, bad, valid and disp_std_* on the grid rows."
+        },
+        {
+          "op": "dvc.strain",
+          "label": "DVC Strain",
+          "summary": "pyALDVC §8 as a node: strain from the grid's displacement field — nine strain_* columns under the chosen measure — without reading a voxel, so a new measure or smoothing re-runs in a second."
         }
       ]
     },
@@ -1046,6 +1076,11 @@
       "detect.beads",
       "detect.particles",
       "detect.spots",
+      "dvc.global_step",
+      "dvc.grid",
+      "dvc.initial_guess",
+      "dvc.local_match",
+      "dvc.strain",
       "track.link",
       "track.objects"
     ],
@@ -7997,6 +8032,715 @@
         "min_radius_z",
         "name",
         "threshold"
+      ]
+    },
+    "dvc.global_step": {
+      "op": "dvc.global_step",
+      "label": "DVC Global Step",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dvc_stages.py",
+      "gui_only": false,
+      "summary": "pyALDVC §5-6 as a node: the global compatibility step + ADMM iterations that reconcile the matched subsets into one kinematically compatible field. Overwrites disp_*/grad_*, writes outlier; β auto-tuned per reference.",
+      "overview": "pyALDVC Sections 5-6 as a node: the global compatibility step and the ADMM iterations that make AL-DVC more than local DVC. The independently matched subsets (``disp_*`` / ``grad_*`` / ``bad`` from the local match) are reconciled into one kinematically compatible field — a badly matched subset is pulled toward what its neighbours imply — alternating a 3-DOF local re-solve with the global solve for ``admm_iterations`` passes. Overwrites ``disp_*`` and ``grad_*``; refreshes ``qfactor`` / ``status`` from the last local pass; writes ``outlier`` (converged, then rejected by the median test and replaced — not a measurement) and ``disp_std_*``. β (``beta``) is auto-tuned by the L-curve once per reference and reused across its frames, exactly as the single-node driver does; ``mu`` is the AL penalty. Resolved spec: category analysis; op ``dvc.global_step``; reads VOXEL + POINT, adds POINT; 3-D only; footprint WHOLE_SERIES / {t,z,y,x} (the local re-solves read the volumes again). Inherits the grid, reference AND local provenance (the local context must be rebuilt identically, so this card has no interpolation/backend controls of its own). Kernel: :func:`nodegraph.kernels.aldvc_field.stage_global` — the driver's `pipeline.py:282-368` verbatim.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dvc",
+          "layer_in": "point",
+          "description": "Which Point table holds the DVC grid this stage fills in — the one DVC Grid wrote (`dvc` unless you renamed it there). The stage reads its rows and the previous stages' columns from it and writes its own columns BACK ONTO THE SAME ROWS, so the Viewer, the Spreadsheet and every downstream node see one table that fills up stage by stage. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "mu",
+          "label": "AL penalty μ",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.001,
+          "description": "Augmented-Lagrangian penalty weighting the constraint that each subset's own displacement equals the globally compatible field. HIGHER enforces agreement harder (smoother, but a real discontinuity is smeared); LOWER lets subsets stay independent (the field converges toward plain local DVC). pyALDVC's default is 1e-3; change it by factors of ten."
+        },
+        {
+          "name": "beta",
+          "label": "Compatibility β",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Weight of the compatibility term of the global solve. 0 = AUTO: the solver sweeps candidates and picks the L-curve corner once per reference, reusing it for every frame against that reference — the documented default. A positive value pins it, which is how two runs are compared on equal terms."
+        },
+        {
+          "name": "admm_iterations",
+          "label": "ADMM iterations",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 4,
+          "description": "Passes of the outer loop that alternates the 3-DOF local re-solve with the global solve; the published guidance is that 3-5 suffice, and the loop stops early once the update falls under pyALDVC's tolerance. 1 runs the global solve once with no re-solve (no refreshed qfactor/status). MORE costs one local pass each."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dvc_global_step",
+      "meta_transform": null,
+      "extra_layers": "_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/aldvc_field.md",
+      "params_read": [
+        "admm_iterations",
+        "beta",
+        "mu"
+      ]
+    },
+    "dvc.grid": {
+      "op": "dvc.grid",
+      "label": "DVC Grid",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dvc_stages.py",
+      "gui_only": false,
+      "summary": "pyALDVC §2 as a node: the correlation node grid (subset size / spacing) as a Point table + the channel and reference policy every later DVC stage inherits. Instant — nothing is correlated. First card of the staged DVC bundle.",
+      "overview": "pyALDVC Section 2 as a node: the correlation node grid for this stack under the subset size / spacing, written as a Point table — one row per node per frame to be correlated, in pyALDVC's node order — plus the reference policy, stamped as ``dvc_*`` provenance for every later stage. No volume is read: this card is instant, and it is where the measurement density is judged on the Viewer before any correlation is paid for. Resolved spec: category analysis; op ``dvc.grid``; reads VOXEL (axes + calibration only), adds POINT; 3-D only (z<2 refused); footprint WHOLE_SERIES / {t,z,y,x} — it declares the whole series because its rows span every frame of it, though nothing is read. ``reference_mode`` fixed_frame writes a row block for every t (the reference's own block is the zero field); previous_frame writes t ≥ 1. Grid via :func:`nodegraph.kernels.aldvc_field.stage_grid` (al_dvc ``build_grid_axes`` + ``mesh_setup``) after :func:`stage_para` validated the subset against the volume (every axis ≥ 16, winsize + 11 ≤ extent, ≥ 2 nodes per axis).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "reference_mode",
+          "label": "Reference",
+          "choices": [
+            "fixed_frame",
+            "previous_frame"
+          ],
+          "default": "fixed_frame",
+          "description": "How frames pair up for correlation — decided once here and inherited by every stage: against one fixed undeformed frame, or each frame against the one before.",
+          "choice_docs": {
+            "fixed_frame": "Every timepoint is correlated against Reference frame: displacements are cumulative from that state and directly comparable across time, and the reference's own rows are the zero field. Breaks down once the total deformation outgrows what a subset can follow.",
+            "previous_frame": "Each timepoint is correlated against the one before it: small increments that track large total deformation, at the price of one reference build per pair and no row for t=0. Compose the increments with Accumulate DVC Field to get totals."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "channel",
+          "label": "Channel",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "pick_kind": "channel",
+          "description": "Which channel every stage correlates (0-based) — decided here, once, and inherited by the stages after. Pick the channel with the most stable, high-contrast speckle (beads, a fiducial), never a reporter whose intensity changes for biological reasons: correlation assumes brightness is conserved, and a channel that violates that produces confident but wrong vectors."
+        },
+        {
+          "name": "reference_frame",
+          "label": "Reference frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "reference_mode": [
+              "fixed_frame"
+            ]
+          },
+          "pick_kind": "frame",
+          "description": "Which timepoint is the undeformed state (0-based) when the reference mode is a fixed frame: every frame is correlated against it, so the displacements are cumulative and directly comparable — until the deformation grows beyond what a subset can follow. Its own row block is the zero field. Inert under `previous_frame`. To use a SEPARATE undeformed stack, chain it in front of the series with Timeseries Builder and keep this at 0."
+        },
+        {
+          "name": "subset_size",
+          "label": "Subset size",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 32,
+          "pick_kind": "grid",
+          "pick_peer": "subset_spacing",
+          "description": "Edge of each correlation subset in VOXELS — the cube of speckle matched between reference and deformed volumes. pyALDVC's sizing rule: 4-5× the speckle/pore diameter, so a subset holds 2-3 features per axis; below that it has too little texture to lock onto. LARGER lowers noise (and acts as a spatial filter); SMALLER resolves strain gradients but assumes one affine deformation across a window that no longer has one. Rounded UP to an even number ≥ 4. Every stage after this one inherits it."
+        },
+        {
+          "name": "subset_size_z",
+          "label": "Subset size (Z)",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "description": "Subset edge along Z in voxels, for anisotropic stacks; 0 = the lateral size on all three axes. A confocal z-step is usually coarser than the pixel, so a cubic voxel subset spans several times more depth than width — set the number of planes covering roughly the same PHYSICAL distance as the lateral subset (e.g. 32/32/16). On a shallow stack this is also what makes a grid possible at all: the solver needs ≥ 2 nodes per axis with a 5-voxel margin each side. Rounded up to an even number ≥ 4."
+        },
+        {
+          "name": "subset_spacing",
+          "label": "Subset spacing",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 16,
+          "pick_kind": "grid",
+          "pick_peer": "subset_size",
+          "description": "Spacing between node centres in voxels — THE grid density, and the dominant runtime knob (cost grows with the cube of the node count). SMALLER gives a denser field; LARGER is faster and can step straight over localised deformation. It does not change any single vector's accuracy — that is Subset size. Rule of thumb: half the subset for smooth fields, a quarter when chasing strain gradients. Pull this card and look: the dots ARE the grid."
+        },
+        {
+          "name": "subset_spacing_z",
+          "label": "Subset spacing (Z)",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "description": "Node spacing along Z in voxels; 0 = the lateral spacing on all three axes. Worth setting on a stack with few planes: the lateral spacing may leave only one or two nodes through the depth, and a grid that thin cannot differentiate the through-plane strain."
+        },
+        {
+          "name": "prefilter_sigma",
+          "label": "Pre-filter σ",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0.0,
+          "description": "Gaussian σ in voxels applied to EVERY volume before any stage correlates it; 0 is off. The recommended first move on a low-SNR scan — pyALDVC names 0.6-1.0 below an SNR of about 5 — because correlation noise enters through the image gradients, which smoothing tames at the cost of a little lateral resolution. Decided here so the seed, the match and the global step all see the same volume."
+        },
+        {
+          "name": "name",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dvc",
+          "layer_out": [
+            "point"
+          ],
+          "description": "Name of the Point table this node writes: one row per grid node per correlated frame, carrying only the node positions until the later stages fill in `disp_*`, `grad_*`, `qfactor`, `status`, `strain_*`. Every stage after this one selects the table by this name."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dvc_grid",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/aldvc_field.md",
+      "params_read": [
+        "__modes__",
+        "channel",
+        "name",
+        "prefilter_sigma",
+        "reference_frame",
+        "subset_size",
+        "subset_size_z",
+        "subset_spacing",
+        "subset_spacing_z"
+      ]
+    },
+    "dvc.initial_guess": {
+      "op": "dvc.initial_guess",
+      "label": "DVC Initial Guess",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dvc_stages.py",
+      "gui_only": false,
+      "summary": "pyALDVC §3 as a node: the starting displacement of every grid node (global shift + pyramid/NCC search) written as disp_* on the grid rows, with seed_cc / seed_ok. Pull it first: a wrong seed is never recovered by the refinement.",
+      "overview": "pyALDVC Section 3 as a node: the starting displacement of every grid node — an FFT whole-volume shift (``global_shift``), then a pyramid / NCC integer search inside ``search_radius`` at the coarsest level, cleaned of outliers and inpainted — written as ``disp_*`` (µm) on the grid rows, with the match score (``seed_cc``) and whether the search accepted the node (``seed_ok``). Pull THIS before the local match: arrows that point the wrong way here mean the radius does not bracket the motion or the volumes are not registered, and no refinement recovers from a wrong seed. Resolved spec: category analysis; op ``dvc.initial_guess``; reads VOXEL + POINT, adds POINT (columns on the grid layer); 3-D only; footprint WHOLE_SERIES / {t,z,y,x} (reads the reference and each correlated frame). Grid, channel and reference policy come from the grid's ``dvc_*`` provenance. ``init_coarse_factor > 1`` runs the coarse-lattice seed (a full solve on every k-th node, interpolated) and also writes its gradient seed as ``grad_*`` for the local stage. Against a fixed reference the previous frame's seed is handed to the next frame's search, as pyALDVC does. Kernel: :func:`nodegraph.kernels.aldvc_field.stage_initial_guess`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "init_guess",
+          "label": "Seed",
+          "choices": [
+            "pyramid",
+            "ncc",
+            "zero",
+            "previous"
+          ],
+          "default": "pyramid",
+          "description": "Where each node's starting displacement comes from.",
+          "choice_docs": {
+            "pyramid": "A coarse-to-fine NCC search: the radius is searched on a downsampled volume and refined level by level — the default, and the one that copes with large displacements at an affordable cost.",
+            "ncc": "A single-level NCC search of the full radius at full resolution: exact within the radius, but the cost grows with its cube, so only for small motions or small grids.",
+            "zero": "Start every node at zero displacement (after the global shift when that is on): free, and right only when the motion is under about a quarter subset everywhere — otherwise the match never finds the feature.",
+            "previous": "Start from the previous frame's field against the same reference (falls back to pyramid on the first frame): the cheap, right choice for a smooth time series where each frame moves a little further."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dvc",
+          "layer_in": "point",
+          "description": "Which Point table holds the DVC grid this stage fills in — the one DVC Grid wrote (`dvc` unless you renamed it there). The stage reads its rows and the previous stages' columns from it and writes its own columns BACK ONTO THE SAME ROWS, so the Viewer, the Spreadsheet and every downstream node see one table that fills up stage by stage. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "search_radius",
+          "label": "Search radius",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "description": "Half-width in voxels per axis of the NCC search that finds each node's integer starting guess at the coarsest pyramid level; 0 leaves pyALDVC's default (8). It must bracket the largest REAL displacement after the whole-volume shift, or a fast-moving region is seeded wrongly and the local match then converges confidently onto the wrong feature. Arrows pointing the wrong way on THIS card are the symptom; raise it (cost grows with the cube)."
+        },
+        {
+          "name": "global_shift",
+          "label": "Remove global shift",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": true,
+          "default": true,
+          "description": "Estimate one rigid whole-volume translation by phase correlation and remove it before the per-node search. ON is what lets a modest search radius cope with a series that drifted bodily (stage drift, a bumped dish). OFF when the volumes are already registered — then it can only add noise."
+        },
+        {
+          "name": "init_coarse_factor",
+          "label": "Coarse factor",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1,
+          "description": "1 = seed every node. k > 1 runs the search AND a full 12-DOF solve on only every k-th node per axis, then interpolates displacement and gradient to the rest as the starting guess (a gradient seed is then written as `grad_*` too). A pure speed lever for SMOOTH fields on dense grids; a localised deformation between coarse nodes is missed in the seed and must be recovered by the match."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dvc_initial_guess",
+      "meta_transform": null,
+      "extra_layers": "_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/aldvc_field.md",
+      "params_read": [
+        "__modes__",
+        "global_shift",
+        "init_coarse_factor",
+        "search_radius"
+      ]
+    },
+    "dvc.local_match": {
+      "op": "dvc.local_match",
+      "label": "DVC Local Match",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dvc_stages.py",
+      "gui_only": false,
+      "summary": "pyALDVC §4 as a node: the 12-DOF IC-GN match of every subset from the seed — the cost centre. Writes sub-voxel disp_*, grad_*, qfactor (ZNCC), status, n_iter, bad, valid and disp_std_* on the grid rows.",
+      "overview": "pyALDVC Section 4 as a node: the 12-DOF inverse-compositional Gauss-Newton match of every subset, seeded by the ``disp_*`` (and, when present, ``grad_*``) on the grid rows — the cost centre of the whole pipeline. Overwrites ``disp_*`` with the sub-voxel result, writes the deformation gradient ``grad_*``, the per-node ZNCC as ``qfactor``, pyALDVC's ``status`` (0 converged, 1 max_iter, 2 out of bounds, 3 invalid subset, 4 singular, 5 nan, 6 skipped, 7 stalled), ``n_iter``, ``bad`` (rejected by the median test and inpainted), ``valid`` (a subset with enough texture to be solved) and the displacement uncertainty ``disp_std_*`` (µm). Resolved spec: category analysis; op ``dvc.local_match``; reads VOXEL + POINT, adds POINT; 3-D only; footprint WHOLE_SERIES / {t,z,y,x}. Inherits the grid / reference provenance; stamps ``dvc_interp_method`` / ``dvc_backend`` / ``dvc_subset_stride`` / ``dvc_tile_local`` / ``dvc_n_threads`` / ``dvc_icgn_max_iter`` so the global step rebuilds the identical local context. Kernel: :func:`nodegraph.kernels.aldvc_field.stage_local`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y",
+          "z"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "interp_method",
+          "label": "Interpolation",
+          "choices": [
+            "cubic",
+            "bspline",
+            "linear"
+          ],
+          "default": "cubic",
+          "description": "How the deformed volume is sampled at sub-voxel positions inside the match.",
+          "choice_docs": {
+            "cubic": "Cubic convolution: sub-voxel accurate at a moderate cost — the default, and what the single DVC node uses.",
+            "bspline": "Cubic B-spline on prefiltered coefficients: the smoothest gradients and the lowest bias on a clean scan, at a higher prepare cost per frame.",
+            "linear": "Trilinear: the fastest and the most biased (it under-estimates sub-voxel motion near half-voxel offsets); for a quick look, not a measurement."
+          }
+        },
+        {
+          "name": "backend",
+          "label": "Backend",
+          "choices": [
+            "auto",
+            "numba",
+            "numpy",
+            "cuda"
+          ],
+          "default": "auto",
+          "description": "Which implementation runs the per-subset solve.",
+          "choice_docs": {
+            "auto": "CUDA when a usable device exists, else the numba CPU kernels, else numpy — the right default everywhere.",
+            "numba": "The compiled multi-threaded CPU kernels (first call in a process compiles, ~10-20 s, cached on disk afterwards).",
+            "numpy": "Pure numpy: no compilation, several times slower; for a machine where numba cannot compile.",
+            "cuda": "The GPU local solver (needs al-dvc[gpu] and a CUDA device); refused with a clear message when none is usable."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dvc",
+          "layer_in": "point",
+          "description": "Which Point table holds the DVC grid this stage fills in — the one DVC Grid wrote (`dvc` unless you renamed it there). The stage reads its rows and the previous stages' columns from it and writes its own columns BACK ONTO THE SAME ROWS, so the Viewer, the Spreadsheet and every downstream node see one table that fills up stage by stage. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "icgn_max_iter",
+          "label": "Max iterations",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 100,
+          "description": "Hard cap on inverse-compositional Gauss-Newton iterations per subset. A node that hits it is reported with status 1 (max_iter) rather than silently accepted, so this is a safety valve: raise it only when many nodes report 1 and their ZNCC is still climbing; lower it to bound the run time on a poor match."
+        },
+        {
+          "name": "subset_stride",
+          "label": "Subset stride",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1,
+          "description": "Sample only every k-th voxel along each axis inside a subset — k³ fewer voxels per iteration, pyALDVC measures about 5× faster at k=2 with a 32-voxel subset — at the cost of a slightly noisier match. Clamped so at least 5 samples per axis remain. Inherited by the global step so its local re-solves match this one."
+        },
+        {
+          "name": "tile_local",
+          "label": "Tile edge",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "description": "Solve in blocks of nodes against a box of the volume this many voxels on an edge instead of holding the whole scan at once; 0 is OFF and right until memory is the problem (the reference's gradient bundle alone is 17 bytes per voxel)."
+        },
+        {
+          "name": "n_threads",
+          "label": "Threads",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "Numba worker threads for the CPU solver; 0 = ALL cores. Lower it to leave headroom when several nodes pull in parallel. Inherited by the global step."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dvc_local_match",
+      "meta_transform": null,
+      "extra_layers": "_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/aldvc_field.md",
+      "params_read": [
+        "__modes__",
+        "icgn_max_iter",
+        "n_threads",
+        "subset_stride",
+        "tile_local"
+      ]
+    },
+    "dvc.strain": {
+      "op": "dvc.strain",
+      "label": "DVC Strain",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dvc_stages.py",
+      "gui_only": false,
+      "summary": "pyALDVC §8 as a node: strain from the grid's displacement field — nine strain_* columns under the chosen measure — without reading a voxel, so a new measure or smoothing re-runs in a second.",
+      "overview": "pyALDVC Section 8 as a node: strain from the displacement field on the grid rows — the nine ``strain_<i><j>`` columns (tensor shear, this repo's (z, y, x) index order, the measure chosen by ``strain_type``) and ``strain_valid``. Reads no volume: the grid is rebuilt from the stamped provenance and the stack's axes, so changing the measure, the smoothing or the differentiation method re-runs in a second, with the correlation untouched. ``direct`` uses the solver's own ``grad_*`` and is only meaningful against a fixed reference (an increment field's gradient is not a strain) — it falls back to the plane fit otherwise, as the driver does. Resolved spec: category analysis; op ``dvc.strain``; reads POINT, adds POINT; footprint WHOLE_SERIES with EMPTY kernel_axes — it crosses every frame of the table and touches no voxel. Stamps ``dvc_strain_type`` / ``dvc_strain_smooth`` / ``dvc_strain_method`` (what Accumulate DVC Field inherits). Kernel: :func:`nodegraph.kernels.aldvc_field.stage_strain`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "strain_method",
+          "label": "Method",
+          "choices": [
+            "plane_fit",
+            "fem",
+            "fd",
+            "direct"
+          ],
+          "default": "plane_fit",
+          "description": "How the displacement gradient is obtained from the grid field.",
+          "choice_docs": {
+            "plane_fit": "A least-squares plane through each node's neighbourhood (Fit half-width wide): robust to a noisy node, the pyALDVC default.",
+            "fem": "The hex-element FEM gradient of the global step's own operators: consistent with the compatibility solve, slightly smoother than the plane fit, and the operators are rebuilt here (a few seconds).",
+            "fd": "Central finite differences between neighbouring nodes: the sharpest and the noisiest — for a dense, clean grid.",
+            "direct": "The solver's own per-subset deformation gradient (`grad_*`), no differentiation across nodes at all: the most local, only meaningful against a FIXED reference (an increment's gradient is not a strain); falls back to the plane fit otherwise."
+          }
+        },
+        {
+          "name": "strain_type",
+          "label": "Measure",
+          "choices": [
+            "infinitesimal",
+            "green_lagrange",
+            "euler_almansi",
+            "hencky"
+          ],
+          "default": "infinitesimal",
+          "description": "Which strain measure the nine strain_* columns report.",
+          "choice_docs": {
+            "infinitesimal": "½(F + Fᵀ) − I: the small-strain measure, linear in the gradient; right under a few percent of strain.",
+            "green_lagrange": "½(FᵀF − I): finite strain referred to the UNDEFORMED configuration — the Lagrangian choice for large gels.",
+            "euler_almansi": "½(I − F⁻ᵀF⁻¹): finite strain referred to the DEFORMED configuration.",
+            "hencky": "½ ln(FᵀF): the logarithmic (true) strain, additive across successive deformations."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dvc",
+          "layer_in": "point",
+          "description": "Which Point table holds the DVC grid this stage fills in — the one DVC Grid wrote (`dvc` unless you renamed it there). The stage reads its rows and the previous stages' columns from it and writes its own columns BACK ONTO THE SAME ROWS, so the Viewer, the Spreadsheet and every downstream node see one table that fills up stage by stage. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "strain_halfwidth",
+          "label": "Fit half-width",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1,
+          "description": "Half-width in NODES of the window the plane-fit method differentiates over: 1 is a 3×3×3 neighbourhood. WIDER is pyALDVC's first suggestion for a speckled strain map — it averages more nodes and so lowers the strain noise, at the cost of smearing a strain gradient over that many nodes. Only read by `plane_fit`."
+        },
+        {
+          "name": "strain_smooth",
+          "label": "Strain smoothing σ",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Gaussian σ in NODE units applied when strain is computed; 0 is off and is the principled default here: the global step already produced a compatible field, so strain is an intrinsic property of it. Use it only on a plainly local run."
+        },
+        {
+          "name": "disp_smoothing",
+          "label": "Displacement smoothing σ",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Gaussian σ in NODE units applied to the displacement field BEFORE it is differentiated — the displacement columns themselves are untouched; 0 is off and right by default (the displacement is what was measured)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dvc_strain",
+      "meta_transform": null,
+      "extra_layers": "_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/aldvc_field.md",
+      "params_read": [
+        "__modes__",
+        "disp_smoothing",
+        "strain_halfwidth",
+        "strain_smooth"
       ]
     },
     "enhance.bilateral": {

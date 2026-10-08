@@ -609,3 +609,326 @@ def run_aldvc(
         voxel_size_um=voxel_size_um, params=params,
         compute_strain=compute_strain, progress_cb=progress_cb)
     return out[0]
+
+
+# ── staged entry points (2026-10-08): pyALDVC's sections as separate calls ─────
+# `run_aldvc` is Sections 2-8 of the ALDVC paper in ONE function (al-dvc 1.2.0
+# `core/pipeline.py:124-390`). The staged DVC nodes — `dvc.grid` → `dvc.initial_guess` →
+# `dvc.local_match` → `dvc.global_step` → `dvc.strain` — call the functions below one at
+# a time so a user can pull, inspect and re-tune each section on its own. Each function
+# reproduces its slice of that driver verbatim (the same calls in the same order, the
+# same `para` rewrites, the same `mesh.node_valid` side effect), so the staged chain and
+# `run_aldvc_series` agree on every node. Everything crosses this boundary in THIS
+# repo's (z, y, x) order; the reversal to pyALDVC's (x, y, z) happens here and only here
+# (see §6a of the contract — one and only one adapter).
+#
+# What a stage needs from the volumes is rebuilt from the volumes: a reference "context"
+# (normalised volume, its gradients, the per-node Hessians, the global operators) is NOT
+# handed from node to node — it is a few seconds to rebuild and would not survive the
+# memo, the spill or a saved file. The displacement field between stages is the Point
+# table the nodes carry, in voxels here (the nodes keep it in µm on the wire).
+
+
+def _al_dvc_modules() -> Dict[str, Any]:
+    """Every pyALDVC module a staged call touches, imported lazily and by path — the
+    `al_dvc.solver` package re-exports the *functions* `local_icgn` / `subpb1_solver`
+    under the names of their modules, so attribute access on the package is ambiguous."""
+    if not al_dvc_available():
+        raise RuntimeError(INSTALL_HINT)
+    m = importlib.import_module
+    return {
+        "config": m("al_dvc.core.config"),
+        "ds": m("al_dvc.core.data_structures"),
+        "vops": m("al_dvc.io.volume_ops"),
+        "grid": m("al_dvc.mesh.grid_mesh"),
+        "tiling": m("al_dvc.solver.tiling"),
+        "local": m("al_dvc.solver.local_icgn"),
+        "gops": m("al_dvc.solver.global_operators"),
+        "init": m("al_dvc.solver.init_disp"),
+        "coarse": m("al_dvc.solver.coarse_init"),
+        "beta": m("al_dvc.solver.beta_tuning"),
+        "sub1": m("al_dvc.solver.subpb1_solver"),
+        "sub2": m("al_dvc.solver.subpb2_solver"),
+        "unc": m("al_dvc.solver.uncertainty"),
+        "strain": m("al_dvc.strain.compute_strain"),
+        "valid": m("al_dvc.utils.validation"),
+        "numba": m("al_dvc._numba_compat"),
+    }
+
+
+@dataclass
+class DVCReference:
+    """Everything the local and global stages need about ONE reference volume on ONE
+    grid — pyALDVC's `get_reference` cache entry (`pipeline.py:190-222`) as a value.
+
+    ``mesh`` is the grid AFTER `precompute_local_context` wrote its validity into it
+    (`mesh.node_valid = ctx.valid`), which is the mesh every later section reads.
+    ``ops`` is ``None`` when the global step is off or the operators could not be
+    built (pyALDVC logs and disables the global step in that case; so do we)."""
+    para: Any
+    shape: Tuple[int, int, int]
+    mesh: Any
+    source: Any
+    ctx: Any
+    ops: Any
+
+    @property
+    def n_nodes(self) -> int:
+        return int(self.mesh.n_nodes)
+
+    @property
+    def valid(self) -> np.ndarray:
+        return np.asarray(self.mesh.node_valid, dtype=bool)
+
+
+def stage_para(params: Dict[str, Any], voxel_size_um: Sequence[float],
+               shape: Tuple[int, int, int]):
+    """Section 2's parameter rewrite: the node's params → a validated ``DVCPara`` with
+    the VOI clamped to ``shape``, ``volume_shape`` set and ``gradient_mode="auto"``
+    resolved — exactly what `run_aldvc` does at `pipeline.py:124-151` before anything
+    else runs. Raises pyALDVC's own ``ValueError`` for a volume too small for the
+    subset (every axis ≥ 16, ``winsize + 11 ≤ extent``)."""
+    M = _al_dvc_modules()
+    from dataclasses import replace
+    shape = tuple(int(s) for s in shape)
+    para = build_dvcpara(dict(params or {}), voxel_size_um)
+    M["valid"].validate_para_against_volume(para, shape)
+    para = replace(para, voi=M["ds"].VOIRange().clamp(shape), volume_shape=shape)
+    resolved = M["vops"].resolve_gradient_mode(para.gradient_mode, shape)
+    if resolved != para.gradient_mode:
+        para = replace(para, gradient_mode=resolved)
+    return para
+
+
+def stage_grid(para, shape: Tuple[int, int, int]) -> Tuple[Any, np.ndarray]:
+    """Section 2: the node grid for ``shape`` under ``para`` →
+    ``(mesh, coords_zyx)`` with ``coords_zyx`` the ``(N, 3)`` node centres in voxels,
+    ``[z, y, x]``, in pyALDVC's node order ``n = iz·ny·nx + iy·nx + ix`` — the row
+    order every stage table keeps. Pure geometry: no volume is read, so a grid node
+    can show the measurement density before any correlation is paid for."""
+    M = _al_dvc_modules()
+    shape = tuple(int(s) for s in shape)
+    x0, y0, z0 = M["grid"].build_grid_axes(para.voi, shape, para.winsize, para.winstepsize)
+    mesh = M["grid"].mesh_setup(x0, y0, z0)
+    coords = np.ascontiguousarray(np.asarray(mesh.coordinates, dtype=np.float64)[:, ::-1])
+    return mesh, coords
+
+
+def stage_reference(ref_vol: np.ndarray, para, shape: Tuple[int, int, int]) -> DVCReference:
+    """Sections 2-3 for ONE reference: normalise + pre-smooth the volume, build its
+    gradient bundle, the grid, the per-node local context (Hessians, validity) and —
+    when the global step is on — the FEM/FD operators (`pipeline.py:190-222`)."""
+    M = _al_dvc_modules()
+    shape = tuple(int(s) for s in shape)
+    vol = np.asarray(ref_vol)
+    if tuple(vol.shape) != shape:
+        raise ValueError(f"reference volume has shape {tuple(vol.shape)}, expected {shape}")
+    f = M["vops"].presmooth_volume(M["vops"].normalize_volume(vol, para.voi),
+                                   para.prefilter_sigma)
+    source = M["tiling"].ReferenceSource(f=f, mask=None, gradient_mode=para.gradient_mode)
+    if not int(getattr(para, "tile_local", 0) or 0):
+        source.bundle_for(M["tiling"].whole_box_tile(source.shape))
+    base_mesh, _coords = stage_grid(para, shape)
+    mesh = M["grid"].apply_mask_to_mesh(base_mesh, None, para.winsize, para.min_valid_ratio,
+                                        cut_bridging=bool(getattr(para, "subset_split", False)))
+    if para.n_threads > 0:
+        M["numba"].set_num_threads(para.n_threads)
+    ctx = M["local"].precompute_local_context(mesh, source, para)
+    mesh.node_valid = ctx.valid.copy()
+    ops = None
+    if para.use_global_step:
+        try:
+            ops = M["gops"].build_global_operators(mesh, para.subpb2_method, para.gauss_pt_order)
+        except ValueError:
+            ops = None
+    return DVCReference(para=para, shape=shape, mesh=mesh, source=source, ctx=ctx, ops=ops)
+
+
+def stage_deformed(def_vol: np.ndarray, para, shape: Tuple[int, int, int]
+                   ) -> Tuple[np.ndarray, np.ndarray]:
+    """One deformed volume → ``(g_norm, g_prep)``: the normalised, pre-smoothed volume
+    the NCC seed searches, and the interpolation-ready copy (B-spline coefficients for
+    ``bspline``) the IC-GN passes sample (`pipeline.py:255-262`, no mask)."""
+    M = _al_dvc_modules()
+    vol = np.asarray(def_vol)
+    if tuple(vol.shape) != tuple(shape):
+        raise ValueError(f"deformed volume has shape {tuple(vol.shape)}, expected {tuple(shape)}")
+    g_norm = M["vops"].presmooth_volume(M["vops"].normalize_volume(vol, para.voi),
+                                        para.prefilter_sigma)
+    g_prep = M["vops"].prepare_deformed(g_norm, para.interp_method, mask=None)
+    return g_norm, g_prep
+
+
+def _u_to_xyz(u_zyx: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if u_zyx is None:
+        return None
+    return np.ascontiguousarray(np.asarray(u_zyx, dtype=np.float64)[:, ::-1])
+
+
+def _u_to_zyx(u_xyz: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(np.asarray(u_xyz, dtype=np.float64)[:, ::-1])
+
+
+def _f_to_xyz(f_zyx: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if f_zyx is None:
+        return None
+    return np.ascontiguousarray(np.asarray(f_zyx, dtype=np.float64)[:, ::-1, ::-1])
+
+
+def _f_to_zyx(f_xyz: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(np.asarray(f_xyz, dtype=np.float64)[:, ::-1, ::-1])
+
+
+def stage_initial_guess(ref: DVCReference, g_norm: np.ndarray, g_prep: np.ndarray, *,
+                        previous_zyx: Optional[np.ndarray] = None
+                        ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    """Section 3 → ``(U0_zyx, F0_zyx | None, info)``: the integer-plus seed for every
+    node (voxels, ``[dz, dy, dx]``), a coarse-lattice gradient seed when
+    ``init_coarse_factor > 1`` (and no previous field), and pyALDVC's info dict
+    (``method``, ``global_shift``, per-node ``cc`` / ``pce`` / ``ok`` where the method
+    searched, ``n_bad``). ``previous_zyx`` is the last solved field against the SAME
+    reference, which `run_aldvc` hands to the seed only in that case
+    (`pipeline.py:266-272`)."""
+    M = _al_dvc_modules()
+    para = ref.para
+    previous = _u_to_xyz(previous_zyx)
+    F0 = None
+    if int(para.init_coarse_factor) > 1 and previous is None:
+        U0, F0, info = M["coarse"].coarse_initial_guess(ref.source, g_norm, g_prep, ref.mesh, para)
+    else:
+        U0, info = M["init"].compute_initial_guess(
+            ref.source.f, g_norm, ref.mesh, para, previous=previous,
+            split_fraction=ref.ctx.split_fraction)
+    return _u_to_zyx(U0), (None if F0 is None else _f_to_zyx(F0)), dict(info)
+
+
+def stage_local(ref: DVCReference, g_prep: np.ndarray, U0_zyx: np.ndarray, *,
+                F0_zyx: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """Section 4: the 12-DOF IC-GN on every subset, seeded by ``U0`` (and ``F0``) →
+    ``{"U", "F", "zncc", "status", "n_iter", "bad", "U_std"}`` in ``(z, y, x)`` voxel
+    order: ``U`` ``(N,3)``, ``F`` ``(N,3,3)`` with ``F[n,i,j] = ∂u_i/∂x_j``, the per-node
+    ZNCC, pyALDVC's status code (0 converged … 7 stalled), the iteration count, the
+    median-test rejections that were inpainted (`fill_bad_nodes` runs inside
+    `local_icgn`), and the displacement uncertainty ``(N,3)`` (`pipeline.py:277-279`,
+    `:377`)."""
+    M = _al_dvc_modules()
+    U1, F1, info, bad = M["local"].local_icgn(ref.ctx, ref.source, g_prep, _u_to_xyz(U0_zyx),
+                                             ref.para, ref.mesh, F0=_f_to_xyz(F0_zyx))
+    U_std = M["unc"].displacement_uncertainty(ref.ctx, info.zncc, info.status)
+    return {
+        "U": _u_to_zyx(U1), "F": _f_to_zyx(F1),
+        "zncc": np.asarray(info.zncc, dtype=np.float64),
+        "status": np.asarray(info.status, dtype=np.int64),
+        "n_iter": np.asarray(info.n_iter, dtype=np.int64),
+        "bad": np.asarray(bad, dtype=bool),
+        "U_std": _u_to_zyx(U_std),
+        "solve_time": float(info.solve_time),
+    }
+
+
+def stage_global(ref: DVCReference, g_prep: np.ndarray, U1_zyx: np.ndarray, F1_zyx: np.ndarray,
+                 bad_local: np.ndarray, *, beta: Optional[float] = None) -> Dict[str, Any]:
+    """Sections 5-6: the global compatibility step and the ADMM iterations
+    (`pipeline.py:282-368`, verbatim) → ``{"U", "F", "zncc", "status", "outlier",
+    "U_std", "beta", "mu", "n_steps", "update_global", "update_local"}`` in ``(z, y, x)``.
+
+    ``beta`` ``None`` auto-tunes by the L-curve on THIS pair (``para.beta`` wins when it
+    is set); the driver tunes once per reference and reuses it, so a caller correlating
+    several frames against one reference should pass the first pair's ``beta`` back in.
+    Refuses (``ValueError``) when the reference holds no global operators — the global
+    step is off in ``para`` or the mesh could not build them."""
+    M = _al_dvc_modules()
+    para = ref.para
+    if ref.ops is None:
+        raise ValueError("the global step needs the FEM/FD operators: use_global_step is off "
+                         "for this reference, or the grid could not build them")
+    mesh, ctx, ops = ref.mesh, ref.ctx, ref.ops
+    U1, F1 = _u_to_xyz(U1_zyx), _f_to_xyz(F1_zyx)
+    bad_local = np.asarray(bad_local, dtype=bool)
+    exclude = np.zeros(mesh.n_nodes, dtype=bool)
+    exclude[mesh.boundary_nodes] = True
+    exclude |= bad_local
+    beta_sweep = None
+    if para.beta is not None:
+        beta_v = float(para.beta)
+    elif beta is not None:
+        beta_v = float(beta)
+    else:
+        beta_v, beta_sweep = M["beta"].auto_tune_beta(ops, para, para.mu, U1, F1, exclude)
+    mu = float(para.mu)
+    system = M["sub2"].build_global_system(ops, beta_v, mu, para.alpha, para)
+    W = np.zeros((mesh.n_nodes, 3, 3))
+    v = np.zeros((mesh.n_nodes, 3))
+    U2, _s2 = M["sub2"].solve_subpb2(system, U1, F1, W, v)
+    F2 = M["gops"].nodal_gradient(ops, U2)
+    F2 = np.where(np.isfinite(F2), F2, F1)
+    W = F2 - F1
+    v = U2 - U1
+
+    def _rms(a: np.ndarray) -> float:
+        a = np.asarray(a, dtype=np.float64)
+        return float(np.sqrt(np.mean(a * a))) if a.size else 0.0
+
+    upd_g: List[float] = []
+    upd_l: List[float] = []
+    zncc = status = None
+    n_steps = 1
+    bad_last = bad_local
+    for step in range(2, int(para.admm_max_iter) + 1):
+        n_steps = step
+        U1_prev = U1
+        U1, info_s1, bad_last = M["sub1"].subpb1_solver(ctx, ref.source, g_prep, U2, F2, v, mu,
+                                                        para, mesh)
+        F1 = F2
+        zncc, status = info_s1.zncc, info_s1.status
+        U2_new, _ = M["sub2"].solve_subpb2(system, U1, F1, W, v)
+        F2_new = M["gops"].nodal_gradient(ops, U2_new)
+        F2_new = np.where(np.isfinite(F2_new), F2_new, F1)
+        du_g = _rms(U2_new - U2)
+        du_l = _rms(U1 - U1_prev)
+        upd_g.append(du_g)
+        upd_l.append(du_l)
+        if para.dual_update == "accumulate":
+            W = W + (F2_new - F1)
+            v = v + (U2_new - U1)
+        else:
+            W = F2_new - F1
+            v = U2_new - U1
+        U2, F2 = U2_new, F2_new
+        if du_g < para.admm_tol or du_l < para.admm_tol:
+            break
+    if zncc is None:
+        # a single ADMM iteration: the status and quality are the local pass's, which the
+        # caller holds — report them as unknown here rather than inventing a pass
+        zncc = np.full(mesh.n_nodes, np.nan)
+        status = np.full(mesh.n_nodes, -1, dtype=np.int64)
+    status_arr = np.asarray(status, dtype=np.int64)
+    outlier = np.asarray(bad_last, dtype=bool) & (status_arr == M["ds"].STATUS_CONVERGED)
+    U_std = M["unc"].displacement_uncertainty(
+        ctx, np.where(np.isfinite(zncc), zncc, 0.0), np.where(status_arr < 0, 0, status_arr))
+    return {
+        "U": _u_to_zyx(U2), "F": _f_to_zyx(F2),
+        "zncc": np.asarray(zncc, dtype=np.float64), "status": status_arr,
+        "outlier": outlier, "U_std": _u_to_zyx(U_std),
+        "beta": beta_v, "mu": mu, "n_steps": int(n_steps),
+        "update_global": tuple(upd_g), "update_local": tuple(upd_l),
+        "beta_sweep": beta_sweep,
+    }
+
+
+def stage_strain(para, shape: Tuple[int, int, int], U_zyx: np.ndarray, *,
+                 F_direct_zyx: Optional[np.ndarray] = None,
+                 valid: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Section 8 on a grid rebuilt from ``para`` + ``shape`` (pure geometry — no volume
+    is read) → ``(strain_zyx (N,3,3), strain_valid (N,), strain_type)``. ``U_zyx`` is the
+    field to differentiate (voxels); ``F_direct_zyx`` the solver's own gradient, used by
+    ``strain_method="direct"`` and only meaningful against frame 0 (`pipeline.py:410`);
+    ``valid`` the node validity the local stage wrote. The tensor comes back in this
+    repo's index order via the same relabelling `frame_to_dvcresult` uses."""
+    M = _al_dvc_modules()
+    mesh, _coords = stage_grid(para, shape)
+    if valid is not None:
+        mesh.node_valid = np.asarray(valid, dtype=bool).copy()
+    sr = M["strain"].compute_strain(mesh, para, _u_to_xyz(U_zyx), F_direct=_f_to_xyz(F_direct_zyx),
+                                    valid=np.asarray(mesh.node_valid, dtype=bool), ops=None)
+    return _strain_tensor_zyx(sr), np.asarray(sr.strain_valid, dtype=bool), str(sr.strain_type)
