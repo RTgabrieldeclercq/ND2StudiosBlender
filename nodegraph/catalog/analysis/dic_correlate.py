@@ -24,10 +24,12 @@ from nodegraph.structure import StructureTable, point_table
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
-from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_trial,
-                                                      open_node_trial, run_units, ship,
+from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_seconds,
+                                                      finish_trial, full_run_estimate,
+                                                      open_node_trial, quality_layers,
+                                                      run_units, scoped_frame, ship,
                                                       stamp_trial, store_sockets, unit_list,
-                                                      unship)
+                                                      unship, with_quality)
 from nodegraph.analysis_store import unit_name
 
 # ── DIC (pyALDIC) — 2D digital image correlation, the image sibling of DVC ──────
@@ -119,6 +121,9 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
     ref_mode = modes.get("reference_mode", "fixed_frame")
     solver = modes.get("solver", "aldic")
     ref_frame = int(ctx.params.get("reference_frame", 0))
+    # under the quick-analysis scope a source frame index is not a payload index
+    ref_local = (scoped_frame(ds.metadata, ref_frame, ax.t, mode=ref_mode, node="DIC")
+                 if ref_prov is None else ref_frame)
     c = min(max(0, int(ctx.params.get("channel", 0))), max(0, ax.c - 1))
     px = ctx.calib("pixel_size_um") or 0.1
     vox: Tuple[float, ...] = (px, px)                    # (y, x) µm/px — kernel §3
@@ -174,7 +179,7 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
             head = (ref_prov, min(m, rax.m - 1), min(max(0, ref_frame), rax.t - 1),
                     min(z, max(0, rax.z - 1)), min(c, max(0, rax.c - 1)))
         else:
-            head = (prov, m, min(max(0, ref_frame), ax.t - 1), z, c)
+            head = (prov, m, min(max(0, ref_local), ax.t - 1), z, c)
         return ([head] + [(prov, m, t, z, c) for t in range(ax.t)],
                 list(range(ax.t)), "accumulative")
 
@@ -213,16 +218,23 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
     prov_md = {"dic_reference_mode": (ref_mode if ref_prov is None else "fixed_frame"),
                "dic_reference_frame": ref_frame, "dic_solver": solver,
                "dic_unsolved_points": n_dropped}
-    finish_trial(opened, run, stamps=prov_md,
+    kept = int(len(merged.get("m", ())))
+    quality = {"dic_solved_frac": (kept / (kept + n_dropped)) if (kept + n_dropped) else None}
+    est = full_run_estimate(ds.metadata, ax, run, per_plane=True, min_inner=2)
+    quality["analysis_est_full_s"] = est
+    if est is not None:
+        prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
+                                        f"(from this quick run)")
+    finish_trial(opened, run, stamps=prov_md, quality=quality,
                  tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"}})
     prov_md = stamp_trial(prov_md, opened, run)
     if not merged:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
-        return ds.with_structure(empty).with_metadata(**prov_md)
+        return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return (ds.with_structure(
+    return with_quality(ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
-        .with_metadata(**prov_md))
+        .with_metadata(**prov_md), quality)
 
 
 class _DICArraySeq:
@@ -287,11 +299,19 @@ def _columns_dic_correlate(params, modes, incoming):
     except Exception:                        # pragma: no cover - defensive
         return ()
 
+def _layers_dic_correlate(params, modes):
+    """The quality scalars (Global) this node writes for a sweep to optimise — no socket
+    names them (``_shared.analysis_units.QUALITY``)."""
+    return quality_layers("analysis.dic_correlate")
+
+
 register_node(
     _compute_dic_correlate, op_key="analysis.dic_correlate", label="DIC (pyALDIC)",
     adds_columns=_columns_dic_correlate,
     category="analysis",
-    reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
+    reads_domains=frozenset({Domain.VOXEL}),
+    adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
+    extra_layers=_layers_dic_correlate,
     inputs=[
         InDataset(),
         InDataset("reference", label="Reference"),

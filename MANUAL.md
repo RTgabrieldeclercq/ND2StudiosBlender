@@ -2711,6 +2711,46 @@ A pull under **F9 troubleshooting** never saves: quick looks stay out of the fol
 - It refuses an image whose positions, frames or planes differ from the trial's.
 - `Onto = tables_only` needs no image.
 
+**Quick analysis: choose the settings before the full run.** Every DIC, PIV, DVC and
+SerialTrack card has a **Quick analysis** section in the inspector, on the staged cards too.
+**Quick analysis** turns F9 on with the frames that analysis needs, then runs it.
+
+| Picks | What it chooses |
+|---|---|
+| Position | the one on screen |
+| Plane | the one on screen for DIC, PIV and 2-D tracking; the whole volume for DVC |
+| Frames | the **reference and the current frame** for a fixed reference; the previous and current frame for frame-to-frame; five frames for tracking |
+| Region | a box about 16 subsets wide in the middle of the image, unless you drew one |
+
+A change of setting then answers in seconds. Every setting you try stays cached, so going back
+to one is instant.
+
+- **The reference frame keeps its meaning under the scope.** Plain F9 renumbers the frames it
+  keeps, so a fixed reference frame would otherwise point at the wrong image. The node maps it
+  back, and refuses with a message if the reference was left out of the picks.
+- **Quick runs are never saved**, so they never clutter the `.analysis` folder.
+- **Full run** turns F9 off.
+
+**Quality metrics, and letting the app pick.** Each analysis also writes a few quality numbers
+as Global scalars:
+
+| Node | Metrics |
+|---|---|
+| DIC | `dic_solved_frac` (share of grid points solved) |
+| PIV | `piv_valid_frac` (vectors that passed validation), `piv_median_s2n` (median signal-to-noise) |
+| DVC | `dvc_valid_frac`, `dvc_median_q` (median correlation quality) |
+
+To let the app choose a setting, put an **Iterate** card around the node
+([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)). Sweep a
+setting (subset or window size, tolerance) with **Preserve = best**, and name one of these
+metrics in **Metric**. With Quick analysis on, every iteration is a quick one.
+
+A quick run also writes **`analysis_est_full_s`**, an estimate of the full run's time on this
+machine. It scales the measured run up to the full series, the full area and every position,
+using the parallel plan the governor would choose. It appears in the node's provenance as, for
+example, "full run ≈ 11 min on this machine (from this quick run)". It is an estimate, given
+so you know whether to start now or overnight.
+
 **Using every core without freezing the machine.** Units run in parallel worker processes,
 and the width is decided by a **resource governor** that reads the machine:
 - Physical cores, free RAM and current load set the width.

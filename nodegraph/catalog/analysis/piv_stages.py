@@ -53,6 +53,7 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
+from nodegraph.catalog._shared.analysis_units import scoped_frame
 
 _DEFAULT_LAYER = "piv"
 FIELD_COLUMNS = ("disp_y", "disp_x", "disp_mag_um", "qfactor", "excluded")
@@ -214,7 +215,10 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
     ref_mode = str(modes.get("reference_mode", "previous_frame"))
     corr = str(modes.get("correlation", "circular"))
     subpix = str(modes.get("subpixel", "gaussian"))
-    ref_frame = int(ctx.params.get("reference_frame", 0))
+    # under the quick-analysis scope a source frame index is not a payload index; the
+    # stamped reference is what the later stages index the payload with
+    ref_frame = scoped_frame(ds.metadata, int(ctx.params.get("reference_frame", 0)), ax.t,
+                             mode=ref_mode, node="PIV First Pass")
     c = min(max(0, int(ctx.params.get("channel", 0))), max(0, ax.c - 1))
     window = max(8, int(ctx.params.get("window_size", 64)))
     overlap = min(0.75, max(0.0, float(ctx.params.get("overlap", 0.5))))

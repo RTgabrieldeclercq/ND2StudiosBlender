@@ -24,10 +24,12 @@ from nodegraph.structure import StructureTable, point_table
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
-from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_trial,
-                                                      open_node_trial, run_units, ship,
+from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_seconds,
+                                                      finish_trial, full_run_estimate,
+                                                      open_node_trial, quality_layers,
+                                                      run_units, scoped_frame, ship,
                                                       stamp_trial, store_sockets, unit_list,
-                                                      unship)
+                                                      unship, with_quality)
 from nodegraph.analysis_store import unit_name
 
 # Params the in-repo ALDVC port read and pyALDVC has no equivalent for, mapped to
@@ -131,6 +133,9 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
 
     ref_mode = modes.get("reference_mode", "fixed_frame")
     ref_frame = int(ctx.params.get("reference_frame", 0))
+    # under the quick-analysis scope a source frame index is not a payload index
+    ref_local = (scoped_frame(ds.metadata, ref_frame, ax.t, mode=ref_mode, node="DVC")
+                 if ref_prov is None else ref_frame)
     c = min(max(0, int(ctx.params.get("channel", 0))), max(0, ax.c - 1))
     px = ctx.calib("pixel_size_um") or 0.1
     zs = ctx.calib("z_step_um") or 0.5
@@ -177,7 +182,7 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
             return (ref_prov, min(m, rax.m - 1),
                     min(max(0, ref_frame), rax.t - 1),
                     min(c, max(0, rax.c - 1)))
-        return (prov, m, min(max(0, ref_frame), ax.t - 1), c)
+        return (prov, m, min(max(0, ref_local), ax.t - 1), c)
 
     shape = (ax.z, ax.y, ax.x)
     # Compare the providers' declared AXES, never a materialized volume: fetching frame 0
@@ -251,15 +256,27 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
         "dvc_strain_smooth": dvc_params["strain_smooth"],
     }
     zk = "subpixel"
-    finish_trial(opened, run, stamps=prov_md,
+    dz = np.asarray(merged.get("disp_z", ()), dtype=float)
+    q = np.asarray(merged.get("qfactor", ()), dtype=float)
+    quality = {
+        "dvc_valid_frac": float(np.isfinite(dz).mean()) if dz.size else None,
+        "dvc_median_q": float(np.nanmedian(q)) if np.isfinite(q).any() else None,
+    }
+    est = full_run_estimate(ds.metadata, ax, run, per_plane=False, min_inner=4)
+    quality["analysis_est_full_s"] = est
+    if est is not None:
+        prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
+                                        f"(from this quick run)")
+    finish_trial(opened, run, stamps=prov_md, quality=quality,
                  tables={"field": {"domain": "point", "layer": layer, "z_kind": zk}})
     prov_md = stamp_trial(prov_md, opened, run)
     if not merged:
         empty = point_table(np.zeros((0, 3)), z_kind=zk, layer=layer)
-        return ds.with_structure(empty).with_metadata(**prov_md)
+        return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return (ds.with_structure(StructureTable(Domain.POINT, merged, layer=layer, z_kind=zk))
-            .with_metadata(**prov_md))
+    return with_quality(
+        ds.with_structure(StructureTable(Domain.POINT, merged, layer=layer, z_kind=zk))
+        .with_metadata(**prov_md), quality)
 
 
 class _DVCVolumeSeq:
@@ -326,11 +343,19 @@ def _columns_dvc_field(params, modes, incoming):
         return ()
 
 
+def _layers_dvc_field(params, modes):
+    """The quality scalars (Global) this node writes for a sweep to optimise — no
+    socket names them (``_shared.analysis_units.QUALITY``)."""
+    return quality_layers("analysis.dvc_field")
+
+
 register_node(
     _compute_dvc_field, op_key="analysis.dvc_field", label="DVC (pyALDVC)",
     adds_columns=_columns_dvc_field,
     category="analysis",
-    reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
+    reads_domains=frozenset({Domain.VOXEL}),
+    adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
+    extra_layers=_layers_dvc_field,
     inputs=[
         InDataset(),
         InDataset("reference", label="Reference"),

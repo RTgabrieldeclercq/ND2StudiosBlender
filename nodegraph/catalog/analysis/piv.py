@@ -25,10 +25,12 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
 from nodegraph.catalog._shared.objects import _frame_interval_s
-from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_trial,
-                                                      open_node_trial, run_units, ship,
+from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_seconds,
+                                                      finish_trial, full_run_estimate,
+                                                      open_node_trial, quality_layers,
+                                                      run_units, scoped_frame, ship,
                                                       stamp_trial, store_sockets, unit_list,
-                                                      unship)
+                                                      unship, with_quality)
 from nodegraph.analysis_store import unit_name
 
 # ── PIV (OpenPIV) — the FLOW sibling of DIC/DVC ─────────────────────────────────
@@ -138,6 +140,9 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     ref_mode = modes.get("reference_mode", "previous_frame")
     corr = modes.get("correlation", "circular")
     ref_frame = int(ctx.params.get("reference_frame", 0))
+    # under the quick-analysis scope a source frame index is not a payload index
+    ref_local = (scoped_frame(ds.metadata, ref_frame, ax.t, mode=ref_mode, node="PIV")
+                 if ref_prov is None else ref_frame)
     c = min(max(0, int(ctx.params.get("channel", 0))), max(0, ax.c - 1))
     px = ctx.calib("pixel_size_um") or 0.1
     vox: Tuple[float, float] = (px, px)                  # (y, x) µm/px — kernel contract §3
@@ -218,7 +223,7 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
             head = (ref_prov, min(m, rax.m - 1), min(max(0, ref_frame), rax.t - 1),
                     min(z, max(0, rax.z - 1)), min(c, max(0, rax.c - 1)))
         else:
-            head = (prov, m, min(max(0, ref_frame), ax.t - 1), z, c)
+            head = (prov, m, min(max(0, ref_local), ax.t - 1), z, c)
         return ([head] + [(prov, m, t, z, c) for t in range(ax.t)],
                 list(range(ax.t)), "fixed_head")
 
@@ -258,16 +263,29 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
                "piv_invalid_points": n_dropped}
     if want_vel:
         prov_md["piv_dt_s"] = float(dt_s)
-    finish_trial(opened, run, stamps=prov_md,
+    kept = int(len(merged.get("m", ())))
+    replaced = int(np.sum(merged["replaced"])) if "replaced" in merged else 0
+    q = np.asarray(merged.get("qfactor", ()), dtype=float)
+    quality = {
+        "piv_valid_frac": ((kept - replaced) / (kept + n_dropped)) if (kept + n_dropped)
+        else None,
+        "piv_median_s2n": float(np.nanmedian(q)) if np.isfinite(q).any() else None,
+    }
+    est = full_run_estimate(ds.metadata, ax, run, per_plane=True, min_inner=1)
+    quality["analysis_est_full_s"] = est
+    if est is not None:
+        prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
+                                        f"(from this quick run)")
+    finish_trial(opened, run, stamps=prov_md, quality=quality,
                  tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"}})
     prov_md = stamp_trial(prov_md, opened, run)
     if not merged:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
-        return ds.with_structure(empty).with_metadata(**prov_md)
+        return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return (ds.with_structure(
+    return with_quality(ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
-        .with_metadata(**prov_md))
+        .with_metadata(**prov_md), quality)
 
 
 class _PIVArraySeq:
@@ -357,11 +375,19 @@ def _columns_piv(params, modes, incoming):
     except Exception:                        # pragma: no cover - defensive
         return ()
 
+def _layers_piv(params, modes):
+    """The quality scalars (Global) this node writes for a sweep to optimise — no
+    socket names them (``_shared.analysis_units.QUALITY``)."""
+    return quality_layers("analysis.piv")
+
+
 register_node(
     _compute_piv, op_key="analysis.piv", label="PIV (OpenPIV)",
     adds_columns=_columns_piv,
     category="analysis",
-    reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
+    reads_domains=frozenset({Domain.VOXEL}),
+    adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
+    extra_layers=_layers_piv,
     inputs=[
         InDataset(),
         InDataset("reference", label="Reference",

@@ -88,6 +88,37 @@ def unit_list(ax: Any, *, per_plane: bool) -> List[Tuple[int, ...]]:
     return [(m,) for m in range(int(ax.m))]
 
 
+# ── the quick-analysis scope ─────────────────────────────────────────────────────
+
+def scoped_frame(md: Any, ref_frame: int, n_t: int, *, mode: str = "fixed_frame",
+                 node: str = "") -> int:
+    """``ref_frame`` — a SOURCE timepoint, as the user set it — as its index in the payload
+    actually wired in (2026-10-09).
+
+    Under the F9 / Quick-analysis scope the source seed holds only the picked frames,
+    renumbered from 0, and the runner stamps the source index of each as ``scope_t``. A
+    fixed reference frame of 5 with frames {2, 5} picked is payload frame 1 — read as
+    frame 5 it would be clamped onto the LAST picked frame and correlate against the wrong
+    image without a word. Unscoped, a ``previous_frame`` policy, or a ``scope_t`` that no
+    longer matches the axis (a node upstream changed T) → ``ref_frame`` unchanged; a
+    reference the picks leave out is refused, naming the fix."""
+    if mode != "fixed_frame":
+        return ref_frame
+    st = md.get("scope_t") if hasattr(md, "get") else None
+    if not st:
+        return ref_frame
+    picks = [int(x) for x in st]
+    if len(picks) != int(n_t):
+        return ref_frame
+    if int(ref_frame) in picks:
+        return picks.index(int(ref_frame))
+    raise ValueError(
+        f"{node or 'this analysis'}: the quick-analysis scope holds frames {picks}, which do "
+        f"not include the reference frame {ref_frame} — every frame is correlated against "
+        f"it. Pick it on the Viewer's T strip too (the Quick analysis button does), or set "
+        f"Reference frame to one of the picked frames.")
+
+
 # ── the trial ────────────────────────────────────────────────────────────────────
 
 def _is_scoped(md: Any) -> bool:
@@ -126,7 +157,7 @@ def open_node_trial(ctx: EvalContext, ds: Any, units: Sequence[Tuple[int, ...]],
                     axes_names: Sequence[str], analysis: str) -> TrialOpen:
     """The saved trial this pull reads from and writes to, or ``None`` with the reason:
     ``results = off``, a scoped quick-analysis pull, or no source file to sit beside."""
-    from nodegraph import analysis_store as S
+    import nodegraph.analysis_store as S
     mode = str(ctx.params.get("results", "reuse") or "reuse")
     if mode == "off":
         return TrialOpen(None, "results not saved (off)")
@@ -299,7 +330,7 @@ def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
     progress — used on the one-lane path, where a long unit would otherwise show a frozen
     bar. ``worker_bytes`` is the first guess at one worker's memory; the governor replaces
     it with the measured peak after the first unit."""
-    from nodegraph import parallel as P
+    import nodegraph.parallel as P
     from nodegraph.catalog._shared.progress import _UnitBar
     from nodegraph.governor import Governor, UnitStats, peak_rss_bytes
 
@@ -368,6 +399,78 @@ def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
                    gov.plan.note(), gov.mean_seconds())
 
 
+# ── quality metrics and the full-run estimate (the quick analysis) ─────────────────
+
+#: The Global scalars each node writes — what an Iterate card's Metric field names to keep
+#: the best setting of a sweep. Every unit-running node also writes ``analysis_est_full_s``.
+QUALITY: Dict[str, Tuple[str, ...]] = {
+    "analysis.dic_correlate": ("dic_solved_frac",),
+    "analysis.piv": ("piv_valid_frac", "piv_median_s2n"),
+    "analysis.dvc_field": ("dvc_valid_frac", "dvc_median_q"),
+}
+EST_KEY = "analysis_est_full_s"
+
+
+def quality_layers(op_key: str) -> Tuple[Tuple[Any, str], ...]:
+    """``((Domain.GLOBAL, name), …)`` for ``extra_layers`` — the scalars ``op_key`` writes."""
+    from nodegraph.domains import Domain
+    return tuple((Domain.GLOBAL, n) for n in QUALITY.get(op_key, ()) + (EST_KEY,))
+
+
+def with_quality(ds: Any, metrics: Dict[str, Optional[float]]) -> Any:
+    """``ds`` with each metric as a dimensionless Global scalar (the estimate in seconds) —
+    the shape ``analysis.reduce_scalar`` writes, so ``flow.iterate`` reads them as metrics.
+    A metric that could not be measured is written as NaN rather than left out, so a sweep
+    sees every iteration."""
+    from nodegraph.domains import Domain
+    from nodegraph.units import with_unit
+    for name, v in metrics.items():
+        val = float("nan") if v is None else float(v)
+        ds = with_unit(ds.with_layer(Domain.GLOBAL, name, np.asarray(val)),
+                       Domain.GLOBAL, name, "s" if name == EST_KEY else "")
+    return ds
+
+
+def full_run_estimate(md: Any, ax: Any, run: "UnitRun", *, per_plane: bool,
+                      min_inner: int = 1) -> Optional[float]:
+    """Seconds the FULL run would take on this machine, from a quick (scoped) run — or
+    ``None`` when the pull was not scoped or nothing was computed.
+
+    The scoped unit's measured time is scaled to a full unit by the frame count and the
+    analysed area (volume, for DVC) the scope cut away — correlation cost grows with the
+    number of grid points and of frame pairs — then spread over the full unit count on
+    the lane plan the governor would choose (:func:`nodegraph.governor.estimate_seconds`).
+    An estimate, not a promise: shown so the user knows whether to start the full run now
+    or overnight."""
+    from nodegraph.governor import estimate_seconds, machine_profile, plan_lanes
+    of = md.get("scope_of") if hasattr(md, "get") else None
+    if not of or run.unit_seconds is None or run.computed == 0:
+        return None
+    M, T, Z, Y, X = (max(1, int(v)) for v in of)
+    n_full = M * Z if per_plane else M
+    t_ratio = T / max(1, int(ax.t))
+    area = (Y * X) / max(1, int(ax.y) * int(ax.x))
+    if not per_plane:
+        area *= Z / max(1, int(ax.z))
+    unit_full = float(run.unit_seconds) * t_ratio * area
+    gov = run.governor
+    peak = int(getattr(gov, "peak_bytes", 0) or 0)
+    wb = int(max(peak, 1) * max(1.0, area) * 1.25) if peak else (1 << 30)
+    plan = plan_lanes(n_full, wb, machine_profile(), min_inner=min_inner)
+    measured = None if (gov is not None and gov.plan.lanes > 1) else plan.usable_cores
+    return estimate_seconds(unit_full, n_full, plan, measured_threads=measured)
+
+
+def describe_seconds(s: Optional[float]) -> str:
+    if s is None:
+        return ""
+    if s < 90:
+        return f"{s:.0f} s"
+    if s < 5400:
+        return f"{s / 60:.0f} min"
+    return f"{s / 3600:.1f} h"
+
+
 def concat_tables(results: Sequence[dict], kind: str) -> Dict[str, np.ndarray]:
     """One column dict from every unit's ``kind`` table, in unit order (empty units skipped;
     a column missing from some units is dropped — a partial column would misalign rows)."""
@@ -409,7 +512,9 @@ def stamp_trial(md_out: Dict[str, Any], opened: TrialOpen, run: UnitRun) -> Dict
 
 
 __all__ = [
-    "STORE_PARAMS", "store_sockets", "unit_list", "TrialOpen", "open_node_trial",
+    "STORE_PARAMS", "store_sockets", "unit_list", "scoped_frame", "TrialOpen",
+    "open_node_trial",
     "SHIP_BYTES", "ShippedArray", "ship", "unship", "UnitRun", "run_units",
-    "concat_tables", "finish_trial", "stamp_trial",
+    "concat_tables", "finish_trial", "stamp_trial", "QUALITY", "EST_KEY",
+    "quality_layers", "with_quality", "full_run_estimate", "describe_seconds",
 ]

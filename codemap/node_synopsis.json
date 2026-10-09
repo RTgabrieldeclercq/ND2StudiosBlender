@@ -1894,6 +1894,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -2146,7 +2147,7 @@
       ],
       "compute": "_compute_dic_correlate",
       "meta_transform": null,
-      "extra_layers": null,
+      "extra_layers": "_layers_dic_correlate",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
@@ -2364,6 +2365,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -2740,7 +2742,7 @@
       ],
       "compute": "_compute_dvc_field",
       "meta_transform": null,
-      "extra_layers": null,
+      "extra_layers": "_layers_dvc_field",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/aldvc_field.md",
@@ -5170,6 +5172,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -5460,7 +5463,7 @@
       ],
       "compute": "_compute_piv",
       "meta_transform": null,
-      "extra_layers": null,
+      "extra_layers": "_layers_piv",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/piv_field.md",

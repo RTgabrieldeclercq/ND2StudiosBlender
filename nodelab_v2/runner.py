@@ -871,8 +871,20 @@ def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEn
     changes = position_subset(env.metadata, kept)
     if changes:
         out = out.with_metadata(**changes)
+    # WHICH source frames this scoped seed holds (2026-10-09): the payload renumbers them
+    # from 0, so a node that names a source frame — an analysis's fixed reference frame —
+    # maps it through these (`_shared.analysis_units.scoped_frame`), and the analysis store
+    # refuses to save a scoped pull. Tuples, not per-position lists: they describe the
+    # scope, and no node that narrows M or T should reindex them.
+    out = out.with_metadata(
+        scope_m=tuple(int(i) for i in kept),
+        scope_t=tuple(int(i) for i in _picked(ts, int(env.axes.t))),
+        scope_z=(tuple(int(i) for i in _picked(zs, int(env.axes.z))) if zs else ()),
+        scope_of=(int(env.axes.m), int(env.axes.t), int(env.axes.z), int(env.axes.y),
+                  int(env.axes.x)))
     region = region_box.clamp(region, (int(view.axes.y), int(view.axes.x)))
     if region is not None:
+        out = out.with_metadata(scope_region=tuple(int(v) for v in region))
         y0, y1, x0, x1 = region
         win_axes = replace(view.axes, y=y1 - y0, x=x1 - x0)
         view = WindowView(view, y0=y0, x0=x0, axes=win_axes)

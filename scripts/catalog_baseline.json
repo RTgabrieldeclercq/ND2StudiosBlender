@@ -1425,12 +1425,13 @@
   },
   "analysis.dic_correlate": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dic_correlate",
    "description": "2D digital image correlation (pyALDIC: IC-GN + ADMM over an adaptive FE mesh) \u2192 a Point displacement field (subset centers, disp \u00b5m, optional strain); fixed/previous self-reference or an external reference Dataset + optional ROI mask. Solves the whole T stack in one call per (m, z). Wired to the vendored kernel; needs al-dic (dep-gated: friendly ImportError at run time until installed).",
-   "extra_layers": null,
+   "extra_layers": "_layers_dic_correlate",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -2616,12 +2617,13 @@
   },
   "analysis.dvc_field": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dvc_field",
    "description": "3D Augmented-Lagrangian digital volume correlation (official pyALDVC: pyramid-NCC seed + 12-DOF IC-GN + global compatibility/ADMM) \u2192 a Point displacement + strain field on the subset grid (disp \u00b5m, dimensionless strain, per-subset ZNCC). Fixed-frame or previous-frame self-reference, or an external reference Dataset. Solves the whole T stack in one call per m. 3D ONLY \u2014 2D is the DIC (pyALDIC) node. Needs al-dvc (dep-gated: friendly error at run time until installed).",
-   "extra_layers": null,
+   "extra_layers": "_layers_dvc_field",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -8882,12 +8884,13 @@
   },
   "analysis.piv": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_piv",
    "description": "2D particle image velocimetry (OpenPIV: multipass FFT correlation with window deformation, universal outlier detection, per-vector S/N) \u2192 a Point displacement field per frame pair; previous/fixed self-reference, ENSEMBLE correlation averaging (one time-averaged field \u2014 the micro-PIV method for sparse seeding), or an external reference Dataset + optional ROI mask; optional vy/vx/speed \u00b5m/s via the file's dt_s and optional per-vector unc_y/unc_x \u00b5m (Sciacchitano image-matching, dep: pivuq). The FLOW sibling of DIC \u2014 independent windows, far faster, per-vector confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError at run time until installed).",
-   "extra_layers": null,
+   "extra_layers": "_layers_piv",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",

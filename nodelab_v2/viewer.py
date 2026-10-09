@@ -2246,6 +2246,13 @@ class ViewerPanel(QWidget):
         to one plane because a cursor happened to sit there would be a trap."""
         return tuple(self._sliders[ax].selection() for ax in _AXES)
 
+    def set_frame_selection(self, ms: Sequence[int] = (), ts: Sequence[int] = (),
+                            zs: Sequence[int] = ()) -> None:
+        """Set the M/T/Z picks programmatically — exactly what ctrl+clicks on the strips do
+        (the Quick analysis button, 2026-10-09). An empty axis clears that axis's picks."""
+        for ax, idx in zip(_AXES, (ms, ts, zs)):
+            self._sliders[ax].setSelection(tuple(int(i) for i in idx))
+
     def clear_frame_selection(self) -> None:
         """Drop every pick — the scope falls back to the cursor's frame, whole volume."""
         for ax in _AXES:

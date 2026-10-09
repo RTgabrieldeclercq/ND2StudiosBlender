@@ -7136,6 +7136,159 @@ def test_analysis_parallel() -> None:
         f"ordered fold) — PIV ran as: {lanes_piv}")
 
 
+def test_quick_scope() -> None:
+    """The quick analysis (2026-10-09): (1) `quick_picks` arms F9 with what each analysis
+    needs — the reference frame INCLUDED, a staged card reading its chain's grid card, the
+    plane for planar methods / the whole volume for DVC, five frames for tracking, a centred
+    box unless one is drawn, a refusal on one timepoint; (2) under a scope a fixed reference
+    frame is a SOURCE index mapped through `scope_t` (frames {2, 5} picked, reference 5 ⇒
+    the same field as the unscoped pair with reference 1), and a reference outside the
+    picks is refused; (3) a scoped pull saves nothing; (4) the quality metrics are Global
+    scalars and a scoped pull estimates the full run; (5) an Iterate sweep keeps the best
+    setting by a quality metric."""
+    if not _HAVE_SKIMAGE:
+        _ok("quick scope: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    import nodegraph.iterate as IT
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    from nodelab_v2.quick import quick_picks, TRACK_FRAMES
+
+    # ── 1. the picks ──────────────────────────────────────────────────────────────
+    ensure_ops()
+    doc = GraphDocument()
+    axs = AxisSizes(m=3, t=10, z=4, c=1, y=2048, x=2048)
+    card = doc.add_node("io.load", x=0, y=0, params={"path": "fake.nd2"})
+    doc.set_meta_seed(card.id, MetaEnvelope(axes=axs, metadata={"pixel_size_um": 0.5}))
+
+    def node(op, params=None, modes=None, src=None):
+        r = doc.add_node(op, x=300, y=0, params=dict(params or {}), modes=dict(modes or {}))
+        doc.connect(src or card.id, "image" if src is None else "out", r.id, "data")
+        return r.id
+    totals, ext = (3, 10, 4), (2048, 2048)
+    dic = node("analysis.dic_correlate", {"reference_frame": 0})
+    q = quick_picks(doc, dic, (1, 6, 2, 0), totals, ext)
+    assert (q.ms, q.ts, q.zs) == ((1,), (0, 6), (2,)), q
+    assert q.region == (704, 1344, 704, 1344), q.region        # 16 × 40 px, centred
+    q = quick_picks(doc, dic, (1, 6, 2, 0), totals, ext, region=(0, 100, 0, 100))
+    assert q.region == (0, 100, 0, 100), "a drawn box must be kept"
+    dic9 = node("analysis.dic_correlate", {"reference_frame": 9})
+    assert quick_picks(doc, dic9, (0, 9, 0, 0), totals, ext).ts == (8, 9)
+    piv = node("analysis.piv")                                   # previous_frame default
+    assert quick_picks(doc, piv, (0, 0, 1, 0), totals, ext).ts == (0, 1)
+    dvc = node("analysis.dvc_field", {"reference_frame": 2})
+    qd = quick_picks(doc, dvc, (2, 5, 3, 0), totals, ext)
+    assert qd.ts == (2, 5) and qd.zs == (), qd                  # DVC needs the whole volume
+    grid = node("dic.grid", {"reference_frame": 3})
+    seed = node("dic.initial_guess", src=grid)
+    match = node("dic.local_match", src=seed)
+    assert quick_picks(doc, match, (0, 7, 0, 0), totals, ext).ts == (3, 7), \
+        "a staged card must read the reference policy off its chain's grid card"
+    trk = node("track.objects", {"method": "serialtrack"})
+    assert quick_picks(doc, trk, (0, 8, 1, 0), totals, ext).ts == \
+        tuple(range(10 - TRACK_FRAMES, 10))
+    assert "one" in quick_picks(doc, dic, (0, 0, 0, 0), (3, 1, 4), ext).error
+
+    if not al_dic_available():
+        _ok("quick scope: picks verified; DIC-backed checks SKIPPED (al-dic absent)")
+        return
+
+    # ── 2-4. reference mapping, no saving, metrics + estimate ────────────────────
+    define_node("io.quickseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(31)
+    patt = gaussian_filter(rng.random((96, 96)), 1.0)
+    frames = [ndshift(patt, (0.4 * t, 0.9 * t), order=3, mode="nearest") for t in range(6)]
+    pair = np.zeros((1, 2, 1, 1, 96, 96))
+    pair[0, 0, 0, 0], pair[0, 1, 0, 0] = frames[2], frames[5]
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=96, x=96)
+    tmp = _tempfile.mkdtemp(prefix="ng-quick-")
+    saved = _os.environ.pop("NODEGRAPH_STORE_DIR", None)
+    _os.environ["NODEGRAPH_STORE_DIR"] = tmp
+    try:
+        def pull(md, ref):
+            ds = Dataset(axes=ax2, metadata=md).with_image(ArrayProvider(pair))
+            g = Graph()
+            g.add(NodeInstance("S", "io.quickseed"))
+            g.add(NodeInstance("D", "analysis.dic_correlate",
+                               params={"winsize": 20, "winstepsize": 16,
+                                       "reference_frame": ref}))
+            g.connect("S", "D", dst_socket="data")
+            return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                          meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=md)}).pull("D")
+        base = {"pixel_size_um": 0.5}
+        scoped = {**base, "scope_m": (0,), "scope_t": (2, 5), "scope_z": (),
+                  "scope_of": (1, 6, 1, 192, 192)}
+        o_s = pull(scoped, 5)                     # SOURCE frame 5 = payload frame 1
+        o_u = pull(base, 1)                       # the same pair, unscoped
+        cs = {a.name: np.asarray(a.values) for a in o_s.layers_on(D.POINT) if a.layer == "dic"}
+        cu = {a.name: np.asarray(a.values) for a in o_u.layers_on(D.POINT) if a.layer == "dic"}
+        for k in ("disp_y", "disp_x", "t"):
+            assert np.allclose(cs[k], cu[k], atol=1e-12, rtol=0), k
+        try:
+            pull(scoped, 3)
+            raise AssertionError("a reference outside the picks was accepted")
+        except ValueError as exc:
+            assert "do not include the reference frame 3" in str(exc), exc
+        # (3) nothing saved for the scoped pull — the unscoped one did save (store dir set)
+        assert o_s.metadata["analysis_trial"] == "" and "quick" in \
+            o_s.metadata["analysis_trial_note"], o_s.metadata["analysis_trial_note"]
+        assert o_u.metadata["analysis_trial"], "the unscoped pull should have saved"
+        # (4) the metrics are Global scalars; the scoped run estimates the full one
+        solved = float(np.asarray(o_s.get(D.GLOBAL, "dic_solved_frac").values).reshape(-1)[0])
+        assert 0.0 < solved <= 1.0, solved
+        est = float(np.asarray(o_s.get(D.GLOBAL, "analysis_est_full_s").values).reshape(-1)[0])
+        assert np.isfinite(est) and est > 0, est
+        assert "full run" in o_s.metadata["analysis_estimate"]
+        est_u = float(np.asarray(o_u.get(D.GLOBAL, "analysis_est_full_s").values).reshape(-1)[0])
+        assert np.isnan(est_u), "an unscoped run has nothing to extrapolate"
+    finally:
+        if saved is None:
+            _os.environ.pop("NODEGRAPH_STORE_DIR", None)
+        else:
+            _os.environ["NODEGRAPH_STORE_DIR"] = saved
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── 5. an Iterate sweep keeps the best window by a PIV quality metric ────────
+    img = np.zeros((1, 3, 1, 1, 96, 96))
+    for t in range(3):
+        img[0, t, 0, 0] = ndshift(patt, (0.6 * t, -0.8 * t), order=3, mode="nearest")
+    ax3 = AxisSizes(m=1, t=3, z=1, c=1, y=96, x=96)
+    ds3 = Dataset(axes=ax3, metadata={"pixel_size_um": 0.5}).with_image(ArrayProvider(img))
+    g = Graph()
+    g.add(NodeInstance("S", "io.quickseed"))
+    g.add(NodeInstance("P", "analysis.piv", params={"window_size": 16, "results": "off"}))
+    g.add(NodeInstance("IT", IT.ITERATE_OP,
+                       params={"v0_list": "8, 16, 32", "metric": "piv_median_s2n"},
+                       modes={"mode": "sweep", "variables": "1", "v0_source": "list",
+                              "preserve": "best", "direction": "max"}))
+    g.connect("S", "P", dst_socket="data")
+    g.connect("P", "IT", dst_socket=IT.SEG_TO)
+    g.connect("IT", "P", src_socket="var0", dst_socket="window_size", kind="driver")
+    flat = IT.unroll(g, sweep_all={"IT"})
+    eng = Engine(flat, computes=COMPUTES, seeds={"S": ds3},
+                 meta_seeds={"S": MetaEnvelope(axes=ax3, metadata={"pixel_size_um": 0.5})},
+                 memo=Memo())
+    per = [float(np.asarray(eng.pull(IT.iter_id("P", "IT", i)).get(
+        D.GLOBAL, "piv_median_s2n").values).reshape(-1)[0]) for i in range(3)]
+    best = eng.pull("IT")
+    won = float(np.asarray(best.get(D.GLOBAL, "sweep_metric").values).reshape(-1)[0])
+    assert won == max(per), (won, per)
+    _ok(f"quick scope (2026-10-09): picks include the reference (fixed {{0,6}}, {{8,9}} at the "
+        f"end, previous {{0,1}}), staged cards read their grid card, DVC keeps the volume, "
+        f"tracking takes {TRACK_FRAMES} frames, a centred 16-subset box unless drawn, one "
+        f"timepoint refused; scoped reference 5 of picks {{2,5}} ≡ unscoped reference 1, an "
+        f"unpicked reference refused; scoped pulls save nothing; dic_solved_frac + "
+        f"analysis_est_full_s are Global; an Iterate sweep keeps the best window by "
+        f"piv_median_s2n ({per})")
+
+
 def test_catalog_piv() -> None:
     """PIV (OpenPIV, ``analysis.piv``) — the FLOW sibling of DIC, WIRED to the piv_field
     kernel driver. ``openpiv`` is an optional dep: when absent the node is fully wired but
@@ -31460,6 +31613,7 @@ def main() -> int:
     test_catalog_dic()
     test_analysis_store()
     test_analysis_parallel()
+    test_quick_scope()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

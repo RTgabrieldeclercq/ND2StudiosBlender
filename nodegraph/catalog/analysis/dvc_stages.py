@@ -61,6 +61,7 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
+from nodegraph.catalog._shared.analysis_units import scoped_frame
 
 _DEFAULT_LAYER = "dvc"
 _AX = ("z", "y", "x")
@@ -225,7 +226,10 @@ def _compute_dvc_grid(ctx: EvalContext) -> Dataset:
     _need_z(ax, "DVC Grid")
     modes = ctx.params.get("__modes__", {})
     ref_mode = str(modes.get("reference_mode", "fixed_frame"))
-    ref_frame = int(ctx.params.get("reference_frame", 0))
+    # under the quick-analysis scope a source frame index is not a payload index; the
+    # stamped reference is what the later stages index the payload with
+    ref_frame = scoped_frame(ds.metadata, int(ctx.params.get("reference_frame", 0)), ax.t,
+                             mode=ref_mode, node="DVC Grid")
     c = min(max(0, int(ctx.params.get("channel", 0))), max(0, ax.c - 1))
     gp = {
         "subset_size": max(4, int(ctx.params.get("subset_size", 32))),
