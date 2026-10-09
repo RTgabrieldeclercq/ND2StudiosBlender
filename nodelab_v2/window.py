@@ -5874,7 +5874,7 @@ class MainWindow(QMainWindow):
         """
         import os
         from nodelab_v2.document import CHANNELS_KEY, TITLE_KEY
-        from nodegraph.metadata import MetaEnvelope, SOURCE_FILE_KEY
+        from nodegraph.metadata import MetaEnvelope, SOURCE_FILE_KEY, SOURCE_PATH_KEY
         from nodegraph.dataset import AxisSizes
         from nodelab_v2.ingest import read_meta_only
         from nodelab_v2.runner import BUNDLE_PATHS_KEY, _unique_labels
@@ -5938,6 +5938,8 @@ class MainWindow(QMainWindow):
         from nodelab_v2.ingest import channel_display_seed
         md = dict(calib0)
         md[SOURCE_FILE_KEY] = [labels[i] for i, h in enumerate(heads)
+                               for _ in range(int(h[1].m))]
+        md[SOURCE_PATH_KEY] = [os.path.abspath(str(paths[i])) for i, h in enumerate(heads)
                                for _ in range(int(h[1].m))]
         md.update(channel_display_seed(disp0, ax0.c))      # the names ride it (step 11g)
         self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))

@@ -68,7 +68,7 @@ from nodegraph.engine import Engine, PullCancelled
 from nodegraph.graph import Graph
 from nodegraph.memo import Memo
 from nodegraph.metadata import (
-    MetaEnvelope, PER_POSITION_KEYS, SOURCE_FILE_KEY, position_subset,
+    MetaEnvelope, PER_POSITION_KEYS, SOURCE_FILE_KEY, SOURCE_PATH_KEY, position_subset,
     shift_origin_um, stamp_source_file)
 from nodegraph.parallel import (
     memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
@@ -308,7 +308,7 @@ def _unique_labels(paths: Sequence[str]) -> List[str]:
 
 
 def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
-                    labels: Sequence[str]) -> MetaEnvelope:
+                    labels: Sequence[str], paths: Sequence[str] = ()) -> MetaEnvelope:
     """One envelope for a bundle of K files: the FIRST file's calibration, its multipoint
     lists concatenated across the members, and a ``source_file`` name per position.
 
@@ -327,7 +327,7 @@ def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
     md: Dict[str, Any] = dict(envs[0].metadata) if envs else {}
     counts = [int(e.axes.m) for e in envs]
     for key in PER_POSITION_KEYS:
-        if key == SOURCE_FILE_KEY:
+        if key in (SOURCE_FILE_KEY, SOURCE_PATH_KEY):
             continue
         vals: List[Any] = []
         for env, n in zip(envs, counts):
@@ -341,6 +341,11 @@ def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
         else:
             md.pop(key, None)
     md[SOURCE_FILE_KEY] = [labels[i] for i, n in enumerate(counts) for _ in range(n)]
+    if len(paths) == len(counts):
+        md[SOURCE_PATH_KEY] = [os.path.abspath(str(paths[i]))
+                               for i, n in enumerate(counts) for _ in range(n)]
+    else:
+        md.pop(SOURCE_PATH_KEY, None)
     return MetaEnvelope(axes=axes, metadata=md)
 
 #: demo calibration for the synthetic fallback source (drives the ƒmd derive pills)
@@ -4855,7 +4860,8 @@ class EngineRunner(QObject):
             # The members share a grid, so they share their channel display; taking the
             # first is not a choice between disagreeing values.
             disp = dict(self._channel_display.get(member_keys[0], {}))
-            env = with_channel_display(bundle_envelope(prov.axes, envs, labels), disp)
+            env = with_channel_display(bundle_envelope(prov.axes, envs, labels, paths),
+                                       disp)
             self._providers[key] = (prov, env)
             self._channel_display[key] = disp
             return prov, env

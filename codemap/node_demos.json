@@ -59,6 +59,14 @@
         "Contrast, gamma, fps and the annotation corner are all parameters, so the movie is reproducible from the graph."
       ]
     },
+    "io.load_analysis": {
+      "kind": "guide",
+      "features": [
+        "Reads a saved DIC / DVC / PIV / SerialTrack trial (the <file>.analysis folder beside the image) back onto the graph without recomputing.",
+        "Pick the trial from the list (analysis, label, saved units, complete or partial); switching entries switches results instantly.",
+        "Wire the image the trial was computed on so the grid and vectors overlay it, or switch Onto to tables_only for the Spreadsheet."
+      ]
+    },
     "io.write_figure": {
       "kind": "guide",
       "features": [

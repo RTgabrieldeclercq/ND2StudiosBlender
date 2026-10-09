@@ -387,7 +387,7 @@ def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
 #: ``frame_time_jd`` is deliberately ABSENT: it is indexed by T, not M.
 PER_POSITION_KEYS: Tuple[str, ...] = (
     "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc",
-    "source_file", "position_group", "position_name", "position_index",
+    "source_file", "source_path", "position_group", "position_name", "position_index",
 )
 
 #: The per-M metadata key naming each position's GROUP — the specimen/mosaic it belongs to
@@ -416,6 +416,14 @@ POSITION_NAME_KEY = "position_name"
 #: (see :data:`PER_POSITION_KEYS`). Named once here so the engine, the exporter and the GUI
 #: cannot disagree about the spelling.
 SOURCE_FILE_KEY = "source_file"
+
+#: The per-M metadata key holding each position's source file as an ABSOLUTE path (2026-10-09)
+#: — :data:`SOURCE_FILE_KEY`'s twin. The name is what a table's ``file`` column shows; the
+#: path is where things that belong NEXT TO the file go: the analysis store
+#: (:mod:`nodegraph.analysis_store`) writes ``<stem>.analysis/`` beside it, and keys a saved
+#: trial on it. Provenance, not geometry, like the name; per position because a file bundle
+#: folds several files onto M.
+SOURCE_PATH_KEY = "source_path"
 
 #: The scalar metadata key naming the experimental CONDITION a Dataset belongs to — stamped by
 #: a Page Output (V4.00: blank = its page's name) and read by ``table.concat``, which writes
@@ -515,7 +523,9 @@ def stamp_source_file(env: "MetaEnvelope", path: str) -> "MetaEnvelope":
     name = os.path.basename(str(path)) or str(path)
     if not name:
         return env
-    return env.with_metadata(**{SOURCE_FILE_KEY: [name] * max(1, int(env.axes.m))})
+    m = max(1, int(env.axes.m))
+    return env.with_metadata(**{SOURCE_FILE_KEY: [name] * m,
+                                SOURCE_PATH_KEY: [os.path.abspath(str(path))] * m})
 
 
 #: EVERY metadata key that is a **list indexed by timepoint**. The per-T member of the same
@@ -2410,6 +2420,7 @@ __all__ = [
     "plane_pick", "select_plane",
     "POSITION_GROUP_KEY", "POSITION_NAME_KEY",
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
+    "SOURCE_PATH_KEY",
     "source_file_runs", "chain_grow", "chained_metadata",
     "ChainMember", "chain_members", "stamp_source_file",
     "PER_TIME_KEYS", "CONDITION_KEY", "CONDITION_SET_KEY", "time_subset", "respaced", "z_home_after",

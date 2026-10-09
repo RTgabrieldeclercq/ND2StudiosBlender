@@ -6867,6 +6867,275 @@ def test_catalog_dic() -> None:
         "rehashes, compute_strain adds a zero strain tensor, calib fenced")
 
 
+def test_analysis_store() -> None:
+    """The analysis store (2026-10-09) on the single DIC node: a two-position series whose
+    `source_path` names a file in a temp folder saves one trial beside it, one Parquet unit
+    per position; a fresh Engine reloads every unit instead of solving; a deleted unit is
+    recomputed alone (resume) to the same numbers; other settings make a second trial and
+    going back reloads the first; `off` writes nothing; `recompute` recomputes; index.json
+    rebuilds; the two-unit run (process lanes) equals a serial in-memory run; Load Analysis
+    puts the identical table back on the image, refuses mismatched axes, and works
+    tables-only."""
+    if not _HAVE_SKIMAGE:
+        _ok("analysis store: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    from nodegraph import analysis_store as S
+    if not al_dic_available():
+        _ok("analysis store: SKIPPED (al-dic absent — DIC is the node it exercises)")
+        return
+
+    tmp = _tempfile.mkdtemp(prefix="ng-store-")
+    saved_env = {k: _os.environ.pop(k, None) for k in ("NODEGRAPH_STORE_DIR",
+                                                       "NODEGRAPH_PARALLEL")}
+    try:
+        src = _os.path.join(tmp, "run_seq.nd2")
+        with open(src, "wb") as fh:
+            fh.write(b"stand-in for the acquisition")
+        define_node("io.storeseed", "S", outputs=[OutDataset()])
+        rng = np.random.default_rng(11)
+        img = np.zeros((2, 3, 1, 1, 96, 96))
+        for m, (dy, dx) in enumerate(((1.0, 2.0), (-1.5, 1.0))):
+            patt = gaussian_filter(rng.random((96, 96)), 1.0)
+            for t in range(3):
+                img[m, t, 0, 0] = patt if t == 0 else ndshift(patt, (dy * t, dx * t),
+                                                               order=3, mode="nearest")
+        ax = AxisSizes(m=2, t=3, z=1, c=1, y=96, x=96)
+        meta = {"pixel_size_um": 0.5, "source_file": ["run_seq.nd2"] * 2,
+                "source_path": [_os.path.abspath(src)] * 2}
+        ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+        base = {"winsize": 20, "winstepsize": 16, "admm_max_iter": 3}
+
+        def pull(params=None, *, load=None, onto="image", data=ds, axes=ax, md=meta):
+            g = Graph()
+            g.add(NodeInstance("S", "io.storeseed"))
+            if load is None:
+                g.add(NodeInstance("D", "analysis.dic_correlate",
+                                   params={**base, **(params or {})}))
+                g.connect("S", "D", dst_socket="data")
+            else:
+                g.add(NodeInstance("D", "io.load_analysis", params={"trial": load},
+                                   modes={"onto": onto}))
+                if onto == "image":
+                    g.connect("S", "D", dst_socket="data")
+            e = Engine(g, computes=COMPUTES, seeds={"S": data},
+                       meta_seeds={"S": MetaEnvelope(axes=axes, metadata=md)})
+            return e.pull("D")
+
+        def cols(o, layer="dic"):
+            return {a.name: np.asarray(a.values) for a in o.layers_on(D.POINT)
+                    if a.layer == layer}
+
+        root = S.trial_root(src)
+        assert root == _os.path.join(tmp, "run_seq.analysis"), root
+
+        # ── 1. first pull: two units computed (process lanes when the pool exists), saved ──
+        o1 = pull()
+        assert o1.metadata["analysis_trial_units"].startswith("0/2 loaded, 2 computed"), \
+            o1.metadata["analysis_trial_units"]
+        from nodegraph import parallel as _P
+        if _P.enabled() and _P.mode() != "thread":
+            assert "in this process" not in o1.metadata["analysis_trial_units"], \
+                f"two units ran serially despite a pool: {o1.metadata['analysis_trial_units']}"
+        trials = S.list_trials(root)
+        assert len(trials) == 1 and trials[0]["units_done"] == 2, trials
+        tpath = trials[0]["path"]
+        assert _os.path.basename(tpath).startswith("dic_correlate-"), tpath
+        hdr = S.read_trial(tpath).header
+        assert hdr["status"] == "complete" and hdr["settings"]["winsize"] == 20, hdr
+        assert hdr["tables"]["field"]["layer"] == "dic" and hdr["source_files"], hdr
+        assert _os.path.isfile(_os.path.join(tpath, "data", "m0001_z0000.field.parquet"))
+        assert _os.path.isfile(_os.path.join(root, "index.json"))
+        c1 = cols(o1)
+
+        # ── 2. a fresh Engine (a new session) loads, solves nothing, same numbers ────────
+        o2 = pull()
+        assert o2.metadata["analysis_trial_units"].startswith("2/2 loaded, 0 computed"), \
+            o2.metadata["analysis_trial_units"]
+        c2 = cols(o2)
+        for k in ("disp_y", "disp_x", "x", "y", "t", "m", "id"):
+            assert np.array_equal(c1[k], c2[k]), k
+
+        # ── 3. resume: one unit lost → only it is solved, to the same numbers ───────────
+        _os.remove(_os.path.join(tpath, "data", "m0001_z0000.done.json"))
+        o3 = pull()
+        assert o3.metadata["analysis_trial_units"].startswith("1/2 loaded, 1 computed"), \
+            o3.metadata["analysis_trial_units"]
+        c3 = cols(o3)
+        assert np.allclose(c1["disp_y"], c3["disp_y"], atol=1e-12, rtol=0)
+
+        # ── 4. other settings → a second trial; back → the first, loaded ────────────────
+        o4 = pull({"winsize": 24, "trial_label": "subset 24"})
+        assert o4.metadata["analysis_trial_units"].startswith("0/2 loaded"), o4.metadata
+        assert len(S.list_trials(root)) == 2
+        assert any(r["label"] == "subset 24" for r in S.list_trials(root))
+        o5 = pull({"trial_label": "renamed only"})          # the label never moves a trial
+        assert o5.metadata["analysis_trial_units"].startswith("2/2 loaded"), o5.metadata
+        assert len(S.list_trials(root)) == 2
+
+        # ── 5. off writes nothing; recompute recomputes ─────────────────────────────────
+        o6 = pull({"results": "off", "winsize": 28})
+        assert o6.metadata["analysis_trial"] == "" and len(S.list_trials(root)) == 2
+        o7 = pull({"results": "recompute"})
+        assert o7.metadata["analysis_trial_units"].startswith("0/2 loaded, 2 computed")
+
+        # ── 6. index.json is a view: delete it, it comes back from the trial folders ────
+        _os.remove(_os.path.join(root, "index.json"))
+        S.refresh_index(root)
+        idx = S._read_json(_os.path.join(root, "index.json"))
+        assert idx and len(idx["trials"]) == 2, idx
+
+        # ── 7. lanes ≡ serial: the process-lane run equals one in-memory serial run ─────
+        _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        cs = cols(pull({"results": "off"}))
+        _os.environ.pop("NODEGRAPH_PARALLEL")
+        for k in ("disp_y", "disp_x"):
+            assert np.allclose(c1[k], cs[k], atol=1e-12, rtol=0), (k, np.abs(c1[k] - cs[k]).max())
+
+        # ── 8. Load Analysis: the same table back on the image; axes guarded; tables-only ─
+        trial_id = _os.path.basename(tpath)
+        choices = S.trial_choices([src])
+        assert any(p == tpath for _l, p in choices), choices
+        ol = pull(load=trial_id)                             # by id, beside the source
+        cl = cols(ol)
+        for k in ("disp_y", "disp_x", "x", "y", "t", "m", "id"):
+            assert np.array_equal(c1[k], cl[k]), k
+        assert ol.metadata["dic_solver"] == "aldic" and ol.metadata["analysis_trial"] == tpath
+        one = Dataset(axes=AxisSizes(m=1, t=3, z=1, c=1, y=96, x=96),
+                      metadata={**meta, "source_path": meta["source_path"][:1]}
+                      ).with_image(ArrayProvider(img[:1]))
+        try:
+            pull(load=tpath, data=one, axes=one.axes, md=one.metadata)
+            raise AssertionError("a Dataset with the wrong M was accepted")
+        except ValueError as exc:
+            assert "does not match the trial" in str(exc), exc
+        ot = pull(load=tpath, onto="tables_only")
+        assert ot.image is None and np.array_equal(cols(ot)["disp_x"], c1["disp_x"])
+        assert ot.metadata.get("pixel_size_um") == 0.5
+        # the inspector's dropdown (Qt-free document half): the trials beside the source the
+        # incoming edge carries, each with a hover line naming its label and settings
+        from nodelab_v2.document import GraphDocument
+        from nodelab_v2.ops import ensure_ops
+        ensure_ops()
+        doc = GraphDocument()
+        card = doc.add_node("io.load", x=0, y=0, params={"path": src})
+        doc.set_meta_seed(card.id, MetaEnvelope(axes=ax, metadata=meta))
+        ld = doc.add_node("io.load_analysis", x=300, y=0)
+        doc.connect(card.id, "image", ld.id, "data")
+        sock = NODES.get("io.load_analysis").input("trial")
+        assert sock.options_from == "analysis_trials"
+        offered = dict(doc.trial_choices(ld.id, sock))
+        assert trial_id in offered and "subset 24" in " ".join(offered.values()), offered
+
+        # ── 9. the redirect: NODEGRAPH_STORE_DIR moves the folder, uniquely named ───────
+        _os.environ["NODEGRAPH_STORE_DIR"] = _os.path.join(tmp, "fast")
+        red = S.trial_root(src)
+        assert red.startswith(_os.path.join(tmp, "fast")) and \
+            _os.path.basename(red).startswith("run_seq.analysis."), red
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        _shutil.rmtree(tmp, ignore_errors=True)
+    _ok("analysis store (2026-10-09): DIC saves one trial beside its source "
+        "(run_seq.analysis/dic_correlate-…/, a Parquet unit per position, trial.json + "
+        "index.json); a new Engine reloads 2/2 with identical columns; a lost unit is "
+        "recomputed alone; other settings = a second trial, back = reloaded, a label never "
+        "moves it; off writes nothing, recompute recomputes; index rebuilds; process lanes ≡ "
+        "serial; Load Analysis restores the table + stamps by id, refuses a wrong M, works "
+        "tables-only; NODEGRAPH_STORE_DIR redirects uniquely")
+
+
+def test_analysis_parallel() -> None:
+    """Process lanes ≡ serial (2026-10-09) for the other two unit families: PIV over three
+    (m, z) units and DVC over two m units, each pulled once on the governor's process lanes
+    and once with parallelism off — the displacement columns must agree (≤1e-12 PIV: numpy
+    FFT, deterministic; ≤1e-10 DVC: numba reductions on a different thread count) and the
+    row order/ids exactly, which is what the ordered fold guarantees. DIC's equivalence is
+    pinned in `test_analysis_store`."""
+    if not _HAVE_SKIMAGE:
+        _ok("analysis parallel: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph import parallel as _P
+    define_node("io.parseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(23)
+
+    def run(op, img, ax, params, *, serial):
+        meta = {"pixel_size_um": 0.5, "z_step_um": 1.0}
+        ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+        g = Graph()
+        g.add(NodeInstance("S", "io.parseed"))
+        g.add(NodeInstance("D", op, params={**params, "results": "off"}))
+        g.connect("S", "D", dst_socket="data")
+        old = _os.environ.get("NODEGRAPH_PARALLEL")
+        if serial:
+            _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        try:
+            out = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                         meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull("D")
+        finally:
+            if serial:
+                if old is None:
+                    _os.environ.pop("NODEGRAPH_PARALLEL", None)
+                else:
+                    _os.environ["NODEGRAPH_PARALLEL"] = old
+        return out
+
+    def table(o, layer):
+        return {a.name: np.asarray(a.values) for a in o.layers_on(D.POINT) if a.layer == layer}
+
+    # ── PIV: 3 positions × 1 plane × 3 frames ───────────────────────────────────────
+    img = np.zeros((3, 3, 1, 1, 96, 96))
+    for m in range(3):
+        patt = gaussian_filter(rng.random((96, 96)), 1.0)
+        for t in range(3):
+            img[m, t, 0, 0] = ndshift(patt, (0.7 * t * (m + 1), -0.4 * t), order=3,
+                                      mode="nearest")
+    ax = AxisSizes(m=3, t=3, z=1, c=1, y=96, x=96)
+    pp = {"window_size": 16, "overlap": 0.5}
+    par = run("analysis.piv", img, ax, pp, serial=False)
+    ser = run("analysis.piv", img, ax, pp, serial=True)
+    a, b = table(par, "piv"), table(ser, "piv")
+    assert a["m"].size and np.array_equal(a["m"], b["m"]) and np.array_equal(a["id"], b["id"])
+    for k in ("disp_y", "disp_x", "x", "y"):
+        assert np.allclose(a[k], b[k], atol=1e-12, rtol=0), (k, np.nanmax(np.abs(a[k] - b[k])))
+    lanes_piv = par.metadata["analysis_trial_units"]
+    if _P.enabled() and _P.mode() != "thread":
+        assert "in this process" not in lanes_piv, lanes_piv
+
+    # ── DVC: 2 positions × 2 frames of a (28, 44, 44) speckle volume ────────────────
+    vol = np.zeros((2, 2, 28, 1, 44, 44))
+    for m in range(2):
+        base = gaussian_filter(rng.random((28, 44, 44)), 1.2)
+        vol[m, 0, :, 0] = base
+        vol[m, 1, :, 0] = ndshift(base, (0.0, 0.5 * (m + 1), -0.8), order=3, mode="nearest")
+    axv = AxisSizes(m=2, t=2, z=28, c=1, y=44, x=44)
+    pv = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10, "subset_spacing_z": 4,
+          "admm_iterations": 1}
+    par = run("analysis.dvc_field", vol, axv, pv, serial=False)
+    ser = run("analysis.dvc_field", vol, axv, pv, serial=True)
+    a, b = table(par, "dvc"), table(ser, "dvc")
+    assert a["m"].size and np.array_equal(a["m"], b["m"]) and np.array_equal(a["id"], b["id"])
+    for k in ("disp_z", "disp_y", "disp_x"):
+        assert np.allclose(a[k], b[k], atol=1e-10, rtol=0, equal_nan=True), \
+            (k, np.nanmax(np.abs(a[k] - b[k])))
+    _ok(f"analysis parallel (2026-10-09): PIV over 3 (m,z) units and DVC over 2 m units on "
+        f"process lanes equal the serial run (PIV ≤1e-12, DVC ≤1e-10; same rows, same ids, "
+        f"ordered fold) — PIV ran as: {lanes_piv}")
+
+
 def test_catalog_piv() -> None:
     """PIV (OpenPIV, ``analysis.piv``) — the FLOW sibling of DIC, WIRED to the piv_field
     kernel driver. ``openpiv`` is an optional dep: when absent the node is fully wired but
@@ -31189,6 +31458,8 @@ def main() -> int:
     test_piv_stages()
     test_dic_stages()
     test_catalog_dic()
+    test_analysis_store()
+    test_analysis_parallel()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

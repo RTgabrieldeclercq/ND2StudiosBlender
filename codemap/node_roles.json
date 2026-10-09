@@ -50,8 +50,8 @@
       "label": "Input / output",
       "stage": "acquire_and_organize",
       "pages": ["input"],
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or figure.",
-      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure"]
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
+      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure", "io.load_analysis"]
     },
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
@@ -214,6 +214,7 @@
     "io.write_tiff": ["analyze"],
     "io.write_movie": ["analyze"],
     "io.write_figure": ["analyze"],
+    "io.load_analysis": ["input", "analyze"],
     "channel.select": ["input", "refine", "process", "analyze"],
     "page.input": ["refine", "process", "analyze"],
     "page.output": ["input", "refine", "process"],

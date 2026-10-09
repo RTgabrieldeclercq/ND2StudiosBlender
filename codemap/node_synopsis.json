@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 129,
+    "nodes": 130,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 866,
-    "outputs": 136,
+    "inputs": 874,
+    "outputs": 137,
     "gui_ops_included": true
   },
   "stages": {
@@ -88,6 +88,7 @@
         "data.part",
         "io.dock",
         "io.load",
+        "io.load_analysis",
         "io.write_figure",
         "io.write_movie",
         "io.write_tiff",
@@ -272,8 +273,8 @@
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or figure.",
-      "count": 5,
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
+      "count": 6,
       "ops": [
         {
           "op": "io.dock",
@@ -284,6 +285,11 @@
           "op": "io.load",
           "label": "Load ND2/TIFF file",
           "summary": "Open an ND2 or TIFF as the pipeline source. Access defaults to Direct — read the ND2 in place, no copy; switch to Auto to build a compressed b2nd store when it clearly pays off, or to Ingest to always build one. Empty path = synthetic demo. Exposes one output per channel + a combined 'All channels' output."
+        },
+        {
+          "op": "io.load_analysis",
+          "label": "Load Analysis",
+          "summary": "Load a saved DIC/DVC/PIV/SerialTrack trial (the `<file>.analysis` folder beside the image) back onto the graph — its tables on their original layers and its provenance — without recomputing."
         },
         {
           "op": "io.write_figure",
@@ -1187,6 +1193,7 @@
     "io": [
       "io.dock",
       "io.load",
+      "io.load_analysis",
       "io.write_figure",
       "io.write_movie",
       "io.write_tiff",
@@ -2098,6 +2105,34 @@
             "point"
           ],
           "description": "Name of the Point field this node writes: one row per correlation subset centre with displacement, strain and a per-point quality value. SPARSE, on the subset grid — use Rasterize Field for a dense per-voxel version. Downstream nodes select it by this name."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -2125,10 +2160,12 @@
         "mu",
         "name",
         "reference_frame",
+        "results",
         "roi",
         "search_range",
         "strain_smoothness",
         "tol",
+        "trial_label",
         "winsize",
         "winsize_min",
         "winstepsize"
@@ -2662,6 +2699,34 @@
             "point"
           ],
           "description": "Name of the Point field this node writes: one row per correlation subset centre carrying displacement, strain and a per-point correlation quality. It is a SPARSE field on the subset grid, not a per-voxel one — use Rasterize Field to interpolate it onto voxels, or Accumulate DVC Field to compose an increment series. Downstream nodes select it by this name."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -2693,6 +2758,7 @@
         "name",
         "prefilter_sigma",
         "reference_frame",
+        "results",
         "search_radius",
         "strain_halfwidth",
         "strain_smooth",
@@ -2702,6 +2768,7 @@
         "subset_spacing_z",
         "subset_stride",
         "tile_local",
+        "trial_label",
         "use_global_step"
       ]
     },
@@ -5352,6 +5419,34 @@
             "point"
           ],
           "description": "Name of the Point field this node writes: one row per interrogation-window centre with displacement (µm), correlation signal-to-noise (`qfactor`) and a `replaced` flag. SPARSE, on the window grid — use Rasterize Field for a dense per-voxel map. Downstream nodes select it by this name."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -5381,12 +5476,14 @@
         "passes",
         "reference_frame",
         "replace",
+        "results",
         "roi",
         "s2n_threshold",
         "smooth",
         "smooth_strength",
         "std_threshold",
         "subpixel",
+        "trial_label",
         "uncertainty",
         "velocity",
         "window_size"
@@ -14363,6 +14460,99 @@
       "trained_params": false,
       "kernel_doc": null,
       "params_read": []
+    },
+    "io.load_analysis": {
+      "op": "io.load_analysis",
+      "label": "Load Analysis",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/io/load_analysis.py",
+      "gui_only": false,
+      "summary": "Load a saved DIC/DVC/PIV/SerialTrack trial (the `<file>.analysis` folder beside the image) back onto the graph — its tables on their original layers and its provenance — without recomputing.",
+      "overview": "A saved analysis trial (:mod:`nodegraph.analysis_store`), read back onto the graph. Every analysis node that saves (DIC, DVC, PIV, SerialTrack and their staged cards) writes a trial folder beside its source file, one Parquet file per finished unit. This node reads one back: its result tables land on their ORIGINAL layers with their original columns, and its metadata stamps (``dic_*`` / ``dvc_*`` / ``piv_*`` / ``track_*``) ride along, so the Viewer's overlays and every downstream node — strain, Accumulate DVC Field, Rasterize Field, Track Field — behave as if the analysis had just run. A trial still being written (or one a crash cut short) loads what it holds; the ``analysis_trial_units`` stamp says how much. ``onto = image`` attaches the tables to the wired Dataset — normally the image the trial was computed on, so the overlays sit on it — and refuses one whose positions, frames or planes do not match the trial's (rows would land on the wrong frame). ``tables_only`` needs no wire: a Dataset with the trial's axes, its calibration and no image, for the Spreadsheet or table nodes. Resolved spec: category io; op ``io.load_analysis``; reads nothing from the image; adds POINT / TRACK (whatever the trial holds — not predictable before the file is read, so no ``layer_out``); footprint WHOLE_SERIES / {} (it reads no pixels).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": [
+          "point",
+          "track"
+        ]
+      },
+      "modes": [
+        {
+          "name": "onto",
+          "label": "Onto",
+          "choices": [
+            "image",
+            "tables_only"
+          ],
+          "default": "image",
+          "description": "What the loaded tables are attached to: the wired image (overlays, and downstream nodes that also need pixels) or nothing (a tables-only Dataset).",
+          "choice_docs": {
+            "image": "Attach the trial's tables to the wired Dataset — the image it was computed on — so the Viewer draws the grid and vectors over it. A Dataset whose positions, frames or planes differ is refused rather than mislabelled.",
+            "tables_only": "No input needed: a Dataset with the trial's axes and calibration but no image, carrying only the tables — for the Spreadsheet, plots and table nodes, or a trial whose image is not at hand."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "available_in": {
+            "onto": [
+              "image"
+            ]
+          },
+          "description": "The image the trial was computed on (the same ND2, the same registration chain) — its tables are attached to it, so overlays line up. Its source file is also where the trial list is looked up."
+        },
+        {
+          "name": "trial",
+          "label": "Trial",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "options_from": "analysis_trials",
+          "description": "Which saved trial to load: the list shows every trial in the `<file>.analysis` folder beside the wired image's source — analysis, label, how many units are saved, complete or partial. Or type a trial folder's full path. Switching entries switches results without recomputing anything."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_load_analysis",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "trial"
+      ]
     },
     "io.write_figure": {
       "op": "io.write_figure",

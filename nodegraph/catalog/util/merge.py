@@ -336,6 +336,9 @@ def _concat_axis_metadata(out: Dataset, files: Tuple[Dataset, ...], axis: str) -
                 # Not itself a nested bundle/merge: every one of this input's own
                 # positions came from this one (labelled by its input slot).
                 vals = [f"input{i}"] * n
+            # source_path has no stand-in: an input that does not know its file leaves the
+            # merged positions without paths (the store then saves nothing for them),
+            # rather than a fabricated path that would put a trial beside the wrong file
             if not isinstance(vals, (list, tuple)) or len(vals) != n:
                 ok = False
                 break

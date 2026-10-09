@@ -209,6 +209,9 @@ MODULES: Tuple[str, ...] = (
     "util.split_t",
     # the T twin of Shift (2026-10-07): move a stream along its own time axis by whole frames
     "util.time_shift",
+    # 2026-10-09: a saved DIC/DVC/PIV/SerialTrack trial read back (nodegraph.analysis_store),
+    # appended for the same reason
+    "io.load_analysis",
 )
 
 

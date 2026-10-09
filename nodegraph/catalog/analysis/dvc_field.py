@@ -24,7 +24,11 @@ from nodegraph.structure import StructureTable, point_table
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
-from nodegraph.catalog._shared.progress import _UnitBar
+from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_trial,
+                                                      open_node_trial, run_units, ship,
+                                                      stamp_trial, store_sockets, unit_list,
+                                                      unship)
+from nodegraph.analysis_store import unit_name
 
 # Params the in-repo ALDVC port read and pyALDVC has no equivalent for, mapped to
 # their old defaults. A saved graph that still carries one at its OLD DEFAULT is
@@ -175,63 +179,65 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
                     min(c, max(0, rax.c - 1)))
         return (prov, m, min(max(0, ref_frame), ax.t - 1), c)
 
-    def _vol(p, m: int, t: int, cc: int) -> np.ndarray:
-        pax = p.axes
-        return p.get_region_volume(0, m, t, cc, 0, pax.z, 0, pax.y, 0, pax.x).astype(float)
+    shape = (ax.z, ax.y, ax.x)
+    # Compare the providers' declared AXES, never a materialized volume: fetching frame 0
+    # just to read `.shape` would pull the whole reference stack here and again inside
+    # LazyVolumeProvider — 1.2 GB read twice on a 1024x1024x306 scan.
+    if ref_prov is not None:              # an external reference always takes this branch
+        rax = ref_prov.axes
+        if (rax.z, rax.y, rax.x) != shape:
+            raise ValueError(
+                f"DVC reference shape {(rax.z, rax.y, rax.x)} != deformed {shape}; the "
+                "reference Dataset must match the primary's Z/Y/X")
 
-    rows: List[Dict[str, np.ndarray]] = []
-    # One solver call per m-position, so the bar's frame axis is m and each unit is one
-    # opaque pyALDVC run whose own 0-1 progress fraction drives the sub bar.
-    bar = _UnitBar(ctx, frames=max(1, ax.m), units_per_frame=1, note="correlating")
-
-    for m in range(ax.m):
+    def _plan(m: int):
+        """``(volume plan [(provider, m, t, c)], the t each result belongs to, ref_indices)``
+        — or ``None`` when the position has nothing to correlate."""
         if ref_mode == "previous_frame" and ref_prov is None:
             # Incremental: frames in series order, each referencing its predecessor.
             # t=0 has nothing to correlate against and yields no row (v1 parity).
             if ax.t < 2:
-                bar.finish_unit(note=f"m={m} (skipped: needs t>1)")
-                continue
-            n_frames = ax.t
-            out_t = list(range(1, ax.t))
-            ref_indices = tuple(range(ax.t - 1))
+                return None
+            return ([(prov, m, t, c) for t in range(ax.t)], list(range(1, ax.t)),
+                    tuple(range(ax.t - 1)))
+        # Fixed reference (self or external): the reference volume is prepended as frame 0
+        # and every timepoint references it, which keeps pyALDVC's DAG rule
+        # (ref_indices[i] <= i) satisfied for ANY reference_frame, including one later in
+        # the series than the frame being correlated.
+        return ([_ref_frame_for(m)] + [(prov, m, t, c) for t in range(ax.t)],
+                list(range(ax.t)), tuple(0 for _ in range(ax.t)))
 
-            def get_volume(i: int, _m=m) -> np.ndarray:
-                return _vol(prov, _m, i, c)
-        else:
-            # Fixed reference (self or external): the reference volume is prepended as
-            # frame 0 and every timepoint references it, which keeps pyALDVC's DAG rule
-            # (ref_indices[i] <= i) satisfied for ANY reference_frame, including one
-            # later in the series than the frame being correlated.
-            rp, rm, rt, rc = _ref_frame_for(m)
-            n_frames = ax.t + 1
-            out_t = list(range(ax.t))
-            ref_indices = tuple(0 for _ in range(ax.t))
+    # One m-position = one UNIT (2026-10-09): its whole T series in one pyALDVC run, never
+    # split in time; positions run across worker processes when the resource governor
+    # affords more than one lane, each saved beside the source as it finishes (`results`).
+    units = unit_list(ax, per_plane=False)
+    names = [unit_name(u, ("m",)) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=("m",), analysis="DVC (pyALDVC)")
 
-            def get_volume(i: int, _m=m, _rp=rp, _rm=rm, _rt=rt, _rc=rc) -> np.ndarray:
-                if i == 0:
-                    return _vol(_rp, _rm, _rt, _rc)
-                return _vol(prov, _m, i - 1, c)
+    def _payload(m: int, plan, frames) -> dict:
+        return {"frames": frames, "n_frames": len(plan[0]), "out_t": plan[1],
+                "ref_indices": plan[2], "shape": shape, "vox": vox, "params": dvc_params,
+                "m": m, "c": c}
 
-        shape = (ax.z, ax.y, ax.x)
-        # Compare the providers' declared AXES, never a materialized volume: fetching
-        # frame 0 just to read `.shape` would pull the whole reference stack here and
-        # again inside LazyVolumeProvider — 1.2 GB read twice on a 1024x1024x306 scan.
-        if ref_prov is not None:          # an external reference always takes this branch
-            rax = ref_prov.axes
-            if (rax.z, rax.y, rax.x) != shape:
-                raise ValueError(
-                    f"DVC reference shape {(rax.z, rax.y, rax.x)} != deformed {shape}; the "
-                    "reference Dataset must match the primary's Z/Y/X")
+    def read(unit):                       # for a worker process: the volumes themselves
+        plan = _plan(unit[0])
+        if plan is None:
+            return {"frames": None}
+        return _payload(unit[0], plan, ship(_DVCVolumeSeq(plan[0])))
 
-        results = run_aldvc_series(
-            get_volume, n_frames, shape,
-            voxel_size_um=vox, params=dvc_params, ref_indices=ref_indices,
-            compute_strain=True,
-            progress_cb=lambda frac, msg, _b=bar: _b.emit(int(100 * float(frac)), None),
-        )
-        for t_out, res in zip(out_t, results):
-            rows.append(_dvc_rows(res, vox, m=m, t=t_out, c=c, z_plane=None))
-        bar.finish_unit(note=f"m={m}")
+    def read_local(unit):                 # in this process: each volume read lazily
+        plan = _plan(unit[0])
+        if plan is None:
+            return {"frames": None}
+        return _payload(unit[0], plan, _DVCVolumeSeq(plan[0]))
+
+    vol_bytes = int(ax.z) * int(ax.y) * int(ax.x) * 4
+    run = run_units(ctx, units, read=read, read_local=read_local, work=_dvc_field_unit,
+                    names=names, trial=opened.trial,
+                    worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, numba=True,
+                    note="correlating",
+                    in_thread=lambda p, cb: _dvc_field_unit(p, progress_cb=cb))
+    merged = concat_tables(run.results, "field")
 
     # Provenance stamp (metadata intelligence): record HOW this field was correlated so a
     # downstream `analysis.accumulate_field` inherits the reference config instead of the
@@ -245,13 +251,63 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
         "dvc_strain_smooth": dvc_params["strain_smooth"],
     }
     zk = "subpixel"
-    if not rows:
+    finish_trial(opened, run, stamps=prov_md,
+                 tables={"field": {"domain": "point", "layer": layer, "z_kind": zk}})
+    prov_md = stamp_trial(prov_md, opened, run)
+    if not merged:
         empty = point_table(np.zeros((0, 3)), z_kind=zk, layer=layer)
         return ds.with_structure(empty).with_metadata(**prov_md)
-    merged = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
     return (ds.with_structure(StructureTable(Domain.POINT, merged, layer=layer, z_kind=zk))
             .with_metadata(**prov_md))
+
+
+class _DVCVolumeSeq:
+    """The volumes of one position's series, read from their providers on demand —
+    ``(provider, m, t, c)`` per entry, in solve order. Native dtype (the worker converts to
+    float), so a shipped copy is the acquisition's size, not float64's."""
+
+    __slots__ = ("_plan",)
+
+    def __init__(self, plan) -> None:
+        self._plan = plan
+
+    def __len__(self) -> int:
+        return len(self._plan)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        p, m, t, cc = self._plan[i]
+        pax = p.axes
+        return np.asarray(p.get_region_volume(0, m, t, cc, 0, pax.z, 0, pax.y, 0, pax.x))
+
+
+def _dvc_field_unit(payload: dict, progress_cb=None) -> dict:
+    """One position's whole series through pyALDVC: the unit worker. Module-level (a worker
+    process imports it by name) and pure. ``frames`` is the series as an array, a shipped
+    memory map, or (in this process) a lazy provider sequence — each volume becomes float
+    when pyALDVC asks for it, exactly as the serial loop converted it."""
+    from nodegraph.kernels.aldvc_field import run_aldvc_series
+    frames = unship(payload.get("frames"))
+    if frames is None:
+        return {"tables": {}, "stats": {}}
+    vox = payload["vox"]
+
+    def get_volume(i: int) -> np.ndarray:
+        return np.asarray(frames[i]).astype(float)
+
+    cb = None
+    if progress_cb is not None:
+        def cb(frac, msg):
+            progress_cb(int(100 * float(frac)))
+    results = run_aldvc_series(
+        get_volume, payload["n_frames"], payload["shape"],
+        voxel_size_um=vox, params=payload["params"], ref_indices=payload["ref_indices"],
+        compute_strain=True, progress_cb=cb)
+    rows = [_dvc_rows(res, vox, m=payload["m"], t=t_out, c=payload["c"], z_plane=None)
+            for t_out, res in zip(payload["out_t"], results)]
+    tables = ({"field": {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}}
+              if rows else {})
+    return {"tables": tables, "stats": {}}
 
 
 def _columns_dvc_field(params, modes, incoming):
@@ -487,6 +543,7 @@ register_node(
                  "is a SPARSE field on the subset grid, not a per-voxel one — use Rasterize "
                  "Field to interpolate it onto voxels, or Accumulate DVC Field to compose an "
                  "increment series. Downstream nodes select it by this name."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[

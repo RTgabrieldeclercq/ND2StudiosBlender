@@ -1714,6 +1714,9 @@ class InspectorPanel(QScrollArea):
               and s.name == PAGE_SOURCE_KEY):
             lay.addWidget(self._page_source_box(node, s))
             return row
+        elif s.type is SocketType.STRING and getattr(s, "options_from", ""):
+            lay.addWidget(self._options_box(node, s))
+            return row
         elif s.type is SocketType.STRING and getattr(s, "choices", ()):
             lay.addWidget(self._choice_box(node, s))
             return row
@@ -1843,6 +1846,29 @@ class InspectorPanel(QScrollArea):
         box.activated.connect(
             lambda _i, nm=s.name, b=box: (self._set_param(node, nm, b.currentText()),
                                           self._after_model_edit(node)))
+        return box
+
+    def _options_box(self, node: NodeItem, s):
+        """An EDITABLE combo for a socket whose entries only exist at run time
+        (``SocketSpec.options_from``, 2026-10-09) — today the saved analysis trials beside
+        the incoming image's source, for Load Analysis. Each entry hovers with what the
+        trial is (label, analysis, saved units, settings); free text stays legal so a trial
+        folder elsewhere can be typed by its full path."""
+        pairs: list = []
+        try:
+            if s.options_from == "analysis_trials":
+                pairs = list(node.doc.trial_choices(node.node_id, s))
+        except Exception:                            # never let a picker break the panel
+            pairs = []
+        ids = [p[0] for p in pairs]
+        box = self._names_box(
+            node, s, ids,
+            present="Saved trials beside the source: ",
+            empty="No saved trials beside the incoming image's source file yet — run a DIC, "
+                  "DVC, PIV or SerialTrack node with Saved results = reuse, or type a trial "
+                  "folder's full path.",
+            note="\n(free text is allowed — a trial folder's full path)")
+        _set_item_tips(box, ids, {i: t for i, t in pairs})
         return box
 
     def _layer_box(self, node: NodeItem, s):

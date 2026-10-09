@@ -25,7 +25,11 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
 from nodegraph.catalog._shared.objects import _frame_interval_s
-from nodegraph.catalog._shared.progress import _UnitBar
+from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_trial,
+                                                      open_node_trial, run_units, ship,
+                                                      stamp_trial, store_sockets, unit_list,
+                                                      unship)
+from nodegraph.analysis_store import unit_name
 
 # ── PIV (OpenPIV) — the FLOW sibling of DIC/DVC ─────────────────────────────────
 #
@@ -218,56 +222,33 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
         return ([head] + [(prov, m, t, z, c) for t in range(ax.t)],
                 list(range(ax.t)), "fixed_head")
 
-    rows: list = []
-    n_dropped = 0
+    # One (m, z) line = one UNIT (2026-10-09): independent of every other, never split in
+    # T. Units run across worker processes when the resource governor affords more than one
+    # lane, each saved beside the source as it finishes (`results`), so a re-pull loads and
+    # a cancelled run resumes.
+    units = unit_list(ax, per_plane=True)
+    names = [unit_name(u, ("m", "z")) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=("m", "z"), analysis="PIV (OpenPIV)")
 
-    def _emit(res, m: int, t: int, z: int, unc=None) -> None:
-        """One PIVResult → filtered Point rows (+ velocity/uncertainty columns)."""
-        nonlocal n_dropped
-        row = _dvc_rows(res, vox, m=m, t=t, c=c, z_plane=z)
-        row["replaced"] = res.flags.reshape(-1).astype(np.int64)
-        if want_vel:                                      # µm / s — one frame step per pair
-            row["vy"] = row["disp_y"] / dt_s
-            row["vx"] = row["disp_x"] / dt_s
-            row["speed"] = row["disp_mag_um"] / dt_s
-        if unc is not None:                               # px → µm, [y, x] components
-            row["unc_y"] = unc[..., 0].reshape(-1) * vox[0]
-            row["unc_x"] = unc[..., 1].reshape(-1) * vox[1]
-        keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
-        if not keep.all():
-            n_dropped += int((~keep).sum())
-            row = {k: v[keep] for k, v in row.items()}
-        if row["m"].size:
-            rows.append(row)
+    def read(unit, local: bool = False):
+        m, z = unit
+        plan, result_t, pairing = _plan(m, z)
+        if len(plan) < 2:                                 # a 1-frame series has no pair
+            return {"frames": None}
+        frames = _PIVPlaneSeq(plan) if local else ship(_PIVPlaneSeq(plan))
+        return {"frames": frames, "params": params, "vox": vox,
+                "pairing": pairing, "roi": _roi_plane(m, z), "ensemble": ref_mode == "ensemble",
+                "result_t": result_t, "m": m, "z": z, "c": c, "dt_s": dt_s,
+                "velocity": want_vel, "uncertainty": want_unc, "window": window}
 
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=1, note="correlating")
-    for m in range(ax.m):
-        for z in range(ax.z):
-            plan, result_t, pairing = _plan(m, z)
-            if len(plan) < 2:                             # a 1-frame series has no pair
-                bar.finish_unit(note=f"m={m} z={z}")
-                continue
-            if ref_mode == "ensemble":
-                # ONE time-averaged field per (m, z), stamped t=0
-                res = run_piv_ensemble(
-                    _PIVPlaneSeq(plan), params, vox, pairing=pairing,
-                    roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
-                _emit(res, m, 0, z)
-            else:
-                seq = _PIVPlaneSeq(plan)
-                series = run_piv_series(
-                    seq, params, vox, pairing=pairing,
-                    roi_mask=_roi_plane(m, z), progress_cb=bar.emit)
-                for i, t in enumerate(result_t):
-                    if i >= len(series):
-                        break
-                    unc = None
-                    if want_unc:                          # re-fetch this result's pair
-                        unc = disparity_uncertainty(
-                            seq[0 if pairing == "fixed_head" else i], seq[i + 1],
-                            series[i], window_size=window)
-                    _emit(series[i], m, t, z, unc)
-            bar.finish_unit(note=f"m={m} z={z}")
+    plane_bytes = int(ax.y) * int(ax.x) * 8
+    run = run_units(ctx, units, read=read, read_local=lambda u: read(u, local=True),
+                    work=_piv_unit, names=names,
+                    trial=opened.trial, worker_bytes=8 * plane_bytes + (300 << 20),
+                    min_inner=1, numba=False, note="correlating",
+                    in_thread=lambda p, cb: _piv_unit(p, progress_cb=cb))
+    n_dropped = sum(int((r.get("stats") or {}).get("dropped", 0)) for r in run.results)
+    merged = concat_tables(run.results, "field")
 
     # Provenance (§7b): PIV-specific keys (NOT the dvc_* keys accumulate_field consumes —
     # a PIV per-step field is Eulerian flow, not an ALDVC volume increment).
@@ -277,14 +258,86 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
                "piv_invalid_points": n_dropped}
     if want_vel:
         prov_md["piv_dt_s"] = float(dt_s)
-    if not rows:
+    finish_trial(opened, run, stamps=prov_md,
+                 tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"}})
+    prov_md = stamp_trial(prov_md, opened, run)
+    if not merged:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
         return ds.with_structure(empty).with_metadata(**prov_md)
-    merged = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
     return (ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
         .with_metadata(**prov_md))
+
+
+class _PIVArraySeq:
+    """``run_piv_series``'s ``images`` over a stacked unit (an array, or the memory map of a
+    shipped one), indexed on demand like :class:`_PIVPlaneSeq`."""
+
+    __slots__ = ("_a",)
+
+    def __init__(self, a: np.ndarray) -> None:
+        self._a = a
+
+    def __len__(self) -> int:
+        return len(self._a)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        return np.asarray(self._a[i])
+
+
+def _piv_unit(payload: dict, progress_cb=None) -> dict:
+    """One (m, z) line through OpenPIV: the unit worker. Module-level (a worker process
+    imports it by name) and pure — everything arrives in ``payload``, read on the pull
+    thread. Returns the unit's Point rows as the ``field`` table and the dropped count."""
+    from nodegraph.kernels.piv_field import (
+        disparity_uncertainty, run_piv_ensemble, run_piv_series)
+    frames = unship(payload.get("frames"))
+    if frames is None:
+        return {"tables": {}, "stats": {"dropped": 0}}
+    vox, params, pairing = payload["vox"], payload["params"], payload["pairing"]
+    m, z, c = payload["m"], payload["z"], payload["c"]
+    dt_s = payload["dt_s"]
+    rows, dropped = [], 0
+
+    def emit(res, t: int, unc=None) -> None:
+        nonlocal dropped
+        row = _dvc_rows(res, vox, m=m, t=t, c=c, z_plane=z)
+        row["replaced"] = res.flags.reshape(-1).astype(np.int64)
+        if payload["velocity"]:                           # µm / s — one frame step per pair
+            row["vy"] = row["disp_y"] / dt_s
+            row["vx"] = row["disp_x"] / dt_s
+            row["speed"] = row["disp_mag_um"] / dt_s
+        if unc is not None:                               # px → µm, [y, x] components
+            row["unc_y"] = unc[..., 0].reshape(-1) * vox[0]
+            row["unc_x"] = unc[..., 1].reshape(-1) * vox[1]
+        keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
+        if not keep.all():
+            dropped += int((~keep).sum())
+            row = {k: v[keep] for k, v in row.items()}
+        if row["m"].size:
+            rows.append(row)
+
+    seq = _PIVArraySeq(frames)
+    if payload["ensemble"]:
+        # ONE time-averaged field per (m, z), stamped t=0
+        emit(run_piv_ensemble(seq, params, vox, pairing=pairing, roi_mask=payload["roi"],
+                              progress_cb=progress_cb), 0)
+    else:
+        series = run_piv_series(seq, params, vox, pairing=pairing, roi_mask=payload["roi"],
+                                progress_cb=progress_cb)
+        for i, t in enumerate(payload["result_t"]):
+            if i >= len(series):
+                break
+            unc = None
+            if payload["uncertainty"]:                    # re-fetch this result's pair
+                unc = disparity_uncertainty(
+                    seq[0 if pairing == "fixed_head" else i], seq[i + 1],
+                    series[i], window_size=payload["window"])
+            emit(series[i], t, unc)
+    tables = ({"field": {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}}
+              if rows else {})
+    return {"tables": tables, "stats": {"dropped": dropped}}
 
 
 
@@ -501,6 +554,7 @@ register_node(
                  "(`qfactor`) and a `replaced` flag. SPARSE, on the window grid — use "
                  "Rasterize Field for a dense per-voxel map. Downstream nodes select it "
                  "by this name."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[Mode("reference_mode", ["previous_frame", "fixed_frame", "ensemble"],
