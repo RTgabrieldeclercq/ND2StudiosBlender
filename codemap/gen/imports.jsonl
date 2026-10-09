@@ -1060,6 +1060,7 @@
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.field"}
 {"dst":"nodegraph.memo","k":"imp","lazy":false,"src":"nodegraph.field"}
 {"dst":"nodegraph.transfer","k":"imp","lazy":false,"src":"nodegraph.field"}
+{"dst":"nodegraph.parallel","k":"imp","lazy":true,"src":"nodegraph.governor"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.graph"}
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodegraph.groups"}
 {"dst":"nodegraph.parallel","k":"imp","lazy":true,"src":"nodegraph.hotreload"}
@@ -1098,6 +1099,7 @@
 {"dst":"nodegraph.catalog.enhance.deconvolve","k":"imp","lazy":false,"src":"nodegraph.nodes"}
 {"dst":"nodegraph.catalog.enhance.temporal_gain","k":"imp","lazy":false,"src":"nodegraph.nodes"}
 {"dst":"nodegraph.catalog.view.overlay","k":"imp","lazy":false,"src":"nodegraph.nodes"}
+{"dst":"nodegraph.governor","k":"imp","lazy":true,"src":"nodegraph.parallel"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.phantom"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.phantom"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":false,"src":"nodegraph.phantom"}
@@ -1143,6 +1145,7 @@
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.field","k":"imp","lazy":false,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.file_sequence","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.governor","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.gpu","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.groups","k":"imp","lazy":true,"src":"nodegraph.selftest"}

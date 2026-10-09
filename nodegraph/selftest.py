@@ -16008,6 +16008,14 @@ def _pw_square(i):
     return i * i
 
 
+def _pw_gov_unit(i):
+    """`adaptive_fold`'s test unit: the value, the worker's pid, and a unit-12 failure."""
+    import os as _os
+    if i == 12:
+        raise ValueError("unit 12 fails on purpose")
+    return i * 3, _os.getpid()
+
+
 def test_parallel() -> None:
     """The V2.14 run-wide fan-out: ordering, re-entrancy, cache locking, and — the one
     that actually matters — that a parallel pull is BYTE-IDENTICAL to a serial one for the
@@ -16213,6 +16221,131 @@ def test_parallel() -> None:
         "unpicklable-closure fallback; TileCache 8-thread accounting exact; "
         "serial≡parallel byte-identical on 4 order-dependent nodes (segment 2D/3D ids, "
         "spot ids, mask) and masks are uint8")
+
+
+def test_parallel_governor() -> None:
+    """The analysis governor (2026-10-09): lane plans that respect the core reserve and the
+    free-RAM floor, live admission that holds on low memory / gives a lane back under a
+    saturated CPU and restores it, calibration on a measured peak, the env overrides — all
+    on FAKE machines — then a real `adaptive_fold` over the spawn pool: ordered fold,
+    several worker processes, per-unit stats, a compute error surfaced with its worker
+    traceback, and the unpicklable-compute fallback."""
+    import os as _os
+    from nodegraph import governor as G
+    from nodegraph import parallel as P
+
+    GiB = 1 << 30
+    big = G.MachineProfile(logical=80, physical=40, total_ram=512 * GiB,
+                           avail_ram=480 * GiB, commit_avail=480 * GiB, cpu_busy=0.1)
+    saved = {k: _os.environ.pop(k, None) for k in
+             ("NODEGRAPH_PROC_WORKERS", "NODEGRAPH_RESERVE_CORES", "NODEGRAPH_MIN_FREE_RAM")}
+    try:
+        # ── 1. the pure plan ─────────────────────────────────────────────────────
+        assert G.reserve_cores(40) == 4 and G.reserve_cores(8) == 2 and G.reserve_cores(2) == 1
+        assert G.min_free_ram(512 * GiB) == 512 * GiB // 10   # 10 % beats the 4 GiB floor
+        assert G.min_free_ram(16 * GiB) == 4 * GiB              # the 4 GiB floor wins
+        p = G.plan_lanes(96, 3 * GiB, big, min_inner=2)
+        assert (p.usable_cores, p.cpu_lanes, p.lanes) == (36, 16, 16), p
+        assert p.lanes * p.inner <= p.usable_cores, p          # the product never oversubscribes
+        tight = G.MachineProfile(logical=80, physical=40, total_ram=512 * GiB,
+                                 avail_ram=G.min_free_ram(512 * GiB) + 8 * GiB,
+                                 commit_avail=0, cpu_busy=0.1)
+        p = G.plan_lanes(96, 3 * GiB, tight, min_inner=2)
+        assert p.lanes == 2 and p.inner == 18, p               # RAM-bound: 8 GiB × 0.8 / 3 GiB
+        assert G.plan_lanes(1, 3 * GiB, big).lanes == 1        # one unit → one lane, all cores
+        assert G.plan_lanes(1, 3 * GiB, big).inner == 36
+        starved = G.MachineProfile(logical=8, physical=4, total_ram=8 * GiB,
+                                   avail_ram=1 * GiB, commit_avail=0)
+        assert G.plan_lanes(10, 3 * GiB, starved).lanes == 1   # floor 1: progress is possible
+        _os.environ["NODEGRAPH_PROC_WORKERS"] = "3"
+        assert G.plan_lanes(96, 1 * GiB, big).lanes == 3
+        _os.environ.pop("NODEGRAPH_PROC_WORKERS")
+        _os.environ["NODEGRAPH_RESERVE_CORES"] = "10"
+        assert G.plan_lanes(96, 1 * GiB, big, min_inner=3).usable_cores == 30
+        _os.environ.pop("NODEGRAPH_RESERVE_CORES")
+        _os.environ["NODEGRAPH_MIN_FREE_RAM"] = "6G"
+        assert G.min_free_ram(512 * GiB) == 6 * GiB
+        _os.environ.pop("NODEGRAPH_MIN_FREE_RAM")
+
+        # ── 2. the live governor on a scripted machine ───────────────────────────
+        state = {"avail": 480 * GiB, "busy": 0.1}
+
+        def fake():
+            return G.MachineProfile(logical=80, physical=40, total_ram=512 * GiB,
+                                    avail_ram=state["avail"], commit_avail=0,
+                                    cpu_busy=state["busy"])
+        gov = G.Governor(96, 3 * GiB, min_inner=2, profile_fn=fake)
+        clock = [0.0]
+        gov._clock = lambda: clock[0]
+        assert gov.allowed(0) == 2, "warm-up must start narrow until a unit reports"
+        assert gov.inner_threads() == 36 // 16, "warm-up threads must be sized for the TARGET"
+        gov.record(G.UnitStats(seconds=10.0, peak_bytes=2 * GiB, pid=1))
+        assert gov.calibrated and gov.plan.worker_bytes == int(2 * GiB * G.PEAK_MARGIN)
+        assert gov.allowed(2) == 16
+        # three units just started: free RAM has not yet seen them grow → hold
+        wb = gov.plan.worker_bytes
+        floor = G.min_free_ram(512 * GiB)
+        for _ in range(3):
+            gov.started()
+        state["avail"] = floor + int(3.5 * wb)
+        assert gov.allowed(3) == 3 and "holding" in gov.note(), gov.note()
+        clock[0] = 60.0                                         # they have grown in now
+        assert gov.allowed(3) == 16, "admission must resume once the young units settle"
+        state["avail"] = floor + wb // 2                        # genuinely short
+        assert gov.allowed(4) == 4                              # hold, never evict
+        assert gov.allowed(0) >= 1                              # but never deadlock
+        state["avail"] = 480 * GiB
+        # a saturated CPU that is not ours: give one lane back, restore with hysteresis
+        state["busy"] = 0.99
+        G._CPU_CACHE = (0.0, None)
+        assert gov.allowed(2) == 15 and gov.cpu_drop == 1
+        state["busy"] = 0.5
+        assert gov.allowed(2) == 16 and gov.cpu_drop == 0
+        est = G.estimate_seconds(30.0, 96, gov.plan, measured_threads=36)
+        assert est > 30.0 * (96 // 16), est                     # fewer threads per lane → slower
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    # ── 3. a real adaptive_fold over the spawn pool ──────────────────────────────
+    got = []
+    gov = G.Governor(12, 64 << 20, min_inner=1)
+    P.adaptive_fold(_pw_gov_unit, list(range(12)),
+                    lambda i, item, res: got.append((i, item, res[0], res[1])),
+                    governor=gov, numba=False, poll_s=0.05)
+    assert [(i, it, v) for i, it, v, _ in got] == [(i, i, i * 3) for i in range(12)], got
+    pids = {pid for *_x, pid in got}
+    pooled = P.enabled() and P.mode() != "thread"
+    if pooled:
+        assert _os.getpid() not in pids, "adaptive_fold ran in the parent despite a pool"
+        assert len(pids) >= 2, f"one worker process only: {pids}"
+    assert len(gov.seconds) == 12 and gov.peak_bytes > 0, (gov.seconds, gov.peak_bytes)
+    # a compute error: the units before it are folded IN ORDER, then UnitError with the
+    # worker's traceback
+    got.clear()
+    try:
+        P.adaptive_fold(_pw_gov_unit, list(range(16)),
+                        lambda i, item, res: got.append(i),
+                        governor=G.Governor(16, 64 << 20), numba=False, poll_s=0.05)
+        raise AssertionError("a failing unit did not propagate")
+    except P.UnitError as exc:
+        assert isinstance(exc.original, ValueError) and "unit 12" in exc.worker_traceback
+    assert got == list(range(len(got))) and len(got) <= 12, got
+    # an unpicklable compute falls back to this thread and still folds every unit, in order
+    mult = 5
+    got.clear()
+    P.adaptive_fold(lambda i: i * mult, list(range(6)), lambda i, it, r: got.append(r),
+                    governor=G.Governor(6, 64 << 20), numba=False, poll_s=0.05)
+    assert got == [i * 5 for i in range(6)], got
+    _ok(f"parallel governor (2026-10-09): plans keep lanes×threads ≤ physical−reserve and "
+        f"lanes×worker RAM above the floor (fake 40-core/512 GiB box: 16×2, RAM-bound 2×18, "
+        f"starved 1); warm-up 2 → calibrated 16; holds on young-unit growth and low RAM, "
+        f"never deadlocks; −1 lane under a foreign CPU load and back; env overrides; real "
+        f"adaptive_fold ordered over {len(pids)} worker process(es), UnitError with the worker "
+        f"traceback, unpicklable-compute fallback")
 
 
 # ── checkpoint + Dock node (V2.18) ───────────────────────────────────────────
@@ -31048,6 +31181,7 @@ def main() -> int:
     test_streaming_slivers()
     test_spill_and_streaming_stats()
     test_parallel()
+    test_parallel_governor()
     test_gpu_platform()
     test_catalog_kernels()
     test_catalog_dvc()
