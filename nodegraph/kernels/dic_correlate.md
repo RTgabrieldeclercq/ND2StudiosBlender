@@ -77,6 +77,36 @@ hands that forward. Measured: an 11 px shift came back as a 6.3 px error under `
 with a plane reader can stream a long series at ~two planes of memory instead of the whole
 `T×H×W` float64 stack.
 
+### 2b. The staged entry points (2026-10-08)
+
+`run_pyaldic_series` runs pyALDIC's Sections 2b-8 in one call. The staged DIC nodes (`dic.grid` →
+`dic.initial_guess` → `dic.local_match` → `dic.global_step` → `dic.strain`, placed by `bundle:dic`) call the
+sections one at a time:
+
+```python
+dic_stage_para(params, shape, *, reference_mode, roi_mask=None) -> DICPara   # §2b rewrite: ROI clamped, img_size, FFT search auto-scaled
+dic_stage_grid(para, shape) -> (x0, y0)                      # the lattice integer_search lays its windows on
+dic_stage_lattice_nodes(para, shape) -> (N, 2) [x, y]        # mesh_setup's node order, the row order every table keeps
+dic_stage_normalize(img, para) -> (H, W)                     # (img − mean_roi) / std_roi
+dic_stage_reference(ref_norm, para, shape, roi_mask=None) -> DICReference   # masked frame, gradients, para with img_ref_mask
+dic_stage_seed(ref, g_norm, *, search=None) -> {x0, y0, U0, cc, search, info}          # §3 FFT seed, auto-expanding retry, init_disp
+dic_stage_mesh(ref, x0, y0) -> DICMesh                       # mesh_setup + the mask trim (elements only)
+dic_stage_seed_on_mesh(ref, mesh, U0, x0, y0) -> U0 (2N,)    # interpolate onto the mesh, NaN under the mask
+dic_stage_local(ref, mesh, g_norm, U0) -> {U, F, conv_iter, bad_pt_num, mark_hole_strain, node_region_map}   # §4
+dic_stage_global(ref, mesh, g_norm, U1, F1, mark_hole_strain, node_region_map, *, beta=None) -> {U, F, beta, n_steps, …}   # §5-6 verbatim
+dic_stage_strain(ref, mesh, U, *, deformed_mask=None) -> StrainResult   # §8 for one frame
+dic_split_u / dic_merge_u / dic_split_f / dic_merge_f        # interleaved ↔ per-component
+```
+
+Each reproduces its slice of `core/pipeline.py:700-1871` (the same calls in the same order, the same `para`
+rewrites, the mesh trimmed exactly as the driver trims it), so for the paths it covers — the FFT seed, no pre-solve
+refinement, no seed propagation — the staged chain and the one-call driver agree on every node: measured
+identical (max |Δ| 0.0 in the kernel, 1e-15 through the Engine) on a synthetic speckle pair. Everything crosses
+this boundary in pyALDIC's own layout (interleaved `U` / `F`, `[x, y]` coordinates); the nodes convert at their
+edge, as `_frame_to_dvcresult` does. The caches `run_aldic` keeps (reference bundle, IC-GN context, subpb1
+precompute, the learned FFT radius, β per reference) are rebuilt per reference frame by each node — seconds —
+because nothing opaque may ride the memo, the spill or a saved file.
+
 ## 3. Inputs
 
 | name | Python type | shape | dtype | axis order | units | required? | meaning & constraints |

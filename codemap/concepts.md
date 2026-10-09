@@ -747,14 +747,20 @@ or a drag onto the canvas — adds the members with fresh ids, wires them, splic
 into the wire it was dropped on, and wraps them in a *frame* (a canvas region: border ports,
 a linked tab on demand). What the document holds afterwards is ordinary nodes; the bundle is
 not recorded in the file and the engine never sees it. It exists so a complex analysis that
-is really several *sections* — DVC is the first: `bundle:dvc` places `dvc.grid` →
-`dvc.initial_guess` → `dvc.local_match` → `dvc.global_step` → `dvc.strain` — can be run and
-re-tuned section by section, each card its own memo entry, instead of as one opaque node.
-It is deliberately not a `nodegraph.groups` group (one card, one Dataset in, one out, run as
-a unit) and not a page recipe (a whole page). Keys are `bundle:<name>`; a bundle's palette
-section is its `role` (bundles are not ops, so `node_roles.json` does not list them); the
-selftest proves every registered bundle against the live registry and places it on a
-Qt-free `GraphDocument`.
+is really several *sections* can be run and re-tuned section by section, each card its own
+memo entry, instead of as one opaque node. Three ship: `bundle:dvc` places `dvc.grid` →
+`dvc.initial_guess` → `dvc.local_match` → `dvc.global_step` → `dvc.strain` (pyALDVC's
+sections); `bundle:dic` the same five for pyALDIC (`dic.*`); `bundle:piv` OpenPIV's ladder as
+`piv.first_pass` → `piv.validate` → `piv.deform_pass` → `piv.validate` → `piv.deform_pass` →
+`piv.validate`. Each chain hands its field down as ONE Point table that the stages fill in
+column by column (a PIV deform pass replaces the table, since its grid changes), and each is
+measured identical to its single-node sibling. It is deliberately not a `nodegraph.groups`
+group (one card, one Dataset in, one out, run as a unit) and not a page recipe (a whole
+page). Keys are `bundle:<name>`; a bundle's palette section is its `role` (bundles are not
+ops, so `node_roles.json` does not list them), and its MEMBER nodes list under the bundle row
+as a third level — stage → role → ⧉ bundle → its stages — rather than beside the ordinary
+nodes, so the list reads "DVC, and here are its parts". The selftest proves every registered
+bundle against the live registry and places it on a Qt-free `GraphDocument`.
 
 ### CON-24 — units, math and the region crop
 anchors: sym:nodegraph.units.conversion_factor, sym:nodegraph.units.unit_of, sym:nodegraph.catalog.math.values._compute_math_values, sym:nodegraph.catalog.util.crop_region._compute_crop_region, sym:nodelab_v2.ops.materialize_outside_taps, sym:nodegraph.metadata.crop_region

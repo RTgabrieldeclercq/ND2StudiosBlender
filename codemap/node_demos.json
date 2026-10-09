@@ -1187,6 +1187,176 @@
         "pyALDVC sections 5-6 as its own card: the global compatibility step and the ADMM iterations that reconcile the matched subsets into one compatible field, with β auto-tuned per reference."
       ]
     },
+    "piv.first_pass": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "OpenPIV's first (coarsest) pass as its own card: FFT cross-correlation of every window on the raw frames, written as raw vectors with signal-to-noise — nothing validated yet.",
+        "Placed by the `bundle:piv` palette entry with Validate and two Deform Passes, wired as the 64 / 32 / 16 px ladder inside one region."
+      ]
+    },
+    "piv.validate": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "piv.first_pass",
+          "params": {
+            "window_size": 32
+          }
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "OpenPIV's validation as its own card: signal-to-noise, global-limit, std and median tests flag vectors, and the flagged ones are filled from their neighbours (`flags` / `replaced`)."
+      ]
+    },
+    "piv.deform_pass": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "piv.first_pass",
+          "params": {
+            "window_size": 32
+          }
+        },
+        {
+          "op": "piv.validate"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "One window-deformation pass as its own card: the previous field predicts, the frames are deformed and re-correlated at half the window, and a NEW finer grid replaces the table."
+      ]
+    },
+    "piv.smooth": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "piv.first_pass",
+          "params": {
+            "window_size": 32
+          }
+        },
+        {
+          "op": "piv.validate"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "Garcia-2010 smoothn on the pass's field as its own card — the between-pass smoothing of the multipass driver, placeable wherever it is wanted."
+      ]
+    },
+    "dic.grid": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the lattice is instant, but the demo chain it heads compiles pyALDIC's kernels on first use",
+      "features": [
+        "pyALDIC section 2b as its own card: the correlation lattice as a Point table, plus the channel, ROI and reference policy every later stage inherits.",
+        "Placed by the `bundle:dic` palette entry with Initial Guess, Local Match, Global Step and Strain, wired in order inside one region."
+      ]
+    },
+    "dic.initial_guess": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "pyALDIC compiles its numba kernels on first use",
+      "features": [
+        "pyALDIC section 3 as its own card: the FFT integer seed of every lattice node with its correlation peak, written as disp_* before any refinement."
+      ]
+    },
+    "dic.local_match": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the 6-DOF IC-GN match of every subset takes seconds, more on first use",
+      "features": [
+        "pyALDIC section 4 as its own card: the 6-DOF IC-GN subset match from the seed — the cost centre — writing sub-pixel disp_*, the gradient grad_*, n_iter and hole."
+      ]
+    },
+    "dic.global_step": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        },
+        {
+          "op": "dic.local_match"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the ADMM iterations re-solve every subset several times",
+      "features": [
+        "pyALDIC sections 5-6 as its own card: the global FEM compatibility solve and the ADMM iterations that reconcile the matched subsets, β auto-tuned per reference."
+      ]
+    },
+    "dic.strain": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        },
+        {
+          "op": "dic.local_match"
+        },
+        {
+          "op": "dic.global_step"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "its upstream chain is a correlation",
+      "features": [
+        "pyALDIC section 8 as its own card: the nodal displacement gradient under the chosen measure, four strain_* columns in image axes, without reading a frame."
+      ]
+    },
     "dvc.strain": {
       "kind": "field",
       "phantom": "speckle_pair",

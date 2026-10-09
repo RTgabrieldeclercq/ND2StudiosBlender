@@ -80,6 +80,8 @@ MODULES: Tuple[str, ...] = (
     "analysis.draw_regions",
     "analysis.dvc_field",
     "analysis.dvc_stages",          # the same solver as five cards + the `bundle:dvc` recipe
+    "analysis.piv_stages",          # OpenPIV's ladder as pass-by-pass cards + `bundle:piv`
+    "analysis.dic_stages",          # pyALDIC's sections as five cards + `bundle:dic`
     "transform.rasterize_field",
     "analysis.accumulate_field",
     "analysis.dic_correlate",

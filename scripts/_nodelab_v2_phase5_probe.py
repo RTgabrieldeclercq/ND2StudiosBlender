@@ -1075,9 +1075,14 @@ def main(argv) -> int:
                     out.append(role)
                 for k in range(role.childCount()):
                     # a role's children are node rows AND, since 2026-10-08, bundle rows
-                    # (one row that places several nodes) — told apart by their kind data
-                    if role.child(k).data(0, _Qt.UserRole + 1) == kind:
-                        out.append(role.child(k))
+                    # (one row that places several nodes) — told apart by their kind data;
+                    # a bundle row holds its MEMBER node rows as a third level
+                    ch = role.child(k)
+                    if ch.data(0, _Qt.UserRole + 1) == kind:
+                        out.append(ch)
+                    if ch.data(0, _Qt.UserRole + 1) == "bundle" and kind == "node":
+                        out.extend(ch.child(q) for q in range(ch.childCount())
+                                   if ch.child(q).data(0, _Qt.UserRole + 1) == "node")
         return out
 
     win.palette.refill("")
@@ -1103,6 +1108,26 @@ def main(argv) -> int:
     bundle_rows = _rows("bundle")
     assert {r.data(0, _Qt.UserRole) for r in bundle_rows} == set(_BUNDLES), \
         ([r.data(0, _Qt.UserRole) for r in bundle_rows], sorted(_BUNDLES))
+    # the third level (2026-10-08): a bundle row holds its family's stages, each ONCE and in
+    # pipeline order (the PIV ladder places Validate thrice; the palette lists it once), the
+    # optional ones the bundle does not place after them — and no stage also sits at role level
+    _family_all = set()
+    for br in bundle_rows:
+        b_ = _BUNDLES[br.data(0, _Qt.UserRole)]
+        kids = [br.child(q).data(0, _Qt.UserRole) for q in range(br.childCount())]
+        assert kids == list(b_.family_ops), (b_.key, kids, b_.family_ops)
+        assert all(br.child(q).data(0, _Qt.UserRole + 1) == "node" for q in range(br.childCount()))
+        _family_all |= set(kids)
+    assert _BUNDLES["bundle:piv"].family_ops == ("piv.first_pass", "piv.validate",
+                                                 "piv.deform_pass", "piv.smooth")
+    for role in _rows("role"):
+        direct = {role.child(k).data(0, _Qt.UserRole) for k in range(role.childCount())
+                  if role.child(k).data(0, _Qt.UserRole + 1) == "node"}
+        assert not (direct & _family_all), ("a stage listed beside the ordinary nodes",
+                                            sorted(direct & _family_all))
+    _ok(f"G2: {len(bundle_rows)} bundle rows (DVC, DIC, PIV) each hold their "
+        f"{len(_family_all)} stage nodes as a third level — once each, in pipeline order — "
+        "and none of those stages is repeated beside the ordinary nodes")
     dvc_row = next(r for r in bundle_rows if r.data(0, _Qt.UserRole) == "bundle:dvc")
     assert dvc_row.text(1).endswith(_BUNDLES["bundle:dvc"].label), dvc_row.text(1)
     tree.setCurrentItem(dvc_row)

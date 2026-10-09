@@ -540,7 +540,7 @@ class PalettePanel(QWidget):
         rrow.setToolTip(0, _squash(rmeta.get("description")))
         head.addChild(rrow)
         rrow.setFirstColumnSpanned(True)
-        for spec in sorted(group, key=lambda s: s.label):
+        def _node_row(spec) -> QTreeWidgetItem:
             row = QTreeWidgetItem(["", spec.label, ""])
             row.setData(0, _OP, spec.op_key)
             row.setData(0, _KIND, "node")
@@ -550,17 +550,39 @@ class PalettePanel(QWidget):
             row.setToolTip(0, "IN: " + ", ".join(w for _, w in ins))
             row.setToolTip(2, "OUT: " + ", ".join(w for _, w in outs))
             row.setToolTip(1, f"{spec.op_key}\n{_squash(spec.description)}")
-            rrow.addChild(row)
+            return row
+
         # node BUNDLES of this role (2026-10-08): one row that places several pre-wired
-        # cards — listed after the nodes, with a ⧉ so it reads as "several" at a glance
+        # cards, with a ⧉ so it reads as "several" at a glance. Its MEMBER nodes — the
+        # stages — sit UNDER it as a third level rather than beside the ordinary nodes:
+        # a stage is still a node (double-click / drag places that one card), but the
+        # list reads "DVC, and here are its parts" instead of five unexplained cards
         from nodegraph.bundles import BUNDLES
-        for b in sorted((b for b in BUNDLES.values() if b.role == rk), key=lambda b: b.label):
+        by_op = {s.op_key: s for s in group}
+        # a bundle is listed where its family is — the search and the page kind already
+        # filtered `group`, so a bundle none of whose stages survived is not shown here
+        bundles = sorted((b for b in BUNDLES.values()
+                          if b.role == rk and any(op in by_op for op in b.family_ops)),
+                         key=lambda b: b.label)
+        members = {op for b in bundles for op in b.family_ops}
+        for spec in sorted(group, key=lambda s: s.label):
+            if spec.op_key in members:
+                continue
+            rrow.addChild(_node_row(spec))
+        for b in bundles:
             row = QTreeWidgetItem(["", f"⧉ {b.label}", ""])
             row.setData(0, _OP, b.key)
             row.setData(0, _KIND, "bundle")
             row.setToolTip(1, f"{b.key} — places {len(b.nodes)} wired nodes in a region\n"
                               f"{_squash(b.description)}")
             rrow.addChild(row)
+            # each stage ONCE, in pipeline order (a PIV ladder places Validate thrice),
+            # then the optional ones the bundle does not place
+            for op in b.family_ops:
+                spec = by_op.get(op)
+                if spec is not None:                # absent = filtered out by the search
+                    row.addChild(_node_row(spec))
+            row.setExpanded(False)
         rrow.setExpanded(True)
 
     # ── selection → overview ──────────────────────────────────────────────────
@@ -694,11 +716,20 @@ class PalettePanel(QWidget):
             desc = _squash(spec.description) if spec is not None else ""
             items.append(f"<li><b>{html.escape(label)}</b> <span class='k'>"
                          f"{html.escape(n.op_key)}</span><br>{html.escape(desc)}</li>")
+        extras = []
+        for op in b.extra_ops:
+            spec = NODES.get(op)
+            label = spec.label if spec is not None else op
+            desc = _squash(spec.description) if spec is not None else ""
+            extras.append(f"<li><b>{html.escape(label)}</b> <span class='k'>"
+                          f"{html.escape(op)}</span><br>{html.escape(desc)}</li>")
+        extra_html = (f"<div class='sec'>Also in this family (not placed — add where "
+                      f"wanted)</div><ul>{''.join(extras)}</ul>" if extras else "")
         self._overview.setHtml(
             self._css() + f"<h3>⧉ {html.escape(b.label)}</h3>"
             f"<div class='k'>{html.escape(b.key)} · places {len(b.nodes)} wired nodes in a "
             f"region</div><div>{html.escape(_squash(b.description))}</div>"
-            f"<div class='sec'>Nodes, in order</div><ol>{''.join(items)}</ol>"
+            f"<div class='sec'>Nodes, in order</div><ol>{''.join(items)}</ol>{extra_html}"
             "<div>Double-click or drag it onto the canvas; drop it on a wire to splice the "
             "whole chain into that wire. Afterwards they are ordinary nodes — pull any one "
             "of them.</div>")

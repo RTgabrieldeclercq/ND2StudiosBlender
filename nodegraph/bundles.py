@@ -71,10 +71,25 @@ class Bundle:
     input: Tuple[str, str]
     output: Tuple[str, str]
     frame_title: str = ""
+    #: Ops that belong to this family but are not placed by default — an optional stage
+    #: (PIV Smooth) the user adds where wanted. The palette lists them under the bundle
+    #: with the placed members; placement ignores them.
+    extra_ops: Tuple[str, ...] = ()
 
     @property
     def op_keys(self) -> Tuple[str, ...]:
+        """The placed members' ops, in placement order, repeats included (a PIV ladder
+        places Validate after every pass)."""
         return tuple(n.op_key for n in self.nodes)
+
+    @property
+    def family_ops(self) -> Tuple[str, ...]:
+        """Every op of the family ONCE, in first-placement order, then the extras — what
+        the palette lists under the bundle row."""
+        seen: Dict[str, None] = {}
+        for op in self.op_keys + tuple(self.extra_ops):
+            seen.setdefault(op, None)
+        return tuple(seen)
 
 
 #: The registry, keyed by bundle key, in registration order.
@@ -116,6 +131,9 @@ def validate_bundle(bundle: Bundle, known_ops=None) -> List[str]:
         for n in bundle.nodes:
             if n.op_key not in known_ops:
                 out.append(f"{bundle.key}: member {n.id!r} uses unregistered op {n.op_key!r}")
+        for op in bundle.extra_ops:
+            if op not in known_ops:
+                out.append(f"{bundle.key}: extra op {op!r} is not registered")
     return out
 
 

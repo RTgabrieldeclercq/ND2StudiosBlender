@@ -648,3 +648,137 @@ def run_piv_ensemble(
                            eff_ws, eff_ov, trimmed, s, voxel_size_um,
                            extra_diag={"ensemble_pairs": n_pairs,
                                        "pairing": pairing})
+
+
+# ── staged entry points (2026-10-08): one multipass PIV as separate calls ────────
+# `_piv_one_pair` is openpiv's `windef.piv` in one function: first pass → validate →
+# replace → (smooth) → deform pass → validate → … The staged PIV nodes (`piv.first_pass`
+# → `piv.validate` → `piv.deform_pass` → `piv.validate` → … → optional `piv.smooth`) call
+# the pieces below one at a time on ONE pass each, so a user can look at the coarse field,
+# see what validation flagged, and watch each refinement pass land. Each function is the
+# corresponding slice of `_piv_one_pair` / `_deform_pass` unchanged (same openpiv calls,
+# same masking, same replacement rule), so a staged chain with the default ladder
+# reproduces `run_piv_pair` on the same frames. Everything is in PIXELS and in openpiv's
+# own (rows, cols) grid order; the nodes keep the field in µm on the wire.
+
+
+def piv_stage_settings(params: Dict[str, Any], shape: Tuple[int, int], window: int,
+                       overlap_frac: float):
+    """A fresh ``PIVSettings`` for ONE pass of ``window`` px on an image of ``shape`` —
+    the correlation and validation knobs from ``params`` exactly as `_build_settings`
+    reads them — plus the overlap in px and the vector grid ``(rows, cols)`` that pass
+    will produce. Refuses a window that does not fit the image."""
+    pyprocess, _windef, _validation, _filters, _smoothn, PIVSettings = _require_openpiv()
+    h, w = int(shape[0]), int(shape[1])
+    window = int(window)
+    if window < 4 or window > min(h, w):
+        raise ValueError(
+            f"PIV window size {window} px does not fit a {h}x{w} px image; use a smaller "
+            "window or crop less aggressively")
+    ov = _overlap_px(window, float(overlap_frac))
+    rows, cols = pyprocess.get_field_shape((h, w), window, ov)
+    s = _build_settings(params, (window,), (ov,), PIVSettings)
+    return s, int(ov), (int(rows), int(cols))
+
+
+def piv_stage_first_pass(frame_a: np.ndarray, frame_b: np.ndarray, s,
+                         roi_mask: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """The first (coarsest) pass: ``windef.first_pass`` on the raw frames →
+    ``{"x", "y", "u", "v", "s2n", "excluded"}`` on the vector grid ``(rows, cols)``;
+    ``u``/``v`` are masked arrays (masked = outside the ROI), ``+v`` = down the rows."""
+    _pyprocess, windef, _validation, _filters, _smoothn, _PIVSettings = _require_openpiv()
+    fa = _as_frame(frame_a, "frame A")
+    fb = _as_frame(frame_b, "frame B")
+    if fa.shape != fb.shape:
+        raise ValueError(f"PIV frame pair shapes differ: {fa.shape} vs {fb.shape}")
+    x, y, u, v, s2n = windef.first_pass(fa, fb, s)
+    excluded = _roi_on_grid(roi_mask, x, y)
+    u = np.ma.masked_array(u, mask=excluded)
+    v = np.ma.masked_array(v, mask=excluded)
+    return {"x": np.asarray(x, float), "y": np.asarray(y, float), "u": u, "v": v,
+            "s2n": np.asarray(s2n, float), "excluded": np.asarray(excluded, bool)}
+
+
+def piv_stage_validate(u, v, s2n: np.ndarray, s, excluded: np.ndarray, *,
+                       replace: bool = True) -> Dict[str, Any]:
+    """``validation.typical_validation`` (signal-to-noise, global limits, standard
+    deviation, median test — whichever ``s`` turns on) → ``flags``; then, when
+    ``replace`` and anything but everything is flagged, ``filters.replace_outliers``
+    inpaints the flagged vectors from their neighbours (``replaced`` True). With
+    ``replace`` off the flagged vectors are set to NaN — `_package_result`'s contract:
+    the field carries only vectors that passed or were filled."""
+    _pyprocess, _windef, validation, filters, _smoothn, _PIVSettings = _require_openpiv()
+    u = np.ma.masked_array(u, mask=excluded)
+    v = np.ma.masked_array(v, mask=excluded)
+    flags = np.asarray(validation.typical_validation(u, v, np.asarray(s2n), s), dtype=bool)
+    replaced = False
+    if replace and flags.any() and not flags.all():
+        u, v = filters.replace_outliers(
+            u, v, flags, method=s.filter_method,
+            max_iter=s.max_filter_iteration, kernel_size=s.filter_kernel_size)
+        u = np.ma.masked_array(u, mask=excluded)
+        v = np.ma.masked_array(v, mask=excluded)
+        replaced = True
+    uu = np.ma.filled(u, np.nan).astype(float)
+    vv = np.ma.filled(v, np.nan).astype(float)
+    if not replaced and flags.any():
+        uu = uu.copy()
+        vv = vv.copy()
+        uu[flags] = np.nan
+        vv[flags] = np.nan
+    return {"flags": flags, "u": uu, "v": vv, "replaced": replaced}
+
+
+def piv_stage_smooth(u, v, s, excluded: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Garcia-2010 ``smoothn`` on both components with ``s.smoothn_p``, re-masked —
+    what `_piv_one_pair` does between passes when ``smoothn`` is on. NaN (a flagged,
+    un-replaced vector) is treated as missing by the smoother and filled."""
+    _pyprocess, _windef, _validation, _filters, smoothn_mod, _PIVSettings = _require_openpiv()
+    us, *_ = smoothn_mod.smoothn(np.ma.filled(np.ma.masked_array(u, mask=excluded), np.nan),
+                                 s=s.smoothn_p)
+    vs, *_ = smoothn_mod.smoothn(np.ma.filled(np.ma.masked_array(v, mask=excluded), np.nan),
+                                 s=s.smoothn_p)
+    us = np.where(excluded, np.nan, np.asarray(us, float))
+    vs = np.where(excluded, np.nan, np.asarray(vs, float))
+    return us, vs
+
+
+def piv_stage_deform_pass(frame_a: np.ndarray, frame_b: np.ndarray, s,
+                          x_old: np.ndarray, y_old: np.ndarray, u_old: np.ndarray,
+                          v_old: np.ndarray, roi_mask: Optional[np.ndarray] = None
+                          ) -> Dict[str, Any]:
+    """One window-deformation pass at ``s.windowsizes[0]`` seeded by the previous pass's
+    field on its own grid (``x_old``/``y_old``/``u_old``/``v_old``) → the new grid and
+    field, as `_deform_pass` computes them. The predictor is a cubic spline over the OLD
+    vector grid, so that grid needs at least 4 rows and 4 columns and may hold no NaN:
+    non-finite vectors are inpainted from their neighbours first (``replace_outliers``,
+    local mean), as the multipass driver always does before a deform pass."""
+    pyprocess, windef, _validation, filters, _smoothn, _PIVSettings = _require_openpiv()
+    fa = _as_frame(frame_a, "frame A")
+    fb = _as_frame(frame_b, "frame B")
+    if fa.shape != fb.shape:
+        raise ValueError(f"PIV frame pair shapes differ: {fa.shape} vs {fb.shape}")
+    x_old = np.asarray(x_old, float)
+    y_old = np.asarray(y_old, float)
+    if x_old.ndim != 2 or min(x_old.shape) < 4:
+        raise ValueError(
+            f"a deformation pass needs the previous pass's grid to be at least 4 x 4 "
+            f"vectors (it is {x_old.shape}); use a smaller previous window or more overlap")
+    uo = np.asarray(u_old, float).copy()
+    vo = np.asarray(v_old, float).copy()
+    holes = ~(np.isfinite(uo) & np.isfinite(vo))
+    if holes.any() and not holes.all():
+        uo, vo = filters.replace_outliers(
+            np.ma.masked_array(np.nan_to_num(uo), mask=holes),
+            np.ma.masked_array(np.nan_to_num(vo), mask=holes), holes,
+            method=s.filter_method, max_iter=s.max_filter_iteration,
+            kernel_size=s.filter_kernel_size)
+        uo, vo = np.ma.filled(uo, 0.0), np.ma.filled(vo, 0.0)
+    elif holes.all():
+        uo = np.zeros_like(uo)
+        vo = np.zeros_like(vo)
+    x, y, u, v, s2n, excluded = _deform_pass(
+        fa, fb, 0, x_old, y_old, np.ma.masked_array(uo), np.ma.masked_array(vo), s,
+        roi_mask, pyprocess, windef)
+    return {"x": np.asarray(x, float), "y": np.asarray(y, float), "u": u, "v": v,
+            "s2n": np.asarray(s2n, float), "excluded": np.asarray(excluded, bool)}

@@ -12929,6 +12929,11 @@ _LAYER_RESOLVE_EXEMPT = {
     ("analysis.dic_correlate", "roi"),
     # Same contract as dic_correlate's roi, same reason: absent layer = whole frame.
     ("analysis.piv", "roi"),
+    # The staged siblings (2026-10-08) decide the ROI once, on their first card, with the
+    # single nodes' contract: a name that matches no Voxel layer correlates the whole frame
+    # (`_roi_plane` returns None), and every later stage inherits that choice from provenance.
+    ("dic.grid", "roi"),
+    ("piv.first_pass", "roi"),
     # Not a layer name at all on 3 of its 5 domains: `source` names an attribute COLUMN, and
     # on a structure domain every invariant coordinate (id/m/t/c/z/y/x) is a "candidate", so
     # "the only one on the wire" is never the question being asked. It also must keep
@@ -30757,6 +30762,231 @@ def test_dvc_stages() -> None:
         f"places 5 wired nodes in a frame, splices into a wire and round-trips as nodes")
 
 
+def test_piv_stages() -> None:
+    """The staged PIV (2026-10-08): OpenPIV's ladder as pass-by-pass nodes — ``piv.first_pass``
+    → ``piv.validate`` → ``piv.deform_pass`` → ``piv.validate`` (+ ``piv.smooth``) — and the
+    ``bundle:piv`` node bundle.
+
+    1. Through the Engine on the ``speckle_pair`` phantom a 32 → 16 px staged chain writes
+       the first pass's rows (7×7), Validate adds ``flags``/``replaced`` on the SAME rows, a
+       Deform Pass REPLACES the table with the 15×15 grid (ids renumbered, no stale column
+       survives), the final field equals ``analysis.piv`` (window 16, 2 passes) on every
+       common grid point to 1e-9 µm.
+    2. Provenance: the first pass stamps the ``piv_*`` keys, the deform pass restamps
+       window / grid / pass; a stage fed a table without them refuses by name.
+    3. The bundle is sound against the registry, places six wired nodes in a frame on a
+       Qt-free ``GraphDocument``, and the palette's member rows are those six ops.
+    Needs scipy/skimage + openpiv for part 1-2 (dep-gated like the single node)."""
+    from nodegraph.bundles import BUNDLES, validate_bundle
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    b = BUNDLES.get("bundle:piv")
+    assert b is not None, "bundle:piv is not registered"
+    assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
+    assert b.op_keys == ("piv.first_pass", "piv.validate", "piv.deform_pass", "piv.validate",
+                         "piv.deform_pass", "piv.validate"), b.op_keys
+    doc = GraphDocument()
+    ids, fid = doc.place_bundle("bundle:piv", x=0, y=0)
+    assert len(ids) == 6 and set(doc.frames[fid].members) == set(ids)
+    edges = {(e.src, e.dst) for e in doc.to_graph(for_run=False).edges}
+    for a, c in zip(ids, ids[1:]):
+        assert (a, c) in edges, (a, c)
+    assert doc.nodes[ids[0]].params.get("window_size") == 64, doc.nodes[ids[0]].params
+
+    if not _HAVE_SKIMAGE:
+        _ok("piv stages: bundle placed; solver parts SKIPPED (scipy absent)")
+        return
+    from nodegraph.kernels.piv_field import openpiv_available
+    if not openpiv_available():
+        _ok("piv stages: bundle placed; solver parts SKIPPED (openpiv absent)")
+        return
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.phantom import phantom
+
+    define_node("io.pivstageseed", "S", outputs=[OutDataset()])
+    ph = phantom("speckle_pair")
+    ds, env = ph.dataset, ph.envelope
+    g = Graph()
+    g.add(NodeInstance("S", "io.pivstageseed"))
+    g.add(NodeInstance("P1", "piv.first_pass", params={"window_size": 32}))
+    g.add(NodeInstance("V1", "piv.validate"))
+    g.add(NodeInstance("P2", "piv.deform_pass"))
+    g.add(NodeInstance("V2", "piv.validate"))
+    for a, c in (("S", "P1"), ("P1", "V1"), ("V1", "P2"), ("P2", "V2")):
+        g.connect(a, c)
+    e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def tab(out, layer="piv"):
+        return {name: np.asarray(a.values) for (dom, lyr, name), a in out.attributes.items()
+                if dom is D.POINT and lyr == layer}
+
+    p1 = tab(e.pull("P1"))
+    md1 = e.pull("P1").metadata
+    assert tuple(md1["piv_grid_shape"]) == (7, 7) and md1["piv_pass"] == 1, md1
+    assert len(p1["id"]) == 49 and {"disp_y", "disp_x", "qfactor", "excluded"} <= set(p1)
+    v1 = tab(e.pull("V1"))
+    assert len(v1["id"]) == 49 and np.array_equal(v1["id"], p1["id"])
+    assert {"flags", "replaced"} <= set(v1) and int(v1["flags"].sum()) >= 0
+    p2 = tab(e.pull("P2"))
+    md2 = e.pull("P2").metadata
+    assert tuple(md2["piv_grid_shape"]) == (15, 15) and md2["piv_window"] == 16 and md2["piv_pass"] == 2, md2
+    assert len(p2["id"]) == 225 and "flags" not in p2, sorted(p2)     # the coarse pass's columns are gone
+    v2 = tab(e.pull("V2"))
+    assert len(v2["id"]) == 225
+    # the single node on the same ladder, compared on the common grid points
+    g2 = Graph()
+    g2.add(NodeInstance("S", "io.pivstageseed"))
+    g2.add(NodeInstance("M", "analysis.piv", params={"window_size": 16, "passes": 2}))
+    g2.connect("S", "M")
+    m = tab(Engine(g2, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("M"))
+    key = {(round(float(y), 3), round(float(x), 3)): i for i, (y, x) in enumerate(zip(v2["y"], v2["x"]))}
+    n_common = 0
+    dmax = 0.0
+    for i, (y, x) in enumerate(zip(m["y"], m["x"])):
+        j = key.get((round(float(y), 3), round(float(x), 3)))
+        if j is None:
+            continue
+        n_common += 1
+        for col in ("disp_y", "disp_x", "qfactor"):
+            a_v, b_v = float(v2[col][j]), float(m[col][i])
+            if np.isfinite(a_v) and np.isfinite(b_v):
+                dmax = max(dmax, abs(a_v - b_v))
+    assert n_common == len(m["id"]) and dmax < 1e-9, (n_common, len(m["id"]), dmax)
+    # a stage without its predecessor refuses by name
+    g3 = Graph()
+    g3.add(NodeInstance("S", "io.pivstageseed"))
+    g3.add(NodeInstance("V", "piv.validate"))
+    g3.connect("S", "V")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("V")
+        raise AssertionError("a validate with no pass upstream must be refused")
+    except ValueError as exc:
+        assert "First Pass" in str(exc), exc
+    _ok(f"piv stages: first pass 7×7 → validate ({int(v1['flags'].sum())} flagged) → deform pass "
+        f"15×15 → validate through the Engine equals analysis.piv on all {n_common} grid points "
+        f"(max |Δ| {dmax:.1e} µm); provenance restamped per pass; bundle:piv places 6 wired "
+        f"nodes in a frame; a stage without its pass refuses by name")
+
+
+def test_dic_stages() -> None:
+    """The staged DIC (2026-10-08): pyALDIC's sections as five nodes — ``dic.grid`` →
+    ``dic.initial_guess`` → ``dic.local_match`` → ``dic.global_step`` → ``dic.strain`` — and
+    the ``bundle:dic`` node bundle.
+
+    1. Through the Engine on a 160² synthetic speckle pair with a known (1.5, 2.0) px shift
+       the chain writes the lattice rows (289 nodes × 2 frames), every later stage adds its
+       columns on the SAME rows, the shift is recovered in µm, and the final field equals
+       ``analysis.dic_correlate`` (same subset / step / search / ADMM) on every node to 1e-9
+       on displacement and the four gradient columns.
+    2. The grid stamps the ``dic_*`` provenance every later stage reads; a stage fed a table
+       without it refuses by name.
+    3. The bundle is sound against the registry and places five wired nodes in a frame.
+    Needs scipy/skimage + al-dic for parts 1-2 (dep-gated like the single node)."""
+    from nodegraph.bundles import BUNDLES, validate_bundle
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    b = BUNDLES.get("bundle:dic")
+    assert b is not None, "bundle:dic is not registered"
+    assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
+    assert b.op_keys == ("dic.grid", "dic.initial_guess", "dic.local_match", "dic.global_step",
+                         "dic.strain"), b.op_keys
+    doc = GraphDocument()
+    ids, fid = doc.place_bundle("bundle:dic", x=0, y=0)
+    assert len(ids) == 5 and set(doc.frames[fid].members) == set(ids)
+
+    if not _HAVE_SKIMAGE:
+        _ok("dic stages: bundle placed; solver parts SKIPPED (scipy absent)")
+        return
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    if not al_dic_available():
+        _ok("dic stages: bundle placed; solver parts SKIPPED (al-dic absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+
+    define_node("io.dicstageseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(5)
+    ref = gaussian_filter(rng.random((160, 160)), 1.0)
+    SHIFT = (1.5, 2.0)
+    img = np.zeros((1, 2, 1, 1, 160, 160))
+    img[0, 0, 0, 0] = ref
+    img[0, 1, 0, 0] = ndshift(ref, SHIFT, order=3, mode="nearest")
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=160, x=160)
+    meta = {"pixel_size_um": 0.5}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    P = {"winsize": 24, "winstepsize": 8, "winsize_min": 8}
+    g = Graph()
+    g.add(NodeInstance("S", "io.dicstageseed"))
+    g.add(NodeInstance("G", "dic.grid", params=dict(P)))
+    g.add(NodeInstance("I", "dic.initial_guess", params={"search_range": 8}))
+    g.add(NodeInstance("L", "dic.local_match"))
+    g.add(NodeInstance("A", "dic.global_step", params={"admm_max_iter": 2}))
+    g.add(NodeInstance("E", "dic.strain"))
+    for a, c in (("S", "G"), ("G", "I"), ("I", "L"), ("L", "A"), ("A", "E")):
+        g.connect(a, c)
+    e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def tab(out, layer="dic"):
+        return {name: np.asarray(a.values) for (dom, lyr, name), a in out.attributes.items()
+                if dom is D.POINT and lyr == layer}
+
+    gr = tab(e.pull("G"))
+    n_rows, ids0 = len(gr["id"]), gr["id"].copy()
+    assert n_rows == 2 * 289, n_rows
+    md = e.pull("G").metadata
+    for k in ("dic_winsize", "dic_winstepsize", "dic_channel", "dic_reference_mode", "dic_n_nodes"):
+        assert k in md, k
+    i_ = tab(e.pull("I"))
+    assert np.array_equal(i_["id"], ids0) and {"disp_y", "disp_x", "seed_cc"} <= set(i_)
+    l_ = tab(e.pull("L"))
+    assert {"grad_yy", "grad_xx", "n_iter", "hole"} <= set(l_)
+    a_ = tab(e.pull("A"))
+    s_ = tab(e.pull("E"))
+    assert {"strain_yy", "strain_yx", "strain_xy", "strain_xx", "strain_valid"} <= set(s_)
+    sel = s_["t"] == 1
+    got = np.array([np.nanmedian(s_["disp_y"][sel]), np.nanmedian(s_["disp_x"][sel])])
+    want = np.array(SHIFT) * 0.5
+    assert np.allclose(got, want, atol=0.01), (got, want)
+    g2 = Graph()
+    g2.add(NodeInstance("S", "io.dicstageseed"))
+    g2.add(NodeInstance("M", "analysis.dic_correlate",
+                        params=dict(P, admm_max_iter=2, search_range=8, compute_strain=True)))
+    g2.connect("S", "M")
+    m = tab(Engine(g2, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("M"))
+    sel2 = m["t"] == 1
+    key = {(round(float(y), 3), round(float(x), 3)): i
+           for i, (y, x) in enumerate(zip(s_["y"][sel], s_["x"][sel]))}
+    idx_s, idx_m = np.flatnonzero(sel), np.flatnonzero(sel2)
+    n_common, dmax = 0, 0.0
+    for i in idx_m:
+        j = key.get((round(float(m["y"][i]), 3), round(float(m["x"][i]), 3)))
+        if j is None:
+            continue
+        n_common += 1
+        for col in ("disp_y", "disp_x", "strain_yy", "strain_yx", "strain_xy", "strain_xx"):
+            a_v, b_v = float(s_[col][idx_s[j]]), float(m[col][i])
+            if np.isfinite(a_v) and np.isfinite(b_v):
+                dmax = max(dmax, abs(a_v - b_v))
+    assert n_common == int(sel2.sum()) == 289 and dmax < 1e-9, (n_common, dmax)
+    g3 = Graph()
+    g3.add(NodeInstance("S", "io.dicstageseed"))
+    g3.add(NodeInstance("L", "dic.local_match"))
+    g3.connect("S", "L")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("L")
+        raise AssertionError("a local match with no grid upstream must be refused")
+    except ValueError as exc:
+        assert "DIC Grid" in str(exc), exc
+    _ok(f"dic stages: grid → seed → local → global → strain through the Engine recovers "
+        f"({got[0]:.3f}, {got[1]:.3f}) µm for the planted shift on the same {n_rows} rows, within "
+        f"{dmax:.1e} of analysis.dic_correlate on all 289 nodes (displacement + gradient); "
+        f"missing grid refused by name; bundle:dic places 5 wired nodes in a frame")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -30822,6 +31052,8 @@ def main() -> int:
     test_catalog_kernels()
     test_catalog_dvc()
     test_dvc_stages()
+    test_piv_stages()
+    test_dic_stages()
     test_catalog_dic()
     test_catalog_piv()
     test_catalog_optical_flow()

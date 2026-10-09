@@ -825,3 +825,390 @@ def has_region(shapes: Optional[Sequence[Dict[str, Any]]]) -> bool:
         if isinstance(shape, dict) and str(shape.get("type", "")) not in ("", "clear"):
             return True
     return False
+
+
+# ── staged entry points (2026-10-08): pyALDIC's sections as separate calls ─────
+# `run_aldic` (al-dic 0.9.0 `core/pipeline.py:700-1871`) is Sections 2b-8 of the ALDIC
+# paper in one ~900-line function. The staged DIC nodes — `dic.grid` → `dic.initial_guess`
+# → `dic.local_match` → `dic.global_step` → `dic.strain` — call the functions below one at
+# a time; each reproduces its slice of that driver (the same calls in the same order, the
+# same `para` rewrites, the mesh trimmed by the mask exactly as the driver trims it). The
+# staged chain therefore agrees with `run_pyaldic_series` on every node for the paths it
+# covers: the FFT seed (`init_guess_mode="fft"`, what this repo's single node uses), no
+# pre-solve mesh refinement, no seed propagation. Everything crosses this boundary in
+# pyALDIC's own layout — ``U`` interleaved ``[u0, v0, u1, v1, …]`` with ``u`` along x
+# (columns) and ``v`` along y (rows), ``F`` interleaved ``[du/dx, dv/dx, du/dy, dv/dy]``,
+# node coordinates ``(N, 2)`` as ``[x, y]`` — and the nodes convert to this repo's
+# ``(y, x)`` columns at their edge, as `_frame_to_dvcresult` does.
+
+
+def _al_dic_modules() -> Dict[str, Any]:
+    """Every pyALDIC module a staged call touches, imported lazily and by path."""
+    config, pipeline = _require_al_dic()
+    m = importlib.import_module
+    return {
+        "config": config, "pipeline": pipeline,
+        "ds": m("al_dic.core.data_structures"),
+        "image_ops": m("al_dic.io.image_ops"),
+        "mesh_setup": m("al_dic.mesh.mesh_setup"),
+        "bridging": m("al_dic.mesh.mark_bridging"),
+        "rasterize": m("al_dic.mesh.rasterize"),
+        "init_disp": m("al_dic.solver.init_disp"),
+        "isearch": m("al_dic.solver.integer_search"),
+        "local": m("al_dic.solver.local_icgn"),
+        "sub1": m("al_dic.solver.subpb1_solver"),
+        "sub2": m("al_dic.solver.subpb2_solver"),
+        "strain": m("al_dic.strain.compute_strain"),
+        "nsfem": m("al_dic.strain.nodal_strain_fem"),
+        "platefit": m("al_dic.strain.platefit_kernel"),
+        "regions": m("al_dic.utils.region_analysis"),
+        "seedprop": m("al_dic.solver.seed_prop_pipeline"),
+    }
+
+
+@dataclass
+class DICReference:
+    """One reference frame as every later section sees it (`pipeline.py:981-1004`):
+    the normalised frame (``f_img_raw``), its masked copy (``f_img``), the mask (all ones
+    without an ROI), the 7-point image gradients and the ``para`` with ``img_ref_mask``
+    installed. ``shape`` is ``(H, W)``."""
+    para: Any
+    shape: Tuple[int, int]
+    f_img_raw: np.ndarray
+    f_img: np.ndarray
+    f_mask: np.ndarray
+    Df: Any
+
+
+def dic_stage_para(params: Dict[str, Any], shape: Tuple[int, int], *,
+                   reference_mode: str = "accumulative",
+                   roi_mask: Optional[np.ndarray] = None):
+    """Section 2b's parameter rewrite: the node's params → a validated ``DICPara`` with
+    the correlation ROI clamped to the image (and to the mask's bounding box when there
+    is one), ``img_size`` set and the FFT search region auto-scaled to what the image can
+    hold — what `run_aldic` does at `pipeline.py:773-799` before any frame is read.
+    Masks are per frame in pyALDIC; the staged nodes use one static ROI per
+    ``(m, z)`` line, so one ``roi_mask`` (truthy = inside) stands for every frame."""
+    M = _al_dic_modules()
+    from dataclasses import replace
+    H, W = int(shape[0]), int(shape[1])
+    use_masks = roi_mask is not None and bool(np.any(~np.asarray(roi_mask, dtype=bool)))
+    roi_bbox = None
+    if use_masks:
+        mk = np.asarray(roi_mask, dtype=np.float64)
+        roi_bbox = _mask_bbox([mk], 0, (H, W))
+    para = _build_dicpara(M["config"], dict(params or {}), (H, W), reference_mode, use_masks,
+                          roi_bbox)
+    clamped = M["image_ops"].compute_clamped_roi((H, W), para.gridxy_roi_range)
+    para = replace(para, gridxy_roi_range=clamped, img_size=(H, W))
+    max_safe = max(10, min(H, W) // 4 - int(para.winsize))
+    if int(para.size_of_fft_search_region) > max_safe:
+        para = replace(para, size_of_fft_search_region=int(max_safe))
+    return para
+
+
+def dic_stage_normalize(img: np.ndarray, para) -> np.ndarray:
+    """``(img − mean_roi) / std_roi`` over the clamped correlation ROI — pyALDIC's own
+    ``normalize_one``, the only thing its frame providers do to a frame."""
+    M = _al_dic_modules()
+    return np.asarray(M["image_ops"].normalize_one(_as_plane(img), para.gridxy_roi_range),
+                      dtype=np.float64)
+
+
+def dic_stage_grid(para, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """The correlation lattice ``(x0, y0)`` for ``para`` on an image of ``shape`` —
+    ``build_grid_for_roi``, the same lattice ``integer_search`` lays its windows on, so a
+    grid card can show the measurement density before any correlation is paid for."""
+    M = _al_dic_modules()
+    x0, y0 = M["seedprop"].build_grid_for_roi(para, int(shape[0]), int(shape[1]))
+    return np.asarray(x0, dtype=np.float64), np.asarray(y0, dtype=np.float64)
+
+
+def dic_stage_reference(ref_norm: np.ndarray, para, shape: Tuple[int, int],
+                        roi_mask: Optional[np.ndarray] = None) -> DICReference:
+    """Section 2b-3 for ONE reference: the masked frame, its gradients and the ``para``
+    that carries the mask (`pipeline.py:985-1004`). ``ref_norm`` is the frame AFTER
+    :func:`dic_stage_normalize`."""
+    M = _al_dic_modules()
+    from dataclasses import replace
+    H, W = int(shape[0]), int(shape[1])
+    f_raw = np.ascontiguousarray(np.asarray(ref_norm, dtype=np.float64))
+    if f_raw.shape != (H, W):
+        raise ValueError(f"reference frame has shape {f_raw.shape}, expected {(H, W)}")
+    f_mask = (np.asarray(roi_mask, dtype=np.float64) if roi_mask is not None
+              else np.ones((H, W), dtype=np.float64))
+    f_img = f_raw * f_mask
+    Df = M["image_ops"].compute_image_gradient(f_img, f_mask, img_raw=f_raw)
+    para = replace(para, img_ref_mask=f_mask)
+    return DICReference(para=para, shape=(H, W), f_img_raw=f_raw, f_img=f_img, f_mask=f_mask,
+                        Df=Df)
+
+
+def dic_stage_seed(ref: DICReference, g_norm: np.ndarray, *, search: Optional[int] = None
+                   ) -> Dict[str, Any]:
+    """Section 3's integer seed: the FFT (or pyramid NCC) search of every lattice window
+    with pyALDIC's auto-expanding retry (`pipeline.py:1088-1151`), then ``init_disp`` —
+    inpainting, three outlier passes, the lattice re-ordered into mesh node order →
+    ``{"x0", "y0", "U0", "cc", "search", "info"}``: the lattice, the interleaved seed
+    ``(2N,)`` in node order, the correlation peak per node (node order), the search
+    radius that finally covered the motion (pass it back in for the next frame against
+    the same reference — the driver remembers it per reference) and the search's info."""
+    M = _al_dic_modules()
+    from dataclasses import replace
+    para = ref.para
+    if search is not None and int(search) != int(para.size_of_fft_search_region):
+        para = replace(para, size_of_fft_search_region=int(search))
+    g = np.ascontiguousarray(np.asarray(g_norm, dtype=np.float64))
+    use_pyramid = int(para.init_fft_search_method) >= 2
+    if use_pyramid:
+        x0, y0, u_grid, v_grid, info = M["isearch"].integer_search_pyramid(ref.f_img_raw, g, para)
+        current = int(para.size_of_fft_search_region)
+    else:
+        x0, y0, u_grid, v_grid, info = M["isearch"].integer_search(ref.f_img_raw, g, para)
+        current = int(para.size_of_fft_search_region)
+        if para.fft_auto_expand_search:
+            H, W = ref.shape
+            cap = max(32, min(H, W) // 2)
+            for _retry in range(6):
+                if not info.get("peak_clipped", False):
+                    break
+                needed = int(np.ceil(float(info["max_abs_disp"]) * 2.0)) + 2
+                new_search = max(needed, current * 2)
+                if new_search >= cap:
+                    new_search = cap
+                    if new_search == current:
+                        break
+                x0, y0, u_grid, v_grid, info = M["isearch"].integer_search(
+                    ref.f_img_raw, g, replace(para, size_of_fft_search_region=new_search))
+                current = new_search
+                if new_search >= cap:
+                    break
+    U0 = np.asarray(M["init_disp"].init_disp(u_grid, v_grid, info["cc_max"], x0, y0),
+                    dtype=np.float64)
+    cc = np.asarray(info["cc_max"], dtype=np.float64)
+    # init_disp lays U0 out as u_clean.T.ravel(): node = ix*ny + iy — the same transpose
+    # takes the (ny, nx) peak grid into node order
+    cc_nodes = cc.T.reshape(-1) if cc.ndim == 2 else cc.reshape(-1)
+    return {"x0": np.asarray(x0, float), "y0": np.asarray(y0, float), "U0": U0, "cc": cc_nodes,
+            "search": int(current), "info": info}
+
+
+def dic_stage_mesh(ref: DICReference, x0: np.ndarray, y0: np.ndarray):
+    """Section 3's mesh: ``mesh_setup`` on the lattice, then the elements more than half
+    masked or bridging a crack dropped (`trimmed_keep_indices`, `pipeline.py:1160-1207`).
+    Nodes are never removed — only elements — so the node count is the lattice's."""
+    M = _al_dic_modules()
+    DICMesh = M["ds"].DICMesh
+    base = M["mesh_setup"].mesh_setup(np.asarray(x0, float), np.asarray(y0, float), ref.para)
+    keep = M["bridging"].trimmed_keep_indices(base.coordinates_fem, base.elements_fem, ref.f_mask)
+    elems = (base.elements_fem[keep] if len(keep) < base.elements_fem.shape[0]
+             else base.elements_fem.copy())
+    return DICMesh(coordinates_fem=base.coordinates_fem.copy(), elements_fem=elems,
+                   irregular=base.irregular, mark_coord_hole_edge=base.mark_coord_hole_edge.copy(),
+                   x0=base.x0, y0=base.y0, element_min_size=base.element_min_size)
+
+
+def dic_stage_seed_on_mesh(ref: DICReference, mesh, U0: np.ndarray, x0: np.ndarray,
+                           y0: np.ndarray) -> np.ndarray:
+    """The seed as Section 4 receives it: interpolated onto the mesh when the FFT lattice
+    and the mesh disagree in size (`pipeline.py:1248-1269`), and NaN at every node whose
+    pixel the mask excludes (`:1285-1296`)."""
+    n = int(mesh.coordinates_fem.shape[0])
+    U = np.asarray(U0, dtype=np.float64).copy()
+    if U.size != 2 * n:
+        from scipy.interpolate import RegularGridInterpolator
+        ny, nx = len(y0), len(x0)
+        u2 = U[0::2].reshape(nx, ny).T
+        v2 = U[1::2].reshape(nx, ny).T
+        iu = RegularGridInterpolator((y0, x0), u2, method="linear", bounds_error=False,
+                                     fill_value=np.nan)
+        iv = RegularGridInterpolator((y0, x0), v2, method="linear", bounds_error=False,
+                                     fill_value=np.nan)
+        xy = mesh.coordinates_fem
+        q = np.column_stack([xy[:, 1], xy[:, 0]])
+        U = np.zeros(2 * n, dtype=np.float64)
+        U[0::2] = iu(q)
+        U[1::2] = iv(q)
+    H, W = ref.shape
+    node_x = np.clip(np.round(mesh.coordinates_fem[:, 0]).astype(int), 0, W - 1)
+    node_y = np.clip(np.round(mesh.coordinates_fem[:, 1]).astype(int), 0, H - 1)
+    nan_nodes = np.where(ref.f_mask[node_y, node_x] < 1.0)[0]
+    if len(nan_nodes):
+        U[2 * nan_nodes] = np.nan
+        U[2 * nan_nodes + 1] = np.nan
+    return U
+
+
+def dic_stage_local(ref: DICReference, mesh, g_norm: np.ndarray, U0: np.ndarray
+                    ) -> Dict[str, Any]:
+    """Section 4: the 6-DOF IC-GN of every subset from the seed (`pipeline.py:1426-1452`)
+    → ``{"U", "F", "conv_iter", "bad_pt_num", "mark_hole_strain", "node_region_map",
+    "solve_time"}``; ``U`` ``(2N,)`` and ``F`` ``(4N,)`` interleaved, bad points already
+    IDW-filled inside ``local_icgn``, ``mark_hole_strain`` the nodes whose subset is
+    mostly masked. The node-region map (connected regions of the mask) is computed here
+    because every later section reads it."""
+    M = _al_dic_modules()
+    para = ref.para
+    g = np.ascontiguousarray(np.asarray(g_norm, dtype=np.float64))
+    ctx = M["local"].local_icgn_precompute(mesh.coordinates_fem, ref.Df, ref.f_img_raw, para)
+    U1, F1, t_local, conv_iter, bad_pt_num, mark_hole = M["local"].local_icgn(
+        np.asarray(U0, dtype=np.float64), mesh.coordinates_fem, ref.Df, ref.f_img_raw, g,
+        para, para.tol, ctx=ctx)
+    regions = M["regions"].precompute_node_regions(mesh.coordinates_fem, ref.f_mask, ref.shape)
+    return {"U": np.asarray(U1, dtype=np.float64), "F": np.asarray(F1, dtype=np.float64),
+            "conv_iter": np.asarray(conv_iter), "bad_pt_num": bad_pt_num,
+            "mark_hole_strain": np.asarray(mark_hole, dtype=np.int64),
+            "node_region_map": regions, "solve_time": float(t_local)}
+
+
+def dic_stage_global(ref: DICReference, mesh, g_norm: np.ndarray, U1: np.ndarray,
+                     F1: np.ndarray, mark_hole_strain: np.ndarray, node_region_map, *,
+                     beta: Optional[float] = None) -> Dict[str, Any]:
+    """Sections 5-6 (`pipeline.py:1465-1673`, verbatim): optional smoothing of the local
+    result, β by the L-curve unless given, the global FEM solve on the mesh with the
+    hole-strain elements trimmed, the post-solve corrections, then the ADMM alternation
+    (3-DOF local re-solve ↔ global solve, duals reassigned each step, stop on
+    ``admm_tol``) → ``{"U", "F", "beta", "n_steps", "update_global", "update_local"}``.
+    ``beta`` is tuned once per reference by the driver and reused — pass the first
+    frame's back in for the next frame against the same reference."""
+    M = _al_dic_modules()
+    from dataclasses import replace
+    P = M["pipeline"]
+    para = ref.para
+    g = np.ascontiguousarray(np.asarray(g_norm, dtype=np.float64))
+    n = int(mesh.coordinates_fem.shape[0])
+    U1 = np.asarray(U1, dtype=np.float64).copy()
+    F1 = np.asarray(F1, dtype=np.float64).copy()
+    mhs = np.asarray(mark_hole_strain, dtype=np.int64)
+    if para.disp_smoothness > 1e-6:
+        U1 = P._smooth_disp(U1, mesh.coordinates_fem, para, node_region_map, mesh=mesh)
+    if para.strain_smoothness > 1e-6:
+        F1 = P._smooth_strain_field(F1, mesh.coordinates_fem, para, node_region_map, mesh=mesh)
+    mu = float(para.mu)
+    grad_dual = np.zeros(4 * n, dtype=np.float64)
+    disp_dual = np.zeros(2 * n, dtype=np.float64)
+    alpha = para.alpha
+    if para.beta is not None:
+        beta_v = float(para.beta)
+    elif beta is not None:
+        beta_v = float(beta)
+    else:
+        beta_v = float(P._auto_tune_beta(mesh, para, mu, U1, F1, mark_hole_strain=mhs))
+    mesh2 = mesh
+    if len(mhs) > 0:
+        mhs_set = set(mhs.tolist())
+        trimmed = mesh.elements_fem.copy()
+        for e in range(trimmed.shape[0]):
+            for j in range(trimmed.shape[1]):
+                if trimmed[e, j] >= 0 and trimmed[e, j] in mhs_set:
+                    trimmed[e, :] = -1
+                    break
+        mesh2 = M["ds"].DICMesh(coordinates_fem=mesh.coordinates_fem, elements_fem=trimmed,
+                                mark_coord_hole_edge=mesh.mark_coord_hole_edge)
+    cache = M["sub2"].precompute_subpb2(mesh2, para.gauss_pt_order, beta_v, mu, alpha)
+    U2 = M["sub2"].subpb2_solver(mesh, para.gauss_pt_order, beta_v, mu, U1, F1, grad_dual,
+                                 disp_dual, alpha, para.winstepsize, precomputed=cache)
+    F2 = M["nsfem"].global_nodal_strain_fem(mesh2, para, U2)
+    U2, F2 = P._apply_post_solve_corrections(U2, F2, U1, F1, mesh, para, node_region_map, mhs)
+    grad_dual = F2 - F1
+    disp_dual = U2 - U1
+    tol2 = para.admm_tol
+    U2_prev, U1_prev = U2.copy(), U1.copy()
+    n_steps = 1
+    upd_g: List[float] = []
+    upd_l: List[float] = []
+    para_w = replace(para, winsize_list=np.full((n, 2), para.winsize, dtype=np.float64))
+    pre1 = M["sub1"].precompute_subpb1(mesh.coordinates_fem, ref.Df, ref.f_img_raw, para_w)
+    for step in range(2, int(para.admm_max_iter) + 1):
+        n_steps = step
+        U1, _t1, _conv, _bad = M["sub1"].subpb1_solver(
+            U2, F2, disp_dual, grad_dual, mesh.coordinates_fem, ref.Df, ref.f_img_raw, g,
+            mu, beta_v, para_w, para.tol, precomputed=pre1)
+        F1 = F2.copy()
+        U2 = M["sub2"].subpb2_solver(mesh, para.gauss_pt_order, beta_v, mu, U1, F1, grad_dual,
+                                     disp_dual, alpha, para.winstepsize, precomputed=cache)
+        F2 = M["nsfem"].global_nodal_strain_fem(mesh2, para_w, U2)
+        U2, F2 = P._apply_post_solve_corrections(U2, F2, U1, F1, mesh, para_w, node_region_map,
+                                                 mhs)
+        du_g = float(np.linalg.norm(U2_prev - U2) / np.sqrt(len(U2)))
+        du_l = float(np.linalg.norm(U1_prev - U1) / np.sqrt(len(U1)))
+        upd_g.append(du_g)
+        upd_l.append(du_l)
+        grad_dual = F2 - F1
+        disp_dual = U2 - U1
+        U2_prev, U1_prev = U2.copy(), U1.copy()
+        if du_g < tol2 or du_l < tol2:
+            break
+    return {"U": np.asarray(U2, dtype=np.float64), "F": np.asarray(F2, dtype=np.float64),
+            "beta": beta_v, "n_steps": int(n_steps), "update_global": tuple(upd_g),
+            "update_local": tuple(upd_l)}
+
+
+def dic_stage_strain(ref: DICReference, mesh, U: np.ndarray, *,
+                     deformed_mask: Optional[np.ndarray] = None):
+    """Section 8 for one frame (`pipeline.py:1746-1827`): the mesh's elements under the
+    deformed mask (``crack_mask_from_deformed``), the region map, three smoothing passes
+    when ``para.smoothness`` asks, then pyALDIC's ``compute_strain`` (plane fit or FEM,
+    the strain measure from ``para``) → its ``StrainResult``."""
+    M = _al_dic_modules()
+    from dataclasses import replace
+    P = M["pipeline"]
+    para = ref.para
+    coords = mesh.coordinates_fem
+    elems = mesh.elements_fem
+    U = np.asarray(U, dtype=np.float64)
+    fallback = ref.f_mask
+    mask_i, elems_i = fallback, elems
+    if deformed_mask is not None and U.size == 2 * coords.shape[0]:
+        mk, el = M["rasterize"].crack_mask_from_deformed(
+            coords, elems, U, np.asarray(deformed_mask, dtype=np.float64), ref.shape)
+        if np.any(mk):
+            mask_i, elems_i = mk, el
+    regions = M["regions"].precompute_node_regions(coords, mask_i, ref.shape)
+    smesh = M["ds"].DICMesh(coordinates_fem=coords, elements_fem=elems_i,
+                            mark_coord_hole_edge=mesh.mark_coord_hole_edge)
+    para_s8 = replace(para, img_ref_mask=mask_i)
+    neighbors = None
+    if int(para.method_to_compute_strain) == 2 and coords.shape[0] > 0:
+        neighbors = M["platefit"].build_neighbor_cache(coords, para.strain_plane_fit_rad)
+    U_local = U.copy()
+    if para.smoothness > 0:
+        for _ in range(3):
+            U_local = P._smooth_disp(U_local, coords, para, regions, mesh=smesh)
+    return M["strain"].compute_strain(smesh, para_s8, U_local, regions, neighbors=neighbors)
+
+
+def dic_split_u(U: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Interleaved ``(2N,)`` → ``(u_x, v_y)`` per node (x along columns, y along rows)."""
+    U = np.asarray(U, dtype=np.float64).reshape(-1)
+    return U[0::2].copy(), U[1::2].copy()
+
+
+def dic_merge_u(u_x: np.ndarray, v_y: np.ndarray) -> np.ndarray:
+    out = np.empty(2 * len(u_x), dtype=np.float64)
+    out[0::2] = u_x
+    out[1::2] = v_y
+    return out
+
+
+def dic_split_f(F: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Interleaved ``(4N,)`` → ``(dudx, dvdx, dudy, dvdy)`` per node — pyALDIC's order."""
+    F = np.asarray(F, dtype=np.float64).reshape(-1)
+    return F[0::4].copy(), F[1::4].copy(), F[2::4].copy(), F[3::4].copy()
+
+
+def dic_merge_f(dudx, dvdx, dudy, dvdy) -> np.ndarray:
+    out = np.empty(4 * len(dudx), dtype=np.float64)
+    out[0::4], out[1::4], out[2::4], out[3::4] = dudx, dvdx, dudy, dvdy
+    return out
+
+
+def dic_stage_lattice_nodes(para, shape: Tuple[int, int]) -> np.ndarray:
+    """The mesh NODES ``(N, 2)`` as ``[x, y]`` in pyALDIC's node order (``node = ix·ny + iy``)
+    for ``para`` on an image of ``shape`` — ``mesh_setup`` on the lattice, no mask, no
+    frame read. The row order every staged DIC table keeps; trimming by a mask drops
+    elements only, never nodes, so this order holds through the whole chain."""
+    M = _al_dic_modules()
+    x0, y0 = dic_stage_grid(para, shape)
+    mesh = M["mesh_setup"].mesh_setup(x0, y0, para)
+    return np.asarray(mesh.coordinates_fem, dtype=np.float64).copy()

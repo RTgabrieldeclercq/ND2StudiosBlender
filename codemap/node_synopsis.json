@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 120,
+    "nodes": 129,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 819,
-    "outputs": 127,
+    "inputs": 866,
+    "outputs": 136,
     "gui_ops_included": true
   },
   "stages": {
@@ -211,6 +211,11 @@
         "analysis.piv",
         "analysis.reduce_scalar",
         "analysis.track_field",
+        "dic.global_step",
+        "dic.grid",
+        "dic.initial_guess",
+        "dic.local_match",
+        "dic.strain",
         "dvc.global_step",
         "dvc.grid",
         "dvc.initial_guess",
@@ -219,6 +224,10 @@
         "math.image",
         "math.mask",
         "math.values",
+        "piv.deform_pass",
+        "piv.first_pass",
+        "piv.smooth",
+        "piv.validate",
         "table.aggregate",
         "table.concat",
         "table.join",
@@ -855,7 +864,7 @@
       "label": "Motion & deformation fields",
       "stage": "quantify",
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
-      "count": 10,
+      "count": 19,
       "ops": [
         {
           "op": "analysis.accumulate_field",
@@ -883,6 +892,31 @@
           "summary": "2D particle image velocimetry (OpenPIV: multipass FFT correlation with window deformation, universal outlier detection, per-vector S/N) → a Point displacement field per frame pair; previous/fixed self-reference, ENSEMBLE correlation averaging (one time-averaged field — the micro-PIV method for sparse seeding), or an external reference Dataset + optional ROI mask; optional vy/vx/speed µm/s via the file's dt_s and optional per-vector unc_y/unc_x µm (Sciacchitano image-matching, dep: pivuq). The FLOW sibling of DIC — independent windows, far faster, per-vector confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError at run time until installed)."
         },
         {
+          "op": "dic.global_step",
+          "label": "DIC Global Step",
+          "summary": "pyALDIC §5-6 as a node: the global FEM compatibility solve + ADMM iterations that reconcile the matched subsets into one compatible field, β auto-tuned per reference. Overwrites disp_* and grad_*."
+        },
+        {
+          "op": "dic.grid",
+          "label": "DIC Grid",
+          "summary": "pyALDIC §2b as a node: the correlation lattice (subset size / step) as a Point table + the channel, ROI and reference policy every later DIC stage inherits. Instant — nothing is correlated. First card of the staged DIC bundle."
+        },
+        {
+          "op": "dic.initial_guess",
+          "label": "DIC Initial Guess",
+          "summary": "pyALDIC §3 as a node: the FFT integer seed of every lattice node (auto-expanding search, outlier-cleaned) written as disp_* with its correlation peak. Pull it first: a wrong seed is never recovered by the refinement."
+        },
+        {
+          "op": "dic.local_match",
+          "label": "DIC Local Match",
+          "summary": "pyALDIC §4 as a node: the 6-DOF IC-GN match of every subset from the seed — the cost centre. Writes sub-pixel disp_*, the gradient grad_*, n_iter and hole."
+        },
+        {
+          "op": "dic.strain",
+          "label": "DIC Strain",
+          "summary": "pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — four strain_* columns in image axes + strain_valid — without reading a frame, so a new measure or radius re-runs in a second."
+        },
+        {
           "op": "dvc.global_step",
           "label": "DVC Global Step",
           "summary": "pyALDVC §5-6 as a node: the global compatibility step + ADMM iterations that reconcile the matched subsets into one kinematically compatible field. Overwrites disp_*/grad_*, writes outlier; β auto-tuned per reference."
@@ -906,6 +940,26 @@
           "op": "dvc.strain",
           "label": "DVC Strain",
           "summary": "pyALDVC §8 as a node: strain from the grid's displacement field — nine strain_* columns under the chosen measure — without reading a voxel, so a new measure or smoothing re-runs in a second."
+        },
+        {
+          "op": "piv.deform_pass",
+          "label": "PIV Deform Pass",
+          "summary": "One window-deformation pass as a node: the previous field predicts, the frames are deformed and re-correlated at a finer window, and a NEW finer grid replaces the table. Chain one per rung of the ladder."
+        },
+        {
+          "op": "piv.first_pass",
+          "label": "PIV First Pass",
+          "summary": "OpenPIV's first (coarsest) pass as a node: FFT cross-correlation of every window on the raw frames → a Point table of raw vectors with signal-to-noise. First card of the staged PIV bundle; decides the channel, reference policy, correlation settings and ROI for every pass after it."
+        },
+        {
+          "op": "piv.smooth",
+          "label": "PIV Smooth",
+          "summary": "Garcia-2010 smoothn on the pass's field, as a node — the between-pass smoothing of the multipass driver, placeable wherever you want it."
+        },
+        {
+          "op": "piv.validate",
+          "label": "PIV Validate",
+          "summary": "OpenPIV's validation as a node: signal-to-noise, global limit, std and median tests flag vectors; flagged ones are filled from neighbours (or left NaN). Writes flags / replaced on the pass's rows."
         }
       ]
     },
@@ -1076,11 +1130,20 @@
       "detect.beads",
       "detect.particles",
       "detect.spots",
+      "dic.global_step",
+      "dic.grid",
+      "dic.initial_guess",
+      "dic.local_match",
+      "dic.strain",
       "dvc.global_step",
       "dvc.grid",
       "dvc.initial_guess",
       "dvc.local_match",
       "dvc.strain",
+      "piv.deform_pass",
+      "piv.first_pass",
+      "piv.smooth",
+      "piv.validate",
       "track.link",
       "track.objects"
     ],
@@ -8034,6 +8097,612 @@
         "threshold"
       ]
     },
+    "dic.global_step": {
+      "op": "dic.global_step",
+      "label": "DIC Global Step",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dic_stages.py",
+      "gui_only": false,
+      "summary": "pyALDIC §5-6 as a node: the global FEM compatibility solve + ADMM iterations that reconcile the matched subsets into one compatible field, β auto-tuned per reference. Overwrites disp_* and grad_*.",
+      "overview": "pyALDIC Sections 5-6 as a node: the global FEM compatibility solve and the ADMM iterations that make AL-DIC more than local DIC — the matched subsets (``disp_*`` / ``grad_*`` / ``hole``) reconciled into one kinematically compatible field, β by the L-curve once per reference unless pinned, the displacement and gradient smoothed as ``disp_smoothness`` / ``strain_smoothness`` ask (pyALDIC's own post-solve corrections included). Overwrites ``disp_*`` and ``grad_*``. Resolved spec: category analysis; op ``dic.global_step``; reads VOXEL + POINT, adds POINT; footprint WHOLE_SERIES / {t,y,x} (the local re-solves read the frames again). Inherits the lattice, reference AND local provenance. Kernel: :func:`nodegraph.kernels.dic_correlate.dic_stage_global` — the driver's `pipeline.py:1465-1673` line for line.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Lattice layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dic",
+          "layer_in": "point",
+          "description": "Which Point table holds the DIC lattice this stage fills in — the one DIC Grid wrote (`dic` unless renamed there). The stage reads its rows and the previous stages' columns and writes its own columns BACK ONTO THE SAME ROWS. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "mu",
+          "label": "AL penalty μ",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.001,
+          "description": "Augmented-Lagrangian penalty weighting the constraint that each subset's own displacement equals the globally compatible field. HIGHER enforces agreement harder (smoother; a real discontinuity is smeared); LOWER lets subsets stay independent. pyALDIC's default is 1e-3; change it by factors of ten."
+        },
+        {
+          "name": "beta",
+          "label": "Compatibility β",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Weight of the compatibility term of the global FEM solve. 0 = AUTO: pyALDIC sweeps candidates and fits the L-curve once per reference, reusing it for every frame against that reference. A positive value pins it."
+        },
+        {
+          "name": "admm_max_iter",
+          "label": "ADMM iterations",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 3,
+          "description": "Passes of the outer loop alternating the local re-solve with the global solve; stops early once the update falls under pyALDIC's tolerance. 1 runs the global solve once with no re-solve. MORE costs one local pass each."
+        },
+        {
+          "name": "disp_smoothness",
+          "label": "Displacement smoothing",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0005,
+          "description": "pyALDIC's displacement smoothing weight applied to the local result before and after each global solve (σ scales with the local node spacing); 0 is off. LARGER flattens the field. The single node's default is 5e-4."
+        },
+        {
+          "name": "strain_smoothness",
+          "label": "Gradient smoothing",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1e-05,
+          "description": "The same for the deformation gradient handed to the global solve; 0 is off. The single node's default is 1e-5."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dic_global_step",
+      "meta_transform": null,
+      "extra_layers": "_dic_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_correlate.md",
+      "params_read": [
+        "admm_max_iter",
+        "beta",
+        "disp_smoothness",
+        "mu",
+        "source",
+        "strain_smoothness"
+      ]
+    },
+    "dic.grid": {
+      "op": "dic.grid",
+      "label": "DIC Grid",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dic_stages.py",
+      "gui_only": false,
+      "summary": "pyALDIC §2b as a node: the correlation lattice (subset size / step) as a Point table + the channel, ROI and reference policy every later DIC stage inherits. Instant — nothing is correlated. First card of the staged DIC bundle.",
+      "overview": "pyALDIC Section 2b as a node: the correlation lattice for this image under the subset size / step (the FE mesh's nodes, in pyALDIC's node order), written as a Point table — one row per node per frame to be correlated — plus the channel, ROI and reference policy, stamped as ``dic_*`` provenance for every later stage. No image is read; the card is instant and shows the measurement density on the Viewer. Resolved spec: category analysis; op ``dic.grid``; reads VOXEL (axes + calibration only), adds POINT (``z_kind`` plane_index); 2-D per plane; footprint WHOLE_SERIES / {t,y,x}. ``winstepsize`` and ``winsize_min`` are snapped to powers of two and ``winsize`` to even, as the single node does. Lattice via :func:`nodegraph.kernels.dic_correlate.dic_stage_grid` (``build_grid_for_roi``, the same lattice ``integer_search`` lays its windows on) and ``mesh_setup`` for the node order.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "reference_mode",
+          "label": "Reference",
+          "choices": [
+            "fixed_frame",
+            "previous_frame"
+          ],
+          "default": "fixed_frame",
+          "description": "How frames pair up — decided once here and inherited by every stage.",
+          "choice_docs": {
+            "fixed_frame": "Every timepoint against Reference frame: cumulative displacement from that state, comparable across time, until the deformation outgrows what a subset can follow.",
+            "previous_frame": "Each timepoint against the one before it: small increments that follow large total deformation; no row for t=0; compose increments downstream if totals are wanted."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "channel",
+          "label": "Channel",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "pick_kind": "channel",
+          "description": "Which channel every stage correlates (0-based) — decided here and inherited. Displacement comes from image texture: pick the channel with stable, high-contrast speckle, not a reporter whose brightness changes biologically."
+        },
+        {
+          "name": "reference_frame",
+          "label": "Reference frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "reference_mode": [
+              "fixed_frame"
+            ]
+          },
+          "pick_kind": "frame",
+          "description": "Which timepoint is the undeformed state (0-based) under a fixed reference: every frame is correlated against it, displacements are cumulative, its own rows are the zero field. Inert under `previous_frame`. For a separate reference acquisition chain it in front with Timeseries Builder and keep this at 0."
+        },
+        {
+          "name": "winsize",
+          "label": "Subset size",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 40,
+          "pick_kind": "grid",
+          "pick_peer": "winstepsize",
+          "description": "Edge of the correlation subset in pixels — the speckle patch matched between frames (snapped to even). LARGER lowers noise and smooths; SMALLER resolves gradients but needs enough speckle inside (3-5 speckles across). Inherited by every stage."
+        },
+        {
+          "name": "winstepsize",
+          "label": "Subset step",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 16,
+          "pick_kind": "grid",
+          "pick_peer": "winsize",
+          "description": "Spacing of the lattice nodes in pixels — THE grid density and the dominant cost lever (snapped to a power of two: 4, 8, 16, 32, 64). The FE mesh for the global step is built on these nodes, so it is also the element size of the compatibility solve."
+        },
+        {
+          "name": "winsize_min",
+          "label": "Min element",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 8,
+          "description": "The smallest element pyALDIC's mesh may use (a power of two, at most the step); only matters when a refinement policy subdivides the mesh, which the staged chain does not run — kept so the lattice matches the single node's."
+        },
+        {
+          "name": "roi",
+          "label": "ROI layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "roi_mask",
+          "layer_in": "voxel",
+          "description": "Optional Voxel mask (ROI Mask / a Threshold) restricting correlation: elements mostly outside it are dropped from the mesh, their nodes seeded NaN and left to the inpainting, and the lattice is tightened to the mask's bounding box. Static in time (the t=0 plane). Absent → the whole frame."
+        },
+        {
+          "name": "name",
+          "label": "Lattice layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dic",
+          "layer_out": [
+            "point"
+          ],
+          "description": "Name of the Point table this node writes: one row per lattice node per correlated frame, positions only until the later stages fill `disp_*`, `grad_*`, `strain_*`. Every stage after this one selects it by this name."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dic_grid",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_correlate.md",
+      "params_read": [
+        "__modes__",
+        "channel",
+        "name",
+        "reference_frame",
+        "roi",
+        "winsize",
+        "winsize_min",
+        "winstepsize"
+      ]
+    },
+    "dic.initial_guess": {
+      "op": "dic.initial_guess",
+      "label": "DIC Initial Guess",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dic_stages.py",
+      "gui_only": false,
+      "summary": "pyALDIC §3 as a node: the FFT integer seed of every lattice node (auto-expanding search, outlier-cleaned) written as disp_* with its correlation peak. Pull it first: a wrong seed is never recovered by the refinement.",
+      "overview": "pyALDIC Section 3 as a node: the integer seed of every lattice node by FFT cross-correlation of its window inside ``search_range`` px, the search widened and retried while peaks sit on its edge (pyALDIC's auto-expand, the radius that finally covered the motion remembered per reference), cleaned by ``init_disp`` (inpainting, three outlier passes). Writes ``disp_*`` (µm) and ``seed_cc`` (the correlation peak). Pull it before the match: a seed that points the wrong way is never recovered by the local refinement. Resolved spec: category analysis; op ``dic.initial_guess``; reads VOXEL + POINT, adds POINT; footprint WHOLE_SERIES / {t,y,x}. Inherits lattice, channel, ROI and reference policy. Kernel: :func:`nodegraph.kernels.dic_correlate.dic_stage_seed`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Lattice layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dic",
+          "layer_in": "point",
+          "description": "Which Point table holds the DIC lattice this stage fills in — the one DIC Grid wrote (`dic` unless renamed there). The stage reads its rows and the previous stages' columns and writes its own columns BACK ONTO THE SAME ROWS. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "search_range",
+          "label": "Search range",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 20,
+          "description": "± half-range in pixels of the FFT integer search that seeds every node. It must cover the largest per-pair displacement or the match starts on the wrong speckle; pyALDIC widens it automatically while peaks land on its edge and remembers the radius that worked, and shrinks it when the image cannot hold it. Arrows pointing the wrong way on THIS card are the symptom of a radius too small."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dic_initial_guess",
+      "meta_transform": null,
+      "extra_layers": "_dic_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_correlate.md",
+      "params_read": [
+        "search_range",
+        "source"
+      ]
+    },
+    "dic.local_match": {
+      "op": "dic.local_match",
+      "label": "DIC Local Match",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dic_stages.py",
+      "gui_only": false,
+      "summary": "pyALDIC §4 as a node: the 6-DOF IC-GN match of every subset from the seed — the cost centre. Writes sub-pixel disp_*, the gradient grad_*, n_iter and hole.",
+      "overview": "pyALDIC Section 4 as a node: the 6-DOF inverse-compositional Gauss-Newton match of every subset, seeded by ``disp_*`` — the cost centre. Overwrites ``disp_*`` with the sub-pixel result, writes the deformation gradient ``grad_*`` (image axes), ``n_iter`` and ``hole`` (a subset mostly outside the mask, whose match is not trusted). Bad points are filled from their neighbours inside the solver, as pyALDIC does. Resolved spec: category analysis; op ``dic.local_match``; reads VOXEL + POINT, adds POINT; footprint WHOLE_SERIES / {t,y,x}. Stamps ``dic_tol`` / ``dic_icgn_max_iter`` so the global step rebuilds the identical local context. Kernel: :func:`nodegraph.kernels.dic_correlate.dic_stage_local`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Lattice layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dic",
+          "layer_in": "point",
+          "description": "Which Point table holds the DIC lattice this stage fills in — the one DIC Grid wrote (`dic` unless renamed there). The stage reads its rows and the previous stages' columns and writes its own columns BACK ONTO THE SAME ROWS. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "icgn_max_iter",
+          "label": "Max iterations",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 100,
+          "description": "Hard cap on inverse-compositional Gauss-Newton iterations per subset — a safety valve: a subset that hits it is treated as a bad point and filled from its neighbours. Raise it only when many `n_iter` sit at the cap."
+        },
+        {
+          "name": "tol",
+          "label": "Tolerance",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.01,
+          "description": "Convergence tolerance of the IC-GN update (pixels): the iteration stops once the step is below it. SMALLER is more precise and slower; pyALDIC's default 0.01 is below the method's own precision floor on real speckle."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dic_local_match",
+      "meta_transform": null,
+      "extra_layers": "_dic_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_correlate.md",
+      "params_read": [
+        "icgn_max_iter",
+        "source",
+        "tol"
+      ]
+    },
+    "dic.strain": {
+      "op": "dic.strain",
+      "label": "DIC Strain",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dic_stages.py",
+      "gui_only": false,
+      "summary": "pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — four strain_* columns in image axes + strain_valid — without reading a frame, so a new measure or radius re-runs in a second.",
+      "overview": "pyALDIC Section 8 as a node: the nodal displacement gradient from the field on the lattice — plane fit over ``strain_plane_fit_rad`` px or the FEM gradient — under the chosen strain measure, with pyALDIC's edge trimming (``strain_valid``). Writes the four ``strain_<i><j>`` columns in image axes (the cross terms sign-corrected from pyALDIC's y-up world frame, exactly as the single node does) and ``strain_valid``. No image is read beyond the ROI mask: the lattice is rebuilt from provenance, so a new measure or radius re-runs in a second with the correlation untouched. Resolved spec: category analysis; op ``dic.strain``; reads POINT (+ the optional ROI Voxel mask), adds POINT; footprint WHOLE_SERIES with empty kernel_axes. Stamps ``dic_strain_method`` / ``dic_strain_type``. Kernel: :func:`nodegraph.kernels.dic_correlate.dic_stage_strain`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "strain_method",
+          "label": "Method",
+          "choices": [
+            "plane_fit",
+            "fem"
+          ],
+          "default": "plane_fit",
+          "description": "How the displacement gradient is obtained from the lattice field.",
+          "choice_docs": {
+            "plane_fit": "A least-squares plane through each node's neighbourhood (Fit radius wide): robust to a noisy node, pyALDIC's default.",
+            "fem": "The FEM gradient on the lattice's elements, area-averaged with an outlier pass: consistent with the global solve, sharper near edges."
+          }
+        },
+        {
+          "name": "strain_type",
+          "label": "Measure",
+          "choices": [
+            "infinitesimal",
+            "green_lagrange",
+            "euler_almansi"
+          ],
+          "default": "infinitesimal",
+          "description": "Which strain measure pyALDIC applies to the gradient before reporting.",
+          "choice_docs": {
+            "infinitesimal": "The small-strain measure, linear in the gradient; right under a few percent of strain.",
+            "green_lagrange": "Finite strain referred to the undeformed frame — the Lagrangian choice for large deformations.",
+            "euler_almansi": "Finite strain referred to the DEFORMED frame — the Eulerian choice, reading strain where the material now is rather than where it started."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Lattice layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dic",
+          "layer_in": "point",
+          "description": "Which Point table holds the DIC lattice this stage fills in — the one DIC Grid wrote (`dic` unless renamed there). The stage reads its rows and the previous stages' columns and writes its own columns BACK ONTO THE SAME ROWS. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "strain_plane_fit_rad",
+          "label": "Fit radius",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 20.0,
+          "description": "Radius in pixels of the neighbourhood the plane-fit method differentiates over. WIDER averages more nodes (lower strain noise, gradients smeared over it); keep it above the lattice step so every node has neighbours. Only read by `plane_fit`."
+        },
+        {
+          "name": "smoothness",
+          "label": "Pre-smoothing",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "pyALDIC's displacement smoothing applied three times before differentiation; 0 is off and right by default — the displacement is what was measured."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dic_strain",
+      "meta_transform": null,
+      "extra_layers": "_dic_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_correlate.md",
+      "params_read": [
+        "__modes__",
+        "smoothness",
+        "source",
+        "strain_plane_fit_rad"
+      ]
+    },
     "dvc.global_step": {
       "op": "dvc.global_step",
       "label": "DVC Global Step",
@@ -8138,7 +8807,8 @@
       "params_read": [
         "admm_iterations",
         "beta",
-        "mu"
+        "mu",
+        "source"
       ]
     },
     "dvc.grid": {
@@ -8447,7 +9117,8 @@
         "__modes__",
         "global_shift",
         "init_coarse_factor",
-        "search_radius"
+        "search_radius",
+        "source"
       ]
     },
     "dvc.local_match": {
@@ -8600,6 +9271,7 @@
         "__modes__",
         "icgn_max_iter",
         "n_threads",
+        "source",
         "subset_stride",
         "tile_local"
       ]
@@ -8739,6 +9411,7 @@
       "params_read": [
         "__modes__",
         "disp_smoothing",
+        "source",
         "strain_halfwidth",
         "strain_smooth"
       ]
@@ -15342,6 +16015,526 @@
       "trained_params": false,
       "kernel_doc": null,
       "params_read": []
+    },
+    "piv.deform_pass": {
+      "op": "piv.deform_pass",
+      "label": "PIV Deform Pass",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/piv_stages.py",
+      "gui_only": false,
+      "summary": "One window-deformation pass as a node: the previous field predicts, the frames are deformed and re-correlated at a finer window, and a NEW finer grid replaces the table. Chain one per rung of the ladder.",
+      "overview": "One window-deformation pass as a node: the previous pass's field is interpolated onto the new, finer grid as a predictor, both frames are deformed by half of it (``symmetric``) or the second frame by all of it (``second image``), the deformed pair is correlated at ``window_size`` px and the predictor added back — OpenPIV's ``multipass_img_deform``, pass by pass. ``window_size`` 0 means HALF the previous window (the ladder convention; never under 8 px). The grid changes, so this node writes a NEW table on the layer: the previous pass's rows and columns are replaced. Holes in the previous field (refused, unfilled vectors) are filled from their neighbours first — the predictor spline tolerates none. Resolved spec: category analysis; op ``piv.deform_pass``; reads VOXEL + POINT, adds POINT; footprint WHOLE_SERIES / {t,y,x}. Inherits correlation, sub-pixel, overlap, reference policy, channel and ROI from provenance; restamps window, grid and pass number. Kernel: :func:`nodegraph.kernels.piv_field.piv_stage_deform_pass`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "deformation",
+          "label": "Deformation",
+          "choices": [
+            "symmetric",
+            "second image"
+          ],
+          "default": "symmetric",
+          "description": "How the predictor field deforms the frames before re-correlating.",
+          "choice_docs": {
+            "symmetric": "Both frames are deformed by half the predictor toward each other: the second-order accurate scheme, OpenPIV's default.",
+            "second image": "Only the second frame is deformed by the full predictor: cheaper, first-order; for a quick look."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "piv",
+          "layer_in": "point",
+          "description": "Which Point table holds the PIV pass this stage works on — the one PIV First Pass wrote (`piv` unless renamed there), or the last Deform Pass's. Validate and Smooth write their columns back onto the SAME rows; a Deform Pass replaces the table with its finer grid. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "window_size",
+          "label": "Window size",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "description": "Edge of THIS pass's interrogation window in pixels. 0 = half the previous pass's window (the coarse-to-fine ladder; never under 8). Finer resolves more structure and gives four times the vectors per halving; the previous pass must have left at least a 4 × 4 grid for the predictor."
+        },
+        {
+          "name": "overlap",
+          "label": "Overlap",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Window overlap for this pass as a fraction; 0 = inherit the first pass's. Sets this pass's grid density."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_piv_deform_pass",
+      "meta_transform": null,
+      "extra_layers": "_piv_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/piv_field.md",
+      "params_read": [
+        "__modes__",
+        "overlap",
+        "source",
+        "window_size"
+      ]
+    },
+    "piv.first_pass": {
+      "op": "piv.first_pass",
+      "label": "PIV First Pass",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/piv_stages.py",
+      "gui_only": false,
+      "summary": "OpenPIV's first (coarsest) pass as a node: FFT cross-correlation of every window on the raw frames → a Point table of raw vectors with signal-to-noise. First card of the staged PIV bundle; decides the channel, reference policy, correlation settings and ROI for every pass after it.",
+      "overview": "The coarse pass of OpenPIV's multipass ladder as a node: ``windef.first_pass`` — FFT cross-correlation of every interrogation window of ``window_size`` px, no deformation — on each frame pair, written as a Point table (one row per window centre, in OpenPIV's grid order) with ``disp_*`` (µm), ``qfactor`` (signal-to-noise) and ``excluded`` (outside the ROI). Nothing is validated here: pull it to see the raw correlation field, then PIV Validate to see what the tests refuse. Resolved spec: category analysis; op ``piv.first_pass``; reads VOXEL, adds POINT; 2-D per plane (``z_kind`` plane_index); footprint WHOLE_SERIES / {t,y,x}. Stamps the ``piv_*`` provenance every later stage inherits: window, overlap, grid shape, pass number, correlation method, sub-pixel estimator, reference policy, channel, ROI layer. Kernel: :func:`nodegraph.kernels.piv_field.piv_stage_first_pass`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "reference_mode",
+          "label": "Reference",
+          "choices": [
+            "previous_frame",
+            "fixed_frame"
+          ],
+          "default": "previous_frame",
+          "description": "How frames pair up — decided here and inherited by every pass.",
+          "choice_docs": {
+            "previous_frame": "Each frame against the one before it: a velocity-like field per step, the PIV default; t=0 has no row.",
+            "fixed_frame": "Every frame against Reference frame: cumulative displacement since that state, comparable across time until the motion outgrows the window."
+          }
+        },
+        {
+          "name": "correlation",
+          "label": "Correlation",
+          "choices": [
+            "circular",
+            "linear"
+          ],
+          "default": "circular",
+          "description": "How each window pair is cross-correlated.",
+          "choice_docs": {
+            "circular": "FFT circular correlation: OpenPIV's default and about twice as fast; wraps at the window edge, fine for motions well inside it.",
+            "linear": "Zero-padded (linear) correlation, normalised: no wrap-around bias near the window edge, at about twice the cost."
+          }
+        },
+        {
+          "name": "subpixel",
+          "label": "Sub-pixel",
+          "choices": [
+            "gaussian",
+            "centroid",
+            "parabolic"
+          ],
+          "default": "gaussian",
+          "description": "How the correlation peak is located between integer pixels.",
+          "choice_docs": {
+            "gaussian": "A three-point Gaussian fit through the peak: the standard, lowest-bias estimator for particle images (~0.1 px).",
+            "centroid": "The intensity-weighted centroid around the peak: robust on a broad peak, more peak-locking bias than the Gaussian fit.",
+            "parabolic": "A three-point parabola through the peak: cheapest, and the most biased toward integer values."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "channel",
+          "label": "Channel",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "pick_kind": "channel",
+          "description": "Which channel every pass correlates (0-based) — decided here and inherited. Displacement comes from image texture: pick the channel with stable, high-contrast speckle, not a reporter whose brightness changes biologically."
+        },
+        {
+          "name": "reference_frame",
+          "label": "Reference frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "reference_mode": [
+              "fixed_frame"
+            ]
+          },
+          "pick_kind": "frame",
+          "description": "Which timepoint every frame is paired with when the reference mode is a fixed frame (0-based); its own pair is the zero field. Inert under `previous_frame`. For a separate reference acquisition, chain it in front with Timeseries Builder and keep this at 0."
+        },
+        {
+          "name": "window_size",
+          "label": "Window size",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 64,
+          "description": "Edge of the interrogation window of THIS pass in pixels — the coarsest of the ladder, so the motion it has to bracket is the whole displacement: keep it above about twice the largest expected shift. Each Deform Pass after it defaults to half this. Must leave at least 4 × 4 windows on the image for a later deform pass to interpolate over."
+        },
+        {
+          "name": "overlap",
+          "label": "Overlap",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.5,
+          "description": "Window overlap as a fraction of the window (0.5 = half-overlapping). It sets the grid DENSITY of every pass (inherited unless a Deform Pass overrides it), not per-vector accuracy; more overlap costs proportionally more windows."
+        },
+        {
+          "name": "roi",
+          "label": "ROI layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "roi_mask",
+          "layer_in": "voxel",
+          "description": "Optional Voxel mask (from ROI Mask or a Threshold) restricting WHERE vectors are computed: windows centred outside it are marked `excluded` and carry no vector, on every pass. Static in time (the t=0 plane is used). Absent → the whole frame."
+        },
+        {
+          "name": "name",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "piv",
+          "layer_out": [
+            "point"
+          ],
+          "description": "Name of the Point table this pass writes — one row per window centre with `disp_y`/`disp_x` (µm), `disp_mag_um`, `qfactor` (signal-to-noise) and `excluded`. Every later stage selects it by this name."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_piv_first_pass",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/piv_field.md",
+      "params_read": [
+        "__modes__",
+        "channel",
+        "name",
+        "overlap",
+        "reference_frame",
+        "roi",
+        "window_size"
+      ]
+    },
+    "piv.smooth": {
+      "op": "piv.smooth",
+      "label": "PIV Smooth",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/piv_stages.py",
+      "gui_only": false,
+      "summary": "Garcia-2010 smoothn on the pass's field, as a node — the between-pass smoothing of the multipass driver, placeable wherever you want it.",
+      "overview": "Garcia-2010 ``smoothn`` (DCT penalised least squares) on the pass's field, as a node — what the multipass driver does between passes when smoothing is on, to stabilise the predictor before the next deformation. Overwrites ``disp_*``; a NaN (a refused, unfilled vector) is treated as missing and filled by the smoother. Resolved spec: category analysis; op ``piv.smooth``; reads POINT, adds POINT; footprint WHOLE_SERIES with empty kernel_axes.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "piv",
+          "layer_in": "point",
+          "description": "Which Point table holds the PIV pass this stage works on — the one PIV First Pass wrote (`piv` unless renamed there), or the last Deform Pass's. Validate and Smooth write their columns back onto the SAME rows; a Deform Pass replaces the table with its finer grid. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "smooth_strength",
+          "label": "Strength",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.05,
+          "description": "The smoother's s parameter — LARGER flattens the field harder. OpenPIV's default 0.05 steadies a predictor between passes without erasing structure; on the FINAL pass it is a filter on the measurement, so use it knowingly."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_piv_smooth",
+      "meta_transform": null,
+      "extra_layers": "_piv_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/piv_field.md",
+      "params_read": [
+        "smooth_strength",
+        "source"
+      ]
+    },
+    "piv.validate": {
+      "op": "piv.validate",
+      "label": "PIV Validate",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/piv_stages.py",
+      "gui_only": false,
+      "summary": "OpenPIV's validation as a node: signal-to-noise, global limit, std and median tests flag vectors; flagged ones are filled from neighbours (or left NaN). Writes flags / replaced on the pass's rows.",
+      "overview": "OpenPIV's ``typical_validation`` as a node, on the pass the table holds: the signal-to-noise test, the global displacement limit, the standard-deviation test and the median test (universal, local, or off) flag vectors; with ``replace`` on, the flagged ones are filled from their valid neighbours (iterative local mean) — which the multipass driver ALWAYS does before a deform pass, since a hole poisons the predictor spline. Writes ``flags`` (refused by a test) and ``replaced`` (filled), and overwrites ``disp_*`` with the filled values, or with NaN at refused vectors when ``replace`` is off. Resolved spec: category analysis; op ``piv.validate``; reads POINT (no voxel is read), adds POINT; footprint WHOLE_SERIES with empty kernel_axes. Inherits the pass's window, overlap and grid from provenance; stamps its own thresholds.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "median_test",
+          "label": "Median test",
+          "choices": [
+            "universal",
+            "local",
+            "off"
+          ],
+          "default": "universal",
+          "description": "The neighbourhood-consistency check, PIV's workhorse outlier detector.",
+          "choice_docs": {
+            "universal": "Westerweel-Scarano normalised median test: the residual is scaled by the neighbourhood's own scatter, so one threshold works across the field.",
+            "local": "Plain local median test: an absolute pixel difference from the 3×3 neighbourhood median; simpler, scale-dependent.",
+            "off": "No median test — only signal-to-noise, limits and the std test run. For fields with genuine sharp structure the median test would flatten."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Grid layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "piv",
+          "layer_in": "point",
+          "description": "Which Point table holds the PIV pass this stage works on — the one PIV First Pass wrote (`piv` unless renamed there), or the last Deform Pass's. Validate and Smooth write their columns back onto the SAME rows; a Deform Pass replaces the table with its finer grid. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "s2n_threshold",
+          "label": "Min signal-to-noise",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1.0,
+          "description": "Minimum ratio of the correlation's first peak to the plane mean for a vector to pass. HIGHER refuses more weak matches (then filled from neighbours or left NaN); 1.0 refuses essentially nothing — raise toward 1.3-2 on noisy images."
+        },
+        {
+          "name": "max_disp",
+          "label": "Max displacement",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0.0,
+          "description": "Hard limit on either displacement component in pixels; vectors beyond it are flagged. 0 = half the pass's window, the physical limit a window can resolve."
+        },
+        {
+          "name": "std_threshold",
+          "label": "Std threshold",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 10.0,
+          "description": "Global filter: flag vectors more than this many standard deviations from the field mean. 10 catches only gross outliers; lower it on a field that should be nearly uniform, never on one with real strong gradients."
+        },
+        {
+          "name": "median_threshold",
+          "label": "Median threshold",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 2.0,
+          "description": "Threshold of the median test: in `universal` mode the normalised residual r* (the literature default 2), in `local` mode an absolute pixel difference from the neighbourhood median. LOWER flags more; on a field with genuine sharp structure the test flags real vectors — raise it or turn the test off."
+        },
+        {
+          "name": "replace",
+          "label": "Replace flagged",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": true,
+          "default": true,
+          "description": "Fill the flagged vectors from their valid neighbours (iterative local mean) and mark them `replaced`. ON is what a following Deform Pass needs (a hole poisons its predictor; it will fill holes itself if you leave them). OFF leaves NaN at the refused vectors — the honest final field."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_piv_validate",
+      "meta_transform": null,
+      "extra_layers": "_piv_layers_on_source",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/piv_field.md",
+      "params_read": [
+        "__modes__",
+        "max_disp",
+        "median_threshold",
+        "replace",
+        "s2n_threshold",
+        "source",
+        "std_threshold"
+      ]
     },
     "plot.distribution": {
       "op": "plot.distribution",
