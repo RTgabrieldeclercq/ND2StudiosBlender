@@ -18,8 +18,13 @@ def _structure_layers(ds: Dataset, domain: Domain) -> list:
     comprehension per node."""
     return sorted({k[1] for k in ds.attributes if k[0] is domain and k[1]})
 def _point_layers(ds: Dataset) -> list:
-    """Names of the Point structures on ``ds`` (each is one table)."""
-    return _structure_layers(ds, Domain.POINT)
+    """Names of the Point structures on ``ds`` (each is one table) — minus the correlation
+    GRIDS a DIC / PIV / DVC node writes beside its field (``<field>_mesh``, listed under the
+    ``__analysis_mesh__`` metadata by :mod:`nodegraph.catalog._shared.analysis_mesh`). A grid
+    annotates a field rather than being one, so leaving it out keeps a lone field
+    auto-resolving in every consumer that picks "the" Point table (2026-10-09)."""
+    marks = ds.metadata.get("__analysis_mesh__") or {}
+    return [n for n in _structure_layers(ds, Domain.POINT) if n not in marks]
 def _label_instances(ds: Dataset) -> list:
     """Names that are a whole Label INSTANCE on ``ds`` — a Voxel raster of ids AND the
     Label table those ids index.

@@ -55,6 +55,9 @@ from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
 from nodegraph.catalog._shared.analysis_units import scoped_frame
+from nodegraph.catalog._shared.analysis_mesh import (concat_rows, lattice_quads,
+                                                     mesh_columns, mesh_layer_name,
+                                                     with_mesh)
 
 _DEFAULT_LAYER = "dic"
 _AX = ("y", "x")
@@ -245,12 +248,25 @@ def _compute_dic_grid(ctx: EvalContext) -> Dataset:
           "dic_roi": roi_name, "dic_n_nodes": n, "dic_stage": "grid"}
     ctx.progress(1, 1, f"{n} lattice nodes per frame at step {para.winstepsize} px, "
                        f"{len(plan)} frame(s) per plane", frames=ax.t)
-    return (ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="plane_index"))
-            .with_metadata(**md))
+    out = ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="plane_index"))
+    # the lattice's cells as the grid the Viewer draws — the same for every frame (t = -1)
+    ys, xs = np.unique(nodes_xy[:, 1]), np.unique(nodes_xy[:, 0])
+    cells = concat_rows([lattice_quads(ys, xs, m=m, t=-1, c=c, z_plane=z)
+                         for m in range(ax.m) for z in range(ax.z)] if blocks else [])
+    out = with_mesh(out, layer, cells, kind="quad", z_kind="plane_index",
+                    window=(int(para.winsize), int(para.winsize)))
+    return out.with_metadata(**md)
 
 
 def _columns_dic_grid(params, modes, incoming):
-    return on_layer(Domain.POINT, str((params or {}).get("name") or _DEFAULT_LAYER), POINT_INVARIANT)
+    name = str((params or {}).get("name") or _DEFAULT_LAYER)
+    return (tuple(on_layer(Domain.POINT, name, POINT_INVARIANT))
+            + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("quad"))))
+
+
+def _layers_dic_grid(params, modes):
+    """The lattice's cell table, named after the lattice layer — no socket names it."""
+    return ((Domain.POINT, mesh_layer_name(str((params or {}).get("name") or _DEFAULT_LAYER))),)
 
 
 # ── §3  DIC Initial Guess ─────────────────────────────────────────────────────────
@@ -617,7 +633,7 @@ _IMG_KAX = frozenset({"t", "y", "x"})
 
 register_node(
     _compute_dic_grid, op_key="dic.grid", label="DIC Grid", category="analysis",
-    adds_columns=_columns_dic_grid,
+    adds_columns=_columns_dic_grid, extra_layers=_layers_dic_grid,
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
     inputs=[
         InDataset(),

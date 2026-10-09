@@ -3941,6 +3941,7 @@ class ViewerPanel(QWidget):
         self._geo_mesh = self._mesh_sections() if s.mesh.enabled else []
         self._geo_scalar = self._scalar_plane() if s.voxels.enabled else None
         self._geo_vectors = self._vector_field() if s.vectors.enabled else None
+        self._geo_grid = self._grid_rects() if s.grid.enabled else None
         self._geo_diff = self._diff_sets() if s.diff.enabled else (None, None)
 
     def _paint_overlays(self, p: QPainter) -> None:
@@ -3967,6 +3968,7 @@ class ViewerPanel(QWidget):
             points=self._geo_points, tracks=self._geo_tracks, mesh=self._geo_mesh,
             label_plane=self._geo_lab, label_keys=self._geo_lab_keys,
             scalar=self._geo_scalar, vectors=self._geo_vectors,
+            grid=getattr(self, "_geo_grid", None),
             diff_a=self._geo_diff[0], diff_b=self._geo_diff[1],
             # the PAYLOAD's t: the trail modes compare it against the `t` values carried by
             # the structure rows this pull produced, which under the solo-frame scope are
@@ -4941,6 +4943,10 @@ class ViewerPanel(QWidget):
             by_layer = {k: v for k, v in by_layer.items() if str(k) == _want}
         else:
             by_layer = self._drop_synth(by_layer, Domain.POINT)
+            # a correlation grid's rows are ELEMENT centres, drawn by the Grid tab — as
+            # points they would only bury the field's own nodes (2026-10-09)
+            _grids = ds.metadata.get("__analysis_mesh__") or {}
+            by_layer = {k: v for k, v in by_layer.items() if str(k) not in _grids}
         out: List[OV.PointMark] = []
         # sorted: the per-layer colour must not depend on dict insertion order
         for li, layer in enumerate(sorted(by_layer, key=lambda v: str(v))):
@@ -5048,6 +5054,81 @@ class ViewerPanel(QWidget):
     # demo recipes already knew about and the Viewer did not (2026-10-08): a pulled DVC
     # field drew no arrows at all
     _VECTOR_COLUMNS = (("u", "v"), ("u_um", "v_um"), ("dy", "dx"), ("disp_y", "disp_x"))
+
+    def _grid_rects(self) -> Optional[np.ndarray]:
+        """The correlation grid on the viewed plane → ``(N, 5)`` ``y_lo, y_hi, x_lo, x_hi,
+        level`` boxes in full-resolution image pixels (2026-10-09).
+
+        Reads every ``<field>_mesh`` table the ``__analysis_mesh__`` metadata names
+        (:mod:`nodegraph.catalog._shared.analysis_mesh`), keeps the viewed position and frame
+        (``t = -1`` rows are a mesh shared by every frame) and the viewed plane — a 2-D
+        element's plane index must equal it, a DVC hex is kept when its z extent spans it,
+        which is the honest 2-D reading of a 3-D grid: its section at this Z. Style
+        ``subsets`` replaces the element boxes with the subset / window around every Nth
+        node of the FIELD table, its size taken from the marker."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return None
+        marks = ds.metadata.get("__analysis_mesh__") or {}
+        if not marks:
+            return None
+        m, t, z, _c = self._payload_coords()
+        g = self.overlays.grid
+        by_layer: Dict[str, Dict[str, np.ndarray]] = {}
+        for (dom, layer, name), attr in ds.attributes.items():
+            if dom is Domain.POINT and layer:
+                by_layer.setdefault(str(layer), {})[str(name)] = attr.values
+        out: List[np.ndarray] = []
+        for mesh_layer, info in marks.items():
+            info = info if isinstance(info, dict) else {}
+            kind = str(info.get("kind", ""))
+            if g.style == "subsets":
+                cols = by_layer.get(str(info.get("field", "")), {})
+                win = info.get("window")
+                if not cols or "y" not in cols or not win:
+                    continue
+                keep = np.ones(len(cols["y"]), dtype=bool)
+                for key, want in (("m", m), ("t", t)):
+                    if key in cols:
+                        keep &= np.asarray(cols[key]) == want
+                if "z" in cols:
+                    zz = np.asarray(cols["z"], dtype=float)
+                    if kind == "hex":
+                        half_z = float((list(win) + [0, 0, 0])[2] or win[0]) / 2.0
+                        keep &= np.abs(zz - z) <= half_z
+                    else:
+                        keep &= np.rint(zz) == z
+                idx = np.flatnonzero(keep)[::max(1, int(g.every))]
+                if idx.size == 0:
+                    continue
+                wy, wx = float(win[0]) / 2.0, float(win[1] if len(win) > 1 else win[0]) / 2.0
+                yy = np.asarray(cols["y"], dtype=float)[idx]
+                xx = np.asarray(cols["x"], dtype=float)[idx]
+                out.append(np.stack([yy - wy, yy + wy, xx - wx, xx + wx,
+                                     np.zeros(idx.size)], axis=1))
+                continue
+            cols = by_layer.get(str(mesh_layer), {})
+            if "y_lo" not in cols:
+                continue
+            keep = np.ones(len(cols["y_lo"]), dtype=bool)
+            if "m" in cols:
+                keep &= np.asarray(cols["m"]) == m
+            if "t" in cols:
+                tt = np.asarray(cols["t"])
+                keep &= (tt == t) | (tt < 0)
+            if kind == "hex":
+                keep &= ((np.asarray(cols["z_lo"], float) <= z + 0.5)
+                         & (np.asarray(cols["z_hi"], float) >= z - 0.5))
+            elif "z" in cols:
+                keep &= np.rint(np.asarray(cols["z"], float)) == z
+            idx = np.flatnonzero(keep)
+            if idx.size == 0:
+                continue
+            lv = (np.asarray(cols["level"], float)[idx] if "level" in cols
+                  else np.zeros(idx.size))
+            out.append(np.stack([np.asarray(cols[k], dtype=float)[idx]
+                                 for k in ("y_lo", "y_hi", "x_lo", "x_hi")] + [lv], axis=1))
+        return np.concatenate(out) if out else None
 
     def _vector_field(self) -> Optional[np.ndarray]:
         """Point-domain displacement vectors on the viewed frame → ``(N, 4)`` ``y,x,u,v``.

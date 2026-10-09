@@ -306,6 +306,27 @@ class MeshOverlay:
 
 
 @dataclass
+class GridOverlay:
+    """The correlation GRID of a DIC / PIV / DVC result (2026-10-09) — the elements the
+    field was measured on, drawn over the image: pyALDIC's quadrilaterals (adaptively
+    refined ones included), PIV's window lattice, a DVC hex grid as its section at the
+    viewed Z. Read from the ``<field>_mesh`` tables :mod:`nodegraph.catalog._shared.
+    analysis_mesh` writes.
+
+    ``elements`` draws each element's outline; ``subsets`` draws the subset / interrogation
+    window around every ``every``-th node instead — the patch each vector was actually
+    matched on, which shows how much neighbouring measurements overlap. Coloured by
+    refinement level by default, so a refined region stands out from the base grid."""
+    enabled: bool = True
+    style: str = "elements"         # elements | subsets
+    color_mode: str = "level"       # level | flat
+    color: str = "#7cf2a0"
+    width: float = 1.0
+    every: int = 4                  # subsets: 1 in N nodes
+    opacity: int = 70
+
+
+@dataclass
 class OverlaySettings:
     """The whole overlay configuration — one group per tab in the popup."""
     points: PointsOverlay = field(default_factory=PointsOverlay)
@@ -315,6 +336,7 @@ class OverlaySettings:
     vectors: VectorsOverlay = field(default_factory=VectorsOverlay)
     diff: DiffOverlay = field(default_factory=DiffOverlay)
     mesh: MeshOverlay = field(default_factory=MeshOverlay)
+    grid: GridOverlay = field(default_factory=GridOverlay)
 
     def group(self, tab: str):
         return getattr(self, tab)
@@ -400,6 +422,10 @@ TAB_INFO: Tuple[TabInfo, ...] = (
     TabInfo("mesh", "Mesh", True,
             "Mesh-domain boundary surfaces, drawn as their cross-section at the viewed "
             "Z (analysis.tessellate)."),
+    TabInfo("grid", "Grid", True,
+            "The correlation grid a DIC, PIV or DVC field was measured on — refined DIC "
+            "elements, the PIV window lattice, a DVC hex grid's section at the viewed Z — "
+            "or the subset windows themselves."),
 )
 TABS: Tuple[str, ...] = tuple(t.key for t in TAB_INFO)
 TAB_BY_KEY: Dict[str, TabInfo] = {t.key: t for t in TAB_INFO}
@@ -407,7 +433,7 @@ TAB_BY_KEY: Dict[str, TabInfo] = {t.key: t for t in TAB_INFO}
 #: Per tab, the ``color_mode`` value that means "give every item its own colour".
 PER_ITEM_MODE: Dict[str, Optional[str]] = {
     "points": "per_point", "labels": "per_label", "tracks": "per_track",
-    "mesh": "per_object", "voxels": None,
+    "mesh": "per_object", "voxels": None, "grid": None,
 }
 
 
@@ -713,6 +739,32 @@ FIELDS: Dict[str, Tuple[FieldSpec, ...]] = {
         FieldSpec("near_z", "float", "Z tolerance", lo=0.0, hi=10.0, step=0.5,
                   decimals=1, unit=" planes", enable_if=("style", ("points",)),
                   tip="How far off the viewed Z a vertex may sit and still be drawn"),
+    ),
+    "grid": (
+        FieldSpec("style", "choice", "Style",
+                  choices=(("elements", "Grid elements"),
+                           ("subsets", "Subset / window boxes")),
+                  tip="`Grid elements` outlines the elements the field was solved on — "
+                      "pyALDIC's quadrilaterals (a refined region shows as smaller boxes), "
+                      "the PIV window lattice, or a DVC hex grid cut at the viewed Z. "
+                      "`Subset / window boxes` draws the patch each vector was matched on "
+                      "around every Nth node instead, which shows how much neighbouring "
+                      "measurements overlap"),
+        FieldSpec("color_mode", "choice", "Colour by", role="color_mode",
+                  choices=(("level", "Refinement level"), ("flat", "One colour")),
+                  tip="`Refinement level` keeps the base grid in the tab colour and gives "
+                      "each level of adaptive refinement its own colour, so refined regions "
+                      "stand out; a uniform grid looks the same either way"),
+        FieldSpec("color", "color", "Colour", role="color",
+                  tip="The base grid's colour (and every element's, under One colour)"),
+        FieldSpec("width", "float", "Line width", role="line_width",
+                  lo=0.3, hi=6.0, step=0.1, decimals=1, unit=" px",
+                  tip="Grid line width in SCREEN pixels — constant at any zoom"),
+        FieldSpec("every", "int", "Every Nth node", lo=1, hi=64,
+                  enable_if=("style", ("subsets",)),
+                  tip="Draw the window of one node in N — overlapping windows tile the image "
+                      "solid at N = 1"),
+        _OPACITY,
     ),
 }
 
@@ -1022,6 +1074,9 @@ class OverlayFrame:
     #: Vectors for this plane, in full-resolution image pixels: ``(y, x, u, v)`` columns.
     #: ``u``/``v`` are the displacement's y/x components in the SAME units as y/x.
     vectors: Optional[np.ndarray] = None
+    #: The correlation grid on this plane (2026-10-09): ``(N, 5)`` ``y_lo, y_hi, x_lo, x_hi,
+    #: level`` boxes in full-resolution image pixels (element outlines, or subset windows).
+    grid: Optional[np.ndarray] = None
     #: The two object sets the comparison overlay judges — ``(N, 2)`` ``y,x`` each, in
     #: full-resolution image pixels. ``diff_a`` is the viewed node's own set and ``diff_b``
     #: the reference it is being scored against.
@@ -1132,6 +1187,9 @@ class OverlayRenderer:
         # (an outline, an arrow, an id) are exactly what you read the field against.
         if s.voxels.enabled and frame.scalar is not None:
             self._paint_scalar(p, s.voxels, frame)
+        # the correlation grid sits under the vectors measured on it
+        if s.grid.enabled and frame.grid is not None and len(frame.grid):
+            self._paint_grid(p, s.grid, frame)
         if s.vectors.enabled and frame.vectors is not None and len(frame.vectors):
             self._paint_vectors(p, s.vectors, frame)
         if s.labels.enabled and frame.label_plane is not None:
@@ -1270,6 +1328,34 @@ class OverlayRenderer:
         if s.color_mode == "per_object":
             return distinct_color(int(object_id), s.sat, s.val, op)
         return qcolor(s.color, op)
+
+    #: refinement level → colour when ``color_mode = level`` (level 0 takes the tab colour)
+    GRID_LEVEL_COLORS = ("#ffb347", "#ff6f91", "#c780fa", "#ff4040", "#ffffff")
+
+    def _paint_grid(self, p: QPainter, s: GridOverlay, frame: OverlayFrame) -> None:
+        """One cosmetic-pen path per colour — thousands of boxes stay one draw call each,
+        and the line keeps its screen width at every zoom."""
+        g = np.asarray(frame.grid, dtype=float)
+        alpha = int(255 * max(0, min(100, int(s.opacity))) / 100)
+        levels = (g[:, 4].astype(int) if s.color_mode == "level"
+                  else np.zeros(len(g), dtype=int))
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setBrush(Qt.NoBrush)
+        for lv in np.unique(levels):
+            col = QColor(s.color if lv <= 0 else
+                         self.GRID_LEVEL_COLORS[min(int(lv) - 1, len(self.GRID_LEVEL_COLORS) - 1)])
+            col.setAlpha(alpha)
+            pen = QPen(col, float(max(0.1, s.width)))
+            pen.setCosmetic(True)
+            p.setPen(pen)
+            path = QPainterPath()
+            for y0, y1, x0, x1, _l in g[levels == lv]:
+                a = frame.map_pt(x0 * frame.sx, y0 * frame.sy)
+                b = frame.map_pt(x1 * frame.sx, y1 * frame.sy)
+                path.addRect(QRectF(a, b).normalized())
+            p.drawPath(path)
+        p.restore()
 
     def _paint_mesh(self, p: QPainter, s: MeshOverlay, frame: OverlayFrame) -> None:
         """Draw each element's Z cross-section (outline / filled) or its near-plane

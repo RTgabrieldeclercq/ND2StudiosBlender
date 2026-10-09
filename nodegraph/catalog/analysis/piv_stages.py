@@ -54,6 +54,9 @@ from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
 from nodegraph.catalog._shared.analysis_units import scoped_frame
+from nodegraph.catalog._shared.analysis_mesh import (concat_rows, lattice_quads,
+                                                     mesh_columns, mesh_layer_name,
+                                                     with_mesh)
 
 _DEFAULT_LAYER = "piv"
 FIELD_COLUMNS = ("disp_y", "disp_x", "disp_mag_um", "qfactor", "excluded")
@@ -140,6 +143,16 @@ def _piv_write(ds: Dataset, layer: str, cols: Dict[str, np.ndarray]) -> Dataset:
     for name, vals in cols.items():
         ds = ds.with_layer(Domain.POINT, name, np.asarray(vals), layer=layer)
     return ds
+
+
+def _piv_cells(r: Dict[str, Any], m: int, z: int, c: int) -> Dict[str, np.ndarray]:
+    """A pass's window-centre lattice as grid cells (t = -1: every frame of the line), the
+    cells touching an excluded window dropped — what the Viewer draws as the PIV grid."""
+    x, y = np.asarray(r["x"], float), np.asarray(r["y"], float)
+    if x.ndim != 2 or min(x.shape) < 2:
+        return {}
+    return lattice_quads(y[:, 0], x[0, :], m=m, t=-1, c=c, z_plane=z,
+                         keep=~np.asarray(r["excluded"], bool))
 
 
 def _piv_rewrite(ds: Dataset, layer: str, cols: Dict[str, np.ndarray]) -> Dataset:
@@ -230,6 +243,7 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
     plan = _piv_plan(ax, ref_mode, ref_frame)
     blocks = _piv_blocks(ax, plan)
     rows: List[Dict[str, np.ndarray]] = []
+    cells: Dict[Any, Dict[str, np.ndarray]] = {}
     bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)),
                    note="first pass")
     for (m, z, t_out, t_ref) in blocks:
@@ -237,6 +251,8 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
         r = piv_stage_first_pass(_piv_plane(prov, m, t_ref, z, c), _piv_plane(prov, m, t_out, z, c), s, roi)
         rows.append(_piv_field_rows(r["x"], r["y"], r["u"], r["v"], r["s2n"], r["excluded"],
                                 px, m, t_out, z, c))
+        if (m, z) not in cells:                      # the window lattice, once per line
+            cells[(m, z)] = _piv_cells(r, m, z, c)
         bar.finish_unit(note=f"m={m} z={z} t={t_out}: {grid[0]}×{grid[1]} vectors at {window} px")
     if rows:
         cols = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
@@ -249,13 +265,21 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
           "piv_correlation": corr, "piv_subpixel": subpix,
           "piv_reference_mode": ref_mode, "piv_reference_frame": ref_frame,
           "piv_channel": c, "piv_roi": roi_name, "piv_stage": "first_pass"}
-    return (ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="plane_index"))
-            .with_metadata(**md))
+    out = ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="plane_index"))
+    out = with_mesh(out, layer, concat_rows(list(cells.values())), kind="quad",
+                    z_kind="plane_index", window=(window, window))
+    return out.with_metadata(**md)
 
 
 def _columns_piv_first_pass(params, modes, incoming):
-    return on_layer(Domain.POINT, str((params or {}).get("name") or _DEFAULT_LAYER),
-                    POINT_INVARIANT + FIELD_COLUMNS)
+    name = str((params or {}).get("name") or _DEFAULT_LAYER)
+    return (tuple(on_layer(Domain.POINT, name, POINT_INVARIANT + FIELD_COLUMNS))
+            + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("quad"))))
+
+
+def _layers_piv_first_pass(params, modes):
+    """The window lattice's cell table, named after the field layer — no socket names it."""
+    return ((Domain.POINT, mesh_layer_name(str((params or {}).get("name") or _DEFAULT_LAYER))),)
 
 
 # ── PIV Validate ──────────────────────────────────────────────────────────────────
@@ -438,6 +462,7 @@ def _compute_piv_deform_pass(ctx: EvalContext) -> Dataset:
     dy = np.asarray(cols["disp_y"], float)
     dx = np.asarray(cols["disp_x"], float)
     rows: List[Dict[str, np.ndarray]] = []
+    cells: Dict[Any, Dict[str, np.ndarray]] = {}
     bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)),
                    note=f"pass at {window} px")
     for (m, z, t_out, t_ref) in _piv_blocks(ax, plan):
@@ -451,6 +476,8 @@ def _compute_piv_deform_pass(ctx: EvalContext) -> Dataset:
                                   x_old, y_old, u_old, v_old, roi)
         rows.append(_piv_field_rows(r["x"], r["y"], r["u"], r["v"], r["s2n"], r["excluded"],
                                 px, m, t_out, z, c))
+        if (m, z) not in cells:                      # the finer lattice replaces the grid
+            cells[(m, z)] = _piv_cells(r, m, z, c)
         bar.finish_unit(note=f"m={m} z={z} t={t_out}: {grid[0]}×{grid[1]} vectors at {window} px")
     if rows:
         out = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
@@ -461,12 +488,21 @@ def _compute_piv_deform_pass(ctx: EvalContext) -> Dataset:
     md = {"piv_window": window, "piv_overlap": overlap, "piv_overlap_px": int(ov_px),
           "piv_grid_shape": (int(grid[0]), int(grid[1])), "piv_pass": int(pv["piv_pass"]) + 1,
           "piv_deformation": deform, "piv_stage": "deform_pass"}
-    return _piv_rewrite(ds, layer, out).with_metadata(**md)
+    res = with_mesh(_piv_rewrite(ds, layer, out), layer, concat_rows(list(cells.values())),
+                    kind="quad", z_kind="plane_index", window=(window, window))
+    return res.with_metadata(**md)
 
 
 def _columns_piv_deform_pass(params, modes, incoming):
-    return on_layer(Domain.POINT, str((params or {}).get("source") or _DEFAULT_LAYER),
-                    POINT_INVARIANT + FIELD_COLUMNS)
+    name = str((params or {}).get("source") or _DEFAULT_LAYER)
+    return (tuple(on_layer(Domain.POINT, name, POINT_INVARIANT + FIELD_COLUMNS))
+            + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("quad"))))
+
+
+def _layers_piv_deform_pass(params, modes):
+    """The rewritten field layer and its finer lattice's cell table."""
+    name = str((params or {}).get("source") or _DEFAULT_LAYER)
+    return ((Domain.POINT, name), (Domain.POINT, mesh_layer_name(name)))
 
 
 # ── registration ─────────────────────────────────────────────────────────────────
@@ -484,7 +520,7 @@ _IMG_KAX = frozenset({"t", "y", "x"})
 
 register_node(
     _compute_piv_first_pass, op_key="piv.first_pass", label="PIV First Pass", category="analysis",
-    adds_columns=_columns_piv_first_pass,
+    adds_columns=_columns_piv_first_pass, extra_layers=_layers_piv_first_pass,
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
     inputs=[
         InDataset(),
@@ -636,7 +672,8 @@ register_node(
 
 register_node(
     _compute_piv_deform_pass, op_key="piv.deform_pass", label="PIV Deform Pass",
-    category="analysis", adds_columns=_columns_piv_deform_pass, extra_layers=_piv_layers_on_source,
+    category="analysis", adds_columns=_columns_piv_deform_pass,
+    extra_layers=_layers_piv_deform_pass,
     reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
     inputs=[
         InDataset(),

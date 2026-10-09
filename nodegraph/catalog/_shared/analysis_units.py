@@ -492,6 +492,11 @@ def finish_trial(opened: TrialOpen, run: UnitRun, *, stamps: Dict[str, Any],
     tr = opened.trial
     if tr is None:
         return
+    tables = {k: dict(v) for k, v in tables.items()}
+    for kind, where in tables.items():                 # the columns, for Load Analysis
+        cols = concat_tables(run.results, kind)
+        if cols:
+            where["columns"] = sorted(set(cols) | {"id"})
     done = len(tr.done_units())
     tr.update(status="complete" if done >= len(tr.units) else "partial",
               stamps=stamps, tables=tables, quality=dict(quality or {}),

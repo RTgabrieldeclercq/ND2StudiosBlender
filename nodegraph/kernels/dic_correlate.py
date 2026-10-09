@@ -685,7 +685,13 @@ def run_pyaldic_series(
         increment = _frame_to_dvcresult(
             mesh, u_incr, step, voxel_size_um, method, params, reference_mode,
             notes="increment", **common)
-        out.append({"primary": primary, "increment": increment})
+        # the FE mesh this frame was solved on (2026-10-09) — `[x, y]` node coordinates
+        # and the Q8 elements, so the node can draw the grid (incl. adaptive refinement)
+        out.append({"primary": primary, "increment": increment,
+                    "mesh": {"coords": _mesh_coords(mesh),
+                             "elements": np.asarray(getattr(mesh, "elements_fem",
+                                                            np.zeros((0, 8))),
+                                                    dtype=np.int64)}})
     return out
 
 

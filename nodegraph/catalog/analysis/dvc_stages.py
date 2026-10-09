@@ -62,6 +62,9 @@ from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
 from nodegraph.catalog._shared.analysis_units import scoped_frame
+from nodegraph.catalog._shared.analysis_mesh import (concat_rows, grid_hexes,
+                                                     mesh_columns, mesh_layer_name,
+                                                     with_mesh)
 
 _DEFAULT_LAYER = "dvc"
 _AX = ("z", "y", "x")
@@ -269,13 +272,25 @@ def _compute_dvc_grid(ctx: EvalContext) -> Dataset:
     }
     ctx.progress(1, 1, f"{n} nodes per frame ({' × '.join(str(s) for s in mesh.grid_shape)}), "
                        f"{len(plan)} frame(s) per position", frames=ax.t)
-    return (ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="subpixel"))
-            .with_metadata(**md))
+    out = ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="subpixel"))
+    # the node grid's hexahedra as the grid the Viewer sections — every frame (t = -1)
+    hexes = concat_rows([grid_hexes(mesh.grid_shape, coords, m=m, t=-1, c=c)
+                         for m in range(ax.m)] if blocks else [])
+    out = with_mesh(out, layer, hexes, kind="hex", z_kind="subpixel",
+                    window=(gp["subset_size"], gp["subset_size"],
+                            gp["subset_size_z"] or gp["subset_size"]))
+    return out.with_metadata(**md)
 
 
 def _columns_dvc_grid(params, modes, incoming):
-    return on_layer(Domain.POINT, str((params or {}).get("name") or _DEFAULT_LAYER),
-                    POINT_INVARIANT)
+    name = str((params or {}).get("name") or _DEFAULT_LAYER)
+    return (tuple(on_layer(Domain.POINT, name, POINT_INVARIANT))
+            + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("hex"))))
+
+
+def _layers_dvc_grid(params, modes):
+    """The grid's hexahedron table, named after the lattice layer — no socket names it."""
+    return ((Domain.POINT, mesh_layer_name(str((params or {}).get("name") or _DEFAULT_LAYER))),)
 
 
 # ── §3  DVC Initial Guess ─────────────────────────────────────────────────────────
@@ -714,7 +729,7 @@ _STAGE_KAX = frozenset({"t", "z", "y", "x"})
 
 register_node(
     _compute_dvc_grid, op_key="dvc.grid", label="DVC Grid", category="analysis",
-    adds_columns=_columns_dvc_grid,
+    adds_columns=_columns_dvc_grid, extra_layers=_layers_dvc_grid,
     reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
     inputs=[
         InDataset(),

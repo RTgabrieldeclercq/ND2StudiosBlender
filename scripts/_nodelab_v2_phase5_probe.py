@@ -636,6 +636,77 @@ def main(argv) -> int:
         if not _had_pc2:
             del _vp._payload_coords
 
+    # THE GRID OVERLAY (2026-10-09): a DIC / PIV / DVC result's `<field>_mesh` table is drawn
+    # as its element boxes on the viewed plane (t = -1 = every frame; a DVC hex where its z
+    # extent spans the plane), `subsets` draws the window around every Nth FIELD node, the
+    # Points overlay leaves the element centres alone, and the renderer paints it.
+    from nodegraph.catalog._shared.analysis_mesh import grid_hexes, lattice_quads, with_mesh
+    from nodelab_v2 import overlays as _OVg
+    assert "grid" in _OVg.TABS and _vp.overlays.grid.enabled
+    _gax = AxisSizes(m=1, t=2, z=3, c=1, y=64, x=64)
+    _gy, _gx = _np.meshgrid([8., 24., 40.], [8., 24., 40., 56.], indexing="ij")
+    _gfield = _STp(_Dom.POINT, {
+        "id": _np.arange(12, dtype=_np.int64), "m": _np.zeros(12, _np.int64),
+        "t": _np.zeros(12, _np.int64), "c": _np.zeros(12, _np.int64),
+        "z": _np.ones(12), "y": _gy.reshape(-1), "x": _gx.reshape(-1)},
+        layer="piv", z_kind="plane_index")
+    _gds = with_mesh(_DS(axes=_gax).with_image(_AP(_np.zeros((1, 2, 3, 1, 64, 64))))
+                     .with_structure(_gfield), "piv",
+                     lattice_quads([8., 24., 40.], [8., 24., 40., 56.], m=0, t=-1, c=0,
+                                   z_plane=1),
+                     kind="quad", z_kind="plane_index", window=(16, 16))
+    _gkeep = (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.grid.style,
+              _vp.overlays.grid.every, _vp.overlays.points.layer)
+    _had_pc3 = "_payload_coords" in _vp.__dict__
+    try:
+        _vp._dataset, _vp._axes = _gds, _gax
+        _vp._ref_plane = _np.zeros((64, 64))
+        _vp.overlays.points.layer = ""
+        _vp._payload_coords = lambda: (0, 1, 1, 0)          # frame 1: the t=-1 grid shows
+        _r = _vp._grid_rects()
+        assert _r is not None and _r.shape == (6, 5), None if _r is None else _r.shape
+        _vp._payload_coords = lambda: (0, 0, 1, 0)          # frame 0 holds the field rows
+        assert len(_vp._point_marks()) == 12, "the Points overlay must skip the grid's centres"
+        _vp._payload_coords = lambda: (0, 1, 0, 0)          # plane 0 holds no grid
+        assert _vp._grid_rects() is None
+        _vp._payload_coords = lambda: (0, 0, 1, 0)
+        _vp.overlays.grid.style, _vp.overlays.grid.every = "subsets", 1
+        _r2 = _vp._grid_rects()
+        assert _r2.shape == (12, 5) and _np.allclose(_r2[:, 1] - _r2[:, 0], 16.0), _r2
+        _vp.overlays.grid.style = "elements"
+        # a DVC hex grid is drawn where its z extent spans the viewed plane
+        _hz, _hy, _hx = _np.meshgrid([0., 2.], [8., 24.], [8., 24.], indexing="ij")
+        _hex = grid_hexes((2, 2, 2), _np.stack([_hz, _hy, _hx], -1).reshape(-1, 3),
+                          m=0, t=-1, c=0)
+        _vp._dataset = with_mesh(_DS(axes=_gax).with_image(
+            _AP(_np.zeros((1, 2, 3, 1, 64, 64)))), "dvc", _hex, kind="hex",
+            z_kind="subpixel")
+        _vp._payload_coords = lambda: (0, 0, 1, 0)
+        assert _vp._grid_rects().shape == (1, 5)
+        _vp._payload_coords = lambda: (0, 0, 2, 0)          # z=2 is the hex's top face
+        assert _vp._grid_rects() is not None
+        # and the renderer paints it (a cosmetic path per level) without error
+        from PySide6.QtGui import QImage as _QI, QPainter as _QP
+        from PySide6.QtCore import QPointF as _QPF
+        _img = _QI(64, 64, _QI.Format_ARGB32)
+        _img.fill(0)
+        _pp = _QP(_img)
+        try:
+            _vp._renderer.paint(_pp, _vp.overlays, _OVg.OverlayFrame(
+                map_pt=lambda x, y: _QPF(x, y), plane_wh=(64, 64), grid=_r))
+        finally:
+            _pp.end()
+        assert any(_img.pixel(int(x), 8) & 0xFF000000 for x in range(8, 57)), \
+            "the grid's top edge at y=8 drew nothing"
+        print("  [grid] DIC/PIV/DVC grid overlay: 6 lattice cells on their plane (t=-1 = every "
+              "frame), none off it, 12 subset windows of 16 px, a hex sectioned at z=1 and z=2, "
+              "element centres kept out of the Points overlay, painted")
+    finally:
+        (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.grid.style,
+         _vp.overlays.grid.every, _vp.overlays.points.layer) = _gkeep
+        if not _had_pc3:
+            _vp.__dict__.pop("_payload_coords", None)
+
     # THE LABELS OVERLAY PICKS ITS LAYER (2026-08-04). It had no selector: `_label_plane`
     # drew whichever integer Voxel raster had the most regions in the viewed plane. Several
     # label rasters on one Dataset is the NORMAL case — `analysis.voronoi` alone emits its

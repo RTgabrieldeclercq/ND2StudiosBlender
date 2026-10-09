@@ -1349,7 +1349,7 @@ new plane once). `NODELAB_GL=0` forces the CPU path; a GL failure falls back aut
 ### Overlays
 
 The **◈ Overlays** button (also `Ctrl+Shift+O`, **View → Overlays…**) opens a popup with a
-tab per domain: **Points**, **Labels**, **Tracks**, **Mesh** (and a reserved Voxels tab).
+tab per domain: **Points**, **Labels**, **Tracks**, **Voxels**, **Vectors**, **Compare**, **Mesh** and **Grid**.
 Quick on/off checkboxes for Points / Labels / Tracks sit in the channel strip.
 
 * **Points** — golden-star glyphs, configurable arm spread, and four **Colour by** modes: one colour, **one per Z plane** (what makes a projected 3-D cloud read as depth), one per point (which follows the *track* once a tracker has linked them, so a particle keeps its colour across T), or one per layer.
@@ -1359,6 +1359,17 @@ Quick on/off checkboxes for Points / Labels / Tracks sit in the channel strip.
   current position.
 * **Mesh** — the **cross-section at the viewed Z**: closed loops where the surface cuts the
   plane, in three styles.
+* **Grid** (2026-10-09) — the **correlation grid** a DIC, PIV or DVC field was measured on,
+  over the image. The node writes it beside its field as `<field>_mesh`:
+  * **DIC:** pyALDIC's own elements. A region refined at an ROI hole, the ROI edge or a
+    brush mask shows as smaller boxes, coloured by refinement level.
+  * **PIV:** the final pass's window lattice. A deform pass replaces it with its finer grid.
+  * **DVC:** the hex grid, cut at the viewed Z.
+
+  **Style** `elements` outlines the elements; `subsets` draws the subset / interrogation window
+  around every Nth node instead, so you can see how much neighbouring measurements overlap. The
+  grid is shared by every frame of a position and comes back with **Load Analysis**. The Points
+  overlay leaves its rows (element centres) alone.
 
 Every overlay size is a **screen** size, so an outline keeps its thickness as you zoom into
 a label instead of being magnified with the image. Region *fills* scale, because a fill is

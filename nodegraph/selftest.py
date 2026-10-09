@@ -7007,6 +7007,10 @@ def test_analysis_store() -> None:
         for k in ("disp_y", "disp_x", "x", "y", "t", "m", "id"):
             assert np.array_equal(c1[k], cl[k]), k
         assert ol.metadata["dic_solver"] == "aldic" and ol.metadata["analysis_trial"] == tpath
+        # the correlation grid comes back too, marked, so the Viewer draws it over the image
+        gm1, gml = cols(o1, "dic_mesh"), cols(ol, "dic_mesh")
+        assert gml and np.array_equal(gm1["y_lo"], gml["y_lo"]), "the grid did not round-trip"
+        assert ol.metadata["__analysis_mesh__"]["dic_mesh"]["window"] == [20.0, 20.0]
         one = Dataset(axes=AxisSizes(m=1, t=3, z=1, c=1, y=96, x=96),
                       metadata={**meta, "source_path": meta["source_path"][:1]}
                       ).with_image(ArrayProvider(img[:1]))
@@ -7287,6 +7291,110 @@ def test_quick_scope() -> None:
         f"unpicked reference refused; scoped pulls save nothing; dic_solved_frac + "
         f"analysis_est_full_s are Global; an Iterate sweep keeps the best window by "
         f"piv_median_s2n ({per})")
+
+
+def test_analysis_mesh() -> None:
+    """The correlation grid (2026-10-09): every DIC / PIV / DVC producer — single node and
+    staged grid card — writes `<field>_mesh`, axis-aligned element boxes the Viewer draws
+    (DIC: pyALDIC's Q8 elements with their node indices; PIV: the window lattice's cells,
+    pitch = window − overlap; DVC: hexes with a z extent), shared by every frame (t = -1),
+    marked in `__analysis_mesh__` with its subset/window size; a PIV deform pass REPLACES
+    the grid with its finer one; a grid never steals a field's auto-resolution
+    (`_point_layers`); Load Analysis puts the grid and its mark back."""
+    if not _HAVE_SKIMAGE:
+        _ok("analysis mesh: SKIPPED (scipy/skimage absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    from nodegraph.catalog._shared.labels import _point_layers
+    from nodegraph.catalog._shared.analysis_mesh import MESH_MARK
+    define_node("io.meshseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(41)
+
+    def run(chain, img, ax, md=None):
+        md = md or {"pixel_size_um": 0.5, "z_step_um": 1.0}
+        ds = Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+        g = Graph()
+        g.add(NodeInstance("S", "io.meshseed"))
+        prev = "S"
+        for i, (op, params) in enumerate(chain):
+            nid = f"N{i}"
+            g.add(NodeInstance(nid, op, params={**params, "results": "off"}
+                               if op.startswith("analysis.") else dict(params)))
+            g.connect(prev, nid, dst_socket="data")
+            prev = nid
+        return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=md)}).pull(prev)
+
+    def mesh(o, layer):
+        return {a.name: np.asarray(a.values) for a in o.layers_on(D.POINT) if a.layer == layer}
+
+    patt = gaussian_filter(rng.random((96, 96)), 1.0)
+    img2 = np.zeros((1, 2, 1, 1, 96, 96))
+    img2[0, 0, 0, 0] = patt
+    img2[0, 1, 0, 0] = ndshift(patt, (0.5, 1.0), order=3, mode="nearest")
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=96, x=96)
+
+    # ── PIV single: the window lattice, pitch = window − overlap ─────────────────────
+    o = run([("analysis.piv", {"window_size": 16, "overlap": 0.5})], img2, ax2)
+    mk = o.metadata[MESH_MARK]["piv_mesh"]
+    assert mk["field"] == "piv" and mk["kind"] == "quad" and mk["window"] == [16.0, 16.0], mk
+    pm = mesh(o, "piv_mesh")
+    assert pm["y_lo"].size and (pm["t"] == -1).all()
+    assert np.allclose(pm["y_hi"] - pm["y_lo"], 8.0) and np.allclose(pm["x_hi"] - pm["x_lo"], 8.0)
+    assert _point_layers(o) == ["piv"], _point_layers(o)      # the grid never auto-resolves
+    # ── PIV staged: a deform pass replaces the grid with its finer lattice ───────────
+    o1 = run([("piv.first_pass", {"window_size": 32}), ("piv.validate", {})], img2, ax2)
+    o2 = run([("piv.first_pass", {"window_size": 32}), ("piv.validate", {}),
+              ("piv.deform_pass", {"window_size": 16})], img2, ax2)
+    c1, c2 = mesh(o1, "piv_mesh"), mesh(o2, "piv_mesh")
+    assert c2["y_lo"].size > c1["y_lo"].size, (c1["y_lo"].size, c2["y_lo"].size)
+    assert np.allclose(c2["size_px"], 8.0) and np.allclose(c1["size_px"], 16.0)
+
+    # ── DVC single + staged grid: hexes with a z extent ─────────────────────────────
+    vol = np.zeros((1, 2, 28, 1, 44, 44))
+    base = gaussian_filter(rng.random((28, 44, 44)), 1.2)
+    vol[0, 0, :, 0] = base
+    vol[0, 1, :, 0] = ndshift(base, (0.0, 0.5, -0.5), order=3, mode="nearest")
+    axv = AxisSizes(m=1, t=2, z=28, c=1, y=44, x=44)
+    pv = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10, "subset_spacing_z": 4,
+          "admm_iterations": 1}
+    ov = run([("analysis.dvc_field", pv)], vol, axv)
+    hv = mesh(ov, "dvc_mesh")
+    assert hv["y_lo"].size and (hv["z_hi"] > hv["z_lo"]).all(), hv.get("z_lo")
+    assert ov.metadata[MESH_MARK]["dvc_mesh"]["window"] == [12.0, 12.0, 8.0]
+    og = run([("dvc.grid", {k: pv[k] for k in ("subset_size", "subset_size_z",
+                                               "subset_spacing", "subset_spacing_z")})],
+             vol, axv)
+    hg = mesh(og, "dvc_mesh")
+    assert hg["y_lo"].size == hv["y_lo"].size, (hg["y_lo"].size, hv["y_lo"].size)
+
+    if not al_dic_available():
+        _ok("analysis mesh: PIV/DVC grids verified; DIC SKIPPED (al-dic absent)")
+        return
+    # ── DIC single: pyALDIC's own elements (Q8 node indices kept) ───────────────────
+    od = run([("analysis.dic_correlate", {"winsize": 20, "winstepsize": 16})], img2, ax2)
+    dm = mesh(od, "dic_mesh")
+    mk = od.metadata[MESH_MARK]["dic_mesh"]
+    assert mk["kind"] == "fem" and mk["window"] == [20.0, 20.0], mk
+    assert dm["y_lo"].size and (dm["t"] == -1).all() and (dm["n0"] >= 0).all()
+    assert np.allclose(dm["size_px"], 16.0), np.unique(dm["size_px"])   # the base step
+    field = mesh(od, "dic")
+    corners = set(zip(np.round(dm["y_lo"], 6), np.round(dm["x_lo"], 6)))
+    nodes = set(zip(np.round(field["y"], 6), np.round(field["x"], 6)))
+    assert corners <= nodes, "element corners must be the field's own nodes"
+    assert od.metadata["dic_winsize"] == 20 and _point_layers(od) == ["dic"]
+    # ── DIC staged grid: the lattice's cells, one set per plane ─────────────────────
+    ogr = run([("dic.grid", {"winsize": 20, "winstepsize": 16})], img2, ax2)
+    gm = mesh(ogr, "dic_mesh")
+    assert gm["y_lo"].size and np.allclose(gm["size_px"], 16.0)
+    _ok(f"analysis mesh (2026-10-09): PIV lattice cells at the 8 px pitch (16 px windows, "
+        f"50 %), a deform pass replaces the 16 px grid with the finer 8 px one "
+        f"({c1['y_lo'].size} → {c2['y_lo'].size} cells); DVC {hv['y_lo'].size} hexes with a z "
+        f"extent, single ≡ grid card; DIC {dm['y_lo'].size} pyALDIC elements whose corners are "
+        f"the field's nodes; all t = -1, marked with their window; grids never auto-resolve")
 
 
 def test_catalog_piv() -> None:
@@ -31614,6 +31722,7 @@ def main() -> int:
     test_analysis_store()
     test_analysis_parallel()
     test_quick_scope()
+    test_analysis_mesh()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

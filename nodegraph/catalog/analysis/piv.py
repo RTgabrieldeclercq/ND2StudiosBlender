@@ -32,6 +32,8 @@ from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_se
                                                       stamp_trial, store_sockets, unit_list,
                                                       unship, with_quality)
 from nodegraph.analysis_store import unit_name
+from nodegraph.catalog._shared.analysis_mesh import (lattice_quads, mesh_columns,
+                                                     mesh_layer_name, with_mesh)
 
 # ── PIV (OpenPIV) — the FLOW sibling of DIC/DVC ─────────────────────────────────
 #
@@ -260,7 +262,7 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     prov_md = {"piv_reference_mode": (ref_mode if ref_prov is None or
                                       ref_mode == "ensemble" else "fixed_frame"),
                "piv_reference_frame": ref_frame, "piv_correlation": corr,
-               "piv_invalid_points": n_dropped}
+               "piv_invalid_points": n_dropped, "piv_window": window}
     if want_vel:
         prov_md["piv_dt_s"] = float(dt_s)
     kept = int(len(merged.get("m", ())))
@@ -277,15 +279,21 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
         prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
                                         f"(from this quick run)")
     finish_trial(opened, run, stamps=prov_md, quality=quality,
-                 tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"}})
+                 tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"},
+                         "mesh": {"domain": "point", "layer": mesh_layer_name(layer),
+                                  "z_kind": "plane_index", "mesh_of": layer,
+                                  "mesh_kind": "quad", "mesh_window": [window, window]}})
     prov_md = stamp_trial(prov_md, opened, run)
+    mesh_rows = concat_tables(run.results, "mesh")
     if not merged:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
         return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return with_quality(ds.with_structure(
+    out = ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
-        .with_metadata(**prov_md), quality)
+    out = with_mesh(out, layer, mesh_rows, kind="quad", z_kind="plane_index",
+                    window=(window, window))
+    return with_quality(out.with_metadata(**prov_md), quality)
 
 
 class _PIVArraySeq:
@@ -337,13 +345,17 @@ def _piv_unit(payload: dict, progress_cb=None) -> dict:
             rows.append(row)
 
     seq = _PIVArraySeq(frames)
+    first = []                                            # the lattice, for the grid table
     if payload["ensemble"]:
         # ONE time-averaged field per (m, z), stamped t=0
-        emit(run_piv_ensemble(seq, params, vox, pairing=pairing, roi_mask=payload["roi"],
-                              progress_cb=progress_cb), 0)
+        res = run_piv_ensemble(seq, params, vox, pairing=pairing, roi_mask=payload["roi"],
+                               progress_cb=progress_cb)
+        first.append(res)
+        emit(res, 0)
     else:
         series = run_piv_series(seq, params, vox, pairing=pairing, roi_mask=payload["roi"],
                                 progress_cb=progress_cb)
+        first.extend(series[:1])
         for i, t in enumerate(payload["result_t"]):
             if i >= len(series):
                 break
@@ -355,6 +367,15 @@ def _piv_unit(payload: dict, progress_cb=None) -> dict:
             emit(series[i], t, unc)
     tables = ({"field": {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}}
               if rows else {})
+    if first:
+        # the final pass's window-centre lattice, one cell per 2 × 2 block of centres — the
+        # same for every pair of the line (t = -1); cells touching an excluded window drop
+        g = np.asarray(first[0].grid_coords, dtype=float)
+        keep = ~np.asarray(first[0].excluded, dtype=bool)
+        mesh_rows = lattice_quads(g[:, 0, 0], g[0, :, 1], m=m, t=-1, c=c, z_plane=z,
+                                  keep=keep)
+        if mesh_rows:
+            tables["mesh"] = mesh_rows
     return {"tables": tables, "stats": {"dropped": dropped}}
 
 
@@ -371,14 +392,17 @@ def _columns_piv(params, modes, incoming):
     try:
         cols = list(dvc_field_columns(is_3d=False))      # PIV correlates PLANES, always 2D
         cols += ["replaced", "vy", "vx", "speed", "unc_y", "unc_x"]
-        return on_layer(Domain.POINT, str((params or {}).get("name") or "piv"), cols)
+        name = str((params or {}).get("name") or "piv")
+        return (tuple(on_layer(Domain.POINT, name, cols))
+                + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("quad"))))
     except Exception:                        # pragma: no cover - defensive
         return ()
 
 def _layers_piv(params, modes):
-    """The quality scalars (Global) this node writes for a sweep to optimise — no
-    socket names them (``_shared.analysis_units.QUALITY``)."""
-    return quality_layers("analysis.piv")
+    """The layers no socket names: the quality scalars (Global) a sweep optimises and the
+    window grid's cell table ``<name>_mesh`` (Point) the Viewer draws."""
+    name = str((params or {}).get("name") or "piv")
+    return quality_layers("analysis.piv") + ((Domain.POINT, mesh_layer_name(name)),)
 
 
 register_node(

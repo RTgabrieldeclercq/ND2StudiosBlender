@@ -144,7 +144,11 @@ because nothing opaque may ride the memo, the spill or a saved file.
 
 For a pair: one `DVCResult`. For a series: `List[Dict[str, DVCResult]]`, one dict
 per deformed frame, keys `"primary"` (cumulative — from pyALDIC `U_accum`, falling
-back to `U`) and `"increment"` (per-step `U`).
+back to `U`) and `"increment"` (per-step `U`), plus (2026-10-09) `"mesh"`:
+`{"coords": (N, 2) [x, y], "elements": (E, 8) int}`, the FE mesh that frame was solved on
+— pyALDIC's Q8 connectivity, `-1` for an absent mid-side (hanging) node, refined elements
+included. `analysis.dic_correlate` turns it into the `<field>_mesh` grid table the
+Viewer draws (`catalog/_shared/analysis_mesh.fem_quads`).
 
 `resample` chooses the output geometry. `G` below is `(Gy, Gx)` for `"grid"` (a regular
 lattice of pitch `winstepsize`, the historical contract) and `(N,)` for `"nodes"` (the FE

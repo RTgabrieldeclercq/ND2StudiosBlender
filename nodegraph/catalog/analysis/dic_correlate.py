@@ -31,6 +31,8 @@ from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_se
                                                       stamp_trial, store_sockets, unit_list,
                                                       unship, with_quality)
 from nodegraph.analysis_store import unit_name
+from nodegraph.catalog._shared.analysis_mesh import (concat_rows, fem_quads, mesh_columns,
+                                                     mesh_layer_name, with_mesh)
 
 # ── DIC (pyALDIC) — 2D digital image correlation, the image sibling of DVC ──────
 #
@@ -217,7 +219,8 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
     # DIC 2D increment is not an ALDVC volume increment, so it must not be fed there).
     prov_md = {"dic_reference_mode": (ref_mode if ref_prov is None else "fixed_frame"),
                "dic_reference_frame": ref_frame, "dic_solver": solver,
-               "dic_unsolved_points": n_dropped}
+               "dic_unsolved_points": n_dropped,
+               "dic_winsize": params["winsize"], "dic_winstepsize": params["winstepsize"]}
     kept = int(len(merged.get("m", ())))
     quality = {"dic_solved_frac": (kept / (kept + n_dropped)) if (kept + n_dropped) else None}
     est = full_run_estimate(ds.metadata, ax, run, per_plane=True, min_inner=2)
@@ -226,15 +229,22 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
         prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
                                         f"(from this quick run)")
     finish_trial(opened, run, stamps=prov_md, quality=quality,
-                 tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"}})
+                 tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"},
+                         "mesh": {"domain": "point", "layer": mesh_layer_name(layer),
+                                  "z_kind": "plane_index", "mesh_of": layer,
+                                  "mesh_kind": "fem",
+                                  "mesh_window": [params["winsize"], params["winsize"]]}})
     prov_md = stamp_trial(prov_md, opened, run)
+    mesh_rows = concat_tables(run.results, "mesh")
     if not merged:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
         return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return with_quality(ds.with_structure(
+    out = ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
-        .with_metadata(**prov_md), quality)
+    out = with_mesh(out, layer, mesh_rows, kind="fem", z_kind="plane_index",
+                    window=(params["winsize"], params["winsize"]))
+    return with_quality(out.with_metadata(**prov_md), quality)
 
 
 class _DICArraySeq:
@@ -282,6 +292,20 @@ def _dic_correlate_unit(payload: dict, progress_cb=None) -> dict:
             rows.append(row)
     tables = ({"field": {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}}
               if rows else {})
+    # the FE grid each result frame was solved on — written ONCE (t = -1, "every frame")
+    # when every frame shares it, which is the usual case (one reference mesh per line)
+    meshes = [(t, series[i].get("mesh")) for i, t in enumerate(payload["result_t"])
+              if i < len(series) and series[i].get("mesh") is not None]
+    if meshes:
+        same = all(np.array_equal(mh["elements"], meshes[0][1]["elements"])
+                   and np.array_equal(mh["coords"], meshes[0][1]["coords"])
+                   for _t, mh in meshes)
+        parts = [fem_quads(mh["coords"], mh["elements"], m=payload["m"],
+                           t=(-1 if same else t), c=payload["c"], z_plane=payload["z"])
+                 for t, mh in (meshes[:1] if same else meshes)]
+        mesh_rows = concat_rows(parts)
+        if mesh_rows:
+            tables["mesh"] = mesh_rows
     return {"tables": tables, "stats": {"dropped": dropped}}
 
 def _columns_dic_correlate(params, modes, incoming):
@@ -294,15 +318,19 @@ def _columns_dic_correlate(params, modes, incoming):
     name — whereas omitting it would make a real column unpickable, which is the direction
     this catalog must not err in."""
     try:
-        return on_layer(Domain.POINT, str((params or {}).get("name") or "dic"),
-                        list(dvc_field_columns(is_3d=False)) + ["qfactor"])
+        name = str((params or {}).get("name") or "dic")
+        return (tuple(on_layer(Domain.POINT, name,
+                               list(dvc_field_columns(is_3d=False)) + ["qfactor"]))
+                + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("fem"))))
     except Exception:                        # pragma: no cover - defensive
         return ()
 
 def _layers_dic_correlate(params, modes):
-    """The quality scalars (Global) this node writes for a sweep to optimise — no socket
-    names them (``_shared.analysis_units.QUALITY``)."""
-    return quality_layers("analysis.dic_correlate")
+    """The layers no socket names: the quality scalars (Global) a sweep optimises
+    (``_shared.analysis_units.QUALITY``) and the correlation grid's element table,
+    ``<name>_mesh`` (Point), which the Viewer draws over the image."""
+    name = str((params or {}).get("name") or "dic")
+    return quality_layers("analysis.dic_correlate") + ((Domain.POINT, mesh_layer_name(name)),)
 
 
 register_node(

@@ -31,6 +31,8 @@ from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_se
                                                       stamp_trial, store_sockets, unit_list,
                                                       unship, with_quality)
 from nodegraph.analysis_store import unit_name
+from nodegraph.catalog._shared.analysis_mesh import (grid_hexes, mesh_columns,
+                                                     mesh_layer_name, with_mesh)
 
 # Params the in-repo ALDVC port read and pyALDVC has no equivalent for, mapped to
 # their old defaults. A saved graph that still carries one at its OLD DEFAULT is
@@ -254,6 +256,8 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
         "dvc_reference_mode": eff_mode, "dvc_reference_frame": ref_frame,
         "dvc_strain_type": dvc_params["strain_type"],
         "dvc_strain_smooth": dvc_params["strain_smooth"],
+        "dvc_subset_size": dvc_params["subset_size"],
+        "dvc_subset_size_z": dvc_params["subset_size_z"],
     }
     zk = "subpixel"
     dz = np.asarray(merged.get("disp_z", ()), dtype=float)
@@ -268,15 +272,24 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
         prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
                                         f"(from this quick run)")
     finish_trial(opened, run, stamps=prov_md, quality=quality,
-                 tables={"field": {"domain": "point", "layer": layer, "z_kind": zk}})
+                 tables={"field": {"domain": "point", "layer": layer, "z_kind": zk},
+                         "mesh": {"domain": "point", "layer": mesh_layer_name(layer),
+                                  "z_kind": zk, "mesh_of": layer, "mesh_kind": "hex",
+                                  "mesh_window": [dvc_params["subset_size"],
+                                                  dvc_params["subset_size"],
+                                                  dvc_params["subset_size_z"]
+                                                  or dvc_params["subset_size"]]}})
     prov_md = stamp_trial(prov_md, opened, run)
+    mesh_rows = concat_tables(run.results, "mesh")
     if not merged:
         empty = point_table(np.zeros((0, 3)), z_kind=zk, layer=layer)
         return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return with_quality(
-        ds.with_structure(StructureTable(Domain.POINT, merged, layer=layer, z_kind=zk))
-        .with_metadata(**prov_md), quality)
+    out = ds.with_structure(StructureTable(Domain.POINT, merged, layer=layer, z_kind=zk))
+    sz = dvc_params["subset_size"]
+    out = with_mesh(out, layer, mesh_rows, kind="hex", z_kind=zk,
+                    window=(sz, sz, dvc_params["subset_size_z"] or sz))
+    return with_quality(out.with_metadata(**prov_md), quality)
 
 
 class _DVCVolumeSeq:
@@ -324,6 +337,16 @@ def _dvc_field_unit(payload: dict, progress_cb=None) -> dict:
             for t_out, res in zip(payload["out_t"], results)]
     tables = ({"field": {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}}
               if rows else {})
+    if results:
+        # the solver's hexahedral grid — one box per 2 × 2 × 2 block of nodes, the same
+        # for every frame of the position (t = -1); a hex touching an unsolved node drops
+        g = np.asarray(results[0].grid_coords, dtype=float)
+        if g.ndim == 4:
+            ok = np.isfinite(np.asarray(results[0].displacement_field, float)).all(axis=-1)
+            mesh_rows = grid_hexes(g.shape[:3], g.reshape(-1, 3), m=payload["m"], t=-1,
+                                   c=payload["c"], valid=ok)
+            if mesh_rows:
+                tables["mesh"] = mesh_rows
     return {"tables": tables, "stats": {}}
 
 
@@ -337,16 +360,19 @@ def _columns_dvc_field(params, modes, incoming):
     lacks is a menu entry the compute then refuses by name — whereas omitting a real column
     would make it unpickable, which is the direction this catalog must not err in."""
     try:
-        return on_layer(Domain.POINT, str((params or {}).get("name") or "dvc"),
-                        list(dvc_field_columns(is_3d=True)) + ["qfactor"])
+        name = str((params or {}).get("name") or "dvc")
+        return (tuple(on_layer(Domain.POINT, name,
+                               list(dvc_field_columns(is_3d=True)) + ["qfactor"]))
+                + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("hex"))))
     except Exception:                        # pragma: no cover - defensive
         return ()
 
 
 def _layers_dvc_field(params, modes):
-    """The quality scalars (Global) this node writes for a sweep to optimise — no
-    socket names them (``_shared.analysis_units.QUALITY``)."""
-    return quality_layers("analysis.dvc_field")
+    """The layers no socket names: the quality scalars (Global) a sweep optimises and the
+    solver grid's hexahedron table ``<name>_mesh`` (Point) the Viewer sections and draws."""
+    name = str((params or {}).get("name") or "dvc")
+    return quality_layers("analysis.dvc_field") + ((Domain.POINT, mesh_layer_name(name)),)
 
 
 register_node(

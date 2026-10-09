@@ -104,6 +104,14 @@ def _compute_load_analysis(ctx: EvalContext) -> Dataset:
             Domain(str(where.get("domain", "point"))), cols,
             layer=str(where.get("layer", kind)),
             z_kind=str(where.get("z_kind", "plane_index"))))
+        if where.get("mesh_of"):                         # a correlation grid: the Viewer
+            from nodegraph.catalog._shared.analysis_mesh import MESH_MARK   # draws it
+            marks = dict(out.metadata.get(MESH_MARK) or {})
+            marks[str(where.get("layer", kind))] = {"field": str(where["mesh_of"]),
+                                                    "kind": str(where.get("mesh_kind", ""))}
+            if where.get("mesh_window"):
+                marks[str(where.get("layer", kind))]["window"] = list(where["mesh_window"])
+            out = out.with_metadata(**{MESH_MARK: marks})
     stamps = dict(hdr.get("stamps") or {})
     stamps.update({
         "analysis_trial": td.path,
@@ -114,8 +122,34 @@ def _compute_load_analysis(ctx: EvalContext) -> Dataset:
     return out.with_metadata(**stamps)
 
 
+def _columns_load_analysis(params, modes, incoming):
+    """The columns the chosen trial's tables carry, read from its ``trial.json`` when the
+    trial is given as a folder path (a bare trial id resolves against the incoming
+    source, which this edit-time hook cannot see — then nothing is declared until the
+    path form is used). Total: any problem declares nothing."""
+    from nodegraph.catalog._shared.columns import on_layer
+    try:
+        import json
+        t = str((params or {}).get("trial", "") or "").strip().strip('"').strip("'")
+        hdr_path = t if t.lower().endswith("trial.json") else os.path.join(t, "trial.json")
+        if not t or not os.path.isfile(hdr_path):
+            return ()
+        with open(hdr_path, "r", encoding="utf-8") as fh:
+            hdr = json.load(fh)
+        out: list = []
+        for _kind, where in (hdr.get("tables") or {}).items():
+            cols = where.get("columns") or []
+            if cols:
+                out.extend(on_layer(Domain(str(where.get("domain", "point"))),
+                                    str(where.get("layer", _kind)), list(cols)))
+        return tuple(out)
+    except Exception:  # noqa: BLE001 — an edit-time declaration must never raise
+        return ()
+
+
 register_node(
     _compute_load_analysis, op_key="io.load_analysis", label="Load Analysis", category="io",
+    adds_columns=_columns_load_analysis,
     reads_domains=frozenset(), adds_domains=frozenset({Domain.POINT, Domain.TRACK}),
     inputs=[
         InDataset(available_in={"onto": frozenset({"image"})},
