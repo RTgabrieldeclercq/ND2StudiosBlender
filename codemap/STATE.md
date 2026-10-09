@@ -4,16 +4,16 @@
 
 | | |
 |---|---|
-| catalog node types | **124** |
+| catalog node types | **125** |
 | GUI-layer ops (`io.load`, `view.viewer`, `io.dock`, `page.input`, `page.output`) | 6 |
-| sockets + mode selectors | 1238 |
+| sockets + mode selectors | 1248 |
 | mapped Python modules | 343 |
-| indexed symbols | 5340 |
+| indexed symbols | 5346 |
 | first-party import edges | 1854 |
-| LOC — `nodegraph/` | 117,058 |
+| LOC — `nodegraph/` | 117,386 |
 | LOC — `nodelab_v2/` | 58,892 |
 | LOC — `scripts/` | 21,642 |
-| map fingerprint | `25c4d706d3378dafdf4f4c5c86df39f5` |
+| map fingerprint | `38b0362120d6859a716e5673b43c1cec` |
 | gates last verified green | **2026-10-07** |
 
 `gates last verified green` moves only when a human or agent passes

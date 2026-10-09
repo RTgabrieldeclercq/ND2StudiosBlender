@@ -7390,11 +7390,67 @@ def test_analysis_mesh() -> None:
     ogr = run([("dic.grid", {"winsize": 20, "winstepsize": 16})], img2, ax2)
     gm = mesh(ogr, "dic_mesh")
     assert gm["y_lo"].size and np.allclose(gm["size_px"], 16.0)
+
+    # ── refinement at an ROI hole: single node and the staged Refine Mesh card ──────
+    N = 160
+    patt2 = gaussian_filter(rng.random((N, N)), 1.0)
+    img_r = np.zeros((1, 2, 1, 1, N, N))
+    img_r[0, 0, 0, 0] = patt2
+    img_r[0, 1, 0, 0] = ndshift(patt2, (0.8, 1.3), order=3, mode="nearest")
+    yy, xx = np.mgrid[:N, :N]
+    roi6 = np.zeros((1, 2, 1, 1, N, N), np.uint8)
+    roi6[0, :, 0, 0] = (yy - N / 2) ** 2 + (xx - N / 2) ** 2 > 22 ** 2
+    axr = AxisSizes(m=1, t=2, z=1, c=1, y=N, x=N)
+
+    def run_roi(chain):
+        md = {"pixel_size_um": 1.0}
+        ds = (Dataset(axes=axr, metadata=md).with_image(ArrayProvider(img_r))
+              .with_layer(D.VOXEL, "roi_mask", roi6))
+        g = Graph()
+        g.add(NodeInstance("S", "io.meshseed"))
+        prev = "S"
+        for i, (op, params) in enumerate(chain):
+            g.add(NodeInstance(f"N{i}", op, params=dict(params)))
+            g.connect(prev, f"N{i}", dst_socket="data")
+            prev = f"N{i}"
+        return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                      meta_seeds={"S": MetaEnvelope(axes=axr, metadata=md)}).pull(prev)
+    base = {"winsize": 24, "winstepsize": 16, "winsize_min": 4}
+    plain = mesh(run_roi([("analysis.dic_correlate", {**base, "results": "off"})]), "dic_mesh")
+    o_ref = run_roi([("analysis.dic_correlate", {**base, "results": "off", "refine_holes": True})])
+    m_ref = mesh(o_ref, "dic_mesh")
+    assert m_ref["y_lo"].size > plain["y_lo"].size and m_ref["level"].max() >= 1, \
+        (plain["y_lo"].size, m_ref["y_lo"].size, np.unique(m_ref["level"]))
+    assert m_ref["size_px"].min() >= 4.0 and (m_ref[[f"n{i}" for i in range(4, 8)][0]] >= -1).all()
+    o_st = run_roi([("dic.grid", {**base, "roi": "roi_mask"}), ("dic.initial_guess", {}),
+                    ("dic.refine_mesh", {"refine_holes": True}), ("dic.local_match", {}),
+                    ("dic.global_step", {})])
+    m_st = mesh(o_st, "dic_mesh")
+    assert np.allclose(np.sort(m_st["y_lo"]), np.sort(m_ref["y_lo"])) and \
+        np.allclose(np.sort(m_st["x_lo"]), np.sort(m_ref["x_lo"])), \
+        "the staged Refine Mesh card must refine exactly as pyALDIC does inside the single node"
+    fs, fr = mesh(o_st, "dic"), mesh(o_ref, "dic")
+    key = {(round(a, 6), round(b, 6), int(t)): i
+           for i, (a, b, t) in enumerate(zip(fs["y"], fs["x"], fs["t"]))}
+    pairs = [(key[(round(a, 6), round(b, 6), int(t))], j)
+             for j, (a, b, t) in enumerate(zip(fr["y"], fr["x"], fr["t"]))
+             if (round(a, 6), round(b, 6), int(t)) in key]
+    assert len(pairs) == len(fr["y"]), "every node the single node solved is in the staged table"
+    ii, jj = np.array(pairs).T
+    dd = np.abs(fs["disp_x"][ii] - fr["disp_x"][jj])
+    assert np.nanmedian(dd) < 1e-10 and np.nanmax(dd) < 1e-2, (np.nanmedian(dd), np.nanmax(dd))
+    off = run_roi([("dic.grid", {**base, "roi": "roi_mask"}), ("dic.initial_guess", {}),
+                   ("dic.refine_mesh", {"refine_holes": False})])
+    assert "dic_refine" not in off.metadata, "Refine Mesh with nothing on must pass through"
     _ok(f"analysis mesh (2026-10-09): PIV lattice cells at the 8 px pitch (16 px windows, "
         f"50 %), a deform pass replaces the 16 px grid with the finer 8 px one "
         f"({c1['y_lo'].size} → {c2['y_lo'].size} cells); DVC {hv['y_lo'].size} hexes with a z "
         f"extent, single ≡ grid card; DIC {dm['y_lo'].size} pyALDIC elements whose corners are "
-        f"the field's nodes; all t = -1, marked with their window; grids never auto-resolve")
+        f"the field's nodes; all t = -1, marked with their window; grids never auto-resolve; "
+        f"refine_holes at an ROI hole {plain['y_lo'].size} → {m_ref['y_lo'].size} elements "
+        f"(levels to {int(m_ref['level'].max())}), the staged Refine Mesh card refines to the "
+        f"SAME elements and matches on every solved node (median {np.nanmedian(dd):.1e} µm), "
+        f"and passes through with nothing on")
 
 
 def test_catalog_piv() -> None:
@@ -31544,7 +31600,8 @@ def test_dic_stages() -> None:
        on displacement and the four gradient columns.
     2. The grid stamps the ``dic_*`` provenance every later stage reads; a stage fed a table
        without it refuses by name.
-    3. The bundle is sound against the registry and places five wired nodes in a frame.
+    3. The bundle is sound against the registry and places six wired nodes in a frame
+       (Refine Mesh among them since 2026-10-09; a pass-through without an ROI).
     Needs scipy/skimage + al-dic for parts 1-2 (dep-gated like the single node)."""
     from nodegraph.bundles import BUNDLES, validate_bundle
     from nodelab_v2.document import GraphDocument
@@ -31553,11 +31610,11 @@ def test_dic_stages() -> None:
     b = BUNDLES.get("bundle:dic")
     assert b is not None, "bundle:dic is not registered"
     assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
-    assert b.op_keys == ("dic.grid", "dic.initial_guess", "dic.local_match", "dic.global_step",
-                         "dic.strain"), b.op_keys
+    assert b.op_keys == ("dic.grid", "dic.initial_guess", "dic.refine_mesh", "dic.local_match",
+                         "dic.global_step", "dic.strain"), b.op_keys
     doc = GraphDocument()
     ids, fid = doc.place_bundle("bundle:dic", x=0, y=0)
-    assert len(ids) == 5 and set(doc.frames[fid].members) == set(ids)
+    assert len(ids) == 6 and set(doc.frames[fid].members) == set(ids)
 
     if not _HAVE_SKIMAGE:
         _ok("dic stages: bundle placed; solver parts SKIPPED (scipy absent)")
@@ -31647,7 +31704,7 @@ def test_dic_stages() -> None:
     _ok(f"dic stages: grid → seed → local → global → strain through the Engine recovers "
         f"({got[0]:.3f}, {got[1]:.3f}) µm for the planted shift on the same {n_rows} rows, within "
         f"{dmax:.1e} of analysis.dic_correlate on all 289 nodes (displacement + gradient); "
-        f"missing grid refused by name; bundle:dic places 5 wired nodes in a frame")
+        f"missing grid refused by name; bundle:dic places 6 wired nodes in a frame")
 
 
 def main() -> int:

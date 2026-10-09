@@ -1296,6 +1296,27 @@
         "pyALDIC section 3 as its own card: the FFT integer seed of every lattice node with its correlation peak, written as disp_* before any refinement."
       ]
     },
+    "dic.refine_mesh": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "pyALDIC compiles its numba kernels on first use",
+      "features": [
+        "pyALDIC's pre-solve adaptive refinement as its own card: elements at ROI holes, the ROI edge or a brush mask are quadtree-split and the seed is interpolated onto the new nodes.",
+        "The refined grid replaces the lattice and shows in the Viewer's Grid tab, coloured by refinement level; with no ROI or brush it passes through."
+      ]
+    },
     "dic.local_match": {
       "kind": "field",
       "phantom": "speckle_pair",

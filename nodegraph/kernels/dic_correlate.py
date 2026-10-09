@@ -1014,6 +1014,32 @@ def dic_stage_mesh(ref: DICReference, x0: np.ndarray, y0: np.ndarray):
                    x0=base.x0, y0=base.y0, element_min_size=base.element_min_size)
 
 
+def dic_stage_refine(ref: DICReference, mesh, U0: Optional[np.ndarray],
+                     refinement: Optional[Dict[str, Any]]):
+    """Pre-solve adaptive refinement (``pipeline.py:1374-1404``) as its own step
+    (2026-10-09): the criteria of ``refinement`` (the same spec ``run_pyaldic_series``
+    takes — ``criteria.mask_boundary`` / ``roi_edge`` / ``brush``, ``brush`` (H, W),
+    ``min_element_size``) applied to ``mesh`` with ``al_dic.mesh.refinement.refine_mesh``,
+    which quadtree-splits the marked elements, rebuilds the Q8 connectivity with hanging
+    nodes, removes in-hole elements and interpolates ``U0`` onto the new nodes.
+
+    → ``(mesh, U0)``: the input mesh and ``U0`` (or zeros) unchanged when no criterion is
+    on. Refinement depends on the mesh, the mask and the criteria — never on ``U0`` — so a
+    stage that needs the refined mesh again (Local Match, Global Step, Strain) rebuilds it
+    exactly by calling this with ``U0=None``; that is how the staged chain carries a refined
+    mesh without serialising pyALDIC's object."""
+    n = int(mesh.coordinates_fem.shape[0])
+    u0 = np.zeros(2 * n) if U0 is None else np.asarray(U0, dtype=np.float64).reshape(-1)
+    policy = _refinement_policy(refinement, half_win=max(1, int(ref.para.winsize) // 2))
+    if policy is None or not policy.has_pre_solve:
+        return mesh, u0.copy()
+    refine = importlib.import_module("al_dic.mesh.refinement")
+    ctx = refine.RefinementContext(mesh=mesh, mask=ref.f_mask)
+    h, w = (int(v) for v in np.asarray(ref.f_mask).shape[:2])
+    return refine.refine_mesh(mesh, list(policy.pre_solve), ctx, u0, mask=ref.f_mask,
+                              img_size=(h, w))
+
+
 def dic_stage_seed_on_mesh(ref: DICReference, mesh, U0: np.ndarray, x0: np.ndarray,
                            y0: np.ndarray) -> np.ndarray:
     """The seed as Section 4 receives it: interpolated onto the mesh when the FFT lattice

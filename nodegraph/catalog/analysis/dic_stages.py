@@ -6,6 +6,7 @@ those sections, one each, the way ``al_dic/core/pipeline.py::run_aldic`` is orga
 
     dic.grid           §2b the correlation lattice + the reference policy          (no correlation)
     dic.initial_guess  §3  the FFT integer seed per lattice node (auto-expanding search)
+    dic.refine_mesh    §3½ pre-solve adaptive refinement (ROI holes / edge / brush)  (optional)
     dic.local_match    §4  the 6-DOF IC-GN subset match                            (the cost centre)
     dic.global_step    §5-6 the global FEM compatibility solve + ADMM iterations
     dic.strain         §8  strain from the displacement field                      (no image read)
@@ -24,8 +25,9 @@ components after pyALDIC's strain post-processing.
 channel, ROI layer and the reference policy are stamped as ``dic_*`` provenance; the
 local stage stamps its tolerance and iteration cap. **Covered paths**: the FFT seed (what
 the single node uses), fixed and previous-frame references, a static ROI mask per
-``(m, z)`` line; not covered (the single node keeps them): pre-solve mesh refinement,
-seed propagation, an external reference Dataset — chain a separate reference in front
+``(m, z)`` line, pre-solve mesh refinement (Refine Mesh, 2026-10-09: the later stages
+re-derive the refined mesh from the stamped ``dic_refine``); not covered (the single node
+keeps them): seed propagation, an external reference Dataset — chain a separate reference in front
 with Timeseries Builder instead.
 """
 
@@ -41,6 +43,7 @@ from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.registry import (
     Granularity,
+    InBool,
     InDataset,
     InFloat,
     InInt,
@@ -55,7 +58,7 @@ from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
 from nodegraph.catalog._shared.analysis_units import scoped_frame
-from nodegraph.catalog._shared.analysis_mesh import (concat_rows, lattice_quads,
+from nodegraph.catalog._shared.analysis_mesh import (concat_rows, fem_quads, lattice_quads,
                                                      mesh_columns, mesh_layer_name,
                                                      with_mesh)
 
@@ -341,6 +344,154 @@ def _columns_dic_initial_guess(params, modes, incoming):
     return on_layer(Domain.POINT, str((params or {}).get("source") or _DEFAULT_LAYER), SEED_COLUMNS)
 
 
+# ── refinement: the spec a Refine Mesh card stamps, and the mesh every later stage uses ──
+
+def _dic_refine_spec(ds: Dataset, m: int, z: int, c: int) -> Optional[Dict[str, Any]]:
+    """The pre-solve refinement ``dic.refine_mesh`` stamped (``dic_refine``), with its brush
+    mask read for this ``(m, z)`` line — or ``None`` when the chain was not refined."""
+    spec = ds.metadata.get("dic_refine")
+    if not spec:
+        return None
+    brush = None
+    name = str(spec.get("brush") or "")
+    if name:
+        attr = ds.get(Domain.VOXEL, name)
+        if attr is not None:
+            v = attr.values
+            s = v.shape
+            brush = (np.asarray(v[min(m, s[0] - 1), 0, min(z, s[2] - 1), min(c, s[3] - 1)]) > 0
+                     ).astype(np.float64)
+    return {"criteria": {"mask_boundary": bool(spec.get("mask_boundary")),
+                         "roi_edge": bool(spec.get("roi_edge")), "brush": brush is not None},
+            "brush": brush, "min_element_size": int(spec.get("min_element_size") or 8)}
+
+
+def _dic_unit_mesh(ref, x0, y0, ds: Dataset, m: int, z: int, c: int):
+    """The mesh a stage solves on for one line: Section 3's trimmed lattice mesh, refined
+    exactly as an upstream Refine Mesh card refined it. Refinement depends only on the mesh,
+    the mask and the criteria (never the displacement), so re-deriving it here reproduces
+    the card's node order — the row order of the table — without carrying pyALDIC's object
+    down the wire."""
+    from nodegraph.kernels.dic_correlate import dic_stage_mesh, dic_stage_refine
+    mesh = dic_stage_mesh(ref, x0, y0)
+    spec = _dic_refine_spec(ds, m, z, c)
+    if spec is not None:
+        mesh, _u = dic_stage_refine(ref, mesh, None, spec)
+    return mesh
+
+
+# ── §3½  DIC Refine Mesh ──────────────────────────────────────────────────────────
+
+def _compute_dic_refine_mesh(ctx: EvalContext) -> Dataset:
+    """pyALDIC's pre-solve adaptive refinement as a node (2026-10-09): the quadtree split
+    ``run_aldic`` applies after the seed and before the local match
+    (``pipeline.py:1374-1404``). Elements straddling a hole in the ROI mask, reaching past
+    its outer edge, or lying inside a brush mask are split down to ``Min element``; the Q8
+    connectivity is rebuilt with hanging nodes and every frame's seed is interpolated onto
+    the new nodes. The lattice table is REPLACED by the refined one (rows per frame = the
+    refined node count of that line) and the ``<layer>_mesh`` grid with pyALDIC's refined
+    elements, coloured by level in the Viewer. With no criterion on it passes the data
+    through untouched.
+
+    Resolved spec: category analysis; op ``dic.refine_mesh``; reads VOXEL + POINT, adds
+    POINT; footprint WHOLE_SERIES / {t,y,x} (no frame is read — the mesh depends on the
+    mask, the seed on the table). Stamps ``dic_refine`` so Local Match / Global Step /
+    Strain re-derive the identical mesh. Kernel:
+    :func:`nodegraph.kernels.dic_correlate.dic_stage_refine`."""
+    from nodegraph.kernels.dic_correlate import (dic_merge_u, dic_split_u, dic_stage_grid,
+                                                 dic_stage_mesh, dic_stage_para,
+                                                 dic_stage_reference, dic_stage_refine)
+    node = "DIC Refine Mesh"
+    ds = ctx.inputs[0]
+    prov = ds.image
+    if prov is None:
+        raise ValueError(f"{node} needs an image provider on its input Dataset")
+    ax = prov.axes
+    layer = _dic_source(ctx, ds, node, ctx.layer("source"))
+    cols = _dic_table(ds, layer, node)
+    for dn in DISP_COLUMNS[:2]:
+        if dn not in cols:
+            raise ValueError(f"{node}: the lattice layer {layer!r} carries no {dn!r} — run DIC "
+                             "Initial Guess first (refinement interpolates the seed onto the new "
+                             "nodes)")
+    gp = _dic_prov(ds.metadata, node)
+    holes = bool(ctx.params.get("refine_holes", True))
+    edge = bool(ctx.params.get("refine_roi_edge", False))
+    brush_name = ctx.layer("refine_brush")
+    min_el = max(2, int(ctx.params.get("min_element_size", 0) or gp["dic_winsize_min"]))
+    if not (holes or edge or brush_name):
+        return ds.with_metadata(dic_stage="refine_mesh (off)")
+    spec_md = {"mask_boundary": holes, "roi_edge": edge, "brush": brush_name,
+               "min_element_size": min_el}
+    probe = ds.with_metadata(dic_refine=spec_md)        # what the later stages will read
+    px = _dic_px(ctx)
+    shape = (ax.y, ax.x)
+    n = int(gp["dic_n_nodes"])
+    c = int(gp["dic_channel"])
+    roi_name = str(gp["dic_roi"] or "")
+    ref_mode = str(gp["dic_reference_mode"])
+    plan = _dic_plan(ax, ref_mode, int(gp["dic_reference_frame"]))
+    disp_in = np.stack([np.asarray(cols["disp_y"], float), np.asarray(cols["disp_x"], float)], axis=1)
+    rows: List[Dict[str, np.ndarray]] = []
+    cells: List[Dict[str, np.ndarray]] = []
+    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)),
+                   note="refining")
+    n_before = n_after = 0
+    for m in range(ax.m):
+        for z in range(ax.z):
+            roi = _dic_roi_plane(ds, roi_name, m, z, c)
+            para = dic_stage_para(_dic_kernel_params(gp, {}), shape,
+                                  reference_mode=_dic_al_mode(ref_mode), roi_mask=roi)
+            x0, y0 = dic_stage_grid(para, shape)
+            # the mesh depends on the mask, not the pixels — the strain stage's blank reference
+            ref = dic_stage_reference(np.zeros(shape, dtype=np.float64), para, shape, roi_mask=roi)
+            base = dic_stage_mesh(ref, x0, y0)
+            spec = _dic_refine_spec(probe, m, z, c)
+            mesh_r = base
+            for (t_out, t_ref) in plan:
+                idx = _dic_rows(cols, m, t_out, z, c, n, node)
+                u0 = dic_merge_u(disp_in[idx, 1] / px, disp_in[idx, 0] / px)
+                mesh_r, u_ref = dic_stage_refine(ref, base, u0, spec)
+                ux, vy = dic_split_u(u_ref)
+                xy = np.asarray(mesh_r.coordinates_fem, dtype=float)
+                k = xy.shape[0]
+                rows.append({"m": np.full(k, m, np.int64), "t": np.full(k, t_out, np.int64),
+                             "c": np.full(k, c, np.int64), "z": np.full(k, float(z)),
+                             "y": xy[:, 1], "x": xy[:, 0], "disp_y": vy * px,
+                             "disp_x": ux * px,
+                             "disp_mag_um": np.sqrt(np.nansum(np.stack([vy, ux]) ** 2, 0)) * px})
+                bar.finish_unit(note=f"m={m} z={z} t={t_out}: {n} → {k} nodes")
+            n_before += n
+            n_after += int(np.asarray(mesh_r.coordinates_fem).shape[0])
+            cells.append(fem_quads(mesh_r.coordinates_fem, mesh_r.elements_fem, m=m, t=-1, c=c,
+                                   z_plane=z))
+    out = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]} if rows else {}
+    res = probe
+    for a in list(res.layers_on(Domain.POINT)):        # the refined grid REPLACES the lattice
+        if a.layer == layer:
+            res = res.without(Domain.POINT, a.name, layer)
+    if out:
+        out = {"id": np.arange(len(out["m"]), dtype=np.int64), **out}
+        res = res.with_structure(StructureTable(Domain.POINT, out, layer=layer,
+                                                z_kind="plane_index"))
+    res = with_mesh(res, layer, concat_rows(cells), kind="fem", z_kind="plane_index",
+                    window=(int(gp["dic_winsize"]), int(gp["dic_winsize"])))
+    return res.with_metadata(dic_stage="refine_mesh",
+                             dic_refined_nodes=f"{n_before} → {n_after} nodes over "
+                                               f"{ax.m * ax.z} line(s)")
+
+
+def _columns_dic_refine_mesh(params, modes, incoming):
+    name = str((params or {}).get("source") or _DEFAULT_LAYER)
+    return (tuple(on_layer(Domain.POINT, name, POINT_INVARIANT + DISP_COLUMNS))
+            + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("fem"))))
+
+
+def _layers_dic_refine_mesh(params, modes):
+    name = str((params or {}).get("source") or _DEFAULT_LAYER)
+    return ((Domain.POINT, name), (Domain.POINT, mesh_layer_name(name)))
+
+
 # ── §4  DIC Local Match ───────────────────────────────────────────────────────────
 
 def _compute_dic_local_match(ctx: EvalContext) -> Dataset:
@@ -396,8 +547,9 @@ def _compute_dic_local_match(ctx: EvalContext) -> Dataset:
                 dic_stage_normalize(_dic_plane(prov, _m, t_ref, _z, c), _p), _p, shape, roi_mask=_r))
             for (t_out, t_ref) in plan:
                 ref = refs.get(t_ref)
+                mesh = _dic_unit_mesh(ref, x0, y0, ds, m, z, c)
+                n = int(mesh.coordinates_fem.shape[0])
                 idx = _dic_rows(cols, m, t_out, z, c, n, node)
-                mesh = dic_stage_mesh(ref, x0, y0)
                 g = dic_stage_normalize(_dic_plane(prov, m, t_out, z, c), para)
                 u0 = dic_merge_u(disp_in[idx, 1] / px, disp_in[idx, 0] / px)
                 r = dic_stage_local(ref, mesh, g, u0)
@@ -497,8 +649,9 @@ def _compute_dic_global_step(ctx: EvalContext) -> Dataset:
             beta_by_ref: Dict[int, float] = {}
             for (t_out, t_ref) in plan:
                 ref = refs.get(t_ref)
+                mesh = _dic_unit_mesh(ref, x0, y0, ds, m, z, c)
+                n = int(mesh.coordinates_fem.shape[0])
                 idx = _dic_rows(cols, m, t_out, z, c, n, node)
-                mesh = dic_stage_mesh(ref, x0, y0)
                 g = dic_stage_normalize(_dic_plane(prov, m, t_out, z, c), para)
                 u1 = dic_merge_u(np.nan_to_num(disp_in[idx, 1]) / px, np.nan_to_num(disp_in[idx, 0]) / px)
                 gyy, gyx, gxy, gxx = (np.nan_to_num(grad_in[idx, k]) for k in range(4))
@@ -592,7 +745,8 @@ def _compute_dic_strain(ctx: EvalContext) -> Dataset:
             # the strain reads no frame: a blank, mask-only reference carries the mask + para
             blank = np.zeros(shape, dtype=np.float64)
             ref = dic_stage_reference(blank, para, shape, roi_mask=roi)
-            mesh = dic_stage_mesh(ref, x0, y0)
+            mesh = _dic_unit_mesh(ref, x0, y0, ds, m, z, c)
+            n = int(mesh.coordinates_fem.shape[0])
             for (t_out, t_ref) in plan:
                 idx = _dic_rows(cols, m, t_out, z, c, n, node)
                 u = dic_merge_u(np.nan_to_num(disp_in[idx, 1]) / px, np.nan_to_num(disp_in[idx, 0]) / px)
@@ -833,25 +987,68 @@ register_node(
 # ── the bundle: what the palette places ─────────────────────────────────────────
 
 _DX = 270.0
+register_node(
+    _compute_dic_refine_mesh, op_key="dic.refine_mesh", label="DIC Refine Mesh",
+    category="analysis", adds_columns=_columns_dic_refine_mesh,
+    extra_layers=_layers_dic_refine_mesh,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    inputs=[
+        InDataset(),
+        _SOURCE,
+        InBool("refine_holes", "Refine at holes", field=False, default=True,
+               description=
+               "Split the elements that straddle a HOLE in the ROI mask (DIC Grid's ROI "
+               "layer), down to Min element, so the field follows the hole's edge instead of "
+               "smearing across it. Only does anything when that ROI has holes. More nodes "
+               "there: every later card solves on the refined mesh. pyALDIC's "
+               "MaskBoundaryCriterion."),
+        InBool("refine_roi_edge", "Refine at ROI edge", field=False, default=False,
+               description=
+               "Split the elements whose subset window reaches past the ROI's OUTER edge, so "
+               "the outermost measurements sit closer to the boundary. Without an ROI the frame "
+               "edge is the ROI. pyALDIC's ROIEdgeCriterion."),
+        InString("refine_brush", "Refine where (mask)", field=False, default="",
+                 layer_in=Domain.VOXEL,
+                 description=
+                 "Optional Voxel mask (e.g. from Draw Regions) marking where YOU want the mesh "
+                 "finer — a crack tip, an inclusion, a cell edge. Its t=0 plane is used. Empty = "
+                 "no brush. pyALDIC's BrushRegionCriterion."),
+        InInt("min_element_size", "Min element", unit="px", field=False, default=0,
+              description=
+              "The smallest element refinement may make, in pixels. 0 = DIC Grid's Min "
+              "element. LOWER resolves sharper features at the refined spots and gives the "
+              "local match smaller, noisier subsets there."),
+    ],
+    outputs=[OutDataset()],
+    granularity=_STAGE_GRAN, kernel_axes=frozenset({"t", "y", "x"}),
+    description="pyALDIC's pre-solve adaptive mesh refinement as its own card: elements at "
+                "ROI holes, the ROI edge or a brush mask are quadtree-split before the local "
+                "match, the seed is interpolated onto the new nodes, and the refined grid "
+                "replaces the lattice (shown in the Viewer's Grid tab by level). Off = pass-"
+                "through.")
+
+
 register_bundle(Bundle(
     key="bundle:dic", label="DIC (pyALDIC) · staged", category="analysis",
     role="motion_and_deformation_fields",
     description=
-    "pyALDIC as five cards, wired in order and framed as one region: Grid → Initial Guess → "
-    "Local Match → Global Step → Strain. Pull any card to run the pipeline up to that section "
-    "and see the field as it stands; change a later card and only that section re-runs. The "
-    "same solver as the single DIC (pyALDIC) node, section for section (FFT seed, no mesh "
-    "refinement).",
+    "pyALDIC as six cards, wired in order and framed as one region: Grid → Initial Guess → "
+    "Refine Mesh → Local Match → Global Step → Strain. Pull any card to run the pipeline up to "
+    "that section and see the field as it stands; change a later card and only that section "
+    "re-runs. The same solver as the single DIC (pyALDIC) node, section for section (FFT "
+    "seed; Refine Mesh refines at ROI holes by default and passes through without an ROI).",
     nodes=(
         BundleNode("dic_grid", "dic.grid", 0.0, 0.0),
         BundleNode("dic_seed", "dic.initial_guess", _DX, 0.0),
-        BundleNode("dic_local", "dic.local_match", 2 * _DX, 0.0),
-        BundleNode("dic_global", "dic.global_step", 3 * _DX, 0.0),
-        BundleNode("dic_strain", "dic.strain", 4 * _DX, 0.0),
+        BundleNode("dic_refine", "dic.refine_mesh", 2 * _DX, 0.0),
+        BundleNode("dic_local", "dic.local_match", 3 * _DX, 0.0),
+        BundleNode("dic_global", "dic.global_step", 4 * _DX, 0.0),
+        BundleNode("dic_strain", "dic.strain", 5 * _DX, 0.0),
     ),
     edges=(
         BundleEdge("dic_grid", "out", "dic_seed", "data"),
-        BundleEdge("dic_seed", "out", "dic_local", "data"),
+        BundleEdge("dic_seed", "out", "dic_refine", "data"),
+        BundleEdge("dic_refine", "out", "dic_local", "data"),
         BundleEdge("dic_local", "out", "dic_global", "data"),
         BundleEdge("dic_global", "out", "dic_strain", "data"),
     ),

@@ -802,7 +802,8 @@ not recorded in the file and the engine never sees it. It exists so a complex an
 is really several *sections* can be run and re-tuned section by section, each card its own
 memo entry, instead of as one opaque node. Three ship: `bundle:dvc` places `dvc.grid` →
 `dvc.initial_guess` → `dvc.local_match` → `dvc.global_step` → `dvc.strain` (pyALDVC's
-sections); `bundle:dic` the same five for pyALDIC (`dic.*`); `bundle:piv` OpenPIV's ladder as
+sections); `bundle:dic` six for pyALDIC (`dic.*`, with `dic.refine_mesh` — pre-solve adaptive
+refinement — between the seed and the match); `bundle:piv` OpenPIV's ladder as
 `piv.first_pass` → `piv.validate` → `piv.deform_pass` → `piv.validate` → `piv.deform_pass` →
 `piv.validate`. Each chain hands its field down as ONE Point table that the stages fill in
 column by column (a PIV deform pass replaces the table, since its grid changes), and each is

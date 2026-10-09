@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 130,
+    "nodes": 131,
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 874,
-    "outputs": 137,
+    "inputs": 883,
+    "outputs": 138,
     "gui_ops_included": true
   },
   "stages": {
@@ -216,6 +216,7 @@
         "dic.grid",
         "dic.initial_guess",
         "dic.local_match",
+        "dic.refine_mesh",
         "dic.strain",
         "dvc.global_step",
         "dvc.grid",
@@ -870,7 +871,7 @@
       "label": "Motion & deformation fields",
       "stage": "quantify",
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
-      "count": 19,
+      "count": 20,
       "ops": [
         {
           "op": "analysis.accumulate_field",
@@ -916,6 +917,11 @@
           "op": "dic.local_match",
           "label": "DIC Local Match",
           "summary": "pyALDIC §4 as a node: the 6-DOF IC-GN match of every subset from the seed — the cost centre. Writes sub-pixel disp_*, the gradient grad_*, n_iter and hole."
+        },
+        {
+          "op": "dic.refine_mesh",
+          "label": "DIC Refine Mesh",
+          "summary": "pyALDIC's pre-solve adaptive mesh refinement as its own card: elements at ROI holes, the ROI edge or a brush mask are quadtree-split before the local match, the seed is interpolated onto the new nodes, and the refined grid replaces the lattice (shown in the Viewer's Grid tab by level). Off = pass-through."
         },
         {
           "op": "dic.strain",
@@ -1140,6 +1146,7 @@
       "dic.grid",
       "dic.initial_guess",
       "dic.local_match",
+      "dic.refine_mesh",
       "dic.strain",
       "dvc.global_step",
       "dvc.grid",
@@ -2005,7 +2012,35 @@
           "is_field": false,
           "unit": "px",
           "default": 8,
-          "description": "Floor on element size during adaptive mesh refinement — how finely the solver may subdivide near a mask edge, ROI boundary or high-error region. It stops refinement from producing subsets too small to correlate reliably, so LOWERING it buys resolution at discontinuities and risks noise there. Snapped to a power of 2 and clamped to at most Grid step."
+          "description": "Floor on element size during adaptive mesh refinement — how finely the solver may subdivide near a mask hole, the ROI edge or a brush mask (the Refine sockets). It stops refinement from producing subsets too small to correlate reliably, so LOWERING it buys resolution at discontinuities and risks noise there. Snapped to a power of 2 and clamped to at most Grid step. Inert while no Refine option is on."
+        },
+        {
+          "name": "refine_holes",
+          "label": "Refine at holes",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Adaptive mesh refinement at HOLES in the ROI mask: elements straddling an internal mask boundary are split (quadtree, down to Min element) before the solve, so the field follows the hole's edge instead of smearing across it. Only does anything with an ROI mask that has holes. More nodes there — the Point table grows, and the Grid overlay shows the smaller elements by colour. pyALDIC's MaskBoundaryCriterion."
+        },
+        {
+          "name": "refine_roi_edge",
+          "label": "Refine at ROI edge",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Adaptive mesh refinement along the ROI's OUTER edge: elements whose subset window reaches past it are split, so the outermost measurements sit closer to the boundary instead of a whole grid step inside it. Adds nodes along the edge; without an ROI mask the frame edge is the ROI. pyALDIC's ROIEdgeCriterion."
+        },
+        {
+          "name": "refine_brush",
+          "label": "Refine where (mask)",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "voxel",
+          "description": "Optional Voxel mask (e.g. from Draw Regions) marking where YOU want the mesh refined — a crack tip, an inclusion, a cell edge. Elements inside it are split down to Min element before the solve; the rest of the grid keeps its step. Static: its t=0 plane is used. Empty = no brush. pyALDIC's BrushRegionCriterion."
         },
         {
           "name": "icgn_max_iter",
@@ -2161,6 +2196,9 @@
         "mu",
         "name",
         "reference_frame",
+        "refine_brush",
+        "refine_holes",
+        "refine_roi_edge",
         "results",
         "roi",
         "search_range",
@@ -8676,6 +8714,125 @@
         "icgn_max_iter",
         "source",
         "tol"
+      ]
+    },
+    "dic.refine_mesh": {
+      "op": "dic.refine_mesh",
+      "label": "DIC Refine Mesh",
+      "category": "analysis",
+      "role": "motion_and_deformation_fields",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/dic_stages.py",
+      "gui_only": false,
+      "summary": "pyALDIC's pre-solve adaptive mesh refinement as its own card: elements at ROI holes, the ROI edge or a brush mask are quadtree-split before the local match, the seed is interpolated onto the new nodes, and the refined grid replaces the lattice (shown in the Viewer's Grid tab by level). Off = pass-through.",
+      "overview": "pyALDIC's pre-solve adaptive refinement as a node (2026-10-09): the quadtree split ``run_aldic`` applies after the seed and before the local match (``pipeline.py:1374-1404``). Elements straddling a hole in the ROI mask, reaching past its outer edge, or lying inside a brush mask are split down to ``Min element``; the Q8 connectivity is rebuilt with hanging nodes and every frame's seed is interpolated onto the new nodes. The lattice table is REPLACED by the refined one (rows per frame = the refined node count of that line) and the ``<layer>_mesh`` grid with pyALDIC's refined elements, coloured by level in the Viewer. With no criterion on it passes the data through untouched. Resolved spec: category analysis; op ``dic.refine_mesh``; reads VOXEL + POINT, adds POINT; footprint WHOLE_SERIES / {t,y,x} (no frame is read — the mesh depends on the mask, the seed on the table). Stamps ``dic_refine`` so Local Match / Global Step / Strain re-derive the identical mesh. Kernel: :func:`nodegraph.kernels.dic_correlate.dic_stage_refine`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [
+          "t",
+          "x",
+          "y"
+        ],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Lattice layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "dic",
+          "layer_in": "point",
+          "description": "Which Point table holds the DIC lattice this stage fills in — the one DIC Grid wrote (`dic` unless renamed there). The stage reads its rows and the previous stages' columns and writes its own columns BACK ONTO THE SAME ROWS. With a single Point table on the wire the name is resolved for you."
+        },
+        {
+          "name": "refine_holes",
+          "label": "Refine at holes",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Split the elements that straddle a HOLE in the ROI mask (DIC Grid's ROI layer), down to Min element, so the field follows the hole's edge instead of smearing across it. Only does anything when that ROI has holes. More nodes there: every later card solves on the refined mesh. pyALDIC's MaskBoundaryCriterion."
+        },
+        {
+          "name": "refine_roi_edge",
+          "label": "Refine at ROI edge",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Split the elements whose subset window reaches past the ROI's OUTER edge, so the outermost measurements sit closer to the boundary. Without an ROI the frame edge is the ROI. pyALDIC's ROIEdgeCriterion."
+        },
+        {
+          "name": "refine_brush",
+          "label": "Refine where (mask)",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "voxel",
+          "description": "Optional Voxel mask (e.g. from Draw Regions) marking where YOU want the mesh finer — a crack tip, an inclusion, a cell edge. Its t=0 plane is used. Empty = no brush. pyALDIC's BrushRegionCriterion."
+        },
+        {
+          "name": "min_element_size",
+          "label": "Min element",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 0,
+          "description": "The smallest element refinement may make, in pixels. 0 = DIC Grid's Min element. LOWER resolves sharper features at the refined spots and gives the local match smaller, noisier subsets there."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_dic_refine_mesh",
+      "meta_transform": null,
+      "extra_layers": "_layers_dic_refine_mesh",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/dic_correlate.md",
+      "params_read": [
+        "min_element_size",
+        "refine_brush",
+        "refine_holes",
+        "refine_roi_edge",
+        "source"
       ]
     },
     "dic.strain": {

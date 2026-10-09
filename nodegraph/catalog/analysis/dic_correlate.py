@@ -195,6 +195,28 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
     names = [unit_name(u, ("m", "z")) for u in units]
     opened = open_node_trial(ctx, ds, units, axes_names=("m", "z"), analysis="DIC (pyALDIC)")
 
+    # adaptive mesh refinement (2026-10-09): pyALDIC's pre-solve quadtree split, by
+    # criterion — at holes in the ROI mask, along its outer edge, or wherever a brush mask
+    # (a Voxel layer, its t=0 plane) says. Off unless asked; the refined elements show in
+    # the Viewer's Grid tab, coloured by level.
+    refine_holes = bool(ctx.params.get("refine_holes", False))
+    refine_edge = bool(ctx.params.get("refine_roi_edge", False))
+    brush_name = ctx.layer("refine_brush")
+    brush_attr = ds.get(Domain.VOXEL, brush_name) if brush_name else None
+    brush6 = brush_attr.values if brush_attr is not None else None
+
+    def _refinement(m: int, z: int):
+        if not (refine_holes or refine_edge or brush6 is not None):
+            return None
+        brush = None
+        if brush6 is not None:
+            s = brush6.shape
+            brush = (np.asarray(brush6[min(m, s[0] - 1), 0, min(z, s[2] - 1),
+                                       min(c, s[3] - 1)]) > 0).astype(np.float64)
+        return {"criteria": {"mask_boundary": refine_holes, "roi_edge": refine_edge,
+                             "brush": brush is not None},
+                "brush": brush, "min_element_size": params["winsize_min"]}
+
     def read(unit, local: bool = False):
         m, z = unit
         plan, result_t, al_mode = _plan(m, z)
@@ -204,6 +226,7 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
                  if roi6 is not None else None)
         frames = _DICPlaneSeq(plan) if local else ship(_DICPlaneSeq(plan))
         return {"frames": frames, "masks": masks, "params": params,
+                "refinement": _refinement(m, z),
                 "vox": vox, "al_mode": al_mode, "result_t": result_t, "m": m, "z": z, "c": c}
 
     plane_bytes = int(ax.y) * int(ax.x) * 8
@@ -276,7 +299,8 @@ def _dic_correlate_unit(payload: dict, progress_cb=None) -> dict:
     vox = payload["vox"]
     series = run_pyaldic_series(
         _DICArraySeq(frames), payload["masks"], payload["params"], vox,
-        reference_mode=al_mode, progress_cb=progress_cb, resample="nodes")
+        reference_mode=al_mode, progress_cb=progress_cb, resample="nodes",
+        refinement=payload.get("refinement"))
     key = "primary" if al_mode == "accumulative" else "increment"
     rows, dropped = [], 0
     for i, t in enumerate(payload["result_t"]):
@@ -396,10 +420,34 @@ register_node(
         InInt("winsize_min", "Min element", unit="px", field=False, default=8,
               description=
               "Floor on element size during adaptive mesh refinement — how finely the solver may "
-              "subdivide near a mask edge, ROI boundary or high-error region. It stops "
-              "refinement from producing subsets too small to correlate reliably, so LOWERING it "
-              "buys resolution at discontinuities and risks noise there. Snapped to a power of 2 "
-              "and clamped to at most Grid step."),
+              "subdivide near a mask hole, the ROI edge or a brush mask (the Refine sockets). It "
+              "stops refinement from producing subsets too small to correlate reliably, so "
+              "LOWERING it buys resolution at discontinuities and risks noise there. Snapped to "
+              "a power of 2 and clamped to at most Grid step. Inert while no Refine option is "
+              "on."),
+        InBool("refine_holes", "Refine at holes", field=False, default=False,
+               description=
+               "Adaptive mesh refinement at HOLES in the ROI mask: elements straddling an "
+               "internal mask boundary are split (quadtree, down to Min element) before the "
+               "solve, so the field follows the hole's edge instead of smearing across it. "
+               "Only does anything with an ROI mask that has holes. More nodes there — the "
+               "Point table grows, and the Grid overlay shows the smaller elements by colour. "
+               "pyALDIC's MaskBoundaryCriterion."),
+        InBool("refine_roi_edge", "Refine at ROI edge", field=False, default=False,
+               description=
+               "Adaptive mesh refinement along the ROI's OUTER edge: elements whose subset "
+               "window reaches past it are split, so the outermost measurements sit closer to "
+               "the boundary instead of a whole grid step inside it. Adds nodes along the "
+               "edge; without an ROI mask the frame edge is the ROI. pyALDIC's "
+               "ROIEdgeCriterion."),
+        InString("refine_brush", "Refine where (mask)", field=False, default="",
+                 layer_in=Domain.VOXEL,
+                 description=
+                 "Optional Voxel mask (e.g. from Draw Regions) marking where YOU want the mesh "
+                 "refined — a crack tip, an inclusion, a cell edge. Elements inside it are "
+                 "split down to Min element before the solve; the rest of the grid keeps its "
+                 "step. Static: its t=0 plane is used. Empty = no brush. pyALDIC's "
+                 "BrushRegionCriterion."),
         InInt("icgn_max_iter", "IC-GN iterations", unit="", field=False, default=100,
               description=
               "Iteration cap for the LOCAL solve — the inverse-compositional Gauss–Newton match "

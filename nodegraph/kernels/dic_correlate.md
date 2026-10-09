@@ -91,6 +91,9 @@ dic_stage_normalize(img, para) -> (H, W)                     # (img − mean_roi
 dic_stage_reference(ref_norm, para, shape, roi_mask=None) -> DICReference   # masked frame, gradients, para with img_ref_mask
 dic_stage_seed(ref, g_norm, *, search=None) -> {x0, y0, U0, cc, search, info}          # §3 FFT seed, auto-expanding retry, init_disp
 dic_stage_mesh(ref, x0, y0) -> DICMesh                       # mesh_setup + the mask trim (elements only)
+dic_stage_refine(ref, mesh, U0|None, refinement) -> (DICMesh, U0)  # pre-solve refinement (2026-10-09);
+                                                             # depends on mesh+mask+criteria only, so
+                                                             # U0=None re-derives the same mesh
 dic_stage_seed_on_mesh(ref, mesh, U0, x0, y0) -> U0 (2N,)    # interpolate onto the mesh, NaN under the mask
 dic_stage_local(ref, mesh, g_norm, U0) -> {U, F, conv_iter, bad_pt_num, mark_hole_strain, node_region_map}   # §4
 dic_stage_global(ref, mesh, g_norm, U1, F1, mark_hole_strain, node_region_map, *, beta=None) -> {U, F, beta, n_steps, …}   # §5-6 verbatim
