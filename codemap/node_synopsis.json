@@ -70,7 +70,7 @@
     "categories": 16,
     "roles": 23,
     "stages": 5,
-    "inputs": 883,
+    "inputs": 901,
     "outputs": 138,
     "gui_ops_included": true
   },
@@ -8336,6 +8336,34 @@
           "is_field": false,
           "default": 1e-05,
           "description": "The same for the deformation gradient handed to the global solve; 0 is off. The single node's default is 1e-5."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -8354,12 +8382,15 @@
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
       "params_read": [
+        "__modes__",
         "admm_max_iter",
         "beta",
         "disp_smoothness",
         "mu",
+        "results",
         "source",
-        "strain_smoothness"
+        "strain_smoothness",
+        "trial_label"
       ]
     },
     "dic.grid": {
@@ -8597,6 +8628,34 @@
           "unit": "px",
           "default": 20,
           "description": "± half-range in pixels of the FFT integer search that seeds every node. It must cover the largest per-pair displacement or the match starts on the wrong speckle; pyALDIC widens it automatically while peaks land on its edge and remembers the radius that worked, and shrinks it when the image cannot hold it. Arrows pointing the wrong way on THIS card are the symptom of a radius too small."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -8615,8 +8674,11 @@
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
       "params_read": [
+        "__modes__",
+        "results",
         "search_range",
-        "source"
+        "source",
+        "trial_label"
       ]
     },
     "dic.local_match": {
@@ -8693,6 +8755,34 @@
           "is_field": false,
           "default": 0.01,
           "description": "Convergence tolerance of the IC-GN update (pixels): the iteration stops once the step is below it. SMALLER is more precise and slower; pyALDIC's default 0.01 is below the method's own precision floor on real speckle."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -8711,9 +8801,12 @@
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
       "params_read": [
+        "__modes__",
         "icgn_max_iter",
+        "results",
         "source",
-        "tol"
+        "tol",
+        "trial_label"
       ]
     },
     "dic.refine_mesh": {
@@ -9044,6 +9137,34 @@
           "is_field": false,
           "default": 4,
           "description": "Passes of the outer loop that alternates the 3-DOF local re-solve with the global solve; the published guidance is that 3-5 suffice, and the loop stops early once the update falls under pyALDVC's tolerance. 1 runs the global solve once with no re-solve (no refreshed qfactor/status). MORE costs one local pass each."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -9062,10 +9183,13 @@
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/aldvc_field.md",
       "params_read": [
+        "__modes__",
         "admm_iterations",
         "beta",
         "mu",
-        "source"
+        "results",
+        "source",
+        "trial_label"
       ]
     },
     "dvc.grid": {
@@ -9353,6 +9477,34 @@
           "is_field": false,
           "default": 1,
           "description": "1 = seed every node. k > 1 runs the search AND a full 12-DOF solve on only every k-th node per axis, then interpolates displacement and gradient to the rest as the starting guess (a gradient seed is then written as `grad_*` too). A pure speed lever for SMOOTH fields on dense grids; a localised deformation between coarse nodes is missed in the seed and must be recovered by the match."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -9374,8 +9526,10 @@
         "__modes__",
         "global_shift",
         "init_coarse_factor",
+        "results",
         "search_radius",
-        "source"
+        "source",
+        "trial_label"
       ]
     },
     "dvc.local_match": {
@@ -9507,6 +9661,34 @@
           "is_field": false,
           "default": 0,
           "description": "Numba worker threads for the CPU solver; 0 = ALL cores. Lower it to leave headroom when several nodes pull in parallel. Inherited by the global step."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -9528,9 +9710,11 @@
         "__modes__",
         "icgn_max_iter",
         "n_threads",
+        "results",
         "source",
         "subset_stride",
-        "tile_local"
+        "tile_local",
+        "trial_label"
       ]
     },
     "dvc.strain": {
@@ -16456,6 +16640,34 @@
           "is_field": false,
           "default": 0.0,
           "description": "Window overlap for this pass as a fraction; 0 = inherit the first pass's. Sets this pass's grid density."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -16476,7 +16688,9 @@
       "params_read": [
         "__modes__",
         "overlap",
+        "results",
         "source",
+        "trial_label",
         "window_size"
       ]
     },
@@ -16636,6 +16850,34 @@
             "point"
           ],
           "description": "Name of the Point table this pass writes — one row per window centre with `disp_y`/`disp_x` (µm), `disp_mag_um`, `qfactor` (signal-to-noise) and `excluded`. Every later stage selects it by this name."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -16659,7 +16901,9 @@
         "name",
         "overlap",
         "reference_frame",
+        "results",
         "roi",
+        "trial_label",
         "window_size"
       ]
     },
@@ -20070,6 +20314,44 @@
             ]
           },
           "description": "Regularisation weight on the fitted global displacement field, as a ratio of smoothness to goodness-of-fit: 1 weights the two equally and visibly smooths, 0.01 gives smoothness 1% of the weight. 0 interpolates the individual matches exactly, so one bad match distorts the field around it; HIGHER suppresses outlier matches and fills gaps where the field is sparse — but oversmoothing flattens genuine local variation, which matters if you go on to differentiate the field into strain. Scale-free: the same value means the same thing at any detection density or pixel size. SerialTrack method only."
+        },
+        {
+          "name": "results",
+          "label": "Saved results",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "reuse",
+          "available_in": {
+            "method": [
+              "serialtrack"
+            ]
+          },
+          "choices": [
+            "reuse",
+            "recompute",
+            "off"
+          ],
+          "choice_docs": {
+            "off": "Neither read nor write saved results: compute in memory only, as before the store existed. Use it for throwaway runs you do not want written beside the data.",
+            "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
+            "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
+          },
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+        },
+        {
+          "name": "trial_label",
+          "label": "Trial label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "method": [
+              "serialtrack"
+            ]
+          },
+          "description": "A name for this combination of settings, shown in the saved trial's `trial.json`, the folder's `index.json` and Load Analysis's list — so \"subset 32, tol 1e-3\" can be told from \"subset 48\" when you switch between trials. Purely a label: it changes neither the result nor which saved trial these settings match."
         }
       ],
       "outputs": [
@@ -20101,8 +20383,10 @@
         "min_track_length",
         "name",
         "points",
+        "results",
         "st_n_neighbors",
-        "st_smoothness"
+        "st_smoothness",
+        "trial_label"
       ]
     },
     "transform.grow_points": {

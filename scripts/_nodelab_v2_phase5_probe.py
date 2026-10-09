@@ -9266,6 +9266,11 @@ def main(argv) -> int:
         "every wire rightward, no card overlapping another or inside a region it is not in — "
         "and Undo reorganize, offered until a card moves, puts every card back")
 
+    # the analysis lanes (2026-10-09): a spawned process pool keeps a management thread and
+    # its worker processes alive; tear them down before os._exit rather than under it, the
+    # same discipline as the LabLink panel above
+    from nodegraph import parallel as _par_end
+    _par_end.shutdown(threads=True)
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

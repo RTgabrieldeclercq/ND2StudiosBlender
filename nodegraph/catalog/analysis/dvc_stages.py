@@ -61,7 +61,10 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
-from nodegraph.catalog._shared.analysis_units import scoped_frame
+from nodegraph.catalog._shared.analysis_units import (finish_stage, run_stage_units,
+                                                      scoped_frame, stage_result,
+                                                      stamp_trial, store_sockets,
+                                                      unit_frames, unit_list)
 from nodegraph.catalog._shared.analysis_mesh import (concat_rows, grid_hexes,
                                                      mesh_columns, mesh_layer_name,
                                                      with_mesh)
@@ -183,6 +186,30 @@ def _source(ctx: EvalContext, ds: Dataset, node: str, want: str) -> str:
         what="DVC grid table", where="the `data` input",
         remedy="run DVC Grid upstream — it writes the Point table the stages fill", ctx=ctx)
     return layer
+
+
+def _dvc_unit_rows(cols: Dict[str, np.ndarray], m: int, c: int, plan) -> Tuple[np.ndarray, List[int]]:
+    """One position's table rows in block order (one block per planned frame) and each
+    block's row count — the order a unit worker writes its columns back in."""
+    parts, counts = [], []
+    for (t_out, _t_ref) in plan:
+        idx = np.flatnonzero((cols["m"] == m) & (cols["t"] == t_out) & (cols["c"] == c))
+        parts.append(idx)
+        counts.append(int(idx.size))
+    return (np.concatenate(parts) if parts else np.zeros(0, np.int64)), counts
+
+
+def _dvc_check_rows(k: int, n: int, m: int, t: int, c: int, node: str) -> None:
+    if k != n:
+        raise ValueError(
+            f"{node}: the layer holds {k} rows for (m={m}, t={t}, c={c}) but the grid "
+            f"has {n} nodes — the table was filtered or re-ordered between stages; "
+            "wire the stages directly after DVC Grid")
+
+
+def _dvc_frame(fr, t: int) -> np.ndarray:
+    """A unit's volume as the serial loop read it (``_vol``: float32)."""
+    return np.asarray(fr.get(t)).astype(np.float32)
 
 
 class _RefCache:
@@ -342,37 +369,37 @@ def _compute_dvc_initial_guess(ctx: EvalContext) -> Dataset:
     seed_cc = np.full(n_rows, np.nan)
     seed_ok = np.zeros(n_rows, dtype=np.int64)
     grad: Optional[np.ndarray] = None
-    bar = _UnitBar(ctx, frames=max(1, ax.m), units_per_frame=max(1, len(plan)), note="seeding")
-    for m in range(ax.m):
-        refs = _RefCache(lambda t_ref, _m=m: stage_reference(_vol(prov, _m, t_ref, c), para, shape))
-        prev_u, prev_ref = None, None
-        for t_out, t_ref in plan:
-            if t_out == t_ref:
-                ref = refs.get(t_ref)
-                idx = _rows(cols, m, t_out, c, ref.n_nodes, node)
-                disp[idx] = 0.0
-                seed_cc[idx] = 1.0
-                seed_ok[idx] = 1
-                bar.finish_unit(note=f"m={m} t={t_out}: the reference itself (zero field)")
-                continue
-            ref = refs.get(t_ref)
-            idx = _rows(cols, m, t_out, c, ref.n_nodes, node)
-            g_norm, g_prep = stage_deformed(_vol(prov, m, t_out, c), para, shape)
-            previous = prev_u if (prev_ref == t_ref and prev_u is not None) else None
-            u0, f0, info = stage_initial_guess(ref, g_norm, g_prep, previous_zyx=previous)
-            disp[idx] = u0 * vox[None, :]
-            cc = info.get("cc")
-            ok = info.get("ok")
-            seed_cc[idx] = np.asarray(cc, dtype=float).reshape(-1) if cc is not None else np.nan
-            seed_ok[idx] = (np.asarray(ok, dtype=bool).reshape(-1).astype(np.int64)
-                            if ok is not None else 1)
-            if f0 is not None:
-                if grad is None:
-                    grad = np.full((n_rows, 3, 3), np.nan)
-                grad[idx] = f0
-            prev_u, prev_ref = u0, t_ref
-            bar.finish_unit(note=f"m={m} t={t_out}: {info.get('method', '?')} seed, "
-                                 f"{int(info.get('n_bad', 0))} nodes inpainted")
+    units = unit_list(ax, per_plane=False)
+
+    def payload(u, local):
+        m = u[0]
+        _idx, counts = _dvc_unit_rows(cols, m, c, plan)
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m: prov.get_region_volume(
+                                          0, _m, t, c, 0, ax.z, 0, ax.y, 0, ax.x),
+                                      local=local),
+                "p": p, "vox": vox, "shape": shape, "plan": plan, "counts": counts,
+                "node": node, "m": m, "c": c}
+
+    vol_bytes = int(ax.z) * int(ax.y) * int(ax.x) * 4
+    parts, opened, run = run_stage_units(
+        ctx, ds, layer, units, axes_names=("m",),
+        rows_of=lambda u: _dvc_unit_rows(cols, u[0], c, plan)[0],
+        payload_of=payload, work=_dvc_seed_unit, analysis="DVC Initial Guess",
+        worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, note="seeding",
+        in_thread=lambda q, cb: _dvc_seed_unit(q, progress_cb=cb), z_kind="subpixel")
+    for part in parts:
+        if not (part.rows.size and part.cols):
+            continue
+        for i, a in enumerate(_AX):
+            disp[part.rows, i] = part.cols[f"disp_{a}"]
+        seed_cc[part.rows] = part.cols["seed_cc"]
+        seed_ok[part.rows] = np.asarray(part.cols["seed_ok"], dtype=np.int64)
+        if all(g in part.cols for g in GRAD_COLUMNS):
+            if grad is None:
+                grad = np.full((n_rows, 3, 3), np.nan)
+            grad[part.rows] = np.stack([part.cols[g] for g in GRAD_COLUMNS],
+                                       axis=1).reshape(-1, 3, 3)
     out = {f"disp_{a}": disp[:, i] for i, a in enumerate(_AX)}
     out["disp_mag_um"] = np.sqrt(np.nansum(disp ** 2, axis=1))
     out["seed_cc"] = seed_cc
@@ -384,7 +411,58 @@ def _compute_dvc_initial_guess(ctx: EvalContext) -> Dataset:
     md = {"dvc_stage": "initial_guess", "dvc_init_guess": p["init_guess"],
           "dvc_search_radius": p["search_radius"], "dvc_global_shift": p["global_shift"],
           "dvc_init_coarse_factor": p["init_coarse_factor"]}
-    return _write(ds, layer, out).with_metadata(**md)
+    finish_stage(opened, run, layer, stamps=md, z_kind="subpixel")
+    return _write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+
+
+def _dvc_seed_unit(q: dict, progress_cb=None) -> dict:
+    """One position through pyALDVC Section 3: the unit worker of DVC Initial Guess."""
+    from nodegraph.kernels.aldvc_field import (stage_deformed, stage_initial_guess, stage_para,
+                                               stage_reference)
+    fr, vox, shape, plan = q["frames"], np.asarray(q["vox"], float), q["shape"], q["plan"]
+    para = stage_para(q["p"], vox, shape)
+    refs = _RefCache(lambda t_ref: stage_reference(_dvc_frame(fr, t_ref), para, shape))
+    acc: Dict[str, list] = {k: [] for k in ("disp_z", "disp_y", "disp_x", "seed_cc", "seed_ok")}
+    grads: list = []
+    have_grad = False
+    prev_u, prev_ref = None, None
+    for bi, (t_out, t_ref) in enumerate(plan):
+        ref = refs.get(t_ref)
+        n = int(ref.n_nodes)
+        _dvc_check_rows(q["counts"][bi], n, q["m"], t_out, q["c"], q["node"])
+        if t_out == t_ref:
+            for a in _AX:
+                acc[f"disp_{a}"].append(np.zeros(n))
+            acc["seed_cc"].append(np.ones(n))
+            acc["seed_ok"].append(np.ones(n, np.int64))
+            grads.append(np.full((n, 3, 3), np.nan))
+        else:
+            g_norm, g_prep = stage_deformed(_dvc_frame(fr, t_out), para, shape)
+            previous = prev_u if (prev_ref == t_ref and prev_u is not None) else None
+            u0, f0, info = stage_initial_guess(ref, g_norm, g_prep, previous_zyx=previous)
+            d = u0 * vox[None, :]
+            for i, a in enumerate(_AX):
+                acc[f"disp_{a}"].append(d[:, i])
+            cc = info.get("cc")
+            ok = info.get("ok")
+            acc["seed_cc"].append(np.asarray(cc, dtype=float).reshape(-1) if cc is not None
+                                  else np.full(n, np.nan))
+            acc["seed_ok"].append(np.asarray(ok, dtype=bool).reshape(-1).astype(np.int64)
+                                  if ok is not None else np.ones(n, np.int64))
+            if f0 is not None:
+                have_grad = True
+                grads.append(np.asarray(f0, dtype=float).reshape(n, 3, 3))
+            else:
+                grads.append(np.full((n, 3, 3), np.nan))
+            prev_u, prev_ref = u0, t_ref
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    new = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in acc.items()}
+    if have_grad and grads:
+        g = np.concatenate(grads).reshape(-1, 9)
+        for k, name in enumerate(GRAD_COLUMNS):
+            new[name] = g[:, k]
+    return stage_result(q, new)
 
 
 def _columns_dvc_initial_guess(params, modes, incoming):
@@ -465,37 +543,38 @@ def _compute_dvc_local_match(ctx: EvalContext) -> Dataset:
     n_iter = np.zeros(n_rows, dtype=np.int64)
     bad = np.zeros(n_rows, dtype=np.int64)
     valid = np.zeros(n_rows, dtype=np.int64)
-    bar = _UnitBar(ctx, frames=max(1, ax.m), units_per_frame=max(1, len(plan)), note="matching")
-    for m in range(ax.m):
-        refs = _RefCache(lambda t_ref, _m=m: stage_reference(_vol(prov, _m, t_ref, c), para, shape))
-        for t_out, t_ref in plan:
-            ref = refs.get(t_ref)
-            idx = _rows(cols, m, t_out, c, ref.n_nodes, node)
-            valid[idx] = ref.valid.astype(np.int64)
-            if t_out == t_ref:
-                disp[idx] = 0.0
-                grad[idx] = 0.0
-                std[idx] = 0.0
-                q[idx] = 1.0
-                status[idx] = 0
-                bar.finish_unit(note=f"m={m} t={t_out}: the reference itself (zero field)")
-                continue
-            _g_norm, g_prep = stage_deformed(_vol(prov, m, t_out, c), para, shape)
-            u0 = np.where(np.isfinite(disp_in[idx]), disp_in[idx], 0.0) / vox[None, :]
-            f0 = None
-            if grad_in is not None and np.all(np.isfinite(grad_in[idx])):
-                f0 = grad_in[idx]
-            r = stage_local(ref, g_prep, u0, F0_zyx=f0)
-            disp[idx] = r["U"] * vox[None, :]
-            grad[idx] = r["F"]
-            std[idx] = r["U_std"] * vox[None, :]
-            q[idx] = r["zncc"]
-            status[idx] = r["status"]
-            n_iter[idx] = r["n_iter"]
-            bad[idx] = r["bad"].astype(np.int64)
-            n_conv = int(np.sum(r["status"] == 0))
-            bar.finish_unit(note=f"m={m} t={t_out}: {n_conv}/{ref.n_nodes} converged in "
-                                 f"{r['solve_time']:.1f} s, ZNCC median {np.nanmedian(r['zncc']):.3f}")
+    units = unit_list(ax, per_plane=False)
+
+    def payload(u, local):
+        m = u[0]
+        idx, counts = _dvc_unit_rows(cols, m, c, plan)
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m: prov.get_region_volume(
+                                          0, _m, t, c, 0, ax.z, 0, ax.y, 0, ax.x),
+                                      local=local),
+                "p": p, "vox": vox, "shape": shape, "plan": plan, "counts": counts,
+                "node": node, "m": m, "c": c, "disp": disp_in[idx],
+                "grad": (grad_in[idx] if grad_in is not None else None)}
+
+    vol_bytes = int(ax.z) * int(ax.y) * int(ax.x) * 4
+    parts, opened, run = run_stage_units(
+        ctx, ds, layer, units, axes_names=("m",),
+        rows_of=lambda u: _dvc_unit_rows(cols, u[0], c, plan)[0],
+        payload_of=payload, work=_dvc_local_unit, analysis="DVC Local Match",
+        worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, note="matching",
+        in_thread=lambda qq, cb: _dvc_local_unit(qq, progress_cb=cb), z_kind="subpixel")
+    for part in parts:
+        if not (part.rows.size and part.cols):
+            continue
+        r_ = part.rows
+        for i, a in enumerate(_AX):
+            disp[r_, i] = part.cols[f"disp_{a}"]
+            std[r_, i] = part.cols[f"disp_std_{a}"]
+        grad[r_] = np.stack([part.cols[g] for g in GRAD_COLUMNS], axis=1).reshape(-1, 3, 3)
+        q[r_] = part.cols["qfactor"]
+        for name, arr in (("status", status), ("n_iter", n_iter), ("bad", bad),
+                          ("valid", valid)):
+            arr[r_] = np.asarray(part.cols[name], dtype=np.int64)
     out = {f"disp_{a}": disp[:, i] for i, a in enumerate(_AX)}
     out["disp_mag_um"] = np.sqrt(np.nansum(disp ** 2, axis=1))
     for i, a in enumerate(_AX):
@@ -508,7 +587,64 @@ def _compute_dvc_local_match(ctx: EvalContext) -> Dataset:
           "dvc_backend": p["backend"], "dvc_subset_stride": p["subset_stride"],
           "dvc_tile_local": p["tile_local"], "dvc_n_threads": p["n_threads"],
           "dvc_icgn_max_iter": p["icgn_max_iter"]}
-    return _write(ds, layer, out).with_metadata(**md)
+    finish_stage(opened, run, layer, stamps=md, z_kind="subpixel")
+    return _write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+
+
+def _dvc_local_unit(qd: dict, progress_cb=None) -> dict:
+    """One position through pyALDVC Section 4: the unit worker of DVC Local Match."""
+    from nodegraph.kernels.aldvc_field import stage_deformed, stage_local, stage_para, stage_reference
+    fr, vox, shape, plan = qd["frames"], np.asarray(qd["vox"], float), qd["shape"], qd["plan"]
+    para = stage_para(qd["p"], vox, shape)
+    refs = _RefCache(lambda t_ref: stage_reference(_dvc_frame(fr, t_ref), para, shape))
+    disp_in = np.asarray(qd["disp"], dtype=float)
+    grad_in = qd["grad"]
+    keys = (tuple(f"disp_{a}" for a in _AX) + tuple(f"disp_std_{a}" for a in _AX)
+            + ("qfactor", "status", "n_iter", "bad", "valid"))
+    acc: Dict[str, list] = {k: [] for k in keys}
+    grads: list = []
+    off = 0
+    for bi, (t_out, t_ref) in enumerate(plan):
+        ref = refs.get(t_ref)
+        n = int(ref.n_nodes)
+        _dvc_check_rows(qd["counts"][bi], n, qd["m"], t_out, qd["c"], qd["node"])
+        sl = slice(off, off + n)
+        off += n
+        acc["valid"].append(np.asarray(ref.valid).astype(np.int64))
+        if t_out == t_ref:
+            for a in _AX:
+                acc[f"disp_{a}"].append(np.zeros(n))
+                acc[f"disp_std_{a}"].append(np.zeros(n))
+            grads.append(np.zeros((n, 3, 3)))
+            acc["qfactor"].append(np.ones(n))
+            acc["status"].append(np.zeros(n, np.int64))
+            acc["n_iter"].append(np.zeros(n, np.int64))
+            acc["bad"].append(np.zeros(n, np.int64))
+        else:
+            _g_norm, g_prep = stage_deformed(_dvc_frame(fr, t_out), para, shape)
+            u0 = np.where(np.isfinite(disp_in[sl]), disp_in[sl], 0.0) / vox[None, :]
+            f0 = None
+            if grad_in is not None and np.all(np.isfinite(grad_in[sl])):
+                f0 = grad_in[sl]
+            r = stage_local(ref, g_prep, u0, F0_zyx=f0)
+            d = r["U"] * vox[None, :]
+            sd = r["U_std"] * vox[None, :]
+            for i, a in enumerate(_AX):
+                acc[f"disp_{a}"].append(d[:, i])
+                acc[f"disp_std_{a}"].append(sd[:, i])
+            grads.append(np.asarray(r["F"], dtype=float).reshape(n, 3, 3))
+            acc["qfactor"].append(np.asarray(r["zncc"], dtype=float))
+            acc["status"].append(np.asarray(r["status"]).astype(np.int64))
+            acc["n_iter"].append(np.asarray(r["n_iter"]).astype(np.int64))
+            acc["bad"].append(np.asarray(r["bad"]).astype(np.int64))
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    new = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in acc.items()}
+    g = np.concatenate(grads).reshape(-1, 9) if grads else np.zeros((0, 9))
+    for k, name in enumerate(GRAD_COLUMNS):
+        new[name] = g[:, k]
+    new["disp_mag_um"] = np.sqrt(new["disp_z"] ** 2 + new["disp_y"] ** 2 + new["disp_x"] ** 2)
+    return stage_result(qd, new)
 
 
 def _columns_dvc_local_match(params, modes, incoming):
@@ -580,33 +716,39 @@ def _compute_dvc_global_step(ctx: EvalContext) -> Dataset:
     status = st_in.copy()
     outlier = np.zeros(n_rows, dtype=np.int64)
     last_beta = None
-    bar = _UnitBar(ctx, frames=max(1, ax.m), units_per_frame=max(1, len(plan)), note="ADMM")
-    for m in range(ax.m):
-        refs = _RefCache(lambda t_ref, _m=m: stage_reference(_vol(prov, _m, t_ref, c), para, shape))
-        beta_by_ref: Dict[int, float] = {}
-        for t_out, t_ref in plan:
-            ref = refs.get(t_ref)
-            idx = _rows(cols, m, t_out, c, ref.n_nodes, node)
-            if t_out == t_ref:
-                std[idx] = 0.0
-                bar.finish_unit(note=f"m={m} t={t_out}: the reference itself (zero field)")
-                continue
-            _g_norm, g_prep = stage_deformed(_vol(prov, m, t_out, c), para, shape)
-            u1 = np.where(np.isfinite(disp_in[idx]), disp_in[idx], 0.0) / vox[None, :]
-            f1 = np.where(np.isfinite(grad_in[idx]), grad_in[idx], 0.0)
-            r = stage_global(ref, g_prep, u1, f1, bad_in[idx], beta=beta_by_ref.get(t_ref))
-            beta_by_ref[t_ref] = float(r["beta"])
-            last_beta = float(r["beta"])
-            disp[idx] = r["U"] * vox[None, :]
-            grad[idx] = r["F"]
-            std[idx] = r["U_std"] * vox[None, :]
-            fin = np.isfinite(r["zncc"])
-            q[idx[fin]] = r["zncc"][fin]
-            known = r["status"] >= 0
-            status[idx[known]] = r["status"][known]
-            outlier[idx] = r["outlier"].astype(np.int64)
-            bar.finish_unit(note=f"m={m} t={t_out}: β={r['beta']:.3g}, {r['n_steps']} ADMM "
-                                 f"step(s), |ΔU| global {r['update_global'][-1] if r['update_global'] else 0:.2e}")
+    units = unit_list(ax, per_plane=False)
+
+    def payload(u, local):
+        m = u[0]
+        idx, counts = _dvc_unit_rows(cols, m, c, plan)
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m: prov.get_region_volume(
+                                          0, _m, t, c, 0, ax.z, 0, ax.y, 0, ax.x),
+                                      local=local),
+                "p": p, "vox": vox, "shape": shape, "plan": plan, "counts": counts,
+                "node": node, "m": m, "c": c, "disp": disp_in[idx], "grad": grad_in[idx],
+                "bad": bad_in[idx], "q": q_in[idx], "st": st_in[idx]}
+
+    vol_bytes = int(ax.z) * int(ax.y) * int(ax.x) * 4
+    parts, opened, run = run_stage_units(
+        ctx, ds, layer, units, axes_names=("m",),
+        rows_of=lambda u: _dvc_unit_rows(cols, u[0], c, plan)[0],
+        payload_of=payload, work=_dvc_global_unit, analysis="DVC Global Step",
+        worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, note="ADMM",
+        in_thread=lambda qq, cb: _dvc_global_unit(qq, progress_cb=cb), z_kind="subpixel")
+    for part in parts:
+        if not (part.rows.size and part.cols):
+            continue
+        r_ = part.rows
+        for i, a in enumerate(_AX):
+            disp[r_, i] = part.cols[f"disp_{a}"]
+            std[r_, i] = part.cols[f"disp_std_{a}"]
+        grad[r_] = np.stack([part.cols[g] for g in GRAD_COLUMNS], axis=1).reshape(-1, 3, 3)
+        q[r_] = part.cols["qfactor"]
+        status[r_] = np.asarray(part.cols["status"], dtype=np.int64)
+        outlier[r_] = np.asarray(part.cols["outlier"], dtype=np.int64)
+        if part.stats.get("beta") is not None:
+            last_beta = float(part.stats["beta"])
     out = {f"disp_{a}": disp[:, i] for i, a in enumerate(_AX)}
     out["disp_mag_um"] = np.sqrt(np.nansum(disp ** 2, axis=1))
     for i, a in enumerate(_AX):
@@ -618,7 +760,63 @@ def _compute_dvc_global_step(ctx: EvalContext) -> Dataset:
     md = {"dvc_stage": "global_step", "dvc_use_global_step": True, "dvc_mu": p["mu"],
           "dvc_beta": (last_beta if last_beta is not None else p["beta"]),
           "dvc_admm_iterations": p["admm_iterations"]}
-    return _write(ds, layer, out).with_metadata(**md)
+    finish_stage(opened, run, layer, stamps=md, z_kind="subpixel")
+    return _write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+
+
+def _dvc_global_unit(qd: dict, progress_cb=None) -> dict:
+    """One position through pyALDVC Sections 5-6: the unit worker of DVC Global Step. β is
+    tuned once per reference within the position, as the driver does."""
+    from nodegraph.kernels.aldvc_field import stage_deformed, stage_global, stage_para, stage_reference
+    fr, vox, shape, plan = qd["frames"], np.asarray(qd["vox"], float), qd["shape"], qd["plan"]
+    para = stage_para(qd["p"], vox, shape)
+    refs = _RefCache(lambda t_ref: stage_reference(_dvc_frame(fr, t_ref), para, shape))
+    disp_in = np.asarray(qd["disp"], dtype=float)
+    grad_in = np.asarray(qd["grad"], dtype=float)
+    bad_in = np.asarray(qd["bad"]).astype(bool)
+    q_all = np.asarray(qd["q"], dtype=float).copy()
+    st_all = np.asarray(qd["st"]).astype(np.int64).copy()
+    disp = disp_in.copy()
+    grad = grad_in.copy()
+    std = np.full((len(disp_in), 3), np.nan)
+    outlier = np.zeros(len(disp_in), dtype=np.int64)
+    beta_by_ref: Dict[int, float] = {}
+    last_beta = None
+    off = 0
+    for bi, (t_out, t_ref) in enumerate(plan):
+        ref = refs.get(t_ref)
+        n = int(ref.n_nodes)
+        _dvc_check_rows(qd["counts"][bi], n, qd["m"], t_out, qd["c"], qd["node"])
+        idx = np.arange(off, off + n)
+        off += n
+        if t_out == t_ref:
+            std[idx] = 0.0
+        else:
+            _g_norm, g_prep = stage_deformed(_dvc_frame(fr, t_out), para, shape)
+            u1 = np.where(np.isfinite(disp_in[idx]), disp_in[idx], 0.0) / vox[None, :]
+            f1 = np.where(np.isfinite(grad_in[idx]), grad_in[idx], 0.0)
+            r = stage_global(ref, g_prep, u1, f1, bad_in[idx], beta=beta_by_ref.get(t_ref))
+            beta_by_ref[t_ref] = float(r["beta"])
+            last_beta = float(r["beta"])
+            disp[idx] = r["U"] * vox[None, :]
+            grad[idx] = r["F"]
+            std[idx] = r["U_std"] * vox[None, :]
+            fin = np.isfinite(r["zncc"])
+            q_all[idx[fin]] = r["zncc"][fin]
+            known = r["status"] >= 0
+            st_all[idx[known]] = r["status"][known]
+            outlier[idx] = r["outlier"].astype(np.int64)
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    new = {f"disp_{a}": disp[:, i] for i, a in enumerate(_AX)}
+    new["disp_mag_um"] = np.sqrt(np.nansum(disp ** 2, axis=1))
+    g = grad.reshape(-1, 9)
+    for k, name in enumerate(GRAD_COLUMNS):
+        new[name] = g[:, k]
+    for i, a in enumerate(_AX):
+        new[f"disp_std_{a}"] = std[:, i]
+    new.update({"qfactor": q_all, "status": st_all, "outlier": outlier})
+    return stage_result(qd, new, {"beta": last_beta})
 
 
 def _columns_dvc_global_step(params, modes, incoming):
@@ -852,6 +1050,7 @@ register_node(
               "rest as the starting guess (a gradient seed is then written as `grad_*` too). "
               "A pure speed lever for SMOOTH fields on dense grids; a localised deformation "
               "between coarse nodes is missed in the seed and must be recovered by the match."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[
@@ -913,6 +1112,7 @@ register_node(
               description=
               "Numba worker threads for the CPU solver; 0 = ALL cores. Lower it to leave "
               "headroom when several nodes pull in parallel. Inherited by the global step."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[
@@ -975,6 +1175,7 @@ register_node(
               "early once the update falls under pyALDVC's tolerance. 1 runs the global solve "
               "once with no re-solve (no refreshed qfactor/status). MORE costs one local pass "
               "each."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     granularity=_STAGE_GRAN, kernel_axes=_STAGE_KAX,

@@ -53,7 +53,11 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
-from nodegraph.catalog._shared.analysis_units import scoped_frame
+from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_stage,
+                                                      open_node_trial, run_units,
+                                                      scoped_frame, stamp_trial,
+                                                      store_sockets, unit_frames, unit_list)
+from nodegraph.analysis_store import unit_name
 from nodegraph.catalog._shared.analysis_mesh import (concat_rows, lattice_quads,
                                                      mesh_columns, mesh_layer_name,
                                                      with_mesh)
@@ -241,21 +245,28 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
     params = {"correlation_method": corr, "subpixel_method": subpix, "overlap": overlap}
     s, ov_px, grid = piv_stage_settings(params, (ax.y, ax.x), window, overlap)
     plan = _piv_plan(ax, ref_mode, ref_frame)
-    blocks = _piv_blocks(ax, plan)
-    rows: List[Dict[str, np.ndarray]] = []
-    cells: Dict[Any, Dict[str, np.ndarray]] = {}
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)),
-                   note="first pass")
-    for (m, z, t_out, t_ref) in blocks:
-        roi = _piv_roi_plane(ds, roi_name, m, z, c)
-        r = piv_stage_first_pass(_piv_plane(prov, m, t_ref, z, c), _piv_plane(prov, m, t_out, z, c), s, roi)
-        rows.append(_piv_field_rows(r["x"], r["y"], r["u"], r["v"], r["s2n"], r["excluded"],
-                                px, m, t_out, z, c))
-        if (m, z) not in cells:                      # the window lattice, once per line
-            cells[(m, z)] = _piv_cells(r, m, z, c)
-        bar.finish_unit(note=f"m={m} z={z} t={t_out}: {grid[0]}×{grid[1]} vectors at {window} px")
-    if rows:
-        cols = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
+    # one (m, z) line = one unit: across worker processes when the governor affords it,
+    # saved beside the source as it finishes (`results`)
+    units = unit_list(ax, per_plane=True)
+    names = [unit_name(u, ("m", "z")) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=("m", "z"), analysis="PIV First Pass")
+
+    def read(u, local=False):
+        m, z = u
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m, _z=z: _piv_plane(prov, _m, t, _z, c),
+                                      local=local),
+                "s": s, "roi": _piv_roi_plane(ds, roi_name, m, z, c), "plan": plan, "px": px,
+                "m": m, "z": z, "c": c}
+
+    run = run_units(ctx, units, read=read, read_local=lambda u: read(u, True),
+                    work=_piv_first_unit, names=names, trial=opened.trial,
+                    worker_bytes=8 * ax.y * ax.x * 8 + (300 << 20), min_inner=1, numba=False,
+                    note="first pass", in_thread=lambda p, cb: _piv_first_unit(p, progress_cb=cb))
+    cols = concat_tables(run.results, "field")
+    cells_rows = concat_tables(run.results, "mesh")
+    if cols:
+        pass
     else:
         cols = {k: np.zeros(0) for k in ("m", "t", "c", "z", "y", "x", "disp_y", "disp_x",
                                           "disp_mag_um", "qfactor", "excluded")}
@@ -265,10 +276,36 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
           "piv_correlation": corr, "piv_subpixel": subpix,
           "piv_reference_mode": ref_mode, "piv_reference_frame": ref_frame,
           "piv_channel": c, "piv_roi": roi_name, "piv_stage": "first_pass"}
+    finish_stage(opened, run, layer, stamps=md, mesh_kind="quad", mesh_window=(window, window))
     out = ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="plane_index"))
-    out = with_mesh(out, layer, concat_rows(list(cells.values())), kind="quad",
-                    z_kind="plane_index", window=(window, window))
-    return out.with_metadata(**md)
+    out = with_mesh(out, layer, cells_rows, kind="quad", z_kind="plane_index",
+                    window=(window, window))
+    return out.with_metadata(**stamp_trial(md, opened, run))
+
+
+def _piv_first_unit(p: dict, progress_cb=None) -> dict:
+    """One (m, z) line through OpenPIV's first pass: the unit worker of PIV First Pass —
+    every planned pair's rows, and the line's window lattice."""
+    from nodegraph.kernels.piv_field import piv_stage_first_pass
+    fr, plan = p["frames"], p["plan"]
+    m, z, c = p["m"], p["z"], p["c"]
+    rows: List[Dict[str, np.ndarray]] = []
+    cells: Dict[str, np.ndarray] = {}
+    for bi, (t_out, t_ref) in enumerate(plan):
+        r = piv_stage_first_pass(np.asarray(fr.get(t_ref), dtype=np.float64),
+                                 np.asarray(fr.get(t_out), dtype=np.float64), p["s"], p["roi"])
+        rows.append(_piv_field_rows(r["x"], r["y"], r["u"], r["v"], r["s2n"], r["excluded"],
+                                    p["px"], m, t_out, z, c))
+        if not cells:
+            cells = _piv_cells(r, m, z, c)
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    tables: Dict[str, Dict[str, np.ndarray]] = {}
+    if rows:
+        tables["field"] = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
+    if cells:
+        tables["mesh"] = cells
+    return {"tables": tables, "stats": {}}
 
 
 def _columns_piv_first_pass(params, modes, incoming):
@@ -461,26 +498,33 @@ def _compute_piv_deform_pass(ctx: EvalContext) -> Dataset:
     plan = _piv_plan(ax, str(pv["piv_reference_mode"]), int(pv["piv_reference_frame"]))
     dy = np.asarray(cols["disp_y"], float)
     dx = np.asarray(cols["disp_x"], float)
-    rows: List[Dict[str, np.ndarray]] = []
-    cells: Dict[Any, Dict[str, np.ndarray]] = {}
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)),
-                   note=f"pass at {window} px")
-    for (m, z, t_out, t_ref) in _piv_blocks(ax, plan):
-        idx = _piv_rows(cols, m, t_out, z, c, n_old, node)
-        x_old = np.asarray(cols["x"], float)[idx].reshape(old_grid)
-        y_old = np.asarray(cols["y"], float)[idx].reshape(old_grid)
-        u_old = (dx[idx] / px).reshape(old_grid)
-        v_old = (dy[idx] / px).reshape(old_grid)
-        roi = _piv_roi_plane(ds, roi_name, m, z, c)
-        r = piv_stage_deform_pass(_piv_plane(prov, m, t_ref, z, c), _piv_plane(prov, m, t_out, z, c), s,
-                                  x_old, y_old, u_old, v_old, roi)
-        rows.append(_piv_field_rows(r["x"], r["y"], r["u"], r["v"], r["s2n"], r["excluded"],
-                                px, m, t_out, z, c))
-        if (m, z) not in cells:                      # the finer lattice replaces the grid
-            cells[(m, z)] = _piv_cells(r, m, z, c)
-        bar.finish_unit(note=f"m={m} z={z} t={t_out}: {grid[0]}×{grid[1]} vectors at {window} px")
-    if rows:
-        out = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
+    units = unit_list(ax, per_plane=True)
+    names = [unit_name(u, ("m", "z")) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=("m", "z"), analysis="PIV Deform Pass")
+
+    def read(u, local=False):
+        m, z = u
+        blocks = []
+        for (t_out, _t_ref) in plan:
+            idx = _piv_rows(cols, m, t_out, z, c, n_old, node)
+            blocks.append((np.asarray(cols["x"], float)[idx].reshape(old_grid),
+                           np.asarray(cols["y"], float)[idx].reshape(old_grid),
+                           (dx[idx] / px).reshape(old_grid), (dy[idx] / px).reshape(old_grid)))
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m, _z=z: _piv_plane(prov, _m, t, _z, c),
+                                      local=local),
+                "s": s, "roi": _piv_roi_plane(ds, roi_name, m, z, c), "plan": plan, "px": px,
+                "old": blocks, "m": m, "z": z, "c": c}
+
+    run = run_units(ctx, units, read=read, read_local=lambda u: read(u, True),
+                    work=_piv_deform_unit, names=names, trial=opened.trial,
+                    worker_bytes=8 * ax.y * ax.x * 8 + (300 << 20), min_inner=1, numba=False,
+                    note=f"pass at {window} px",
+                    in_thread=lambda p, cb: _piv_deform_unit(p, progress_cb=cb))
+    out = concat_tables(run.results, "field")
+    cells_rows = concat_tables(run.results, "mesh")
+    if out:
+        pass
     else:
         out = {k: np.zeros(0) for k in ("m", "t", "c", "z", "y", "x", "disp_y", "disp_x",
                                          "disp_mag_um", "qfactor", "excluded")}
@@ -488,9 +532,36 @@ def _compute_piv_deform_pass(ctx: EvalContext) -> Dataset:
     md = {"piv_window": window, "piv_overlap": overlap, "piv_overlap_px": int(ov_px),
           "piv_grid_shape": (int(grid[0]), int(grid[1])), "piv_pass": int(pv["piv_pass"]) + 1,
           "piv_deformation": deform, "piv_stage": "deform_pass"}
-    res = with_mesh(_piv_rewrite(ds, layer, out), layer, concat_rows(list(cells.values())),
+    finish_stage(opened, run, layer, stamps=md, mesh_kind="quad", mesh_window=(window, window))
+    res = with_mesh(_piv_rewrite(ds, layer, out), layer, cells_rows,
                     kind="quad", z_kind="plane_index", window=(window, window))
-    return res.with_metadata(**md)
+    return res.with_metadata(**stamp_trial(md, opened, run))
+
+
+def _piv_deform_unit(p: dict, progress_cb=None) -> dict:
+    """One (m, z) line through one window-deformation pass: the unit worker of PIV Deform
+    Pass — every planned pair's finer rows, and the line's finer lattice."""
+    from nodegraph.kernels.piv_field import piv_stage_deform_pass
+    fr, plan = p["frames"], p["plan"]
+    m, z, c = p["m"], p["z"], p["c"]
+    rows: List[Dict[str, np.ndarray]] = []
+    cells: Dict[str, np.ndarray] = {}
+    for bi, ((t_out, t_ref), (x_old, y_old, u_old, v_old)) in enumerate(zip(plan, p["old"])):
+        r = piv_stage_deform_pass(np.asarray(fr.get(t_ref), dtype=np.float64),
+                                  np.asarray(fr.get(t_out), dtype=np.float64), p["s"],
+                                  x_old, y_old, u_old, v_old, p["roi"])
+        rows.append(_piv_field_rows(r["x"], r["y"], r["u"], r["v"], r["s2n"], r["excluded"],
+                                    p["px"], m, t_out, z, c))
+        if not cells:
+            cells = _piv_cells(r, m, z, c)
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    tables: Dict[str, Dict[str, np.ndarray]] = {}
+    if rows:
+        tables["field"] = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
+    if cells:
+        tables["mesh"] = cells
+    return {"tables": tables, "stats": {}}
 
 
 def _columns_piv_deform_pass(params, modes, incoming):
@@ -560,6 +631,7 @@ register_node(
                  "Name of the Point table this pass writes — one row per window centre with "
                  "`disp_y`/`disp_x` (µm), `disp_mag_um`, `qfactor` (signal-to-noise) and "
                  "`excluded`. Every later stage selects it by this name."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[
@@ -688,6 +760,7 @@ register_node(
                 description=
                 "Window overlap for this pass as a fraction; 0 = inherit the first pass's. "
                 "Sets this pass's grid density."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[

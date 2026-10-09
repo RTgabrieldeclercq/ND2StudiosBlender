@@ -92,6 +92,8 @@ def _compute_load_analysis(ctx: EvalContext) -> Dataset:
                       metadata=dict(hdr.get("calibration") or {}))
     placement: Dict[str, Dict[str, Any]] = hdr.get("tables") or {}
     for kind, parts in td.tables.items():
+        if placement and kind not in placement:
+            continue                    # a per-unit working table (SerialTrack's links)
         where = placement.get(kind) or {"domain": "point", "layer": kind,
                                         "z_kind": "plane_index"}
         keys = [k for k in parts[0] if all(k in p for p in parts)]

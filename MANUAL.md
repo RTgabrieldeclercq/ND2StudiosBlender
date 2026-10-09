@@ -2670,8 +2670,16 @@ print(report.summary(), report.removed, report.added)
 DIC, DVC and PIV can run for hours. Their results are now **written beside the image as they
 are produced**, and **read back** instead of being recomputed.
 
-**What is saved, and where.** The single DIC (pyALDIC), DVC (pyALDVC) and PIV (OpenPIV) nodes
-save into one folder beside the source file:
+**What is saved, and where.** The analyses below save into one folder beside the source
+file:
+- the single DIC (pyALDIC), DVC (pyALDVC) and PIV (OpenPIV) nodes;
+- every staged card that reads frames: Initial Guess, Local Match and Global Step for DIC and
+  DVC, and First Pass and Deform Pass for PIV;
+- **Track Objects** with the SerialTrack method, saved per (position, channel, plane) group.
+
+A staged card's trial holds the complete table as it stood after that card, so it loads back
+on its own. A SerialTrack trial also holds the finished Track table and the members' `track_id`.
+
 
 ```
 Channel640_Seq0001.nd2

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from typing import Dict
+from typing import Dict, List
 
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
@@ -28,6 +28,9 @@ from nodegraph.catalog._shared.labels import (
     _resolve_layer,
 )
 from nodegraph.catalog._shared.units import to_pixels_v2
+from nodegraph.catalog._shared.analysis_units import (open_node_trial, run_units,
+                                                      stamp_trial, store_sockets)
+from nodegraph.analysis_store import unit_name
 
 # ── Track Objects (the vendored v1 `track_objects` kernel — five linkers) ───────
 #
@@ -411,7 +414,14 @@ def _compute_track_objects(ctx: EvalContext) -> Dataset:
     )
     if label_masks is not None:
         kp["label_masks"] = label_masks
-    _tk.link_objects(rows, **kp)
+    st_run = None
+    if method_key == "serialtrack":
+        # SerialTrack is 1-2 orders slower than the other linkers, so it runs group by
+        # group — (m, channel, z) in 2-D, (m, channel) in 3-D; never split in time —
+        # across worker processes, each group saved as it finishes (2026-10-09)
+        st_run = _track_serialtrack_units(ctx, ds, rows, kp, want_3d)
+    else:
+        _tk.link_objects(rows, **kp)
 
     # ── renumber through the shared membership builder (track.link conventions) ─
     # Kernel gotcha #8 ("two-frame minimum", track_objects.md §6): EVERY linker
@@ -485,10 +495,93 @@ def _compute_track_objects(ctx: EvalContext) -> Dataset:
                # `st_dim=2D` on a subpixel layer is a legitimate but lossy choice (depth
                # discarded, planes isolated) and nothing downstream could otherwise tell.
                "track_dim": "3D" if want_3d else "2D"}
+    if st_run is not None:
+        opened, run = st_run
+        tr = opened.trial
+        if tr is not None:
+            # the whole tracking result as one more unit, so Load Analysis restores the
+            # Track table and the members with their track_id without the detections chain
+            members = {a.name: np.asarray(a.values) for a in ds.layers_on(member_domain)
+                       if a.layer == src}
+            members["track_id"] = back
+            try:
+                tr.save("final", {"tracks": dict(track_tbl.columns), "members": members})
+                tr.update(units=list(tr.units) + ["final"], status="complete",
+                          stamps=prov_md,
+                          tables={"tracks": {"domain": "track", "layer": out_layer,
+                                             "z_kind": "subpixel" if want_3d
+                                             else "plane_index"},
+                                  "members": {"domain": member_domain.value, "layer": src,
+                                              "z_kind": zk}})
+            except OSError:
+                pass
+        prov_md = stamp_trial(prov_md, opened, run)
     return (ds.with_structure(track_tbl)
               .with_structure(StructureTable(member_domain, {"track_id": back},
                                              layer=src, z_kind=zk))
               .with_metadata(**prov_md))
+
+
+def _track_group_unit(key: tuple, want_3d: bool) -> tuple:
+    """A SerialTrack group key ``(segmentation_channel, m_position)`` as a unit of ints:
+    ``(m, c, z)`` in 2-D (the channel key is ``c<c>z<z>``), ``(m, c)`` in 3-D."""
+    ch, m = str(key[0]), int(key[1])
+    c, _, z = ch[1:].partition("z")
+    return (m, int(c or 0)) if want_3d else (m, int(c or 0), int(z or 0))
+
+
+def _track_serialtrack_units(ctx: EvalContext, ds: Dataset, rows: list, kp: dict,
+                             want_3d: bool):
+    """Link SerialTrack group by group through the unit runner: groups in their first-
+    appearance order (the kernel's own order), each linked with a fresh id counter in a
+    worker, then offset by the ids of the groups before it — the same tracks the shared
+    counter produced (the node renumbers them through `build_membership` anyway; distinct
+    ids per group are what matters). Saved per group in a trial beside the source."""
+    groups: Dict[tuple, List[int]] = {}
+    for i, r in enumerate(rows):
+        groups.setdefault((r["segmentation_channel"], r["m_position"]), []).append(i)
+    keys = list(groups)
+    units = [_track_group_unit(k, want_3d) for k in keys]
+    by_unit = dict(zip(units, keys))
+    axes = ("m", "c") if want_3d else ("m", "c", "z")
+    names = [unit_name(u, axes) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=axes, analysis="SerialTrack")
+    kw = {k: v for k, v in kp.items() if k not in ("progress_cb", "label_masks")}
+
+    def read(u):
+        return {"rows": [rows[i] for i in groups[by_unit[u]]], "kp": kw}
+
+    run = run_units(ctx, units, read=read, work=_track_serialtrack_unit, names=names,
+                    trial=opened.trial, worker_bytes=1 << 30, min_inner=2, numba=True,
+                    note="tracking", in_thread=lambda p, cb: _track_serialtrack_unit(
+                        p, progress_cb=cb))
+    offset = 0
+    for key, res in zip(keys, run.results):
+        links = (res.get("tables") or {}).get("links") or {}
+        tid_of = dict(zip(np.asarray(links.get("label_id", []), dtype=np.int64).tolist(),
+                          np.asarray(links.get("track_id", []), dtype=np.int64).tolist()))
+        top = 0
+        for i in groups[key]:
+            t = tid_of.get(int(rows[i]["label_id"]), -1)
+            rows[i]["track_id"] = None if t < 0 else int(t) + offset
+            top = max(top, t)
+        offset += max(0, top)
+    return opened, run
+
+
+def _track_serialtrack_unit(p: dict, progress_cb=None) -> dict:
+    """One SerialTrack group, linked: the unit worker. Module-level (a worker process
+    imports it by name); returns each member's kernel track id (-1 = untracked)."""
+    from nodegraph.kernels import track_objects as _tko
+    rows = [dict(r) for r in p["rows"]]
+    kw = dict(p["kp"])
+    if progress_cb is not None:
+        kw["progress_cb"] = lambda frac, _msg="": progress_cb(int(100 * float(frac)))
+    _tko.link_objects(rows, **kw)
+    return {"tables": {"links": {
+        "label_id": np.array([int(r["label_id"]) for r in rows], dtype=np.int64),
+        "track_id": np.array([-1 if r.get("track_id") is None else int(r["track_id"])
+                              for r in rows], dtype=np.int64)}}, "stats": {}}
 
 def _columns_track_objects(params, modes, incoming):
     """BOTH tables this node writes (V2.28), because they answer different questions and
@@ -665,6 +758,7 @@ register_node(
                 "flattens genuine local variation, which matters if you go on to differentiate "
                 "the field into strain. Scale-free: the same value means the same thing at any "
                 "detection density or pixel size. SerialTrack method only."),
+        *store_sockets(available_in={"method": frozenset({"serialtrack"})}),
     ],
     outputs=[OutDataset()],
     modes=[Mode("target", ["label", "point"], default="label", label="Members",

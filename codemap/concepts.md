@@ -762,7 +762,10 @@ anchors: sym:nodegraph.analysis_store.open_trial, sym:nodegraph.analysis_store.r
 An **analysis unit** (2026-10-09) is the independent piece of an expensive analysis: a
 position × plane `(m, z)` for a planar method (DIC, PIV, 2-D SerialTrack), a position `(m,)`
 for a volumetric one (DVC, 3-D SerialTrack). A unit always spans the whole time series, since
-these methods compare frames, so T is never split. `_shared/analysis_units.run_units` runs a
+these methods compare frames, so T is never split. A SerialTrack unit is one
+(position, channel[, plane]) group, offset into the shared track ids in group order. Staged
+cards go through `run_stage_units`; their unit rows are written back in block order, and each
+saves its unit's FULL rows. `_shared/analysis_units.run_units` runs a
 node's units: it loads the ones already saved, then computes the rest on the governor's
 process lanes (CON-27), or in-thread when one lane is all there is. Results come back in unit
 order, so ids are identical to a serial run.

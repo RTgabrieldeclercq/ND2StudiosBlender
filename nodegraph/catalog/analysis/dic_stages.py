@@ -57,7 +57,10 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
-from nodegraph.catalog._shared.analysis_units import scoped_frame
+from nodegraph.catalog._shared.analysis_units import (finish_stage, run_stage_units,
+                                                      scoped_frame, stage_result,
+                                                      stamp_trial, store_sockets,
+                                                      unit_frames, unit_list)
 from nodegraph.catalog._shared.analysis_mesh import (concat_rows, fem_quads, lattice_quads,
                                                      mesh_columns, mesh_layer_name,
                                                      with_mesh)
@@ -309,35 +312,74 @@ def _compute_dic_initial_guess(ctx: EvalContext) -> Dataset:
     n_rows = len(cols["id"])
     disp = np.full((n_rows, 2), np.nan)
     seed_cc = np.full(n_rows, np.nan)
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)), note="seeding")
+    units = unit_list(ax, per_plane=True)
+
+    def payload(u, local):
+        m, z = u
+        _idx, counts = _dic_unit_rows(cols, m, z, c, plan)
+        for (t_out, _r), k in zip(plan, counts):
+            _dic_check_rows(k, n, m, t_out, z, c, node)
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m, _z=z: _dic_plane(prov, _m, t, _z, c),
+                                      local=local),
+                "gp": gp, "search": search, "shape": shape, "px": px, "n": n,
+                "roi": _dic_roi_plane(ds, roi_name, m, z, c), "plan": plan,
+                "ref_mode": ref_mode}
+
+    parts, opened, run = run_stage_units(
+        ctx, ds, layer, units, axes_names=("m", "z"),
+        rows_of=lambda u: _dic_unit_rows(cols, u[0], u[1], c, plan)[0],
+        payload_of=payload, work=_dic_seed_unit, analysis="DIC Initial Guess",
+        worker_bytes=12 * shape[0] * shape[1] * 8 + (400 << 20), min_inner=2,
+        note="seeding", in_thread=lambda p, cb: _dic_seed_unit(p, progress_cb=cb))
     search_used = search
-    for m in range(ax.m):
-        for z in range(ax.z):
-            roi = _dic_roi_plane(ds, roi_name, m, z, c)
-            para = dic_stage_para(_dic_kernel_params(gp, {"size_of_fft_search_region": search}), shape,
-                                  reference_mode=_dic_al_mode(ref_mode), roi_mask=roi)
-            refs = _dic_RefCache(lambda t_ref, _m=m, _z=z, _p=para, _r=roi: dic_stage_reference(
-                dic_stage_normalize(_dic_plane(prov, _m, t_ref, _z, c), _p), _p, shape, roi_mask=_r))
-            learned: Dict[int, int] = {}
-            for (t_out, t_ref) in plan:
-                ref = refs.get(t_ref)
-                idx = _dic_rows(cols, m, t_out, z, c, n, node)
-                g = dic_stage_normalize(_dic_plane(prov, m, t_out, z, c), para)
-                sd = dic_stage_seed(ref, g, search=learned.get(t_ref))
-                learned[t_ref] = int(sd["search"])
-                search_used = int(sd["search"])
-                mesh = dic_stage_mesh(ref, sd["x0"], sd["y0"])
-                u0 = dic_stage_seed_on_mesh(ref, mesh, sd["U0"], sd["x0"], sd["y0"])
-                ux, vy = dic_split_u(u0)
-                disp[idx, 0] = vy * px
-                disp[idx, 1] = ux * px
-                cc = np.asarray(sd["cc"], float).reshape(-1)
-                seed_cc[idx] = cc if cc.size == n else np.nan
-                bar.finish_unit(note=f"m={m} z={z} t={t_out}: search ±{sd['search']} px")
+    for part in parts:
+        if part.rows.size and part.cols:
+            disp[part.rows, 0] = part.cols["disp_y"]
+            disp[part.rows, 1] = part.cols["disp_x"]
+            seed_cc[part.rows] = part.cols["seed_cc"]
+        search_used = int(part.stats.get("search_used", search_used))
     out = {"disp_y": disp[:, 0], "disp_x": disp[:, 1],
            "disp_mag_um": np.sqrt(np.nansum(disp ** 2, axis=1)), "seed_cc": seed_cc}
     md = {"dic_stage": "initial_guess", "dic_search_range": search, "dic_search_used": search_used}
-    return _dic_write(ds, layer, out).with_metadata(**md)
+    finish_stage(opened, run, layer, stamps=md)
+    return _dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+
+
+def _dic_seed_unit(p: dict, progress_cb=None) -> dict:
+    """One (m, z) line through pyALDIC Section 3: the unit worker of DIC Initial Guess."""
+    from nodegraph.kernels.dic_correlate import (dic_split_u, dic_stage_mesh, dic_stage_normalize,
+                                                 dic_stage_para, dic_stage_reference,
+                                                 dic_stage_seed, dic_stage_seed_on_mesh)
+    fr, shape, px, n, plan = p["frames"], p["shape"], p["px"], p["n"], p["plan"]
+    para = dic_stage_para(_dic_kernel_params(p["gp"], {"size_of_fft_search_region": p["search"]}),
+                          shape, reference_mode=_dic_al_mode(p["ref_mode"]), roi_mask=p["roi"])
+    refs = _dic_RefCache(lambda t_ref: dic_stage_reference(
+        dic_stage_normalize(_dic_frame(fr, t_ref), para), para, shape, roi_mask=p["roi"]))
+    learned: Dict[int, int] = {}
+    dy, dx, ccs = [], [], []
+    search_used = p["search"]
+    for bi, (t_out, t_ref) in enumerate(plan):
+        ref = refs.get(t_ref)
+        g = dic_stage_normalize(_dic_frame(fr, t_out), para)
+        sd = dic_stage_seed(ref, g, search=learned.get(t_ref))
+        learned[t_ref] = int(sd["search"])
+        search_used = int(sd["search"])
+        mesh = dic_stage_mesh(ref, sd["x0"], sd["y0"])
+        u0 = dic_stage_seed_on_mesh(ref, mesh, sd["U0"], sd["x0"], sd["y0"])
+        ux, vy = dic_split_u(u0)
+        dy.append(vy * px)
+        dx.append(ux * px)
+        cc = np.asarray(sd["cc"], float).reshape(-1)
+        ccs.append(cc if cc.size == n else np.full(n, np.nan))
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    vy_all = np.concatenate(dy) if dy else np.zeros(0)
+    vx_all = np.concatenate(dx) if dx else np.zeros(0)
+    return stage_result(p, {"disp_y": vy_all, "disp_x": vx_all,
+                            "disp_mag_um": np.sqrt(vy_all ** 2 + vx_all ** 2),
+                            "seed_cc": np.concatenate(ccs) if ccs else np.zeros(0)},
+                        {"search_used": search_used})
 
 
 def _columns_dic_initial_guess(params, modes, incoming):
@@ -345,6 +387,40 @@ def _columns_dic_initial_guess(params, modes, incoming):
 
 
 # ── refinement: the spec a Refine Mesh card stamps, and the mesh every later stage uses ──
+
+def _dic_unit_rows(cols: Dict[str, np.ndarray], m: int, z: int, c: int, plan) -> Tuple[np.ndarray, List[int]]:
+    """The table rows of one (m, z) line in block order (one block per planned frame) and
+    each block's row count — the order a unit worker writes its columns back in."""
+    parts, counts = [], []
+    for (t_out, _t_ref) in plan:
+        idx = np.flatnonzero((cols["m"] == m) & (cols["t"] == t_out) & (cols["z"] == z)
+                             & (cols["c"] == c))
+        parts.append(idx)
+        counts.append(int(idx.size))
+    return (np.concatenate(parts) if parts else np.zeros(0, np.int64)), counts
+
+
+def _dic_check_rows(k: int, n: int, m: int, t: int, z: int, c: int, node: str) -> None:
+    if k != n:
+        raise ValueError(
+            f"{node}: the layer holds {k} rows for (m={m}, t={t}, z={z}, c={c}) but the "
+            f"mesh has {n} nodes — the table was filtered or re-ordered between stages; wire "
+            "the stages directly after DIC Grid")
+
+
+def _dic_frame(fr, t: int) -> np.ndarray:
+    """A unit's frame as the serial loop read it (``_dic_plane``: float64)."""
+    return np.asarray(fr.get(t), dtype=np.float64)
+
+
+def _dic_mesh_for(ref, x0, y0, spec: Optional[Dict[str, Any]]):
+    """Section 3's trimmed lattice mesh, refined by ``spec`` when a Refine Mesh card ran."""
+    from nodegraph.kernels.dic_correlate import dic_stage_mesh, dic_stage_refine
+    mesh = dic_stage_mesh(ref, x0, y0)
+    if spec is not None:
+        mesh, _u = dic_stage_refine(ref, mesh, None, spec)
+    return mesh
+
 
 def _dic_refine_spec(ds: Dataset, m: int, z: int, c: int) -> Optional[Dict[str, Any]]:
     """The pre-solve refinement ``dic.refine_mesh`` stamped (``dic_refine``), with its brush
@@ -372,12 +448,7 @@ def _dic_unit_mesh(ref, x0, y0, ds: Dataset, m: int, z: int, c: int):
     the mask and the criteria (never the displacement), so re-deriving it here reproduces
     the card's node order — the row order of the table — without carrying pyALDIC's object
     down the wire."""
-    from nodegraph.kernels.dic_correlate import dic_stage_mesh, dic_stage_refine
-    mesh = dic_stage_mesh(ref, x0, y0)
-    spec = _dic_refine_spec(ds, m, z, c)
-    if spec is not None:
-        mesh, _u = dic_stage_refine(ref, mesh, None, spec)
-    return mesh
+    return _dic_mesh_for(ref, x0, y0, _dic_refine_spec(ds, m, z, c))
 
 
 # ── §3½  DIC Refine Mesh ──────────────────────────────────────────────────────────
@@ -536,42 +607,83 @@ def _compute_dic_local_match(ctx: EvalContext) -> Dataset:
     grad = np.full((n_rows, 4), np.nan)
     n_iter = np.zeros(n_rows, dtype=np.int64)
     hole = np.zeros(n_rows, dtype=np.int64)
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)), note="matching")
-    for m in range(ax.m):
-        for z in range(ax.z):
-            roi = _dic_roi_plane(ds, roi_name, m, z, c)
-            para = dic_stage_para(_dic_kernel_params(gp, {"tol": tol, "icgn_max_iter": max_iter}), shape,
-                                  reference_mode=_dic_al_mode(ref_mode), roi_mask=roi)
-            x0, y0 = dic_stage_grid(para, shape)
-            refs = _dic_RefCache(lambda t_ref, _m=m, _z=z, _p=para, _r=roi: dic_stage_reference(
-                dic_stage_normalize(_dic_plane(prov, _m, t_ref, _z, c), _p), _p, shape, roi_mask=_r))
-            for (t_out, t_ref) in plan:
-                ref = refs.get(t_ref)
-                mesh = _dic_unit_mesh(ref, x0, y0, ds, m, z, c)
-                n = int(mesh.coordinates_fem.shape[0])
-                idx = _dic_rows(cols, m, t_out, z, c, n, node)
-                g = dic_stage_normalize(_dic_plane(prov, m, t_out, z, c), para)
-                u0 = dic_merge_u(disp_in[idx, 1] / px, disp_in[idx, 0] / px)
-                r = dic_stage_local(ref, mesh, g, u0)
-                ux, vy = dic_split_u(r["U"])
-                disp[idx, 0] = vy * px
-                disp[idx, 1] = ux * px
-                gyy, gyx, gxy, gxx = _dic_grad_image_axes(r["F"])
-                grad[idx] = np.stack([gyy, gyx, gxy, gxx], axis=1)
-                ci = np.asarray(r["conv_iter"]).reshape(-1)
-                n_iter[idx] = ci.astype(np.int64) if ci.size == n else 0
-                h = np.zeros(n, dtype=np.int64)
-                h[np.asarray(r["mark_hole_strain"], dtype=np.int64)] = 1
-                hole[idx] = h
-                bar.finish_unit(note=f"m={m} z={z} t={t_out}: {n} subsets in {r['solve_time']:.1f} s, "
-                                     f"{len(r['mark_hole_strain'])} holes")
+    units = unit_list(ax, per_plane=True)
+
+    def payload(u, local):
+        m, z = u
+        idx, counts = _dic_unit_rows(cols, m, z, c, plan)
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m, _z=z: _dic_plane(prov, _m, t, _z, c),
+                                      local=local),
+                "gp": gp, "tol": tol, "max_iter": max_iter, "shape": shape, "px": px,
+                "roi": _dic_roi_plane(ds, roi_name, m, z, c), "plan": plan, "ref_mode": ref_mode,
+                "refine": _dic_refine_spec(ds, m, z, c), "counts": counts, "node": node,
+                "m": m, "z": z, "c": c,
+                "disp_y": disp_in[idx, 0], "disp_x": disp_in[idx, 1]}
+
+    parts, opened, run = run_stage_units(
+        ctx, ds, layer, units, axes_names=("m", "z"),
+        rows_of=lambda u: _dic_unit_rows(cols, u[0], u[1], c, plan)[0],
+        payload_of=payload, work=_dic_local_unit, analysis="DIC Local Match",
+        worker_bytes=12 * shape[0] * shape[1] * 8 + (400 << 20), min_inner=2,
+        note="matching", in_thread=lambda p, cb: _dic_local_unit(p, progress_cb=cb))
+    for part in parts:
+        if not (part.rows.size and part.cols):
+            continue
+        disp[part.rows, 0] = part.cols["disp_y"]
+        disp[part.rows, 1] = part.cols["disp_x"]
+        grad[part.rows] = np.stack([part.cols[g] for g in GRAD_COLUMNS], axis=1)
+        n_iter[part.rows] = np.asarray(part.cols["n_iter"], dtype=np.int64)
+        hole[part.rows] = np.asarray(part.cols["hole"], dtype=np.int64)
     out = {"disp_y": disp[:, 0], "disp_x": disp[:, 1], "disp_mag_um": np.sqrt(np.nansum(disp ** 2, axis=1))}
     for k, name in enumerate(GRAD_COLUMNS):
         out[name] = grad[:, k]
     out["n_iter"] = n_iter
     out["hole"] = hole
     md = {"dic_stage": "local_match", "dic_tol": tol, "dic_icgn_max_iter": max_iter}
-    return _dic_write(ds, layer, out).with_metadata(**md)
+    finish_stage(opened, run, layer, stamps=md)
+    return _dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+
+
+def _dic_local_unit(p: dict, progress_cb=None) -> dict:
+    """One (m, z) line through pyALDIC Section 4: the unit worker of DIC Local Match."""
+    from nodegraph.kernels.dic_correlate import (dic_merge_u, dic_split_u, dic_stage_grid,
+                                                 dic_stage_local, dic_stage_normalize,
+                                                 dic_stage_para, dic_stage_reference)
+    fr, shape, px, plan = p["frames"], p["shape"], p["px"], p["plan"]
+    para = dic_stage_para(_dic_kernel_params(p["gp"], {"tol": p["tol"],
+                                                       "icgn_max_iter": p["max_iter"]}),
+                          shape, reference_mode=_dic_al_mode(p["ref_mode"]), roi_mask=p["roi"])
+    x0, y0 = dic_stage_grid(para, shape)
+    refs = _dic_RefCache(lambda t_ref: dic_stage_reference(
+        dic_stage_normalize(_dic_frame(fr, t_ref), para), para, shape, roi_mask=p["roi"]))
+    acc: Dict[str, list] = {k: [] for k in ("disp_y", "disp_x", "n_iter", "hole") + GRAD_COLUMNS}
+    off = 0
+    for bi, (t_out, t_ref) in enumerate(plan):
+        ref = refs.get(t_ref)
+        mesh = _dic_mesh_for(ref, x0, y0, p["refine"])
+        n = int(mesh.coordinates_fem.shape[0])
+        _dic_check_rows(p["counts"][bi], n, p["m"], t_out, p["z"], p["c"], p["node"])
+        sl = slice(off, off + n)
+        off += n
+        g = dic_stage_normalize(_dic_frame(fr, t_out), para)
+        u0 = dic_merge_u(p["disp_x"][sl] / px, p["disp_y"][sl] / px)
+        r = dic_stage_local(ref, mesh, g, u0)
+        ux, vy = dic_split_u(r["U"])
+        acc["disp_y"].append(vy * px)
+        acc["disp_x"].append(ux * px)
+        for name, comp in zip(GRAD_COLUMNS, _dic_grad_image_axes(r["F"])):
+            acc[name].append(np.asarray(comp, dtype=float))
+        ci = np.asarray(r["conv_iter"]).reshape(-1)
+        acc["n_iter"].append(ci.astype(np.int64) if ci.size == n else np.zeros(n, np.int64))
+        h = np.zeros(n, dtype=np.int64)
+        h[np.asarray(r["mark_hole_strain"], dtype=np.int64)] = 1
+        acc["hole"].append(h)
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    new = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in acc.items()}
+    new["disp_mag_um"] = np.sqrt(new["disp_y"] ** 2 + new["disp_x"] ** 2)
+    return stage_result(p, new)
 
 
 def _columns_dic_local_match(params, modes, incoming):
@@ -633,40 +745,35 @@ def _compute_dic_global_step(ctx: EvalContext) -> Dataset:
     disp = disp_in.copy()
     grad = grad_in.copy()
     last_beta = None
-    regions_mod = _al_dic_modules()["regions"]
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=max(1, len(plan)), note="ADMM")
-    for m in range(ax.m):
-        for z in range(ax.z):
-            roi = _dic_roi_plane(ds, roi_name, m, z, c)
-            para = dic_stage_para(_dic_kernel_params(gp, p_extra), shape,
-                                  reference_mode=_dic_al_mode(ref_mode), roi_mask=roi)
-            if beta_param > 0:
-                from dataclasses import replace
-                para = replace(para, beta=beta_param)
-            x0, y0 = dic_stage_grid(para, shape)
-            refs = _dic_RefCache(lambda t_ref, _m=m, _z=z, _p=para, _r=roi: dic_stage_reference(
-                dic_stage_normalize(_dic_plane(prov, _m, t_ref, _z, c), _p), _p, shape, roi_mask=_r))
-            beta_by_ref: Dict[int, float] = {}
-            for (t_out, t_ref) in plan:
-                ref = refs.get(t_ref)
-                mesh = _dic_unit_mesh(ref, x0, y0, ds, m, z, c)
-                n = int(mesh.coordinates_fem.shape[0])
-                idx = _dic_rows(cols, m, t_out, z, c, n, node)
-                g = dic_stage_normalize(_dic_plane(prov, m, t_out, z, c), para)
-                u1 = dic_merge_u(np.nan_to_num(disp_in[idx, 1]) / px, np.nan_to_num(disp_in[idx, 0]) / px)
-                gyy, gyx, gxy, gxx = (np.nan_to_num(grad_in[idx, k]) for k in range(4))
-                f1 = dic_merge_f(gxx, gyx, gxy, gyy)        # (dudx, dvdx, dudy, dvdy)
-                mhs = np.flatnonzero(hole_in[idx]).astype(np.int64)
-                regions = regions_mod.precompute_node_regions(mesh.coordinates_fem, ref.f_mask, shape)
-                r = dic_stage_global(ref, mesh, g, u1, f1, mhs, regions, beta=beta_by_ref.get(t_ref))
-                beta_by_ref[t_ref] = float(r["beta"])
-                last_beta = float(r["beta"])
-                ux, vy = dic_split_u(r["U"])
-                disp[idx, 0] = vy * px
-                disp[idx, 1] = ux * px
-                gyy, gyx, gxy, gxx = _dic_grad_image_axes(r["F"])
-                grad[idx] = np.stack([gyy, gyx, gxy, gxx], axis=1)
-                bar.finish_unit(note=f"m={m} z={z} t={t_out}: β={r['beta']:.3g}, {r['n_steps']} ADMM step(s)")
+    units = unit_list(ax, per_plane=True)
+
+    def payload(u, local):
+        m, z = u
+        idx, counts = _dic_unit_rows(cols, m, z, c, plan)
+        return {"frames": unit_frames([t for b in plan for t in b],
+                                      lambda t, _m=m, _z=z: _dic_plane(prov, _m, t, _z, c),
+                                      local=local),
+                "gp": gp, "p_extra": p_extra, "beta": beta_param, "shape": shape, "px": px,
+                "roi": _dic_roi_plane(ds, roi_name, m, z, c), "plan": plan, "ref_mode": ref_mode,
+                "refine": _dic_refine_spec(ds, m, z, c), "counts": counts, "node": node,
+                "m": m, "z": z, "c": c,
+                "disp_y": disp_in[idx, 0], "disp_x": disp_in[idx, 1], "grad": grad_in[idx],
+                "hole": hole_in[idx]}
+
+    parts, opened, run = run_stage_units(
+        ctx, ds, layer, units, axes_names=("m", "z"),
+        rows_of=lambda u: _dic_unit_rows(cols, u[0], u[1], c, plan)[0],
+        payload_of=payload, work=_dic_global_unit, analysis="DIC Global Step",
+        worker_bytes=12 * shape[0] * shape[1] * 8 + (400 << 20), min_inner=2,
+        note="ADMM", in_thread=lambda p, cb: _dic_global_unit(p, progress_cb=cb))
+    for part in parts:
+        if not (part.rows.size and part.cols):
+            continue
+        disp[part.rows, 0] = part.cols["disp_y"]
+        disp[part.rows, 1] = part.cols["disp_x"]
+        grad[part.rows] = np.stack([part.cols[g] for g in GRAD_COLUMNS], axis=1)
+        if part.stats.get("beta") is not None:
+            last_beta = float(part.stats["beta"])
     out = {"disp_y": disp[:, 0], "disp_x": disp[:, 1], "disp_mag_um": np.sqrt(np.nansum(disp ** 2, axis=1))}
     for k, name in enumerate(GRAD_COLUMNS):
         out[name] = grad[:, k]
@@ -675,7 +782,60 @@ def _compute_dic_global_step(ctx: EvalContext) -> Dataset:
           "dic_admm_max_iter": p_extra["admm_max_iter"],
           "dic_disp_smoothness": p_extra["disp_smoothness"],
           "dic_strain_smoothness": p_extra["strain_smoothness"], "dic_solver": "aldic"}
-    return _dic_write(ds, layer, out).with_metadata(**md)
+    finish_stage(opened, run, layer, stamps=md)
+    return _dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+
+
+def _dic_global_unit(p: dict, progress_cb=None) -> dict:
+    """One (m, z) line through pyALDIC Sections 5-6: the unit worker of DIC Global Step. β is
+    tuned once per reference within the line, as the driver does."""
+    from nodegraph.kernels.dic_correlate import (dic_merge_f, dic_merge_u, dic_split_u,
+                                                 dic_stage_global, dic_stage_grid,
+                                                 dic_stage_normalize, dic_stage_para,
+                                                 dic_stage_reference)
+    from nodegraph.kernels.dic_correlate import _al_dic_modules
+    fr, shape, px, plan = p["frames"], p["shape"], p["px"], p["plan"]
+    regions_mod = _al_dic_modules()["regions"]
+    para = dic_stage_para(_dic_kernel_params(p["gp"], p["p_extra"]), shape,
+                          reference_mode=_dic_al_mode(p["ref_mode"]), roi_mask=p["roi"])
+    if p["beta"] > 0:
+        from dataclasses import replace
+        para = replace(para, beta=p["beta"])
+    x0, y0 = dic_stage_grid(para, shape)
+    refs = _dic_RefCache(lambda t_ref: dic_stage_reference(
+        dic_stage_normalize(_dic_frame(fr, t_ref), para), para, shape, roi_mask=p["roi"]))
+    beta_by_ref: Dict[int, float] = {}
+    acc: Dict[str, list] = {k: [] for k in ("disp_y", "disp_x") + GRAD_COLUMNS}
+    off = 0
+    last_beta = None
+    grad_in = np.asarray(p["grad"], dtype=float)
+    hole_in = np.asarray(p["hole"]).astype(bool)
+    for bi, (t_out, t_ref) in enumerate(plan):
+        ref = refs.get(t_ref)
+        mesh = _dic_mesh_for(ref, x0, y0, p["refine"])
+        n = int(mesh.coordinates_fem.shape[0])
+        _dic_check_rows(p["counts"][bi], n, p["m"], t_out, p["z"], p["c"], p["node"])
+        sl = slice(off, off + n)
+        off += n
+        g = dic_stage_normalize(_dic_frame(fr, t_out), para)
+        u1 = dic_merge_u(np.nan_to_num(p["disp_x"][sl]) / px, np.nan_to_num(p["disp_y"][sl]) / px)
+        gyy, gyx, gxy, gxx = (np.nan_to_num(grad_in[sl, k]) for k in range(4))
+        f1 = dic_merge_f(gxx, gyx, gxy, gyy)            # (dudx, dvdx, dudy, dvdy)
+        mhs = np.flatnonzero(hole_in[sl]).astype(np.int64)
+        regions = regions_mod.precompute_node_regions(mesh.coordinates_fem, ref.f_mask, shape)
+        r = dic_stage_global(ref, mesh, g, u1, f1, mhs, regions, beta=beta_by_ref.get(t_ref))
+        beta_by_ref[t_ref] = float(r["beta"])
+        last_beta = float(r["beta"])
+        ux, vy = dic_split_u(r["U"])
+        acc["disp_y"].append(vy * px)
+        acc["disp_x"].append(ux * px)
+        for name, comp in zip(GRAD_COLUMNS, _dic_grad_image_axes(r["F"])):
+            acc[name].append(np.asarray(comp, dtype=float))
+        if progress_cb is not None:
+            progress_cb(int(100 * (bi + 1) / max(1, len(plan))))
+    new = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in acc.items()}
+    new["disp_mag_um"] = np.sqrt(new["disp_y"] ** 2 + new["disp_x"] ** 2)
+    return stage_result(p, new, {"beta": last_beta})
 
 
 def _columns_dic_global_step(params, modes, incoming):
@@ -869,6 +1029,7 @@ register_node(
               "pyALDIC widens it automatically while peaks land on its edge and remembers the "
               "radius that worked, and shrinks it when the image cannot hold it. Arrows pointing "
               "the wrong way on THIS card are the symptom of a radius too small."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     granularity=_STAGE_GRAN, kernel_axes=_IMG_KAX,
@@ -893,6 +1054,7 @@ register_node(
                 "Convergence tolerance of the IC-GN update (pixels): the iteration stops once "
                 "the step is below it. SMALLER is more precise and slower; pyALDIC's default "
                 "0.01 is below the method's own precision floor on real speckle."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     granularity=_STAGE_GRAN, kernel_axes=_IMG_KAX,
@@ -931,6 +1093,7 @@ register_node(
                 description=
                 "The same for the deformation gradient handed to the global solve; 0 is off. "
                 "The single node's default is 1e-5."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     granularity=_STAGE_GRAN, kernel_axes=_IMG_KAX,

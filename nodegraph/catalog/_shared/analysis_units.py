@@ -56,10 +56,13 @@ _RESULTS_DOCS = {
 }
 
 
-def store_sockets() -> list:
-    """The ``results`` and ``trial_label`` sockets, declared once for every saving node."""
+def store_sockets(available_in: Optional[Dict[str, Any]] = None) -> list:
+    """The ``results`` and ``trial_label`` sockets, declared once for every saving node.
+    ``available_in`` gates them to the mode values that save (SerialTrack, on a tracker
+    whose other methods are fast enough not to)."""
     return [
         InString("results", "Saved results", field=False, default="reuse",
+                 available_in=available_in,
                  choices=("reuse", "recompute", "off"), choice_docs=_RESULTS_DOCS,
                  description=(
                      "Whether this analysis saves its result beside the source file "
@@ -70,6 +73,7 @@ def store_sockets() -> list:
                      "read from and written to disk. Quick-analysis (F9-scoped) pulls never "
                      "save.")),
         InString("trial_label", "Trial label", field=False, default="",
+                 available_in=available_in,
                  description=(
                      "A name for this combination of settings, shown in the saved trial's "
                      "`trial.json`, the folder's `index.json` and Load Analysis's list — so "
@@ -471,6 +475,142 @@ def describe_seconds(s: Optional[float]) -> str:
     return f"{s / 3600:.1f} h"
 
 
+# ── staged cards: a unit's frames, its rows, and the shared run ─────────────────────
+
+class _LazyFrames:
+    """``reader(t)`` for each ``t`` of ``ts`` as an indexable sequence — what :func:`ship`
+    streams to disk one frame at a time instead of stacking the whole series in RAM."""
+
+    def __init__(self, reader: Callable[[int], np.ndarray], ts: Sequence[int]) -> None:
+        self._reader, self._ts = reader, list(ts)
+
+    def __len__(self) -> int:
+        return len(self._ts)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        return np.asarray(self._reader(self._ts[i]))
+
+
+class UnitFrames:
+    """The frames one unit reads, addressed by SOURCE timepoint. Built on the pull thread:
+    in-process it wraps the provider reader (lazy, nothing copied); for a worker it holds
+    the frames as an array or a :class:`ShippedArray` (picklable, read lazily there).
+    ``get(t)`` returns the frame in its native dtype — the stage converts it exactly as its
+    serial loop did, so results stay bit-identical."""
+
+    def __init__(self, ts: Sequence[int], *, frames: Any = None,
+                 reader: Optional[Callable[[int], np.ndarray]] = None) -> None:
+        self.ts = [int(t) for t in ts]
+        self._index = {t: i for i, t in enumerate(self.ts)}
+        self._frames = frames
+        self._reader = reader
+        self._opened: Any = None
+
+    def __getstate__(self):
+        return {"ts": self.ts, "_index": self._index, "_frames": self._frames,
+                "_reader": None, "_opened": None}
+
+    def get(self, t: int) -> np.ndarray:
+        if self._reader is not None:
+            return np.asarray(self._reader(int(t)))
+        if self._opened is None:
+            self._opened = unship(self._frames)
+        return np.asarray(self._opened[self._index[int(t)]])
+
+
+def unit_frames(ts: Sequence[int], reader: Callable[[int], np.ndarray], *,
+                local: bool) -> UnitFrames:
+    """The :class:`UnitFrames` for ``ts`` — lazy in-process, shipped for a worker."""
+    ts = sorted({int(t) for t in ts})
+    if local:
+        return UnitFrames(ts, reader=reader)
+    return UnitFrames(ts, frames=ship(_LazyFrames(reader, ts)) if ts else None)
+
+
+@dataclass
+class StagePart:
+    """One unit of a staged card, folded: the table rows it covers (in the order the worker
+    produced them) and the columns it wrote there."""
+    unit: Tuple[int, ...]
+    rows: np.ndarray
+    cols: Dict[str, np.ndarray]
+    stats: dict
+
+
+def stage_result(payload: dict, new_cols: Dict[str, np.ndarray],
+                 stats: Optional[dict] = None) -> dict:
+    """What a staged card's unit worker returns: the unit's FULL rows with its new columns
+    overwritten (so a saved stage loads back as a complete table), its grid rows passed
+    through, and per-unit stats."""
+    field = dict(payload.get("_rows") or {})
+    field.update({k: np.asarray(v) for k, v in new_cols.items()})
+    tables = {"field": field} if field else {}
+    mesh = payload.get("_mesh")
+    if mesh:
+        tables["mesh"] = mesh
+    return {"tables": tables, "stats": dict(stats or {})}
+
+
+def run_stage_units(ctx: EvalContext, ds: Any, layer: str, units: Sequence[Tuple[int, ...]],
+                    *, axes_names: Sequence[str],
+                    rows_of: Callable[[Tuple[int, ...]], np.ndarray],
+                    payload_of: Callable[[Tuple[int, ...], bool], dict],
+                    work: Callable[[Any], dict], analysis: str, worker_bytes: int,
+                    min_inner: int = 1, numba: bool = True, note: str = "analysing",
+                    in_thread: Optional[Callable[[Any, Callable[[int], None]], dict]] = None,
+                    z_kind: str = "plane_index",
+                    ) -> Tuple[List[StagePart], "TrialOpen", "UnitRun"]:
+    """A staged card's units through :func:`run_units` and the store: each unit's payload
+    (``payload_of(unit, local)``) gets the unit's rows of the input table (``rows_of`` — the
+    row order the worker writes back in) and its grid rows, the units run across lanes /
+    load from the card's trial, and the parts come back in unit order for the card to write.
+    The trial records the field and grid placement so Load Analysis reads a stage's trial as
+    the complete table at that stage."""
+    from nodegraph.analysis_store import unit_name as _uname
+    from nodegraph.domains import Domain
+    cols = {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.POINT) if a.layer == layer}
+    mesh_name = f"{layer}_mesh"
+    mesh_cols = {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.POINT)
+                 if a.layer == mesh_name}
+    names = [_uname(u, axes_names) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=axes_names, analysis=analysis)
+    rows = {tuple(u): np.asarray(rows_of(u), dtype=np.int64) for u in units}
+
+    def build(u, local: bool) -> dict:
+        p = payload_of(u, local)
+        idx = rows[tuple(u)]
+        p["_rows"] = {k: v[idx] for k, v in cols.items()}
+        if mesh_cols:
+            keep = np.ones(len(next(iter(mesh_cols.values()))), dtype=bool)
+            for a, i in zip(axes_names, u):
+                if a in mesh_cols:
+                    keep &= np.rint(np.asarray(mesh_cols[a], float)) == int(i)
+            p["_mesh"] = {k: v[keep] for k, v in mesh_cols.items()}
+        return p
+
+    run = run_units(ctx, units, read=lambda u: build(u, False),
+                    read_local=lambda u: build(u, True), work=work, names=names,
+                    trial=opened.trial, worker_bytes=worker_bytes, min_inner=min_inner,
+                    numba=numba, note=note, in_thread=in_thread)
+    parts = [StagePart(tuple(u), rows[tuple(u)], (r.get("tables") or {}).get("field", {}),
+                       r.get("stats") or {}) for u, r in zip(units, run.results)]
+    return parts, opened, run
+
+
+def finish_stage(opened: "TrialOpen", run: "UnitRun", layer: str, *, stamps: Dict[str, Any],
+                 z_kind: str = "plane_index", mesh_kind: str = "",
+                 mesh_window: Optional[Sequence[float]] = None) -> None:
+    """:func:`finish_trial` for a staged card — its field, and its grid when it has one."""
+    tables: Dict[str, Dict[str, Any]] = {
+        "field": {"domain": "point", "layer": layer, "z_kind": z_kind}}
+    if mesh_kind:
+        tables["mesh"] = {"domain": "point", "layer": f"{layer}_mesh", "z_kind": z_kind,
+                          "mesh_of": layer, "mesh_kind": mesh_kind}
+        if mesh_window is not None:
+            tables["mesh"]["mesh_window"] = [float(w) for w in mesh_window]
+    finish_trial(opened, run, stamps=stamps, tables=tables)
+
+
 def concat_tables(results: Sequence[dict], kind: str) -> Dict[str, np.ndarray]:
     """One column dict from every unit's ``kind`` table, in unit order (empty units skipped;
     a column missing from some units is dropped — a partial column would misalign rows)."""
@@ -521,5 +661,7 @@ __all__ = [
     "open_node_trial",
     "SHIP_BYTES", "ShippedArray", "ship", "unship", "UnitRun", "run_units",
     "concat_tables", "finish_trial", "stamp_trial", "QUALITY", "EST_KEY",
+    "UnitFrames", "unit_frames", "StagePart", "stage_result", "run_stage_units",
+    "finish_stage",
     "quality_layers", "with_quality", "full_run_estimate", "describe_seconds",
 ]

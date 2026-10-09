@@ -7135,9 +7135,128 @@ def test_analysis_parallel() -> None:
     for k in ("disp_z", "disp_y", "disp_x"):
         assert np.allclose(a[k], b[k], atol=1e-10, rtol=0, equal_nan=True), \
             (k, np.nanmax(np.abs(a[k] - b[k])))
+    # ── the staged chains: every frame-reading card on lanes ≡ serial ───────────────
+    def run_chain(chain, img, ax, *, serial):
+        meta = {"pixel_size_um": 0.5, "z_step_um": 1.0}
+        ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+        g = Graph()
+        g.add(NodeInstance("S", "io.parseed"))
+        prev = "S"
+        for i, (op, params) in enumerate(chain):
+            g.add(NodeInstance(f"N{i}", op, params={**params, "results": "off"}
+                               if "results" in {s.name for s in NODES.get(op).inputs}
+                               else dict(params)))
+            g.connect(prev, f"N{i}", dst_socket="data")
+            prev = f"N{i}"
+        old = _os.environ.get("NODEGRAPH_PARALLEL")
+        if serial:
+            _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        try:
+            return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                          meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull(prev)
+        finally:
+            if serial:
+                if old is None:
+                    _os.environ.pop("NODEGRAPH_PARALLEL", None)
+                else:
+                    _os.environ["NODEGRAPH_PARALLEL"] = old
+
+    def same(chain, img, ax, layer, keys, tol):
+        a = table(run_chain(chain, img, ax, serial=False), layer)
+        b = table(run_chain(chain, img, ax, serial=True), layer)
+        assert a["m"].size and np.array_equal(a["m"], b["m"]) and np.array_equal(a["t"], b["t"])
+        for k in keys:
+            assert np.allclose(a[k], b[k], atol=tol, rtol=0, equal_nan=True), \
+                (chain[-1][0], k, np.nanmax(np.abs(a[k] - b[k])))
+        return a
+    img2 = img[:2]                                              # 2 positions of the PIV set
+    ax2p = AxisSizes(m=2, t=3, z=1, c=1, y=96, x=96)
+    same([("piv.first_pass", {"window_size": 32}), ("piv.validate", {}),
+          ("piv.deform_pass", {"window_size": 16})], img2, ax2p, "piv",
+         ("disp_y", "disp_x"), 1e-12)
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    if al_dic_available():
+        same([("dic.grid", {"winsize": 20, "winstepsize": 16}), ("dic.initial_guess", {}),
+              ("dic.local_match", {}), ("dic.global_step", {})], img2, ax2p, "dic",
+             ("disp_y", "disp_x", "grad_xx"), 1e-12)
+    same([("dvc.grid", {k: pv[k] for k in ("subset_size", "subset_size_z", "subset_spacing",
+                                           "subset_spacing_z")}),
+          ("dvc.initial_guess", {}), ("dvc.local_match", {})], vol, axv, "dvc",
+         ("disp_z", "disp_y", "disp_x"), 1e-10)
+
+    # ── SerialTrack: 2 positions × 2 planes = 4 groups on lanes ≡ serial; saved, reloaded ──
+    from nodegraph.structure import StructureTable
+    T, Y, X = 4, 48, 48
+    BASE = np.array([[8.0, 8.0], [26.0, 30.0], [38.0, 12.0]])
+    cols: dict = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x")}
+    nid = 1
+    for m in range(2):
+        for t in range(T):
+            for z in range(2):
+                for (cy, cx) in BASE + t * np.array([2.0, 1.0 + m]):
+                    for k, v in (("id", nid), ("m", m), ("t", t), ("c", 0), ("z", z),
+                                 ("y", cy), ("x", cx)):
+                        cols[k].append(v)
+                    nid += 1
+    axt = AxisSizes(m=2, t=T, z=2, c=1, y=Y, x=X)
+    dst = Dataset(axes=axt).with_structure(StructureTable(
+        D.POINT, {k: np.asarray(v) for k, v in cols.items()}, layer="spots",
+        z_kind="plane_index"))
+
+    def track(results, serial=False, store=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.parseed"))
+        g.add(NodeInstance("K", "track.objects",
+                           params={"max_distance": 6.0, "results": results},
+                           modes={"target": "point", "method": "serialtrack"}))
+        g.connect("S", "K")
+        saved = {k: _os.environ.get(k) for k in ("NODEGRAPH_PARALLEL", "NODEGRAPH_STORE_DIR")}
+        if serial:
+            _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        if store:
+            _os.environ["NODEGRAPH_STORE_DIR"] = store
+        try:
+            return Engine(g, computes=COMPUTES, seeds={"S": dst},
+                          meta_seeds={"S": MetaEnvelope(axes=axt, metadata={
+                              "pixel_size_um": 0.5})}).pull("K")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    _os.environ.pop(k, None)
+                else:
+                    _os.environ[k] = v
+
+    def tracks(o):
+        get = lambda n: np.asarray(o.get(D.TRACK, n, layer="tracks").values)
+        return get("track_id"), get("member_id"), get("t")
+    tp, ts = tracks(track("off")), tracks(track("off", serial=True))
+    assert all(np.array_equal(a, b) for a, b in zip(tp, ts)), "SerialTrack lanes ≠ serial"
+    assert len(set(tp[0].tolist())) == 12, f"4 groups × 3 objects, got {sorted(set(tp[0]))}"
+    import tempfile as _tf
+    import shutil as _sh
+    tmp = _tf.mkdtemp(prefix="ng-st-")
+    try:
+        o1 = track("reuse", store=tmp)
+        o2 = track("reuse", store=tmp)
+        assert o2.metadata["analysis_trial_units"].startswith("4/4 loaded"), \
+            o2.metadata["analysis_trial_units"]
+        assert all(np.array_equal(a, b) for a, b in zip(tracks(o1), tracks(o2)))
+        g = Graph()
+        g.add(NodeInstance("L", "io.load_analysis",
+                           params={"trial": o1.metadata["analysis_trial"]},
+                           modes={"onto": "tables_only"}))
+        lo = Engine(g, computes=COMPUTES).pull("L")
+        assert all(np.array_equal(a, b) for a, b in zip(tracks(lo), tracks(o1))), \
+            "Load Analysis must restore the SerialTrack result"
+        assert lo.get(D.POINT, "track_id", layer="spots") is not None
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
     _ok(f"analysis parallel (2026-10-09): PIV over 3 (m,z) units and DVC over 2 m units on "
         f"process lanes equal the serial run (PIV ≤1e-12, DVC ≤1e-10; same rows, same ids, "
-        f"ordered fold) — PIV ran as: {lanes_piv}")
+        f"ordered fold) — PIV ran as: {lanes_piv}; the staged PIV / DIC / DVC chains on 2 "
+        f"positions equal their serial runs; SerialTrack over 4 (m,c,z) groups gives the "
+        f"same 12 tracks on lanes and serially, saves per group, reloads 4/4, and Load "
+        f"Analysis restores the Track table and the members' track_id")
 
 
 def test_quick_scope() -> None:
