@@ -5863,7 +5863,7 @@ class MainWindow(QMainWindow):
         """
         import os
         from nodelab_v2.document import CHANNELS_KEY, TITLE_KEY
-        from nodegraph.metadata import MetaEnvelope, SOURCE_FILE_KEY
+        from nodegraph.metadata import MetaEnvelope
         from nodegraph.dataset import AxisSizes
         from nodelab_v2.ingest import read_meta_only
         from nodelab_v2.runner import BUNDLE_PATHS_KEY, _unique_labels
@@ -5924,10 +5924,13 @@ class MainWindow(QMainWindow):
         # The seed envelope must say the same thing the pull will (the edit-time envelope
         # and the payload agreeing is the standing rule for anything that changes axes):
         # M is the sum, and `source_file` names the file each position came from.
+        # Through `bundle_envelope`, the SAME function the pull builds the bundle's envelope
+        # with: the per-M calibration (`origin_um`) is concatenated across the files rather
+        # than file 0's n-long list standing on a K·n-long M axis until the first pull.
         from nodelab_v2.ingest import channel_display_seed
-        md = dict(calib0)
-        md[SOURCE_FILE_KEY] = [labels[i] for i, h in enumerate(heads)
-                               for _ in range(int(h[1].m))]
+        from nodelab_v2.runner import bundle_envelope
+        md = dict(bundle_envelope(axes, [MetaEnvelope(axes=h[1], metadata=dict(h[2]))
+                                         for h in heads], labels).metadata)
         md.update(channel_display_seed(disp0, ax0.c))      # the names ride it (step 11g)
         self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))
         return rec, axes

@@ -650,6 +650,12 @@ wired into a **Timeseries Builder** in pick order, which accepts files that diff
 axis being built. Different frame counts (8, 8, 8, 7, 7) are the usual reason a sequence
 cannot share one card.
 
+**Each file keeps its own positions and clock.** The bundle's stage log (`stage_xy_um`,
+`stage_z_um`), point names and per-frame clock (`source_frame_time_jd`) are concatenated
+across its files, position by position. Stitch by stage, the Viewer's stage readout and a
+Timeseries Builder after the card therefore see every file's real coordinates and times,
+not the first file's.
+
 **Exports name the file.** Every table a bundle produces gains a **`file`** column, sitting
 immediately before `m`, naming the source of each row — so one CSV holds every replicate and
 stays sortable by file. (A single-file load is unchanged and gains no column.) Where two

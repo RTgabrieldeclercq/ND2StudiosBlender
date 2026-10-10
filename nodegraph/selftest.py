@@ -30737,13 +30737,33 @@ def test_timeseries_frame_interleave() -> None:
     ix2 = sequence_indexer(swapped, ["T", "P", "C", "Y", "X"], {"T": 3, "P": 2, "C": 2})
     assert ix2({"T": 1, "P": 0}) == 1 and ix2({"T": 0, "P": 1}) == 3, "the file's own order wins"
 
+    # 8. a multi-file card's display dict: shared things from file 0, per-position lists
+    #    (the stage log, the point names) concatenated across the files, all-or-nothing --
+    #    file 0's n-long list on a K*n-long M axis was rejected everywhere, so a bundle had
+    #    no stage log at all
+    from nodelab_v2.runner import bundle_display
+    d0 = {"channel_names": ["GFP"], "stage_xy_um": [[1.0, 2.0], [3.0, 4.0]],
+          "stage_z_um": [10.0, 11.0], "position_name": ["#1", "#2"],
+          "frame_time_jd": [1.0, 2.0, 3.0]}
+    d1 = {"channel_names": ["GFP"], "stage_xy_um": [[5.0, 6.0]], "stage_z_um": [12.0],
+          "frame_time_jd": [7.0, 8.0, 9.0]}
+    bd = bundle_display([d0, d1], envs)
+    assert bd["stage_xy_um"] == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], bd
+    assert bd["stage_z_um"] == [10.0, 11.0, 12.0] and bd["channel_names"] == ["GFP"], bd
+    assert "position_name" not in bd, "missing on one file: dropped whole, never padded"
+    assert bd[SOURCE_CLOCK_KEY] == [[1.0, 2.0, 3.0]] * 2 + [[7.0, 8.0, 9.0]], bd
+    assert bd["frame_time_jd"] == [1.0, 2.0, 3.0], "the shared per-T clock stays file 0's"
+    assert d0["stage_xy_um"] == [[1.0, 2.0], [3.0, 4.0]], "the member's own dict is untouched"
+    short = bundle_display([d0, {**d1, "stage_xy_um": [[5.0, 6.0], [7.0, 8.0]]}], envs)
+    assert "stage_xy_um" not in short, "a member list of the wrong length drops the key"
     _ok("timeseries per-frame clock: alternating files interleave (pixels, clock, datetime, "
         "note, envelope agree), a glitch never reorders its own file, non-overlapping files "
         "stay in blocks, sequence/loaded never interleave, a clocked multi-file card "
         "interleaves and an unclocked one keeps the old drop, the per-M clock follows "
         "time_subset / position_subset / onto-M, and the runner stamps it all-or-nothing; "
         "an interleaved series gets one dt_s only when evenly spaced and the note says when "
-        "it drops it; the ND2 reader indexes frames by loops alone (C is in-frame)")
+        "it drops it; the ND2 reader indexes frames by loops alone (C is in-frame); a "
+        "multi-file card's stage log and point names concatenate across its files")
 
 
 def main() -> int:

@@ -353,6 +353,47 @@ def bundle_source_clock(displays: Sequence[Mapping[str, Any]],
         out.extend(list(clock) for _ in range(int(env.axes.m)))
     return out
 
+
+def bundle_display(displays: Sequence[Mapping[str, Any]],
+                   envs: Sequence[MetaEnvelope]) -> Dict[str, Any]:
+    """The display dict a bundle's payload carries: member 0's for everything a bundle's
+    files share (channel names, colours, emission, bit depth), but every PER-POSITION list
+    concatenated across the members, and each file's own clock per position
+    (:func:`bundle_source_clock`).
+
+    Until 2026-10-09 the bundle took member 0's display dict whole, and the display dict is
+    where the ND2 reader puts the stage log (``stage_xy_um``, ``stage_z_um``) and the point
+    names. So a bundle of K files carried file 0's ``n``-long lists on a ``K·n``-long M axis,
+    every positional reader rejected them as the wrong length, and the bundle had no stage
+    log at all: Stitch by stage refused, the Viewer's hover readout had no stage position,
+    and a Timeseries Builder after the card had no log to keep. The rule is
+    :func:`bundle_envelope`'s for the calibration: a key missing from any member, or the
+    wrong length on one, is dropped for the whole bundle rather than padded."""
+    disp: Dict[str, Any] = dict(displays[0]) if displays else {}
+    if len(displays) != len(envs):
+        return disp
+    counts = [int(e.axes.m) for e in envs]
+    for key in PER_POSITION_KEYS:
+        if key == SOURCE_CLOCK_KEY or not any(key in (d or {}) for d in displays):
+            continue
+        vals: Optional[List[Any]] = []
+        for d, n in zip(displays, counts):
+            got = (d or {}).get(key)
+            if not isinstance(got, (list, tuple)) or len(got) != n:
+                vals = None
+                break
+            vals.extend(got)
+        if vals:
+            disp[key] = vals
+        else:
+            disp.pop(key, None)
+    clock = bundle_source_clock(displays, envs)
+    if clock is not None:
+        disp[SOURCE_CLOCK_KEY] = clock
+    else:
+        disp.pop(SOURCE_CLOCK_KEY, None)
+    return disp
+
 #: demo calibration for the synthetic fallback source (drives the ƒmd derive pills)
 _SYNTH_META = {
     "pixel_size_um": 0.1, "z_step_um": 0.3, "objective_na": 1.4,
@@ -4859,16 +4900,12 @@ class EngineRunner(QObject):
             labels = _unique_labels(paths)
             prov = MultiSourceProvider(provs, labels=labels)
             # The members share a grid, so they share their channel display; taking the
-            # first is not a choice between disagreeing values.
-            disp = dict(self._channel_display.get(member_keys[0], {}))
-            env = with_channel_display(bundle_envelope(prov.axes, envs, labels), disp)
-            # ...but the CLOCK differs per file, and member 0's says nothing about the
-            # others' frame times. Each file's own rides the payload per position, so a
-            # Timeseries Builder can place every frame of every file by its timestamp.
-            clock = bundle_source_clock(
+            # first is not a choice between disagreeing values -- but they do NOT share
+            # their positions or their clocks: the stage log, the point names and each
+            # file's own frame times are concatenated per position (`bundle_display`).
+            disp = bundle_display(
                 [self._channel_display.get(k, {}) for k in member_keys], envs)
-            if clock is not None:
-                disp[SOURCE_CLOCK_KEY] = clock
+            env = with_channel_display(bundle_envelope(prov.axes, envs, labels), disp)
             self._providers[key] = (prov, env)
             self._channel_display[key] = disp
             return prov, env
@@ -5003,4 +5040,4 @@ class EngineRunner(QObject):
 
 __all__ = ["EngineRunner", "ensure_gui_ops", "render_plane", "render_plane_native",
            "PlaneCache", "ingest_workers", "source_key", "bundle_key",
-           "bundle_envelope", "bundle_source_clock", "BUNDLE_PATHS_KEY"]
+           "bundle_envelope", "bundle_source_clock", "bundle_display", "BUNDLE_PATHS_KEY"]
