@@ -1349,7 +1349,7 @@ new plane once). `NODELAB_GL=0` forces the CPU path; a GL failure falls back aut
 ### Overlays
 
 The **◈ Overlays** button (also `Ctrl+Shift+O`, **View → Overlays…**) opens a popup with a
-tab per domain: **Points**, **Labels**, **Tracks**, **Voxels**, **Vectors**, **Compare**, **Mesh** and **Grid**.
+tab per domain: **Points**, **Labels**, **Tracks**, **Voxels**, **Vectors**, **Field**, **Compare**, **Mesh** and **Grid**.
 Quick on/off checkboxes for Points / Labels / Tracks sit in the channel strip.
 
 * **Points** — golden-star glyphs, configurable arm spread, and four **Colour by** modes: one colour, **one per Z plane** (what makes a projected 3-D cloud read as depth), one per point (which follows the *track* once a tracker has linked them, so a particle keeps its colour across T), or one per layer.
@@ -1359,6 +1359,40 @@ Quick on/off checkboxes for Points / Labels / Tracks sit in the channel strip.
   current position.
 * **Mesh** — the **cross-section at the viewed Z**: closed loops where the surface cuts the
   plane, in three styles.
+* **Field** (2026-10-09) — the image **coloured by any column of a measured field**: the
+  displacement magnitude of a DIC / PIV / DVC result, or a Field card's strain, rotation,
+  Jacobian or stress (§16 D4).
+  * **Which table / Colour by** are live pickers. Auto takes the most derived quantity on the
+    table: `von_mises`, then `strain_eq`, `jacobian`, `curl`, then `disp_mag_um`.
+  * **Style:**
+    * `smooth` — a wash interpolated between nodes;
+    * `cells` — each node's own value as a flat patch, which is what was actually measured;
+    * `contours` — iso-lines in their level's colour, which leave the image visible.
+  * **Limits** default to the 1st–99th percentile over the **whole series**, so a colour means
+    the same value on every frame. You can also fit each frame, or type the limits.
+  * **Colour map** Auto uses the diverging `coolwarm` for a column with both signs (strain,
+    curl, a stress component) and `turbo` otherwise.
+  * A **colour bar** at the top right names the column and its unit, and the hover readout
+    adds the value under the cursor.
+  * **Principal axes** (`strain` / `stress`) adds a cross on every Nth node, along the principal
+    directions of the Strain or Stress card's in-plane tensor. Bar length shows magnitude: red
+    is tension, blue compression. This shows the DIRECTION of stretch, which a scalar map
+    cannot. Lengths share one scale across the series.
+  * **How each field is drawn:**
+    * A grid field (every correlation result) is drawn one cell per node, with holes left
+      empty.
+    * A 3-D grid is interpolated between the node planes either side of the viewed Z.
+    * Tracked particles are resampled near the particles only.
+* **Vectors** — arrows of the displacement (or, with only a velocity, the motion over one frame
+  interval). Since 2026-10-09 they are drawn in **image pixels**. Before that a µm displacement
+  was drawn at pixel positions, so every arrow was 1/pixel-size of its true length.
+  * **Which table** picks the field.
+  * **Auto length** (on) draws the series' 95th-percentile arrow one node spacing long;
+    **Arrow scale** multiplies on top.
+  * Magnitude colours use the series' range, not each frame's.
+  * A field measured on one channel shows on every channel.
+  * On a 3-D field, the node plane nearest the viewed Z is drawn.
+* **Voxels** — a scalar Voxel layer as a colour wash; the **contour** style draws iso-lines.
 * **Grid** (2026-10-09) — the **correlation grid** a DIC, PIV or DVC field was measured on,
   over the image. The node writes it beside its field as `<field>_mesh`:
   * **DIC:** pyALDIC's own elements. A region refined at an ROI hole, the ROI edge or a
@@ -1366,8 +1400,13 @@ Quick on/off checkboxes for Points / Labels / Tracks sit in the channel strip.
   * **PIV:** the final pass's window lattice. A deform pass replaces it with its finer grid.
   * **DVC:** the hex grid, cut at the viewed Z.
 
-  **Style** `elements` outlines the elements; `subsets` draws the subset / interrogation window
-  around every Nth node instead, so you can see how much neighbouring measurements overlap. The
+  **Style:**
+  * `elements` outlines the elements.
+  * `subsets` draws the subset / interrogation window around every Nth node instead, so you can
+    see how much neighbouring measurements overlap.
+  * `deformed` joins the field's nodes through their **displaced** positions, × **Exaggerate**,
+    so the deformation reads as a distorted lattice. It needs a grid field, not tracks or a
+    refined DIC mesh. The
   grid is shared by every frame of a position and comes back with **Load Analysis**. The Points
   overlay leaves its rows (element centres) alone.
 
@@ -3418,6 +3457,11 @@ io.load ─→ analysis.piv / analysis.dic_correlate / analysis.dvc_field / trac
   `curl`, `jacobian`, `stress_*`, `von_mises` … row for row. Drop `bundle:mechanics` (Field
   Gradient → Strain → Stress) after the correlation card and add Rotation & Curl or Volume
   Change off the same gradient.
+* **See it on the image.** The Viewer's **Field** overlay (§2 Overlays) colours the image by
+  any of these columns. With nothing picked it shows the most derived one: von Mises after
+  Stress, `strain_eq` after Strain, the Jacobian after Volume Change, otherwise the
+  displacement magnitude. It has a colour bar and series-wide limits, so frames compare;
+  switch **Style** to contours to keep the image readable underneath.
 * **Choose the differentiation once.** Field Gradient's method and radius are the gauge length
   every later number inherits. `auto` differences a regular grid (DIC/PIV/DVC) and fits a plane
   through anything else (a refined DIC mesh, tracked beads). A larger radius steadies strain

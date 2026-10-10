@@ -60,6 +60,7 @@ from nodegraph.metadata import POSITION_GROUP_KEY, SOURCE_FILE_KEY
 from nodegraph.domains import Domain
 from nodegraph.mesh import mesh_part as MESH_PART
 from nodegraph.provider import subset_index
+from nodelab_v2 import field_view as FV
 from nodelab_v2 import overlays as OV
 from nodelab_v2 import region_box
 from nodelab_v2 import theme as T
@@ -3891,7 +3892,8 @@ class ViewerPanel(QWidget):
         from nodelab_v2.overlay_dialog import OverlayDialog
         if self._ovl_dialog is None:
             dlg = OverlayDialog(self.overlays, self._renderer, self,
-                                layer_names=self.overlay_layer_names)
+                                layer_names=self.overlay_layer_names,
+                                column_names=self.overlay_column_names)
             dlg.changed.connect(self._overlays_changed)
             self._ovl_dialog = dlg
             if self._ovl_sources:
@@ -3940,8 +3942,16 @@ class ViewerPanel(QWidget):
         self._geo_lab_keys = self._label_keys(self._geo_lab)
         self._geo_mesh = self._mesh_sections() if s.mesh.enabled else []
         self._geo_scalar = self._scalar_plane() if s.voxels.enabled else None
-        self._geo_vectors = self._vector_field() if s.vectors.enabled else None
-        self._geo_grid = self._grid_rects() if s.grid.enabled else None
+        self._geo_vec = self._vector_info() if s.vectors.enabled else None
+        self._geo_vectors = None if self._geo_vec is None else self._geo_vec.rows
+        self._geo_field = self._field_info() if s.field.enabled else None
+        self._geo_glyphs = (self._glyph_info()
+                            if s.field.enabled and s.field.glyphs in ("strain", "stress")
+                            else None)
+        deformed = s.grid.enabled and s.grid.style == "deformed"
+        self._geo_grid_lines = self._deformed_lines() if deformed else None
+        self._geo_grid = (self._grid_rects()
+                          if s.grid.enabled and s.grid.style != "deformed" else None)
         self._geo_diff = self._diff_sets() if s.diff.enabled else (None, None)
 
     def _paint_overlays(self, p: QPainter) -> None:
@@ -3968,6 +3978,15 @@ class ViewerPanel(QWidget):
             points=self._geo_points, tracks=self._geo_tracks, mesh=self._geo_mesh,
             label_plane=self._geo_lab, label_keys=self._geo_lab_keys,
             scalar=self._geo_scalar, vectors=self._geo_vectors,
+            vec_hi=(self._geo_vec.mag_hi if self._geo_vec is not None else 0.0),
+            vec_auto=(FV.auto_scale(self._geo_vec)
+                      if self._geo_vec is not None else 0.0),
+            field=(self._geo_field[0] if self._geo_field is not None else None),
+            field_lims=(self._geo_field[1] if self._geo_field is not None else None),
+            field_cmap=(self._geo_field[2] if self._geo_field is not None else ""),
+            field_label=(self._geo_field[3] if self._geo_field is not None else ""),
+            glyphs=getattr(self, "_geo_glyphs", None),
+            grid_lines=getattr(self, "_geo_grid_lines", None),
             grid=getattr(self, "_geo_grid", None),
             diff_a=self._geo_diff[0], diff_b=self._geo_diff[1],
             # the PAYLOAD's t: the trail modes compare it against the `t` values carried by
@@ -4444,6 +4463,11 @@ class ViewerPanel(QWidget):
                 parts.append(f"stage {sx:.1f}, {sy:.1f} µm")
         if vals:
             parts.append(" · ".join(vals))
+        fi = getattr(self, "_geo_field", None)
+        if fi is not None and self.overlays.field.enabled:
+            fv = FV.value_at(fi[0], float(pt[1]), float(pt[0]))
+            if fv is not None:
+                parts.append(f"{fi[3]} {fv:.4g}")
         return "  ·  ".join(parts)
 
     # ── coordinates + probes ──────────────────────────────────────────────────
@@ -4516,7 +4540,18 @@ class ViewerPanel(QWidget):
             return self.label_layer_names()
         if tab == "points":
             return self.point_layer_names()
+        if tab in ("field", "vectors"):
+            return (FV.layer_names(self._dataset) if tab == "field"
+                    else FV.vector_layer_names(self._dataset))
         return []
+
+    def overlay_column_names(self, tab: str) -> list:
+        """The live columns for a ``column``-kind field: the Field tab offers every numeric
+        column of the table its Which-table pick resolves to."""
+        if tab != "field":
+            return []
+        layer, _col = FV.auto_pick(self._dataset, self.overlays.field.layer, "")
+        return FV.column_names(self._dataset, layer) if layer else []
 
     def label_layer_names(self) -> list:
         """The label rasters on the viewed payload — every integer 6-D Voxel layer, by name.
@@ -5045,16 +5080,6 @@ class ViewerPanel(QWidget):
         tx = max(1, int(np.ceil(ax_ / self._ref_plane.shape[1])))
         return best[::ty, ::tx]
 
-    #: Column-name pairs a Point structure may use for a displacement's (y, x) components,
-    #: in preference order. `u`/`v` is what the DVC/DIC kernels emit; the `_um` pair is what
-    #: a calibrated field carries; `dy`/`dx` covers a hand-built table. Matched as a PAIR so
-    #: a table with only one half is skipped rather than drawn as a half-field.
-    # the displacement pairs a Point table may carry, first match wins: PIV/DIC's (u, v),
-    # their µm twins, tracking's (dy, dx) — and DVC's (disp_y, disp_x) in µm, which the
-    # demo recipes already knew about and the Viewer did not (2026-10-08): a pulled DVC
-    # field drew no arrows at all
-    _VECTOR_COLUMNS = (("u", "v"), ("u_um", "v_um"), ("dy", "dx"), ("disp_y", "disp_x"))
-
     def _grid_rects(self) -> Optional[np.ndarray]:
         """The correlation grid on the viewed plane → ``(N, 5)`` ``y_lo, y_hi, x_lo, x_hi,
         level`` boxes in full-resolution image pixels (2026-10-09).
@@ -5131,48 +5156,79 @@ class ViewerPanel(QWidget):
         return np.concatenate(out) if out else None
 
     def _vector_field(self) -> Optional[np.ndarray]:
-        """Point-domain displacement vectors on the viewed frame → ``(N, 4)`` ``y,x,u,v``.
+        """Point-domain displacement vectors on the viewed frame → ``(N, 4)`` ``y,x,u,v``
+        in IMAGE PIXELS (:func:`nodelab_v2.field_view.vectors`: µm converted by the
+        payload's pixel size; a 3-D field shows its node plane nearest the viewed Z)."""
+        vf = self._vector_info()
+        return None if vf is None else vf.rows
 
-        Reads the Point structure's own coordinate columns and the first displacement pair
-        it carries, filtered to the viewed ``(m, t, c)`` — and to the viewed Z when the
-        table is a per-plane 2D field, which is what ``z_kind`` records. A 3D field's
-        vectors are shown whole, because their ``z`` is a subpixel coordinate rather than a
-        plane index and cutting on it would drop almost everything.
-        """
+    def _vector_info(self):
+        """The Vectors tab's :class:`nodelab_v2.field_view.VectorField` for the viewed
+        plane — the rows plus the series-wide length statistics the colour and Auto length
+        use — from the picked table (or the first one carrying a displacement)."""
         ds = self._dataset
         if ds is None or not hasattr(ds, "attributes"):
             return None
         m, t, z, c = self._payload_coords()
-        by_layer: Dict[str, Dict[str, np.ndarray]] = {}
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.POINT and layer:
-                by_layer.setdefault(str(layer), {})[str(name)] = attr.values
-        for layer, cols in by_layer.items():
-            uy = ux = None
-            for a, b in self._VECTOR_COLUMNS:
-                if a in cols and b in cols:
-                    uy, ux = cols[a], cols[b]
-                    break
-            if uy is None or "y" not in cols or "x" not in cols:
-                continue
-            keep = np.ones(len(cols["y"]), dtype=bool)
-            for key, want in (("m", m), ("t", t), ("c", c)):
-                if key in cols:
-                    keep &= np.asarray(cols[key]) == want
-            try:
-                z_kind = ds.structure_zkind(Domain.POINT, layer)
-            except Exception:      # noqa: BLE001 — provenance is advisory here
-                z_kind = None
-            if z_kind == "plane_index" and "z" in cols:
-                keep &= np.asarray(cols["z"]) == z
-            idx = np.flatnonzero(keep)
-            if idx.size == 0:
-                continue
-            return np.stack([np.asarray(cols["y"], dtype=float)[idx],
-                             np.asarray(cols["x"], dtype=float)[idx],
-                             np.asarray(uy, dtype=float)[idx],
-                             np.asarray(ux, dtype=float)[idx]], axis=1)
-        return None
+        return FV.vectors(ds, m, t, z, c, layer=self.overlays.vectors.layer)
+
+    def _field_info(self):
+        """The Field tab's ``(raster, limits, colour map, colour-bar label)`` for the viewed
+        plane, or ``None``: the picked (or Auto) table and column, rasterised by
+        :func:`nodelab_v2.field_view.raster`, limits by the tab's Limits setting (the
+        series' 1st / 99th percentile cached per payload and column)."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return None
+        s = self.overlays.field
+        layer, col = FV.auto_pick(ds, s.layer, s.column)
+        if not col:
+            return None
+        m, t, z, c = self._payload_coords()
+        fr = FV.raster(ds, layer, col, m, t, z, c)
+        if fr is None:
+            return None
+        if s.limits == "manual":
+            lims = (float(s.clim_lo), float(s.clim_hi))
+        elif s.limits == "frame":
+            g = fr.grid[np.isfinite(fr.grid)]
+            lims = (tuple(float(v) for v in np.percentile(g, [1.0, 99.0]))
+                    if g.size else (0.0, 1.0))
+        else:
+            cache = self.__dict__.setdefault("_field_lim_cache", {})
+            key = (id(ds), layer, col)
+            if key not in cache:
+                if len(cache) > 32:
+                    cache.clear()
+                cache[key] = FV.series_limits(ds, layer, col)
+            lims = cache[key]
+        cmap = s.colormap if s.colormap != "auto" else (
+            "coolwarm" if lims[0] < 0.0 < lims[1] else "turbo")
+        unit = FV.column_unit(ds, layer, col)
+        return fr, lims, cmap, (f"{col} ({unit})" if unit else col)
+
+    def _glyph_info(self):
+        """The Field tab's principal-axis glyphs for the viewed plane (the Strain / Stress
+        tensor on the table the tab draws), or ``None``."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return None
+        s = self.overlays.field
+        layer, _col = FV.auto_pick(ds, s.layer, "")
+        if not layer:
+            return None
+        m, t, z, c = self._payload_coords()
+        return FV.tensor_glyphs(ds, layer, s.glyphs, m, t, z, c, every=s.glyph_every)
+
+    def _deformed_lines(self):
+        """The Grid tab's deformed lattice: the Vectors table's nodes joined through their
+        displaced positions, ``exaggerate`` times the displacement."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes"):
+            return None
+        m, t, z, c = self._payload_coords()
+        return FV.deformed_lines(ds, self.overlays.vectors.layer, m, t, z, c,
+                                 exaggerate=self.overlays.grid.exaggerate) or None
 
     def _diff_sets(self):
         """The two Point sets the comparison overlay judges → ``(a, b)`` of ``(N,2)`` yx.

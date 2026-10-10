@@ -32083,6 +32083,111 @@ def test_field_mechanics() -> None:
         "back by u; every misuse refused by name; bundle:mechanics")
 
 
+def test_field_view() -> None:
+    """What the Viewer draws of a measured field (2026-10-09, ``nodelab_v2.field_view`` — the
+    Qt-free seam): arrows in IMAGE PIXELS (a µm displacement over the pixel size; a velocity
+    over one frame), a lattice field rasterised one cell per node with its holes empty, a 3-D
+    lattice interpolated between the planes bracketing the viewed z, a scattered field
+    resampled near its nodes only, Auto picking the most derived column, the series limits,
+    and iso-lines that close around a hole."""
+    import nodelab_v2.field_view as FV
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.analysis_mesh import lattice_quads, with_mesh
+
+    ax = AxisSizes(m=1, t=2, z=3, c=2, y=64, x=64)
+    gy, gx = np.meshgrid(np.arange(8.0, 64.0, 8.0), np.arange(8.0, 64.0, 8.0), indexing="ij")
+    n = gy.size
+    cols = {"id": np.arange(n), "m": np.zeros(n), "t": np.ones(n), "c": np.zeros(n),
+            "z": np.ones(n), "y": gy.ravel(), "x": gx.ravel(),
+            "disp_y": np.full(n, 0.25), "disp_x": gx.ravel() * 0.01,
+            "disp_mag_um": np.hypot(0.25, gx.ravel() * 0.01),
+            "strain_eq": gy.ravel() * 1e-3, "track_id": np.arange(n)}
+    hole = np.ones(n, bool)
+    hole[[10, 24]] = False
+    cols = {k: np.asarray(v)[hole] for k, v in cols.items()}
+    ds = (Dataset(axes=ax, metadata={"pixel_size_um": 0.5})
+          .with_structure(StructureTable(Domain.POINT, cols, layer="piv", z_kind="plane_index")))
+    ds = with_mesh(ds, "piv", lattice_quads(list(np.arange(8.0, 64.0, 8.0)),
+                                            list(np.arange(8.0, 64.0, 8.0)), m=0, t=-1, c=0,
+                                            z_plane=1), kind="quad", z_kind="plane_index")
+    assert FV.layer_names(ds) == ["piv"], FV.layer_names(ds)      # the grid table is not a field
+    assert "track_id" not in FV.column_names(ds, "piv") and "y" not in FV.column_names(ds, "piv")
+    assert FV.auto_pick(ds) == ("piv", "strain_eq")               # most derived first
+    assert FV.auto_pick(ds, "piv", "disp_x") == ("piv", "disp_x")
+    assert FV.auto_pick(ds, "gone", "gone") == ("piv", "strain_eq")
+    # arrows: 0.25 µm at 0.5 µm/px = 0.5 px; channel 1 (unmeasured) still shows channel 0's
+    vf = FV.vectors(ds, 0, 1, 1, 1)
+    assert vf is not None and np.allclose(vf.rows[:, 2], 0.5) and np.allclose(
+        vf.rows[:, 3], vf.rows[:, 1] * 0.02), vf.rows[:2]
+    assert abs(vf.spacing_px - 8.0) < 1e-9 and FV.vectors(ds, 0, 1, 0, 0) is None  # other plane
+    assert abs(FV.auto_scale(vf) * vf.p95 - 8.0) < 1e-9
+    # the lattice raster: one cell per node, the holes empty, centred cells
+    fr = FV.raster(ds, "piv", "strain_eq", 0, 1, 1, 0)
+    assert fr is not None and fr.lattice and fr.grid.shape == (7, 7), fr.grid.shape
+    assert int(np.isnan(fr.grid).sum()) == 2 and fr.extent == (4.0, 60.0, 4.0, 60.0)
+    assert abs(FV.value_at(fr, 16.0, 40.0) - 0.016) < 1e-12        # the node at y=16
+    lo, hi = FV.series_limits(ds, "piv", "strain_eq")
+    assert lo < hi and abs(hi - np.percentile(cols["strain_eq"], 99)) < 1e-12
+    assert FV.column_unit(ds, "piv", "disp_mag_um") == "µm"
+    lines = FV.contour_lines(fr.grid, [0.03])
+    assert lines and lines[0][1], "an iso-line through the middle rows"
+    # velocity only: drawn as the motion over ONE frame interval
+    vel = {k: cols[k] for k in ("id", "m", "t", "c", "z", "y", "x")}
+    vel.update(vy=np.zeros(hole.sum()), vx=np.full(hole.sum(), 2.0))
+    dsv = Dataset(axes=ax, metadata={"pixel_size_um": 0.5, "piv_dt_s": 0.5}).with_structure(
+        StructureTable(Domain.POINT, vel, layer="flow", z_kind="plane_index"))
+    assert np.allclose(FV.vectors(dsv, 0, 1, 1, 0).rows[:, 3], 2.0)   # 2 µm/s · 0.5 s / 0.5
+    # a 3-D lattice: the slice between the planes at z=0 and z=4, linearly
+    zz, yy, xx = np.meshgrid([0.0, 4.0], [8.0, 16.0, 24.0], [8.0, 16.0], indexing="ij")
+    n3 = zz.size
+    c3 = {"id": np.arange(n3), "m": np.zeros(n3), "t": np.zeros(n3), "c": np.zeros(n3),
+          "z": zz.ravel(), "y": yy.ravel(), "x": xx.ravel(), "disp_z": zz.ravel(),
+          "disp_y": np.zeros(n3), "disp_x": np.zeros(n3), "jacobian": 1.0 + zz.ravel() * 0.1}
+    ds3 = Dataset(axes=AxisSizes(m=1, t=1, z=5, c=1, y=32, x=32),
+                  metadata={"pixel_size_um": 0.5}).with_structure(
+        StructureTable(Domain.POINT, c3, layer="dvc", z_kind="subpixel"))
+    r3 = FV.raster(ds3, "dvc", "jacobian", 0, 0, 1, 0)
+    assert r3 is not None and r3.grid.shape == (3, 2) and np.allclose(r3.grid, 1.1), r3.grid
+    assert len(FV.vectors(ds3, 0, 0, 1, 0).rows) == 6               # the nearest node plane
+    # scattered: resampled, empty far from every node
+    rng = np.random.default_rng(3)
+    sy, sx = rng.uniform(0, 30, 200), rng.uniform(0, 30, 200)
+    sc = {"id": np.arange(200), "m": np.zeros(200), "t": np.zeros(200), "c": np.zeros(200),
+          "z": np.zeros(200), "y": np.r_[sy[:199], 60.0], "x": np.r_[sx[:199], 60.0],
+          "strain_eq": np.ones(200)}
+    dss = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64),
+                  metadata={"pixel_size_um": 0.5}).with_structure(
+        StructureTable(Domain.POINT, sc, layer="trk", z_kind="plane_index"))
+    rs = FV.raster(dss, "trk", "strain_eq", 0, 0, 0, 0)
+    assert rs is not None and not rs.lattice and np.isfinite(rs.grid).any()
+    assert np.isnan(rs.grid).any(), "the gap between the cloud and its outlier stays empty"
+    # principal-axis glyphs: a pure shear e_yx = e_xy = g has axes at 45° (down-right in
+    # image axes) with values ±g; the series' 95th-percentile half-bar is 0.45 spacings
+    g = 0.02
+    gl_ds = ds.with_layer(Domain.POINT, "strain_yy", np.zeros(hole.sum()), layer="piv")               .with_layer(Domain.POINT, "strain_yx", np.full(hole.sum(), g), layer="piv")               .with_layer(Domain.POINT, "strain_xy", np.full(hole.sum(), g), layer="piv")               .with_layer(Domain.POINT, "strain_xx", np.zeros(hole.sum()), layer="piv")
+    gly = FV.tensor_glyphs(gl_ds, "piv", "strain", 0, 1, 1, 0, every=2)
+    assert gly is not None and len(gly.rows) == (int(hole.sum()) + 1) // 2, len(gly.rows)
+    assert np.allclose(np.abs(np.degrees(gly.rows[:, 2])) % 180.0, 45.0), gly.rows[:2]
+    assert np.allclose(gly.rows[:, 3], g) and np.allclose(gly.rows[:, 4], -g)
+    assert abs(gly.scale * g - 0.45 * 8.0) < 1e-9
+    assert FV.tensor_glyphs(ds, "piv", "stress", 0, 1, 1, 0) is None   # no stress columns
+    # the deformed grid: the lattice's 7 rows and 7 columns, broken at the holes (1, 3) and
+    # (3, 3): rows 1 and 3 split in two (9 row runs); column 3 keeps only its 3-node run
+    # below the second hole — single-node runs draw nothing (7 - 1 + 1 = 7 column runs)
+    lines = FV.deformed_lines(ds, "piv", 0, 1, 1, 0, exaggerate=10.0)
+    assert len(lines) == 9 + 7, len(lines)
+    first = lines[0]
+    assert np.allclose(first[:, 0], 8.0 + 10.0 * 0.5)  # disp_y 0.25 µm = 0.5 px, ×10
+    assert FV.deformed_lines(dss, "trk", 0, 0, 0, 0) == []          # no lattice, no grid
+    _ok("field view (2026-10-09): arrows in image pixels (0.25 µm → 0.5 px at 0.5 µm/px; a "
+        "velocity over one frame), a one-channel field shown on any channel, the auto length "
+        "one node spacing; a lattice field one cell per node (7×7, holes empty, centred "
+        "extent), a 3-D lattice interpolated between planes, a scattered field resampled and "
+        "empty away from its nodes; Auto picks the most derived column and skips the grid "
+        "table; series limits, units and iso-lines; principal-axis glyphs at 45° ±γ for a "
+        "pure shear; the deformed lattice through the displaced nodes, broken at holes")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -32157,6 +32262,7 @@ def main() -> int:
     test_quick_scope()
     test_analysis_mesh()
     test_field_mechanics()
+    test_field_view()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

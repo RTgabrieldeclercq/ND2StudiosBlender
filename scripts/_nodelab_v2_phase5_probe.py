@@ -707,6 +707,96 @@ def main(argv) -> int:
         if not _had_pc3:
             _vp.__dict__.pop("_payload_coords", None)
 
+    # THE FIELD OVERLAY + VECTOR UNITS (2026-10-09): the Field tab colours the image by any
+    # column of a field table (Auto = the most derived: a Stress card's von_mises beats a
+    # strain beats the displacement), lattice rows one cell per node, with a colour bar and
+    # iso-contours; the arrows are in PIXELS (a µm displacement divided by the pixel size).
+    from nodelab_v2 import field_view as _FVp
+    assert "field" in _OVg.TABS and _vp.overlays.field.enabled
+    _fax = AxisSizes(m=1, t=2, z=1, c=1, y=64, x=64)
+    _fy, _fx = _np.meshgrid(_np.arange(8., 64., 8.), _np.arange(8., 64., 8.), indexing="ij")
+    _nf = _fy.size
+    _fcols = {"id": _np.arange(2 * _nf, dtype=_np.int64),
+              "m": _np.zeros(2 * _nf, _np.int64),
+              "t": _np.repeat(_np.arange(2, dtype=_np.int64), _nf),
+              "c": _np.zeros(2 * _nf, _np.int64), "z": _np.zeros(2 * _nf),
+              "y": _np.tile(_fy.ravel(), 2), "x": _np.tile(_fx.ravel(), 2),
+              "disp_y": _np.zeros(2 * _nf), "disp_x": _np.tile(_fx.ravel(), 2) * 0.01,
+              "strain_xx": _np.tile(_fx.ravel() - 32.0, 2) * 1e-3,
+              "strain_yy": _np.full(2 * _nf, -0.01), "strain_yx": _np.full(2 * _nf, 0.004),
+              "strain_xy": _np.full(2 * _nf, 0.004),
+              "von_mises": _np.tile(_fy.ravel(), 2) * 2.0}
+    _fds = (_DS(axes=_fax, metadata={"pixel_size_um": 0.5})
+            .with_image(_AP(_np.zeros((1, 2, 1, 1, 64, 64))))
+            .with_structure(_STp(_Dom.POINT, _fcols, layer="piv", z_kind="plane_index")))
+    _fkeep = (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.field.column,
+              _vp.overlays.field.style, _vp.overlays.field.glyphs, _vp.overlays.grid.style)
+    _had_pc4 = "_payload_coords" in _vp.__dict__
+    try:
+        _vp._dataset, _vp._axes = _fds, _fax
+        _vp._ref_plane = _np.zeros((64, 64))
+        _vp._payload_coords = lambda: (0, 1, 0, 0)
+        _vp.overlays.field.column = ""
+        assert _vp.overlay_layer_names("field") == ["piv"]
+        assert {"von_mises", "strain_xx", "disp_x"} <= set(_vp.overlay_column_names("field"))
+        _fi = _vp._field_info()
+        assert _fi is not None and _fi[0].column == "von_mises" and _fi[0].lattice
+        assert _fi[0].grid.shape == (7, 7) and _fi[2] == "turbo", (_fi[0].grid.shape, _fi[2])
+        _vp.overlays.field.column = "strain_xx"                # signed → the diverging map
+        _fs = _vp._field_info()
+        assert _fs[2] == "coolwarm" and not _np.allclose(_fs[0].grid, _fi[0].grid)
+        # the arrows: disp_x 0.01·x µm at 0.5 µm/px → 0.02·x px, NOT 0.01·x
+        _vrows = _vp._vector_field()
+        assert _vrows is not None and _np.allclose(_vrows[:, 3], _vrows[:, 1] * 0.02), _vrows[:3]
+        # painted: the wash, then the contours, each with the colour bar
+        _img2 = _QI(320, 240, _QI.Format_ARGB32)
+        for _style in ("smooth", "contours"):
+            _img2.fill(0)
+            _vp.overlays.field.style = _style
+            _pp2 = _QP(_img2)
+            try:
+                _vp._renderer.paint(_pp2, _vp.overlays, _OVg.OverlayFrame(
+                    map_pt=lambda x, y: _QPF(x * 4, y * 3), plane_wh=(64, 64),
+                    field=_fs[0], field_lims=_fs[1], field_cmap=_fs[2], field_label=_fs[3]))
+            finally:
+                _pp2.end()
+            _hits = sum(1 for x in range(0, 240, 5) for y in range(30, 230, 5)
+                        if _img2.pixel(x, y) & 0xFF000000)
+            assert _hits > (200 if _style == "smooth" else 5), (_style, _hits)
+            assert any(_img2.pixel(x, 30) & 0xFF000000 for x in range(250, 315)), \
+                "the colour bar at the top right drew nothing"
+        assert _FVp.value_at(_fs[0], 32.0, 8.0) is not None
+        # principal-axis glyphs and the deformed grid, from the Viewer's own extractors
+        _vp.overlays.field.glyphs = "strain"
+        _gly = _vp._glyph_info()
+        assert _gly is not None and len(_gly.rows) == _nf, None if _gly is None else len(_gly.rows)
+        _vp.overlays.grid.style = "deformed"
+        _dl = _vp._deformed_lines()
+        assert _dl and len(_dl) == 14, None if not _dl else len(_dl)   # 7 rows + 7 columns
+        _img2.fill(0)
+        _pp3 = _QP(_img2)
+        try:
+            _vp._renderer.paint(_pp3, _vp.overlays, _OVg.OverlayFrame(
+                map_pt=lambda x, y: _QPF(x * 4, y * 3), plane_wh=(64, 64),
+                glyphs=_gly, grid_lines=_dl))
+        finally:
+            _pp3.end()
+        _red = sum(1 for x in range(0, 256, 2) for y in range(0, 192, 2)
+                   if (_img2.pixel(x, y) >> 16) & 0xFF > 180 and (_img2.pixel(x, y) & 0xFF) < 120)
+        _blue = sum(1 for x in range(0, 256, 2) for y in range(0, 192, 2)
+                    if (_img2.pixel(x, y) & 0xFF) > 180 and (_img2.pixel(x, y) >> 16) & 0xFF < 120)
+        assert _red > 10 and _blue > 10, (_red, _blue)     # tension AND compression bars
+        print("  [field] Field overlay: Auto picked von_mises (turbo), strain_xx switches to "
+              "the diverging map and a different raster, 7×7 lattice cells, wash + contours "
+              "+ colour bar painted; arrows in px (µm ÷ 0.5 µm/px); principal-axis glyphs "
+              "(red tension, blue compression) and the 14-line deformed grid painted")
+    finally:
+        (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.field.column,
+         _vp.overlays.field.style, _vp.overlays.field.glyphs,
+         _vp.overlays.grid.style) = _fkeep
+        if not _had_pc4:
+            _vp.__dict__.pop("_payload_coords", None)
+
     # THE LABELS OVERLAY PICKS ITS LAYER (2026-08-04). It had no selector: `_label_plane`
     # drew whichever integer Voxel raster had the most regions in the viewed plane. Several
     # label rasters on one Dataset is the NORMAL case — `analysis.voronoi` alone emits its

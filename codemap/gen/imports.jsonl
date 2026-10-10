@@ -1281,6 +1281,7 @@
 {"dst":"nodelab_v2.demo_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.field_view","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.graph_layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.lablink","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1362,6 +1363,7 @@
 {"dst":"nodegraph.roles","k":"imp","lazy":false,"src":"nodelab_v2.demo_recipes"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.demo_recipes"}
 {"dst":"nodegraph.streaming","k":"imp","lazy":false,"src":"nodelab_v2.demo_recipes"}
+{"dst":"nodelab_v2.field_view","k":"imp","lazy":true,"src":"nodelab_v2.demo_recipes"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"nodelab_v2.demo_recipes"}
 {"dst":"nodelab_v2.picker","k":"imp","lazy":true,"src":"nodelab_v2.demo_recipes"}
 {"dst":"nodelab_v2.tables","k":"imp","lazy":true,"src":"nodelab_v2.demo_recipes"}
@@ -1396,6 +1398,9 @@
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.edge_item"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.edge_item"}
 {"dst":"nodelab_v2.tables","k":"imp","lazy":false,"src":"nodelab_v2.export"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.field_view"}
+{"dst":"nodegraph.kernels.field_mechanics","k":"imp","lazy":true,"src":"nodelab_v2.field_view"}
+{"dst":"nodegraph.units","k":"imp","lazy":true,"src":"nodelab_v2.field_view"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
@@ -1541,6 +1546,7 @@
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.overlay_dialog"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.overlay_dialog"}
 {"dst":"nodegraph.catalog._shared.label_paint","k":"imp","lazy":false,"src":"nodelab_v2.overlays"}
+{"dst":"nodelab_v2.field_view","k":"imp","lazy":true,"src":"nodelab_v2.overlays"}
 {"dst":"nodelab_v2.overlay_render","k":"imp","lazy":true,"src":"nodelab_v2.overlays"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
 {"dst":"nodegraph.roles","k":"imp","lazy":false,"src":"nodelab_v2.page_recipes"}
@@ -1636,6 +1642,7 @@
 {"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.viewer"}
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
+{"dst":"nodelab_v2.field_view","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
 {"dst":"nodelab_v2.framestrip","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
 {"dst":"nodelab_v2.glview","k":"imp","lazy":true,"src":"nodelab_v2.viewer"}
 {"dst":"nodelab_v2.minimap","k":"imp","lazy":false,"src":"nodelab_v2.viewer"}
@@ -1808,6 +1815,7 @@
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodelab_v2.field_view","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.frame_item","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.glview","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

@@ -96,6 +96,11 @@ class _ColorButton(QPushButton):
             self.picked.emit(col.name())
 
 
+#: the first entry of a live picker — an explicit Auto, never a guess dressed as a name
+_AUTO_TEXT = {"layer": "Auto — this node's own output",
+              "column": "Auto — the most derived quantity"}
+
+
 class OverlayDialog(QDialog):
     """The tabbed overlay editor. Mutates the caller's :class:`OverlaySettings` in place
     and emits :data:`changed` after every edit."""
@@ -105,7 +110,8 @@ class OverlayDialog(QDialog):
     def __init__(self, settings: OV.OverlaySettings,
                  renderer: Optional[OV.OverlayRenderer] = None,
                  parent: Optional[QWidget] = None,
-                 layer_names: Optional[Callable[[str], List[str]]] = None) -> None:
+                 layer_names: Optional[Callable[[str], List[str]]] = None,
+                 column_names: Optional[Callable[[str], List[str]]] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Overlays")
         self.setWindowFlag(Qt.Window)
@@ -116,6 +122,9 @@ class OverlayDialog(QDialog):
         #: than reached for, so the dialog stays constructible (and testable) without a
         #: Viewer — it just offers Auto alone.
         self._layer_names = layer_names or (lambda _tab: [])
+        #: the same for a ``column``-kind field: the numeric columns of the table the tab's
+        #: ``layer`` currently resolves to (the Field tab's Colour by)
+        self._column_names = column_names or (lambda _tab: [])
         self._widgets: Dict[Tuple[str, str], QWidget] = {}
         self._rows: Dict[Tuple[str, str], Tuple[QWidget, QWidget]] = {}
         self._previews: Dict[str, _PreviewStrip] = {}
@@ -270,12 +279,13 @@ class OverlayDialog(QDialog):
             editor.currentIndexChanged.connect(
                 lambda _i, t=tab, k=spec.key, w=editor:
                 self._set(t, k, w.currentData()))
-        elif spec.kind == "layer":
-            # A choice whose options are the LIVE payload's layers, not a static table — so
-            # it is repopulated on every `reload`, and it keeps "Auto" as an explicit first
-            # entry rather than pretending the guess is a name.
+        elif spec.kind in ("layer", "column"):
+            # A choice whose options are the LIVE payload's layers (or the picked layer's
+            # columns), not a static table — so it is repopulated on every `reload`, and it
+            # keeps "Auto" as an explicit first entry rather than pretending the guess is a
+            # name.
             editor = QComboBox()
-            editor.addItem("Auto — this node's own output", "")
+            editor.addItem(_AUTO_TEXT[spec.kind], "")
             editor.currentIndexChanged.connect(
                 lambda _i, t=tab, k=spec.key, w=editor:
                 self._set(t, k, w.currentData() or ""))
@@ -299,12 +309,13 @@ class OverlayDialog(QDialog):
                 for spec in OV.FIELDS[tab]:
                     w = self._widgets[(tab, spec.key)]
                     val = getattr(grp, spec.key)
-                    if spec.kind == "layer" and isinstance(w, QComboBox):
+                    if spec.kind in ("layer", "column") and isinstance(w, QComboBox):
                         # rebuild from the live payload every time the dialog syncs: the
                         # answer changes as the user views a different node
-                        names = list(self._layer_names(tab))
+                        names = list(self._layer_names(tab) if spec.kind == "layer"
+                                     else self._column_names(tab))
                         w.clear()
-                        w.addItem("Auto — this node's own output", "")
+                        w.addItem(_AUTO_TEXT[spec.kind], "")
                         for nm in names:
                             w.addItem(nm, nm)
                         cur = str(val or "")
@@ -348,8 +359,29 @@ class OverlayDialog(QDialog):
         if getattr(grp, key) == value:
             return
         setattr(grp, key, value)
+        if key == "layer" and any(sp.kind == "column" for sp in OV.FIELDS[tab]):
+            self._refill_columns(tab)          # a new table offers its own columns
         self._sync_dependencies()
         self._apply(f"{OV.TAB_BY_KEY[tab].title}: {key} = {value}")
+
+    def _refill_columns(self, tab: str) -> None:
+        """Repopulate ``tab``'s column pickers for the table its ``layer`` now names."""
+        grp = self._settings.group(tab)
+        for spec in OV.FIELDS[tab]:
+            w = self._widgets.get((tab, spec.key))
+            if spec.kind != "column" or not isinstance(w, QComboBox):
+                continue
+            was, self._loading = self._loading, True
+            try:
+                w.clear()
+                w.addItem(_AUTO_TEXT["column"], "")
+                for nm in self._column_names(tab):
+                    w.addItem(nm, nm)
+                cur = str(getattr(grp, spec.key) or "")
+                idx = w.findData(cur)
+                w.setCurrentIndex(idx if idx >= 0 else 0)
+            finally:
+                self._loading = was
 
     def _set_enabled(self, tab: str, on: bool) -> None:
         if self._loading:
