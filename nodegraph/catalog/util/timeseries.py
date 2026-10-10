@@ -36,6 +36,17 @@ result here depends on and nothing else in the GUI shows it. The output carries 
 concatenated per-frame clock and timestamps, so a Viewer's timestamp overlay downstream
 reads the real acquisition time of every frame of the built series.
 
+**Every FRAME by its own clock, not just every file** (2026-10-09). A microscope that writes
+one run as a numbered sequence of files does not always fill one file before starting the
+next: neighbouring timepoints can sit in neighbouring files. Sorting whole files by their
+first frame then plays each file as one block, out of time order, and nothing errors. So
+onto T, ``time`` reads EVERY frame's timestamp in EVERY file and merges the files by them
+(:func:`~nodegraph.metadata.chain_frame_order`): each file keeps its own frames in the
+order it holds them, and the files interleave wherever their clocks do. Files that do not
+overlap in time come out exactly as before. A multi-file card now carries each of its
+files' own clocks (``source_frame_time_jd``, stamped by the runner's bundle resolve), so
+this works whether the files arrive as one card or as many.
+
 **Why not ``util.merge``.** Merge does the same index arithmetic, and for two or three files
 it is the right node. Its member order is the engine's edge-creation order — invisible in
 the GUI, and load-bearing for T and Z (its own docstring says so) — and it cannot see inside
@@ -72,10 +83,11 @@ from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
 from nodegraph.file_sequence import describe as _seq_describe
 from nodegraph.metadata import (
-    CHAIN_ORDERS, chain_grow as _meta_chain_grow, chain_member_clock, chain_members,
-    chain_order_used, chain_position_spread, chain_position_tolerance, chained_metadata)
+    CHAIN_ORDERS, chain_frame_order, chain_grow as _meta_chain_grow, chain_member_clock,
+    chain_members, chain_order_used, chain_position_spread, chain_position_tolerance,
+    chained_metadata)
 from nodegraph.placement import jd_to_datetime_text
-from nodegraph.provider import AxisRespreadProvider
+from nodegraph.provider import AxisRespreadProvider, FrameRemapProvider
 from nodegraph.registry import Granularity, InDataset, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
@@ -108,8 +120,8 @@ _CALIBRATION_MUST_MATCH: Tuple[str, ...] = ("pixel_size_um", "z_step_um", "bit_d
 _SLOT_DOC = (
     "Another source file (or multi-file card) for the series. Slots appear one at a time "
     "as you fill them, so there is always exactly one empty slot to drop the next file "
-    "into. The order you wire them in does not matter under `File order = time`: the "
-    "files are sorted by their first frame's acquisition clock.")
+    "into. The order you wire them in does not matter under `File order = time`: every "
+    "frame is placed by its own acquisition clock.")
 
 
 def _compute_timeseries(ctx: EvalContext) -> Dataset:
@@ -143,6 +155,14 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
     back toward wiring order where its information is missing, and the stamped
     :data:`CHAIN_KEY` note says which rule actually applied (``"time"`` / ``"sequence"`` /
     ``"wired"``) and lists the resolved order with each file's first timestamp.
+
+    **Onto T, ``time`` orders FRAMES** (2026-10-09): when every file carries a full
+    per-frame clock, :func:`~nodegraph.metadata.chain_frame_order` merges the files frame by
+    frame, and where that interleaves them the block chain is re-read through a
+    :class:`~nodegraph.provider.FrameRemapProvider` — still TILEABLE, still one input voxel
+    per output voxel. The note then stamps ``interleaved: true`` and ``frame_file`` (each
+    output frame's index into ``files``), since the file list alone no longer says what
+    plays when.
 
     **A no-op rather than a refusal** wherever there is nothing to do: fewer than two files
     across every slot, or an axis it does not recognise. The input comes back untouched, so
@@ -207,6 +227,13 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
     prov = AxisRespreadProvider(
         [(inputs[mm.source].image, mm.start, mm.count) for mm in members], axis,
         labels=[mm.name or f"file slot {mm.source + 1}" for mm in members])
+    # Onto T under `time`, every FRAME is placed by its own clock, so files whose frames
+    # interleave (t0 in file 1, t1 in file 2, ...) play in acquisition order rather than
+    # as one block per file. The files are still laid end to end above; this re-reads
+    # that block order frame by frame -- still a pure index remap, nothing copied.
+    perm = chain_frame_order(members, axis, order)
+    if perm is not None:
+        prov = FrameRemapProvider(prov, perm)
     # The chained axis is the SUM of what each file contributes, not a multiple of the
     # first file's: files are allowed to differ on the axis being chained (5 frames then
     # 3 is still one series), and only the axes NOT being chained have to agree.
@@ -215,10 +242,29 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
     new_axes = replace(ax, m=total) if axis == "m" else replace(ax, m=n, **{axis: total})
     out = ds.with_image(prov).reshaped_axes(new_axes)
 
-    changes: Dict[str, Any] = dict(chained_metadata(members, axis, n))
+    changes: Dict[str, Any] = dict(chained_metadata(members, axis, n, order=order))
     names = [mm.name for mm in members]
     used = chain_order_used(members, order)
     clocks = [chain_member_clock(mm) for mm in members]
+    if perm is not None:
+        # Which file each output frame came from, by its index into `files` -- once
+        # frames interleave, the file order alone no longer says what plays when.
+        block = [j for j, mm in enumerate(members) for _ in range(mm.extent(axis))]
+        frame_file = [block[i] for i in perm]
+        jd = changes.get("frame_time_jd") or []
+        span = (f", {jd_to_datetime_text(jd[0])} → {jd_to_datetime_text(jd[-1])}"
+                if jd else "")
+        note = (f"{total} frames from {k} files, each placed by its own acquisition "
+                f"clock — the files interleave{span}")
+    elif used == "time":
+        frame_file = None
+        note = (f"{k} files in acquisition-clock order"
+                + (f", {jd_to_datetime_text(clocks[0])} → {jd_to_datetime_text(clocks[-1])}"
+                   if clocks and clocks[0] is not None and clocks[-1] is not None else ""))
+    else:
+        frame_file = None
+        note = (_seq_describe(names) if used == "sequence" else
+                f"{k} files in wiring order — no clock and no filenames to order by")
     changes[CHAIN_KEY] = {
         "axis": axis.upper(), "files": [nm or "?" for nm in names],
         "per_file": [mm.extent(axis) for mm in members], "positions": n,
@@ -226,14 +272,12 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
         # WHICH rule ordered them, not just which order resulted: the one thing a wrong
         # result here depends on, so it is stated rather than inferable.
         "order": used,
+        "interleaved": perm is not None,
         "first_frame": [jd_to_datetime_text(c) if c is not None else "" for c in clocks],
-        "note": (f"{k} files in acquisition-clock order"
-                 + (f", {jd_to_datetime_text(clocks[0])} → {jd_to_datetime_text(clocks[-1])}"
-                    if clocks and clocks[0] is not None and clocks[-1] is not None else "")
-                 if used == "time" else
-                 _seq_describe(names) if used == "sequence" else
-                 f"{k} files in wiring order — no clock and no filenames to order by"),
+        "note": note,
     }
+    if frame_file is not None:
+        changes[CHAIN_KEY]["frame_file"] = frame_file
     # How far apart the files put each position, against how far they may be and still be
     # one field. Recorded because it DECIDES whether the stage log survives (see
     # `chained_metadata`), and a downstream Stitch that finds no log should be able to say
@@ -269,10 +313,11 @@ register_node(
                       "analysis.optical_flow start seeing a series instead of 120 "
                       "unrelated fields. Files need NOT hold the same number of frames: a "
                       "series exported in unequal chunks (5 then 3) becomes t=0..7. "
-                      "Separately loaded files each contribute their own clock, which is "
-                      "concatenated so every frame of the result keeps its real acquisition "
-                      "time; within one multi-file card the clock is DROPPED: the bundle "
-                      "only ever carried the first file's. dt_s is left alone and still "
+                      "Every file contributes its own clock — a separately loaded card "
+                      "its frame_time_jd, a multi-file card each of its files' own "
+                      "(source_frame_time_jd) — so every frame of the result keeps its "
+                      "real acquisition time; a card that carries only its first file's "
+                      "clock has it DROPPED rather than repeated. dt_s is left alone and still "
                       "describes spacing WITHIN a file, not the gap between two. The stage "
                       "log is kept (first file's reading) wherever every file puts a "
                       "position within a tenth of a field of the same place, so Stitch by "
@@ -306,12 +351,16 @@ register_node(
                  "GUI shows the answer — the node card's note reports the rule that was "
                  "actually used and the resolved order, with each file's first timestamp."),
              choice_docs={
-                 "time": "By each file's acquisition clock — its first frame's absolute "
-                         "time as the microscope recorded it (frame_time_jd), so the series "
-                         "is correct whatever order the files were wired in and whatever "
-                         "their names say. Needs a clock on EVERY file; where one is "
-                         "missing the node falls back to the filename sequence and the "
-                         "card's note says so. The default.",
+                 "time": "By the acquisition clock the microscope recorded (frame_time_jd), "
+                         "so the series is correct whatever order the files were wired in "
+                         "and whatever their names say. Onto Time it reads EVERY frame's "
+                         "timestamp in EVERY file, so a run written as a sequence of files "
+                         "whose neighbouring timepoints sit in neighbouring files plays in "
+                         "true time order — the files interleave, each keeping its own "
+                         "frames in order, and the card's note says so. Onto the other "
+                         "axes the files are ordered by their first frame. Needs a clock "
+                         "on EVERY file; where one is missing the node falls back to the "
+                         "filename sequence and the card's note says so. The default.",
                  "sequence": "By the counting number in the filenames: the numeric field "
                              "that VARIES across them, so t9 sorts before t10 and a "
                              "constant _z002 elsewhere in the name is not mistaken for the "

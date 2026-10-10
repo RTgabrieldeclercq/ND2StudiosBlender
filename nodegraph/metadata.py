@@ -384,10 +384,19 @@ def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
 #:   before (it printed ``m0``, its LOCAL index, for every single position). Provenance,
 #:   not geometry, like ``source_file``; nothing computes from it; not a table column.
 #:
+#: * ``source_frame_time_jd`` (2026-10-09, :data:`SOURCE_CLOCK_KEY`) — the per-T clock of
+#:   the FILE position ``m`` came from, one list per M. Only a **file bundle** stamps it,
+#:   for the reason ``source_file`` exists: a bundle's ``frame_time_jd`` is its FIRST file's
+#:   clock, so without this the other files' frame times are simply gone, and
+#:   ``util.timeseries`` cannot place a frame of file 3 between two frames of file 2. It is
+#:   indexed by M on the outside and by T on the inside, so it is a member of this family
+#:   (a position subset reindexes the outer list) AND reindexed by :func:`time_subset`.
+#:
 #: ``frame_time_jd`` is deliberately ABSENT: it is indexed by T, not M.
 PER_POSITION_KEYS: Tuple[str, ...] = (
     "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc",
     "source_file", "position_group", "position_name", "position_index",
+    "source_frame_time_jd",
 )
 
 #: The per-M metadata key naming each position's GROUP — the specimen/mosaic it belongs to
@@ -416,6 +425,12 @@ POSITION_NAME_KEY = "position_name"
 #: (see :data:`PER_POSITION_KEYS`). Named once here so the engine, the exporter and the GUI
 #: cannot disagree about the spelling.
 SOURCE_FILE_KEY = "source_file"
+
+#: The per-M metadata key carrying each position's own FILE clock — a list of Julian days,
+#: one per T, per position (see :data:`PER_POSITION_KEYS`). The per-T twin of
+#: :data:`SOURCE_FILE_KEY`: stamped by a file bundle alone, read by ``util.timeseries`` to
+#: order FRAMES rather than files. Named once so the runner and the engine agree.
+SOURCE_CLOCK_KEY = "source_frame_time_jd"
 
 #: The scalar metadata key naming the experimental CONDITION a Dataset belongs to — stamped by
 #: a Page Output (V4.00: blank = its page's name) and read by ``table.concat``, which writes
@@ -545,6 +560,9 @@ def time_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, A
     too SHORT to cover an index in ``keep`` is dropped whole rather than silently shortened,
     because a partial positional list reports some other frame's time instead of admitting
     it does not know.
+
+    :data:`SOURCE_CLOCK_KEY` is reindexed here too, one level down: it is a per-M list of
+    per-T clocks, so each position's inner list follows ``keep``, by the same rules.
     """
     changes: Dict[str, Any] = {}
     for key in PER_TIME_KEYS:
@@ -553,6 +571,11 @@ def time_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, A
             continue
         changes[key] = ([vals[i] for i in keep] if all(0 <= i < len(vals) for i in keep)
                         else None)
+    per_m = metadata.get(SOURCE_CLOCK_KEY)
+    if isinstance(per_m, (list, tuple)):
+        ok = all(isinstance(v, (list, tuple)) and all(0 <= i < len(v) for i in keep)
+                 for v in per_m)
+        changes[SOURCE_CLOCK_KEY] = [[v[i] for i in keep] for v in per_m] if ok else None
     return changes
 
 
@@ -1670,12 +1693,58 @@ class ChainMember:
 CHAIN_ORDERS: Tuple[str, ...] = ("time", "sequence", "loaded")
 
 
+def _finite_clock(vals: Any, n: int) -> Optional[List[float]]:
+    """``vals`` as ``n`` finite Julian days, or ``None`` if it is not exactly that."""
+    if not isinstance(vals, (list, tuple)) or len(vals) != n or n < 1:
+        return None
+    try:
+        out = [float(v) for v in vals]
+    except (TypeError, ValueError):
+        return None
+    return out if all(math.isfinite(v) for v in out) else None
+
+
+def chain_member_frame_clock(mm: "ChainMember") -> Optional[List[float]]:
+    """EVERY frame's Julian day for this member's own FILE, one per T — or ``None`` when
+    that cannot be known.
+
+    Two sources, and only two, because only these describe THIS file rather than some
+    other one:
+
+    * the member's slice of :data:`SOURCE_CLOCK_KEY`, which a file bundle stamps per
+      position from each member file's own clock;
+    * its input's ``frame_time_jd``, but only when the member IS the whole input (a
+      separately loaded card). A bundle's ``frame_time_jd`` is its first file's alone, so
+      handing it to the bundle's other files would place them at instants they were never
+      acquired at.
+
+    The list must be exactly the member's own T long and finite throughout: a clock left
+    behind by a node that narrowed T reports some other frame's time, so it is ignored
+    rather than half-used (the :data:`PER_TIME_KEYS` rule)."""
+    t = max(1, int(mm.input_axes.t))
+    per_m = mm.metadata.get(SOURCE_CLOCK_KEY)
+    if isinstance(per_m, (list, tuple)) and len(per_m) == int(mm.input_axes.m):
+        got = _finite_clock(per_m[mm.start], t)
+        if got is not None:
+            return got
+    if mm.start == 0 and mm.count == int(mm.input_axes.m):
+        return _finite_clock(mm.metadata.get("frame_time_jd"), t)
+    return None
+
+
 def chain_member_clock(mm: "ChainMember") -> Optional[float]:
     """The Julian day of a member's FIRST frame, or ``None`` when its input carries no
-    per-T clock. A member of a bundle shares its input's list, which describes the
-    bundle's first file only, so a bundle's members all answer with the same instant —
-    they then keep their name order among themselves (the sort is stable) while the
+    per-T clock.
+
+    The member's own file clock (:func:`chain_member_frame_clock`) when it has one — which
+    is what places each file of a bundle by its own time. Otherwise the input's
+    ``frame_time_jd``: for a bundle that predates :data:`SOURCE_CLOCK_KEY` that list
+    describes the bundle's first file only, so its members all answer with the same instant
+    — they then keep their name order among themselves (the sort is stable) while the
     bundle as a block is placed by that instant."""
+    own = chain_member_frame_clock(mm)
+    if own is not None:
+        return own[0]
     jd = mm.metadata.get("frame_time_jd")
     if not isinstance(jd, (list, tuple)) or not jd:
         return None
@@ -1684,6 +1753,50 @@ def chain_member_clock(mm: "ChainMember") -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return v if v == v else None
+
+
+def chain_frame_order(members: Sequence["ChainMember"], axis: str,
+                      order: Optional[str]) -> Optional[List[int]]:
+    """``util.timeseries``'s per-FRAME order onto T under ``chain_order="time"``: for each
+    output frame, the index of the frame it reads in the files laid end to end in
+    ``members`` order (block order) — or ``None`` when block order is already the answer.
+
+    **Why frames, not files.** A microscope that writes a run as a numbered sequence of
+    files does not necessarily fill one before starting the next: neighbouring timepoints
+    can sit in neighbouring files (t0 in file 1, t1 in file 2, t2 in file 1, …), and
+    sorting whole files by their first frame then plays every file's frames as one block,
+    out of time order, while everything still runs. So every frame of every file is placed
+    by its OWN timestamp (:func:`chain_member_frame_clock`). The files are MERGED rather
+    than their frames sorted: each file's frames keep the order the file holds them in,
+    which is acquisition order by construction, so a clock glitch inside one file cannot
+    shuffle that file — it can only move where the other files' frames fall around it.
+    Equal instants keep file order.
+
+    ``None`` — block order stands — when the axis is not T, when the rule actually in force
+    is not ``time`` (:func:`chain_order_used`), when ANY member lacks a full per-frame
+    clock (a half-clocked set has no coherent frame order, the same rule ``time`` applies
+    to files), and when the merge comes out identical to block order, which is the
+    ordinary case of files that do not overlap in time. That last ``None`` keeps a
+    non-interleaved series on exactly the provider and memo identity it had before.
+
+    Shared by the compute (which remaps the provider's T through it) and
+    :func:`chained_metadata` (which reindexes the per-T clock through it), so the frame a
+    pull serves and the timestamp the card shows for it cannot disagree."""
+    import heapq
+
+    if str(axis).lower() != "t" or not order or chain_order_used(members, order) != "time":
+        return None
+    clocks = [chain_member_frame_clock(mm) for mm in members]
+    if not clocks or any(c is None for c in clocks):
+        return None
+    off, run = [], 0
+    for c in clocks:
+        off.append(run)
+        run += len(c)
+    merged = heapq.merge(*[[(v, j, i) for i, v in enumerate(c)]
+                           for j, c in enumerate(clocks)])
+    perm = [off[j] + i for _v, j, i in merged]
+    return None if perm == list(range(run)) else perm
 
 
 def chain_members(inputs: Sequence[Tuple[Mapping[str, Any], AxisSizes]], axis: str, *,
@@ -1723,7 +1836,8 @@ def chain_members(inputs: Sequence[Tuple[Mapping[str, Any], AxisSizes]], axis: s
     and the rest wherever they fell, which reads as working. Otherwise the order is the
     wiring order — inputs in socket order, each input's own files in bundle order — which
     is the only information that exists in that case. :func:`chain_order_used` names the
-    rule that actually applied.
+    rule that actually applied. This is the FILE order; onto T, ``time`` then places each
+    FRAME by its own clock (:func:`chain_frame_order`), which may interleave the files.
     """
     axis = str(axis).lower()
     if order is None:
@@ -1877,7 +1991,8 @@ def chain_position_tolerance(members: Sequence[ChainMember]) -> Tuple[float, flo
     return lat, (dz if dz > 0 else 0.0)
 
 
-def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[str, Any]:
+def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
+                     order: Optional[str] = None) -> Dict[str, Any]:
     """The metadata changes ``chain_grow`` and ``util.chain``'s compute BOTH apply.
 
     One function because the two must agree exactly — the standing lockstep rule for an
@@ -1908,9 +2023,20 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[
 
     * onto **T** it is dropped. Repeating it would say every file was acquired at the same
       instants, which is the one thing a timelapse-per-file series is guaranteed not to be.
+      UNLESS every member carries its own file clock (:func:`chain_member_frame_clock` —
+      a bundle stamps :data:`SOURCE_CLOCK_KEY`, 2026-10-09): then the clock is each
+      member's own, concatenated exactly as for distinct inputs, and ``frame_datetime`` is
+      derived from it the way the ND2 reader derives it.
     * onto **C** it is tiled anyway. That is not a guess: the loader refuses to bundle
       files whose channel names differ, so block ``i``'s channels genuinely are the same
       stains in the same order.
+
+    **Interleaved frames** (``order``, 2026-10-09). Onto T under ``chain_order="time"`` the
+    output's frames may interleave the files (:func:`chain_frame_order`); the per-T lists
+    are then reindexed through that same order (:func:`time_subset`), so each frame keeps
+    its own timestamp. ``order=None`` is block order, for callers that predate it.
+    :data:`SOURCE_CLOCK_KEY` itself retires onto T: the built series is ONE file's worth of
+    clock now, and ``frame_time_jd`` carries it.
 
     ``dt_s``/``z_step_um`` are deliberately left alone. They describe the spacing WITHIN a
     file, which the chain does not change; the gap BETWEEN two files is unknown and this
@@ -1964,6 +2090,23 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[
             out[key] = list(members[0].metadata[key]) * k
         else:
             out[key] = None
+
+    if axis == "t":
+        # Every member's OWN file clock, where every member has one. For distinct cards
+        # that is the list concatenated above; for a bundle's files it is the only honest
+        # source, since the bundle's `frame_time_jd` is its first file's alone.
+        clocks = [chain_member_frame_clock(mm) for mm in members]
+        if all(c is not None for c in clocks):
+            from nodegraph.placement import jd_to_datetime_text
+            jd = [v for c in clocks for v in c]
+            out["frame_time_jd"] = jd
+            out["frame_datetime"] = [jd_to_datetime_text(v) for v in jd]
+        if any(SOURCE_CLOCK_KEY in mm.metadata for mm in members):
+            out[SOURCE_CLOCK_KEY] = None
+        perm = chain_frame_order(members, axis, order)
+        if perm is not None:
+            out.update(time_subset({key: out[key] for key in PER_TIME_KEYS
+                                    if isinstance(out.get(key), list)}, perm))
     return out
 
 
@@ -2049,16 +2192,16 @@ def chain_grow(env: MetaEnvelope, params: Mapping, modes: Mapping,
     # be measured against a length that is not real. Stay unknown rather than compound it.
     if any({"m", axis} & set(e.unknown_axes) for e in envs):
         return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({axis, "m"}))
+    order = str((modes or {}).get("chain_order", "time"))
     members, n, problem = chain_members(
-        [(e.metadata, e.axes) for e in envs], axis,
-        order=str((modes or {}).get("chain_order", "time")))
+        [(e.metadata, e.axes) for e in envs], axis, order=order)
     if problem is not None:
         return env.with_axes(env.axes, unknown=env.unknown_axes | frozenset({axis, "m"}))
     if len(members) < 2:
         return env
     ax = env.axes
     total = sum(mm.extent(axis) for mm in members)
-    changes = chained_metadata(members, axis, n)
+    changes = chained_metadata(members, axis, n, order=order)
     new_axes = replace(ax, m=total) if axis == "m" else \
         replace(ax, m=n, **{axis: total})
     return env.with_axes(new_axes,
@@ -2410,8 +2553,9 @@ __all__ = [
     "plane_pick", "select_plane",
     "POSITION_GROUP_KEY", "POSITION_NAME_KEY",
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
-    "source_file_runs", "chain_grow", "chained_metadata",
-    "ChainMember", "chain_members", "stamp_source_file",
+    "SOURCE_CLOCK_KEY", "source_file_runs", "chain_grow", "chained_metadata",
+    "ChainMember", "chain_members", "chain_member_frame_clock", "chain_frame_order",
+    "stamp_source_file",
     "PER_TIME_KEYS", "CONDITION_KEY", "CONDITION_SET_KEY", "time_subset", "respaced", "z_home_after",
     "eval_derive", "resolve_dim_default",
 ]

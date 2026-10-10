@@ -55,8 +55,8 @@ import time
 import traceback
 from collections import OrderedDict
 from dataclasses import replace
-from typing import (Any, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence,
-                    Tuple)
+from typing import (Any, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple, Optional,
+                    Sequence, Tuple)
 
 import numpy as np
 
@@ -68,7 +68,7 @@ from nodegraph.engine import Engine, PullCancelled
 from nodegraph.graph import Graph
 from nodegraph.memo import Memo
 from nodegraph.metadata import (
-    MetaEnvelope, PER_POSITION_KEYS, SOURCE_FILE_KEY, position_subset,
+    MetaEnvelope, PER_POSITION_KEYS, SOURCE_CLOCK_KEY, SOURCE_FILE_KEY, position_subset,
     shift_origin_um, stamp_source_file)
 from nodegraph.parallel import (
     cpu_budget, memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
@@ -317,6 +317,41 @@ def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
             md.pop(key, None)
     md[SOURCE_FILE_KEY] = [labels[i] for i, n in enumerate(counts) for _ in range(n)]
     return MetaEnvelope(axes=axes, metadata=md)
+
+
+def bundle_source_clock(displays: Sequence[Mapping[str, Any]],
+                        envs: Sequence[MetaEnvelope]) -> Optional[List[List[float]]]:
+    """A bundle's per-M :data:`~nodegraph.metadata.SOURCE_CLOCK_KEY` — for each position,
+    the per-T clock (``frame_time_jd``) of the FILE it came from — or ``None`` when any
+    member file has no full clock (2026-10-09).
+
+    A bundle's own ``frame_time_jd`` is its FIRST file's: the display dict that carries the
+    clock is member 0's, like the calibration. That is harmless for a stack of positions
+    acquired together, and it erases every other file's frame times for a run the
+    microscope wrote as a SEQUENCE of files — which is the case ``util.timeseries`` exists
+    for, and the one where neighbouring timepoints may sit in neighbouring files. This list
+    is what lets that node place each frame of each file by its own timestamp.
+
+    All-or-nothing, for the reason :func:`bundle_envelope` drops a short per-M list: a
+    partial one would order some files by time and the rest by nothing, which reads as
+    working. Each member's clock is read from its display dict (where the ND2 reader puts
+    it), else from its envelope."""
+    if len(displays) != len(envs) or not envs:
+        return None
+    out: List[List[float]] = []
+    for disp, env in zip(displays, envs):
+        jd = (disp or {}).get("frame_time_jd")
+        if jd is None:
+            jd = env.metadata.get("frame_time_jd")
+        t = int(env.axes.t)
+        if not isinstance(jd, (list, tuple)) or len(jd) != t or t < 1:
+            return None
+        try:
+            clock = [float(v) for v in jd]
+        except (TypeError, ValueError):
+            return None
+        out.extend(list(clock) for _ in range(int(env.axes.m)))
+    return out
 
 #: demo calibration for the synthetic fallback source (drives the ƒmd derive pills)
 _SYNTH_META = {
@@ -4827,6 +4862,13 @@ class EngineRunner(QObject):
             # first is not a choice between disagreeing values.
             disp = dict(self._channel_display.get(member_keys[0], {}))
             env = with_channel_display(bundle_envelope(prov.axes, envs, labels), disp)
+            # ...but the CLOCK differs per file, and member 0's says nothing about the
+            # others' frame times. Each file's own rides the payload per position, so a
+            # Timeseries Builder can place every frame of every file by its timestamp.
+            clock = bundle_source_clock(
+                [self._channel_display.get(k, {}) for k in member_keys], envs)
+            if clock is not None:
+                disp[SOURCE_CLOCK_KEY] = clock
             self._providers[key] = (prov, env)
             self._channel_display[key] = disp
             return prov, env
@@ -4961,4 +5003,4 @@ class EngineRunner(QObject):
 
 __all__ = ["EngineRunner", "ensure_gui_ops", "render_plane", "render_plane_native",
            "PlaneCache", "ingest_workers", "source_key", "bundle_key",
-           "bundle_envelope", "BUNDLE_PATHS_KEY"]
+           "bundle_envelope", "bundle_source_clock", "BUNDLE_PATHS_KEY"]

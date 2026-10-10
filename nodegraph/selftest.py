@@ -30569,6 +30569,141 @@ def test_canvas_pill_and_reorganize() -> None:
         "the context; merge_frames / remove_from_frames work and a linked page refuses them")
 
 
+def test_timeseries_frame_interleave() -> None:
+    """``util.timeseries`` under ``chain_order=time`` onto T places every FRAME by its own
+    clock (2026-10-09), so a run the microscope wrote as a sequence of files whose
+    neighbouring timepoints sit in neighbouring files plays in true time order.
+
+    1. Two separate cards whose frames alternate in time (A at 0,2,4 min, B at 1,3,5),
+       wired B first: the output reads A0 B0 A1 B1 A2 B2, the clock is monotone,
+       ``frame_datetime`` follows it, the note says ``interleaved`` and maps every frame
+       to its file, and the edit-time envelope carries the same clock.
+    2. A clock glitch INSIDE one file never reorders that file -- the files are merged,
+       not their frames sorted.
+    3. Files that do not overlap in time come out in block order exactly as before
+       (``interleaved`` false), and ``sequence`` / ``loaded`` never interleave.
+    4. ONE multi-file card carrying each file's own clock (``source_frame_time_jd``)
+       interleaves the same way and gets the real per-frame clock; the per-M key retires.
+       The same card without it keeps the old behaviour: block order, clock dropped.
+       Onto M, the per-M key concatenates with the positions.
+    5. ``time_subset`` reindexes the per-M key's inner lists; ``position_subset`` its
+       outer list; ``runner.bundle_source_clock`` stamps it all-or-nothing.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import jd_to_datetime_text
+    from nodegraph.provider import ArrayProvider, MultiSourceProvider
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_CLOCK_KEY, SOURCE_FILE_KEY,
+                                    position_subset, time_subset)
+    from nodelab_v2.runner import bundle_source_clock
+
+    J, MIN = 2460000.0, 1.0 / 1440.0
+
+    def arr(fid, t):
+        a = np.zeros((1, t, 1, 1, 4, 4))
+        for i in range(t):
+            a[0, i] = 10 * fid + i          # value says (file, own frame)
+        return a
+
+    def card(fid, name, mins):
+        jd = [J + m * MIN for m in mins]
+        md = {"pixel_size_um": 0.5, "z_step_um": 1.0, SOURCE_FILE_KEY: [name],
+              "frame_time_jd": jd, "frame_datetime": [jd_to_datetime_text(v) for v in jd]}
+        return Dataset(axes=AxisSizes(m=1, t=len(mins), z=1, c=1, y=4, x=4),
+                       metadata=md).with_image(ArrayProvider(arr(fid, len(mins))))
+
+    def run(seeds, order="time", axis="T"):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
+        nodes["C"] = NodeInstance("C", "util.timeseries",
+                                  modes={"chain_axis": axis, "chain_order": order})
+        g = Graph(nodes=nodes,
+                  edges=[Edge(f"L{i}", "C", "image", "data" if i == 0 else f"file_{i + 1}",
+                              "forward") for i in range(len(seeds))])
+        eng = Engine(g, computes=COMPUTES, seeds={f"L{i}": d for i, d in enumerate(seeds)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(seeds)})
+        return eng, eng.pull("C")
+
+    def frames(ds):
+        return [int(ds.image.get_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0])
+                for t in range(int(ds.axes.t))]
+
+    # 1. alternating frames across two separate cards, wired B first
+    a, b = card(1, "run_001.nd2", [0, 2, 4]), card(2, "run_002.nd2", [1, 3, 5])
+    eng, out = run([b, a])
+    assert out.axes.t == 6 and out.axes.m == 1, out.axes
+    assert frames(out) == [10, 20, 11, 21, 12, 22], frames(out)
+    jd = out.metadata["frame_time_jd"]
+    assert jd == [J + m * MIN for m in range(6)], jd
+    assert out.metadata["frame_datetime"] == [jd_to_datetime_text(v) for v in jd]
+    note = out.metadata["__chain__"]
+    assert note["order"] == "time" and note["interleaved"] is True, note
+    assert note["files"] == ["run_001.nd2", "run_002.nd2"], note
+    assert note["frame_file"] == [0, 1, 0, 1, 0, 1], note
+    assert "interleave" in note["note"], note["note"]
+    env = eng.env("C")
+    assert env.axes == out.axes and env.metadata.get("frame_time_jd") == jd, \
+        "the edit-time envelope must carry the same interleaved clock as the pull"
+    assert env.metadata.get("frame_datetime") == out.metadata["frame_datetime"]
+
+    # 2. a glitch inside file A (its frame 2 stamped before its frame 1) stays in A's order
+    ga, gb = card(1, "g_001.nd2", [0, 3, 2]), card(2, "g_002.nd2", [1, 4])
+    _e, out_g = run([ga, gb])
+    assert frames(out_g) == [10, 20, 11, 12, 21], frames(out_g)
+
+    # 3. non-overlapping files: block order, nothing interleaved; other rules never do
+    blk_a, blk_b = card(1, "b_001.nd2", [0, 1, 2]), card(2, "b_002.nd2", [3, 4])
+    _e, out_b = run([blk_b, blk_a])
+    assert frames(out_b) == [10, 11, 12, 20, 21], frames(out_b)
+    assert out_b.metadata["__chain__"]["interleaved"] is False
+    assert "frame_file" not in out_b.metadata["__chain__"]
+    _e, out_s = run([b, a], "sequence")
+    assert frames(out_s) == [10, 11, 12, 20, 21, 22], frames(out_s)
+    assert out_s.metadata["frame_time_jd"] == [J + m * MIN for m in (0, 2, 4, 1, 3, 5)], \
+        "sequence order keeps each frame's own time, in the order it plays"
+    _e, out_l = run([b, a], "loaded")
+    assert frames(out_l) == [20, 21, 22, 10, 11, 12], frames(out_l)
+
+    # 4. ONE multi-file card of the same two files
+    pa, pb = ArrayProvider(arr(1, 3)), ArrayProvider(arr(2, 3))
+    prov = MultiSourceProvider([pa, pb], labels=["run_001.nd2", "run_002.nd2"])
+    ja, jb = a.metadata["frame_time_jd"], b.metadata["frame_time_jd"]
+    base = {"pixel_size_um": 0.5, "z_step_um": 1.0,
+            SOURCE_FILE_KEY: ["run_001.nd2", "run_002.nd2"], "frame_time_jd": ja}
+    clocked = Dataset(axes=prov.axes, metadata={**base, SOURCE_CLOCK_KEY: [ja, jb]}
+                      ).with_image(prov)
+    _e, out_bt = run([clocked])
+    assert frames(out_bt) == [10, 20, 11, 21, 12, 22], frames(out_bt)
+    assert out_bt.metadata["frame_time_jd"] == [J + m * MIN for m in range(6)]
+    assert out_bt.metadata.get(SOURCE_CLOCK_KEY) is None, "the per-M clock retires onto T"
+    legacy = Dataset(axes=prov.axes, metadata=dict(base)).with_image(prov)
+    _e, out_lg = run([legacy])
+    assert frames(out_lg) == [10, 11, 12, 20, 21, 22], frames(out_lg)
+    assert out_lg.metadata.get("frame_time_jd") is None, \
+        "a card carrying only its first file's clock still drops it rather than repeat it"
+    _e, out_m = run([clocked], axis="M")
+    assert out_m.metadata.get(SOURCE_CLOCK_KEY) == [ja, jb], out_m.metadata.get(SOURCE_CLOCK_KEY)
+
+    # 5. the family helpers and the runner's stamp
+    md = {SOURCE_CLOCK_KEY: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], "frame_time_jd": [1.0, 2.0, 3.0]}
+    sub = time_subset(md, [2, 0])
+    assert sub[SOURCE_CLOCK_KEY] == [[3.0, 1.0], [6.0, 4.0]], sub
+    assert time_subset(md, [5])[SOURCE_CLOCK_KEY] is None, "a short inner list drops whole"
+    assert position_subset(md, [1])[SOURCE_CLOCK_KEY] == [[4.0, 5.0, 6.0]]
+    envs = [MetaEnvelope(axes=AxisSizes(m=2, t=3, z=1, c=1, y=4, x=4), metadata={}),
+            MetaEnvelope(axes=AxisSizes(m=1, t=3, z=1, c=1, y=4, x=4), metadata={})]
+    got = bundle_source_clock([{"frame_time_jd": [1, 2, 3]}, {"frame_time_jd": [7, 8, 9]}],
+                              envs)
+    assert got == [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [7.0, 8.0, 9.0]], got
+    assert bundle_source_clock([{"frame_time_jd": [1, 2, 3]}, {}], envs) is None
+    assert bundle_source_clock([{"frame_time_jd": [1, 2, 3]}, {"frame_time_jd": [7]}],
+                               envs) is None
+    _ok("timeseries per-frame clock: alternating files interleave (pixels, clock, datetime, "
+        "note, envelope agree), a glitch never reorders its own file, non-overlapping files "
+        "stay in blocks, sequence/loaded never interleave, a clocked multi-file card "
+        "interleaves and an unclocked one keeps the old drop, the per-M clock follows "
+        "time_subset / position_subset / onto-M, and the runner stamps it all-or-nothing")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -30774,6 +30909,7 @@ def main() -> int:
     test_node_demos()
     test_region_tabs()
     test_canvas_pill_and_reorganize()
+    test_timeseries_frame_interleave()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
