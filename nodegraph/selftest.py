@@ -2954,12 +2954,62 @@ def test_stitch() -> None:
             (Dataset(axes=ax, metadata={"pixel_size_um": PX,             # M = repeat visits
                                         "stage_xy_um": [(0.0, 0.0)] * N_M}
                      ).with_image(ArrayProvider(tiles)), env, "repeat visits"),
-            (ds.with_layer(D.POINT, "spots", np.zeros((3,))), env, "structure table")):
+            (ds.with_layer(D.TRACK, "track_id", np.zeros((3,)), "tracks"), env,
+             "structure table"),                                        # tracks: refused
+            (ds.with_layer(D.POINT, "spots", np.zeros((3,)), "spots"), env,
+             "no m/y/x")):                                     # a Point table with no address
         try:
             eng(seed=seed, senv=senv).pull("N")
             raise AssertionError(f"expected a refusal mentioning {needle!r}")
         except ValueError as exc:
             assert needle in str(exc), (needle, str(exc)[:160])
+
+    # ── 5b. Point tables move with their tiles (2026-10-09) ────────────────────
+    # A 16 px lattice in every tile; the 64 px tile step is a multiple of 16, so the
+    # overlaps hold EXACT duplicates of their neighbours' nodes. Each must survive once,
+    # from the tile whose centre is nearest, at its canvas position.
+    from nodegraph.structure import StructureTable
+    rows = {k: [] for k in ("m", "t", "c", "z", "y", "x", "y_lo", "y_hi", "x_lo", "x_hi",
+                            "y_um", "x_um", "who")}
+    lat = np.arange(8, TH, 16, dtype=float)
+    for m in range(N_M):
+        for t in range(N_T):
+            yy, xx = np.meshgrid(lat, lat, indexing="ij")
+            n = yy.size
+            for k, v in (("m", np.full(n, m)), ("t", np.full(n, t)), ("c", np.zeros(n)),
+                         ("z", np.zeros(n)), ("y", yy.ravel()), ("x", xx.ravel()),
+                         ("y_lo", yy.ravel() - 8), ("y_hi", yy.ravel() + 8),
+                         ("x_lo", xx.ravel() - 8), ("x_hi", xx.ravel() + 8),
+                         ("y_um", yy.ravel() * PX), ("x_um", xx.ravel() * PX),
+                         ("who", np.full(n, 1000.0 * m))):
+                rows[k].append(v)
+    cols = {k: np.concatenate(v) for k, v in rows.items()}
+    cols["id"] = np.arange(len(cols["m"]))
+    with_pts = ds.with_structure(StructureTable(D.POINT, cols, layer="field",
+                                                z_kind="plane_index"))
+    got = eng(modes={"blend": "overwrite"}, seed=with_pts).pull("N")
+    pts = {a.name: np.asarray(a.values) for a in got.attributes.values()
+           if a.domain is D.POINT and a.layer == "field"}
+    canvas_pts = {(int(t), int(y), int(x)) for t, y, x in zip(pts["t"], pts["y"], pts["x"])}
+    n_unique = N_T * len(np.arange(8, H, 16)) * len(np.arange(8, W, 16))
+    assert len(pts["y"]) == len(canvas_pts) == n_unique, (len(pts["y"]), n_unique)
+    assert not np.any(pts["m"]), "every row is on the one canvas position"
+    src_m = (pts["who"] // 1000).astype(int)
+    oy = np.array([OFFS[m][0] for m in src_m], dtype=float)
+    ox = np.array([OFFS[m][1] for m in src_m], dtype=float)
+    assert np.all((pts["y"] - oy) % 16 == 8) and np.all((pts["x"] - ox) % 16 == 8)
+    assert np.allclose(pts["y_lo"], pts["y"] - 8) and np.allclose(pts["x_hi"], pts["x"] + 8)
+    assert np.allclose(pts["y_um"], pts["y"] * PX) and np.allclose(pts["x_um"], pts["x"] * PX)
+
+    def owner(y, x):
+        return int(src_m[(pts["t"] == 0) & (pts["y"] == y) & (pts["x"] == x)][0])
+
+    assert owner(72, 72) == 0, owner(72, 72)       # 4 tiles cover it; (0,0)'s centre nearest
+    assert owner(88, 88) == 4, owner(88, 88)       # (64,64)'s centre nearest
+    assert owner(8, 200) == 2                      # covered by one tile only
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    stamp = str(got.metadata.get(SAMPLING_KEY, ())[-1])
+    assert f"field: {n_unique} rows" in stamp and "kept from the nearer tile" in stamp, stamp
     # ...and `grid` is the explicit way to get a montage without a position log
     gg, ga = plane(eng(modes={"layout": "grid"}, seed=bare, senv=benv))
     assert (ga.y, ga.x) == (2 * TH, 3 * TW), (ga.y, ga.x)
@@ -3062,8 +3112,10 @@ def test_stitch() -> None:
         "EXACTLY through all four blends on both frames; header says m=1 with y/x UNKNOWN "
         "while the payload carries the real %dx%d canvas; pixel_size_um memo-fenced; "
         "blends/layout/flip re-key and gate their sockets; MULTI_VIEW resolved; streamed "
-        "canvas == bare-ctx eager and a sub-window == its slice; 4 refusals (no/short "
-        "stage log, repeat-visit M, structure table) with `grid` as the explicit way out; "
+        "canvas == bare-ctx eager and a sub-window == its slice; 5 refusals (no/short "
+        "stage log, repeat-visit M, a Track table, a Point table with no address) with "
+        "`grid` as the explicit way out; a Point field moves with its tiles (m→0, y/x, box "
+        "and µm columns offset; each overlap node kept once, from the nearest-centre tile); "
         "refine recovers a %d px jitter to %d px; and the display PYRAMID is forwarded "
         "from the base (level 1 == the downsampled level 0 exactly, for all 4 blends; the "
         "Viewer takes the coarse level; a pyramid-less base stays level-0 only)"
@@ -32612,13 +32664,32 @@ def test_plot_field() -> None:
     assert dc["colormap"] == "coolwarm" and dc["range"] == [-max(-p1_, p99), max(-p1_, p99)], dc
     _, ot = pull(ds, env, {"value": "curl", "color_range": "-0.01, 0.05"})
     assert ot.metadata["figure_spec"]["draw"]["range"] == [-0.01, 0.05]
+    # arrows thin on a spatial grid, never past _MAX_ARROWS (a stitched mosaic has ~10^5
+    # nodes a view), and lengthen to the gap between the arrows drawn
+    import nodegraph.catalog.plot.field as PF
+    g = np.arange(0.0, 40.0 * 8, 8.0)                 # 1600 nodes: under the cap
+    yy, xx = np.meshgrid(g, g, indexing="ij")
+    lat_rows = np.stack([yy.ravel(), xx.ravel(), np.ones(yy.size), np.ones(yy.size)], 1)
+    kept1, cell1 = PF._thin_arrows(lat_rows, 8.0, 1)
+    kept2, cell2 = PF._thin_arrows(lat_rows, 8.0, 2)
+    assert len(kept1) == len(lat_rows) and cell1 == 8.0
+    assert len(kept2) == len(lat_rows) // 4 and cell2 == 16.0
+    assert len(np.unique(kept2[:, 0])) == 20 and len(np.unique(kept2[:, 1])) == 20
+    g = np.arange(0.0, 300 * 4.0, 4.0)
+    yy, xx = np.meshgrid(g, g, indexing="ij")
+    dense = np.stack([yy.ravel(), xx.ravel(), np.ones(yy.size), np.ones(yy.size)], 1)
+    kd, cd = PF._thin_arrows(dense, 4.0, 1)
+    assert len(kd) <= PF._MAX_ARROWS and len(kd) > 0.8 * PF._MAX_ARROWS, len(kd)
+    assert cd > 4.0 * 5
     _ok(f"plot field (2026-10-09): one view per position/frame/plane, picked by the "
         f"playback strip (no Frame/Position/Plane socket, no Per mode); a {w}×{h} picture "
         f"whose M,T,Z = the input's and = the envelope's; each frame its own view; Auto drew "
         f"strain_eq (turbo) on the table's 1–99 % range; arrows 2 px for 1 µm at 0.5 µm/px; a "
         f"{sb['um']:g} µm scale bar from the input's pixel size; titles name position, frame "
         f"and plane; Export Figure wrote view (1, 1, 2); Write Movie refused to max-project 3 "
-        f"planes; an unknown column refused; a signed column centred on zero unless typed")
+        f"planes; an unknown column refused; a signed column centred on zero unless typed; "
+        f"arrows thin on a spatial grid (every N = one per N×N block) and cap at "
+        f"{PF._MAX_ARROWS} a view ({len(dense)} nodes → {len(kd)})")
 
 
 def test_field_end_to_end() -> None:

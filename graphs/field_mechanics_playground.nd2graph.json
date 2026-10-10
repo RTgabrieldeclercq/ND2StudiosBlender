@@ -418,6 +418,34 @@
               "src_socket": "image"
             },
             {
+              "dst": "fig_curl",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "stitch",
+              "src_socket": "out"
+            },
+            {
+              "dst": "fig_div",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "stitch",
+              "src_socket": "out"
+            },
+            {
+              "dst": "fig_rate",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "stitch",
+              "src_socket": "out"
+            },
+            {
+              "dst": "fig_speed",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "stitch",
+              "src_socket": "out"
+            },
+            {
               "dst": "rot",
               "dst_socket": "data",
               "kind": "forward",
@@ -425,28 +453,7 @@
               "src_socket": "out"
             },
             {
-              "dst": "fig_curl",
-              "dst_socket": "data",
-              "kind": "forward",
-              "src": "stress",
-              "src_socket": "out"
-            },
-            {
-              "dst": "fig_div",
-              "dst_socket": "data",
-              "kind": "forward",
-              "src": "stress",
-              "src_socket": "out"
-            },
-            {
-              "dst": "fig_rate",
-              "dst_socket": "data",
-              "kind": "forward",
-              "src": "stress",
-              "src_socket": "out"
-            },
-            {
-              "dst": "fig_speed",
+              "dst": "stitch",
               "dst_socket": "data",
               "kind": "forward",
               "src": "stress",
@@ -467,7 +474,7 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "scale_bar_um": 100.0,
+                "scale_bar_um": 500.0,
                 "title": "Vorticity (1/s, + = CCW)",
                 "value": "curl"
               }
@@ -479,7 +486,7 @@
               "params": {
                 "arrow_every": 2,
                 "arrows": false,
-                "scale_bar_um": 100.0,
+                "scale_bar_um": 500.0,
                 "title": "In-plane divergence (1/s)",
                 "value": "divergence"
               }
@@ -490,7 +497,7 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "scale_bar_um": 100.0,
+                "scale_bar_um": 500.0,
                 "title": "Equivalent strain rate (1/s)",
                 "value": "strain_eq"
               }
@@ -501,7 +508,7 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "scale_bar_um": 100.0,
+                "scale_bar_um": 500.0,
                 "title": "Bead speed (um/s)",
                 "value": "speed"
               }
@@ -661,6 +668,15 @@
               }
             },
             {
+              "id": "stitch",
+              "modes": {
+                "blend": "feather",
+                "layout": "stage"
+              },
+              "op_key": "util.stitch",
+              "params": {}
+            },
+            {
               "id": "strain",
               "modes": {
                 "measure": "infinitesimal"
@@ -728,37 +744,38 @@
             "f3": {
               "color": null,
               "members": [
+                "stitch",
                 "fig_speed",
                 "fig_curl",
                 "fig_rate",
                 "fig_div"
               ],
-              "title": "Figures: the playback strip picks position and plane (position 24, plane 3 has the fastest flow)"
+              "title": "Figures of the whole chip: Stitch (M\u21921) puts the 36 positions together; the playback strip picks the plane (plane 3 has the fastest flow)"
             }
           },
           "nodes": {
             "fig_curl": {
               "collapsed": false,
               "muted": false,
-              "x": 1240.0,
+              "x": 1560.0,
               "y": -110.0
             },
             "fig_div": {
               "collapsed": false,
               "muted": false,
-              "x": 1240.0,
+              "x": 1560.0,
               "y": 330.0
             },
             "fig_rate": {
               "collapsed": false,
               "muted": false,
-              "x": 1240.0,
+              "x": 1560.0,
               "y": 110.0
             },
             "fig_speed": {
               "collapsed": false,
               "muted": false,
-              "x": 1240.0,
+              "x": 1560.0,
               "y": -330.0
             },
             "grad": {
@@ -862,6 +879,12 @@
               "muted": false,
               "x": -1500.0,
               "y": 320.0
+            },
+            "stitch": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1240.0,
+              "y": 0.0
             },
             "strain": {
               "collapsed": false,

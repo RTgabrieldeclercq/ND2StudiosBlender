@@ -760,6 +760,12 @@ frame and plane of its input, drawn on first read by `figure.ViewFigureProvider`
 Viewer's playback strip picks it as it picks a plane of an image. The node has no frame,
 position or plane control of its own; Export Figure, a writer, picks a view with its own.
 
+A field crosses `util.stitch` (2026-10-09): Point tables move onto the mosaic with their
+tiles (`stitch._stitch_points`: `m` → 0, the position columns offset, one row per overlap
+from the nearest-centre tile), so Stitch between the Field cards and `plot.field` draws the
+field over the whole mosaic. A merged mosaic is rarely one lattice, so it is drawn as a
+scattered field. `plot.field` thins its arrows on a spatial grid, at most 2500 a view.
+
 ### CON-27 — resource governor
 anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold
 

@@ -22,13 +22,15 @@ The pages:
    Stress (neo-Hookean, plane stress, E = 1 kPa) → four Plot Field figures.
 2. **Chip flow PIV (real data).** The bead flow through the granular pack: ensemble PIV with
    the pore mask, as in ``piv_alia_chip_flow``. The velocity field gives the strain RATE,
-   vorticity, divergence and the viscous stress of water.
+   vorticity, divergence and the viscous stress of water. A Stitch (M→1) card before the
+   figures puts the 36 positions together, so each figure shows the whole chip; delete it
+   (or wire the figures to Stress) to look at one position at a time.
 3. **3-D gel (synthetic).** A bead-gel volume, 40 × 160² at 0.5 µm/px with a 1 µm z step,
    3 frames. A spherical cell contracts 10 % and twists 6° about the optical axis, over a 1.5 %
    x stretch. It runs DVC → the same chain → figures.
 
 On every page the Viewer's playback strip picks the position, frame and plane each figure
-shows, as it does for the image.
+shows, as it does for the image (on page 2, after the stitch, only the plane).
 
 The beads are rendered at their exactly displaced positions; the image is not warped. So the
 only error in what the correlations recover is their own. ``truth.json`` beside the data gives
@@ -243,12 +245,12 @@ def build_graph(out_path, path_2d, path_3d):
                    ("vol", "stress")])
         return ids
 
-    def plots(doc, x0, specs, **common):
+    def plots(doc, x0, specs, src="stress", **common):
         ids = []
         for i, (nid, value, title, extra) in enumerate(specs):
             params = dict(common, value=value, title=title, **extra)
             doc.add_node("plot.field", node_id=nid, x=x0, y=-330 + 220 * i, params=params)
-            wire(doc, [("stress", nid)])
+            wire(doc, [(src, nid)])
             ids.append(nid)
         return ids
 
@@ -302,18 +304,24 @@ def build_graph(out_path, path_2d, path_3d):
             ("pore", "piv")])
     chain = mechanics(d, "piv", -260, "velocity", "infinitesimal", {"viscosity": 1.0e-3},
                       {"model": "newtonian_fluid"})
-    figs = plots(d, 1240, [
+    # the 36 positions are a 6 × 6 serpentine of abutting fields; the stage log places
+    # them (Flip X on: this scope's image +x runs along stage -x)
+    d.add_node("util.stitch", node_id="stitch", x=1240, y=0,
+               modes={"layout": "stage", "blend": "feather"})
+    wire(d, [("stress", "stitch")])
+    figs = plots(d, 1560, [
         ("fig_speed", "speed", "Bead speed (um/s)", {}),
         ("fig_curl", "curl", "Vorticity (1/s, + = CCW)", {}),
         ("fig_rate", "strain_eq", "Equivalent strain rate (1/s)", {}),
         ("fig_div", "divergence", "In-plane divergence (1/s)", {"arrows": False}),
-    ], arrow_every=2, scale_bar_um=100.0)
+    ], src="stitch", arrow_every=2, scale_bar_um=500.0)
     d.add_frame("Bead flow through the granular pack: 10 burst files chained on T, PIV "
                 "only inside the pores (ensemble, velocity)",
                 srcs + ["series", "rb", "granules", "pore", "piv"])
     d.add_frame("Velocity → strain RATE, vorticity, divergence, viscous stress (water)", chain)
-    d.add_frame("Figures: the playback strip picks position and plane (position 24, "
-                "plane 3 has the fastest flow)", figs)
+    d.add_frame("Figures of the whole chip: Stitch (M→1) puts the 36 positions together; "
+                "the playback strip picks the plane (plane 3 has the fastest flow)",
+                ["stitch"] + figs)
 
     # 3 ── 3-D gel (synthetic) ───────────────────────────────────────────────────────────
     d = GraphDocument()

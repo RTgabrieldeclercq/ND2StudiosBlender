@@ -603,7 +603,7 @@
         {
           "op": "util.stitch",
           "label": "Stitch (M→1)",
-          "summary": "Stitch the multipoint axis into one mosaic (M→1, Y/X grow): tiles placed from the file's stage log (optionally refined by phase correlation) or on an explicit grid, blended feather/max/mean/overwrite."
+          "summary": "Stitch the multipoint axis into one mosaic (M→1, Y/X grow): tiles placed from the file's stage log (optionally refined by phase correlation) or on an explicit grid, blended feather/max/mean/overwrite. Point tables (a PIV or DIC field and its Field-card columns) move onto the canvas with their tiles, one row per overlap; Label and Track tables are refused."
         },
         {
           "op": "util.zproject",
@@ -18412,7 +18412,7 @@
           "role": "parameter",
           "is_field": false,
           "default": true,
-          "description": "Draw the displacement as arrows, auto-lengthened so the 95th-percentile vector is one node spacing long."
+          "description": "Draw the displacement as arrows, auto-lengthened so the 95th-percentile vector spans the gap between drawn arrows. At most 2500 are drawn per view: a bigger field (a stitched mosaic) is thinned further, evenly."
         },
         {
           "name": "arrow_every",
@@ -18421,7 +18421,7 @@
           "role": "parameter",
           "is_field": false,
           "default": 1,
-          "description": "Draw one arrow in N — for a dense field whose arrows would overlap. Only read when Arrows is on."
+          "description": "Draw one arrow per block of N × N nodes — for a dense field whose arrows would overlap. HIGHER draws fewer, longer arrows. Only read when Arrows is on."
         },
         {
           "name": "contours",
@@ -24324,8 +24324,8 @@
       ],
       "module": "nodegraph/catalog/util/stitch.py",
       "gui_only": false,
-      "summary": "Stitch the multipoint axis into one mosaic (M→1, Y/X grow): tiles placed from the file's stage log (optionally refined by phase correlation) or on an explicit grid, blended feather/max/mean/overwrite.",
-      "overview": "Fuse the multipoint axis into one mosaic (M→1, Y/X grow) — the tile-stitch node. Resolved spec (`build-node-v2` §0): * **Kind** utility, axis-changing → ``op_key=\"util.stitch\"``, ``meta_transform=stitch`` (M→1; the canvas extent is reported UNKNOWN, never guessed — see below). * **Data contract** image → image. Lattice attribute layers that no longer fit the canvas are dropped by ``reshaped_axes``, exactly as Crop/Resample drop theirs; a **structure** table (Label/Point/Track/Mesh) is REFUSED, because its ``m``/``y``/``x`` columns index the tile grid and nothing here can honestly re-address them (detections duplicated across a seam would need deduplicating, which is a different node's job). Stitch first, then detect. * **2D/3D** no lever: each ``(t, z, c)`` plane is placed with the same layout, so the node is dimension-agnostic. A z-stack stitches to a z-stack. * **Footprint** ``MULTI_VIEW`` / ``{\"m\",\"y\",\"x\"}`` — it reads every M at one ``(t,z,c)`` and is the first node in the catalog to claim the footprint V2.02 defined for it. * **Backend** numpy for the paste; ``skimage.registration.phase_cross_correlation`` + ``scipy.ndimage.shift`` only on the ``stage+refine`` path. * **Performance** no numba: the hot path is whole-array slice-adds into a canvas, which is already one vectorized pass per tile (`wire-node-v2` §12, row 1). **Why the header says UNKNOWN.** ``metadata.stitch`` marks the output Y/X unknown because the canvas depends on the stage log, and the stage log rides the *payload*, not the envelope — the runner deliberately keeps per-M geometry out of the calibration schema. So the edit-time pass cannot compute the extent without reading data, and it reports \"not statically knowable\" rather than the input's tile size, which would be a confident lie. The payload's axes are the real canvas. **The canvas is streamed, never realized 6-D.** One plane of a 49-position mosaic is ~268 Mpx; the whole 6-D array would be tens of GB. A :class:`~nodegraph.streaming.MultiViewProvider` stitches one ``(t,z,c)`` plane on demand instead, pulling one tile at a time.",
+      "summary": "Stitch the multipoint axis into one mosaic (M→1, Y/X grow): tiles placed from the file's stage log (optionally refined by phase correlation) or on an explicit grid, blended feather/max/mean/overwrite. Point tables (a PIV or DIC field and its Field-card columns) move onto the canvas with their tiles, one row per overlap; Label and Track tables are refused.",
+      "overview": "Fuse the multipoint axis into one mosaic (M→1, Y/X grow) — the tile-stitch node. Resolved spec (`build-node-v2` §0): * **Kind** utility, axis-changing → ``op_key=\"util.stitch\"``, ``meta_transform=stitch`` (M→1; the canvas extent is reported UNKNOWN, never guessed — see below). * **Data contract** image → image. Lattice attribute layers that no longer fit the canvas are dropped by ``reshaped_axes``, exactly as Crop/Resample drop theirs. **Point tables move with their tiles** (2026-10-09, so a correlation field — PIV, DIC, the Field cards' columns — can be drawn over the whole mosaic): each row's ``m`` becomes 0 and its position columns move by its tile's offset (:func:`_stitch_points`). Where tiles overlap, a row is kept only from the tile whose centre is nearest, so nothing is counted twice. **Label / Track / Mesh tables are still REFUSED**: a label's raster and its bounding box, a track's continuity across a seam and a mesh's CSR links cannot be re-addressed row by row. Stitch first, then segment or track. * **2D/3D** no lever: each ``(t, z, c)`` plane is placed with the same layout, so the node is dimension-agnostic. A z-stack stitches to a z-stack. * **Footprint** ``MULTI_VIEW`` / ``{\"m\",\"y\",\"x\"}`` — it reads every M at one ``(t,z,c)`` and is the first node in the catalog to claim the footprint V2.02 defined for it. * **Backend** numpy for the paste; ``skimage.registration.phase_cross_correlation`` + ``scipy.ndimage.shift`` only on the ``stage+refine`` path. * **Performance** no numba: the hot path is whole-array slice-adds into a canvas, which is already one vectorized pass per tile (`wire-node-v2` §12, row 1). **Why the header says UNKNOWN.** ``metadata.stitch`` marks the output Y/X unknown because the canvas depends on the stage log, and the stage log rides the *payload*, not the envelope — the runner deliberately keeps per-M geometry out of the calibration schema. So the edit-time pass cannot compute the extent without reading data, and it reports \"not statically knowable\" rather than the input's tile size, which would be a confident lie. The payload's axes are the real canvas. **The canvas is streamed, never realized 6-D.** One plane of a 49-position mosaic is ~268 Mpx; the whole 6-D array would be tens of GB. A :class:`~nodegraph.streaming.MultiViewProvider` stitches one ``(t,z,c)`` plane on demand instead, pulling one tile at a time.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,

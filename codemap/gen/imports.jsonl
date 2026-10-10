@@ -1238,6 +1238,7 @@
 {"dst":"nodegraph.catalog.enhance.zs_deconvnet","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.io.write_movie","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.io.write_tiff","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.catalog.plot.field","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.util.batch","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.util.crop_to","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog.util.time_shift","k":"imp","lazy":true,"src":"nodegraph.selftest"}

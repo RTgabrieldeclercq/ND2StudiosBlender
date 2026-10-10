@@ -63,10 +63,43 @@ def _background(ds: Dataset, m: int, t: int, z: int, c: int, side: int
     return img, f * k
 
 
+#: The most arrows one view draws. Past a few thousand they merge into a texture that shows
+#: no direction, and each one costs the spec and matplotlib time: a stitched 36-tile chip
+#: mosaic has ~90,000 PIV nodes per view.
+_MAX_ARROWS = 2500
+
+
+def _thin_arrows(rows: np.ndarray, spacing: float, every: int) -> Tuple[np.ndarray, float]:
+    """One arrow per square block ``every`` node spacings wide — the first node in each —
+    the blocks widened until at most :data:`_MAX_ARROWS` remain. Returns the kept rows and
+    the block size in pixels. On a lattice with ``every = 1`` every node is its own block,
+    so every arrow stays.
+
+    Spatial rather than every N-th row: rows come tile by tile and row by row, so a stride
+    leaves stripes on a lattice and clumps on a mosaic."""
+    rows = rows[np.isfinite(rows).all(axis=1)]
+    s = float(spacing) if np.isfinite(spacing) and spacing > 0 else 1.0
+    if rows.shape[0] == 0:
+        return rows, s
+    y, x = rows[:, 0], rows[:, 1]
+    span_y = float(y.max() - y.min()) + s
+    span_x = float(x.max() - x.min()) + s
+    cell = s * max(1, int(every))
+    if (span_y / cell) * (span_x / cell) > _MAX_ARROWS:
+        cell = float(np.sqrt(span_y * span_x / _MAX_ARROWS))
+    by = np.floor((y - y.min() + s / 2.0) / cell).astype(np.int64)
+    bx = np.floor((x - x.min() + s / 2.0) / cell).astype(np.int64)
+    _, first = np.unique(by * (int(bx.max()) + 1) + bx, return_index=True)
+    return rows[np.sort(first)], cell
+
+
 def _frame_entry(ds: Dataset, layer: str, col: str, m: int, t: int, z: int, c: int,
                  side: int, arrows: bool, every: int) -> Dict[str, Any]:
     img, _f = _background(ds, m, t, z, c, side)
-    fr = FM.raster(ds, layer, col, m, t, z, c)
+    # a lattice field draws one cell per node whatever this says; a scattered one (a
+    # stitched mosaic, tracked points) is resampled to about two figure pixels a cell —
+    # finer than the Viewer's 128, which has the GUI thread's budget to keep
+    fr = FM.raster(ds, layer, col, m, t, z, c, max_side=max(128, side // 2))
     entry: Dict[str, Any] = {"m": int(m), "t": int(t), "z": int(z),
                              "image": None if img is None else FIG.pack_plane(img)}
     if fr is not None:
@@ -77,10 +110,11 @@ def _frame_entry(ds: Dataset, layer: str, col: str, m: int, t: int, z: int, c: i
     if arrows:
         vf = FM.vectors(ds, m, t, z, c, layer=layer)
         if vf is not None:
-            rows = vf.rows[::max(1, int(every))]
-            rows = rows[np.isfinite(rows).all(axis=1)]
+            rows, cell = _thin_arrows(vf.rows, vf.spacing_px, every)
             entry["arrows"] = [[float(v) for v in r] for r in rows]
-            entry["arrow_scale"] = float(FM.auto_scale(vf))
+            # the 95th-percentile arrow as long as the gap between DRAWN arrows
+            s = vf.spacing_px if np.isfinite(vf.spacing_px) and vf.spacing_px > 0 else cell
+            entry["arrow_scale"] = float(FM.auto_scale(vf)) * cell / s
     return entry
 
 
@@ -268,10 +302,13 @@ register_node(
                             "shows more of the image; 1 hides it under the field."),
         InBool("arrows", "Arrows", field=False, default=True,
                description="Draw the displacement as arrows, auto-lengthened so the "
-                           "95th-percentile vector is one node spacing long."),
+                           "95th-percentile vector spans the gap between drawn arrows. At "
+                           "most 2500 are drawn per view: a bigger field (a stitched "
+                           "mosaic) is thinned further, evenly."),
         InInt("arrow_every", "Arrows every", unit="", field=False, default=1,
-              description="Draw one arrow in N — for a dense field whose arrows would "
-                          "overlap. Only read when Arrows is on."),
+              description="Draw one arrow per block of N × N nodes — for a dense field "
+                          "whose arrows would overlap. HIGHER draws fewer, longer arrows. "
+                          "Only read when Arrows is on."),
         InInt("contours", "Contours", unit="", field=False, default=0,
               description="How many iso-lines to draw over the colour map; 0 draws none."),
         InFloat("scale_bar_um", "Scale bar", unit="um", field=False, default=0.0,
