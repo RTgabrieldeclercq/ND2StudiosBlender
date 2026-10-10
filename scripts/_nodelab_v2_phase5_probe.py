@@ -711,7 +711,7 @@ def main(argv) -> int:
     # column of a field table (Auto = the most derived: a Stress card's von_mises beats a
     # strain beats the displacement), lattice rows one cell per node, with a colour bar and
     # iso-contours; the arrows are in PIXELS (a µm displacement divided by the pixel size).
-    from nodelab_v2 import field_view as _FVp
+    import nodegraph.fieldmap as _FVp
     assert "field" in _OVg.TABS and _vp.overlays.field.enabled
     _fax = AxisSizes(m=1, t=2, z=1, c=1, y=64, x=64)
     _fy, _fx = _np.meshgrid(_np.arange(8., 64., 8.), _np.arange(8., 64., 8.), indexing="ij")

@@ -220,6 +220,8 @@ MODULES: Tuple[str, ...] = (
     "field.rotation",
     "field.volume_change",
     "field.stress",
+    # 2026-10-09: a field drawn on its image as a figure, appended for the same reason
+    "plot.field",
 )
 
 

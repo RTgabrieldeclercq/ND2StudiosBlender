@@ -253,7 +253,7 @@ class VectorsOverlay:
 
     Screen-space like every other overlay: an arrow keeps its weight and head size as you
     zoom, so zooming inspects the field rather than magnifying the drawing of it. The
-    geometry comes from :func:`nodelab_v2.field_view.vectors`, in image pixels — a µm
+    geometry comes from :func:`nodegraph.fieldmap.vectors`, in image pixels — a µm
     displacement is converted by the payload's pixel size (2026-10-09; it used to be drawn
     in µm at pixel positions, 1/pixel_size of its true length)."""
     enabled: bool = True
@@ -275,7 +275,7 @@ class VectorsOverlay:
 class FieldOverlay:
     """Colours the image by any numeric column of a measured field (2026-10-09) — the
     displacement magnitude of a correlation, a Field card's strain, rotation, Jacobian or
-    stress. The column is rasterised by :func:`nodelab_v2.field_view.raster` (a lattice
+    stress. The column is rasterised by :func:`nodegraph.fieldmap.raster` (a lattice
     one cell per node, a scattered field resampled) and drawn under the grid and arrows,
     with a colour bar naming the column and its unit.
 
@@ -297,7 +297,7 @@ class FieldOverlay:
     width: float = 1.2              # contour line width, screen px
     colorbar: bool = True
     #: crossed bars along the principal axes of the Strain / Stress card's tensor at every
-    #: `glyph_every`-th node — red tension, blue compression (:func:`field_view.tensor_glyphs`)
+    #: `glyph_every`-th node — red tension, blue compression (:func:`nodegraph.fieldmap.tensor_glyphs`)
     glyphs: str = "none"            # none | strain | stress
     glyph_every: int = 1
 
@@ -1189,20 +1189,20 @@ class OverlayFrame:
     scalar: Optional[np.ndarray] = None
     #: Vectors for this plane, in full-resolution image pixels: ``(y, x, u, v)`` columns.
     #: ``u``/``v`` are the displacement's y/x components in the SAME units as y/x — image
-    #: pixels, converted from µm by :func:`nodelab_v2.field_view.vectors`.
+    #: pixels, converted from µm by :func:`nodegraph.fieldmap.vectors`.
     vectors: Optional[np.ndarray] = None
     #: the series' 99th-percentile vector length (px) — the magnitude colour's top, so a
     #: colour means the same length on every frame; 0 = this frame's own maximum
     vec_hi: float = 0.0
-    #: the Auto-length multiplier (:func:`nodelab_v2.field_view.auto_scale`); 0 = none
+    #: the Auto-length multiplier (:func:`nodegraph.fieldmap.auto_scale`); 0 = none
     vec_auto: float = 0.0
-    #: the Field tab's raster for this plane (:class:`nodelab_v2.field_view.FieldRaster`),
+    #: the Field tab's raster for this plane (:class:`nodegraph.fieldmap.FieldRaster`),
     #: its resolved limits, colour map and colour-bar label
     field: Optional[Any] = None
     field_lims: Optional[Tuple[float, float]] = None
     field_cmap: str = ""
     field_label: str = ""
-    #: principal-axis glyphs (:class:`nodelab_v2.field_view.Glyphs`) and the deformed grid's
+    #: principal-axis glyphs (:class:`nodegraph.fieldmap.Glyphs`) and the deformed grid's
     #: polylines (``(K, 2)`` y/x, image px) — both ``None`` when off
     glyphs: Optional[Any] = None
     grid_lines: Optional[Sequence[np.ndarray]] = None
@@ -1529,10 +1529,10 @@ class OverlayRenderer:
     def _paint_contours(self, p: QPainter, grid: np.ndarray, levels, cmap: str,
                         lo: float, hi: float, to_widget, width: float,
                         opacity: int) -> None:
-        """Iso-lines of ``grid`` (:func:`nodelab_v2.field_view.contour_lines`), one cosmetic
+        """Iso-lines of ``grid`` (:func:`nodegraph.fieldmap.contour_lines`), one cosmetic
         path per level in that level's colour; ``to_widget(row, col)`` maps grid index
         coordinates to the widget."""
-        from nodelab_v2.field_view import contour_lines
+        from nodegraph.fieldmap import contour_lines
         from nodelab_v2.overlay_render import colormap_lut
         lut = colormap_lut(cmap)
         span = (hi - lo) if hi > lo else 1.0
@@ -2273,7 +2273,7 @@ def render_preview(p: QPainter, rect: QRectF, s: OverlaySettings, tab: str,
     elif tab == "field":
         # a signed saddle on a 12 x 20 lattice, so auto picks the diverging map and the
         # wash / cells / contour styles all show something honest
-        from nodelab_v2.field_view import FieldRaster
+        from nodegraph.fieldmap import FieldRaster
         gy, gx = np.mgrid[0:12, 0:20]
         sad = np.sin(gx / 3.0) * np.cos(gy / 2.5)
         frame.field = FieldRaster(sad, (0.0, h, 0.0, w), True, "preview", "strain_xx")

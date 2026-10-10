@@ -32084,13 +32084,13 @@ def test_field_mechanics() -> None:
 
 
 def test_field_view() -> None:
-    """What the Viewer draws of a measured field (2026-10-09, ``nodelab_v2.field_view`` — the
-    Qt-free seam): arrows in IMAGE PIXELS (a µm displacement over the pixel size; a velocity
+    """What the Viewer draws of a measured field (2026-10-09, ``nodegraph.fieldmap``, shared
+    with ``plot.field``): arrows in IMAGE PIXELS (a µm displacement over the pixel size; a velocity
     over one frame), a lattice field rasterised one cell per node with its holes empty, a 3-D
     lattice interpolated between the planes bracketing the viewed z, a scattered field
     resampled near its nodes only, Auto picking the most derived column, the series limits,
     and iso-lines that close around a hole."""
-    import nodelab_v2.field_view as FV
+    import nodegraph.fieldmap as FV
     from nodegraph.structure import StructureTable
     from nodegraph.catalog._shared.analysis_mesh import lattice_quads, with_mesh
 
@@ -32188,6 +32188,176 @@ def test_field_view() -> None:
         "pure shear; the deformed lattice through the displaced nodes, broken at holes")
 
 
+def test_plot_field() -> None:
+    """Plot Field (2026-10-09): a field drawn on its image as a PICTURE — the picture is the
+    style's size and matches the edit-time envelope; Auto draws the most derived column on the
+    series' 1st–99th percentile; arrows in image pixels; a scale bar from the INPUT's pixel
+    size; Per frame gives one figure per frame on one scale; Export Figure's renderer writes
+    PNG and SVG; an unknown column is refused by name."""
+    import importlib.util
+    import os
+    import tempfile
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot.field: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.structure import StructureTable
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    define_node("io.plotfieldseed", "S", outputs=[OutDataset()])
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=96, x=128)
+    md = {"pixel_size_um": 0.5}
+    img = np.zeros((1, 2, 1, 1, 96, 128), np.float32)
+    img[..., ::7, :] = 100.0
+    gy, gx = np.meshgrid(np.arange(8.0, 96.0, 16.0), np.arange(8.0, 128.0, 16.0), indexing="ij")
+    n = gy.size
+    cols = {"id": np.arange(2 * n), "m": np.zeros(2 * n), "t": np.repeat([0, 1], n),
+            "c": np.zeros(2 * n), "z": np.zeros(2 * n),
+            "y": np.tile(gy.ravel(), 2), "x": np.tile(gx.ravel(), 2),
+            "disp_y": np.zeros(2 * n), "disp_x": np.repeat([0.0, 1.0], n),
+            "disp_mag_um": np.repeat([0.0, 1.0], n),
+            "strain_eq": np.r_[np.zeros(n), gx.ravel() * 1e-3]}
+    ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+          .with_structure(StructureTable(Domain.POINT, cols, layer="piv", z_kind="plane_index")))
+    env = MetaEnvelope(axes=ax, metadata=md)
+
+    def pull(params=None, modes=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.plotfieldseed"))
+        g.add(NodeInstance("P", "plot.field", params=params or {}, modes=modes or {}))
+        g.connect("S", "P")
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull("P")
+
+    e, o = pull({"frame": 1})
+    spec = o.metadata["figure_spec"]
+    h, w = FIG.figure_pixels(spec["style"]["width_mm"], spec["style"]["height_mm"],
+                             spec["style"]["dpi"])
+    assert (o.axes.y, o.axes.x, o.axes.c, o.axes.t) == (h, w, 3, 1), o.axes
+    assert e.env("P").axes == o.axes, (e.env("P").axes, o.axes)
+    assert spec["kind"] == "field" and spec["source"]["value"] == "strain_eq"
+    lo, hi = spec["draw"]["range"]
+    assert abs(hi - np.percentile(cols["strain_eq"], 99)) < 1e-12 and spec["draw"]["colormap"] == "turbo"
+    fr = spec["frames"][0]
+    assert fr["t"] == 1 and len(fr["grid"]) == 6 and len(fr["grid"][0]) == 8
+    arr = np.asarray(fr["arrows"])
+    assert np.allclose(arr[:, 3], 2.0), arr[:3]         # 1 µm at 0.5 µm/px = 2 px
+    sb = spec["draw"]["scale_bar"]
+    assert sb and abs(sb["px"] - sb["um"] / 0.5) < 1e-12 and sb["um"] in (10.0, 20.0, 5.0)
+    assert FIG.unpack_plane(fr["image"]).dtype == np.uint8
+    # Per frame: one figure per frame, each its own entry, one shared scale
+    e2, o2 = pull({}, {"per": "frame"})
+    assert o2.axes.t == 2 and e2.env("P").axes == o2.axes
+    sp2 = o2.metadata["figure_spec"]
+    assert [f["t"] for f in sp2["frames"]] == [0, 1] and sp2["draw"]["range"] == [lo, hi]
+    assert FIG.frame_spec(sp2, 1)["frames"][0]["t"] == 1
+    # Export Figure's path: the same spec written as PNG and SVG
+    with tempfile.TemporaryDirectory() as td:
+        for fmt in ("png", "svg"):
+            pth = FIG.render_file(spec, os.path.join(td, f"f.{fmt}"), fmt)
+            assert os.path.getsize(pth) > 1000, fmt
+    try:
+        pull({"value": "nope"})
+        raise AssertionError("an unknown column must be refused")
+    except ValueError as exc:
+        assert "nope" in str(exc) and "strain_eq" in str(exc), exc
+    _ok(f"plot field (2026-10-09): a {w}×{h} picture matching its envelope; Auto drew "
+        f"strain_eq (turbo) on the series' 1–99 % range; arrows 2 px for 1 µm at 0.5 µm/px; "
+        f"a {sb['um']:g} µm scale bar from the input's pixel size; Per frame = 2 figures on "
+        f"one scale; PNG + SVG written; an unknown column refused by name")
+
+
+def test_field_end_to_end() -> None:
+    """The Field cards on REAL correlations of known deformations (2026-10-09): a speckle
+    image warped by F = I + A through ``analysis.piv`` → Field Gradient → Strain (Green-
+    Lagrange) → Volume Change recovers A, E and det F; a speckle volume dilated by 1.02
+    through ``analysis.dvc_field`` → Field Gradient → Volume Change recovers J = 1.0612 and a
+    neo-Hookean Stress reads it as tension (negative pressure) with ~zero von Mises."""
+    import importlib.util
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    have_piv = importlib.util.find_spec("openpiv") is not None
+    have_dvc = importlib.util.find_spec("al_dvc") is not None
+    if not (have_piv or have_dvc):
+        _ok("field end to end: SKIPPED (neither openpiv nor al_dvc installed)")
+        return
+    define_node("io.fielde2eseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(7)
+
+    def run(ds, ax, md, steps, layer):
+        g = Graph()
+        g.add(NodeInstance("S", "io.fielde2eseed"))
+        prev = "S"
+        for nid, op, params, modes in steps:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+            g.connect(prev, nid, dst_socket="data")
+            prev = nid
+        o = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=md)}).pull(prev)
+        return lambda c: np.asarray(o.get(Domain.POINT, c, layer=layer).values)
+
+    notes = []
+    if have_piv:
+        Y = X = 384
+        A = np.array([[0.010, 0.004], [-0.006, -0.008]])
+        ref = gaussian_filter(rng.random((Y, X)), 1.5)
+        yy, xx = np.mgrid[0:Y, 0:X].astype(float)
+        Fi = np.linalg.inv(np.eye(2) + A)
+        dy, dx = yy - Y / 2, xx - X / 2
+        dfm = map_coordinates(ref, [Y / 2 + Fi[0, 0] * dy + Fi[0, 1] * dx,
+                                    X / 2 + Fi[1, 0] * dy + Fi[1, 1] * dx],
+                              order=3, mode="reflect")
+        ax = AxisSizes(m=1, t=2, z=1, c=1, y=Y, x=X)
+        md = {"pixel_size_um": 0.5}
+        ds = Dataset(axes=ax, metadata=md).with_image(
+            ArrayProvider(np.stack([ref, dfm])[None, :, None, None].astype(np.float32)))
+        get = run(ds, ax, md, [("P", "analysis.piv", {"results": "off"}, {}),
+                               ("G", "field.gradient", {}, {}),
+                               ("E", "field.strain", {}, {"measure": "green_lagrange"}),
+                               ("V", "field.volume_change", {}, {})], "piv")
+        t1 = get("t") == 1
+        G = np.nanmedian(np.stack([get(c) for c in ("grad_yy", "grad_yx", "grad_xy",
+                                                    "grad_xx")], 1)[t1], axis=0)
+        assert np.abs(G - A.ravel()).max() < 5e-4, (G, A)
+        F = np.eye(2) + A
+        E = 0.5 * (F.T @ F - np.eye(2))
+        assert abs(np.nanmedian(get("strain_yy")[t1]) - E[0, 0]) < 5e-4
+        assert abs(np.nanmedian(get("strain_yx")[t1]) - E[0, 1]) < 5e-4
+        J = float(np.nanmedian(get("jacobian")[t1]))
+        assert abs(J - np.linalg.det(F)) < 5e-4, J
+        notes.append(f"PIV gradient within {np.abs(G - A.ravel()).max():.1e} of A, "
+                     f"J {J:.4f} (true {np.linalg.det(F):.4f})")
+    if have_dvc:
+        Z, Y3, X3 = 48, 96, 96
+        vol = gaussian_filter(rng.random((Z, Y3, X3)), 1.2)
+        s = 1.02
+        zz, yy, xx = np.mgrid[0:Z, 0:Y3, 0:X3].astype(float)
+        c = np.array([Z, Y3, X3]) / 2.0
+        dvol = map_coordinates(vol, [c[0] + (zz - c[0]) / s, c[1] + (yy - c[1]) / s,
+                                     c[2] + (xx - c[2]) / s], order=3, mode="reflect")
+        ax3 = AxisSizes(m=1, t=2, z=Z, c=1, y=Y3, x=X3)
+        md3 = {"pixel_size_um": 1.0, "z_step_um": 1.0}
+        ds3 = Dataset(axes=ax3, metadata=md3).with_image(
+            ArrayProvider(np.stack([vol, dvol])[None, :, :, None].astype(np.float32)))
+        get3 = run(ds3, ax3, md3, [
+            ("D", "analysis.dvc_field", {"results": "off", "subset_size": 24,
+                                         "subset_size_z": 16, "subset_spacing": 12,
+                                         "subset_spacing_z": 8}, {}),
+            ("G", "field.gradient", {}, {}), ("V", "field.volume_change", {}, {}),
+            ("T", "field.stress", {"youngs_modulus": 5000.0, "poisson_ratio": 0.45},
+             {"model": "neo_hookean"})], "dvc")
+        t1 = get3("t") == 1
+        J3 = float(np.nanmedian(get3("jacobian")[t1]))
+        assert abs(J3 - s ** 3) < 5e-3, J3
+        p = float(np.nanmedian(get3("pressure")[t1]))
+        vm = float(np.nanmedian(get3("von_mises")[t1]))
+        assert p < 0 and vm < 0.05 * abs(p), (p, vm)        # expansion = tension, ~no shear
+        notes.append(f"DVC J {J3:.4f} (true {s ** 3:.4f}), neo-Hookean pressure {p:.0f} Pa "
+                     f"with von Mises {vm:.1f} Pa")
+    _ok("field end to end (2026-10-09): " + "; ".join(notes))
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -32263,6 +32433,8 @@ def main() -> int:
     test_analysis_mesh()
     test_field_mechanics()
     test_field_view()
+    test_plot_field()
+    test_field_end_to_end()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

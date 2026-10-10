@@ -3061,7 +3061,7 @@ Notation: **lever** = has the 2D/3D header switch · **modes** = in-body dropdow
 Iterate node's feedback search, minted by the rewrite between two iterations (never placed by
 hand, hidden from the palette).
 
-### Plotting (4)
+### Plotting (5)
 
 | Node | `op_key` | Key controls | Notes |
 |---|---|---|---|
@@ -3069,6 +3069,7 @@ hand, hidden from the palette).
 | Plot Time Series | `plot.timeseries` | `domain` label / point / track · `table` · `value`, `group_by` columns · `time` elapsed / clock / frame · `kind` line / scatter / line_markers · `error` none / sd / sem (default) / ci95 with `error_style` bars / band (default) · `per` all / frame · the style controls of Plot XY | Draws a column against the experiment's own **time axis**, one curve per `group_by` value, each frame's rows as their mean ± the chosen spread. `elapsed` reads the file's per-frame clock (`frame_time_jd`), else frame × interval (`dt_s`), else the frame number, and then the axis says *frame (no frame times in the file)*; the unit (s, min or h) is picked once from the span. `clock` puts each frame's wall-clock time on the axis (elapsed when the file has no clock); `frame` the frame index. **Per frame** draws the course up to each frame with a dashed cursor at it. A Picture like Plot XY. |
 | Plot Distribution | `plot.distribution` | `domain` · `table` · `value`, `group_by` columns · `kind` histogram / kde / box / violin / ecdf · `bins` and `normalize` count / density / percent (histogram only) · the style controls | The spread of one column, one distribution per group. Histogram groups share bins over the range of every group and overlay translucently; kde is a Gaussian density (Scott's bandwidth); box and violin stand the groups side by side; ecdf is the cumulative fraction, with no bins to choose. Non-finite values are left out, and a log axis leaves out the values it cannot place. The histogram's `bins` span the X range when one is fixed (else the data's), geometrically on a log x axis. A Picture like Plot XY. |
 | Plot Heatmap | `plot.heatmap` | `source` label / point / track / voxel · `table` · `row`, `column`, `value` columns and `reducer` mean / median / sum / min / max / count / std (table sources) · `frame`, `position` (voxel) · `colormap` viridis / magma / cividis / gray / coolwarm · `color_range` · the style controls | From a table: one cell per (row value, column value), the reducer of the `value` rows in it — rows `t`, columns `m`, mean `area` is the mean area per frame and position; an empty cell is blank, not zero. From a **Voxel layer** (a mask, a distance field, labels): its plane at `frame` and `position`, Z max-projected, mean-pooled to at most 512 px a side. A colour bar names the value (Legend turns it off; Grid outlines a table heatmap's cells; there is no Palette — the colour map colours it); `color_range` (`low, high`) fixes the scale so two heatmaps compare by colour. Past 40 rows or columns every k-th tick is labelled, always with the real value. A Picture like Plot XY. |
+| **Plot Field** | `plot.field` | `table` (field; blank = the only one) · `value` column (blank = the most derived: von_mises → strain_eq → jacobian → curl → disp_mag_um) · `frame`, `position`, `plane`, `channel` · `color_range` · `opacity` · `arrows` + `arrow_every` · `contours` · `scale_bar_um` (0 = a round fifth of the field) · `colormap` auto / turbo / viridis / magma / cividis / coolwarm · `per` all / frame · the style controls | A measured field drawn on its image as a figure (2026-10-09): the image plane in grey, the column as a colour map with a colour bar naming it and its unit, arrows (auto length — the 95th-percentile vector one node spacing), iso-contours, a µm scale bar. Rasterised by `nodegraph.fieldmap`, the Viewer's own Field-overlay code, so the figure and the screen agree. Blank `color_range` = the column's 1st–99th percentile over the WHOLE series, so `per frame` (one figure per frame, backgrounds ≤ 512 px) makes a movie on one scale for Export Movie; Export Figure writes PNG / SVG / PDF. The scale bar reads the input's pixel size (a picture itself carries no calibration) |
 
 ### Tables (3)
 
@@ -3457,6 +3458,9 @@ io.load ─→ analysis.piv / analysis.dic_correlate / analysis.dvc_field / trac
   `curl`, `jacobian`, `stress_*`, `von_mises` … row for row. Drop `bundle:mechanics` (Field
   Gradient → Strain → Stress) after the correlation card and add Rotation & Curl or Volume
   Change off the same gradient.
+* **Make a figure or a movie.** **Plot Field** draws the same thing as a picture: the image,
+  the column as a colour map with its colour bar, arrows, contours and a scale bar. Export
+  Figure writes it; with **Per** = frame, Export Movie animates it on one colour scale.
 * **See it on the image.** The Viewer's **Field** overlay (§2 Overlays) colours the image by
   any of these columns. With nothing picked it shows the most derived one: von Mises after
   Stress, `strain_eq` after Strain, the Jacobian after Volume Change, otherwise the

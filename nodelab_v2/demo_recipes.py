@@ -1203,10 +1203,10 @@ class DemoSession:
 
     @staticmethod
     def _vectors(ds: Dataset, m: int, t: int, z: int, c: int) -> Optional[np.ndarray]:
-        """The Viewer's own arrows (:func:`nodelab_v2.field_view.vectors`) — image pixels,
+        """The Viewer's own arrows (:func:`nodegraph.fieldmap.vectors`) — image pixels,
         a µm displacement converted by the payload's pixel size — so the demo window and
         the Viewer can never draw one field two ways."""
-        from nodelab_v2.field_view import vectors
+        from nodegraph.fieldmap import vectors
         vf = vectors(ds, m, t, z, c)
         return None if vf is None else vf.rows
 

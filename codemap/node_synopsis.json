@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 136,
+    "nodes": 137,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 917,
-    "outputs": 143,
+    "inputs": 941,
+    "outputs": 144,
     "gui_ops_included": true
   },
   "stages": {
@@ -261,6 +261,7 @@
         "page.input",
         "page.output",
         "plot.distribution",
+        "plot.field",
         "plot.heatmap",
         "plot.timeseries",
         "plot.xy",
@@ -1106,13 +1107,18 @@
     "plotting": {
       "label": "Plotting",
       "stage": "control_and_present",
-      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, and Plot Heatmap a table summary on a grid or a Voxel layer's plane.",
-      "count": 4,
+      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, Plot Heatmap a table summary on a grid or a Voxel layer's plane, and Plot Field a measured field drawn on its image (colour map, arrows, contours, scale bar).",
+      "count": 5,
       "ops": [
         {
           "op": "plot.distribution",
           "label": "Plot Distribution",
           "summary": "The distribution of one column of a Label, Point or Track table — histogram, density, box, violin or cumulative — one per group, drawn as a true-colour picture."
+        },
+        {
+          "op": "plot.field",
+          "label": "Plot Field",
+          "summary": "A measured field drawn on its image as a figure: the image plane in grey, a field column as a colour map with a colour bar, optional arrows and contours, a µm scale bar — one frame, or one figure per frame for a movie."
         },
         {
           "op": "plot.heatmap",
@@ -1264,6 +1270,7 @@
     ],
     "plot": [
       "plot.distribution",
+      "plot.field",
       "plot.heatmap",
       "plot.timeseries",
       "plot.xy"
@@ -18212,6 +18219,441 @@
         "x_range",
         "y_label",
         "y_range"
+      ]
+    },
+    "plot.field": {
+      "op": "plot.field",
+      "label": "Plot Field",
+      "category": "plot",
+      "role": "plotting",
+      "stage": "control_and_present",
+      "pages": [
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/plot/field.py",
+      "gui_only": false,
+      "summary": "A measured field drawn on its image as a figure: the image plane in grey, a field column as a colour map with a colour bar, optional arrows and contours, a µm scale bar — one frame, or one figure per frame for a movie.",
+      "overview": "A measured field drawn on its image, as a PICTURE. Resolved spec (§0, 2026-10-09): * **Kind** plot → ``op_key=\"plot.field\"``, category ``plot``: a picture of the input like every plot node (``fresh_output``, the ``figure_frame`` envelope), whole table at once (WHOLE_SERIES, empty kernel_axes — the background plane is read through the provider). * **What it draws** the image plane of ``position`` / ``frame`` / ``plane`` / ``channel`` (auto contrast, pooled to ≤ 1024 px) in grey; the ``value`` column of the ``table`` field as a colour map at ``opacity`` — rasterised by :mod:`nodegraph.fieldmap`, the Viewer's own Field-overlay rasteriser, so screen and figure agree — with a colour bar naming the column and its unit; optional arrows (auto length: the 95th-percentile vector one node spacing) and iso-contours; a µm scale bar. * **Per** ``all`` = the one frame chosen; ``frame`` = one figure per frame of the input (backgrounds ≤ 512 px), drawn when shown — scrub it in the Viewer or export a movie. * **Limits** ``color_range`` 'low, high'; blank = the column's 1st–99th percentile over the whole series, so every frame of a movie shares one scale.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "voxel"
+        ]
+      },
+      "modes": [
+        {
+          "name": "colormap",
+          "label": "Colour map",
+          "choices": [
+            "auto",
+            "turbo",
+            "viridis",
+            "magma",
+            "cividis",
+            "coolwarm"
+          ],
+          "default": "auto",
+          "description": "The colours the field column is drawn in.",
+          "choice_docs": {
+            "auto": "coolwarm (diverging, zero neutral) for a column with both signs — strain, curl, a stress component — and turbo otherwise: the Viewer Field overlay's own choice.",
+            "turbo": "A high-contrast rainbow — what displacement magnitude is usually shown in; not perceptually uniform, so judge levels from the bar.",
+            "viridis": "Dark purple to yellow, perceptually uniform and colour-blind safe — the accessible choice for a one-signed quantity.",
+            "magma": "Black through red to pale yellow, perceptually uniform — strong contrast where the field peaks.",
+            "cividis": "Blue to yellow, designed to read the same for the common colour-vision deficiencies.",
+            "coolwarm": "Blue through white to red, diverging — for a signed quantity whose zero must read as neutral."
+          }
+        },
+        {
+          "name": "per",
+          "label": "Per",
+          "choices": [
+            "all",
+            "frame"
+          ],
+          "default": "all",
+          "description": "One figure of the chosen frame, or one figure per frame of the input.",
+          "choice_docs": {
+            "all": "One figure of the timepoint Frame names — what Export Figure writes as PNG, SVG or PDF.",
+            "frame": "One figure per frame of the input, drawn when shown, on one colour scale — scrub it in the Viewer or export it with Export Movie."
+          }
+        },
+        {
+          "name": "style",
+          "label": "Style",
+          "choices": [
+            "paper",
+            "talk",
+            "poster",
+            "dark"
+          ],
+          "default": "paper",
+          "description": "The figure's size, resolution, type sizes and line weights as one preset for where it is going. Each re-renders the picture; switch Detail to custom to set any of them by hand.",
+          "choice_docs": {
+            "paper": "A one-column journal figure: 85 x 65 mm at 300 dpi, 8 pt text, thin lines and small markers, no grid, on white. Sized to drop into a manuscript at 100 %.",
+            "talk": "A slide: 160 x 100 mm at 150 dpi with 14 pt text and heavier lines, plus a light grid, so the chart reads from the back of a room on a projector.",
+            "poster": "A poster panel: 250 x 180 mm at 150 dpi with 20 pt text and the heaviest lines, readable from a couple of metres; the largest picture of the four.",
+            "dark": "The talk layout on a dark background with light text and grid — for slides and screens with a dark theme. Prints badly; pick another style for paper."
+          }
+        },
+        {
+          "name": "detail",
+          "label": "Detail",
+          "choices": [
+            "preset",
+            "custom"
+          ],
+          "default": "preset",
+          "description": "Whether the style preset decides every size and weight, or the custom fields below do.",
+          "choice_docs": {
+            "preset": "Use the chosen style exactly — size, dpi, type, lines, grid and legend — and hide the fields that would override it.",
+            "custom": "Show width, height, dpi, type size, line width, marker size, font, grid and legend, and draw with them. They start at the paper preset's values; the style still picks light or dark."
+          }
+        },
+        {
+          "name": "font",
+          "label": "Font",
+          "choices": [
+            "sans",
+            "serif"
+          ],
+          "default": "sans",
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The typeface of every label. Both ship with the app, so a figure renders identically on every machine.",
+          "choice_docs": {
+            "sans": "DejaVu Sans, a plain sans-serif like most journals' figure text and every slide template — the default.",
+            "serif": "DejaVu Serif, for a document set in a serif face whose figures should match its body text."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset carrying the image and the field table — a DIC / PIV / DVC node's output, or a Field card's."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "The field table to draw. Blank uses the only one on the wire (correlation grids are not fields and are skipped)."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in": "point",
+          "column_from": "table",
+          "description": "The column the colour map shows. Blank picks the most derived one on the table — von_mises, then strain_eq, jacobian, curl, then disp_mag_um. The plot changes no measurement."
+        },
+        {
+          "name": "frame",
+          "label": "Frame",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "per": [
+              "all"
+            ]
+          },
+          "description": "Which timepoint is drawn (the first is 0); beyond the last, the last. With Per frame every timepoint gets its own figure."
+        },
+        {
+          "name": "position",
+          "label": "Position",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "Which stage position is drawn (the first is 0)."
+        },
+        {
+          "name": "plane",
+          "label": "Plane",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "Which Z plane: a per-plane 2-D field is drawn on its plane; a 3-D field is cut there (interpolated between its node planes)."
+        },
+        {
+          "name": "channel",
+          "label": "Channel",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "Which channel the grey background shows. The field itself is drawn whichever channel it was measured on."
+        },
+        {
+          "name": "color_range",
+          "label": "Colour range",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Fix the colour scale as 'low, high'. Blank uses the column's 1st–99th percentile over the whole series, so every frame of a movie shares one scale."
+        },
+        {
+          "name": "opacity",
+          "label": "Opacity",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.6,
+          "description": "How opaque the colour map is over the image, 0 to 1. Lower shows more of the image; 1 hides it under the field."
+        },
+        {
+          "name": "arrows",
+          "label": "Arrows",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Draw the displacement as arrows, auto-lengthened so the 95th-percentile vector is one node spacing long."
+        },
+        {
+          "name": "arrow_every",
+          "label": "Arrows every",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 1,
+          "description": "Draw one arrow in N — for a dense field whose arrows would overlap. Only read when Arrows is on."
+        },
+        {
+          "name": "contours",
+          "label": "Contours",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "How many iso-lines to draw over the colour map; 0 draws none."
+        },
+        {
+          "name": "scale_bar_um",
+          "label": "Scale bar",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "The scale bar's length in µm; 0 picks a round length about a fifth of the field. No bar without a pixel size."
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The text above the chart. Blank draws no title — the usual choice for a manuscript, whose caption carries it."
+        },
+        {
+          "name": "x_label",
+          "label": "X label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The horizontal axis label. Blank uses the x column's name; add the unit here, e.g. 'time (min)'."
+        },
+        {
+          "name": "y_label",
+          "label": "Y label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The vertical axis label. Blank uses the y column's name; add the unit here, e.g. 'area (µm²)'."
+        },
+        {
+          "name": "width_mm",
+          "label": "Width",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "mm",
+          "default": 85.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The figure's printed width. Together with dpi it sets the picture's pixel size; text and lines keep their point sizes, so a wider figure gives the data more room, not bigger type."
+        },
+        {
+          "name": "height_mm",
+          "label": "Height",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "mm",
+          "default": 65.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The figure's printed height (see Width)."
+        },
+        {
+          "name": "dpi",
+          "label": "Resolution",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "dpi",
+          "default": 300,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "Pixels per inch of the picture. 300 is print quality; 150 is plenty on screen and four times fewer pixels. Export Figure can write another resolution without changing this."
+        },
+        {
+          "name": "font_pt",
+          "label": "Text size",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "pt",
+          "default": 8.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The axis-label size in points; tick labels are a little smaller and the title a little larger."
+        },
+        {
+          "name": "line_width",
+          "label": "Line width",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "pt",
+          "default": 1.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The data lines' width in points; axes, ticks and error bars scale with it."
+        },
+        {
+          "name": "marker_size",
+          "label": "Marker size",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "pt",
+          "default": 3.0,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "The diameter of a point's marker in points."
+        },
+        {
+          "name": "grid",
+          "label": "Grid",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "Outline every cell of a table heatmap with a thin line in the background colour, so neighbouring cells of a similar colour stay apart. A Voxel plane has no cells to outline."
+        },
+        {
+          "name": "legend",
+          "label": "Legend",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "description": "Show the colour bar that says which value each colour stands for. Off leaves the scale to a caption."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "Figure",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_plot_field",
+      "meta_transform": "figure_frame",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "params_read": [
+        "__modes__",
+        "arrow_every",
+        "arrows",
+        "channel",
+        "color_range",
+        "contours",
+        "dpi",
+        "font_pt",
+        "frame",
+        "grid",
+        "height_mm",
+        "legend",
+        "line_width",
+        "marker_size",
+        "opacity",
+        "plane",
+        "position",
+        "scale_bar_um",
+        "table",
+        "title",
+        "value",
+        "width_mm",
+        "x_label",
+        "y_label"
       ]
     },
     "plot.heatmap": {

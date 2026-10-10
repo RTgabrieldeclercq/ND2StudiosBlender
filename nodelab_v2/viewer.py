@@ -60,7 +60,7 @@ from nodegraph.metadata import POSITION_GROUP_KEY, SOURCE_FILE_KEY
 from nodegraph.domains import Domain
 from nodegraph.mesh import mesh_part as MESH_PART
 from nodegraph.provider import subset_index
-from nodelab_v2 import field_view as FV
+import nodegraph.fieldmap as FV
 from nodelab_v2 import overlays as OV
 from nodelab_v2 import region_box
 from nodelab_v2 import theme as T
@@ -5157,13 +5157,13 @@ class ViewerPanel(QWidget):
 
     def _vector_field(self) -> Optional[np.ndarray]:
         """Point-domain displacement vectors on the viewed frame → ``(N, 4)`` ``y,x,u,v``
-        in IMAGE PIXELS (:func:`nodelab_v2.field_view.vectors`: µm converted by the
+        in IMAGE PIXELS (:func:`nodegraph.fieldmap.vectors`: µm converted by the
         payload's pixel size; a 3-D field shows its node plane nearest the viewed Z)."""
         vf = self._vector_info()
         return None if vf is None else vf.rows
 
     def _vector_info(self):
-        """The Vectors tab's :class:`nodelab_v2.field_view.VectorField` for the viewed
+        """The Vectors tab's :class:`nodegraph.fieldmap.VectorField` for the viewed
         plane — the rows plus the series-wide length statistics the colour and Auto length
         use — from the picked table (or the first one carrying a displacement)."""
         ds = self._dataset
@@ -5175,7 +5175,7 @@ class ViewerPanel(QWidget):
     def _field_info(self):
         """The Field tab's ``(raster, limits, colour map, colour-bar label)`` for the viewed
         plane, or ``None``: the picked (or Auto) table and column, rasterised by
-        :func:`nodelab_v2.field_view.raster`, limits by the tab's Limits setting (the
+        :func:`nodegraph.fieldmap.raster`, limits by the tab's Limits setting (the
         series' 1st / 99th percentile cached per payload and column)."""
         ds = self._dataset
         if ds is None or not hasattr(ds, "attributes"):

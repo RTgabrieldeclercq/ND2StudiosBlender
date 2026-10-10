@@ -1,6 +1,8 @@
-"""field_view — what the Viewer draws of a measured field, as plain numpy (Qt-free, testable).
+"""fieldmap — a measured field drawn on its image, as plain numpy (Qt-free, testable).
 
-Two overlays read a **field layer** (the Point table a DIC / PIV / DVC node, a staged card, Track
+Shared by the Viewer's overlays (``nodelab_v2``) and the ``plot.field`` figure node, so the
+screen and an exported figure draw a field the same way; it lives in the engine because a
+catalog node may not import the GUI (the seam, CLAUDE.md). Two overlays read a **field layer** (the Point table a DIC / PIV / DVC node, a staged card, Track
 Field, Load Analysis or a ``field.*`` card wrote):
 
 * the **Vectors** tab draws its displacement as arrows — :func:`vectors`;

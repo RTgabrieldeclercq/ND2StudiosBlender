@@ -31,6 +31,7 @@ the payload in lockstep (INV-04).
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 from collections import OrderedDict
@@ -39,6 +40,7 @@ import logging
 import math
 import os
 import threading
+import zlib
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -609,12 +611,36 @@ PER_DOCS = {
 }
 
 
+def pack_plane(img: np.ndarray) -> Dict[str, Any]:
+    """A uint8 plane as JSON — zlib + base64 — so a figure spec that carries an image (Plot
+    Field's background) stays one string rather than a list of a million numbers."""
+    a = np.ascontiguousarray(img, dtype=np.uint8)
+    return {"shape": list(a.shape),
+            "b64": base64.b64encode(zlib.compress(a.tobytes(), 6)).decode("ascii")}
+
+
+def unpack_plane(blob: Mapping[str, Any]) -> np.ndarray:
+    raw = zlib.decompress(base64.b64decode(blob["b64"]))
+    return np.frombuffer(raw, dtype=np.uint8).reshape(blob["shape"])
+
+
 def frame_spec(spec: Mapping[str, Any], t: int) -> Dict[str, Any]:
     """The figure of frame ``t`` of a PER-FRAME spec (``per = "frame"``): the rows of that frame
-    (``xy``), or the course up to it with a cursor (``timeseries``), on the axes every frame
-    shares. A spec drawn whole is returned as it is."""
+    (``xy``), the course up to it with a cursor (``timeseries``), or that frame's entry
+    (``field``), on the axes every frame shares. A spec drawn whole is returned as it is."""
     if spec.get("per") != "frame":
         return dict(spec)
+    if spec.get("kind") == "field":
+        out = dict(spec)
+        frames = list(spec.get("frames") or [])
+        out["frames"] = [frames[min(max(0, int(t)), len(frames) - 1)]] if frames else []
+        out["per"] = "all"
+        a = dict(spec.get("axes") or {})
+        label = (spec.get("frame_labels") or [])
+        stamp = label[t] if 0 <= t < len(label) else f"frame {t + 1}"
+        a["title"] = (f"{a['title']} — {stamp}" if a.get("title") else stamp)
+        out["axes"] = a
+        return out
     rows = spec.get("rows") or {}
     tt = np.asarray(rows.get("t", []), dtype=float)
     sel = (tt <= t) if spec.get("kind") == "timeseries" else (tt == t)
@@ -725,6 +751,8 @@ def draw(spec: Mapping[str, Any]):
         _draw_distribution(ax, spec, colors, fg, lw, ms)
     elif kind == "heatmap":
         _draw_heatmap(fig, ax, spec, fg, pt, fam, style=style, bg=bg, lw=lw)
+    elif kind == "field":
+        _draw_field(fig, ax, spec, fg, pt, fam, style=style, lw=lw)
     else:
         _draw_xy(ax, spec, colors, lw, ms)
     if spec.get("cursor_x") is not None:
@@ -871,6 +899,65 @@ def _draw_heatmap(fig, ax, spec, fg, pt, fam, *, style=None, bg="#ffffff",
         cb.outline.set_edgecolor(fg)
 
 
+def _draw_field(fig, ax, spec, fg, pt, fam, *, style=None, lw=1.0) -> None:
+    """Plot Field: the grey image plane, the field column as a colour map over it (NaN cells
+    transparent), iso-contours and arrows in image-pixel coordinates (y down, so the figure
+    reads like the Viewer), a colour bar and a µm scale bar."""
+    dr = spec.get("draw") or {}
+    frames = list(spec.get("frames") or [])
+    fr = frames[0] if frames else {}
+    H, W = (list(spec.get("image_hw") or [1, 1]) + [1, 1])[:2]
+    if fr.get("image"):
+        ax.imshow(unpack_plane(fr["image"]), cmap="gray", vmin=0, vmax=255,
+                  extent=(0, W, H, 0), interpolation="bilinear")
+    lo, hi = (list(dr.get("range") or [None, None]) + [None, None])[:2]
+    cmap = str(dr.get("colormap", "turbo"))
+    im = None
+    grid = fr.get("grid")
+    if grid:
+        g = np.array([[np.nan if v is None else v for v in row] for row in grid], dtype=float)
+        y0, y1, x0, x1 = fr.get("extent") or [0, H, 0, W]
+        im = ax.imshow(np.ma.masked_invalid(g), cmap=cmap, vmin=lo, vmax=hi,
+                       alpha=float(dr.get("opacity", 0.6)), extent=(x0, x1, y1, y0),
+                       interpolation="bilinear" if fr.get("lattice", True) else "nearest")
+        n = int(dr.get("contours", 0) or 0)
+        if n > 0 and np.isfinite(g).sum() >= 4 and min(g.shape) >= 2:
+            ny, nx = g.shape
+            gy = y0 + (np.arange(ny) + 0.5) * (y1 - y0) / ny
+            gx = x0 + (np.arange(nx) + 0.5) * (x1 - x0) / nx
+            levels = np.linspace(lo, hi, n + 2)[1:-1] if lo is not None and hi is not None \
+                and hi > lo else n
+            ax.contour(gx, gy, np.ma.masked_invalid(g), levels=levels, cmap=cmap,
+                       linewidths=lw * 0.8)
+    arrows = fr.get("arrows")
+    if arrows:
+        a = np.asarray(arrows, dtype=float)
+        k = float(fr.get("arrow_scale", 1.0) or 1.0)
+        ax.quiver(a[:, 1], a[:, 0], a[:, 3] * k, a[:, 2] * k, angles="xy",
+                  scale_units="xy", scale=1.0, color=fg, width=0.0025 * lw,
+                  headwidth=4, headlength=4.5)
+    bar = dr.get("scale_bar")
+    if bar and bar.get("px"):
+        L = float(bar["px"])
+        xb, yb = 0.05 * W, 0.94 * H
+        ax.plot([xb, xb + L], [yb, yb], color="white", lw=lw * 3.0, solid_capstyle="butt")
+        um = float(bar["um"])
+        ax.text(xb + L / 2.0, yb - 0.02 * H, f"{um:g} µm", color="white", ha="center",
+                va="bottom", fontsize=pt * 0.9, family=fam)
+    ax.set_xlim(0, W)
+    ax.set_ylim(H, 0)
+    ax.set_aspect("equal")
+    a_ = spec.get("axes") or {}
+    if not (a_.get("x_label") or a_.get("y_label")):
+        ax.set_xticks([])
+        ax.set_yticks([])
+    if im is not None and (style or {}).get("legend", True):
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        cb.ax.tick_params(labelsize=pt * 0.85, colors=fg)
+        cb.set_label(str(dr.get("value_label", "")), fontsize=pt, color=fg, family=fam)
+        cb.outline.set_edgecolor(fg)
+
+
 def _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw) -> None:
     """Axes, labels, ticks, spines, grid and legend — the same on every kind of figure."""
     a = spec.get("axes") or {}
@@ -901,18 +988,22 @@ def _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw) -> None:
         loc = mdates.AutoDateLocator()
         ax.xaxis.set_major_locator(loc)
         ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(loc))
-    if style.get("grid") and kind != "heatmap":
+    if style.get("grid") and kind not in ("heatmap", "field"):
         ax.grid(True, color=grid, linewidth=lw * 0.5)
         ax.set_axisbelow(True)
-    if style.get("legend") and kind not in ("heatmap",) and \
+    if style.get("legend") and kind not in ("heatmap", "field") and \
             not (kind == "distribution" and str((spec.get("draw") or {}).get("mode"))
                  in ("box", "violin")) and \
             1 <= len([s for s in series if str(s.get("label", ""))]) <= LEGEND_MAX:
         leg = ax.legend(frameon=False, prop={"family": fam, "size": pt * 0.9})
         for txt in leg.get_texts():
             txt.set_color(fg)
-    empty = (not spec.get("matrix")) if kind == "heatmap" else \
-        not any(s.get("values") or s.get("x") for s in series)
+    if kind == "field":
+        fr0 = (spec.get("frames") or [{}])[0]
+        empty = not (fr0.get("grid") or fr0.get("arrows") or fr0.get("image"))
+    else:
+        empty = (not spec.get("matrix")) if kind == "heatmap" else \
+            not any(s.get("values") or s.get("x") for s in series)
     if empty:
         ax.text(0.5, 0.5, "no rows to plot", transform=ax.transAxes, ha="center",
                 va="center", color=fg, fontsize=pt, family=fam)
@@ -1142,4 +1233,4 @@ __all__ = ["STYLE_PRESETS", "PALETTES", "MATPLOTLIB_MISSING", "PICTURE_METADATA"
            "padded_range", "frame_spec", "FigureProvider", "picture_series",
            "frame_clock", "PER_DOCS", "json_value", "axis_range",
            "figure_frame_clocked", "check_pixels", "group_parts", "MISSING_GROUP", "LEGEND_MAX",
-           "MAX_PIXELS"]
+           "MAX_PIXELS", "pack_plane", "unpack_plane"]

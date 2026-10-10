@@ -204,8 +204,8 @@
       "label": "Plotting",
       "stage": "control_and_present",
       "pages": ["analyze"],
-      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, and Plot Heatmap a table summary on a grid or a Voxel layer's plane.",
-      "ops": ["plot.xy", "plot.timeseries", "plot.distribution", "plot.heatmap"]
+      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, Plot Heatmap a table summary on a grid or a Voxel layer's plane, and Plot Field a measured field drawn on its image (colour map, arrows, contours, scale bar).",
+      "ops": ["plot.xy", "plot.timeseries", "plot.distribution", "plot.heatmap", "plot.field"]
     },
     "page_boundary": {
       "label": "Page boundary",

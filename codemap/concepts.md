@@ -751,7 +751,11 @@ Volume Change and Stress read only those columns, refusing a layer without them.
 records its columns' units (dimensionless, 1/s, deg, Pa) and its settings under the
 `__field_mechanics__[layer]` metadata. Image axes run y DOWN: 2-D curl and rotation are positive
 counter-clockwise on screen. The maths is `kernels/field_mechanics.py`, which reuses
-`field_math.strain_from_gradient` and `track_field`'s MLS gauge and Hooke's law.
+`field_math.strain_from_gradient` and `track_field`'s MLS gauge and Hooke's law. A field is
+DRAWN by `nodegraph/fieldmap.py`, shared by the Viewer's Field and Vectors overlays and the
+`plot.field` figure node. It works in image pixels, converting a µm displacement by the
+payload's pixel size. It places a lattice field one cell per node and resamples a scattered
+one near its nodes only.
 
 ### CON-27 — resource governor
 anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold
