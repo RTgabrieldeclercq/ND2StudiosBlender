@@ -806,6 +806,14 @@ last, so a unit with no marker does not exist. Workers write their own units, so
 or crashed run resumes. `index.json` lists every trial and is rebuilt from the `trial.json`
 files.
 
+A trial has a second home, the **spare folder** `analysis_store.spare_root`: under
+`~/.nd2studios/analysis/`, one folder per source path. A unit the source's folder refuses
+(a read-only share, a full or failing disk) is saved there (`save_unit_to`), and
+`Trial.has` / `load` search both folders. When the source's folder cannot hold the trial
+at all, `open_node_trial` swaps the two roots. Each half's `trial.json` names the other
+(`also_saved_in`), so `list_trials`, `read_trial` and `list_source_trials` see the whole
+trial from either.
+
 The trial key hashes the node's `Engine.lineage`, an identity that is the same in every
 session. It covers:
 - the op;

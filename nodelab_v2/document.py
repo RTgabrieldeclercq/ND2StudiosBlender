@@ -3081,9 +3081,10 @@ class GraphDocument:
     def trial_choices(self, node_id: str, sock) -> list:
         """``[(trial_id, hover_text)]`` for an ``options_from="analysis_trials"`` socket: the
         saved analysis trials in the ``<stem>.analysis`` folder beside each source file the
-        node's primary input carries (its ``source_path`` metadata). Newest first; empty when
-        nothing is wired or nothing is saved. Reads only small JSON headers."""
-        from nodegraph.analysis_store import list_trials, trial_root
+        node's primary input carries (its ``source_path`` metadata), and in each file's spare
+        folder. Newest first; empty when nothing is wired or nothing is saved. Reads only
+        small JSON headers."""
+        from nodegraph.analysis_store import list_source_trials
         from nodegraph.metadata import SOURCE_PATH_KEY
         rec = self.nodes.get(node_id)
         spec = rec.spec() if rec else None
@@ -3096,24 +3097,16 @@ class GraphDocument:
             return []
         paths = self.env(edge[0]).metadata.get(SOURCE_PATH_KEY) or []
         out: list = []
-        seen: set = set()
-        for p in paths:
-            if not p:
-                continue
-            root = trial_root(str(p))
-            if root in seen:
-                continue
-            seen.add(root)
-            for r in list_trials(root):
-                head = r["label"] or r["id"]
-                q = r.get("quality") or {}
-                qtxt = ("\nquality: " + ", ".join(f"{k}={v:.3g}" if isinstance(v, float)
-                                                  else f"{k}={v}" for k, v in q.items())
-                        if q else "")
-                out.append((r["id"], f"{head} — {r['analysis']}, {r['units_done']}/"
-                                     f"{r['units_total']} units {r['status']} "
-                                     f"(updated {r['updated']})\nsettings: {r['settings']}"
-                                     f"{qtxt}"))
+        for r in list_source_trials(str(p) for p in paths if p):
+            head = r["label"] or r["id"]
+            q = r.get("quality") or {}
+            qtxt = ("\nquality: " + ", ".join(f"{k}={v:.3g}" if isinstance(v, float)
+                                              else f"{k}={v}" for k, v in q.items())
+                    if q else "")
+            out.append((r["id"], f"{head} — {r['analysis']}, {r['units_done']}/"
+                                 f"{r['units_total']} units {r['status']} "
+                                 f"(updated {r['updated']})\nsettings: {r['settings']}"
+                                 f"{qtxt}"))
         return out
 
     # ── column picker (V2.28) ──────────────────────────────────────────────────

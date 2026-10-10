@@ -73,7 +73,10 @@ def store_sockets(available_in: Optional[Dict[str, Any]] = None) -> list:
                  description=(
                      "Whether this analysis saves its result beside the source file "
                      "(`<file>.analysis/`, one Parquet file per finished position) and reuses "
-                     "it. `reuse` loads what is already saved for these exact settings and "
+                     "it. A unit that folder refuses (a read-only share, a full or failing "
+                     "disk) is saved in a spare folder under `~/.nd2studios/analysis/` "
+                     "instead, and found there next time. "
+                     "`reuse` loads what is already saved for these exact settings and "
                      "computes only the rest; `recompute` redoes everything; `off` keeps it "
                      "in memory only. Does not change the numbers — only whether they are "
                      "read from and written to disk. Quick-analysis (F9-scoped) pulls never "
@@ -156,6 +159,18 @@ def _store_root(md: Any) -> Optional[str]:
     return None
 
 
+def _spare_root(md: Any, root: str) -> str:
+    """The spare folder for the first position's source file (``""`` with no file, or when
+    it is ``root`` itself): where a unit goes when ``root`` refuses it."""
+    from nodegraph.analysis_store import spare_root
+    paths = _source_paths(md)
+    if not paths:
+        return ""
+    sp = spare_root(paths[0])
+    same = os.path.normcase(os.path.abspath(sp)) == os.path.normcase(os.path.abspath(root))
+    return "" if same else sp
+
+
 @dataclass
 class TrialOpen:
     """What :func:`open_node_trial` decided: the trial (or ``None``) and why, in words."""
@@ -166,7 +181,12 @@ class TrialOpen:
 def open_node_trial(ctx: EvalContext, ds: Any, units: Sequence[Tuple[int, ...]], *,
                     axes_names: Sequence[str], analysis: str) -> TrialOpen:
     """The saved trial this pull reads from and writes to, or ``None`` with the reason:
-    ``results = off``, a scoped quick-analysis pull, or no source file to sit beside."""
+    ``results = off``, a scoped quick-analysis pull, or no source file to sit beside.
+
+    The trial lives beside the source, with the spare folder (``analysis_store.spare_root``)
+    as its second home: a unit the source's folder refuses is saved there, and both are
+    searched on every run. When the source's folder cannot hold the trial at all, the spare
+    becomes the trial's home and the source's folder is still read."""
     import nodegraph.analysis_store as S
     mode = str(ctx.params.get("results", "reuse") or "reuse")
     if mode == "off":
@@ -213,13 +233,25 @@ def open_node_trial(ctx: EvalContext, ds: Any, units: Sequence[Tuple[int, ...]],
                   "under data/ as each finished. 'settings' and 'modes' are this node's; "
                   "'upstream' is the chain that fed it; 'source_files' the image(s) analysed."),
     }
+    spare = _spare_root(md, root)
+    note = f"trial {S.trial_folder_name(ctx.op_key, key)}"
     try:
-        tr = S.open_trial(root, op_key=ctx.op_key, key=key, units=names, header=header)
+        tr = S.open_trial(root, op_key=ctx.op_key, key=key, units=names, header=header,
+                          alt_root=spare)
     except OSError as exc:
-        return TrialOpen(None, f"cannot write beside the source ({exc}) — not saved")
+        if not spare:
+            return TrialOpen(None, f"cannot write beside the source ({exc}) — not saved")
+        try:
+            tr = S.open_trial(spare, op_key=ctx.op_key, key=key, units=names, header=header,
+                              alt_root=root)
+        except OSError as exc2:
+            return TrialOpen(None, f"cannot write beside the source ({exc}) nor in the "
+                                   f"spare folder {spare} ({exc2}) — not saved")
+        note = (f"{note}, saved in the spare folder {spare}: the source's folder refused "
+                f"it ({exc})")
     if mode == "recompute":
         tr.clear()
-    return TrialOpen(tr, f"trial {tr.folder}")
+    return TrialOpen(tr, note)
 
 
 # ── handing a big array to a worker ─────────────────────────────────────────────
@@ -293,20 +325,33 @@ def _discard_shipped(payload: Any) -> None:
 
 # ── the run ──────────────────────────────────────────────────────────────────────
 
-def _unit_task(payload: Tuple[Callable[[Any], dict], Any, str, str]) -> dict:
+def _unit_task(payload: Tuple[Callable[[Any], dict], Any, str, str, str]) -> dict:
     """The task a worker runs: the node's own unit worker, then — in that same process —
-    the unit's save, so a cancel or crash in the parent loses nothing that finished."""
-    work, inner, data_dir, name = payload
+    the unit's save, so a cancel or crash in the parent loses nothing that finished. The
+    save goes to the trial's folder, or to its spare when that folder refuses it."""
+    work, inner, data_dir, alt_dir, name = payload
     res = work(inner)
     if data_dir:
-        from nodegraph.analysis_store import save_unit
+        from nodegraph.analysis_store import save_unit_to
         try:
-            save_unit(data_dir, name, res.get("tables") or {}, res.get("stats") or {})
+            refused = save_unit_to(data_dir, alt_dir, name, res.get("tables") or {},
+                                   res.get("stats") or {})
+            if refused:
+                res = dict(res, saved_spare=refused)
         except OSError as exc:
             # the result is finished. A store that cannot be written is a lost
             # convenience, not a lost analysis: say so on the output, never fail the run
             res = dict(res, save_error=f"{type(exc).__name__}: {exc}")
     return res
+
+
+def _save_note(res: dict) -> str:
+    """What the progress line says about a unit's save when it did not simply land."""
+    if res.get("save_error"):
+        return " · NOT saved"
+    if res.get("saved_spare"):
+        return " · saved in the spare folder"
+    return ""
 
 
 @dataclass
@@ -323,6 +368,11 @@ class UnitRun:
     def save_errors(self) -> List[str]:
         """Why each unit that was computed but could not be written to the trial failed."""
         return [str(r["save_error"]) for r in self.results if r.get("save_error")]
+
+    @property
+    def spare_saves(self) -> List[str]:
+        """Why the trial's folder refused each unit that was saved in the spare instead."""
+        return [str(r["saved_spare"]) for r in self.results if r.get("saved_spare")]
 
 
 def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
@@ -387,28 +437,33 @@ def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
                 _discard_shipped(payload)
             if trial is not None:
                 try:
-                    trial.save(names[i], res.get("tables") or {}, res.get("stats") or {})
+                    refused = trial.save(names[i], res.get("tables") or {},
+                                         res.get("stats") or {})
+                    if refused:
+                        res = dict(res, saved_spare=refused)
                 except OSError as exc:
                     res = dict(res, save_error=f"{type(exc).__name__}: {exc}")
             gov.record(UnitStats(seconds=time.perf_counter() - t0,
                                  peak_bytes=peak_rss_bytes(), pid=os.getpid()))
             results[i] = res
-            bar.finish_unit(note=f"{names[i]} ({time.perf_counter() - t0:.1f} s)")
+            bar.finish_unit(note=f"{names[i]} ({time.perf_counter() - t0:.1f} s)"
+                                 f"{_save_note(res)}")
         return UnitRun([r for r in results if r is not None], loaded, len(todo), gov,
                        "1 lane (in this process)", gov.mean_seconds())
 
     data_dir = trial.data_dir if trial is not None else ""
+    alt_dir = trial.alt_data_dir if trial is not None else ""
     shipped: Dict[int, Any] = {}
 
     def prepare(i: int):
         payload = read(units[i])
         shipped[i] = payload
-        return (work, payload, data_dir, names[i])
+        return (work, payload, data_dir, alt_dir, names[i])
 
     def fold(_k: int, i: int, res: dict) -> None:
         results[i] = res
         _discard_shipped(shipped.pop(i, None))
-        bar.finish_unit(note=f"{names[i]} · {gov.note()}")
+        bar.finish_unit(note=f"{names[i]} · {gov.note()}{_save_note(res)}")
 
     try:
         P.adaptive_fold(_unit_task, todo, fold, governor=gov, prepare=prepare,
@@ -687,11 +742,15 @@ def stamp_trial(md_out: Dict[str, Any], opened: TrialOpen, run: UnitRun) -> Dict
     tr = opened.trial
     md_out["analysis_trial"] = tr.path if tr is not None else ""
     md_out["analysis_trial_note"] = opened.note
+    spare = run.spare_saves
+    if spare and tr is not None:
+        md_out["analysis_trial_note"] += (f"; {len(spare)} unit(s) saved in the spare folder "
+                                          f"{tr.alt_root} because the trial's folder refused "
+                                          f"them: {spare[0]}")
     errs = run.save_errors
     if errs:
-        md_out["analysis_trial_note"] = (f"{opened.note}; {len(errs)} unit(s) NOT saved "
-                                         f"(results are complete, the trial is partial): "
-                                         f"{errs[0]}")
+        md_out["analysis_trial_note"] += (f"; {len(errs)} unit(s) NOT saved (results are "
+                                          f"complete, the trial is partial): {errs[0]}")
     total = run.loaded + run.computed
     md_out["analysis_trial_units"] = (f"{run.loaded}/{total} loaded, {run.computed} computed"
                                       f" ({run.lanes_note})")

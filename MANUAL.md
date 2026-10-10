@@ -2738,6 +2738,14 @@ Channel640_Seq0001.analysis/
   (`pd.read_parquet(folder)`), MATLAB and R.
 - **Moving the store.** `NODEGRAPH_STORE_DIR` moves the folder to a fast disk, exactly as it
   does for ingest stores and docks.
+- **When the data's folder will not take a file**, the unit is saved in a **spare folder**
+  on your own disk instead: `~/.nd2studios/analysis/<file>.analysis.<code>/`. This covers a
+  read-only share, a full disk and a failing drive.
+  - Every run looks in both places, so a restart still reuses it.
+  - The card's progress line says `saved in the spare folder` for such a unit, and
+    `NOT saved` only when the spare refused it too.
+  - Each half's `trial.json` names the other (`also_saved_in`). Load Analysis lists and
+    reads the whole trial from either.
 
 **Each settings combination is its own trial.** A trial is keyed on four things:
 - the node's settings;
@@ -2761,8 +2769,8 @@ So:
 A pull under **F9 troubleshooting** never saves: quick looks stay out of the folder.
 
 **Load Analysis** (`io.load_analysis`) brings any saved trial back:
-- Pick it from the list of trials beside the wired image's source file. Hovering an entry shows
-  its settings.
+- Pick it from the list of trials beside the wired image's source file (and in its spare
+  folder). Hovering an entry shows its settings.
 - Its tables land on their original layers, with the original provenance. The Viewer's
   overlays and downstream nodes (strain, Accumulate DVC Field, Rasterize Field) work as if the
   analysis had just run.

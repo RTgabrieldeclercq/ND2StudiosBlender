@@ -7068,7 +7068,18 @@ def test_analysis_store_writes() -> None:
 
     Now a failed write leaves no ``*.tmp`` behind, for both the JSON and the Parquet
     writer. A unit whose save raises returns its result with ``save_error``. The output's
-    trial note says how many units were not saved."""
+    trial note says how many units were not saved.
+
+    The spare folder (same day, found when the field playground's PIV re-ran in full after a
+    restart: 395 of its 396 units had not been saved on that drive):
+    - a unit the source's folder refuses is saved in the spare, from a worker
+      (``_unit_task``) and from ``Trial.save``;
+    - the trial finds and loads it there;
+    - both headers name each other (``also_saved_in``), so ``list_trials``, ``read_trial``,
+      ``find_trial`` and ``trial_choices`` see the whole trial from either folder;
+    - when the source's folder cannot hold the trial at all, ``open_node_trial`` opens it
+      in the spare, still reading the source's folder;
+    - the output's note says how many units went to the spare."""
     import os as _os
     import tempfile as _tempfile
     import importlib.util
@@ -7131,21 +7142,112 @@ def test_analysis_store_writes() -> None:
     def boom(*a, **k):
         raise OSError(5, "Input/output error")
 
+    work = lambda p: {"tables": {"field": {"x": p}}, "stats": {"n": 3}}  # noqa: E731
     S.save_unit = boom
     try:
-        res = AU._unit_task((lambda p: {"tables": {"field": {"x": p}}, "stats": {}},
-                             np.ones(3), "somewhere", "m0"))
+        res = AU._unit_task((work, np.ones(3), "somewhere", "", "m0"))
+        both = AU._unit_task((work, np.ones(3), "somewhere", "spare", "m0"))
     finally:
         S.save_unit = real_save
     assert np.array_equal(res["tables"]["field"]["x"], np.ones(3))
     assert "Input/output error" in res["save_error"], res
+    assert "the spare folder refused it too" in both["save_error"], both
     run = AU.UnitRun([res, {"tables": {}, "stats": {}}], 0, 2, None, "2 lanes", 1.0)
     md = AU.stamp_trial({}, AU.TrialOpen(None, "saved beside the source"), run)
     assert "1 unit(s) NOT saved" in md["analysis_trial_note"], md
     assert run.save_errors == [res["save_error"]]
+
+    # ── the spare folder ─────────────────────────────────────────────────────────
+    from nodegraph.dataset import AxisSizes, Dataset
+    from nodegraph.metadata import SOURCE_PATH_KEY
+    real_spare = S.SPARE_DIR
+    with _tempfile.TemporaryDirectory() as td:
+        S.SPARE_DIR = _os.path.join(td, "home", "analysis")
+        src = _os.path.join(td, "data", "run_seq.nd2")
+        _os.makedirs(_os.path.dirname(src))
+        with open(src, "wb") as fh:
+            fh.write(b"stand-in")
+        beside, spare = S.trial_roots(src)
+        assert beside == S.trial_root(src) and spare == S.spare_root(src)
+        assert spare.startswith(S.SPARE_DIR) and "run_seq.analysis." in spare
+        units = ["m0000_z0000", "m0001_z0000"]
+        tr = S.open_trial(beside, op_key="analysis.piv", key="k" * 32, units=units,
+                          header={"analysis": "PIV", "units": units}, alt_root=spare)
+        refusing = _os.path.normcase(tr.data_dir)
+
+        def picky(data_dir, *a, **k):          # the source's disk refuses every unit
+            if _os.path.normcase(data_dir) == refusing:
+                raise OSError(22, "Invalid argument")
+            return real_save(data_dir, *a, **k)
+
+        S.save_unit = picky
+        try:
+            r0 = AU._unit_task((work, np.arange(3.0), tr.data_dir, tr.alt_data_dir, units[0]))
+            refused = tr.save(units[1], {"field": {"x": np.arange(4.0)}}, {"n": 4})
+        finally:
+            S.save_unit = real_save
+        assert "save_error" not in r0 and "Invalid argument" in r0["saved_spare"], r0
+        assert "Invalid argument" in refused
+        assert tr.done_units() == units and tr.alt_units() == units
+        assert not any(S.unit_done(tr.data_dir, u) for u in units)
+        tables, stats = tr.load(units[1])
+        assert np.array_equal(tables["field"]["x"], np.arange(4.0)) and stats == {"n": 4}
+        tr.update(status="complete")
+        h_beside = S._read_json(_os.path.join(tr.path, S.TRIAL_NAME))
+        h_spare = S._read_json(_os.path.join(tr.alt_path, S.TRIAL_NAME))
+        assert h_beside["also_saved_in"] == tr.alt_path, h_beside
+        assert h_spare["also_saved_in"] == tr.path, h_spare
+        assert h_beside["units_done"] == 2 and h_spare["status"] == "complete"
+        for root in (beside, spare):           # either folder sees the whole trial
+            assert [r["units_done"] for r in S.list_trials(root)] == [2], root
+        assert S.read_trial(tr.path).units == units
+        assert len(S.read_trial(tr.alt_path).tables["field"]) == 2
+        assert [r["id"] for r in S.list_source_trials([src])] == [tr.folder]
+        assert S.find_trial([src], tr.folder) in (tr.path, tr.alt_path)
+        assert "2/2 complete" in S.trial_choices([src])[0][0]
+        # a later run, same folders: everything loads, nothing is recomputed
+        again = S.open_trial(beside, op_key="analysis.piv", key="k" * 32, units=units,
+                             header={}, alt_root=spare)
+        assert all(again.has(u) for u in units)
+
+        # the source's folder cannot hold a trial at all: open_node_trial uses the spare
+        src2 = _os.path.join(td, "data", "other.nd2")
+        with open(src2, "wb") as fh:
+            fh.write(b"stand-in")
+        with open(S.trial_root(src2), "wb") as fh:      # a FILE where the folder would go
+            fh.write(b"in the way")
+
+        class _Ctx:
+            op_key = "analysis.piv"
+            params = {"results": "reuse", "window_size": 32}
+
+            def lineage(self, exclude=()):
+                return "lineage-of-other"
+
+            def calib(self, key):
+                return None
+
+            def upstream_chain(self):
+                return []
+
+        ds = Dataset(axes=AxisSizes(m=2, t=3, z=1, c=1, y=8, x=8),
+                     metadata={SOURCE_PATH_KEY: [src2]})
+        opened = AU.open_node_trial(_Ctx(), ds, [(0, 0), (1, 0)], axes_names=("m", "z"),
+                                    analysis="PIV")
+        assert opened.trial is not None, opened.note
+        assert opened.trial.root == S.spare_root(src2), opened.trial
+        assert opened.trial.alt_root == S.trial_root(src2)
+        assert "spare folder" in opened.note, opened.note
+        run2 = AU.UnitRun([dict(r0), {"tables": {}, "stats": {}}], 0, 2, None, "1 lane", 1.0)
+        md2 = AU.stamp_trial({}, opened, run2)
+        assert "1 unit(s) saved in the spare folder" in md2["analysis_trial_note"], md2
+    S.SPARE_DIR = real_spare
     _ok("analysis store writes (2026-10-09): a write that fails mid-file leaves no temp "
         "file (JSON and Parquet); a unit whose save raises keeps its result with "
-        "save_error, and the output's trial note says 1 unit NOT saved")
+        "save_error, and the output's trial note says 1 unit NOT saved. A unit the "
+        "source's folder refuses goes to the spare folder (worker and Trial.save), is "
+        "loaded from there, and both headers name each other so either folder lists and "
+        "reads the whole trial; an unwritable source folder opens the trial in the spare")
 
 
 def test_analysis_parallel() -> None:

@@ -19,23 +19,23 @@ from nodegraph.catalog._base import register_node
 
 def _load_analysis_trial_path(trial: str, ds: Optional[Dataset]) -> str:
     """``trial`` as a folder: an existing path as given, otherwise a trial id looked up in
-    the ``<stem>.analysis`` folder beside each of the incoming data's source files."""
-    from nodegraph.analysis_store import trial_root
+    the ``<stem>.analysis`` folder beside each of the incoming data's source files, and in
+    each file's spare folder (``analysis_store.spare_root``)."""
+    from nodegraph.analysis_store import find_trial, trial_roots
     from nodegraph.metadata import SOURCE_PATH_KEY
     t = trial.strip().strip('"').strip("'")
     if os.path.isdir(t) or os.path.isfile(t):
         return t
+    sources = [str(p) for p in (ds.metadata.get(SOURCE_PATH_KEY) or [])
+               if p] if ds is not None else []
+    found = find_trial(sources, t)
+    if found:
+        return found
     roots: List[str] = []
-    if ds is not None:
-        for p in ds.metadata.get(SOURCE_PATH_KEY) or []:
-            if p:
-                r = trial_root(str(p))
-                if r not in roots:
-                    roots.append(r)
-    for r in roots:
-        cand = os.path.join(r, t)
-        if os.path.isdir(cand):
-            return cand
+    for p in sources:
+        for r in trial_roots(p):
+            if r not in roots:
+                roots.append(r)
     where = (" or in " + ", ".join(roots)) if roots else (
         " — and the input carries no source file to look beside (wire the image this trial "
         "was computed on, or give the trial folder's full path)")
@@ -163,9 +163,11 @@ register_node(
                  options_from="analysis_trials",
                  description=
                  "Which saved trial to load: the list shows every trial in the "
-                 "`<file>.analysis` folder beside the wired image's source — analysis, label, "
-                 "how many units are saved, complete or partial. Or type a trial folder's full "
-                 "path. Switching entries switches results without recomputing anything."),
+                 "`<file>.analysis` folder beside the wired image's source, and in its spare "
+                 "folder under `~/.nd2studios/analysis/` (where units go when the source's "
+                 "folder refuses them) — analysis, label, how many units are saved, complete "
+                 "or partial. Or type a trial folder's full path. Switching entries switches "
+                 "results without recomputing anything."),
     ],
     outputs=[OutDataset()],
     modes=[Mode("onto", ["image", "tables_only"], default="image", label="Onto",

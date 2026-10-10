@@ -2212,7 +2212,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -2810,7 +2810,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -5531,7 +5531,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -8408,7 +8408,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -8701,7 +8701,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -8829,7 +8829,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -9212,7 +9212,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -9553,7 +9553,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -9738,7 +9738,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -15511,7 +15511,7 @@
           "is_field": false,
           "default": "",
           "options_from": "analysis_trials",
-          "description": "Which saved trial to load: the list shows every trial in the `<file>.analysis` folder beside the wired image's source — analysis, label, how many units are saved, complete or partial. Or type a trial folder's full path. Switching entries switches results without recomputing anything."
+          "description": "Which saved trial to load: the list shows every trial in the `<file>.analysis` folder beside the wired image's source, and in its spare folder under `~/.nd2studios/analysis/` (where units go when the source's folder refuses them) — analysis, label, how many units are saved, complete or partial. Or type a trial folder's full path. Switching entries switches results without recomputing anything."
         }
       ],
       "outputs": [
@@ -17323,7 +17323,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -17534,7 +17534,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",
@@ -21389,7 +21389,7 @@
             "recompute": "Ignore what is saved for these settings and compute every unit again, overwriting the trial's files as each unit finishes — use it after fixing something upstream whose code (not settings) changed, which the trial key cannot see.",
             "reuse": "Load every unit (position, or position × plane) already saved for exactly these settings and this input, compute only the missing ones, and save each new unit the moment it finishes. A cancelled or crashed run resumes where it stopped; changing a setting starts (or finds) a different trial."
           },
-          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
+          "description": "Whether this analysis saves its result beside the source file (`<file>.analysis/`, one Parquet file per finished position) and reuses it. A unit that folder refuses (a read-only share, a full or failing disk) is saved in a spare folder under `~/.nd2studios/analysis/` instead, and found there next time. `reuse` loads what is already saved for these exact settings and computes only the rest; `recompute` redoes everything; `off` keeps it in memory only. Does not change the numbers — only whether they are read from and written to disk. Quick-analysis (F9-scoped) pulls never save."
         },
         {
           "name": "trial_label",

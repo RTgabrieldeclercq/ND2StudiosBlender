@@ -40,6 +40,12 @@ Why this shape:
 * Honours ``NODEGRAPH_STORE_DIR`` exactly as ingest stores and docks do
   (:func:`nodegraph.parallel.store_dir`): beside the file by default, one fast directory when
   the source sits on slow media.
+* **A spare folder** (:data:`SPARE_DIR`, per user, local). When the folder beside the source
+  refuses a unit — a read-only share, a full disk, a failing drive — the unit is saved there
+  instead, and every run looks in both. Until 2026-10-09 such a unit was only reported as
+  "not saved", so a restart repeated hours of work on exactly the disks that can least
+  afford it. The two halves of a split trial name each other in ``trial.json``
+  (``also_saved_in``), so Load Analysis reads the whole trial from either.
 
 Qt-free. pyarrow is imported lazily, on first read or write.
 """
@@ -141,6 +147,32 @@ def trial_root(source_path: str) -> str:
     return os.path.join(target, f"{os.path.basename(base)}.{tag}")
 
 
+#: Where a unit goes when the folder beside its source refuses the write. Per user and on
+#: the local disk, so a long analysis survives a restart whatever the data's disk is doing.
+#: A module attribute so a test can move it; worker processes are handed the path itself.
+SPARE_DIR = os.path.join(os.path.expanduser("~"), ".nd2studios", "analysis")
+
+
+def spare_root(source_path: str) -> str:
+    """The spare store folder for ``source_path``: ``<stem>.analysis.<digest>`` inside
+    :data:`SPARE_DIR`. The digest of the full path keeps two same-named files from different
+    folders apart, as :func:`trial_root`'s redirect does."""
+    stem = os.path.splitext(os.path.abspath(str(source_path)))[0]
+    base = stem + STORE_SUFFIX
+    tag = hashlib.blake2b(base.lower().encode("utf-8"), digest_size=6).hexdigest()
+    return os.path.join(SPARE_DIR, f"{os.path.basename(base)}.{tag}")
+
+
+def trial_roots(source_path: str) -> List[str]:
+    """Every folder that may hold ``source_path``'s trials: :func:`trial_root`, then
+    :func:`spare_root` (listed once when the two are the same folder)."""
+    out = [trial_root(source_path)]
+    sp = spare_root(source_path)
+    if os.path.normcase(os.path.abspath(sp)) != os.path.normcase(os.path.abspath(out[0])):
+        out.append(sp)
+    return out
+
+
 def trial_folder_name(op_key: str, key: str) -> str:
     """``analysis.dic_correlate`` + key → ``dic_correlate-3f9a2c1b``; ``dic.local_match`` →
     ``dic_local_match-…`` — the analysis readable first, the settings hash after."""
@@ -207,6 +239,30 @@ def save_unit(data_dir: str, name: str, tables: Mapping[str, Mapping[str, np.nda
                  "saved": time.strftime("%Y-%m-%dT%H:%M:%S")})
 
 
+def save_unit_to(data_dir: str, alt_dir: str, name: str,
+                 tables: Mapping[str, Mapping[str, np.ndarray]],
+                 stats: Optional[Mapping[str, Any]] = None) -> str:
+    """:func:`save_unit` into ``data_dir`` or, when that folder refuses the write and
+    ``alt_dir`` is given, into ``alt_dir``.
+
+    Returns ``""`` when the unit landed in ``data_dir``, otherwise why ``data_dir`` refused
+    it. Raises :class:`OSError` only when both refuse. A unit half-written into
+    ``data_dir`` has no ``.done.json`` there, so it does not exist in that folder."""
+    try:
+        save_unit(data_dir, name, tables, stats)
+        return ""
+    except OSError as exc:
+        if not alt_dir:
+            raise
+        refused = f"{type(exc).__name__}: {exc}"
+    try:
+        save_unit(alt_dir, name, tables, stats)
+    except OSError as exc:
+        raise OSError(f"{refused}; the spare folder refused it too: "
+                      f"{type(exc).__name__}: {exc}") from exc
+    return refused
+
+
 def unit_done(data_dir: str, name: str) -> bool:
     return os.path.isfile(os.path.join(data_dir, name + DONE_SUFFIX))
 
@@ -223,12 +279,20 @@ def load_unit(data_dir: str, name: str) -> Tuple[Dict[str, Dict[str, np.ndarray]
 
 @dataclass
 class Trial:
-    """One trial folder. Plain data — picklable — so a worker can be handed one."""
+    """One trial, held in one folder or split across two. Plain data — picklable — so a
+    worker can be handed one.
+
+    ``alt_root``, when set, is a second root holding the same trial folder: units are looked
+    up in both and saved there when ``root`` refuses the write. Normally ``root`` is beside
+    the source and ``alt_root`` the spare (:func:`spare_root`); when the source's folder
+    cannot even be created, the two swap, so what is already saved beside the source is
+    still read."""
     root: str
     folder: str
     key: str
     op_key: str
     units: List[str] = field(default_factory=list)
+    alt_root: str = ""
 
     @property
     def path(self) -> str:
@@ -238,55 +302,100 @@ class Trial:
     def data_dir(self) -> str:
         return os.path.join(self.path, DATA_DIR)
 
+    @property
+    def alt_path(self) -> str:
+        return os.path.join(self.alt_root, self.folder) if self.alt_root else ""
+
+    @property
+    def alt_data_dir(self) -> str:
+        return os.path.join(self.alt_path, DATA_DIR) if self.alt_root else ""
+
+    def _dir_of(self, name: str) -> str:
+        if unit_done(self.data_dir, name):
+            return self.data_dir
+        if self.alt_root and unit_done(self.alt_data_dir, name):
+            return self.alt_data_dir
+        return ""
+
     def has(self, name: str) -> bool:
-        return unit_done(self.data_dir, name)
+        return bool(self._dir_of(name))
 
     def done_units(self) -> List[str]:
         return [u for u in self.units if self.has(u)]
 
-    def load(self, name: str):
-        return load_unit(self.data_dir, name)
+    def alt_units(self) -> List[str]:
+        """The finished units only the alternate folder holds."""
+        if not self.alt_root:
+            return []
+        return [u for u in self.units
+                if unit_done(self.alt_data_dir, u) and not unit_done(self.data_dir, u)]
 
-    def save(self, name: str, tables, stats=None) -> None:
-        save_unit(self.data_dir, name, tables, stats)
+    def load(self, name: str):
+        return load_unit(self._dir_of(name) or self.data_dir, name)
+
+    def save(self, name: str, tables, stats=None) -> str:
+        """Save one unit (:func:`save_unit_to`): ``""``, or why ``root`` refused it and the
+        unit went to ``alt_root``."""
+        return save_unit_to(self.data_dir, self.alt_data_dir, name, tables, stats)
 
     def header(self) -> dict:
-        return _read_json(os.path.join(self.path, TRIAL_NAME)) or {}
+        got = _read_json(os.path.join(self.path, TRIAL_NAME))
+        if got is None and self.alt_root:
+            got = _read_json(os.path.join(self.alt_path, TRIAL_NAME))
+        return got or {}
 
     def update(self, **fields: Any) -> None:
-        """Merge ``fields`` into ``trial.json`` and refresh the index. Best-effort: a header
-        that cannot be written (a read-only share, a file open in an editor) never fails
-        the analysis — the unit files are the record, the header only explains them."""
-        try:
-            hdr = self.header()
-            hdr.update(fields)
-            hdr["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            hdr["units_done"] = len(self.done_units())
-            _write_json(os.path.join(self.path, TRIAL_NAME), hdr)
-            refresh_index(self.root)
-        except OSError:
-            pass
+        """Merge ``fields`` into ``trial.json`` and refresh the index — in both folders once
+        the alternate one holds a unit, each header naming the other (``also_saved_in``).
+        Best-effort: a header that cannot be written (a read-only share, a file open in an
+        editor) never fails the analysis — the unit files are the record, the header only
+        explains them."""
+        hdr = self.header()
+        hdr.update(fields)
+        hdr["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        hdr["units_done"] = len(self.done_units())
+        hdr.pop("also_saved_in", None)
+        places = [(self.root, self.path, "")]
+        if self.alt_units() or (self.alt_root and
+                                os.path.isfile(os.path.join(self.alt_path, TRIAL_NAME))):
+            places = [(self.root, self.path, self.alt_path),
+                      (self.alt_root, self.alt_path, self.path)]
+        for root, path, other in places:
+            try:
+                _write_json(os.path.join(path, TRIAL_NAME),
+                            dict(hdr, also_saved_in=other) if other else hdr)
+                refresh_index(root)
+            except OSError:
+                pass
 
     def clear(self) -> None:
-        """Forget every saved unit (``results = recompute``)."""
-        try:
-            for fn in os.listdir(self.data_dir):
-                if fn.endswith(DONE_SUFFIX):
-                    os.remove(os.path.join(self.data_dir, fn))
-        except OSError:
-            pass
+        """Forget every saved unit, in both folders (``results = recompute``)."""
+        for ddir in (self.data_dir, self.alt_data_dir):
+            if not ddir:
+                continue
+            try:
+                for fn in os.listdir(ddir):
+                    if fn.endswith(DONE_SUFFIX):
+                        os.remove(os.path.join(ddir, fn))
+            except OSError:
+                pass
 
 
 def open_trial(root: str, *, op_key: str, key: str, units: Sequence[str],
-               header: Mapping[str, Any]) -> Trial:
-    """Open (creating if needed) the trial for ``key`` under ``root``. A new trial writes its
-    ``trial.json`` from ``header``; an existing one keeps its header and refreshes only the
-    fields a new run may legitimately change (the label, the unit list)."""
+               header: Mapping[str, Any], alt_root: str = "") -> Trial:
+    """Open (creating if needed) the trial for ``key`` under ``root``, with ``alt_root`` as
+    its second folder (:class:`Trial`). A new trial writes its ``trial.json`` from
+    ``header``; an existing one keeps its header and refreshes only the fields a new run may
+    legitimately change (the label, the unit list). Raises :class:`OSError` when ``root``
+    cannot hold the trial folder at all."""
     folder = trial_folder_name(op_key, key)
-    tr = Trial(root=root, folder=folder, key=key, op_key=op_key, units=list(units))
+    tr = Trial(root=root, folder=folder, key=key, op_key=op_key, units=list(units),
+               alt_root=alt_root)
     os.makedirs(tr.data_dir, exist_ok=True)
     hdr_path = os.path.join(tr.path, TRIAL_NAME)
     existing = _read_json(hdr_path)
+    if existing is None and alt_root:
+        existing = _read_json(os.path.join(tr.alt_path, TRIAL_NAME))
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     if existing is None or existing.get("key") != key:
         hdr = {"schema": SCHEMA, "key": key, "id": folder, "op": op_key,
@@ -322,6 +431,17 @@ def _summary(hdr: Mapping[str, Any]) -> str:
     return out if len(out) <= 160 else out[:157] + "…"
 
 
+def _unit_dirs(path: str, hdr: Mapping[str, Any]) -> List[str]:
+    """The data folders holding the trial at ``path``: its own, and the other half's when
+    the header names one (``also_saved_in``)."""
+    dirs = [os.path.join(path, DATA_DIR)]
+    other = str(hdr.get("also_saved_in") or "")
+    if other and os.path.normcase(os.path.abspath(other)) != os.path.normcase(
+            os.path.abspath(path)):
+        dirs.append(os.path.join(other, DATA_DIR))
+    return dirs
+
+
 def list_trials(root: str) -> List[dict]:
     """Every trial under ``root``, newest first, read from the ``trial.json`` files (the
     source of truth) with the finished-unit count re-counted from disk."""
@@ -335,8 +455,8 @@ def list_trials(root: str) -> List[dict]:
         if not hdr:
             continue
         units = list(hdr.get("units") or [])
-        ddir = os.path.join(root, name, DATA_DIR)
-        done = sum(1 for u in units if unit_done(ddir, u))
+        dirs = _unit_dirs(os.path.join(root, name), hdr)
+        done = sum(1 for u in units if any(unit_done(d, u) for d in dirs))
         total = int(hdr.get("units_total") or len(units))
         status = hdr.get("status", "")
         if status == "complete" and done < total:
@@ -366,23 +486,44 @@ def refresh_index(root: str) -> None:
         pass
 
 
-def trial_choices(source_paths: Iterable[str]) -> List[Tuple[str, str]]:
-    """``[(label, trial_path)]`` for the trials beside any of ``source_paths`` — what the
-    Load Analysis node's dropdown lists."""
+def list_source_trials(source_paths: Iterable[str]) -> List[dict]:
+    """:func:`list_trials` over every folder that may hold the trials of ``source_paths``
+    (:func:`trial_roots`), one row per trial: of a trial found in two folders, the row
+    counting more finished units. Newest first."""
+    best: Dict[str, dict] = {}
     seen = set()
-    out: List[Tuple[str, str]] = []
     for sp in source_paths:
         if not sp:
             continue
-        root = trial_root(sp)
-        if root in seen:
-            continue
-        seen.add(root)
-        for r in list_trials(root):
-            name = r["label"] or r["id"]
-            text = (f"{name} · {r['analysis']} · {r['units_done']}/{r['units_total']} "
-                    f"{r['status']}")
-            out.append((text, r["path"]))
+        for root in trial_roots(str(sp)):
+            if root in seen:
+                continue
+            seen.add(root)
+            for r in list_trials(root):
+                cur = best.get(r["id"])
+                if cur is None or r["units_done"] > cur["units_done"]:
+                    best[r["id"]] = r
+    out = list(best.values())
+    out.sort(key=lambda r: r.get("updated", ""), reverse=True)
+    return out
+
+
+def find_trial(source_paths: Iterable[str], trial_id: str) -> Optional[str]:
+    """The folder of the trial ``trial_id`` among ``source_paths``' trials
+    (:func:`list_source_trials`), or ``None``."""
+    return next((r["path"] for r in list_source_trials(source_paths) if r["id"] == trial_id),
+                None)
+
+
+def trial_choices(source_paths: Iterable[str]) -> List[Tuple[str, str]]:
+    """``[(label, trial_path)]`` for the trials of ``source_paths``, beside each file or in
+    the spare folder — what the Load Analysis node's dropdown lists."""
+    out: List[Tuple[str, str]] = []
+    for r in list_source_trials(source_paths):
+        name = r["label"] or r["id"]
+        text = (f"{name} · {r['analysis']} · {r['units_done']}/{r['units_total']} "
+                f"{r['status']}")
+        out.append((text, r["path"]))
     return out
 
 
@@ -397,18 +538,24 @@ class TrialData:
 
 
 def read_trial(path: str) -> TrialData:
-    """Every finished unit of the trial at ``path`` (a trial folder, or its ``trial.json``)."""
+    """Every finished unit of the trial at ``path`` (a trial folder, or its ``trial.json``),
+    including those its other half holds (``also_saved_in``)."""
     if os.path.basename(path).lower() == TRIAL_NAME:
         path = os.path.dirname(path)
     hdr = _read_json(os.path.join(path, TRIAL_NAME))
     if hdr is None:
         raise FileNotFoundError(f"{path!r} is not an analysis trial folder (no {TRIAL_NAME})")
-    ddir = os.path.join(path, DATA_DIR)
-    units = [u for u in (hdr.get("units") or []) if unit_done(ddir, u)]
+    dirs = _unit_dirs(path, hdr)
+    where = {}
+    for u in hdr.get("units") or []:
+        d = next((d for d in dirs if unit_done(d, u)), "")
+        if d:
+            where[u] = d
+    units = list(where)
     tables: Dict[str, List[Dict[str, np.ndarray]]] = {}
     stats: Dict[str, dict] = {}
     for u in units:
-        t, st = load_unit(ddir, u)
+        t, st = load_unit(where[u], u)
         stats[u] = st
         for kind, cols in t.items():
             tables.setdefault(kind, []).append(cols)
@@ -416,8 +563,10 @@ def read_trial(path: str) -> TrialData:
 
 
 __all__ = [
-    "SCHEMA", "STORE_SUFFIX", "trial_root", "trial_folder_name", "trial_key", "unit_name",
-    "write_table", "read_table", "save_unit", "unit_done", "load_unit",
-    "Trial", "open_trial", "list_trials", "refresh_index", "trial_choices",
+    "SCHEMA", "STORE_SUFFIX", "SPARE_DIR", "trial_root", "spare_root", "trial_roots",
+    "trial_folder_name", "trial_key", "unit_name",
+    "write_table", "read_table", "save_unit", "save_unit_to", "unit_done", "load_unit",
+    "Trial", "open_trial", "list_trials", "list_source_trials", "find_trial", "refresh_index",
+    "trial_choices",
     "TrialData", "read_trial",
 ]
