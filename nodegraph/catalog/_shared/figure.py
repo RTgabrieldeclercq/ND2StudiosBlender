@@ -41,7 +41,7 @@ import math
 import os
 import threading
 import zlib
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1095,18 +1095,20 @@ class FigureProvider(TileProvider):
     figure are one memo entry and an edit re-keys it."""
 
     def __init__(self, spec: Mapping[str, Any], frames: int, h: int, w: int, *,
-                 keep: int = 8) -> None:
+                 keep: int = 8, axes: Optional[AxisSizes] = None,
+                 key: Optional[str] = None) -> None:
         from nodegraph.memo import digest
         self.spec = dict(spec)
-        self.axes = AxisSizes(m=1, t=max(1, int(frames)), z=1, c=3, y=int(h), x=int(w))
+        self.axes = axes if axes is not None else AxisSizes(
+            m=1, t=max(1, int(frames)), z=1, c=3, y=int(h), x=int(w))
         self.levels = 1
         self.tile = 512
         self._keep = int(keep)
-        self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._cache: "OrderedDict[Tuple[int, int, int], np.ndarray]" = OrderedDict()
         self._lock = threading.Lock()
-        self._key = digest("figure-provider", _DRAW_CODE,
-                           json.dumps(self.spec, sort_keys=True, default=str))
-        self._busy: Dict[int, threading.Event] = {}
+        self._key = key or digest("figure-provider", _DRAW_CODE,
+                                  json.dumps(self.spec, sort_keys=True, default=str))
+        self._busy: Dict[Tuple[int, int, int], threading.Event] = {}
         self.dtype = np.dtype(np.uint8)
 
     #: a read RUNS a figure render (it is not a decompress): the runner's prefetch and
@@ -1117,42 +1119,84 @@ class FigureProvider(TileProvider):
     def nbytes(self) -> int:
         """What this provider can hold resident: its frame cache at its fullest. The memo's
         byte budget reads it, so superseded per-frame figures are evicted like any image."""
-        return int(min(self._keep, self.axes.t) * self.axes.y * self.axes.x * 3)
+        n = int(self.axes.m) * int(self.axes.t) * int(self.axes.z)
+        return int(min(self._keep, n) * self.axes.y * self.axes.x * 3)
+
+    def spec_for(self, m: int, t: int, z: int) -> Dict[str, Any]:
+        """The whole figure spec of one view, what :func:`render_rgb` and Export Figure
+        draw. A per-frame series has only ``t``."""
+        return frame_spec(self.spec, t)
 
     def frame(self, t: int) -> np.ndarray:
-        """Frame ``t``, drawn ONCE however many readers ask at the same time (the R, G and B
-        planes of one frame are read on different threads during playback)."""
-        t = int(t)
+        return self.view(0, t, 0)
+
+    def view(self, m: int, t: int, z: int) -> np.ndarray:
+        """View ``(m, t, z)``, drawn ONCE however many readers ask at the same time (the R,
+        G and B planes of one view are read on different threads during playback)."""
+        k = (int(m), int(t), int(z))
         while True:
             with self._lock:
-                got = self._cache.get(t)
+                got = self._cache.get(k)
                 if got is not None:
-                    self._cache.move_to_end(t)
+                    self._cache.move_to_end(k)
                     return got
-                ev = self._busy.get(t)
+                ev = self._busy.get(k)
                 if ev is None:
-                    ev = self._busy[t] = threading.Event()
+                    ev = self._busy[k] = threading.Event()
                     break                                # this reader draws it
             ev.wait()                                    # another reader is drawing it
         rgb = None
         try:
-            rgb = render_rgb(frame_spec(self.spec, t))
+            rgb = render_rgb(self.spec_for(*k))
         finally:
             with self._lock:
                 if rgb is not None:
-                    self._cache[t] = rgb
+                    self._cache[k] = rgb
                     while len(self._cache) > self._keep:
                         self._cache.popitem(last=False)
-                self._busy.pop(t, None)
+                self._busy.pop(k, None)
             ev.set()                                     # a failed draw lets a waiter retry
         return rgb
 
     def read_region(self, level: int, m: int, t: int, z: int, c: int,
                     y0: int, y1: int, x0: int, x1: int, *, b: int = 0) -> np.ndarray:
-        return np.ascontiguousarray(self.frame(t)[y0:y1, x0:x1, c])
+        return np.ascontiguousarray(self.view(m, t, z)[y0:y1, x0:x1, c])
 
     def fingerprint(self) -> tuple:
-        return ("figure", self._key, self.axes.t, self.axes.y, self.axes.x)
+        ax = self.axes
+        return ("figure", self._key, ax.m, ax.t, ax.z, ax.y, ax.x)
+
+
+class ViewFigureProvider(FigureProvider):
+    """A figure with one VIEW per ``(position, frame, plane)`` of its input. Axes are
+    ``(M, T, Z, 3, H, W)``, so the Viewer's playback strip picks the view, as it picks a plane
+    of an image (2026-10-09). Plot Field builds it.
+
+    ``spec_at(m, t, z, side)`` makes the whole spec of a view; ``side`` is the background's
+    longest side in px. A view is drawn on first read with the screen's side, and Export
+    Figure asks for the full one. ``key`` must identify everything ``spec_at`` reads: the
+    template, the input's data and the drawing code. It is the provider's identity, so two
+    inputs never share a cached view."""
+
+    #: the background side a view is drawn with on screen, and the one Export Figure asks
+    #: for (a file is looked at closer than a scrubbed view)
+    SCREEN_SIDE = 512
+    EXPORT_SIDE = 1024
+
+    def __init__(self, template: Mapping[str, Any],
+                 spec_at: Callable[[int, int, int, int], Dict[str, Any]],
+                 m: int, t: int, z: int, h: int, w: int, *, key: str,
+                 keep: int = 8) -> None:
+        super().__init__(template, 1, h, w, keep=keep, key=key, axes=AxisSizes(
+            m=max(1, int(m)), t=max(1, int(t)), z=max(1, int(z)), c=3, y=int(h),
+            x=int(w)))
+        self._spec_at = spec_at
+
+    def spec_for(self, m: int, t: int, z: int, side: Optional[int] = None) -> Dict[str, Any]:
+        ax = self.axes
+        clamp = lambda v, n: min(max(0, int(v)), int(n) - 1)          # noqa: E731
+        return self._spec_at(clamp(m, ax.m), clamp(t, ax.t), clamp(z, ax.z),
+                             int(side or self.SCREEN_SIDE))
 
 
 def picture_series(spec: Mapping[str, Any], frames: int, h: int, w: int,
@@ -1169,6 +1213,74 @@ def picture_series(spec: Mapping[str, Any], frames: int, h: int, w: int,
               figure_size_mm=[st.get("width_mm"), st.get("height_mm")])
     md.update(dict(extra or {}))
     return Dataset(axes=prov.axes, metadata=md).with_image(prov)
+
+
+def picture_views(provider: "ViewFigureProvider",
+                  extra: Optional[Mapping[str, Any]] = None) -> Dataset:
+    """A Picture with one view per ``(m, t, z)`` of its input (:class:`ViewFigureProvider`):
+    the picture metadata, the provider's template spec as ``figure_spec``, and ``extra``,
+    which is what :func:`figure_views` predicts at edit time."""
+    ax = provider.axes
+    check_pixels(ax.y, ax.x)
+    spec = provider.spec
+    st = dict(spec.get("style") or {})
+    md = dict(PICTURE_METADATA)
+    md["channel_colors"] = [list(c) for c in PICTURE_METADATA["channel_colors"]]
+    md["channel_names"] = list(PICTURE_METADATA["channel_names"])
+    md.update(figure_spec=dict(spec), figure_dpi=st.get("dpi"),
+              figure_size_mm=[st.get("width_mm"), st.get("height_mm")])
+    md.update(dict(extra or {}))
+    return Dataset(axes=ax, metadata=md).with_image(provider)
+
+
+#: the per-position labels a view picture keeps, so the playback strip can name positions
+VIEW_POSITION_KEYS = ("position_name", "position_index")
+
+
+def view_metadata(src: Mapping[str, Any], axes: Any) -> Dict[str, Any]:
+    """What a view picture carries from its input: the frame clock (``dt_s`` and the
+    per-frame times) and the position labels, each only when it covers the input's axis.
+    Shared by the compute and :func:`figure_views`, so the payload and the envelope agree."""
+    from nodegraph.metadata import PER_TIME_KEYS
+    src = src or {}
+    out: Dict[str, Any] = {}
+    if src.get("dt_s") is not None:
+        out["dt_s"] = src["dt_s"]
+    n_t = int(getattr(axes, "t", 1) or 1)
+    n_m = int(getattr(axes, "m", 1) or 1)
+    for key in PER_TIME_KEYS:
+        vals = src.get(key)
+        if isinstance(vals, (list, tuple)) and len(vals) >= n_t:
+            out[key] = list(vals)[:n_t]
+    for key in VIEW_POSITION_KEYS:
+        vals = src.get(key)
+        if isinstance(vals, (list, tuple)) and len(vals) >= n_m:
+            out[key] = list(vals)[:n_m]
+    return out
+
+
+def figure_views(env, params: Mapping[str, Any], modes: Mapping[str, str]):
+    """The ``meta_transform`` of a figure with one view per ``(m, t, z)`` (Plot Field): an
+    RGB picture of the style's size, with the INPUT's M, T and Z, so the Viewer's playback
+    strip scrubs position, frame and plane. It has no calibration, but keeps the clock and
+    position labels (:func:`view_metadata`). An input axis still unknown stays unknown.
+    Total: never raises."""
+    try:
+        h, w = picture_pixels(params or {}, modes or {})
+    except Exception:                                   # noqa: BLE001 — total by contract
+        h, w = picture_pixels({}, {})
+    ax = env.axes
+    md: Dict[str, Any] = {
+        "bit_depth": 8,
+        "channel_names": list(PICTURE_METADATA["channel_names"]),
+        "channel_colors": [list(c) for c in PICTURE_METADATA["channel_colors"]]}
+    md.update(view_metadata(env.metadata or {}, ax))
+    unknown = frozenset({"m", "t", "z"}) & frozenset(getattr(env, "unknown_axes", ()) or ())
+    return replace(env, axes=AxisSizes(m=max(1, int(getattr(ax, "m", 1) or 1)),
+                                       t=max(1, int(getattr(ax, "t", 1) or 1)),
+                                       z=max(1, int(getattr(ax, "z", 1) or 1)),
+                                       c=3, y=int(h), x=int(w)),
+                   metadata=md, unknown_axes=unknown, layers=())
 
 
 # ── the edit-time envelope of a plot node ────────────────────────────────────────
@@ -1233,4 +1345,5 @@ __all__ = ["STYLE_PRESETS", "PALETTES", "MATPLOTLIB_MISSING", "PICTURE_METADATA"
            "padded_range", "frame_spec", "FigureProvider", "picture_series",
            "frame_clock", "PER_DOCS", "json_value", "axis_range",
            "figure_frame_clocked", "check_pixels", "group_parts", "MISSING_GROUP", "LEGEND_MAX",
-           "MAX_PIXELS", "pack_plane", "unpack_plane"]
+           "MAX_PIXELS", "pack_plane", "unpack_plane", "ViewFigureProvider", "picture_views",
+           "view_metadata", "figure_views", "VIEW_POSITION_KEYS"]

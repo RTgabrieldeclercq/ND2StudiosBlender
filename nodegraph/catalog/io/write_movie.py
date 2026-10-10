@@ -487,6 +487,14 @@ def _compute_write_movie(ctx: EvalContext) -> Dataset:
     contrast = modes.get("contrast", "auto")
     split = modes.get("split", "none")
     existing = modes.get("existing", "overwrite")
+    if ((ds.metadata or {}).get("picture") == "rgb" and int(ds.axes.z) > 1
+            and sweep == "time" and z_reduce != "mid"):
+        # a figure's planes are separate pictures (Plot Field draws one per plane): a
+        # maximum or mean of them is not a picture of anything (2026-10-09)
+        raise ValueError(
+            f"Export Movie: this figure has {int(ds.axes.z)} planes, one picture each, and "
+            f"'{z_reduce}' would blend them into one another. Set Z projection to 'mid' "
+            f"for the middle plane, or Sweep to 'z' to play through the planes.")
 
     path = str(ch.param("path") or "").strip()
     if not path:
@@ -1031,7 +1039,8 @@ register_node(
              description=
              "How a Z-stack collapses to the one frame a movie can show at each timepoint. "
              "Only read when Sweep = 'time' (when Z is what plays there is nothing to "
-             "collapse), and inert on data with a single Z slice.",
+             "collapse), and inert on data with a single Z slice. A FIGURE with several "
+             "planes (Plot Field) accepts only 'mid': its planes are separate pictures.",
              choice_docs={
                  "max":
                      "Maximum along Z — the brightest value at each (y, x). The default and "

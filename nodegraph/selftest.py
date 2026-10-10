@@ -32366,11 +32366,20 @@ def test_field_view() -> None:
 
 
 def test_plot_field() -> None:
-    """Plot Field (2026-10-09): a field drawn on its image as a PICTURE — the picture is the
-    style's size and matches the edit-time envelope; Auto draws the most derived column on the
-    series' 1st–99th percentile; arrows in image pixels; a scale bar from the INPUT's pixel
-    size; Per frame gives one figure per frame on one scale; Export Figure's renderer writes
-    PNG and SVG; an unknown column is refused by name."""
+    """Plot Field (2026-10-09): a field drawn on its image as a PICTURE with one VIEW per
+    position, frame and plane of its input, so the Viewer's playback strip picks what is
+    shown. The node has no Frame / Position / Plane socket and no Per mode.
+
+    Checks:
+    - the picture's M, T and Z are the input's, and the edit-time envelope predicts them;
+    - each view draws its own frame (the image differs);
+    - Auto draws the most derived column on the whole table's 1st–99th percentile;
+    - arrows are in image pixels, and the scale bar comes from the INPUT's pixel size;
+    - a view's title names its position (by name), frame and plane;
+    - Export Figure writes a chosen view as PNG and SVG;
+    - Write Movie refuses to max-project a multi-plane figure;
+    - an unknown column is refused by name;
+    - a signed column on coolwarm is centred on zero unless typed."""
     import importlib.util
     import os
     import tempfile
@@ -32381,77 +32390,133 @@ def test_plot_field() -> None:
     from nodegraph.structure import StructureTable
     from nodegraph.nodes import COMPUTES
     from nodegraph.provider import ArrayProvider
+    spec_node = NODES.get("plot.field")
+    names_in = {i.name for i in spec_node.inputs}
+    assert not names_in & {"frame", "position", "plane"}, names_in
+    assert "per" not in {m.name for m in spec_node.modes}
     define_node("io.plotfieldseed", "S", outputs=[OutDataset()])
-    ax = AxisSizes(m=1, t=2, z=1, c=1, y=96, x=128)
-    md = {"pixel_size_um": 0.5}
-    img = np.zeros((1, 2, 1, 1, 96, 128), np.float32)
-    img[..., ::7, :] = 100.0
-    gy, gx = np.meshgrid(np.arange(8.0, 96.0, 16.0), np.arange(8.0, 128.0, 16.0), indexing="ij")
-    n = gy.size
-    cols = {"id": np.arange(2 * n), "m": np.zeros(2 * n), "t": np.repeat([0, 1], n),
-            "c": np.zeros(2 * n), "z": np.zeros(2 * n),
-            "y": np.tile(gy.ravel(), 2), "x": np.tile(gx.ravel(), 2),
-            "disp_y": np.zeros(2 * n), "disp_x": np.repeat([0.0, 1.0], n),
-            "disp_mag_um": np.repeat([0.0, 1.0], n),
-            "strain_eq": np.r_[np.zeros(n), gx.ravel() * 1e-3],
-            "curl": np.r_[np.zeros(n), gx.ravel() * 1e-3 - 0.02]}      # signed, lopsided
-    ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
-          .with_structure(StructureTable(Domain.POINT, cols, layer="piv", z_kind="plane_index")))
-    env = MetaEnvelope(axes=ax, metadata=md)
 
-    def pull(params=None, modes=None):
+    def field_ds(m, t, z):
+        ax = AxisSizes(m=m, t=t, z=z, c=1, y=96, x=128)
+        md = {"pixel_size_um": 0.5, "position_name": [f"well {k}" for k in range(m)]}
+        img = np.zeros((m, t, z, 1, 96, 128), np.float32)
+        img[..., ::7, :] = 100.0
+        gy, gx = np.meshgrid(np.arange(8.0, 96.0, 16.0), np.arange(8.0, 128.0, 16.0),
+                             indexing="ij")
+        n = gy.size
+        cols = {k: [] for k in ("m", "t", "z", "c", "y", "x", "disp_y", "disp_x",
+                                "disp_mag_um", "strain_eq", "curl")}
+        for mm in range(m):
+            for tt in range(t):
+                for zz in range(z):
+                    cols["m"].append(np.full(n, mm))
+                    cols["t"].append(np.full(n, tt))
+                    cols["z"].append(np.full(n, zz))
+                    cols["c"].append(np.zeros(n))
+                    cols["y"].append(gy.ravel())
+                    cols["x"].append(gx.ravel())
+                    cols["disp_y"].append(np.zeros(n))
+                    cols["disp_x"].append(np.full(n, float(tt)))
+                    cols["disp_mag_um"].append(np.full(n, float(tt)))
+                    cols["strain_eq"].append(gx.ravel() * 1e-3 * tt)
+                    cols["curl"].append((gx.ravel() * 1e-3 - 0.02) * tt)   # signed, lopsided
+        cols = {k: np.concatenate(v) for k, v in cols.items()}
+        cols["id"] = np.arange(len(cols["m"]))
+        ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+              .with_structure(StructureTable(Domain.POINT, cols, layer="piv",
+                                             z_kind="plane_index")))
+        return ds, MetaEnvelope(axes=ax, metadata=md), cols
+
+    def pull(ds, env, params=None, modes=None, tail=None):
         g = Graph()
         g.add(NodeInstance("S", "io.plotfieldseed"))
         g.add(NodeInstance("P", "plot.field", params=params or {}, modes=modes or {}))
         g.connect("S", "P")
+        last = "P"
+        if tail is not None:
+            g.add(NodeInstance("X", tail[0], params=tail[1], modes=tail[2]))
+            g.connect("P", "X")
+            last = "X"
         e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
-        return e, e.pull("P")
+        return e, e.pull(last)
 
-    e, o = pull({"frame": 1})
+    ds, env, cols = field_ds(1, 2, 1)
+    e, o = pull(ds, env)
     spec = o.metadata["figure_spec"]
     h, w = FIG.figure_pixels(spec["style"]["width_mm"], spec["style"]["height_mm"],
                              spec["style"]["dpi"])
-    assert (o.axes.y, o.axes.x, o.axes.c, o.axes.t) == (h, w, 3, 1), o.axes
+    assert (o.axes.m, o.axes.t, o.axes.z, o.axes.c, o.axes.y, o.axes.x) == (1, 2, 1, 3, h, w)
     assert e.env("P").axes == o.axes, (e.env("P").axes, o.axes)
-    assert spec["kind"] == "field" and spec["source"]["value"] == "strain_eq"
+    assert spec["kind"] == "field" and spec["per"] == "view"
+    assert spec["source"]["value"] == "strain_eq"
     lo, hi = spec["draw"]["range"]
-    assert abs(hi - np.percentile(cols["strain_eq"], 99)) < 1e-12 and spec["draw"]["colormap"] == "turbo"
-    fr = spec["frames"][0]
-    assert fr["t"] == 1 and len(fr["grid"]) == 6 and len(fr["grid"][0]) == 8
+    assert abs(hi - np.percentile(cols["strain_eq"], 99)) < 1e-12
+    assert spec["draw"]["colormap"] == "turbo"
+    prov = o.image
+    assert isinstance(prov, FIG.ViewFigureProvider)
+    v1 = prov.spec_for(0, 1, 0)
+    fr = v1["frames"][0]
+    assert (fr["m"], fr["t"], fr["z"]) == (0, 1, 0)
+    assert len(fr["grid"]) == 6 and len(fr["grid"][0]) == 8
     arr = np.asarray(fr["arrows"])
     assert np.allclose(arr[:, 3], 2.0), arr[:3]         # 1 µm at 0.5 µm/px = 2 px
-    sb = spec["draw"]["scale_bar"]
+    sb = v1["draw"]["scale_bar"]
     assert sb and abs(sb["px"] - sb["um"] / 0.5) < 1e-12 and sb["um"] in (10.0, 20.0, 5.0)
     assert FIG.unpack_plane(fr["image"]).dtype == np.uint8
-    # Per frame: one figure per frame, each its own entry, one shared scale
-    e2, o2 = pull({}, {"per": "frame"})
-    assert o2.axes.t == 2 and e2.env("P").axes == o2.axes
-    sp2 = o2.metadata["figure_spec"]
-    assert [f["t"] for f in sp2["frames"]] == [0, 1] and sp2["draw"]["range"] == [lo, hi]
-    assert FIG.frame_spec(sp2, 1)["frames"][0]["t"] == 1
-    # Export Figure's path: the same spec written as PNG and SVG
+    assert v1["axes"]["title"] == "frame 2/2", v1["axes"]
+    # each frame is its own view, read the way the Viewer reads a plane
+    p0 = prov.read_region(0, 0, 0, 0, 0, 0, h, 0, w)
+    p1 = prov.read_region(0, 0, 1, 0, 0, 0, h, 0, w)
+    assert p0.shape == (h, w) and not np.array_equal(p0, p1)
+
+    # positions and planes: the picture has them, the envelope says so, titles name them
+    ds3, env3, _c3 = field_ds(2, 2, 3)
+    e3, o3 = pull(ds3, env3, {"title": "strain"})
+    assert (o3.axes.m, o3.axes.t, o3.axes.z) == (2, 2, 3), o3.axes
+    assert e3.env("P").axes == o3.axes, (e3.env("P").axes, o3.axes)
+    assert o3.metadata.get("position_name") == ["well 0", "well 1"]
+    assert e3.env("P").metadata.get("position_name") == ["well 0", "well 1"]
+    t3 = o3.image.spec_for(1, 0, 2)["axes"]["title"]
+    assert t3 == "strain — well 1 · frame 1/2 · plane 3/3", t3
+    assert o3.image.spec_for(9, 9, 9)["frames"][0]["z"] == 2      # clamped, not an error
+
     with tempfile.TemporaryDirectory() as td:
         for fmt in ("png", "svg"):
-            pth = FIG.render_file(spec, os.path.join(td, f"f.{fmt}"), fmt)
+            pth = FIG.render_file(v1, os.path.join(td, f"f.{fmt}"), fmt)
             assert os.path.getsize(pth) > 1000, fmt
+        # Export Figure picks a view with its own sockets: a writer cannot follow the strip
+        target = os.path.join(td, "view.png")
+        pull(ds3, env3, {}, {}, ("io.write_figure", {"path": target, "position": 1,
+                                                     "frame": 1, "plane": 2},
+                                 {"format": "png"}))
+        assert os.path.getsize(target) > 1000
+        # Write Movie: a figure's planes are separate pictures, never max-projected
+        try:
+            pull(ds3, env3, {}, {}, ("io.write_movie", {"path": os.path.join(td, "m.mp4")},
+                                     {"sweep": "time", "z_reduce": "max"}))
+            raise AssertionError("a multi-plane figure must not be max-projected")
+        except ValueError as exc:
+            assert "3 planes" in str(exc) and "'mid'" in str(exc), exc
     try:
-        pull({"value": "nope"})
+        pull(ds, env, {"value": "nope"})
         raise AssertionError("an unknown column must be refused")
     except ValueError as exc:
         assert "nope" in str(exc) and "strain_eq" in str(exc), exc
     # a signed column on the diverging map: blank limits centred on zero (white = 0, as the
     # Viewer's Field overlay draws it); typed limits kept exactly as typed
-    _, oc = pull({"frame": 1, "value": "curl"})
+    _, oc = pull(ds, env, {"value": "curl"})
     dc = oc.metadata["figure_spec"]["draw"]
-    p1, p99 = np.percentile(cols["curl"], [1, 99])
-    assert dc["colormap"] == "coolwarm" and dc["range"] == [-max(-p1, p99), max(-p1, p99)], dc
-    _, ot = pull({"frame": 1, "value": "curl", "color_range": "-0.01, 0.05"})
+    p1_, p99 = np.percentile(cols["curl"], [1, 99])
+    assert dc["colormap"] == "coolwarm" and dc["range"] == [-max(-p1_, p99), max(-p1_, p99)], dc
+    _, ot = pull(ds, env, {"value": "curl", "color_range": "-0.01, 0.05"})
     assert ot.metadata["figure_spec"]["draw"]["range"] == [-0.01, 0.05]
-    _ok(f"plot field (2026-10-09): a {w}×{h} picture matching its envelope; Auto drew "
-        f"strain_eq (turbo) on the series' 1–99 % range; arrows 2 px for 1 µm at 0.5 µm/px; "
-        f"a {sb['um']:g} µm scale bar from the input's pixel size; Per frame = 2 figures on "
-        f"one scale; PNG + SVG written; an unknown column refused by name; a signed column "
-        f"on coolwarm centred on zero unless typed")
+    _ok(f"plot field (2026-10-09): one view per position/frame/plane, picked by the "
+        f"playback strip (no Frame/Position/Plane socket, no Per mode); a {w}×{h} picture "
+        f"whose M,T,Z = the input's and = the envelope's; each frame its own view; Auto drew "
+        f"strain_eq (turbo) on the table's 1–99 % range; arrows 2 px for 1 µm at 0.5 µm/px; a "
+        f"{sb['um']:g} µm scale bar from the input's pixel size; titles name position, frame "
+        f"and plane; Export Figure wrote view (1, 1, 2); Write Movie refused to max-project 3 "
+        f"planes; an unknown column refused; a signed column centred on zero unless typed")
 
 
 def test_field_end_to_end() -> None:

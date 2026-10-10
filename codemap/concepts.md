@@ -755,7 +755,10 @@ counter-clockwise on screen. The maths is `kernels/field_mechanics.py`, which re
 DRAWN by `nodegraph/fieldmap.py`, shared by the Viewer's Field and Vectors overlays and the
 `plot.field` figure node. It works in image pixels, converting a µm displacement by the
 payload's pixel size. It places a lattice field one cell per node and resamples a scattered
-one near its nodes only.
+one near its nodes only. `plot.field`'s figure is a **view picture**: one view per position,
+frame and plane of its input, drawn on first read by `figure.ViewFigureProvider`, so the
+Viewer's playback strip picks it as it picks a plane of an image. The node has no frame,
+position or plane control of its own; Export Figure, a writer, picks a view with its own.
 
 ### CON-27 — resource governor
 anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold

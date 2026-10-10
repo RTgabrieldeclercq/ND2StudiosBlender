@@ -97,9 +97,8 @@
               "params": {
                 "arrow_every": 2,
                 "contours": 6,
-                "frame": 5,
                 "scale_bar_um": 50.0,
-                "title": "Area change J, frame 5",
+                "title": "Area change J",
                 "value": "jacobian"
               }
             },
@@ -109,9 +108,8 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "frame": 5,
                 "scale_bar_um": 50.0,
-                "title": "Rotation (deg, + = CCW), frame 5",
+                "title": "Rotation (deg, + = CCW)",
                 "value": "rotation_deg"
               }
             },
@@ -121,9 +119,8 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "frame": 5,
                 "scale_bar_um": 50.0,
-                "title": "Equivalent strain, frame 5",
+                "title": "Equivalent strain",
                 "value": "strain_eq"
               }
             },
@@ -133,9 +130,8 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "frame": 5,
                 "scale_bar_um": 50.0,
-                "title": "von Mises stress (Pa), frame 5",
+                "title": "von Mises stress (Pa)",
                 "value": "von_mises"
               }
             },
@@ -225,7 +221,7 @@
                 "fig_J",
                 "fig_vm"
               ],
-              "title": "Figures (Per = frame for a movie)"
+              "title": "Figures: the playback strip picks the frame (5 = full deformation)"
             }
           },
           "nodes": {
@@ -471,8 +467,6 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "plane": 3,
-                "position": 24,
                 "scale_bar_um": 100.0,
                 "title": "Vorticity (1/s, + = CCW)",
                 "value": "curl"
@@ -485,8 +479,6 @@
               "params": {
                 "arrow_every": 2,
                 "arrows": false,
-                "plane": 3,
-                "position": 24,
                 "scale_bar_um": 100.0,
                 "title": "In-plane divergence (1/s)",
                 "value": "divergence"
@@ -498,8 +490,6 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "plane": 3,
-                "position": 24,
                 "scale_bar_um": 100.0,
                 "title": "Equivalent strain rate (1/s)",
                 "value": "strain_eq"
@@ -511,10 +501,8 @@
               "op_key": "plot.field",
               "params": {
                 "arrow_every": 2,
-                "plane": 3,
-                "position": 24,
                 "scale_bar_um": 100.0,
-                "title": "Bead speed (um/s), position 24, plane 3",
+                "title": "Bead speed (um/s)",
                 "value": "speed"
               }
             },
@@ -745,7 +733,7 @@
                 "fig_rate",
                 "fig_div"
               ],
-              "title": "Figures (Position and Plane pick the field)"
+              "title": "Figures: the playback strip picks position and plane (position 24, plane 3 has the fastest flow)"
             }
           },
           "nodes": {
@@ -992,10 +980,8 @@
               "op_key": "plot.field",
               "params": {
                 "contours": 6,
-                "frame": 2,
-                "plane": 20,
                 "scale_bar_um": 20.0,
-                "title": "Volume change J, mid plane, frame 2",
+                "title": "Volume change J",
                 "value": "jacobian"
               }
             },
@@ -1004,8 +990,6 @@
               "modes": {},
               "op_key": "plot.field",
               "params": {
-                "frame": 2,
-                "plane": 20,
                 "scale_bar_um": 20.0,
                 "title": "Pressure (Pa, + = compression)",
                 "value": "pressure"
@@ -1016,10 +1000,8 @@
               "modes": {},
               "op_key": "plot.field",
               "params": {
-                "frame": 2,
-                "plane": 20,
                 "scale_bar_um": 20.0,
-                "title": "Rotation (deg), mid plane, frame 2",
+                "title": "Rotation (deg)",
                 "value": "rotation_deg"
               }
             },
@@ -1028,8 +1010,6 @@
               "modes": {},
               "op_key": "plot.field",
               "params": {
-                "frame": 2,
-                "plane": 20,
                 "scale_bar_um": 20.0,
                 "title": "von Mises stress (Pa)",
                 "value": "von_mises"
@@ -1120,7 +1100,7 @@
                 "fig_p",
                 "fig_vm"
               ],
-              "title": "Figures (Plane picks the z slice)"
+              "title": "Figures: the playback strip picks frame and plane (frame 2, plane 20 = the cell's centre)"
             }
           },
           "nodes": {

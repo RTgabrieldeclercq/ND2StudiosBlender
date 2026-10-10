@@ -772,6 +772,7 @@
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.plot.field"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.plot.field"}
 {"dst":"nodegraph.fieldmap","k":"imp","lazy":false,"src":"nodegraph.catalog.plot.field"}
+{"dst":"nodegraph.memo","k":"imp","lazy":true,"src":"nodegraph.catalog.plot.field"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.plot.field"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.plot.heatmap"}
 {"dst":"nodegraph.catalog._shared.figure","k":"imp","lazy":false,"src":"nodegraph.catalog.plot.heatmap"}

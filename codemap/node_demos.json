@@ -1872,12 +1872,11 @@
       "kind": "plot",
       "phantom": "speckle_pair",
       "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}, {"op": "field.strain"}],
-      "view": {"t": 0},
-      "fixed_params": {"frame": 1},
+      "view": {"t": 1},
       "requires": ["openpiv"],
       "features": [
         "The warped speckle pair's field drawn as a figure: the image in grey, the most derived column (here strain_eq) as a colour map with a colour bar naming it and its unit, the displacement as arrows and a µm scale bar.",
-        "Pick any column with Value, add iso-lines with Contours, fix the scale with Colour range; Per frame makes one figure per frame on one colour scale for Export Movie.",
+        "Pick any column with Value, add iso-lines with Contours, fix the scale with Colour range; the playback strip picks the position, frame and plane, every view on one colour scale.",
         "Export Figure writes it as PNG, SVG or PDF at the style's size and resolution."
       ]
     },

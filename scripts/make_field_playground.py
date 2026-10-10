@@ -25,7 +25,10 @@ The pages:
    vorticity, divergence and the viscous stress of water.
 3. **3-D gel (synthetic).** A bead-gel volume, 40 × 160² at 0.5 µm/px with a 1 µm z step,
    3 frames. A spherical cell contracts 10 % and twists 6° about the optical axis, over a 1.5 %
-   x stretch. It runs DVC → the same chain → figures on the middle plane.
+   x stretch. It runs DVC → the same chain → figures.
+
+On every page the Viewer's playback strip picks the position, frame and plane each figure
+shows, as it does for the image.
 
 The beads are rendered at their exactly displaced positions; the image is not warped. So the
 only error in what the correlations recover is their own. ``truth.json`` beside the data gives
@@ -261,16 +264,16 @@ def build_graph(out_path, path_2d, path_3d):
                       {"youngs_modulus": 1000.0, "poisson_ratio": 0.45},
                       {"model": "neo_hookean", "plane": "stress"})
     figs = plots(d, 1520, [
-        ("fig_strain", "strain_eq", "Equivalent strain, frame 5", {}),
-        ("fig_rot", "rotation_deg", "Rotation (deg, + = CCW), frame 5", {}),
-        ("fig_J", "jacobian", "Area change J, frame 5", {"contours": 6}),
-        ("fig_vm", "von_mises", "von Mises stress (Pa), frame 5", {}),
-    ], frame=T2 - 1, arrow_every=2, scale_bar_um=50.0)
+        ("fig_strain", "strain_eq", "Equivalent strain", {}),
+        ("fig_rot", "rotation_deg", "Rotation (deg, + = CCW)", {}),
+        ("fig_J", "jacobian", "Area change J", {"contours": 6}),
+        ("fig_vm", "von_mises", "von Mises stress (Pa)", {}),
+    ], arrow_every=2, scale_bar_um=50.0)
     d.add_frame("Synthetic bead gel: a cell contracts 12 % (upper left), a vortex turns "
                 "10° CCW (lower right), 1 % stretch in x; frames 0→5 ramp it in",
                 ["gel2d", "dic"])
     d.add_frame("Mechanics chain: each card adds columns to the DIC table", chain)
-    d.add_frame("Figures (Per = frame for a movie)", figs)
+    d.add_frame("Figures: the playback strip picks the frame (5 = full deformation)", figs)
 
     # 2 ── chip flow PIV (real data) ─────────────────────────────────────────────────────
     d = GraphDocument()
@@ -299,18 +302,18 @@ def build_graph(out_path, path_2d, path_3d):
             ("pore", "piv")])
     chain = mechanics(d, "piv", -260, "velocity", "infinitesimal", {"viscosity": 1.0e-3},
                       {"model": "newtonian_fluid"})
-    # position 24, plane 3 (42 µm): the fastest flow in the earlier PIV summary
     figs = plots(d, 1240, [
-        ("fig_speed", "speed", "Bead speed (um/s), position 24, plane 3", {}),
+        ("fig_speed", "speed", "Bead speed (um/s)", {}),
         ("fig_curl", "curl", "Vorticity (1/s, + = CCW)", {}),
         ("fig_rate", "strain_eq", "Equivalent strain rate (1/s)", {}),
         ("fig_div", "divergence", "In-plane divergence (1/s)", {"arrows": False}),
-    ], position=24, plane=3, arrow_every=2, scale_bar_um=100.0)
+    ], arrow_every=2, scale_bar_um=100.0)
     d.add_frame("Bead flow through the granular pack: 10 burst files chained on T, PIV "
                 "only inside the pores (ensemble, velocity)",
                 srcs + ["series", "rb", "granules", "pore", "piv"])
     d.add_frame("Velocity → strain RATE, vorticity, divergence, viscous stress (water)", chain)
-    d.add_frame("Figures (Position and Plane pick the field)", figs)
+    d.add_frame("Figures: the playback strip picks position and plane (position 24, "
+                "plane 3 has the fastest flow)", figs)
 
     # 3 ── 3-D gel (synthetic) ───────────────────────────────────────────────────────────
     d = GraphDocument()
@@ -325,16 +328,17 @@ def build_graph(out_path, path_2d, path_3d):
                       {"youngs_modulus": 1000.0, "poisson_ratio": 0.45},
                       {"model": "neo_hookean"})
     figs = plots(d, 1520, [
-        ("fig_J", "jacobian", "Volume change J, mid plane, frame 2", {"contours": 6}),
-        ("fig_rot", "rotation_deg", "Rotation (deg), mid plane, frame 2", {}),
+        ("fig_J", "jacobian", "Volume change J", {"contours": 6}),
+        ("fig_rot", "rotation_deg", "Rotation (deg)", {}),
         ("fig_p", "pressure", "Pressure (Pa, + = compression)", {}),
         ("fig_vm", "von_mises", "von Mises stress (Pa)", {}),
-    ], frame=T3 - 1, plane=Z3 // 2, scale_bar_um=20.0)
+    ], scale_bar_um=20.0)
     d.add_frame("Synthetic bead volume: a cell at the centre contracts 10 % and twists 6° "
                 "about z, over a 1.5 % stretch in x; frames 0→2",
                 ["gel3d", "dvc"])
     d.add_frame("Mechanics chain on the 3-D DVC field", chain)
-    d.add_frame("Figures (Plane picks the z slice)", figs)
+    d.add_frame("Figures: the playback strip picks frame and plane (frame 2, plane 20 = "
+                "the cell's centre)", figs)
 
     ws.active = "pg1"
     ws.save_file(out_path)
