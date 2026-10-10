@@ -6669,10 +6669,18 @@ def main(argv) -> int:
     _del = next(a for a in _cm.actions() if a.text().startswith("Delete"))
     assert _del.isEnabled() and _del.toolTip() == _LkAsk, "it asks — and says it will"
     win.statusBar().clearMessage()
+    # Driven by a REAL event loop, as the app's own is: Qt hands an exception escaping a slot
+    # to sys.excepthook (the backstop) only from inside `exec()`. A Python-driven
+    # `processEvents()` re-raises it to its caller instead (PySide6 6.11), so spinning one
+    # here let the refusal escape the probe, which then died at teardown with no traceback
+    # right after PG14 (2026-10-09).
+    from PySide6.QtCore import QEventLoop as _LkLoop
+    _lkl = _LkLoop()
+    win.statusBar().messageChanged.connect(_lkl.quit)
     _LkTimer.singleShot(0, lambda: _lk.add_node("enhance.gamma"))    # no guard: the backstop
-    _t0 = time.time()
-    while not win.statusBar().currentMessage() and time.time() - _t0 < 5:
-        app.processEvents()
+    _LkTimer.singleShot(5000, _lkl.quit)
+    _lkl.exec()
+    win.statusBar().messageChanged.disconnect(_lkl.quit)
     assert win.statusBar().currentMessage() == _LkHint and set(_lk.nodes) == _n6
     # a value edit is this page's override: marked in Properties, reset to the master's
     win.scene.clearSelection()
