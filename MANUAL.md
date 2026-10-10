@@ -3460,7 +3460,21 @@ io.load ─→ analysis.piv / analysis.dic_correlate / analysis.dvc_field / trac
   Change off the same gradient.
 * **Make a figure or a movie.** **Plot Field** draws the same thing as a picture: the image,
   the column as a colour map with its colour bar, arrows, contours and a scale bar. Export
-  Figure writes it; with **Per** = frame, Export Movie animates it on one colour scale.
+  Figure writes it; with **Per** = frame, Export Movie animates it on one colour scale. A
+  signed column (a strain component, curl, pressure) is drawn on coolwarm with its limits
+  centred on zero, so white means 0. A peak beyond the 1st–99th percentile range saturates:
+  type a wider **Colour range** to see it.
+* **A graph to try it on.** `graphs/field_mechanics_playground.nd2graph.json` has three
+  pages:
+  * a synthetic 2-D bead gel run through DIC: a cell contracting 12 %, a vortex turning 10°,
+    and a 1 % stretch in x;
+  * the chip-flow beads run through PIV, giving strain rate, vorticity, divergence and
+    viscous stress;
+  * a synthetic 3-D gel run through DVC: a cell contracting 10 % and twisting 6°.
+
+  Its gels are git-ignored. On a new machine, write them with
+  `.venv\Scripts\python.exe scripts/make_field_playground.py`; it also writes their
+  analytic `truth.json` and re-points the graph at your copy.
 * **See it on the image.** The Viewer's **Field** overlay (§2 Overlays) colours the image by
   any of these columns. With nothing picked it shows the most derived one: von Mises after
   Stress, `strain_eq` after Strain, the Jacobian after Volume Change, otherwise the

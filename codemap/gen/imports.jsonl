@@ -1918,6 +1918,11 @@
 {"dst":"nodegraph.provider","k":"imp","lazy":true,"src":"scripts.dic_synthetic_bench"}
 {"dst":"nodegraph.registry","k":"imp","lazy":true,"src":"scripts.dic_synthetic_bench"}
 {"dst":"nodegraph.structure","k":"imp","lazy":true,"src":"scripts.dic_synthetic_bench"}
+{"dst":"nodegraph","k":"imp","lazy":true,"src":"scripts.make_field_playground"}
+{"dst":"nodegraph.nodes","k":"imp","lazy":true,"src":"scripts.make_field_playground"}
+{"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"scripts.make_field_playground"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"scripts.make_field_playground"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"scripts.make_field_playground"}
 {"dst":"nodegraph.kernels.piv_field","k":"imp","lazy":false,"src":"scripts.piv_synthetic_bench"}
 {"dst":"nodegraph.kernels","k":"imp","lazy":false,"src":"scripts.registration_synthetic_bench"}
 {"dst":"nodegraph.kernels.registration","k":"imp","lazy":false,"src":"scripts.registration_synthetic_bench"}
