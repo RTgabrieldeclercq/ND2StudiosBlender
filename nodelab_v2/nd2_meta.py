@@ -53,6 +53,52 @@ def _safe(get, default=None):
         return default
 
 
+#: Axes of ``ND2File.sizes`` that live INSIDE one frame of the sequence rather than being a
+#: loop over frames: the image plane, its channels and its RGB components.
+_IN_FRAME_DIMS = ("Y", "X", "C", "S")
+
+
+def sequence_indexer(loop_indices, dim_order, sizes):
+    """``coords -> sequence index`` (or ``None``) for ``ND2File.frame_metadata``.
+
+    A sequence index counts FRAMES, and a frame holds every channel: ``C`` (and an RGB
+    file's ``S``) is in-frame, never a loop. Until 2026-10-09 the index was computed over
+    every axis but Y/X, so ``C`` was folded in as if it were the innermost loop, and timepoint
+    ``t`` of a T/P/Z/C=3 file was read at ``t*3`` times its real index. That read the wrong
+    frames for small ``t`` and ran off the end for larger ones, and the per-T clock was then
+    dropped whole as partial. So no multichannel time-lapse long enough carried a
+    ``frame_time_jd`` (or a ``dt_s``) at all, and the Timeseries Builder quietly fell back to
+    filename order on exactly the files it exists for (the CRC_TF_ELISA ``_Seq`` series).
+
+    The file's own ``loop_indices`` (one ``{loop: index}`` dict per frame) is the authority
+    when it is there: a lookup cannot get the loop nesting wrong. Otherwise the index is
+    row-major over the LOOP axes alone, in ``dim_order``. A coordinate on an axis the file
+    does not loop over is ignored; an index outside the file is ``None``."""
+    loops = [d for d in dim_order if d not in _IN_FRAME_DIMS]
+    table = None
+    if loop_indices:
+        keys = list(loop_indices[0].keys())
+        if keys:
+            loops = [d for d in loops if d in keys] + [d for d in keys if d not in loops]
+        table = {}
+        for i, li in enumerate(loop_indices):
+            table.setdefault(tuple(int(li.get(d, 0)) for d in loops), i)
+
+    def index(coords):
+        key = tuple(int(coords.get(d, 0)) for d in loops)
+        if table is not None:
+            return table.get(key)
+        idx = 0
+        for d, v in zip(loops, key):
+            n = int(sizes.get(d, 1))
+            if not 0 <= v < n:
+                return None
+            idx = idx * n + v
+        return idx
+
+    return index
+
+
 def _point_names(f, n_m):
     """The acquisition's own name for each multipoint, or ``[]``.
 
@@ -186,12 +232,9 @@ def read_nd2_metadata_extended(filepath):
         m_axis = "P" if "P" in seq_dims else ("M" if "M" in seq_dims else None)
         n_m = sizes.get(m_axis, 1) if m_axis else 1
         n_t = out["n_timepoints"]
-
-        def _flat(coords: Dict[str, int]) -> int:
-            idx = 0
-            for d in seq_dims:
-                idx = idx * sizes.get(d, 1) + int(coords.get(d, 0))
-            return idx
+        # Channels are IN a frame, not a loop over frames — see `sequence_indexer`.
+        _flat = sequence_indexer(_safe(lambda: list(f.loop_indices), default=None),
+                                 out["dim_order"], sizes)
 
         def _read_xy_from_experiment():
             """Planned stage positions from ``f.experiment`` (XYPosLoop) →
@@ -235,7 +278,8 @@ def read_nd2_metadata_extended(filepath):
             for m in range(n_m):
                 coords = {m_axis: m, "T": 0, "Z": 0, "C": 0}
                 seq_idx = _flat(coords)
-                fm = _safe(lambda i=seq_idx: f.frame_metadata(i))
+                fm = (_safe(lambda i=seq_idx: f.frame_metadata(i)) if seq_idx is not None
+                      else None)
                 if fm is None:
                     continue
                 pos = (
@@ -296,7 +340,8 @@ def read_nd2_metadata_extended(filepath):
             if m_axis is not None:
                 coords[m_axis] = 0
             seq_idx = _flat(coords)
-            fm = _safe(lambda i=seq_idx: f.frame_metadata(i))
+            fm = (_safe(lambda i=seq_idx: f.frame_metadata(i)) if seq_idx is not None
+                  else None)
             if fm is None:
                 continue
             ts = (

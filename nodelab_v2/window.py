@@ -5985,7 +5985,8 @@ class MainWindow(QMainWindow):
 
         Everything after the dialog is :meth:`_load_source_paths`, so a series whose files
         do not share a grid is refused with the same message, and the same "load as separate
-        cards" fallback, as any other bundle.
+        cards" fallback, as any other bundle — which, for a sequence, still wires those cards
+        into the Timeseries Builder (files differing on T is the usual reason).
         """
         path, _f = QFileDialog.getOpenFileName(
             self, "Pick one file of the sequence", "",
@@ -6095,10 +6096,16 @@ class MainWindow(QMainWindow):
 
         ``chain_axis`` (:meth:`file_load_sequence`) additionally wires a ``util.timeseries`` card
         onto the bundle, preset to that axis. It rides HERE rather than in the caller so the
-        sequence loader inherits this method's grid-mismatch handling unchanged — and it is
-        deliberately dropped by the "separate cards" fallback, since there is no bundle left
-        for a chain to re-address."""
+        sequence loader inherits this method's grid-mismatch handling unchanged. The
+        "separate cards" fallback KEEPS it (2026-10-09): each card goes into its own slot of
+        the builder, in pick order, and the builder's output is what gets published. The
+        commonest reason a sequence cannot share one card is that its files differ on T
+        (the CRC_TF_ELISA ``_Seq`` series: 8, 8, 8, 7, 7 frames), which is exactly what the
+        builder accepts; dropping it left the user five unrelated sources and no series.
+        Onto M there is nothing to build, and past the builder's slot ceiling the cards
+        load unwired and the status bar says why."""
         import os
+        from nodegraph.catalog.util.timeseries import MAX_FILES as _TS_SLOTS
 
         publish = self._begin_source_load()     # V4.00 step 11: onto the Image Input page
         if publish is None:
@@ -6126,7 +6133,7 @@ class MainWindow(QMainWindow):
                 box.setDefaultButton(sep)
                 box.exec()
                 if box.clickedButton() is sep:
-                    self._load_source_paths(paths, group=False)
+                    self._load_source_paths(paths, group=False, chain_axis=chain_axis)
                 return
             QApplication.restoreOverrideCursor()
             chain = None
@@ -6161,6 +6168,11 @@ class MainWindow(QMainWindow):
                 self.pull_node(rec.id)          # the Viewer shows what was loaded
             return
 
+        # A sequence that could not share one card still becomes ONE series: the cards go
+        # into a Timeseries Builder, and the builder (not each card) is what gets published.
+        chain_wanted = bool(chain_axis) and chain_axis != "M" and len(paths) >= 2
+        chain_fits = chain_wanted and len(paths) <= _TS_SLOTS
+        y0 = y
         # Reading N files' metadata is N ND2 header parses — fast per file, but visibly not
         # instant for a folder's worth, and it all happens before the first card appears.
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -6172,7 +6184,7 @@ class MainWindow(QMainWindow):
                     failed.append((path, exc))
                     continue
                 added.append((rec, axes))
-                if publish:
+                if publish and not chain_fits:
                     outs.append(self._publish_source(rec, path))
                 item = self.scene.node_items.get(rec.id)
                 # `card_rect` is the card's real geometry (boundingRect carries the glow
@@ -6183,7 +6195,24 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        items = [self.scene.node_items[r.id] for r in [a[0] for a in added] + outs
+        chain = None
+        if chain_fits and len(added) >= 2:
+            chain = self.doc.add_node("util.timeseries", x=x + SEQUENCE_CHAIN_GAP, y=y0,
+                                      modes={"chain_axis": chain_axis})
+            # in pick order: `data`, then `file_2`, … — each connect reveals the next slot
+            for i, (rec, _axes) in enumerate(added):
+                self.doc.connect(rec.id, "image", chain.id,
+                                 "data" if i == 0 else f"file_{i + 1}")
+            if publish:
+                outs.append(self._publish_source(chain, added[0][0].params["path"],
+                                                 from_socket="out"))
+        elif chain_fits and publish:
+            # too few survived to build anything from: publish them as an ordinary load does
+            for rec, _axes in added:
+                outs.append(self._publish_source(rec, rec.params["path"]))
+
+        items = [self.scene.node_items[r.id] for r in
+                 [a[0] for a in added] + ([chain] if chain is not None else []) + outs
                  if r.id in self.scene.node_items]
         if items:
             self.scene.clearSelection()
@@ -6206,16 +6235,25 @@ class MainWindow(QMainWindow):
             rec, axes = added[0]
             self.statusBar().showMessage(
                 f"loaded {os.path.basename(rec.params['path'])} — {axes.c} channel(s)")
+        elif chain is not None:
+            self.statusBar().showMessage(
+                f"{len(added)} files loaded as separate cards and wired into a Timeseries "
+                f"Builder onto {chain_axis} — they are "
+                f"{_AXIS_NOUN.get(chain_axis, chain_axis)} of one series now; its card "
+                f"says the order it used")
         else:
             shown = [os.path.basename(r.params["path"]) for r, _a in added[:3]]
             more = len(added) - len(shown)
             self.statusBar().showMessage(
                 f"loaded {len(added)} files — " + ", ".join(shown)
-                + (f" +{more} more" if more else ""))
+                + (f" +{more} more" if more else "")
+                + (f"; a Timeseries Builder takes at most {_TS_SLOTS} cards, so they are "
+                   f"not wired into one" if chain_wanted and not chain_fits else ""))
         if outs:
             self.statusBar().showMessage(
                 self.statusBar().currentMessage() + self._published_note(outs))
-            self.pull_node(added[0][0].id)      # the Viewer shows what was loaded
+            # the Viewer shows what was loaded -- the built series, when there is one
+            self.pull_node(chain.id if chain is not None else added[0][0].id)
 
     def file_open(self) -> None:
         path, _f = QFileDialog.getOpenFileName(self, "Open graph", "", FILE_FILTER)

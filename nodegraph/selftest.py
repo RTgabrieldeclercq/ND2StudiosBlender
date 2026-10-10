@@ -30697,11 +30697,53 @@ def test_timeseries_frame_interleave() -> None:
     assert bundle_source_clock([{"frame_time_jd": [1, 2, 3]}, {}], envs) is None
     assert bundle_source_clock([{"frame_time_jd": [1, 2, 3]}, {"frame_time_jd": [7]}],
                                envs) is None
+    # 6. dt_s once frames interleave: a uniform merge gets its single step, an uneven one
+    #    drops it (the `respaced` rule) and the note says so; block order leaves it alone
+    from nodegraph.metadata import chain_uniform_step_s
+
+    def timed(fid, name, mins, dt):
+        d = card(fid, name, mins)
+        return d.with_metadata(dt_s=dt)
+
+    _e, out_u = run([timed(1, "u_001.nd2", [0, 2, 4], 120.0),
+                     timed(2, "u_002.nd2", [1, 3, 5], 120.0)])
+    # (a Julian day near 2.46e6 resolves ~50 µs, so the step is 60 s to within that)
+    assert abs(out_u.metadata["dt_s"] - 60.0) < 1e-3, out_u.metadata.get("dt_s")
+    _e, out_n = run([timed(1, "n_001.nd2", [0, 3, 6], 180.0),
+                     timed(2, "n_002.nd2", [1, 4, 7], 180.0)])
+    assert out_n.metadata.get("dt_s") is None, "uneven frames carry no spacing (key dropped)"
+    assert "dt_s is dropped" in out_n.metadata["__chain__"]["note"], out_n.metadata["__chain__"]
+    _e, out_k = run([timed(1, "k_001.nd2", [0, 1, 2], 60.0), timed(2, "k_002.nd2", [3, 4], 60.0)])
+    assert out_k.metadata["dt_s"] == 60.0, "block order keeps the in-file spacing"
+    assert chain_uniform_step_s([J, J + MIN, J + 2.05 * MIN]) is not None
+    assert chain_uniform_step_s([J, J + MIN, J + 3 * MIN]) is None
+    assert chain_uniform_step_s([J, J]) is None and chain_uniform_step_s([J]) is None
+
+    # 7. the ND2 reader's frame index: channels are IN a frame, never a loop. The CRC_TF_ELISA
+    #    `_Seq` layout (T=8, P=40, Z=3, C=3) put timepoint t at t*360 instead of t*120, so
+    #    the clock ran off the end and was dropped whole.
+    from nodelab_v2.nd2_meta import sequence_indexer
+    sizes = {"T": 8, "P": 40, "Z": 3, "C": 3, "Y": 4, "X": 4}
+    order_ = list(sizes)
+    loops = [{"T": t, "P": p, "Z": z} for t in range(8) for p in range(40) for z in range(3)]
+    for li in (loops, None):              # the file's own table, and the arithmetic fallback
+        ix = sequence_indexer(li, order_, sizes)
+        assert [ix({"T": t, "P": 0, "Z": 0, "C": 0}) for t in range(8)] == \
+            [t * 120 for t in range(8)], [ix({"T": t, "P": 0, "Z": 0}) for t in range(8)]
+        assert ix({"T": 0, "P": 5, "Z": 2, "C": 2}) == 17, "C is ignored, never multiplied in"
+        assert ix({"T": 8, "P": 0, "Z": 0}) is None, "past the end is None, not a wrong frame"
+    # a loop nesting other than dim order is read from the table, not assumed
+    swapped = [{"P": p, "T": t} for p in range(2) for t in range(3)]
+    ix2 = sequence_indexer(swapped, ["T", "P", "C", "Y", "X"], {"T": 3, "P": 2, "C": 2})
+    assert ix2({"T": 1, "P": 0}) == 1 and ix2({"T": 0, "P": 1}) == 3, "the file's own order wins"
+
     _ok("timeseries per-frame clock: alternating files interleave (pixels, clock, datetime, "
         "note, envelope agree), a glitch never reorders its own file, non-overlapping files "
         "stay in blocks, sequence/loaded never interleave, a clocked multi-file card "
         "interleaves and an unclocked one keeps the old drop, the per-M clock follows "
-        "time_subset / position_subset / onto-M, and the runner stamps it all-or-nothing")
+        "time_subset / position_subset / onto-M, and the runner stamps it all-or-nothing; "
+        "an interleaved series gets one dt_s only when evenly spaced and the note says when "
+        "it drops it; the ND2 reader indexes frames by loops alone (C is in-frame)")
 
 
 def main() -> int:

@@ -2040,7 +2040,10 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
 
     ``dt_s``/``z_step_um`` are deliberately left alone. They describe the spacing WITHIN a
     file, which the chain does not change; the gap BETWEEN two files is unknown and this
-    schema has nowhere to put an irregular one. See ``util.chain``'s description.
+    schema has nowhere to put an irregular one. See ``util.chain``'s description. The one
+    exception is an interleaved series, where neighbouring frames come from different files:
+    there ``dt_s`` is the merged clock's single step if it has one
+    (:func:`chain_uniform_step_s`), and is dropped if not.
     """
     out: Dict[str, Any] = {}
     k = len(members)
@@ -2107,7 +2110,39 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
         if perm is not None:
             out.update(time_subset({key: out[key] for key in PER_TIME_KEYS
                                     if isinstance(out.get(key), list)}, perm))
+            # Interleaved, neighbouring output frames are no longer one in-file interval
+            # apart, so the file's `dt_s` would be believed and be wrong (a speed divided
+            # by 163 min where the frames are 30 min apart). The `respaced` rule: a uniform
+            # merge has a spacing and gets it; an irregular one has none and drops it.
+            if members[0].metadata.get("dt_s") is not None:
+                out["dt_s"] = chain_uniform_step_s(out.get("frame_time_jd"))
     return out
+
+
+#: How far each step of an interleaved series may stray from the median step and still
+#: count as ONE spacing (``dt_s``), as a fraction of it. A microscope's own clock wanders a
+#: fraction of a percent between frames of one file; two files offset by anything other
+#: than half an interval differ by tens of percent. A tenth separates the two.
+CHAIN_UNIFORM_STEP_TOL = 0.1
+
+
+def chain_uniform_step_s(jd: Any) -> Optional[float]:
+    """The single spacing in seconds of a per-frame clock, or ``None`` when it has none:
+    fewer than two finite frames, a step that is not forward, or any step more than
+    :data:`CHAIN_UNIFORM_STEP_TOL` away from the median step."""
+    if not isinstance(jd, (list, tuple)) or len(jd) < 2:
+        return None
+    try:
+        steps = sorted((float(b) - float(a)) * 86400.0 for a, b in zip(jd, jd[1:]))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(s) and s > 0 for s in steps):
+        return None
+    med = steps[len(steps) // 2]
+    if steps[0] < med * (1 - CHAIN_UNIFORM_STEP_TOL) or \
+            steps[-1] > med * (1 + CHAIN_UNIFORM_STEP_TOL):
+        return None
+    return med
 
 
 def canvas_changes(base: Mapping[str, Any], canvas: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2555,7 +2590,7 @@ __all__ = [
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
     "SOURCE_CLOCK_KEY", "source_file_runs", "chain_grow", "chained_metadata",
     "ChainMember", "chain_members", "chain_member_frame_clock", "chain_frame_order",
-    "stamp_source_file",
+    "chain_uniform_step_s", "stamp_source_file",
     "PER_TIME_KEYS", "CONDITION_KEY", "CONDITION_SET_KEY", "time_subset", "respaced", "z_home_after",
     "eval_derive", "resolve_dim_default",
 ]

@@ -9146,6 +9146,59 @@ def main(argv) -> int:
         "every wire rightward, no card overlapping another or inside a region it is not in — "
         "and Undo reorganize, offered until a card moves, puts every card back")
 
+    # ── SQ2: a sequence that cannot share one card still becomes ONE series ──────────
+    # (user report 2026-10-09: the CRC_TF_ELISA _Seq files hold 8, 8, 8, 7, 7 frames, so the
+    # bundle is refused on T, and the "separate cards" fallback dropped the Timeseries
+    # Builder the sequence loader had meant to wire -- five unrelated sources, no series)
+    win.file_new()
+    app.processEvents()
+    _sd17 = tempfile.mkdtemp(prefix="nd2seq_")
+    _sp17 = []
+    for _k17, _t17 in enumerate((3, 3, 2)):
+        _p17 = os.path.join(_sd17, f"run_Seq{_k17 * 3:04d}.tif")
+        _tiff11.imwrite(_p17, np.full((_t17, 24, 28), 100 * (_k17 + 1), np.uint16),
+                        metadata={"axes": "TYX"})
+        _sp17.append(_p17)
+    _before17 = set(win.doc.nodes)
+    _done17: list = []
+    win.runner.finished.connect(lambda nid, *a: _done17.append(nid))
+    _msgs17: list = []          # the load's own message; the pull after it overwrites it
+    win.statusBar().messageChanged.connect(_msgs17.append)
+    # what the "Cannot group these files" box's "Load as separate cards" button now calls
+    win._load_source_paths(_sp17, group=False, chain_axis="T")
+    app.processEvents()
+    win.statusBar().messageChanged.disconnect(_msgs17.append)
+    _new17 = {i: win.doc.nodes[i] for i in set(win.doc.nodes) - _before17}
+    _ld17 = [r for r in _new17.values() if r.op_key == "io.load"]
+    _ts17 = [r for r in _new17.values() if r.op_key == "util.timeseries"]
+    assert len(_ld17) == 3 and len(_ts17) == 1, sorted(r.op_key for r in _new17.values())
+    _ts17 = _ts17[0]
+    assert (_ts17.modes or {}).get("chain_axis") == "T", _ts17.modes
+    _by17 = {r.id: r.params["path"] for r in _ld17}
+    _in17 = {ts: _by17[s] for (s, _ss, t, ts) in win.doc.edges if t == _ts17.id}
+    assert [_in17.get(k) for k in ("data", "file_2", "file_3")] == _sp17, \
+        ("each card in its own slot, in pick order", _in17)
+    assert win.doc.env(_ts17.id).axes.t == 8, ("3 + 3 + 2 frames", win.doc.env(_ts17.id).axes)
+    _pub17 = [r for r in _new17.values() if r.op_key == "page.output"]
+    if _pub17:
+        _src17 = {s for (s, _ss, t, _ts) in win.doc.edges if t in {r.id for r in _pub17}}
+        assert _src17 == {_ts17.id}, ("the built series is what is published, once", _src17)
+        # ...and it is what the load previews: wait for that pull, which also keeps it from
+        # still running when the probe's os._exit tears the process down
+        _rid17 = _q11(win.workspace.active, _ts17.id)
+        _t017 = time.time()
+        while _rid17 not in _done17 and time.time() - _t017 < 240:
+            app.processEvents()
+            time.sleep(0.005)
+        assert _rid17 in _done17, ("the built series is pulled", _done17)
+        _ax17 = win.viewer.axes() if callable(win.viewer.axes) else win.viewer.axes
+        assert _ax17 is not None and _ax17.t == 8, ("the Viewer shows 8 frames", _ax17)
+    assert any("wired into a Timeseries Builder" in m for m in _msgs17), _msgs17
+    _ok("SQ2 a file sequence refused one card (3, 3, 2 frames) and loaded as separate cards "
+        "is still ONE series: the cards go into a Timeseries Builder in pick order "
+        "(data, file_2, file_3), the builder predicts 8 frames, it is what gets published, "
+        "and the status bar says so")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

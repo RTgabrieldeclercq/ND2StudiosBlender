@@ -256,6 +256,9 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
                 if jd else "")
         note = (f"{total} frames from {k} files, each placed by its own acquisition "
                 f"clock — the files interleave{span}")
+        if "dt_s" in changes and changes["dt_s"] is None:
+            note += (" · frames are unevenly spaced, so dt_s is dropped — each frame's "
+                     "own time is in its clock")
     elif used == "time":
         frame_file = None
         note = (f"{k} files in acquisition-clock order"
