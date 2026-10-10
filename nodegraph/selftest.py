@@ -7403,6 +7403,17 @@ def test_quick_scope() -> None:
     best = eng.pull("IT")
     won = float(np.asarray(best.get(D.GLOBAL, "sweep_metric").values).reshape(-1)[0])
     assert won == max(per), (won, per)
+    # the staged cards score their own section too (a sweep can sit around any of them)
+    gs = Graph()
+    gs.add(NodeInstance("S", "io.quickseed"))
+    gs.add(NodeInstance("F", "piv.first_pass", params={"window_size": 32, "results": "off"}))
+    gs.connect("S", "F", dst_socket="data")
+    of = Engine(gs, computes=COMPUTES, seeds={"S": ds3},
+                meta_seeds={"S": MetaEnvelope(axes=ax3, metadata={"pixel_size_um": 0.5})}
+                ).pull("F")
+    vf = float(np.asarray(of.get(D.GLOBAL, "piv_valid_frac").values).reshape(-1)[0])
+    sn = float(np.asarray(of.get(D.GLOBAL, "piv_median_s2n").values).reshape(-1)[0])
+    assert 0.0 < vf <= 1.0 and np.isfinite(sn) and sn > 0, (vf, sn)
     _ok(f"quick scope (2026-10-09): picks include the reference (fixed {{0,6}}, {{8,9}} at the "
         f"end, previous {{0,1}}), staged cards read their grid card, DVC keeps the volume, "
         f"tracking takes {TRACK_FRAMES} frames, a centred 16-subset box unless drawn, one "
@@ -16713,6 +16724,19 @@ def _pw_square(i):
     return i * i
 
 
+def _pw_priority(_i):
+    """The worker's Windows priority class (0 elsewhere) — the governor's freeze guard."""
+    import sys as _sys
+    if _sys.platform != "win32":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+    return int(k32.GetPriorityClass(k32.GetCurrentProcess()))
+
+
 def _pw_gov_unit(i):
     """`adaptive_fold`'s test unit: the value, the worker's pid, and a unit-12 failure."""
     import os as _os
@@ -17039,12 +17063,24 @@ def test_parallel_governor() -> None:
     except P.UnitError as exc:
         assert isinstance(exc.original, ValueError) and "unit 12" in exc.worker_traceback
     assert got == list(range(len(got))) and len(got) <= 12, got
+    # every worker runs below normal priority, so the GUI and input always win the CPU
+    # (a 32-bit pseudo-handle once made SetPriorityClass fail silently — workers stayed Normal)
+    import sys as _sys
+    if pooled and _sys.platform == "win32":
+        prios = []
+        P.adaptive_fold(_pw_priority, list(range(4)), lambda i, it, r: prios.append(r),
+                        governor=G.Governor(4, 64 << 20), numba=False, poll_s=0.05)
+        assert set(prios) == {0x4000}, [hex(v) for v in prios]
     # an unpicklable compute falls back to this thread and still folds every unit, in order
     mult = 5
     got.clear()
+    fb_gov = G.Governor(6, 64 << 20)
     P.adaptive_fold(lambda i: i * mult, list(range(6)), lambda i, it, r: got.append(r),
-                    governor=G.Governor(6, 64 << 20), numba=False, poll_s=0.05)
+                    governor=fb_gov, numba=False, poll_s=0.05)
     assert got == [i * 5 for i in range(6)], got
+    if pooled:   # ...and SAYS so: a silent fallback reads as "the lanes are slow"
+        assert fb_gov.fallback and fb_gov.note() == fb_gov.fallback, fb_gov.note()
+        assert "finished in this process" in fb_gov.fallback, fb_gov.fallback
     _ok(f"parallel governor (2026-10-09): plans keep lanes×threads ≤ physical−reserve and "
         f"lanes×worker RAM above the floor (fake 40-core/512 GiB box: 16×2, RAM-bound 2×18, "
         f"starved 1); warm-up 2 → calibrated 16; holds on young-unit growth and low RAM, "

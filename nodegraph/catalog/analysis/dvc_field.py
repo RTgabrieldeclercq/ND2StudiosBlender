@@ -24,7 +24,8 @@ from nodegraph.structure import StructureTable, point_table
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
-from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_seconds,
+from nodegraph.catalog._shared.analysis_units import (ALDVC_PREIMPORT, concat_tables,
+                                                      describe_seconds,
                                                       finish_trial, full_run_estimate,
                                                       open_node_trial, quality_layers,
                                                       run_units, scoped_frame, ship,
@@ -242,7 +243,7 @@ def _compute_dvc_field(ctx: EvalContext) -> Dataset:
     run = run_units(ctx, units, read=read, read_local=read_local, work=_dvc_field_unit,
                     names=names, trial=opened.trial,
                     worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, numba=True,
-                    note="correlating",
+                    note="correlating", preimport=ALDVC_PREIMPORT,
                     in_thread=lambda p, cb: _dvc_field_unit(p, progress_cb=cb))
     merged = concat_tables(run.results, "field")
 

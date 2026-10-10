@@ -2758,6 +2758,7 @@ as Global scalars:
 | DIC | `dic_solved_frac` (share of grid points solved) |
 | PIV | `piv_valid_frac` (vectors that passed validation), `piv_median_s2n` (median signal-to-noise) |
 | DVC | `dvc_valid_frac`, `dvc_median_q` (median correlation quality) |
+| Staged cards | each scores its own section: DIC Initial Guess `dic_median_cc`; Local Match `dic_solved_frac`, `dic_hole_frac`, `dic_median_iter`; Global Step `dic_solved_frac`; PIV First / Deform Pass `piv_valid_frac`, `piv_median_s2n`; DVC Initial Guess `dvc_seed_ok_frac`; Local Match and Global Step `dvc_valid_frac`, `dvc_median_q` |
 
 To let the app choose a setting, put an **Iterate** card around the node
 ([§12c](#12c-iterating-a-parameter-sweeps-and-searches-v219-segment-rewrite-v222)). Sweep a

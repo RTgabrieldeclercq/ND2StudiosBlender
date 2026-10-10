@@ -53,10 +53,12 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
-from nodegraph.catalog._shared.analysis_units import (concat_tables, finish_stage,
-                                                      open_node_trial, run_units,
-                                                      scoped_frame, stamp_trial,
-                                                      store_sockets, unit_frames, unit_list)
+from nodegraph.catalog._shared.analysis_units import (_frac, _nanmedian, concat_tables,
+                                                      finish_stage, full_run_estimate,
+                                                      open_node_trial, quality_layers,
+                                                      run_units, scoped_frame, stamp_trial,
+                                                      store_sockets, unit_frames, unit_list,
+                                                      with_quality)
 from nodegraph.analysis_store import unit_name
 from nodegraph.catalog._shared.analysis_mesh import (concat_rows, lattice_quads,
                                                      mesh_columns, mesh_layer_name,
@@ -147,6 +149,20 @@ def _piv_write(ds: Dataset, layer: str, cols: Dict[str, np.ndarray]) -> Dataset:
     for name, vals in cols.items():
         ds = ds.with_layer(Domain.POINT, name, np.asarray(vals), layer=layer)
     return ds
+
+
+def _piv_quality(cols: Dict[str, np.ndarray], ds: Dataset, ax, run) -> Dict[str, Any]:
+    """A pass's quality scalars: the share of in-ROI windows that produced a vector, the
+    median signal-to-noise over them, and (on a quick run) the full-run estimate."""
+    exc = np.asarray(cols.get("excluded", np.zeros(0)), dtype=bool)
+    inside = ~exc if exc.size else np.ones(len(cols.get("m", ())), bool)
+    fin = (np.isfinite(np.asarray(cols.get("disp_y", np.zeros(0)), float))
+           & np.isfinite(np.asarray(cols.get("disp_x", np.zeros(0)), float)))
+    q = np.asarray(cols.get("qfactor", np.zeros(0)), float)
+    return {"piv_valid_frac": _frac(fin[inside]) if inside.size else None,
+            "piv_median_s2n": _nanmedian(q[inside]) if q.size else None,
+            "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=True,
+                                                     min_inner=1)}
 
 
 def _piv_cells(r: Dict[str, Any], m: int, z: int, c: int) -> Dict[str, np.ndarray]:
@@ -280,7 +296,8 @@ def _compute_piv_first_pass(ctx: EvalContext) -> Dataset:
     out = ds.with_structure(StructureTable(Domain.POINT, cols, layer=layer, z_kind="plane_index"))
     out = with_mesh(out, layer, cells_rows, kind="quad", z_kind="plane_index",
                     window=(window, window))
-    return out.with_metadata(**stamp_trial(md, opened, run))
+    return with_quality(out.with_metadata(**stamp_trial(md, opened, run)),
+                        _piv_quality(cols, ds, ax, run))
 
 
 def _piv_first_unit(p: dict, progress_cb=None) -> dict:
@@ -315,8 +332,10 @@ def _columns_piv_first_pass(params, modes, incoming):
 
 
 def _layers_piv_first_pass(params, modes):
-    """The window lattice's cell table, named after the field layer — no socket names it."""
-    return ((Domain.POINT, mesh_layer_name(str((params or {}).get("name") or _DEFAULT_LAYER))),)
+    """The window lattice's cell table, named after the field layer — no socket names it —
+    and the pass's quality scalars (Global)."""
+    return ((Domain.POINT, mesh_layer_name(str((params or {}).get("name") or _DEFAULT_LAYER))),
+            ) + quality_layers("piv.first_pass")
 
 
 # ── PIV Validate ──────────────────────────────────────────────────────────────────
@@ -535,7 +554,8 @@ def _compute_piv_deform_pass(ctx: EvalContext) -> Dataset:
     finish_stage(opened, run, layer, stamps=md, mesh_kind="quad", mesh_window=(window, window))
     res = with_mesh(_piv_rewrite(ds, layer, out), layer, cells_rows,
                     kind="quad", z_kind="plane_index", window=(window, window))
-    return res.with_metadata(**stamp_trial(md, opened, run))
+    return with_quality(res.with_metadata(**stamp_trial(md, opened, run)),
+                        _piv_quality(out, ds, ax, run))
 
 
 def _piv_deform_unit(p: dict, progress_cb=None) -> dict:
@@ -573,7 +593,8 @@ def _columns_piv_deform_pass(params, modes, incoming):
 def _layers_piv_deform_pass(params, modes):
     """The rewritten field layer and its finer lattice's cell table."""
     name = str((params or {}).get("source") or _DEFAULT_LAYER)
-    return ((Domain.POINT, name), (Domain.POINT, mesh_layer_name(name)))
+    return ((Domain.POINT, name), (Domain.POINT, mesh_layer_name(name))) + \
+        quality_layers("piv.deform_pass")
 
 
 # ── registration ─────────────────────────────────────────────────────────────────
@@ -592,7 +613,7 @@ _IMG_KAX = frozenset({"t", "y", "x"})
 register_node(
     _compute_piv_first_pass, op_key="piv.first_pass", label="PIV First Pass", category="analysis",
     adds_columns=_columns_piv_first_pass, extra_layers=_layers_piv_first_pass,
-    reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
+    reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         InInt("channel", "Channel", unit="", field=False, default=0, pick_kind="channel",
@@ -746,7 +767,7 @@ register_node(
     _compute_piv_deform_pass, op_key="piv.deform_pass", label="PIV Deform Pass",
     category="analysis", adds_columns=_columns_piv_deform_pass,
     extra_layers=_layers_piv_deform_pass,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,

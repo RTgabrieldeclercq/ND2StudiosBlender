@@ -57,10 +57,12 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
-from nodegraph.catalog._shared.analysis_units import (finish_stage, run_stage_units,
-                                                      scoped_frame, stage_result,
-                                                      stamp_trial, store_sockets,
-                                                      unit_frames, unit_list)
+from nodegraph.catalog._shared.analysis_units import (_frac, _nanmedian, finish_stage,
+                                                      full_run_estimate, quality_layers,
+                                                      run_stage_units, scoped_frame,
+                                                      stage_result, stamp_trial,
+                                                      store_sockets, unit_frames, unit_list,
+                                                      with_quality)
 from nodegraph.catalog._shared.analysis_mesh import (concat_rows, fem_quads, lattice_quads,
                                                      mesh_columns, mesh_layer_name,
                                                      with_mesh)
@@ -195,6 +197,19 @@ class _dic_RefCache:
 
 def _dic_layers_on_source(params, modes):
     return ((Domain.POINT, str((params or {}).get("source") or _DEFAULT_LAYER)),)
+
+
+def _dic_layers_initial_guess(params, modes):
+    """The lattice layer it fills, plus its quality scalars (Global) for a sweep."""
+    return _dic_layers_on_source(params, modes) + quality_layers("dic.initial_guess")
+
+
+def _dic_layers_local_match(params, modes):
+    return _dic_layers_on_source(params, modes) + quality_layers("dic.local_match")
+
+
+def _dic_layers_global_step(params, modes):
+    return _dic_layers_on_source(params, modes) + quality_layers("dic.global_step")
 
 
 # ── §2b  DIC Grid ─────────────────────────────────────────────────────────────────
@@ -342,8 +357,12 @@ def _compute_dic_initial_guess(ctx: EvalContext) -> Dataset:
     out = {"disp_y": disp[:, 0], "disp_x": disp[:, 1],
            "disp_mag_um": np.sqrt(np.nansum(disp ** 2, axis=1)), "seed_cc": seed_cc}
     md = {"dic_stage": "initial_guess", "dic_search_range": search, "dic_search_used": search_used}
+    quality = {"dic_median_cc": _nanmedian(seed_cc),
+               "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=True,
+                                                        min_inner=2)}
     finish_stage(opened, run, layer, stamps=md)
-    return _dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+    return with_quality(_dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run)),
+                        quality)
 
 
 def _dic_seed_unit(p: dict, progress_cb=None) -> dict:
@@ -641,8 +660,14 @@ def _compute_dic_local_match(ctx: EvalContext) -> Dataset:
     out["n_iter"] = n_iter
     out["hole"] = hole
     md = {"dic_stage": "local_match", "dic_tol": tol, "dic_icgn_max_iter": max_iter}
+    quality = {"dic_solved_frac": _frac(np.isfinite(disp).all(axis=1) & (hole == 0)),
+               "dic_hole_frac": _frac(hole > 0),
+               "dic_median_iter": _nanmedian(n_iter[n_iter > 0]) if (n_iter > 0).any() else None,
+               "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=True,
+                                                        min_inner=2)}
     finish_stage(opened, run, layer, stamps=md)
-    return _dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+    return with_quality(_dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run)),
+                        quality)
 
 
 def _dic_local_unit(p: dict, progress_cb=None) -> dict:
@@ -782,8 +807,12 @@ def _compute_dic_global_step(ctx: EvalContext) -> Dataset:
           "dic_admm_max_iter": p_extra["admm_max_iter"],
           "dic_disp_smoothness": p_extra["disp_smoothness"],
           "dic_strain_smoothness": p_extra["strain_smoothness"], "dic_solver": "aldic"}
+    quality = {"dic_solved_frac": _frac(np.isfinite(disp).all(axis=1)),
+               "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=True,
+                                                        min_inner=2)}
     finish_stage(opened, run, layer, stamps=md)
-    return _dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+    return with_quality(_dic_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run)),
+                        quality)
 
 
 def _dic_global_unit(p: dict, progress_cb=None) -> dict:
@@ -1017,8 +1046,8 @@ register_node(
 
 register_node(
     _compute_dic_initial_guess, op_key="dic.initial_guess", label="DIC Initial Guess",
-    category="analysis", adds_columns=_columns_dic_initial_guess, extra_layers=_dic_layers_on_source,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    category="analysis", adds_columns=_columns_dic_initial_guess, extra_layers=_dic_layers_initial_guess,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,
@@ -1039,8 +1068,8 @@ register_node(
 
 register_node(
     _compute_dic_local_match, op_key="dic.local_match", label="DIC Local Match",
-    category="analysis", adds_columns=_columns_dic_local_match, extra_layers=_dic_layers_on_source,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    category="analysis", adds_columns=_columns_dic_local_match, extra_layers=_dic_layers_local_match,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,
@@ -1063,8 +1092,8 @@ register_node(
 
 register_node(
     _compute_dic_global_step, op_key="dic.global_step", label="DIC Global Step",
-    category="analysis", adds_columns=_columns_dic_global_step, extra_layers=_dic_layers_on_source,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    category="analysis", adds_columns=_columns_dic_global_step, extra_layers=_dic_layers_global_step,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,

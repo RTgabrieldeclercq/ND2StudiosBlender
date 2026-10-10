@@ -752,9 +752,13 @@ units will still grow into is under the floor, and gives a lane back while other
 saturate the CPU. `parallel.adaptive_fold` is the rolling process-pool fold that asks it
 before every start, folds results strictly in unit order, pins each worker's numba/BLAS to
 the inner count and runs workers at below-normal priority (`_worker_init`, the main freeze
-guard). It is used only by the analysis nodes through `_shared/analysis_units.run_units`; the
-cheap per-plane nodes keep `parallel.fold_units` / `map_units`. Overrides:
-`NODEGRAPH_PROC_WORKERS`, `NODEGRAPH_RESERVE_CORES`, `NODEGRAPH_MIN_FREE_RAM`.
+guard). A pool that cannot start or breaks finishes the remaining units in this thread and
+says so in `Governor.fallback`, which becomes the run's note and the `analysis_trial_units`
+stamp. A script driving the engine must guard its top level with `if __name__ ==
+"__main__":`, because a spawned worker re-imports the main script. It is used only by the
+analysis nodes through `_shared/analysis_units.run_units`; the cheap per-plane nodes keep
+`parallel.fold_units` / `map_units`. Overrides: `NODEGRAPH_PROC_WORKERS`,
+`NODEGRAPH_RESERVE_CORES`, `NODEGRAPH_MIN_FREE_RAM`.
 
 ### CON-26 — analysis unit, trial and store
 anchors: sym:nodegraph.analysis_store.open_trial, sym:nodegraph.analysis_store.read_trial, sym:nodegraph.catalog._shared.analysis_units.run_units, sym:nodegraph.engine.Engine.lineage

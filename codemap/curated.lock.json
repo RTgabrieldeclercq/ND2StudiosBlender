@@ -232,7 +232,7 @@
   "anchors": {
    "sym:nodegraph.analysis_store.open_trial": "eb3d4aed1cfebb11e3de0f19a5c81977",
    "sym:nodegraph.analysis_store.read_trial": "759e0672fb0633b8ac019c5358f52288",
-   "sym:nodegraph.catalog._shared.analysis_units.run_units": "5193d83c813f35f653028197a2e468c9",
+   "sym:nodegraph.catalog._shared.analysis_units.run_units": "401f94c7a92dc97053c3c9236f060d07",
    "sym:nodegraph.engine.Engine.lineage": "131a4170de78fb40ff79ec6b32739a94"
   },
   "blessed": "2026-10-09",
@@ -242,7 +242,7 @@
   "anchors": {
    "sym:nodegraph.governor.Governor": "e2b4360003ef3d619631e8bd0a633d3f",
    "sym:nodegraph.governor.plan_lanes": "c36e87f472210a2e34dbbe40198149a0",
-   "sym:nodegraph.parallel.adaptive_fold": "e3ec928296f78f19ff121b906f706eed"
+   "sym:nodegraph.parallel.adaptive_fold": "335c39af17f9dd485e10b81379e8c546"
   },
   "blessed": "2026-10-09",
   "file": "codemap/concepts.md"

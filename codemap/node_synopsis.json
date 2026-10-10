@@ -8270,6 +8270,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -8377,7 +8378,7 @@
       ],
       "compute": "_compute_dic_global_step",
       "meta_transform": null,
-      "extra_layers": "_dic_layers_on_source",
+      "extra_layers": "_dic_layers_global_step",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
@@ -8597,6 +8598,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -8669,7 +8671,7 @@
       ],
       "compute": "_compute_dic_initial_guess",
       "meta_transform": null,
-      "extra_layers": "_dic_layers_on_source",
+      "extra_layers": "_dic_layers_initial_guess",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
@@ -8716,6 +8718,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -8796,7 +8799,7 @@
       ],
       "compute": "_compute_dic_local_match",
       "meta_transform": null,
-      "extra_layers": "_dic_layers_on_source",
+      "extra_layers": "_dic_layers_local_match",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/dic_correlate.md",
@@ -9089,6 +9092,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -9178,7 +9182,7 @@
       ],
       "compute": "_compute_dvc_global_step",
       "meta_transform": null,
-      "extra_layers": "_layers_on_source",
+      "extra_layers": "_layers_dvc_global_step",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/aldvc_field.md",
@@ -9409,6 +9413,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -9518,7 +9523,7 @@
       ],
       "compute": "_compute_dvc_initial_guess",
       "meta_transform": null,
-      "extra_layers": "_layers_on_source",
+      "extra_layers": "_layers_dvc_initial_guess",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/aldvc_field.md",
@@ -9568,6 +9573,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -9702,7 +9708,7 @@
       ],
       "compute": "_compute_dvc_local_match",
       "meta_transform": null,
-      "extra_layers": "_layers_on_source",
+      "extra_layers": "_layers_dvc_local_match",
       "adds_columns": true,
       "trained_params": false,
       "kernel_doc": "nodegraph/kernels/aldvc_field.md",
@@ -16585,6 +16591,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },
@@ -16728,6 +16735,7 @@
         ],
         "reads_by_mode": {},
         "adds": [
+          "global",
           "point"
         ]
       },

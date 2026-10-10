@@ -37,6 +37,12 @@ import numpy as np
 from nodegraph.engine import EvalContext
 from nodegraph.registry import InString
 
+#: Modules a pyALDVC worker imports one at a time before its first unit: ``al_dvc``'s
+#: import-time cache probe writes and deletes a file in its own ``__pycache__``, and workers
+#: starting together collide on it — the losers turn numba's disk cache off and recompile
+#: every kernel (:func:`nodegraph.governor.serialized_import`).
+ALDVC_PREIMPORT: Tuple[str, ...] = ("al_dvc._numba_compat",)
+
 #: The two store-control sockets every saving node carries. Excluded from the trial key
 #: (``ctx.lineage(exclude=STORE_PARAMS)``) so changing them never moves a trial.
 STORE_PARAMS: Tuple[str, ...] = ("results", "trial_label")
@@ -320,6 +326,7 @@ def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
               numba: bool = True,
               note: str = "analysing",
               in_thread: Optional[Callable[[Any, Callable[[int], None]], dict]] = None,
+              preimport: Sequence[str] = (),
               ) -> UnitRun:
     """Every unit's result, in unit order — loaded from ``trial`` where it is saved,
     computed otherwise.
@@ -395,12 +402,13 @@ def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
 
     try:
         P.adaptive_fold(_unit_task, todo, fold, governor=gov, prepare=prepare,
-                        numba=numba, on_wait=lambda: bar.emit_unknown(note=gov.note()))
+                        numba=numba, on_wait=lambda: bar.emit_unknown(note=gov.note()),
+                        preimport=preimport)
     finally:
         for p in shipped.values():
             _discard_shipped(p)
     return UnitRun([r for r in results if r is not None], loaded, len(todo), gov,
-                   gov.plan.note(), gov.mean_seconds())
+                   gov.fallback or gov.plan.note(), gov.mean_seconds())
 
 
 # ── quality metrics and the full-run estimate (the quick analysis) ─────────────────
@@ -411,7 +419,26 @@ QUALITY: Dict[str, Tuple[str, ...]] = {
     "analysis.dic_correlate": ("dic_solved_frac",),
     "analysis.piv": ("piv_valid_frac", "piv_median_s2n"),
     "analysis.dvc_field": ("dvc_valid_frac", "dvc_median_q"),
+    # the staged cards that read frames — each scores its own section
+    "dic.initial_guess": ("dic_median_cc",),
+    "dic.local_match": ("dic_solved_frac", "dic_hole_frac", "dic_median_iter"),
+    "dic.global_step": ("dic_solved_frac",),
+    "piv.first_pass": ("piv_valid_frac", "piv_median_s2n"),
+    "piv.deform_pass": ("piv_valid_frac", "piv_median_s2n"),
+    "dvc.initial_guess": ("dvc_seed_ok_frac",),
+    "dvc.local_match": ("dvc_valid_frac", "dvc_median_q"),
+    "dvc.global_step": ("dvc_valid_frac", "dvc_median_q"),
 }
+
+
+def _nanmedian(v) -> Optional[float]:
+    a = np.asarray(v, dtype=float)
+    return float(np.nanmedian(a)) if a.size and np.isfinite(a).any() else None
+
+
+def _frac(mask) -> Optional[float]:
+    m = np.asarray(mask, dtype=bool)
+    return float(m.mean()) if m.size else None
 EST_KEY = "analysis_est_full_s"
 
 
@@ -558,7 +585,7 @@ def run_stage_units(ctx: EvalContext, ds: Any, layer: str, units: Sequence[Tuple
                     work: Callable[[Any], dict], analysis: str, worker_bytes: int,
                     min_inner: int = 1, numba: bool = True, note: str = "analysing",
                     in_thread: Optional[Callable[[Any, Callable[[int], None]], dict]] = None,
-                    z_kind: str = "plane_index",
+                    z_kind: str = "plane_index", preimport: Sequence[str] = (),
                     ) -> Tuple[List[StagePart], "TrialOpen", "UnitRun"]:
     """A staged card's units through :func:`run_units` and the store: each unit's payload
     (``payload_of(unit, local)``) gets the unit's rows of the input table (``rows_of`` — the
@@ -591,7 +618,7 @@ def run_stage_units(ctx: EvalContext, ds: Any, layer: str, units: Sequence[Tuple
     run = run_units(ctx, units, read=lambda u: build(u, False),
                     read_local=lambda u: build(u, True), work=work, names=names,
                     trial=opened.trial, worker_bytes=worker_bytes, min_inner=min_inner,
-                    numba=numba, note=note, in_thread=in_thread)
+                    numba=numba, note=note, in_thread=in_thread, preimport=preimport)
     parts = [StagePart(tuple(u), rows[tuple(u)], (r.get("tables") or {}).get("field", {}),
                        r.get("stats") or {}) for u, r in zip(units, run.results)]
     return parts, opened, run
@@ -657,11 +684,13 @@ def stamp_trial(md_out: Dict[str, Any], opened: TrialOpen, run: UnitRun) -> Dict
 
 
 __all__ = [
-    "STORE_PARAMS", "store_sockets", "unit_list", "scoped_frame", "TrialOpen",
+    "STORE_PARAMS", "ALDVC_PREIMPORT", "store_sockets", "unit_list", "scoped_frame",
+    "TrialOpen",
     "open_node_trial",
     "SHIP_BYTES", "ShippedArray", "ship", "unship", "UnitRun", "run_units",
     "concat_tables", "finish_trial", "stamp_trial", "QUALITY", "EST_KEY",
     "UnitFrames", "unit_frames", "StagePart", "stage_result", "run_stage_units",
     "finish_stage",
     "quality_layers", "with_quality", "full_run_estimate", "describe_seconds",
+    "_nanmedian", "_frac",
 ]

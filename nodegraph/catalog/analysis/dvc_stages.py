@@ -61,10 +61,13 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import POINT_INVARIANT, on_layer
 from nodegraph.catalog._shared.labels import _point_layers, _resolve_layer
 from nodegraph.catalog._shared.progress import _UnitBar
-from nodegraph.catalog._shared.analysis_units import (finish_stage, run_stage_units,
-                                                      scoped_frame, stage_result,
-                                                      stamp_trial, store_sockets,
-                                                      unit_frames, unit_list)
+from nodegraph.catalog._shared.analysis_units import (ALDVC_PREIMPORT, _frac, _nanmedian,
+                                                      finish_stage,
+                                                      full_run_estimate, quality_layers,
+                                                      run_stage_units, scoped_frame,
+                                                      stage_result, stamp_trial,
+                                                      store_sockets, unit_frames, unit_list,
+                                                      with_quality)
 from nodegraph.catalog._shared.analysis_mesh import (concat_rows, grid_hexes,
                                                      mesh_columns, mesh_layer_name,
                                                      with_mesh)
@@ -387,7 +390,8 @@ def _compute_dvc_initial_guess(ctx: EvalContext) -> Dataset:
         rows_of=lambda u: _dvc_unit_rows(cols, u[0], c, plan)[0],
         payload_of=payload, work=_dvc_seed_unit, analysis="DVC Initial Guess",
         worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, note="seeding",
-        in_thread=lambda q, cb: _dvc_seed_unit(q, progress_cb=cb), z_kind="subpixel")
+        in_thread=lambda q, cb: _dvc_seed_unit(q, progress_cb=cb), z_kind="subpixel",
+        preimport=ALDVC_PREIMPORT)
     for part in parts:
         if not (part.rows.size and part.cols):
             continue
@@ -412,7 +416,11 @@ def _compute_dvc_initial_guess(ctx: EvalContext) -> Dataset:
           "dvc_search_radius": p["search_radius"], "dvc_global_shift": p["global_shift"],
           "dvc_init_coarse_factor": p["init_coarse_factor"]}
     finish_stage(opened, run, layer, stamps=md, z_kind="subpixel")
-    return _write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+    quality = {"dvc_seed_ok_frac": _frac(seed_ok > 0),
+               "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=False,
+                                                        min_inner=4)}
+    return with_quality(_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run)),
+                        quality)
 
 
 def _dvc_seed_unit(q: dict, progress_cb=None) -> dict:
@@ -470,6 +478,19 @@ def _columns_dvc_initial_guess(params, modes, incoming):
     if int((params or {}).get("init_coarse_factor", 1) or 1) > 1:
         cols += list(GRAD_COLUMNS)
     return on_layer(Domain.POINT, str((params or {}).get("source") or _DEFAULT_LAYER), cols)
+
+
+def _layers_dvc_initial_guess(params, modes):
+    """The grid layer it fills, plus its quality scalars (Global) for a sweep."""
+    return _layers_on_source(params, modes) + quality_layers("dvc.initial_guess")
+
+
+def _layers_dvc_local_match(params, modes):
+    return _layers_on_source(params, modes) + quality_layers("dvc.local_match")
+
+
+def _layers_dvc_global_step(params, modes):
+    return _layers_on_source(params, modes) + quality_layers("dvc.global_step")
 
 
 def _layers_on_source(params, modes):
@@ -562,7 +583,8 @@ def _compute_dvc_local_match(ctx: EvalContext) -> Dataset:
         rows_of=lambda u: _dvc_unit_rows(cols, u[0], c, plan)[0],
         payload_of=payload, work=_dvc_local_unit, analysis="DVC Local Match",
         worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, note="matching",
-        in_thread=lambda qq, cb: _dvc_local_unit(qq, progress_cb=cb), z_kind="subpixel")
+        in_thread=lambda qq, cb: _dvc_local_unit(qq, progress_cb=cb), z_kind="subpixel",
+        preimport=ALDVC_PREIMPORT)
     for part in parts:
         if not (part.rows.size and part.cols):
             continue
@@ -588,7 +610,12 @@ def _compute_dvc_local_match(ctx: EvalContext) -> Dataset:
           "dvc_tile_local": p["tile_local"], "dvc_n_threads": p["n_threads"],
           "dvc_icgn_max_iter": p["icgn_max_iter"]}
     finish_stage(opened, run, layer, stamps=md, z_kind="subpixel")
-    return _write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+    quality = {"dvc_valid_frac": _frac((status == 0)[valid > 0]) if (valid > 0).any() else None,
+               "dvc_median_q": _nanmedian(q),
+               "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=False,
+                                                        min_inner=4)}
+    return with_quality(_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run)),
+                        quality)
 
 
 def _dvc_local_unit(qd: dict, progress_cb=None) -> dict:
@@ -735,7 +762,8 @@ def _compute_dvc_global_step(ctx: EvalContext) -> Dataset:
         rows_of=lambda u: _dvc_unit_rows(cols, u[0], c, plan)[0],
         payload_of=payload, work=_dvc_global_unit, analysis="DVC Global Step",
         worker_bytes=10 * vol_bytes + (500 << 20), min_inner=4, note="ADMM",
-        in_thread=lambda qq, cb: _dvc_global_unit(qq, progress_cb=cb), z_kind="subpixel")
+        in_thread=lambda qq, cb: _dvc_global_unit(qq, progress_cb=cb), z_kind="subpixel",
+        preimport=ALDVC_PREIMPORT)
     for part in parts:
         if not (part.rows.size and part.cols):
             continue
@@ -761,7 +789,12 @@ def _compute_dvc_global_step(ctx: EvalContext) -> Dataset:
           "dvc_beta": (last_beta if last_beta is not None else p["beta"]),
           "dvc_admm_iterations": p["admm_iterations"]}
     finish_stage(opened, run, layer, stamps=md, z_kind="subpixel")
-    return _write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run))
+    quality = {"dvc_valid_frac": _frac(np.isfinite(disp).all(axis=1) & (status == 0)),
+               "dvc_median_q": _nanmedian(q),
+               "analysis_est_full_s": full_run_estimate(ds.metadata, ax, run, per_plane=False,
+                                                        min_inner=4)}
+    return with_quality(_write(ds, layer, out).with_metadata(**stamp_trial(md, opened, run)),
+                        quality)
 
 
 def _dvc_global_unit(qd: dict, progress_cb=None) -> dict:
@@ -1024,8 +1057,8 @@ register_node(
 
 register_node(
     _compute_dvc_initial_guess, op_key="dvc.initial_guess", label="DVC Initial Guess",
-    category="analysis", adds_columns=_columns_dvc_initial_guess, extra_layers=_layers_on_source,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    category="analysis", adds_columns=_columns_dvc_initial_guess, extra_layers=_layers_dvc_initial_guess,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,
@@ -1083,8 +1116,8 @@ register_node(
 
 register_node(
     _compute_dvc_local_match, op_key="dvc.local_match", label="DVC Local Match",
-    category="analysis", adds_columns=_columns_dvc_local_match, extra_layers=_layers_on_source,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    category="analysis", adds_columns=_columns_dvc_local_match, extra_layers=_layers_dvc_local_match,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,
@@ -1150,8 +1183,8 @@ register_node(
 
 register_node(
     _compute_dvc_global_step, op_key="dvc.global_step", label="DVC Global Step",
-    category="analysis", adds_columns=_columns_dvc_global_step, extra_layers=_layers_on_source,
-    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT}),
+    category="analysis", adds_columns=_columns_dvc_global_step, extra_layers=_layers_dvc_global_step,
+    reads_domains=frozenset({Domain.VOXEL, Domain.POINT}), adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
     inputs=[
         InDataset(),
         _SOURCE,

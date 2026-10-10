@@ -15757,12 +15757,13 @@
   },
   "dic.global_step": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dic_global_step",
    "description": "pyALDIC \u00a75-6 as a node: the global FEM compatibility solve + ADMM iterations that reconcile the matched subsets into one compatible field, \u03b2 auto-tuned per reference. Overwrites disp_* and grad_*.",
-   "extra_layers": "_dic_layers_on_source",
+   "extra_layers": "_dic_layers_global_step",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -16581,12 +16582,13 @@
   },
   "dic.initial_guess": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dic_initial_guess",
    "description": "pyALDIC \u00a73 as a node: the FFT integer seed of every lattice node (auto-expanding search, outlier-cleaned) written as disp_* with its correlation peak. Pull it first: a wrong seed is never recovered by the refinement.",
-   "extra_layers": "_dic_layers_on_source",
+   "extra_layers": "_dic_layers_initial_guess",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -16852,12 +16854,13 @@
   },
   "dic.local_match": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dic_local_match",
    "description": "pyALDIC \u00a74 as a node: the 6-DOF IC-GN match of every subset from the seed \u2014 the cost centre. Writes sub-pixel disp_*, the gradient grad_*, n_iter and hole.",
-   "extra_layers": "_dic_layers_on_source",
+   "extra_layers": "_dic_layers_local_match",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -17721,12 +17724,13 @@
   },
   "dvc.global_step": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dvc_global_step",
    "description": "pyALDVC \u00a75-6 as a node: the global compatibility step + ADMM iterations that reconcile the matched subsets into one kinematically compatible field. Overwrites disp_*/grad_*, writes outlier; \u03b2 auto-tuned per reference.",
-   "extra_layers": "_layers_on_source",
+   "extra_layers": "_layers_dvc_global_step",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -18509,12 +18513,13 @@
   },
   "dvc.initial_guess": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dvc_initial_guess",
    "description": "pyALDVC \u00a73 as a node: the starting displacement of every grid node (global shift + pyramid/NCC search) written as disp_* on the grid rows, with seed_cc / seed_ok. Pull it first: a wrong seed is never recovered by the refinement.",
-   "extra_layers": "_layers_on_source",
+   "extra_layers": "_layers_dvc_initial_guess",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -18880,12 +18885,13 @@
   },
   "dvc.local_match": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
    "compute": "_compute_dvc_local_match",
    "description": "pyALDVC \u00a74 as a node: the 12-DOF IC-GN match of every subset from the seed \u2014 the cost centre. Writes sub-voxel disp_*, grad_*, qfactor (ZNCC), status, n_iter, bad, valid and disp_std_* on the grid rows.",
-   "extra_layers": "_layers_on_source",
+   "extra_layers": "_layers_dvc_local_match",
    "footprint_mode": "dim",
    "fresh_output": false,
    "granularity": "whole_series",
@@ -33222,6 +33228,7 @@
   },
   "piv.deform_pass": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",
@@ -33550,6 +33557,7 @@
   },
   "piv.first_pass": {
    "adds_domains": [
+    "global",
     "point"
    ],
    "category": "analysis",

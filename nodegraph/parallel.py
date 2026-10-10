@@ -674,7 +674,8 @@ def adaptive_fold(compute: Callable[[T], R], items: Sequence[T],
                   prepare: Optional[Callable[[T], Any]] = None,
                   numba: bool = True,
                   on_wait: Optional[Callable[[], None]] = None,
-                  poll_s: float = 0.5) -> None:
+                  poll_s: float = 0.5,
+                  preimport: Sequence[str] = ()) -> None:
     """:func:`fold_units` for the expensive analysis nodes: **process-pool compute →
     strictly ordered fold**, with the width decided unit by unit by a
     :class:`nodegraph.governor.Governor` instead of fixed up front.
@@ -697,13 +698,21 @@ def adaptive_fold(compute: Callable[[T], R], items: Sequence[T],
       a progress bar and, through it, raise the engine's cancellation. On any exception out
       of the loop nothing new is submitted; units already running finish in their workers
       (their results are simply not folded).
+    * ``preimport`` names modules every worker imports ONE AT A TIME before its first unit
+      (:func:`nodegraph.governor.serialized_import`) — for packages whose import-time probe
+      races between processes starting together.
 
     ``compute`` must be module-level and payloads picklable (``prepare`` builds them on
     the calling thread, one unit ahead of its start). A compute error is re-raised as
     :class:`UnitError`. A pool that cannot be created or breaks (spawn refused, a worker
     killed) falls back to running the remaining units **serially in this thread** — the
     analysis kernels are GIL-bound Python plus numba, so a thread fallback would only
-    contend with the GUI."""
+    contend with the GUI — and says so in ``governor.fallback`` (the run's note).
+
+    A script that drives the engine must keep its top-level code under
+    ``if __name__ == "__main__":`` — a spawned worker re-imports the main script, so
+    unguarded code re-runs the whole script in every lane (measured: a benchmark that read
+    as lanes 8× slower than serial was each worker re-running the benchmark)."""
     from concurrent.futures import FIRST_COMPLETED, wait
     from nodegraph.governor import ERROR_TAG, timed_call
 
@@ -739,6 +748,8 @@ def adaptive_fold(compute: Callable[[T], R], items: Sequence[T],
     pool = None
     if enabled() and not in_parallel_region() and mode() != "thread" and n > 1:
         pool = process_pool(governor.pool_width())
+        if pool is None:
+            governor.fallback = "no process pool could be started; ran in this process"
     if pool is None:
         serial_from(0)
         return
@@ -749,7 +760,8 @@ def adaptive_fold(compute: Callable[[T], R], items: Sequence[T],
     def submit(i: int, payload: Any):
         try:
             return pool.submit(timed_call, compute, payload,
-                               {"inner": governor.inner_threads(), "numba": bool(numba)})
+                               {"inner": governor.inner_threads(), "numba": bool(numba),
+                                "preimport": tuple(preimport)})
         except Exception as exc:  # noqa: BLE001 — a dead/shut pool refuses submissions
             raise _PoolFailed(exc) from exc
 
@@ -784,9 +796,13 @@ def adaptive_fold(compute: Callable[[T], R], items: Sequence[T],
                 governor.record(stats)
                 buffered[i] = unwrap(res)
             drain()
-    except _PoolFailed:
+    except _PoolFailed as exc:
         # Finish the rest in this thread; units already folded or buffered are kept, so
-        # nothing is computed twice.
+        # nothing is computed twice. Said out loud in the run's note: a silent fallback
+        # reads as "lanes are slow" when the lanes never ran.
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        governor.fallback = (f"process lanes failed ({type(cause).__name__}: "
+                             f"{str(cause)[:120]}); finished in this process")
         for fut in in_flight:
             fut.cancel()
         shutdown()

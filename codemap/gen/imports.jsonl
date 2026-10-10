@@ -1745,6 +1745,7 @@
 {"dst":"nodegraph.mesh","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.nodes","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodegraph.parallel","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.provider","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.registry","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.roles","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

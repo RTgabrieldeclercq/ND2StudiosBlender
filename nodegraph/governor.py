@@ -390,6 +390,7 @@ class Governor:
         self.calibrated = False
         self.cpu_drop = 0
         self.held = ""
+        self.fallback = ""                   # set by adaptive_fold when the lanes fail
         self.seconds: List[float] = []
         self.peak_bytes = 0
         self._starts: List[float] = []        # monotonic start times of units in flight
@@ -465,6 +466,8 @@ class Governor:
         return (sum(self.seconds) / len(self.seconds)) if self.seconds else None
 
     def note(self) -> str:
+        if self.fallback:
+            return self.fallback
         if self.held:
             return self.held
         prof = self._last
@@ -498,8 +501,14 @@ def _below_normal_priority() -> None:
     try:
         if sys.platform == "win32":
             import ctypes
+            from ctypes import wintypes
             below_normal_priority_class = 0x4000
-            k32 = ctypes.windll.kernel32
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # HANDLE-typed, or ctypes passes the pseudo-handle (-1) as a 32-bit int and the
+            # call fails silently on 64-bit Windows — measured: workers stayed at Normal
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k32.SetPriorityClass.restype = wintypes.BOOL
             k32.SetPriorityClass(k32.GetCurrentProcess(), below_normal_priority_class)
         else:
             os.nice(5)
@@ -572,6 +581,65 @@ def peak_rss_bytes() -> int:
         return 0
 
 
+class _FileLock:
+    """A machine-wide lock on a file — ``msvcrt.locking`` on Windows, ``fcntl.flock``
+    elsewhere — held for a ``with`` block. Waits (never fails) for the holder to finish."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        self._fh = open(self.path, "a+b")
+        if sys.platform == "win32":
+            import msvcrt
+            while True:
+                try:
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:          # LK_LOCK gives up after ~10 s; keep waiting
+                    continue
+        else:
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+
+
+def serialized_import(name: str):
+    """Import module ``name`` holding a machine-wide lock, so worker processes starting at
+    the same moment import it ONE AT A TIME.
+
+    For a package whose import-time probe races between processes: ``al_dvc``'s
+    ``_numba_compat`` writes and deletes a probe file in its own ``__pycache__`` to decide
+    whether numba may cache compiled kernels on disk. Eight workers importing together on
+    Windows collide on that file (removing a file another process holds open fails), the
+    losers silently turn the cache OFF and recompile every kernel — measured as a DVC run
+    on 8 lanes taking 8× the serial time. Already-imported modules return at once."""
+    import importlib
+    if name in sys.modules:
+        return sys.modules[name]
+    import tempfile
+    lock = os.path.join(tempfile.gettempdir(), f"nodegraph-import-{name}.lock")
+    try:
+        with _FileLock(lock):
+            return importlib.import_module(name)
+    except OSError:                      # no lock possible: import unguarded
+        return importlib.import_module(name)
+
+
 #: The sentinel tag :func:`timed_call` wraps a compute exception in.
 ERROR_TAG = "__unit_error__"
 
@@ -583,6 +651,11 @@ def timed_call(fn, payload, setup: Optional[Dict[str, object]] = None):
     ``((ERROR_TAG, exc, traceback_text), None)`` rather than raised, so the parent can tell
     a genuine compute failure (re-raise it) from a broken pool (fall back)."""
     setup = setup or {}
+    for name in setup.get("preimport") or ():
+        try:
+            serialized_import(str(name))
+        except ImportError:
+            pass
     worker_enter(int(setup.get("inner", 1) or 1), numba=bool(setup.get("numba", True)))
     t0 = time.perf_counter()
     try:
@@ -605,5 +678,6 @@ __all__ = [
     "MachineProfile", "machine_profile", "physical_cores", "reserve_cores", "min_free_ram",
     "LanePlan", "plan_lanes", "UnitStats", "Governor", "estimate_seconds",
     "worker_enter", "peak_rss_bytes", "timed_call", "describe", "ERROR_TAG",
+    "serialized_import",
     "MAX_LANES", "RAM_SHARE", "PEAK_MARGIN",
 ]
