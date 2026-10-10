@@ -16738,10 +16738,14 @@ def _pw_priority(_i):
 
 
 def _pw_gov_unit(i):
-    """`adaptive_fold`'s test unit: the value, the worker's pid, and a unit-12 failure."""
+    """`adaptive_fold`'s test unit: the value, the worker's pid, and a unit-12 failure. It
+    takes 50 ms, so units spread over the warm workers instead of one worker draining a queue
+    of instant tasks before the next has started (a measured flake, 2026-10-09)."""
     import os as _os
+    import time as _t
     if i == 12:
         raise ValueError("unit 12 fails on purpose")
+    _t.sleep(0.05)
     return i * 3, _os.getpid()
 
 
@@ -17042,6 +17046,13 @@ def test_parallel_governor() -> None:
     # ── 3. a real adaptive_fold over the spawn pool ──────────────────────────────
     got = []
     gov = G.Governor(12, 64 << 20, min_inner=1)
+    # warm two workers of the width the fold will ask for (two concurrent sleeps force two
+    # live processes), so "ran in ≥ 2 workers" tests the fold, not spawn timing
+    import time as _time
+    _warm = P.process_pool(gov.pool_width()) if (P.enabled() and P.mode() != "thread") else None
+    if _warm is not None:
+        for _f in [_warm.submit(_time.sleep, 1.0) for _ in range(2)]:
+            _f.result()
     P.adaptive_fold(_pw_gov_unit, list(range(12)),
                     lambda i, item, res: got.append((i, item, res[0], res[1])),
                     governor=gov, numba=False, poll_s=0.05)

@@ -10,10 +10,10 @@
 | mapped Python modules | 353 |
 | indexed symbols | 5502 |
 | first-party import edges | 1924 |
-| LOC — `nodegraph/` | 121,307 |
-| LOC — `nodelab_v2/` | 59,284 |
+| LOC — `nodegraph/` | 121,318 |
+| LOC — `nodelab_v2/` | 59,293 |
 | LOC — `scripts/` | 21,737 |
-| map fingerprint | `237d0eaa3998bc894b6c386e3e69fd05` |
+| map fingerprint | `197168cf2189c32f4fd427e6adde1391` |
 | gates last verified green | **2026-10-07** |
 
 `gates last verified green` moves only when a human or agent passes
