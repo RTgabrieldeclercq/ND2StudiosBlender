@@ -20,6 +20,8 @@ from nodegraph.registry import (Granularity, InBool, InDataset, InFloat, InInt, 
 #: the background's longest side in the figure spec: one figure, or each frame of a series
 _SIDE_ONE, _SIDE_FRAME = 1024, 512
 _CMAPS = ("auto", "turbo", "viridis", "magma", "cividis", "coolwarm")
+#: maps with a meaningful midpoint: blank limits are centred on zero for these
+_DIVERGING = frozenset({"coolwarm"})
 _ONE = {"per": frozenset({"all"})}
 
 
@@ -97,7 +99,9 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
     * **Per** ``all`` = the one frame chosen; ``frame`` = one figure per frame of the input
       (backgrounds ≤ 512 px), drawn when shown — scrub it in the Viewer or export a movie.
     * **Limits** ``color_range`` 'low, high'; blank = the column's 1st–99th percentile over
-      the whole series, so every frame of a movie shares one scale.
+      the whole series, so every frame of a movie shares one scale. Blank limits on a
+      DIVERGING map are made symmetric about zero, so its neutral colour sits on 0 (the
+      Viewer Field overlay's ``center_zero`` default). Typed limits are kept as typed.
     """
     FIG.require_matplotlib()
     ds: Dataset = ctx.inputs[0]
@@ -129,6 +133,11 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
     hi = rng[1] if rng[1] is not None else hi
     cm = str(modes.get("colormap", "auto"))
     cmap = cm if cm != "auto" else ("coolwarm" if lo < 0.0 < hi else "turbo")
+    if cmap in _DIVERGING and rng[0] is None and rng[1] is None:
+        # a diverging map's midpoint must BE zero, or an unrotated background reads as
+        # negative rotation; the Viewer's Field overlay centres the same way by default
+        r = max(abs(lo), abs(hi))
+        lo, hi = -r, r
     unit = FM.column_unit(ds, layer, col)
     # the INPUT's pixel size, not ctx.calib: a plot's own envelope carries no calibration
     # (figure_frame — a chart has no µm, and the Viewer must not draw a scale bar on it), so
@@ -199,7 +208,9 @@ register_node(
         InString("color_range", "Colour range", field=False, default="",
                  description="Fix the colour scale as 'low, high'. Blank uses the column's "
                              "1st–99th percentile over the whole series, so every frame of a "
-                             "movie shares one scale."),
+                             "movie shares one scale; on the diverging coolwarm map, blank "
+                             "is also made symmetric about zero so white means 0. A peak "
+                             "beyond the range saturates: type a wider range to see it."),
         InFloat("opacity", "Opacity", unit="", field=False, default=0.6,
                 description="How opaque the colour map is over the image, 0 to 1. Lower "
                             "shows more of the image; 1 hides it under the field."),
@@ -233,7 +244,8 @@ register_node(
                  "cividis": "Blue to yellow, designed to read the same for the common "
                             "colour-vision deficiencies.",
                  "coolwarm": "Blue through white to red, diverging — for a signed quantity "
-                             "whose zero must read as neutral.",
+                             "whose zero must read as neutral. Blank limits are centred on "
+                             "zero.",
              }),
         Mode("per", ["all", "frame"], default="all", label="Per",
              description="One figure of the chosen frame, or one figure per frame of the "

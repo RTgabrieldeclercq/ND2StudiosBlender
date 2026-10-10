@@ -182,6 +182,25 @@ def _build_settings(params: Dict[str, Any], eff_ws, eff_ov, PIVSettings):
     return s
 
 
+def _predictor(u) -> np.ndarray:
+    """A pass's field as the next pass's predictor: masked (outside the ROI) AND non-finite
+    windows read 0 px, a window with no measurement predicting no shift.
+
+    ``RectBivariateSpline`` fits ONE global B-spline, so a single NaN turns the whole
+    predictor NaN. SciPy's ``map_coordinates`` then segfaults on the all-NaN deformation
+    coordinates; a single NaN is tolerated, a whole field of them is not.
+
+    The NaN can come from a window with no correlation peak, such as plain camera
+    background. Such a window is NaN but not flagged, so when no other vector fails,
+    replacement never runs to fill it.
+
+    Found 2026-10-09: chip-flow ensemble PIV at position 0, plane 5. Three background corner
+    windows crashed the worker, and then the serial fallback crashed the GUI process."""
+    a = np.array(np.ma.filled(u, 0.0), dtype=float)
+    a[~np.isfinite(a)] = 0.0
+    return a
+
+
 def _roi_on_grid(roi_mask: Optional[np.ndarray], x, y) -> np.ndarray:
     """True where a grid point falls OUTSIDE the ROI (nearest-neighbour sampling —
     windef spline-interpolates its boolean static mask, order 0 is the sane choice
@@ -210,8 +229,8 @@ def _deform_pass(frame_a, frame_b, i, x_old, y_old, u_old, v_old, s,
     overlap = s.overlap[i]
     x, y = pyprocess.get_rect_coordinates(frame_a.shape, window_size, overlap)
 
-    ip_u = RectBivariateSpline(y_old[:, 0], x_old[0, :], np.ma.filled(u_old, 0.0))
-    ip_v = RectBivariateSpline(y_old[:, 0], x_old[0, :], np.ma.filled(v_old, 0.0))
+    ip_u = RectBivariateSpline(y_old[:, 0], x_old[0, :], _predictor(u_old))
+    ip_v = RectBivariateSpline(y_old[:, 0], x_old[0, :], _predictor(v_old))
     u_pre = ip_u(y[:, 0], x[0, :])
     v_pre = ip_v(y[:, 0], x[0, :])
 
@@ -616,8 +635,8 @@ def run_piv_ensemble(
         for i in range(1, n_passes):
             window_size, overlap = s.windowsizes[i], s.overlap[i]
             x_new, y_new = pyprocess.get_rect_coordinates(shape, window_size, overlap)
-            ip_u = RectBivariateSpline(y[:, 0], x[0, :], np.ma.filled(u, 0.0))
-            ip_v = RectBivariateSpline(y[:, 0], x[0, :], np.ma.filled(v, 0.0))
+            ip_u = RectBivariateSpline(y[:, 0], x[0, :], _predictor(u))
+            ip_v = RectBivariateSpline(y[:, 0], x[0, :], _predictor(v))
             u_pre = ip_u(y_new[:, 0], x_new[0, :])
             v_pre = ip_v(y_new[:, 0], x_new[0, :])
             # the deformation coordinates depend only on the ENSEMBLE predictor, so

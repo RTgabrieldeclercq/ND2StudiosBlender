@@ -423,6 +423,13 @@ SOURCE_FILE_KEY = "source_file"
 #: (:mod:`nodegraph.analysis_store`) writes ``<stem>.analysis/`` beside it, and keys a saved
 #: trial on it. Provenance, not geometry, like the name; per position because a file bundle
 #: folds several files onto M.
+#:
+#: After a chain onto T, C or Z (:func:`chained_metadata`), a position is built from K files.
+#: Unlike every other per-position key, this one then KEEPS the first file's path, in chain
+#: order, rather than dropping, because it answers "where do this series' results go", and
+#: the answer is beside its first file. Identity is not lost: the saved trial's lineage still
+#: identifies every chained file at its own source card. Until 2026-10-09 it was dropped, and
+#: every chained series silently saved no results.
 SOURCE_PATH_KEY = "source_path"
 
 #: The scalar metadata key naming the experimental CONDITION a Dataset belongs to — stamped by
@@ -1909,6 +1916,11 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[
     :data:`SOURCE_FILE_KEY` falls out of this by itself — the names never agree — which is
     correct and needs no special case.
 
+    :data:`SOURCE_PATH_KEY` is the one exception. Off ``m`` it keeps the FIRST member's
+    paths, because it says where results are stored, not where a voxel came from. Dropping
+    it left a chained series with nowhere to save, and the analysis store then saved
+    nothing, silently.
+
     **The chained axis's own family** (:data:`PER_TIME_KEYS` onto T,
     :data:`PER_CHANNEL_KEYS` onto C) is concatenated per member, each contributing its OWN
     length — which is what lets files with different frame counts chain — but only when the
@@ -1943,6 +1955,8 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int) -> Dict[
             out[key] = [v for sl in slices for v in sl]
         elif all(sl == slices[0] for sl in slices):
             out[key] = slices[0]
+        elif key == SOURCE_PATH_KEY:
+            out[key] = slices[0]            # results go beside the series' first file
         else:
             # A coordinate that differs by stage jitter is still ONE field -- the first
             # file's reading is kept, the same one-value-per-position a native multi-T

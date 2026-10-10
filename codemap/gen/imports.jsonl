@@ -1216,6 +1216,7 @@
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared.analysis_mesh","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.catalog._shared.analysis_units","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared.drift_layers","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared.figure","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.catalog._shared.label_paint","k":"imp","lazy":true,"src":"nodegraph.selftest"}

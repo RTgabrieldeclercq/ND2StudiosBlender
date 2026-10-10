@@ -37022,7 +37022,7 @@
      "column_join": [],
      "default": "",
      "derive": "",
-     "description": "Fix the colour scale as 'low, high'. Blank uses the column's 1st\u201399th percentile over the whole series, so every frame of a movie shares one scale.",
+     "description": "Fix the colour scale as 'low, high'. Blank uses the column's 1st\u201399th percentile over the whole series, so every frame of a movie shares one scale; on the diverging coolwarm map, blank is also made symmetric about zero so white means 0. A peak beyond the range saturates: type a wider range to see it.",
      "dims": 3,
      "direction": "Direction.IN",
      "domain": null,
@@ -37700,7 +37700,7 @@
      "choice_docs": {
       "auto": "coolwarm (diverging, zero neutral) for a column with both signs \u2014 strain, curl, a stress component \u2014 and turbo otherwise: the Viewer Field overlay's own choice.",
       "cividis": "Blue to yellow, designed to read the same for the common colour-vision deficiencies.",
-      "coolwarm": "Blue through white to red, diverging \u2014 for a signed quantity whose zero must read as neutral.",
+      "coolwarm": "Blue through white to red, diverging \u2014 for a signed quantity whose zero must read as neutral. Blank limits are centred on zero.",
       "magma": "Black through red to pale yellow, perceptually uniform \u2014 strong contrast where the field peaks.",
       "turbo": "A high-contrast rainbow \u2014 what displacement magnitude is usually shown in; not perceptually uniform, so judge levels from the bar.",
       "viridis": "Dark purple to yellow, perceptually uniform and colour-blind safe \u2014 the accessible choice for a one-signed quantity."

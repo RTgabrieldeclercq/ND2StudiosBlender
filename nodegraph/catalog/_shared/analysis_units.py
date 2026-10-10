@@ -300,7 +300,12 @@ def _unit_task(payload: Tuple[Callable[[Any], dict], Any, str, str]) -> dict:
     res = work(inner)
     if data_dir:
         from nodegraph.analysis_store import save_unit
-        save_unit(data_dir, name, res.get("tables") or {}, res.get("stats") or {})
+        try:
+            save_unit(data_dir, name, res.get("tables") or {}, res.get("stats") or {})
+        except OSError as exc:
+            # the result is finished. A store that cannot be written is a lost
+            # convenience, not a lost analysis: say so on the output, never fail the run
+            res = dict(res, save_error=f"{type(exc).__name__}: {exc}")
     return res
 
 
@@ -313,6 +318,11 @@ class UnitRun:
     governor: Any
     lanes_note: str
     unit_seconds: Optional[float]
+
+    @property
+    def save_errors(self) -> List[str]:
+        """Why each unit that was computed but could not be written to the trial failed."""
+        return [str(r["save_error"]) for r in self.results if r.get("save_error")]
 
 
 def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
@@ -378,8 +388,8 @@ def run_units(ctx: EvalContext, units: Sequence[Tuple[int, ...]], *,
             if trial is not None:
                 try:
                     trial.save(names[i], res.get("tables") or {}, res.get("stats") or {})
-                except OSError:
-                    pass
+                except OSError as exc:
+                    res = dict(res, save_error=f"{type(exc).__name__}: {exc}")
             gov.record(UnitStats(seconds=time.perf_counter() - t0,
                                  peak_bytes=peak_rss_bytes(), pid=os.getpid()))
             results[i] = res
@@ -677,6 +687,11 @@ def stamp_trial(md_out: Dict[str, Any], opened: TrialOpen, run: UnitRun) -> Dict
     tr = opened.trial
     md_out["analysis_trial"] = tr.path if tr is not None else ""
     md_out["analysis_trial_note"] = opened.note
+    errs = run.save_errors
+    if errs:
+        md_out["analysis_trial_note"] = (f"{opened.note}; {len(errs)} unit(s) NOT saved "
+                                         f"(results are complete, the trial is partial): "
+                                         f"{errs[0]}")
     total = run.loaded + run.computed
     md_out["analysis_trial_units"] = (f"{run.loaded}/{total} loaded, {run.computed} computed"
                                       f" ({run.lanes_note})")

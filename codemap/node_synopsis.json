@@ -18233,7 +18233,7 @@
       "module": "nodegraph/catalog/plot/field.py",
       "gui_only": false,
       "summary": "A measured field drawn on its image as a figure: the image plane in grey, a field column as a colour map with a colour bar, optional arrows and contours, a µm scale bar — one frame, or one figure per frame for a movie.",
-      "overview": "A measured field drawn on its image, as a PICTURE. Resolved spec (§0, 2026-10-09): * **Kind** plot → ``op_key=\"plot.field\"``, category ``plot``: a picture of the input like every plot node (``fresh_output``, the ``figure_frame`` envelope), whole table at once (WHOLE_SERIES, empty kernel_axes — the background plane is read through the provider). * **What it draws** the image plane of ``position`` / ``frame`` / ``plane`` / ``channel`` (auto contrast, pooled to ≤ 1024 px) in grey; the ``value`` column of the ``table`` field as a colour map at ``opacity`` — rasterised by :mod:`nodegraph.fieldmap`, the Viewer's own Field-overlay rasteriser, so screen and figure agree — with a colour bar naming the column and its unit; optional arrows (auto length: the 95th-percentile vector one node spacing) and iso-contours; a µm scale bar. * **Per** ``all`` = the one frame chosen; ``frame`` = one figure per frame of the input (backgrounds ≤ 512 px), drawn when shown — scrub it in the Viewer or export a movie. * **Limits** ``color_range`` 'low, high'; blank = the column's 1st–99th percentile over the whole series, so every frame of a movie shares one scale.",
+      "overview": "A measured field drawn on its image, as a PICTURE. Resolved spec (§0, 2026-10-09): * **Kind** plot → ``op_key=\"plot.field\"``, category ``plot``: a picture of the input like every plot node (``fresh_output``, the ``figure_frame`` envelope), whole table at once (WHOLE_SERIES, empty kernel_axes — the background plane is read through the provider). * **What it draws** the image plane of ``position`` / ``frame`` / ``plane`` / ``channel`` (auto contrast, pooled to ≤ 1024 px) in grey; the ``value`` column of the ``table`` field as a colour map at ``opacity`` — rasterised by :mod:`nodegraph.fieldmap`, the Viewer's own Field-overlay rasteriser, so screen and figure agree — with a colour bar naming the column and its unit; optional arrows (auto length: the 95th-percentile vector one node spacing) and iso-contours; a µm scale bar. * **Per** ``all`` = the one frame chosen; ``frame`` = one figure per frame of the input (backgrounds ≤ 512 px), drawn when shown — scrub it in the Viewer or export a movie. * **Limits** ``color_range`` 'low, high'; blank = the column's 1st–99th percentile over the whole series, so every frame of a movie shares one scale. Blank limits on a DIVERGING map are made symmetric about zero, so its neutral colour sits on 0 (the Viewer Field overlay's ``center_zero`` default). Typed limits are kept as typed.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -18274,7 +18274,7 @@
             "viridis": "Dark purple to yellow, perceptually uniform and colour-blind safe — the accessible choice for a one-signed quantity.",
             "magma": "Black through red to pale yellow, perceptually uniform — strong contrast where the field peaks.",
             "cividis": "Blue to yellow, designed to read the same for the common colour-vision deficiencies.",
-            "coolwarm": "Blue through white to red, diverging — for a signed quantity whose zero must read as neutral."
+            "coolwarm": "Blue through white to red, diverging — for a signed quantity whose zero must read as neutral. Blank limits are centred on zero."
           }
         },
         {
@@ -18420,7 +18420,7 @@
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "description": "Fix the colour scale as 'low, high'. Blank uses the column's 1st–99th percentile over the whole series, so every frame of a movie shares one scale."
+          "description": "Fix the colour scale as 'low, high'. Blank uses the column's 1st–99th percentile over the whole series, so every frame of a movie shares one scale; on the diverging coolwarm map, blank is also made symmetric about zero so white means 0. A peak beyond the range saturates: type a wider range to see it."
         },
         {
           "name": "opacity",

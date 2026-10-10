@@ -67,15 +67,32 @@ DONE_SUFFIX = ".done.json"
 
 # ── atomic file writes ──────────────────────────────────────────────────────────
 
+#: The largest single ``write`` the store issues. Some drives refuse one big write call
+#: with ``EINVAL``. The lab's 13 TB S: drive takes 16 MiB but refuses 24 MiB (measured
+#: 2026-10-09). pyarrow writes a whole Parquet file in a call that size, so every unit of a
+#: real PIV run failed to save, and that failure failed the run. Writing in chunks costs
+#: nothing measurable.
+WRITE_CHUNK = 4 << 20
+
+
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-        fh.flush()
-        try:
-            os.fsync(fh.fileno())
+    view = memoryview(data)
+    try:
+        with open(tmp, "wb") as fh:
+            for i in range(0, len(view), WRITE_CHUNK):
+                fh.write(view[i:i + WRITE_CHUNK])
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+    except BaseException:
+        try:                                # a refused write leaves no half file behind
+            os.remove(tmp)
         except OSError:
             pass
+        raise
     os.replace(tmp, path)
 
 
@@ -161,10 +178,13 @@ def _to_arrow(cols: Mapping[str, np.ndarray]):
 
 
 def write_table(path: str, cols: Mapping[str, np.ndarray]) -> None:
+    """One table as zstd Parquet, built in memory, then written in :data:`WRITE_CHUNK`
+    pieces and renamed into place, never handed to pyarrow's own one-call file write."""
+    import pyarrow as pa
     import pyarrow.parquet as pq
-    tmp = f"{path}.{os.getpid()}.tmp"
-    pq.write_table(_to_arrow(cols), tmp, compression="zstd")
-    os.replace(tmp, path)
+    buf = pa.BufferOutputStream()
+    pq.write_table(_to_arrow(cols), buf, compression="zstd")
+    _atomic_write_bytes(path, buf.getvalue().to_pybytes())
 
 
 def read_table(path: str) -> Dict[str, np.ndarray]:

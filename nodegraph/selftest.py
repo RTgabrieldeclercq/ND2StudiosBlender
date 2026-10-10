@@ -7058,6 +7058,94 @@ def test_analysis_store() -> None:
         "tables-only; NODEGRAPH_STORE_DIR redirects uniquely")
 
 
+def test_analysis_store_writes() -> None:
+    """The analysis store's writes on a drive that refuses big writes (2026-10-09).
+
+    The lab's S: drive returns EINVAL for one ``write`` of 24 MiB or more. pyarrow wrote each
+    Parquet unit in one such call, so a real PIV run failed every save, and the failure
+    failed the run.
+
+    Under a fake ``open`` that refuses writes larger than 64 KiB, a ~2 MB table must
+    round-trip. A unit whose save raises must still return its result, with ``save_error``
+    set. The output's trial note must say how many units were not saved."""
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph import analysis_store as S
+    from nodegraph.catalog._shared import analysis_units as AU
+    import importlib.util
+    if importlib.util.find_spec("pyarrow") is None:
+        _ok("analysis store writes: SKIPPED (pyarrow absent)")
+        return
+    limit = 64 << 10
+    real_open = open
+
+    class _Picky:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def write(self, b):
+            if len(b) > limit:
+                raise OSError(22, "Invalid argument")
+            return self.fh.write(b)
+
+        def __getattr__(self, k):
+            return getattr(self.fh, k)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return self.fh.__exit__(*a)
+
+    def picky_open(path, mode="r", *a, **k):
+        fh = real_open(path, mode, *a, **k)
+        return _Picky(fh) if "w" in mode else fh
+
+    rng = np.random.default_rng(5)
+    cols = {"x": rng.random(250_000), "id": np.arange(250_000)}
+    chunk = S.WRITE_CHUNK
+    with _tempfile.TemporaryDirectory() as td:
+        p = _os.path.join(td, "u.parquet")
+        S.open = picky_open                      # module global shadows the builtin
+        try:
+            S.WRITE_CHUNK = limit
+            S.write_table(p, cols)
+            back = S.read_table(p)
+            assert np.array_equal(back["x"], cols["x"]) and _os.path.getsize(p) > limit
+            S.WRITE_CHUNK = 8 * limit            # chunks too big for this drive: refused
+            try:
+                S.write_table(_os.path.join(td, "v.parquet"), cols)
+                raise AssertionError("the fake drive must refuse a write over its limit")
+            except OSError:
+                pass
+        finally:
+            S.WRITE_CHUNK = chunk
+            del S.open
+        assert not [f for f in _os.listdir(td) if f.startswith("v.parquet")], _os.listdir(td)
+    # a save that raises: the unit's result survives, marked
+    real_save = S.save_unit
+
+    def boom(*a, **k):
+        raise OSError(22, "Invalid argument")
+
+    S.save_unit = boom
+    try:
+        res = AU._unit_task((lambda p: {"tables": {"field": {"x": p}}, "stats": {}},
+                             np.ones(3), "somewhere", "m0"))
+    finally:
+        S.save_unit = real_save
+    assert np.array_equal(res["tables"]["field"]["x"], np.ones(3))
+    assert "Invalid argument" in res["save_error"], res
+    run = AU.UnitRun([res, {"tables": {}, "stats": {}}], 0, 2, None, "2 lanes", 1.0)
+    md = AU.stamp_trial({}, AU.TrialOpen(None, "saved beside the source"), run)
+    assert "1 unit(s) NOT saved" in md["analysis_trial_note"], md
+    assert run.save_errors == [res["save_error"]]
+    _ok(f"analysis store writes (2026-10-09): a ~2 MB table round-trips through a drive "
+        f"that refuses writes over {limit >> 10} KiB (chunked at WRITE_CHUNK), and a refused "
+        f"write leaves no file behind; a unit whose save raises keeps its result with "
+        f"save_error, and the output's trial note says 1 unit NOT saved")
+
+
 def test_analysis_parallel() -> None:
     """Process lanes ≡ serial (2026-10-09) for the other two unit families: PIV over three
     (m, z) units and DVC over two m units, each pulled once on the governor's process lanes
@@ -23636,8 +23724,9 @@ def test_chain_files() -> None:
     from dataclasses import replace
     from nodegraph import file_sequence as FS
     from nodegraph.domains import Domain
-    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, chain_grow,
-                                    chain_members, source_file_runs, stamp_source_file)
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, SOURCE_PATH_KEY,
+                                    chain_grow, chain_members, source_file_runs,
+                                    stamp_source_file)
     from nodegraph.nodes import COMPUTES
     from nodegraph.provider import ArrayProvider, AxisRespreadProvider, MultiSourceProvider
 
@@ -23783,6 +23872,17 @@ def test_chain_files() -> None:
     # the files already agreed. `source_file` never agrees -- it drops out by itself.
     assert out.metadata.get(SOURCE_FILE_KEY) is None, out.metadata
     assert out.metadata.get("stage_xy_um") == [[7.0, 8.0]], out.metadata
+    # `source_path` is the one per-position key a chain keeps when the files disagree. It
+    # says where results go, and a series' results sit beside its FIRST file in chain
+    # order. Dropping it (until 2026-10-09) left the analysis store nowhere to save, so a
+    # chained series silently re-ran its whole PIV/DIC/DVC on every launch.
+    sp = [one([10], "w_t010.nd2", **{SOURCE_PATH_KEY: ["C:/d/w_t010.nd2"]}),
+          one([2], "w_t002.nd2", **{SOURCE_PATH_KEY: ["C:/d/w_t002.nd2"]}),
+          one([1], "w_t001.nd2", **{SOURCE_PATH_KEY: ["C:/d/w_t001.nd2"]})]
+    _esp, out_sp = run(sp, "T")
+    assert out_sp.metadata.get(SOURCE_PATH_KEY) == ["C:/d/w_t001.nd2"], out_sp.metadata
+    assert _esp.env("C").metadata.get(SOURCE_PATH_KEY) == ["C:/d/w_t001.nd2"]
+    assert out_sp.metadata.get(SOURCE_FILE_KEY) is None
     _p2, ds2 = bundle([[1], [2]], ["a_t1.nd2", "a_t2.nd2"])
     ds2 = ds2.with_metadata(stage_xy_um=[[0.0, 0.0], [99.0, 99.0]])
     _e2, out2 = run([ds2], "T")
@@ -31647,6 +31747,70 @@ def test_dvc_stages() -> None:
         f"places 5 wired nodes in a frame, splices into a wire and round-trips as nodes")
 
 
+def test_piv_nan_predictor() -> None:
+    """A NaN vector in a PIV pass must not poison the next pass's predictor (2026-10-09).
+
+    The bug: a window with no correlation peak (plain camera background) came back NaN but
+    unflagged, so replacement never filled it. The predictor's global spline then turned the
+    whole field NaN, and SciPy's ``map_coordinates`` segfaulted on all-NaN deformation
+    coordinates. On chip-flow ensemble PIV this crashed a worker, then the serial fallback
+    crashed the GUI process.
+
+    The test injects one NaN vector into pass 0 of both drivers, the ensemble and the
+    per-pair path, on clean frames with a planted shift. Both must finish and recover the
+    shift everywhere else.
+
+    Without the fix this 256² case does not segfault, but the ensemble returns no finite
+    vector at all. The segfault itself needs a full-size frame: it was seen on 1024²."""
+    import importlib.util
+    if importlib.util.find_spec("openpiv") is None:
+        _ok("PIV NaN predictor: SKIPPED (openpiv not installed)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from openpiv import pyprocess, windef
+    from nodegraph.kernels.piv_field import _predictor, run_piv_ensemble, run_piv_series
+    a = _predictor(np.ma.masked_array([[np.nan, 1.0], [2.0, np.inf]], mask=[[0, 0], [1, 0]]))
+    assert a.tolist() == [[0.0, 1.0], [0.0, 0.0]], a
+    rng = np.random.default_rng(11)
+    patt = gaussian_filter(rng.random((256, 256)), 1.5) * 1000.0
+    fr = [ndshift(patt, (1.0 * t, 2.0 * t), order=3, mode="nearest") for t in range(3)]
+    P = {"windowsizes": (32, 16), "overlap": 0.5}
+    real_c2d, real_fp = pyprocess.correlation_to_displacement, windef.first_pass
+    hit = {"n": 0}
+
+    def c2d(*a, **k):                    # the ensemble's pass 0 peak finder
+        u, v = real_c2d(*a, **k)
+        if hit["n"] == 0:
+            u, v = np.array(u, float), np.array(v, float)
+            u.flat[0] = v.flat[0] = np.nan
+        hit["n"] += 1
+        return u, v
+
+    def fp(*a, **k):                     # the per-pair driver's pass 0
+        x, y, u, v, s2n = real_fp(*a, **k)
+        u, v = np.array(u, float), np.array(v, float)
+        u.flat[0] = v.flat[0] = np.nan
+        return x, y, u, v, s2n
+
+    pyprocess.correlation_to_displacement, windef.first_pass = c2d, fp
+    try:
+        ens = run_piv_ensemble(fr, P, (0.5, 0.5), pairing="previous")
+        ser = run_piv_series(fr, P, (0.5, 0.5), pairing="previous")[0]
+    finally:
+        pyprocess.correlation_to_displacement, windef.first_pass = real_c2d, real_fp
+    assert hit["n"] >= 2, hit                      # pass 0 and the deform pass both ran
+    for name, r in (("ensemble", ens), ("per-pair", ser)):
+        d = np.asarray(r.displacement_field, float).reshape(-1, 2)
+        ok = np.isfinite(d).all(axis=1)
+        assert ok.mean() > 0.9, (name, ok.mean())
+        med = np.median(d[ok], axis=0)                 # [dy, dx] in px
+        assert np.allclose(med, [1.0, 2.0], atol=0.1), (name, med)
+    _ok("PIV NaN predictor (2026-10-09): a NaN vector injected into pass 0 of the ensemble "
+        "and per-pair drivers no longer poisons the deform pass's spline (an all-NaN "
+        "predictor; map_coordinates segfaulted on it at 1024²); both recover the planted "
+        "(1, 2) px shift")
+
+
 def test_piv_stages() -> None:
     """The staged PIV (2026-10-08): OpenPIV's ladder as pass-by-pass nodes — ``piv.first_pass``
     → ``piv.validate`` → ``piv.deform_pass`` → ``piv.validate`` (+ ``piv.smooth``) — and the
@@ -32227,7 +32391,8 @@ def test_plot_field() -> None:
             "y": np.tile(gy.ravel(), 2), "x": np.tile(gx.ravel(), 2),
             "disp_y": np.zeros(2 * n), "disp_x": np.repeat([0.0, 1.0], n),
             "disp_mag_um": np.repeat([0.0, 1.0], n),
-            "strain_eq": np.r_[np.zeros(n), gx.ravel() * 1e-3]}
+            "strain_eq": np.r_[np.zeros(n), gx.ravel() * 1e-3],
+            "curl": np.r_[np.zeros(n), gx.ravel() * 1e-3 - 0.02]}      # signed, lopsided
     ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
           .with_structure(StructureTable(Domain.POINT, cols, layer="piv", z_kind="plane_index")))
     env = MetaEnvelope(axes=ax, metadata=md)
@@ -32272,10 +32437,19 @@ def test_plot_field() -> None:
         raise AssertionError("an unknown column must be refused")
     except ValueError as exc:
         assert "nope" in str(exc) and "strain_eq" in str(exc), exc
+    # a signed column on the diverging map: blank limits centred on zero (white = 0, as the
+    # Viewer's Field overlay draws it); typed limits kept exactly as typed
+    _, oc = pull({"frame": 1, "value": "curl"})
+    dc = oc.metadata["figure_spec"]["draw"]
+    p1, p99 = np.percentile(cols["curl"], [1, 99])
+    assert dc["colormap"] == "coolwarm" and dc["range"] == [-max(-p1, p99), max(-p1, p99)], dc
+    _, ot = pull({"frame": 1, "value": "curl", "color_range": "-0.01, 0.05"})
+    assert ot.metadata["figure_spec"]["draw"]["range"] == [-0.01, 0.05]
     _ok(f"plot field (2026-10-09): a {w}×{h} picture matching its envelope; Auto drew "
         f"strain_eq (turbo) on the series' 1–99 % range; arrows 2 px for 1 µm at 0.5 µm/px; "
         f"a {sb['um']:g} µm scale bar from the input's pixel size; Per frame = 2 figures on "
-        f"one scale; PNG + SVG written; an unknown column refused by name")
+        f"one scale; PNG + SVG written; an unknown column refused by name; a signed column "
+        f"on coolwarm centred on zero unless typed")
 
 
 def test_field_end_to_end() -> None:
@@ -32435,10 +32609,12 @@ def main() -> int:
     test_catalog_kernels()
     test_catalog_dvc()
     test_dvc_stages()
+    test_piv_nan_predictor()
     test_piv_stages()
     test_dic_stages()
     test_catalog_dic()
     test_analysis_store()
+    test_analysis_store_writes()
     test_analysis_parallel()
     test_quick_scope()
     test_analysis_mesh()
