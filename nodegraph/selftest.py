@@ -7059,34 +7059,34 @@ def test_analysis_store() -> None:
 
 
 def test_analysis_store_writes() -> None:
-    """The analysis store's writes on a drive that refuses big writes (2026-10-09).
+    """A store that cannot be written must not cost a finished analysis (2026-10-09).
 
-    The lab's S: drive returns EINVAL for one ``write`` of 24 MiB or more. pyarrow wrote each
-    Parquet unit in one such call, so a real PIV run failed every save, and the failure
-    failed the run.
+    Found when the lab's S: drive began failing I/O mid-run (iaStorE "I/O on <disk> has
+    failed", NTFS "failed to flush ... Corruption may occur"). Every unit's save raised
+    ``OSError``; the worker re-raised it, and a 7-minute PIV run was thrown away after its
+    compute.
 
-    Under a fake ``open`` that refuses writes larger than 64 KiB, a ~2 MB table must
-    round-trip. A unit whose save raises must still return its result, with ``save_error``
-    set. The output's trial note must say how many units were not saved."""
+    Now a failed write leaves no ``*.tmp`` behind, for both the JSON and the Parquet
+    writer. A unit whose save raises returns its result with ``save_error``. The output's
+    trial note says how many units were not saved."""
     import os as _os
     import tempfile as _tempfile
+    import importlib.util
     from nodegraph import analysis_store as S
     from nodegraph.catalog._shared import analysis_units as AU
-    import importlib.util
     if importlib.util.find_spec("pyarrow") is None:
         _ok("analysis store writes: SKIPPED (pyarrow absent)")
         return
-    limit = 64 << 10
-    real_open = open
+    import pyarrow.parquet as pq
+    real_open, real_pq = open, pq.write_table
 
-    class _Picky:
+    class _Dying:
         def __init__(self, fh):
             self.fh = fh
 
         def write(self, b):
-            if len(b) > limit:
-                raise OSError(22, "Invalid argument")
-            return self.fh.write(b)
+            self.fh.write(bytes(b)[:10])        # some bytes land, then the device fails
+            raise OSError(5, "Input/output error")
 
         def __getattr__(self, k):
             return getattr(self.fh, k)
@@ -7097,36 +7097,39 @@ def test_analysis_store_writes() -> None:
         def __exit__(self, *a):
             return self.fh.__exit__(*a)
 
-    def picky_open(path, mode="r", *a, **k):
-        fh = real_open(path, mode, *a, **k)
-        return _Picky(fh) if "w" in mode else fh
+    def dying_pq(table, where, **k):
+        with real_open(where, "wb") as fh:
+            fh.write(b"PAR1")
+        raise OSError(5, "Input/output error")
 
-    rng = np.random.default_rng(5)
-    cols = {"x": rng.random(250_000), "id": np.arange(250_000)}
-    chunk = S.WRITE_CHUNK
     with _tempfile.TemporaryDirectory() as td:
-        p = _os.path.join(td, "u.parquet")
-        S.open = picky_open                      # module global shadows the builtin
+        S.open = lambda p, m="r", *a, **k: (_Dying(real_open(p, m, *a, **k)) if "w" in m
+                                            else real_open(p, m, *a, **k))
         try:
-            S.WRITE_CHUNK = limit
-            S.write_table(p, cols)
-            back = S.read_table(p)
-            assert np.array_equal(back["x"], cols["x"]) and _os.path.getsize(p) > limit
-            S.WRITE_CHUNK = 8 * limit            # chunks too big for this drive: refused
             try:
-                S.write_table(_os.path.join(td, "v.parquet"), cols)
-                raise AssertionError("the fake drive must refuse a write over its limit")
+                S._atomic_write_bytes(_os.path.join(td, "x.json"), b"{}" * 100)
+                raise AssertionError("a failing device must raise")
             except OSError:
                 pass
         finally:
-            S.WRITE_CHUNK = chunk
             del S.open
-        assert not [f for f in _os.listdir(td) if f.startswith("v.parquet")], _os.listdir(td)
-    # a save that raises: the unit's result survives, marked
+        pq.write_table = dying_pq
+        try:
+            try:
+                S.write_table(_os.path.join(td, "u.parquet"), {"x": np.arange(5.0)})
+                raise AssertionError("a failing device must raise")
+            except OSError:
+                pass
+        finally:
+            pq.write_table = real_pq
+        assert _os.listdir(td) == [], _os.listdir(td)   # no half-written temp files
+        S.write_table(_os.path.join(td, "ok.parquet"), {"x": np.arange(5.0)})
+        assert np.array_equal(S.read_table(_os.path.join(td, "ok.parquet"))["x"],
+                              np.arange(5.0))
     real_save = S.save_unit
 
     def boom(*a, **k):
-        raise OSError(22, "Invalid argument")
+        raise OSError(5, "Input/output error")
 
     S.save_unit = boom
     try:
@@ -7135,15 +7138,14 @@ def test_analysis_store_writes() -> None:
     finally:
         S.save_unit = real_save
     assert np.array_equal(res["tables"]["field"]["x"], np.ones(3))
-    assert "Invalid argument" in res["save_error"], res
+    assert "Input/output error" in res["save_error"], res
     run = AU.UnitRun([res, {"tables": {}, "stats": {}}], 0, 2, None, "2 lanes", 1.0)
     md = AU.stamp_trial({}, AU.TrialOpen(None, "saved beside the source"), run)
     assert "1 unit(s) NOT saved" in md["analysis_trial_note"], md
     assert run.save_errors == [res["save_error"]]
-    _ok(f"analysis store writes (2026-10-09): a ~2 MB table round-trips through a drive "
-        f"that refuses writes over {limit >> 10} KiB (chunked at WRITE_CHUNK), and a refused "
-        f"write leaves no file behind; a unit whose save raises keeps its result with "
-        f"save_error, and the output's trial note says 1 unit NOT saved")
+    _ok("analysis store writes (2026-10-09): a write that fails mid-file leaves no temp "
+        "file (JSON and Parquet); a unit whose save raises keeps its result with "
+        "save_error, and the output's trial note says 1 unit NOT saved")
 
 
 def test_analysis_parallel() -> None:

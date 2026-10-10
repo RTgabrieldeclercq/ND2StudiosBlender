@@ -32,12 +32,8 @@ own runner on real data, and each has a regression test.
   the series' first file. Every other per-position key still drops when the files disagree.
 - **Test.** An assertion in `test_chain_files`.
 
-**3. The analysis store writes on drives that refuse big writes, and a failed save no longer
-fails the analysis** (`nodegraph/analysis_store.py`, `catalog/_shared/analysis_units.py`).
-- **Chunked writes.**
-  - Every store file is written in `WRITE_CHUNK` (4 MiB) pieces, then renamed into place.
-  - Parquet units are built in memory first, instead of pyarrow's one-call file write.
-  - A refused write removes its temp file.
+**3. A failed save no longer fails the analysis** (`nodegraph/analysis_store.py`,
+`catalog/_shared/analysis_units.py`).
 - **Saves never fail a run.**
   - A unit whose save raises `OSError` keeps its result and carries `save_error`, in the
     worker path and the serial path. The serial path used to swallow the error silently.
@@ -45,6 +41,10 @@ fails the analysis** (`nodegraph/analysis_store.py`, `catalog/_shared/analysis_u
   - `stamp_trial` writes "N unit(s) NOT saved (results are complete, the trial is partial):
     <reason>" into the output's `analysis_trial_note`.
 - **Test.** `test_analysis_store_writes`.
+- **Correction (next commit).** As first committed, this also wrote store files in 4 MiB
+  chunks, for a supposed drive limit on write size. That "limit" was a failing disk; see
+  `2026-10-09_store-chunking-reverted.md`. The chunking is reverted; failed writes now remove
+  their temp file.
 
 **4. Plot Field centres a diverging map on zero** (`nodegraph/catalog/plot/field.py`).
 - **Fix.** With blank Colour range limits and the coolwarm map (Auto picks it for a signed
@@ -83,14 +83,13 @@ and pulling the last card does, and these fell out.
   file".
 
 **3. The store writes.**
-- **Symptom.** Once fix 2 let the chip run save, every unit's save failed: pyarrow raised
+- **Symptom.** Once fix 2 let the chip run save, every unit's save failed with
   `OSError: [Errno 22] Invalid argument`. Because the worker re-raised it, the whole PIV pull
   failed after its compute.
-- **Measurement.** S: (13 TB, 7 % used) accepts a single 16 MiB write and refuses 24 MiB, from
-  Python and from pyarrow, even with small row groups.
-- **Why chunk and soften.** Chunking makes the store work there. Not failing the run
-  restores the store's contract that saving is a convenience: the design note already said a
-  crash "loses nothing that finished", but a failed save was discarding a finished analysis.
+- **Cause.** The S: drive is failing I/O (the next commit's worklog has the event-log
+  evidence).
+- **Why soften.** Whatever the cause (a failing, full or read-only drive), a store that cannot
+  be written must cost the saved copy, not the analysis.
 
 **4. The plot limits.**
 - **Symptom.** The playground's rotation figure ran from −1.1° to 4.5°, so its white point sat
@@ -101,8 +100,7 @@ and pulling the last card does, and these fell out.
 
 - `nodegraph/kernels/piv_field.py`: `_predictor()` in `_deform_pass` and `run_piv_ensemble`.
 - `nodegraph/metadata.py`: `chained_metadata` keeps `source_path` off M; `SOURCE_PATH_KEY` doc.
-- `nodegraph/analysis_store.py`: `WRITE_CHUNK`; chunked `_atomic_write_bytes`; in-memory
-  `write_table`.
+- `nodegraph/analysis_store.py`: chunked writes, reverted in the next commit.
 - `nodegraph/catalog/_shared/analysis_units.py`: `save_error` on a unit,
   `UnitRun.save_errors`, the note in `stamp_trial`.
 - `nodegraph/catalog/plot/field.py`: zero-centred limits on a diverging map; docs.
