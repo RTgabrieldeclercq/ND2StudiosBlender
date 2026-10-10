@@ -458,9 +458,10 @@ register_node(
               "when convergence is declared."),
         InBool("compute_strain", "Compute strain", field=False, default=False,
                description=
-               "Also emit the solver's own nodal displacement gradients as `strain_yy`, "
-               "`strain_yx`, `strain_xy`, `strain_xx` columns — the same columns the DVC node "
-               "writes. Prefer this to differencing the displacement field downstream: it is a "
+               "Also emit the solver's own nodal strain (the symmetric small strain of its FEM "
+               "displacement gradient; tensor shear in `strain_yx` = `strain_xy`) as "
+               "`strain_yy`, `strain_yx`, `strain_xy`, `strain_xx` — the same columns the DVC "
+               "node writes. Prefer this to differencing the displacement field downstream: it is a "
                "smoothed finite-element fit rather than a difference of two neighbouring "
                "subsets, which on a 2% biaxial test recovers 0.01984 against a true 0.0200 "
                "where the raw per-subset gradient gives 0.01928. Costs roughly 20% more time. "

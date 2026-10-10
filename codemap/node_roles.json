@@ -172,6 +172,13 @@
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
       "ops": ["analysis.dic_correlate", "dic.grid", "dic.initial_guess", "dic.refine_mesh", "dic.local_match", "dic.global_step", "dic.strain", "analysis.dvc_field", "dvc.grid", "dvc.initial_guess", "dvc.local_match", "dvc.global_step", "dvc.strain", "analysis.piv", "piv.first_pass", "piv.validate", "piv.deform_pass", "piv.smooth", "analysis.optical_flow", "analysis.accumulate_field"]
     },
+    "field_mechanics": {
+      "label": "Field mechanics",
+      "stage": "quantify",
+      "pages": ["process", "analyze"],
+      "description": "What follows from a measured displacement or velocity field, written back onto the field's own table: its gradient (lattice differences or a local plane fit), strain under a chosen measure with principal values and von Mises equivalent, curl and finite rotation, the Jacobian / dilatation / divergence of volume change, and stress through a stated material law (Hooke, Saint Venant-Kirchhoff, neo-Hookean, Newtonian fluid).",
+      "ops": ["field.gradient", "field.strain", "field.rotation", "field.volume_change", "field.stress"]
+    },
     "control_flow": {
       "label": "Control flow",
       "stage": "control_and_present",

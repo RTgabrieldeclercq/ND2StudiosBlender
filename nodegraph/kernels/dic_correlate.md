@@ -162,7 +162,7 @@ mesh nodes themselves).
 | `dim` | scalar | int | — | — | always `2`. |
 | `grid_coords` | `(*G, 2)` | float64 | `[y, x]` | pixels (downsampled) | Node coordinates; `[...,0]=y`, `[...,1]=x`. |
 | `displacement_field` | `(*G, 2)` | float64 | `[y, x]` | pixels | `[...,0]=dy`, `[...,1]=dx`. Convert to µm via `.displacement_um()`. **Non-finite at nodes the solver could not resolve** (masked-out subsets) — that is the honest answer, not a defect. |
-| `strain_field` | `(*G, 2, 2)` or `None` | float64 | `[y, x]` | — | `[i, j] = ∂disp_i/∂axis_j`, from al_dic's FEM nodal gradients. `None` unless `compute_strain=True`. **Cross terms are sign-corrected — see §6.** |
+| `strain_field` | `(*G, 2, 2)` or `None` | float64 | `[y, x]` | — | The SYMMETRIC small strain `[i, j] = ½(∂disp_i/∂axis_j + ∂disp_j/∂axis_i)` (tensor shear), from al_dic's FEM nodal gradients — the tensor `analysis.dvc_field` and `analysis.track_field` write under the same `strain_*` names. Until 2026-10-09 the cross slots held the raw gradient; it lives in the staged cards' / Field Gradient's `grad_*` now. `None` unless `compute_strain=True`. **Cross terms are sign-corrected — see §6.** |
 | `voxel_size_um` | len-2 tuple | float | `(y, x)` | µm/px | as supplied. |
 | `qfactor` | — | — | — | — | `None`. al-dic 0.7.2 keeps its per-point NCC quality factors inside `solver/integer_search.py` (`fft_info["cc_max"]`) and never places them on `PipelineResult`, so there is no honest per-node confidence to report without patching the solver. |
 | `converged` | scalar | bool | — | — | `False` for frames at/after an early stop (`PipelineResult.stopped_at_frame`), else `True`. |

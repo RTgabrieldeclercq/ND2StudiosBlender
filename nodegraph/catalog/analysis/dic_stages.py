@@ -943,7 +943,8 @@ def _compute_dic_strain(ctx: EvalContext) -> Dataset:
                 comps = _strain_components(sr)
                 if comps is not None:
                     dudx, dudy, dvdx, dvdy = comps
-                    strain[idx] = np.stack([dvdy, dvdx, dudy, dudx], axis=1)
+                    shear = 0.5 * (dvdx + dudy)        # tensor shear: the symmetric strain
+                    strain[idx] = np.stack([dvdy, shear, shear, dudx], axis=1)
                 sv = np.asarray(getattr(sr, "strain_valid", np.ones(n, bool)), dtype=bool).reshape(-1)
                 valid[idx] = sv.astype(np.int64) if sv.size == n else 1
                 bar.finish_unit(note=f"m={m} z={z} t={t_out}: {int(valid[idx].sum())}/{n} nodes with strain")
@@ -1172,7 +1173,7 @@ register_node(
     ],
     granularity=_STAGE_GRAN, kernel_axes=frozenset(),
     description="pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — "
-                "four strain_* columns in image axes + strain_valid — without reading a frame, so "
+                "four symmetric strain_* columns in image axes + strain_valid — without reading a frame, so "
                 "a new measure or radius re-runs in a second.")
 
 

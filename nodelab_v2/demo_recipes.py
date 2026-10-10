@@ -200,6 +200,7 @@ ROLE_DEFAULTS: Dict[str, Tuple[str, str, Dict[str, Any], str]] = {
     "table_synthesis": ("table", "cells2d", {}, "measured2d"),
     "tracking": ("tracks", "moving_cells", {}, "labels2d"),
     "motion_and_deformation_fields": ("field", "speckle_pair", {}, ""),
+    "field_mechanics": ("field", "speckle_pair", {}, ""),
     "control_flow": (GUIDE, "", {}, ""),
     "graph_structure": (GUIDE, "", {}, ""),
     "visualization": ("image", "cells2d", {}, ""),

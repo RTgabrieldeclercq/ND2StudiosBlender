@@ -212,6 +212,14 @@ MODULES: Tuple[str, ...] = (
     # 2026-10-09: a saved DIC/DVC/PIV/SerialTrack trial read back (nodegraph.analysis_store),
     # appended for the same reason
     "io.load_analysis",
+    # 2026-10-09: the Field cards — a measured displacement / velocity field's gradient and
+    # what follows from it (strain, rotation and curl, volume change, stress). Appended, like
+    # everything since V2.20: this list's order is the link-drag search menu's order.
+    "field.gradient",
+    "field.strain",
+    "field.rotation",
+    "field.volume_change",
+    "field.stress",
 )
 
 

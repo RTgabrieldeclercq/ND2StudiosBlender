@@ -31862,6 +31862,227 @@ def test_dic_stages() -> None:
         f"missing grid refused by name; bundle:dic places 6 wired nodes in a frame")
 
 
+def test_field_mechanics() -> None:
+    """The Field cards (2026-10-09): ``kernels/field_mechanics`` against analytic fields on
+    both gradient paths in 2-D and 3-D, then Field Gradient → Strain → Rotation & Curl →
+    Volume Change → Stress through the Engine on a lattice with holes, the velocity branch,
+    tracked (current-position) fields, and the refusals."""
+    import nodegraph.kernels.field_mechanics as FM
+    from nodegraph.units import recorded_unit
+    from nodegraph.bundles import BUNDLES
+    from nodegraph.structure import StructureTable
+    from nodegraph.nodes import COMPUTES
+
+    # ── 1. the kernel on analytic fields ─────────────────────────────────────────────
+    yy, xx = np.mgrid[0:200:16, 0:240:16]
+    co = np.column_stack([yy.ravel(), xx.ravel()]).astype(float)
+    sc = np.array([0.5, 0.5])
+    X = co * sc
+    A = np.array([[0.02, -0.01], [0.03, 0.015]])
+    u = X @ A.T + np.array([1.0, -2.0])
+    for meth, tol in (("lattice", 1e-10), ("local_fit", 1e-8)):
+        r = FM.gradient(co, sc, u, method=meth)
+        assert r.method == meth and r.valid.all(), (meth, r.method, r.valid.mean())
+        assert np.nanmax(np.abs(r.G - A)) < tol, (meth, np.nanmax(np.abs(r.G - A)))
+    keep = np.ones(len(co), bool)
+    keep[[50, 51, 80]] = False                      # holes: one-sided beside them, no spread
+    r = FM.gradient(co[keep], sc, u[keep], method="auto")
+    assert r.method == "lattice" and np.nanmax(np.abs(r.G - A)) < 1e-10
+    # only node (4, 5) — BOTH y-neighbours (3, 5) and (5, 5) are holes — has no y-derivative
+    lost = co[keep][~r.valid]
+    assert lost.tolist() == [[64.0, 80.0]], lost
+    assert FM.lattice_of(co[::7] + 0.37 * np.arange(len(co[::7]))[:, None]) is None
+    # a 10° rigid turn, counter-clockwise ON SCREEN (y runs down the rows)
+    th = np.radians(10.0)
+    yup = -X[:, 0]
+    xr = np.cos(th) * X[:, 1] - np.sin(th) * yup
+    yupr = np.sin(th) * X[:, 1] + np.cos(th) * yup
+    G = FM.gradient(co, sc, np.column_stack([-yupr - X[:, 0], xr - X[:, 1]])).G
+    assert abs(np.nanmean(FM.rotation_deg(G)) - 10.0) < 1e-9, np.nanmean(FM.rotation_deg(G))
+    for m in ("green_lagrange", "euler_almansi", "hencky"):
+        assert np.nanmax(np.abs(FM.strain(G, m))) < 1e-12, m       # rotation-free
+    assert np.nanmax(np.abs(FM.strain(G, "infinitesimal"))) > 0.01  # why the measures exist
+    G = FM.gradient(co, sc, X * 0.1).G
+    assert abs(np.nanmean(FM.volume_change(G)["jacobian"]) - 1.21) < 1e-12
+    g = 0.05                                         # simple shear u_x = g·y: the top moves left
+    G = FM.gradient(co, sc, np.column_stack([np.zeros(len(X)), g * X[:, 0]])).G
+    assert abs(np.nanmean(FM.curl(G)["curl"]) - g) < 1e-12
+    assert abs(np.nanmean(FM.volume_change(G)["jacobian"]) - 1.0) < 1e-12
+    vals, ang = FM.principal(FM.strain(G))
+    assert np.allclose(vals[0], [g / 2, -g / 2]) and abs(ang[0] + 45.0) < 1e-9, (vals[0], ang[0])
+    e = FM.equivalent_strain(np.array([[[-0.005, 0.0], [0.0, 0.01]]]))
+    assert abs(e[0] - 0.01) < 1e-12, e              # uniaxial, incompressible: ε_eq = ε
+    # 3-D on an ANISOTROPIC stack: the auto radius must reach the planes above and below
+    zz, y3, x3 = np.mgrid[0:6, 0:5, 0:7]
+    c3 = np.column_stack([zz.ravel(), y3.ravel(), x3.ravel()]).astype(float)
+    s3 = np.array([2.0, 0.5, 0.5])
+    A3 = np.array([[0.01, 0.02, -0.01], [0.0, 0.03, 0.005], [0.01, -0.02, 0.02]])
+    for meth in ("lattice", "local_fit"):
+        r = FM.gradient(c3, s3, (c3 * s3) @ A3.T, method=meth)
+        assert r.valid.all() and np.nanmax(np.abs(r.G - A3)) < 1e-9, (meth, r.valid.mean())
+    G3 = FM.gradient(c3, s3, (c3 * s3) * 0.1).G
+    assert abs(np.nanmean(FM.volume_change(G3)["jacobian"]) - 1.331) < 1e-12
+    cu = FM.curl(np.array([[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.04, 0.0]]]))
+    assert abs(cu["curl_view"][0] - 0.04) < 1e-12 and abs(cu["curl_z"][0] + 0.04) < 1e-12
+    # stress: Hooke, then plane stress σ_zz = 0 for both hyperelastic laws, which agree with
+    # Hooke to O(ε²); the Newtonian fluid's shear stress
+    E, NU = 1000.0, 0.3
+    Gu = np.zeros((1, 2, 2))
+    Gu[0, 1, 1], Gu[0, 0, 0] = 1e-3, -NU * 1e-3
+    s, _w = FM.stress(Gu, "linear_elastic", youngs_modulus=E, poisson_ratio=NU, plane="stress")
+    assert abs(s[0, 2, 2] - 1.0) < 1e-12 and abs(s[0, 1, 1]) < 1e-12 and s[0, 0, 0] == 0.0
+    Gs = np.array([[[0.05, 0.02], [0.01, -0.03]]])
+    Gsmall = np.array([[[1e-4, 2e-5], [3e-5, -2e-5]]])
+    hooke = FM.stress(Gsmall, "linear_elastic", youngs_modulus=E, poisson_ratio=NU)[0]
+    for mdl in ("saint_venant_kirchhoff", "neo_hookean"):
+        s2, w2 = FM.stress(Gs, mdl, youngs_modulus=E, poisson_ratio=NU, plane="stress")
+        assert abs(s2[0, 0, 0]) < 1e-9 and w2[0] > 0, (mdl, s2[0, 0, 0])
+        rel = np.abs(FM.stress(Gsmall, mdl, youngs_modulus=E, poisson_ratio=NU)[0] - hooke)
+        assert rel.max() / np.abs(hooke).max() < 1e-3, (mdl, rel.max())
+    Gv = np.zeros((1, 2, 2))
+    Gv[0, 1, 0] = 2.0                                 # dv_x/dy: a shear flow
+    sv, _w = FM.stress(Gv, "newtonian_fluid", viscosity=0.5)
+    assert abs(sv[0, 2, 1] - 1.0) < 1e-12 and abs(np.trace(sv[0])) < 1e-12
+    for bad in ({"youngs_modulus": -1.0}, {"poisson_ratio": 0.5}):
+        try:
+            FM.stress(Gs, "linear_elastic", **bad)
+            raise AssertionError(f"{bad} was accepted")
+        except ValueError:
+            pass
+
+    # ── 2. the cards through the Engine: a PIV-shaped lattice with holes, two frames ──
+    define_node("io.fieldmechseed", "S", outputs=[OutDataset()])
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=128, x=128)
+    md = {"pixel_size_um": 0.5, "piv_reference_mode": "fixed_frame"}
+    gy, gx = np.mgrid[8:120:8, 8:120:8]
+    py, px_ = gy.ravel().astype(float), gx.ravel().astype(float)
+    cols: Dict[str, list] = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x", "disp_y",
+                                             "disp_x", "vy", "vx")}
+    n0 = py.size
+    for t in range(2):
+        uu = (np.column_stack([py, px_]) * 0.5) @ A.T * t
+        for k, v in (("id", np.arange(t * n0, (t + 1) * n0)), ("m", np.zeros(n0)),
+                     ("t", np.full(n0, t)), ("c", np.zeros(n0)), ("z", np.zeros(n0)),
+                     ("y", py), ("x", px_), ("disp_y", uu[:, 0]), ("disp_x", uu[:, 1]),
+                     ("vy", uu[:, 0] / 2.0), ("vx", uu[:, 1] / 2.0)):
+            cols[k] += list(v)
+    arr = {k: np.asarray(v) for k, v in cols.items()}
+    hole = np.ones(arr["id"].size, bool)
+    hole[[30, 31, 200]] = False
+    arr = {k: v[hole] for k, v in arr.items()}
+    ds = Dataset(axes=ax, metadata=md).with_structure(
+        StructureTable(Domain.POINT, arr, layer="piv", z_kind="plane_index"))
+    env = MetaEnvelope(axes=ax, metadata=md)
+
+    def chain(steps):
+        g = Graph()
+        g.add(NodeInstance("S", "io.fieldmechseed"))
+        prev = "S"
+        for nid, op, params, modes in steps:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+            g.connect(prev, nid, dst_socket="data")
+            prev = nid
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull(prev)
+
+    e, o = chain([("G", "field.gradient", {}, {}),
+                  ("E", "field.strain", {}, {"measure": "green_lagrange"}),
+                  ("R", "field.rotation", {}, {}),
+                  ("V", "field.volume_change", {}, {}),
+                  ("T", "field.stress", {}, {"model": "neo_hookean", "plane": "stress"})])
+    get = lambda name: np.asarray(o.get(Domain.POINT, name, layer="piv").values)
+    t1 = get("t") == 1
+    Gc = np.stack([get(c) for c in ("grad_yy", "grad_yx", "grad_xy", "grad_xx")], axis=1)
+    assert np.nanmax(np.abs(Gc[t1] - A.ravel())) < 1e-10 and np.nanmax(np.abs(Gc[~t1])) < 1e-12
+    F = np.eye(2) + A
+    El = 0.5 * (F.T @ F - np.eye(2))
+    assert np.nanmax(np.abs(get("strain_yx")[t1] - El[0, 1])) < 1e-12
+    assert np.nanmax(np.abs(get("strain_xx")[t1] - El[1, 1])) < 1e-12
+    assert np.nanmax(np.abs(get("jacobian")[t1] - np.linalg.det(F))) < 1e-12
+    assert np.nanmax(np.abs(get("curl")[t1] - (A[1, 0] - A[0, 1]))) < 1e-12
+    assert np.nanmax(np.abs(get("stress_zz"))) < 1e-8 and np.nanmin(get("von_mises")[t1]) > 0
+    assert len(get("id")) == int(hole.sum()), "the rows must come back one for one"
+    assert recorded_unit(o.metadata, Domain.POINT, "von_mises", "piv") == "Pa"
+    assert recorded_unit(o.metadata, Domain.POINT, "strain_xx", "piv") == ""
+    assert recorded_unit(o.metadata, Domain.POINT, "rotation_deg", "piv") == "deg"
+    fm = o.metadata["__field_mechanics__"]["piv"]
+    assert fm["gradient"]["method"] == "lattice" and fm["strain"]["measure"] == "green_lagrange"
+    assert fm["stress"]["model"] == "neo_hookean" and fm["stress"]["plane"] == "stress"
+    # each card re-keys only on its own state: a second measure off the same gradient is ONE
+    # more compute, not a re-differentiation
+    g5 = Graph()
+    g5.add(NodeInstance("S", "io.fieldmechseed"))
+    g5.add(NodeInstance("G", "field.gradient"))
+    g5.add(NodeInstance("E1", "field.strain"))
+    g5.add(NodeInstance("E2", "field.strain", modes={"measure": "hencky"}))
+    for a_, b_ in (("S", "G"), ("G", "E1"), ("G", "E2")):
+        g5.connect(a_, b_, dst_socket="data")
+    e5 = Engine(g5, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+    e5.pull("E1")
+    n1 = e5.compute_count
+    e5.pull("E2")
+    assert e5.compute_count - n1 == 1, "a strain-measure change re-ran more than Strain"
+    assert e5.entry("E1").recipe_hash != e5.entry("E2").recipe_hash
+    # the velocity branch: strain RATE (1/s), vorticity, divergence; a solid's law refused
+    _e3, o3 = chain([("G", "field.gradient", {}, {"quantity": "velocity"}),
+                     ("E", "field.strain", {}, {}), ("R", "field.rotation", {}, {}),
+                     ("V", "field.volume_change", {}, {}),
+                     ("T", "field.stress", {"viscosity": 0.5}, {"model": "newtonian_fluid"})])
+    g3 = lambda name: np.asarray(o3.get(Domain.POINT, name, layer="piv").values)
+    assert recorded_unit(o3.metadata, Domain.POINT, "strain_xx", "piv") == "1/s"
+    assert np.nanmax(np.abs(g3("strain_xx")[t1] - A[1, 1] / 2.0)) < 1e-12
+    names3 = {a.name for a in o3.layers_on(Domain.POINT) if a.layer == "piv"}
+    assert "rotation_deg" not in names3 and "jacobian" not in names3 and "divergence" in names3
+    assert np.isnan(g3("pressure")).all() and "strain_energy" not in names3
+    for steps, needle in (
+            ([("E", "field.strain", {}, {})], "Field Gradient"),
+            ([("G", "field.gradient", {}, {"quantity": "velocity"}),
+              ("E", "field.strain", {}, {"measure": "hencky"})], "rate"),
+            ([("G", "field.gradient", {}, {"quantity": "velocity"}),
+              ("T", "field.stress", {}, {})], "velocity"),
+            ([("G", "field.gradient", {}, {}),
+              ("T", "field.stress", {}, {"model": "newtonian_fluid"})], "displacement"),
+            ([("G", "field.gradient", {}, {"method": "local_fit"}),
+              ("T", "field.stress", {"poisson_ratio": 0.5}, {})], "0.5")):
+        try:
+            chain(steps)
+            raise AssertionError(f"{steps} was not refused")
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc)[:200])
+    # a TRACKED field: rows sit where the particles ARE, so the fit moves them back by u
+    rng = np.random.default_rng(5)
+    Xr = rng.uniform(5, 120, size=(300, 2))
+    ur = (Xr * 0.5) @ A.T
+    cur = Xr + ur / 0.5
+    tr = {"id": np.arange(300), "m": np.zeros(300), "t": np.ones(300), "c": np.zeros(300),
+          "z": np.zeros(300), "y": cur[:, 0], "x": cur[:, 1], "track_id": np.arange(1, 301),
+          "disp_y": ur[:, 0], "disp_x": ur[:, 1]}
+    ds_t = Dataset(axes=ax, metadata={"pixel_size_um": 0.5}).with_structure(
+        StructureTable(Domain.POINT, tr, layer="tracks_field", z_kind="plane_index"))
+    gt = Graph()
+    gt.add(NodeInstance("S", "io.fieldmechseed"))
+    gt.add(NodeInstance("G", "field.gradient"))
+    gt.connect("S", "G", dst_socket="data")
+    ot = Engine(gt, computes=COMPUTES, seeds={"S": ds_t},
+                meta_seeds={"S": MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.5})}).pull("G")
+    Gt = np.stack([np.asarray(ot.get(Domain.POINT, c, layer="tracks_field").values)
+                   for c in ("grad_yy", "grad_yx", "grad_xy", "grad_xx")], axis=1)
+    ok = np.isfinite(Gt).all(axis=1)
+    assert ok.mean() > 0.9 and np.abs(Gt[ok] - A.ravel()).max() < 1e-8, np.abs(Gt[ok] - A.ravel()).max()
+    assert ot.metadata["__field_mechanics__"]["tracks_field"]["gradient"]["positions"] == "current"
+    b = BUNDLES.get("bundle:mechanics")
+    assert b is not None and b.op_keys == ("field.gradient", "field.strain", "field.stress")
+    _ok("field mechanics (2026-10-09): the kernel recovers an affine gradient exactly on the "
+        "lattice (holes one-sided, no spread) and by local fit, in 2-D and on an anisotropic "
+        "3-D stack; a 10° on-screen CCW turn reads rotation +10° with zero Green-Lagrange / "
+        "Almansi / Hencky strain; J 1.21 / 1.331; simple shear curl +γ, principal −45°; "
+        "Hooke, plane-stress SVK and neo-Hookean σ_zz = 0 and → Hooke at small strain; "
+        "Newtonian σ_xy = ηγ̇. Through the Engine Field Gradient → Strain → Rotation → Volume "
+        "Change → Stress write exact columns back onto the same rows with their units; a new "
+        "measure re-keys only Strain; the velocity branch gives rates; tracked rows are moved "
+        "back by u; every misuse refused by name; bundle:mechanics")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -31935,6 +32156,7 @@ def main() -> int:
     test_analysis_parallel()
     test_quick_scope()
     test_analysis_mesh()
+    test_field_mechanics()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

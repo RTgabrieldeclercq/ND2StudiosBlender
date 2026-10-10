@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 131,
-    "categories": 16,
-    "roles": 23,
+    "nodes": 136,
+    "categories": 17,
+    "roles": 24,
     "stages": 5,
-    "inputs": 901,
-    "outputs": 138,
+    "inputs": 917,
+    "outputs": 143,
     "gui_ops_included": true
   },
   "stages": {
@@ -196,7 +196,8 @@
         "object_filtering_and_selection",
         "table_synthesis",
         "tracking",
-        "motion_and_deformation_fields"
+        "motion_and_deformation_fields",
+        "field_mechanics"
       ],
       "ops": [
         "analysis.accumulate_field",
@@ -223,6 +224,11 @@
         "dvc.initial_guess",
         "dvc.local_match",
         "dvc.strain",
+        "field.gradient",
+        "field.rotation",
+        "field.strain",
+        "field.stress",
+        "field.volume_change",
         "math.image",
         "math.mask",
         "math.values",
@@ -926,7 +932,7 @@
         {
           "op": "dic.strain",
           "label": "DIC Strain",
-          "summary": "pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — four strain_* columns in image axes + strain_valid — without reading a frame, so a new measure or radius re-runs in a second."
+          "summary": "pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — four symmetric strain_* columns in image axes + strain_valid — without reading a frame, so a new measure or radius re-runs in a second."
         },
         {
           "op": "dvc.global_step",
@@ -972,6 +978,39 @@
           "op": "piv.validate",
           "label": "PIV Validate",
           "summary": "OpenPIV's validation as a node: signal-to-noise, global limit, std and median tests flag vectors; flagged ones are filled from neighbours (or left NaN). Writes flags / replaced on the pass's rows."
+        }
+      ]
+    },
+    "field_mechanics": {
+      "label": "Field mechanics",
+      "stage": "quantify",
+      "description": "What follows from a measured displacement or velocity field, written back onto the field's own table: its gradient (lattice differences or a local plane fit), strain under a chosen measure with principal values and von Mises equivalent, curl and finite rotation, the Jacobian / dilatation / divergence of volume change, and stress through a stated material law (Hooke, Saint Venant-Kirchhoff, neo-Hookean, Newtonian fluid).",
+      "count": 5,
+      "ops": [
+        {
+          "op": "field.gradient",
+          "label": "Field Gradient",
+          "summary": "The displacement (or velocity) gradient of a measured field on every node — grad_* columns written back onto the field's table, by lattice differences or a local plane fit. Strain, Rotation & Curl, Volume Change and Stress read it."
+        },
+        {
+          "op": "field.rotation",
+          "label": "Rotation & Curl",
+          "summary": "The curl of a field (vorticity for a velocity) and the finite rotation of its polar decomposition, counter-clockwise on screen positive — from Field Gradient's grad_* columns."
+        },
+        {
+          "op": "field.strain",
+          "label": "Strain",
+          "summary": "The strain tensor of a field under the chosen measure — components, principal values and angle, von Mises equivalent, max shear, trace — from Field Gradient's grad_* columns; the strain RATE for a velocity field."
+        },
+        {
+          "op": "field.stress",
+          "label": "Stress",
+          "summary": "Cauchy stress from a field's gradient through a stated material law (Hooke, Saint Venant-Kirchhoff, neo-Hookean, or a Newtonian fluid) and its parameters — components, principal stresses, pressure, von Mises, max shear, strain energy."
+        },
+        {
+          "op": "field.volume_change",
+          "label": "Volume Change",
+          "summary": "The Jacobian det F (area ratio in 2-D, volume ratio in 3-D), the dilatation J − 1 and the divergence of a field — from Field Gradient's grad_* columns."
         }
       ]
     },
@@ -1185,6 +1224,13 @@
       "enhance.unsharp",
       "enhance.wavelet_denoise",
       "enhance.zs_deconvnet"
+    ],
+    "field": [
+      "field.gradient",
+      "field.rotation",
+      "field.strain",
+      "field.stress",
+      "field.volume_change"
     ],
     "flow": [
       "flow.advance",
@@ -2058,7 +2104,7 @@
           "role": "parameter",
           "is_field": false,
           "default": false,
-          "description": "Also emit the solver's own nodal displacement gradients as `strain_yy`, `strain_yx`, `strain_xy`, `strain_xx` columns — the same columns the DVC node writes. Prefer this to differencing the displacement field downstream: it is a smoothed finite-element fit rather than a difference of two neighbouring subsets, which on a 2% biaxial test recovers 0.01984 against a true 0.0200 where the raw per-subset gradient gives 0.01928. Costs roughly 20% more time. Off by default so the node stays a pure displacement measurement."
+          "description": "Also emit the solver's own nodal strain (the symmetric small strain of its FEM displacement gradient; tensor shear in `strain_yx` = `strain_xy`) as `strain_yy`, `strain_yx`, `strain_xy`, `strain_xx` — the same columns the DVC node writes. Prefer this to differencing the displacement field downstream: it is a smoothed finite-element fit rather than a difference of two neighbouring subsets, which on a 2% biaxial test recovers 0.01984 against a true 0.0200 where the raw per-subset gradient gives 0.01928. Costs roughly 20% more time. Off by default so the node stays a pure displacement measurement."
         },
         {
           "name": "admm_max_iter",
@@ -8942,7 +8988,7 @@
       ],
       "module": "nodegraph/catalog/analysis/dic_stages.py",
       "gui_only": false,
-      "summary": "pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — four strain_* columns in image axes + strain_valid — without reading a frame, so a new measure or radius re-runs in a second.",
+      "summary": "pyALDIC §8 as a node: the nodal displacement gradient under the chosen measure — four symmetric strain_* columns in image axes + strain_valid — without reading a frame, so a new measure or radius re-runs in a second.",
       "overview": "pyALDIC Section 8 as a node: the nodal displacement gradient from the field on the lattice — plane fit over ``strain_plane_fit_rad`` px or the FEM gradient — under the chosen strain measure, with pyALDIC's edge trimming (``strain_valid``). Writes the four ``strain_<i><j>`` columns in image axes (the cross terms sign-corrected from pyALDIC's y-up world frame, exactly as the single node does) and ``strain_valid``. No image is read beyond the ROI mask: the lattice is rebuilt from provenance, so a new measure or radius re-runs in a second with the correlation untouched. Resolved spec: category analysis; op ``dic.strain``; reads POINT (+ the optional ROI Voxel mask), adds POINT; footprint WHOLE_SERIES with empty kernel_axes. Stamps ``dic_strain_method`` / ``dic_strain_type``. Kernel: :func:`nodegraph.kernels.dic_correlate.dic_stage_strain`.",
       "overview_source": "compute",
       "dimensionality": {
@@ -13334,6 +13380,583 @@
         "weights_path"
       ]
     },
+    "field.gradient": {
+      "op": "field.gradient",
+      "label": "Field Gradient",
+      "category": "field",
+      "role": "field_mechanics",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/field/gradient.py",
+      "gui_only": false,
+      "summary": "The displacement (or velocity) gradient of a measured field on every node — grad_* columns written back onto the field's table, by lattice differences or a local plane fit. Strain, Rotation & Curl, Volume Change and Stress read it.",
+      "overview": "The gradient of a field layer's displacement (or velocity), per independent field. Resolved spec (§0, 2026-10-09): * **Kind** analysis on a Point field → ``op_key=\"field.gradient\"``, category ``field``. Reads POINT, adds POINT (columns on the SAME table — the field layer). No pixels. * **Data contract** adds ``grad_<i><j>`` (``d u_i / d X_j``, image axes slowest first: 4 columns in 2-D, 9 in 3-D) and ``grad_valid``; dimensionless for a displacement, 1/s for a velocity (recorded in the units table). Stamps ``__field_mechanics__ [layer][\"gradient\"]`` = quantity, method(s), radius, smoothing, positions, dim, whether the field is a frame-to-frame increment. * **2D/3D** INHERITED from the layer's ``z_kind`` (§7b): ``plane_index`` → every (m, t, c, z) plane is its own 2-D field; ``subpixel`` → a (m, t, c) frame is a volume. Nothing is ever differentiated across planes, frames, channels or positions. * **Footprint** WHOLE_SERIES, empty ``kernel_axes``: it reads every row of the table and touches no voxel. * **Backend** :func:`nodegraph.kernels.field_mechanics.gradient` — NaN-aware finite differences on a regular lattice (correlation grids, holes included), or the moving-least-squares plane fit of ``track_field`` for any other layout. * **Calibration** ``pixel_size_um`` (+ ``z_step_um`` in 3-D) via ``ctx.calib`` — the gradient is per µm; a missing value is refused, never defaulted to 1. * **Numba** no: one batched numpy solve or a few array differences per field.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "method",
+          "label": "Method",
+          "choices": [
+            "auto",
+            "lattice",
+            "local_fit"
+          ],
+          "default": "auto",
+          "description": "How the field is differentiated.",
+          "choice_docs": {
+            "auto": "Lattice differences when the nodes form a regular grid (DIC, PIV and DVC grids, holes allowed), otherwise the local plane fit (a refined DIC mesh, tracked particles).",
+            "lattice": "Central differences between neighbouring grid nodes, one-sided beside holes and at edges — the sharpest gradient a grid allows. Refused when the nodes are not a regular grid.",
+            "local_fit": "A weighted plane fitted through the nodes within the radius — any layout, smoother than differences (the radius is the gauge length); nodes with too few neighbours come out NaN."
+          }
+        },
+        {
+          "name": "quantity",
+          "label": "Field",
+          "choices": [
+            "auto",
+            "displacement",
+            "velocity"
+          ],
+          "default": "auto",
+          "description": "Which vector the gradient is taken of. The table usually says: a correlation writes a displacement, PIV can add a velocity beside it.",
+          "choice_docs": {
+            "auto": "The displacement (disp_*) when the table has one, else the velocity (v*). PIV with velocity on carries both, and this takes the displacement.",
+            "displacement": "disp_* in µm: the gradient is dimensionless, F = I + grad, and the finite strain measures, rotation and volume change all apply.",
+            "velocity": "v* in µm/s: the velocity gradient (1/s). Strain becomes the strain RATE, curl the vorticity, volume change the divergence; the finite measures and a solid's stress do not apply and are refused."
+          }
+        },
+        {
+          "name": "positions",
+          "label": "Positions",
+          "choices": [
+            "auto",
+            "reference",
+            "current"
+          ],
+          "default": "auto",
+          "description": "Whether a row's y/x are where the material WAS (the reference configuration) or where it IS now. The gradient must be taken in the reference configuration for F = I + grad to hold.",
+          "choice_docs": {
+            "auto": "Reference for a correlation grid (DIC / PIV / DVC nodes sit on the reference image), current for a tracked field (a track_id column: Track Field, the linkers), whose rows move with the particles.",
+            "reference": "Fit at y/x as given. Right for every correlation grid; on tracks it would fit the SPATIAL gradient, which turns Green-Lagrange into Almansi.",
+            "current": "Fit at y/x minus the displacement — where each particle started. Right for tracks; on a correlation grid it would move nodes that never moved."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Field layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "Which Point table holds the field — the one a DIC / PIV / DVC node, a staged card, Track Field or Load Analysis wrote (`dic`, `piv`, `dvc`, …). Blank picks the only field on the wire; with two, name one. The card writes its columns BACK ONTO THE SAME ROWS, so every later card and the Viewer's Field overlay see the whole chain on one table."
+        },
+        {
+          "name": "radius",
+          "label": "Fit radius",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "available_in": {
+            "method": [
+              "auto",
+              "local_fit"
+            ]
+          },
+          "pick_kind": "distance",
+          "description": "Radius of the neighbourhood a plane is fitted over (local fit), in µm — the gauge length of every quantity derived from the gradient. 0 = automatic: 1.5x the distance to each node's first full shell of neighbours (about 2 node spacings; on a stack it reaches the planes above and below). LARGER smooths and steadies strain but blurs concentrations and loses edge nodes; SMALLER follows sharp features and is noisier. Inert when the lattice path runs."
+        },
+        {
+          "name": "neighbors",
+          "label": "Neighbours",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "method": [
+              "auto",
+              "local_fit"
+            ]
+          },
+          "description": "How many nearest nodes are considered before the radius cut (local fit). 0 = automatic from the radius and the field's density. Raise it only if a large radius on a dense field leaves nodes invalid; it costs memory linearly."
+        },
+        {
+          "name": "smooth",
+          "label": "Pre-smoothing",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "method": [
+              "auto",
+              "lattice"
+            ]
+          },
+          "description": "Gaussian smoothing of the field before differencing, in NODE spacings (lattice path); 0 = off. Holes neither contribute nor get filled, so a hole does not drag its neighbours toward zero. 1 suppresses node-to-node noise that differencing amplifies; it also lowers peak strain values."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_field_gradient",
+      "meta_transform": null,
+      "extra_layers": "layer_announce",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "params_read": [
+        "__modes__",
+        "neighbors",
+        "radius",
+        "smooth",
+        "source"
+      ]
+    },
+    "field.rotation": {
+      "op": "field.rotation",
+      "label": "Rotation & Curl",
+      "category": "field",
+      "role": "field_mechanics",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/field/rotation.py",
+      "gui_only": false,
+      "summary": "The curl of a field (vorticity for a velocity) and the finite rotation of its polar decomposition, counter-clockwise on screen positive — from Field Gradient's grad_* columns.",
+      "overview": "Curl and rotation from a field layer's gradient. Resolved spec (§0, 2026-10-09): * **Kind** analysis on a Point field → ``op_key=\"field.rotation\"``, category ``field``. Reads POINT (``grad_*``), adds POINT columns on the same table; WHOLE_SERIES, empty kernel_axes; dimensionality inherited from the gradient. * **2-D** ``curl = du_x/dy - du_y/dx`` in image axes — **positive counter-clockwise as seen on screen** (y runs down the rows), twice the small rotation angle in radians; ``rotation_deg`` the exact finite rotation of ``F = R U``, same sign. * **3-D** ``curl_z, curl_y, curl_x`` in the frame (x right, y down, z = plane index), right-handed when z runs away from the viewer; ``curl_mag``; ``curl_view = -curl_z``, the on-screen in-plane part with the 2-D sign; ``rotation_deg`` the unsigned angle of R. * **Velocity** the curl is the vorticity (1/s); a rate has no finite rotation, so ``rotation_deg`` is not written. * **Backend** :func:`nodegraph.kernels.field_mechanics.curl` / ``rotation_deg``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Field layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "Which Point table holds the field — the one a DIC / PIV / DVC node, a staged card, Track Field or Load Analysis wrote (`dic`, `piv`, `dvc`, …). Blank picks the only field on the wire; with two, name one. The card writes its columns BACK ONTO THE SAME ROWS, so every later card and the Viewer's Field overlay see the whole chain on one table."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_field_rotation",
+      "meta_transform": null,
+      "extra_layers": "layer_announce",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "params_read": [
+        "source"
+      ]
+    },
+    "field.strain": {
+      "op": "field.strain",
+      "label": "Strain",
+      "category": "field",
+      "role": "field_mechanics",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/field/strain.py",
+      "gui_only": false,
+      "summary": "The strain tensor of a field under the chosen measure — components, principal values and angle, von Mises equivalent, max shear, trace — from Field Gradient's grad_* columns; the strain RATE for a velocity field.",
+      "overview": "Strain from a field layer's gradient. Resolved spec (§0, 2026-10-09): * **Kind** analysis on a Point field → ``op_key=\"field.strain\"``, category ``field``. Reads POINT (the ``grad_*`` columns), adds POINT columns on the same table. * **Data contract** ``strain_<i><j>`` (symmetric, TENSOR shear — half the engineering shear; image axes slowest first), ``strain_p1..pD`` (principal values, largest first), ``strain_angle_deg`` (2-D: the largest principal axis, counter-clockwise on screen from +x), ``strain_eq`` (von Mises equivalent; 2-D takes e_zz from incompressibility, the commercial-DIC convention), ``strain_max_shear`` ((e_max - e_min)/2) and ``strain_vol`` (the trace). Same names as ``analysis.track_field`` / ``dvc.strain``. * **Velocity** a velocity gradient gives the strain RATE ``sym(L)`` under the same names in 1/s (the units table says which); a finite measure is refused there. * **2D/3D** inherited from the gradient (4 or 9 components); **footprint** WHOLE_SERIES, empty kernel_axes; **backend** :func:`nodegraph.kernels.field_mechanics.strain` (``field_math.strain_from_gradient`` — the measure code ``dvc.strain`` and Track Field use).",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "measure",
+          "label": "Measure",
+          "choices": [
+            "infinitesimal",
+            "green_lagrange",
+            "euler_almansi",
+            "hencky"
+          ],
+          "default": "infinitesimal",
+          "description": "Which strain tensor is computed from the gradient. They agree to first order; they part ways above a few percent strain or under any noticeable rotation.",
+          "choice_docs": {
+            "infinitesimal": "sym(grad) — linear, the classic small-strain tensor. Wrong under rotation: a rigid 10° turn reads as 1.5 % strain. Fine below ~2 % strain with little rotation; the only choice for a velocity (it is then the strain rate).",
+            "green_lagrange": "(FᵀF − I)/2 in the REFERENCE configuration — exact under any rotation, the measure finite-strain solid mechanics and Saint Venant-Kirchhoff use; stretches read larger than compressions of the same size.",
+            "euler_almansi": "(I − F⁻ᵀF⁻¹)/2 in the CURRENT configuration — exact under rotation, referred to the deformed shape; compressions read larger than stretches.",
+            "hencky": "ln(U), the logarithmic (true) strain — rotation-free and symmetric between stretch and compression, additive over successive stretches; the large-strain measure for soft gels."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Field layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "Which Point table holds the field — the one a DIC / PIV / DVC node, a staged card, Track Field or Load Analysis wrote (`dic`, `piv`, `dvc`, …). Blank picks the only field on the wire; with two, name one. The card writes its columns BACK ONTO THE SAME ROWS, so every later card and the Viewer's Field overlay see the whole chain on one table."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_field_strain",
+      "meta_transform": null,
+      "extra_layers": "layer_announce",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "params_read": [
+        "__modes__",
+        "source"
+      ]
+    },
+    "field.stress": {
+      "op": "field.stress",
+      "label": "Stress",
+      "category": "field",
+      "role": "field_mechanics",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/field/stress.py",
+      "gui_only": false,
+      "summary": "Cauchy stress from a field's gradient through a stated material law (Hooke, Saint Venant-Kirchhoff, neo-Hookean, or a Newtonian fluid) and its parameters — components, principal stresses, pressure, von Mises, max shear, strain energy.",
+      "overview": "Stress from a field layer's gradient and a material model. Resolved spec (§0, 2026-10-09): * **Kind** analysis on a Point field → ``op_key=\"field.stress\"``, category ``field``. Reads POINT (``grad_*``), adds POINT columns on the same table; WHOLE_SERIES, empty kernel_axes; dimensionality inherited from the gradient. * **Laws** (:func:`nodegraph.kernels.field_mechanics.stress`): ``linear_elastic`` (Hooke on sym(grad), ``track_field``'s), ``saint_venant_kirchhoff`` (Green-Lagrange, pushed forward), ``neo_hookean`` (compressible), all from E and ν; ``newtonian_fluid`` — the deviatoric viscous stress 2η dev(D) of a VELOCITY field. Elastic laws on a velocity, or the fluid on a displacement, are refused. * **2-D** ``plane``: ``strain`` (``F_zz = 1``, a thick specimen — a gel slab) or ``stress`` (``σ_zz = 0``, a thin free sheet); inert for a 3-D field. * **Columns** ``stress_<i><j>`` in (z, y, x) (2-D: zz, yy, yx, xy, xx), ``stress_p1..p3`` (largest first), ``pressure`` (−tr/3, compression positive; NaN for the fluid, whose pressure the velocity does not determine), ``von_mises``, ``max_shear`` (Tresca), ``strain_energy`` (elastic laws; J/m³ = Pa). Units: the modulus's (Pa). * Names match ``analysis.track_field``'s, so its tables and plots read both alike.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "model",
+          "label": "Material law",
+          "choices": [
+            "linear_elastic",
+            "saint_venant_kirchhoff",
+            "neo_hookean",
+            "newtonian_fluid"
+          ],
+          "default": "linear_elastic",
+          "description": "The constitutive law turning the gradient into stress. Every elastic law agrees with Hooke below ~1 % strain; they part ways beyond it.",
+          "choice_docs": {
+            "linear_elastic": "Hooke's law on the small strain sym(grad) — stress proportional to strain. Right for small strains with little rotation; a rotation reads as spurious stress.",
+            "saint_venant_kirchhoff": "Hooke's law on the Green-Lagrange strain, pushed to the deformed shape — rotation-proof, but it softens unphysically under large compression.",
+            "neo_hookean": "The compressible neo-Hookean solid — the standard large-strain law for rubbery gels and soft tissue; stiffens under compression and stays well behaved at large stretch.",
+            "newtonian_fluid": "A viscous fluid: deviatoric stress 2η times the strain rate. Needs a VELOCITY field (PIV with velocity on); the pressure is not determined and is left blank."
+          }
+        },
+        {
+          "name": "plane",
+          "label": "2D assumption",
+          "choices": [
+            "strain",
+            "stress"
+          ],
+          "default": "strain",
+          "available_in": {
+            "model": [
+              "linear_elastic",
+              "neo_hookean",
+              "saint_venant_kirchhoff"
+            ]
+          },
+          "description": "What the unmeasured out-of-plane direction does in a 2-D field — it changes every stress value. Inert for a 3-D field.",
+          "choice_docs": {
+            "strain": "Plane strain: no out-of-plane stretch (F_zz = 1). A slice through a THICK specimen such as a gel slab, where the surrounding material holds the plane; σ_zz comes out non-zero.",
+            "stress": "Plane stress: no out-of-plane traction (σ_zz = 0). A THIN free sheet or membrane that may thin or thicken freely."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Field layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "Which Point table holds the field — the one a DIC / PIV / DVC node, a staged card, Track Field or Load Analysis wrote (`dic`, `piv`, `dvc`, …). Blank picks the only field on the wire; with two, name one. The card writes its columns BACK ONTO THE SAME ROWS, so every later card and the Viewer's Field overlay see the whole chain on one table."
+        },
+        {
+          "name": "youngs_modulus",
+          "label": "Young's modulus",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "Pa",
+          "default": 1000.0,
+          "available_in": {
+            "model": [
+              "linear_elastic",
+              "neo_hookean",
+              "saint_venant_kirchhoff"
+            ]
+          },
+          "description": "The material's stiffness E, in Pa. It scales every stress column LINEARLY (and strain energy) and sets their unit — enter it in Pa and the columns are Pa. The 1000 here is a placeholder, not a recommendation: a soft polyacrylamide or collagen gel is roughly 0.1-50 kPa; measure yours."
+        },
+        {
+          "name": "poisson_ratio",
+          "label": "Poisson ratio",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.45,
+          "available_in": {
+            "model": [
+              "linear_elastic",
+              "neo_hookean",
+              "saint_venant_kirchhoff"
+            ]
+          },
+          "description": "ν, from −1 to just under 0.5 (0.5 exactly — incompressible — is refused: the pressure is then not set by the strain at all; use 0.49 for a nearly-incompressible gel). Moves `pressure` strongly, `von_mises` far less, and in 2-D decides how much the out-of-plane direction stiffens the plane."
+        },
+        {
+          "name": "viscosity",
+          "label": "Viscosity",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "Pa*s",
+          "default": 0.001,
+          "available_in": {
+            "model": [
+              "newtonian_fluid"
+            ]
+          },
+          "description": "The fluid's dynamic viscosity η in Pa·s (water ≈ 0.001, glycerol ≈ 1.4). Every stress column is 2η times the strain-rate deviator, so it scales them linearly. Only read by the Newtonian-fluid law."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_field_stress",
+      "meta_transform": null,
+      "extra_layers": "layer_announce",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "params_read": [
+        "__modes__",
+        "poisson_ratio",
+        "source",
+        "viscosity",
+        "youngs_modulus"
+      ]
+    },
+    "field.volume_change": {
+      "op": "field.volume_change",
+      "label": "Volume Change",
+      "category": "field",
+      "role": "field_mechanics",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/field/volume_change.py",
+      "gui_only": false,
+      "summary": "The Jacobian det F (area ratio in 2-D, volume ratio in 3-D), the dilatation J − 1 and the divergence of a field — from Field Gradient's grad_* columns.",
+      "overview": "Jacobian, dilatation and divergence from a field layer's gradient. Resolved spec (§0, 2026-10-09): * **Kind** analysis on a Point field → ``op_key=\"field.volume_change\"``, category ``field``. Reads POINT (``grad_*``), adds POINT columns on the same table; WHOLE_SERIES, empty kernel_axes; dimensionality inherited from the gradient. * **Columns** ``jacobian = det(I + grad)`` — the local AREA ratio of a 2-D field (the out-of-plane stretch is not measured) or the VOLUME ratio of a 3-D one; 1 is no change, below 1 compaction. ``dilatation = J - 1``. ``divergence = tr(grad)``, the small-strain volumetric strain — equal to the dilatation to first order. * **Velocity** only ``divergence`` (1/s), the rate of volume change; a rate has no J. * **Backend** :func:`nodegraph.kernels.field_mechanics.volume_change`.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "point"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "source",
+          "label": "Field layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "Which Point table holds the field — the one a DIC / PIV / DVC node, a staged card, Track Field or Load Analysis wrote (`dic`, `piv`, `dvc`, …). Blank picks the only field on the wire; with two, name one. The card writes its columns BACK ONTO THE SAME ROWS, so every later card and the Viewer's Field overlay see the whole chain on one table."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_field_volume_change",
+      "meta_transform": null,
+      "extra_layers": "layer_announce",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "nodegraph/kernels/field_math.md",
+      "params_read": [
+        "source"
+      ]
+    },
     "flow.advance": {
       "op": "flow.advance",
       "label": "Search Step",
@@ -16235,13 +16858,17 @@
             "1/s",
             "counts",
             "rad",
-            "deg"
+            "deg",
+            "Pa",
+            "kPa"
           ],
           "choice_docs": {
             "1/s": "A rate per second — the unit of a divergence or curl, or of a count divided by a time in seconds.",
+            "Pa": "A pascal — a stress or pressure (N/m²), the unit of the Field Stress card's stress, pressure and von Mises columns when the modulus is given in Pa. Converts to kPa by a fixed factor.",
             "counts": "Camera intensity (ADU) — the unit of every `*_intensity` column and of the image's pixel values; a threshold level is in counts.",
             "deg": "An angle in degrees — for a constant stated in degrees; converts to radians by a fixed factor.",
             "frame": "A timepoint index of THIS series. Converts to seconds by the Dataset's frame interval; a constant in frames scales with the acquisition rate.",
+            "kPa": "A kilopascal (10³ Pa) — the usual scale for a soft gel's modulus and the stresses in it; converts to Pa by a fixed factor.",
             "min": "A minute (60 s) — for a constant stated in minutes, such as a treatment time; converts to seconds by a fixed factor.",
             "ms": "A millisecond (10⁻³ s) — for a constant stated in ms, an exposure or a short interval; converts to seconds by a fixed factor.",
             "nm": "A nanometre (10⁻³ µm) — for a constant stated in nm, an emission wavelength or a bead size; converts to µm by a fixed factor.",
@@ -16285,14 +16912,18 @@
             "1/s",
             "counts",
             "rad",
-            "deg"
+            "deg",
+            "Pa",
+            "kPa"
           ],
           "choice_docs": {
             "1/s": "A rate per second — the unit of a divergence or curl, or of a count divided by a time in seconds.",
+            "Pa": "A pascal — a stress or pressure (N/m²), the unit of the Field Stress card's stress, pressure and von Mises columns when the modulus is given in Pa. Converts to kPa by a fixed factor.",
             "auto": "Take A's unit as its producer recorded it, else as the catalog's naming convention says (`area` is px² or voxels by the table's dimensionality, `*_um` is µm, `*_intensity` is counts); unknown if neither knows.",
             "counts": "Camera intensity (ADU) — the unit of every `*_intensity` column and of the image's pixel values; a threshold level is in counts.",
             "deg": "An angle in degrees — for a constant stated in degrees; converts to radians by a fixed factor.",
             "frame": "A timepoint index of THIS series. Converts to seconds by the Dataset's frame interval; a constant in frames scales with the acquisition rate.",
+            "kPa": "A kilopascal (10³ Pa) — the usual scale for a soft gel's modulus and the stresses in it; converts to Pa by a fixed factor.",
             "min": "A minute (60 s) — for a constant stated in minutes, such as a treatment time; converts to seconds by a fixed factor.",
             "ms": "A millisecond (10⁻³ s) — for a constant stated in ms, an exposure or a short interval; converts to seconds by a fixed factor.",
             "nm": "A nanometre (10⁻³ µm) — for a constant stated in nm, an emission wavelength or a bead size; converts to µm by a fixed factor.",

@@ -3050,6 +3050,23 @@ takes it as Group by; CSV export writes it as it is.
 | **Image Math** | `math.image` | `Other` (optional second image) · `value` (the constant when `Other` is unwired) · op `add/subtract/multiply/divide/min/max/difference/mean` | Pixel arithmetic, lazy per plane, float. `Other` may be a projection / one timepoint / one channel of the same field (broadcasts), never a different field or a differently cropped branch (refused). `add` widens `bit_depth` by one bit, `multiply`/`divide` drop it, the rest keep it; ÷0 is NaN |
 | **Math** | `math.values` | `On` lever (global / label / point / track / voxel / plane / frame / timepoint / multipoint / channel) · `a` · `table` (structure domains, when ambiguous) · `b` (same domain on `Other` or `data`, or a Global scalar) · `value` + `value_unit` (the constant) · `a_unit` (override / unknown) · op `add/subtract/multiply/divide/power/min/max/abs/sqrt/log10/to_physical/to_pixels` · `name` | Arithmetic **with units** (`nodegraph.units`): like units for sums and extremes (B converted into A's unit by the calibration; different dimensions refused), composed for products and ratios, `to_physical`/`to_pixels` by pixel size / Z step / frame interval (refused by name without them). Result is a column beside A, or a layer/scalar, auto-named (`total_intensity_per_area`, `area_physical`) and **recorded with its unit**; the next card's picker offers it. Reduce → Scalar records its scalar's unit too |
 
+### Field mechanics (5) — 2026-10-09
+
+All five read a **field layer** — the Point table a DIC / PIV / DVC node, a staged card, Track
+Field or Load Analysis wrote — and **add columns to that same table**, so one table carries
+displacement → gradient → strain → stress and the Viewer can colour the image by any of them.
+2-D vs 3-D is **inherited** from the table's `z_kind` (per plane, or per volume), never a lever.
+Columns record their units (dimensionless, 1/s, deg, Pa). `bundle:mechanics` drops Field
+Gradient → Strain → Stress already wired.
+
+| Node | `op_key` | Key controls | Notes |
+|---|---|---|---|
+| **Field Gradient** | `field.gradient` | `source` (field layer; blank = the only one) · method `auto/lattice/local_fit` · `radius` µm (0 = auto, local fit) · `neighbors` (0 = auto) · `smooth` (node spacings, lattice) · field `auto/displacement/velocity` · positions `auto/reference/current` | Writes `grad_<i><j> = ∂u_i/∂X_j` (4 columns in 2-D, 9 in 3-D) and `grad_valid`. **The hinge:** every later Field card reads these columns, so the differentiation is chosen once, here. `lattice` takes central differences on a regular grid (one-sided beside holes and at edges — a node whose two neighbours along an axis are both missing gets no gradient); `local_fit` fits a plane over `radius` for any layout (refined DIC meshes, tracks), smoothing over that radius. On tracks (`track_id` present) the fit runs where each particle WAS (`x − u`); getting that backwards turns Green-Lagrange into Almansi. A velocity gives the velocity gradient (1/s) |
+| **Strain** | `field.strain` | measure `infinitesimal/green_lagrange/euler_almansi/hencky` | `strain_<i><j>` (symmetric, tensor shear), `strain_p1..` (largest first), `strain_angle_deg` (2-D, counter-clockwise on screen from +x), `strain_eq` (von Mises; 2-D takes e_zz from incompressibility, the commercial-DIC convention), `strain_max_shear`, `strain_vol` (trace). `infinitesimal` reads a rigid rotation as strain (10° → 1.5 %); the three finite measures do not. On a velocity field these are strain RATES (1/s) and the finite measures are refused |
+| **Rotation & Curl** | `field.rotation` | — | 2-D `curl` (= 2 × the small rotation, positive counter-clockwise on screen) and `rotation_deg` (the exact finite rotation of F = RU). 3-D `curl_z/y/x`, `curl_mag`, `curl_view` (the on-screen in-plane part, 2-D sign) and the unsigned `rotation_deg`. On a velocity field the curl is the vorticity (1/s) |
+| **Volume Change** | `field.volume_change` | — | `jacobian` = det F — an AREA ratio in 2-D (the out-of-plane stretch is not measured), a VOLUME ratio in 3-D; `dilatation` = J − 1; `divergence` = tr(grad). A velocity field gets only `divergence` (1/s) |
+| **Stress** | `field.stress` | law `linear_elastic/saint_venant_kirchhoff/neo_hookean/newtonian_fluid` · `youngs_modulus` Pa · `poisson_ratio` · 2-D `plane` `strain/stress` · `viscosity` Pa·s (fluid) | Cauchy `stress_<i><j>` (2-D: zz, yy, yx, xy, xx), `stress_p1..p3`, `pressure` (compression positive), `von_mises`, `max_shear` (Tresca), `strain_energy` — in the unit of E. The three elastic laws agree below ~1 % strain; neo-Hookean is the large-strain law for soft gels. **2-D needs an out-of-plane assumption**: plane strain for a slice through a thick gel, plane stress for a thin sheet — it changes every value. ν = 0.5 is refused. A Newtonian fluid needs a velocity field and reports the deviatoric stress only (its pressure is not set by the flow). The default E is a placeholder |
+
 ### 15.1 Particle detection on a noisy stack
 
 If Particle Detection returns thousands of hits, it is finding **shot noise**, not particles.
@@ -3386,6 +3403,37 @@ comes from the trajectories.
   half-space inversion, not a local law — and is not in this node.
 * Re-running `track_field` with another strain measure or another modulus **does not re-run
   the tracking**, which is the expensive half by one to two orders of magnitude.
+
+### D4. Strain, rotation, volume change and stress from any field
+
+```
+io.load ─→ analysis.piv / analysis.dic_correlate / analysis.dvc_field / track.objects → analysis.track_field
+        ─→ field.gradient ─→ field.strain ─→ field.stress
+                          ├─→ field.rotation
+                          └─→ field.volume_change
+```
+
+* **One table, one chain.** Each Field card writes its columns onto the field's own table, so
+  after the chain the `piv` (or `dic`, `dvc`) table carries `disp_*`, `grad_*`, `strain_*`,
+  `curl`, `jacobian`, `stress_*`, `von_mises` … row for row. Drop `bundle:mechanics` (Field
+  Gradient → Strain → Stress) after the correlation card and add Rotation & Curl or Volume
+  Change off the same gradient.
+* **Choose the differentiation once.** Field Gradient's method and radius are the gauge length
+  every later number inherits. `auto` differences a regular grid (DIC/PIV/DVC) and fits a plane
+  through anything else (a refined DIC mesh, tracked beads). A larger radius steadies strain
+  and lowers its peaks.
+* **Pick the measure by the size of the deformation.** Below ~2 % strain with little rotation
+  every measure agrees; beyond that, or under any visible rotation, use Green-Lagrange
+  (reference shape), Almansi (deformed shape) or Hencky (true strain, the soft-gel choice).
+* **Stress is a claim about the material, not the images.** Enter the gel's measured E and ν;
+  in 2-D decide plane strain (a slice through a thick gel) or plane stress (a thin sheet).
+  For flows, run PIV with velocity on and use `newtonian_fluid` with the viscosity.
+* **Increments.** On a `previous_frame` field every card reports frame-to-frame increments
+  (the progress note says so); compose them with Accumulate Field first for cumulative strain.
+* **DIC's own `strain_*` (compute_strain, DIC Strain) are now the symmetric tensor** (tensor
+  shear in `strain_yx` = `strain_xy`), the same tensor DVC and Track Field write. Until
+  2026-10-09 the two cross columns held the raw gradient `dv/dx` and `du/dy`; that lives in
+  `grad_*` now.
 
 ### E. Point cloud → mesh → label volume
 

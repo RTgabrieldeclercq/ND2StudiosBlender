@@ -1821,6 +1821,64 @@
         "T, the frame interval and the per-frame clock do not change: the content moved on the same grid, which is what lets two streams of one acquisition be lined up for a Merge or a comparison when one lags the other.",
         "Frames with no source repeat the nearest edge frame (`hold`) or are blank (`blank`); per-frame masks and detections move with the image, and rows shifted off either end are dropped. The T twin of Shift."
       ]
+    },
+    "field.gradient": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "Differentiates the PIV field of the sinusoidally warped speckle pair: grad_yy, grad_yx, grad_xy, grad_xx on every grid node, written back onto the `piv` table the arrows come from.",
+        "Method `auto` takes lattice differences on a regular grid (holes allowed) and a local plane fit otherwise; the fit radius is the gauge length every later card inherits.",
+        "Strain, Rotation & Curl, Volume Change and Stress all read these columns — this card is where the differentiation is chosen, once."
+      ]
+    },
+    "field.strain": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "The strain tensor of the warp under the chosen measure, its principal values and angle, the von Mises equivalent strain, max shear and trace — columns on the field's own table.",
+        "Switch Measure: infinitesimal reads a rotation as strain, Green-Lagrange / Almansi / Hencky do not; on this small warp they agree to the third decimal.",
+        "Colour the image by strain_eq or strain_xx in the Viewer's Field overlay."
+      ]
+    },
+    "field.rotation": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "The curl of the warp (twice the local rotation in radians; the vorticity for a velocity field) and the exact finite rotation in degrees, counter-clockwise on screen positive.",
+        "A rigid spin shows up here and not in a finite strain measure — the two cards split rotation from deformation."
+      ]
+    },
+    "field.volume_change": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "J = det F per node — the local area ratio of a 2-D field (volume ratio in 3-D) — with the dilatation J − 1 and the divergence: below 1 the material compacted, above it expanded.",
+        "For a velocity field only the divergence (1/s) is written: the rate of volume change."
+      ]
+    },
+    "field.stress": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "Cauchy stress of the warp through the chosen material law and its E and ν — components, principal stresses, pressure, von Mises, Tresca max shear and strain energy, in Pa.",
+        "2-D fields need an out-of-plane assumption: plane strain for a slice through a thick gel, plane stress for a thin sheet. Neo-Hookean is the large-strain law for soft gels.",
+        "The modulus is a placeholder: every stress column scales linearly with it, so enter your gel's measured E."
+      ]
     }
   }
 }

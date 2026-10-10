@@ -71,13 +71,16 @@ class UnitError(ValueError):
 #: step: they are different lengths on every microscope that is not isotropic, which is why
 #: a voxel is ``px²·zpx`` and not ``px³``, and why converting either to microns needs its own
 #: calibration key.
-CANONICAL_BASES: Tuple[str, ...] = ("um", "px", "zpx", "s", "frame", "counts", "rad")
+CANONICAL_BASES: Tuple[str, ...] = ("um", "px", "zpx", "s", "frame", "counts", "rad", "Pa")
 
 #: Scaled spellings → ``(canonical base, factor)``: one of these equals ``factor`` of the base.
 _SCALED: Dict[str, Tuple[str, float]] = {
     "nm": ("um", 1e-3), "mm": ("um", 1e3),
     "ms": ("s", 1e-3), "min": ("s", 60.0), "h": ("s", 3600.0),
     "deg": ("rad", math.pi / 180.0),
+    # pressure / stress (the Field nodes' stress columns and a gel's modulus). Case matters:
+    # mPa (milli — a viscosity in mPa·s) and MPa (mega) differ by 10^9.
+    "kPa": ("Pa", 1e3), "MPa": ("Pa", 1e6), "mPa": ("Pa", 1e-3),
 }
 
 #: Every accepted spelling of a base or scaled symbol → the symbol it means. ``vox`` is
@@ -97,12 +100,16 @@ _ALIASES: Dict[str, str] = {
     "counts": "counts", "count": "counts", "adu": "counts", "intensity": "counts",
     "rad": "rad", "radian": "rad", "radians": "rad",
     "deg": "deg", "degree": "deg", "degrees": "deg",
+    # no lower-case "mpa": it would make milli- and mega-pascal the same word
+    "Pa": "Pa", "pa": "Pa", "pascal": "Pa", "pascals": "Pa",
+    "kPa": "kPa", "kpa": "kPa", "MPa": "MPa", "mPa": "mPa",
 }
 _VOXEL_WORDS = frozenset({"vox", "voxel", "voxels"})
 _DIMENSIONLESS_WORDS = frozenset({"", "1", "ratio", "dimensionless", "none", "fraction", "-"})
 _SUPERSCRIPTS = {"²": 2, "³": 3, "⁻¹": -1, "⁻²": -2, "⁻³": -3}
 #: The order symbols are written in, so one unit has exactly one spelling.
-_ORDER = ("um", "nm", "mm", "px", "zpx", "s", "ms", "min", "h", "frame", "counts", "rad", "deg")
+_ORDER = ("um", "nm", "mm", "px", "zpx", "Pa", "kPa", "MPa", "mPa", "s", "ms", "min", "h",
+          "frame", "counts", "rad", "deg")
 _PRETTY = {"um": "µm", "deg": "°"}
 
 _TOKEN_RE = re.compile(r"^([A-Za-zµμ]+?)(?:\^)?(-?\d+)?$")
@@ -152,7 +159,7 @@ def parse_unit(text: Union[str, Mapping[str, int], None]) -> Unit:
             if sym is None:
                 raise UnitError(
                     f"cannot read the unit {text!r}: {word!r} is not a known unit (known: "
-                    f"um nm mm px zpx vox s ms min h frame counts rad deg)")
+                    f"um nm mm px zpx vox s ms min h frame counts rad deg Pa kPa MPa mPa)")
             out[sym] = out.get(sym, 0) + exp * sign
     return _clean(out)
 
@@ -449,7 +456,7 @@ def with_unit(ds: Dataset, domain: Domain, name: str, unit: Any,
 #: :func:`parse_unit` reads it as ``{}``.
 UNIT_CHOICES: Tuple[str, ...] = (
     "none", "px", "px2", "vox", "um", "um2", "um3", "nm", "s", "ms", "min", "frame",
-    "um/s", "px/frame", "1/s", "counts", "rad", "deg")
+    "um/s", "px/frame", "1/s", "counts", "rad", "deg", "Pa", "kPa")
 
 UNIT_CHOICE_DOCS: Dict[str, str] = {
     "none": "Dimensionless — a plain number: a ratio, a count, an exponent, a scale factor. "
@@ -487,6 +494,11 @@ UNIT_CHOICE_DOCS: Dict[str, str] = {
               "image's pixel values; a threshold level is in counts.",
     "rad": "An angle in radians — the unit of `orientation`; converts to degrees by a fixed "
            "factor.",
+    "Pa": "A pascal — a stress or pressure (N/m²), the unit of the Field Stress card's "
+          "stress, pressure and von Mises columns when the modulus is given in Pa. Converts "
+          "to kPa by a fixed factor.",
+    "kPa": "A kilopascal (10³ Pa) — the usual scale for a soft gel's modulus and the "
+           "stresses in it; converts to Pa by a fixed factor.",
     "deg": "An angle in degrees — for a constant stated in degrees; converts to radians by "
            "a fixed factor.",
 }

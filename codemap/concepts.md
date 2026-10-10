@@ -737,6 +737,22 @@ see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream knows where it came from
 
 ---
 
+### CON-28 — field layer and its mechanics chain
+anchors: sym:nodegraph.kernels.field_mechanics.gradient, sym:nodegraph.kernels.field_mechanics.stress, sym:nodegraph.catalog._shared.field_nodes.read_gradient, sym:nodegraph.catalog._shared.field_nodes.write
+
+A **field layer** (2026-10-09) is a Point table whose rows are the nodes of a measured
+displacement (`disp_*`, µm) or velocity (`v*`, µm/s) field: what DIC, PIV, DVC, the staged
+cards, Track Field and Load Analysis write. Its `z_kind` decides 2-D vs 3-D (`plane_index` →
+each (m, t, c, z) plane is its own field; `subpixel` → each (m, t, c) frame is a volume). The
+five `field.*` cards **add columns to that same table**: `field.gradient` writes
+`grad_<i><j> = ∂u_i/∂X_j` (lattice differences on a regular grid, holes one-sided, or a
+local MLS plane fit; tracked rows are moved back by `u` first), and Strain, Rotation & Curl,
+Volume Change and Stress read only those columns, refusing a layer without them. Each card
+records its columns' units (dimensionless, 1/s, deg, Pa) and its settings under the
+`__field_mechanics__[layer]` metadata. Image axes run y DOWN: 2-D curl and rotation are positive
+counter-clockwise on screen. The maths is `kernels/field_mechanics.py`, which reuses
+`field_math.strain_from_gradient` and `track_field`'s MLS gauge and Hooke's law.
+
 ### CON-27 — resource governor
 anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold
 

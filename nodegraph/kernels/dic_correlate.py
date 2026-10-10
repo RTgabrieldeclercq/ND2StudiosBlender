@@ -490,6 +490,18 @@ def _strain_components(strain) -> Optional[Tuple[np.ndarray, np.ndarray,
     return dudx, -dudy, -dvdx, dvdy
 
 
+def _small_strain(dudx, dudy, dvdx, dvdy) -> np.ndarray:
+    """The SYMMETRIC small-strain tensor ``(..., 2, 2)`` in ``[y, x]`` order from the four
+    image-axis gradient components — tensor shear ``(dv/dx + du/dy) / 2`` in both cross
+    slots, the same tensor ``analysis.dvc_field`` and ``analysis.track_field`` write under
+    the ``strain_*`` names. (Until 2026-10-09 the two cross slots held the raw gradient
+    ``dv/dx`` and ``du/dy`` while the result was stamped ``infinitesimal`` strain; the raw
+    gradient now lives where it is named — ``grad_*``, from the staged cards or the Field
+    Gradient card.)"""
+    s = 0.5 * (dvdx + dudy)
+    return np.stack([np.stack([dvdy, s], axis=-1), np.stack([s, dudx], axis=-1)], axis=-2)
+
+
 def _frame_to_dvcresult(mesh, U: np.ndarray, step: int,
                         voxel_size_um: Tuple[float, ...], method: str,
                         params: Dict[str, Any], reference_mode: str,
@@ -527,9 +539,7 @@ def _frame_to_dvcresult(mesh, U: np.ndarray, step: int,
         strain_field = None
         if grads is not None:
             dudx, dudy, dvdx, dvdy = grads
-            # strain[i, j] = d(disp_i)/d(axis_j) in DVCResult's own [y, x] axis order.
-            strain_field = np.stack([np.stack([dvdy, dvdx], axis=-1),
-                                     np.stack([dudy, dudx], axis=-1)], axis=-2)
+            strain_field = _small_strain(dudx, dudy, dvdx, dvdy)
     else:
         Yq, Xq, grid_shape = _regular_grid(coords, step)
         lat = _lattice_index(coords, Yq, Xq)
@@ -541,17 +551,16 @@ def _frame_to_dvcresult(mesh, U: np.ndarray, step: int,
         if grads is not None:
             g = [_interp_to_grid(coords, c, Yq, Xq, lat) for c in grads]
             dudx, dudy, dvdx, dvdy = g
-            strain_field = np.stack([np.stack([dvdy, dvdx], axis=-1),
-                                     np.stack([dudy, dudx], axis=-1)], axis=-2)
+            strain_field = _small_strain(dudx, dudy, dvdx, dvdy)
 
     return DVCResult(
         dim=2,
         grid_coords=np.asarray(grid_coords, dtype=np.float64),
         displacement_field=np.asarray(disp, dtype=np.float64),
         voxel_size_um=tuple(float(v) for v in voxel_size_um),
-        # (Gy, Gx, 2, 2) / (N, 2, 2) nodal displacement gradient, or None when the
-        # caller left compute_strain off — al_dic's own FEM strain, not a finite
-        # difference taken on the coarse grid downstream.
+        # (Gy, Gx, 2, 2) / (N, 2, 2) symmetric small strain from al_dic's nodal
+        # displacement gradient, or None when the caller left compute_strain off —
+        # al_dic's own FEM strain, not a finite difference taken downstream.
         strain_field=strain_field,
         strain_type="infinitesimal",
         # qfactor stays None: al-dic 0.7.2 keeps its per-point NCC quality factors
