@@ -998,7 +998,9 @@ class NodeItem(QGraphicsObject):
         """The mirror/merge checkbox, and — on a ticked card — a ring in the mode's colour
         (white: mirror, yellow: merge) just outside the card, inside the glow margin, so the
         set reads at a glance at any zoom. A dark hairline keeps both colours legible on the
-        light theme."""
+        light theme. Nothing while the page's mode is off."""
+        if not ML.active(self.doc):
+            return
         on = ML.is_ticked(self.doc, self.rec.id)
         col = T.MIRROR if ML.mode(self.doc) == ML.MIRROR else T.MERGE
         if on:
@@ -1868,10 +1870,11 @@ class NodeItem(QGraphicsObject):
         same rects, so a control can never be painted somewhere it cannot be clicked. A
         collapsed card, a reroute dot or an unrecognized op has none — there are no rows to
         put them on — except the header's mirror/merge checkbox, which every card but a dot
-        has, collapsed or not."""
+        has, collapsed or not, while the page's mirror/merge mode is on."""
         if self._is_dot:
             return []
-        out: List[Ctl] = [Ctl(self._mm_check_rect(), "mm", None)]
+        out: List[Ctl] = ([Ctl(self._mm_check_rect(), "mm", None)]
+                          if ML.active(self.doc) else [])
         if self.rec.collapsed or self.spec is None:
             return out
         # the footprint band's population pill, ABOVE the rows (V2.27) — the rows start at
@@ -2355,9 +2358,13 @@ class NodeItem(QGraphicsObject):
             super().mousePressEvent(e)
             return
         if ctl.kind == "mm":
-            # the mirror/merge tick: not a selection and not an edit — the set's own
-            # listeners repaint every card and canvas showing this page
-            ML.toggle(self.doc, self.rec.id)
+            # the mirror/merge tick IS the selection while a mode is on: the scene adds this
+            # card to it or takes it out (never clearing the rest), and the ticks follow
+            sc = self.scene()
+            if sc is not None and hasattr(sc, "toggle_tick"):
+                sc.toggle_tick(self.rec.id)
+            else:
+                ML.toggle(self.doc, self.rec.id)
             e.accept()
             return
         if not self.isSelected():                # clicking a control selects its card too

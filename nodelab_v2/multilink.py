@@ -1,8 +1,11 @@
 """Mirror and merge: link several nodes in one gesture (2026-10-12). Qt-free.
 
-Every card carries a checkbox in its header. Ticking cards puts them in the canvas's
-**multi-link set**, and a wire then drawn OUT of a ticked node applies to the whole set, in
-whichever of two modes the canvas is in (the button beside the action pill):
+The button beside the action pill cycles the page through three modes: **off** (the
+default — no checkbox shows, every wire is an ordinary wire), **mirror** and **merge**.
+While a mode is on, every card (and every region) carries a checkbox, and the ticked set IS
+the selection — selecting or dragging cards ticks them, a region ticks its cards, a
+checkbox click adds a card to the selection or takes it out (the canvas keeps the two in
+step, :func:`set_ticks`). A wire then drawn OUT of a ticked node applies to the whole set:
 
 * **merge**: every ticked node is wired INTO the node the wire reaches. The node dragged
   from takes the target's primary (first) input; the others follow in alphabetical order
@@ -33,8 +36,13 @@ groups are not saved with the file. Every canvas showing the page sees the same 
 tick is not a graph edit, so it never re-propagates metadata or cancels a pull. Listeners
 (the page's scenes) repaint on :meth:`MultiLinkState.on_change`.
 
-A wire drawn from a node that is neither ticked (with another ticked) nor a mirror-group
-member in mirror mode, or from an input socket, behaves exactly as it always did.
+After a mirror that MADE nodes, the canvas selects the new group (the node placed and every
+copy) and nothing else, so they are what is ticked next — switch to merge, and a wire from
+one of them merges them.
+
+A wire drawn while the page is off, from a node that is neither ticked (with another
+ticked) nor a mirror-group member in mirror mode, or from an input socket, behaves exactly
+as it always did.
 """
 
 from __future__ import annotations
@@ -45,9 +53,11 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 from nodelab_v2.document import TITLE_KEY
 from nodelab_v2.ops import PAGE_NAME_KEY
 
+OFF = "off"
 MIRROR = "mirror"
 MERGE = "merge"
-MODES = (MIRROR, MERGE)
+#: the mode button cycles through these, in this order; a page starts OFF (2026-10-12)
+MODES = (OFF, MIRROR, MERGE)
 
 #: params a mirror copy keeps its OWN value of. A Page Output's variable name is unique
 #: across the workspace (a copy is renamed ``name2``), and a title names one particular card,
@@ -63,7 +73,7 @@ class MultiLinkState:
 
     def __init__(self) -> None:
         self.ticked: Dict[str, None] = {}          # an insertion-ordered set
-        self.mode: str = MIRROR
+        self.mode: str = OFF
         #: the mirror groups, each ``{lane: node id}`` — a lane is named by the ticked node
         #: it started from, so two groups made from one ticked set line up lane by lane
         self.groups: List[Dict[str, str]] = []
@@ -137,18 +147,42 @@ def mode(doc) -> str:
 
 
 def set_mode(doc, value: str) -> None:
+    """Switch the page's mode. Turning it OFF unticks every node: off, the checkboxes are
+    not shown and a tick would mean nothing. Switching between mirror and merge keeps the
+    ticks — that is how the copies a mirror just made get merged next."""
     st = state(doc)
     if value not in MODES:
         raise ValueError(f"multi-link mode must be one of {MODES}, got {value!r}")
     if value != st.mode:
         st.mode = value
+        if value == OFF:
+            st.ticked.clear()
         st.emit()
 
 
+def next_mode(doc) -> str:
+    """The mode the button switches to: off → mirror → merge → off."""
+    return MODES[(MODES.index(mode(doc)) + 1) % len(MODES)]
+
+
+def set_ticks(doc, node_ids) -> bool:
+    """Make the ticked set exactly ``node_ids`` (live nodes only), keeping the order of those
+    already ticked and appending the rest. What the canvas calls while a mode is on, so that
+    the ticks ARE the selection. Returns whether anything changed."""
+    st = state(doc)
+    want = [n for n in dict.fromkeys(node_ids) if n in doc.nodes]
+    order = [n for n in st.ticked if n in want] + [n for n in want if n not in st.ticked]
+    if order == list(st.ticked):
+        return False
+    st.ticked = dict.fromkeys(order)
+    st.emit()
+    return True
+
+
 def active(doc) -> bool:
-    """Is the page in a multi-link mode: at least one node ticked? What the canvas border
-    and the mode button's emphasis show."""
-    return bool(ticked(doc))
+    """Is the page in a multi-link mode — mirror or merge, not off? What the checkboxes,
+    the canvas border and the mode button's fill show."""
+    return mode(doc) != OFF
 
 
 def lanes_of(doc, node_id: str) -> Dict[str, str]:
@@ -168,14 +202,24 @@ def lanes_for(doc, src_id: str) -> Optional[Dict[str, str]]:
     """The lanes a wire drawn out of ``src_id`` is repeated across, or ``None`` for a plain
     wire:
 
-    * ``src_id`` is ticked and another node is: every ticked node is a lane, its own member;
-    * else, in MIRROR mode (mirror selected, something ticked), ``src_id`` is a member of a
-      mirror group with another live member: that group's lanes. This is what lets a chain
-      placed after a mirrored node be mirrored too, step by step."""
+    * ``src_id`` is ticked and another node is: every ticked node is a lane, its own member
+      — unless the ticked nodes are exactly one mirror group, which keeps ITS lanes (after a
+      mirror the new copies are what is ticked, and they still line up with the groups made
+      before them);
+    * else, in MIRROR mode, ``src_id`` is a member of a mirror group with another live
+      member: that group's lanes. This is what lets a chain placed after a mirrored node be
+      mirrored too, step by step, whatever is selected.
+
+    Nothing while the page is OFF."""
+    if not active(doc):
+        return None
     t = ticked(doc)
     if src_id in t and len(t) >= 2:
+        g = lanes_of(doc, src_id)
+        if g and set(g.values()) == set(t):
+            return g
         return {n: n for n in t}
-    if mode(doc) == MIRROR and t:
+    if mode(doc) == MIRROR:
         g = lanes_of(doc, src_id)
         if len(g) >= 2:
             return g
@@ -397,9 +441,9 @@ def group_of(doc, node_id: str) -> List[str]:
 
 def mirror_siblings(doc, node_id: str) -> List[str]:
     """The nodes an edit to ``node_id`` also applies to: its mirror group, but only while
-    the page is IN mirror mode — mirror selected and at least one node ticked. Outside it
-    the copies are ordinary nodes and can be tuned one by one."""
-    if mode(doc) != MIRROR or not active(doc):
+    the page is IN mirror mode. Off, or in merge, the copies are ordinary nodes and can be
+    tuned one by one."""
+    if mode(doc) != MIRROR:
         return []
     return group_of(doc, node_id)[1:]
 
@@ -422,7 +466,8 @@ def copy_values(doc, src_id: str, dst_id: str) -> bool:
     return True
 
 
-__all__ = ["MIRROR", "MERGE", "MODES", "MultiLinkState", "Outcome", "state", "ticked",
-           "is_ticked", "set_ticked", "toggle", "clear", "mode", "set_mode", "active",
+__all__ = ["OFF", "MIRROR", "MERGE", "MODES", "MultiLinkState", "Outcome", "state",
+           "ticked", "is_ticked", "set_ticked", "set_ticks", "toggle", "clear", "mode",
+           "set_mode", "next_mode", "active",
            "lanes_of", "lane_in", "lanes_for", "applies", "merge_plan", "merge", "mirror",
            "group_of", "mirror_siblings", "copy_values"]

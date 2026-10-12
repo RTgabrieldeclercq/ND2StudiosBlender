@@ -3384,13 +3384,13 @@ def main(argv) -> int:
         "offer max/mean/none here, i.e. a footprint control that changes the reducer"
     assert _zitem._foot_slots()[1] == "WHOLE VOLUME" and "`method`" in _zitem._footprint_line(), \
         f"zproject's band must read its footprint, never its reducer ({_zitem._foot_slots()})"
-    # a collapsed card has no param controls — only the header's mirror/merge checkbox
-    # (2026-10-12), which every card but a dot carries; the tooltip still carries the
+    # a collapsed card has no controls at all (the header's mirror/merge box shows only
+    # while that mode is on, and a page starts off); the tooltip still carries the
     # footprint, which is the only readout a collapsed card has
     _frec.collapsed = True
     _fitem.refresh()
-    assert [c.kind for c in _fitem.controls()] == ["mm"] \
-        and "population" in _fitem._footprint_line(), [c.kind for c in _fitem.controls()]
+    assert _fitem.controls() == [] and "population" in _fitem._footprint_line(), \
+        [c.kind for c in _fitem.controls()]
     _frec.collapsed = False
     _fitem.refresh()
 
@@ -9283,8 +9283,8 @@ def main(argv) -> int:
         "bar; run again it is greyed (“already read”); on Image Input it is greyed and says "
         "why; a linked page asks first — cancelled changes nothing, kept adds them there")
 
-    # ── MM1: mirror / merge — a checkbox on every card, a mode beside the pill ────────
-    # (user request 2026-10-12)
+    # ── MM1: mirror / merge — off by default; on, the ticks ARE the selection ─────────
+    # (user requests 2026-10-12)
     from nodelab_v2 import multilink as _ML
     from nodelab_v2.document import TITLE_KEY as _TK19
     win.file_new()
@@ -9294,18 +9294,14 @@ def main(argv) -> int:
                                  ("mM", "mid", 340.0)):
         _d19.add_node("enhance.gaussian", node_id=_nid19, x=0.0, y=_yy19,
                       params={_TK19: _tt19})
+    for _nid19, _yy19 in (("mR1", 600.0), ("mR2", 770.0)):     # two cards in a region
+        _d19.add_node("enhance.gaussian", node_id=_nid19, x=0.0, y=_yy19)
+    _fr19 = _d19.add_frame("Lane R", members=["mR1", "mR2"]).id
     app.processEvents()
     _mb19, _cb19, _ap19 = _v19.mm_mode_btn, _v19.mm_clear_btn, _v19.action_pill
     assert _mb19.isVisible() and _cb19.isVisible()
     assert _mb19.x() >= _ap19.x() + _ap19.width() and _cb19.x() >= _mb19.x() + _mb19.width(), \
         ("beside the action pill", _ap19.geometry(), _mb19.geometry(), _cb19.geometry())
-    assert "Mirror" in _mb19.text() and not _cb19.isEnabled()
-    for _nid19 in ("mZ", "mA", "mM"):                    # click each header checkbox
-        _it19 = _sc19.node_items[_nid19]
-        _it19.mousePressEvent(_FakePress(_it19._mm_check_rect().center()))
-    app.processEvents()
-    assert _ML.ticked(_d19) == ["mZ", "mA", "mM"], _ML.ticked(_d19)
-    assert _cb19.isEnabled() and "(3)" in _cb19.text(), _cb19.text()
 
     def _near19(c, ref, tol=40):
         return (abs(c.red() - ref.red()) + abs(c.green() - ref.green())
@@ -9314,12 +9310,50 @@ def main(argv) -> int:
     def _px19(x):
         return _v19.viewport().grab().toImage().pixelColor(x, _v19.viewport().height() // 2)
 
+    # OFF by default: no box on any card or region, no border, nothing ticked by selecting
+    assert _ML.mode(_d19) == _ML.OFF and "off" in _mb19.text() and not _cb19.isEnabled()
+    assert not [c for c in _sc19.node_items["mZ"].controls() if c.kind == "mm"]
+    assert not _near19(_px19(1), T.MIRROR) and not _near19(_px19(1), T.MERGE), _px19(1).name()
+    _sc19.node_items["mZ"].setSelected(True)
+    app.processEvents()
+    assert _ML.ticked(_d19) == [], "off: selecting ticks nothing"
+    # ON (the button: off → mirror): what is already selected is ticked at once, and
+    # selecting more — a drag-select, a click — ticks more
+    _mb19.click()
+    app.processEvents()
+    assert "Mirror" in _mb19.text() and _ML.mode(_d19) == _ML.MIRROR
+    assert _ML.ticked(_d19) == ["mZ"], _ML.ticked(_d19)
+    assert [c.kind for c in _sc19.node_items["mZ"].controls()][:1] == ["mm"]
+    _sc19.node_items["mA"].setSelected(True)
+    app.processEvents()
+    assert _ML.ticked(_d19) == ["mZ", "mA"], _ML.ticked(_d19)
+    # a card's box adds it to the selection, keeping the rest — and takes it out again
+    _itM19 = _sc19.node_items["mM"]
+    _itM19.mousePressEvent(_FakePress(_itM19._mm_check_rect().center()))
+    app.processEvents()
+    assert _ML.ticked(_d19) == ["mZ", "mA", "mM"] and _itM19.isSelected()
+    _itM19.mousePressEvent(_FakePress(_itM19._mm_check_rect().center()))
+    app.processEvents()
+    assert _ML.ticked(_d19) == ["mZ", "mA"] and not _itM19.isSelected()
+    # a REGION's box ticks every card in it, and unticks them all
+    _fi19 = _sc19.frame_items[_fr19]
+    _fi19.mousePressEvent(_FakePress(_fi19.mm_check_rect().center()))
+    app.processEvents()
+    assert set(_ML.ticked(_d19)) == {"mZ", "mA", "mR1", "mR2"} and _fi19.mm_ticked()
+    _fi19.mousePressEvent(_FakePress(_fi19.mm_check_rect().center()))
+    app.processEvents()
+    assert set(_ML.ticked(_d19)) == {"mZ", "mA"} and not _fi19.mm_ticked()
+    _itM19.mousePressEvent(_FakePress(_itM19._mm_check_rect().center()))
+    app.processEvents()
+    assert _ML.ticked(_d19) == ["mZ", "mA", "mM"] and "(3)" in _cb19.text(), _cb19.text()
+    # the border: white at the very edge in mirror mode, yellow in merge, and with the
+    # troubleshooting frame up: yellow at the edge, plain canvas, amber further in
     assert _near19(_px19(1), T.MIRROR), ("white border in mirror mode", _px19(1).name())
     _mb19.click()
     app.processEvents()
     assert "Merge" in _mb19.text() and _ML.mode(_d19) == _ML.MERGE
+    assert _ML.ticked(_d19) == ["mZ", "mA", "mM"], "mirror → merge keeps the ticks"
     assert _near19(_px19(1), T.MERGE), ("yellow border in merge mode", _px19(1).name())
-    # with the troubleshooting frame up: yellow at the edge, plain canvas, amber further in
     _v19.set_troubleshooting(True, "t0")
     app.processEvents()
     _img19 = _v19.viewport().grab().toImage()
@@ -9352,20 +9386,29 @@ def main(argv) -> int:
     _n019 = set(_d19.nodes)                                # a NEW single-input node: removed
     assert _sc19.link_new_node("mZ", "out", "out", "enhance.gamma", "data", 420.0, 640.0) \
         is None and set(_d19.nodes) == _n019, "a refused merge leaves no node behind"
-    # MIRROR from the link search: one Gamma per ticked card; an edit on one edits all
+    # merge → OFF unticks everything (the selection stays); off → MIRROR ticks it again
     _mb19.click()
     app.processEvents()
+    assert _ML.mode(_d19) == _ML.OFF and _ML.ticked(_d19) == [] and "off" in _mb19.text()
+    assert not _near19(_px19(1), T.MIRROR) and not _near19(_px19(1), T.MERGE)
+    _mb19.click()
+    app.processEvents()
+    assert _ML.mode(_d19) == _ML.MIRROR and set(_ML.ticked(_d19)) == {"mZ", "mA", "mM"}
+    # MIRROR from the link search: one Gamma per ticked card; the NEW Gammas become the
+    # selection (so the ticks) and the cards they came from drop out of it
     _g019 = _sc19.link_new_node("mZ", "out", "out", "enhance.gamma", "data", 300.0, 20.0)
     app.processEvents()
     _grp19 = _ML.group_of(_d19, _g019)
     assert len(_grp19) == 3, _grp19
     assert {e[0] for e in _d19.edges if e[2] in _grp19 and e[3] == "data"} == \
         {"mZ", "mA", "mM"}
+    assert set(_ML.ticked(_d19)) == set(_grp19), (_ML.ticked(_d19), _grp19)
+    assert not any(_sc19.node_items[n].isSelected() for n in ("mZ", "mA", "mM"))
     _sc19.node_items[_grp19[1]]._write_param("gamma", 1.7)      # from one copy's card
     assert all(_d19.nodes[n].params.get("gamma") == 1.7 for n in _grp19), \
         [_d19.nodes[n].params.get("gamma") for n in _grp19]
-    # the mirror CONTINUES: a node placed after a mirrored Gamma (itself not ticked) is
-    # placed in every lane, wired from that lane's own Gamma
+    # the mirror CONTINUES from the new Gammas: the next node is placed in every lane, and
+    # the selection moves on to the newest nodes again
     _gl19 = _ML.lanes_of(_d19, _g019)
     _y019 = _sc19.link_new_node(_g019, "out", "out", "enhance.gaussian", "data", 600.0, 20.0)
     app.processEvents()
@@ -9373,7 +9416,7 @@ def main(argv) -> int:
     assert set(_yl19) == {"mZ", "mA", "mM"} == set(_gl19), (_yl19, _gl19)
     assert all((_gl19[_l], "out", _yl19[_l], "data") in _d19.edges for _l in _gl19), \
         [e for e in _d19.edges if e[2] in _yl19.values()]
-    assert "mirrored" in _msgs19[-1], _msgs19[-1]
+    assert set(_ML.ticked(_d19)) == set(_yl19.values()) and "mirrored" in _msgs19[-1]
     # ...and dragging a wire on from one of THOSE onto a fresh node continues again
     _d19.add_node("enhance.gamma", node_id="mW", x=900.0, y=20.0)
     app.processEvents()
@@ -9381,21 +9424,40 @@ def main(argv) -> int:
     _sc19.begin_wire(_yo19, _yo19.anchor())
     _sc19._end_wire(_sc19.node_items["mW"].socket("in", "data").anchor(), None)
     app.processEvents()
-    assert set(_ML.lanes_of(_d19, "mW")) == {"mZ", "mA", "mM"}, _ML.lanes_of(_d19, "mW")
-    # Clear selected: every box unticked, the border gone, edits one node at a time again
+    _wl19 = _ML.lanes_of(_d19, "mW")
+    assert set(_wl19) == {"mZ", "mA", "mM"} and set(_ML.ticked(_d19)) == set(_wl19.values())
+    # switch to MERGE: the newest copies (what is selected) merge into one node
+    _mb19.click()
+    app.processEvents()
+    _d19.add_node("util.timeseries", node_id="mTS2", x=1200.0, y=20.0)
+    app.processEvents()
+    _wo19 = _sc19.node_items["mW"].socket("out", "out")
+    _sc19.begin_wire(_wo19, _wo19.anchor())
+    _sc19._end_wire(_sc19.node_items["mTS2"].socket("in", "data").anchor(), None)
+    app.processEvents()
+    _into19 = {e[3]: e[0] for e in _d19.edges if e[2] == "mTS2"}
+    assert _into19.get("data") == "mW" and set(_into19.values()) == set(_wl19.values()), \
+        _into19
+    # Clear selected: every box unticked and nothing selected — merge stays on (border up)
     _cb19.click()
     app.processEvents()
-    assert not _ML.active(_d19) and not _cb19.isEnabled()
-    assert not _near19(_px19(1), T.MIRROR), _px19(1).name()
+    assert _ML.ticked(_d19) == [] and not _sc19.selectedItems() and not _cb19.isEnabled()
+    assert _near19(_px19(1), T.MERGE), "the mode is still on"
+    # OFF: no border, and edits are one node at a time again
+    _mb19.click()
+    app.processEvents()
+    assert _ML.mode(_d19) == _ML.OFF and not _near19(_px19(1), T.MERGE)
     _sc19.node_items[_grp19[1]]._write_param("gamma", 0.5)
-    assert _d19.nodes[_grp19[0]].params.get("gamma") == 1.7, "out of mirror mode: one node"
-    _ok("MM1 every card has a mirror/merge checkbox; the mode button and Clear selected sit "
-        "beside the action pill; the canvas is outlined white (mirror) or yellow (merge) "
-        "at its very edge, apart from the amber troubleshooting frame; a merge wire fills "
-        "the dragged-from card first and the rest alphabetically, and is refused into a "
-        "single-input node (a new one is removed); a mirror wire copies the node per ticked "
-        "card and an edit on one copy edits all; the mirror continues from a mirrored node "
-        "(link search and wire drag) in every lane; Clear selected unticks them and ends it")
+    assert _d19.nodes[_grp19[0]].params.get("gamma") == 1.7, "off: one node"
+    _ok("MM1 mirror/merge starts OFF (no box, no border; selecting ticks nothing) and the "
+        "button steps off → mirror → merge → off beside the action pill, Clear selected "
+        "beside it; on, the ticks ARE the selection — what is selected is ticked, a card's "
+        "or a region's box adds it or takes it out; the canvas is outlined white or yellow "
+        "at its very edge, apart from the amber troubleshooting frame; merge fills the "
+        "dragged-from card first and the rest alphabetically and is refused into a "
+        "single-input node; a mirror selects the new copies instead of the cards it came "
+        "from, an edit on one copy edits all, the mirror continues down the lanes, and the "
+        "newest copies merge when the mode is switched; off unticks all and ends it")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

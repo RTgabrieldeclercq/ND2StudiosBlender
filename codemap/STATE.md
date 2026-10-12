@@ -8,12 +8,12 @@
 | GUI-layer ops (`io.load`, `view.viewer`, `io.dock`, `page.input`, `page.output`) | 6 |
 | sockets + mode selectors | 1123 |
 | mapped Python modules | 334 |
-| indexed symbols | 5103 |
-| first-party import edges | 1780 |
-| LOC — `nodegraph/` | 110,228 |
-| LOC — `nodelab_v2/` | 59,105 |
-| LOC — `scripts/` | 21,773 |
-| map fingerprint | `bee87ea913851c4f5b4060458d85dd29` |
+| indexed symbols | 5114 |
+| first-party import edges | 1781 |
+| LOC — `nodegraph/` | 110,250 |
+| LOC — `nodelab_v2/` | 59,299 |
+| LOC — `scripts/` | 21,835 |
+| map fingerprint | `b317de01739acd3fcf73c41a44dde71b` |
 | gates last verified green | **2026-10-07** |
 
 `gates last verified green` moves only when a human or agent passes

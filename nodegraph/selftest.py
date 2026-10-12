@@ -30812,8 +30812,10 @@ def test_page_inputs_from_previous() -> None:
 def test_multilink() -> None:
     """Mirror and merge (``nodelab_v2.multilink``, 2026-10-12), the Qt-free half.
 
-    1. Ticks are per document, ordered, pruned when a node goes; ``applies`` needs the
-       drag source ticked AND another node ticked; ``clear`` unticks all.
+    1. A page starts OFF (nothing applies); the mode steps off → mirror → merge → off,
+       and off unticks everything. Ticks are per document, ordered (``set_ticks`` keeps
+       the old order), pruned when a node goes; ``applies`` needs a mode on, the drag
+       source ticked AND another node ticked; ``clear`` unticks all.
     2. MERGE: into a growing-slot node (Timeseries Builder) the dragged-from node takes the
        primary input and the rest follow ALPHABETICALLY by title; into a multi-input socket
        (Merge) all go to that socket in the same order; into two distinct inputs (Overlay)
@@ -30840,17 +30842,27 @@ def test_multilink() -> None:
     feeder("A", "alpha", 0, 200)
     feeder("M", "mid", 0, 400)
 
-    # 1. the set
-    assert not ML.active(doc) and not ML.applies(doc, "Z")
-    assert ML.toggle(doc, "Z") and not ML.applies(doc, "Z"), "alone: a plain wire"
+    # 1. the set — and the mode, OFF until switched on
+    assert ML.mode(doc) == ML.OFF and not ML.active(doc) and not ML.applies(doc, "Z")
+    ML.set_ticked(doc, "Z", True)
+    ML.set_ticked(doc, "A", True)
+    assert not ML.applies(doc, "Z"), "off: every wire is a plain wire"
+    assert ML.next_mode(doc) == ML.MIRROR
+    ML.set_mode(doc, ML.MIRROR)
+    assert ML.active(doc) and ML.next_mode(doc) == ML.MERGE
+    ML.set_ticked(doc, "A", False)
+    assert not ML.applies(doc, "Z"), "alone: a plain wire"
     ML.set_ticked(doc, "A", True)
     ML.set_ticked(doc, "M", True)
     assert ML.ticked(doc) == ["Z", "A", "M"] and ML.applies(doc, "Z")
-    assert not ML.applies(doc, "nope") and ML.mode(doc) == ML.MIRROR
+    assert not ML.applies(doc, "nope")
+    assert not ML.set_ticks(doc, ["M", "Z", "A"]) and ML.ticked(doc) == ["Z", "A", "M"], \
+        "set_ticks keeps the order of what was already ticked"
     seen = []
     ML.state(doc).on_change(lambda: seen.append(1))
     ML.set_mode(doc, ML.MERGE)
-    assert seen, "a mode change notifies"
+    assert seen and ML.next_mode(doc) == ML.OFF, "a mode change notifies; merge → off"
+    assert ML.ticked(doc) == ["Z", "A", "M"], "switching mirror ↔ merge keeps the ticks"
 
     # 2. merge into growing slots: dragged-from first, the rest alphabetical
     doc.add_node("util.timeseries", node_id="TS", x=400, y=0)
@@ -30900,6 +30912,10 @@ def test_multilink() -> None:
     lanes = ML.lanes_of(doc, "G0")
     assert set(lanes) == {"Z", "A", "M"} and lanes["Z"] == "G0", lanes
     assert ML.applies(doc, "G0") and not ML.applies(doc, "TS"), "a group member mirrors"
+    # the canvas ticks the new group after a mirror: ticked EXACTLY a group, its lanes hold
+    ML.set_ticks(doc, ML.group_of(doc, "G0"))
+    assert ML.lanes_for(doc, "G0") == lanes, ML.lanes_for(doc, "G0")
+    ML.set_ticks(doc, ["Z", "A", "M"])
     doc.add_node("enhance.gaussian", node_id="Y0", x=600, y=50)
     doc.connect("G0", "out", "Y0", "data")
     res2 = ML.mirror(doc, "G0", "out", "Y0", "data")
@@ -30950,10 +30966,16 @@ def test_multilink() -> None:
     doc.touch("G0")
     assert doc.nodes[cp].params.get("gamma") == 2.2, "merge mode: no propagation"
     ML.set_mode(doc, ML.MIRROR)
-    assert ML.clear(doc) == 3 and not ML.active(doc)
+    assert ML.clear(doc) == 3 and ML.ticked(doc) == [] and ML.active(doc)
     doc.nodes["G0"].params["gamma"] = 4.0
     doc.touch("G0")
-    assert doc.nodes[cp].params.get("gamma") == 2.2, "nothing ticked: no propagation"
+    assert doc.nodes[cp].params.get("gamma") == 4.0, "mirror mode shares edits, ticked or not"
+    ML.set_ticked(doc, "A", True)
+    ML.set_mode(doc, ML.OFF)
+    assert ML.ticked(doc) == [] and not ML.active(doc), "off unticks every node"
+    doc.nodes["G0"].params["gamma"] = 5.0
+    doc.touch("G0")
+    assert doc.nodes[cp].params.get("gamma") == 4.0, "off: no propagation"
     ML.set_ticked(doc, "Z", True)
     doc.remove_node("Z")
     assert ML.ticked(doc) == [], "a deleted node drops out of the set"

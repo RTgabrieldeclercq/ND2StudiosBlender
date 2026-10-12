@@ -294,8 +294,12 @@ class GraphScene(QGraphicsScene):
         document.on_change(self.sync)
         document.on_moved(self._on_moved)
         # the mirror/merge set (2026-10-12): a tick or a mode change repaints the cards and
-        # every canvas showing this page — not a graph edit, so not through `on_change`
+        # every canvas showing this page — not a graph edit, so not through `on_change`.
+        # While a mode is on the ticks ARE the selection (`_ticks_follow_selection`).
+        self._ml_mode = ML.mode(document)
+        self._hold_ticks = False
         ML.state(document).on_change(self._on_multilink)
+        self.selectionChanged.connect(self._ticks_follow_selection)
         self.sync()
 
     def _on_moved(self, node_id: str) -> None:
@@ -318,13 +322,93 @@ class GraphScene(QGraphicsScene):
         self._anim.stop()
 
     def _on_multilink(self) -> None:
-        """The page's mirror/merge set changed: repaint the cards (their checkbox and ring)
-        and the canvases (their mode button and border)."""
+        """The page's mirror/merge set changed: repaint the cards and regions (their
+        checkbox and ring) and the canvases (their mode button and border). Turning a mode
+        ON ticks what is already selected — the ticks are the selection from then on."""
+        was, self._ml_mode = self._ml_mode, ML.mode(self.doc)
+        if was == ML.OFF and self._ml_mode != ML.OFF:
+            self._ticks_follow_selection()
         for item in self.node_items.values():
             item.update()
+        for fr in self.frame_items.values():
+            fr.update()
         for v in self.views():
             if hasattr(v, "refresh_multilink"):
                 v.refresh_multilink()
+
+    # ── mirror / merge: the ticks are the selection while a mode is on ─────────────
+    def selection_tick_ids(self) -> List[str]:
+        """What the selection ticks: every selected card (a reroute or batch dot has no
+        box) and every card of every selected region, in that order."""
+        ids: List[str] = []
+        for it in self.selectedItems():
+            if isinstance(it, NodeItem) and not it._is_dot:
+                ids.append(it.node_id)
+            elif isinstance(it, FrameItem):
+                ids.extend(m for m in it.rec.members if m in self.doc.nodes)
+        return list(dict.fromkeys(ids))
+
+    def _ticks_follow_selection(self) -> None:
+        if self._hold_ticks or not ML.active(self.doc):
+            return
+        ML.set_ticks(self.doc, self.selection_tick_ids())
+
+    def _selecting(self, change: Callable[[], None]) -> None:
+        """Run ``change`` (several selection edits) and sync the ticks ONCE after it."""
+        self._hold_ticks = True
+        try:
+            change()
+        finally:
+            self._hold_ticks = False
+        self._ticks_follow_selection()
+
+    def toggle_tick(self, node_id: str) -> None:
+        """A card's checkbox: add the card to the selection, or take it out — never clearing
+        the rest. A card ticked only because its region is selected unticks alone: the
+        region gives way to its other cards, selected one by one."""
+        item = self.node_items.get(node_id)
+        if item is None:
+            return
+
+        def change() -> None:
+            if ML.is_ticked(self.doc, node_id):
+                for fr in self.frame_items.values():
+                    if fr.isSelected() and node_id in fr.rec.members:
+                        fr.setSelected(False)
+                        for m in fr.rec.members:
+                            if m != node_id and m in self.node_items:
+                                self.node_items[m].setSelected(True)
+                item.setSelected(False)
+            else:
+                item.setSelected(True)
+        self._selecting(change)
+
+    def toggle_region_tick(self, frame_id: str) -> None:
+        """A region's checkbox: tick every card in it (the region is selected), or untick
+        them all (the region and its cards leave the selection)."""
+        fr = self.frame_items.get(frame_id)
+        if fr is None:
+            return
+
+        def change() -> None:
+            if fr.mm_ticked():
+                fr.setSelected(False)
+                for m in fr.rec.members:
+                    if m in self.node_items:
+                        self.node_items[m].setSelected(False)
+            else:
+                fr.setSelected(True)
+        self._selecting(change)
+
+    def select_only(self, node_ids) -> None:
+        """Make ``node_ids`` the whole selection — and so, while a mode is on, the ticks."""
+        def change() -> None:
+            self.clearSelection()
+            for n in node_ids:
+                it = self.node_items.get(n)
+                if it is not None:
+                    it.setSelected(True)
+        self._selecting(change)
 
     # ── model → canvas ────────────────────────────────────────────────────────
     def sync(self) -> None:
@@ -842,11 +926,11 @@ class GraphScene(QGraphicsScene):
 
     def _multilink(self, s_id: str, s_sock: str, d_id: str, d_sock: str, *,
                    created: bool = False) -> bool:
-        """A wire drawn out of a ticked node while others are ticked (2026-10-12): MERGE
-        wires every ticked node into ``d_id`` (refused whole when they do not all fit — a
-        node created for this wire is then removed again, so a refusal changes nothing);
-        MIRROR makes this wire, then gives every other ticked node its own copy of
-        ``d_id``. Says what happened on the status bar (:attr:`multilink_note`)."""
+        """A wire drawn through the page's mode (2026-10-12): MERGE wires every ticked node
+        into ``d_id`` (refused whole when they do not all fit — a node created for this
+        wire is then removed again, so a refusal changes nothing); MIRROR makes this wire,
+        then repeats it in every other lane (:func:`multilink.mirror`) and selects the
+        nodes that made. Says what happened on the status bar (:attr:`multilink_note`)."""
         if ML.mode(self.doc) == ML.MERGE:
             out = ML.merge(self.doc, s_id, s_sock, d_id)
             if not out.ok and created and d_id in self.doc.nodes:
@@ -854,6 +938,10 @@ class GraphScene(QGraphicsScene):
         else:
             self.doc.connect(s_id, s_sock, d_id, d_sock)
             out = ML.mirror(self.doc, s_id, s_sock, d_id, d_sock)
+            if out.nodes:
+                # the new nodes — the one placed and every copy — become the selection, and
+                # so the ticks: switch to merge now and a wire from one of them merges them
+                self.select_only(ML.group_of(self.doc, d_id))
         self.multilink_note.emit(out.message)
         return out.ok
 
@@ -1350,10 +1438,11 @@ class GraphView(QGraphicsView):
         self.action_pill.setText("Graph")
         self._pill_armed = False
         self._canvas_active = False
-        # mirror / merge (2026-10-12), beside the action pill: the mode that wires drawn out
-        # of a TICKED card go through (click to switch), and Clear selected, which unticks
-        # every card. The page's ticks and mode live in `multilink`, so every canvas showing
-        # the page agrees; this canvas is outlined in the mode's colour while any is ticked.
+        # mirror / merge (2026-10-12), beside the action pill: the mode (off → mirror →
+        # merge, click to step) that wires drawn out of a TICKED card go through, and Clear
+        # selected, which unticks every card. The page's ticks and mode live in `multilink`,
+        # so every canvas showing the page agrees; this canvas is outlined in the mode's
+        # colour while mirror or merge is on.
         self.mm_mode_btn = QToolButton(self)
         self.mm_mode_btn.setObjectName("mmMode")
         self.mm_mode_btn.setCursor(Qt.PointingHandCursor)
@@ -1455,20 +1544,24 @@ class GraphView(QGraphicsView):
             self._place_corner_chrome()
             return
         mode, n = ML.mode(doc), len(ML.ticked(doc))
-        mirror = mode == ML.MIRROR
-        self.mm_mode_btn.setText("⧉ Mirror" if mirror else "⤞ Merge")
+        self.mm_mode_btn.setText({ML.OFF: "Mirror / Merge: off", ML.MIRROR: "⧉ Mirror",
+                                  ML.MERGE: "⤞ Merge"}[mode])
+        nxt = {ML.OFF: "Mirror", ML.MIRROR: "Merge", ML.MERGE: "off"}[mode]
         self.mm_mode_btn.setToolTip(
-            ("MIRROR: a wire drawn out of a ticked card gives every other ticked card its "
-             "own copy of the node it reaches, wired the same way — and while in mirror "
-             "mode, editing one copy edits them all, and a wire drawn on from any copy is "
-             "mirrored down every lane too."
-             if mirror else
-             "MERGE: a wire drawn out of a ticked card wires EVERY ticked card into the node "
-             "it reaches — the card you drag from into its first input, the rest in "
-             "alphabetical order. Refused if the node cannot take them all.")
-            + f"\n\nTick a card's box (top right of its header) to add it"
-            + (f" — {n} ticked." if n else ".") + "  Click to switch to "
-            + ("Merge." if mirror else "Mirror."))
+            {ML.OFF: "Mirror and merge are OFF: every wire is an ordinary wire.",
+             ML.MIRROR: "MIRROR: a wire drawn out of a ticked card gives every other ticked "
+                        "card its own copy of the node it reaches, wired the same way. The "
+                        "new nodes become the selection. While in mirror mode, editing one "
+                        "copy edits them all, and a wire drawn on from any copy is mirrored "
+                        "down every lane too.",
+             ML.MERGE: "MERGE: a wire drawn out of a ticked card wires EVERY ticked card "
+                       "into the node it reaches — the card you drag from into its first "
+                       "input, the rest in alphabetical order. Refused if the node cannot "
+                       "take them all."}[mode]
+            + ("" if mode == ML.OFF else
+               "\n\nSelecting cards (or a region) ticks them; a card's or a region's box adds "
+               "it to the selection or takes it out" + (f" — {n} ticked." if n else "."))
+            + f"\n\nClick to switch to {nxt}.")
         self.mm_clear_btn.setEnabled(n > 0)
         self.mm_clear_btn.setText(f"Clear selected ({n})" if n else "Clear selected")
         self._style_mm()
@@ -1478,27 +1571,35 @@ class GraphView(QGraphicsView):
         self.viewport().update()
 
     def _toggle_mm_mode(self) -> None:
+        """The mode button: off → mirror → merge → off."""
         doc = self._mm_doc()
         if doc is not None:
-            ML.set_mode(doc, ML.MERGE if ML.mode(doc) == ML.MIRROR else ML.MIRROR)
+            ML.set_mode(doc, ML.next_mode(doc))
 
     def _clear_mm(self) -> None:
+        """Clear selected: untick every card — and, since the ticks are the selection while
+        a mode is on, deselect them too, or the next selection change would tick them back."""
         doc = self._mm_doc()
-        if doc is not None:
-            ML.clear(doc)
+        if doc is None:
+            return
+        sc = self.scene()
+        if hasattr(sc, "select_only"):
+            sc.select_only([])
+        ML.clear(doc)
 
     def _style_mm(self) -> None:
-        """The mode button in its mode's colour — filled while cards are ticked (the mode is
-        live), outlined otherwise; Clear selected as a plain chip."""
+        """The mode button filled in its mode's colour while mirror or merge is on, a plain
+        muted chip while off; Clear selected as a plain chip."""
         doc = self._mm_doc()
         live = doc is not None and ML.active(doc)
-        col = T.MIRROR if doc is None or ML.mode(doc) == ML.MIRROR else T.MERGE
+        col = T.MERGE if doc is not None and ML.mode(doc) == ML.MERGE else T.MIRROR
         dark = "#14171c"
-        bg, ink = (col.name(), dark) if live else (T.PANEL.name(), col.name()
-                                                    if T.MODE == "dark" else T.INK.name())
+        bg, ink = (col.name(), dark) if live else (T.PANEL.name(), T.MUTED.name())
+        edge = (col.name() if T.MODE == "dark" else T.BORDER_HI.name()) if live \
+            else T.BORDER_HI.name()
         self.mm_mode_btn.setStyleSheet(
             f"QToolButton#mmMode {{ background:{bg}; color:{ink}; "
-            f"border:1px solid {col.name() if T.MODE == 'dark' else T.BORDER_HI.name()}; "
+            f"border:1px solid {edge}; "
             f"border-radius:11px; padding:3px 12px; font-size:11px; font-weight:800; }}"
             f"QToolButton#mmMode:hover {{ border-color:{T.ACCENT.name()}; }}")
         self.mm_clear_btn.setStyleSheet(

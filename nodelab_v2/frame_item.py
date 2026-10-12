@@ -28,6 +28,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, 
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsObject
 
 from nodegraph.sockets import SocketType
+from nodelab_v2 import multilink as ML
 from nodelab_v2 import theme as T
 
 
@@ -41,6 +42,7 @@ class FrameItem(QGraphicsObject):
     PORT_R = 5.0          # a port dot's radius
     PORT_GAP = 14.0       # the least vertical distance between two ports on one side
     LABEL_W = 170.0       # how far a port's label may run OUTSIDE the frame
+    CHECK = 12.0          # the mirror/merge checkbox's side (2026-10-12)
 
     def __init__(self, frame_rec, scene) -> None:
         super().__init__()
@@ -164,6 +166,38 @@ class FrameItem(QGraphicsObject):
         path.addRoundedRect(self._rect, 9, 9)
         return path
 
+    # ── mirror / merge (2026-10-12) ───────────────────────────────────────────
+    def mm_check_rect(self) -> QRectF:
+        """The region's mirror/merge checkbox, at the right end of its title bar."""
+        return QRectF(self._rect.width() - 11 - self.CHECK, (self.TITLE_H - self.CHECK) / 2,
+                      self.CHECK, self.CHECK)
+
+    def mm_ticked(self) -> bool:
+        """The box reads ticked while the region is selected (which ticks every card in
+        it) or every one of its cards is ticked."""
+        doc = getattr(self._scene, "doc", None)
+        if doc is None:
+            return False
+        live = [m for m in self.rec.members if m in doc.nodes]
+        return self.isSelected() or bool(live) and all(ML.is_ticked(doc, m) for m in live)
+
+    def _paint_mm(self, p: QPainter) -> None:
+        doc = getattr(self._scene, "doc", None)
+        if doc is None or not ML.active(doc):
+            return
+        on = self.mm_ticked()
+        col = T.MIRROR if ML.mode(doc) == ML.MIRROR else T.MERGE
+        r = self.mm_check_rect()
+        p.setPen(QPen(QColor(0, 0, 0, 150) if on else T.MUTED, 1))
+        p.setBrush(col if on else T.BODY)
+        p.drawRoundedRect(r, 2.5, 2.5)
+        if on:
+            p.setPen(QPen(QColor(20, 23, 28), 1.8))
+            x0, y0, w = r.left(), r.top(), r.width()
+            p.drawPolyline([QPointF(x0 + 0.25 * w, y0 + 0.52 * w),
+                            QPointF(x0 + 0.44 * w, y0 + 0.72 * w),
+                            QPointF(x0 + 0.78 * w, y0 + 0.30 * w)])
+
     def _color(self) -> QColor:
         return QColor(*self.rec.color) if self.rec.color else QColor(T.ACCENT)
 
@@ -186,7 +220,7 @@ class FrameItem(QGraphicsObject):
         f.setBold(True)
         p.setFont(f)
         p.setPen(T.INK)
-        p.drawText(QRectF(11, 0, self._rect.width() - 22, self.TITLE_H),
+        p.drawText(QRectF(11, 0, self._rect.width() - 22 - self.CHECK - 6, self.TITLE_H),
                    Qt.AlignVCenter | Qt.AlignLeft, self.rec.title)
         suffix = self.title_text()[len(self.rec.title):]
         if suffix:
@@ -194,8 +228,9 @@ class FrameItem(QGraphicsObject):
             f2 = QFont(T.SANS, 8)
             p.setFont(f2)
             p.setPen(T.MUTED)
-            p.drawText(QRectF(x, 0, max(0.0, self._rect.width() - 11 - x), self.TITLE_H),
-                       Qt.AlignVCenter | Qt.AlignLeft, suffix)
+            p.drawText(QRectF(x, 0, max(0.0, self._rect.width() - 17 - self.CHECK - x),
+                              self.TITLE_H), Qt.AlignVCenter | Qt.AlignLeft, suffix)
+        self._paint_mm(p)
         # ports: a Dataset-coloured dot on the border, its label outside
         if self._ports:
             port_col = T.SOCKET.get(SocketType.DATASET, col)
@@ -216,6 +251,12 @@ class FrameItem(QGraphicsObject):
 
     # ── drag = move all members together ────────────────────────────────────────
     def mousePressEvent(self, e) -> None:
+        doc = getattr(self._scene, "doc", None)
+        if e.button() == Qt.LeftButton and doc is not None and ML.active(doc)                 and self.mm_check_rect().contains(e.pos())                 and hasattr(self._scene, "toggle_region_tick"):
+            # the region's box: tick (or untick) every card in it, as a selection
+            self._scene.toggle_region_tick(self.rec.id)
+            e.accept()
+            return
         if e.button() == Qt.LeftButton:
             self.setSelected(True)
             self._drag_last = e.scenePos()

@@ -2215,23 +2215,31 @@ has moved since.
 
 ### Mirror and merge — one wire, many nodes (2026-10-12)
 
-Every card has a **checkbox at the right of its header**. Tick several cards and a wire you
-draw **out of one of them** applies to all of them, in the mode shown by the button **beside
-the action pill**. Click that button to switch between the two modes:
+The button **beside the action pill** steps the page through three modes: **off** (the
+default: every wire is an ordinary wire, and no card shows a checkbox), **Mirror** and
+**Merge**. While a mode is on, every card has a **checkbox at the right of its header**, and
+every region has one at the right of its title bar. **The ticked cards are the selected
+cards.** Selecting cards, by clicking, dragging or drag-selecting, ticks them, and selecting a
+region ticks every card in it. A box adds its card or region to the selection or takes it
+out, without clearing the rest. A plain click on empty canvas deselects, and so unticks,
+everything. Turning a mode on ticks whatever is already selected. A wire you then draw **out
+of a ticked card** applies to all of them:
 
 * **Mirror** — every other ticked card gets **its own copy** of the node the wire reaches. The
   copy has the same type and values and the same wire from its own card, sits at the same offset
   from it, and takes the original's other incoming wires too, so a shared reference stays
   shared. This works for a wire dropped on an existing node and for a node made from the
-  link-drag search. **While in mirror mode, editing any of the copies edits all of them**, on
-  the card or in Properties. A Page Output's name and a card's title stay each copy's own.
+  link-drag search. **The new nodes then become the selection** — the one placed and every
+  copy — and the cards they came from drop out of it. **While in mirror mode, editing any of
+  the copies edits all of them**, on the card or in Properties. A Page Output's name and a card's
+  title stay each copy's own.
   **The mirror continues down the chain.** Each ticked card starts a *lane*. A wire drawn on
-  from any mirrored copy, which needs no tick of its own, is drawn in every lane. To a new
-  node, each lane gets its own copy, and those copies continue the same way, however long the
-  chain. To a node that is itself that lane's copy (say Z's Overlay, when drawing from Z's
-  Gamma), the same wire is drawn between each lane's two copies and no node is made. A copied
-  node's other inputs follow their lane too. A wire from one lane into another lane's copy
-  stays a single wire, and the status bar says so.
+  from any mirrored copy is drawn in every lane. To a new node, each lane gets its own copy,
+  and those copies continue the same way, however long the chain. To a node that is itself
+  that lane's copy (say Z's Overlay, when drawing from Z's Gamma), the same wire is drawn
+  between each lane's two copies and no node is made. A copied node's other inputs follow
+  their lane too. A wire from one lane into another lane's copy stays a single wire, and the
+  status bar says so.
 * **Merge** — **every ticked card is wired into the one node** the wire reaches. The card you
   drag from goes into its **primary (first) input**, and the others follow **in alphabetical
   order** of their titles. They fill a node's several inputs in turn (Overlay's two), its
@@ -2240,16 +2248,21 @@ the action pill**. Click that button to switch between the two modes:
   changes**. A node with only one input always refuses, and the status bar says why. A node
   made from the link-drag search for a refused merge is removed again.
 
-While any card is ticked the canvas is **outlined at its very edge**: **white** for mirror,
+Switching between Mirror and Merge keeps the ticks. So **mirror a step, switch to Merge, and
+draw a wire from one of the new copies** to bring every lane back into one node.
+
+While a mode is on, the canvas is **outlined at its very edge**: **white** for mirror,
 **yellow** for merge. It is a square band with a dark hairline inside, so it reads on both
 themes. It stays clear of the troubleshooting frame, which is amber, rounded and further in,
-with plain canvas between the two. **Clear selected**, beside the mode button, unticks every
-card. That ends the mode, so the copies become ordinary nodes, edited one at a time again.
+with plain canvas between the two. Ticked cards wear a ring in the same colour. **Clear
+selected**, beside the mode button, unticks and deselects every card; the mode stays on.
+Stepping the button to **off** unticks everything and ends the mode, so the copies become
+ordinary nodes, edited one at a time again.
 
-A wire drawn from an unticked card that is not a mirrored copy, from a card that is the only
-one ticked, or from an input socket, is an ordinary wire. So is a wire from a mirrored copy
-in merge mode: merge acts on the ticked cards. The ticks, the mode and which nodes are copies of each
-other belong to the page and the session; they are not saved with the file.
+A wire drawn while off, from an unticked card that is not a mirrored copy, from a card that is
+the only one ticked, or from an input socket, is an ordinary wire. So is a wire from a mirrored
+copy in merge mode: merge acts on the ticked cards. The mode, the ticks and which nodes are
+copies of each other belong to the page and the session; they are not saved with the file.
 
 ### Node groups — `Ctrl+G` / `Ctrl+Shift+G`
 
