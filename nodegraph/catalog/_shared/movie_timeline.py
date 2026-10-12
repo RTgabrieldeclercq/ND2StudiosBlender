@@ -384,7 +384,7 @@ class MovieSource:
     """
 
     __slots__ = ("letter", "ds", "ax", "prov", "px_um", "z_step", "dt_s", "emis",
-                 "bit_depth", "names", "pos_names", "_vox", "picture", "colors")
+                 "bit_depth", "names", "pos_names", "_vox", "picture", "colors", "frame_s")
 
     def __init__(self, letter: str, ds, *, calib: Callable, meta: Callable) -> None:
         self.letter, self.ds, self.ax = letter, ds, ds.axes
@@ -407,6 +407,13 @@ class MovieSource:
         own = dict(getattr(ds, "metadata", None) or {})
         self.names = list(meta("channel_names") or own.get("channel_names") or [])
         self.pos_names = list(meta("position_name") or own.get("position_name") or [])
+        # the ACQUISITION clock, seconds since the first frame (2026-10-12): display
+        # metadata like the names, so the Dataset's own dict is the fallback. What the burned-in
+        # time reads first — a Timeseries Builder's interleaved series is unevenly spaced, so
+        # `t × interval` would print a time the frame was not taken at.
+        from nodegraph.placement import frame_seconds
+        self.frame_s = frame_seconds(meta("frame_time_jd") or own.get("frame_time_jd"),
+                                     int(self.ax.t)) or []
         self._vox: Dict[str, np.ndarray] = {}
 
     def channel_name(self, c: int) -> str:
@@ -951,9 +958,35 @@ class Timeline:
         if v.tile_axis == "z":
             return f"z {int(z) + 1}"
         if v.tile_axis == "t":
-            iv = self._interval(v.src)
-            return _time_text(t, iv, v.src.ax.t) if iv > 0 else f"t {t + 1}"
+            return self._time_at(v.src, t) or f"t {t + 1}"
         return ""
+
+    def _time_at(self, src: MovieSource, t: int) -> str:
+        """The elapsed time burned in for timepoint ``t`` of ``src``: from its ACQUISITION
+        clock when it carries one for every frame (frame 0 = 0, the real gap however uneven
+        — 2026-10-12), else ``t ×`` :meth:`_interval`; ``""`` when neither says."""
+        fs = src.frame_s
+        if fs and 0 <= int(t) < len(fs):
+            from nodegraph.placement import elapsed_text
+            return elapsed_text(fs[int(t)], fs[-1] - fs[0])
+        iv = self._interval(src)
+        return _time_text(t, iv, src.ax.t) if iv and iv > 0 else ""
+
+    def frame_timing(self, k: int) -> List[str]:
+        """When output frame ``k``'s timepoint was acquired, the gap from the timepoint
+        before it, and the mean gap across its source — from that source's clock
+        (:func:`nodegraph.placement.frame_timing_lines`); ``[]`` when it has none. What the
+        Movie Editor's readout and its timeline's hover show."""
+        ci, tp, zp, lt = self.frames[int(k)]
+        c = self._clips[ci]
+        if not c.views:
+            return []
+        _m, t, _z = self._bind(c.views[0], tp, zp, lt)
+        fs = c.views[0].src.frame_s
+        if not fs or not isinstance(t, int) or not 0 <= t < len(fs):
+            return []
+        from nodegraph.placement import frame_timing_lines
+        return [f"t {t + 1}: " + frame_timing_lines(fs, t)[0]] + frame_timing_lines(fs, t)[1:]
 
     def _interval(self, src: MovieSource) -> float:
         """Seconds between timepoints: the node's own ``Frame interval`` for ``A``, which
@@ -1038,9 +1071,9 @@ class Timeline:
         if ann["frame"]:
             lines.append(f"{k + 1}/{self.n_frames}")
         if ann["time"] and v0.tile_axis != "t":
-            iv = self._interval(src)
-            if iv and iv > 0:
-                lines.append(_time_text(t0, iv, src.ax.t))
+            when = self._time_at(src, t0)
+            if when:
+                lines.append(when)
         if ann["z"] and v0.tile_axis != "z" and isinstance(z0, int) and src.ax.z > 1:
             txt = f"z {z0 + 1}/{src.ax.z}"
             if src.z_step:

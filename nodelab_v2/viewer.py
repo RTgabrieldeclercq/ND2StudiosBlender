@@ -3323,7 +3323,21 @@ class ViewerPanel(QWidget):
     def _apply_axes(self, axes, dataset) -> None:
         self._apply_cursor_ranges(axes)
         self._apply_position_groups(dataset)
+        self._apply_frame_times(dataset)
         self._rebuild_channels(axes, dataset)
+
+    def _apply_frame_times(self, dataset) -> None:
+        """Give the T strip the payload's acquisition clock (2026-10-12), so hovering a
+        frame says when it was taken (frame 0 = 0), how long after the frame before, and the
+        mean gap — the real per-frame times, which an interleaved Timeseries Builder series
+        needs because its gaps are uneven. After :meth:`_apply_cursor_ranges`, like the M
+        groups: the strip refuses a clock that does not cover its axis, so under the
+        troubleshooting scope (a payload holding only the picked frames) it shows none
+        rather than another frame's time."""
+        from nodegraph.placement import frame_seconds
+        md = getattr(dataset, "metadata", {}) or {}
+        strip = self._sliders["t"]
+        strip.setFrameTimes(frame_seconds(md.get("frame_time_jd"), strip.count()))
 
     def _apply_position_groups(self, dataset) -> None:
         """Band the M strip by specimen, from the payload's per-position group list.

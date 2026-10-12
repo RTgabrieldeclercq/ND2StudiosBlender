@@ -9459,6 +9459,28 @@ def main(argv) -> int:
         "from, an edit on one copy edits all, the mirror continues down the lanes, and the "
         "newest copies merge when the mode is switched; off unticks all and ends it")
 
+    # ── FT1: hovering a T frame says when it was acquired (2026-10-12) ───────────────
+    # frame 0 = 0, the gap from the frame before, and the mean gap across the series —
+    # from the payload's own clock, uneven gaps and all (an interleaved Timeseries Builder)
+    from nodegraph.dataset import Dataset as _DS20
+    _ts20 = win.viewer._sliders["t"]
+    _ts20.setMaximum(4)
+    _jd20 = [2460000.0 + _mn / 1440.0 for _mn in (0, 33, 65, 98, 130)]
+    win.viewer._apply_frame_times(_DS20(axes=AxisSizes(m=1, t=5, z=1, c=1, y=4, x=4),
+                                        metadata={"frame_time_jd": _jd20}))
+    _tip20 = _ts20._tip(2)
+    assert "acquired 01:05:00 after frame 0" in _tip20 and "Δ 00:32:00 after frame 1" in \
+        _tip20 and "mean Δ 00:32:30 over 4 intervals" in _tip20, _tip20
+    assert "the first frame — time 0" in _ts20._tip(0), _ts20._tip(0)
+    _ts20.setMaximum(9)                       # another length: that clock is not this one
+    assert "acquired" not in _ts20._tip(2), _ts20._tip(2)
+    win.viewer._apply_frame_times(_DS20(axes=AxisSizes(m=1, t=10, z=1, c=1, y=4, x=4),
+                                        metadata={"frame_time_jd": _jd20}))
+    assert "acquired" not in _ts20._tip(2), "a clock that does not cover the axis shows none"
+    _ok("FT1 hovering a T frame shows when it was acquired (frame 0 = 0), the gap from the "
+        "frame before and the mean gap, from the payload's clock; a clock that does not "
+        "cover the strip shows none")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

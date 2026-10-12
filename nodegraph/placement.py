@@ -54,6 +54,7 @@ __all__ = [
     "context_extent", "sub_field_box", "source_window",
     "secondary_z_index", "ZGrid", "merge_z_grid", "Z_GRID_BLOWUP",
     "paired_t_frac", "map_t", "secondary_z_weights", "plan_time", "frame_interval_s",
+    "frame_seconds", "frame_timing", "frame_timing_lines",
     "snap_rate", "parse_pins", "pins_json", "nudge_delta_um", "RATE_SNAP_TOL",
     "SUB_TICK_CAP", "union_canvas", "CANVAS_MAX_PX", "CANVAS_MAX_Z", "canvas_flip",
     "canvas_mapping",
@@ -116,6 +117,54 @@ def elapsed_text(seconds: float, span_seconds: float) -> str:
     if span < 86400.0:                                 # under a day -> hh:mm:ss
         return f"{sign}{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
     return f"{sign}{s // 86400}d {(s % 86400) // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def frame_seconds(jd: Any, n: int) -> Optional[List[float]]:
+    """Seconds since the FIRST frame, one per timepoint — frame 0 is ``0`` — from a per-T
+    Julian-day clock (``frame_time_jd``), or ``None`` when ``jd`` is not ``n`` finite values.
+    The acquisition clock, not ``t × dt_s``: an interleaved series (a Timeseries Builder
+    that merged several files frame by frame) is not evenly spaced, and only the clock says
+    when each frame was really taken (2026-10-12)."""
+    if not isinstance(jd, (list, tuple)) or n < 1 or len(jd) != int(n):
+        return None
+    try:
+        vals = [float(v) for v in jd]
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(v) for v in vals):
+        return None
+    return [(v - vals[0]) * SECONDS_PER_DAY for v in vals]
+
+
+def frame_timing(seconds: Sequence[float], i: int
+                 ) -> Tuple[float, Optional[float], Optional[float]]:
+    """``(elapsed, delta, mean)`` for frame ``i`` of a clock in seconds since frame 0
+    (:func:`frame_seconds`): its time after the first frame, the gap from the frame BEFORE
+    it (``None`` for the first), and the mean gap between consecutive frames over the whole
+    series — ``(last - first) / (n - 1)``, ``None`` for a single frame."""
+    n = len(seconds)
+    i = max(0, min(int(i), n - 1))
+    delta = float(seconds[i]) - float(seconds[i - 1]) if i > 0 else None
+    mean = (float(seconds[-1]) - float(seconds[0])) / (n - 1) if n > 1 else None
+    return float(seconds[i]), delta, mean
+
+
+def frame_timing_lines(seconds: Sequence[float], i: int) -> List[str]:
+    """The three readouts a hovered or shown timepoint carries — the Viewer's T strip and
+    the Movie Editor say the same thing from this one function: when it was taken
+    (frame 0 = 0), how long after the frame before, and the mean gap across the series.
+    Each formatted at the unit the whole span picks (:func:`elapsed_text`)."""
+    if not seconds:
+        return []
+    span = float(seconds[-1]) - float(seconds[0])
+    elapsed, delta, mean = frame_timing(seconds, i)
+    i = max(0, min(int(i), len(seconds) - 1))
+    lines = [f"acquired {elapsed_text(elapsed, span)} after frame 0"]
+    lines.append(f"Δ {elapsed_text(delta, span)} after frame {i - 1}" if delta is not None
+                 else "the first frame — time 0")
+    if mean is not None:
+        lines.append(f"mean Δ {elapsed_text(mean, span)} over {len(seconds) - 1} intervals")
+    return lines
 
 #: Two fields are treated as describing the same field of view when their physical extents
 #: agree to within this fraction. Deliberately loose: a resample by a non-integer factor

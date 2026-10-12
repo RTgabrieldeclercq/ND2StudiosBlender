@@ -13342,7 +13342,7 @@
           "unit": "s",
           "default": 0.0,
           "derive": "dt_s or 0.0",
-          "description": "Seconds of EXPERIMENT time between frames, used for the burned-in clock. Auto-filled from the file's own per-frame timestamps (the median interval), so on an ND2 you should not have to touch it. It is the median of a nominally-regular acquisition, not a per-frame clock, so a run that stalled shows nominal time — override it here if you know better. 0 means unknown, and the time readout is then omitted rather than showing a made-up number. Changes only the overlay; nothing about the pixels or the playback speed."
+          "description": "Seconds of EXPERIMENT time between frames, for the burned-in clock of a source that carries no per-frame acquisition clock (a source that does — an ND2, a Timeseries Builder's series — burns each frame's real time instead). Auto-filled from the file's own per-frame timestamps (the median interval). 0 means unknown, and the time readout is then omitted rather than showing a made-up number. Changes only the overlay; nothing about the pixels or the playback speed."
         },
         {
           "name": "max_px",
@@ -13500,7 +13500,7 @@
               "z"
             ]
           },
-          "description": "Burn the elapsed EXPERIMENT time into the corner, from `Frame interval`. The unit is picked once from the run's total duration and then holds, so a 6-hour run reads `01:15:00` and a 90-second one reads `12.5 s` rather than `00:00:12`. Silently omitted when the interval is 0/unknown, and inert when Sweep = 'z' — a Z position is not a time."
+          "description": "Burn the elapsed EXPERIMENT time into the corner: from each frame's own acquisition clock when the source carries one (frame 0 is 0, and every gap is the real one — what a Timeseries Builder's interleaved series needs), else from `Frame interval`. The unit is picked once from the run's total duration and then holds, so a 6-hour run reads `01:15:00` and a 90-second one reads `12.5 s` rather than `00:00:12`. Silently omitted when there is neither a clock nor an interval, and inert when Sweep = 'z' — a Z position is not a time."
         },
         {
           "name": "show_scalebar",
@@ -21038,7 +21038,7 @@
           "default": "time",
           "description": "Which file becomes frame 0, and the rest after it. This is the one setting a wrong result here actually depends on, and nothing else in the GUI shows the answer — the node card's note reports the rule that was actually used and the resolved order, with each file's first timestamp.",
           "choice_docs": {
-            "time": "By the acquisition clock the microscope recorded (frame_time_jd), so the series is correct whatever order the files were wired in and whatever their names say. Onto Time it reads EVERY frame's timestamp in EVERY file, so a run written as a sequence of files whose neighbouring timepoints sit in neighbouring files plays in true time order — the files interleave, each keeping its own frames in order, and the card's note says so. Onto the other axes the files are ordered by their first frame. Needs a clock on EVERY file; where one is missing the node falls back to the filename sequence and the card's note says so. The default.",
+            "time": "By the acquisition clock the microscope recorded (frame_time_jd), so the series is correct whatever order the files were wired in and whatever their names say. Onto Time it reads EVERY frame's timestamp in EVERY file, so a run written as a sequence of files whose neighbouring timepoints sit in neighbouring files plays in true time order — the files interleave, each keeping its own frames in order, and the card's note says so. Files whose visits to a position land a few µm apart then jitter frame to frame — put Registration → Stabilize after the builder. Onto the other axes the files are ordered by their first frame. Needs a clock on EVERY file; where one is missing the node falls back to the filename sequence and the card's note says so. The default.",
             "sequence": "By the counting number in the filenames: the numeric field that VARIES across them, so t9 sorts before t10 and a constant _z002 elsewhere in the name is not mistaken for the counter. Falls back to a plain natural sort when no single field varies, and to wiring order when any file has no name. Use it for files whose clocks are wrong or missing.",
             "loaded": "Wiring order: the slots in the order you wired them, and each card's own files in the order it holds them. Use it when both the clocks and the names are unusable and you have assembled the set by hand in the order you want. The card's note reads 'wired' whenever this order is in force, chosen or fallen back to."
           }

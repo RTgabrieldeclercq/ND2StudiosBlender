@@ -360,7 +360,9 @@ register_node(
                          "timestamp in EVERY file, so a run written as a sequence of files "
                          "whose neighbouring timepoints sit in neighbouring files plays in "
                          "true time order — the files interleave, each keeping its own "
-                         "frames in order, and the card's note says so. Onto the other "
+                         "frames in order, and the card's note says so. Files whose visits "
+                         "to a position land a few µm apart then jitter frame to frame — put "
+                         "Registration → Stabilize after the builder. Onto the other "
                          "axes the files are ordered by their first frame. Needs a clock "
                          "on EVERY file; where one is missing the node falls back to the "
                          "filename sequence and the card's note says so. The default.",

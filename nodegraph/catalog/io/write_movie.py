@@ -790,13 +790,13 @@ register_node(
         InFloat("interval_s", "Frame interval", unit="s", field=False, default=0.0,
                 derive="dt_s or 0.0",
                 description=
-                "Seconds of EXPERIMENT time between frames, used for the burned-in clock. "
-                "Auto-filled from the file's own per-frame timestamps (the median interval), "
-                "so on an ND2 you should not have to touch it. It is the median of a "
-                "nominally-regular acquisition, not a per-frame clock, so a run that stalled "
-                "shows nominal time — override it here if you know better. 0 means unknown, "
-                "and the time readout is then omitted rather than showing a made-up number. "
-                "Changes only the overlay; nothing about the pixels or the playback speed."),
+                "Seconds of EXPERIMENT time between frames, for the burned-in clock of a "
+                "source that carries no per-frame acquisition clock (a source that does — an "
+                "ND2, a Timeseries Builder's series — burns each frame's real time instead). "
+                "Auto-filled from the file's own per-frame timestamps (the median interval). "
+                "0 means unknown, and the time readout is then omitted rather than showing "
+                "a made-up number. Changes only the overlay; nothing about the pixels or the "
+                "playback speed."),
         InInt("max_px", "Max px", unit="px", field=False, default=1200,
               description=
               "Downscale so the frame's longest edge is at most this many pixels; 0 leaves "
@@ -881,11 +881,14 @@ register_node(
         InBool("show_time", "Elapsed time", field=False, default=True,
                available_in={"sweep": _FLAT},
                description=
-               "Burn the elapsed EXPERIMENT time into the corner, from `Frame interval`. "
-               "The unit is picked once from the run's total duration and then holds, so a "
-               "6-hour run reads `01:15:00` and a 90-second one reads `12.5 s` rather than "
-               "`00:00:12`. Silently omitted when the interval is 0/unknown, and inert when "
-               "Sweep = 'z' — a Z position is not a time."),
+               "Burn the elapsed EXPERIMENT time into the corner: from each frame's own "
+               "acquisition clock when the source carries one (frame 0 is 0, and every gap "
+               "is the real one — what a Timeseries Builder's interleaved series needs), "
+               "else from `Frame interval`. The unit is picked once from the run's total "
+               "duration and then holds, so a 6-hour run reads `01:15:00` and a 90-second "
+               "one reads `12.5 s` rather than `00:00:12`. Silently omitted when there is "
+               "neither a clock nor an interval, and inert when Sweep = 'z' — a Z position "
+               "is not a time."),
         InBool("show_scalebar", "Scale bar", field=False, default=True,
                available_in={"sweep": _FLAT},
                description=

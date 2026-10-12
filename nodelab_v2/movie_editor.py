@@ -33,13 +33,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
-    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QToolButton, QToolTip, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from nodegraph.catalog._shared import movie_timeline as MT
@@ -237,6 +237,10 @@ class _TimelineStrip(QWidget):
         self._total = 0
         self._cursor = 0
         self._selected = -1
+        #: ``k -> str`` (rich text): what hovering output frame ``k`` says — set by the panel
+        #: from its Timeline (frame, segment, and the frame's acquisition timing)
+        self.describe = None
+        self.setMouseTracking(True)
 
     def set_timeline(self, spans: Sequence[Tuple[int, int]], labels: Sequence[str],
                      total: int) -> None:
@@ -291,6 +295,17 @@ class _TimelineStrip(QWidget):
     def mouseMoveEvent(self, e) -> None:
         if e.buttons() & Qt.LeftButton:
             self.seek.emit(self._frame_at(e.position().x()))
+
+    def event(self, e) -> bool:
+        # hovering a frame says what it is and WHEN it was acquired (2026-10-12)
+        if e.type() == QEvent.ToolTip and self._total > 0 and self.describe is not None:
+            text = self.describe(self._frame_at(e.pos().x()))
+            if text:
+                QToolTip.showText(e.globalPos(), text, self)
+            else:
+                QToolTip.hideText()
+            return True
+        return super().event(e)
 
 
 class _Monitor(QLabel):
@@ -466,6 +481,7 @@ class MovieEditorPanel(QWidget):
         self._monitor = _Monitor()
         mv.addWidget(self._monitor, 1)
         self._strip = _TimelineStrip()
+        self._strip.describe = self._describe_hover
         self._strip.seek.connect(self.seek)
         self._strip.picked.connect(lambda i: self.select(("seg", i)))
         mv.addWidget(self._strip)
@@ -1411,7 +1427,16 @@ class MovieEditorPanel(QWidget):
             bits.append(f"z {info['z'] + 1}")
         seg = self._spec["segments"][info["segment"]]
         bits.append(segment_label(seg))
+        # the real acquisition timing of the frame shown (2026-10-12): frame 0 = 0, the gap
+        # from the frame before, the mean gap — from the source's own clock
+        bits.extend(self._tl.frame_timing(k))
         return "  ·  ".join(bits)
+
+    def _describe_hover(self, k: int) -> str:
+        """The timeline's hover text for output frame ``k``: the readout's facts, one a line."""
+        if self._tl is None or not 0 <= int(k) < self._tl.n_frames:
+            return ""
+        return "<br>".join(self._describe(int(k)).split("  ·  "))
 
     def _on_rendered(self, gen: int, k: int, out: Any) -> None:
         if gen != self._gen:

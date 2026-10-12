@@ -30987,7 +30987,107 @@ def test_multilink() -> None:
         "lane by lane from a mirrored node (a chain of any length; a parallel input from "
         "each lane's own member; a wire between two parallel groups drawn in every lane "
         "with no node made; a cross-lane wire left single); an edit applies to the mirror "
-        "group only while in mirror mode with something ticked")
+        "group while in mirror mode, ticked or not, and not once the page is off")
+
+
+def test_frame_timing() -> None:
+    """Per-frame acquisition timing (2026-10-12) — what hovering a T frame says, and what the
+    Movie Editor shows and burns in — plus the troubleshooting scope's re-addressing guard.
+
+    1. ``placement.frame_seconds`` turns a ``frame_time_jd`` clock into seconds since frame
+       0 (frame 0 is 0), refusing a clock of the wrong length or with a hole;
+       ``frame_timing`` gives each frame's elapsed time, its gap from the frame before and
+       the series' mean gap; ``frame_timing_lines`` words them at the span's unit.
+    2. A movie source carries its file's clock: the burned-in time is ``clock[t] - clock[0]``
+       — uneven gaps and all — not ``t × interval``, which stays the fallback for a source
+       with no clock; the Movie Editor's readout lines come from the same clock.
+    3. ``runner.readdressed_axes`` finds every axis a node upstream re-addresses (a
+       Timeseries Builder onto T or M, a Time Shift, a Select Frame, a concatenating
+       Merge), and ``_pin_frames`` takes ``None`` on an axis as "every index of this
+       source" — so the troubleshooting scope never cuts the sources to an index that means
+       something else downstream.
+    """
+    from nodegraph.placement import (elapsed_text, frame_seconds, frame_timing,
+                                     frame_timing_lines)
+    J, MIN = 2460000.0, 1.0 / 1440.0
+    mins = (0, 33, 65, 98, 130)                         # uneven, as an interleaved series is
+    jd = [J + m * MIN for m in mins]
+    s = frame_seconds(jd, 5)
+    assert s[0] == 0.0 and all(abs(a - 60 * m) < 1e-3 for a, m in zip(s, mins)), s
+    assert frame_seconds(jd, 4) is None and frame_seconds([J, "x"], 2) is None
+    assert frame_seconds([J, float("nan")], 2) is None and frame_seconds(None, 1) is None
+    el, d, mean = frame_timing(s, 2)
+    assert abs(el - 3900) < 1e-3 and abs(d - 1920) < 1e-3 and abs(mean - 1950) < 1e-3
+    assert frame_timing(s, 0)[1] is None and frame_timing([0.0], 0)[2] is None
+    assert frame_timing_lines(s, 2) == ["acquired 01:05:00 after frame 0",
+                                        "Δ 00:32:00 after frame 1",
+                                        "mean Δ 00:32:30 over 4 intervals"], \
+        frame_timing_lines(s, 2)
+    assert frame_timing_lines(s, 0)[1] == "the first frame — time 0"
+
+    # 2. the movie: the clock wins over t × interval, the interval stays the fallback
+    try:
+        import cv2  # noqa: F401
+        from PIL import Image  # noqa: F401
+        movie = True
+    except Exception:  # noqa: BLE001
+        movie = False
+    if movie:
+        from nodegraph.catalog._shared import movie_timeline as MT
+        from nodegraph.provider import ArrayProvider
+        ax = AxisSizes(m=1, t=5, z=1, c=1, y=8, x=8)
+        img = np.zeros((1, 5, 1, 1, 8, 8), np.uint16)
+        clocked = {"pixel_size_um": 0.5, "dt_s": 60.0, "frame_time_jd": jd}
+        plain = {"pixel_size_um": 0.5, "dt_s": 60.0}
+        style = MT.MovieStyle(max_px=0, corner="top_left", font_px=0,
+                              text_rgb=(255, 255, 255), interval_s=60.0)
+        spec = {"segments": [{"play": {"axis": "t"}, "panels": [{"source": "A"}]}]}
+        for md, want in ((clocked, elapsed_text(3900, 7800)),
+                         (plain, MT._time_text(2, 60.0, 5))):
+            ds = Dataset(axes=ax, metadata=dict(md)).with_image(ArrayProvider(img))
+            src = MT.MovieSource("A", ds, calib=md.get, meta=lambda _k: None)
+            tl = MT.Timeline(spec, {"A": src}, style)
+            assert tl._time_at(src, 2) == want, (tl._time_at(src, 2), want)
+        ds = Dataset(axes=ax, metadata=dict(clocked)).with_image(ArrayProvider(img))
+        tl = MT.Timeline(spec, {"A": MT.MovieSource("A", ds, calib=clocked.get,
+                                                    meta=lambda _k: None)}, style)
+        k2 = next(k for k in range(tl.n_frames) if tl.frame_info(k)["t"] == 2)
+        assert tl.frame_timing(k2) == ["t 3: acquired 01:05:00 after frame 0",
+                                       "Δ 00:32:00 after frame 1",
+                                       "mean Δ 00:32:30 over 4 intervals"], tl.frame_timing(k2)
+
+    # 3. the troubleshooting scope leaves a re-addressed axis whole
+    from nodelab_v2.runner import _pin_frames, readdressed_axes
+    from nodegraph.provider import ArrayProvider as _AP
+
+    def chain(op, **modes):
+        return Graph(nodes={"L": NodeInstance("L", "io.load"),
+                            "X": NodeInstance("X", op, modes=modes),
+                            "V": NodeInstance("V", "enhance.gamma")},
+                     edges=[Edge("L", "X", "image", "data"), Edge("X", "V", "out", "data")])
+
+    assert readdressed_axes(chain("util.timeseries", chain_axis="T"), "V") == {"t"}
+    assert readdressed_axes(chain("util.timeseries", chain_axis="M"), "V") == {"m"}
+    assert readdressed_axes(chain("util.time_shift"), "V") == {"t"}
+    assert readdressed_axes(chain("util.select_frame"), "V") == {"t"}
+    assert readdressed_axes(chain("util.merge", merge_axis="T"), "V") == {"t"}
+    assert readdressed_axes(chain("util.merge", merge_axis="C"), "V") == frozenset()
+    assert readdressed_axes(chain("enhance.gaussian"), "V") == frozenset()
+    assert readdressed_axes(chain("util.timeseries", chain_axis="T"), "L") == frozenset(), \
+        "only what is UPSTREAM of the pulled node counts"
+    pax = AxisSizes(m=2, t=3, z=1, c=1, y=4, x=4)
+    prov = _AP(np.zeros((2, 3, 1, 1, 4, 4), np.uint16))
+    env = MetaEnvelope(axes=pax, metadata={})
+    v, e = _pin_frames(prov, env, (None, None, None, None))
+    assert (v.axes.m, v.axes.t) == (2, 3) and (e.axes.m, e.axes.t) == (2, 3), v.axes
+    v, e = _pin_frames(prov, env, ((1,), None, None, None))
+    assert (v.axes.m, v.axes.t) == (1, 3), v.axes
+    _ok("frame timing: the clock in seconds since frame 0 (refusing a clock of the wrong "
+        "length), each frame's gap from the one before and the mean gap, worded at the "
+        "span's unit; a movie burns the CLOCK (t × interval only without one) and the Movie "
+        "Editor reads its timing from it; the troubleshooting scope leaves an axis whole "
+        "where a node upstream re-addresses it (Timeseries Builder T/M, Time Shift, Select "
+        "Frame, Merge T)")
 
 
 def main() -> int:
@@ -31198,6 +31298,7 @@ def main() -> int:
     test_timeseries_frame_interleave()
     test_page_inputs_from_previous()
     test_multilink()
+    test_frame_timing()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

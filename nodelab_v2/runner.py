@@ -824,11 +824,57 @@ def render_plane_native(provider: Any, m: int, t: int, z: int, c: int,
 #: to the display cursor); ``zs`` is ``None`` when the whole volume runs, which is the
 #: default because a 3D node needs one.
 #: ``(ms, ts, zs, region)`` — the solo-frame scope a pull runs under. ``zs`` is ``None`` for
-#: the whole volume; ``region`` (2026-10-02) is the ``(y0, y1, x0, x1)`` source window the
+#: the whole volume, and ``ms`` / ``ts`` are ``None`` for an axis left whole because a node
+#: upstream of the pulled one re-addresses it (:func:`readdressed_axes`, 2026-10-12); ``region`` (2026-10-02) is the ``(y0, y1, x0, x1)`` source window the
 #: Viewer's troubleshooting box selects, or ``None`` for the whole frame. Both ``None``s are
 #: the identities the pre-region pin had, so an untouched box re-keys nothing.
-Pin = Tuple[Tuple[int, ...], Tuple[int, ...], Optional[Tuple[int, ...]],
+Pin = Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[Tuple[int, ...]],
             Optional[Tuple[int, int, int, int]]]
+
+
+#: The nodes whose OUTPUT addresses an axis differently from their input — so a source cut
+#: to "the frame the Viewer is on" would feed them the wrong frame: the Viewer's index is
+#: an index into their OUTPUT, not into any source. ``op_key -> (mode, {mode value: axis})``
+#: or ``op_key -> axis`` for a node that always re-addresses that one axis.
+_READDRESSING = {
+    "util.timeseries": ("chain_axis", {"T": "t", "M": "m", "Z": "z"}),
+    "util.merge": ("merge_axis", {"T": "t", "M": "m", "Z": "z"}),
+    "util.time_shift": "t",
+    "util.select_frame": "t",
+}
+
+
+def readdressed_axes(graph: Any, target: str) -> FrozenSet[str]:
+    """The axes (``"m"``, ``"t"``, ``"z"``) that some node UPSTREAM of ``target`` in the run
+    ``graph`` re-addresses (:data:`_READDRESSING`), found by walking its in-edges.
+
+    The troubleshooting scope cuts the SOURCES to the Viewer's cursor, which is right only
+    while every node keeps the source's indexing. A Timeseries Builder onto T makes frame 7
+    of its output some file's frame 1; a Time Shift plays frame 5 at 7; a Select Frame's
+    one frame is the source's frame k, not 0 — cutting the source to the cursor's index then
+    builds the shown frame out of the wrong ones, which reads as frames jumping about. Those
+    axes are left whole instead (2026-10-12): slower to scope, never wrong."""
+    nodes = getattr(graph, "nodes", {}) or {}
+    edges = list(getattr(graph, "edges", ()) or ())
+    seen: set = set()
+    stack = [target]
+    out: set = set()
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        inst = nodes.get(nid)
+        rule = _READDRESSING.get(getattr(inst, "op_key", "")) if inst is not None else None
+        if isinstance(rule, str):
+            out.add(rule)
+        elif rule is not None:
+            mode, axes = rule
+            ax = axes.get(str((getattr(inst, "modes", None) or {}).get(mode, "")).upper())
+            if ax:
+                out.add(ax)
+        stack.extend(e.src for e in edges if e.dst == nid)
+    return frozenset(out)
 
 
 class _HeldView(NamedTuple):
@@ -909,6 +955,10 @@ def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEn
     full-frame box is the identity the pre-region pin had.
     """
     ms, ts, zs = pin[0], pin[1], pin[2]
+    # an axis left whole (a node downstream re-addresses it): every index of THIS source,
+    # whose length may differ from the next one's (files of 8 and 7 frames)
+    ms = tuple(range(int(env.axes.m))) if ms is None else ms
+    ts = tuple(range(int(env.axes.t))) if ts is None else ts
     region = pin[3] if len(pin) > 3 else None
     view = (FrameSliceProvider(provider, ms[0], ts[0], zs) if len(ms) == len(ts) == 1
             else FrameSubsetProvider(provider, ms, ts, zs))
@@ -2357,7 +2407,7 @@ class EngineRunner(QObject):
             view = self._view_of(node_id) or self._rearm_view(node_id)
             if (view is not None and view.provider is not None
                     and self._rev(node_id) == view.rev
-                    and self._pin_for(coords) == view.pin):
+                    and self._pin_for(coords, node_id) == view.pin):
                 # `sub` is the Play-all sub-tick (overlay planes only). A full pull below
                 # draws sub-tick 0: it happens at a document change, never mid-playback.
                 self._serve_from_cache(node_id, coords, channels, sub, pull=pull)
@@ -2607,15 +2657,46 @@ class EngineRunner(QObject):
     def region(self) -> Optional[Tuple[int, int, int, int]]:
         return self._sel_region
 
-    def _pin_for(self, coords: Optional[Tuple[int, int, int, int]]) -> Optional[Pin]:
+    def _pin_for(self, coords: Optional[Tuple[int, int, int, int]],
+                 node_id: Optional[str] = None) -> Optional[Pin]:
         """The ``(ms, ts, zs, region)`` a request scopes to — ``None`` when the whole series
         runs. The picks where the user made them; the display cursor (exactly "the frame
         the user is on") on whichever *frame* axis they did not; the whole volume when z
-        is unpicked; and the troubleshooting box's window, or the whole frame."""
+        is unpicked; and the troubleshooting box's window, or the whole frame.
+
+        With ``node_id``, an axis a node upstream of it re-addresses is left WHOLE
+        (``None``, :func:`readdressed_axes`, 2026-10-12): the cursor indexes that node's
+        output, so cutting the sources to it would build the shown frame from the wrong
+        source frames."""
         if not self._solo or coords is None:
             return None
-        return (self._sel_m or (int(coords[0]),), self._sel_t or (int(coords[1]),),
-                self._sel_z or None, self._sel_region)
+        ms = self._sel_m or (int(coords[0]),)
+        ts = self._sel_t or (int(coords[1]),)
+        zs = self._sel_z or None
+        if node_id is not None:
+            free = self._readdressed(node_id)
+            ms = None if "m" in free else ms
+            ts = None if "t" in free else ts
+            zs = None if "z" in free else zs
+        return (ms, ts, zs, self._sel_region)
+
+    def _readdressed(self, node_id: str) -> FrozenSet[str]:
+        """:func:`readdressed_axes` for ``node_id``'s run graph, cached per page revision —
+        the held-view fast path asks on every cursor move."""
+        rid = self._rid(node_id)
+        rev = self._rev(rid)
+        cache = self.__dict__.setdefault("_readdressed_cache", {})
+        hit = cache.get(rid)
+        if hit is not None and hit[0] == rev:
+            return hit[1]
+        try:
+            composed = self._compose(rid)
+            free = readdressed_axes(composed.graph,
+                                    self._pull_id(rid, composed.graph, composed))
+        except Exception:  # noqa: BLE001 — a graph mid-edit: scope as before
+            free = frozenset()
+        cache[rid] = (rev, free)
+        return free
 
     @staticmethod
     def _payload_coords(coords, pin: Optional[Pin]):
@@ -4142,7 +4223,7 @@ class EngineRunner(QObject):
         pull_id = self._pull_id(node_id, graph, composed)
         sources, every = self._sources_for(pull_id, graph)
         job = _Job(self._epoch, graph, composed.revision, node_id, None, None,
-                   sources, pin=self._pin_for(coords) if scoped else None,
+                   sources, pin=self._pin_for(coords, node_id) if scoped else None,
                    bake={"store": store, "precision": precision, "bake_id": bake_id,
                          "signature": signature, "scoped": bool(scoped),
                          "hold": bool(hold)},
@@ -4384,7 +4465,7 @@ class EngineRunner(QObject):
         sources, every = self._sources_for(pull_id, graph)
         job = _Job(self._epoch, graph,
                    composed.revision, node_id, coords, channels, sources,
-                   pin=None if fetch else self._pin_for(coords), all_sources=every,
+                   pin=None if fetch else self._pin_for(coords, node_id), all_sources=every,
                    pull_id=pull_id)
         if fetch:
             self._fetches.add(self._epoch)
@@ -4621,7 +4702,8 @@ class EngineRunner(QObject):
             # — re-apply the subset to the merged result, or the pin's fix is undone one
             # line later.
             if job.pin is not None:
-                changes = position_subset(md, _picked(job.pin[0], full_m))
+                changes = position_subset(md, _picked(
+                    job.pin[0] if job.pin[0] is not None else range(full_m), full_m))
                 md.update({k: v for k, v in changes.items() if v is not None})
                 for k, v in changes.items():
                     if v is None:

@@ -81,6 +81,8 @@ class FrameStrip(QWidget):
         #: contiguous ``(start, end, key)`` runs this axis is divided into, or ``[]``.
         #: Set for M when the acquisition holds several specimens — see :meth:`setGroups`.
         self._groups: List[Tuple[int, int, str]] = []
+        #: seconds since index 0, one per index, or ``[]`` — see :meth:`setFrameTimes`
+        self._times: List[float] = []
         self._sel_dirty = False
         self._compact = False
         self.setMouseTracking(True)
@@ -143,6 +145,19 @@ class FrameStrip(QWidget):
                 return key
         return ""
 
+    def frameTimes(self) -> Optional[List[float]]:
+        return list(self._times) if self._times else None
+
+    def setFrameTimes(self, seconds: Optional[Sequence[float]]) -> None:
+        """When each index was acquired, in seconds since index 0 (2026-10-12) — the T
+        strip's hover then says when the hovered frame was taken, how long after the frame
+        before it, and the mean gap across the series
+        (:func:`nodegraph.placement.frame_timing_lines`). ``None`` — or a list that does not
+        cover the axis — shows none: a clock for some other length would put another
+        frame's time on this one."""
+        vals = list(seconds) if seconds is not None else []
+        self._times = vals if len(vals) == self.count() else []
+
     def setMaximum(self, hi: int) -> None:
         """Re-range the axis. Shrinking drops out-of-range picks — a selection that
         outlived its source would silently scope a run to frames that no longer exist."""
@@ -150,6 +165,8 @@ class FrameStrip(QWidget):
         if hi == self._max:
             return
         self._max = hi
+        if len(self._times) != hi + 1:
+            self._times = []                    # a clock for the old length is not this one
         trimmed = {i for i in self._sel if i <= hi}
         dropped = trimmed != self._sel
         self._sel = trimmed
@@ -419,7 +436,11 @@ class FrameStrip(QWidget):
             a, b, _k = next(r for r in self._groups if r[0] <= i <= r[1])
             grp = (f"<br>group <b>{grp}</b> &nbsp;— {ax} {a}-{b} "
                    f"({b - a + 1} of {n})")
-        return (f"<b>{ax} {i}</b> of {n}{grp}{pick}"
+        when = ""
+        if self._times and 0 <= i < len(self._times):
+            from nodegraph.placement import frame_timing_lines
+            when = "<br>" + "<br>".join(frame_timing_lines(self._times, i))
+        return (f"<b>{ax} {i}</b> of {n}{when}{grp}{pick}"
                 f"<br><br>drag &nbsp;— scrub (keeps working outside the strip)"
                 f"<br>ctrl+click / drag &nbsp;— pick {ax} for the run scope"
                 f"<br>shift+click &nbsp;— pick the range from the last one"

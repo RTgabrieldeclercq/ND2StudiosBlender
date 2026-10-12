@@ -66,6 +66,7 @@
 {"dst":"nodegraph.catalog._shared.labels","k":"imp","lazy":true,"src":"nodegraph.catalog._shared.movie_timeline"}
 {"dst":"nodegraph.catalog._shared.movie_draw","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.movie_timeline"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.movie_timeline"}
+{"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodegraph.catalog._shared.movie_timeline"}
 {"dst":"nodegraph.gpu","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.ndimage"}
 {"dst":"nodegraph.catalog._shared.labels","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.objects"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.objects"}
@@ -1273,6 +1274,7 @@
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2.multilink","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
+{"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.framestrip"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.framestrip"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.framestrip"}
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.glview"}
