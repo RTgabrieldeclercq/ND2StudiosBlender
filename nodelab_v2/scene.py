@@ -1354,6 +1354,8 @@ class GraphView(QGraphicsView):
     region_drawn = Signal(QRectF)
     #: the region box was armed (True — R, the menus) or put away (False — drawn, or Esc)
     region_mode_changed = Signal(bool)
+    #: the Node queue button was clicked (2026-10-12) — the window opens the queue under it
+    queue_requested = Signal()
 
     #: troubleshooting frame: stroke width, and the inset its rounded rect sits at.
     TS_BORDER = 3
@@ -1412,6 +1414,18 @@ class GraphView(QGraphicsView):
         self._fit_btn = HudButton("fit", self)
         self._fit_btn.setToolTip("Fit the view to the nodes (Home)")
         self._fit_btn.clicked.connect(lambda _=False: self.fit_all())
+        # beside them: the NODE QUEUE (2026-10-12) — what is running and what waits behind
+        # it, each with a way to cancel it. The window owns the runner, so it fills the text
+        # (`set_queue_count`) and opens the list (`queue_requested`)
+        self.queue_btn = QToolButton(self)
+        self.queue_btn.setObjectName("queueBtn")
+        self.queue_btn.setCursor(Qt.PointingHandCursor)
+        self.queue_btn.setFocusPolicy(Qt.NoFocus)
+        self.queue_btn.setToolTip("Node queue: the node computing now and the ones waiting "
+                                  "behind it — where each is, and Cancel")
+        self.queue_btn.clicked.connect(lambda _=False: self.queue_requested.emit())
+        self._queue_n = 0
+        self.set_queue_count(0)
         # the page switcher (V4.00 step 5): which page this canvas shows, and the menu that
         # changes it — top-left, where the troubleshooting badge steps aside for it
         self.page_button = QToolButton(self)
@@ -1465,6 +1479,14 @@ class GraphView(QGraphicsView):
         self._max_btn.raise_()
         self._fit_btn.move(self._max_btn.x() - self._fit_btn.width() - 6, 12)
         self._fit_btn.raise_()
+        qb = getattr(self, "queue_btn", None)
+        if qb is not None:
+            # a row of its own, under the corner buttons: the top row is the page switcher,
+            # the action pill and the mirror/merge buttons, and a narrow canvas fills it
+            qb.adjustSize()
+            qb.move(self._max_btn.x() + self._max_btn.width() - qb.width(),
+                    12 + self._max_btn.height() + 6)
+            qb.raise_()
         pb = getattr(self, "page_button", None)
         if pb is not None and pb.text():
             pb.adjustSize()
@@ -1609,6 +1631,27 @@ class GraphView(QGraphicsView):
             f"QToolButton#mmClear:hover {{ border-color:{T.ACCENT.name()}; }}"
             f"QToolButton#mmClear:disabled {{ color:{T.MUTED.name()}; "
             f"border-color:{T.BORDER.name()}; }}")
+
+    # ── the Node queue button (2026-10-12) ─────────────────────────────────────
+    def set_queue_count(self, n: int) -> None:
+        """How many jobs the runner holds — running and waiting. The button reads
+        ``Node queue`` when idle and ``Node queue · N`` (accented) while there is work."""
+        n = max(0, int(n))
+        self._queue_n = n
+        self.queue_btn.setText(f"Node queue · {n}" if n else "Node queue")
+        self._style_queue_btn()
+        self._place_corner_chrome()
+
+    def _style_queue_btn(self) -> None:
+        busy = getattr(self, "_queue_n", 0) > 0
+        edge = T.ACCENT if busy else T.BORDER
+        ink = T.INK if busy else T.MUTED
+        self.queue_btn.setStyleSheet(
+            f"QToolButton#queueBtn {{ background:{T.PANEL.name()}; color:{ink.name()}; "
+            f"border:1px solid {edge.name()}; border-radius:6px; padding:2px 8px; "
+            f"font-size:10px; font-weight:{800 if busy else 600}; }}"
+            f"QToolButton#queueBtn:hover {{ background:{T.PANEL_HI.name()}; "
+            f"color:{T.INK.name()}; }}")
 
     def set_canvas_active(self, on: bool) -> None:
         """An accent on the switcher while this is the canvas the user works in — what
@@ -1757,6 +1800,7 @@ class GraphView(QGraphicsView):
     def restyle(self) -> None:
         self._style_action_pill()
         self._style_mm()
+        self._style_queue_btn()
         self._max_btn.update()
         self._style_ts_badge()          # amber + ink come from the theme tokens
         self._style_page_button()

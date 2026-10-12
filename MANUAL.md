@@ -892,8 +892,11 @@ asked for and computes only what that request needs.
 | Re-pull the currently viewed node | `Shift+F5` |
 | Preview whatever you click | **View → Preview clicked node** (always on while the canvas is maximised) |
 | Analyse only the frame(s) you pick | `F9` — see [Troubleshooting mode](#troubleshooting-mode-analyse-the-frames-you-pick--f9) |
+| See what is running and waiting; cancel any of it | the **Node queue** button, under the canvas's top-right corner — see [The Node queue](#the-node-queue--see-what-runs-cancel-it-2026-10-12) |
 
-One pull runs at a time (latest-wins queueing) on a worker thread, so the UI never blocks.
+One pull runs at a time on a worker thread, so the UI never blocks. A pull you ask for while
+another runs waits in line behind it, in the order you asked; asking again for a node already
+waiting keeps its place.
 Edits invalidate in-flight results by epoch, so a stale result can never land in the Viewer.
 A re-pull with nothing changed is a **full memo hit** — every card reports `cached` and
 nothing recomputes.
@@ -1227,6 +1230,45 @@ Two safety properties make `auto` safe to try on real data:
 * **One device, one queue.** Device work is serialized. Without that, worker threads each
   push their own transfer + kernel at a single card and it thrashes — measured as a **33×
   regression** before the queue was added.
+
+### The Node queue — see what runs, cancel it (2026-10-12)
+
+Every canvas has a **Node queue** button under its top-right corner. It counts what the
+machine is doing for you — `Node queue · 3` is one job running and two waiting — and a click
+opens the list:
+
+| Row | What it says |
+|---|---|
+| `RUNNING` | the node computing now, its page, how long it has run (`running 3:07`), and which node of its chain it is on (`computing Gaussian (3/8)`) |
+| `#1`, `#2`, … | a pull waiting its turn, and its place in line |
+| a bake | a Dock being baked (**Stop** instead of **Cancel**) |
+| a fetch | a source the Movie Editor asked for, behind your own pulls |
+| `INGEST` | a source file being copied in — listed, but not cancellable (stopping half-way would leave a torn copy) |
+
+Each row has **Show**, which takes you to the node: its page on this canvas, the card
+selected and centred. It also has **Cancel**:
+
+- **Cancel a waiting node** and it leaves the line. Its card stops showing `queued`.
+- **Cancel the running node** and it stops at its next node boundary — or at the next tick
+  of a node that reports progress. A single opaque call (a CellSAM inference) finishes that
+  call first. The next job in line starts at once. Every node the run already finished stays
+  in the memo, so pulling it again later resumes from there rather than starting over.
+- **Stop a bake** and it stops at its next block; nothing is written.
+- **Cancel all** clears the line first and then stops the running job, so nothing waiting
+  starts the moment the running one stops.
+
+A cancelled run is not a failed one: no card goes red and nothing lands in the Console.
+
+**While something runs, the nodes that already ran stay yours.** Double-click a card you
+have already pulled and its result is shown immediately, without waiting in line. You can
+play its timelapse, scrub T/Z/M, change channels and LUTs, and compare it. Its frames are
+decoded beside the running job, not behind it. That holds even after you edit the page
+while you wait, so long as the edit is not upstream of that node: a result is kept for
+what it computed (the nodes and wires upstream of it, their parameters and modes, the
+source file), not for the page as a whole. An edit **upstream** of it does make it stale,
+and pulling it then waits its turn like any other pull. The app remembers up to 32 finished
+results, within a quarter of the memo budget; past that the least recently viewed are
+forgotten, and pulling one again is a memo hit rather than a recompute.
 
 ### Deleting a node while it runs
 

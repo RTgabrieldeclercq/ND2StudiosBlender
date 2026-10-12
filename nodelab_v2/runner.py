@@ -432,12 +432,55 @@ def ensure_gui_ops() -> None:
 MAX_DISPLAY_DIM = int(os.environ.get("NODELAB_MAX_DISPLAY_DIM", "") or 4096)
 
 #: How many FINISHED branch results to keep for instant re-viewing
-#: (:attr:`EngineRunner._results`). Four covers the shape this exists for — a handful of
-#: per-channel branches off one file, switched between while the slowest is still going —
-#: without turning the runner into a second, unbudgeted memo. The payloads are lazy, so the
-#: cost is the entry, not the pixels; what the cap really bounds is how long an eager node's
-#: realized raster is held against the Memo's own byte budget.
-_FINISHED_RESULTS = 4
+#: (:attr:`EngineRunner._results`). Raised from 4 to 32 (2026-10-12): the ask is "while a
+#: node is queued, go back to the nodes that already ran — play them, adjust their LUTs",
+#: and four branches is one short graph's worth. The payloads are mostly lazy, so the cost
+#: is the entry, not the pixels; what the cap bounds is how long an eager node's realized
+#: raster is held against the Memo's own budget, which :data:`_FINISHED_BYTES_SHARE` now
+#: bounds directly.
+_FINISHED_RESULTS = 32
+
+#: The remembered results' REALIZED bytes (:func:`nodegraph.memo.payload_bytes` — a lazy
+#: payload counts 0) may use this share of the Memo's budget; past it the oldest go first.
+#: The newest result is always kept, whatever its size.
+_FINISHED_BYTES_SHARE = 0.25
+
+
+def cone_signature(graph: Any, target: str,
+                   source_keys: Optional[Mapping[str, Any]] = None) -> str:
+    """A digest of everything a pull of ``target`` computes from: every node upstream of
+    it in the run ``graph`` (its id, op, params and modes — a muted node is already bypassed
+    there) and every wire between them, plus each source's resolved file key.
+
+    Two pulls with the same signature compute the same thing, so a finished result stays
+    TRUE across any edit that leaves this signature alone — an edit to another branch of the
+    page, a node added beside it — and can be served while another run holds the pull slot.
+    The page revision alone could not say that: it moves on any edit to the page."""
+    import hashlib
+    import json
+    nodes = getattr(graph, "nodes", {}) or {}
+    edges = list(getattr(graph, "edges", ()) or ())
+    seen: set = set()
+    stack = [target]
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        stack.extend(e.src for e in edges if e.dst == nid)
+    rows = []
+    for nid in sorted(seen):
+        inst = nodes.get(nid)
+        rows.append([nid, getattr(inst, "op_key", ""),
+                     sorted((str(k), repr(v)) for k, v in
+                            (getattr(inst, "params", None) or {}).items()),
+                     sorted((str(k), repr(v)) for k, v in
+                            (getattr(inst, "modes", None) or {}).items()),
+                     repr((source_keys or {}).get(nid))])
+    wires = sorted([e.src, e.src_socket, e.dst, e.dst_socket, getattr(e, "kind", "")]
+                   for e in edges if e.dst in seen)
+    blob = json.dumps([target, rows, wires], separators=(",", ":"))
+    return hashlib.blake2b(blob.encode("utf-8"), digest_size=16).hexdigest()
 
 #: Share of installed RAM the Viewer may hold in decoded display frames — the budget that
 #: decides whether a big frame is shown WHOLE at full resolution or progressively off the
@@ -1823,6 +1866,18 @@ class EngineRunner(QObject):
         #: editor's preview, which must never delay the result someone is waiting to see.
         self._fetches: set = set()
         self._fetch_queue: "OrderedDict[str, None]" = OrderedDict()
+        #: epoch → when that run started (monotonic seconds) and → the last ``(event, run
+        #: node id, info)`` it reported — what the Node Queue shows as elapsed time and as
+        #: "computing <node>" (2026-10-12). Both are dropped when the run is delivered.
+        self._run_t0: Dict[int, float] = {}
+        self._run_step: Dict[int, Tuple[str, str, Dict[str, Any]]] = {}
+        #: epoch → the run graph and pull id its :func:`cone_signature` is taken from, and
+        #: every remembered result's signature (keyed like :attr:`_results`) — what lets a
+        #: finished result be served after an edit that did not touch it (2026-10-12). The
+        #: signature is taken at DELIVERY: a source's file key is resolved by the run itself,
+        #: so one taken at submit would lack it and never match a later lookup.
+        self._run_sig: Dict[int, Tuple[Any, str]] = {}
+        self._result_sig: Dict[Tuple[str, Any], str] = {}
         #: node_id → the Dataset a ``held`` dock is serving, and its envelope. Modelled on
         #: :attr:`_providers` (keyed by source path): a payload cache that must OUTLIVE every
         #: engine rebuild, because `_ensure_engine` builds a new Engine per document revision
@@ -2256,8 +2311,8 @@ class EngineRunner(QObject):
 
         Only for the CURRENT document revision — an edit bumps it, and a re-pull is then
         genuinely required rather than merely slow."""
-        key = (node_id, self._rev(node_id))
-        entry = self._results.get(key)
+        key = self._finished_key(node_id)
+        entry = self._results.get(key) if key is not None else None
         if entry is None:
             return False
         payload, axes = entry
@@ -2275,6 +2330,97 @@ class EngineRunner(QObject):
         """How many pulls are waiting behind the running one (0 when nothing is queued)."""
         return len(self._queue)
 
+    # ── the Node Queue (2026-10-12) ────────────────────────────────────────────
+    def queue_snapshot(self) -> List[Dict[str, Any]]:
+        """Every job the runner holds, in the order it will run them — what the canvas's
+        Node Queue lists. One dict per job:
+
+        * ``node`` — the run id (``"<page>/<node>"``) it computes;
+        * ``kind`` — ``"pull"`` (a result someone asked to see), ``"fetch"`` (a source the
+          Movie Editor needs), ``"bake"`` (a Dock writing its checkpoint) or ``"ingest"``
+          (a source file being copied into its store — several run at once, beside the
+          pull slot);
+        * ``state`` — ``"running"``, ``"stopping"`` (a bake asked to stop) or ``"queued"``;
+        * ``position`` — ``0`` while running, else its place in line (1 = next);
+        * ``elapsed`` — seconds since it started, while running;
+        * ``step`` — ``(event, run node id, info)`` it last reported, while running;
+        * ``cancellable`` — an ingest is not: it is left to finish so no torn store is left
+          behind (:meth:`_prune`)."""
+        out: List[Dict[str, Any]] = []
+        act = self._active
+        if self._busy and act is not None:
+            bake = act.bake is not None
+            if (act.epoch in self._bakes) if bake else (act.epoch in self._runs):
+                t0 = self._run_t0.get(act.epoch)
+                out.append({
+                    "node": act.node_id,
+                    "kind": "bake" if bake else
+                            ("fetch" if act.epoch in self._fetches else "pull"),
+                    "state": "stopping" if bake and self._stop_bake else "running",
+                    "position": 0,
+                    "elapsed": (time.monotonic() - t0) if t0 is not None else None,
+                    "step": self._run_step.get(act.epoch),
+                    "cancellable": not (bake and self._stop_bake)})
+        n = 0
+        for nid in self._queue:
+            n += 1
+            out.append({"node": nid, "kind": "pull", "state": "queued", "position": n,
+                        "elapsed": None, "step": None, "cancellable": True})
+        for nid in self._fetch_queue:
+            n += 1
+            out.append({"node": nid, "kind": "fetch", "state": "queued", "position": n,
+                        "elapsed": None, "step": None, "cancellable": True})
+        for nid in self._ingesting:
+            out.append({"node": nid, "kind": "ingest", "state": "running", "position": 0,
+                        "elapsed": None, "step": None, "cancellable": False})
+        return out
+
+    def cancel(self, node_id: str, kind: str = "pull") -> bool:
+        """Cancel ONE job the Node Queue lists — ``kind`` as :meth:`queue_snapshot` names
+        it. Returns whether anything was cancelled.
+
+        A queued pull or fetch simply leaves the line, and its cards leave "queued"
+        (:attr:`cancelled`). The RUNNING pull or fetch is cancelled exactly as an edit in its
+        cone cancels it (:meth:`invalidate`): it stops being live, its job's ``cancelled`` flag
+        is latched so the engine unwinds at its next node boundary or progress tick, and the
+        pull slot then passes to the next job in line. A running bake is asked to stop
+        (:meth:`request_stop_bake`) — it writes no manifest, so the half-written store reads
+        as un-baked. An ingest is not cancellable."""
+        node_id = self._rid(node_id)
+        if kind == "pull" and node_id in self._queue:
+            del self._queue[node_id]
+            self.cancelled.emit(node_id)
+            return True
+        if kind == "fetch" and node_id in self._fetch_queue:
+            del self._fetch_queue[node_id]
+            self.cancelled.emit(node_id)
+            return True
+        act = self._active
+        if not self._busy or act is None or act.node_id != node_id:
+            return False
+        if act.bake is not None:
+            if kind != "bake" or act.epoch not in self._bakes or self._stop_bake:
+                return False
+            self.request_stop_bake()
+            return True
+        running = "fetch" if act.epoch in self._fetches else "pull"
+        if kind != running or act.epoch not in self._runs:
+            return False
+        self._runs.pop(act.epoch, None)
+        self._run_cones.pop(act.epoch, None)
+        act.cancelled = True              # latched before `cancelled`, as `invalidate` does
+        self.cancelled.emit(node_id)
+        return True
+
+    def cancel_all(self) -> int:
+        """Cancel every cancellable job — the queue first, so nothing waiting starts the
+        moment the running one is stopped. Returns how many were cancelled."""
+        n = 0
+        for entry in reversed(self.queue_snapshot()):
+            if entry["cancellable"] and self.cancel(entry["node"], entry["kind"]):
+                n += 1
+        return n
+
     def in_flight(self, node_id: str) -> bool:
         """Whether a live run (the one on the worker or one waiting behind it) reads
         ``node_id`` — i.e. whether an edit to it now would cancel work in progress."""
@@ -2288,7 +2434,8 @@ class EngineRunner(QObject):
         it was scoped to, and handing it out as the node's answer would play a truncated
         series."""
         node_id = self._rid(node_id)
-        entry = self._results.get((node_id, self._rev(node_id)))
+        key = self._finished_key(node_id)
+        entry = self._results.get(key) if key is not None else None
         return entry[0] if entry is not None else None
 
     def fetch(self, node_id: str) -> None:
@@ -2344,31 +2491,83 @@ class EngineRunner(QObject):
         Unpinned results only, because :attr:`_results` stores nothing else: a scoped
         payload holds only its picked frames and re-serving it as the node's whole
         answer would show a truncated series."""
-        rev = self._rev(node_id)
-        entry = self._results.get((node_id, rev))
+        key = self._finished_key(node_id)
+        entry = self._results.get(key) if key is not None else None
         if entry is None:
             return None
         payload, _axes = entry
         if not (isinstance(payload, Dataset) and payload.image is not None):
             return None
-        self._results.move_to_end((node_id, rev))
-        self._restore_ctx((node_id, rev))
+        self._results.move_to_end(key)
+        self._restore_ctx(key)
         self._hold_view(node_id, payload, pin=None)
         return self._views[node_id]
 
     def _remember(self, key: Tuple[str, Any], payload: Any, axes: Any, *,
-                  ctx: Any = None, has_ctx: bool = False) -> None:
-        """File a finished result (and the overlay context it was delivered with) under
-        ``key``; the oldest past :data:`_FINISHED_RESULTS` age out together."""
+                  ctx: Any = None, has_ctx: bool = False,
+                  sig: Optional[str] = None) -> None:
+        """File a finished result (and the overlay context it was delivered with, and the
+        :func:`cone_signature` of what it computed) under ``key``. The oldest age out past
+        :data:`_FINISHED_RESULTS`, or while the results' realized bytes exceed
+        :data:`_FINISHED_BYTES_SHARE` of the Memo budget — never the newest."""
+        from nodegraph.memo import payload_bytes
         self._results[key] = (payload, axes)
         self._results.move_to_end(key)
         if has_ctx:
             self._result_ctx[key] = ctx
+        if sig is not None:
+            self._result_sig[key] = sig
         # without a context (a fetch) a stored one STAYS: the same key is the same node at
         # the same run identity, so the context still describes the payload
-        while len(self._results) > _FINISHED_RESULTS:
+        budget = int(_FINISHED_BYTES_SHARE * memo_bytes())
+
+        def size() -> int:
+            return sum(payload_bytes(v[0]) for v in self._results.values())
+
+        while len(self._results) > _FINISHED_RESULTS or \
+                (len(self._results) > 1 and size() > budget):
             old, _ = self._results.popitem(last=False)
             self._result_ctx.pop(old, None)
+            self._result_sig.pop(old, None)
+
+    def _signature(self, graph: Any, pull_id: str) -> str:
+        """:func:`cone_signature` of ``pull_id`` in ``graph``, with each source's resolved
+        file key folded in (a source re-pointed at another file computes something else)."""
+        keys = {nid: self._node_source_key.get(nid) for nid in graph.nodes
+                if nid in self._node_source_key}
+        return cone_signature(graph, pull_id, keys)
+
+    def _finished_key(self, node_id: str) -> Optional[Tuple[str, Any]]:
+        """The :attr:`_results` key that answers ``node_id`` now, or ``None``.
+
+        The current page revision first. Failing that, a result remembered for this node
+        under an EARLIER revision whose :func:`cone_signature` still matches what a pull
+        would compute now — the page changed, but nothing this node reads did — re-filed
+        under the current revision so the held view and every later lookup find it
+        directly. That is what keeps a node that already ran viewable, playable and
+        adjustable while another runs, after the edits a user makes while waiting
+        (2026-10-12): before, any edit anywhere on the page sent it to the back of the
+        queue."""
+        key = (node_id, self._rev(node_id))
+        if key in self._results:
+            return key
+        older = [k for k in self._results if k[0] == node_id and k in self._result_sig]
+        if not older:
+            return None
+        try:
+            composed = self._compose(node_id)
+            sig = self._signature(composed.graph,
+                                  self._pull_id(node_id, composed.graph, composed))
+        except Exception:  # noqa: BLE001 — an unbuildable graph serves nothing stale
+            return None
+        for k in reversed(older):                       # newest first
+            if self._result_sig.get(k) == sig:
+                self._results[key] = self._results.pop(k)
+                self._result_sig[key] = self._result_sig.pop(k)
+                if k in self._result_ctx:
+                    self._result_ctx[key] = self._result_ctx.pop(k)
+                return key
+        return None
 
     def _restore_ctx(self, key: Tuple[str, Any]) -> None:
         """Put a remembered result's overlay context back (see :attr:`_result_ctx`)."""
@@ -4153,6 +4352,8 @@ class EngineRunner(QObject):
         if (epoch is not None and epoch not in self._runs
                 and epoch not in self._bakes):
             return                            # a cancelled pull's tail — the cards moved on
+        if epoch is not None and event in ("start", "progress", "decode"):
+            self._run_step[epoch] = (event, node_id, info)
         self.node_progress.emit(event, node_id, info)
 
     def planned_nodes(self, node_id: str, graph: Optional[Graph] = None) -> List[str]:
@@ -4229,6 +4430,7 @@ class EngineRunner(QObject):
                          "hold": bool(hold)},
                    all_sources=every, pull_id=pull_id)
         self._busy = True
+        self._run_t0[job.epoch] = time.monotonic()
         self._active = job          # what the worker is running (never cancel-latched:
         #                             a bake resolves outside the staleness rule)
         self._bakes[job.epoch] = job.bake
@@ -4463,6 +4665,7 @@ class EngineRunner(QObject):
         graph = composed.graph
         pull_id = self._pull_id(node_id, graph, composed)
         sources, every = self._sources_for(pull_id, graph)
+        self._run_sig[self._epoch] = (graph, pull_id)
         job = _Job(self._epoch, graph,
                    composed.revision, node_id, coords, channels, sources,
                    pin=None if fetch else self._pin_for(coords, node_id), all_sources=every,
@@ -4470,6 +4673,7 @@ class EngineRunner(QObject):
         if fetch:
             self._fetches.add(self._epoch)
         self._busy = True
+        self._run_t0[job.epoch] = time.monotonic()
         self._active = job          # the job on the worker — `invalidate` latches its
         #                             cancel flag so the engine can abort mid-run
         # Registered LIVE for the whole run. `_deliver` accepts a result iff its id is still
@@ -4558,6 +4762,9 @@ class EngineRunner(QObject):
         (epoch, node_id, payload, plane, axes, dt, err, revision, coords, channels,
          pin, octx) = packet
         self._run_cones.pop(epoch, None)
+        self._run_t0.pop(epoch, None)
+        self._run_step.pop(epoch, None)
+        sig_of = self._run_sig.pop(epoch, None)
         # `_busy` is cleared by `_start_next` alone (see there), so every exit path below
         # frees the slot AND starts the next branch, and neither can be forgotten separately.
         # A bake is resolved FIRST and outside the staleness rule. Its real result is a
@@ -4611,7 +4818,8 @@ class EngineRunner(QObject):
             # plane decoded, no `finished` — so no pane is retargeted and none is left
             # showing a run that never delivers.
             if isinstance(payload, Dataset):
-                self._remember((node_id, self._rev(node_id)), payload, axes)
+                self._remember((node_id, self._rev(node_id)), payload, axes,
+                               sig=self._signature(*sig_of) if sig_of else None)
             self.fetched.emit(node_id, payload, dt)
             return
         # Hold the image provider so subsequent coords-only requests skip the engine
@@ -4630,7 +4838,8 @@ class EngineRunner(QObject):
             self._overlay_ctxs[node_id] = ctx
         if pin is None and err is None:
             self._remember((node_id, self._rev(node_id)), payload, axes,
-                           ctx=ctx, has_ctx=has_ctx)
+                           ctx=ctx, has_ctx=has_ctx,
+                           sig=self._signature(*sig_of) if sig_of else None)
         if isinstance(payload, Dataset) and payload.image is not None:
             self._hold_view(node_id, payload, pin=pin)   # which frame this held payload IS
         # The worker only ever ASSIGNS one overlay-context key; the bound is applied here,

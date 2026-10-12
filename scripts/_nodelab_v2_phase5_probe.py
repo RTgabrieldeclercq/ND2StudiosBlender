@@ -9481,6 +9481,113 @@ def main(argv) -> int:
         "frame before and the mean gap, from the payload's clock; a clock that does not "
         "cover the strip shows none")
 
+    # ── NQ1: the Node queue — see what runs and what waits, cancel any of it; and the
+    #    nodes that already ran stay viewable and playable meanwhile (2026-10-12) ──────
+    import types as _types21
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=4, z=1, c=1, y=48, x=48)
+    win.file_new()
+    app.processEvents()
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner._raw_src.clear()
+    win.runner.invalidate()
+    _d21 = win.doc
+    _d21.add_node("io.load", node_id="qL", x=0, y=0)
+    _d21.set_meta_seed("qL", MetaEnvelope(axes=_RN._SYNTH_AXES, metadata=dict(_RN._SYNTH_META)))
+    for _nid21, _y21 in (("qA", -100.0), ("qB", 100.0), ("qC", 300.0)):
+        _d21.add_node("enhance.gamma", node_id=_nid21, x=260, y=_y21, params={"gamma": 0.8})
+        _d21.connect("qL", "image", _nid21, "data")
+    app.processEvents()
+    _pulls.clear()
+    win.pull_node("qA")                                    # qA has RUN: a finished result
+    _await_pull()
+    _vb21 = win._main_canvas.view.queue_btn
+    win._refresh_queue_ui()
+    assert _vb21.isVisible() and _vb21.text() == "Node queue", _vb21.text()
+    # a long run holds the slot (qB, 65 s in, computing node 3 of 8), qC waits behind it
+    _r21 = win.runner
+    _job21 = _types21.SimpleNamespace(epoch=9100, node_id=_rq("qB"), bake=None,
+                                      cancelled=False)
+    _r21._busy, _r21._active = True, _job21
+    _r21._runs[9100] = _rq("qB")
+    _r21._run_cones[9100] = frozenset({_rq("qL"), _rq("qB")})   # an edit elsewhere spares it
+    _r21._run_t0[9100] = time.monotonic() - 65.0
+    _r21._run_step[9100] = ("progress", _rq("qB"), {"done": 3, "total": 8})
+    _r21.pull("qC")
+    assert _r21.queue_depth() == 1
+    win._refresh_queue_ui()
+    assert _vb21.text() == "Node queue · 2", _vb21.text()
+    win.show_node_queue(win._main_canvas)
+    app.processEvents()
+    _pop21 = win._node_queue
+    assert _pop21.isVisible() and [r["badge"] for r in _pop21.rows] == ["RUNNING", "#1"], \
+        _pop21.rows
+    _run21, _wait21 = _pop21.rows
+    assert _run21["title"] == "Gamma" and _run21["page"] and "running 1:05" in \
+        _run21["detail"] and "computing Gamma (3/8)" in _run21["detail"], _run21
+    assert "#1 in line" in _wait21["detail"], _wait21
+    # Show goes to the node: its card selected on the canvas
+    win.show_queue_entry(_wait21)
+    assert [i.node_id for i in win.scene.selectedItems() if hasattr(i, "node_id")] == ["qC"]
+    # ...and while qB runs, qA — which already ran — is served at once (not queued) even
+    # after an edit ELSEWHERE on the page, and plays: its planes decode beside the slot
+    _d21.add_node("enhance.gaussian", node_id="qX", x=600, y=0)     # an unrelated edit
+    app.processEvents()
+    _fin21: list = []
+    _cf21 = _r21.finished.connect(lambda nid, *a: _fin21.append(nid))
+    _r21.pull("qA", (0, 0, 0, 0), (0,))
+    app.processEvents()
+    assert _fin21 == [_rq("qA")] and _r21.queue_depth() == 1, (_fin21, _r21.queued_nodes())
+    _pr21: list = []
+    _cp21 = _r21.plane_ready.connect(lambda nid, *a: _pr21.append(nid))
+    for _t21 in (1, 2, 3):                                   # scrub through its timelapse
+        _r21.request_plane("qA", (0, _t21, 0, 0), (0,))
+    _t0 = time.time()
+    while len(_pr21) < 3 and time.time() - _t0 < 30:
+        app.processEvents()
+        time.sleep(0.005)
+    assert len(_pr21) >= 3 and set(_pr21) == {_rq("qA")}, _pr21
+    assert _r21.preload_series("qA", (0, 0, 0, 0), (0,)) >= 0 and _r21.queue_depth() == 1
+    _r21.finished.disconnect(_cf21)
+    _r21.plane_ready.disconnect(_cp21)
+    # an edit INSIDE qA's cone does make its result stale: then it queues, as it must
+    _d21.nodes["qA"].params["gamma"] = 1.3
+    _d21.touch("qA")
+    _r21.pull("qA")
+    assert _rq("qA") in _r21.queued_nodes(), _r21.queued_nodes()
+    _r21.cancel(_rq("qA"), "pull")
+    # Cancel the WAITING one: it leaves the line and its card leaves "queued"
+    _cn21: list = []
+    _cc21 = _r21.cancelled.connect(_cn21.append)
+    _pop21.refresh()
+    _pop21._cancel(_pop21.rows[1])
+    assert _r21.queue_depth() == 0 and _cn21 == [_rq("qC")], (_cn21, _r21.queued_nodes())
+    assert [r["badge"] for r in _pop21.rows] == ["RUNNING"] and _vb21.text() == "Node queue · 1"
+    # Cancel the RUNNING one: no longer live, its job latched to stop at the next node
+    _pop21._cancel(_pop21.rows[0])
+    assert _job21.cancelled and 9100 not in _r21._runs and _cn21[-1] == _rq("qB"), _cn21
+    assert not _pop21.rows and _pop21.empty.isVisible() and _vb21.text() == "Node queue"
+    # an ingest is listed but cannot be cancelled, and says why
+    _r21._ingesting[_rq("qL")] = "key"
+    _pop21.refresh()
+    assert _pop21.rows[0]["badge"] == "INGEST" and not _pop21.rows[0]["cancellable"] \
+        and "torn" in _pop21.rows[0]["why_not"], _pop21.rows
+    _r21._ingesting.clear()
+    _r21.cancelled.disconnect(_cc21)
+    _pop21.hide()
+    _r21._busy, _r21._active = False, None
+    _r21._run_t0.pop(9100, None)
+    _r21._run_step.pop(9100, None)
+    _r21._run_cones.pop(9100, None)
+    win._refresh_queue_ui()
+    _ok("NQ1 the Node queue button counts what runs and waits; its list names each node and "
+        "page, how long the running one has gone and which node it is computing, each "
+        "waiting one's place in line; Show selects the node, Cancel takes a waiting one out "
+        "of line and stops the running one; an ingest says why it cannot be cancelled; "
+        "while a run holds the slot, a node that already ran is served at once — even after "
+        "an edit elsewhere on its page — and its frames decode for playback beside the slot; "
+        "an edit inside its own cone makes it queue")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

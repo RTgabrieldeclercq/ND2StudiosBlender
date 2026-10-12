@@ -18811,9 +18811,11 @@ def test_held_views() -> None:
     r._rev = lambda rid: r.document.revision
     r._rid = lambda nid: nid
     r._result_ctx = {}
+    r._result_sig = {}           # no cone signatures here: a revision miss is a plain miss
     r._overlay_ctxs = {}
     r._restore_ctx = lambda key: EngineRunner._restore_ctx(r, key)
     r._hold_view = lambda *a, **k: EngineRunner._hold_view(r, *a, **k)
+    r._finished_key = lambda nid: EngineRunner._finished_key(r, nid)
 
     a, b, c = _ds(12), _ds(), _ds(12)
     EngineRunner._hold_view(r, "A", a, pin=None)
@@ -31090,6 +31092,41 @@ def test_frame_timing() -> None:
         "Frame, Merge T)")
 
 
+def test_cone_signature() -> None:
+    """``runner.cone_signature`` (2026-10-12) — what lets a node that already ran stay
+    viewable while another run holds the pull slot: a finished result is keyed by what it
+    COMPUTED, not by the page's revision. The digest covers the target's upstream run graph
+    (ids, ops, params, modes, wires) and the sources' resolved file keys: an edit ELSEWHERE
+    leaves it alone; a param, a mode, a wire or a source file inside the cone moves it."""
+    from nodelab_v2.runner import cone_signature
+
+    def g(gamma=0.8, extra=False, rewire=False, mode="2D"):
+        nodes = {"L": NodeInstance("L", "io.load"),
+                 "A": NodeInstance("A", "enhance.gamma", params={"gamma": gamma}),
+                 "B": NodeInstance("B", "enhance.gaussian", params={"sigma": 1.0},
+                                   modes={"dim": mode})}
+        edges = [Edge("L", "A", "image", "data"), Edge("A", "B", "out", "data")]
+        if extra:
+            nodes["X"] = NodeInstance("X", "enhance.gamma", params={"gamma": 3.0})
+            edges.append(Edge("L", "X", "image", "data"))
+        if rewire:
+            edges = [Edge("L", "B", "image", "data")] + edges[:1]
+        return Graph(nodes=nodes, edges=edges)
+
+    base = cone_signature(g(), "B", {"L": "file-1"})
+    assert cone_signature(g(), "B", {"L": "file-1"}) == base, "deterministic"
+    assert cone_signature(g(extra=True), "B", {"L": "file-1"}) == base, \
+        "a node added beside the cone changes nothing it computes"
+    assert cone_signature(g(gamma=0.9), "B", {"L": "file-1"}) != base, "a param upstream"
+    assert cone_signature(g(mode="3D"), "B", {"L": "file-1"}) != base, "a mode"
+    assert cone_signature(g(rewire=True), "B", {"L": "file-1"}) != base, "a wire"
+    assert cone_signature(g(), "B", {"L": "file-2"}) != base, "another source file"
+    assert cone_signature(g(gamma=0.9), "L", {"L": "file-1"}) == \
+        cone_signature(g(), "L", {"L": "file-1"}), "downstream of the target is not its cone"
+    _ok("cone signature: deterministic; unmoved by an edit beside the cone or downstream; "
+        "moved by a param, a mode, a wire or a source file inside it")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -31299,6 +31336,7 @@ def main() -> int:
     test_page_inputs_from_previous()
     test_multilink()
     test_frame_timing()
+    test_cone_signature()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

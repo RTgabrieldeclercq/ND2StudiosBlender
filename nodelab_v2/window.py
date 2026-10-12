@@ -351,6 +351,16 @@ class _MovieHost:
         self._w.export_movie(node_id, page_id=self._pid())
 
 
+def _clock(seconds) -> str:
+    """``42 s`` / ``3:07`` / ``1:02:09`` — elapsed time as the Node queue shows it."""
+    s = int(max(0.0, float(seconds or 0.0)))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60}:{s % 60:02d}"
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *, persist_layout: Optional[bool] = None) -> None:
         """``persist_layout``: restore the saved panel layout now and save it on close
@@ -593,6 +603,14 @@ class MainWindow(QMainWindow):
         # ...and a run dropped by an edit inside its cone has to leave the running state, or
         # its card spins for a result that will never arrive.
         self.runner.cancelled.connect(self._on_run_cancelled)
+        # the Node queue (2026-10-12): every canvas's button counts what the runner holds,
+        # and an open queue lists it. Re-read on every signal that can change the line.
+        self._node_queue = None
+        for sig in (self.runner.started, self.runner.finished, self.runner.failed,
+                    self.runner.cancelled, self.runner.queued, self.runner.baked,
+                    self.runner.fetched, self.runner.fetch_started,
+                    self.runner.ingest_started, self.runner.ingest_finished):
+            sig.connect(lambda *_a: self._refresh_queue_ui())
         # (each viewer's own signals are wired where it is made — `_make_viewer`)
         self.runner.preload_progress.connect(self._on_preload_progress)
         self.runner.preload_finished.connect(self._on_preload_finished)
@@ -1168,6 +1186,7 @@ class MainWindow(QMainWindow):
         c.view.region_mode_changed.connect(lambda _on, c=c: self.sync_action_pill(c))
         c.page_changed.connect(lambda c, _pid: self.sync_action_pill(c))
         c.view.maximize_toggled.connect(part(self._on_canvas_maximize, c))
+        c.view.queue_requested.connect(lambda c=c: self.show_node_queue(c))
         c.minimap.restore_requested.connect(lambda: self.set_maximized(False))
         # the welcome card: the canvas it sits on becomes the one worked in first (its
         # buttons take focus, which activates a docked canvas; the main one is told here)
@@ -5687,6 +5706,114 @@ class MainWindow(QMainWindow):
         for p, sc in list(self._scenes.items()):
             sc.clear_run_plan(self._key_on(full, p))
             sc.finish_run(None)
+
+    # ── the Node queue (2026-10-12) ────────────────────────────────────────────
+    def node_queue_rows(self) -> List[dict]:
+        """The runner's :meth:`~nodelab_v2.runner.EngineRunner.queue_snapshot` as the Node
+        queue shows it: per job its node's title and page, a badge (``RUNNING``, ``#2``…),
+        what it is doing — how long it has run and which node it is computing, or its place
+        in line — and whether it can be cancelled."""
+        rows: List[dict] = []
+        for e in self.runner.queue_snapshot():
+            title, page = self._queue_names(e["node"])
+            kind, state = e["kind"], e["state"]
+            what = {"fetch": "a source for the Movie Editor", "bake": "baking its checkpoint",
+                    "ingest": "ingesting its file"}.get(kind, "")
+            if state == "queued":
+                badge = f"#{e['position']}"
+                detail = f"waiting — #{e['position']} in line" + (f" · {what}" if what else "")
+            else:
+                badge = {"running": "RUNNING", "stopping": "STOPPING"}.get(state, state.upper())
+                if kind == "ingest":
+                    badge = "INGEST"
+                bits = [f"running {_clock(e['elapsed'])}" if e.get("elapsed") is not None
+                        else ("stopping…" if state == "stopping" else "running")]
+                step = e.get("step")
+                if step and kind != "ingest":
+                    event, rnode, info = step
+                    if event == "decode":
+                        bits.append("reading the result's planes")
+                    else:
+                        done, total = info.get("done"), info.get("total")
+                        frac = (f" ({done}/{total})" if isinstance(done, int)
+                                and isinstance(total, int) and total > 1 else "")
+                        bits.append(f"computing {self._queue_names(rnode)[0]}{frac}")
+                if what:
+                    bits.append(what)
+                detail = " · ".join(bits)
+            rows.append({"node": e["node"], "kind": kind, "state": state, "badge": badge,
+                         "title": title, "page": page, "detail": detail,
+                         "cancellable": bool(e.get("cancellable")),
+                         "why_not": "" if e.get("cancellable") else (
+                             "An ingest finishes on its own: stopping it half-way would "
+                             "leave a torn copy of the file" if kind == "ingest"
+                             else "Already stopping")})
+        return rows
+
+    def _queue_names(self, run_id: str) -> Tuple[str, str]:
+        """``(node title, page name)`` for a run id — the id itself when the node is gone."""
+        pid, nid = split_run_id(str(run_id))
+        page = self.workspace.pages.get(pid or (self.workspace.active or ""))
+        if page is None:
+            return nid or str(run_id), ""
+        doc = page.doc
+        base = nid.split("#", 1)[0].split("%", 1)[0]     # an iterate clone / a group body
+        title = doc.title_of(base) if base in doc.nodes else (nid or str(run_id))
+        return title, page.name
+
+    def cancel_queue_entry(self, row: dict) -> bool:
+        """Cancel one job of the Node queue (:meth:`EngineRunner.cancel`)."""
+        ok = self.runner.cancel(row["node"], row["kind"])
+        title = row.get("title") or row["node"]
+        self.statusBar().showMessage(
+            (f"stopping the bake of “{title}”…" if row["kind"] == "bake" else
+             f"cancelled “{title}” — what it already finished stays cached")
+            if ok else f"“{title}” could not be cancelled", 6000)
+        self._refresh_queue_ui()
+        return ok
+
+    def cancel_queue_all(self) -> int:
+        n = self.runner.cancel_all()
+        self.statusBar().showMessage(
+            f"cancelled {n} job{'' if n == 1 else 's'} in the node queue" if n
+            else "nothing in the node queue could be cancelled", 6000)
+        self._refresh_queue_ui()
+        return n
+
+    def show_queue_entry(self, row: dict) -> None:
+        """Go to a queued or running node: its page on the active canvas, the card selected
+        and centred."""
+        pid, nid = split_run_id(str(row["node"]))
+        pid = pid or (self.workspace.active or "")
+        if pid not in self.workspace.pages:
+            return
+        c = self._canvas
+        self._show_page(c, pid)
+        sc = self.scene_for(pid)
+        base = nid.split("#", 1)[0].split("%", 1)[0]
+        item = sc.node_items.get(base)
+        if item is None:
+            return
+        sc.clearSelection()
+        item.setSelected(True)
+        c.view.centerOn(item)
+
+    def show_node_queue(self, c: Optional[CanvasPanel] = None) -> None:
+        """Open the Node queue under canvas ``c``'s button."""
+        from nodelab_v2.node_queue import NodeQueuePopup
+        c = c or self._canvas
+        if self._node_queue is None:
+            self._node_queue = NodeQueuePopup(self, self)
+        self._node_queue.restyle()
+        self._node_queue.popup_at(c.view.queue_btn)
+
+    def _refresh_queue_ui(self) -> None:
+        n = len(self.runner.queue_snapshot())
+        for c in self.canvases():
+            c.view.set_queue_count(n)
+        pop = getattr(self, "_node_queue", None)
+        if pop is not None and pop.isVisible():
+            pop.refresh()
 
     def _on_run_cancelled(self, node_id: str) -> None:
         """A queued or running pull was dropped because an edit landed inside its cone.
