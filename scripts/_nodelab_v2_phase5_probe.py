@@ -9588,6 +9588,78 @@ def main(argv) -> int:
         "an edit elsewhere on its page — and its frames decode for playback beside the slot; "
         "an edit inside its own cone makes it queue")
 
+    # ── TSB1: troubleshooting picks frames of the REBUILT T axis (2026-10-12) ────────
+    # (user report: "in Troubleshooting mode the Timeseries Builder should let you select
+    # the frames you want from the rebuilt T axis, but it cuts it once entering the mode")
+    win.file_new()
+    app.processEvents()
+    _sd22 = tempfile.mkdtemp(prefix="nd2tb_")
+    _sp22 = []
+    for _k22 in range(2):                     # file k, frame j holds 100*(k+1) + j
+        _p22 = os.path.join(_sd22, f"tb_Seq{_k22 * 3:04d}.tif")
+        _tiff11.imwrite(_p22, np.stack([np.full((24, 28), 100 * (_k22 + 1) + _j22, np.uint16)
+                                        for _j22 in range(3)]), metadata={"axes": "TYX"})
+        _sp22.append(_p22)
+    _before22 = set(win.doc.nodes)
+    win._load_source_paths(_sp22, group=False, chain_axis="T")
+    app.processEvents()
+    _ts22 = next(r for i, r in win.doc.nodes.items()
+                 if i not in _before22 and r.op_key == "util.timeseries")
+    _rid22 = _q11(win.workspace.active, _ts22.id)
+    _t022 = time.time()
+    while (win.runner._busy or win.runner.queue_depth()) and time.time() - _t022 < 240:
+        app.processEvents()                   # the load's own preview pull, if any
+        time.sleep(0.005)
+    _got22: list = []
+    _cf22 = win.runner.finished.connect(lambda nid, payload, *a: _got22.append((nid, payload)))
+
+    def _await22(limit=240.0):
+        n = len(_got22)
+        t0 = time.time()
+        while not any(nid == _rid22 for nid, _p in _got22[n:]) and time.time() - t0 < limit:
+            app.processEvents()
+            time.sleep(0.005)
+        hit = [p for nid, p in _got22[n:] if nid == _rid22]
+        assert hit, "the builder's pull did not land"
+        return hit[-1]
+
+    def _vals22(ds):
+        return [float(np.asarray(ds.image.get_region(0, 0, k, 0, 0, 0, 1, 0, 1)).ravel()[0])
+                for k in range(ds.axes.t)]
+
+    win.pull_node(_ts22.id)
+    _full22 = _await22()
+    assert _vals22(_full22) == [100.0, 101.0, 102.0, 200.0, 201.0, 202.0], _vals22(_full22)
+    _ts_strip22 = win.viewer._sliders["t"]
+    win.set_solo_frame(True)                  # ← F9
+    _await22()
+    # the strip spans the REBUILT series, not one file's 3 frames
+    assert _ts_strip22.maximum() == 5, ("T spans the built 6 frames", _ts_strip22.maximum())
+    _ts_strip22.setSelection((1, 4))          # ← ctrl+click two boxes of the rebuilt axis
+    _pk22 = _await22()
+    assert _vals22(_pk22) == [101.0, 201.0], ("rebuilt frames 1 and 4", _vals22(_pk22))
+    assert (_pk22.axes.m, _pk22.axes.t) == (1, 2), _pk22.axes
+    assert _rid22 + "#solo" in win.runner._engine.graph.nodes, \
+        "the picks are cut after the builder, in the run graph only"
+    assert "#solo" not in "".join(win.doc.nodes), "the canvas never sees the cut"
+    win.viewer._sliders["t"].setValue(4)
+    app.processEvents()
+    assert win.viewer._payload_coords()[1] == 1, "the cursor on t=4 is the 2nd picked frame"
+    win.clear_frame_picks()
+    _one22 = _await22()
+    assert _vals22(_one22) == [201.0], ("the cursor's own rebuilt frame", _vals22(_one22))
+    win.set_solo_frame(False)
+    app.processEvents()
+    win.runner.finished.disconnect(_cf22)
+    _t022 = time.time()
+    while (win.runner._busy or win.runner.queue_depth()) and time.time() - _t022 < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    _ok("TSB1 troubleshooting below a Timeseries Builder: the T strip spans the rebuilt "
+        "series (6 frames from two 3-frame files, not 3); picking rebuilt frames 1 and 4 "
+        "delivers file 1's frame 1 and file 2's frame 1, cut after the builder in the run "
+        "graph only; with no picks the cursor's own rebuilt frame runs")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

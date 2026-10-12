@@ -31068,7 +31068,10 @@ def test_frame_timing() -> None:
                             "V": NodeInstance("V", "enhance.gamma")},
                      edges=[Edge("L", "X", "image", "data"), Edge("X", "V", "out", "data")])
 
-    assert readdressed_axes(chain("util.timeseries", chain_axis="T"), "V") == {"t"}
+    # the builder re-addresses M on every axis it builds onto: a bundle's files ARE positions
+    assert readdressed_axes(chain("util.timeseries", chain_axis="T"), "V") == {"t", "m"}
+    assert readdressed_axes(chain("util.timeseries"), "V") == {"t", "m"}, \
+        "a builder left at its DEFAULT axis (no explicit mode) re-addresses T too"
     assert readdressed_axes(chain("util.timeseries", chain_axis="M"), "V") == {"m"}
     assert readdressed_axes(chain("util.time_shift"), "V") == {"t"}
     assert readdressed_axes(chain("util.select_frame"), "V") == {"t"}
@@ -31125,6 +31128,155 @@ def test_cone_signature() -> None:
         cone_signature(g(), "L", {"L": "file-1"}), "downstream of the target is not its cone"
     _ok("cone signature: deterministic; unmoved by an edit beside the cone or downstream; "
         "moved by a param, a mode, a wire or a source file inside it")
+
+
+def test_solo_scope_plan() -> None:
+    """Troubleshooting below a Timeseries Builder (2026-10-12, ``nodelab_v2.solo_scope``):
+    the picks are the VIEWED node's frames, so they are cut where they mean that.
+
+    1. ``scope_plan`` cuts after the LAST node that re-addresses an axis (a builder onto T
+       re-addresses T and M — a bundle's files are positions — even at its default axis),
+       keeps the sources behind it whole on those axes, and leaves an axis unscoped where a
+       node reaches the target both through a re-addressing node and around it.
+    2. ``scoped_graph`` puts a frames-mode ``util.crop`` after each cut, clamped to the cut
+       node's extent; the target's own cut is what gets pulled.
+    3. Through the engine: a builder over a two-file BUNDLE (or two cards of 3 and 2
+       frames) scoped to output frames {1, 3} delivers exactly the full build's frames 1
+       and 3 — where cutting the bundle source to the cursor left one file, which the
+       builder passed through, and the rebuilt axis was gone.
+    4. The document's strip extents under the scope span the REBUILT series.
+    """
+    from types import SimpleNamespace as _NS
+    from nodegraph.metadata import SOURCE_FILE_KEY
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider, MultiSourceProvider
+    from nodelab_v2.runner import _pin_frames
+    from nodelab_v2.solo_scope import (graph_scope_plan, readdressed_by, scope_plan,
+                                       scoped_graph, source_pin)
+
+    # 1. the plan
+    def g(*mid, target_edges=True):
+        nodes = {"L": NodeInstance("L", "io.load"), "V": NodeInstance("V", "enhance.gamma")}
+        edges, prev = [], ("L", "image")
+        for nid, op, modes in mid:
+            nodes[nid] = NodeInstance(nid, op, modes=modes)
+            edges.append(Edge(prev[0], nid, prev[1], "data"))
+            prev = (nid, "out")
+        edges.append(Edge(prev[0], "V", prev[1], "data"))
+        return Graph(nodes=nodes, edges=edges)
+
+    gb = g(("B", "util.timeseries", {}))                   # the builder at its DEFAULT axis
+    p = graph_scope_plan(gb, "V")
+    assert dict(p.cuts) == {"B": {"t", "m"}} and dict(p.whole) == {"L": {"t", "m"}} \
+        and not p.unscoped, p
+    assert dict(graph_scope_plan(gb, "B").cuts) == {"B": {"t", "m"}}, "the builder itself"
+    assert not graph_scope_plan(gb, "L").cuts and not graph_scope_plan(g(), "V").whole
+    p2 = graph_scope_plan(g(("B", "util.timeseries", {"chain_axis": "T"}),
+                            ("S", "util.time_shift", {})), "V")
+    assert dict(p2.cuts) == {"B": {"m"}, "S": {"t"}} and dict(p2.whole) == {"L": {"t", "m"}}, \
+        "T is cut after the LAST node that re-addresses it"
+    assert readdressed_by(_NS(op_key="util.timeseries", muted=True, state=dict)) == frozenset()
+    ups = {"V": ["X", "L"], "X": ["L"], "L": []}
+    pc = scope_plan("V", ups.__getitem__, lambda n: frozenset({"t"}) if n == "X" else frozenset())
+    assert pc.unscoped == {"t"} and dict(pc.whole) == {"L": {"t"}} and not pc.cuts, pc
+    assert source_pin(((0,), (1, 3), None, None), {"t", "m"}) == (None, None, None, None)
+    assert source_pin(((0,), (1, 3), None, None), ()) == ((0,), (1, 3), None, None)
+
+    # 2. the scoped run graph
+    ext = lambda _n: AxisSizes(m=1, t=4, z=1, c=1, y=4, x=4)  # noqa: E731
+    g2, pid, inj = scoped_graph(gb, "V", p, ((0,), (1, 9), None, None), ext)
+    assert pid == "V" and inj == (("B#solo", "m0,t1,3"),), (pid, inj)  # 9 clamps to 3
+    assert g2.nodes["B#solo"].op_key == "util.crop" and \
+        g2.nodes["B#solo"].modes == {"region": "frames"}
+    assert {(e.src, e.dst) for e in g2.edges} == {("L", "B"), ("B", "B#solo"), ("B#solo", "V")}
+    assert {(e.src, e.dst) for e in gb.edges} == {("L", "B"), ("B", "V")}, "input untouched"
+    assert scoped_graph(gb, "B", p, ((0,), (1,), None, None), ext)[1] == "B#solo"
+    assert scoped_graph(gb, "V", p, None)[2] == ()
+
+    # 3. through the engine
+    def src(v, t):
+        a = np.zeros((1, t, 1, 1, 4, 4), dtype=np.uint16)
+        for k in range(t):
+            a[0, k] = v + 100 * k
+        return ArrayProvider(a)
+
+    def card(v, t, name):
+        pr = src(v, t)
+        return Dataset(axes=pr.axes, metadata={"pixel_size_um": 0.5,
+                                               SOURCE_FILE_KEY: [name]}).with_image(pr)
+
+    names = ["w_t001.nd2", "w_t002.nd2"]
+    mp = MultiSourceProvider([src(10, 2), src(20, 2)], labels=names)
+    bundle = Dataset(axes=mp.axes, metadata={"pixel_size_um": 0.5,
+                                             SOURCE_FILE_KEY: list(names)}).with_image(mp)
+
+    def build(seeds, pin=None, target="B"):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
+        nodes["B"] = NodeInstance("B", "util.timeseries", modes={"chain_order": "sequence"})
+        graph = Graph(nodes=nodes, edges=[
+            Edge(f"L{i}", "B", "image", "data" if i == 0 else f"file_{i + 1}")
+            for i in range(len(seeds))])
+        plan = graph_scope_plan(graph, target)
+        full_env = Engine(graph, computes=COMPUTES, seeds={f"L{i}": d for i, d in enumerate(seeds)},
+                          meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                      for i, d in enumerate(seeds)}).env(target)
+        graph, pull, _inj = scoped_graph(graph, target, plan, pin, lambda _n: full_env.axes)
+        cut = {}
+        for i, d in enumerate(seeds):
+            sp = source_pin(pin, plan.whole.get(f"L{i}", ()))
+            if sp is None:
+                cut[f"L{i}"] = d
+            else:
+                v, e = _pin_frames(d.image, MetaEnvelope(axes=d.axes, metadata=d.metadata), sp)
+                cut[f"L{i}"] = Dataset(axes=e.axes, metadata=dict(e.metadata)).with_image(v)
+        eng = Engine(graph, computes=COMPUTES, seeds=cut,
+                     meta_seeds={k: MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for k, d in cut.items()})
+        out = eng.pull(pull)
+        assert eng.env(pull).axes == out.axes, (eng.env(pull).axes, out.axes)
+        return out
+
+    def frames(ds):
+        return [float(ds.image.get_region(0, 0, k, 0, 0, 0, 4, 0, 4)[0, 0])
+                for k in range(ds.axes.t)]
+
+    full = build([bundle])
+    assert frames(full) == [10.0, 110.0, 20.0, 120.0], frames(full)
+    picked = build([bundle], ((0,), (1, 2), None, None))
+    assert (picked.axes.m, picked.axes.t) == (1, 2) and frames(picked) == [110.0, 20.0], \
+        frames(picked)
+    # what the old scope did: the bundle source cut to the cursor's position is ONE file
+    v_old, _e = _pin_frames(mp, MetaEnvelope(axes=mp.axes, metadata=dict(bundle.metadata)),
+                            ((0,), None, None, None))
+    assert v_old.axes.m == 1, "cutting the source's M kept one of the two files"
+    cards = [card(10, 3, names[0]), card(20, 2, names[1])]
+    assert frames(build(cards)) == [10.0, 110.0, 210.0, 20.0, 120.0]
+    assert frames(build(cards, ((0,), (1, 3), None, None))) == [110.0, 20.0]
+    assert frames(build(cards, ((0,), (4,), None, None))) == [120.0], "file 2's 2nd frame"
+
+    # 4. the strips span the rebuilt series
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    OPS.ensure_ops()
+    doc = GraphDocument()
+    for i, d in enumerate(cards):
+        doc.add_node("io.load", node_id=f"L{i}", x=0, y=100 * i)
+        doc.set_meta_seed(f"L{i}", MetaEnvelope(axes=d.axes, metadata=dict(d.metadata)))
+    doc.add_node("util.timeseries", node_id="B", x=200, y=0,
+                 modes={"chain_order": "sequence"})
+    doc.add_node("enhance.gamma", node_id="V", x=400, y=0)
+    doc.connect("L0", "image", "B", "data")
+    doc.connect("L1", "image", "B", "file_2")
+    doc.connect("B", "out", "V", "data")
+    assert doc.source_scope_totals("V") == (1, 5, 1), doc.source_scope_totals("V")
+    assert doc.source_scope_totals("B") == (1, 5, 1)
+    assert doc.source_scope_totals("L0") == (1, 3, 1), "a source spans its own frames"
+    _ok("troubleshooting below a Timeseries Builder: the picks are the viewed node's own "
+        "frames — cut after the last node that re-addresses the axis (a builder: T and M, "
+        "even at its default axis), its sources kept whole; a node reaching the target both "
+        "ways leaves the axis unscoped; a bundle or two cards scoped to rebuilt frames "
+        "{1, 3} deliver exactly those frames of the full build; the strips span the rebuilt "
+        "series")
 
 
 def main() -> int:
@@ -31337,6 +31489,7 @@ def main() -> int:
     test_multilink()
     test_frame_timing()
     test_cone_signature()
+    test_solo_scope_plan()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

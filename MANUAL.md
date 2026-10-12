@@ -930,11 +930,19 @@ maximised the badge steps to the right of the mini-map rather than hiding behind
   3 timepoints × 5 planes runs 6 frames of 5 planes each. The two defaults differ on
   purpose — an unpicked M or T means *the frame the cursor is on*, an unpicked Z means
   *the whole volume*, because a 3D node needs one.
-* **A node that re-addresses frames runs that axis whole.** The cursor indexes the viewed
-  node's OUTPUT. Below a Timeseries Builder (onto T or M), a Time Shift, a Select Frame or a
-  Merge onto T/M/Z, that index is not the files' own, so cutting the sources to it would
-  build the shown frame from the wrong source frames. Troubleshooting leaves that axis uncut
-  there: slower to scope, never the wrong frame.
+* **Below a Timeseries Builder you pick from the rebuilt series.** The strips index the
+  viewed node's OUTPUT. A Timeseries Builder, a Time Shift, a Select Frame or a Merge onto
+  T/M/Z re-addresses frames, so below one of them an index is not the files' own. Cutting
+  the sources to it would build the shown frame from the wrong source frames. A builder
+  also re-addresses M: a multi-file card's files arrive as positions. So the scope is cut
+  right **after** the last such node instead: its sources stay whole, and your picks select
+  frames of its output. Under a builder, the T strip spans the whole rebuilt series (every
+  file's frames, in the built order). Picking rebuilt frames 12 and 40 computes exactly
+  those two, wherever they sit in which file. The builder only re-indexes, so only those
+  source frames are read. The cut lives in the run only; your canvas and saved file never
+  show it. One case is left whole: a node that reaches the viewed node both through such a
+  node and around it. There is no single place where the picks mean the viewed node's
+  frames, so that axis runs whole: slower, never the wrong frame.
 * **Drag the amber box to run on a region only.** The moment F9 is on, an amber rectangle
   with eight handles frames the whole image in the Viewer. Drag an edge or corner to resize
   it, drag its interior to move it, and on release the viewed node re-runs on **that window

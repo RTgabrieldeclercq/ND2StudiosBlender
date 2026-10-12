@@ -2142,25 +2142,45 @@ class GraphDocument:
         scope is applied at the source seed, upstream of both. Same root walk as
         :meth:`source_channel_total`; the max over roots, so a graph fed by two files
         offers the longer series.
+
+        **Except where a node upstream re-addresses the axis** (2026-10-12,
+        :mod:`nodelab_v2.solo_scope`): below a Timeseries Builder the scope is cut on the
+        builder's OUTPUT, so T (and M) span the rebuilt series — every file's frames, in
+        the built order — not one file's. Spanning the source there showed one file's
+        frames the moment the mode came on, and the rebuilt axis could not be picked from.
         """
+        from nodelab_v2.solo_scope import readdressed_by, scope_plan
+        if node_id not in self.nodes:
+            ax = self.env(node_id).axes
+            return (max(1, ax.m), max(1, ax.t), max(1, ax.z))
+
+        def preds(nid: str) -> List[str]:
+            return [e[0] for e in self.edges if e[2] == nid and e[0] in self.nodes]
+
+        plan = scope_plan(node_id, preds, lambda nid: readdressed_by(self.nodes.get(nid)))
         seen: set = set()
         stack = [node_id]
-        totals: List[Tuple[int, int, int]] = []
+        roots: List[str] = []
         while stack:
             nid = stack.pop()
             if nid in seen or nid not in self.nodes:
                 continue
             seen.add(nid)
-            preds = [e for e in self.edges if e[2] == nid]
-            if preds:
-                stack.extend(e[0] for e in preds)
+            up = preds(nid)
+            if up:
+                stack.extend(up)
             else:
-                ax = self.env(nid).axes
-                totals.append((ax.m, ax.t, ax.z))
-        if not totals:
-            ax = self.env(node_id).axes
-            totals = [(ax.m, ax.t, ax.z)]
-        return tuple(max(1, max(t[i] for t in totals)) for i in range(3))
+                roots.append(nid)
+        out = []
+        for i, a in enumerate(("m", "t", "z")):
+            # where the picks on this axis are applied: each cut on it, and each source the
+            # plan does not keep whole on it
+            at = [n for n, axes in plan.cuts.items() if a in axes]
+            at += [n for n in roots if a not in plan.whole.get(n, ())]
+            if not at:
+                at = [node_id]
+            out.append(max(1, max(int(getattr(self.env(n).axes, a)) for n in at)))
+        return tuple(out)
 
     def source_scope_extent(self, node_id: str) -> Tuple[int, int]:
         """``(Y, X)`` of the source data feeding ``node_id`` — the frame the troubleshooting

@@ -77,6 +77,8 @@ from nodegraph.provider import (
     _picked, subset_index)
 from nodegraph.streaming import StreamProvider, TileCache, WindowView
 from nodelab_v2 import region_box
+from nodelab_v2.solo_scope import (NO_PLAN, READDRESSING, ScopePlan, graph_scope_plan,
+                                   scoped_graph, source_pin)
 from nodelab_v2.document import BUNDLE_PATHS_KEY, GraphDocument
 from nodelab_v2.ops import (ACCESS_AUTO, ACCESS_DIRECT, ACCESS_INGEST, ACCESS_MODE,
                             CALIB_OVERRIDE_KEYS, GROUPING_AUTO, GROUPING_DEFAULT,
@@ -866,58 +868,32 @@ def render_plane_native(provider: Any, m: int, t: int, z: int, c: int,
 #: ``None`` for the whole series. ``ms``/``ts`` are sorted and never empty (they fall back
 #: to the display cursor); ``zs`` is ``None`` when the whole volume runs, which is the
 #: default because a 3D node needs one.
-#: ``(ms, ts, zs, region)`` — the solo-frame scope a pull runs under. ``zs`` is ``None`` for
-#: the whole volume, and ``ms`` / ``ts`` are ``None`` for an axis left whole because a node
-#: upstream of the pulled one re-addresses it (:func:`readdressed_axes`, 2026-10-12); ``region`` (2026-10-02) is the ``(y0, y1, x0, x1)`` source window the
+#: ``(ms, ts, zs, region)`` — the solo-frame scope a pull runs under, in the PULLED node's
+#: own frame indices. ``zs`` is ``None`` for the whole volume, and ``ms`` / ``ts`` are
+#: ``None`` for an axis no cut can serve (:attr:`~nodelab_v2.solo_scope.ScopePlan.unscoped`,
+#: 2026-10-12); ``region`` (2026-10-02) is the ``(y0, y1, x0, x1)`` source window the
 #: Viewer's troubleshooting box selects, or ``None`` for the whole frame. Both ``None``s are
-#: the identities the pre-region pin had, so an untouched box re-keys nothing.
+#: the identities the pre-region pin had, so an untouched box re-keys nothing. Each SOURCE
+#: seed takes it through :func:`~nodelab_v2.solo_scope.source_pin`: an axis a node
+#: downstream re-addresses is whole there and cut after that node instead.
 Pin = Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[Tuple[int, ...]],
             Optional[Tuple[int, int, int, int]]]
 
 
-#: The nodes whose OUTPUT addresses an axis differently from their input — so a source cut
-#: to "the frame the Viewer is on" would feed them the wrong frame: the Viewer's index is
-#: an index into their OUTPUT, not into any source. ``op_key -> (mode, {mode value: axis})``
-#: or ``op_key -> axis`` for a node that always re-addresses that one axis.
-_READDRESSING = {
-    "util.timeseries": ("chain_axis", {"T": "t", "M": "m", "Z": "z"}),
-    "util.merge": ("merge_axis", {"T": "t", "M": "m", "Z": "z"}),
-    "util.time_shift": "t",
-    "util.select_frame": "t",
-}
+#: The nodes whose OUTPUT addresses an axis differently from their input
+#: (:data:`nodelab_v2.solo_scope.READDRESSING`, which owns the table).
+_READDRESSING = READDRESSING
 
 
 def readdressed_axes(graph: Any, target: str) -> FrozenSet[str]:
     """The axes (``"m"``, ``"t"``, ``"z"``) that some node UPSTREAM of ``target`` in the run
-    ``graph`` re-addresses (:data:`_READDRESSING`), found by walking its in-edges.
+    ``graph`` re-addresses — the union over its :func:`~nodelab_v2.solo_scope.scope_plan`.
 
-    The troubleshooting scope cuts the SOURCES to the Viewer's cursor, which is right only
-    while every node keeps the source's indexing. A Timeseries Builder onto T makes frame 7
-    of its output some file's frame 1; a Time Shift plays frame 5 at 7; a Select Frame's
-    one frame is the source's frame k, not 0 — cutting the source to the cursor's index then
-    builds the shown frame out of the wrong ones, which reads as frames jumping about. Those
-    axes are left whole instead (2026-10-12): slower to scope, never wrong."""
-    nodes = getattr(graph, "nodes", {}) or {}
-    edges = list(getattr(graph, "edges", ()) or ())
-    seen: set = set()
-    stack = [target]
-    out: set = set()
-    while stack:
-        nid = stack.pop()
-        if nid in seen:
-            continue
-        seen.add(nid)
-        inst = nodes.get(nid)
-        rule = _READDRESSING.get(getattr(inst, "op_key", "")) if inst is not None else None
-        if isinstance(rule, str):
-            out.add(rule)
-        elif rule is not None:
-            mode, axes = rule
-            ax = axes.get(str((getattr(inst, "modes", None) or {}).get(mode, "")).upper())
-            if ax:
-                out.add(ax)
-        stack.extend(e.src for e in edges if e.dst == nid)
-    return frozenset(out)
+    A source cut to the Viewer's cursor is right only while every node keeps the source's
+    indexing; below a Timeseries Builder, a Time Shift, a Select Frame or a concatenating
+    Merge the cursor indexes THEIR output. Those axes are cut after that node instead of at
+    the sources (2026-10-12, :mod:`nodelab_v2.solo_scope`)."""
+    return graph_scope_plan(graph, target).readdressed
 
 
 class _HeldView(NamedTuple):
@@ -1154,7 +1130,7 @@ def request_answers(request, coords, channels) -> bool:
 
 class _Job:
     __slots__ = ("epoch", "graph", "revision", "node_id", "pull_id", "coords", "channels",
-                 "sources", "all_sources", "pin", "bake", "cancelled")
+                 "sources", "all_sources", "pin", "bake", "cancelled", "whole", "variant")
 
     def __init__(self, epoch: int, graph: Graph, revision: Any, node_id: str,
                  coords: Optional[Tuple[int, int, int, int]],
@@ -1163,9 +1139,16 @@ class _Job:
                  pin: Optional[Pin] = None,
                  bake: Optional[Dict[str, Any]] = None,
                  all_sources: Optional[frozenset] = None,
-                 pull_id: Optional[str] = None) -> None:
+                 pull_id: Optional[str] = None,
+                 whole: Optional[Mapping[str, FrozenSet[str]]] = None,
+                 variant: Tuple = ()) -> None:
         self.epoch = epoch
         self.graph = graph
+        # the troubleshooting scope's plan for this run (`nodelab_v2.solo_scope`): source →
+        # the axes its seed keeps whole because they are cut after a re-addressing node,
+        # and the cuts the run graph carries for that — a scoped graph is its own engine
+        self.whole = dict(whole or {})
+        self.variant = tuple(variant)
         # The run identity of the pulled node's PAGE — `Workspace.revision_of`, a digest over
         # every page the composed graph splices in (V4.00 step 2); a document revision before.
         self.revision = revision
@@ -2863,39 +2846,60 @@ class EngineRunner(QObject):
         the user is on") on whichever *frame* axis they did not; the whole volume when z
         is unpicked; and the troubleshooting box's window, or the whole frame.
 
-        With ``node_id``, an axis a node upstream of it re-addresses is left WHOLE
-        (``None``, :func:`readdressed_axes`, 2026-10-12): the cursor indexes that node's
-        output, so cutting the sources to it would build the shown frame from the wrong
-        source frames."""
+        The picks are always the PULLED node's own frame indices — what the strips show.
+        Where a node upstream re-addresses an axis, the run cuts after it rather than at the
+        sources (:meth:`_scoped`, 2026-10-12); only an axis no single cut can serve
+        (:attr:`~nodelab_v2.solo_scope.ScopePlan.unscoped`) is left WHOLE (``None``)."""
         if not self._solo or coords is None:
             return None
         ms = self._sel_m or (int(coords[0]),)
         ts = self._sel_t or (int(coords[1]),)
         zs = self._sel_z or None
         if node_id is not None:
-            free = self._readdressed(node_id)
+            free = self._scope_plan(node_id).unscoped
             ms = None if "m" in free else ms
             ts = None if "t" in free else ts
             zs = None if "z" in free else zs
         return (ms, ts, zs, self._sel_region)
 
-    def _readdressed(self, node_id: str) -> FrozenSet[str]:
-        """:func:`readdressed_axes` for ``node_id``'s run graph, cached per page revision —
-        the held-view fast path asks on every cursor move."""
+    def _scope_plan(self, node_id: str) -> ScopePlan:
+        """The :func:`~nodelab_v2.solo_scope.scope_plan` of ``node_id``'s run graph, cached
+        per page revision — the held-view fast path asks on every cursor move."""
         rid = self._rid(node_id)
         rev = self._rev(rid)
-        cache = self.__dict__.setdefault("_readdressed_cache", {})
+        cache = self.__dict__.setdefault("_scope_plan_cache", {})
         hit = cache.get(rid)
         if hit is not None and hit[0] == rev:
             return hit[1]
         try:
             composed = self._compose(rid)
-            free = readdressed_axes(composed.graph,
+            plan = graph_scope_plan(composed.graph,
                                     self._pull_id(rid, composed.graph, composed))
-        except Exception:  # noqa: BLE001 — a graph mid-edit: scope as before
-            free = frozenset()
-        cache[rid] = (rev, free)
-        return free
+        except Exception:  # noqa: BLE001 — a graph mid-edit: scope at the sources
+            plan = NO_PLAN
+        cache[rid] = (rev, plan)
+        return plan
+
+    def _scoped(self, graph: Graph, pull_id: str, pin: Optional[Pin]):
+        """``(graph, pull_id, whole, variant)`` for a pull under ``pin``: the run graph with
+        a frames crop after every node the scope plan cuts at
+        (:func:`~nodelab_v2.solo_scope.scoped_graph`), the id to pull from it, which axes
+        each source keeps whole, and the injected crops (the scoped graph's identity).
+        Unscoped, the graph as it is."""
+        if pin is None:
+            return graph, pull_id, {}, ()
+        plan = graph_scope_plan(graph, pull_id)
+        if not plan.cuts and not plan.whole:
+            return graph, pull_id, {}, ()
+
+        def extent(nid: str):
+            try:
+                return self._source.env(_doc_id_of(nid)).axes
+            except Exception:  # noqa: BLE001 — no envelope: the picks pass unclamped
+                return None
+
+        g, pid, variant = scoped_graph(graph, pull_id, plan, pin, extent)
+        return g, pid, plan.whole, variant
 
     @staticmethod
     def _payload_coords(coords, pin: Optional[Pin]):
@@ -4423,12 +4427,14 @@ class EngineRunner(QObject):
         graph = composed.graph
         pull_id = self._pull_id(node_id, graph, composed)
         sources, every = self._sources_for(pull_id, graph)
+        pin = self._pin_for(coords, node_id) if scoped else None
+        graph, pull_id, whole, variant = self._scoped(graph, pull_id, pin)
         job = _Job(self._epoch, graph, composed.revision, node_id, None, None,
-                   sources, pin=self._pin_for(coords, node_id) if scoped else None,
+                   sources, pin=pin,
                    bake={"store": store, "precision": precision, "bake_id": bake_id,
                          "signature": signature, "scoped": bool(scoped),
                          "hold": bool(hold)},
-                   all_sources=every, pull_id=pull_id)
+                   all_sources=every, pull_id=pull_id, whole=whole, variant=variant)
         self._busy = True
         self._run_t0[job.epoch] = time.monotonic()
         self._active = job          # what the worker is running (never cancel-latched:
@@ -4666,10 +4672,14 @@ class EngineRunner(QObject):
         pull_id = self._pull_id(node_id, graph, composed)
         sources, every = self._sources_for(pull_id, graph)
         self._run_sig[self._epoch] = (graph, pull_id)
+        pin = None if fetch else self._pin_for(coords, node_id)
+        # under the troubleshooting scope the picks are cut where they mean the pulled
+        # node's frames: after a re-addressing node, not at its sources (`solo_scope`)
+        graph, pull_id, whole, variant = self._scoped(graph, pull_id, pin)
         job = _Job(self._epoch, graph,
                    composed.revision, node_id, coords, channels, sources,
-                   pin=None if fetch else self._pin_for(coords, node_id), all_sources=every,
-                   pull_id=pull_id)
+                   pin=pin, all_sources=every, pull_id=pull_id, whole=whole,
+                   variant=variant)
         if fetch:
             self._fetches.add(self._epoch)
         self._busy = True
@@ -4898,8 +4908,9 @@ class EngineRunner(QObject):
         for nid, cfg in job.sources.items():
             prov, env = self._resolve_source(nid, cfg, epoch=job.epoch)
             full_m = int(env.axes.m)
-            if job.pin is not None:
-                prov, env = _pin_frames(prov, env, job.pin)
+            spin = source_pin(job.pin, job.whole.get(nid, ()))
+            if spin is not None:
+                prov, env = _pin_frames(prov, env, spin)
             # The FULL display dict (excitation, bit depth, the stage keys) rides on the seed
             # Dataset only; the engine meta-seed keeps to the calibration schema plus the
             # per-channel names/colours (`ingest.channel_display_seed`, V4.00 step 11g).
@@ -4910,9 +4921,9 @@ class EngineRunner(QObject):
             # So this merge lands after `_pin_frames` and would put the un-subset list back
             # — re-apply the subset to the merged result, or the pin's fix is undone one
             # line later.
-            if job.pin is not None:
+            if spin is not None:
                 changes = position_subset(md, _picked(
-                    job.pin[0] if job.pin[0] is not None else range(full_m), full_m))
+                    spin[0] if spin[0] is not None else range(full_m), full_m))
                 md.update({k: v for k, v in changes.items() if v is not None})
                 for k, v in changes.items():
                     if v is None:
@@ -4951,12 +4962,16 @@ class EngineRunner(QObject):
                           # such chain reading through _NO_CACHE afterwards.
                           tiles=self._tiles,
                           seeds=seeds, meta_seeds=meta_seeds)
-        if self._engine is None or self._engine_rev != job.revision:
+        # A scoped run graph (a crop after a re-addressing node) is a different graph at
+        # the same revision, so its cuts are part of the engine's identity — the Memo is
+        # shared, so switching between scopes recomputes nothing already computed.
+        ident = (job.revision, job.variant) if job.variant else job.revision
+        if self._engine is None or self._engine_rev != ident:
             from nodegraph.nodes import COMPUTES
             self._engine = Engine(job.graph, computes=COMPUTES, memo=self._memo,
                                   tiles=self._tiles,
                                   seeds=seeds, meta_seeds=meta_seeds)
-            self._engine_rev = job.revision
+            self._engine_rev = ident
             self._seed_axes = dict(seed_axes)
             self._meta_seeds = dict(meta_seeds)
             return self._engine
