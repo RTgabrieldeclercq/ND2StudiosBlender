@@ -1202,7 +1202,8 @@ class MainWindow(QMainWindow):
 
     def fill_page_menu(self, menu, c: CanvasPanel) -> None:
         """A canvas's page switcher: every page grouped by kind (the one shown ticked), then
-        New page ▸ <kind>, Duplicate, Open in a new canvas, Rename…, Delete."""
+        New page ▸ <kind>, Load all outputs from “<previous page>”, Duplicate, Open in a new
+        canvas, Rename…, Delete."""
         from nodegraph import roles as R
         menu.clear()
         ws = self.workspace
@@ -1235,6 +1236,8 @@ class MainWindow(QMainWindow):
         dlg.triggered.connect(
             lambda _=False, c=c, k=(PR.next_kind(shown.kind) or shown.kind) if shown else "refine":
             self.new_page_dialog(kind=k, canvas=c))
+        menu.addSeparator()
+        self._add_load_outputs_action(menu, c)
         menu.addSeparator()
         menu.addAction("Duplicate page").triggered.connect(
             lambda _=False, c=c: self.duplicate_page(c.page_id, canvas=c))
@@ -1283,6 +1286,101 @@ class MainWindow(QMainWindow):
         dele = menu.addAction("Delete page")
         dele.setEnabled(len(ws.pages) > 1)
         dele.triggered.connect(lambda _=False, c=c: self.delete_page(c.page_id))
+
+    def _add_load_outputs_action(self, menu, c: CanvasPanel) -> None:
+        """The page menu's *Load all outputs from “<page>”* (2026-10-12): one entry naming the
+        previous page (:meth:`Workspace.previous_feeder`) and how many Page Inputs it adds;
+        greyed, with the reason, when there is nothing to add."""
+        ws = self.workspace
+        page = ws.pages.get(c.page_id)
+        up = ws.previous_feeder(c.page_id) if page is not None else None
+        if page is None or up is None:
+            act = menu.addAction("Load all outputs from the previous page")
+            act.setEnabled(False)
+            feeders = ws.feeder_pages(c.page_id) if page is not None else []
+            act.setToolTip(
+                f"“{page.name}” is where data starts — no page comes before it to read from."
+                if page is not None and not feeders else
+                f"No earlier page publishes a named output yet — add a Page Output on "
+                f"“{feeders[0][1]}” first." if feeders else "")
+            return
+        up_page = ws.pages[up]
+        todo = ws.unread_outputs(c.page_id, up)
+        act = menu.addAction(kind_icon(up_page.kind),
+                             f"Load all outputs from “{up_page.name}”"
+                             + (f"  ({len(todo)})" if todo else ""))
+        act.setEnabled(bool(todo))
+        names = [s.split(":", 1)[1] for s in todo]
+        act.setToolTip(
+            f"A Page Input on this page for each output “{up_page.name}” publishes that no Input "
+            f"here reads yet: {', '.join(names)}." if todo else
+            f"Every output of “{up_page.name}” is already read on this page.")
+        act.triggered.connect(lambda _=False, c=c: self.load_previous_outputs(c))
+
+    def load_previous_outputs(self, c: Optional[CanvasPanel] = None,
+                              from_page: Optional[str] = None) -> List[str]:
+        """Add a Page Input on canvas ``c``'s page for every named Output of ``from_page``
+        (default: the previous page, :meth:`Workspace.previous_feeder`) that no Input there
+        reads yet (:meth:`Workspace.unread_outputs`). The Inputs stack in a column at the
+        left of the page — under the Inputs it already has, else left of its nodes — each
+        placed by the card above it's real height, then are selected and brought into view.
+        A linked page asks how the edit applies first, as every structural edit does.
+        Returns the new node ids (none when there was nothing to add, or it was cancelled)."""
+        c = c if c is not None else self._canvas
+        ws = self.workspace
+        pid = c.page_id
+        page = ws.pages.get(pid)
+        if page is None:
+            return []
+        up = from_page or ws.previous_feeder(pid)
+        if up is None or up not in ws.pages:
+            self.statusBar().showMessage(
+                "no earlier page publishes a named output for this page to read", 8000)
+            return []
+        up_name = ws.pages[up].name
+        todo = ws.unread_outputs(pid, up)
+        if not todo:
+            self.statusBar().showMessage(
+                f"every output of “{up_name}” is already read on “{page.name}”", 8000)
+            return []
+        if not self._topology_ok(page.doc):
+            return []
+        page = ws.pages[pid]                      # Make unique swaps the page's document
+        doc, sc = page.doc, self.scene_for(pid)
+
+        def height(nid: str) -> float:
+            item = sc.node_items.get(nid)
+            return item.card_rect().height() if item is not None else 120.0
+
+        ins = [r for r in doc.nodes.values() if r.op_key == PAGE_INPUT_OP]
+        if ins:
+            x = min(r.x for r in ins)
+            y = max(r.y + height(r.id) for r in ins) + SOURCE_STACK_GAP
+        elif doc.nodes:
+            x = min(r.x for r in doc.nodes.values()) - 280.0
+            y = min(r.y for r in doc.nodes.values())
+        else:
+            x, y = 40.0, 120.0
+        new: List[str] = []
+        for src in todo:
+            rec = doc.add_node(PAGE_INPUT_OP, x=x, y=y, params={PAGE_SOURCE_KEY: src})
+            new.append(rec.id)
+            y += height(rec.id) + SOURCE_STACK_GAP
+        items = [sc.node_items[n] for n in new if n in sc.node_items]
+        if items:
+            sc.clearSelection()
+            span = QRectF()
+            for it in items:
+                it.setSelected(True)
+                span = span.united(it.card_rect().translated(it.pos()))
+            if c.page_id == pid:
+                c.view.ensureVisible(span, 60, 60)
+        names = [s.split(":", 1)[1] for s in todo]
+        self.statusBar().showMessage(
+            f"{len(new)} Page Input{'' if len(new) == 1 else 's'} on “{page.name}” now "
+            f"read “{up_name}”: " + ", ".join(names[:4])
+            + (f" +{len(names) - 4} more" if len(names) > 4 else ""), 8000)
+        return new
 
     def _show_page(self, c: CanvasPanel, page_id: str) -> None:
         """Show ``page_id`` on canvas ``c`` and work there."""

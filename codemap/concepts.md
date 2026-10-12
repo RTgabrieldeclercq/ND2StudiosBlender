@@ -462,7 +462,10 @@ installs `doc.node_defaults`, which `GraphDocument.add_node` merges UNDER explic
 hand-placed Output gets `unique_output_name` (`out`, `out2`, …), a hand-placed Input gets
 `default_source` (the most recently added named Output of the nearest feeder page,
 `feeder_pages`: nearest kind, latest page, a Free feeder last); the load, duplicate and
-group paths build records directly and keep their values. `add_page(seed_input=True)` (the
+group paths build records directly and keep their values. The page menu's *Load all outputs
+from “<page>”* (`MainWindow.load_previous_outputs`, 2026-10-12) uses the same "previous page",
+`Workspace.previous_feeder`, and adds an Input per `Workspace.unread_outputs`: that page's
+named Outputs in the order added, minus those an Input here already reads. `add_page(seed_input=True)` (the
 switcher's *New page*) and the first visit to an empty downstream page add one bound Input.
 Readiness (`readiness.problems`) states the fixes as `Suggestion.action` — `set_param`
 (bind, name) and `append` (a Page Output after a terminal node or an unpublished loader, the

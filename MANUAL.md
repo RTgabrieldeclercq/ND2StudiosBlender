@@ -236,7 +236,15 @@ Input** (load and organise the data), **Image Refinement** (prepare the image, f
 from before V4 opens as one Free page). **File → New holds the four standard pages**, one of
 each kind in that order, Image Input active. The button in a canvas's top-left corner is the
 **page switcher**: it names the page shown and lists every page by kind; its menu adds a page
-of any kind, duplicates, renames or deletes one, or opens it in a new canvas. **Keeping track
+of any kind, duplicates, renames or deletes one, or opens it in a new canvas. Its **Load all
+outputs from “<previous page>”** puts a **Page Input for every output the previous page
+publishes** that this page does not read yet. The previous page is the nearest earlier page
+with a named output, the one a new Page Input reads by default. The Inputs stack in a column
+at the left, under any Inputs the page already has, and are selected. The entry says how many
+it will add and greys out, with the reason, when there is nothing to add: on Image Input, or
+when every output is already read. Run it again after the earlier page gains an output and it
+adds only that one. On a linked page it first asks how the edit applies, like any change to
+the graph. **Keeping track
 of pages:** every canvas has **two rows of tabs** along its top edge. The top row has a tab per
 page **kind** in pipeline order (*Image Input · Image Refinement · Image Processing · Analysis*,
 then *Free*), with a count when a kind holds several pages; click one to show that kind's

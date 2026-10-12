@@ -1317,6 +1317,32 @@ class Workspace:
                 return f"{pid}:{outs[-1][0]}"
         return ""
 
+    def previous_feeder(self, page_id: str) -> Optional[str]:
+        """The page the page menu's *Load all outputs from …* reads (2026-10-12): the
+        nearest page that may feed ``page_id`` (:meth:`feeder_pages`) and publishes at least
+        one named Output — the same "previous page" a new Page Input's :meth:`default_source`
+        picks from, so the two never disagree about which page that is. ``None`` when no
+        page that may feed this one publishes anything (an Image Input page always)."""
+        for pid, _name in self.feeder_pages(page_id):
+            if self._outputs_in_order(pid):
+                return pid
+        return None
+
+    def unread_outputs(self, page_id: str, from_page: str) -> List[str]:
+        """The Sources (``"<page id>:<name>"``) of ``from_page``'s named Outputs that no Page
+        Input on ``page_id`` reads yet, in the order the Outputs were added — what *Load all
+        outputs from …* adds an Input for. An Output already read is skipped rather than
+        doubled, so the action can be run again after the earlier page gains an Output and
+        adds only that one. Empty when ``from_page`` may not feed ``page_id``."""
+        page = self.pages.get(page_id)
+        if page is None or from_page not in self.pages or not self._may_feed(from_page, page_id):
+            return []
+        read = {str(r.params.get(PAGE_SOURCE_KEY, "") or "").strip()
+                for r in page.doc.nodes.values() if r.op_key == PAGE_INPUT_OP}
+        return [src for src in (f"{from_page}:{name}"
+                                for name, _nid in self._outputs_in_order(from_page))
+                if src not in read]
+
     def resolve_source(self, page_id: str, value: Any) -> Optional[Tuple[str, str]]:
         """``(upstream page id, Output node id)`` for a source value, or ``None`` when it
         names nothing this page may read (unknown page, unknown name, wrong kind, a cycle)."""

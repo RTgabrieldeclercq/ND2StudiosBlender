@@ -9199,6 +9199,88 @@ def main(argv) -> int:
         "(data, file_2, file_3), the builder predicts 8 frames, it is what gets published, "
         "and the status bar says so")
 
+    # ── PI1: the page menu loads every output of the previous page as Page Inputs ─────
+    # (user request 2026-10-12: one entry in each tab's dropdown, rather than one Page Input
+    # placed and bound by hand per output)
+    from nodelab_v2.linked_document import EDIT_MODIFIED as _PIMod
+    win.file_new()
+    app.processEvents()
+    _ws18 = win.workspace
+    _inp18 = next(p for p in _ws18.pages.values() if p.kind == "input")
+    _ref18 = next(p for p in _ws18.pages.values() if p.kind == "refine")
+    for _nm18 in ("raw", "mask", "dapi"):
+        _inp18.doc.add_node("page.output", params={"name": _nm18})
+    win._show_page(win._main_canvas, _ref18.id)    # its first visit seeds ONE bound Input
+    app.processEvents()
+
+    _pi_menus: list = []                         # held: a collected menu deletes its actions
+
+    def _pi_entry():
+        _mm = _PMenu()
+        _pi_menus.append(_mm)
+        win.fill_page_menu(_mm, win._main_canvas)
+        return next(a for a in _mm.actions() if a.text().startswith("Load all outputs from"))
+
+    def _pi_reads(pg):
+        return [str(r.params.get("source") or "") for r in pg.doc.nodes.values()
+                if r.op_key == "page.input"]
+
+    _seed18 = _pi_reads(_ref18)
+    assert len(_seed18) == 1, _seed18
+    _act18 = _pi_entry()
+    assert _act18.isEnabled() and f"“{_inp18.name}”" in _act18.text() \
+        and "(2)" in _act18.text(), _act18.text()
+    _before18 = set(_ref18.doc.nodes)
+    _msgs18: list = []
+    win.statusBar().messageChanged.connect(_msgs18.append)
+    _act18.trigger()
+    app.processEvents()
+    win.statusBar().messageChanged.disconnect(_msgs18.append)
+    _new18 = [n for n in _ref18.doc.nodes if n not in _before18]
+    assert sorted(_pi_reads(_ref18)) == sorted(f"{_inp18.id}:{n}" for n in ("raw", "mask", "dapi")), \
+        _pi_reads(_ref18)
+    _sc18 = win.scene_for(_ref18.id)
+    assert {i.node_id for i in _sc18.selectedItems() if hasattr(i, "node_id")} == set(_new18), \
+        "the new Inputs are selected"
+    # one column under the seeded Input, no card overlapping another
+    _cards18 = [_sc18.node_items[n] for n in sorted(_ref18.doc.nodes,
+                                                     key=lambda n: _ref18.doc.nodes[n].y)
+                if _ref18.doc.nodes[n].op_key == "page.input"]
+    assert len({round(c.pos().x()) for c in _cards18}) == 1, "one column"
+    for _a, _b in zip(_cards18, _cards18[1:]):
+        assert not _a.mapToScene(_a.card_rect()).boundingRect().intersects(
+            _b.mapToScene(_b.card_rect()).boundingRect()), (_a.node_id, _b.node_id)
+    assert any("2 Page Inputs" in m and "now read" in m for m in _msgs18), _msgs18
+    _act18 = _pi_entry()
+    assert not _act18.isEnabled() and "already read" in _act18.toolTip(), _act18.toolTip()
+    assert win.load_previous_outputs(win._main_canvas) == [], "run again: nothing to add"
+    # Image Input has no previous page: the entry is there, greyed, and says why
+    win._show_page(win._main_canvas, _inp18.id)
+    app.processEvents()
+    _act18 = _pi_entry()
+    assert not _act18.isEnabled() and "where data starts" in _act18.toolTip(), _act18.toolTip()
+    # a LINKED page asks first, like every structural edit: cancelled, nothing changes;
+    # kept on the page, the Inputs are added there
+    _lk18 = win.duplicate_page(_ref18.id, linked=True)
+    app.processEvents()
+    _inp18.doc.add_node("page.output", params={"name": "late"})
+    _lkp18 = _ws18.pages[_lk18]
+    _ask18: list = []
+    win.ask_linked_edit = lambda pid, shape=False, push_note="": (_ask18.append(pid) or "")
+    _n18 = set(_lkp18.doc.nodes)
+    assert win.load_previous_outputs(win._main_canvas) == [] and set(_lkp18.doc.nodes) == _n18
+    assert _ask18 == [_lk18], _ask18
+    win.ask_linked_edit = lambda pid, shape=False, push_note="": _PIMod
+    _added18 = win.load_previous_outputs(win._main_canvas)
+    assert len(_added18) == 1 and f"{_inp18.id}:late" in _pi_reads(_ws18.pages[_lk18]), \
+        _pi_reads(_ws18.pages[_lk18])
+    del win.ask_linked_edit
+    _ok("PI1 a tab's dropdown offers “Load all outputs from <previous page>” with how many it "
+        "adds: one click puts a Page Input per unread output in a column under the page's "
+        "Inputs, bound in the order they were published, selected and named in the status "
+        "bar; run again it is greyed (“already read”); on Image Input it is greyed and says "
+        "why; a linked page asks first — cancelled changes nothing, kept adds them there")
+
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

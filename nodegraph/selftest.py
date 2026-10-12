@@ -30766,6 +30766,49 @@ def test_timeseries_frame_interleave() -> None:
         "multi-file card's stage log and point names concatenate across its files")
 
 
+def test_page_inputs_from_previous() -> None:
+    """The page menu's *Load all outputs from “<previous page>”* (2026-10-12), its Qt-free
+    half: ``Workspace.previous_feeder`` is the nearest page that may feed this one AND
+    publishes a named Output (the page ``default_source`` reads), ``None`` on Image Input;
+    ``Workspace.unread_outputs`` lists that page's Outputs in the order they were added,
+    minus the ones an Input here already reads, and nothing for a page that may not feed this
+    one. Inputs bound to what it lists resolve in the composed run graph."""
+    ws, _ds, _env, _ax = _ws_fixture()    # Input pg1 "raw" → Refine pg2 "smooth" → pg3, pg4
+    assert ws.previous_feeder("pg1") is None, "Image Input: nothing comes before it"
+    assert ws.previous_feeder("pg2") == "pg1" and ws.previous_feeder("pg3") == "pg2"
+    Rf = ws.pages["pg2"].doc
+    Rf.add_node("page.output", node_id="O2", params={"name": "alpha"})
+    Rf.connect("G", "out", "O2", "data")
+    Rf.add_node("page.output", node_id="O3", params={"name": "beta"})
+    Rf.connect("IN", "out", "O3", "data")
+    # pg3 already reads pg2:smooth; the other two are listed, in the order they were ADDED
+    assert ws.unread_outputs("pg3", "pg2") == ["pg2:alpha", "pg2:beta"], \
+        ws.unread_outputs("pg3", "pg2")
+    assert ws.unread_outputs("pg2", "pg1") == [], "Refine already reads raw"
+    assert ws.unread_outputs("pg2", "pg3") == [], "a later page may not feed an earlier one"
+    assert ws.unread_outputs("pg3", "pg4") == [], "nor may a page of the same kind"
+    P1 = ws.pages["pg3"].doc
+    for src in ws.unread_outputs("pg3", "pg2"):
+        P1.add_node("page.input", params={"source": src})
+    assert ws.unread_outputs("pg3", "pg2") == [], "run again: nothing left to add"
+    g = ws.compose("pg3").graph
+    assert not [n for n in g.nodes.values() if n.op_key == "page.input"], \
+        "every new Input resolves to its Output in the run graph"
+    # Analysis reads Processing first; with no Processing Output it falls back to Refine
+    An = ws.add_page("An", "analyze")
+    assert ws.previous_feeder(An.id) == "pg2", ws.previous_feeder(An.id)
+    P1.add_node("page.output", node_id="OC", params={"name": "cells"})
+    P1.connect("X", "out", "OC", "data")
+    assert ws.previous_feeder(An.id) == "pg3", "the nearest kind that publishes wins"
+    assert ws.unread_outputs(An.id, "pg3") == ["pg3:cells"]
+    from nodelab_v2.workspace import Workspace
+    assert Workspace.standard().previous_feeder("pg2") is None, "nothing published yet"
+    _ok("page inputs from the previous page: previous_feeder is the nearest feeding page "
+        "that publishes (None on Image Input or when nothing is published); unread_outputs "
+        "lists its Outputs in the order added minus those already read, and nothing for a "
+        "page that may not feed this one; the Inputs it implies resolve in the run graph")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -30972,6 +31015,7 @@ def main() -> int:
     test_region_tabs()
     test_canvas_pill_and_reorganize()
     test_timeseries_frame_interleave()
+    test_page_inputs_from_previous()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
