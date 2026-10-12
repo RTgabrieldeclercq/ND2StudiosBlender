@@ -30895,6 +30895,46 @@ def test_multilink() -> None:
         assert (rec.x, rec.y) == (doc.nodes[src].x + 300, doc.nodes[src].y + 50)
     assert sorted(ML.group_of(doc, "G0")) == sorted(["G0", *res.nodes])
 
+    # 3b. the mirror CONTINUES down the chain: a node placed after a mirrored node (which is
+    #     not ticked) is mirrored in every lane, and so is the one placed after that
+    lanes = ML.lanes_of(doc, "G0")
+    assert set(lanes) == {"Z", "A", "M"} and lanes["Z"] == "G0", lanes
+    assert ML.applies(doc, "G0") and not ML.applies(doc, "TS"), "a group member mirrors"
+    doc.add_node("enhance.gaussian", node_id="Y0", x=600, y=50)
+    doc.connect("G0", "out", "Y0", "data")
+    res2 = ML.mirror(doc, "G0", "out", "Y0", "data")
+    ylanes = ML.lanes_of(doc, "Y0")
+    assert res2.ok and len(res2.nodes) == 2 and set(ylanes) == {"Z", "A", "M"}, res2
+    for lane in ("A", "M"):
+        assert (lanes[lane], "out", ylanes[lane], "data") in doc.edges, (lane, doc.edges)
+        assert (doc.nodes[ylanes[lane]].x, doc.nodes[ylanes[lane]].y) == \
+            (doc.nodes[lanes[lane]].x + 300, doc.nodes[lanes[lane]].y), "same offset per lane"
+    doc.add_node("enhance.gamma", node_id="W0", x=900, y=50)
+    doc.connect("Y0", "out", "W0", "data")
+    assert len(ML.mirror(doc, "Y0", "out", "W0", "data").nodes) == 2, "and again: no end"
+    # ...a parallel input of the node mirrored comes from each lane's OWN member
+    doc.add_node("view.overlay", node_id="D0", x=900, y=300)
+    doc.connect("G0", "out", "D0", "secondary")
+    doc.connect("Y0", "out", "D0", "data")
+    ML.mirror(doc, "Y0", "out", "D0", "data")
+    dl = ML.lanes_of(doc, "D0")
+    for lane in ("A", "M"):
+        assert (lanes[lane], "out", dl[lane], "secondary") in doc.edges, "parallel stays parallel"
+    # a CONNECTION between two parallel groups is drawn in every lane, and no node is made
+    doc.add_node("view.overlay", node_id="O0", x=600, y=300)
+    doc.connect("Z", "out", "O0", "data")
+    ML.mirror(doc, "Z", "out", "O0", "data")                 # from the ticked set
+    olanes = ML.lanes_of(doc, "O0")
+    n_nodes = len(doc.nodes)
+    doc.connect("G0", "out", "O0", "secondary")
+    link = ML.mirror(doc, "G0", "out", "O0", "secondary")
+    assert link.ok and not link.nodes and len(doc.nodes) == n_nodes, link
+    for lane in ("A", "M"):
+        assert (lanes[lane], "out", olanes[lane], "secondary") in doc.edges, lane
+    # ...but a wire from one lane into ANOTHER lane's member stays one wire
+    cross = ML.mirror(doc, "Y0", "out", olanes["A"], "secondary")
+    assert not cross.ok and "crosses mirror lanes" in cross.message, cross
+
     # 4. an edit applies to the group while in mirror mode -- and only then
     doc.nodes["G0"].params["gamma"] = 1.9
     doc.touch("G0")
@@ -30921,8 +30961,11 @@ def test_multilink() -> None:
         "with the dragged-from node and the rest alphabetically (growing slots, a "
         "multi-input socket, two distinct inputs), refuses with nothing changed when they "
         "do not all fit and says a single-input node accepts only one; mirror copies the "
-        "target per ticked node with its values, offset and other wires; an edit applies "
-        "to the mirror group only while in mirror mode with something ticked")
+        "target per ticked node with its values, offset and other wires, and CONTINUES "
+        "lane by lane from a mirrored node (a chain of any length; a parallel input from "
+        "each lane's own member; a wire between two parallel groups drawn in every lane "
+        "with no node made; a cross-lane wire left single); an edit applies to the mirror "
+        "group only while in mirror mode with something ticked")
 
 
 def main() -> int:

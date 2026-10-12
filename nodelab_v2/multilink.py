@@ -17,13 +17,24 @@ whichever of two modes the canvas is in (the button beside the action pill):
   (:func:`mirror_siblings`, called from :meth:`GraphDocument.touch`, the one call every
   editor makes after a value edit).
 
+**Lanes: mirroring continues down the chain** (2026-10-12). Each ticked node starts a
+LANE, and a mirror group maps every lane to its own member (``{lane: node}``): the copy
+made for ticked node ``C`` sits in lane ``C``. A wire drawn out of ANY member of a mirror
+group, while the page is in mirror mode, mirrors the same way the ticked set does
+(:func:`lanes_for`). To a fresh node, every other lane gets its own copy, wired from that
+lane's member, and the new nodes form a group with the same lanes, so a chain of steps
+placed after the first mirrored one is built once per lane. To a node that is itself the
+SAME lane's member of another group, the wire is drawn in every lane between that lane's
+two members, and no node is made. A wire from one lane into another lane's member has no
+per-lane meaning and stays one wire.
+
 The state is per DOCUMENT (one page) and per session: the ticks, the mode and the mirror
 groups are not saved with the file. Every canvas showing the page sees the same set. A
 tick is not a graph edit, so it never re-propagates metadata or cancels a pull. Listeners
 (the page's scenes) repaint on :meth:`MultiLinkState.on_change`.
 
-A wire drawn from a node that is NOT ticked, from a node that is the only one ticked, or
-from an input socket, behaves exactly as it always did.
+A wire drawn from a node that is neither ticked (with another ticked) nor a mirror-group
+member in mirror mode, or from an input socket, behaves exactly as it always did.
 """
 
 from __future__ import annotations
@@ -53,7 +64,9 @@ class MultiLinkState:
     def __init__(self) -> None:
         self.ticked: Dict[str, None] = {}          # an insertion-ordered set
         self.mode: str = MIRROR
-        self.groups: List[Set[str]] = []
+        #: the mirror groups, each ``{lane: node id}`` — a lane is named by the ticked node
+        #: it started from, so two groups made from one ticked set line up lane by lane
+        self.groups: List[Dict[str, str]] = []
         self._listeners: List[Callable[[], None]] = []
 
     def on_change(self, cb: Callable[[], None]) -> None:
@@ -138,12 +151,46 @@ def active(doc) -> bool:
     return bool(ticked(doc))
 
 
-def applies(doc, src_id: str) -> bool:
-    """Does a wire drawn out of ``src_id`` go through the multi-link mode? Only when that
-    node is ticked AND at least one other is: with nothing else ticked, there is nothing to
-    mirror or merge, and the plain wire is the right answer."""
+def lanes_of(doc, node_id: str) -> Dict[str, str]:
+    """``{lane: node}`` of the mirror group ``node_id`` is in (its live members only), or
+    ``{}`` — whatever the mode."""
+    for g in state(doc).groups:
+        if node_id in g.values():
+            return {lane: n for lane, n in g.items() if n in doc.nodes}
+    return {}
+
+
+def lane_in(lanes: Dict[str, str], node_id: str) -> Optional[str]:
+    return next((lane for lane, n in lanes.items() if n == node_id), None)
+
+
+def lanes_for(doc, src_id: str) -> Optional[Dict[str, str]]:
+    """The lanes a wire drawn out of ``src_id`` is repeated across, or ``None`` for a plain
+    wire:
+
+    * ``src_id`` is ticked and another node is: every ticked node is a lane, its own member;
+    * else, in MIRROR mode (mirror selected, something ticked), ``src_id`` is a member of a
+      mirror group with another live member: that group's lanes. This is what lets a chain
+      placed after a mirrored node be mirrored too, step by step."""
     t = ticked(doc)
-    return src_id in t and len(t) >= 2
+    if src_id in t and len(t) >= 2:
+        return {n: n for n in t}
+    if mode(doc) == MIRROR and t:
+        g = lanes_of(doc, src_id)
+        if len(g) >= 2:
+            return g
+    return None
+
+
+def applies(doc, src_id: str) -> bool:
+    """Does a wire drawn out of ``src_id`` go through the multi-link mode? When
+    :func:`lanes_for` names lanes for it: a ticked node with another ticked, or — mirror only
+    — a member of a mirror group. With nothing to repeat it across, the plain wire is the
+    right answer. MERGE acts on the ticked set alone (:func:`merge`)."""
+    lanes = lanes_for(doc, src_id)
+    if lanes is None:
+        return False
+    return mode(doc) == MIRROR or src_id in ticked(doc)
 
 
 class Outcome(NamedTuple):
@@ -246,21 +293,55 @@ def merge(doc, src: str, src_socket: str, dst: str) -> Outcome:
 
 
 def mirror(doc, src: str, src_socket: str, dst: str, dst_socket: str) -> Outcome:
-    """Give every OTHER ticked node its own copy of ``dst``, wired from it the way ``src``
-    is wired into ``dst`` (``src_socket`` → ``dst_socket``; the caller has made that first
-    wire). A copy has ``dst``'s type, values, mode and switches, sits at ``dst``'s offset from
-    ``src`` measured from its own feeder, and takes ``dst``'s OTHER incoming wires too (a
-    shared reference stays shared). A ticked node with no output that fits gets no copy,
-    and the message says so. ``dst`` and its copies form one mirror group."""
-    others = _by_title(doc, [n for n in ticked(doc) if n not in (src, dst)])
+    """Repeat the wire ``src.src_socket`` → ``dst.dst_socket`` (the caller has drawn it) in
+    every other lane of ``src`` (:func:`lanes_for`: the ticked set, or ``src``'s mirror
+    group), lane by lane:
+
+    * ``dst`` is the SAME lane's member of a mirror group: each other lane's member of
+      ``src``'s group is wired into its own lane's member of ``dst``'s group — the
+      connection is mirrored, no node is made. A lane ``dst``'s group lacks gets a copy;
+    * ``dst`` is a member of a group in ANOTHER lane: the wire crosses lanes, has no per-lane
+      meaning, and stays one wire;
+    * otherwise every other lane gets its own copy of ``dst`` — its type, values, mode and
+      switches — at ``dst``'s offset from ``src`` measured from that lane's member, wired the
+      same way. ``dst``'s OTHER incoming wires come along: from a member of a mirror group,
+      that lane's member of it (a parallel chain stays parallel); from anything else, the
+      same node (a shared reference stays shared). ``dst`` and its copies form a new mirror
+      group with the same lanes, which is what lets the NEXT node placed after it mirror too.
+
+    A lane whose member has no output that fits gets nothing, and the message says so."""
+    lanes = lanes_for(doc, src) or {}
+    l0 = lane_in(lanes, src)
+    if l0 is None:
+        return Outcome(False, "nothing to mirror", [], [])
+    target = lanes_of(doc, dst)
+    t_lane = lane_in(target, dst)
+    if target and t_lane != l0:
+        return Outcome(False, f"“{doc.title_of(src)}” → “{doc.title_of(dst)}” crosses mirror "
+                              f"lanes, so it was drawn once and not mirrored", [], [])
+    others = [(lane, n) for lane, n in lanes.items()
+              if lane != l0 and n in doc.nodes and n != dst]
     x = doc.nodes[dst]
     s = doc.nodes[src]
     dx, dy = x.x - s.x, x.y - s.y
     incoming = [e for e in doc.edges if e[2] == dst and e[3] != dst_socket]
     made: List[str] = []
+    linked: List[str] = []
     added: List[EdgeTuple] = []
     skipped: List[str] = []
-    for c in others:
+    group: Dict[str, str] = dict(target) if target else {l0: dst}
+    for lane, c in others:
+        twin = target.get(lane) if target else None
+        if twin is not None:
+            # a connection between two parallel groups: draw it in this lane too
+            out = _output_for(doc, c, src_socket, twin, dst_socket)
+            if out is None:
+                skipped.append(c)
+                continue
+            doc.connect(c, out, twin, dst_socket)
+            added.append((c, out, twin, dst_socket))
+            linked.append(twin)
+            continue
         crec = doc.nodes[c]
         rec = doc.add_node(x.op_key, x=crec.x + dx, y=crec.y + dy,
                            params=copy.deepcopy(dict(x.params)), modes=dict(x.modes))
@@ -273,39 +354,45 @@ def mirror(doc, src: str, src_socket: str, dst: str, dst_socket: str) -> Outcome
         doc.connect(c, out, rec.id, dst_socket)
         added.append((c, out, rec.id, dst_socket))
         for (u, us, _d, ds) in incoming:
-            if u != rec.id and doc.can_connect(u, us, rec.id, ds)[0]:
-                doc.connect(u, us, rec.id, ds)
-                added.append((u, us, rec.id, ds))
+            uu = lanes_of(doc, u).get(lane, u)          # parallel stays parallel
+            if uu != rec.id and doc.can_connect(uu, us, rec.id, ds)[0]:
+                doc.connect(uu, us, rec.id, ds)
+                added.append((uu, us, rec.id, ds))
+        group[lane] = rec.id
         made.append(rec.id)
     if made:
-        _join_group(doc, [dst] + made)
-    msg = (f"mirrored “{doc.title_of(dst)}” onto {len(made)} more node"
-           f"{'' if len(made) == 1 else 's'}" if made else
-           f"nothing to mirror: no other ticked node has an output that fits “{doc.title_of(dst)}”")
-    if skipped and made:
+        _set_group(doc, group)
+    name = doc.title_of(dst)
+    parts = []
+    if made:
+        parts.append(f"mirrored “{name}” onto {len(made)} more node"
+                     f"{'' if len(made) == 1 else 's'}")
+    if linked:
+        parts.append(f"drew the wire into “{name}” in {len(linked)} more lane"
+                     f"{'' if len(linked) == 1 else 's'}")
+    msg = "; ".join(parts) if parts else \
+        f"nothing to mirror: no other lane has an output that fits “{name}”"
+    if skipped and parts:
         msg += f"; no output fits for {', '.join(doc.title_of(n) for n in skipped)}"
-    return Outcome(bool(made), msg, added, made)
+    return Outcome(bool(made or linked), msg, added, made)
 
 
-def _join_group(doc, ids: List[str]) -> None:
-    """Put ``ids`` in one mirror group, absorbing any group one of them is already in."""
+def _set_group(doc, lanes: Dict[str, str]) -> None:
+    """Record ``lanes`` (``{lane: node}``) as one mirror group. A node is in one group at
+    most: the group already holding any of these nodes is replaced by this one, which is a
+    superset of it (a group gains lanes, never loses them here)."""
     st = state(doc)
-    joined = set(ids)
-    keep = []
-    for g in st.groups:
-        if g & joined:
-            joined |= g
-        else:
-            keep.append(g)
-    st.groups = keep + [joined]
+    members = set(lanes.values())
+    st.groups = [g for g in st.groups if not (set(g.values()) & members)] + [dict(lanes)]
 
 
 def group_of(doc, node_id: str) -> List[str]:
-    """``node_id``'s mirror group (itself first), or ``[]`` — whatever the mode."""
-    for g in state(doc).groups:
-        if node_id in g:
-            return [node_id] + sorted(n for n in g if n != node_id and n in doc.nodes)
-    return []
+    """``node_id``'s mirror group (itself first, then in lane order), or ``[]`` — whatever
+    the mode."""
+    lanes = lanes_of(doc, node_id)
+    if node_id not in lanes.values():
+        return []
+    return [node_id] + [n for n in lanes.values() if n != node_id]
 
 
 def mirror_siblings(doc, node_id: str) -> List[str]:
@@ -337,5 +424,5 @@ def copy_values(doc, src_id: str, dst_id: str) -> bool:
 
 __all__ = ["MIRROR", "MERGE", "MODES", "MultiLinkState", "Outcome", "state", "ticked",
            "is_ticked", "set_ticked", "toggle", "clear", "mode", "set_mode", "active",
-           "applies", "merge_plan", "merge", "mirror", "group_of", "mirror_siblings",
-           "copy_values"]
+           "lanes_of", "lane_in", "lanes_for", "applies", "merge_plan", "merge", "mirror",
+           "group_of", "mirror_siblings", "copy_values"]

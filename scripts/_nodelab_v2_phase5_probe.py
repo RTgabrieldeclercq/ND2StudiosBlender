@@ -9364,6 +9364,24 @@ def main(argv) -> int:
     _sc19.node_items[_grp19[1]]._write_param("gamma", 1.7)      # from one copy's card
     assert all(_d19.nodes[n].params.get("gamma") == 1.7 for n in _grp19), \
         [_d19.nodes[n].params.get("gamma") for n in _grp19]
+    # the mirror CONTINUES: a node placed after a mirrored Gamma (itself not ticked) is
+    # placed in every lane, wired from that lane's own Gamma
+    _gl19 = _ML.lanes_of(_d19, _g019)
+    _y019 = _sc19.link_new_node(_g019, "out", "out", "enhance.gaussian", "data", 600.0, 20.0)
+    app.processEvents()
+    _yl19 = _ML.lanes_of(_d19, _y019)
+    assert set(_yl19) == {"mZ", "mA", "mM"} == set(_gl19), (_yl19, _gl19)
+    assert all((_gl19[_l], "out", _yl19[_l], "data") in _d19.edges for _l in _gl19), \
+        [e for e in _d19.edges if e[2] in _yl19.values()]
+    assert "mirrored" in _msgs19[-1], _msgs19[-1]
+    # ...and dragging a wire on from one of THOSE onto a fresh node continues again
+    _d19.add_node("enhance.gamma", node_id="mW", x=900.0, y=20.0)
+    app.processEvents()
+    _yo19 = _sc19.node_items[_y019].socket("out", "out")
+    _sc19.begin_wire(_yo19, _yo19.anchor())
+    _sc19._end_wire(_sc19.node_items["mW"].socket("in", "data").anchor(), None)
+    app.processEvents()
+    assert set(_ML.lanes_of(_d19, "mW")) == {"mZ", "mA", "mM"}, _ML.lanes_of(_d19, "mW")
     # Clear selected: every box unticked, the border gone, edits one node at a time again
     _cb19.click()
     app.processEvents()
@@ -9376,7 +9394,8 @@ def main(argv) -> int:
         "at its very edge, apart from the amber troubleshooting frame; a merge wire fills "
         "the dragged-from card first and the rest alphabetically, and is refused into a "
         "single-input node (a new one is removed); a mirror wire copies the node per ticked "
-        "card and an edit on one copy edits all; Clear selected unticks them and ends it")
+        "card and an edit on one copy edits all; the mirror continues from a mirrored node "
+        "(link search and wire drag) in every lane; Clear selected unticks them and ends it")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

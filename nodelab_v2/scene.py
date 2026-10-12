@@ -1460,7 +1460,8 @@ class GraphView(QGraphicsView):
         self.mm_mode_btn.setToolTip(
             ("MIRROR: a wire drawn out of a ticked card gives every other ticked card its "
              "own copy of the node it reaches, wired the same way — and while in mirror "
-             "mode, editing one copy edits them all."
+             "mode, editing one copy edits them all, and a wire drawn on from any copy is "
+             "mirrored down every lane too."
              if mirror else
              "MERGE: a wire drawn out of a ticked card wires EVERY ticked card into the node "
              "it reaches — the card you drag from into its first input, the rest in "

@@ -2225,6 +2225,13 @@ the action pill**. Click that button to switch between the two modes:
   shared. This works for a wire dropped on an existing node and for a node made from the
   link-drag search. **While in mirror mode, editing any of the copies edits all of them**, on
   the card or in Properties. A Page Output's name and a card's title stay each copy's own.
+  **The mirror continues down the chain.** Each ticked card starts a *lane*. A wire drawn on
+  from any mirrored copy, which needs no tick of its own, is drawn in every lane. To a new
+  node, each lane gets its own copy, and those copies continue the same way, however long the
+  chain. To a node that is itself that lane's copy (say Z's Overlay, when drawing from Z's
+  Gamma), the same wire is drawn between each lane's two copies and no node is made. A copied
+  node's other inputs follow their lane too. A wire from one lane into another lane's copy
+  stays a single wire, and the status bar says so.
 * **Merge** — **every ticked card is wired into the one node** the wire reaches. The card you
   drag from goes into its **primary (first) input**, and the others follow **in alphabetical
   order** of their titles. They fill a node's several inputs in turn (Overlay's two), its
@@ -2239,8 +2246,9 @@ themes. It stays clear of the troubleshooting frame, which is amber, rounded and
 with plain canvas between the two. **Clear selected**, beside the mode button, unticks every
 card. That ends the mode, so the copies become ordinary nodes, edited one at a time again.
 
-A wire drawn from an unticked card, from a card that is the only one ticked, or from an
-input socket is an ordinary wire. The ticks, the mode and which nodes are copies of each
+A wire drawn from an unticked card that is not a mirrored copy, from a card that is the only
+one ticked, or from an input socket, is an ordinary wire. So is a wire from a mirrored copy
+in merge mode: merge acts on the ticked cards. The ticks, the mode and which nodes are copies of each
 other belong to the page and the session; they are not saved with the file.
 
 ### Node groups — `Ctrl+G` / `Ctrl+Shift+G`
