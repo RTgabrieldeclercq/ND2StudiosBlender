@@ -27,6 +27,7 @@ _DARK = {
     "ACCENT": "#6fe3ff", "ACCENT_INK": "#06222b", "ACCENT_DIM": "#284a56",
     "DIM2D": "#e0a13a", "DIM2D_INK": "#2a1c03", "WIRE": "#5fd06a", "ERROR": "#e05a5a",
     "PROG_FRAME": "#e0a13a", "PROG_TRACK": "#2b323c",
+    "MIRROR": "#ffffff", "MERGE": "#ffe23a",
 }
 _LIGHT = {
     "BG": "#eef1f5", "GRID_DOT": "#d2d9e2", "PANEL": "#ffffff", "PANEL_HI": "#f4f7fa",
@@ -35,6 +36,7 @@ _LIGHT = {
     "ACCENT": "#0f8fb2", "ACCENT_INK": "#e6feff", "ACCENT_DIM": "#bce4ef",
     "DIM2D": "#b9770c", "DIM2D_INK": "#fff2d8", "WIRE": "#2c9a37", "ERROR": "#c23b3b",
     "PROG_FRAME": "#d18a10", "PROG_TRACK": "#d2d9e2",
+    "MIRROR": "#ffffff", "MERGE": "#f5d000",
 }
 _PALETTES = {"dark": _DARK, "light": _LIGHT}
 
@@ -48,6 +50,7 @@ BG = GRID_DOT = PANEL = PANEL_HI = BODY = BORDER = BORDER_HI = None       # type
 INK = INK_2 = MUTED = ACCENT = ACCENT_INK = ACCENT_DIM = None             # type: ignore
 DIM2D = DIM2D_INK = WIRE = ERROR = None                                   # type: ignore
 PROG_FRAME = PROG_TRACK = None                                            # type: ignore
+MIRROR = MERGE = None                                                     # type: ignore
 
 
 def apply(mode: str) -> None:

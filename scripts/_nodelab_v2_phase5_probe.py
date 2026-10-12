@@ -3384,11 +3384,13 @@ def main(argv) -> int:
         "offer max/mean/none here, i.e. a footprint control that changes the reducer"
     assert _zitem._foot_slots()[1] == "WHOLE VOLUME" and "`method`" in _zitem._footprint_line(), \
         f"zproject's band must read its footprint, never its reducer ({_zitem._foot_slots()})"
-    # a collapsed card and a reroute have no controls at all; the tooltip still carries the
+    # a collapsed card has no param controls — only the header's mirror/merge checkbox
+    # (2026-10-12), which every card but a dot carries; the tooltip still carries the
     # footprint, which is the only readout a collapsed card has
     _frec.collapsed = True
     _fitem.refresh()
-    assert _fitem.controls() == [] and "population" in _fitem._footprint_line()
+    assert [c.kind for c in _fitem.controls()] == ["mm"] \
+        and "population" in _fitem._footprint_line(), [c.kind for c in _fitem.controls()]
     _frec.collapsed = False
     _fitem.refresh()
 
@@ -9280,6 +9282,101 @@ def main(argv) -> int:
         "Inputs, bound in the order they were published, selected and named in the status "
         "bar; run again it is greyed (“already read”); on Image Input it is greyed and says "
         "why; a linked page asks first — cancelled changes nothing, kept adds them there")
+
+    # ── MM1: mirror / merge — a checkbox on every card, a mode beside the pill ────────
+    # (user request 2026-10-12)
+    from nodelab_v2 import multilink as _ML
+    from nodelab_v2.document import TITLE_KEY as _TK19
+    win.file_new()
+    app.processEvents()
+    _d19, _sc19, _v19 = win.doc, win.scene, win._main_canvas.view
+    for _nid19, _tt19, _yy19 in (("mZ", "zeta", 0.0), ("mA", "alpha", 170.0),
+                                 ("mM", "mid", 340.0)):
+        _d19.add_node("enhance.gaussian", node_id=_nid19, x=0.0, y=_yy19,
+                      params={_TK19: _tt19})
+    app.processEvents()
+    _mb19, _cb19, _ap19 = _v19.mm_mode_btn, _v19.mm_clear_btn, _v19.action_pill
+    assert _mb19.isVisible() and _cb19.isVisible()
+    assert _mb19.x() >= _ap19.x() + _ap19.width() and _cb19.x() >= _mb19.x() + _mb19.width(), \
+        ("beside the action pill", _ap19.geometry(), _mb19.geometry(), _cb19.geometry())
+    assert "Mirror" in _mb19.text() and not _cb19.isEnabled()
+    for _nid19 in ("mZ", "mA", "mM"):                    # click each header checkbox
+        _it19 = _sc19.node_items[_nid19]
+        _it19.mousePressEvent(_FakePress(_it19._mm_check_rect().center()))
+    app.processEvents()
+    assert _ML.ticked(_d19) == ["mZ", "mA", "mM"], _ML.ticked(_d19)
+    assert _cb19.isEnabled() and "(3)" in _cb19.text(), _cb19.text()
+
+    def _near19(c, ref, tol=40):
+        return (abs(c.red() - ref.red()) + abs(c.green() - ref.green())
+                + abs(c.blue() - ref.blue())) < 3 * tol
+
+    def _px19(x):
+        return _v19.viewport().grab().toImage().pixelColor(x, _v19.viewport().height() // 2)
+
+    assert _near19(_px19(1), T.MIRROR), ("white border in mirror mode", _px19(1).name())
+    _mb19.click()
+    app.processEvents()
+    assert "Merge" in _mb19.text() and _ML.mode(_d19) == _ML.MERGE
+    assert _near19(_px19(1), T.MERGE), ("yellow border in merge mode", _px19(1).name())
+    # with the troubleshooting frame up: yellow at the edge, plain canvas, amber further in
+    _v19.set_troubleshooting(True, "t0")
+    app.processEvents()
+    _img19 = _v19.viewport().grab().toImage()
+    _row19 = _v19.viewport().height() // 2
+    _edge19, _gap19, _ts19 = (_img19.pixelColor(x, _row19) for x in (1, 5, 12))
+    assert _near19(_edge19, T.MERGE) and _near19(_ts19, T.DIM2D) \
+        and not _near19(_gap19, T.MERGE) and not _near19(_gap19, T.DIM2D), \
+        ("the two frames stay apart", _edge19.name(), _gap19.name(), _ts19.name())
+    assert abs(T.MERGE.hslHue() - T.DIM2D.hslHue()) >= 12, "yellow is not the amber"
+    _v19.set_troubleshooting(False)
+    app.processEvents()
+    # MERGE by dragging a wire: the dragged-from card first, the rest alphabetically
+    _msgs19: list = []
+    _sc19.multilink_note.connect(_msgs19.append)
+    _d19.add_node("util.timeseries", node_id="mTS", x=420.0, y=0.0)
+    _d19.add_node("enhance.gamma", node_id="mGA", x=420.0, y=320.0)
+    app.processEvents()
+    _zo19 = _sc19.node_items["mZ"].socket("out", "out")
+    _sc19.begin_wire(_zo19, _zo19.anchor())
+    _sc19._end_wire(_sc19.node_items["mTS"].socket("in", "data").anchor(), None)
+    app.processEvents()
+    assert {e[3]: e[0] for e in _d19.edges if e[2] == "mTS"} == \
+        {"data": "mZ", "file_2": "mA", "file_3": "mM"}, [e for e in _d19.edges if e[2] == "mTS"]
+    assert _msgs19 and _msgs19[-1].startswith("merged 3 nodes"), _msgs19
+    _sc19.begin_wire(_zo19, _zo19.anchor())                # into a single-input node
+    _sc19._end_wire(_sc19.node_items["mGA"].socket("in", "data").anchor(), None)
+    app.processEvents()
+    assert not [e for e in _d19.edges if e[2] == "mGA"] and "accepts only one input" in \
+        _msgs19[-1], _msgs19[-1]
+    _n019 = set(_d19.nodes)                                # a NEW single-input node: removed
+    assert _sc19.link_new_node("mZ", "out", "out", "enhance.gamma", "data", 420.0, 640.0) \
+        is None and set(_d19.nodes) == _n019, "a refused merge leaves no node behind"
+    # MIRROR from the link search: one Gamma per ticked card; an edit on one edits all
+    _mb19.click()
+    app.processEvents()
+    _g019 = _sc19.link_new_node("mZ", "out", "out", "enhance.gamma", "data", 300.0, 20.0)
+    app.processEvents()
+    _grp19 = _ML.group_of(_d19, _g019)
+    assert len(_grp19) == 3, _grp19
+    assert {e[0] for e in _d19.edges if e[2] in _grp19 and e[3] == "data"} == \
+        {"mZ", "mA", "mM"}
+    _sc19.node_items[_grp19[1]]._write_param("gamma", 1.7)      # from one copy's card
+    assert all(_d19.nodes[n].params.get("gamma") == 1.7 for n in _grp19), \
+        [_d19.nodes[n].params.get("gamma") for n in _grp19]
+    # Clear selected: every box unticked, the border gone, edits one node at a time again
+    _cb19.click()
+    app.processEvents()
+    assert not _ML.active(_d19) and not _cb19.isEnabled()
+    assert not _near19(_px19(1), T.MIRROR), _px19(1).name()
+    _sc19.node_items[_grp19[1]]._write_param("gamma", 0.5)
+    assert _d19.nodes[_grp19[0]].params.get("gamma") == 1.7, "out of mirror mode: one node"
+    _ok("MM1 every card has a mirror/merge checkbox; the mode button and Clear selected sit "
+        "beside the action pill; the canvas is outlined white (mirror) or yellow (merge) "
+        "at its very edge, apart from the amber troubleshooting frame; a merge wire fills "
+        "the dragged-from card first and the rest alphabetically, and is refused into a "
+        "single-input node (a new one is removed); a mirror wire copies the node per ticked "
+        "card and an edit on one copy edits all; Clear selected unticks them and ends it")
 
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()

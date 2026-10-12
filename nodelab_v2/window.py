@@ -1110,6 +1110,7 @@ class MainWindow(QMainWindow):
         sc.pick_requested.connect(self._arm_pick)
         sc.dock_action.connect(self._on_dock_action)
         sc.topology_refused.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
+        sc.multilink_note.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         sc.topology_gate = self._scene_topology_gate
         sc.new_page_from_output.connect(part(self._new_page_from_output, page_id))
         sc.frame_action.connect(part(self._on_frame_action, page_id))

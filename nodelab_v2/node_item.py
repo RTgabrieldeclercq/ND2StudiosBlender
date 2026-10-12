@@ -58,6 +58,7 @@ from nodegraph.groups import group_name_of
 from nodegraph.metadata import envelope_symbols, eval_derive
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType
+from nodelab_v2 import multilink as ML
 from nodelab_v2 import theme as T
 from nodelab_v2.document import (
     BATCH_OP, BUNDLE_PATHS_KEY, GraphDocument, NodeRecord, TITLE_KEY, UNBATCH_OP)
@@ -136,8 +137,9 @@ class Ctl(NamedTuple):
     band — V2.27, the only control not derived from a row's y), or — on a split card
     (2026-10-07) — ``"check"`` (the checkbox beside a data output; ``obj`` that output's
     spec), ``"group"`` (the Group selected button) and ``"ungroup"`` (the Ungroup button;
-    ``obj`` is ``None`` for both buttons). ``obj`` is otherwise the ``SocketSpec`` or
-    ``ModeSpec`` behind it."""
+    ``obj`` is ``None`` for both buttons), and on every card ``"mm"`` (the header's
+    mirror/merge checkbox, 2026-10-12; ``obj`` ``None``). ``obj`` is otherwise the
+    ``SocketSpec`` or ``ModeSpec`` behind it."""
 
     rect: QRectF
     kind: str
@@ -984,6 +986,41 @@ class NodeItem(QGraphicsObject):
         """Whether a ticked output is a GROUP — what makes Ungroup worth offering."""
         return any(_SPLIT_GROUP_RE.match(k) for k in self._split_picked())
 
+    def _mm_check_rect(self) -> QRectF:
+        """The header's mirror/merge checkbox (2026-10-12): at the header's right end, or
+        just left of the 2D/3D switch on a card that has one. The title is elided short of
+        it (``paint``), and the hover ✕ sits above-right of it on the corner."""
+        right = (T.NODE_W - SwitchItem.WIDTH - 16) if self._switch is not None \
+            else (T.NODE_W - 14)
+        return QRectF(right - _CHECK_W, (T.HEADER_H - _CHECK_W) / 2 + 1, _CHECK_W, _CHECK_W)
+
+    def _paint_mm(self, p: QPainter, body: QRectF) -> None:
+        """The mirror/merge checkbox, and — on a ticked card — a ring in the mode's colour
+        (white: mirror, yellow: merge) just outside the card, inside the glow margin, so the
+        set reads at a glance at any zoom. A dark hairline keeps both colours legible on the
+        light theme."""
+        on = ML.is_ticked(self.doc, self.rec.id)
+        col = T.MIRROR if ML.mode(self.doc) == ML.MIRROR else T.MERGE
+        if on:
+            ring = body.adjusted(-3, -3, 3, 3)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(0, 0, 0, 120), 3.6))
+            p.drawRoundedRect(ring, T.RADIUS + 3, T.RADIUS + 3)
+            p.setPen(QPen(col, 1.8))
+            p.drawRoundedRect(ring, T.RADIUS + 3, T.RADIUS + 3)
+        r = self._mm_check_rect()
+        hot = self._hot_ctl is not None and self._hot_ctl.kind == "mm"
+        p.setPen(QPen(QColor(0, 0, 0, 150) if on else (T.ACCENT if hot else T.MUTED),
+                      1.4 if hot else 1))
+        p.setBrush(col if on else (T.mix(T.BODY, T.PANEL_HI, 0.6) if hot else T.BODY))
+        p.drawRoundedRect(r, 2.5, 2.5)
+        if on:
+            p.setPen(QPen(QColor(20, 23, 28), 1.8))
+            x0, y0, w = r.left(), r.top(), r.width()
+            p.drawPolyline([QPointF(x0 + 0.25 * w, y0 + 0.52 * w),
+                            QPointF(x0 + 0.44 * w, y0 + 0.72 * w),
+                            QPointF(x0 + 0.78 * w, y0 + 0.30 * w)])
+
     @staticmethod
     def _check_rect(y: float) -> QRectF:
         """The checkbox beside an output row, at the card's left edge — the outputs'
@@ -1447,9 +1484,10 @@ class NodeItem(QGraphicsObject):
         self._paint_header_rail(p)
         self._paint_status_dot(p)
 
-        # header text — ELIDED so long titles never run under the switch (G10)
+        # header text — ELIDED so long titles never run under the switch (G10) or the
+        # mirror/merge checkbox beside it
         title_w = (T.NODE_W - 90 if self._switch is None
-                   else T.NODE_W - SwitchItem.WIDTH - 34)
+                   else T.NODE_W - SwitchItem.WIDTH - 54)
         cat_f = QFont(T.SANS, 6); cat_f.setBold(True)
         cat_f.setCapitalization(QFont.AllUppercase)
         cat_f.setLetterSpacing(QFont.PercentageSpacing, 112)
@@ -1493,6 +1531,7 @@ class NodeItem(QGraphicsObject):
                  or (spec.label if spec else self.rec.op_key))
         label = QFontMetricsF(tf).elidedText(label, Qt.ElideRight, title_w)
         p.drawText(QRectF(12, 15, title_w, 16), Qt.AlignVCenter | Qt.AlignLeft, label)
+        self._paint_mm(p, body)
 
         if self.rec.collapsed:
             return                     # header-only compact card (sockets at edges)
@@ -1828,10 +1867,13 @@ class NodeItem(QGraphicsObject):
         THE single source of the card's interaction surface: :meth:`paint` draws from the
         same rects, so a control can never be painted somewhere it cannot be clicked. A
         collapsed card, a reroute dot or an unrecognized op has none — there are no rows to
-        put them on."""
-        if self._is_dot or self.rec.collapsed or self.spec is None:
+        put them on — except the header's mirror/merge checkbox, which every card but a dot
+        has, collapsed or not."""
+        if self._is_dot:
             return []
-        out: List[Ctl] = []
+        out: List[Ctl] = [Ctl(self._mm_check_rect(), "mm", None)]
+        if self.rec.collapsed or self.spec is None:
+            return out
         # the footprint band's population pill, ABOVE the rows (V2.27) — the rows start at
         # HEADER_H + GRAN_H, so this is the one control not derived from a row's y.
         _scope = self._scope_mode()
@@ -2311,6 +2353,12 @@ class NodeItem(QGraphicsObject):
         ctl = self.control_at(e.pos()) if e.button() == Qt.LeftButton else None
         if ctl is None:
             super().mousePressEvent(e)
+            return
+        if ctl.kind == "mm":
+            # the mirror/merge tick: not a selection and not an edit — the set's own
+            # listeners repaint every card and canvas showing this page
+            ML.toggle(self.doc, self.rec.id)
+            e.accept()
             return
         if not self.isSelected():                # clicking a control selects its card too
             sc = self.scene()

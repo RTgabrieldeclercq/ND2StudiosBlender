@@ -2213,6 +2213,36 @@ so the master moves too; on a **region tab** only the tab's own Page Inputs and 
 round the region. **Undo reorganize** in the pill puts every card back, for as long as no card
 has moved since.
 
+### Mirror and merge — one wire, many nodes (2026-10-12)
+
+Every card has a **checkbox at the right of its header**. Tick several cards and a wire you
+draw **out of one of them** applies to all of them, in the mode shown by the button **beside
+the action pill**. Click that button to switch between the two modes:
+
+* **Mirror** — every other ticked card gets **its own copy** of the node the wire reaches. The
+  copy has the same type and values and the same wire from its own card, sits at the same offset
+  from it, and takes the original's other incoming wires too, so a shared reference stays
+  shared. This works for a wire dropped on an existing node and for a node made from the
+  link-drag search. **While in mirror mode, editing any of the copies edits all of them**, on
+  the card or in Properties. A Page Output's name and a card's title stay each copy's own.
+* **Merge** — **every ticked card is wired into the one node** the wire reaches. The card you
+  drag from goes into its **primary (first) input**, and the others follow **in alphabetical
+  order** of their titles. They fill a node's several inputs in turn (Overlay's two), its
+  growing slots (a Timeseries Builder's files, a Viewer's sources), or a multi-input socket
+  (Merge) all at once. If the node cannot take them all, **the merge is refused and nothing
+  changes**. A node with only one input always refuses, and the status bar says why. A node
+  made from the link-drag search for a refused merge is removed again.
+
+While any card is ticked the canvas is **outlined at its very edge**: **white** for mirror,
+**yellow** for merge. It is a square band with a dark hairline inside, so it reads on both
+themes. It stays clear of the troubleshooting frame, which is amber, rounded and further in,
+with plain canvas between the two. **Clear selected**, beside the mode button, unticks every
+card. That ends the mode, so the copies become ordinary nodes, edited one at a time again.
+
+A wire drawn from an unticked card, from a card that is the only one ticked, or from an
+input socket is an ordinary wire. The ticks, the mode and which nodes are copies of each
+other belong to the page and the session; they are not saved with the file.
+
 ### Node groups — `Ctrl+G` / `Ctrl+Shift+G`
 
 **Graph → Group selection…** collapses a selected **linear** sub-chain (exactly one external

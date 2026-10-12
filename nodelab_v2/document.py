@@ -595,10 +595,32 @@ class GraphDocument:
         ``node_id`` names the card that was edited. It narrows the invalidation to the pulls
         that node can affect, so nudging a threshold on one branch no longer cancels another
         branch's running segmentation. Omitting it keeps the conservative "cancel everything"
-        behaviour, which is still correct — just wasteful."""
+        behaviour, which is still correct — just wasteful.
+
+        An edit to a node of a MIRROR group, while its page is in mirror mode
+        (:func:`nodelab_v2.multilink.mirror_siblings`, 2026-10-12), is applied to every
+        other node of the group here, so it holds whatever surface made the edit. Each
+        sibling is then touched through ``self.touch`` (a linked page records it as its own
+        override that way); the guard keeps the siblings from bouncing it back."""
         if node_id is not None:
             self._settle_output_name(node_id)
+            self._mirror_edit(node_id)
         self._notify(None if node_id is None else (node_id,))
+
+    def _mirror_edit(self, node_id: str) -> None:
+        if self.__dict__.get("_mirroring"):
+            return
+        from nodelab_v2 import multilink as ML
+        siblings = ML.mirror_siblings(self, node_id)
+        if not siblings:
+            return
+        self.__dict__["_mirroring"] = True
+        try:
+            for sib in siblings:
+                if ML.copy_values(self, node_id, sib):
+                    self.touch(sib)
+        finally:
+            self.__dict__["_mirroring"] = False
 
     # ── Page Output names (V4.00 step 11e) ────────────────────────────────────
     def _claim_output_name_here(self, node_id: str, name: str) -> str:

@@ -30809,6 +30809,122 @@ def test_page_inputs_from_previous() -> None:
         "page that may not feed this one; the Inputs it implies resolve in the run graph")
 
 
+def test_multilink() -> None:
+    """Mirror and merge (``nodelab_v2.multilink``, 2026-10-12), the Qt-free half.
+
+    1. Ticks are per document, ordered, pruned when a node goes; ``applies`` needs the
+       drag source ticked AND another node ticked; ``clear`` unticks all.
+    2. MERGE: into a growing-slot node (Timeseries Builder) the dragged-from node takes the
+       primary input and the rest follow ALPHABETICALLY by title; into a multi-input socket
+       (Merge) all go to that socket in the same order; into two distinct inputs (Overlay)
+       two fit and a third ticked node is REFUSED with nothing changed; a single-input node
+       (Gamma) is refused with "accepts only one input".
+    3. MIRROR: every other ticked node gets its own copy of the target, same op and values,
+       wired from it, at the same offset, taking the target's OTHER incoming wires too; the
+       copies form one group.
+    4. While in mirror mode (mirror + something ticked) an edit through ``doc.touch`` applies
+       to the whole group (a Page Output's name and a card title stay each node's own); out
+       of it (cleared, or merge mode), it does not.
+    """
+    from nodelab_v2 import multilink as ML
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument, TITLE_KEY
+    OPS.ensure_ops()
+    doc = GraphDocument()
+
+    def feeder(nid, title, x, y):
+        doc.add_node("enhance.gaussian", node_id=nid, x=x, y=y,
+                     params={TITLE_KEY: title, "sigma": 1.0})
+
+    feeder("Z", "zeta", 0, 0)
+    feeder("A", "alpha", 0, 200)
+    feeder("M", "mid", 0, 400)
+
+    # 1. the set
+    assert not ML.active(doc) and not ML.applies(doc, "Z")
+    assert ML.toggle(doc, "Z") and not ML.applies(doc, "Z"), "alone: a plain wire"
+    ML.set_ticked(doc, "A", True)
+    ML.set_ticked(doc, "M", True)
+    assert ML.ticked(doc) == ["Z", "A", "M"] and ML.applies(doc, "Z")
+    assert not ML.applies(doc, "nope") and ML.mode(doc) == ML.MIRROR
+    seen = []
+    ML.state(doc).on_change(lambda: seen.append(1))
+    ML.set_mode(doc, ML.MERGE)
+    assert seen, "a mode change notifies"
+
+    # 2. merge into growing slots: dragged-from first, the rest alphabetical
+    doc.add_node("util.timeseries", node_id="TS", x=400, y=0)
+    out = ML.merge(doc, "Z", "out", "TS")
+    assert out.ok, out.message
+    into = {e[3]: e[0] for e in doc.edges if e[2] == "TS"}
+    assert into == {"data": "Z", "file_2": "A", "file_3": "M"}, into
+    assert [s.name for s in doc.input_specs("TS")][:4] == ["data", "file_2", "file_3",
+                                                           "file_4"], "the slots grew"
+    # ...into one multi-input socket: all there, the same order
+    doc.add_node("util.merge", node_id="MG", x=400, y=300)
+    assert ML.merge(doc, "A", "out", "MG").ok
+    assert [e[0] for e in doc.edges if e[2] == "MG"] == ["A", "M", "Z"], \
+        [e for e in doc.edges if e[2] == "MG"]
+    # ...into two distinct inputs: two fit, the third is refused, nothing changes
+    doc.add_node("view.overlay", node_id="OV", x=400, y=600)
+    before = list(doc.edges)
+    bad = ML.merge(doc, "Z", "out", "OV")
+    assert not bad.ok and "room for 2 of the 3" in bad.message, bad.message
+    assert doc.edges == before, "a refused merge changes nothing"
+    ML.set_ticked(doc, "M", False)
+    assert ML.merge(doc, "Z", "out", "OV").ok
+    assert {e[3]: e[0] for e in doc.edges if e[2] == "OV"} == {"data": "Z", "secondary": "A"}
+    # ...into a single-input node: refused
+    doc.add_node("enhance.gamma", node_id="GA", x=400, y=900)
+    one = ML.merge(doc, "Z", "out", "GA")
+    assert not one.ok and "accepts only one input" in one.message, one.message
+    assert not [e for e in doc.edges if e[2] == "GA"]
+
+    # 3. mirror: one copy per other ticked node, same values, same offset, same wires
+    ML.set_mode(doc, ML.MIRROR)
+    ML.set_ticked(doc, "M", True)
+    doc.add_node("enhance.gamma", node_id="G0", x=300, y=50, params={"gamma": 0.7})
+    doc.connect("Z", "out", "G0", "data")                    # the drawn wire
+    res = ML.mirror(doc, "Z", "out", "G0", "data")
+    assert res.ok and len(res.nodes) == 2, res
+    by_src = {e[0]: e[2] for e in doc.edges if e[3] == "data" and e[2] in res.nodes}
+    assert set(by_src) == {"A", "M"}, by_src
+    for src, cp in by_src.items():
+        rec = doc.nodes[cp]
+        assert rec.op_key == "enhance.gamma" and rec.params.get("gamma") == 0.7
+        assert (rec.x, rec.y) == (doc.nodes[src].x + 300, doc.nodes[src].y + 50)
+    assert sorted(ML.group_of(doc, "G0")) == sorted(["G0", *res.nodes])
+
+    # 4. an edit applies to the group while in mirror mode -- and only then
+    doc.nodes["G0"].params["gamma"] = 1.9
+    doc.touch("G0")
+    assert all(doc.nodes[n].params.get("gamma") == 1.9 for n in res.nodes)
+    cp = res.nodes[0]
+    doc.nodes[cp].params[TITLE_KEY] = "my copy"
+    doc.nodes[cp].params["gamma"] = 2.2
+    doc.touch(cp)
+    assert doc.nodes["G0"].params.get("gamma") == 2.2, "from any member"
+    assert TITLE_KEY not in doc.nodes["G0"].params, "a title stays the card's own"
+    ML.set_mode(doc, ML.MERGE)
+    doc.nodes["G0"].params["gamma"] = 3.0
+    doc.touch("G0")
+    assert doc.nodes[cp].params.get("gamma") == 2.2, "merge mode: no propagation"
+    ML.set_mode(doc, ML.MIRROR)
+    assert ML.clear(doc) == 3 and not ML.active(doc)
+    doc.nodes["G0"].params["gamma"] = 4.0
+    doc.touch("G0")
+    assert doc.nodes[cp].params.get("gamma") == 2.2, "nothing ticked: no propagation"
+    ML.set_ticked(doc, "Z", True)
+    doc.remove_node("Z")
+    assert ML.ticked(doc) == [], "a deleted node drops out of the set"
+    _ok("multilink: ticks per document, ordered and pruned; merge fills the primary input "
+        "with the dragged-from node and the rest alphabetically (growing slots, a "
+        "multi-input socket, two distinct inputs), refuses with nothing changed when they "
+        "do not all fit and says a single-input node accepts only one; mirror copies the "
+        "target per ticked node with its values, offset and other wires; an edit applies "
+        "to the mirror group only while in mirror mode with something ticked")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -31016,6 +31132,7 @@ def main() -> int:
     test_canvas_pill_and_reorganize()
     test_timeseries_frame_interleave()
     test_page_inputs_from_previous()
+    test_multilink()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

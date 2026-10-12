@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QPainter, QPen, QTransform
+from PySide6.QtGui import QColor, QPainter, QPen, QTransform
 from PySide6.QtWidgets import (
     QApplication, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QToolButton, QVBoxLayout, QWidget,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 from nodegraph import roles as R
 from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType, can_connect as _sock_can_connect
+from nodelab_v2 import multilink as ML
 from nodelab_v2 import theme as T
 from nodelab_v2.document import BATCH_OP, UNBATCH_OP, GraphDocument
 
@@ -258,6 +259,9 @@ class GraphScene(QGraphicsScene):
     #: as a linked tab, ``"rename"`` renames it; the window acts (it owns the dialogs and
     #: the workspace)
     frame_action = Signal(str, str)
+    #: what a mirror or merge wire did, or why it was refused (2026-10-12) — for the
+    #: window's status bar
+    multilink_note = Signal(str)
 
     def __init__(self, document: GraphDocument) -> None:
         super().__init__()
@@ -289,6 +293,9 @@ class GraphScene(QGraphicsScene):
         self.setSceneRect(-400, -300, 3200, 2000)
         document.on_change(self.sync)
         document.on_moved(self._on_moved)
+        # the mirror/merge set (2026-10-12): a tick or a mode change repaints the cards and
+        # every canvas showing this page — not a graph edit, so not through `on_change`
+        ML.state(document).on_change(self._on_multilink)
         self.sync()
 
     def _on_moved(self, node_id: str) -> None:
@@ -307,7 +314,17 @@ class GraphScene(QGraphicsScene):
         the scene that replaced it, the window's hooks — never run."""
         self.doc.off_change(self.sync)
         self.doc.off_moved(self._on_moved)
+        ML.state(self.doc).off_change(self._on_multilink)
         self._anim.stop()
+
+    def _on_multilink(self) -> None:
+        """The page's mirror/merge set changed: repaint the cards (their checkbox and ring)
+        and the canvases (their mode button and border)."""
+        for item in self.node_items.values():
+            item.update()
+        for v in self.views():
+            if hasattr(v, "refresh_multilink"):
+                v.refresh_multilink()
 
     # ── model → canvas ────────────────────────────────────────────────────────
     def sync(self) -> None:
@@ -812,15 +829,54 @@ class GraphScene(QGraphicsScene):
             ends = self._endpoints(sock, fixed)
             if ends is not None:
                 src, dst = ends
-                ok, _reason = self.doc.can_connect(
-                    src.node_item.node_id, src.spec.name,
-                    dst.node_item.node_id, dst.spec.name)
-                if ok:
-                    self.doc.connect(src.node_item.node_id, src.spec.name,
-                                     dst.node_item.node_id, dst.spec.name)
+                s_id, s_sock = src.node_item.node_id, src.spec.name
+                d_id, d_sock = dst.node_item.node_id, dst.spec.name
+                ok, _reason = self.doc.can_connect(s_id, s_sock, d_id, d_sock)
+                if ok and fixed.io == "out" and ML.applies(self.doc, s_id):
+                    self._multilink(s_id, s_sock, d_id, d_sock)
+                elif ok:
+                    self.doc.connect(s_id, s_sock, d_id, d_sock)
             return
         # empty canvas → link-drag search (G1)
         self._open_link_search(fixed, scene_pos, screen_pos)
+
+    def _multilink(self, s_id: str, s_sock: str, d_id: str, d_sock: str, *,
+                   created: bool = False) -> bool:
+        """A wire drawn out of a ticked node while others are ticked (2026-10-12): MERGE
+        wires every ticked node into ``d_id`` (refused whole when they do not all fit — a
+        node created for this wire is then removed again, so a refusal changes nothing);
+        MIRROR makes this wire, then gives every other ticked node its own copy of
+        ``d_id``. Says what happened on the status bar (:attr:`multilink_note`)."""
+        if ML.mode(self.doc) == ML.MERGE:
+            out = ML.merge(self.doc, s_id, s_sock, d_id)
+            if not out.ok and created and d_id in self.doc.nodes:
+                self.doc.remove_node(d_id)
+        else:
+            self.doc.connect(s_id, s_sock, d_id, d_sock)
+            out = ML.mirror(self.doc, s_id, s_sock, d_id, d_sock)
+        self.multilink_note.emit(out.message)
+        return out.ok
+
+    def link_new_node(self, fixed_id: str, fixed_name: str, fixed_io: str, op_key: str,
+                      sock_name: str, x: float, y: float) -> Optional[str]:
+        """What the link-drag search does once an entry is picked: place ``op_key`` at
+        ``(x, y)`` and wire it to the socket the drag started from — through the mirror or
+        merge mode when that drag came out of a ticked node. Returns the new node's id, or
+        ``None`` (the anchor is gone, or a merge into it was refused and it was removed)."""
+        if fixed_id not in self.doc.nodes:
+            return None                   # the anchor node was deleted meanwhile
+        rec = self.doc.add_node(op_key, x=x, y=y)
+        try:
+            if fixed_io == "out" and ML.applies(self.doc, fixed_id):
+                self._multilink(fixed_id, fixed_name, rec.id, sock_name, created=True)
+                return rec.id if rec.id in self.doc.nodes else None
+            if fixed_io == "out":
+                self.doc.connect(fixed_id, fixed_name, rec.id, sock_name)
+            else:
+                self.doc.connect(rec.id, sock_name, fixed_id, fixed_name)
+        except ValueError:                # socket no longer active / incompatible
+            pass
+        return rec.id
 
     def _cancel_temp(self) -> None:
         if self._temp_wire is not None:
@@ -856,17 +912,8 @@ class GraphScene(QGraphicsScene):
         fixed_io = fixed.io
 
         def pick(op_key: str, sock_name: str) -> None:
-            if fixed_id not in self.doc.nodes:
-                return                    # the anchor node was deleted meanwhile
-            rec = self.doc.add_node(op_key, x=scene_pos.x() - 20,
-                                    y=scene_pos.y() - 30)
-            try:
-                if fixed_io == "out":
-                    self.doc.connect(fixed_id, fixed_name, rec.id, sock_name)
-                else:
-                    self.doc.connect(rec.id, sock_name, fixed_id, fixed_name)
-            except ValueError:            # socket no longer active / incompatible
-                pass
+            self.link_new_node(fixed_id, fixed_name, fixed_io, op_key, sock_name,
+                               scene_pos.x() - 20, scene_pos.y() - 30)
 
         popup = LinkSearchPopup(view, entries, pick)
         popup.move(screen_pos)
@@ -1303,9 +1350,25 @@ class GraphView(QGraphicsView):
         self.action_pill.setText("Graph")
         self._pill_armed = False
         self._canvas_active = False
+        # mirror / merge (2026-10-12), beside the action pill: the mode that wires drawn out
+        # of a TICKED card go through (click to switch), and Clear selected, which unticks
+        # every card. The page's ticks and mode live in `multilink`, so every canvas showing
+        # the page agrees; this canvas is outlined in the mode's colour while any is ticked.
+        self.mm_mode_btn = QToolButton(self)
+        self.mm_mode_btn.setObjectName("mmMode")
+        self.mm_mode_btn.setCursor(Qt.PointingHandCursor)
+        self.mm_mode_btn.setFocusPolicy(Qt.NoFocus)
+        self.mm_mode_btn.clicked.connect(lambda _=False: self._toggle_mm_mode())
+        self.mm_clear_btn = QToolButton(self)
+        self.mm_clear_btn.setObjectName("mmClear")
+        self.mm_clear_btn.setText("Clear selected")
+        self.mm_clear_btn.setCursor(Qt.PointingHandCursor)
+        self.mm_clear_btn.setFocusPolicy(Qt.NoFocus)
+        self.mm_clear_btn.setToolTip("Untick every card's mirror/merge box on this page")
+        self.mm_clear_btn.clicked.connect(lambda _=False: self._clear_mm())
         self._style_page_button()
         self._style_action_pill()
-        self._place_corner_chrome()
+        self.refresh_multilink()
 
     # ── corner chrome (maximize, fit to nodes, the troubleshooting badge) ──────
     def _place_corner_chrome(self) -> None:
@@ -1323,6 +1386,14 @@ class GraphView(QGraphicsView):
             ap.adjustSize()
             ap.move(max(12, (self.width() - ap.width()) // 2), 12)
             ap.raise_()
+            mb, cb = getattr(self, "mm_mode_btn", None), getattr(self, "mm_clear_btn", None)
+            if mb is not None and cb is not None:
+                mb.adjustSize()
+                mb.move(ap.x() + ap.width() + 8, 12 + (ap.height() - mb.height()) // 2)
+                mb.raise_()
+                cb.adjustSize()
+                cb.move(mb.x() + mb.width() + 6, 12 + (ap.height() - cb.height()) // 2)
+                cb.raise_()
         self._place_ts_badge()
 
     # ── the page switcher (V4.00 step 5) ──────────────────────────────────────
@@ -1357,6 +1428,85 @@ class GraphView(QGraphicsView):
             f"border-color:{T.ACCENT.name()}; }}"
             f"QToolButton#actionPill::menu-indicator {{ subcontrol-position: right center; "
             f"right: 8px; }}")
+
+    # ── mirror / merge (2026-10-12) ─────────────────────────────────────────────
+    #: the mode border: its stroke width. It hugs the viewport's very EDGE, square-cornered,
+    #: so it can never be read as the troubleshooting frame — which is rounded, amber, sits
+    #: at :attr:`TS_INSET` and glows inward and outward of it; a strip of plain canvas
+    #: separates the two whenever both are up.
+    MM_BORDER = 3
+
+    def _mm_doc(self):
+        sc = self.scene()
+        return getattr(sc, "doc", None)
+
+    def setScene(self, scene) -> None:                  # noqa: N802 — Qt override
+        """Another page on this canvas: its mirror/merge state is the one to show."""
+        super().setScene(scene)
+        self.refresh_multilink()
+
+    def refresh_multilink(self) -> None:
+        """Mirror the page's mirror/merge state on the mode button, Clear selected and the
+        canvas border (called by the scene whenever a tick or the mode changes)."""
+        doc = self._mm_doc()
+        if doc is None:
+            self.mm_mode_btn.hide()
+            self.mm_clear_btn.hide()
+            self._place_corner_chrome()
+            return
+        mode, n = ML.mode(doc), len(ML.ticked(doc))
+        mirror = mode == ML.MIRROR
+        self.mm_mode_btn.setText("⧉ Mirror" if mirror else "⤞ Merge")
+        self.mm_mode_btn.setToolTip(
+            ("MIRROR: a wire drawn out of a ticked card gives every other ticked card its "
+             "own copy of the node it reaches, wired the same way — and while in mirror "
+             "mode, editing one copy edits them all."
+             if mirror else
+             "MERGE: a wire drawn out of a ticked card wires EVERY ticked card into the node "
+             "it reaches — the card you drag from into its first input, the rest in "
+             "alphabetical order. Refused if the node cannot take them all.")
+            + f"\n\nTick a card's box (top right of its header) to add it"
+            + (f" — {n} ticked." if n else ".") + "  Click to switch to "
+            + ("Merge." if mirror else "Mirror."))
+        self.mm_clear_btn.setEnabled(n > 0)
+        self.mm_clear_btn.setText(f"Clear selected ({n})" if n else "Clear selected")
+        self._style_mm()
+        self.mm_mode_btn.show()
+        self.mm_clear_btn.show()
+        self._place_corner_chrome()
+        self.viewport().update()
+
+    def _toggle_mm_mode(self) -> None:
+        doc = self._mm_doc()
+        if doc is not None:
+            ML.set_mode(doc, ML.MERGE if ML.mode(doc) == ML.MIRROR else ML.MIRROR)
+
+    def _clear_mm(self) -> None:
+        doc = self._mm_doc()
+        if doc is not None:
+            ML.clear(doc)
+
+    def _style_mm(self) -> None:
+        """The mode button in its mode's colour — filled while cards are ticked (the mode is
+        live), outlined otherwise; Clear selected as a plain chip."""
+        doc = self._mm_doc()
+        live = doc is not None and ML.active(doc)
+        col = T.MIRROR if doc is None or ML.mode(doc) == ML.MIRROR else T.MERGE
+        dark = "#14171c"
+        bg, ink = (col.name(), dark) if live else (T.PANEL.name(), col.name()
+                                                    if T.MODE == "dark" else T.INK.name())
+        self.mm_mode_btn.setStyleSheet(
+            f"QToolButton#mmMode {{ background:{bg}; color:{ink}; "
+            f"border:1px solid {col.name() if T.MODE == 'dark' else T.BORDER_HI.name()}; "
+            f"border-radius:11px; padding:3px 12px; font-size:11px; font-weight:800; }}"
+            f"QToolButton#mmMode:hover {{ border-color:{T.ACCENT.name()}; }}")
+        self.mm_clear_btn.setStyleSheet(
+            f"QToolButton#mmClear {{ background:{T.PANEL.name()}; color:{T.INK.name()}; "
+            f"border:1px solid {T.BORDER_HI.name()}; border-radius:11px; padding:3px 12px; "
+            f"font-size:11px; font-weight:700; }}"
+            f"QToolButton#mmClear:hover {{ border-color:{T.ACCENT.name()}; }}"
+            f"QToolButton#mmClear:disabled {{ color:{T.MUTED.name()}; "
+            f"border-color:{T.BORDER.name()}; }}")
 
     def set_canvas_active(self, on: bool) -> None:
         """An accent on the switcher while this is the canvas the user works in — what
@@ -1504,6 +1654,7 @@ class GraphView(QGraphicsView):
 
     def restyle(self) -> None:
         self._style_action_pill()
+        self._style_mm()
         self._max_btn.update()
         self._style_ts_badge()          # amber + ink come from the theme tokens
         self._style_page_button()
@@ -1527,6 +1678,21 @@ class GraphView(QGraphicsView):
             p.setPen(QPen(T.ACCENT, 1.5 / k, Qt.DashLine))
             p.setBrush(T.alpha(T.ACCENT, 28))
             p.drawRoundedRect(self._region_rect, 6 / k, 6 / k)
+            p.restore()
+        doc = self._mm_doc()
+        if doc is not None and ML.active(doc):
+            # the mirror (white) / merge (yellow) border: a square band at the viewport's
+            # very edge, a dark hairline inside it so white reads on the light theme too
+            p.save()
+            p.setTransform(QTransform())
+            vp = QRectF(self.viewport().rect())
+            h = self.MM_BORDER / 2
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(T.MIRROR if ML.mode(doc) == ML.MIRROR else T.MERGE, self.MM_BORDER))
+            p.drawRect(vp.adjusted(h, h, -h, -h))
+            p.setPen(QPen(QColor(0, 0, 0, 170), 1))
+            e = self.MM_BORDER + 0.5
+            p.drawRect(vp.adjusted(e, e, -e, -e))
             p.restore()
         if not self._ts_on:
             return
@@ -1696,6 +1862,16 @@ class GraphView(QGraphicsView):
     def wheelEvent(self, e) -> None:
         factor = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802 — Qt override
+        """A pan scrolls the viewport's pixels and repaints only the strip it uncovers, so
+        a frame drawn in VIEWPORT coordinates (the mirror/merge border, the troubleshooting
+        frame) would be dragged along with the graph and smeared. While one is up, repaint
+        the whole viewport instead; otherwise keep Qt's cheap scroll."""
+        super().scrollContentsBy(dx, dy)
+        doc = self._mm_doc()
+        if self._ts_on or (doc is not None and ML.active(doc)):
+            self.viewport().update()
 
     def fit_all(self) -> None:
         r = self.scene().itemsBoundingRect()
