@@ -33509,6 +33509,88 @@ def test_field_end_to_end() -> None:
     _ok("field end to end (2026-10-09): " + "; ".join(notes))
 
 
+def test_lattice_tables_elided_batch() -> None:
+    """A lattice layer is unrolled by its array's OWN axes (2026-10-12): ``b`` is elided at
+    ``b == 1`` (V3.01, ``AxisSizes.axis_list``), so a Frame layer is ``(M, T)``, not
+    ``(B, M, T)``.
+
+    User report: Registration after a Timeseries Builder (38 frames) crashed the
+    Spreadsheet — ``lattice_tables`` built index rows from ``axes_of(domain)``, which keeps
+    ``b``, so a Frame table had three index rows for a two-axis array. A series whose
+    ``2·M·T`` is a multiple of 3 did not crash: it showed ``t`` starting at 13. The same
+    list put ``zone.frame``'s T slice on the wrong axis. Covered: the tables at 38 and 39
+    frames, a Plane table, a real batch (``b`` kept), ``zone.frame`` on a Frame layer, and
+    builder → Stabilize → the Spreadsheet's tables end to end."""
+    from nodegraph.metadata import SOURCE_FILE_KEY
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.tables import all_tables, lattice_tables
+
+    def frame_ds(m, t, b=1):
+        ax = AxisSizes(b=b, m=m, t=t, z=1, c=1, y=4, x=4)
+        vals = np.arange(b * m * t, dtype=float).reshape(ax.shape_for(Domain.FRAME))
+        return Dataset(axes=ax, metadata={}).with_layer(Domain.FRAME, "v", vals)
+
+    for t in (38, 39):   # 2·M·T not a multiple of 3 crashed; a multiple of 3 shifted `t`
+        cols = lattice_tables(frame_ds(1, t))[("frame", None)]
+        assert sorted(cols) == ["m", "t", "v"], sorted(cols)
+        assert list(cols["t"]) == list(range(t)) and not any(cols["m"]), list(cols["t"])[:4]
+        assert list(cols["v"]) == [float(i) for i in range(t)]
+    cols = lattice_tables(frame_ds(2, 3, b=2))[("frame", None)]
+    assert sorted(cols) == ["b", "m", "t", "v"] and list(cols["b"]) == [0] * 6 + [1] * 6
+    pax = AxisSizes(m=2, t=3, z=2, c=1, y=4, x=4)
+    pl = Dataset(axes=pax, metadata={}).with_layer(
+        Domain.PLANE, "p", np.arange(12, dtype=float).reshape(pax.shape_for(Domain.PLANE)))
+    cols = lattice_tables(pl)[("plane", None)]
+    assert (list(cols["m"]), list(cols["t"]), list(cols["z"])) == (
+        [0] * 6 + [1] * 6, [0, 0, 1, 1, 2, 2] * 2, [0, 1] * 6), cols
+
+    # zone.frame slices T, which is axis 1 of a Frame layer
+    src = frame_ds(1, 5)
+    src = src.with_image(ArrayProvider(np.zeros((1, 5, 1, 1, 4, 4), np.uint16)))
+    g = Graph(nodes={"L": NodeInstance("L", "io.load"),
+                     "F": NodeInstance("F", "zone.frame", params={"__frame__": 3})},
+              edges=[Edge("L", "F", "image", "data")])
+    fr = Engine(g, computes=COMPUTES, seeds={"L": src},
+                meta_seeds={"L": MetaEnvelope(axes=src.axes, metadata={})}).pull("F")
+    _fv = np.asarray(fr.get(Domain.FRAME, "v").values)
+    assert _fv.tolist() == [[3.0]], _fv
+
+    # builder → Stabilize → the Spreadsheet's tables: the user's graph
+    rng = np.random.default_rng(7)
+    base = rng.random((40, 40))
+
+    def card(k, t, name):
+        a = np.zeros((1, t, 1, 1, 32, 32), np.float32)
+        for j in range(t):
+            dy, dx = (j + k) % 3, (2 * j + k) % 3
+            a[0, j, 0, 0] = base[dy:dy + 32, dx:dx + 32]
+        p = ArrayProvider(a)
+        return Dataset(axes=p.axes, metadata={"pixel_size_um": 0.5,
+                                              SOURCE_FILE_KEY: [name]}).with_image(p)
+
+    cards = [card(0, 19, "w_t001.nd2"), card(1, 19, "w_t002.nd2")]
+    nodes = {"L0": NodeInstance("L0", "io.load"), "L1": NodeInstance("L1", "io.load"),
+             "B": NodeInstance("B", "util.timeseries", modes={"chain_order": "sequence"}),
+             "R": NodeInstance("R", "registration.stabilize")}
+    g = Graph(nodes=nodes, edges=[Edge("L0", "B", "image", "data"),
+                                  Edge("L1", "B", "image", "file_2"),
+                                  Edge("B", "R", "out", "data")])
+    eng = Engine(g, computes=COMPUTES, seeds={"L0": cards[0], "L1": cards[1]},
+                 meta_seeds={k: MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                             for k, d in (("L0", cards[0]), ("L1", cards[1]))})
+    reg = eng.pull("R")
+    assert reg.axes.t == 38, reg.axes
+    tabs = all_tables(reg)
+    frame = tabs[("frame", None)]
+    assert list(frame["t"]) == list(range(38)) and {"drift_y", "drift_x"} <= set(frame), \
+        sorted(frame)
+    _ok("lattice tables unroll a layer by its array's own axes (b elided at b == 1): a "
+        "38- or 39-frame Frame table has m/t columns 0..T-1 (it crashed, or showed t from "
+        "13), a Plane table m/t/z, a real batch keeps b; zone.frame slices a Frame layer's "
+        "T; builder → Stabilize → the Spreadsheet's tables carry every rebuilt frame's drift")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -33734,6 +33816,7 @@ def main() -> int:
     test_frame_timing()
     test_cone_signature()
     test_solo_scope_plan()
+    test_lattice_tables_elided_batch()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

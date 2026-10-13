@@ -7,7 +7,7 @@ import numpy as np
 from dataclasses import replace
 
 from nodegraph.dataset import AxisSizes, Dataset
-from nodegraph.domains import AXIS_ORDER, axes_of, is_lattice
+from nodegraph.domains import axes_of, is_lattice
 from nodegraph.engine import EvalContext
 from nodegraph.memo import digest as _digest
 from nodegraph.metadata import frame_slice as _meta_frame_slice
@@ -62,7 +62,9 @@ def _compute_zone_frame(ctx: EvalContext) -> Dataset:
     for attr in ds.attributes.values():
         axset = axes_of(attr.domain) or frozenset()
         if is_lattice(attr.domain) and "t" in axset:
-            order = [a for a in AXIS_ORDER if a in axset]
+            # the array's own axes: `b` is elided at b == 1 (V3.01), so the T axis of a
+            # Frame layer (M, T) is axis 1, not the 2 that `AXIS_ORDER` ∩ axes would say
+            order = list(ax.axis_list(attr.domain))
             sliced = np.take(attr.values, [t], axis=order.index("t"))   # keepdim → t==1
             out = out.with_layer(attr.domain, attr.name, sliced, attr.layer)
         else:

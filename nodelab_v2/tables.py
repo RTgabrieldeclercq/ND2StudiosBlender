@@ -91,8 +91,13 @@ def lattice_tables(dataset) -> Tables:
     """Group a Dataset's COARSE lattice attributes into the same ``{(domain, layer):
     {col: values}}`` shape, with the domain's own axes unrolled as leading index columns.
 
-    A lattice attribute's array is shaped by ``axes_of(domain)`` in :data:`AXIS_ORDER`, so
-    a Frame layer is ``(M, T)`` and a Global layer is a scalar. Every layer on one domain
+    A lattice attribute's array is shaped by ``axes.axis_list(domain)`` — the domain's axes
+    in :data:`AXIS_ORDER`, with the batch axis ``b`` ELIDED at ``b == 1`` (V3.01) — so a
+    Frame layer is ``(M, T)`` and a Global layer is a scalar. The index columns are built
+    from that same list: built from ``axes_of(domain)``, which keeps ``b``, a Frame layer
+    got three index rows for a two-axis array — a ``ValueError`` when ``2·M·T`` is not a
+    multiple of 3 (a 38-frame rebuilt series, 2026-10-12) and, worse, silently shifted
+    ``m``/``t`` columns when it is. Every layer on one domain
     shares that index space, so they merge into one table: ``m, t, drift_y, drift_x``. The
     index columns are named for the axes themselves, which is also what makes the CSV
     self-describing without a separate header.
@@ -108,8 +113,10 @@ def lattice_tables(dataset) -> Tables:
     for (domain, layer, name), attr in dataset.attributes.items():
         if not is_lattice(domain) or domain is Domain.VOXEL:
             continue
-        dom_axes = tuple(a for a in AXIS_ORDER if a in (axes_of(domain) or frozenset()))
         values = np.asarray(attr.values)
+        dom_axes = (tuple(axes.axis_list(domain)) if axes is not None else
+                    tuple(a for a in AXIS_ORDER if a in (axes_of(domain) or frozenset())
+                          and not (a == "b" and values.ndim < len(axes_of(domain) or ()))))
         if axes is not None:
             try:
                 if tuple(values.shape) != axes.shape_for(domain):

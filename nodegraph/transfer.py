@@ -413,7 +413,12 @@ def execute_bridge_plan(carrier: Carrier, plan: TransferPlan, *,
                 raise NotImplementedError(
                     f"lattice hop {step.describe()} mid-route needs a lattice array "
                     f"carrier; this executor chains the structure spine (C2 scope)")
-            cur_axes = [a for a in AXIS_ORDER if a in (axes_of(cur.domain) or set())]
+            # the carrier's own axes: `b` elided at b == 1 like every lattice array
+            # (V3.01, :meth:`AxisSizes.axis_list`), unless this carrier still holds it
+            cur_axes = list(grid.axis_list(cur.domain))
+            full = [a for a in AXIS_ORDER if a in (axes_of(cur.domain) or set())]
+            if np.ndim(cur.array) == len(full) != len(cur_axes):
+                cur_axes = full
             arr, _ = _apply_lattice_step(cur.array, cur_axes, step, grid)
             cur = Carrier(cur.domain, array=arr)
         else:
