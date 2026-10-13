@@ -24,7 +24,15 @@ from nodegraph.structure import StructureTable, point_table
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
-from nodegraph.catalog._shared.progress import _UnitBar
+from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_seconds,
+                                                      finish_trial, full_run_estimate,
+                                                      open_node_trial, quality_layers,
+                                                      run_units, scoped_frame, ship,
+                                                      stamp_trial, store_sockets, unit_list,
+                                                      unship, with_quality)
+from nodegraph.analysis_store import unit_name
+from nodegraph.catalog._shared.analysis_mesh import (concat_rows, fem_quads, mesh_columns,
+                                                     mesh_layer_name, with_mesh)
 
 # ── DIC (pyALDIC) — 2D digital image correlation, the image sibling of DVC ──────
 #
@@ -115,6 +123,9 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
     ref_mode = modes.get("reference_mode", "fixed_frame")
     solver = modes.get("solver", "aldic")
     ref_frame = int(ctx.params.get("reference_frame", 0))
+    # under the quick-analysis scope a source frame index is not a payload index
+    ref_local = (scoped_frame(ds.metadata, ref_frame, ax.t, mode=ref_mode, node="DIC")
+                 if ref_prov is None else ref_frame)
     c = min(max(0, int(ctx.params.get("channel", 0))), max(0, ax.c - 1))
     px = ctx.calib("pixel_size_um") or 0.1
     vox: Tuple[float, ...] = (px, px)                    # (y, x) µm/px — kernel §3
@@ -170,54 +181,156 @@ def _compute_dic_correlate(ctx: EvalContext) -> Dataset:
             head = (ref_prov, min(m, rax.m - 1), min(max(0, ref_frame), rax.t - 1),
                     min(z, max(0, rax.z - 1)), min(c, max(0, rax.c - 1)))
         else:
-            head = (prov, m, min(max(0, ref_frame), ax.t - 1), z, c)
+            head = (prov, m, min(max(0, ref_local), ax.t - 1), z, c)
         return ([head] + [(prov, m, t, z, c) for t in range(ax.t)],
                 list(range(ax.t)), "accumulative")
 
-    rows: list = []
-    n_dropped = 0
-    # One IC-GN/ADMM series solve per (m, z) line. The solve is long enough that whole-unit
-    # counting would freeze the sub bar through it, so the kernel's 0-100 callback drives
-    # the sub bar and the frame bar steps once per completed (m, z) series (V2.18 — it
-    # counted timepoints while each pair was its own solve).
-    bar = _UnitBar(ctx, frames=max(1, ax.m * ax.z), units_per_frame=1, note="correlating")
-    for m in range(ax.m):
-        for z in range(ax.z):
-            plan, result_t, al_mode = _plan(m, z)
-            if len(plan) < 2:                             # a 1-frame series has no pair
-                bar.finish_unit(note=f"m={m} z={z}")
-                continue
-            masks = ([_roi_plane(m, t, z, c) for (_p, _m, t, _z, _c) in plan]
-                     if roi6 is not None else None)
-            series = run_pyaldic_series(
-                _DICPlaneSeq(plan), masks, params, vox, reference_mode=al_mode,
-                progress_cb=bar.emit, resample="nodes")
-            key = "primary" if al_mode == "accumulative" else "increment"
-            for i, t in enumerate(result_t):
-                if i >= len(series):
-                    break
-                row = _dvc_rows(series[i][key], vox, m=m, t=t, c=c, z_plane=z)
-                keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
-                if not keep.all():
-                    n_dropped += int((~keep).sum())
-                    row = {k: v[keep] for k, v in row.items()}
-                if row["m"].size:
-                    rows.append(row)
-            bar.finish_unit(note=f"m={m} z={z}")
+    # One IC-GN/ADMM series solve per (m, z) line — the UNIT (2026-10-09): independent of
+    # every other line, never split in T. Units run across worker processes when the
+    # resource governor affords more than one lane, and each is saved beside the source file
+    # as it finishes (`results` socket), so a re-pull loads instead of re-solving and a
+    # cancelled run resumes. On one lane the kernel's 0-100 callback still drives the sub
+    # bar (V2.18).
+    units = unit_list(ax, per_plane=True)
+    names = [unit_name(u, ("m", "z")) for u in units]
+    opened = open_node_trial(ctx, ds, units, axes_names=("m", "z"), analysis="DIC (pyALDIC)")
+
+    # adaptive mesh refinement (2026-10-09): pyALDIC's pre-solve quadtree split, by
+    # criterion — at holes in the ROI mask, along its outer edge, or wherever a brush mask
+    # (a Voxel layer, its t=0 plane) says. Off unless asked; the refined elements show in
+    # the Viewer's Grid tab, coloured by level.
+    refine_holes = bool(ctx.params.get("refine_holes", False))
+    refine_edge = bool(ctx.params.get("refine_roi_edge", False))
+    brush_name = ctx.layer("refine_brush")
+    brush_attr = ds.get(Domain.VOXEL, brush_name) if brush_name else None
+    brush6 = brush_attr.values if brush_attr is not None else None
+
+    def _refinement(m: int, z: int):
+        if not (refine_holes or refine_edge or brush6 is not None):
+            return None
+        brush = None
+        if brush6 is not None:
+            s = brush6.shape
+            brush = (np.asarray(brush6[min(m, s[0] - 1), 0, min(z, s[2] - 1),
+                                       min(c, s[3] - 1)]) > 0).astype(np.float64)
+        return {"criteria": {"mask_boundary": refine_holes, "roi_edge": refine_edge,
+                             "brush": brush is not None},
+                "brush": brush, "min_element_size": params["winsize_min"]}
+
+    def read(unit, local: bool = False):
+        m, z = unit
+        plan, result_t, al_mode = _plan(m, z)
+        if len(plan) < 2:                                 # a 1-frame series has no pair
+            return {"frames": None}
+        masks = ([_roi_plane(m, t, z, c) for (_p, _m, t, _z, _c) in plan]
+                 if roi6 is not None else None)
+        frames = _DICPlaneSeq(plan) if local else ship(_DICPlaneSeq(plan))
+        return {"frames": frames, "masks": masks, "params": params,
+                "refinement": _refinement(m, z),
+                "vox": vox, "al_mode": al_mode, "result_t": result_t, "m": m, "z": z, "c": c}
+
+    plane_bytes = int(ax.y) * int(ax.x) * 8
+    run = run_units(ctx, units, read=read, read_local=lambda u: read(u, local=True),
+                    work=_dic_correlate_unit, names=names,
+                    trial=opened.trial, worker_bytes=12 * plane_bytes + (400 << 20),
+                    min_inner=2, numba=True, note="correlating",
+                    in_thread=lambda p, cb: _dic_correlate_unit(p, progress_cb=cb))
+    n_dropped = sum(int((r.get("stats") or {}).get("dropped", 0)) for r in run.results)
+    merged = concat_tables(run.results, "field")
 
     # Provenance (§7b): DIC-specific keys (NOT the dvc_* keys accumulate_field consumes — a
     # DIC 2D increment is not an ALDVC volume increment, so it must not be fed there).
     prov_md = {"dic_reference_mode": (ref_mode if ref_prov is None else "fixed_frame"),
                "dic_reference_frame": ref_frame, "dic_solver": solver,
-               "dic_unsolved_points": n_dropped}
-    if not rows:
+               "dic_unsolved_points": n_dropped,
+               "dic_winsize": params["winsize"], "dic_winstepsize": params["winstepsize"]}
+    kept = int(len(merged.get("m", ())))
+    quality = {"dic_solved_frac": (kept / (kept + n_dropped)) if (kept + n_dropped) else None}
+    est = full_run_estimate(ds.metadata, ax, run, per_plane=True, min_inner=2)
+    quality["analysis_est_full_s"] = est
+    if est is not None:
+        prov_md["analysis_estimate"] = (f"full run ≈ {describe_seconds(est)} on this machine "
+                                        f"(from this quick run)")
+    finish_trial(opened, run, stamps=prov_md, quality=quality,
+                 tables={"field": {"domain": "point", "layer": layer, "z_kind": "plane_index"},
+                         "mesh": {"domain": "point", "layer": mesh_layer_name(layer),
+                                  "z_kind": "plane_index", "mesh_of": layer,
+                                  "mesh_kind": "fem",
+                                  "mesh_window": [params["winsize"], params["winsize"]]}})
+    prov_md = stamp_trial(prov_md, opened, run)
+    mesh_rows = concat_tables(run.results, "mesh")
+    if not merged:
         empty = point_table(np.zeros((0, 2)), z_kind="plane_index", layer=layer)
-        return ds.with_structure(empty).with_metadata(**prov_md)
-    merged = {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
+        return with_quality(ds.with_structure(empty).with_metadata(**prov_md), quality)
     merged["id"] = np.arange(len(merged["m"]), dtype=np.int64)               # global ids
-    return (ds.with_structure(
+    out = ds.with_structure(
         StructureTable(Domain.POINT, merged, layer=layer, z_kind="plane_index"))
-        .with_metadata(**prov_md))
+    out = with_mesh(out, layer, mesh_rows, kind="fem", z_kind="plane_index",
+                    window=(params["winsize"], params["winsize"]))
+    return with_quality(out.with_metadata(**prov_md), quality)
+
+
+class _DICArraySeq:
+    """``run_pyaldic_series``'s ``images`` over a stacked unit (an array, or the memory map
+    of a shipped one) — indexed on demand, so a memory-mapped stack is read one plane at a
+    time exactly as :class:`_DICPlaneSeq` reads a provider."""
+
+    __slots__ = ("_a",)
+
+    def __init__(self, a: np.ndarray) -> None:
+        self._a = a
+
+    def __len__(self) -> int:
+        return len(self._a)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        return np.asarray(self._a[i])
+
+
+def _dic_correlate_unit(payload: dict, progress_cb=None) -> dict:
+    """One (m, z) line, solved: the unit worker. Module-level (a worker process imports it by
+    name) and pure — everything it needs arrives in ``payload``, read on the pull thread.
+    Returns the unit's Point rows as the ``field`` table and its unsolved-node count."""
+    from nodegraph.kernels.dic_correlate import run_pyaldic_series
+    frames = unship(payload.get("frames"))
+    if frames is None:
+        return {"tables": {}, "stats": {"dropped": 0}}
+    al_mode = payload["al_mode"]
+    vox = payload["vox"]
+    series = run_pyaldic_series(
+        _DICArraySeq(frames), payload["masks"], payload["params"], vox,
+        reference_mode=al_mode, progress_cb=progress_cb, resample="nodes",
+        refinement=payload.get("refinement"))
+    key = "primary" if al_mode == "accumulative" else "increment"
+    rows, dropped = [], 0
+    for i, t in enumerate(payload["result_t"]):
+        if i >= len(series):
+            break
+        row = _dvc_rows(series[i][key], vox, m=payload["m"], t=t, c=payload["c"],
+                        z_plane=payload["z"])
+        keep = np.isfinite(row["disp_y"]) & np.isfinite(row["disp_x"])
+        if not keep.all():
+            dropped += int((~keep).sum())
+            row = {k: v[keep] for k, v in row.items()}
+        if row["m"].size:
+            rows.append(row)
+    tables = ({"field": {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}}
+              if rows else {})
+    # the FE grid each result frame was solved on — written ONCE (t = -1, "every frame")
+    # when every frame shares it, which is the usual case (one reference mesh per line)
+    meshes = [(t, series[i].get("mesh")) for i, t in enumerate(payload["result_t"])
+              if i < len(series) and series[i].get("mesh") is not None]
+    if meshes:
+        same = all(np.array_equal(mh["elements"], meshes[0][1]["elements"])
+                   and np.array_equal(mh["coords"], meshes[0][1]["coords"])
+                   for _t, mh in meshes)
+        parts = [fem_quads(mh["coords"], mh["elements"], m=payload["m"],
+                           t=(-1 if same else t), c=payload["c"], z_plane=payload["z"])
+                 for t, mh in (meshes[:1] if same else meshes)]
+        mesh_rows = concat_rows(parts)
+        if mesh_rows:
+            tables["mesh"] = mesh_rows
+    return {"tables": tables, "stats": {"dropped": dropped}}
 
 def _columns_dic_correlate(params, modes, incoming):
     """The correlation grid this node writes, as ``_shared.dvc._dvc_rows`` builds it.
@@ -229,16 +342,28 @@ def _columns_dic_correlate(params, modes, incoming):
     name — whereas omitting it would make a real column unpickable, which is the direction
     this catalog must not err in."""
     try:
-        return on_layer(Domain.POINT, str((params or {}).get("name") or "dic"),
-                        list(dvc_field_columns(is_3d=False)) + ["qfactor"])
+        name = str((params or {}).get("name") or "dic")
+        return (tuple(on_layer(Domain.POINT, name,
+                               list(dvc_field_columns(is_3d=False)) + ["qfactor"]))
+                + tuple(on_layer(Domain.POINT, mesh_layer_name(name), mesh_columns("fem"))))
     except Exception:                        # pragma: no cover - defensive
         return ()
+
+def _layers_dic_correlate(params, modes):
+    """The layers no socket names: the quality scalars (Global) a sweep optimises
+    (``_shared.analysis_units.QUALITY``) and the correlation grid's element table,
+    ``<name>_mesh`` (Point), which the Viewer draws over the image."""
+    name = str((params or {}).get("name") or "dic")
+    return quality_layers("analysis.dic_correlate") + ((Domain.POINT, mesh_layer_name(name)),)
+
 
 register_node(
     _compute_dic_correlate, op_key="analysis.dic_correlate", label="DIC (pyALDIC)",
     adds_columns=_columns_dic_correlate,
     category="analysis",
-    reads_domains=frozenset({Domain.VOXEL}), adds_domains=frozenset({Domain.POINT}),
+    reads_domains=frozenset({Domain.VOXEL}),
+    adds_domains=frozenset({Domain.POINT, Domain.GLOBAL}),
+    extra_layers=_layers_dic_correlate,
     inputs=[
         InDataset(),
         InDataset("reference", label="Reference"),
@@ -295,10 +420,34 @@ register_node(
         InInt("winsize_min", "Min element", unit="px", field=False, default=8,
               description=
               "Floor on element size during adaptive mesh refinement — how finely the solver may "
-              "subdivide near a mask edge, ROI boundary or high-error region. It stops "
-              "refinement from producing subsets too small to correlate reliably, so LOWERING it "
-              "buys resolution at discontinuities and risks noise there. Snapped to a power of 2 "
-              "and clamped to at most Grid step."),
+              "subdivide near a mask hole, the ROI edge or a brush mask (the Refine sockets). It "
+              "stops refinement from producing subsets too small to correlate reliably, so "
+              "LOWERING it buys resolution at discontinuities and risks noise there. Snapped to "
+              "a power of 2 and clamped to at most Grid step. Inert while no Refine option is "
+              "on."),
+        InBool("refine_holes", "Refine at holes", field=False, default=False,
+               description=
+               "Adaptive mesh refinement at HOLES in the ROI mask: elements straddling an "
+               "internal mask boundary are split (quadtree, down to Min element) before the "
+               "solve, so the field follows the hole's edge instead of smearing across it. "
+               "Only does anything with an ROI mask that has holes. More nodes there — the "
+               "Point table grows, and the Grid overlay shows the smaller elements by colour. "
+               "pyALDIC's MaskBoundaryCriterion."),
+        InBool("refine_roi_edge", "Refine at ROI edge", field=False, default=False,
+               description=
+               "Adaptive mesh refinement along the ROI's OUTER edge: elements whose subset "
+               "window reaches past it are split, so the outermost measurements sit closer to "
+               "the boundary instead of a whole grid step inside it. Adds nodes along the "
+               "edge; without an ROI mask the frame edge is the ROI. pyALDIC's "
+               "ROIEdgeCriterion."),
+        InString("refine_brush", "Refine where (mask)", field=False, default="",
+                 layer_in=Domain.VOXEL,
+                 description=
+                 "Optional Voxel mask (e.g. from Draw Regions) marking where YOU want the mesh "
+                 "refined — a crack tip, an inclusion, a cell edge. Elements inside it are "
+                 "split down to Min element before the solve; the rest of the grid keeps its "
+                 "step. Static: its t=0 plane is used. Empty = no brush. pyALDIC's "
+                 "BrushRegionCriterion."),
         InInt("icgn_max_iter", "IC-GN iterations", unit="", field=False, default=100,
               description=
               "Iteration cap for the LOCAL solve — the inverse-compositional Gauss–Newton match "
@@ -309,9 +458,10 @@ register_node(
               "when convergence is declared."),
         InBool("compute_strain", "Compute strain", field=False, default=False,
                description=
-               "Also emit the solver's own nodal displacement gradients as `strain_yy`, "
-               "`strain_yx`, `strain_xy`, `strain_xx` columns — the same columns the DVC node "
-               "writes. Prefer this to differencing the displacement field downstream: it is a "
+               "Also emit the solver's own nodal strain (the symmetric small strain of its FEM "
+               "displacement gradient; tensor shear in `strain_yx` = `strain_xy`) as "
+               "`strain_yy`, `strain_yx`, `strain_xy`, `strain_xx` — the same columns the DVC "
+               "node writes. Prefer this to differencing the displacement field downstream: it is a "
                "smoothed finite-element fit rather than a difference of two neighbouring "
                "subsets, which on a 2% biaxial test recovers 0.01984 against a true 0.0200 "
                "where the raw per-subset gradient gives 0.01928. Costs roughly 20% more time. "
@@ -376,6 +526,7 @@ register_node(
                  "centre with displacement, strain and a per-point quality value. SPARSE, on "
                  "the subset grid — use Rasterize Field for a dense per-voxel version. "
                  "Downstream nodes select it by this name."),
+        *store_sockets(),
     ],
     outputs=[OutDataset()],
     modes=[Mode("reference_mode", ["fixed_frame", "previous_frame"],

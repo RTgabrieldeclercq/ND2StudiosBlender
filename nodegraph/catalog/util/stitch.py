@@ -8,7 +8,7 @@ from dataclasses import replace
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from nodegraph.dataset import AxisSizes, Dataset
-from nodegraph.domains import is_structure
+from nodegraph.domains import Domain, is_structure
 from nodegraph.engine import EvalContext
 from nodegraph.metadata import drop_position_keys, stitch as _meta_stitch
 from nodegraph.provider import ArrayProvider
@@ -123,6 +123,93 @@ def _stitch_pairs(offsets: list, tile_h: int, tile_w: int) -> list:
             if (y1 - y0) >= _STITCH_MIN_OVERLAP_PX and (x1 - x0) >= _STITCH_MIN_OVERLAP_PX:
                 pairs.append((i, j, y0, y1, x0, x1))
     return pairs
+
+
+#: The pixel-position columns of a Point table, ``(y-like, x-like)``: moved by the tile's
+#: canvas offset. ``y``/``x`` are the invariant schema; the box columns are a correlation
+#: grid's cells (``analysis_mesh.BOX_COLUMNS``); ``centroid_*`` a region's centre.
+_STITCH_PX_COLUMNS = (("y", "x"), ("y_lo", "x_lo"), ("y_hi", "x_hi"),
+                      ("centroid_y", "centroid_x"))
+#: Positions in µm within the tile (``analysis.measure``): moved by the offset × pixel size.
+_STITCH_UM_COLUMNS = (("y_um", "x_um"),)
+
+
+def _stitch_owner(m: np.ndarray, y: np.ndarray, x: np.ndarray, offsets: list,
+                  tile_h: int, tile_w: int) -> np.ndarray:
+    """Which rows to keep: a row survives only from the tile whose CENTRE is nearest its
+    canvas point, among the tiles that cover it. Where tiles overlap, the same feature was
+    measured by both; keeping the nearer-centre tile's row keeps one of them, the one from
+    the part of its field a microscope images best. A point no tile covers is kept."""
+    best_d = np.full(m.shape, np.inf)
+    best_m = np.full(m.shape, -1, dtype=np.int64)
+    for j, (oy, ox) in enumerate(offsets):
+        cover = ((y >= oy - 0.5) & (y < oy + tile_h - 0.5)
+                 & (x >= ox - 0.5) & (x < ox + tile_w - 0.5))
+        d = (y - (oy + (tile_h - 1) / 2.0)) ** 2 + (x - (ox + (tile_w - 1) / 2.0)) ** 2
+        better = cover & (d < best_d)
+        best_d[better] = d[better]
+        best_m[better] = j
+    return (best_m == m) | (best_m < 0)
+
+
+def _stitch_points(out: Dataset, src: Dataset, offsets: list, tile_h: int, tile_w: int,
+                   px_um: float) -> Tuple[Dataset, str]:
+    """Every Point table of ``src`` moved onto the canvas → ``(out with them, a note)``.
+
+    A row's ``m`` becomes 0 and its position columns (:data:`_STITCH_PX_COLUMNS`,
+    :data:`_STITCH_UM_COLUMNS`) move by its tile's offset; every other column (a
+    displacement, a velocity, a strain, an id) is a property of the row, not a place, and is
+    kept as it is. Rows in an overlap are kept from one tile only (:func:`_stitch_owner`).
+    A table without the invariant ``m``/``y``/``x`` is refused: nothing says where its rows
+    are."""
+    groups: Dict[Any, Dict[str, Any]] = {}
+    for attr in src.attributes.values():
+        if attr.domain is Domain.POINT:
+            groups.setdefault(attr.layer, {})[attr.name] = attr
+    oy_all = np.array([o[0] for o in offsets], dtype=float)
+    ox_all = np.array([o[1] for o in offsets], dtype=float)
+    notes = []
+    for layer, cols in groups.items():
+        lengths = {np.asarray(a.values).shape for a in cols.values()}
+        if not {"m", "y", "x"} <= set(cols) or len(lengths) != 1 or len(lengths.pop()) != 1:
+            raise ValueError(
+                f"the Point table {layer!r} has no m/y/x row address (or columns of unequal "
+                f"length), so nothing says where its rows go on the canvas. Remove it "
+                f"before stitching, or stitch before the node that made it.")
+        m = np.rint(np.asarray(cols["m"].values, dtype=float)).astype(np.int64)
+        if m.size and (m.min() < 0 or m.max() >= len(offsets)):
+            raise ValueError(
+                f"the Point table {layer!r} has rows on position {int(m.max())}, and this "
+                f"Dataset has {len(offsets)} positions — it was not measured on this image.")
+        oy, ox = oy_all[m], ox_all[m]
+        keep = _stitch_owner(m, np.asarray(cols["y"].values, dtype=float) + oy,
+                             np.asarray(cols["x"].values, dtype=float) + ox,
+                             offsets, tile_h, tile_w)
+        moves = {}
+        for ky, kx in _STITCH_PX_COLUMNS:
+            moves[ky], moves[kx] = oy, ox
+        for ky, kx in _STITCH_UM_COLUMNS:
+            moves[ky], moves[kx] = oy * px_um, ox * px_um
+        lost = []
+        for name, attr in cols.items():
+            v = np.asarray(attr.values)
+            if name == "m":
+                new = np.zeros_like(v)
+            elif name in moves:
+                if px_um <= 0 and any(name in p for p in _STITCH_UM_COLUMNS):
+                    out = out.without(Domain.POINT, name, layer)   # no µm per pixel known
+                    lost.append(name)
+                    continue
+                shifted = v.astype(float) + moves[name]
+                new = shifted.astype(v.dtype) if np.issubdtype(v.dtype, np.integer) else shifted
+            else:
+                new = v
+            out = out.with_layer(Domain.POINT, name, new[keep], layer)
+        dup = int(keep.size - np.count_nonzero(keep))
+        notes.append(f"{layer}: {int(np.count_nonzero(keep))} rows"
+                     + (f", {dup} in overlaps kept from the nearer tile" if dup else "")
+                     + (f", {'/'.join(lost)} dropped (no pixel size)" if lost else ""))
+    return out, "; ".join(notes)
 def _stitch_refine(ctx: EvalContext, prov: Any, offsets: list, tile_h: int, tile_w: int,
                    *, max_shift_px: float, min_ncc: float, hp_sigma_px: float,
                    ref_t: int, ref_z: int, ref_c: int):
@@ -375,11 +462,15 @@ def _compute_stitch(ctx: EvalContext) -> Dataset:
     * **Kind** utility, axis-changing → ``op_key="util.stitch"``, ``meta_transform=stitch``
       (M→1; the canvas extent is reported UNKNOWN, never guessed — see below).
     * **Data contract** image → image. Lattice attribute layers that no longer fit the
-      canvas are dropped by ``reshaped_axes``, exactly as Crop/Resample drop theirs; a
-      **structure** table (Label/Point/Track/Mesh) is REFUSED, because its ``m``/``y``/``x``
-      columns index the tile grid and nothing here can honestly re-address them (detections
-      duplicated across a seam would need deduplicating, which is a different node's job).
-      Stitch first, then detect.
+      canvas are dropped by ``reshaped_axes``, exactly as Crop/Resample drop theirs.
+      **Point tables move with their tiles** (2026-10-09, so a correlation field — PIV, DIC,
+      the Field cards' columns — can be drawn over the whole mosaic): each row's ``m``
+      becomes 0 and its position columns move by its tile's offset
+      (:func:`_stitch_points`). Where tiles overlap, a row is kept only from the tile whose
+      centre is nearest, so nothing is counted twice. **Label / Track / Mesh tables are
+      still REFUSED**: a label's raster and its bounding box, a track's continuity across a
+      seam and a mesh's CSR links cannot be re-addressed row by row. Stitch first, then
+      segment or track.
     * **2D/3D** no lever: each ``(t, z, c)`` plane is placed with the same layout, so the
       node is dimension-agnostic. A z-stack stitches to a z-stack.
     * **Footprint** ``MULTI_VIEW`` / ``{"m","y","x"}`` — it reads every M at one ``(t,z,c)``
@@ -407,14 +498,14 @@ def _compute_stitch(ctx: EvalContext) -> Dataset:
         raise ValueError("stitch needs an image provider on its input Dataset")
     ax = prov.axes
     structure = sorted({attr.domain.value for attr in ds.attributes.values()
-                        if is_structure(attr.domain)})
+                        if is_structure(attr.domain) and attr.domain is not Domain.POINT})
     if structure:
         raise ValueError(
-            f"this Dataset carries {'/'.join(structure)} structure table(s), whose m/y/x "
-            f"columns address the per-tile grid — stitching would silently leave every "
-            f"object at the wrong place on the canvas, and objects seen twice across a "
-            f"seam would stay duplicated. Stitch BEFORE detection/labelling, then run the "
-            f"analysis on the mosaic.")
+            f"this Dataset carries {'/'.join(structure)} structure table(s), which cannot "
+            f"be moved onto the canvas row by row: a label's raster and bounding box, a "
+            f"track that crosses a seam and a mesh's links all address the per-tile grid. "
+            f"(Point tables, such as a PIV or DIC field, are moved with their tiles.) "
+            f"Stitch BEFORE segmentation or tracking, then run them on the mosaic.")
     if int(ax.m) < 2:
         raise ValueError(
             "this input has only ONE multipoint, so there is no tile grid to stitch — the "
@@ -464,6 +555,10 @@ def _compute_stitch(ctx: EvalContext) -> Dataset:
         res = ds.with_image(
             MultiViewProvider(prov, new_axes, fuse, tuple(offsets), fp=fp, cache=cache)
         ).reshaped_axes(new_axes)
+    res, moved = _stitch_points(res, ds, offsets, ax.y, ax.x,
+                                float(ctx.calib("pixel_size_um") or 0.0))
+    if moved:
+        note = f"{note}; {moved}"
     out = _sampled(res, f"stitch[{note}]")
     # M→1 collapses twelve origins into the mosaic's union corner; sync it from the env
     # (post-`_meta_stitch`) so payload and header agree.
@@ -619,4 +714,6 @@ register_node(
     meta_transform=_meta_stitch,
     description="Stitch the multipoint axis into one mosaic (M→1, Y/X grow): tiles placed "
                 "from the file's stage log (optionally refined by phase correlation) or on "
-                "an explicit grid, blended feather/max/mean/overwrite.")
+                "an explicit grid, blended feather/max/mean/overwrite. Point tables (a PIV "
+                "or DIC field and its Field-card columns) move onto the canvas with their "
+                "tiles, one row per overlap; Label and Track tables are refused.")

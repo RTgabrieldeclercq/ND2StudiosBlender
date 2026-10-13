@@ -101,6 +101,25 @@ self-pair, matching the DIC node's behaviour). `images` is **indexed lazily**
 Unlike al-dic, openpiv holds **no cross-pair caches**, so there is no speed penalty
 hidden in pair-at-a-time semantics — the series call is a convenience, not a contract.
 
+### 2b. The staged entry points (2026-10-08)
+
+`_piv_one_pair` is one multipass run; the staged PIV nodes (`piv.first_pass` → `piv.validate` →
+`piv.deform_pass` → … → optional `piv.smooth`, placed by `bundle:piv`) call its pieces one pass at a time:
+
+```python
+piv_stage_settings(params, shape, window, overlap_frac) -> (PIVSettings, overlap_px, (rows, cols))
+piv_stage_first_pass(frame_a, frame_b, s, roi_mask=None) -> {x, y, u, v, s2n, excluded}
+piv_stage_validate(u, v, s2n, s, excluded, *, replace=True) -> {flags, u, v, replaced}
+piv_stage_smooth(u, v, s, excluded) -> (u, v)
+piv_stage_deform_pass(frame_a, frame_b, s, x_old, y_old, u_old, v_old, roi_mask=None) -> {x, y, u, v, s2n, excluded}
+```
+
+Each is the corresponding slice of `_piv_one_pair` / `_deform_pass` unchanged (same openpiv calls, same masking,
+same replacement rule), so a staged chain with the default ladder reproduces `run_piv_pair` on the same
+frames — measured identical (max |Δ| 0.0 in the kernel, 1e-13 through the Engine) on the speckle phantom.
+Everything is in pixels and openpiv's (rows, cols) grid order; the nodes keep µm on the wire. A deform pass
+needs the previous grid to be ≥ 4 × 4 and inpaints any NaN hole in it first (the predictor spline tolerates none).
+
 ## 3. Inputs
 
 | name | type | shape | axis order | units | required? | meaning & constraints |

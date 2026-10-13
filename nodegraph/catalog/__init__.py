@@ -79,6 +79,9 @@ MODULES: Tuple[str, ...] = (
     "analysis.roi_mask",
     "analysis.draw_regions",
     "analysis.dvc_field",
+    "analysis.dvc_stages",          # the same solver as five cards + the `bundle:dvc` recipe
+    "analysis.piv_stages",          # OpenPIV's ladder as pass-by-pass cards + `bundle:piv`
+    "analysis.dic_stages",          # pyALDIC's sections as five cards + `bundle:dic`
     "transform.rasterize_field",
     "analysis.accumulate_field",
     "analysis.dic_correlate",
@@ -206,6 +209,19 @@ MODULES: Tuple[str, ...] = (
     "util.split_t",
     # the T twin of Shift (2026-10-07): move a stream along its own time axis by whole frames
     "util.time_shift",
+    # 2026-10-09: a saved DIC/DVC/PIV/SerialTrack trial read back (nodegraph.analysis_store),
+    # appended for the same reason
+    "io.load_analysis",
+    # 2026-10-09: the Field cards — a measured displacement / velocity field's gradient and
+    # what follows from it (strain, rotation and curl, volume change, stress). Appended, like
+    # everything since V2.20: this list's order is the link-drag search menu's order.
+    "field.gradient",
+    "field.strain",
+    "field.rotation",
+    "field.volume_change",
+    "field.stress",
+    # 2026-10-09: a field drawn on its image as a figure, appended for the same reason
+    "plot.field",
 )
 
 

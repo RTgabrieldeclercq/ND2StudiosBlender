@@ -632,6 +632,7 @@ class MainWindow(QMainWindow):
         # dialogs outlive a selection change and are shut down with the app.
         self._demo_windows = {}
         self.inspector.demo_requested.connect(self.open_node_demo)
+        self.inspector.quick_action.connect(self._on_quick_action)
         self.inspector.add_requested.connect(self._on_add_requested)
         self.inspector.append_requested.connect(self._on_append_requested)
         self.inspector.page_requested.connect(
@@ -3412,7 +3413,12 @@ class MainWindow(QMainWindow):
 
     @_needs_topology
     def _add_at_center(self, op_key: str) -> None:
+        from nodegraph.bundles import is_bundle_key
         c = self.view.mapToScene(self.view.viewport().rect().center())
+        if is_bundle_key(op_key):
+            # a bundle (2026-10-08) lays its members out to the right of the drop point
+            self.doc.place_bundle(op_key, x=c.x() - 100, y=c.y() - 40)
+            return
         self.doc.add_node(op_key, x=c.x() - 100, y=c.y() - 40)
 
     @_needs_shape
@@ -3805,6 +3811,12 @@ class MainWindow(QMainWindow):
         # splice-on-wire: if the node is dropped on a link, insert it into that wire
         e = self.scene.edge_at(pos)
         edge_tuple = e.model_edge if e is not None else None
+        from nodegraph.bundles import is_bundle_key
+        if is_bundle_key(op_key):
+            # a bundle (2026-10-08): its members are placed and wired, and the whole chain
+            # is spliced into the wire it was dropped on
+            self.doc.place_bundle(op_key, x=pos.x() - 20, y=pos.y() - 20, splice=edge_tuple)
+            return
         rec = self.doc.add_node(op_key, x=pos.x() - 20, y=pos.y() - 20)
         if edge_tuple is not None:
             self.scene.splice_onto(rec.id, edge_tuple)
@@ -5208,6 +5220,48 @@ class MainWindow(QMainWindow):
             f"Z strip to pick more, F9 to run the full series"
             if on else "troubleshooting off — pulls analyse the whole series")
 
+    def _on_quick_action(self, node_id: str, action: str) -> None:
+        """The inspector's **Quick analysis** / **Full run** on a DIC, PIV, DVC or SerialTrack
+        node (2026-10-09). Quick arms the F9 scope with the picks the analysis needs —
+        the position and plane on screen, its reference and current frame, a box about 16
+        subsets wide unless one is already drawn (:func:`nodelab_v2.quick.quick_picks`) —
+        and pulls the node; Full run turns the scope off.
+
+        The picks and the box are set with the Viewer's signals blocked and handed to the
+        runner directly, so arming the scope costs ONE pull of the scoped node rather than
+        a pull per pick (and never a whole-frame pull of a DVC volume on the way)."""
+        if action == "full":
+            self.set_solo_frame(False)
+            return
+        from nodelab_v2.quick import quick_picks
+        doc = self.doc
+        rec = doc.nodes.get(node_id)
+        if rec is None:
+            return
+        v = self._ensure_viewer()
+        extent = doc.source_scope_extent(node_id)
+        picks = quick_picks(doc, node_id, v.coords(), doc.source_scope_totals(node_id),
+                            extent, v.region)
+        if picks.error:
+            self.statusBar().showMessage(f"Quick analysis: {picks.error}")
+            return
+        v.blockSignals(True)
+        try:
+            v.set_frame_selection(picks.ms, picks.ts, picks.zs)
+            v.set_region_extent(tuple(extent))
+            v.set_region(picks.region)
+        finally:
+            v.blockSignals(False)
+        self.runner.set_frame_selection(*v.frame_selection())
+        self.runner.set_region(v.region)
+        if not self.runner.solo_frame:
+            self.set_solo_frame(True)
+        self.pull_node(node_id, viewer=v, page_id=self.workspace.active or "")
+        label = rec.spec().label if rec.spec() is not None else rec.op_key
+        self.statusBar().showMessage(
+            f"quick analysis of {label}: {picks.note} — tune, then Full run (F9 off) for "
+            f"every position and frame")
+
     def _scope_phrase(self) -> str:
         """What the next scoped pull will run, in words — shared by the status line and
         the chip's tooltip so the two can never disagree."""
@@ -6154,9 +6208,11 @@ class MainWindow(QMainWindow):
         # with: the per-M calibration (`origin_um`) is concatenated across the files rather
         # than file 0's n-long list standing on a K·n-long M axis until the first pull.
         from nodelab_v2.ingest import channel_display_seed
+        # ...and each position's absolute path (`SOURCE_PATH_KEY`): `bundle_envelope`
+        # stamps it when it is handed the paths, exactly as the pull's resolve does
         from nodelab_v2.runner import bundle_envelope
         md = dict(bundle_envelope(axes, [MetaEnvelope(axes=h[1], metadata=dict(h[2]))
-                                         for h in heads], labels).metadata)
+                                         for h in heads], labels, paths).metadata)
         md.update(channel_display_seed(disp0, ax0.c))      # the names ride it (step 11g)
         self.doc.set_meta_seed(rec.id, MetaEnvelope(axes=axes, metadata=md))
         return rec, axes

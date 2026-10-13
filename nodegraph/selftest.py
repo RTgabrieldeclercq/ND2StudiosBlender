@@ -2954,12 +2954,62 @@ def test_stitch() -> None:
             (Dataset(axes=ax, metadata={"pixel_size_um": PX,             # M = repeat visits
                                         "stage_xy_um": [(0.0, 0.0)] * N_M}
                      ).with_image(ArrayProvider(tiles)), env, "repeat visits"),
-            (ds.with_layer(D.POINT, "spots", np.zeros((3,))), env, "structure table")):
+            (ds.with_layer(D.TRACK, "track_id", np.zeros((3,)), "tracks"), env,
+             "structure table"),                                        # tracks: refused
+            (ds.with_layer(D.POINT, "spots", np.zeros((3,)), "spots"), env,
+             "no m/y/x")):                                     # a Point table with no address
         try:
             eng(seed=seed, senv=senv).pull("N")
             raise AssertionError(f"expected a refusal mentioning {needle!r}")
         except ValueError as exc:
             assert needle in str(exc), (needle, str(exc)[:160])
+
+    # ── 5b. Point tables move with their tiles (2026-10-09) ────────────────────
+    # A 16 px lattice in every tile; the 64 px tile step is a multiple of 16, so the
+    # overlaps hold EXACT duplicates of their neighbours' nodes. Each must survive once,
+    # from the tile whose centre is nearest, at its canvas position.
+    from nodegraph.structure import StructureTable
+    rows = {k: [] for k in ("m", "t", "c", "z", "y", "x", "y_lo", "y_hi", "x_lo", "x_hi",
+                            "y_um", "x_um", "who")}
+    lat = np.arange(8, TH, 16, dtype=float)
+    for m in range(N_M):
+        for t in range(N_T):
+            yy, xx = np.meshgrid(lat, lat, indexing="ij")
+            n = yy.size
+            for k, v in (("m", np.full(n, m)), ("t", np.full(n, t)), ("c", np.zeros(n)),
+                         ("z", np.zeros(n)), ("y", yy.ravel()), ("x", xx.ravel()),
+                         ("y_lo", yy.ravel() - 8), ("y_hi", yy.ravel() + 8),
+                         ("x_lo", xx.ravel() - 8), ("x_hi", xx.ravel() + 8),
+                         ("y_um", yy.ravel() * PX), ("x_um", xx.ravel() * PX),
+                         ("who", np.full(n, 1000.0 * m))):
+                rows[k].append(v)
+    cols = {k: np.concatenate(v) for k, v in rows.items()}
+    cols["id"] = np.arange(len(cols["m"]))
+    with_pts = ds.with_structure(StructureTable(D.POINT, cols, layer="field",
+                                                z_kind="plane_index"))
+    got = eng(modes={"blend": "overwrite"}, seed=with_pts).pull("N")
+    pts = {a.name: np.asarray(a.values) for a in got.attributes.values()
+           if a.domain is D.POINT and a.layer == "field"}
+    canvas_pts = {(int(t), int(y), int(x)) for t, y, x in zip(pts["t"], pts["y"], pts["x"])}
+    n_unique = N_T * len(np.arange(8, H, 16)) * len(np.arange(8, W, 16))
+    assert len(pts["y"]) == len(canvas_pts) == n_unique, (len(pts["y"]), n_unique)
+    assert not np.any(pts["m"]), "every row is on the one canvas position"
+    src_m = (pts["who"] // 1000).astype(int)
+    oy = np.array([OFFS[m][0] for m in src_m], dtype=float)
+    ox = np.array([OFFS[m][1] for m in src_m], dtype=float)
+    assert np.all((pts["y"] - oy) % 16 == 8) and np.all((pts["x"] - ox) % 16 == 8)
+    assert np.allclose(pts["y_lo"], pts["y"] - 8) and np.allclose(pts["x_hi"], pts["x"] + 8)
+    assert np.allclose(pts["y_um"], pts["y"] * PX) and np.allclose(pts["x_um"], pts["x"] * PX)
+
+    def owner(y, x):
+        return int(src_m[(pts["t"] == 0) & (pts["y"] == y) & (pts["x"] == x)][0])
+
+    assert owner(72, 72) == 0, owner(72, 72)       # 4 tiles cover it; (0,0)'s centre nearest
+    assert owner(88, 88) == 4, owner(88, 88)       # (64,64)'s centre nearest
+    assert owner(8, 200) == 2                      # covered by one tile only
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    stamp = str(got.metadata.get(SAMPLING_KEY, ())[-1])
+    assert f"field: {n_unique} rows" in stamp and "kept from the nearer tile" in stamp, stamp
     # ...and `grid` is the explicit way to get a montage without a position log
     gg, ga = plane(eng(modes={"layout": "grid"}, seed=bare, senv=benv))
     assert (ga.y, ga.x) == (2 * TH, 3 * TW), (ga.y, ga.x)
@@ -3062,8 +3112,10 @@ def test_stitch() -> None:
         "EXACTLY through all four blends on both frames; header says m=1 with y/x UNKNOWN "
         "while the payload carries the real %dx%d canvas; pixel_size_um memo-fenced; "
         "blends/layout/flip re-key and gate their sockets; MULTI_VIEW resolved; streamed "
-        "canvas == bare-ctx eager and a sub-window == its slice; 4 refusals (no/short "
-        "stage log, repeat-visit M, structure table) with `grid` as the explicit way out; "
+        "canvas == bare-ctx eager and a sub-window == its slice; 5 refusals (no/short "
+        "stage log, repeat-visit M, a Track table, a Point table with no address) with "
+        "`grid` as the explicit way out; a Point field moves with its tiles (m→0, y/x, box "
+        "and µm columns offset; each overlap node kept once, from the nearest-centre tile); "
         "refine recovers a %d px jitter to %d px; and the display PYRAMID is forwarded "
         "from the base (level 1 == the downsampled level 0 exactly, for all 4 blends; the "
         "Viewer takes the coarse level; a pyramid-less base stays level-0 only)"
@@ -6865,6 +6917,914 @@ def test_catalog_dic() -> None:
         "shift across t=1,2 in µm, self-pair~0, a LARGE (-6,9)px first step is still found "
         "(the init-guess regression), previous_frame gives increments, Local solver agrees + "
         "rehashes, compute_strain adds a zero strain tensor, calib fenced")
+
+
+def test_analysis_store() -> None:
+    """The analysis store (2026-10-09) on the single DIC node: a two-position series whose
+    `source_path` names a file in a temp folder saves one trial beside it, one Parquet unit
+    per position; a fresh Engine reloads every unit instead of solving; a deleted unit is
+    recomputed alone (resume) to the same numbers; other settings make a second trial and
+    going back reloads the first; `off` writes nothing; `recompute` recomputes; index.json
+    rebuilds; the two-unit run (process lanes) equals a serial in-memory run; Load Analysis
+    puts the identical table back on the image, refuses mismatched axes, and works
+    tables-only."""
+    if not _HAVE_SKIMAGE:
+        _ok("analysis store: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    from nodegraph import analysis_store as S
+    if not al_dic_available():
+        _ok("analysis store: SKIPPED (al-dic absent — DIC is the node it exercises)")
+        return
+
+    tmp = _tempfile.mkdtemp(prefix="ng-store-")
+    saved_env = {k: _os.environ.pop(k, None) for k in ("NODEGRAPH_STORE_DIR",
+                                                       "NODEGRAPH_PARALLEL")}
+    try:
+        src = _os.path.join(tmp, "run_seq.nd2")
+        with open(src, "wb") as fh:
+            fh.write(b"stand-in for the acquisition")
+        define_node("io.storeseed", "S", outputs=[OutDataset()])
+        rng = np.random.default_rng(11)
+        img = np.zeros((2, 3, 1, 1, 96, 96))
+        for m, (dy, dx) in enumerate(((1.0, 2.0), (-1.5, 1.0))):
+            patt = gaussian_filter(rng.random((96, 96)), 1.0)
+            for t in range(3):
+                img[m, t, 0, 0] = patt if t == 0 else ndshift(patt, (dy * t, dx * t),
+                                                               order=3, mode="nearest")
+        ax = AxisSizes(m=2, t=3, z=1, c=1, y=96, x=96)
+        meta = {"pixel_size_um": 0.5, "source_file": ["run_seq.nd2"] * 2,
+                "source_path": [_os.path.abspath(src)] * 2}
+        ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+        base = {"winsize": 20, "winstepsize": 16, "admm_max_iter": 3}
+
+        def pull(params=None, *, load=None, onto="image", data=ds, axes=ax, md=meta):
+            g = Graph()
+            g.add(NodeInstance("S", "io.storeseed"))
+            if load is None:
+                g.add(NodeInstance("D", "analysis.dic_correlate",
+                                   params={**base, **(params or {})}))
+                g.connect("S", "D", dst_socket="data")
+            else:
+                g.add(NodeInstance("D", "io.load_analysis", params={"trial": load},
+                                   modes={"onto": onto}))
+                if onto == "image":
+                    g.connect("S", "D", dst_socket="data")
+            e = Engine(g, computes=COMPUTES, seeds={"S": data},
+                       meta_seeds={"S": MetaEnvelope(axes=axes, metadata=md)})
+            return e.pull("D")
+
+        def cols(o, layer="dic"):
+            return {a.name: np.asarray(a.values) for a in o.layers_on(D.POINT)
+                    if a.layer == layer}
+
+        root = S.trial_root(src)
+        assert root == _os.path.join(tmp, "run_seq.analysis"), root
+
+        # ── 1. first pull: two units computed (process lanes when the pool exists), saved ──
+        o1 = pull()
+        assert o1.metadata["analysis_trial_units"].startswith("0/2 loaded, 2 computed"), \
+            o1.metadata["analysis_trial_units"]
+        from nodegraph import parallel as _P
+        if _P.enabled() and _P.mode() != "thread":
+            assert "in this process" not in o1.metadata["analysis_trial_units"], \
+                f"two units ran serially despite a pool: {o1.metadata['analysis_trial_units']}"
+        trials = S.list_trials(root)
+        assert len(trials) == 1 and trials[0]["units_done"] == 2, trials
+        tpath = trials[0]["path"]
+        assert _os.path.basename(tpath).startswith("dic_correlate-"), tpath
+        hdr = S.read_trial(tpath).header
+        assert hdr["status"] == "complete" and hdr["settings"]["winsize"] == 20, hdr
+        assert hdr["tables"]["field"]["layer"] == "dic" and hdr["source_files"], hdr
+        assert _os.path.isfile(_os.path.join(tpath, "data", "m0001_z0000.field.parquet"))
+        assert _os.path.isfile(_os.path.join(root, "index.json"))
+        c1 = cols(o1)
+
+        # ── 2. a fresh Engine (a new session) loads, solves nothing, same numbers ────────
+        o2 = pull()
+        assert o2.metadata["analysis_trial_units"].startswith("2/2 loaded, 0 computed"), \
+            o2.metadata["analysis_trial_units"]
+        c2 = cols(o2)
+        for k in ("disp_y", "disp_x", "x", "y", "t", "m", "id"):
+            assert np.array_equal(c1[k], c2[k]), k
+
+        # ── 3. resume: one unit lost → only it is solved, to the same numbers ───────────
+        _os.remove(_os.path.join(tpath, "data", "m0001_z0000.done.json"))
+        o3 = pull()
+        assert o3.metadata["analysis_trial_units"].startswith("1/2 loaded, 1 computed"), \
+            o3.metadata["analysis_trial_units"]
+        c3 = cols(o3)
+        assert np.allclose(c1["disp_y"], c3["disp_y"], atol=1e-12, rtol=0)
+
+        # ── 4. other settings → a second trial; back → the first, loaded ────────────────
+        o4 = pull({"winsize": 24, "trial_label": "subset 24"})
+        assert o4.metadata["analysis_trial_units"].startswith("0/2 loaded"), o4.metadata
+        assert len(S.list_trials(root)) == 2
+        assert any(r["label"] == "subset 24" for r in S.list_trials(root))
+        o5 = pull({"trial_label": "renamed only"})          # the label never moves a trial
+        assert o5.metadata["analysis_trial_units"].startswith("2/2 loaded"), o5.metadata
+        assert len(S.list_trials(root)) == 2
+
+        # ── 5. off writes nothing; recompute recomputes ─────────────────────────────────
+        o6 = pull({"results": "off", "winsize": 28})
+        assert o6.metadata["analysis_trial"] == "" and len(S.list_trials(root)) == 2
+        o7 = pull({"results": "recompute"})
+        assert o7.metadata["analysis_trial_units"].startswith("0/2 loaded, 2 computed")
+
+        # ── 6. index.json is a view: delete it, it comes back from the trial folders ────
+        _os.remove(_os.path.join(root, "index.json"))
+        S.refresh_index(root)
+        idx = S._read_json(_os.path.join(root, "index.json"))
+        assert idx and len(idx["trials"]) == 2, idx
+
+        # ── 7. lanes ≡ serial: the process-lane run equals one in-memory serial run ─────
+        _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        cs = cols(pull({"results": "off"}))
+        _os.environ.pop("NODEGRAPH_PARALLEL")
+        for k in ("disp_y", "disp_x"):
+            assert np.allclose(c1[k], cs[k], atol=1e-12, rtol=0), (k, np.abs(c1[k] - cs[k]).max())
+
+        # ── 8. Load Analysis: the same table back on the image; axes guarded; tables-only ─
+        trial_id = _os.path.basename(tpath)
+        choices = S.trial_choices([src])
+        assert any(p == tpath for _l, p in choices), choices
+        ol = pull(load=trial_id)                             # by id, beside the source
+        cl = cols(ol)
+        for k in ("disp_y", "disp_x", "x", "y", "t", "m", "id"):
+            assert np.array_equal(c1[k], cl[k]), k
+        assert ol.metadata["dic_solver"] == "aldic" and ol.metadata["analysis_trial"] == tpath
+        # the correlation grid comes back too, marked, so the Viewer draws it over the image
+        gm1, gml = cols(o1, "dic_mesh"), cols(ol, "dic_mesh")
+        assert gml and np.array_equal(gm1["y_lo"], gml["y_lo"]), "the grid did not round-trip"
+        assert ol.metadata["__analysis_mesh__"]["dic_mesh"]["window"] == [20.0, 20.0]
+        one = Dataset(axes=AxisSizes(m=1, t=3, z=1, c=1, y=96, x=96),
+                      metadata={**meta, "source_path": meta["source_path"][:1]}
+                      ).with_image(ArrayProvider(img[:1]))
+        try:
+            pull(load=tpath, data=one, axes=one.axes, md=one.metadata)
+            raise AssertionError("a Dataset with the wrong M was accepted")
+        except ValueError as exc:
+            assert "does not match the trial" in str(exc), exc
+        ot = pull(load=tpath, onto="tables_only")
+        assert ot.image is None and np.array_equal(cols(ot)["disp_x"], c1["disp_x"])
+        assert ot.metadata.get("pixel_size_um") == 0.5
+        # the inspector's dropdown (Qt-free document half): the trials beside the source the
+        # incoming edge carries, each with a hover line naming its label and settings
+        from nodelab_v2.document import GraphDocument
+        from nodelab_v2.ops import ensure_ops
+        ensure_ops()
+        doc = GraphDocument()
+        card = doc.add_node("io.load", x=0, y=0, params={"path": src})
+        doc.set_meta_seed(card.id, MetaEnvelope(axes=ax, metadata=meta))
+        ld = doc.add_node("io.load_analysis", x=300, y=0)
+        doc.connect(card.id, "image", ld.id, "data")
+        sock = NODES.get("io.load_analysis").input("trial")
+        assert sock.options_from == "analysis_trials"
+        offered = dict(doc.trial_choices(ld.id, sock))
+        assert trial_id in offered and "subset 24" in " ".join(offered.values()), offered
+
+        # ── 9. the redirect: NODEGRAPH_STORE_DIR moves the folder, uniquely named ───────
+        _os.environ["NODEGRAPH_STORE_DIR"] = _os.path.join(tmp, "fast")
+        red = S.trial_root(src)
+        assert red.startswith(_os.path.join(tmp, "fast")) and \
+            _os.path.basename(red).startswith("run_seq.analysis."), red
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        _shutil.rmtree(tmp, ignore_errors=True)
+    _ok("analysis store (2026-10-09): DIC saves one trial beside its source "
+        "(run_seq.analysis/dic_correlate-…/, a Parquet unit per position, trial.json + "
+        "index.json); a new Engine reloads 2/2 with identical columns; a lost unit is "
+        "recomputed alone; other settings = a second trial, back = reloaded, a label never "
+        "moves it; off writes nothing, recompute recomputes; index rebuilds; process lanes ≡ "
+        "serial; Load Analysis restores the table + stamps by id, refuses a wrong M, works "
+        "tables-only; NODEGRAPH_STORE_DIR redirects uniquely")
+
+
+def test_analysis_store_writes() -> None:
+    """A store that cannot be written must not cost a finished analysis (2026-10-09).
+
+    Found when the lab's S: drive began failing I/O mid-run (iaStorE "I/O on <disk> has
+    failed", NTFS "failed to flush ... Corruption may occur"). Every unit's save raised
+    ``OSError``; the worker re-raised it, and a 7-minute PIV run was thrown away after its
+    compute.
+
+    Now a failed write leaves no ``*.tmp`` behind, for both the JSON and the Parquet
+    writer. A unit whose save raises returns its result with ``save_error``. The output's
+    trial note says how many units were not saved.
+
+    The spare folder (same day, found when the field playground's PIV re-ran in full after a
+    restart: 395 of its 396 units had not been saved on that drive):
+    - a unit the source's folder refuses is saved in the spare, from a worker
+      (``_unit_task``) and from ``Trial.save``;
+    - the trial finds and loads it there;
+    - both headers name each other (``also_saved_in``), so ``list_trials``, ``read_trial``,
+      ``find_trial`` and ``trial_choices`` see the whole trial from either folder;
+    - when the source's folder cannot hold the trial at all, ``open_node_trial`` opens it
+      in the spare, still reading the source's folder;
+    - the output's note says how many units went to the spare."""
+    import os as _os
+    import tempfile as _tempfile
+    import importlib.util
+    from nodegraph import analysis_store as S
+    from nodegraph.catalog._shared import analysis_units as AU
+    if importlib.util.find_spec("pyarrow") is None:
+        _ok("analysis store writes: SKIPPED (pyarrow absent)")
+        return
+    import pyarrow.parquet as pq
+    real_open, real_pq = open, pq.write_table
+
+    class _Dying:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def write(self, b):
+            self.fh.write(bytes(b)[:10])        # some bytes land, then the device fails
+            raise OSError(5, "Input/output error")
+
+        def __getattr__(self, k):
+            return getattr(self.fh, k)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return self.fh.__exit__(*a)
+
+    def dying_pq(table, where, **k):
+        with real_open(where, "wb") as fh:
+            fh.write(b"PAR1")
+        raise OSError(5, "Input/output error")
+
+    with _tempfile.TemporaryDirectory() as td:
+        S.open = lambda p, m="r", *a, **k: (_Dying(real_open(p, m, *a, **k)) if "w" in m
+                                            else real_open(p, m, *a, **k))
+        try:
+            try:
+                S._atomic_write_bytes(_os.path.join(td, "x.json"), b"{}" * 100)
+                raise AssertionError("a failing device must raise")
+            except OSError:
+                pass
+        finally:
+            del S.open
+        pq.write_table = dying_pq
+        try:
+            try:
+                S.write_table(_os.path.join(td, "u.parquet"), {"x": np.arange(5.0)})
+                raise AssertionError("a failing device must raise")
+            except OSError:
+                pass
+        finally:
+            pq.write_table = real_pq
+        assert _os.listdir(td) == [], _os.listdir(td)   # no half-written temp files
+        S.write_table(_os.path.join(td, "ok.parquet"), {"x": np.arange(5.0)})
+        assert np.array_equal(S.read_table(_os.path.join(td, "ok.parquet"))["x"],
+                              np.arange(5.0))
+    real_save = S.save_unit
+
+    def boom(*a, **k):
+        raise OSError(5, "Input/output error")
+
+    work = lambda p: {"tables": {"field": {"x": p}}, "stats": {"n": 3}}  # noqa: E731
+    S.save_unit = boom
+    try:
+        res = AU._unit_task((work, np.ones(3), "somewhere", "", "m0"))
+        both = AU._unit_task((work, np.ones(3), "somewhere", "spare", "m0"))
+    finally:
+        S.save_unit = real_save
+    assert np.array_equal(res["tables"]["field"]["x"], np.ones(3))
+    assert "Input/output error" in res["save_error"], res
+    assert "the spare folder refused it too" in both["save_error"], both
+    run = AU.UnitRun([res, {"tables": {}, "stats": {}}], 0, 2, None, "2 lanes", 1.0)
+    md = AU.stamp_trial({}, AU.TrialOpen(None, "saved beside the source"), run)
+    assert "1 unit(s) NOT saved" in md["analysis_trial_note"], md
+    assert run.save_errors == [res["save_error"]]
+
+    # ── the spare folder ─────────────────────────────────────────────────────────
+    from nodegraph.dataset import AxisSizes, Dataset
+    from nodegraph.metadata import SOURCE_PATH_KEY
+    real_spare = S.SPARE_DIR
+    with _tempfile.TemporaryDirectory() as td:
+        S.SPARE_DIR = _os.path.join(td, "home", "analysis")
+        src = _os.path.join(td, "data", "run_seq.nd2")
+        _os.makedirs(_os.path.dirname(src))
+        with open(src, "wb") as fh:
+            fh.write(b"stand-in")
+        beside, spare = S.trial_roots(src)
+        assert beside == S.trial_root(src) and spare == S.spare_root(src)
+        assert spare.startswith(S.SPARE_DIR) and "run_seq.analysis." in spare
+        units = ["m0000_z0000", "m0001_z0000"]
+        tr = S.open_trial(beside, op_key="analysis.piv", key="k" * 32, units=units,
+                          header={"analysis": "PIV", "units": units}, alt_root=spare)
+        refusing = _os.path.normcase(tr.data_dir)
+
+        def picky(data_dir, *a, **k):          # the source's disk refuses every unit
+            if _os.path.normcase(data_dir) == refusing:
+                raise OSError(22, "Invalid argument")
+            return real_save(data_dir, *a, **k)
+
+        S.save_unit = picky
+        try:
+            r0 = AU._unit_task((work, np.arange(3.0), tr.data_dir, tr.alt_data_dir, units[0]))
+            refused = tr.save(units[1], {"field": {"x": np.arange(4.0)}}, {"n": 4})
+        finally:
+            S.save_unit = real_save
+        assert "save_error" not in r0 and "Invalid argument" in r0["saved_spare"], r0
+        assert "Invalid argument" in refused
+        assert tr.done_units() == units and tr.alt_units() == units
+        assert not any(S.unit_done(tr.data_dir, u) for u in units)
+        tables, stats = tr.load(units[1])
+        assert np.array_equal(tables["field"]["x"], np.arange(4.0)) and stats == {"n": 4}
+        tr.update(status="complete")
+        h_beside = S._read_json(_os.path.join(tr.path, S.TRIAL_NAME))
+        h_spare = S._read_json(_os.path.join(tr.alt_path, S.TRIAL_NAME))
+        assert h_beside["also_saved_in"] == tr.alt_path, h_beside
+        assert h_spare["also_saved_in"] == tr.path, h_spare
+        assert h_beside["units_done"] == 2 and h_spare["status"] == "complete"
+        for root in (beside, spare):           # either folder sees the whole trial
+            assert [r["units_done"] for r in S.list_trials(root)] == [2], root
+        assert S.read_trial(tr.path).units == units
+        assert len(S.read_trial(tr.alt_path).tables["field"]) == 2
+        assert [r["id"] for r in S.list_source_trials([src])] == [tr.folder]
+        assert S.find_trial([src], tr.folder) in (tr.path, tr.alt_path)
+        assert "2/2 complete" in S.trial_choices([src])[0][0]
+        # a later run, same folders: everything loads, nothing is recomputed
+        again = S.open_trial(beside, op_key="analysis.piv", key="k" * 32, units=units,
+                             header={}, alt_root=spare)
+        assert all(again.has(u) for u in units)
+
+        # the source's folder cannot hold a trial at all: open_node_trial uses the spare
+        src2 = _os.path.join(td, "data", "other.nd2")
+        with open(src2, "wb") as fh:
+            fh.write(b"stand-in")
+        with open(S.trial_root(src2), "wb") as fh:      # a FILE where the folder would go
+            fh.write(b"in the way")
+
+        class _Ctx:
+            op_key = "analysis.piv"
+            params = {"results": "reuse", "window_size": 32}
+
+            def lineage(self, exclude=()):
+                return "lineage-of-other"
+
+            def calib(self, key):
+                return None
+
+            def upstream_chain(self):
+                return []
+
+        ds = Dataset(axes=AxisSizes(m=2, t=3, z=1, c=1, y=8, x=8),
+                     metadata={SOURCE_PATH_KEY: [src2]})
+        opened = AU.open_node_trial(_Ctx(), ds, [(0, 0), (1, 0)], axes_names=("m", "z"),
+                                    analysis="PIV")
+        assert opened.trial is not None, opened.note
+        assert opened.trial.root == S.spare_root(src2), opened.trial
+        assert opened.trial.alt_root == S.trial_root(src2)
+        assert "spare folder" in opened.note, opened.note
+        run2 = AU.UnitRun([dict(r0), {"tables": {}, "stats": {}}], 0, 2, None, "1 lane", 1.0)
+        md2 = AU.stamp_trial({}, opened, run2)
+        assert "1 unit(s) saved in the spare folder" in md2["analysis_trial_note"], md2
+    S.SPARE_DIR = real_spare
+    _ok("analysis store writes (2026-10-09): a write that fails mid-file leaves no temp "
+        "file (JSON and Parquet); a unit whose save raises keeps its result with "
+        "save_error, and the output's trial note says 1 unit NOT saved. A unit the "
+        "source's folder refuses goes to the spare folder (worker and Trial.save), is "
+        "loaded from there, and both headers name each other so either folder lists and "
+        "reads the whole trial; an unwritable source folder opens the trial in the spare")
+
+
+def test_analysis_parallel() -> None:
+    """Process lanes ≡ serial (2026-10-09) for the other two unit families: PIV over three
+    (m, z) units and DVC over two m units, each pulled once on the governor's process lanes
+    and once with parallelism off — the displacement columns must agree (≤1e-12 PIV: numpy
+    FFT, deterministic; ≤1e-10 DVC: numba reductions on a different thread count) and the
+    row order/ids exactly, which is what the ordered fold guarantees. DIC's equivalence is
+    pinned in `test_analysis_store`."""
+    if not _HAVE_SKIMAGE:
+        _ok("analysis parallel: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph import parallel as _P
+    define_node("io.parseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(23)
+
+    def run(op, img, ax, params, *, serial):
+        meta = {"pixel_size_um": 0.5, "z_step_um": 1.0}
+        ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+        g = Graph()
+        g.add(NodeInstance("S", "io.parseed"))
+        g.add(NodeInstance("D", op, params={**params, "results": "off"}))
+        g.connect("S", "D", dst_socket="data")
+        old = _os.environ.get("NODEGRAPH_PARALLEL")
+        if serial:
+            _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        try:
+            out = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                         meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull("D")
+        finally:
+            if serial:
+                if old is None:
+                    _os.environ.pop("NODEGRAPH_PARALLEL", None)
+                else:
+                    _os.environ["NODEGRAPH_PARALLEL"] = old
+        return out
+
+    def table(o, layer):
+        return {a.name: np.asarray(a.values) for a in o.layers_on(D.POINT) if a.layer == layer}
+
+    # ── PIV: 3 positions × 1 plane × 3 frames ───────────────────────────────────────
+    img = np.zeros((3, 3, 1, 1, 96, 96))
+    for m in range(3):
+        patt = gaussian_filter(rng.random((96, 96)), 1.0)
+        for t in range(3):
+            img[m, t, 0, 0] = ndshift(patt, (0.7 * t * (m + 1), -0.4 * t), order=3,
+                                      mode="nearest")
+    ax = AxisSizes(m=3, t=3, z=1, c=1, y=96, x=96)
+    pp = {"window_size": 16, "overlap": 0.5}
+    par = run("analysis.piv", img, ax, pp, serial=False)
+    ser = run("analysis.piv", img, ax, pp, serial=True)
+    a, b = table(par, "piv"), table(ser, "piv")
+    assert a["m"].size and np.array_equal(a["m"], b["m"]) and np.array_equal(a["id"], b["id"])
+    for k in ("disp_y", "disp_x", "x", "y"):
+        assert np.allclose(a[k], b[k], atol=1e-12, rtol=0), (k, np.nanmax(np.abs(a[k] - b[k])))
+    lanes_piv = par.metadata["analysis_trial_units"]
+    if _P.enabled() and _P.mode() != "thread":
+        assert "in this process" not in lanes_piv, lanes_piv
+
+    # ── DVC: 2 positions × 2 frames of a (28, 44, 44) speckle volume ────────────────
+    vol = np.zeros((2, 2, 28, 1, 44, 44))
+    for m in range(2):
+        base = gaussian_filter(rng.random((28, 44, 44)), 1.2)
+        vol[m, 0, :, 0] = base
+        vol[m, 1, :, 0] = ndshift(base, (0.0, 0.5 * (m + 1), -0.8), order=3, mode="nearest")
+    axv = AxisSizes(m=2, t=2, z=28, c=1, y=44, x=44)
+    pv = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10, "subset_spacing_z": 4,
+          "admm_iterations": 1}
+    par = run("analysis.dvc_field", vol, axv, pv, serial=False)
+    ser = run("analysis.dvc_field", vol, axv, pv, serial=True)
+    a, b = table(par, "dvc"), table(ser, "dvc")
+    assert a["m"].size and np.array_equal(a["m"], b["m"]) and np.array_equal(a["id"], b["id"])
+    for k in ("disp_z", "disp_y", "disp_x"):
+        assert np.allclose(a[k], b[k], atol=1e-10, rtol=0, equal_nan=True), \
+            (k, np.nanmax(np.abs(a[k] - b[k])))
+    # ── the staged chains: every frame-reading card on lanes ≡ serial ───────────────
+    def run_chain(chain, img, ax, *, serial):
+        meta = {"pixel_size_um": 0.5, "z_step_um": 1.0}
+        ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+        g = Graph()
+        g.add(NodeInstance("S", "io.parseed"))
+        prev = "S"
+        for i, (op, params) in enumerate(chain):
+            g.add(NodeInstance(f"N{i}", op, params={**params, "results": "off"}
+                               if "results" in {s.name for s in NODES.get(op).inputs}
+                               else dict(params)))
+            g.connect(prev, f"N{i}", dst_socket="data")
+            prev = f"N{i}"
+        old = _os.environ.get("NODEGRAPH_PARALLEL")
+        if serial:
+            _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        try:
+            return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                          meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull(prev)
+        finally:
+            if serial:
+                if old is None:
+                    _os.environ.pop("NODEGRAPH_PARALLEL", None)
+                else:
+                    _os.environ["NODEGRAPH_PARALLEL"] = old
+
+    def same(chain, img, ax, layer, keys, tol):
+        a = table(run_chain(chain, img, ax, serial=False), layer)
+        b = table(run_chain(chain, img, ax, serial=True), layer)
+        assert a["m"].size and np.array_equal(a["m"], b["m"]) and np.array_equal(a["t"], b["t"])
+        for k in keys:
+            assert np.allclose(a[k], b[k], atol=tol, rtol=0, equal_nan=True), \
+                (chain[-1][0], k, np.nanmax(np.abs(a[k] - b[k])))
+        return a
+    img2 = img[:2]                                              # 2 positions of the PIV set
+    ax2p = AxisSizes(m=2, t=3, z=1, c=1, y=96, x=96)
+    same([("piv.first_pass", {"window_size": 32}), ("piv.validate", {}),
+          ("piv.deform_pass", {"window_size": 16})], img2, ax2p, "piv",
+         ("disp_y", "disp_x"), 1e-12)
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    if al_dic_available():
+        same([("dic.grid", {"winsize": 20, "winstepsize": 16}), ("dic.initial_guess", {}),
+              ("dic.local_match", {}), ("dic.global_step", {})], img2, ax2p, "dic",
+             ("disp_y", "disp_x", "grad_xx"), 1e-12)
+    same([("dvc.grid", {k: pv[k] for k in ("subset_size", "subset_size_z", "subset_spacing",
+                                           "subset_spacing_z")}),
+          ("dvc.initial_guess", {}), ("dvc.local_match", {})], vol, axv, "dvc",
+         ("disp_z", "disp_y", "disp_x"), 1e-10)
+
+    # ── SerialTrack: 2 positions × 2 planes = 4 groups on lanes ≡ serial; saved, reloaded ──
+    from nodegraph.structure import StructureTable
+    T, Y, X = 4, 48, 48
+    BASE = np.array([[8.0, 8.0], [26.0, 30.0], [38.0, 12.0]])
+    cols: dict = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x")}
+    nid = 1
+    for m in range(2):
+        for t in range(T):
+            for z in range(2):
+                for (cy, cx) in BASE + t * np.array([2.0, 1.0 + m]):
+                    for k, v in (("id", nid), ("m", m), ("t", t), ("c", 0), ("z", z),
+                                 ("y", cy), ("x", cx)):
+                        cols[k].append(v)
+                    nid += 1
+    axt = AxisSizes(m=2, t=T, z=2, c=1, y=Y, x=X)
+    dst = Dataset(axes=axt).with_structure(StructureTable(
+        D.POINT, {k: np.asarray(v) for k, v in cols.items()}, layer="spots",
+        z_kind="plane_index"))
+
+    def track(results, serial=False, store=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.parseed"))
+        g.add(NodeInstance("K", "track.objects",
+                           params={"max_distance": 6.0, "results": results},
+                           modes={"target": "point", "method": "serialtrack"}))
+        g.connect("S", "K")
+        saved = {k: _os.environ.get(k) for k in ("NODEGRAPH_PARALLEL", "NODEGRAPH_STORE_DIR")}
+        if serial:
+            _os.environ["NODEGRAPH_PARALLEL"] = "off"
+        if store:
+            _os.environ["NODEGRAPH_STORE_DIR"] = store
+        try:
+            return Engine(g, computes=COMPUTES, seeds={"S": dst},
+                          meta_seeds={"S": MetaEnvelope(axes=axt, metadata={
+                              "pixel_size_um": 0.5})}).pull("K")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    _os.environ.pop(k, None)
+                else:
+                    _os.environ[k] = v
+
+    def tracks(o):
+        get = lambda n: np.asarray(o.get(D.TRACK, n, layer="tracks").values)
+        return get("track_id"), get("member_id"), get("t")
+    tp, ts = tracks(track("off")), tracks(track("off", serial=True))
+    assert all(np.array_equal(a, b) for a, b in zip(tp, ts)), "SerialTrack lanes ≠ serial"
+    assert len(set(tp[0].tolist())) == 12, f"4 groups × 3 objects, got {sorted(set(tp[0]))}"
+    import tempfile as _tf
+    import shutil as _sh
+    tmp = _tf.mkdtemp(prefix="ng-st-")
+    try:
+        o1 = track("reuse", store=tmp)
+        o2 = track("reuse", store=tmp)
+        assert o2.metadata["analysis_trial_units"].startswith("4/4 loaded"), \
+            o2.metadata["analysis_trial_units"]
+        assert all(np.array_equal(a, b) for a, b in zip(tracks(o1), tracks(o2)))
+        g = Graph()
+        g.add(NodeInstance("L", "io.load_analysis",
+                           params={"trial": o1.metadata["analysis_trial"]},
+                           modes={"onto": "tables_only"}))
+        lo = Engine(g, computes=COMPUTES).pull("L")
+        assert all(np.array_equal(a, b) for a, b in zip(tracks(lo), tracks(o1))), \
+            "Load Analysis must restore the SerialTrack result"
+        assert lo.get(D.POINT, "track_id", layer="spots") is not None
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+    _ok(f"analysis parallel (2026-10-09): PIV over 3 (m,z) units and DVC over 2 m units on "
+        f"process lanes equal the serial run (PIV ≤1e-12, DVC ≤1e-10; same rows, same ids, "
+        f"ordered fold) — PIV ran as: {lanes_piv}; the staged PIV / DIC / DVC chains on 2 "
+        f"positions equal their serial runs; SerialTrack over 4 (m,c,z) groups gives the "
+        f"same 12 tracks on lanes and serially, saves per group, reloads 4/4, and Load "
+        f"Analysis restores the Track table and the members' track_id")
+
+
+def test_quick_scope() -> None:
+    """The quick analysis (2026-10-09): (1) `quick_picks` arms F9 with what each analysis
+    needs — the reference frame INCLUDED, a staged card reading its chain's grid card, the
+    plane for planar methods / the whole volume for DVC, five frames for tracking, a centred
+    box unless one is drawn, a refusal on one timepoint; (2) under a scope a fixed reference
+    frame is a SOURCE index mapped through `scope_t` (frames {2, 5} picked, reference 5 ⇒
+    the same field as the unscoped pair with reference 1), and a reference outside the
+    picks is refused; (3) a scoped pull saves nothing; (4) the quality metrics are Global
+    scalars and a scoped pull estimates the full run; (5) an Iterate sweep keeps the best
+    setting by a quality metric."""
+    if not _HAVE_SKIMAGE:
+        _ok("quick scope: SKIPPED (scipy/skimage absent)")
+        return
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    import nodegraph.iterate as IT
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    from nodelab_v2.quick import quick_picks, TRACK_FRAMES
+
+    # ── 1. the picks ──────────────────────────────────────────────────────────────
+    ensure_ops()
+    doc = GraphDocument()
+    axs = AxisSizes(m=3, t=10, z=4, c=1, y=2048, x=2048)
+    card = doc.add_node("io.load", x=0, y=0, params={"path": "fake.nd2"})
+    doc.set_meta_seed(card.id, MetaEnvelope(axes=axs, metadata={"pixel_size_um": 0.5}))
+
+    def node(op, params=None, modes=None, src=None):
+        r = doc.add_node(op, x=300, y=0, params=dict(params or {}), modes=dict(modes or {}))
+        doc.connect(src or card.id, "image" if src is None else "out", r.id, "data")
+        return r.id
+    totals, ext = (3, 10, 4), (2048, 2048)
+    dic = node("analysis.dic_correlate", {"reference_frame": 0})
+    q = quick_picks(doc, dic, (1, 6, 2, 0), totals, ext)
+    assert (q.ms, q.ts, q.zs) == ((1,), (0, 6), (2,)), q
+    assert q.region == (704, 1344, 704, 1344), q.region        # 16 × 40 px, centred
+    q = quick_picks(doc, dic, (1, 6, 2, 0), totals, ext, region=(0, 100, 0, 100))
+    assert q.region == (0, 100, 0, 100), "a drawn box must be kept"
+    dic9 = node("analysis.dic_correlate", {"reference_frame": 9})
+    assert quick_picks(doc, dic9, (0, 9, 0, 0), totals, ext).ts == (8, 9)
+    piv = node("analysis.piv")                                   # previous_frame default
+    assert quick_picks(doc, piv, (0, 0, 1, 0), totals, ext).ts == (0, 1)
+    dvc = node("analysis.dvc_field", {"reference_frame": 2})
+    qd = quick_picks(doc, dvc, (2, 5, 3, 0), totals, ext)
+    assert qd.ts == (2, 5) and qd.zs == (), qd                  # DVC needs the whole volume
+    grid = node("dic.grid", {"reference_frame": 3})
+    seed = node("dic.initial_guess", src=grid)
+    match = node("dic.local_match", src=seed)
+    assert quick_picks(doc, match, (0, 7, 0, 0), totals, ext).ts == (3, 7), \
+        "a staged card must read the reference policy off its chain's grid card"
+    trk = node("track.objects", {"method": "serialtrack"})
+    assert quick_picks(doc, trk, (0, 8, 1, 0), totals, ext).ts == \
+        tuple(range(10 - TRACK_FRAMES, 10))
+    assert "one" in quick_picks(doc, dic, (0, 0, 0, 0), (3, 1, 4), ext).error
+
+    if not al_dic_available():
+        _ok("quick scope: picks verified; DIC-backed checks SKIPPED (al-dic absent)")
+        return
+
+    # ── 2-4. reference mapping, no saving, metrics + estimate ────────────────────
+    define_node("io.quickseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(31)
+    patt = gaussian_filter(rng.random((96, 96)), 1.0)
+    frames = [ndshift(patt, (0.4 * t, 0.9 * t), order=3, mode="nearest") for t in range(6)]
+    pair = np.zeros((1, 2, 1, 1, 96, 96))
+    pair[0, 0, 0, 0], pair[0, 1, 0, 0] = frames[2], frames[5]
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=96, x=96)
+    tmp = _tempfile.mkdtemp(prefix="ng-quick-")
+    saved = _os.environ.pop("NODEGRAPH_STORE_DIR", None)
+    _os.environ["NODEGRAPH_STORE_DIR"] = tmp
+    try:
+        def pull(md, ref):
+            ds = Dataset(axes=ax2, metadata=md).with_image(ArrayProvider(pair))
+            g = Graph()
+            g.add(NodeInstance("S", "io.quickseed"))
+            g.add(NodeInstance("D", "analysis.dic_correlate",
+                               params={"winsize": 20, "winstepsize": 16,
+                                       "reference_frame": ref}))
+            g.connect("S", "D", dst_socket="data")
+            return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                          meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=md)}).pull("D")
+        base = {"pixel_size_um": 0.5}
+        scoped = {**base, "scope_m": (0,), "scope_t": (2, 5), "scope_z": (),
+                  "scope_of": (1, 6, 1, 192, 192)}
+        o_s = pull(scoped, 5)                     # SOURCE frame 5 = payload frame 1
+        o_u = pull(base, 1)                       # the same pair, unscoped
+        cs = {a.name: np.asarray(a.values) for a in o_s.layers_on(D.POINT) if a.layer == "dic"}
+        cu = {a.name: np.asarray(a.values) for a in o_u.layers_on(D.POINT) if a.layer == "dic"}
+        for k in ("disp_y", "disp_x", "t"):
+            assert np.allclose(cs[k], cu[k], atol=1e-12, rtol=0), k
+        try:
+            pull(scoped, 3)
+            raise AssertionError("a reference outside the picks was accepted")
+        except ValueError as exc:
+            assert "do not include the reference frame 3" in str(exc), exc
+        # (3) nothing saved for the scoped pull — the unscoped one did save (store dir set)
+        assert o_s.metadata["analysis_trial"] == "" and "quick" in \
+            o_s.metadata["analysis_trial_note"], o_s.metadata["analysis_trial_note"]
+        assert o_u.metadata["analysis_trial"], "the unscoped pull should have saved"
+        # (4) the metrics are Global scalars; the scoped run estimates the full one
+        solved = float(np.asarray(o_s.get(D.GLOBAL, "dic_solved_frac").values).reshape(-1)[0])
+        assert 0.0 < solved <= 1.0, solved
+        est = float(np.asarray(o_s.get(D.GLOBAL, "analysis_est_full_s").values).reshape(-1)[0])
+        assert np.isfinite(est) and est > 0, est
+        assert "full run" in o_s.metadata["analysis_estimate"]
+        est_u = float(np.asarray(o_u.get(D.GLOBAL, "analysis_est_full_s").values).reshape(-1)[0])
+        assert np.isnan(est_u), "an unscoped run has nothing to extrapolate"
+    finally:
+        if saved is None:
+            _os.environ.pop("NODEGRAPH_STORE_DIR", None)
+        else:
+            _os.environ["NODEGRAPH_STORE_DIR"] = saved
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── 5. an Iterate sweep keeps the best window by a PIV quality metric ────────
+    img = np.zeros((1, 3, 1, 1, 96, 96))
+    for t in range(3):
+        img[0, t, 0, 0] = ndshift(patt, (0.6 * t, -0.8 * t), order=3, mode="nearest")
+    ax3 = AxisSizes(m=1, t=3, z=1, c=1, y=96, x=96)
+    ds3 = Dataset(axes=ax3, metadata={"pixel_size_um": 0.5}).with_image(ArrayProvider(img))
+    g = Graph()
+    g.add(NodeInstance("S", "io.quickseed"))
+    g.add(NodeInstance("P", "analysis.piv", params={"window_size": 16, "results": "off"}))
+    g.add(NodeInstance("IT", IT.ITERATE_OP,
+                       params={"v0_list": "8, 16, 32", "metric": "piv_median_s2n"},
+                       modes={"mode": "sweep", "variables": "1", "v0_source": "list",
+                              "preserve": "best", "direction": "max"}))
+    g.connect("S", "P", dst_socket="data")
+    g.connect("P", "IT", dst_socket=IT.SEG_TO)
+    g.connect("IT", "P", src_socket="var0", dst_socket="window_size", kind="driver")
+    flat = IT.unroll(g, sweep_all={"IT"})
+    eng = Engine(flat, computes=COMPUTES, seeds={"S": ds3},
+                 meta_seeds={"S": MetaEnvelope(axes=ax3, metadata={"pixel_size_um": 0.5})},
+                 memo=Memo())
+    per = [float(np.asarray(eng.pull(IT.iter_id("P", "IT", i)).get(
+        D.GLOBAL, "piv_median_s2n").values).reshape(-1)[0]) for i in range(3)]
+    best = eng.pull("IT")
+    won = float(np.asarray(best.get(D.GLOBAL, "sweep_metric").values).reshape(-1)[0])
+    assert won == max(per), (won, per)
+    # the staged cards score their own section too (a sweep can sit around any of them)
+    gs = Graph()
+    gs.add(NodeInstance("S", "io.quickseed"))
+    gs.add(NodeInstance("F", "piv.first_pass", params={"window_size": 32, "results": "off"}))
+    gs.connect("S", "F", dst_socket="data")
+    of = Engine(gs, computes=COMPUTES, seeds={"S": ds3},
+                meta_seeds={"S": MetaEnvelope(axes=ax3, metadata={"pixel_size_um": 0.5})}
+                ).pull("F")
+    vf = float(np.asarray(of.get(D.GLOBAL, "piv_valid_frac").values).reshape(-1)[0])
+    sn = float(np.asarray(of.get(D.GLOBAL, "piv_median_s2n").values).reshape(-1)[0])
+    assert 0.0 < vf <= 1.0 and np.isfinite(sn) and sn > 0, (vf, sn)
+    _ok(f"quick scope (2026-10-09): picks include the reference (fixed {{0,6}}, {{8,9}} at the "
+        f"end, previous {{0,1}}), staged cards read their grid card, DVC keeps the volume, "
+        f"tracking takes {TRACK_FRAMES} frames, a centred 16-subset box unless drawn, one "
+        f"timepoint refused; scoped reference 5 of picks {{2,5}} ≡ unscoped reference 1, an "
+        f"unpicked reference refused; scoped pulls save nothing; dic_solved_frac + "
+        f"analysis_est_full_s are Global; an Iterate sweep keeps the best window by "
+        f"piv_median_s2n ({per})")
+
+
+def test_analysis_mesh() -> None:
+    """The correlation grid (2026-10-09): every DIC / PIV / DVC producer — single node and
+    staged grid card — writes `<field>_mesh`, axis-aligned element boxes the Viewer draws
+    (DIC: pyALDIC's Q8 elements with their node indices; PIV: the window lattice's cells,
+    pitch = window − overlap; DVC: hexes with a z extent), shared by every frame (t = -1),
+    marked in `__analysis_mesh__` with its subset/window size; a PIV deform pass REPLACES
+    the grid with its finer one; a grid never steals a field's auto-resolution
+    (`_point_layers`); Load Analysis puts the grid and its mark back."""
+    if not _HAVE_SKIMAGE:
+        _ok("analysis mesh: SKIPPED (scipy/skimage absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    from nodegraph.catalog._shared.labels import _point_layers
+    from nodegraph.catalog._shared.analysis_mesh import MESH_MARK
+    define_node("io.meshseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(41)
+
+    def run(chain, img, ax, md=None):
+        md = md or {"pixel_size_um": 0.5, "z_step_um": 1.0}
+        ds = Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+        g = Graph()
+        g.add(NodeInstance("S", "io.meshseed"))
+        prev = "S"
+        for i, (op, params) in enumerate(chain):
+            nid = f"N{i}"
+            g.add(NodeInstance(nid, op, params={**params, "results": "off"}
+                               if op.startswith("analysis.") else dict(params)))
+            g.connect(prev, nid, dst_socket="data")
+            prev = nid
+        return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=md)}).pull(prev)
+
+    def mesh(o, layer):
+        return {a.name: np.asarray(a.values) for a in o.layers_on(D.POINT) if a.layer == layer}
+
+    patt = gaussian_filter(rng.random((96, 96)), 1.0)
+    img2 = np.zeros((1, 2, 1, 1, 96, 96))
+    img2[0, 0, 0, 0] = patt
+    img2[0, 1, 0, 0] = ndshift(patt, (0.5, 1.0), order=3, mode="nearest")
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=96, x=96)
+
+    # ── PIV single: the window lattice, pitch = window − overlap ─────────────────────
+    o = run([("analysis.piv", {"window_size": 16, "overlap": 0.5})], img2, ax2)
+    mk = o.metadata[MESH_MARK]["piv_mesh"]
+    assert mk["field"] == "piv" and mk["kind"] == "quad" and mk["window"] == [16.0, 16.0], mk
+    pm = mesh(o, "piv_mesh")
+    assert pm["y_lo"].size and (pm["t"] == -1).all()
+    assert np.allclose(pm["y_hi"] - pm["y_lo"], 8.0) and np.allclose(pm["x_hi"] - pm["x_lo"], 8.0)
+    assert _point_layers(o) == ["piv"], _point_layers(o)      # the grid never auto-resolves
+    # ── PIV staged: a deform pass replaces the grid with its finer lattice ───────────
+    o1 = run([("piv.first_pass", {"window_size": 32}), ("piv.validate", {})], img2, ax2)
+    o2 = run([("piv.first_pass", {"window_size": 32}), ("piv.validate", {}),
+              ("piv.deform_pass", {"window_size": 16})], img2, ax2)
+    c1, c2 = mesh(o1, "piv_mesh"), mesh(o2, "piv_mesh")
+    assert c2["y_lo"].size > c1["y_lo"].size, (c1["y_lo"].size, c2["y_lo"].size)
+    assert np.allclose(c2["size_px"], 8.0) and np.allclose(c1["size_px"], 16.0)
+
+    # ── DVC single + staged grid: hexes with a z extent ─────────────────────────────
+    vol = np.zeros((1, 2, 28, 1, 44, 44))
+    base = gaussian_filter(rng.random((28, 44, 44)), 1.2)
+    vol[0, 0, :, 0] = base
+    vol[0, 1, :, 0] = ndshift(base, (0.0, 0.5, -0.5), order=3, mode="nearest")
+    axv = AxisSizes(m=1, t=2, z=28, c=1, y=44, x=44)
+    pv = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10, "subset_spacing_z": 4,
+          "admm_iterations": 1}
+    ov = run([("analysis.dvc_field", pv)], vol, axv)
+    hv = mesh(ov, "dvc_mesh")
+    assert hv["y_lo"].size and (hv["z_hi"] > hv["z_lo"]).all(), hv.get("z_lo")
+    assert ov.metadata[MESH_MARK]["dvc_mesh"]["window"] == [12.0, 12.0, 8.0]
+    og = run([("dvc.grid", {k: pv[k] for k in ("subset_size", "subset_size_z",
+                                               "subset_spacing", "subset_spacing_z")})],
+             vol, axv)
+    hg = mesh(og, "dvc_mesh")
+    assert hg["y_lo"].size == hv["y_lo"].size, (hg["y_lo"].size, hv["y_lo"].size)
+
+    if not al_dic_available():
+        _ok("analysis mesh: PIV/DVC grids verified; DIC SKIPPED (al-dic absent)")
+        return
+    # ── DIC single: pyALDIC's own elements (Q8 node indices kept) ───────────────────
+    od = run([("analysis.dic_correlate", {"winsize": 20, "winstepsize": 16})], img2, ax2)
+    dm = mesh(od, "dic_mesh")
+    mk = od.metadata[MESH_MARK]["dic_mesh"]
+    assert mk["kind"] == "fem" and mk["window"] == [20.0, 20.0], mk
+    assert dm["y_lo"].size and (dm["t"] == -1).all() and (dm["n0"] >= 0).all()
+    assert np.allclose(dm["size_px"], 16.0), np.unique(dm["size_px"])   # the base step
+    field = mesh(od, "dic")
+    corners = set(zip(np.round(dm["y_lo"], 6), np.round(dm["x_lo"], 6)))
+    nodes = set(zip(np.round(field["y"], 6), np.round(field["x"], 6)))
+    assert corners <= nodes, "element corners must be the field's own nodes"
+    assert od.metadata["dic_winsize"] == 20 and _point_layers(od) == ["dic"]
+    # ── DIC staged grid: the lattice's cells, one set per plane ─────────────────────
+    ogr = run([("dic.grid", {"winsize": 20, "winstepsize": 16})], img2, ax2)
+    gm = mesh(ogr, "dic_mesh")
+    assert gm["y_lo"].size and np.allclose(gm["size_px"], 16.0)
+
+    # ── refinement at an ROI hole: single node and the staged Refine Mesh card ──────
+    N = 160
+    patt2 = gaussian_filter(rng.random((N, N)), 1.0)
+    img_r = np.zeros((1, 2, 1, 1, N, N))
+    img_r[0, 0, 0, 0] = patt2
+    img_r[0, 1, 0, 0] = ndshift(patt2, (0.8, 1.3), order=3, mode="nearest")
+    yy, xx = np.mgrid[:N, :N]
+    roi6 = np.zeros((1, 2, 1, 1, N, N), np.uint8)
+    roi6[0, :, 0, 0] = (yy - N / 2) ** 2 + (xx - N / 2) ** 2 > 22 ** 2
+    axr = AxisSizes(m=1, t=2, z=1, c=1, y=N, x=N)
+
+    def run_roi(chain):
+        md = {"pixel_size_um": 1.0}
+        ds = (Dataset(axes=axr, metadata=md).with_image(ArrayProvider(img_r))
+              .with_layer(D.VOXEL, "roi_mask", roi6))
+        g = Graph()
+        g.add(NodeInstance("S", "io.meshseed"))
+        prev = "S"
+        for i, (op, params) in enumerate(chain):
+            g.add(NodeInstance(f"N{i}", op, params=dict(params)))
+            g.connect(prev, f"N{i}", dst_socket="data")
+            prev = f"N{i}"
+        return Engine(g, computes=COMPUTES, seeds={"S": ds},
+                      meta_seeds={"S": MetaEnvelope(axes=axr, metadata=md)}).pull(prev)
+    base = {"winsize": 24, "winstepsize": 16, "winsize_min": 4}
+    plain = mesh(run_roi([("analysis.dic_correlate", {**base, "results": "off"})]), "dic_mesh")
+    o_ref = run_roi([("analysis.dic_correlate", {**base, "results": "off", "refine_holes": True})])
+    m_ref = mesh(o_ref, "dic_mesh")
+    assert m_ref["y_lo"].size > plain["y_lo"].size and m_ref["level"].max() >= 1, \
+        (plain["y_lo"].size, m_ref["y_lo"].size, np.unique(m_ref["level"]))
+    assert m_ref["size_px"].min() >= 4.0 and (m_ref[[f"n{i}" for i in range(4, 8)][0]] >= -1).all()
+    o_st = run_roi([("dic.grid", {**base, "roi": "roi_mask"}), ("dic.initial_guess", {}),
+                    ("dic.refine_mesh", {"refine_holes": True}), ("dic.local_match", {}),
+                    ("dic.global_step", {})])
+    m_st = mesh(o_st, "dic_mesh")
+    assert np.allclose(np.sort(m_st["y_lo"]), np.sort(m_ref["y_lo"])) and \
+        np.allclose(np.sort(m_st["x_lo"]), np.sort(m_ref["x_lo"])), \
+        "the staged Refine Mesh card must refine exactly as pyALDIC does inside the single node"
+    fs, fr = mesh(o_st, "dic"), mesh(o_ref, "dic")
+    key = {(round(a, 6), round(b, 6), int(t)): i
+           for i, (a, b, t) in enumerate(zip(fs["y"], fs["x"], fs["t"]))}
+    pairs = [(key[(round(a, 6), round(b, 6), int(t))], j)
+             for j, (a, b, t) in enumerate(zip(fr["y"], fr["x"], fr["t"]))
+             if (round(a, 6), round(b, 6), int(t)) in key]
+    assert len(pairs) == len(fr["y"]), "every node the single node solved is in the staged table"
+    ii, jj = np.array(pairs).T
+    dd = np.abs(fs["disp_x"][ii] - fr["disp_x"][jj])
+    assert np.nanmedian(dd) < 1e-10 and np.nanmax(dd) < 1e-2, (np.nanmedian(dd), np.nanmax(dd))
+    off = run_roi([("dic.grid", {**base, "roi": "roi_mask"}), ("dic.initial_guess", {}),
+                   ("dic.refine_mesh", {"refine_holes": False})])
+    assert "dic_refine" not in off.metadata, "Refine Mesh with nothing on must pass through"
+    _ok(f"analysis mesh (2026-10-09): PIV lattice cells at the 8 px pitch (16 px windows, "
+        f"50 %), a deform pass replaces the 16 px grid with the finer 8 px one "
+        f"({c1['y_lo'].size} → {c2['y_lo'].size} cells); DVC {hv['y_lo'].size} hexes with a z "
+        f"extent, single ≡ grid card; DIC {dm['y_lo'].size} pyALDIC elements whose corners are "
+        f"the field's nodes; all t = -1, marked with their window; grids never auto-resolve; "
+        f"refine_holes at an ROI hole {plain['y_lo'].size} → {m_ref['y_lo'].size} elements "
+        f"(levels to {int(m_ref['level'].max())}), the staged Refine Mesh card refines to the "
+        f"SAME elements and matches on every solved node (median {np.nanmedian(dd):.1e} µm), "
+        f"and passes through with nothing on")
 
 
 def test_catalog_piv() -> None:
@@ -12929,6 +13889,11 @@ _LAYER_RESOLVE_EXEMPT = {
     ("analysis.dic_correlate", "roi"),
     # Same contract as dic_correlate's roi, same reason: absent layer = whole frame.
     ("analysis.piv", "roi"),
+    # The staged siblings (2026-10-08) decide the ROI once, on their first card, with the
+    # single nodes' contract: a name that matches no Voxel layer correlates the whole frame
+    # (`_roi_plane` returns None), and every later stage inherits that choice from provenance.
+    ("dic.grid", "roi"),
+    ("piv.first_pass", "roi"),
     # Not a layer name at all on 3 of its 5 domains: `source` names an attribute COLUMN, and
     # on a structure domain every invariant coordinate (id/m/t/c/z/y/x) is a "candidate", so
     # "the only one on the wire" is never the question being asked. It also must keep
@@ -16003,6 +16968,31 @@ def _pw_square(i):
     return i * i
 
 
+def _pw_priority(_i):
+    """The worker's Windows priority class (0 elsewhere) — the governor's freeze guard."""
+    import sys as _sys
+    if _sys.platform != "win32":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+    return int(k32.GetPriorityClass(k32.GetCurrentProcess()))
+
+
+def _pw_gov_unit(i):
+    """`adaptive_fold`'s test unit: the value, the worker's pid, and a unit-12 failure. It
+    takes 50 ms, so units spread over the warm workers instead of one worker draining a queue
+    of instant tasks before the next has started (a measured flake, 2026-10-09)."""
+    import os as _os
+    import time as _t
+    if i == 12:
+        raise ValueError("unit 12 fails on purpose")
+    _t.sleep(0.05)
+    return i * 3, _os.getpid()
+
+
 def test_parallel() -> None:
     """The V2.14 run-wide fan-out: ordering, re-entrancy, cache locking, and — the one
     that actually matters — that a parallel pull is BYTE-IDENTICAL to a serial one for the
@@ -16208,6 +17198,150 @@ def test_parallel() -> None:
         "unpicklable-closure fallback; TileCache 8-thread accounting exact; "
         "serial≡parallel byte-identical on 4 order-dependent nodes (segment 2D/3D ids, "
         "spot ids, mask) and masks are uint8")
+
+
+def test_parallel_governor() -> None:
+    """The analysis governor (2026-10-09): lane plans that respect the core reserve and the
+    free-RAM floor, live admission that holds on low memory / gives a lane back under a
+    saturated CPU and restores it, calibration on a measured peak, the env overrides — all
+    on FAKE machines — then a real `adaptive_fold` over the spawn pool: ordered fold,
+    several worker processes, per-unit stats, a compute error surfaced with its worker
+    traceback, and the unpicklable-compute fallback."""
+    import os as _os
+    from nodegraph import governor as G
+    from nodegraph import parallel as P
+
+    GiB = 1 << 30
+    big = G.MachineProfile(logical=80, physical=40, total_ram=512 * GiB,
+                           avail_ram=480 * GiB, commit_avail=480 * GiB, cpu_busy=0.1)
+    saved = {k: _os.environ.pop(k, None) for k in
+             ("NODEGRAPH_PROC_WORKERS", "NODEGRAPH_RESERVE_CORES", "NODEGRAPH_MIN_FREE_RAM")}
+    try:
+        # ── 1. the pure plan ─────────────────────────────────────────────────────
+        assert G.reserve_cores(40) == 4 and G.reserve_cores(8) == 2 and G.reserve_cores(2) == 1
+        assert G.min_free_ram(512 * GiB) == 512 * GiB // 10   # 10 % beats the 4 GiB floor
+        assert G.min_free_ram(16 * GiB) == 4 * GiB              # the 4 GiB floor wins
+        p = G.plan_lanes(96, 3 * GiB, big, min_inner=2)
+        assert (p.usable_cores, p.cpu_lanes, p.lanes) == (36, 16, 16), p
+        assert p.lanes * p.inner <= p.usable_cores, p          # the product never oversubscribes
+        tight = G.MachineProfile(logical=80, physical=40, total_ram=512 * GiB,
+                                 avail_ram=G.min_free_ram(512 * GiB) + 8 * GiB,
+                                 commit_avail=0, cpu_busy=0.1)
+        p = G.plan_lanes(96, 3 * GiB, tight, min_inner=2)
+        assert p.lanes == 2 and p.inner == 18, p               # RAM-bound: 8 GiB × 0.8 / 3 GiB
+        assert G.plan_lanes(1, 3 * GiB, big).lanes == 1        # one unit → one lane, all cores
+        assert G.plan_lanes(1, 3 * GiB, big).inner == 36
+        starved = G.MachineProfile(logical=8, physical=4, total_ram=8 * GiB,
+                                   avail_ram=1 * GiB, commit_avail=0)
+        assert G.plan_lanes(10, 3 * GiB, starved).lanes == 1   # floor 1: progress is possible
+        _os.environ["NODEGRAPH_PROC_WORKERS"] = "3"
+        assert G.plan_lanes(96, 1 * GiB, big).lanes == 3
+        _os.environ.pop("NODEGRAPH_PROC_WORKERS")
+        _os.environ["NODEGRAPH_RESERVE_CORES"] = "10"
+        assert G.plan_lanes(96, 1 * GiB, big, min_inner=3).usable_cores == 30
+        _os.environ.pop("NODEGRAPH_RESERVE_CORES")
+        _os.environ["NODEGRAPH_MIN_FREE_RAM"] = "6G"
+        assert G.min_free_ram(512 * GiB) == 6 * GiB
+        _os.environ.pop("NODEGRAPH_MIN_FREE_RAM")
+
+        # ── 2. the live governor on a scripted machine ───────────────────────────
+        state = {"avail": 480 * GiB, "busy": 0.1}
+
+        def fake():
+            return G.MachineProfile(logical=80, physical=40, total_ram=512 * GiB,
+                                    avail_ram=state["avail"], commit_avail=0,
+                                    cpu_busy=state["busy"])
+        gov = G.Governor(96, 3 * GiB, min_inner=2, profile_fn=fake)
+        clock = [0.0]
+        gov._clock = lambda: clock[0]
+        assert gov.allowed(0) == 2, "warm-up must start narrow until a unit reports"
+        assert gov.inner_threads() == 36 // 16, "warm-up threads must be sized for the TARGET"
+        gov.record(G.UnitStats(seconds=10.0, peak_bytes=2 * GiB, pid=1))
+        assert gov.calibrated and gov.plan.worker_bytes == int(2 * GiB * G.PEAK_MARGIN)
+        assert gov.allowed(2) == 16
+        # three units just started: free RAM has not yet seen them grow → hold
+        wb = gov.plan.worker_bytes
+        floor = G.min_free_ram(512 * GiB)
+        for _ in range(3):
+            gov.started()
+        state["avail"] = floor + int(3.5 * wb)
+        assert gov.allowed(3) == 3 and "holding" in gov.note(), gov.note()
+        clock[0] = 60.0                                         # they have grown in now
+        assert gov.allowed(3) == 16, "admission must resume once the young units settle"
+        state["avail"] = floor + wb // 2                        # genuinely short
+        assert gov.allowed(4) == 4                              # hold, never evict
+        assert gov.allowed(0) >= 1                              # but never deadlock
+        state["avail"] = 480 * GiB
+        # a saturated CPU that is not ours: give one lane back, restore with hysteresis
+        state["busy"] = 0.99
+        G._CPU_CACHE = (0.0, None)
+        assert gov.allowed(2) == 15 and gov.cpu_drop == 1
+        state["busy"] = 0.5
+        assert gov.allowed(2) == 16 and gov.cpu_drop == 0
+        est = G.estimate_seconds(30.0, 96, gov.plan, measured_threads=36)
+        assert est > 30.0 * (96 // 16), est                     # fewer threads per lane → slower
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    # ── 3. a real adaptive_fold over the spawn pool ──────────────────────────────
+    got = []
+    gov = G.Governor(12, 64 << 20, min_inner=1)
+    # warm two workers of the width the fold will ask for (two concurrent sleeps force two
+    # live processes), so "ran in ≥ 2 workers" tests the fold, not spawn timing
+    import time as _time
+    _warm = P.process_pool(gov.pool_width()) if (P.enabled() and P.mode() != "thread") else None
+    if _warm is not None:
+        for _f in [_warm.submit(_time.sleep, 1.0) for _ in range(2)]:
+            _f.result()
+    P.adaptive_fold(_pw_gov_unit, list(range(12)),
+                    lambda i, item, res: got.append((i, item, res[0], res[1])),
+                    governor=gov, numba=False, poll_s=0.05)
+    assert [(i, it, v) for i, it, v, _ in got] == [(i, i, i * 3) for i in range(12)], got
+    pids = {pid for *_x, pid in got}
+    pooled = P.enabled() and P.mode() != "thread"
+    if pooled:
+        assert _os.getpid() not in pids, "adaptive_fold ran in the parent despite a pool"
+        assert len(pids) >= 2, f"one worker process only: {pids}"
+    assert len(gov.seconds) == 12 and gov.peak_bytes > 0, (gov.seconds, gov.peak_bytes)
+    # a compute error: the units before it are folded IN ORDER, then UnitError with the
+    # worker's traceback
+    got.clear()
+    try:
+        P.adaptive_fold(_pw_gov_unit, list(range(16)),
+                        lambda i, item, res: got.append(i),
+                        governor=G.Governor(16, 64 << 20), numba=False, poll_s=0.05)
+        raise AssertionError("a failing unit did not propagate")
+    except P.UnitError as exc:
+        assert isinstance(exc.original, ValueError) and "unit 12" in exc.worker_traceback
+    assert got == list(range(len(got))) and len(got) <= 12, got
+    # every worker runs below normal priority, so the GUI and input always win the CPU
+    # (a 32-bit pseudo-handle once made SetPriorityClass fail silently — workers stayed Normal)
+    import sys as _sys
+    if pooled and _sys.platform == "win32":
+        prios = []
+        P.adaptive_fold(_pw_priority, list(range(4)), lambda i, it, r: prios.append(r),
+                        governor=G.Governor(4, 64 << 20), numba=False, poll_s=0.05)
+        assert set(prios) == {0x4000}, [hex(v) for v in prios]
+    # an unpicklable compute falls back to this thread and still folds every unit, in order
+    mult = 5
+    got.clear()
+    fb_gov = G.Governor(6, 64 << 20)
+    P.adaptive_fold(lambda i: i * mult, list(range(6)), lambda i, it, r: got.append(r),
+                    governor=fb_gov, numba=False, poll_s=0.05)
+    assert got == [i * 5 for i in range(6)], got
+    if pooled:   # ...and SAYS so: a silent fallback reads as "the lanes are slow"
+        assert fb_gov.fallback and fb_gov.note() == fb_gov.fallback, fb_gov.note()
+        assert "finished in this process" in fb_gov.fallback, fb_gov.fallback
+    _ok(f"parallel governor (2026-10-09): plans keep lanes×threads ≤ physical−reserve and "
+        f"lanes×worker RAM above the floor (fake 40-core/512 GiB box: 16×2, RAM-bound 2×18, "
+        f"starved 1); warm-up 2 → calibrated 16; holds on young-unit growth and low RAM, "
+        f"never deadlocks; −1 lane under a foreign CPU load and back; env overrides; real "
+        f"adaptive_fold ordered over {len(pids)} worker process(es), UnitError with the worker "
+        f"traceback, unpicklable-compute fallback")
 
 
 # ── checkpoint + Dock node (V2.18) ───────────────────────────────────────────
@@ -22748,8 +23882,9 @@ def test_chain_files() -> None:
     from dataclasses import replace
     from nodegraph import file_sequence as FS
     from nodegraph.domains import Domain
-    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, chain_grow,
-                                    chain_members, source_file_runs, stamp_source_file)
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, SOURCE_PATH_KEY,
+                                    chain_grow, chain_members, source_file_runs,
+                                    stamp_source_file)
     from nodegraph.nodes import COMPUTES
     from nodegraph.provider import ArrayProvider, AxisRespreadProvider, MultiSourceProvider
 
@@ -22895,6 +24030,17 @@ def test_chain_files() -> None:
     # the files already agreed. `source_file` never agrees -- it drops out by itself.
     assert out.metadata.get(SOURCE_FILE_KEY) is None, out.metadata
     assert out.metadata.get("stage_xy_um") == [[7.0, 8.0]], out.metadata
+    # `source_path` is the one per-position key a chain keeps when the files disagree. It
+    # says where results go, and a series' results sit beside its FIRST file in chain
+    # order. Dropping it (until 2026-10-09) left the analysis store nowhere to save, so a
+    # chained series silently re-ran its whole PIV/DIC/DVC on every launch.
+    sp = [one([10], "w_t010.nd2", **{SOURCE_PATH_KEY: ["C:/d/w_t010.nd2"]}),
+          one([2], "w_t002.nd2", **{SOURCE_PATH_KEY: ["C:/d/w_t002.nd2"]}),
+          one([1], "w_t001.nd2", **{SOURCE_PATH_KEY: ["C:/d/w_t001.nd2"]})]
+    _esp, out_sp = run(sp, "T")
+    assert out_sp.metadata.get(SOURCE_PATH_KEY) == ["C:/d/w_t001.nd2"], out_sp.metadata
+    assert _esp.env("C").metadata.get(SOURCE_PATH_KEY) == ["C:/d/w_t001.nd2"]
+    assert out_sp.metadata.get(SOURCE_FILE_KEY) is None
     _p2, ds2 = bundle([[1], [2]], ["a_t1.nd2", "a_t2.nd2"])
     ds2 = ds2.with_metadata(stage_xy_um=[[0.0, 0.0], [99.0, 99.0]])
     _e2, out2 = run([ds2], "T")
@@ -31234,6 +32380,9 @@ def test_solo_scope_plan() -> None:
                                  for k, d in cut.items()})
         out = eng.pull(pull)
         assert eng.env(pull).axes == out.axes, (eng.env(pull).axes, out.axes)
+        for k in ("scope_m", "scope_t", "scope_of"):     # the envelope says what came out
+            assert eng.env(pull).metadata.get(k) == out.metadata.get(k), \
+                (k, eng.env(pull).metadata.get(k), out.metadata.get(k))
         return out
 
     def frames(ds):
@@ -31271,12 +32420,1093 @@ def test_solo_scope_plan() -> None:
     assert doc.source_scope_totals("V") == (1, 5, 1), doc.source_scope_totals("V")
     assert doc.source_scope_totals("B") == (1, 5, 1)
     assert doc.source_scope_totals("L0") == (1, 3, 1), "a source spans its own frames"
+
+    # 5. the scope stamps follow the cut: an analysis below the builder maps its fixed
+    #    reference frame (a frame of the REBUILT series) to the right payload frame
+    from nodegraph.catalog._shared.analysis_units import scoped_frame
+    from nodegraph.metadata import scope_stamp_subset
+    pk = build(cards, ((0,), (1, 3), None, None))
+    assert tuple(pk.metadata["scope_t"]) == (1, 3), pk.metadata.get("scope_t")
+    assert tuple(pk.metadata["scope_of"])[1] == 5, "the full series the estimate scales to"
+    assert scoped_frame(pk.metadata, 3, pk.axes.t) == 1, "rebuilt frame 3 is payload frame 1"
+    _ax1 = AxisSizes(m=1, t=3, z=1, c=1, y=1, x=1)
+    assert scope_stamp_subset({"scope_t": (2, 5, 7)}, _ax1, {"t": (0, 2), "m": None}) == \
+        {"scope_t": (2, 7)}, "a current stamp is remapped to the survivors' source frames"
+    assert scope_stamp_subset({}, _ax1, {"t": (0,)}) == {}, "unscoped: nothing stamped"
     _ok("troubleshooting below a Timeseries Builder: the picks are the viewed node's own "
         "frames — cut after the last node that re-addresses the axis (a builder: T and M, "
         "even at its default axis), its sources kept whole; a node reaching the target both "
         "ways leaves the axis unscoped; a bundle or two cards scoped to rebuilt frames "
         "{1, 3} deliver exactly those frames of the full build; the strips span the rebuilt "
-        "series")
+        "series; the scope stamps follow the cut, so a reference frame maps correctly")
+
+
+def test_dvc_stages() -> None:
+    """The staged DVC (2026-10-08): pyALDVC's sections as five nodes — ``dvc.grid`` →
+    ``dvc.initial_guess`` → ``dvc.local_match`` → ``dvc.global_step`` → ``dvc.strain`` — and
+    the ``bundle:dvc`` node bundle that places them.
+
+    1. Through the Engine on the ``test_catalog_dvc`` fixture (28×44×44, a known 3-D shift)
+       the chain recovers the shift in µm; every stage adds its columns on the SAME rows of
+       the grid layer (ids untouched, row count constant); the grid carries the ``dvc_*``
+       provenance and every later stage inherits it (no re-asked grid/reference control);
+       the final field equals ``analysis.dvc_field``'s to 1e-6 on displacement, strain and
+       qfactor — the same solver, section for section.
+    2. The memo: each stage's recipe hash fences on the calibration it reads; a strain
+       measure change re-keys only the strain stage.
+    3. A stage fed a table without the grid provenance refuses by name; a stage before its
+       predecessor (local match without a seed) refuses by name.
+    4. The bundle: registered, structurally sound against the live registry; placed on a
+       Qt-free ``GraphDocument`` it yields five nodes in bundle order, four wires, one frame
+       holding exactly those nodes; dropped onto a wire it splices the whole chain in
+       (the original wire gone, both new wires present); the document round-trips through
+       ``to_dict``/``load_dict`` as plain nodes (no bundle record).
+    Needs scipy/skimage + al-dvc for parts 1-3 (dep-gated like the single node)."""
+    import json as _json
+    from nodegraph.bundles import BUNDLES, validate_bundle
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+
+    # ── 4. the bundle, Qt-free ────────────────────────────────────────────────────
+    b = BUNDLES.get("bundle:dvc")
+    assert b is not None, "bundle:dvc is not registered"
+    assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
+    assert b.op_keys == ("dvc.grid", "dvc.initial_guess", "dvc.local_match",
+                         "dvc.global_step", "dvc.strain"), b.op_keys
+    doc = GraphDocument()
+    doc.add_node("io.load", node_id="src", x=0, y=0)
+    doc.add_node("transform.rasterize_field", node_id="ras", x=900, y=0)
+    doc.connect("src", "image", "ras", "data")
+    ids, fid = doc.place_bundle("bundle:dvc", x=100, y=0, splice=("src", "image", "ras", "data"))
+    assert len(ids) == 5 and [doc.nodes[i].op_key for i in ids] == list(b.op_keys), ids
+    assert fid in doc.frames and set(doc.frames[fid].members) == set(ids), doc.frames
+    edges = {(e.src, e.src_socket, e.dst, e.dst_socket) for e in doc.to_graph(for_run=False).edges}
+    assert ("src", "image", "ras", "data") not in edges, "the spliced wire survived"
+    assert ("src", "image", ids[0], "data") in edges, edges
+    assert (ids[-1], "out", "ras", "data") in edges, edges
+    for a, c in zip(ids, ids[1:]):
+        assert (a, "out", c, "data") in edges, (a, c, edges)
+    d = doc.to_dict()
+    assert "bundle:" not in _json.dumps(d), "a bundle record leaked into the saved file"
+    doc2 = GraphDocument()
+    doc2.load_dict(d)
+    assert set(doc2.nodes) == set(doc.nodes) and len(doc2.frames) == 1, (doc2.nodes, doc2.frames)
+
+    if not _HAVE_SKIMAGE:
+        _ok("dvc stages: bundle placed/spliced/round-tripped; solver parts SKIPPED (scipy absent)")
+        return
+    from nodegraph.kernels.aldvc_field import al_dvc_available
+    if not al_dvc_available():
+        _ok("dvc stages: bundle placed/spliced/round-tripped; solver parts SKIPPED (al-dvc absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.nodes import COMPUTES
+
+    define_node("io.dvcstageseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(3)
+    vol = gaussian_filter(rng.random((28, 44, 44)).astype(float), 1.2)
+    SHIFT = (1.0, 1.0, 1.5)
+    img = np.zeros((1, 2, 28, 1, 44, 44))
+    img[0, 0, :, 0] = vol
+    img[0, 1, :, 0] = ndshift(vol, SHIFT, order=3, mode="nearest")
+    px, zs = 0.2, 0.5
+    meta = {"pixel_size_um": px, "z_step_um": zs}
+    ax = AxisSizes(m=1, t=2, z=28, c=1, y=44, x=44)
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    P = {"subset_size": 12, "subset_size_z": 8, "subset_spacing": 10, "subset_spacing_z": 4}
+
+    def chain(strain_modes=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.dvcstageseed"))
+        g.add(NodeInstance("G", "dvc.grid", params=dict(P)))
+        g.add(NodeInstance("I", "dvc.initial_guess", params={"search_radius": 3},
+                           modes={"init_guess": "ncc"}))
+        g.add(NodeInstance("L", "dvc.local_match", params={"n_threads": 2}))
+        g.add(NodeInstance("A", "dvc.global_step", params={"admm_iterations": 2}))
+        g.add(NodeInstance("E", "dvc.strain", modes=strain_modes or {}))
+        for a, c in (("S", "G"), ("G", "I"), ("I", "L"), ("L", "A"), ("A", "E")):
+            g.connect(a, c)
+        return Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def tab(out):
+        return {name: np.asarray(a.values) for (dom, lyr, name), a in out.attributes.items()
+                if dom is D.POINT and lyr == "dvc"}
+
+    e = chain()
+    g_ = tab(e.pull("G"))
+    assert set(g_) == {"id", "m", "t", "c", "z", "y", "x"}, sorted(g_)
+    n_rows, ids0 = len(g_["id"]), g_["id"].copy()
+    assert n_rows == 2 * 27, n_rows                      # 3×3×3 nodes × 2 frames
+    md_g = e.pull("G").metadata
+    for k in ("dvc_subset_size", "dvc_subset_spacing", "dvc_channel", "dvc_reference_mode",
+              "dvc_reference_frame", "dvc_grid_shape"):
+        assert k in md_g, k
+    assert tuple(md_g["dvc_grid_shape"]) == (3, 3, 3), md_g["dvc_grid_shape"]
+    i_ = tab(e.pull("I"))
+    sel = i_["t"] == 1
+    assert {"disp_z", "disp_y", "disp_x", "seed_cc", "seed_ok"} <= set(i_), sorted(i_)
+    assert len(i_["id"]) == n_rows and np.array_equal(i_["id"], ids0), "the seed re-emitted rows"
+    l_ = tab(e.pull("L"))
+    assert {"grad_zz", "grad_xx", "qfactor", "status", "n_iter", "bad", "valid",
+            "disp_std_x"} <= set(l_), sorted(l_)
+    assert np.all(l_["status"][sel] == 0), np.bincount(l_["status"][sel])
+    a_ = tab(e.pull("A"))
+    assert "outlier" in a_ and len(a_["id"]) == n_rows
+    s_ = tab(e.pull("E"))
+    assert {f"strain_{i}{j}" for i in "zyx" for j in "zyx"} | {"strain_valid"} <= set(s_), sorted(s_)
+    want = np.array(SHIFT) * np.array([zs, px, px])
+    got = np.array([np.median(s_[f"disp_{a}"][sel]) for a in "zyx"])
+    assert np.allclose(got, want, atol=0.02), (got, want)
+    md = e.pull("E").metadata
+    assert md["dvc_stage"] == "strain" and md["dvc_strain_type"] == "infinitesimal", md
+    # the single node, same solver, same answer
+    g2 = Graph()
+    g2.add(NodeInstance("S", "io.dvcstageseed"))
+    g2.add(NodeInstance("M", "analysis.dvc_field",
+                        params=dict(P, admm_iterations=2, search_radius=3, n_threads=2),
+                        modes={"init_guess": "ncc"}))
+    g2.connect("S", "M")
+    m_ = tab(Engine(g2, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("M"))
+    sel2 = m_["t"] == 1
+    for col in ("disp_z", "disp_y", "disp_x", "strain_xx", "strain_zy", "qfactor"):
+        dmax = float(np.nanmax(np.abs(np.asarray(s_[col][sel], float)
+                                      - np.asarray(m_[col][sel2], float))))
+        assert dmax < 1e-6, f"{col}: staged differs from the single node by {dmax:.2e}"
+
+    # ── 2. memo ───────────────────────────────────────────────────────────────────
+    for nid in ("G", "I", "L", "A"):
+        reads = {k for k, _ in e.entry(nid).reads}
+        assert {"pixel_size_um", "z_step_um"} <= reads, (nid, reads)
+    # two strain measures on ONE global step: distinct strain keys, and the second pull
+    # computes exactly one node — the correlation is not re-run for a strain change
+    g5 = Graph()
+    g5.add(NodeInstance("S", "io.dvcstageseed"))
+    g5.add(NodeInstance("G", "dvc.grid", params=dict(P)))
+    g5.add(NodeInstance("I", "dvc.initial_guess", params={"search_radius": 3},
+                        modes={"init_guess": "ncc"}))
+    g5.add(NodeInstance("L", "dvc.local_match", params={"n_threads": 2}))
+    g5.add(NodeInstance("A", "dvc.global_step", params={"admm_iterations": 2}))
+    g5.add(NodeInstance("E1", "dvc.strain"))
+    g5.add(NodeInstance("E2", "dvc.strain", modes={"strain_type": "green_lagrange"}))
+    for a, c in (("S", "G"), ("G", "I"), ("I", "L"), ("L", "A"), ("A", "E1"), ("A", "E2")):
+        g5.connect(a, c)
+    e5 = Engine(g5, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+    e5.pull("E1")
+    n1 = e5.compute_count
+    e5.pull("E2")
+    assert e5.compute_count - n1 == 1, "a strain-measure change re-ran more than the strain stage"
+    assert e5.entry("E1").recipe_hash != e5.entry("E2").recipe_hash
+
+    # ── 3. refusals ───────────────────────────────────────────────────────────────
+    g3 = Graph()
+    g3.add(NodeInstance("S", "io.dvcstageseed"))
+    g3.add(NodeInstance("L", "dvc.local_match"))
+    g3.connect("S", "L")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("L")
+        raise AssertionError("a local match with no grid upstream must be refused")
+    except ValueError as exc:
+        assert "DVC Grid" in str(exc), exc
+    g4 = Graph()
+    g4.add(NodeInstance("S", "io.dvcstageseed"))
+    g4.add(NodeInstance("G", "dvc.grid", params=dict(P)))
+    g4.add(NodeInstance("L", "dvc.local_match"))
+    g4.connect("S", "G")
+    g4.connect("G", "L")
+    try:
+        Engine(g4, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("L")
+        raise AssertionError("a local match with no seed must be refused")
+    except ValueError as exc:
+        assert "Initial Guess" in str(exc), exc
+
+    _ok(f"dvc stages: grid → seed → local → global → strain through the Engine recovers "
+        f"({', '.join(f'{v:.3f}' for v in got)}) µm for the planted shift, every stage on the "
+        f"same {n_rows} rows, provenance inherited, within 1e-6 of the single node; strain "
+        f"measure re-keys only its stage; missing grid / seed refused by name; bundle:dvc "
+        f"places 5 wired nodes in a frame, splices into a wire and round-trips as nodes")
+
+
+def test_piv_nan_predictor() -> None:
+    """A NaN vector in a PIV pass must not poison the next pass's predictor (2026-10-09).
+
+    The bug: a window with no correlation peak (plain camera background) came back NaN but
+    unflagged, so replacement never filled it. The predictor's global spline then turned the
+    whole field NaN, and SciPy's ``map_coordinates`` segfaulted on all-NaN deformation
+    coordinates. On chip-flow ensemble PIV this crashed a worker, then the serial fallback
+    crashed the GUI process.
+
+    The test injects one NaN vector into pass 0 of both drivers, the ensemble and the
+    per-pair path, on clean frames with a planted shift. Both must finish and recover the
+    shift everywhere else.
+
+    Without the fix this 256² case does not segfault, but the ensemble returns no finite
+    vector at all. The segfault itself needs a full-size frame: it was seen on 1024²."""
+    import importlib.util
+    if importlib.util.find_spec("openpiv") is None:
+        _ok("PIV NaN predictor: SKIPPED (openpiv not installed)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from openpiv import pyprocess, windef
+    from nodegraph.kernels.piv_field import _predictor, run_piv_ensemble, run_piv_series
+    a = _predictor(np.ma.masked_array([[np.nan, 1.0], [2.0, np.inf]], mask=[[0, 0], [1, 0]]))
+    assert a.tolist() == [[0.0, 1.0], [0.0, 0.0]], a
+    rng = np.random.default_rng(11)
+    patt = gaussian_filter(rng.random((256, 256)), 1.5) * 1000.0
+    fr = [ndshift(patt, (1.0 * t, 2.0 * t), order=3, mode="nearest") for t in range(3)]
+    P = {"windowsizes": (32, 16), "overlap": 0.5}
+    real_c2d, real_fp = pyprocess.correlation_to_displacement, windef.first_pass
+    hit = {"n": 0}
+
+    def c2d(*a, **k):                    # the ensemble's pass 0 peak finder
+        u, v = real_c2d(*a, **k)
+        if hit["n"] == 0:
+            u, v = np.array(u, float), np.array(v, float)
+            u.flat[0] = v.flat[0] = np.nan
+        hit["n"] += 1
+        return u, v
+
+    def fp(*a, **k):                     # the per-pair driver's pass 0
+        x, y, u, v, s2n = real_fp(*a, **k)
+        u, v = np.array(u, float), np.array(v, float)
+        u.flat[0] = v.flat[0] = np.nan
+        return x, y, u, v, s2n
+
+    pyprocess.correlation_to_displacement, windef.first_pass = c2d, fp
+    try:
+        ens = run_piv_ensemble(fr, P, (0.5, 0.5), pairing="previous")
+        ser = run_piv_series(fr, P, (0.5, 0.5), pairing="previous")[0]
+    finally:
+        pyprocess.correlation_to_displacement, windef.first_pass = real_c2d, real_fp
+    assert hit["n"] >= 2, hit                      # pass 0 and the deform pass both ran
+    for name, r in (("ensemble", ens), ("per-pair", ser)):
+        d = np.asarray(r.displacement_field, float).reshape(-1, 2)
+        ok = np.isfinite(d).all(axis=1)
+        assert ok.mean() > 0.9, (name, ok.mean())
+        med = np.median(d[ok], axis=0)                 # [dy, dx] in px
+        assert np.allclose(med, [1.0, 2.0], atol=0.1), (name, med)
+    _ok("PIV NaN predictor (2026-10-09): a NaN vector injected into pass 0 of the ensemble "
+        "and per-pair drivers no longer poisons the deform pass's spline (an all-NaN "
+        "predictor; map_coordinates segfaulted on it at 1024²); both recover the planted "
+        "(1, 2) px shift")
+
+
+def test_piv_stages() -> None:
+    """The staged PIV (2026-10-08): OpenPIV's ladder as pass-by-pass nodes — ``piv.first_pass``
+    → ``piv.validate`` → ``piv.deform_pass`` → ``piv.validate`` (+ ``piv.smooth``) — and the
+    ``bundle:piv`` node bundle.
+
+    1. Through the Engine on the ``speckle_pair`` phantom a 32 → 16 px staged chain writes
+       the first pass's rows (7×7), Validate adds ``flags``/``replaced`` on the SAME rows, a
+       Deform Pass REPLACES the table with the 15×15 grid (ids renumbered, no stale column
+       survives), the final field equals ``analysis.piv`` (window 16, 2 passes) on every
+       common grid point to 1e-9 µm.
+    2. Provenance: the first pass stamps the ``piv_*`` keys, the deform pass restamps
+       window / grid / pass; a stage fed a table without them refuses by name.
+    3. The bundle is sound against the registry, places six wired nodes in a frame on a
+       Qt-free ``GraphDocument``, and the palette's member rows are those six ops.
+    Needs scipy/skimage + openpiv for part 1-2 (dep-gated like the single node)."""
+    from nodegraph.bundles import BUNDLES, validate_bundle
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    b = BUNDLES.get("bundle:piv")
+    assert b is not None, "bundle:piv is not registered"
+    assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
+    assert b.op_keys == ("piv.first_pass", "piv.validate", "piv.deform_pass", "piv.validate",
+                         "piv.deform_pass", "piv.validate"), b.op_keys
+    doc = GraphDocument()
+    ids, fid = doc.place_bundle("bundle:piv", x=0, y=0)
+    assert len(ids) == 6 and set(doc.frames[fid].members) == set(ids)
+    edges = {(e.src, e.dst) for e in doc.to_graph(for_run=False).edges}
+    for a, c in zip(ids, ids[1:]):
+        assert (a, c) in edges, (a, c)
+    assert doc.nodes[ids[0]].params.get("window_size") == 64, doc.nodes[ids[0]].params
+
+    if not _HAVE_SKIMAGE:
+        _ok("piv stages: bundle placed; solver parts SKIPPED (scipy absent)")
+        return
+    from nodegraph.kernels.piv_field import openpiv_available
+    if not openpiv_available():
+        _ok("piv stages: bundle placed; solver parts SKIPPED (openpiv absent)")
+        return
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.phantom import phantom
+
+    define_node("io.pivstageseed", "S", outputs=[OutDataset()])
+    ph = phantom("speckle_pair")
+    ds, env = ph.dataset, ph.envelope
+    g = Graph()
+    g.add(NodeInstance("S", "io.pivstageseed"))
+    g.add(NodeInstance("P1", "piv.first_pass", params={"window_size": 32}))
+    g.add(NodeInstance("V1", "piv.validate"))
+    g.add(NodeInstance("P2", "piv.deform_pass"))
+    g.add(NodeInstance("V2", "piv.validate"))
+    for a, c in (("S", "P1"), ("P1", "V1"), ("V1", "P2"), ("P2", "V2")):
+        g.connect(a, c)
+    e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def tab(out, layer="piv"):
+        return {name: np.asarray(a.values) for (dom, lyr, name), a in out.attributes.items()
+                if dom is D.POINT and lyr == layer}
+
+    p1 = tab(e.pull("P1"))
+    md1 = e.pull("P1").metadata
+    assert tuple(md1["piv_grid_shape"]) == (7, 7) and md1["piv_pass"] == 1, md1
+    assert len(p1["id"]) == 49 and {"disp_y", "disp_x", "qfactor", "excluded"} <= set(p1)
+    v1 = tab(e.pull("V1"))
+    assert len(v1["id"]) == 49 and np.array_equal(v1["id"], p1["id"])
+    assert {"flags", "replaced"} <= set(v1) and int(v1["flags"].sum()) >= 0
+    p2 = tab(e.pull("P2"))
+    md2 = e.pull("P2").metadata
+    assert tuple(md2["piv_grid_shape"]) == (15, 15) and md2["piv_window"] == 16 and md2["piv_pass"] == 2, md2
+    assert len(p2["id"]) == 225 and "flags" not in p2, sorted(p2)     # the coarse pass's columns are gone
+    v2 = tab(e.pull("V2"))
+    assert len(v2["id"]) == 225
+    # the single node on the same ladder, compared on the common grid points
+    g2 = Graph()
+    g2.add(NodeInstance("S", "io.pivstageseed"))
+    g2.add(NodeInstance("M", "analysis.piv", params={"window_size": 16, "passes": 2}))
+    g2.connect("S", "M")
+    m = tab(Engine(g2, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("M"))
+    key = {(round(float(y), 3), round(float(x), 3)): i for i, (y, x) in enumerate(zip(v2["y"], v2["x"]))}
+    n_common = 0
+    dmax = 0.0
+    for i, (y, x) in enumerate(zip(m["y"], m["x"])):
+        j = key.get((round(float(y), 3), round(float(x), 3)))
+        if j is None:
+            continue
+        n_common += 1
+        for col in ("disp_y", "disp_x", "qfactor"):
+            a_v, b_v = float(v2[col][j]), float(m[col][i])
+            if np.isfinite(a_v) and np.isfinite(b_v):
+                dmax = max(dmax, abs(a_v - b_v))
+    assert n_common == len(m["id"]) and dmax < 1e-9, (n_common, len(m["id"]), dmax)
+    # a stage without its predecessor refuses by name
+    g3 = Graph()
+    g3.add(NodeInstance("S", "io.pivstageseed"))
+    g3.add(NodeInstance("V", "piv.validate"))
+    g3.connect("S", "V")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("V")
+        raise AssertionError("a validate with no pass upstream must be refused")
+    except ValueError as exc:
+        assert "First Pass" in str(exc), exc
+    _ok(f"piv stages: first pass 7×7 → validate ({int(v1['flags'].sum())} flagged) → deform pass "
+        f"15×15 → validate through the Engine equals analysis.piv on all {n_common} grid points "
+        f"(max |Δ| {dmax:.1e} µm); provenance restamped per pass; bundle:piv places 6 wired "
+        f"nodes in a frame; a stage without its pass refuses by name")
+
+
+def test_dic_stages() -> None:
+    """The staged DIC (2026-10-08): pyALDIC's sections as five nodes — ``dic.grid`` →
+    ``dic.initial_guess`` → ``dic.local_match`` → ``dic.global_step`` → ``dic.strain`` — and
+    the ``bundle:dic`` node bundle.
+
+    1. Through the Engine on a 160² synthetic speckle pair with a known (1.5, 2.0) px shift
+       the chain writes the lattice rows (289 nodes × 2 frames), every later stage adds its
+       columns on the SAME rows, the shift is recovered in µm, and the final field equals
+       ``analysis.dic_correlate`` (same subset / step / search / ADMM) on every node to 1e-9
+       on displacement and the four gradient columns.
+    2. The grid stamps the ``dic_*`` provenance every later stage reads; a stage fed a table
+       without it refuses by name.
+    3. The bundle is sound against the registry and places six wired nodes in a frame
+       (Refine Mesh among them since 2026-10-09; a pass-through without an ROI).
+    Needs scipy/skimage + al-dic for parts 1-2 (dep-gated like the single node)."""
+    from nodegraph.bundles import BUNDLES, validate_bundle
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    b = BUNDLES.get("bundle:dic")
+    assert b is not None, "bundle:dic is not registered"
+    assert validate_bundle(b, NODES) == [], validate_bundle(b, NODES)
+    assert b.op_keys == ("dic.grid", "dic.initial_guess", "dic.refine_mesh", "dic.local_match",
+                         "dic.global_step", "dic.strain"), b.op_keys
+    doc = GraphDocument()
+    ids, fid = doc.place_bundle("bundle:dic", x=0, y=0)
+    assert len(ids) == 6 and set(doc.frames[fid].members) == set(ids)
+
+    if not _HAVE_SKIMAGE:
+        _ok("dic stages: bundle placed; solver parts SKIPPED (scipy absent)")
+        return
+    from nodegraph.kernels.dic_correlate import al_dic_available
+    if not al_dic_available():
+        _ok("dic stages: bundle placed; solver parts SKIPPED (al-dic absent)")
+        return
+    from scipy.ndimage import gaussian_filter, shift as ndshift
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+
+    define_node("io.dicstageseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(5)
+    ref = gaussian_filter(rng.random((160, 160)), 1.0)
+    SHIFT = (1.5, 2.0)
+    img = np.zeros((1, 2, 1, 1, 160, 160))
+    img[0, 0, 0, 0] = ref
+    img[0, 1, 0, 0] = ndshift(ref, SHIFT, order=3, mode="nearest")
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=160, x=160)
+    meta = {"pixel_size_um": 0.5}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    P = {"winsize": 24, "winstepsize": 8, "winsize_min": 8}
+    g = Graph()
+    g.add(NodeInstance("S", "io.dicstageseed"))
+    g.add(NodeInstance("G", "dic.grid", params=dict(P)))
+    g.add(NodeInstance("I", "dic.initial_guess", params={"search_range": 8}))
+    g.add(NodeInstance("L", "dic.local_match"))
+    g.add(NodeInstance("A", "dic.global_step", params={"admm_max_iter": 2}))
+    g.add(NodeInstance("E", "dic.strain"))
+    for a, c in (("S", "G"), ("G", "I"), ("I", "L"), ("L", "A"), ("A", "E")):
+        g.connect(a, c)
+    e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+
+    def tab(out, layer="dic"):
+        return {name: np.asarray(a.values) for (dom, lyr, name), a in out.attributes.items()
+                if dom is D.POINT and lyr == layer}
+
+    gr = tab(e.pull("G"))
+    n_rows, ids0 = len(gr["id"]), gr["id"].copy()
+    assert n_rows == 2 * 289, n_rows
+    md = e.pull("G").metadata
+    for k in ("dic_winsize", "dic_winstepsize", "dic_channel", "dic_reference_mode", "dic_n_nodes"):
+        assert k in md, k
+    i_ = tab(e.pull("I"))
+    assert np.array_equal(i_["id"], ids0) and {"disp_y", "disp_x", "seed_cc"} <= set(i_)
+    l_ = tab(e.pull("L"))
+    assert {"grad_yy", "grad_xx", "n_iter", "hole"} <= set(l_)
+    a_ = tab(e.pull("A"))
+    s_ = tab(e.pull("E"))
+    assert {"strain_yy", "strain_yx", "strain_xy", "strain_xx", "strain_valid"} <= set(s_)
+    sel = s_["t"] == 1
+    got = np.array([np.nanmedian(s_["disp_y"][sel]), np.nanmedian(s_["disp_x"][sel])])
+    want = np.array(SHIFT) * 0.5
+    assert np.allclose(got, want, atol=0.01), (got, want)
+    g2 = Graph()
+    g2.add(NodeInstance("S", "io.dicstageseed"))
+    g2.add(NodeInstance("M", "analysis.dic_correlate",
+                        params=dict(P, admm_max_iter=2, search_range=8, compute_strain=True)))
+    g2.connect("S", "M")
+    m = tab(Engine(g2, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("M"))
+    sel2 = m["t"] == 1
+    key = {(round(float(y), 3), round(float(x), 3)): i
+           for i, (y, x) in enumerate(zip(s_["y"][sel], s_["x"][sel]))}
+    idx_s, idx_m = np.flatnonzero(sel), np.flatnonzero(sel2)
+    n_common, dmax = 0, 0.0
+    for i in idx_m:
+        j = key.get((round(float(m["y"][i]), 3), round(float(m["x"][i]), 3)))
+        if j is None:
+            continue
+        n_common += 1
+        for col in ("disp_y", "disp_x", "strain_yy", "strain_yx", "strain_xy", "strain_xx"):
+            a_v, b_v = float(s_[col][idx_s[j]]), float(m[col][i])
+            if np.isfinite(a_v) and np.isfinite(b_v):
+                dmax = max(dmax, abs(a_v - b_v))
+    assert n_common == int(sel2.sum()) == 289 and dmax < 1e-9, (n_common, dmax)
+    g3 = Graph()
+    g3.add(NodeInstance("S", "io.dicstageseed"))
+    g3.add(NodeInstance("L", "dic.local_match"))
+    g3.connect("S", "L")
+    try:
+        Engine(g3, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env}).pull("L")
+        raise AssertionError("a local match with no grid upstream must be refused")
+    except ValueError as exc:
+        assert "DIC Grid" in str(exc), exc
+    _ok(f"dic stages: grid → seed → local → global → strain through the Engine recovers "
+        f"({got[0]:.3f}, {got[1]:.3f}) µm for the planted shift on the same {n_rows} rows, within "
+        f"{dmax:.1e} of analysis.dic_correlate on all 289 nodes (displacement + gradient); "
+        f"missing grid refused by name; bundle:dic places 6 wired nodes in a frame")
+
+
+def test_field_mechanics() -> None:
+    """The Field cards (2026-10-09): ``kernels/field_mechanics`` against analytic fields on
+    both gradient paths in 2-D and 3-D, then Field Gradient → Strain → Rotation & Curl →
+    Volume Change → Stress through the Engine on a lattice with holes, the velocity branch,
+    tracked (current-position) fields, and the refusals."""
+    import nodegraph.kernels.field_mechanics as FM
+    from nodegraph.units import recorded_unit
+    from nodegraph.bundles import BUNDLES
+    from nodegraph.structure import StructureTable
+    from nodegraph.nodes import COMPUTES
+
+    # ── 1. the kernel on analytic fields ─────────────────────────────────────────────
+    yy, xx = np.mgrid[0:200:16, 0:240:16]
+    co = np.column_stack([yy.ravel(), xx.ravel()]).astype(float)
+    sc = np.array([0.5, 0.5])
+    X = co * sc
+    A = np.array([[0.02, -0.01], [0.03, 0.015]])
+    u = X @ A.T + np.array([1.0, -2.0])
+    for meth, tol in (("lattice", 1e-10), ("local_fit", 1e-8)):
+        r = FM.gradient(co, sc, u, method=meth)
+        assert r.method == meth and r.valid.all(), (meth, r.method, r.valid.mean())
+        assert np.nanmax(np.abs(r.G - A)) < tol, (meth, np.nanmax(np.abs(r.G - A)))
+    keep = np.ones(len(co), bool)
+    keep[[50, 51, 80]] = False                      # holes: one-sided beside them, no spread
+    r = FM.gradient(co[keep], sc, u[keep], method="auto")
+    assert r.method == "lattice" and np.nanmax(np.abs(r.G - A)) < 1e-10
+    # only node (4, 5) — BOTH y-neighbours (3, 5) and (5, 5) are holes — has no y-derivative
+    lost = co[keep][~r.valid]
+    assert lost.tolist() == [[64.0, 80.0]], lost
+    assert FM.lattice_of(co[::7] + 0.37 * np.arange(len(co[::7]))[:, None]) is None
+    # a 10° rigid turn, counter-clockwise ON SCREEN (y runs down the rows)
+    th = np.radians(10.0)
+    yup = -X[:, 0]
+    xr = np.cos(th) * X[:, 1] - np.sin(th) * yup
+    yupr = np.sin(th) * X[:, 1] + np.cos(th) * yup
+    G = FM.gradient(co, sc, np.column_stack([-yupr - X[:, 0], xr - X[:, 1]])).G
+    assert abs(np.nanmean(FM.rotation_deg(G)) - 10.0) < 1e-9, np.nanmean(FM.rotation_deg(G))
+    for m in ("green_lagrange", "euler_almansi", "hencky"):
+        assert np.nanmax(np.abs(FM.strain(G, m))) < 1e-12, m       # rotation-free
+    assert np.nanmax(np.abs(FM.strain(G, "infinitesimal"))) > 0.01  # why the measures exist
+    G = FM.gradient(co, sc, X * 0.1).G
+    assert abs(np.nanmean(FM.volume_change(G)["jacobian"]) - 1.21) < 1e-12
+    g = 0.05                                         # simple shear u_x = g·y: the top moves left
+    G = FM.gradient(co, sc, np.column_stack([np.zeros(len(X)), g * X[:, 0]])).G
+    assert abs(np.nanmean(FM.curl(G)["curl"]) - g) < 1e-12
+    assert abs(np.nanmean(FM.volume_change(G)["jacobian"]) - 1.0) < 1e-12
+    vals, ang = FM.principal(FM.strain(G))
+    assert np.allclose(vals[0], [g / 2, -g / 2]) and abs(ang[0] + 45.0) < 1e-9, (vals[0], ang[0])
+    e = FM.equivalent_strain(np.array([[[-0.005, 0.0], [0.0, 0.01]]]))
+    assert abs(e[0] - 0.01) < 1e-12, e              # uniaxial, incompressible: ε_eq = ε
+    # 3-D on an ANISOTROPIC stack: the auto radius must reach the planes above and below
+    zz, y3, x3 = np.mgrid[0:6, 0:5, 0:7]
+    c3 = np.column_stack([zz.ravel(), y3.ravel(), x3.ravel()]).astype(float)
+    s3 = np.array([2.0, 0.5, 0.5])
+    A3 = np.array([[0.01, 0.02, -0.01], [0.0, 0.03, 0.005], [0.01, -0.02, 0.02]])
+    for meth in ("lattice", "local_fit"):
+        r = FM.gradient(c3, s3, (c3 * s3) @ A3.T, method=meth)
+        assert r.valid.all() and np.nanmax(np.abs(r.G - A3)) < 1e-9, (meth, r.valid.mean())
+    G3 = FM.gradient(c3, s3, (c3 * s3) * 0.1).G
+    assert abs(np.nanmean(FM.volume_change(G3)["jacobian"]) - 1.331) < 1e-12
+    cu = FM.curl(np.array([[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.04, 0.0]]]))
+    assert abs(cu["curl_view"][0] - 0.04) < 1e-12 and abs(cu["curl_z"][0] + 0.04) < 1e-12
+    # stress: Hooke, then plane stress σ_zz = 0 for both hyperelastic laws, which agree with
+    # Hooke to O(ε²); the Newtonian fluid's shear stress
+    E, NU = 1000.0, 0.3
+    Gu = np.zeros((1, 2, 2))
+    Gu[0, 1, 1], Gu[0, 0, 0] = 1e-3, -NU * 1e-3
+    s, _w = FM.stress(Gu, "linear_elastic", youngs_modulus=E, poisson_ratio=NU, plane="stress")
+    assert abs(s[0, 2, 2] - 1.0) < 1e-12 and abs(s[0, 1, 1]) < 1e-12 and s[0, 0, 0] == 0.0
+    Gs = np.array([[[0.05, 0.02], [0.01, -0.03]]])
+    Gsmall = np.array([[[1e-4, 2e-5], [3e-5, -2e-5]]])
+    hooke = FM.stress(Gsmall, "linear_elastic", youngs_modulus=E, poisson_ratio=NU)[0]
+    for mdl in ("saint_venant_kirchhoff", "neo_hookean"):
+        s2, w2 = FM.stress(Gs, mdl, youngs_modulus=E, poisson_ratio=NU, plane="stress")
+        assert abs(s2[0, 0, 0]) < 1e-9 and w2[0] > 0, (mdl, s2[0, 0, 0])
+        rel = np.abs(FM.stress(Gsmall, mdl, youngs_modulus=E, poisson_ratio=NU)[0] - hooke)
+        assert rel.max() / np.abs(hooke).max() < 1e-3, (mdl, rel.max())
+    Gv = np.zeros((1, 2, 2))
+    Gv[0, 1, 0] = 2.0                                 # dv_x/dy: a shear flow
+    sv, _w = FM.stress(Gv, "newtonian_fluid", viscosity=0.5)
+    assert abs(sv[0, 2, 1] - 1.0) < 1e-12 and abs(np.trace(sv[0])) < 1e-12
+    for bad in ({"youngs_modulus": -1.0}, {"poisson_ratio": 0.5}):
+        try:
+            FM.stress(Gs, "linear_elastic", **bad)
+            raise AssertionError(f"{bad} was accepted")
+        except ValueError:
+            pass
+
+    # ── 2. the cards through the Engine: a PIV-shaped lattice with holes, two frames ──
+    define_node("io.fieldmechseed", "S", outputs=[OutDataset()])
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=128, x=128)
+    md = {"pixel_size_um": 0.5, "piv_reference_mode": "fixed_frame"}
+    gy, gx = np.mgrid[8:120:8, 8:120:8]
+    py, px_ = gy.ravel().astype(float), gx.ravel().astype(float)
+    cols: Dict[str, list] = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x", "disp_y",
+                                             "disp_x", "vy", "vx")}
+    n0 = py.size
+    for t in range(2):
+        uu = (np.column_stack([py, px_]) * 0.5) @ A.T * t
+        for k, v in (("id", np.arange(t * n0, (t + 1) * n0)), ("m", np.zeros(n0)),
+                     ("t", np.full(n0, t)), ("c", np.zeros(n0)), ("z", np.zeros(n0)),
+                     ("y", py), ("x", px_), ("disp_y", uu[:, 0]), ("disp_x", uu[:, 1]),
+                     ("vy", uu[:, 0] / 2.0), ("vx", uu[:, 1] / 2.0)):
+            cols[k] += list(v)
+    arr = {k: np.asarray(v) for k, v in cols.items()}
+    hole = np.ones(arr["id"].size, bool)
+    hole[[30, 31, 200]] = False
+    arr = {k: v[hole] for k, v in arr.items()}
+    ds = Dataset(axes=ax, metadata=md).with_structure(
+        StructureTable(Domain.POINT, arr, layer="piv", z_kind="plane_index"))
+    env = MetaEnvelope(axes=ax, metadata=md)
+
+    def chain(steps):
+        g = Graph()
+        g.add(NodeInstance("S", "io.fieldmechseed"))
+        prev = "S"
+        for nid, op, params, modes in steps:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+            g.connect(prev, nid, dst_socket="data")
+            prev = nid
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull(prev)
+
+    e, o = chain([("G", "field.gradient", {}, {}),
+                  ("E", "field.strain", {}, {"measure": "green_lagrange"}),
+                  ("R", "field.rotation", {}, {}),
+                  ("V", "field.volume_change", {}, {}),
+                  ("T", "field.stress", {}, {"model": "neo_hookean", "plane": "stress"})])
+    get = lambda name: np.asarray(o.get(Domain.POINT, name, layer="piv").values)
+    t1 = get("t") == 1
+    Gc = np.stack([get(c) for c in ("grad_yy", "grad_yx", "grad_xy", "grad_xx")], axis=1)
+    assert np.nanmax(np.abs(Gc[t1] - A.ravel())) < 1e-10 and np.nanmax(np.abs(Gc[~t1])) < 1e-12
+    F = np.eye(2) + A
+    El = 0.5 * (F.T @ F - np.eye(2))
+    assert np.nanmax(np.abs(get("strain_yx")[t1] - El[0, 1])) < 1e-12
+    assert np.nanmax(np.abs(get("strain_xx")[t1] - El[1, 1])) < 1e-12
+    assert np.nanmax(np.abs(get("jacobian")[t1] - np.linalg.det(F))) < 1e-12
+    assert np.nanmax(np.abs(get("curl")[t1] - (A[1, 0] - A[0, 1]))) < 1e-12
+    assert np.nanmax(np.abs(get("stress_zz"))) < 1e-8 and np.nanmin(get("von_mises")[t1]) > 0
+    assert len(get("id")) == int(hole.sum()), "the rows must come back one for one"
+    assert recorded_unit(o.metadata, Domain.POINT, "von_mises", "piv") == "Pa"
+    assert recorded_unit(o.metadata, Domain.POINT, "strain_xx", "piv") == ""
+    assert recorded_unit(o.metadata, Domain.POINT, "rotation_deg", "piv") == "deg"
+    fm = o.metadata["__field_mechanics__"]["piv"]
+    assert fm["gradient"]["method"] == "lattice" and fm["strain"]["measure"] == "green_lagrange"
+    assert fm["stress"]["model"] == "neo_hookean" and fm["stress"]["plane"] == "stress"
+    # each card re-keys only on its own state: a second measure off the same gradient is ONE
+    # more compute, not a re-differentiation
+    g5 = Graph()
+    g5.add(NodeInstance("S", "io.fieldmechseed"))
+    g5.add(NodeInstance("G", "field.gradient"))
+    g5.add(NodeInstance("E1", "field.strain"))
+    g5.add(NodeInstance("E2", "field.strain", modes={"measure": "hencky"}))
+    for a_, b_ in (("S", "G"), ("G", "E1"), ("G", "E2")):
+        g5.connect(a_, b_, dst_socket="data")
+    e5 = Engine(g5, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+    e5.pull("E1")
+    n1 = e5.compute_count
+    e5.pull("E2")
+    assert e5.compute_count - n1 == 1, "a strain-measure change re-ran more than Strain"
+    assert e5.entry("E1").recipe_hash != e5.entry("E2").recipe_hash
+    # the velocity branch: strain RATE (1/s), vorticity, divergence; a solid's law refused
+    _e3, o3 = chain([("G", "field.gradient", {}, {"quantity": "velocity"}),
+                     ("E", "field.strain", {}, {}), ("R", "field.rotation", {}, {}),
+                     ("V", "field.volume_change", {}, {}),
+                     ("T", "field.stress", {"viscosity": 0.5}, {"model": "newtonian_fluid"})])
+    g3 = lambda name: np.asarray(o3.get(Domain.POINT, name, layer="piv").values)
+    assert recorded_unit(o3.metadata, Domain.POINT, "strain_xx", "piv") == "1/s"
+    assert np.nanmax(np.abs(g3("strain_xx")[t1] - A[1, 1] / 2.0)) < 1e-12
+    names3 = {a.name for a in o3.layers_on(Domain.POINT) if a.layer == "piv"}
+    assert "rotation_deg" not in names3 and "jacobian" not in names3 and "divergence" in names3
+    assert np.isnan(g3("pressure")).all() and "strain_energy" not in names3
+    for steps, needle in (
+            ([("E", "field.strain", {}, {})], "Field Gradient"),
+            ([("G", "field.gradient", {}, {"quantity": "velocity"}),
+              ("E", "field.strain", {}, {"measure": "hencky"})], "rate"),
+            ([("G", "field.gradient", {}, {"quantity": "velocity"}),
+              ("T", "field.stress", {}, {})], "velocity"),
+            ([("G", "field.gradient", {}, {}),
+              ("T", "field.stress", {}, {"model": "newtonian_fluid"})], "displacement"),
+            ([("G", "field.gradient", {}, {"method": "local_fit"}),
+              ("T", "field.stress", {"poisson_ratio": 0.5}, {})], "0.5")):
+        try:
+            chain(steps)
+            raise AssertionError(f"{steps} was not refused")
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc)[:200])
+    # a TRACKED field: rows sit where the particles ARE, so the fit moves them back by u
+    rng = np.random.default_rng(5)
+    Xr = rng.uniform(5, 120, size=(300, 2))
+    ur = (Xr * 0.5) @ A.T
+    cur = Xr + ur / 0.5
+    tr = {"id": np.arange(300), "m": np.zeros(300), "t": np.ones(300), "c": np.zeros(300),
+          "z": np.zeros(300), "y": cur[:, 0], "x": cur[:, 1], "track_id": np.arange(1, 301),
+          "disp_y": ur[:, 0], "disp_x": ur[:, 1]}
+    ds_t = Dataset(axes=ax, metadata={"pixel_size_um": 0.5}).with_structure(
+        StructureTable(Domain.POINT, tr, layer="tracks_field", z_kind="plane_index"))
+    gt = Graph()
+    gt.add(NodeInstance("S", "io.fieldmechseed"))
+    gt.add(NodeInstance("G", "field.gradient"))
+    gt.connect("S", "G", dst_socket="data")
+    ot = Engine(gt, computes=COMPUTES, seeds={"S": ds_t},
+                meta_seeds={"S": MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.5})}).pull("G")
+    Gt = np.stack([np.asarray(ot.get(Domain.POINT, c, layer="tracks_field").values)
+                   for c in ("grad_yy", "grad_yx", "grad_xy", "grad_xx")], axis=1)
+    ok = np.isfinite(Gt).all(axis=1)
+    assert ok.mean() > 0.9 and np.abs(Gt[ok] - A.ravel()).max() < 1e-8, np.abs(Gt[ok] - A.ravel()).max()
+    assert ot.metadata["__field_mechanics__"]["tracks_field"]["gradient"]["positions"] == "current"
+    b = BUNDLES.get("bundle:mechanics")
+    assert b is not None and b.op_keys == ("field.gradient", "field.strain", "field.stress")
+    _ok("field mechanics (2026-10-09): the kernel recovers an affine gradient exactly on the "
+        "lattice (holes one-sided, no spread) and by local fit, in 2-D and on an anisotropic "
+        "3-D stack; a 10° on-screen CCW turn reads rotation +10° with zero Green-Lagrange / "
+        "Almansi / Hencky strain; J 1.21 / 1.331; simple shear curl +γ, principal −45°; "
+        "Hooke, plane-stress SVK and neo-Hookean σ_zz = 0 and → Hooke at small strain; "
+        "Newtonian σ_xy = ηγ̇. Through the Engine Field Gradient → Strain → Rotation → Volume "
+        "Change → Stress write exact columns back onto the same rows with their units; a new "
+        "measure re-keys only Strain; the velocity branch gives rates; tracked rows are moved "
+        "back by u; every misuse refused by name; bundle:mechanics")
+
+
+def test_field_view() -> None:
+    """What the Viewer draws of a measured field (2026-10-09, ``nodegraph.fieldmap``, shared
+    with ``plot.field``): arrows in IMAGE PIXELS (a µm displacement over the pixel size; a velocity
+    over one frame), a lattice field rasterised one cell per node with its holes empty, a 3-D
+    lattice interpolated between the planes bracketing the viewed z, a scattered field
+    resampled near its nodes only, Auto picking the most derived column, the series limits,
+    and iso-lines that close around a hole."""
+    import nodegraph.fieldmap as FV
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.analysis_mesh import lattice_quads, with_mesh
+
+    ax = AxisSizes(m=1, t=2, z=3, c=2, y=64, x=64)
+    gy, gx = np.meshgrid(np.arange(8.0, 64.0, 8.0), np.arange(8.0, 64.0, 8.0), indexing="ij")
+    n = gy.size
+    cols = {"id": np.arange(n), "m": np.zeros(n), "t": np.ones(n), "c": np.zeros(n),
+            "z": np.ones(n), "y": gy.ravel(), "x": gx.ravel(),
+            "disp_y": np.full(n, 0.25), "disp_x": gx.ravel() * 0.01,
+            "disp_mag_um": np.hypot(0.25, gx.ravel() * 0.01),
+            "strain_eq": gy.ravel() * 1e-3, "track_id": np.arange(n)}
+    hole = np.ones(n, bool)
+    hole[[10, 24]] = False
+    cols = {k: np.asarray(v)[hole] for k, v in cols.items()}
+    ds = (Dataset(axes=ax, metadata={"pixel_size_um": 0.5})
+          .with_structure(StructureTable(Domain.POINT, cols, layer="piv", z_kind="plane_index")))
+    ds = with_mesh(ds, "piv", lattice_quads(list(np.arange(8.0, 64.0, 8.0)),
+                                            list(np.arange(8.0, 64.0, 8.0)), m=0, t=-1, c=0,
+                                            z_plane=1), kind="quad", z_kind="plane_index")
+    assert FV.layer_names(ds) == ["piv"], FV.layer_names(ds)      # the grid table is not a field
+    assert "track_id" not in FV.column_names(ds, "piv") and "y" not in FV.column_names(ds, "piv")
+    assert FV.auto_pick(ds) == ("piv", "strain_eq")               # most derived first
+    assert FV.auto_pick(ds, "piv", "disp_x") == ("piv", "disp_x")
+    assert FV.auto_pick(ds, "gone", "gone") == ("piv", "strain_eq")
+    # arrows: 0.25 µm at 0.5 µm/px = 0.5 px; channel 1 (unmeasured) still shows channel 0's
+    vf = FV.vectors(ds, 0, 1, 1, 1)
+    assert vf is not None and np.allclose(vf.rows[:, 2], 0.5) and np.allclose(
+        vf.rows[:, 3], vf.rows[:, 1] * 0.02), vf.rows[:2]
+    assert abs(vf.spacing_px - 8.0) < 1e-9 and FV.vectors(ds, 0, 1, 0, 0) is None  # other plane
+    assert abs(FV.auto_scale(vf) * vf.p95 - 8.0) < 1e-9
+    # the lattice raster: one cell per node, the holes empty, centred cells
+    fr = FV.raster(ds, "piv", "strain_eq", 0, 1, 1, 0)
+    assert fr is not None and fr.lattice and fr.grid.shape == (7, 7), fr.grid.shape
+    assert int(np.isnan(fr.grid).sum()) == 2 and fr.extent == (4.0, 60.0, 4.0, 60.0)
+    assert abs(FV.value_at(fr, 16.0, 40.0) - 0.016) < 1e-12        # the node at y=16
+    lo, hi = FV.series_limits(ds, "piv", "strain_eq")
+    assert lo < hi and abs(hi - np.percentile(cols["strain_eq"], 99)) < 1e-12
+    assert FV.column_unit(ds, "piv", "disp_mag_um") == "µm"
+    lines = FV.contour_lines(fr.grid, [0.03])
+    assert lines and lines[0][1], "an iso-line through the middle rows"
+    # velocity only: drawn as the motion over ONE frame interval
+    vel = {k: cols[k] for k in ("id", "m", "t", "c", "z", "y", "x")}
+    vel.update(vy=np.zeros(hole.sum()), vx=np.full(hole.sum(), 2.0))
+    dsv = Dataset(axes=ax, metadata={"pixel_size_um": 0.5, "piv_dt_s": 0.5}).with_structure(
+        StructureTable(Domain.POINT, vel, layer="flow", z_kind="plane_index"))
+    assert np.allclose(FV.vectors(dsv, 0, 1, 1, 0).rows[:, 3], 2.0)   # 2 µm/s · 0.5 s / 0.5
+    # a 3-D lattice: the slice between the planes at z=0 and z=4, linearly
+    zz, yy, xx = np.meshgrid([0.0, 4.0], [8.0, 16.0, 24.0], [8.0, 16.0], indexing="ij")
+    n3 = zz.size
+    c3 = {"id": np.arange(n3), "m": np.zeros(n3), "t": np.zeros(n3), "c": np.zeros(n3),
+          "z": zz.ravel(), "y": yy.ravel(), "x": xx.ravel(), "disp_z": zz.ravel(),
+          "disp_y": np.zeros(n3), "disp_x": np.zeros(n3), "jacobian": 1.0 + zz.ravel() * 0.1}
+    ds3 = Dataset(axes=AxisSizes(m=1, t=1, z=5, c=1, y=32, x=32),
+                  metadata={"pixel_size_um": 0.5}).with_structure(
+        StructureTable(Domain.POINT, c3, layer="dvc", z_kind="subpixel"))
+    r3 = FV.raster(ds3, "dvc", "jacobian", 0, 0, 1, 0)
+    assert r3 is not None and r3.grid.shape == (3, 2) and np.allclose(r3.grid, 1.1), r3.grid
+    assert len(FV.vectors(ds3, 0, 0, 1, 0).rows) == 6               # the nearest node plane
+    # scattered: resampled, empty far from every node
+    rng = np.random.default_rng(3)
+    sy, sx = rng.uniform(0, 30, 200), rng.uniform(0, 30, 200)
+    sc = {"id": np.arange(200), "m": np.zeros(200), "t": np.zeros(200), "c": np.zeros(200),
+          "z": np.zeros(200), "y": np.r_[sy[:199], 60.0], "x": np.r_[sx[:199], 60.0],
+          "strain_eq": np.ones(200)}
+    dss = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64),
+                  metadata={"pixel_size_um": 0.5}).with_structure(
+        StructureTable(Domain.POINT, sc, layer="trk", z_kind="plane_index"))
+    rs = FV.raster(dss, "trk", "strain_eq", 0, 0, 0, 0)
+    assert rs is not None and not rs.lattice and np.isfinite(rs.grid).any()
+    assert np.isnan(rs.grid).any(), "the gap between the cloud and its outlier stays empty"
+    # principal-axis glyphs: a pure shear e_yx = e_xy = g has axes at 45° (down-right in
+    # image axes) with values ±g; the series' 95th-percentile half-bar is 0.45 spacings
+    g = 0.02
+    gl_ds = ds.with_layer(Domain.POINT, "strain_yy", np.zeros(hole.sum()), layer="piv")               .with_layer(Domain.POINT, "strain_yx", np.full(hole.sum(), g), layer="piv")               .with_layer(Domain.POINT, "strain_xy", np.full(hole.sum(), g), layer="piv")               .with_layer(Domain.POINT, "strain_xx", np.zeros(hole.sum()), layer="piv")
+    gly = FV.tensor_glyphs(gl_ds, "piv", "strain", 0, 1, 1, 0, every=2)
+    assert gly is not None and len(gly.rows) == (int(hole.sum()) + 1) // 2, len(gly.rows)
+    assert np.allclose(np.abs(np.degrees(gly.rows[:, 2])) % 180.0, 45.0), gly.rows[:2]
+    assert np.allclose(gly.rows[:, 3], g) and np.allclose(gly.rows[:, 4], -g)
+    assert abs(gly.scale * g - 0.45 * 8.0) < 1e-9
+    assert FV.tensor_glyphs(ds, "piv", "stress", 0, 1, 1, 0) is None   # no stress columns
+    # the deformed grid: the lattice's 7 rows and 7 columns, broken at the holes (1, 3) and
+    # (3, 3): rows 1 and 3 split in two (9 row runs); column 3 keeps only its 3-node run
+    # below the second hole — single-node runs draw nothing (7 - 1 + 1 = 7 column runs)
+    lines = FV.deformed_lines(ds, "piv", 0, 1, 1, 0, exaggerate=10.0)
+    assert len(lines) == 9 + 7, len(lines)
+    first = lines[0]
+    assert np.allclose(first[:, 0], 8.0 + 10.0 * 0.5)  # disp_y 0.25 µm = 0.5 px, ×10
+    assert FV.deformed_lines(dss, "trk", 0, 0, 0, 0) == []          # no lattice, no grid
+    _ok("field view (2026-10-09): arrows in image pixels (0.25 µm → 0.5 px at 0.5 µm/px; a "
+        "velocity over one frame), a one-channel field shown on any channel, the auto length "
+        "one node spacing; a lattice field one cell per node (7×7, holes empty, centred "
+        "extent), a 3-D lattice interpolated between planes, a scattered field resampled and "
+        "empty away from its nodes; Auto picks the most derived column and skips the grid "
+        "table; series limits, units and iso-lines; principal-axis glyphs at 45° ±γ for a "
+        "pure shear; the deformed lattice through the displaced nodes, broken at holes")
+
+
+def test_plot_field() -> None:
+    """Plot Field (2026-10-09): a field drawn on its image as a PICTURE with one VIEW per
+    position, frame and plane of its input, so the Viewer's playback strip picks what is
+    shown. The node has no Frame / Position / Plane socket and no Per mode.
+
+    Checks:
+    - the picture's M, T and Z are the input's, and the edit-time envelope predicts them;
+    - each view draws its own frame (the image differs);
+    - Auto draws the most derived column on the whole table's 1st–99th percentile;
+    - arrows are in image pixels, and the scale bar comes from the INPUT's pixel size;
+    - a view's title names its position (by name), frame and plane;
+    - Export Figure writes a chosen view as PNG and SVG;
+    - Write Movie refuses to max-project a multi-plane figure;
+    - an unknown column is refused by name;
+    - a signed column on coolwarm is centred on zero unless typed."""
+    import importlib.util
+    import os
+    import tempfile
+    if importlib.util.find_spec("matplotlib") is None:
+        _ok("plot.field: SKIPPED (matplotlib unavailable)")
+        return
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.structure import StructureTable
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    spec_node = NODES.get("plot.field")
+    names_in = {i.name for i in spec_node.inputs}
+    assert not names_in & {"frame", "position", "plane"}, names_in
+    assert "per" not in {m.name for m in spec_node.modes}
+    define_node("io.plotfieldseed", "S", outputs=[OutDataset()])
+
+    def field_ds(m, t, z):
+        ax = AxisSizes(m=m, t=t, z=z, c=1, y=96, x=128)
+        md = {"pixel_size_um": 0.5, "position_name": [f"well {k}" for k in range(m)]}
+        img = np.zeros((m, t, z, 1, 96, 128), np.float32)
+        img[..., ::7, :] = 100.0
+        gy, gx = np.meshgrid(np.arange(8.0, 96.0, 16.0), np.arange(8.0, 128.0, 16.0),
+                             indexing="ij")
+        n = gy.size
+        cols = {k: [] for k in ("m", "t", "z", "c", "y", "x", "disp_y", "disp_x",
+                                "disp_mag_um", "strain_eq", "curl")}
+        for mm in range(m):
+            for tt in range(t):
+                for zz in range(z):
+                    cols["m"].append(np.full(n, mm))
+                    cols["t"].append(np.full(n, tt))
+                    cols["z"].append(np.full(n, zz))
+                    cols["c"].append(np.zeros(n))
+                    cols["y"].append(gy.ravel())
+                    cols["x"].append(gx.ravel())
+                    cols["disp_y"].append(np.zeros(n))
+                    cols["disp_x"].append(np.full(n, float(tt)))
+                    cols["disp_mag_um"].append(np.full(n, float(tt)))
+                    cols["strain_eq"].append(gx.ravel() * 1e-3 * tt)
+                    cols["curl"].append((gx.ravel() * 1e-3 - 0.02) * tt)   # signed, lopsided
+        cols = {k: np.concatenate(v) for k, v in cols.items()}
+        cols["id"] = np.arange(len(cols["m"]))
+        ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+              .with_structure(StructureTable(Domain.POINT, cols, layer="piv",
+                                             z_kind="plane_index")))
+        return ds, MetaEnvelope(axes=ax, metadata=md), cols
+
+    def pull(ds, env, params=None, modes=None, tail=None):
+        g = Graph()
+        g.add(NodeInstance("S", "io.plotfieldseed"))
+        g.add(NodeInstance("P", "plot.field", params=params or {}, modes=modes or {}))
+        g.connect("S", "P")
+        last = "P"
+        if tail is not None:
+            g.add(NodeInstance("X", tail[0], params=tail[1], modes=tail[2]))
+            g.connect("P", "X")
+            last = "X"
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds}, meta_seeds={"S": env})
+        return e, e.pull(last)
+
+    ds, env, cols = field_ds(1, 2, 1)
+    e, o = pull(ds, env)
+    spec = o.metadata["figure_spec"]
+    h, w = FIG.figure_pixels(spec["style"]["width_mm"], spec["style"]["height_mm"],
+                             spec["style"]["dpi"])
+    assert (o.axes.m, o.axes.t, o.axes.z, o.axes.c, o.axes.y, o.axes.x) == (1, 2, 1, 3, h, w)
+    assert e.env("P").axes == o.axes, (e.env("P").axes, o.axes)
+    assert spec["kind"] == "field" and spec["per"] == "view"
+    assert spec["source"]["value"] == "strain_eq"
+    lo, hi = spec["draw"]["range"]
+    assert abs(hi - np.percentile(cols["strain_eq"], 99)) < 1e-12
+    assert spec["draw"]["colormap"] == "turbo"
+    prov = o.image
+    assert isinstance(prov, FIG.ViewFigureProvider)
+    v1 = prov.spec_for(0, 1, 0)
+    fr = v1["frames"][0]
+    assert (fr["m"], fr["t"], fr["z"]) == (0, 1, 0)
+    assert len(fr["grid"]) == 6 and len(fr["grid"][0]) == 8
+    arr = np.asarray(fr["arrows"])
+    assert np.allclose(arr[:, 3], 2.0), arr[:3]         # 1 µm at 0.5 µm/px = 2 px
+    sb = v1["draw"]["scale_bar"]
+    assert sb and abs(sb["px"] - sb["um"] / 0.5) < 1e-12 and sb["um"] in (10.0, 20.0, 5.0)
+    assert FIG.unpack_plane(fr["image"]).dtype == np.uint8
+    assert v1["axes"]["title"] == "frame 2/2", v1["axes"]
+    # each frame is its own view, read the way the Viewer reads a plane
+    p0 = prov.read_region(0, 0, 0, 0, 0, 0, h, 0, w)
+    p1 = prov.read_region(0, 0, 1, 0, 0, 0, h, 0, w)
+    assert p0.shape == (h, w) and not np.array_equal(p0, p1)
+
+    # positions and planes: the picture has them, the envelope says so, titles name them
+    ds3, env3, _c3 = field_ds(2, 2, 3)
+    e3, o3 = pull(ds3, env3, {"title": "strain"})
+    assert (o3.axes.m, o3.axes.t, o3.axes.z) == (2, 2, 3), o3.axes
+    assert e3.env("P").axes == o3.axes, (e3.env("P").axes, o3.axes)
+    assert o3.metadata.get("position_name") == ["well 0", "well 1"]
+    assert e3.env("P").metadata.get("position_name") == ["well 0", "well 1"]
+    t3 = o3.image.spec_for(1, 0, 2)["axes"]["title"]
+    assert t3 == "strain — well 1 · frame 1/2 · plane 3/3", t3
+    assert o3.image.spec_for(9, 9, 9)["frames"][0]["z"] == 2      # clamped, not an error
+
+    with tempfile.TemporaryDirectory() as td:
+        for fmt in ("png", "svg"):
+            pth = FIG.render_file(v1, os.path.join(td, f"f.{fmt}"), fmt)
+            assert os.path.getsize(pth) > 1000, fmt
+        # Export Figure picks a view with its own sockets: a writer cannot follow the strip
+        target = os.path.join(td, "view.png")
+        pull(ds3, env3, {}, {}, ("io.write_figure", {"path": target, "position": 1,
+                                                     "frame": 1, "plane": 2},
+                                 {"format": "png"}))
+        assert os.path.getsize(target) > 1000
+        # Write Movie: a figure's planes are separate pictures, never max-projected
+        try:
+            pull(ds3, env3, {}, {}, ("io.write_movie", {"path": os.path.join(td, "m.mp4")},
+                                     {"sweep": "time", "z_reduce": "max"}))
+            raise AssertionError("a multi-plane figure must not be max-projected")
+        except ValueError as exc:
+            assert "3 planes" in str(exc) and "'mid'" in str(exc), exc
+    try:
+        pull(ds, env, {"value": "nope"})
+        raise AssertionError("an unknown column must be refused")
+    except ValueError as exc:
+        assert "nope" in str(exc) and "strain_eq" in str(exc), exc
+    # a signed column on the diverging map: blank limits centred on zero (white = 0, as the
+    # Viewer's Field overlay draws it); typed limits kept exactly as typed
+    _, oc = pull(ds, env, {"value": "curl"})
+    dc = oc.metadata["figure_spec"]["draw"]
+    p1_, p99 = np.percentile(cols["curl"], [1, 99])
+    assert dc["colormap"] == "coolwarm" and dc["range"] == [-max(-p1_, p99), max(-p1_, p99)], dc
+    _, ot = pull(ds, env, {"value": "curl", "color_range": "-0.01, 0.05"})
+    assert ot.metadata["figure_spec"]["draw"]["range"] == [-0.01, 0.05]
+    # arrows thin on a spatial grid, never past _MAX_ARROWS (a stitched mosaic has ~10^5
+    # nodes a view), and lengthen to the gap between the arrows drawn
+    import nodegraph.catalog.plot.field as PF
+    g = np.arange(0.0, 40.0 * 8, 8.0)                 # 1600 nodes: under the cap
+    yy, xx = np.meshgrid(g, g, indexing="ij")
+    lat_rows = np.stack([yy.ravel(), xx.ravel(), np.ones(yy.size), np.ones(yy.size)], 1)
+    kept1, cell1 = PF._thin_arrows(lat_rows, 8.0, 1)
+    kept2, cell2 = PF._thin_arrows(lat_rows, 8.0, 2)
+    assert len(kept1) == len(lat_rows) and cell1 == 8.0
+    assert len(kept2) == len(lat_rows) // 4 and cell2 == 16.0
+    assert len(np.unique(kept2[:, 0])) == 20 and len(np.unique(kept2[:, 1])) == 20
+    g = np.arange(0.0, 300 * 4.0, 4.0)
+    yy, xx = np.meshgrid(g, g, indexing="ij")
+    dense = np.stack([yy.ravel(), xx.ravel(), np.ones(yy.size), np.ones(yy.size)], 1)
+    kd, cd = PF._thin_arrows(dense, 4.0, 1)
+    assert len(kd) <= PF._MAX_ARROWS and len(kd) > 0.8 * PF._MAX_ARROWS, len(kd)
+    assert cd > 4.0 * 5
+    _ok(f"plot field (2026-10-09): one view per position/frame/plane, picked by the "
+        f"playback strip (no Frame/Position/Plane socket, no Per mode); a {w}×{h} picture "
+        f"whose M,T,Z = the input's and = the envelope's; each frame its own view; Auto drew "
+        f"strain_eq (turbo) on the table's 1–99 % range; arrows 2 px for 1 µm at 0.5 µm/px; a "
+        f"{sb['um']:g} µm scale bar from the input's pixel size; titles name position, frame "
+        f"and plane; Export Figure wrote view (1, 1, 2); Write Movie refused to max-project 3 "
+        f"planes; an unknown column refused; a signed column centred on zero unless typed; "
+        f"arrows thin on a spatial grid (every N = one per N×N block) and cap at "
+        f"{PF._MAX_ARROWS} a view ({len(dense)} nodes → {len(kd)})")
+
+
+def test_field_end_to_end() -> None:
+    """The Field cards on REAL correlations of known deformations (2026-10-09): a speckle
+    image warped by F = I + A through ``analysis.piv`` → Field Gradient → Strain (Green-
+    Lagrange) → Volume Change recovers A, E and det F; a speckle volume dilated by 1.02
+    through ``analysis.dvc_field`` → Field Gradient → Volume Change recovers J = 1.0612 and a
+    neo-Hookean Stress reads it as tension (negative pressure) with ~zero von Mises."""
+    import importlib.util
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    have_piv = importlib.util.find_spec("openpiv") is not None
+    have_dvc = importlib.util.find_spec("al_dvc") is not None
+    if not (have_piv or have_dvc):
+        _ok("field end to end: SKIPPED (neither openpiv nor al_dvc installed)")
+        return
+    define_node("io.fielde2eseed", "S", outputs=[OutDataset()])
+    rng = np.random.default_rng(7)
+
+    def run(ds, ax, md, steps, layer):
+        g = Graph()
+        g.add(NodeInstance("S", "io.fielde2eseed"))
+        prev = "S"
+        for nid, op, params, modes in steps:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+            g.connect(prev, nid, dst_socket="data")
+            prev = nid
+        o = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=md)}).pull(prev)
+        return lambda c: np.asarray(o.get(Domain.POINT, c, layer=layer).values)
+
+    notes = []
+    if have_piv:
+        Y = X = 384
+        A = np.array([[0.010, 0.004], [-0.006, -0.008]])
+        ref = gaussian_filter(rng.random((Y, X)), 1.5)
+        yy, xx = np.mgrid[0:Y, 0:X].astype(float)
+        Fi = np.linalg.inv(np.eye(2) + A)
+        dy, dx = yy - Y / 2, xx - X / 2
+        dfm = map_coordinates(ref, [Y / 2 + Fi[0, 0] * dy + Fi[0, 1] * dx,
+                                    X / 2 + Fi[1, 0] * dy + Fi[1, 1] * dx],
+                              order=3, mode="reflect")
+        ax = AxisSizes(m=1, t=2, z=1, c=1, y=Y, x=X)
+        md = {"pixel_size_um": 0.5}
+        ds = Dataset(axes=ax, metadata=md).with_image(
+            ArrayProvider(np.stack([ref, dfm])[None, :, None, None].astype(np.float32)))
+        get = run(ds, ax, md, [("P", "analysis.piv", {"results": "off"}, {}),
+                               ("G", "field.gradient", {}, {}),
+                               ("E", "field.strain", {}, {"measure": "green_lagrange"}),
+                               ("V", "field.volume_change", {}, {})], "piv")
+        t1 = get("t") == 1
+        G = np.nanmedian(np.stack([get(c) for c in ("grad_yy", "grad_yx", "grad_xy",
+                                                    "grad_xx")], 1)[t1], axis=0)
+        assert np.abs(G - A.ravel()).max() < 5e-4, (G, A)
+        F = np.eye(2) + A
+        E = 0.5 * (F.T @ F - np.eye(2))
+        assert abs(np.nanmedian(get("strain_yy")[t1]) - E[0, 0]) < 5e-4
+        assert abs(np.nanmedian(get("strain_yx")[t1]) - E[0, 1]) < 5e-4
+        J = float(np.nanmedian(get("jacobian")[t1]))
+        assert abs(J - np.linalg.det(F)) < 5e-4, J
+        notes.append(f"PIV gradient within {np.abs(G - A.ravel()).max():.1e} of A, "
+                     f"J {J:.4f} (true {np.linalg.det(F):.4f})")
+    if have_dvc:
+        Z, Y3, X3 = 48, 96, 96
+        vol = gaussian_filter(rng.random((Z, Y3, X3)), 1.2)
+        s = 1.02
+        zz, yy, xx = np.mgrid[0:Z, 0:Y3, 0:X3].astype(float)
+        c = np.array([Z, Y3, X3]) / 2.0
+        dvol = map_coordinates(vol, [c[0] + (zz - c[0]) / s, c[1] + (yy - c[1]) / s,
+                                     c[2] + (xx - c[2]) / s], order=3, mode="reflect")
+        ax3 = AxisSizes(m=1, t=2, z=Z, c=1, y=Y3, x=X3)
+        md3 = {"pixel_size_um": 1.0, "z_step_um": 1.0}
+        ds3 = Dataset(axes=ax3, metadata=md3).with_image(
+            ArrayProvider(np.stack([vol, dvol])[None, :, :, None].astype(np.float32)))
+        get3 = run(ds3, ax3, md3, [
+            ("D", "analysis.dvc_field", {"results": "off", "subset_size": 24,
+                                         "subset_size_z": 16, "subset_spacing": 12,
+                                         "subset_spacing_z": 8}, {}),
+            ("G", "field.gradient", {}, {}), ("V", "field.volume_change", {}, {}),
+            ("T", "field.stress", {"youngs_modulus": 5000.0, "poisson_ratio": 0.45},
+             {"model": "neo_hookean"})], "dvc")
+        t1 = get3("t") == 1
+        J3 = float(np.nanmedian(get3("jacobian")[t1]))
+        assert abs(J3 - s ** 3) < 5e-3, J3
+        p = float(np.nanmedian(get3("pressure")[t1]))
+        vm = float(np.nanmedian(get3("von_mises")[t1]))
+        assert p < 0 and vm < 0.05 * abs(p), (p, vm)        # expansion = tension, ~no shear
+        notes.append(f"DVC J {J3:.4f} (true {s ** 3:.4f}), neo-Hookean pressure {p:.0f} Pa "
+                     f"with von Mises {vm:.1f} Pa")
+    _ok("field end to end (2026-10-09): " + "; ".join(notes))
 
 
 def main() -> int:
@@ -31340,10 +33570,24 @@ def main() -> int:
     test_streaming_slivers()
     test_spill_and_streaming_stats()
     test_parallel()
+    test_parallel_governor()
     test_gpu_platform()
     test_catalog_kernels()
     test_catalog_dvc()
+    test_dvc_stages()
+    test_piv_nan_predictor()
+    test_piv_stages()
+    test_dic_stages()
     test_catalog_dic()
+    test_analysis_store()
+    test_analysis_store_writes()
+    test_analysis_parallel()
+    test_quick_scope()
+    test_analysis_mesh()
+    test_field_mechanics()
+    test_field_view()
+    test_plot_field()
+    test_field_end_to_end()
     test_catalog_piv()
     test_catalog_optical_flow()
     test_channel_derive()

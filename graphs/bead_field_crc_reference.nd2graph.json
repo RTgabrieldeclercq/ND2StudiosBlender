@@ -1,0 +1,90 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "beads",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "pos",
+              "src_socket": "out"
+            },
+            {
+              "dst": "pos",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "src",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "beads",
+              "modes": {
+                "projection": "max",
+                "slabs": "auto"
+              },
+              "op_key": "detect.beads",
+              "params": {
+                "diameter": 1.0,
+                "min_snr": 3.0,
+                "name": "beads"
+              }
+            },
+            {
+              "id": "pos",
+              "modes": {},
+              "op_key": "util.select_position",
+              "params": {
+                "position": "0"
+              }
+            },
+            {
+              "id": "src",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/9.1.26_CRC_Gradient/20260904_135958_104_reference/Channel640_Seq0000.nd2"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "Bead field",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "beads": {
+              "collapsed": false,
+              "muted": false,
+              "x": 180.0,
+              "y": 0.0
+            },
+            "pos": {
+              "collapsed": false,
+              "muted": false,
+              "x": -120.0,
+              "y": 0.0
+            },
+            "src": {
+              "collapsed": false,
+              "muted": false,
+              "x": -420.0,
+              "y": 0.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,234 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "dvc_strain9",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "dvc_global8",
+              "src_socket": "out"
+            },
+            {
+              "dst": "dvc_seed6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "dvc_grid5",
+              "src_socket": "out"
+            },
+            {
+              "dst": "dvc_global8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "dvc_local7",
+              "src_socket": "out"
+            },
+            {
+              "dst": "dvc_local7",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "dvc_seed6",
+              "src_socket": "out"
+            },
+            {
+              "dst": "reg",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "frames",
+              "src_socket": "out"
+            },
+            {
+              "dst": "frames",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "pos",
+              "src_socket": "out"
+            },
+            {
+              "dst": "dvc_grid5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "reg",
+              "src_socket": "out"
+            },
+            {
+              "dst": "pos",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "src",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "dvc_global8",
+              "modes": {},
+              "op_key": "dvc.global_step",
+              "params": {
+                "admm_iterations": 4
+              }
+            },
+            {
+              "id": "dvc_grid5",
+              "modes": {},
+              "op_key": "dvc.grid",
+              "params": {
+                "prefilter_sigma": 1.0,
+                "subset_size": 32,
+                "subset_size_z": 24,
+                "subset_spacing": 32,
+                "subset_spacing_z": 8
+              }
+            },
+            {
+              "id": "dvc_local7",
+              "modes": {},
+              "op_key": "dvc.local_match",
+              "params": {
+                "subset_stride": 2
+              }
+            },
+            {
+              "id": "dvc_seed6",
+              "modes": {},
+              "op_key": "dvc.initial_guess",
+              "params": {}
+            },
+            {
+              "id": "dvc_strain9",
+              "modes": {},
+              "op_key": "dvc.strain",
+              "params": {}
+            },
+            {
+              "id": "frames",
+              "modes": {
+                "dim": "3D",
+                "region": "frames"
+              },
+              "op_key": "util.crop",
+              "params": {
+                "frames": ""
+              }
+            },
+            {
+              "id": "pos",
+              "modes": {},
+              "op_key": "util.select_position",
+              "params": {
+                "position": "0"
+              }
+            },
+            {
+              "id": "reg",
+              "modes": {
+                "dim": "3D",
+                "model": "translation",
+                "reference": "first"
+              },
+              "op_key": "registration.stabilize",
+              "params": {
+                "highpass_sigma": 2.0,
+                "lowpass_sigma": 1.5,
+                "min_confidence": 0.0,
+                "ref_channel": 0,
+                "upsample": 20
+              }
+            },
+            {
+              "id": "src",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "path": "S:/9.1.26_CRC_Gradient/20260901_023728_582_early run/Channel640_Seq0001.nd2"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "Register + staged DVC",
+        "ui": {
+          "frames": {
+            "f1": {
+              "color": null,
+              "members": [
+                "dvc_grid5",
+                "dvc_seed6",
+                "dvc_local7",
+                "dvc_global8",
+                "dvc_strain9"
+              ],
+              "title": "DVC (pyALDVC)"
+            }
+          },
+          "nodes": {
+            "dvc_global8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1110.0,
+              "y": 0.0
+            },
+            "dvc_grid5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": 0.0
+            },
+            "dvc_local7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 840.0,
+              "y": 0.0
+            },
+            "dvc_seed6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 570.0,
+              "y": 0.0
+            },
+            "dvc_strain9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1380.0,
+              "y": 0.0
+            },
+            "frames": {
+              "collapsed": false,
+              "muted": false,
+              "x": -280.0,
+              "y": 0.0
+            },
+            "pos": {
+              "collapsed": false,
+              "muted": false,
+              "x": -540.0,
+              "y": 0.0
+            },
+            "reg": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 0.0
+            },
+            "src": {
+              "collapsed": false,
+              "muted": false,
+              "x": -820.0,
+              "y": 0.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

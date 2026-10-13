@@ -68,10 +68,10 @@ from nodegraph.engine import Engine, PullCancelled
 from nodegraph.graph import Graph
 from nodegraph.memo import Memo
 from nodegraph.metadata import (
-    MetaEnvelope, PER_POSITION_KEYS, SOURCE_CLOCK_KEY, SOURCE_FILE_KEY, position_subset,
-    shift_origin_um, stamp_source_file)
+    MetaEnvelope, PER_POSITION_KEYS, SOURCE_CLOCK_KEY, SOURCE_FILE_KEY, SOURCE_PATH_KEY,
+    position_subset, shift_origin_um, stamp_source_file)
 from nodegraph.parallel import (
-    cpu_budget, memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
+    memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
 from nodegraph.provider import (
     FrameSliceProvider, FrameSubsetProvider, MultiSourceProvider, SyntheticProvider,
     _picked, subset_index)
@@ -116,7 +116,32 @@ def ingest_workers() -> int:
             return max(1, int(n))
         except ValueError:
             pass
-    return max(1, min(4, cpu_budget() // 4))
+    # sized from the CORES, not from `cpu_budget()`: that budget is now capped at a
+    # handful of threads for the GUI's sake (`parallel.DEFAULT_WORKER_CAP`), and an
+    # ingest is mostly blosc2 + IO that release the GIL — four of them on a big box is
+    # exactly what this lane was measured for
+    return max(1, min(4, ((os.cpu_count() or 2) - 2) // 4))
+
+
+def display_workers() -> int:
+    """How many display jobs (plane decode, prefetch, preload, viewport detail) may run at
+    once on the runner's shared pool.
+
+    ``QThreadPool.globalInstance()`` sizes itself to the core count — 80 threads on an
+    80-core workstation — and :meth:`EngineRunner.preload_series` fans a warm-up out to
+    ``maxThreadCount - 1`` jobs. Every one of those is a Python thread contending with the
+    GUI thread for the GIL (the decode is numpy, but each job's glue is Python), so on a
+    many-core machine a scrub or a playback warm-up is a GIL convoy and the cursor lags
+    behind the strip — the same convoy :data:`nodegraph.parallel.DEFAULT_WORKER_CAP` caps on
+    the engine side. A handful of decoders already saturates the disk and the blosc2
+    threads (which release the GIL themselves). ``NODELAB_DISPLAY_WORKERS`` overrides."""
+    n = os.environ.get("NODELAB_DISPLAY_WORKERS", "").strip()
+    if n:
+        try:
+            return max(1, int(n))
+        except ValueError:
+            pass
+    return max(1, min(8, (os.cpu_count() or 2) - 2))
 
 
 def _clean_source_path(path: Any) -> str:
@@ -285,7 +310,7 @@ def _unique_labels(paths: Sequence[str]) -> List[str]:
 
 
 def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
-                    labels: Sequence[str]) -> MetaEnvelope:
+                    labels: Sequence[str], paths: Sequence[str] = ()) -> MetaEnvelope:
     """One envelope for a bundle of K files: the FIRST file's calibration, its multipoint
     lists concatenated across the members, and a ``source_file`` name per position.
 
@@ -304,7 +329,7 @@ def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
     md: Dict[str, Any] = dict(envs[0].metadata) if envs else {}
     counts = [int(e.axes.m) for e in envs]
     for key in PER_POSITION_KEYS:
-        if key == SOURCE_FILE_KEY:
+        if key in (SOURCE_FILE_KEY, SOURCE_PATH_KEY):
             continue
         vals: List[Any] = []
         for env, n in zip(envs, counts):
@@ -318,6 +343,11 @@ def bundle_envelope(axes: AxisSizes, envs: Sequence[MetaEnvelope],
         else:
             md.pop(key, None)
     md[SOURCE_FILE_KEY] = [labels[i] for i, n in enumerate(counts) for _ in range(n)]
+    if len(paths) == len(counts):
+        md[SOURCE_PATH_KEY] = [os.path.abspath(str(paths[i]))
+                               for i, n in enumerate(counts) for _ in range(n)]
+    else:
+        md.pop(SOURCE_PATH_KEY, None)
     return MetaEnvelope(axes=axes, metadata=md)
 
 
@@ -986,8 +1016,20 @@ def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEn
     changes = position_subset(env.metadata, kept)
     if changes:
         out = out.with_metadata(**changes)
+    # WHICH source frames this scoped seed holds (2026-10-09): the payload renumbers them
+    # from 0, so a node that names a source frame — an analysis's fixed reference frame —
+    # maps it through these (`_shared.analysis_units.scoped_frame`), and the analysis store
+    # refuses to save a scoped pull. Tuples, not per-position lists: they describe the
+    # scope, and no node that narrows M or T should reindex them.
+    out = out.with_metadata(
+        scope_m=tuple(int(i) for i in kept),
+        scope_t=tuple(int(i) for i in _picked(ts, int(env.axes.t))),
+        scope_z=(tuple(int(i) for i in _picked(zs, int(env.axes.z))) if zs else ()),
+        scope_of=(int(env.axes.m), int(env.axes.t), int(env.axes.z), int(env.axes.y),
+                  int(env.axes.x)))
     region = region_box.clamp(region, (int(view.axes.y), int(view.axes.x)))
     if region is not None:
+        out = out.with_metadata(scope_region=tuple(int(v) for v in region))
         y0, y1, x0, x1 = region
         win_axes = replace(view.axes, y=y1 - y0, x=x1 - x0)
         view = WindowView(view, y0=y0, x0=x0, axes=win_axes)
@@ -1672,8 +1714,12 @@ class EngineRunner(QObject):
         self._source: GraphSource = (Workspace.single(source)
                                      if isinstance(source, GraphDocument) else source)
         #: the shared pool, for the jobs that only READ providers (display decode, prefetch,
-        #: viewport detail). Deliberately NOT the pull: see :class:`_PullThread`.
+        #: viewport detail). Deliberately NOT the pull: see :class:`_PullThread`. Capped
+        #: at :func:`display_workers` — the global pool's own default is one thread per
+        #: core, and a core count's worth of Python decoders starves the GUI thread of the
+        #: GIL on a big machine.
         self._pool = QThreadPool.globalInstance()
+        self._pool.setMaxThreadCount(display_workers())
         #: the single Python-owned thread every node compute runs on (:class:`_PullThread`).
         self._pull_thread = _PullThread()
         # Persists across engine rebuilds — so it's the memory hazard V2.04 flagged: an
@@ -5211,7 +5257,8 @@ class EngineRunner(QObject):
             # file's own frame times are concatenated per position (`bundle_display`).
             disp = bundle_display(
                 [self._channel_display.get(k, {}) for k in member_keys], envs)
-            env = with_channel_display(bundle_envelope(prov.axes, envs, labels), disp)
+            env = with_channel_display(bundle_envelope(prov.axes, envs, labels, paths),
+                                       disp)
             self._providers[key] = (prov, env)
             self._channel_display[key] = disp
             return prov, env

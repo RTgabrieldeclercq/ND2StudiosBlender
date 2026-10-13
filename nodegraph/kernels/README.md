@@ -1,11 +1,12 @@
 # `pure_analysis/` — portable analysis math-kernels
 
-Nineteen self-contained analysis **math-kernels**. Thirteen were vendored (byte-verbatim)
+Twenty self-contained analysis **math-kernels**. Thirteen were vendored (byte-verbatim)
 out of the ND2Studios app (branch `Version-1.45`) so they can be ported into a *different*
 software's new node system without dragging along the ND2Studios GUI, its plugin
 registry, or its pipeline runtime; three (`cellsam_segment`, V2.12, `piv_field`, V3 W5-P2,
 and `aldvc_field`, rewritten 2026-09-25) are adapters of the same shape around third-party
-packages; and three are in-repo math — `bead_slabs` (2026-10-07), the slab-projected bead
+packages; and four are in-repo math — `field_mechanics` (2026-10-09), the gradient / strain /
+rotation / volume-change / stress maths behind the `field.*` cards, `bead_slabs` (2026-10-07), the slab-projected bead
 finder behind `detect.beads`, `track_field` (2026-09-17), the post-processing half of
 SerialTrack, derived from `track_objects`' own gauge and pinned to it by selftest, and
 `field_math` (2026-09-25), the dimension-agnostic strain/accumulation maths lifted out of the
@@ -59,6 +60,7 @@ it returns a numpy result. That is the whole contract.
 | [`aldvc_field`](aldvc_field.md) | DVC (pyALDVC) — **3D only** | `run_aldvc_series(get_volume, n_frames, shape, voxel_size_um, params, ...)`; `run_aldvc(ref_vol, def_vol, ...)` for one pair | **external** `al-dvc` (pyALDVC) | numpy, al-dvc* |
 | [`field_math`](field_math.md) | *(no node — shared maths)* | `build_grid(...)`, `compute_strain(...)`, `strain_from_gradient(...)`, `accumulate_incremental(...)`; owns `DVCResult` | in-repo (lifted from the ALDVC port) | numpy, scipy |
 | [`track_objects`](track_objects.md) | Track Objects | `link_objects(rows, ...)` — `link_objects_with_params(...)` µm-wrapper | in-repo (no tracking pkg) | numpy, scipy, numba, pandas, sklearn*, skimage* |
+| [`field_mechanics`](field_mechanics.md) | Field Gradient / Strain / Rotation & Curl / Volume Change / Stress | `gradient(coords, scale, vec, ...)`, `strain(G, measure)`, `curl(G)`, `rotation_deg(G)`, `volume_change(G)`, `stress(G, model, ...)` | in-repo (lattice differences + reuse of `field_math` / `track_field`; textbook finite-strain laws) | numpy, scipy* |
 | [`track_field`](track_field.md) | Track Field | `mls_displacement_gradient(coords, disp, ...)`, `linear_elastic_stress(strain, ...)`, `stress_invariants(...)` | in-repo (SerialTrack's `funCompDefGrad3` + isotropic linear elasticity) | numpy, scipy* |
 | [`registration`](registration.md) | Registration | `estimate_series(...)` (2-D or 3-D series), `apply_series(...)`, `apply_frame(...)`, `apply_volume(...)`, `estimate_from_landmarks(...)`, `apply_shift(...)` (also the `align.shift` node's apply) | in-repo (on scipy/skimage/cv2) | numpy, scikit-image, scipy, opencv-python |
 | [`bead_detect`](bead_detect.md) | Bead Detection | `detect_beads(volume_zhw, voxel_size_um, params)` | in-repo (ParticleDetector) | numpy, scipy, numba, scikit-image* |
@@ -182,6 +184,9 @@ is defined by the external package's version:
   `histogram_threshold`, `field_math` (the strain-measure and Lagrangian-accumulation maths
   the correlation nodes share; it owns the `DVCResult` contract but does no correlation),
   `track_objects`,
+  `field_mechanics` (new 2026-10-09: lattice detection, NaN-aware differences, curl /
+  rotation / volume change, Saint Venant-Kirchhoff, neo-Hookean and Newtonian stress, on top
+  of `field_math`'s measures and `track_field`'s gauge and Hooke's law),
   `track_field` (new 2026-09-17, not a vendor: SerialTrack's own scattered strain gauge
   re-derived in vectorised form, plus isotropic linear elasticity, which SerialTrack has
   no counterpart for),
@@ -222,6 +227,7 @@ degrades gracefully / falls back if absent). Blank = not used.
 | aldvc_field | IT | | | | | | | | | | L | |
 | field_math | IT | IT | | | | | | | | | | |
 | track_objects | IT | IT | L | | IT | IT | L | | | | | |
+| field_mechanics | IT | L | | | | | | | | | | |
 | track_field | IT | L | | | | | | | | | | |
 | registration | IT | L | IT | L | | | | | | | | |
 | bead_detect | IT | IT | L·opt | | IT | | | | | | | |
@@ -278,6 +284,7 @@ Each kernel was smoke-tested: `import` check plus a synthetic call where all dep
 | aldvc_field | ok | ran | 3-D pair + series against analytic truth; 18 adapter checks in `scripts/_aldvc_validate.py` (axis reversal, asymmetric-strain relabelling, no sign flip, anisotropic rescale, frame schedule) |
 | field_math | ok | ran | shear fixture: tensor shear symmetric at half the gradient; grid build on a 40³ volume |
 | track_objects | ok | ran | all 5 linking methods; in-place mutation confirmed |
+| field_mechanics | ok | ran | analytic suite: affine gradient exact on the lattice and by local fit (2-D, anisotropic 3-D), rigid rotation strain-free under the finite measures, J, curl sign, plane-stress σ_zz = 0 for SVK / neo-Hookean, Newtonian shear |
 | track_field | ok | ran | closed-form suite: affine gradient exact to 1e-15, parity with the `compute_strain_mls` loop, and every elasticity case (uniaxial / shear / hydrostatic / plane stress / plane strain) against its analytic answer |
 | registration | ok | ran | every entry point; translation recovered injected drift exactly |
 | bead_detect | ok | ran | 3-D detection + 2-D fallback |

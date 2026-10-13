@@ -252,9 +252,15 @@ class VectorsOverlay:
     """A displacement field (DIC/DVC ``u``/``v``) as decimated arrows (V2.19).
 
     Screen-space like every other overlay: an arrow keeps its weight and head size as you
-    zoom, so zooming inspects the field rather than magnifying the drawing of it."""
+    zoom, so zooming inspects the field rather than magnifying the drawing of it. The
+    geometry comes from :func:`nodegraph.fieldmap.vectors`, in image pixels — a µm
+    displacement is converted by the payload's pixel size (2026-10-09; it used to be drawn
+    in µm at pixel positions, 1/pixel_size of its true length)."""
     enabled: bool = True
+    layer: str = ""                 # "" = Auto: the first table carrying a displacement
     every: int = 4                  # draw 1 in N vectors
+    #: scale so the series' 95th-percentile arrow is one node spacing long, THEN `scale`
+    auto_scale: bool = True
     scale: float = 1.0              # multiplies BOTH components — never one
     gate: float = 0.0               # hide vectors shorter than this
     color_mode: str = "magnitude"   # magnitude | flat
@@ -263,6 +269,37 @@ class VectorsOverlay:
     width: float = 1.3
     head_px: float = 5.0
     opacity: int = 90
+
+
+@dataclass
+class FieldOverlay:
+    """Colours the image by any numeric column of a measured field (2026-10-09) — the
+    displacement magnitude of a correlation, a Field card's strain, rotation, Jacobian or
+    stress. The column is rasterised by :func:`nodegraph.fieldmap.raster` (a lattice
+    one cell per node, a scattered field resampled) and drawn under the grid and arrows,
+    with a colour bar naming the column and its unit.
+
+    ``limits = series`` takes the 1st / 99th percentile over EVERY frame of the table, so a
+    colour means the same value as you scrub time; ``frame`` re-fits each frame; ``manual``
+    uses the pair below. ``colormap = auto`` picks the diverging ``coolwarm`` for a column
+    with both signs (strain, curl, stress components) and ``turbo`` otherwise."""
+    enabled: bool = True
+    layer: str = ""                 # "" = Auto
+    column: str = ""                # "" = Auto: the most derived quantity on the table
+    style: str = "smooth"           # smooth | cells | contours
+    levels: int = 8                 # contours: how many iso-lines
+    colormap: str = "auto"
+    limits: str = "series"          # series | frame | manual
+    clim_lo: float = 0.0
+    clim_hi: float = 1.0
+    center_zero: bool = True        # symmetric about zero (diverging maps only)
+    opacity: int = 55
+    width: float = 1.2              # contour line width, screen px
+    colorbar: bool = True
+    #: crossed bars along the principal axes of the Strain / Stress card's tensor at every
+    #: `glyph_every`-th node — red tension, blue compression (:func:`nodegraph.fieldmap.tensor_glyphs`)
+    glyphs: str = "none"            # none | strain | stress
+    glyph_every: int = 1
 
 
 @dataclass
@@ -306,6 +343,28 @@ class MeshOverlay:
 
 
 @dataclass
+class GridOverlay:
+    """The correlation GRID of a DIC / PIV / DVC result (2026-10-09) — the elements the
+    field was measured on, drawn over the image: pyALDIC's quadrilaterals (adaptively
+    refined ones included), PIV's window lattice, a DVC hex grid as its section at the
+    viewed Z. Read from the ``<field>_mesh`` tables :mod:`nodegraph.catalog._shared.
+    analysis_mesh` writes.
+
+    ``elements`` draws each element's outline; ``subsets`` draws the subset / interrogation
+    window around every ``every``-th node instead — the patch each vector was actually
+    matched on, which shows how much neighbouring measurements overlap. Coloured by
+    refinement level by default, so a refined region stands out from the base grid."""
+    enabled: bool = True
+    style: str = "elements"         # elements | subsets | deformed
+    color_mode: str = "level"       # level | flat
+    exaggerate: float = 5.0         # deformed: displacement multiplier
+    color: str = "#7cf2a0"
+    width: float = 1.0
+    every: int = 4                  # subsets: 1 in N nodes
+    opacity: int = 70
+
+
+@dataclass
 class OverlaySettings:
     """The whole overlay configuration — one group per tab in the popup."""
     points: PointsOverlay = field(default_factory=PointsOverlay)
@@ -315,6 +374,11 @@ class OverlaySettings:
     vectors: VectorsOverlay = field(default_factory=VectorsOverlay)
     diff: DiffOverlay = field(default_factory=DiffOverlay)
     mesh: MeshOverlay = field(default_factory=MeshOverlay)
+    grid: GridOverlay = field(default_factory=GridOverlay)
+    # LAST, and it must stay last: once this line binds the class attribute `field`, a
+    # later `field(default_factory=…)` in this body would call the FieldOverlay default
+    # instead of `dataclasses.field`
+    field: FieldOverlay = field(default_factory=FieldOverlay)
 
     def group(self, tab: str):
         return getattr(self, tab)
@@ -394,12 +458,21 @@ TAB_INFO: Tuple[TabInfo, ...] = (
     TabInfo("vectors", "Vectors", True,
             "Displacement fields as decimated arrows, optionally coloured by magnitude "
             "(analysis.dvc_field, analysis.dic_correlate)."),
+    TabInfo("field", "Field", True,
+            "The image coloured by any column of a measured field — displacement "
+            "magnitude, or a Field card's strain, rotation, Jacobian or stress — as a "
+            "smooth wash, per-node cells or iso-contours, with a colour bar naming the "
+            "column and its unit."),
     TabInfo("diff", "Compare", True,
             "Two object sets matched and split into matched / only-here / only-there — "
             "the 'did it get better' view for a segmentation or a detector."),
     TabInfo("mesh", "Mesh", True,
             "Mesh-domain boundary surfaces, drawn as their cross-section at the viewed "
             "Z (analysis.tessellate)."),
+    TabInfo("grid", "Grid", True,
+            "The correlation grid a DIC, PIV or DVC field was measured on — refined DIC "
+            "elements, the PIV window lattice, a DVC hex grid's section at the viewed Z — "
+            "or the subset windows themselves."),
 )
 TABS: Tuple[str, ...] = tuple(t.key for t in TAB_INFO)
 TAB_BY_KEY: Dict[str, TabInfo] = {t.key: t for t in TAB_INFO}
@@ -407,7 +480,7 @@ TAB_BY_KEY: Dict[str, TabInfo] = {t.key: t for t in TAB_INFO}
 #: Per tab, the ``color_mode`` value that means "give every item its own colour".
 PER_ITEM_MODE: Dict[str, Optional[str]] = {
     "points": "per_point", "labels": "per_label", "tracks": "per_track",
-    "mesh": "per_object", "voxels": None,
+    "mesh": "per_object", "voxels": None, "grid": None, "field": None,
 }
 
 
@@ -440,6 +513,8 @@ _OPACITY = FieldSpec("opacity", "int", "Opacity", role="opacity", lo=5, hi=100,
 #: offer "gray", which is not a key there and silently fell back to viridis).
 _CMAP_CHOICES: Tuple[Tuple[str, str], ...] = tuple(
     (k, k) for k in __import__("nodelab_v2.overlay_render", fromlist=["COLORMAPS"]).COLORMAPS)
+_FIELD_CMAP_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("auto", "Auto — diverging for a signed column"),) + _CMAP_CHOICES
 
 _POINT_SHAPES = (("star", "Golden star (8 arms, gradient)"),
                  ("cross", "Cross + (4 arms, gradient)"),
@@ -628,6 +703,14 @@ FIELDS: Dict[str, Tuple[FieldSpec, ...]] = {
                   tip="Iso-contour line width in screen pixels"),
     ),
     "vectors": (
+        FieldSpec("layer", "layer", "Which table",
+                  tip="The Point table whose displacement is drawn. Auto takes the first one "
+                      "carrying disp_*, u/v, dy/dx or a velocity"),
+        FieldSpec("auto_scale", "bool", "Auto length",
+                  tip="Scale the arrows so the series' 95th-percentile vector is one node "
+                      "spacing long — readable at any displacement size, the same on every "
+                      "frame. Arrow scale then multiplies on top; off, the arrows are drawn "
+                      "at their true length in pixels times Arrow scale"),
         FieldSpec("every", "int", "Draw every", lo=1, hi=64,
                   tip="Keep 1 vector in N. A dense field is unreadable at full density "
                       "and slow to pan; this is the first knob to reach for"),
@@ -713,6 +796,91 @@ FIELDS: Dict[str, Tuple[FieldSpec, ...]] = {
         FieldSpec("near_z", "float", "Z tolerance", lo=0.0, hi=10.0, step=0.5,
                   decimals=1, unit=" planes", enable_if=("style", ("points",)),
                   tip="How far off the viewed Z a vertex may sit and still be drawn"),
+    ),
+    "field": (
+        FieldSpec("layer", "layer", "Which table",
+                  tip="The field table to colour by. Auto takes the one carrying the most "
+                      "derived quantity"),
+        FieldSpec("column", "column", "Colour by",
+                  tip="Any numeric column of that table. Auto picks the most derived one: "
+                      "von_mises, then strain_eq, jacobian, curl, then disp_mag_um"),
+        FieldSpec("style", "choice", "Style",
+                  choices=(("smooth", "Smooth wash"), ("cells", "One cell per node"),
+                           ("contours", "Iso-contours")),
+                  tip="Smooth interpolates between nodes; cells shows each node's own value "
+                      "as a flat patch (what was actually measured); contours draws "
+                      "iso-lines in the colour of their level and leaves the image visible"),
+        FieldSpec("levels", "int", "Contour levels", lo=2, hi=40,
+                  enable_if=("style", ("contours",)),
+                  tip="How many iso-lines between the limits"),
+        FieldSpec("colormap", "choice", "Colour map", role="colormap",
+                  choices=_FIELD_CMAP_CHOICES,
+                  tip="Auto uses coolwarm (diverging, zero neutral) for a column with both "
+                      "signs — strain, curl, a stress component — and turbo otherwise"),
+        FieldSpec("limits", "choice", "Limits",
+                  choices=(("series", "Whole series (1–99 %)"), ("frame", "This frame (1–99 %)"),
+                           ("manual", "Manual")),
+                  tip="Whole series keeps a colour meaning the same value on every frame — "
+                      "the setting to compare timepoints. This frame re-fits per frame"),
+        FieldSpec("clim_lo", "float", "Limit low", lo=-1e9, hi=1e9, step=0.001, decimals=4,
+                  enable_if=("limits", ("manual",)),
+                  tip="Value at the bottom of the colour ramp, in the column's unit"),
+        FieldSpec("clim_hi", "float", "Limit high", lo=-1e9, hi=1e9, step=0.001, decimals=4,
+                  enable_if=("limits", ("manual",)),
+                  tip="Value at the top of the colour ramp, in the column's unit"),
+        FieldSpec("center_zero", "bool", "Centre on zero",
+                  tip="Symmetric limits about zero so the neutral colour sits exactly on 0 — "
+                      "applied to a diverging map only"),
+        _OPACITY,
+        FieldSpec("width", "float", "Contour width", role="line_width",
+                  lo=0.4, hi=6.0, step=0.1, decimals=1, unit=" px",
+                  enable_if=("style", ("contours",)),
+                  tip="Iso-line width in screen pixels"),
+        FieldSpec("colorbar", "bool", "Colour bar",
+                  tip="Draw the colour bar (column, unit, limits) at the top right"),
+        FieldSpec("glyphs", "choice", "Principal axes",
+                  choices=(("none", "Off"), ("strain", "Strain tensor"),
+                           ("stress", "Stress tensor")),
+                  tip="Crossed bars along the principal directions of the Strain or Stress "
+                      "card's in-plane tensor at each node — length by magnitude, red for "
+                      "tension, blue for compression — which shows the DIRECTION a scalar "
+                      "map cannot. Needs that card upstream"),
+        FieldSpec("glyph_every", "int", "Axes every", lo=1, hi=32,
+                  enable_if=("glyphs", ("strain", "stress")),
+                  tip="Draw the axes of one node in N"),
+    ),
+    "grid": (
+        FieldSpec("style", "choice", "Style",
+                  choices=(("elements", "Grid elements"),
+                           ("subsets", "Subset / window boxes"),
+                           ("deformed", "Deformed grid")),
+                  tip="`Grid elements` outlines the elements the field was solved on — "
+                      "pyALDIC's quadrilaterals (a refined region shows as smaller boxes), "
+                      "the PIV window lattice, or a DVC hex grid cut at the viewed Z. "
+                      "`Subset / window boxes` draws the patch each vector was matched on "
+                      "around every Nth node instead, which shows how much neighbouring "
+                      "measurements overlap. `Deformed grid` joins the field's nodes "
+                      "through their DISPLACED positions (exaggerated) — the deformation as "
+                      "a distorted lattice; grid fields only (not tracks or a refined mesh)"),
+        FieldSpec("color_mode", "choice", "Colour by", role="color_mode",
+                  choices=(("level", "Refinement level"), ("flat", "One colour")),
+                  tip="`Refinement level` keeps the base grid in the tab colour and gives "
+                      "each level of adaptive refinement its own colour, so refined regions "
+                      "stand out; a uniform grid looks the same either way"),
+        FieldSpec("color", "color", "Colour", role="color",
+                  tip="The base grid's colour (and every element's, under One colour)"),
+        FieldSpec("width", "float", "Line width", role="line_width",
+                  lo=0.3, hi=6.0, step=0.1, decimals=1, unit=" px",
+                  tip="Grid line width in SCREEN pixels — constant at any zoom"),
+        FieldSpec("exaggerate", "float", "Exaggerate", lo=0.1, hi=1000.0, step=0.5,
+                  decimals=1, unit="x", enable_if=("style", ("deformed",)),
+                  tip="Multiplies the displacement the deformed grid is drawn with — 1 is "
+                      "the true deformation, which is usually too small to see"),
+        FieldSpec("every", "int", "Every Nth node", lo=1, hi=64,
+                  enable_if=("style", ("subsets",)),
+                  tip="Draw the window of one node in N — overlapping windows tile the image "
+                      "solid at N = 1"),
+        _OPACITY,
     ),
 }
 
@@ -1020,8 +1188,27 @@ class OverlayFrame:
     #: viewed node carries no scalar layer, which is every node that is not producing one.
     scalar: Optional[np.ndarray] = None
     #: Vectors for this plane, in full-resolution image pixels: ``(y, x, u, v)`` columns.
-    #: ``u``/``v`` are the displacement's y/x components in the SAME units as y/x.
+    #: ``u``/``v`` are the displacement's y/x components in the SAME units as y/x — image
+    #: pixels, converted from µm by :func:`nodegraph.fieldmap.vectors`.
     vectors: Optional[np.ndarray] = None
+    #: the series' 99th-percentile vector length (px) — the magnitude colour's top, so a
+    #: colour means the same length on every frame; 0 = this frame's own maximum
+    vec_hi: float = 0.0
+    #: the Auto-length multiplier (:func:`nodegraph.fieldmap.auto_scale`); 0 = none
+    vec_auto: float = 0.0
+    #: the Field tab's raster for this plane (:class:`nodegraph.fieldmap.FieldRaster`),
+    #: its resolved limits, colour map and colour-bar label
+    field: Optional[Any] = None
+    field_lims: Optional[Tuple[float, float]] = None
+    field_cmap: str = ""
+    field_label: str = ""
+    #: principal-axis glyphs (:class:`nodegraph.fieldmap.Glyphs`) and the deformed grid's
+    #: polylines (``(K, 2)`` y/x, image px) — both ``None`` when off
+    glyphs: Optional[Any] = None
+    grid_lines: Optional[Sequence[np.ndarray]] = None
+    #: The correlation grid on this plane (2026-10-09): ``(N, 5)`` ``y_lo, y_hi, x_lo, x_hi,
+    #: level`` boxes in full-resolution image pixels (element outlines, or subset windows).
+    grid: Optional[np.ndarray] = None
     #: The two object sets the comparison overlay judges — ``(N, 2)`` ``y,x`` each, in
     #: full-resolution image pixels. ``diff_a`` is the viewed node's own set and ``diff_b``
     #: the reference it is being scored against.
@@ -1132,6 +1319,16 @@ class OverlayRenderer:
         # (an outline, an arrow, an id) are exactly what you read the field against.
         if s.voxels.enabled and frame.scalar is not None:
             self._paint_scalar(p, s.voxels, frame)
+        # a measured field's column, under the grid and the arrows it was computed from
+        if s.field.enabled and frame.field is not None:
+            self._paint_field(p, s.field, frame)
+        if s.field.enabled and frame.glyphs is not None:
+            self._paint_glyphs(p, frame)
+        # the correlation grid sits under the vectors measured on it
+        if s.grid.enabled and frame.grid is not None and len(frame.grid):
+            self._paint_grid(p, s.grid, frame)
+        if s.grid.enabled and frame.grid_lines:
+            self._paint_grid_lines(p, s.grid, frame)
         if s.vectors.enabled and frame.vectors is not None and len(frame.vectors):
             self._paint_vectors(p, s.vectors, frame)
         if s.labels.enabled and frame.label_plane is not None:
@@ -1158,9 +1355,19 @@ class OverlayRenderer:
         Transparency comes from :func:`nodelab_v2.overlay_render.scalar_rgba` — the field's
         own values decide where the image shows through, which is what makes a heatmap
         readable instead of a coloured sheet over the data."""
-        from nodelab_v2.overlay_render import scalar_rgba
+        from nodelab_v2.overlay_render import normalize_for_map, scalar_rgba
         arr = np.asarray(frame.scalar)
         if arr.ndim != 2 or arr.size == 0:
+            return
+        if s.style == "contour":
+            # iso-lines on the plane's own grid (cell centres at +0.5), coloured by level
+            _t, lo, hi = normalize_for_map(
+                arr, (s.clim_lo if s.clim_auto is False else None),
+                (s.clim_hi if s.clim_auto is False else None),
+                center_zero=bool(s.center_zero), cmap=s.colormap)
+            self._paint_contours(p, arr, np.linspace(lo, hi, 9)[1:-1], s.colormap, lo, hi,
+                                 lambda r, c: frame.map_pt(c + 0.5, r + 0.5),
+                                 float(s.width), s.opacity)
             return
         rgba = scalar_rgba(
             arr, cmap=s.colormap,
@@ -1193,14 +1400,19 @@ class OverlayRenderer:
         v = np.asarray(frame.vectors, dtype=float)
         if v.ndim != 2 or v.shape[1] < 4:
             return
+        scale = float(s.scale) * (float(frame.vec_auto)
+                                  if getattr(s, "auto_scale", False) and frame.vec_auto > 0
+                                  else 1.0)
         tails, heads, mag = quiver_arrows(
             v[:, 0], v[:, 1], v[:, 2], v[:, 3],
-            every=max(1, int(s.every)), scale=float(s.scale),
+            every=max(1, int(s.every)), scale=scale,
             gate=float(s.gate))
         if not len(tails):
             return
         lut = colormap_lut(s.colormap)
-        hi = float(mag.max()) if (s.color_mode == "magnitude" and mag.size) else 0.0
+        hi = 0.0
+        if s.color_mode == "magnitude" and mag.size:
+            hi = float(frame.vec_hi) if frame.vec_hi > 0 else float(mag.max())
         flat = qcolor(s.color, s.opacity)
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -1225,6 +1437,164 @@ class OverlayRenderer:
             for sign in (-1.0, 1.0):
                 p.drawLine(b, QPointF(b.x() - head_px * (ux + sign * 0.6 * uy),
                                       b.y() - head_px * (uy - sign * 0.6 * ux)))
+        p.restore()
+
+    # ── a measured field's column (2026-10-09) ────────────────────────────────
+    def _paint_field(self, p: QPainter, s: "FieldOverlay", frame: OverlayFrame) -> None:
+        """The Field tab: the raster as one RGBA image over its extent (``smooth`` lets Qt
+        interpolate between node cells, ``cells`` keeps each node's own patch) or as
+        iso-contours, then the colour bar."""
+        from nodelab_v2.overlay_render import normalize_for_map, scalar_rgba
+        fr = frame.field
+        grid = np.asarray(getattr(fr, "grid", None), dtype=float)
+        if grid.ndim != 2 or grid.size == 0 or not np.isfinite(grid).any():
+            return
+        cmap = frame.field_cmap or (s.colormap if s.colormap != "auto" else "turbo")
+        lo, hi = frame.field_lims if frame.field_lims else (None, None)
+        _t, lo, hi = normalize_for_map(grid, lo, hi, center_zero=bool(s.center_zero),
+                                       cmap=cmap)
+        y0, y1, x0, x1 = fr.extent
+        ny, nx = grid.shape
+        if s.style == "contours":
+            dy, dx = (y1 - y0) / ny, (x1 - x0) / nx
+            levels = np.linspace(lo, hi, max(2, int(s.levels)) + 2)[1:-1]
+            self._paint_contours(
+                p, grid, levels, cmap, lo, hi,
+                lambda r, c: frame.map_pt((x0 + (c + 0.5) * dx) * frame.sx,
+                                          (y0 + (r + 0.5) * dy) * frame.sy),
+                float(s.width), 100)
+        else:
+            rgba = np.ascontiguousarray(scalar_rgba(
+                grid, cmap=cmap, lo=lo, hi=hi, center_zero=bool(s.center_zero),
+                alpha_mode="flat", opacity=max(0.0, min(1.0, s.opacity / 100.0))))
+            img = QImage(rgba.data, nx, ny, 4 * nx, QImage.Format_RGBA8888).copy()
+            tl = frame.map_pt(x0 * frame.sx, y0 * frame.sy)
+            br = frame.map_pt(x1 * frame.sx, y1 * frame.sy)
+            p.save()
+            p.setRenderHint(QPainter.SmoothPixmapTransform, s.style == "smooth")
+            p.drawImage(QRectF(tl, br), img)
+            p.restore()
+        if s.colorbar:
+            self._paint_colorbar(p, cmap, lo, hi, frame.field_label)
+
+    def _paint_glyphs(self, p: QPainter, frame: OverlayFrame) -> None:
+        """Crossed principal-axis bars, centred on their node, half-length ``|value| ×
+        scale`` image px; red for tension, blue for compression. Two cosmetic paths, so a
+        dense field costs two draws, not one per bar."""
+        g = frame.glyphs
+        rows = np.asarray(getattr(g, "rows", np.zeros((0, 5))), dtype=float)
+        if rows.ndim != 2 or not len(rows):
+            return
+        k = float(getattr(g, "scale", 1.0))
+        paths = {True: QPainterPath(), False: QPainterPath()}
+        for y, x, th, p1, p2 in rows:
+            for val, ang in ((p1, th), (p2, th + np.pi / 2.0)):
+                if not np.isfinite(val) or val == 0.0:
+                    continue
+                h = abs(val) * k
+                dx, dy = np.cos(ang) * h, np.sin(ang) * h
+                path = paths[val > 0]
+                path.moveTo(frame.map_pt((x - dx) * frame.sx, (y - dy) * frame.sy))
+                path.lineTo(frame.map_pt((x + dx) * frame.sx, (y + dy) * frame.sy))
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        for tension, col in ((True, QColor(235, 70, 55, 235)), (False, QColor(70, 120, 240, 235))):
+            pen = QPen(col, 1.8)
+            pen.setCosmetic(True)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.drawPath(paths[tension])
+        p.restore()
+
+    def _paint_grid_lines(self, p: QPainter, s: GridOverlay, frame: OverlayFrame) -> None:
+        """The deformed grid: the field's lattice rows and columns through the displaced
+        nodes, one cosmetic path in the grid colour."""
+        path = QPainterPath()
+        for line in frame.grid_lines or ():
+            a = np.asarray(line, dtype=float)
+            if a.ndim != 2 or len(a) < 2:
+                continue
+            path.moveTo(frame.map_pt(a[0, 1] * frame.sx, a[0, 0] * frame.sy))
+            for yy, xx in a[1:]:
+                path.lineTo(frame.map_pt(xx * frame.sx, yy * frame.sy))
+        pen = QPen(qcolor(s.color, s.opacity), max(0.3, float(s.width)))
+        pen.setCosmetic(True)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        p.restore()
+
+    def _paint_contours(self, p: QPainter, grid: np.ndarray, levels, cmap: str,
+                        lo: float, hi: float, to_widget, width: float,
+                        opacity: int) -> None:
+        """Iso-lines of ``grid`` (:func:`nodegraph.fieldmap.contour_lines`), one cosmetic
+        path per level in that level's colour; ``to_widget(row, col)`` maps grid index
+        coordinates to the widget."""
+        from nodegraph.fieldmap import contour_lines
+        from nodelab_v2.overlay_render import colormap_lut
+        lut = colormap_lut(cmap)
+        span = (hi - lo) if hi > lo else 1.0
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        for lv, polys in contour_lines(grid, levels):
+            if not polys:
+                continue
+            r, g, b = lut[int(np.clip((lv - lo) / span * 255.0, 0, 255))]
+            pen = QPen(QColor(int(r), int(g), int(b), _alpha(opacity)), max(0.4, width))
+            pen.setCosmetic(True)
+            path = QPainterPath()
+            for poly in polys:
+                path.moveTo(to_widget(float(poly[0, 0]), float(poly[0, 1])))
+                for rr, cc in poly[1:]:
+                    path.lineTo(to_widget(float(rr), float(cc)))
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+        p.restore()
+
+    def _paint_colorbar(self, p: QPainter, cmap: str, lo: float, hi: float,
+                        label: str) -> None:
+        """A vertical colour bar at the widget's top right: the ramp, the limits and the
+        midpoint, and the column with its unit above it — screen-space, so it stays put
+        and legible while the image pans and zooms."""
+        from nodelab_v2.overlay_render import colormap_lut
+        win = p.window()
+        bar_h = float(max(60.0, min(180.0, 0.35 * win.height())))
+        bar_w = 12.0
+        fm = QFontMetricsF(p.font())
+        ticks = [hi, 0.5 * (lo + hi), lo]
+        texts = [f"{v:.3g}" for v in ticks]
+        tw = max(fm.horizontalAdvance(t) for t in texts)
+        title = label or ""
+        ttw = fm.horizontalAdvance(title) if title else 0.0
+        box_w = max(bar_w + 8.0 + tw, ttw) + 16.0
+        box = QRectF(win.right() - box_w - 10.0, win.top() + 10.0, box_w,
+                     bar_h + fm.height() * (2.2 if title else 1.2) + 8.0)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(12, 14, 18, 170))
+        p.drawRoundedRect(box, 5.0, 5.0)
+        top = box.top() + 6.0 + (fm.height() * 1.1 if title else 0.0)
+        lut = colormap_lut(cmap)[::-1].copy()            # top of the bar = high values
+        ramp = np.repeat(lut[:, None, :], 2, axis=1)
+        ramp = np.ascontiguousarray(np.concatenate(
+            [ramp, np.full(ramp.shape[:2] + (1,), 255, np.uint8)], axis=2))
+        img = QImage(ramp.data, 2, 256, 8, QImage.Format_RGBA8888).copy()
+        bar = QRectF(box.left() + 8.0, top + fm.height() * 0.5, bar_w, bar_h)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(bar, img)
+        p.setPen(QPen(QColor(220, 225, 232), 1.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(bar)
+        if title:
+            p.drawText(QPointF(box.left() + 8.0, box.top() + 4.0 + fm.ascent()), title)
+        for k, t in enumerate(texts):
+            yy = bar.top() + bar.height() * k / 2.0
+            p.drawLine(QPointF(bar.right(), yy), QPointF(bar.right() + 3.0, yy))
+            p.drawText(QPointF(bar.right() + 6.0, yy + fm.ascent() / 2.0 - 1.0), t)
         p.restore()
 
     # ── comparison (V2.19) ────────────────────────────────────────────────────
@@ -1270,6 +1640,34 @@ class OverlayRenderer:
         if s.color_mode == "per_object":
             return distinct_color(int(object_id), s.sat, s.val, op)
         return qcolor(s.color, op)
+
+    #: refinement level → colour when ``color_mode = level`` (level 0 takes the tab colour)
+    GRID_LEVEL_COLORS = ("#ffb347", "#ff6f91", "#c780fa", "#ff4040", "#ffffff")
+
+    def _paint_grid(self, p: QPainter, s: GridOverlay, frame: OverlayFrame) -> None:
+        """One cosmetic-pen path per colour — thousands of boxes stay one draw call each,
+        and the line keeps its screen width at every zoom."""
+        g = np.asarray(frame.grid, dtype=float)
+        alpha = int(255 * max(0, min(100, int(s.opacity))) / 100)
+        levels = (g[:, 4].astype(int) if s.color_mode == "level"
+                  else np.zeros(len(g), dtype=int))
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setBrush(Qt.NoBrush)
+        for lv in np.unique(levels):
+            col = QColor(s.color if lv <= 0 else
+                         self.GRID_LEVEL_COLORS[min(int(lv) - 1, len(self.GRID_LEVEL_COLORS) - 1)])
+            col.setAlpha(alpha)
+            pen = QPen(col, float(max(0.1, s.width)))
+            pen.setCosmetic(True)
+            p.setPen(pen)
+            path = QPainterPath()
+            for y0, y1, x0, x1, _l in g[levels == lv]:
+                a = frame.map_pt(x0 * frame.sx, y0 * frame.sy)
+                b = frame.map_pt(x1 * frame.sx, y1 * frame.sy)
+                path.addRect(QRectF(a, b).normalized())
+            p.drawPath(path)
+        p.restore()
 
     def _paint_mesh(self, p: QPainter, s: MeshOverlay, frame: OverlayFrame) -> None:
         """Draw each element's Z cross-section (outline / filled) or its near-plane
@@ -1872,6 +2270,17 @@ def render_preview(p: QPainter, rect: QRectF, s: OverlaySettings, tab: str,
             TrackPath(2, [(18.0, 6.0), (16.0, 13.0), (15.0, 21.0), (12.0, 29.0)],
                       2, [0, 1, 2, 3]),
         ]
+    elif tab == "field":
+        # a signed saddle on a 12 x 20 lattice, so auto picks the diverging map and the
+        # wash / cells / contour styles all show something honest
+        from nodegraph.fieldmap import FieldRaster
+        gy, gx = np.mgrid[0:12, 0:20]
+        sad = np.sin(gx / 3.0) * np.cos(gy / 2.5)
+        frame.field = FieldRaster(sad, (0.0, h, 0.0, w), True, "preview", "strain_xx")
+        cm = s.field.colormap
+        frame.field_cmap = "coolwarm" if cm == "auto" else cm
+        frame.field_lims = (-1.0, 1.0)
+        frame.field_label = "strain_xx"
     elif tab == "mesh":
         # two closed cross-sections — a hexagon and an L, so the fill / outline / vertex
         # styles all show something honest (the L proves a concave section renders)
@@ -1891,6 +2300,7 @@ __all__ = [
     "MAX_CONSTRAINT_HUES",
     "neighbor_pairs", "deconflict_slots", "slot_lut", "slot_of",
     "PointsOverlay", "LabelsOverlay", "TracksOverlay", "VoxelsOverlay", "MeshOverlay",
+    "FieldOverlay",
     "OverlaySettings", "TabInfo", "TAB_INFO", "TABS", "TAB_BY_KEY", "PER_ITEM_MODE",
     "FieldSpec", "FIELDS", "SPREAD_ROLES", "SPREAD_ROLE_LABEL", "field_enabled",
     "spread_settings", "FILE_SUFFIX", "FILE_FILTER", "USER_FILE", "PROJECT_FILE",

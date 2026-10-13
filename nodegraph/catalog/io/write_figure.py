@@ -40,6 +40,10 @@ def _compute_write_figure(ctx: EvalContext) -> Dataset:
     * ``path`` is required (an empty one is refused, as Export TIFF does); the format's
       extension is added when missing; ``existing`` decides about a file already there;
     * written atomically through ``<stem>.part<ext>``; a pass-through tap like Export TIFF.
+    * a figure with one VIEW per position / frame / plane (Plot Field, 2026-10-09): the
+      Viewer's playback strip picks the view on screen, but a writer cannot follow it, so
+      ``position`` / ``frame`` / ``plane`` pick the view written, drawn from the picture's
+      provider at full background resolution.
     """
     ds = ctx.inputs[0]
     modes = ctx.params.get("__modes__", {}) or {}
@@ -57,11 +61,23 @@ def _compute_write_figure(ctx: EvalContext) -> Dataset:
         raise ValueError(f"Export Figure: {target} already exists and Existing is 'refuse' — "
                          f"move it, pick another name, or set Existing to overwrite")
     FIG.require_matplotlib()
+    # each read with its literal key: the socket contract's index finds reads by name
+    want_m = ctx.params.get("position", 0)
+    want_t = ctx.params.get("frame", 0)
+    want_z = ctx.params.get("plane", 0)
+    pick = lambda v, n: min(max(0, int(v or 0)), max(1, int(n)) - 1)    # noqa: E731
     if spec.get("per") == "frame":
         # a per-frame figure: write the chosen frame (the last one when past the end)
-        frames = max(1, int(ds.axes.t))
-        spec = FIG.frame_spec(spec, min(max(0, int(ctx.params.get("frame", 0) or 0)),
-                                        frames - 1))
+        spec = FIG.frame_spec(spec, pick(want_t, ds.axes.t))
+    elif spec.get("per") == "view":
+        prov = getattr(ds, "image", None)
+        if not isinstance(prov, FIG.ViewFigureProvider):
+            raise ValueError("Export Figure: this figure draws its views on demand, and the "
+                             "picture reaching it no longer carries them — wire the Plot "
+                             "node into Export Figure directly")
+        ax = ds.axes
+        spec = prov.spec_for(pick(want_m, ax.m), pick(want_t, ax.t), pick(want_z, ax.z),
+                             side=prov.EXPORT_SIDE)
     folder = os.path.dirname(os.path.abspath(target))
     os.makedirs(folder, exist_ok=True)
     ctx.progress(0, 1, f"writing {os.path.basename(target)}")
@@ -89,6 +105,15 @@ register_node(
               description="Which frame of a PER-FRAME figure to write (the first is 0; past "
                           "the last, the last). A figure drawn whole has one frame and "
                           "ignores it; a movie of all frames is Export Movie's job."),
+        InInt("position", "Position", unit="", field=False, default=0,
+              description="Which stage position of a figure with one view per position "
+                          "(Plot Field) to write; the first is 0, and past the last, the last. "
+                          "The Viewer's playback strip picks what you see; this picks what "
+                          "is written. Other figures have one position and ignore it."),
+        InInt("plane", "Plane", unit="", field=False, default=0,
+              description="Which Z plane of a figure with one view per plane (Plot Field) "
+                          "to write; the first is 0, and past the last, the last. Other "
+                          "figures have one plane and ignore it."),
         InInt("dpi", "Resolution", unit="dpi", field=False, default=300,
               available_in={"format": frozenset({"png", "tiff"})},
               description="Pixels per inch of a PNG or TIFF. The figure is drawn again at "

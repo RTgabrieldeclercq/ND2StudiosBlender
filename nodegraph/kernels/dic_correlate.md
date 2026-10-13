@@ -77,6 +77,39 @@ hands that forward. Measured: an 11 px shift came back as a 6.3 px error under `
 with a plane reader can stream a long series at ~two planes of memory instead of the whole
 `T×H×W` float64 stack.
 
+### 2b. The staged entry points (2026-10-08)
+
+`run_pyaldic_series` runs pyALDIC's Sections 2b-8 in one call. The staged DIC nodes (`dic.grid` →
+`dic.initial_guess` → `dic.local_match` → `dic.global_step` → `dic.strain`, placed by `bundle:dic`) call the
+sections one at a time:
+
+```python
+dic_stage_para(params, shape, *, reference_mode, roi_mask=None) -> DICPara   # §2b rewrite: ROI clamped, img_size, FFT search auto-scaled
+dic_stage_grid(para, shape) -> (x0, y0)                      # the lattice integer_search lays its windows on
+dic_stage_lattice_nodes(para, shape) -> (N, 2) [x, y]        # mesh_setup's node order, the row order every table keeps
+dic_stage_normalize(img, para) -> (H, W)                     # (img − mean_roi) / std_roi
+dic_stage_reference(ref_norm, para, shape, roi_mask=None) -> DICReference   # masked frame, gradients, para with img_ref_mask
+dic_stage_seed(ref, g_norm, *, search=None) -> {x0, y0, U0, cc, search, info}          # §3 FFT seed, auto-expanding retry, init_disp
+dic_stage_mesh(ref, x0, y0) -> DICMesh                       # mesh_setup + the mask trim (elements only)
+dic_stage_refine(ref, mesh, U0|None, refinement) -> (DICMesh, U0)  # pre-solve refinement (2026-10-09);
+                                                             # depends on mesh+mask+criteria only, so
+                                                             # U0=None re-derives the same mesh
+dic_stage_seed_on_mesh(ref, mesh, U0, x0, y0) -> U0 (2N,)    # interpolate onto the mesh, NaN under the mask
+dic_stage_local(ref, mesh, g_norm, U0) -> {U, F, conv_iter, bad_pt_num, mark_hole_strain, node_region_map}   # §4
+dic_stage_global(ref, mesh, g_norm, U1, F1, mark_hole_strain, node_region_map, *, beta=None) -> {U, F, beta, n_steps, …}   # §5-6 verbatim
+dic_stage_strain(ref, mesh, U, *, deformed_mask=None) -> StrainResult   # §8 for one frame
+dic_split_u / dic_merge_u / dic_split_f / dic_merge_f        # interleaved ↔ per-component
+```
+
+Each reproduces its slice of `core/pipeline.py:700-1871` (the same calls in the same order, the same `para`
+rewrites, the mesh trimmed exactly as the driver trims it), so for the paths it covers — the FFT seed, no pre-solve
+refinement, no seed propagation — the staged chain and the one-call driver agree on every node: measured
+identical (max |Δ| 0.0 in the kernel, 1e-15 through the Engine) on a synthetic speckle pair. Everything crosses
+this boundary in pyALDIC's own layout (interleaved `U` / `F`, `[x, y]` coordinates); the nodes convert at their
+edge, as `_frame_to_dvcresult` does. The caches `run_aldic` keeps (reference bundle, IC-GN context, subpb1
+precompute, the learned FFT radius, β per reference) are rebuilt per reference frame by each node — seconds —
+because nothing opaque may ride the memo, the spill or a saved file.
+
 ## 3. Inputs
 
 | name | Python type | shape | dtype | axis order | units | required? | meaning & constraints |
@@ -114,7 +147,11 @@ with a plane reader can stream a long series at ~two planes of memory instead of
 
 For a pair: one `DVCResult`. For a series: `List[Dict[str, DVCResult]]`, one dict
 per deformed frame, keys `"primary"` (cumulative — from pyALDIC `U_accum`, falling
-back to `U`) and `"increment"` (per-step `U`).
+back to `U`) and `"increment"` (per-step `U`), plus (2026-10-09) `"mesh"`:
+`{"coords": (N, 2) [x, y], "elements": (E, 8) int}`, the FE mesh that frame was solved on
+— pyALDIC's Q8 connectivity, `-1` for an absent mid-side (hanging) node, refined elements
+included. `analysis.dic_correlate` turns it into the `<field>_mesh` grid table the
+Viewer draws (`catalog/_shared/analysis_mesh.fem_quads`).
 
 `resample` chooses the output geometry. `G` below is `(Gy, Gx)` for `"grid"` (a regular
 lattice of pitch `winstepsize`, the historical contract) and `(N,)` for `"nodes"` (the FE
@@ -125,7 +162,7 @@ mesh nodes themselves).
 | `dim` | scalar | int | — | — | always `2`. |
 | `grid_coords` | `(*G, 2)` | float64 | `[y, x]` | pixels (downsampled) | Node coordinates; `[...,0]=y`, `[...,1]=x`. |
 | `displacement_field` | `(*G, 2)` | float64 | `[y, x]` | pixels | `[...,0]=dy`, `[...,1]=dx`. Convert to µm via `.displacement_um()`. **Non-finite at nodes the solver could not resolve** (masked-out subsets) — that is the honest answer, not a defect. |
-| `strain_field` | `(*G, 2, 2)` or `None` | float64 | `[y, x]` | — | `[i, j] = ∂disp_i/∂axis_j`, from al_dic's FEM nodal gradients. `None` unless `compute_strain=True`. **Cross terms are sign-corrected — see §6.** |
+| `strain_field` | `(*G, 2, 2)` or `None` | float64 | `[y, x]` | — | The SYMMETRIC small strain `[i, j] = ½(∂disp_i/∂axis_j + ∂disp_j/∂axis_i)` (tensor shear), from al_dic's FEM nodal gradients — the tensor `analysis.dvc_field` and `analysis.track_field` write under the same `strain_*` names. Until 2026-10-09 the cross slots held the raw gradient; it lives in the staged cards' / Field Gradient's `grad_*` now. `None` unless `compute_strain=True`. **Cross terms are sign-corrected — see §6.** |
 | `voxel_size_um` | len-2 tuple | float | `(y, x)` | µm/px | as supplied. |
 | `qfactor` | — | — | — | — | `None`. al-dic 0.7.2 keeps its per-point NCC quality factors inside `solver/integer_search.py` (`fft_info["cc_max"]`) and never places them on `PipelineResult`, so there is no honest per-node confidence to report without patching the solver. |
 | `converged` | scalar | bool | — | — | `False` for frames at/after an early stop (`PipelineResult.stopped_at_frame`), else `True`. |

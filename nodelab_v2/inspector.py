@@ -55,6 +55,7 @@ from nodelab_v2.ops import (DOCK_OP, MOVIE_OP, PAGE_INPUT_OP, PAGE_SOURCE_KEY,
                             PRECISION_UNSET, bake_record)
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 from nodelab_v2 import readiness as RD
+from nodelab_v2.quick import is_quick_op
 from nodegraph.registry import NODES
 
 #: a drawing node's tool settings (presentation params), edited inside its Draw section
@@ -326,6 +327,8 @@ class InspectorPanel(QScrollArea):
     #: (show the master page, this node selected — the graph is edited there) or ``unique``
     #: (turn this page into a page of its own). The panel asks; the window owns the pages.
     linked_action = Signal(str, str)
+    #: the Quick analysis section (2026-10-09): ``(node_id, "quick" | "full")``
+    quick_action = Signal(str, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -568,6 +571,9 @@ class InspectorPanel(QScrollArea):
         self._problem_sockets = RD.socket_problems(self._problems)
         self._v.addWidget(self._readiness_section(node, self._problems))
         self._v.addWidget(self._sep())
+        if is_quick_op(spec.op_key):
+            self._v.addWidget(self._quick_section(node))
+            self._v.addWidget(self._sep())
 
         # footprint — the read COST (a fact), plus the statistics POPULATION (a control, V2.27)
         fp = self._section("Footprint")
@@ -1071,8 +1077,45 @@ class InspectorPanel(QScrollArea):
         can warn when a sweep is about to run over the whole series."""
         if bool(on) != getattr(self, "_solo_frame", False):
             self._solo_frame = bool(on)
-            if self._node is not None and getattr(self._node, "op_key", "") == ITERATE_OP:
+            if self._node is not None and (getattr(self._node, "op_key", "") == ITERATE_OP
+                                           or is_quick_op(getattr(self._node, "op_key", ""))):
                 self._rebuild()
+
+    # ── quick analysis (2026-10-09) ──────────────────────────────────────────
+    def _quick_section(self, node: NodeItem) -> QWidget:
+        """DIC / PIV / DVC / SerialTrack: run on the frame being viewed, in seconds, to tune
+        the settings before the full run. Arms the F9 scope with the picks the analysis
+        needs (:func:`nodelab_v2.quick.quick_picks` — the reference frame included, which
+        the plain F9 defaults would leave out) and pulls; Full run turns the scope off."""
+        sec = self._section("Quick analysis")
+        row = QHBoxLayout()
+        quick = QPushButton("Quick analysis")
+        quick.setToolTip(
+            "Run this analysis on the position and plane the Viewer shows, between its "
+            "reference and current frame, inside a box about 16 subsets wide — seconds "
+            "instead of the whole series. Arms F9 (troubleshooting) with those picks; drag "
+            "the amber box or ctrl+click strips to change them. Each setting you try is "
+            "cached, so going back is instant. Quick runs are never saved to disk.")
+        quick.clicked.connect(lambda: self.quick_action.emit(node.node_id, "quick"))
+        full = QPushButton("Full run")
+        full.setToolTip("Turn the troubleshooting scope off: the next pull analyses every "
+                        "position and frame, and saves the result beside the source.")
+        full.setEnabled(bool(getattr(self, "_solo_frame", False)))
+        full.clicked.connect(lambda: self.quick_action.emit(node.node_id, "full"))
+        row.addWidget(quick)
+        row.addWidget(full)
+        row.addStretch(1)
+        sec._lay.addLayout(row)  # type: ignore[attr-defined]
+        note = QLabel(
+            "Tune here, then Full run. To let the app choose, add an Iterate card around this "
+            "node and sweep a setting with Preserve = best on a quality metric this node "
+            "writes (e.g. dic_solved_frac, piv_valid_frac, dvc_valid_frac). A quick run also "
+            "estimates the full run's time on this machine (analysis_est_full_s).")
+        note.setProperty("role", "muted")
+        note.setWordWrap(True)
+        nf = note.font(); nf.setPointSize(9); note.setFont(nf)
+        sec._lay.addWidget(note)  # type: ignore[attr-defined]
+        return sec
 
     # ── dock section ────────────────────────────────────────────────────────
     #: what each dock status means, in the user's terms — the sentence under the buttons.
@@ -1714,6 +1757,9 @@ class InspectorPanel(QScrollArea):
               and s.name == PAGE_SOURCE_KEY):
             lay.addWidget(self._page_source_box(node, s))
             return row
+        elif s.type is SocketType.STRING and getattr(s, "options_from", ""):
+            lay.addWidget(self._options_box(node, s))
+            return row
         elif s.type is SocketType.STRING and getattr(s, "choices", ()):
             lay.addWidget(self._choice_box(node, s))
             return row
@@ -1843,6 +1889,29 @@ class InspectorPanel(QScrollArea):
         box.activated.connect(
             lambda _i, nm=s.name, b=box: (self._set_param(node, nm, b.currentText()),
                                           self._after_model_edit(node)))
+        return box
+
+    def _options_box(self, node: NodeItem, s):
+        """An EDITABLE combo for a socket whose entries only exist at run time
+        (``SocketSpec.options_from``, 2026-10-09) — today the saved analysis trials beside
+        the incoming image's source, for Load Analysis. Each entry hovers with what the
+        trial is (label, analysis, saved units, settings); free text stays legal so a trial
+        folder elsewhere can be typed by its full path."""
+        pairs: list = []
+        try:
+            if s.options_from == "analysis_trials":
+                pairs = list(node.doc.trial_choices(node.node_id, s))
+        except Exception:                            # never let a picker break the panel
+            pairs = []
+        ids = [p[0] for p in pairs]
+        box = self._names_box(
+            node, s, ids,
+            present="Saved trials beside the source: ",
+            empty="No saved trials beside the incoming image's source file yet — run a DIC, "
+                  "DVC, PIV or SerialTrack node with Saved results = reuse, or type a trial "
+                  "folder's full path.",
+            note="\n(free text is allowed — a trial folder's full path)")
+        _set_item_tips(box, ids, {i: t for i, t in pairs})
         return box
 
     def _layer_box(self, node: NodeItem, s):

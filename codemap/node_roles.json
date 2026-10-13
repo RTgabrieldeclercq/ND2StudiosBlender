@@ -50,8 +50,8 @@
       "label": "Input / output",
       "stage": "acquire_and_organize",
       "pages": ["input"],
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, and sinks that write it back out as TIFF, movie, image sequence or figure.",
-      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure"]
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
+      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure", "io.load_analysis"]
     },
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
@@ -170,7 +170,14 @@
       "stage": "quantify",
       "pages": ["process"],
       "description": "Dense or gridded motion between frames without discrete objects: 2D digital image correlation, 3D digital volume correlation, particle image velocimetry, per-pixel optical flow, and accumulation of DVC increments into cumulative displacement and strain.",
-      "ops": ["analysis.dic_correlate", "analysis.dvc_field", "analysis.piv", "analysis.optical_flow", "analysis.accumulate_field"]
+      "ops": ["analysis.dic_correlate", "dic.grid", "dic.initial_guess", "dic.refine_mesh", "dic.local_match", "dic.global_step", "dic.strain", "analysis.dvc_field", "dvc.grid", "dvc.initial_guess", "dvc.local_match", "dvc.global_step", "dvc.strain", "analysis.piv", "piv.first_pass", "piv.validate", "piv.deform_pass", "piv.smooth", "analysis.optical_flow", "analysis.accumulate_field"]
+    },
+    "field_mechanics": {
+      "label": "Field mechanics",
+      "stage": "quantify",
+      "pages": ["process", "analyze"],
+      "description": "What follows from a measured displacement or velocity field, written back onto the field's own table: its gradient (lattice differences or a local plane fit), strain under a chosen measure with principal values and von Mises equivalent, curl and finite rotation, the Jacobian / dilatation / divergence of volume change, and stress through a stated material law (Hooke, Saint Venant-Kirchhoff, neo-Hookean, Newtonian fluid).",
+      "ops": ["field.gradient", "field.strain", "field.rotation", "field.volume_change", "field.stress"]
     },
     "control_flow": {
       "label": "Control flow",
@@ -197,8 +204,8 @@
       "label": "Plotting",
       "stage": "control_and_present",
       "pages": ["analyze"],
-      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, and Plot Heatmap a table summary on a grid or a Voxel layer's plane.",
-      "ops": ["plot.xy", "plot.timeseries", "plot.distribution", "plot.heatmap"]
+      "description": "Charts of the measured tables, drawn with matplotlib as a true-colour picture the Viewer shows and Export Figure writes as PNG, SVG, PDF or TIFF: Plot XY draws one column against another, Plot Time Series one over the experiment's own clock (both optionally one figure per frame), Plot Distribution a column's spread per group, Plot Heatmap a table summary on a grid or a Voxel layer's plane, and Plot Field a measured field drawn on its image (colour map, arrows, contours, scale bar).",
+      "ops": ["plot.xy", "plot.timeseries", "plot.distribution", "plot.heatmap", "plot.field"]
     },
     "page_boundary": {
       "label": "Page boundary",
@@ -214,6 +221,7 @@
     "io.write_tiff": ["analyze"],
     "io.write_movie": ["analyze"],
     "io.write_figure": ["analyze"],
+    "io.load_analysis": ["input", "analyze"],
     "channel.select": ["input", "refine", "process", "analyze"],
     "page.input": ["refine", "process", "analyze"],
     "page.output": ["input", "refine", "process"],

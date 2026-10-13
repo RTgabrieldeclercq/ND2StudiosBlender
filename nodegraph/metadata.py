@@ -395,7 +395,7 @@ def shift_origin_um(env: MetaEnvelope, dz: float = 0.0, dy: float = 0.0,
 #: ``frame_time_jd`` is deliberately ABSENT: it is indexed by T, not M.
 PER_POSITION_KEYS: Tuple[str, ...] = (
     "origin_um", "stage_xy_um", "stage_z_um", "__align_um__", "align_to_ncc",
-    "source_file", "position_group", "position_name", "position_index",
+    "source_file", "source_path", "position_group", "position_name", "position_index",
     "source_frame_time_jd",
 )
 
@@ -431,6 +431,21 @@ SOURCE_FILE_KEY = "source_file"
 #: :data:`SOURCE_FILE_KEY`: stamped by a file bundle alone, read by ``util.timeseries`` to
 #: order FRAMES rather than files. Named once so the runner and the engine agree.
 SOURCE_CLOCK_KEY = "source_frame_time_jd"
+
+#: The per-M metadata key holding each position's source file as an ABSOLUTE path (2026-10-09)
+#: — :data:`SOURCE_FILE_KEY`'s twin. The name is what a table's ``file`` column shows; the
+#: path is where things that belong NEXT TO the file go: the analysis store
+#: (:mod:`nodegraph.analysis_store`) writes ``<stem>.analysis/`` beside it, and keys a saved
+#: trial on it. Provenance, not geometry, like the name; per position because a file bundle
+#: folds several files onto M.
+#:
+#: After a chain onto T, C or Z (:func:`chained_metadata`), a position is built from K files.
+#: Unlike every other per-position key, this one then KEEPS the first file's path, in chain
+#: order, rather than dropping, because it answers "where do this series' results go", and
+#: the answer is beside its first file. Identity is not lost: the saved trial's lineage still
+#: identifies every chained file at its own source card. Until 2026-10-09 it was dropped, and
+#: every chained series silently saved no results.
+SOURCE_PATH_KEY = "source_path"
 
 #: The scalar metadata key naming the experimental CONDITION a Dataset belongs to — stamped by
 #: a Page Output (V4.00: blank = its page's name) and read by ``table.concat``, which writes
@@ -530,7 +545,9 @@ def stamp_source_file(env: "MetaEnvelope", path: str) -> "MetaEnvelope":
     name = os.path.basename(str(path)) or str(path)
     if not name:
         return env
-    return env.with_metadata(**{SOURCE_FILE_KEY: [name] * max(1, int(env.axes.m))})
+    m = max(1, int(env.axes.m))
+    return env.with_metadata(**{SOURCE_FILE_KEY: [name] * m,
+                                SOURCE_PATH_KEY: [os.path.abspath(str(path))] * m})
 
 
 #: EVERY metadata key that is a **list indexed by timepoint**. The per-T member of the same
@@ -1289,6 +1306,7 @@ def crop_frames(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvel
     if zs is not None:
         changes["z_step_um"] = respaced(z_step, keep_z)
         changes.update(z_home_after(env.metadata, keep_z))
+    changes.update(scope_stamp_subset(env.metadata, ax, picks))
     # The z shift uses the SOURCE spacing, deliberately: `origin_um` is where plane 0 sits,
     # so the corner moves by however many real planes were dropped below the first kept one.
     # Computing it from the RESPACED step would scale the shift by the stride as well.
@@ -1303,6 +1321,45 @@ def crop_frames(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvel
             # `axes.m`, and after an M subset only the already-narrowed list on the
             # already-narrowed axes passes that check.
             out = out.with_metadata(**shift_origin_um(out, dz, 0.0, 0.0))
+    return out
+
+
+def scope_stamp_subset(metadata: Mapping[str, Any], axes: Any,
+                       keep: Mapping[str, Optional[Sequence[int]]]) -> Dict[str, Any]:
+    """The troubleshooting scope's stamps after a frames cut keeps ``keep[axis]`` of M / T
+    / Z (2026-10-12) — ``{}`` outside a scoped pull.
+
+    A scoped source seed says WHICH source frames it holds (``scope_m`` / ``scope_t`` /
+    ``scope_z``, the runner's ``_pin_frames``), and an analysis maps a fixed reference frame
+    through them (``_shared.analysis_units.scoped_frame``). A cut downstream changes which
+    frames those are. A stamp that still describes the axis (one entry per index) is
+    remapped through the kept indices: the survivors' own source frames. One that no
+    longer does — a Timeseries Builder upstream rebuilt the axis, so its entries name one
+    file's frames — is REPLACED by the kept indices, and ``scope_of`` takes that axis's
+    extent: below a builder a reference frame is a frame of the rebuilt series, which is
+    what the troubleshooting cut after a builder picks (``nodelab_v2.solo_scope``).
+    Left stale, the length check in ``scoped_frame`` read the reference as a payload index
+    and correlated against the wrong frame."""
+    if not any(k in metadata for k in ("scope_m", "scope_t", "scope_z", "scope_region")):
+        return {}
+    out: Dict[str, Any] = {}
+    sizes = {"m": int(axes.m), "t": int(axes.t), "z": int(axes.z)}
+    of0 = metadata.get("scope_of")
+    of = list(of0) if isinstance(of0, (list, tuple)) and len(of0) == 5 else None
+    for i, a in enumerate(("m", "t", "z")):
+        kept = keep.get(a)
+        if kept is None:
+            continue
+        key = f"scope_{a}"
+        st = metadata.get(key)
+        if isinstance(st, (list, tuple)) and st and len(st) == sizes[a]:
+            out[key] = tuple(int(st[j]) for j in kept)
+        else:
+            out[key] = tuple(int(j) for j in kept)
+            if of is not None:
+                of[i] = sizes[a]
+    if of is not None and tuple(of) != tuple(of0):
+        out["scope_of"] = tuple(int(v) for v in of)
     return out
 
 
@@ -2014,6 +2071,11 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
     :data:`SOURCE_FILE_KEY` falls out of this by itself — the names never agree — which is
     correct and needs no special case.
 
+    :data:`SOURCE_PATH_KEY` is the one exception. Off ``m`` it keeps the FIRST member's
+    paths, because it says where results are stored, not where a voxel came from. Dropping
+    it left a chained series with nowhere to save, and the analysis store then saved
+    nothing, silently.
+
     **The chained axis's own family** (:data:`PER_TIME_KEYS` onto T,
     :data:`PER_CHANNEL_KEYS` onto C) is concatenated per member, each contributing its OWN
     length — which is what lets files with different frame counts chain — but only when the
@@ -2062,6 +2124,8 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
             out[key] = [v for sl in slices for v in sl]
         elif all(sl == slices[0] for sl in slices):
             out[key] = slices[0]
+        elif key == SOURCE_PATH_KEY:
+            out[key] = slices[0]            # results go beside the series' first file
         else:
             # A coordinate that differs by stage jitter is still ONE field -- the first
             # file's reading is kept, the same one-value-per-position a native multi-T
@@ -2588,9 +2652,9 @@ __all__ = [
     "plane_pick", "select_plane",
     "POSITION_GROUP_KEY", "POSITION_NAME_KEY",
     "PER_POSITION_KEYS", "position_subset", "drop_position_keys", "SOURCE_FILE_KEY",
-    "SOURCE_CLOCK_KEY", "source_file_runs", "chain_grow", "chained_metadata",
-    "ChainMember", "chain_members", "chain_member_frame_clock", "chain_frame_order",
-    "chain_uniform_step_s", "stamp_source_file",
+    "SOURCE_CLOCK_KEY", "SOURCE_PATH_KEY", "source_file_runs", "chain_grow",
+    "chained_metadata", "ChainMember", "chain_members", "chain_member_frame_clock",
+    "chain_frame_order", "chain_uniform_step_s", "stamp_source_file", "scope_stamp_subset",
     "PER_TIME_KEYS", "CONDITION_KEY", "CONDITION_SET_KEY", "time_subset", "respaced", "z_home_after",
     "eval_derive", "resolve_dim_default",
 ]

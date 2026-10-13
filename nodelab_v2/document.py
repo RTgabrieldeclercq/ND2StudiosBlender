@@ -694,6 +694,40 @@ class GraphDocument:
             i += 1
         return f"f{i}"
 
+    def place_bundle(self, key: str, *, x: float = 0.0, y: float = 0.0,
+                     splice: Optional[tuple] = None) -> Tuple[List[str], str]:
+        """Place a node BUNDLE (:mod:`nodegraph.bundles`, 2026-10-08): add every member
+        node at its relative position from ``(x, y)`` with fresh ids, wire the members as
+        the bundle says, and frame them as a region titled after the bundle → the new
+        node ids (in bundle order) and the frame id. ``splice`` is a wire ``(s, ss, d, ds)``
+        the bundle was dropped onto: its source is re-pointed at the bundle's input socket
+        and the bundle's output feeds its destination, the original wire removed — the
+        multi-node form of :meth:`GraphScene.splice_onto`, transactional in the same way
+        (both ends are checked before the wire is touched). What the document holds
+        afterwards is ordinary nodes; the bundle itself is not recorded."""
+        from nodegraph.bundles import bundle_of
+        b = bundle_of(key)
+        ids: Dict[str, str] = {}
+        for bn in b.nodes:
+            nid = self.new_id(bn.id.rstrip("0123456789") or "n")
+            rec = self.add_node(bn.op_key, x=x + bn.x, y=y + bn.y, node_id=nid,
+                                params=dict(bn.params), modes=dict(bn.modes))
+            ids[bn.id] = rec.id
+        for e in b.edges:
+            self.connect(ids[e.src], e.src_socket, ids[e.dst], e.dst_socket)
+        if splice is not None:
+            s, ss, d, ds = splice
+            in_id, in_sock = ids[b.input[0]], b.input[1]
+            out_id, out_sock = ids[b.output[0]], b.output[1]
+            ok_a, _ = self.can_connect(s, ss, in_id, in_sock)
+            ok_b, _ = self.can_connect(out_id, out_sock, d, ds)
+            if ok_a and ok_b:
+                self.disconnect(s, ss, d, ds)
+                self.connect(s, ss, in_id, in_sock)
+                self.connect(out_id, out_sock, d, ds)
+        fr = self.add_frame(b.frame_title or b.label, members=list(ids.values()))
+        return [ids[bn.id] for bn in b.nodes], fr.id
+
     def add_frame(self, title: str = "Frame", members=(), color=None,
                   frame_id: Optional[str] = None) -> FrameRecord:
         """Create a labelled frame around ``members`` (only the ids that exist are
@@ -3084,6 +3118,38 @@ class GraphDocument:
         if edge is None:
             return []
         return list(self.env(edge[0]).layers_in(domain))
+
+    # ── run-time option lists (2026-10-09) ─────────────────────────────────────
+    def trial_choices(self, node_id: str, sock) -> list:
+        """``[(trial_id, hover_text)]`` for an ``options_from="analysis_trials"`` socket: the
+        saved analysis trials in the ``<stem>.analysis`` folder beside each source file the
+        node's primary input carries (its ``source_path`` metadata), and in each file's spare
+        folder. Newest first; empty when nothing is wired or nothing is saved. Reads only
+        small JSON headers."""
+        from nodegraph.analysis_store import list_source_trials
+        from nodegraph.metadata import SOURCE_PATH_KEY
+        rec = self.nodes.get(node_id)
+        spec = rec.spec() if rec else None
+        if spec is None:
+            return []
+        primary = next((s.name for s in spec.inputs
+                        if s.type is SocketType.DATASET), None)
+        edge = self.edge_into(node_id, primary) if primary else None
+        if edge is None:
+            return []
+        paths = self.env(edge[0]).metadata.get(SOURCE_PATH_KEY) or []
+        out: list = []
+        for r in list_source_trials(str(p) for p in paths if p):
+            head = r["label"] or r["id"]
+            q = r.get("quality") or {}
+            qtxt = ("\nquality: " + ", ".join(f"{k}={v:.3g}" if isinstance(v, float)
+                                              else f"{k}={v}" for k, v in q.items())
+                    if q else "")
+            out.append((r["id"], f"{head} — {r['analysis']}, {r['units_done']}/"
+                                 f"{r['units_total']} units {r['status']} "
+                                 f"(updated {r['updated']})\nsettings: {r['settings']}"
+                                 f"{qtxt}"))
+        return out
 
     # ── column picker (V2.28) ──────────────────────────────────────────────────
     def column_choices(self, node_id: str, sock) -> list:

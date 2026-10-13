@@ -59,6 +59,14 @@
         "Contrast, gamma, fps and the annotation corner are all parameters, so the movie is reproducible from the graph."
       ]
     },
+    "io.load_analysis": {
+      "kind": "guide",
+      "features": [
+        "Reads a saved DIC / DVC / PIV / SerialTrack trial (the <file>.analysis folder beside the image) back onto the graph without recomputing.",
+        "Pick the trial from the list (analysis, label, saved units, complete or partial); switching entries switches results instantly.",
+        "Wire the image the trial was computed on so the grid and vectors overlay it, or switch Onto to tables_only for the Spreadsheet."
+      ]
+    },
     "io.write_figure": {
       "kind": "guide",
       "features": [
@@ -1101,6 +1109,312 @@
         "Digital volume correlation (ALDVC): the 3-D counterpart of DIC, on subsets of a volume."
       ]
     },
+    "dvc.grid": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the grid is instant, but the demo chain it heads is a 3-D correlation",
+      "features": [
+        "pyALDVC section 2 as its own card: the correlation node grid as a Point table, plus the channel and reference policy every later stage inherits.",
+        "Placed by the `bundle:dvc` palette entry together with Initial Guess, Local Match, Global Step and Strain, wired in order inside one region."
+      ]
+    },
+    "dvc.initial_guess": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "a 3-D NCC seed search takes seconds",
+      "features": [
+        "pyALDVC section 3 as its own card: the whole-volume shift plus the pyramid/NCC integer seed of every grid node, written as disp_* before any refinement.",
+        "Pull it first: arrows pointing the wrong way here mean the search radius does not bracket the motion."
+      ]
+    },
+    "dvc.local_match": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        },
+        {
+          "op": "dvc.initial_guess"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the 12-DOF IC-GN match of every subset takes many seconds",
+      "features": [
+        "pyALDVC section 4 as its own card: the 12-DOF IC-GN subset match from the seed — the cost centre — writing sub-voxel disp_*, grad_*, qfactor, status and disp_std_*."
+      ]
+    },
+    "dvc.global_step": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        },
+        {
+          "op": "dvc.initial_guess"
+        },
+        {
+          "op": "dvc.local_match"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the ADMM iterations re-solve every subset several times",
+      "features": [
+        "pyALDVC sections 5-6 as its own card: the global compatibility step and the ADMM iterations that reconcile the matched subsets into one compatible field, with β auto-tuned per reference."
+      ]
+    },
+    "piv.first_pass": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "OpenPIV's first (coarsest) pass as its own card: FFT cross-correlation of every window on the raw frames, written as raw vectors with signal-to-noise — nothing validated yet.",
+        "Placed by the `bundle:piv` palette entry with Validate and two Deform Passes, wired as the 64 / 32 / 16 px ladder inside one region."
+      ]
+    },
+    "piv.validate": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "piv.first_pass",
+          "params": {
+            "window_size": 32
+          }
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "OpenPIV's validation as its own card: signal-to-noise, global-limit, std and median tests flag vectors, and the flagged ones are filled from their neighbours (`flags` / `replaced`)."
+      ]
+    },
+    "piv.deform_pass": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "piv.first_pass",
+          "params": {
+            "window_size": 32
+          }
+        },
+        {
+          "op": "piv.validate"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "One window-deformation pass as its own card: the previous field predicts, the frames are deformed and re-correlated at half the window, and a NEW finer grid replaces the table."
+      ]
+    },
+    "piv.smooth": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "piv.first_pass",
+          "params": {
+            "window_size": 32
+          }
+        },
+        {
+          "op": "piv.validate"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "Garcia-2010 smoothn on the pass's field as its own card — the between-pass smoothing of the multipass driver, placeable wherever it is wanted."
+      ]
+    },
+    "dic.grid": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the lattice is instant, but the demo chain it heads compiles pyALDIC's kernels on first use",
+      "features": [
+        "pyALDIC section 2b as its own card: the correlation lattice as a Point table, plus the channel, ROI and reference policy every later stage inherits.",
+        "Placed by the `bundle:dic` palette entry with Initial Guess, Local Match, Global Step and Strain, wired in order inside one region."
+      ]
+    },
+    "dic.initial_guess": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "pyALDIC compiles its numba kernels on first use",
+      "features": [
+        "pyALDIC section 3 as its own card: the FFT integer seed of every lattice node with its correlation peak, written as disp_* before any refinement."
+      ]
+    },
+    "dic.refine_mesh": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "pyALDIC compiles its numba kernels on first use",
+      "features": [
+        "pyALDIC's pre-solve adaptive refinement as its own card: elements at ROI holes, the ROI edge or a brush mask are quadtree-split and the seed is interpolated onto the new nodes.",
+        "The refined grid replaces the lattice and shows in the Viewer's Grid tab, coloured by refinement level; with no ROI or brush it passes through."
+      ]
+    },
+    "dic.local_match": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the 6-DOF IC-GN match of every subset takes seconds, more on first use",
+      "features": [
+        "pyALDIC section 4 as its own card: the 6-DOF IC-GN subset match from the seed — the cost centre — writing sub-pixel disp_*, the gradient grad_*, n_iter and hole."
+      ]
+    },
+    "dic.global_step": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        },
+        {
+          "op": "dic.local_match"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "the ADMM iterations re-solve every subset several times",
+      "features": [
+        "pyALDIC sections 5-6 as its own card: the global FEM compatibility solve and the ADMM iterations that reconcile the matched subsets, β auto-tuned per reference."
+      ]
+    },
+    "dic.strain": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [
+        {
+          "op": "dic.grid"
+        },
+        {
+          "op": "dic.initial_guess"
+        },
+        {
+          "op": "dic.local_match"
+        },
+        {
+          "op": "dic.global_step"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "its upstream chain is a correlation",
+      "features": [
+        "pyALDIC section 8 as its own card: the nodal displacement gradient under the chosen measure, four strain_* columns in image axes, without reading a frame."
+      ]
+    },
+    "dvc.strain": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "phantom_kw": {
+        "three_d": true
+      },
+      "prelude": [
+        {
+          "op": "dvc.grid"
+        },
+        {
+          "op": "dvc.initial_guess"
+        },
+        {
+          "op": "dvc.local_match"
+        },
+        {
+          "op": "dvc.global_step"
+        }
+      ],
+      "view": {
+        "t": 1
+      },
+      "live": false,
+      "slow_reason": "its upstream chain is a 3-D correlation",
+      "features": [
+        "pyALDVC section 8 as its own card: strain from the grid's displacement field under the chosen measure, without reading a voxel — change the measure and it re-runs in a second."
+      ]
+    },
     "analysis.optical_flow": {
       "kind": "scalar",
       "phantom": "moving_cells",
@@ -1506,6 +1820,76 @@
         "Delays the series by two frames: the before view is frame 3 of the input, the after view shows what frame 1 looked like — the beads are back where they were two frames earlier (the field drifts (+1.5, −2.0) px a frame). Drag Delta to change the lag; Direction `earlier` pulls later frames forward instead.",
         "T, the frame interval and the per-frame clock do not change: the content moved on the same grid, which is what lets two streams of one acquisition be lined up for a Merge or a comparison when one lags the other.",
         "Frames with no source repeat the nearest edge frame (`hold`) or are blank (`blank`); per-frame masks and detections move with the image, and rows shifted off either end are dropped. The T twin of Shift."
+      ]
+    },
+    "field.gradient": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "Differentiates the PIV field of the sinusoidally warped speckle pair: grad_yy, grad_yx, grad_xy, grad_xx on every grid node, written back onto the `piv` table the arrows come from.",
+        "Method `auto` takes lattice differences on a regular grid (holes allowed) and a local plane fit otherwise; the fit radius is the gauge length every later card inherits.",
+        "Strain, Rotation & Curl, Volume Change and Stress all read these columns — this card is where the differentiation is chosen, once."
+      ]
+    },
+    "field.strain": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "The strain tensor of the warp under the chosen measure, its principal values and angle, the von Mises equivalent strain, max shear and trace — columns on the field's own table.",
+        "Switch Measure: infinitesimal reads a rotation as strain, Green-Lagrange / Almansi / Hencky do not; on this small warp they agree to the third decimal.",
+        "Colour the image by strain_eq or strain_xx in the Viewer's Field overlay."
+      ]
+    },
+    "field.rotation": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "The curl of the warp (twice the local rotation in radians; the vorticity for a velocity field) and the exact finite rotation in degrees, counter-clockwise on screen positive.",
+        "A rigid spin shows up here and not in a finite strain measure — the two cards split rotation from deformation."
+      ]
+    },
+    "field.volume_change": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "J = det F per node — the local area ratio of a 2-D field (volume ratio in 3-D) — with the dilatation J − 1 and the divergence: below 1 the material compacted, above it expanded.",
+        "For a velocity field only the divergence (1/s) is written: the rate of volume change."
+      ]
+    },
+    "plot.field": {
+      "kind": "plot",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}, {"op": "field.strain"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "The warped speckle pair's field drawn as a figure: the image in grey, the most derived column (here strain_eq) as a colour map with a colour bar naming it and its unit, the displacement as arrows and a µm scale bar.",
+        "Pick any column with Value, add iso-lines with Contours, fix the scale with Colour range; the playback strip picks the position, frame and plane, every view on one colour scale.",
+        "Export Figure writes it as PNG, SVG or PDF at the style's size and resolution."
+      ]
+    },
+    "field.stress": {
+      "kind": "field",
+      "phantom": "speckle_pair",
+      "prelude": [{"op": "analysis.piv"}, {"op": "field.gradient"}],
+      "view": {"t": 1},
+      "requires": ["openpiv"],
+      "features": [
+        "Cauchy stress of the warp through the chosen material law and its E and ν — components, principal stresses, pressure, von Mises, Tresca max shear and strain energy, in Pa.",
+        "2-D fields need an out-of-plane assumption: plane strain for a slice through a thick gel, plane stress for a thin sheet. Neo-Hookean is the large-strain law for soft gels.",
+        "The modulus is a placeholder: every stress column scales linearly with it, so enter your gel's measured E."
       ]
     }
   }

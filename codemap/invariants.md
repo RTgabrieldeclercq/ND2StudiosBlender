@@ -136,7 +136,10 @@ the caller (`analysis.track_field`) is where the `(dz, dy, dx)` scaling happens.
 — every size it works with arrives already in voxels (`sigma_xy_px`, `sigma_z_px`,
 `slab_px`), converted by the node (`detect.beads`) from µm with `to_pixels_v2`, and its
 output positions are voxels the node leaves as voxels (the µm columns it adds are the fitted
-sigmas, scaled once by `pixel_size_um` and `z_step_um`).
+sigmas, scaled once by `pixel_size_um` and `z_step_um`). `field_mechanics` (2026-10-09) takes
+its node positions in index units plus a `scale` of µm per index unit, slowest-first like
+everything else — `(z_step_um, pixel_size_um, pixel_size_um)` in 3-D — so the lattice is
+detected on clean index values and the gradient still comes out per µm.
 
 The invariant is the KERNEL's boundary, not the upstream package's. `aldvc_field` wraps
 pyALDVC, whose `DVCPara` triples are `(x, y, z)`, and `dic_correlate` wraps pyALDIC, which

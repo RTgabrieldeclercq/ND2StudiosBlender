@@ -295,6 +295,7 @@ class Worker:
         self._busy = threading.Event()
         self._answered: set = set()
         self._beat_stop: Optional[threading.Event] = None
+        self._beat_thread: Optional[threading.Thread] = None
         #: while set, the engine observer emits nothing — see :meth:`_observer`.
         self._muted = False
 
@@ -1264,12 +1265,20 @@ class Worker:
                     info["cache_bytes"] = int(getattr(self._tiles, "nbytes", 0) or 0)
                 emit(id=mid, ev="beat", **info)
 
-        threading.Thread(target=pulse, name="lwp-beat", daemon=True).start()
+        th = threading.Thread(target=pulse, name="lwp-beat", daemon=True)
+        self._beat_thread = th
+        th.start()
 
     def _stop_beats(self) -> None:
+        """Stop the beats and WAIT for a beat already being assembled: setting the event alone
+        let a pulse that had just woken finish its emit after the command's own reply — a beat
+        for a command that was over (measured as a selftest failure under CPU load)."""
         if self._beat_stop is not None:
             self._beat_stop.set()
             self._beat_stop = None
+        th, self._beat_thread = self._beat_thread, None
+        if th is not None and th is not threading.current_thread():
+            th.join(timeout=5.0)
 
     # ── artifacts ───────────────────────────────────────────────────────────────
     def _write_artifacts(self, payload: Any, engine: Any, counters: Dict[str, int],

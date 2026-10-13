@@ -219,6 +219,44 @@
   "blessed": "2026-10-07",
   "file": "codemap/concepts.md"
  },
+ "CON-25": {
+  "anchors": {
+   "sym:nodegraph.bundles.Bundle": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.bundles.register_bundle": "36b0258616fa6b4249751a76ce8d2e57",
+   "sym:nodelab_v2.document.GraphDocument.place_bundle": "d823c9439be064bb49cfaad0355d191c"
+  },
+  "blessed": "2026-10-08",
+  "file": "codemap/concepts.md"
+ },
+ "CON-26": {
+  "anchors": {
+   "sym:nodegraph.analysis_store.open_trial": "edf09de3276c1c1893551fac5fe1a55c",
+   "sym:nodegraph.analysis_store.read_trial": "759e0672fb0633b8ac019c5358f52288",
+   "sym:nodegraph.catalog._shared.analysis_units.run_units": "401f94c7a92dc97053c3c9236f060d07",
+   "sym:nodegraph.engine.Engine.lineage": "131a4170de78fb40ff79ec6b32739a94"
+  },
+  "blessed": "2026-10-09",
+  "file": "codemap/concepts.md"
+ },
+ "CON-27": {
+  "anchors": {
+   "sym:nodegraph.governor.Governor": "e2b4360003ef3d619631e8bd0a633d3f",
+   "sym:nodegraph.governor.plan_lanes": "c36e87f472210a2e34dbbe40198149a0",
+   "sym:nodegraph.parallel.adaptive_fold": "335c39af17f9dd485e10b81379e8c546"
+  },
+  "blessed": "2026-10-09",
+  "file": "codemap/concepts.md"
+ },
+ "CON-28": {
+  "anchors": {
+   "sym:nodegraph.catalog._shared.field_nodes.read_gradient": "3765f8beffa220dba82ace645fe740d8",
+   "sym:nodegraph.catalog._shared.field_nodes.write": "98e541b486ca6ac739a7f1fe6648999b",
+   "sym:nodegraph.kernels.field_mechanics.gradient": "ec31f4384ffc11db92af3e80b79bf2b1",
+   "sym:nodegraph.kernels.field_mechanics.stress": "d3a071acaaf29c71174c5ed9105b6c62"
+  },
+  "blessed": "2026-10-09",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
@@ -290,16 +328,16 @@
  },
  "INV-10": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "e6d0971275e5eb30d72505845eb730fb"
+   "file:nodegraph/kernels/README.md": "b1a97bfba132949362a6d291844d7382"
   },
-  "blessed": "2026-10-07",
+  "blessed": "2026-10-09",
   "file": "codemap/invariants.md"
  },
  "INV-11": {
   "anchors": {
-   "file:nodegraph/kernels/README.md": "e6d0971275e5eb30d72505845eb730fb"
+   "file:nodegraph/kernels/README.md": "b1a97bfba132949362a6d291844d7382"
   },
-  "blessed": "2026-10-07",
+  "blessed": "2026-10-09",
   "file": "codemap/invariants.md"
  },
  "INV-12": {

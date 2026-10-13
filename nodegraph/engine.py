@@ -28,7 +28,7 @@ import threading
 import time
 from collections.abc import Mapping as _ABCMapping
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from nodegraph.dataset import CALIBRATION_KEYS, Dataset
 from nodegraph.field import FieldCache
@@ -379,6 +379,33 @@ class EvalContext:
     #: A node serving something the engine holds IN MEMORY (a held dock) has no path to
     #: re-open, and this is how it reaches it.
     seed: Any = None
+    #: lazily computes :meth:`Engine.lineage` for this node (see :meth:`lineage`).
+    lineage_fn: Optional[Callable[..., str]] = None
+    #: lazily lists this node's upstream chain for a human (:meth:`Engine.lineage_chain`).
+    chain_fn: Optional[Callable[[], list]] = None
+
+    def lineage(self, exclude: Sequence[str] = ()) -> str:
+        """A hash of WHAT this node computes that is the same in every session — op,
+        params, modes, the whole upstream chain, and each source's file identity — unlike
+        the memo's recipe hash, which folds per-session revisions. It is what keys a result
+        saved to disk (:mod:`nodegraph.analysis_store`): the same settings on the same file
+        through the same chain find yesterday's trial. Computed on first call only, so a
+        node that never asks pays nothing. ``""`` outside an engine pull.
+
+        ``exclude`` names params of THIS node to leave out — the store's own control
+        sockets, so changing them never moves a trial."""
+        if self.lineage_fn is None:
+            return ""
+        key = tuple(sorted(str(x) for x in exclude))
+        cache = self.__dict__.setdefault("_lineage_cache", {})
+        if key not in cache:
+            cache[key] = self.lineage_fn(frozenset(key))
+        return cache[key]
+
+    def upstream_chain(self) -> list:
+        """``[{"node", "op", "params"}]`` for this node's ancestors, sources first — what
+        a saved trial's header records so a person can read what produced it."""
+        return self.chain_fn() if self.chain_fn is not None else []
 
     def progress(self, done: int, total: int, note: str = "", *,
                  frames: Optional[int] = None,
@@ -711,6 +738,104 @@ class Engine:
         with recursion_headroom(8 * len(self.graph.nodes)):
             return self._entry(node_id, set())
 
+    def lineage(self, node_id: str, exclude: Sequence[str] = ()) -> str:
+        """The session-stable identity of what ``node_id`` computes (2026-10-09).
+
+        The memo's recipe hash cannot key anything that outlives the session: it folds the
+        upstream entries' **revisions**, a counter that restarts at every launch, and a
+        source's ``__source__`` node id. This hash keeps the parts that DO describe the
+        result — the op, the params and mode state (presentation params dropped, as the
+        memo drops them), the wiring (which socket each upstream lineage arrives on) — and
+        identifies a source by its FILE: the stamped ``source_path`` list plus each file's
+        size and ``mtime_ns``, so the same ND2 read direct or through an ingest store, today
+        or next week, is one identity, and an edited file is another. A run scope (the F9
+        picks) rides in as well, so a scoped result never shares a key with the full series.
+        A source with no stamped path falls back to its provider/seed ``version``.
+
+        Upstream CODE is deliberately not part of it: a saved trial survives an edit to a
+        node's source, which is what a cache of hours-long results must do (the user forces a
+        recompute when a fix should invalidate it).
+
+        ``exclude`` drops those params of ``node_id`` itself (not of its ancestors)."""
+        return self._lineage(node_id, frozenset(), frozenset(exclude))
+
+    def lineage_chain(self, node_id: str) -> list:
+        """The ancestors of ``node_id`` (exclusive), sources first, each as
+        ``{"node", "op", "params"}`` with the GUI's private ``__…`` keys dropped."""
+        order: list = []
+        seen: set = set()
+
+        def visit(nid: str) -> None:
+            if nid in seen:
+                return
+            seen.add(nid)
+            for e in self.graph.preds(nid):
+                visit(e.src)
+            order.append(nid)
+        visit(node_id)
+        out = []
+        for nid in order[:-1]:
+            node = self.graph.nodes[nid]
+            out.append({"node": nid, "op": node.op_key,
+                        "params": {k: v for k, v in node.params.items()
+                                   if not str(k).startswith("__")}})
+        return out
+
+    def _lineage(self, node_id: str, stack: frozenset,
+                 exclude: frozenset = frozenset()) -> str:
+        if node_id in stack:
+            raise ValueError(f"cycle through {node_id!r}")
+        node = self.graph.nodes[node_id]
+        spec = node.spec()
+        state = node.state(spec)
+        preds = self.graph.preds(node_id)
+        if spec is not None:
+            pos = {sk.name: i for i, sk in enumerate(spec.inputs)}
+            preds = [e for _, e in sorted(
+                enumerate(preds),
+                key=lambda ie: (pos.get(ie[1].dst_socket, len(pos)), ie[0]))]
+        ups = tuple((e.dst_socket, self._lineage(e.src, stack | {node_id})) for e in preds)
+        params = {k: v for k, v in node.params.items()
+                  if not str(k).startswith("__") and k not in exclude}
+        params["__modes__"] = dict(state)
+        if spec is not None:
+            drop = {i.name for i in spec.inputs if getattr(i, "presentation", False)}
+            params = {k: v for k, v in params.items() if k not in drop}
+        source: Any = None
+        if not preds:
+            source = self._source_identity(node_id)
+        return digest("lineage", node.op_key, params, ups, source)
+
+    def _source_identity(self, node_id: str) -> Any:
+        import os
+        from nodegraph.metadata import SOURCE_PATH_KEY
+        try:
+            md = self.env(node_id).metadata
+        except Exception:  # noqa: BLE001 — identity is best-effort, never a pull failure
+            md = {}
+        scope = tuple((k, repr(md.get(k))) for k in ("scope_m", "scope_t", "scope_z",
+                                                     "scope_region") if k in md)
+        paths = md.get(SOURCE_PATH_KEY)
+        if isinstance(paths, (list, tuple)) and paths and all(paths):
+            files = []
+            for p in dict.fromkeys(str(x) for x in paths):
+                try:
+                    st = os.stat(p)
+                    files.append((os.path.normcase(os.path.abspath(p)),
+                                  int(st.st_size), int(st.st_mtime_ns)))
+                except OSError:
+                    files.append((os.path.normcase(os.path.abspath(p)), None, None))
+            return ("files", tuple(files), len(paths), scope)
+        prov = self.providers.get(node_id)
+        if prov is not None:
+            return ("provider", getattr(prov, "version", None), scope)
+        seed = self.seeds.get(node_id)
+        if seed is not None:
+            img = getattr(seed, "image", None)
+            return ("seed", getattr(img, "version", None) if img is not None
+                    else getattr(seed, "fingerprint", lambda: None)(), scope)
+        return ("none", node_id, scope)
+
     def _require_primary_input(self, node_id: str, spec: Any,
                                state: Mapping[str, str], preds: Any) -> None:
         """Refuse a pull through a node whose **primary DATASET input is unwired**.
@@ -848,6 +973,9 @@ class Engine:
             by_name=by_name, tiles=self.tiles, fields=self.fields, spec=spec,
             observer=self.observer, seed=self.seeds.get(node_id),
             should_stop=self.should_stop,
+            lineage_fn=(lambda exclude=frozenset(), _nid=node_id:
+                        self.lineage(_nid, exclude)),
+            chain_fn=(lambda _nid=node_id: self.lineage_chain(_nid)),
         )
         fn = self.computes.get(node.op_key)
         # per-node progress: the window between "start" and "done" is exactly the time

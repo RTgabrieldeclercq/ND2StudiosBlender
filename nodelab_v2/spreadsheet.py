@@ -35,9 +35,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QTabBar, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QTabBar, QTableView,
     QVBoxLayout, QWidget,
 )
 
@@ -48,6 +49,85 @@ from nodelab_v2.tables import (
     _COORD_ORDER, _STRUCTURE_NAMES, SOURCE_FILE_COLUMN, _ordered_columns,
     all_tables, lattice_tables, structure_tables,
 )
+
+
+#: How many rows the column widths are measured over. Widths are a courtesy, not a
+#: contract, and a few hundred rows of a 20 000-row table size the columns the same.
+_WIDTH_SAMPLE_ROWS = 200
+
+
+def _cell_text(val) -> str:
+    """One value, as the grid shows it — floats to 4 significant figures, ``None`` blank."""
+    if isinstance(val, (float, np.floating)):
+        return f"{float(val):.4g}"
+    if val is None:
+        return ""
+    return str(val)
+
+
+class _ColumnsModel(QAbstractTableModel):
+    """A read-only table model over the selected table's numpy columns.
+
+    **Virtual on purpose** (2026-10-08). The grid used to be a ``QTableWidget`` filled
+    with one ``QTableWidgetItem`` per cell, on the GUI thread, on every delivery. That is
+    linear in rows × columns and ran at ~30 µs a cell: a noisy threshold labelling 21 620
+    specks took 6–7 s to tabulate — per pull, so under the troubleshooting scope every
+    cursor move froze the window for that long, after the frame itself had computed in a
+    quarter of a second. A model formats a cell only when the view paints it, so showing
+    a table costs the same whether it has 20 rows or 200 000.
+
+    ``rows`` narrows the model to a subset of the table's rows (the per-file tabs) and
+    the vertical header then names each row by its ORIGINAL index, so a row can still be
+    found in the full table and in the exported CSV, which is not filtered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._names: List[str] = []
+        self._cols: Dict[str, np.ndarray] = {}
+        self._rows: Optional[np.ndarray] = None
+        self._n = 0
+
+    def set_table(self, names: List[str], cols: Dict[str, np.ndarray],
+                  rows: Optional[List[int]] = None, total: int = 0) -> None:
+        self.beginResetModel()
+        self._names = list(names)
+        self._cols = dict(cols)
+        self._rows = None if rows is None else np.asarray(rows, dtype=np.int64)
+        self._n = int(total if rows is None else len(rows))
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()) -> int:          # noqa: N802 — Qt override
+        return 0 if parent.isValid() else self._n
+
+    def columnCount(self, parent=QModelIndex()) -> int:       # noqa: N802 — Qt override
+        return 0 if parent.isValid() else len(self._names)
+
+    def row_index(self, row: int) -> int:
+        """The table row the model's ``row`` shows (identity without a file filter)."""
+        return int(self._rows[row]) if self._rows is not None else int(row)
+
+    def text(self, row: int, column: int) -> str:
+        if not (0 <= row < self._n and 0 <= column < len(self._names)):
+            return ""
+        vals = self._cols[self._names[column]]
+        r = self.row_index(row)
+        return _cell_text(vals[r] if r < len(vals) else None)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        if role == Qt.DisplayRole:
+            return self.text(index.row(), index.column())
+        if role == Qt.TextAlignmentRole:
+            return int(Qt.AlignVCenter | Qt.AlignRight)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):  # noqa: N802
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self._names[section] if 0 <= section < len(self._names) else None
+        return str(self.row_index(section)) if 0 <= section < self._n else None
 
 
 class SpreadsheetPanel(QWidget):
@@ -80,9 +160,11 @@ class SpreadsheetPanel(QWidget):
         self._files.currentChanged.connect(self._show_rows)
         self._files.hide()
         v.addWidget(self._files)
-        self._table = QTableWidget()
+        self._model = _ColumnsModel()
+        self._table = QTableView()
+        self._table.setModel(self._model)
         self._table.setAlternatingRowColors(False)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         v.addWidget(self._table, 1)
         self._status = QLabel("")
         self._status.setProperty("role", "muted")
@@ -95,7 +177,7 @@ class SpreadsheetPanel(QWidget):
         self.setStyleSheet(f"""
             QWidget {{ background:{T.PANEL.name()}; color:{T.INK.name()}; }}
             QLabel[role="muted"] {{ color:{T.MUTED.name()}; }}
-            QTableWidget {{ background:{T.BG.name()}; color:{T.INK.name()};
+            QTableView {{ background:{T.BG.name()}; color:{T.INK.name()};
                 gridline-color:{T.BORDER.name()}; border:1px solid {T.BORDER.name()};
                 border-radius:8px; font-family:{T.MONO}; outline:0; }}
             QHeaderView::section {{ background:{T.BODY.name()}; color:{T.INK_2.name()};
@@ -104,8 +186,8 @@ class SpreadsheetPanel(QWidget):
                 font-weight:600; }}
             QTableCornerButton::section {{ background:{T.BODY.name()};
                 border:0; border-bottom:1px solid {T.BORDER.name()}; }}
-            QTableWidget::item {{ padding:2px 4px; }}
-            QTableWidget::item:selected {{ background:{T.ACCENT_DIM.name()};
+            QTableView::item {{ padding:2px 4px; }}
+            QTableView::item:selected {{ background:{T.ACCENT_DIM.name()};
                 color:{T.INK.name()}; }}
         """ + T.controls_qss())
 
@@ -123,9 +205,7 @@ class SpreadsheetPanel(QWidget):
             self._pick.setCurrentIndex(0)
             self._show_current()
         else:
-            self._table.clear()
-            self._table.setRowCount(0)
-            self._table.setColumnCount(0)
+            self._model.set_table([], {}, None, 0)
             self._status.setText(f"{node_id}: no tabulatable attributes on this "
                                  f"output (image layers show in the Viewer)")
 
@@ -171,6 +251,21 @@ class SpreadsheetPanel(QWidget):
         self._files.blockSignals(False)
         self._show_rows()
 
+    def _size_columns(self, names: List[str]) -> None:
+        """Column widths from the header and the first :data:`_WIDTH_SAMPLE_ROWS` rows.
+
+        ``resizeColumnsToContents`` measures every row the model has, which brings back
+        the per-cell cost the virtual model exists to avoid; a sample sizes the columns
+        the same and costs the same for any table."""
+        fm = QFontMetrics(self._table.font())
+        pad = 18
+        m = self._model
+        for c, name in enumerate(names):
+            w = fm.horizontalAdvance(str(name))
+            for r in range(min(m.rowCount(), _WIDTH_SAMPLE_ROWS)):
+                w = max(w, fm.horizontalAdvance(m.text(r, c)))
+            self._table.setColumnWidth(c, w + pad)
+
     def _show_rows(self, *_a) -> None:
         """Fill the grid with the selected table, narrowed to the selected file."""
         key = self._pick.currentData()
@@ -185,37 +280,19 @@ class SpreadsheetPanel(QWidget):
         # filter in exactly the cases where the panel is being populated before display
         tabbed = self._files.count() > 1
         idx = self._files.currentIndex() if tabbed else 0
-        rows = list(range(total))
+        rows: Optional[List[int]] = None
         picked = ""
         if tabbed and idx > 0 and (idx - 1) < len(files):
             picked = files[idx - 1]
             vals = cols.get(SOURCE_FILE_COLUMN)
+            # the row header keeps the ORIGINAL row number while a file is selected, so a
+            # row can still be found in the full table and in the exported CSV, which is
+            # not filtered — a renumbered view would quietly disagree with the file on disk
             rows = [r for r in range(total)
                     if r < len(vals) and str(vals[r]) == picked]
-        n = len(rows)
-        self._table.clear()
-        self._table.setColumnCount(len(names))
-        self._table.setRowCount(n)
-        self._table.setHorizontalHeaderLabels(names)
-        # the row header keeps the ORIGINAL row number while a file is selected, so a row
-        # can still be found in the full table and in the exported CSV, which is not
-        # filtered — a renumbered view would quietly disagree with the file on disk
-        if picked:
-            self._table.setVerticalHeaderLabels([str(r) for r in rows])
-        for c, name in enumerate(names):
-            vals = cols[name]
-            for r_out, r in enumerate(rows):
-                val = vals[r] if r < len(vals) else None
-                if isinstance(val, (float, np.floating)):
-                    txt = f"{float(val):.4g}"
-                elif val is None:
-                    txt = ""
-                else:
-                    txt = str(val)
-                it = QTableWidgetItem(txt)
-                it.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
-                self._table.setItem(r_out, c, it)
-        self._table.resizeColumnsToContents()
+        n = total if rows is None else len(rows)
+        self._model.set_table(names, cols, rows, total)
+        self._size_columns(names)
         dom, layer = key
         unit = "elements" if dom in _STRUCTURE_NAMES else "index rows"
         note = f"{dom}" + (f" · {layer}" if layer else "")

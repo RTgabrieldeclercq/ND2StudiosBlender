@@ -740,6 +740,128 @@ see: CON-17 · CON-22 · CON-12 · [MANUAL §4 A stream knows where it came from
 
 ---
 
+### CON-28 — field layer and its mechanics chain
+anchors: sym:nodegraph.kernels.field_mechanics.gradient, sym:nodegraph.kernels.field_mechanics.stress, sym:nodegraph.catalog._shared.field_nodes.read_gradient, sym:nodegraph.catalog._shared.field_nodes.write
+
+A **field layer** (2026-10-09) is a Point table whose rows are the nodes of a measured
+displacement (`disp_*`, µm) or velocity (`v*`, µm/s) field: what DIC, PIV, DVC, the staged
+cards, Track Field and Load Analysis write. Its `z_kind` decides 2-D vs 3-D (`plane_index` →
+each (m, t, c, z) plane is its own field; `subpixel` → each (m, t, c) frame is a volume). The
+five `field.*` cards **add columns to that same table**: `field.gradient` writes
+`grad_<i><j> = ∂u_i/∂X_j` (lattice differences on a regular grid, holes one-sided, or a
+local MLS plane fit; tracked rows are moved back by `u` first), and Strain, Rotation & Curl,
+Volume Change and Stress read only those columns, refusing a layer without them. Each card
+records its columns' units (dimensionless, 1/s, deg, Pa) and its settings under the
+`__field_mechanics__[layer]` metadata. Image axes run y DOWN: 2-D curl and rotation are positive
+counter-clockwise on screen. The maths is `kernels/field_mechanics.py`, which reuses
+`field_math.strain_from_gradient` and `track_field`'s MLS gauge and Hooke's law. A field is
+DRAWN by `nodegraph/fieldmap.py`, shared by the Viewer's Field and Vectors overlays and the
+`plot.field` figure node. It works in image pixels, converting a µm displacement by the
+payload's pixel size. It places a lattice field one cell per node and resamples a scattered
+one near its nodes only. `plot.field`'s figure is a **view picture**: one view per position,
+frame and plane of its input, drawn on first read by `figure.ViewFigureProvider`, so the
+Viewer's playback strip picks it as it picks a plane of an image. The node has no frame,
+position or plane control of its own; Export Figure, a writer, picks a view with its own.
+
+A field crosses `util.stitch` (2026-10-09): Point tables move onto the mosaic with their
+tiles (`stitch._stitch_points`: `m` → 0, the position columns offset, one row per overlap
+from the nearest-centre tile), so Stitch between the Field cards and `plot.field` draws the
+field over the whole mosaic. A merged mosaic is rarely one lattice, so it is drawn as a
+scattered field. `plot.field` thins its arrows on a spatial grid, at most 2500 a view.
+
+### CON-27 — resource governor
+anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold
+
+The **resource governor** (2026-10-09) decides how many analysis units run at once on THIS
+machine right now, so the expensive nodes use every core without freezing the desktop.
+`machine_profile()` reads logical and physical cores, available RAM and system CPU load live
+(ctypes on Windows, /proc on Linux, psutil if present). `plan_lanes()` is the pure rule:
+keep a core reserve of `max(2, physical // 10)` for the GUI and OS, make lanes × inner threads
+≤ the rest, and keep lanes × worker RAM above a free-RAM floor of `max(4 GiB, 10 %)`; at most
+16 lanes, at least 1. The live `Governor` starts at 2 lanes, re-plans on the first unit's
+MEASURED peak working set (× 1.25), holds new units while free RAM minus what just-started
+units will still grow into is under the floor, and gives a lane back while other programs
+saturate the CPU. `parallel.adaptive_fold` is the rolling process-pool fold that asks it
+before every start, folds results strictly in unit order, pins each worker's numba/BLAS to
+the inner count and runs workers at below-normal priority (`_worker_init`, the main freeze
+guard). A pool that cannot start or breaks finishes the remaining units in this thread and
+says so in `Governor.fallback`, which becomes the run's note and the `analysis_trial_units`
+stamp. A script driving the engine must guard its top level with `if __name__ ==
+"__main__":`, because a spawned worker re-imports the main script. It is used only by the
+analysis nodes through `_shared/analysis_units.run_units`; the cheap per-plane nodes keep
+`parallel.fold_units` / `map_units`. Overrides: `NODEGRAPH_PROC_WORKERS`,
+`NODEGRAPH_RESERVE_CORES`, `NODEGRAPH_MIN_FREE_RAM`.
+
+### CON-26 — analysis unit, trial and store
+anchors: sym:nodegraph.analysis_store.open_trial, sym:nodegraph.analysis_store.read_trial, sym:nodegraph.catalog._shared.analysis_units.run_units, sym:nodegraph.engine.Engine.lineage
+
+An **analysis unit** (2026-10-09) is the independent piece of an expensive analysis: a
+position × plane `(m, z)` for a planar method (DIC, PIV, 2-D SerialTrack), a position `(m,)`
+for a volumetric one (DVC, 3-D SerialTrack). A unit always spans the whole time series, since
+these methods compare frames, so T is never split. A SerialTrack unit is one
+(position, channel[, plane]) group, offset into the shared track ids in group order. Staged
+cards go through `run_stage_units`; their unit rows are written back in block order, and each
+saves its unit's FULL rows. `_shared/analysis_units.run_units` runs a
+node's units: it loads the ones already saved, then computes the rest on the governor's
+process lanes (CON-27), or in-thread when one lane is all there is. Results come back in unit
+order, so ids are identical to a serial run.
+
+A **trial** is one settings combination's saved result. It is a folder
+`<source stem>.analysis/<op>-<key8>/` beside the source file (redirected by
+`NODEGRAPH_STORE_DIR`). The folder holds `trial.json` (op, settings, modes, upstream chain,
+source files with size and mtime, axes, units, table placement, stamps, quality) and `data/`,
+with one Parquet file per unit per table kind. Every unit gets a `.done.json` marker, written
+last, so a unit with no marker does not exist. Workers write their own units, so a cancelled
+or crashed run resumes. `index.json` lists every trial and is rebuilt from the `trial.json`
+files.
+
+A trial has a second home, the **spare folder** `analysis_store.spare_root`: under
+`~/.nd2studios/analysis/`, one folder per source path. A unit the source's folder refuses
+(a read-only share, a full or failing disk) is saved there (`save_unit_to`), and
+`Trial.has` / `load` search both folders. When the source's folder cannot hold the trial
+at all, `open_node_trial` swaps the two roots. Each half's `trial.json` names the other
+(`also_saved_in`), so `list_trials`, `read_trial` and `list_source_trials` see the whole
+trial from either.
+
+The trial key hashes the node's `Engine.lineage`, an identity that is the same in every
+session. It covers:
+- the op;
+- the params, minus the store sockets `results` and `trial_label`;
+- the modes;
+- the wiring and the upstream lineages;
+- each source's FILE: the stamped `source_path` plus size and mtime.
+
+It leaves out upstream code and per-session revisions. That is why different settings make a
+new trial, and changing them back reloads the old one. A scoped (F9) pull never saves. The
+`results` socket picks `reuse` / `recompute` / `off`. `io.load_analysis` reads any trial back
+onto its original layers.
+
+### CON-25 — node bundle
+anchors: sym:nodegraph.bundles.Bundle, sym:nodegraph.bundles.register_bundle, sym:nodelab_v2.document.GraphDocument.place_bundle
+
+A **node bundle** (2026-10-08) is a palette entry that places SEVERAL pre-wired nodes at
+once: a named recipe of member nodes with relative positions, the wires between them, an
+input and an output socket for splice-on-wire, and a frame title. Placing it — double-click,
+or a drag onto the canvas — adds the members with fresh ids, wires them, splices the chain
+into the wire it was dropped on, and wraps them in a *frame* (a canvas region: border ports,
+a linked tab on demand). What the document holds afterwards is ordinary nodes; the bundle is
+not recorded in the file and the engine never sees it. It exists so a complex analysis that
+is really several *sections* can be run and re-tuned section by section, each card its own
+memo entry, instead of as one opaque node. Three ship: `bundle:dvc` places `dvc.grid` →
+`dvc.initial_guess` → `dvc.local_match` → `dvc.global_step` → `dvc.strain` (pyALDVC's
+sections); `bundle:dic` six for pyALDIC (`dic.*`, with `dic.refine_mesh` — pre-solve adaptive
+refinement — between the seed and the match); `bundle:piv` OpenPIV's ladder as
+`piv.first_pass` → `piv.validate` → `piv.deform_pass` → `piv.validate` → `piv.deform_pass` →
+`piv.validate`. Each chain hands its field down as ONE Point table that the stages fill in
+column by column (a PIV deform pass replaces the table, since its grid changes), and each is
+measured identical to its single-node sibling. It is deliberately not a `nodegraph.groups`
+group (one card, one Dataset in, one out, run as a unit) and not a page recipe (a whole
+page). Keys are `bundle:<name>`; a bundle's palette section is its `role` (bundles are not
+ops, so `node_roles.json` does not list them), and its MEMBER nodes list under the bundle row
+as a third level — stage → role → ⧉ bundle → its stages — rather than beside the ordinary
+nodes, so the list reads "DVC, and here are its parts". The selftest proves every registered
+bundle against the live registry and places it on a Qt-free `GraphDocument`.
+
 ### CON-24 — units, math and the region crop
 anchors: sym:nodegraph.units.conversion_factor, sym:nodegraph.units.unit_of, sym:nodegraph.catalog.math.values._compute_math_values, sym:nodegraph.catalog.util.crop_region._compute_crop_region, sym:nodelab_v2.ops.materialize_outside_taps, sym:nodegraph.metadata.crop_region
 

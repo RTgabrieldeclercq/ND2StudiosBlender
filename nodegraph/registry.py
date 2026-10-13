@@ -58,6 +58,13 @@ DIM_MODE = "dim"
 #: and the socket would look like an ordinary text field.
 PATH_KINDS: FrozenSet[str] = frozenset({"open_file", "save_file", "directory"})
 
+#: Legal :attr:`SocketSpec.options_from` values (2026-10-09) — named sources of a dropdown's
+#: entries that only exist at RUN time, so they cannot be a static ``choices`` tuple:
+#:
+#: * ``analysis_trials`` — the saved analysis trials beside the incoming source file
+#:   (:func:`nodegraph.analysis_store.trial_choices`), for ``io.load_analysis``.
+OPTIONS_FROM: FrozenSet[str] = frozenset({"analysis_trials"})
+
 #: Legal :attr:`SocketSpec.pick_kind` values (V2.16) — the INTERACTIVE gesture a param
 #: offers instead of (never *only* instead of — the number stays editable) hand-typing:
 #:
@@ -266,6 +273,12 @@ class SocketSpec:
     path_kind: str = ""
     path_filter: str = ""
     path_hint: str = ""
+    #: ── run-time option lists (2026-10-09) ─────────────────────────────────────
+    #: A STRING socket whose dropdown entries come from somewhere only known at run time —
+    #: one of :data:`OPTIONS_FROM`. The inspector offers them in an EDITABLE combo (free text
+    #: stays legal: a path typed by hand, an entry that appears later). Presentation-only,
+    #: like :attr:`path_kind`: never hashed.
+    options_from: str = ""
     #: ── interactive picks + closed vocabularies (V2.16) ──────────────────────
     #: ``pick_kind`` names the GESTURE this param offers on the image / histogram / frame
     #: strip instead of a typed number — one of :data:`PICK_KINDS`. It is the ONLY thing
@@ -772,7 +785,7 @@ def _in_value(t: SocketType):
              pick_bounds: Sequence[str] = (), choices: Sequence[str] = (),
              vocab: Sequence[str] = (),
              choice_docs: Optional[Mapping[str, str]] = None,
-             presentation: bool = False) -> SocketSpec:
+             presentation: bool = False, options_from: str = "") -> SocketSpec:
         return SocketSpec(name, t, Direction.IN, label=label, is_field=field,
                           unit=unit, derive=derive, default=default, domain=domain,
                           multi=multi, dims=dims, available_in=available_in,
@@ -787,7 +800,7 @@ def _in_value(t: SocketType):
                           pick_bounds=tuple(pick_bounds),
                           choices=tuple(choices), vocab=tuple(vocab),
                           choice_docs=dict(choice_docs or {}),
-                          presentation=bool(presentation))
+                          presentation=bool(presentation), options_from=options_from)
     return make
 
 
@@ -956,6 +969,15 @@ class NodeRegistry:
                     raise ValueError(
                         f"{spec.op_key}.{s.name}: path_kind is only meaningful on a STRING "
                         f"socket, got {s.type.name}")
+            if s.options_from:
+                if s.options_from not in OPTIONS_FROM:
+                    raise ValueError(
+                        f"{spec.op_key}.{s.name}: options_from={s.options_from!r} is not one "
+                        f"of {sorted(OPTIONS_FROM)}")
+                if s.type is not SocketType.STRING:
+                    raise ValueError(
+                        f"{spec.op_key}.{s.name}: options_from is only meaningful on a "
+                        f"STRING socket, got {s.type.name}")
             self._check_layer_from(spec, s)
             self._check_interaction(spec, s, in_names)
         for m in spec.modes:
@@ -1318,7 +1340,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
 __all__ = [
     "SocketSpec", "ModeSpec", "NodeSpec", "NodeRegistry", "NODES",
     "Granularity", "DIM_MODE", "DIM_DESCRIPTION", "DIM_CHOICE_DOCS",
-    "PATH_KINDS", "PICK_KINDS", "BOUND_PICK_KINDS",
+    "PATH_KINDS", "PICK_KINDS", "BOUND_PICK_KINDS", "OPTIONS_FROM",
     "InDataset", "OutDataset", "OutValue", "Mode", "DimMode",
     "InFloat", "InInt", "InBool", "InVector", "InColor", "InString",
     "define_node", "layer_value",

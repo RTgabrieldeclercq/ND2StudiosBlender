@@ -160,6 +160,15 @@ def deconflict_slots(prefer: Mapping[Any, int], pairs: Iterable[Tuple[Any, Any]]
     tie-break is an index scan. The required separation shrinks for a crowded object
     (``330/(n+1)``), because 8 neighbours cannot all be 30° from each other *and* from the
     newcomer — better a guaranteed-feasible spread than an arbitrary give-up.
+
+    **This runs on the GUI thread, once per delivered payload, over every object** — so
+    the common case (the object's own preference already clears its neighbours) is kept
+    to plain Python arithmetic over a handful of hues. Spelling it in numpy cost ~90 µs an
+    object in four tiny array calls, which on a 40k-speck threshold under the
+    troubleshooting scope froze the Viewer for ~5 s on every cursor move (2026-10-08). The
+    hue arithmetic is the SAME double-precision ``(slot × golden) % 360`` as :func:`_hues`,
+    so the slots handed out are unchanged; only the search for a clearing slot — the rare
+    branch — still goes through numpy, over the 512 candidates at once.
     """
     adj: Dict[Any, set] = {}
     for a, b in pairs:
@@ -170,27 +179,81 @@ def deconflict_slots(prefer: Mapping[Any, int], pairs: Iterable[Tuple[Any, Any]]
     offsets = np.arange(1, MAX_SLOT_SEARCH + 1, dtype=np.int64)
     taken: set = set()
     slot: Dict[Any, int] = {}
+    hue_of: Dict[int, float] = {}                 # slot → its hue, memoised per object
+    min_sep = float(min_sep)
     for obj in sorted(prefer, key=lambda o: (int(prefer[o]), str(o))):
         want = int(prefer[obj])
-        placed = [slot[nb] for nb in adj.get(obj, ()) if nb in slot]
-        if placed:
-            hues = np.unique(_hues(np.asarray(placed)))     # sorted around the wheel
-            sep = min(float(min_sep), 330.0 / (len(hues) + 1))
-            if len(hues) > MAX_CONSTRAINT_HUES:             # even sample, arcs preserved
-                hues = hues[np.linspace(0, len(hues) - 1, MAX_CONSTRAINT_HUES).astype(int)]
-            if float(_hue_gaps(_hues(np.array([want])), hues)[0]) < sep:
-                gaps = _hue_gaps(_hues(want + offsets), hues)
-                ok = np.nonzero(gaps >= sep)[0]
-                if not ok.size:                             # the wheel is full: least bad
-                    want += int(offsets[int(np.argmax(gaps))])
-                else:
-                    # the nearest clearing slot, skipping ones already spoken for
-                    free = [want + int(offsets[j]) for j in ok[:64].tolist()
-                            if want + int(offsets[j]) not in taken]
-                    want = free[0] if free else want + int(offsets[int(ok[0])])
+        nbs = adj.get(obj)
+        if nbs:
+            hs = {hue_of[slot[nb]] for nb in nbs if nb in slot}
+            if hs:
+                hues_list = sorted(hs)                      # sorted around the wheel
+                sep = min(min_sep, 330.0 / (len(hues_list) + 1))
+                if len(hues_list) > MAX_CONSTRAINT_HUES:    # even sample, arcs preserved
+                    pick = np.linspace(0, len(hues_list) - 1,
+                                       MAX_CONSTRAINT_HUES).astype(int)
+                    hues_list = [hues_list[int(i)] for i in pick]
+                wh = (float(want) * GOLDEN_ANGLE) % 360.0
+                gap = 360.0
+                for h in hues_list:                       # distance the short way round
+                    d = abs(wh - h)
+                    d = d if d <= 180.0 else 360.0 - d
+                    if d < gap:
+                        gap = d
+                if gap < sep:
+                    want = _clearing_slot(want, np.asarray(hues_list), sep, offsets, taken)
         slot[obj] = want
         taken.add(want)
+        if want not in hue_of:
+            hue_of[want] = (float(want) * GOLDEN_ANGLE) % 360.0
     return slot
+
+
+#: How many candidate slots :func:`_clearing_slot` scores per chunk. The search almost
+#: always ends in the first chunk, so scoring all :data:`MAX_SLOT_SEARCH` candidates up
+#: front spent 8× the work on the answer it had already found.
+_SEARCH_CHUNK = 64
+
+#: Among the slots that clear every neighbour, how many are tried before the search gives
+#: up on finding one nobody holds yet and settles for the first clearing one.
+_FREE_TRIES = 64
+
+
+def _clearing_slot(want: int, hues: np.ndarray, sep: float, offsets: np.ndarray,
+                   taken: set) -> int:
+    """The slot an object moves to when its preference ``want`` sits within ``sep``
+    degrees of a neighbour: the nearest slot above ``want`` whose hue clears every hue in
+    ``hues``, skipping (up to :data:`_FREE_TRIES` times) ones already spoken for; failing
+    any clearing slot in the whole search range, the one with the widest gap.
+
+    Scored in chunks of :data:`_SEARCH_CHUNK` offsets, nearest first, and the same answer
+    as scoring every offset at once: the chosen slot is the first clearing one not yet
+    taken among the first :data:`_FREE_TRIES` clearing slots, else the first clearing
+    slot, else the argmax of the gap over the full range (ties to the lowest offset, as
+    ``np.argmax`` breaks them)."""
+    first_ok = -1
+    seen_ok = 0
+    best_gap, best_j = -1.0, 0
+    for lo in range(0, len(offsets), _SEARCH_CHUNK):
+        chunk = offsets[lo:lo + _SEARCH_CHUNK]
+        gaps = _hue_gaps(_hues(want + chunk), hues)
+        ok = np.nonzero(gaps >= sep)[0]
+        for j in ok.tolist():
+            if first_ok < 0:
+                first_ok = lo + j
+            seen_ok += 1
+            if seen_ok > _FREE_TRIES:
+                return want + int(offsets[first_ok])
+            cand = want + int(chunk[j])
+            if cand not in taken:                           # the nearest free clearing slot
+                return cand
+        if first_ok < 0:
+            g = int(np.argmax(gaps))
+            if float(gaps[g]) > best_gap:                   # strict: ties keep the lowest
+                best_gap, best_j = float(gaps[g]), lo + g
+    if first_ok >= 0:                                       # every free try was taken
+        return want + int(offsets[first_ok])
+    return want + int(offsets[best_j])                      # the wheel is full: least bad
 
 
 def slot_lut(ids: np.ndarray, slots: np.ndarray,

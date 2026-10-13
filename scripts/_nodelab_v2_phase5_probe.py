@@ -636,6 +636,167 @@ def main(argv) -> int:
         if not _had_pc2:
             del _vp._payload_coords
 
+    # THE GRID OVERLAY (2026-10-09): a DIC / PIV / DVC result's `<field>_mesh` table is drawn
+    # as its element boxes on the viewed plane (t = -1 = every frame; a DVC hex where its z
+    # extent spans the plane), `subsets` draws the window around every Nth FIELD node, the
+    # Points overlay leaves the element centres alone, and the renderer paints it.
+    from nodegraph.catalog._shared.analysis_mesh import grid_hexes, lattice_quads, with_mesh
+    from nodelab_v2 import overlays as _OVg
+    assert "grid" in _OVg.TABS and _vp.overlays.grid.enabled
+    _gax = AxisSizes(m=1, t=2, z=3, c=1, y=64, x=64)
+    _gy, _gx = _np.meshgrid([8., 24., 40.], [8., 24., 40., 56.], indexing="ij")
+    _gfield = _STp(_Dom.POINT, {
+        "id": _np.arange(12, dtype=_np.int64), "m": _np.zeros(12, _np.int64),
+        "t": _np.zeros(12, _np.int64), "c": _np.zeros(12, _np.int64),
+        "z": _np.ones(12), "y": _gy.reshape(-1), "x": _gx.reshape(-1)},
+        layer="piv", z_kind="plane_index")
+    _gds = with_mesh(_DS(axes=_gax).with_image(_AP(_np.zeros((1, 2, 3, 1, 64, 64))))
+                     .with_structure(_gfield), "piv",
+                     lattice_quads([8., 24., 40.], [8., 24., 40., 56.], m=0, t=-1, c=0,
+                                   z_plane=1),
+                     kind="quad", z_kind="plane_index", window=(16, 16))
+    _gkeep = (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.grid.style,
+              _vp.overlays.grid.every, _vp.overlays.points.layer)
+    _had_pc3 = "_payload_coords" in _vp.__dict__
+    try:
+        _vp._dataset, _vp._axes = _gds, _gax
+        _vp._ref_plane = _np.zeros((64, 64))
+        _vp.overlays.points.layer = ""
+        _vp._payload_coords = lambda: (0, 1, 1, 0)          # frame 1: the t=-1 grid shows
+        _r = _vp._grid_rects()
+        assert _r is not None and _r.shape == (6, 5), None if _r is None else _r.shape
+        _vp._payload_coords = lambda: (0, 0, 1, 0)          # frame 0 holds the field rows
+        assert len(_vp._point_marks()) == 12, "the Points overlay must skip the grid's centres"
+        _vp._payload_coords = lambda: (0, 1, 0, 0)          # plane 0 holds no grid
+        assert _vp._grid_rects() is None
+        _vp._payload_coords = lambda: (0, 0, 1, 0)
+        _vp.overlays.grid.style, _vp.overlays.grid.every = "subsets", 1
+        _r2 = _vp._grid_rects()
+        assert _r2.shape == (12, 5) and _np.allclose(_r2[:, 1] - _r2[:, 0], 16.0), _r2
+        _vp.overlays.grid.style = "elements"
+        # a DVC hex grid is drawn where its z extent spans the viewed plane
+        _hz, _hy, _hx = _np.meshgrid([0., 2.], [8., 24.], [8., 24.], indexing="ij")
+        _hex = grid_hexes((2, 2, 2), _np.stack([_hz, _hy, _hx], -1).reshape(-1, 3),
+                          m=0, t=-1, c=0)
+        _vp._dataset = with_mesh(_DS(axes=_gax).with_image(
+            _AP(_np.zeros((1, 2, 3, 1, 64, 64)))), "dvc", _hex, kind="hex",
+            z_kind="subpixel")
+        _vp._payload_coords = lambda: (0, 0, 1, 0)
+        assert _vp._grid_rects().shape == (1, 5)
+        _vp._payload_coords = lambda: (0, 0, 2, 0)          # z=2 is the hex's top face
+        assert _vp._grid_rects() is not None
+        # and the renderer paints it (a cosmetic path per level) without error
+        from PySide6.QtGui import QImage as _QI, QPainter as _QP
+        from PySide6.QtCore import QPointF as _QPF
+        _img = _QI(64, 64, _QI.Format_ARGB32)
+        _img.fill(0)
+        _pp = _QP(_img)
+        try:
+            _vp._renderer.paint(_pp, _vp.overlays, _OVg.OverlayFrame(
+                map_pt=lambda x, y: _QPF(x, y), plane_wh=(64, 64), grid=_r))
+        finally:
+            _pp.end()
+        assert any(_img.pixel(int(x), 8) & 0xFF000000 for x in range(8, 57)), \
+            "the grid's top edge at y=8 drew nothing"
+        print("  [grid] DIC/PIV/DVC grid overlay: 6 lattice cells on their plane (t=-1 = every "
+              "frame), none off it, 12 subset windows of 16 px, a hex sectioned at z=1 and z=2, "
+              "element centres kept out of the Points overlay, painted")
+    finally:
+        (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.grid.style,
+         _vp.overlays.grid.every, _vp.overlays.points.layer) = _gkeep
+        if not _had_pc3:
+            _vp.__dict__.pop("_payload_coords", None)
+
+    # THE FIELD OVERLAY + VECTOR UNITS (2026-10-09): the Field tab colours the image by any
+    # column of a field table (Auto = the most derived: a Stress card's von_mises beats a
+    # strain beats the displacement), lattice rows one cell per node, with a colour bar and
+    # iso-contours; the arrows are in PIXELS (a µm displacement divided by the pixel size).
+    import nodegraph.fieldmap as _FVp
+    assert "field" in _OVg.TABS and _vp.overlays.field.enabled
+    _fax = AxisSizes(m=1, t=2, z=1, c=1, y=64, x=64)
+    _fy, _fx = _np.meshgrid(_np.arange(8., 64., 8.), _np.arange(8., 64., 8.), indexing="ij")
+    _nf = _fy.size
+    _fcols = {"id": _np.arange(2 * _nf, dtype=_np.int64),
+              "m": _np.zeros(2 * _nf, _np.int64),
+              "t": _np.repeat(_np.arange(2, dtype=_np.int64), _nf),
+              "c": _np.zeros(2 * _nf, _np.int64), "z": _np.zeros(2 * _nf),
+              "y": _np.tile(_fy.ravel(), 2), "x": _np.tile(_fx.ravel(), 2),
+              "disp_y": _np.zeros(2 * _nf), "disp_x": _np.tile(_fx.ravel(), 2) * 0.01,
+              "strain_xx": _np.tile(_fx.ravel() - 32.0, 2) * 1e-3,
+              "strain_yy": _np.full(2 * _nf, -0.01), "strain_yx": _np.full(2 * _nf, 0.004),
+              "strain_xy": _np.full(2 * _nf, 0.004),
+              "von_mises": _np.tile(_fy.ravel(), 2) * 2.0}
+    _fds = (_DS(axes=_fax, metadata={"pixel_size_um": 0.5})
+            .with_image(_AP(_np.zeros((1, 2, 1, 1, 64, 64))))
+            .with_structure(_STp(_Dom.POINT, _fcols, layer="piv", z_kind="plane_index")))
+    _fkeep = (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.field.column,
+              _vp.overlays.field.style, _vp.overlays.field.glyphs, _vp.overlays.grid.style)
+    _had_pc4 = "_payload_coords" in _vp.__dict__
+    try:
+        _vp._dataset, _vp._axes = _fds, _fax
+        _vp._ref_plane = _np.zeros((64, 64))
+        _vp._payload_coords = lambda: (0, 1, 0, 0)
+        _vp.overlays.field.column = ""
+        assert _vp.overlay_layer_names("field") == ["piv"]
+        assert {"von_mises", "strain_xx", "disp_x"} <= set(_vp.overlay_column_names("field"))
+        _fi = _vp._field_info()
+        assert _fi is not None and _fi[0].column == "von_mises" and _fi[0].lattice
+        assert _fi[0].grid.shape == (7, 7) and _fi[2] == "turbo", (_fi[0].grid.shape, _fi[2])
+        _vp.overlays.field.column = "strain_xx"                # signed → the diverging map
+        _fs = _vp._field_info()
+        assert _fs[2] == "coolwarm" and not _np.allclose(_fs[0].grid, _fi[0].grid)
+        # the arrows: disp_x 0.01·x µm at 0.5 µm/px → 0.02·x px, NOT 0.01·x
+        _vrows = _vp._vector_field()
+        assert _vrows is not None and _np.allclose(_vrows[:, 3], _vrows[:, 1] * 0.02), _vrows[:3]
+        # painted: the wash, then the contours, each with the colour bar
+        _img2 = _QI(320, 240, _QI.Format_ARGB32)
+        for _style in ("smooth", "contours"):
+            _img2.fill(0)
+            _vp.overlays.field.style = _style
+            _pp2 = _QP(_img2)
+            try:
+                _vp._renderer.paint(_pp2, _vp.overlays, _OVg.OverlayFrame(
+                    map_pt=lambda x, y: _QPF(x * 4, y * 3), plane_wh=(64, 64),
+                    field=_fs[0], field_lims=_fs[1], field_cmap=_fs[2], field_label=_fs[3]))
+            finally:
+                _pp2.end()
+            _hits = sum(1 for x in range(0, 240, 5) for y in range(30, 230, 5)
+                        if _img2.pixel(x, y) & 0xFF000000)
+            assert _hits > (200 if _style == "smooth" else 5), (_style, _hits)
+            assert any(_img2.pixel(x, 30) & 0xFF000000 for x in range(250, 315)), \
+                "the colour bar at the top right drew nothing"
+        assert _FVp.value_at(_fs[0], 32.0, 8.0) is not None
+        # principal-axis glyphs and the deformed grid, from the Viewer's own extractors
+        _vp.overlays.field.glyphs = "strain"
+        _gly = _vp._glyph_info()
+        assert _gly is not None and len(_gly.rows) == _nf, None if _gly is None else len(_gly.rows)
+        _vp.overlays.grid.style = "deformed"
+        _dl = _vp._deformed_lines()
+        assert _dl and len(_dl) == 14, None if not _dl else len(_dl)   # 7 rows + 7 columns
+        _img2.fill(0)
+        _pp3 = _QP(_img2)
+        try:
+            _vp._renderer.paint(_pp3, _vp.overlays, _OVg.OverlayFrame(
+                map_pt=lambda x, y: _QPF(x * 4, y * 3), plane_wh=(64, 64),
+                glyphs=_gly, grid_lines=_dl))
+        finally:
+            _pp3.end()
+        _red = sum(1 for x in range(0, 256, 2) for y in range(0, 192, 2)
+                   if (_img2.pixel(x, y) >> 16) & 0xFF > 180 and (_img2.pixel(x, y) & 0xFF) < 120)
+        _blue = sum(1 for x in range(0, 256, 2) for y in range(0, 192, 2)
+                    if (_img2.pixel(x, y) & 0xFF) > 180 and (_img2.pixel(x, y) >> 16) & 0xFF < 120)
+        assert _red > 10 and _blue > 10, (_red, _blue)     # tension AND compression bars
+        print("  [field] Field overlay: Auto picked von_mises (turbo), strain_xx switches to "
+              "the diverging map and a different raster, 7×7 lattice cells, wash + contours "
+              "+ colour bar painted; arrows in px (µm ÷ 0.5 µm/px); principal-axis glyphs "
+              "(red tension, blue compression) and the 14-line deformed grid painted")
+    finally:
+        (_vp._dataset, _vp._axes, _vp._ref_plane, _vp.overlays.field.column,
+         _vp.overlays.field.style, _vp.overlays.field.glyphs,
+         _vp.overlays.grid.style) = _fkeep
+        if not _had_pc4:
+            _vp.__dict__.pop("_payload_coords", None)
+
     # THE LABELS OVERLAY PICKS ITS LAYER (2026-08-04). It had no selector: `_label_plane`
     # drew whichever integer Voxel raster had the most regions in the viewed plane. Several
     # label rasters on one Dataset is the NORMAL case — `analysis.voronoi` alone emits its
@@ -1074,8 +1235,15 @@ def main(argv) -> int:
                 if kind == "role":
                     out.append(role)
                 for k in range(role.childCount()):
-                    if kind == "node":
-                        out.append(role.child(k))
+                    # a role's children are node rows AND, since 2026-10-08, bundle rows
+                    # (one row that places several nodes) — told apart by their kind data;
+                    # a bundle row holds its MEMBER node rows as a third level
+                    ch = role.child(k)
+                    if ch.data(0, _Qt.UserRole + 1) == kind:
+                        out.append(ch)
+                    if ch.data(0, _Qt.UserRole + 1) == "bundle" and kind == "node":
+                        out.extend(ch.child(q) for q in range(ch.childCount())
+                                   if ch.child(q).data(0, _Qt.UserRole + 1) == "node")
         return out
 
     win.palette.refill("")
@@ -1095,6 +1263,51 @@ def main(argv) -> int:
         (len(_rows("role")), len(roles_with_visible))   # graph-structure ops are hidden
     nodes = _rows("node")
     assert len(nodes) == len(visible_specs()), (len(nodes), len(visible_specs()))
+    # a node BUNDLE (2026-10-08) is one palette row under its role that places several
+    # wired nodes in a frame: the DVC stages. Double-click = place at the view centre.
+    from nodegraph.bundles import BUNDLES as _BUNDLES
+    bundle_rows = _rows("bundle")
+    assert {r.data(0, _Qt.UserRole) for r in bundle_rows} == set(_BUNDLES), \
+        ([r.data(0, _Qt.UserRole) for r in bundle_rows], sorted(_BUNDLES))
+    # the third level (2026-10-08): a bundle row holds its family's stages, each ONCE and in
+    # pipeline order (the PIV ladder places Validate thrice; the palette lists it once), the
+    # optional ones the bundle does not place after them — and no stage also sits at role level
+    _family_all = set()
+    for br in bundle_rows:
+        b_ = _BUNDLES[br.data(0, _Qt.UserRole)]
+        kids = [br.child(q).data(0, _Qt.UserRole) for q in range(br.childCount())]
+        assert kids == list(b_.family_ops), (b_.key, kids, b_.family_ops)
+        assert all(br.child(q).data(0, _Qt.UserRole + 1) == "node" for q in range(br.childCount()))
+        _family_all |= set(kids)
+    assert _BUNDLES["bundle:piv"].family_ops == ("piv.first_pass", "piv.validate",
+                                                 "piv.deform_pass", "piv.smooth")
+    for role in _rows("role"):
+        direct = {role.child(k).data(0, _Qt.UserRole) for k in range(role.childCount())
+                  if role.child(k).data(0, _Qt.UserRole + 1) == "node"}
+        assert not (direct & _family_all), ("a stage listed beside the ordinary nodes",
+                                            sorted(direct & _family_all))
+    _ok(f"G2: {len(bundle_rows)} bundle rows (DVC, DIC, PIV) each hold their "
+        f"{len(_family_all)} stage nodes as a third level — once each, in pipeline order — "
+        "and none of those stages is repeated beside the ordinary nodes")
+    dvc_row = next(r for r in bundle_rows if r.data(0, _Qt.UserRole) == "bundle:dvc")
+    assert dvc_row.text(1).endswith(_BUNDLES["bundle:dvc"].label), dvc_row.text(1)
+    tree.setCurrentItem(dvc_row)
+    assert "places 5 wired nodes" in win.palette.overview_html(), "bundle overview"
+    n_before, f_before = len(win.doc.nodes), len(win.doc.frames)
+    win.palette._add_current(dvc_row)
+    app.processEvents()
+    assert len(win.doc.nodes) == n_before + 5 and len(win.doc.frames) == f_before + 1, \
+        (len(win.doc.nodes) - n_before, len(win.doc.frames) - f_before)
+    placed = [nid for nid, rec in win.doc.nodes.items() if rec.op_key.startswith("dvc.")]
+    assert len(placed) == 5, placed
+    fr = next(f for f in win.doc.frames.values() if set(f.members) == set(placed))
+    assert fr.title == "DVC (pyALDVC)", fr.title
+    for nid in placed:
+        win.doc.remove_node(nid)
+    app.processEvents()
+    assert len(win.doc.nodes) == n_before and len(win.doc.frames) == f_before, "bundle undo"
+    _ok("G2: the bundle:dvc palette row places 5 wired DVC stage nodes in a 'DVC (pyALDVC)' "
+        "frame; its overview names them; removing them empties the frame")
     gauss = next(r for r in nodes if r.data(0, _Qt.UserRole) == "enhance.gaussian")
     label = next(r for r in nodes if r.data(0, _Qt.UserRole) == "analysis.label")
     for r in (gauss, label):
@@ -1140,7 +1353,8 @@ def main(argv) -> int:
         out, stack = [], [item]
         while stack:
             it = stack.pop()
-            if it.data(0, _Qt.UserRole):
+            # ops only: a bundle row (2026-10-08) carries a `bundle:` key, not an op
+            if it.data(0, _Qt.UserRole) and it.data(0, _Qt.UserRole + 1) == "node":
                 out.append(it.data(0, _Qt.UserRole))
             stack.extend(it.child(j) for j in range(it.childCount()))
         return out
@@ -1378,9 +1592,10 @@ def main(argv) -> int:
     pt_idx = next(i for i in range(win.sheet._pick.count())
                   if win.sheet._pick.itemData(i) == ("point", "spots"))
     win.sheet._pick.setCurrentIndex(pt_idx)
-    assert win.sheet._table.rowCount() == 2               # 2 points
-    hdrs = [win.sheet._table.horizontalHeaderItem(i).text()
-            for i in range(win.sheet._table.columnCount())]
+    from PySide6.QtCore import Qt as _Qt
+    _sm = win.sheet._table.model()                        # a virtual model (2026-10-08)
+    assert _sm.rowCount() == 2                            # 2 points
+    hdrs = [_sm.headerData(i, _Qt.Horizontal) for i in range(_sm.columnCount())]
     assert hdrs[0] == "id" and "intensity" in hdrs        # coord columns first
     _ok(f"G5: spreadsheet groups {len(tables)} structure tables (point+label), "
         f"coord columns first")
@@ -5539,11 +5754,13 @@ def main(argv) -> int:
     _ttabs = [_panel._files.tabText(i) for i in range(_panel._files.count())]
     assert _ttabs == ["All (3 files)", "A.nd2", "B.nd2", "C.nd2"], _ttabs
 
+    from PySide6.QtCore import Qt as _Qt
+    _tm = _panel._table.model()                               # virtual model (2026-10-08)
+
     def _areas():
-        _c = [n for n in range(_panel._table.columnCount())
-              if _panel._table.horizontalHeaderItem(n).text() == "area"][0]
-        return [_panel._table.item(r, _c).text()
-                for r in range(_panel._table.rowCount())]
+        _c = [n for n in range(_tm.columnCount())
+              if _tm.headerData(n, _Qt.Horizontal) == "area"][0]
+        return [_tm.text(r, _c) for r in range(_tm.rowCount())]
 
     assert len(_areas()) == 6, _areas()                       # All
     for _i, _want in ((1, ["10", "11"]), (2, ["20", "21"]), (3, ["30", "31"])):
@@ -5551,7 +5768,7 @@ def main(argv) -> int:
         assert _areas() == _want, (_i, _areas())
         # the row header keeps the ORIGINAL row number, so a filtered row is still
         # findable in the unfiltered CSV the export writes
-        assert _panel._table.verticalHeaderItem(0).text() == str((_i - 1) * 2)
+        assert _tm.headerData(0, _Qt.Vertical) == str((_i - 1) * 2)
     _panel._files.setCurrentIndex(0)
     assert len(_areas()) == 6, _areas()
     # a SINGLE-file table grows no tabs — one tab beside `All` would offer the same rows
@@ -6196,7 +6413,8 @@ def main(argv) -> int:
         while stack:
             it = stack.pop()
             op = it.data(0, _PQt.UserRole)
-            if op:
+            # ops only: a bundle row (2026-10-08) carries a `bundle:` key under its role
+            if op and it.data(0, _PQt.UserRole + 1) == "node":
                 out.add(op)
             stack.extend(it.child(i) for i in range(it.childCount()))
         return out
@@ -9660,6 +9878,11 @@ def main(argv) -> int:
         "delivers file 1's frame 1 and file 2's frame 1, cut after the builder in the run "
         "graph only; with no picks the cursor's own rebuilt frame runs")
 
+    # the analysis lanes (2026-10-09): a spawned process pool keeps a management thread and
+    # its worker processes alive; tear them down before os._exit rather than under it, the
+    # same discipline as the LabLink panel above
+    from nodegraph import parallel as _par_end
+    _par_end.shutdown(threads=True)
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

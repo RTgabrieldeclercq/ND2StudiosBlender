@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
 from nodegraph.metadata import (crop as _meta_crop, format_indices, frame_spec_picks,
-                                position_subset, respaced, shift_origin_um, time_subset,
-                                z_home_after)
+                                position_subset, respaced, scope_stamp_subset,
+                                shift_origin_um, time_subset, z_home_after)
 from nodegraph.provider import FrameSubsetProvider
 from nodegraph.registry import (DimMode, InDataset, InInt, InString, Mode, OutDataset)
 from nodegraph.streaming import WindowView
@@ -157,6 +157,9 @@ def _crop_frames(ctx: EvalContext, ds: Dataset, prov: Any, raw: Any) -> Dataset:
     if zs is not None:
         changes["z_step_um"] = respaced(md.get("z_step_um"), keep_z)
         changes.update(z_home_after(md, keep_z))
+    # which SOURCE frames survive, under the troubleshooting scope (the meta transform
+    # applies the same helper, so the envelope and the payload agree)
+    changes.update(scope_stamp_subset(md, ax, keep))
     out = out.with_metadata(**changes)
     z_step = md.get("z_step_um")
     if zs is not None and z_step and keep_z[0]:

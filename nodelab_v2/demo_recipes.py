@@ -200,6 +200,7 @@ ROLE_DEFAULTS: Dict[str, Tuple[str, str, Dict[str, Any], str]] = {
     "table_synthesis": ("table", "cells2d", {}, "measured2d"),
     "tracking": ("tracks", "moving_cells", {}, "labels2d"),
     "motion_and_deformation_fields": ("field", "speckle_pair", {}, ""),
+    "field_mechanics": ("field", "speckle_pair", {}, ""),
     "control_flow": (GUIDE, "", {}, ""),
     "graph_structure": (GUIDE, "", {}, ""),
     "visualization": ("image", "cells2d", {}, ""),
@@ -859,9 +860,6 @@ class DemoResult:
     frame_values: Dict[str, float] = field(default_factory=dict)
 
 
-_VECTOR_COLUMNS = (("u", "v"), ("u_um", "v_um"), ("dy", "dx"), ("disp_y", "disp_x"))
-
-
 class DemoSession:
     """One node's demo: owns the phantom, a persistent memo and tile cache, and runs
     ``seed → prelude → node`` with whatever the sliders say. Qt-free; the window drives it
@@ -1205,34 +1203,12 @@ class DemoSession:
 
     @staticmethod
     def _vectors(ds: Dataset, m: int, t: int, z: int, c: int) -> Optional[np.ndarray]:
-        by_layer: Dict[str, Dict[str, np.ndarray]] = {}
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.POINT and layer:
-                by_layer.setdefault(str(layer), {})[str(name)] = attr.values
-        for layer, cols in by_layer.items():
-            uy = ux = None
-            for a, b in _VECTOR_COLUMNS:
-                if a in cols and b in cols:
-                    uy, ux = cols[a], cols[b]
-                    break
-            if uy is None or "y" not in cols or "x" not in cols:
-                continue
-            keep = np.ones(len(cols["y"]), dtype=bool)
-            for key, want in (("m", m), ("t", t), ("c", c)):
-                if key in cols:
-                    keep &= np.asarray(cols[key]) == want
-            try:
-                z_kind = ds.structure_zkind(Domain.POINT, layer)
-            except Exception:                  # noqa: BLE001 — provenance is advisory
-                z_kind = None
-            if z_kind == "plane_index" and "z" in cols:
-                keep &= np.asarray(cols["z"]) == z
-            idx = np.flatnonzero(keep)
-            if idx.size == 0:
-                continue
-            return np.stack([np.asarray(cols["y"], float)[idx], np.asarray(cols["x"], float)[idx],
-                             np.asarray(uy, float)[idx], np.asarray(ux, float)[idx]], axis=1)
-        return None
+        """The Viewer's own arrows (:func:`nodegraph.fieldmap.vectors`) — image pixels,
+        a µm displacement converted by the payload's pixel size — so the demo window and
+        the Viewer can never draw one field two ways."""
+        from nodegraph.fieldmap import vectors
+        vf = vectors(ds, m, t, z, c)
+        return None if vf is None else vf.rows
 
     @staticmethod
     def _mesh(ds: Dataset, m: int, t: int, z: int, c: int, *, near: float = 1.0

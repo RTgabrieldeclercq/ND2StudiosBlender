@@ -78,6 +78,33 @@ normalize_strain_type(name) -> str        # 'green-lagrange' -> 'green_lagrange'
 LazyVolumeProvider(get_volume, n_frames, shape, *, voi=None, cache_size=3)
 ```
 
+### 2b. The staged entry points (2026-10-08)
+
+`run_aldvc_series` runs pyALDVC's Sections 2-8 in one call. The staged DVC nodes
+(`dvc.grid` → `dvc.initial_guess` → `dvc.local_match` → `dvc.global_step` → `dvc.strain`,
+placed together by the `bundle:dvc` palette entry) call the sections one at a time:
+
+```python
+stage_para(params, voxel_size_um, shape) -> DVCPara          # §2's rewrite: validated, VOI clamped, gradient_mode resolved
+stage_grid(para, shape) -> (mesh, coords_zyx)                 # §2: the node grid, no volume read
+stage_reference(ref_vol, para, shape) -> DVCReference         # §2-3 for one reference: bundle, Hessians, validity, operators
+stage_deformed(def_vol, para, shape) -> (g_norm, g_prep)      # one deformed frame, normalised + interpolation-ready
+stage_initial_guess(ref, g_norm, g_prep, *, previous_zyx) -> (U0_zyx, F0_zyx | None, info)   # §3
+stage_local(ref, g_prep, U0_zyx, *, F0_zyx) -> {U, F, zncc, status, n_iter, bad, U_std}      # §4
+stage_global(ref, g_prep, U1_zyx, F1_zyx, bad_local, *, beta) -> {U, F, zncc, status, outlier, U_std, beta, mu, n_steps, …}  # §5-6, the ADMM loop verbatim
+stage_strain(para, shape, U_zyx, *, F_direct_zyx, valid) -> (strain_zyx (N,3,3), strain_valid, strain_type)  # §8, grid rebuilt, no volume read
+```
+
+Each reproduces its slice of `core/pipeline.py:124-390` (the same calls, the same `para`
+rewrites, the same `mesh.node_valid = ctx.valid` side effect), so the staged chain and the
+one-call driver agree on every node — measured identical to 1e-8 on the selftest fixture
+through the Engine. Everything crosses this boundary in `(z, y, x)`; the reversal lives in
+these functions and in `frame_to_dvcresult`, nowhere else. A `DVCReference` is a value, not a
+cache: the nodes rebuild it per reference frame (seconds) rather than pass it between cards,
+because nothing opaque may ride the memo, the spill or a saved file. The ADMM loop is the one
+piece of the driver that is not a function upstream; `stage_global` re-implements it line for
+line (`W`, `v` duals from zero, `dual_update="accumulate"`, the `admm_tol` stop).
+
 ## 3. Inputs
 
 | arg | shape / type | notes |

@@ -41,7 +41,7 @@ different box (or a bisect) needs no code edit:
 
 ===============================  =====================================================
 ``NODEGRAPH_PARALLEL``           ``auto`` (default) / ``thread`` / ``process`` / ``off``
-``NODEGRAPH_WORKERS``            max workers (default ``cpu_count-2``, floor 1)
+``NODEGRAPH_WORKERS``            max workers (default ``min(cpu_count-2, 8)``, floor 1)
 ``NODEGRAPH_PROC_WORKERS``       process-pool size (default ``min(workers, 8)``)
 ``NODEGRAPH_CACHE_BYTES``        engine TileCache budget (default: RAM-derived)
 ``NODEGRAPH_MEMO_BYTES``         persistent Memo budget (default: RAM-derived)
@@ -49,7 +49,14 @@ different box (or a bisect) needs no code edit:
 ``NODEGRAPH_FLOAT32``            ``1`` = stream in float32 (opt-in; changes numerics)
 ``NODEGRAPH_GPU``                ``off`` (default) / ``auto`` / ``on`` (CuPy dispatch)
 ``NODEGRAPH_STORE_DIR``          redirect ``.b2nd`` ingest stores off slow media
+``NODEGRAPH_RESERVE_CORES``      cores the analysis governor keeps free (default
+                                 ``max(2, physical // 10)``) — :mod:`nodegraph.governor`
+``NODEGRAPH_MIN_FREE_RAM``       free-RAM floor the governor never plans below (``6G``)
 ===============================  =====================================================
+
+The expensive analysis nodes (DIC, DVC, PIV, SerialTrack) do not use the fixed-width maps:
+:func:`adaptive_fold` sizes their process lanes unit by unit from a live reading of the
+machine — see :mod:`nodegraph.governor`.
 
 Qt-free; numpy + stdlib only.
 """
@@ -104,17 +111,30 @@ def _env_flag(key: str, default: bool = False) -> bool:
 
 # ── machine sizing ─────────────────────────────────────────────────────────────
 
+#: Ceiling on the default worker count. The unit pool is a THREAD pool in the GUI's own
+#: process, and every worker runs Python glue between its numpy calls, so each one is a
+#: contender for the GIL against the GUI thread. Measured 2026-10-08 on an 80-core box
+#: (Threshold over a 66-position ND2, direct access): 78 workers 53.6 s with the GUI frozen
+#: for 31.6 s at a stretch; 16 workers 69 s; 8 workers 49.7 s with the longest GUI stall
+#: 0.3 s. Past a handful of threads the GIL is the bottleneck, so more workers only make
+#: the convoy worse — the run gets no faster and every click waits behind it.
+#: ``NODEGRAPH_WORKERS`` still sets any number, above or below.
+DEFAULT_WORKER_CAP = 8
+
+
 def cpu_budget() -> int:
     """How many workers to run at once.
 
     ``cpu_count - 2`` rather than ``cpu_count``: the GUI thread and the Qt worker that
     drives the pull both need to stay responsive, and the point of parallelising is a
-    smoother run, not a pegged machine. Floor 1 (never zero — a zero-worker pool
-    deadlocks). ``NODEGRAPH_WORKERS`` overrides."""
+    smoother run, not a pegged machine — and never more than :data:`DEFAULT_WORKER_CAP`,
+    because on a many-core machine the extra threads fight the GUI for the GIL instead of
+    shortening the run. Floor 1 (never zero — a zero-worker pool deadlocks).
+    ``NODEGRAPH_WORKERS`` overrides, in either direction."""
     n = _env_int("NODEGRAPH_WORKERS", None)
     if n is not None:
         return max(1, int(n))
-    return max(1, (os.cpu_count() or 2) - 2)
+    return max(1, min((os.cpu_count() or 2) - 2, DEFAULT_WORKER_CAP))
 
 
 def proc_budget() -> int:
@@ -298,6 +318,13 @@ def _worker_init() -> None:
     ``N`` workers do not each try to use the whole machine."""
     global _IS_POOL_WORKER
     _IS_POOL_WORKER = True
+    # Below-normal priority for every pool worker: whatever it computes, the GUI and the
+    # user's input must win the scheduler (nodegraph.governor — the main freeze guard).
+    try:
+        from nodegraph.governor import _below_normal_priority
+        _below_normal_priority()
+    except Exception:  # noqa: BLE001
+        pass
     n = str(inner_threads(proc_budget()))
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS"):
@@ -629,6 +656,159 @@ def fold_units(compute: Callable[[T], R], items: Sequence[T],
             break
 
 
+class UnitError(RuntimeError):
+    """A unit's compute raised inside a worker process. Carries the original exception
+    (``.original``) and the worker-side traceback text, because the parent's own traceback
+    would only show the pool machinery."""
+
+    def __init__(self, original: BaseException, worker_traceback: str) -> None:
+        super().__init__(f"{type(original).__name__}: {original}\n--- in the worker ---\n"
+                         f"{worker_traceback}")
+        self.original = original
+        self.worker_traceback = worker_traceback
+
+
+def adaptive_fold(compute: Callable[[T], R], items: Sequence[T],
+                  fold: Callable[[int, T, R], None], *,
+                  governor: Any,
+                  prepare: Optional[Callable[[T], Any]] = None,
+                  numba: bool = True,
+                  on_wait: Optional[Callable[[], None]] = None,
+                  poll_s: float = 0.5,
+                  preimport: Sequence[str] = ()) -> None:
+    """:func:`fold_units` for the expensive analysis nodes: **process-pool compute →
+    strictly ordered fold**, with the width decided unit by unit by a
+    :class:`nodegraph.governor.Governor` instead of fixed up front.
+
+    Differences from :func:`fold_units`, each one for a unit that is a whole position
+    holding gigabytes for minutes:
+
+    * **Rolling, not batched.** A unit is started the moment a slot frees and the governor
+      allows it (:meth:`~nodegraph.governor.Governor.allowed` re-reads free RAM and system
+      load before every start), so one slow position never idles the other lanes, and a
+      machine that runs short of memory mid-run stops getting new units instead of paging.
+    * **Calibrated.** Every task runs through :func:`nodegraph.governor.timed_call`, which
+      pins the worker's numba/BLAS threads to the governor's inner count, drops it to
+      below-normal priority, and reports the unit's wall time and peak working set — the
+      first report re-plans the width on measured memory.
+    * **Ordered by a reorder buffer.** Results land in any order and are folded in
+      submission order, so a running counter in ``fold`` (ids, track offsets) produces the
+      serial run's output exactly.
+    * ``on_wait()`` is called every ``poll_s`` while waiting — the caller's chance to tick
+      a progress bar and, through it, raise the engine's cancellation. On any exception out
+      of the loop nothing new is submitted; units already running finish in their workers
+      (their results are simply not folded).
+    * ``preimport`` names modules every worker imports ONE AT A TIME before its first unit
+      (:func:`nodegraph.governor.serialized_import`) — for packages whose import-time probe
+      races between processes starting together.
+
+    ``compute`` must be module-level and payloads picklable (``prepare`` builds them on
+    the calling thread, one unit ahead of its start). A compute error is re-raised as
+    :class:`UnitError`. A pool that cannot be created or breaks (spawn refused, a worker
+    killed) falls back to running the remaining units **serially in this thread** — the
+    analysis kernels are GIL-bound Python plus numba, so a thread fallback would only
+    contend with the GUI — and says so in ``governor.fallback`` (the run's note).
+
+    A script that drives the engine must keep its top-level code under
+    ``if __name__ == "__main__":`` — a spawned worker re-imports the main script, so
+    unguarded code re-runs the whole script in every lane (measured: a benchmark that read
+    as lanes 8× slower than serial was each worker re-running the benchmark)."""
+    from concurrent.futures import FIRST_COMPLETED, wait
+    from nodegraph.governor import ERROR_TAG, timed_call
+
+    n = len(items)
+    if n == 0:
+        return
+    payload_of = prepare if prepare is not None else (lambda x: x)
+    buffered: dict = {}
+    next_fold = 0
+
+    def drain() -> None:
+        nonlocal next_fold
+        while next_fold in buffered:
+            fold(next_fold, items[next_fold], buffered.pop(next_fold))
+            next_fold += 1
+
+    def unwrap(res):
+        if isinstance(res, tuple) and len(res) == 3 and res[0] == ERROR_TAG:
+            raise UnitError(res[1], res[2])
+        return res
+
+    def serial_from(start: int) -> None:
+        for i in range(start, n):
+            if i < next_fold or i in buffered:
+                continue
+            if on_wait is not None:
+                on_wait()
+            res, stats = timed_call(compute, payload_of(items[i]), None)
+            governor.record(stats)
+            buffered[i] = unwrap(res)
+            drain()
+
+    pool = None
+    if enabled() and not in_parallel_region() and mode() != "thread" and n > 1:
+        pool = process_pool(governor.pool_width())
+        if pool is None:
+            governor.fallback = "no process pool could be started; ran in this process"
+    if pool is None:
+        serial_from(0)
+        return
+
+    class _PoolFailed(Exception):
+        pass
+
+    def submit(i: int, payload: Any):
+        try:
+            return pool.submit(timed_call, compute, payload,
+                               {"inner": governor.inner_threads(), "numba": bool(numba),
+                                "preimport": tuple(preimport)})
+        except Exception as exc:  # noqa: BLE001 — a dead/shut pool refuses submissions
+            raise _PoolFailed(exc) from exc
+
+    def outcome(fut):
+        # Compute errors come back WRAPPED by `timed_call`, so anything raised by
+        # `result()` itself is the pool's own failure: an unpicklable payload or result
+        # (TypeError / AttributeError / PicklingError, varying by Python version), or a
+        # worker that died (BrokenProcessPool).
+        try:
+            return fut.result()
+        except Exception as exc:  # noqa: BLE001
+            raise _PoolFailed(exc) from exc
+
+    in_flight: dict = {}                       # future -> unit index
+    next_submit = 0
+    try:
+        while next_fold < n:
+            while next_submit < n and len(in_flight) < governor.allowed(len(in_flight)):
+                fut = submit(next_submit, payload_of(items[next_submit]))
+                governor.started()
+                in_flight[fut] = next_submit
+                next_submit += 1
+            if not in_flight:                   # everything submitted is folded
+                drain()
+                continue
+            done, _ = wait(list(in_flight), timeout=poll_s, return_when=FIRST_COMPLETED)
+            if on_wait is not None:
+                on_wait()
+            for fut in done:
+                i = in_flight.pop(fut)
+                res, stats = outcome(fut)
+                governor.record(stats)
+                buffered[i] = unwrap(res)
+            drain()
+    except _PoolFailed as exc:
+        # Finish the rest in this thread; units already folded or buffered are kept, so
+        # nothing is computed twice. Said out loud in the run's note: a silent fallback
+        # reads as "lanes are slow" when the lanes never ran.
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        governor.fallback = (f"process lanes failed ({type(cause).__name__}: "
+                             f"{str(cause)[:120]}); finished in this process")
+        for fut in in_flight:
+            fut.cancel()
+        shutdown()
+        serial_from(next_fold)
+
+
 def describe() -> str:
     """One-line summary of the resolved policy — for a startup log / bug report."""
     import numpy as np
@@ -640,7 +820,8 @@ def describe() -> str:
             f"dtype={np.dtype(stream_dtype()).name} "
             # ask the gpu module rather than re-reading the env var, so the two can never
             # disagree about what the default is
-            f"gpu={__import__('nodegraph.gpu', fromlist=['mode']).mode()}")
+            f"gpu={__import__('nodegraph.gpu', fromlist=['mode']).mode()} "
+            f"{__import__('nodegraph.governor', fromlist=['describe']).describe()}")
 
 
 __all__ = [
@@ -648,5 +829,5 @@ __all__ = [
     "tile_cache_bytes", "memo_bytes", "plane_cache_bytes", "stream_dtype",
     "store_dir", "mode", "enabled", "inner_threads", "in_parallel_region",
     "process_pool", "shutdown", "map_units", "map_units_proc", "fold_units",
-    "describe",
+    "adaptive_fold", "UnitError", "describe",
 ]
