@@ -155,8 +155,8 @@
       "label": "Table synthesis",
       "stage": "quantify",
       "pages": ["process", "analyze"],
-      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, and Table Aggregate summarises a column per group (mean, sem, count, ...).",
-      "ops": ["table.concat", "table.join", "table.aggregate"]
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N.",
+      "ops": ["table.concat", "table.join", "table.aggregate", "table.unique_objects"]
     },
     "tracking": {
       "label": "Tracking",

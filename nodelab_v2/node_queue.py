@@ -16,15 +16,27 @@ the node: its page on this canvas, the card selected and centred) and **Cancel**
 nothing waiting starts the moment the running job stops.
 
 Cancelling never costs the work already done: a run stops at its next node boundary, and
-every node it finished stays in the memo — re-running it later resumes from there.
+every node it finished stays in the memo — re-running it later resumes from there. Until it
+reaches that boundary it is listed as STOPPING, so a long node that is still finishing its
+step does not look like a cancel that did nothing.
+
+**Rows are kept, not rebuilt** (2026-10-13). The list used to be torn down and rebuilt on
+every 500 ms tick, which broke it twice over on a real screen: a row added to a VISIBLE
+popup is only shown on a queued call, so the list measured its hidden new rows as 0 px and
+collapsed — the queue appeared, then emptied half a second later, and a click where a row
+had been landed outside the shrunken popup and closed it; and a click whose press and
+release straddled a tick was released over a deleted button, so Cancel did nothing. Each
+job's row now lives as long as the job does and is updated in place; the list is rebuilt
+only when the line itself changes, never while a mouse button is down, and new rows are
+shown before anything is measured.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol
 
 from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-                               QSizePolicy, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QPushButton,
+                               QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 from nodelab_v2 import theme as T
 
@@ -43,16 +55,29 @@ class QueueHost(Protocol):
     def show_queue_entry(self, row: Dict[str, Any]) -> None: ...
 
 
+def row_key(row: Dict[str, Any]) -> tuple:
+    """A job's identity in the list: the node it computes and what kind of job it is. A row
+    keeps its widgets for as long as its key stays in the line."""
+    return (str(row.get("node", "")), str(row.get("kind", "")))
+
+
 class NodeQueuePopup(QFrame):
-    """The list. Rebuilt from :meth:`QueueHost.node_queue_rows` on every refresh — the line
-    is short, and a rebuild is the only way the row ORDER can never disagree with the
-    runner's."""
+    """The list, re-read from :meth:`QueueHost.node_queue_rows` on every refresh. The rows
+    follow the runner's ORDER exactly — the list is rebuilt whenever the sequence of jobs
+    changes — but a job that is still in line keeps its row widget, updated in place, so a
+    button is never deleted from under the pointer."""
 
     def __init__(self, host: QueueHost, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent, Qt.Popup)
         self.setObjectName("nodeQueue")
         self._host = host
         self.rows: List[Dict[str, Any]] = []
+        #: row key → (row frame, badge, text, show button, cancel button)
+        self._row_w: Dict[tuple, tuple] = {}
+        #: row key → the row as last read, which a button click acts on
+        self._row_of: Dict[tuple, Dict[str, Any]] = {}
+        self._keys: List[tuple] = []
+        self._anchor: Optional[QWidget] = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 10)
         lay.setSpacing(6)
@@ -87,17 +112,32 @@ class NodeQueuePopup(QFrame):
 
     # ── showing ────────────────────────────────────────────────────────────────
     def popup_at(self, anchor: QWidget) -> None:
-        """Open under ``anchor`` (the canvas's button), right-aligned to it, kept on screen."""
+        """Open under ``anchor`` (the canvas's button), right-aligned to it, kept on screen
+        — above the button when there is no room under it."""
+        self._anchor = anchor
         self.refresh()
         self.adjustSize()
-        g = anchor.mapToGlobal(QPoint(anchor.width(), anchor.height() + 4))
-        x = g.x() - self.width()
-        scr = anchor.screen().availableGeometry() if anchor.screen() else None
-        if scr is not None:
-            x = max(scr.left() + 4, min(x, scr.right() - self.width() - 4))
-        self.move(x, g.y())
+        self._place()
         self.show()
         self._timer.start()
+
+    def _place(self) -> None:
+        anchor = self._anchor
+        if anchor is None:
+            return
+        try:
+            below = anchor.mapToGlobal(QPoint(anchor.width(), anchor.height() + 4))
+            above = anchor.mapToGlobal(QPoint(anchor.width(), -4))
+            scr = anchor.screen().availableGeometry() if anchor.screen() else None
+        except RuntimeError:                     # the canvas went away under an open list
+            return
+        x, y = below.x() - self.width(), below.y()
+        if scr is not None:
+            x = max(scr.left() + 4, min(x, scr.right() - self.width() - 4))
+            if y + self.height() > scr.bottom() - 4:
+                # no room under the button: open upward, and never above the screen
+                y = max(scr.top() + 4, above.y() - self.height())
+        self.move(x, y)
 
     def hideEvent(self, e) -> None:                     # noqa: N802 — Qt override
         self._timer.stop()
@@ -105,19 +145,45 @@ class NodeQueuePopup(QFrame):
 
     # ── content ────────────────────────────────────────────────────────────────
     def refresh(self) -> None:
-        """Re-read the rows and rebuild the list."""
-        self.rows = list(self._host.node_queue_rows())
-        while self._list_lay.count():
-            item = self._list_lay.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        for row in self.rows:
-            self._list_lay.addWidget(self._row_widget(row))
-        self._list_lay.addStretch(1)
-        self.empty.setVisible(not self.rows)
-        self._scroll.setVisible(bool(self.rows))
+        """Re-read the rows; update each kept row in place, and rebuild the list only when
+        the line itself (which jobs, in what order) changed."""
+        rows = list(self._host.node_queue_rows())
+        keys = [row_key(r) for r in rows]
+        if keys != self._keys and QApplication.mouseButtons() != Qt.NoButton \
+                and self.isVisible():
+            # a press is in progress inside the list: rebuilding now could move or delete
+            # the button being clicked. The next tick (or the click's own refresh) does it.
+            return
+        self.rows = rows
+        self._row_of = {row_key(r): r for r in rows}
+        rebuild = keys != self._keys
+        if rebuild:
+            gone = [k for k in self._row_w if k not in self._row_of]
+            for k in gone:
+                frame = self._row_w.pop(k)[0]
+                frame.hide()
+                frame.setParent(None)
+                frame.deleteLater()
+            while self._list_lay.count():
+                self._list_lay.takeAt(0)          # detach (kept rows are re-added below)
+        for r in rows:
+            k = row_key(r)
+            if k not in self._row_w:
+                self._row_w[k] = self._make_row(k)
+            self._fill_row(k, r)
+            if rebuild:
+                self._list_lay.addWidget(self._row_w[k][0])
+                # shown NOW: a child added to a visible parent is otherwise only shown on a
+                # queued call, and a hidden row measures 0 px — which is how the list
+                # used to collapse to nothing half a second after opening
+                self._row_w[k][0].show()
+        if rebuild:
+            self._list_lay.addStretch(1)
+        self._keys = keys
+        self.empty.setVisible(not rows)
+        self._scroll.setVisible(bool(rows))
         # as tall as its rows, up to MAX_LIST_PX — then it scrolls
+        self._list_lay.activate()
         self._list.adjustSize()
         hint = self._list.sizeHint()
         bar = self._scroll.verticalScrollBar().sizeHint().width()
@@ -125,21 +191,19 @@ class NodeQueuePopup(QFrame):
         self._scroll.setFixedHeight(min(MAX_LIST_PX, hint.height() + 2))
         if self.isVisible():
             self.adjustSize()
-        self.cancel_all_btn.setEnabled(any(r.get("cancellable") for r in self.rows))
+            self._place()
+        self.cancel_all_btn.setEnabled(any(r.get("cancellable") for r in rows))
 
-    def _row_widget(self, row: Dict[str, Any]) -> QWidget:
+    def _make_row(self, key: tuple) -> tuple:
         w = QFrame()
-        w.setObjectName("nqRowRunning" if row.get("state") != "queued" else "nqRow")
         h = QHBoxLayout(w)
         h.setContentsMargins(8, 5, 6, 5)
         h.setSpacing(6)
-        badge = QLabel(row.get("badge", ""))
+        badge = QLabel("")
         badge.setObjectName("nqBadge")
         badge.setMinimumWidth(62)
         h.addWidget(badge)
-        text = QLabel(f"<b>{row.get('title', '')}</b>"
-                      f"<span style='color:{T.MUTED.name()}'> · {row.get('page', '')}</span>"
-                      f"<br><span style='color:{T.INK_2.name()}'>{row.get('detail', '')}</span>")
+        text = QLabel("")
         text.setTextFormat(Qt.RichText)
         text.setWordWrap(True)
         text.setMinimumWidth(240)           # a wrapping label is otherwise squeezed to a word
@@ -148,20 +212,43 @@ class NodeQueuePopup(QFrame):
         show = QToolButton()
         show.setText("Show")
         show.setToolTip("Go to this node — its page on the canvas, the card selected")
-        show.clicked.connect(lambda _=False, r=row: self._host.show_queue_entry(r))
+        # the click acts on the row AS IT IS NOW, looked up by key, not on a stale copy
+        show.clicked.connect(lambda _=False, k=key: self._show(k))
         h.addWidget(show)
         cancel = QToolButton()
         cancel.setObjectName("nqCancel")
+        cancel.clicked.connect(lambda _=False, k=key: self._cancel_key(k))
+        h.addWidget(cancel)
+        return (w, badge, text, show, cancel)
+
+    def _fill_row(self, key: tuple, row: Dict[str, Any]) -> None:
+        w, badge, text, show, cancel = self._row_w[key]
+        name = "nqRowRunning" if row.get("state") != "queued" else "nqRow"
+        if w.objectName() != name:
+            w.setObjectName(name)
+            w.style().unpolish(w)
+            w.style().polish(w)
+        badge.setText(row.get("badge", ""))
+        text.setText(f"<b>{row.get('title', '')}</b>"
+                     f"<span style='color:{T.MUTED.name()}'> · {row.get('page', '')}</span>"
+                     f"<br><span style='color:{T.INK_2.name()}'>{row.get('detail', '')}</span>")
         cancel.setText("Stop" if row.get("kind") == "bake" else "Cancel")
         cancel.setEnabled(bool(row.get("cancellable")))
         cancel.setToolTip(row.get("why_not") or (
             "Stop the bake at its next block — nothing is written" if row.get("kind") == "bake"
             else "Stop computing this node — what it already finished stays cached"
             if row.get("state") == "running" else "Take this node out of the line"))
-        cancel.clicked.connect(lambda _=False, r=row: self._cancel(r))
-        h.addWidget(cancel)
         row["_widgets"] = (show, cancel)
-        return w
+
+    def _show(self, key: tuple) -> None:
+        row = self._row_of.get(key)
+        if row is not None:
+            self._host.show_queue_entry(row)
+
+    def _cancel_key(self, key: tuple) -> None:
+        row = self._row_of.get(key)
+        if row is not None and row.get("cancellable"):
+            self._cancel(row)
 
     def _cancel(self, row: Dict[str, Any]) -> None:
         self._host.cancel_queue_entry(row)
@@ -189,4 +276,4 @@ class NodeQueuePopup(QFrame):
             f"QToolButton:disabled {{ color:{T.MUTED.name()}; }}")
 
 
-__all__ = ["MAX_LIST_PX", "NodeQueuePopup", "QueueHost", "REFRESH_MS"]
+__all__ = ["MAX_LIST_PX", "NodeQueuePopup", "QueueHost", "REFRESH_MS", "row_key"]

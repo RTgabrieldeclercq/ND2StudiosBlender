@@ -392,17 +392,61 @@ def _sort_key(v):
     return (1, 0.0, str(v))
 
 
+def pooled_stats(ys, ns, sds) -> Tuple[float, float, int]:
+    """``(mean, sd, N)`` of every raw measurement behind some summary rows — row ``i`` the
+    mean ``ys[i]`` of ``ns[i]`` measurements with sample SD ``sds[i]`` (a bead's pixels).
+    Exactly the mean and the n - 1 SD of the pooled measurements themselves:
+    ``M = Σ nᵢyᵢ / N`` and ``var = (Σ (nᵢ - 1) sᵢ² + Σ nᵢ (yᵢ - M)²) / (N - 1)``. A
+    one-measurement row adds no within-row spread (its SD is undefined, read as 0); a row
+    with no count, or several measurements and no SD, cannot be pooled and is skipped.
+    ``(nan, nan, 0)`` with nothing to pool; the SD is 0 for one measurement."""
+    y = np.asarray(ys, dtype=float)
+    n = np.asarray(ns, dtype=float)
+    s = np.asarray(sds, dtype=float)
+    ok = np.isfinite(y) & np.isfinite(n) & (n > 0) & (np.isfinite(s) | (n == 1))
+    y, n, s = y[ok], n[ok], np.where(np.isfinite(s[ok]), s[ok], 0.0)
+    big_n = float(n.sum())
+    if big_n <= 0:
+        return float("nan"), float("nan"), 0
+    mean = float((n * y).sum() / big_n)
+    if big_n <= 1:
+        return mean, 0.0, int(big_n)
+    var = (((n - 1.0) * s ** 2).sum() + (n * (y - mean) ** 2).sum()) / (big_n - 1.0)
+    return mean, float(math.sqrt(max(var, 0.0))), int(big_n)
+
+
 def xy_series(x, y, group=None, error: str = "none", *, log_x: bool = False,
-              log_y: bool = False) -> List[Dict[str, Any]]:
+              log_y: bool = False, pool_n=None, pool_sd=None, color=None,
+              text=None) -> List[Dict[str, Any]]:
     """The series of an XY plot, one per value of ``group`` (one in all when ``None``).
 
     ``error = "none"`` keeps every row as a point, ordered by x so a line reads left to right.
     Otherwise the rows sharing an x are summarised: their mean, with ``sd``, ``sem`` or the
     95 % confidence half-width (Student's t, n - 1 degrees of freedom) as the error; a lone
     row has no spread and gets 0. Rows whose x or y is not finite — or not positive on a log
-    axis — are left out."""
+    axis — are left out.
+
+    ``error = "pooled_sd"`` (2026-10-13) reads each row as a SUMMARY of raw measurements —
+    ``y`` their mean, ``pool_n`` how many, ``pool_sd`` their SD (a bead's pixels) — and
+    pools them (:func:`pooled_stats`): the point is the mean of every raw measurement at that
+    x, the error the SD of all of them together, so within-row and between-row spread both
+    count. ``n_pooled`` per point records how many measurements that is.
+
+    ``color`` / ``text`` (2026-10-14, ``plot.xy`` Colour by / Label by) ride along with
+    ``error = "none"`` only — each point is one row there, so it has one value to colour by
+    and one label: ``c`` (a float per point, NaN where the row has none) and ``text`` (a
+    string per point, ``""`` for no label), in the points' own x order. A summarised point
+    is several rows and has neither."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
+    cv = None if color is None else np.asarray(color, dtype=float)
+    tv = None if text is None else np.asarray(["" if v is None else str(v) for v in text],
+                                              dtype=object)
+    if error == "pooled_sd":
+        if pool_n is None or pool_sd is None:
+            raise ValueError("pooled SD needs a count and an SD column per row")
+        pn = np.asarray(pool_n, dtype=float)
+        ps = np.asarray(pool_sd, dtype=float)
     keep = np.isfinite(x) & np.isfinite(y)
     if log_x:
         keep &= x > 0
@@ -417,12 +461,23 @@ def xy_series(x, y, group=None, error: str = "none", *, log_x: bool = False,
         xs, ys = x[m], y[m]
         if error == "none":
             order = np.argsort(xs, kind="stable")
-            out.append({"label": label, "x": xs[order].tolist(), "y": ys[order].tolist(),
-                        "err": None, "n": int(m.size)})
+            s = {"label": label, "x": xs[order].tolist(), "y": ys[order].tolist(),
+                 "err": None, "n": int(m.size)}
+            if cv is not None:
+                s["c"] = [json_value(v) for v in cv[m][order]]
+            if tv is not None:
+                s["text"] = [str(v) for v in tv[m][order]]
+            out.append(s)
             continue
         ux = np.unique(xs)
         mean: List[float] = []
         err: List[float] = []
+        if error == "pooled_sd":
+            pooled = [pooled_stats(ys[xs == v], pn[m][xs == v], ps[m][xs == v]) for v in ux]
+            out.append({"label": label, "x": ux.tolist(), "y": [p[0] for p in pooled],
+                        "err": [p[1] for p in pooled], "n": int(m.size),
+                        "n_pooled": [p[2] for p in pooled]})
+            continue
         for v in ux:
             vals = ys[xs == v]
             n = int(vals.size)
@@ -441,6 +496,226 @@ def xy_series(x, y, group=None, error: str = "none", *, log_x: bool = False,
         out.append({"label": label, "x": ux.tolist(), "y": mean, "err": err,
                     "n": int(m.size)})
     return out
+
+
+#: the trendline choices of an XY plot (``plot.xy`` `fit`, 2026-10-13; ``langmuir`` the
+#: same day, for a binding standard curve)
+XY_FITS = ("none", "linear", "langmuir")
+
+#: what an XY plot does with rows at x <= 0 (``plot.xy`` `zero_x`, 2026-10-13) — a blank or
+#: a 0 dose: no place on a log axis, and not a concentration to fit a curve through
+XY_ZERO_X = ("drop", "reference_line")
+
+#: the continuous colour maps a point can be coloured by (``plot.xy`` Colour by, 2026-10-14)
+XY_COLORMAPS = ("viridis", "inferno", "magma", "plasma", "cividis", "turbo", "coolwarm")
+
+#: how a Colour by column's values map onto its colour map
+XY_COLOR_SCALES = ("linear", "log")
+
+
+def color_limits(values, fixed: Sequence[Optional[float]] = (None, None), *,
+                 scale: str = "linear") -> List[Optional[float]]:
+    """``[low, high]`` of a Colour by scale: each end ``fixed`` gives wins, the other comes
+    from the finite ``values`` — over the POSITIVE ones on a log scale, which cannot place
+    zero or below. ``[None, None]`` when nothing is left to span. A per-frame figure calls
+    this once over every frame's rows, so all its frames share one scale."""
+    v = np.asarray(list(values), dtype=float)
+    v = v[np.isfinite(v)]
+    if scale == "log":
+        v = v[v > 0]
+    lo, hi = (list(fixed or (None, None)) + [None, None])[:2]
+    lo = float(lo) if lo is not None else (float(v.min()) if v.size else None)
+    hi = float(hi) if hi is not None else (float(v.max()) if v.size else None)
+    if scale == "log" and lo is not None and lo <= 0:
+        lo = float(v.min()) if v.size and v.min() > 0 else None
+    if lo is not None and hi is not None and not hi > lo:
+        hi = lo * 1.1 if (scale == "log" and lo > 0) else lo + 1.0
+    return [lo, hi]
+
+
+def point_text(values, *, decimals: int = 0, unit: str = "") -> List[str]:
+    """The words printed beside each point (``plot.xy`` Label by): a number rounded to
+    ``decimals`` places with its ``unit`` after it, text as it is, ``""`` (no label) for a
+    missing value."""
+    out: List[str] = []
+    d = max(0, int(decimals))
+    for v in values:
+        if v is None:
+            out.append("")
+            continue
+        if isinstance(v, (bytes, str, np.str_, np.bytes_)):
+            out.append(v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v))
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            out.append(str(v))
+            continue
+        if not math.isfinite(f):
+            out.append("")
+            continue
+        out.append(f"{f:.{d}f} {unit}".rstrip() if unit else f"{f:.{d}f}")
+    return out
+
+
+def xy_fit(xs, ys, *, log_x: bool = False, log_y: bool = False) -> Optional[Dict[str, Any]]:
+    """The least-squares straight line through one series, fitted IN THE PLOTTED
+    COORDINATES — log10 of x and/or y where that axis is logarithmic — so the trendline is
+    straight on the figure the user reads: linear axes give ``y = b·x + a``, log-log a power
+    law ``y = A·x^b``, log x alone ``y = b·log10 x + a``, log y alone ``y = A·10^(b·x)``.
+
+    ``R²`` is computed in the same coordinates (it measures how straight the PLOTTED points
+    are, which is the question "did the log scale reach a linear regime"). Points that are
+    not finite, or not positive on a log axis, are left out. ``None`` with fewer than two
+    usable points or a single distinct x — a line through one x is not determined."""
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    if log_x:
+        keep &= x > 0
+    if log_y:
+        keep &= y > 0
+    x, y = x[keep], y[keep]
+    if x.size < 2 or np.unique(x).size < 2:
+        return None
+    X = np.log10(x) if log_x else x
+    Y = np.log10(y) if log_y else y
+    b, a = np.polyfit(X, Y, 1)
+    pred = a + b * X
+    ss_res = float(((Y - pred) ** 2).sum())
+    ss_tot = float(((Y - Y.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    sign = "+" if a >= 0 else "−"
+    if log_x and log_y:
+        text = f"y = {10 ** a:.4g}·x^{b:.3f}"
+    elif log_x:
+        text = f"y = {b:.4g}·log₁₀x {sign} {abs(a):.4g}"
+    elif log_y:
+        text = f"y = {10 ** a:.4g}·10^({b:.4g}·x)"
+    else:
+        text = f"y = {b:.4g}·x {sign} {abs(a):.4g}"
+    return {"slope": float(b), "intercept": float(a), "r2": float(r2), "n": int(x.size),
+            "x0": float(x.min()), "x1": float(x.max()), "log_x": bool(log_x),
+            "log_y": bool(log_y), "text": f"{text}, R² = {r2:.3f}"}
+
+
+def xy_langmuir(xs, ys, *, log_x: bool = False, log_y: bool = False
+                ) -> Optional[Dict[str, Any]]:
+    """The least-squares Langmuir (one-site binding) curve ``y = Bmax·x / (Kd + x)`` through
+    one series, fitted IN DATA UNITS whatever the axes — the model is a statement about the
+    numbers, not about how they are drawn, so logging an axis changes the picture and never
+    the fit. ``Kd`` is the x at half of ``Bmax`` (in x's units); ``R²`` is over the same
+    points, in data units.
+
+    Only points with x > 0 enter (the model passes through the origin, and a blank belongs
+    in ``zero_x``'s reference line, not in the curve); on a log y axis only y > 0 ones, as
+    drawn. ``None`` with fewer than two distinct x, or when the solver does not converge.
+    ``x0`` is where the drawn curve starts: 0 on a linear x axis (the curve's own origin),
+    the smallest x on a log one."""
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y) & (x > 0)
+    if log_y:
+        keep &= y > 0
+    x, y = x[keep], y[keep]
+    if x.size < 2 or np.unique(x).size < 2:
+        return None
+    from scipy.optimize import curve_fit
+
+    def model(v, bmax, kd):
+        return bmax * v / (kd + v)
+
+    top = float(y[np.argmax(np.abs(y))])
+    try:
+        with np.errstate(all="ignore"):
+            (bmax, kd), _cov = curve_fit(
+                model, x, y, p0=(1.5 * top if top else 1.0, float(np.median(x))),
+                bounds=((-np.inf, float(x.max()) * 1e-9), (np.inf, np.inf)), maxfev=20000)
+    except (RuntimeError, ValueError):
+        return None
+    if not (math.isfinite(bmax) and math.isfinite(kd)):
+        return None
+    pred = model(x, bmax, kd)
+    ss_res = float(((y - pred) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return {"model": "langmuir", "bmax": float(bmax), "kd": float(kd), "r2": float(r2),
+            "n": int(x.size), "x0": float(x.min()) if log_x else 0.0, "x1": float(x.max()),
+            "log_x": bool(log_x), "log_y": bool(log_y),
+            "text": f"Bmax = {bmax:.4g}, Kd = {kd:.4g}, R² = {r2:.3f}"}
+
+
+def xy_zero_refs(x, y, group=None, *, log_y: bool = False,
+                 pool_n=None) -> Dict[str, Dict[str, Any]]:
+    """``{series label: {"y": mean, "n": rows, "drawable": bool}}`` of the rows at x <= 0 —
+    what a log x axis cannot place — one entry per ``group`` value (the label ``""`` with no
+    group). The mean is over EVERY finite row: a background-subtracted blank scatters around
+    zero, and averaging only its positive rows (all a log y axis could show) would report a
+    level the blank does not have. A mean at or below zero on a log y axis is kept but marked
+    not ``drawable`` — the figure says so instead of drawing a line somewhere else."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y) & (x <= 0)
+    w = None
+    if pool_n is not None:              # pooled rows: each weighs its measurement count
+        w = np.asarray(pool_n, dtype=float)
+        keep &= np.isfinite(w) & (w > 0)
+    parts = [("", np.flatnonzero(keep))] if group is None else group_parts(group, keep)
+    out: Dict[str, Dict[str, Any]] = {}
+    for label, m in parts:
+        if not m.size:
+            continue
+        mean = float(y[m].mean()) if w is None else float((w[m] * y[m]).sum() / w[m].sum())
+        out[label] = {"y": mean, "n": int(m.size), "drawable": bool(mean > 0 or not log_y)}
+    return out
+
+
+def decorate_xy(series: List[Dict[str, Any]], x, y, group=None, *, fit: str = "none",
+                zero_x: str = "drop", log_x: bool = False, log_y: bool = False,
+                pool_n=None) -> List[Dict[str, Any]]:
+    """Add each XY series' trendline (``fit = "linear"``: :func:`xy_fit`; ``"langmuir"``:
+    :func:`xy_langmuir` — both on the points the series draws, the means when rows are
+    summarised, every row otherwise) and, with ``zero_x = "reference_line"``, its x <= 0
+    rows as a horizontal reference (:func:`xy_zero_refs`) — never part of the fit, and on a
+    linear x axis taken OUT of the series' points too (2026-10-13: a blank is a level, not a
+    concentration). A group whose rows are ALL at x <= 0 still gets its line, as a series
+    with no points. The fit's equation and R² go into the series' legend entry (``legend``),
+    so the legend stays one line per series. In place; returns ``series``. Shared by the
+    whole-table figure and every per-frame one. ``pool_n`` (pooled-SD rows) weighs each
+    x <= 0 row by its measurement count, as the points are."""
+    if zero_x == "reference_line":
+        refs = xy_zero_refs(x, y, group, log_y=log_y, pool_n=pool_n)
+        have = {s["label"] for s in series}
+        for s in series:
+            if not log_x:
+                xs = np.asarray(s["x"], dtype=float)
+                pos = np.flatnonzero(~(xs <= 0))
+                if pos.size != xs.size:
+                    s["x"] = [s["x"][i] for i in pos]
+                    s["y"] = [s["y"][i] for i in pos]
+                    if s.get("err") is not None:
+                        s["err"] = [s["err"][i] for i in pos]
+                    if s.get("n_pooled") is not None:
+                        s["n_pooled"] = [s["n_pooled"][i] for i in pos]
+                    for key in ("c", "text"):
+                        if s.get(key) is not None:
+                            s[key] = [s[key][i] for i in pos]
+                    s["n"] = max(0, int(s.get("n", 0)) - refs.get(s["label"], {}).get("n", 0))
+            if s["label"] in refs:
+                s["zero_ref"] = refs[s["label"]]
+        for label, ref in refs.items():
+            if label not in have:
+                series.append({"label": label, "x": [], "y": [], "err": None, "n": 0,
+                               "zero_ref": ref})
+    if fit in ("linear", "langmuir"):
+        fitter = xy_langmuir if fit == "langmuir" else xy_fit
+        for s in series:
+            f = fitter(s["x"], s["y"], log_x=log_x, log_y=log_y)
+            if f is not None:
+                s["fit"] = f
+                lab = str(s.get("label", ""))
+                s["legend"] = f"{lab} — {f['text']}" if lab else f["text"]
+    return series
 
 
 def distribution_series(values, group=None) -> List[Dict[str, Any]]:
@@ -486,15 +761,26 @@ def heatmap_grid(rows, cols, values, reducer: str = "mean"
     return [_series_label(x) for x in rk], [_series_label(x) for x in ck], mat
 
 
+def _offset_days(utc_offset_s: Any) -> float:
+    """A UTC offset in seconds as a fraction of a day; ``0`` for anything unreadable."""
+    try:
+        v = float(utc_offset_s or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return v / 86400.0 if math.isfinite(v) else 0.0
+
+
 def frame_times(n_frames: int, *, frame_time_jd: Any = None, dt_s: Any = None,
-                mode: str = "elapsed") -> Tuple[List[float], str, str]:
+                mode: str = "elapsed", utc_offset_s: Any = 0) -> Tuple[List[float], str, str]:
     """``(x value per frame, axis label, kind)`` for a time axis of ``mode`` elapsed | clock |
     frame. ``kind`` is ``"clock"`` when the values are wall-clock dates, else ``""``.
 
     elapsed — seconds since the first frame from the file's own per-frame clock
     (``frame_time_jd``), else ``t x dt_s``, else the frame index (the label says so); the
     unit is picked ONCE from the span (s / min / h). clock — each frame's wall-clock time
-    (matplotlib date numbers), when the file has a per-frame clock; otherwise elapsed.
+    (matplotlib date numbers), when the file has a per-frame clock; otherwise elapsed. The
+    clock is UTC, so ``utc_offset_s`` (the file's ``utc_offset_s``) shifts it to the
+    microscope's LOCAL time (2026-10-13) — the same reading the Viewer's overlay shows.
     frame — the frame index."""
     n = max(0, int(n_frames))
     idx = list(range(n))
@@ -509,7 +795,8 @@ def frame_times(n_frames: int, *, frame_time_jd: Any = None, dt_s: Any = None,
     if mode == "frame":
         return [float(i) for i in idx], "frame", ""
     if mode == "clock" and jd is not None:
-        return [v - 2440587.5 for v in jd], "clock time", "clock"   # JD of 1970-01-01
+        return ([v - 2440587.5 + _offset_days(utc_offset_s) for v in jd],   # JD of 1970-01-01
+                "clock time", "clock")
     try:
         dt = float(dt_s) if dt_s not in (None, "") else 0.0
     except (TypeError, ValueError):
@@ -553,6 +840,8 @@ def frame_clock(md: Mapping[str, Any], frames: int,
         extra["frame_time_jd"] = list(jd)[:n]
     if isinstance(fd, (list, tuple)) and len(fd) >= n:
         extra["frame_datetime"] = list(fd)[:n]
+    if (md or {}).get("utc_offset_s") is not None:
+        extra["utc_offset_s"] = md["utc_offset_s"]     # the clock's zone rides with it
     try:
         dt = float(dt_s) if dt_s not in (None, "") else 0.0
     except (TypeError, ValueError):
@@ -650,8 +939,19 @@ def frame_spec(spec: Mapping[str, Any], t: int) -> Dict[str, Any]:
     y = np.asarray(rows.get("y", []), dtype=float)[sel]
     a = dict(spec.get("axes") or {})
     out = dict(spec)
+    pn = (np.asarray(rows["pn"], dtype=float)[sel] if rows.get("pn") is not None
+          else None)
+    psd = (np.asarray(rows["psd"], dtype=float)[sel] if rows.get("psd") is not None
+           else None)
+    cv = (np.asarray([np.nan if v is None else v for v in rows["c"]], dtype=float)[sel]
+          if rows.get("c") is not None else None)
     out["series"] = xy_series(x, y, pick("g"), str(spec.get("error", "none")),
-                              log_x=bool(a.get("log_x")), log_y=bool(a.get("log_y")))
+                              log_x=bool(a.get("log_x")), log_y=bool(a.get("log_y")),
+                              pool_n=pn, pool_sd=psd, color=cv, text=pick("lab"))
+    dr = spec.get("draw") or {}
+    decorate_xy(out["series"], x, y, pick("g"), fit=str(dr.get("fit", "none")),
+                zero_x=str(dr.get("zero_x", "drop")), log_x=bool(a.get("log_x")),
+                log_y=bool(a.get("log_y")), pool_n=pn)
     if rows.get("g") is not None:
         g_all = rows["g"]
         order = {label: i for i, (label, _idx) in
@@ -747,6 +1047,7 @@ def draw(spec: Mapping[str, Any]):
     colors = PALETTES.get(str(style.get("palette", "colorblind")), PALETTES["colorblind"])
     kind = str(spec.get("kind", "xy"))
     series = list(spec.get("series") or [])
+    point_labels: List[Tuple[float, float, str]] = []
     if kind == "distribution":
         _draw_distribution(ax, spec, colors, fg, lw, ms)
     elif kind == "heatmap":
@@ -754,27 +1055,118 @@ def draw(spec: Mapping[str, Any]):
     elif kind == "field":
         _draw_field(fig, ax, spec, fg, pt, fam, style=style, lw=lw)
     else:
-        _draw_xy(ax, spec, colors, lw, ms)
+        point_labels = _draw_xy(ax, spec, colors, lw, ms, fig=fig, fg=fg, pt=pt, fam=fam)
     if spec.get("cursor_x") is not None:
         ax.axvline(float(spec["cursor_x"]), color=fg, lw=lw * 0.8, ls="--", alpha=0.7)
     _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw)
+    if point_labels:
+        # after the layout: a label is placed in display space, clear of the others
+        _place_point_labels(fig, ax, point_labels, fg=fg, bg=bg, fam=fam, pt=pt, lw=lw,
+                            ms=ms)
     return fig, (h, w)
 
 
-def _draw_xy(ax, spec, colors, lw, ms) -> None:
+#: one marker per series when the colour carries a value, so the groups stay apart
+_XY_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "h")
+
+
+def _xy_colour_scale(dr: Mapping[str, Any]):
+    """``(cmap, norm, scale_spec)`` of a Colour by figure, or ``(None, None, None)``. A
+    missing value is drawn grey; a value under the range (zero or below on a log scale
+    included) in the scale's bottom colour, one over it in its top colour."""
+    cs = dr.get("color")
+    if not cs:
+        return None, None, None
+    import matplotlib
+    from matplotlib.colors import LogNorm, Normalize
+    name = str(cs.get("colormap", "viridis"))
+    cmap = matplotlib.colormaps[name if name in XY_COLORMAPS else "viridis"]
+    cmap = cmap.with_extremes(bad="#9a9a9a", under=cmap(0.0), over=cmap(1.0))
+    lo, hi = (list(cs.get("range") or [None, None]) + [None, None])[:2]
+    if str(cs.get("scale", "linear")) == "log" and lo is not None and lo > 0 and \
+            hi is not None and hi > lo:
+        norm = LogNorm(vmin=lo, vmax=hi)
+    else:
+        norm = Normalize(vmin=lo, vmax=hi)
+    return cmap, norm, cs
+
+
+def _draw_xy(ax, spec, colors, lw, ms, *, fig=None, fg: str = "#111111", pt: float = 8.0,
+             fam: str = "DejaVu Sans") -> List[Tuple[float, float, str]]:
+    """Draw an XY figure's series; returns the ``(x, y, text)`` point labels to place once
+    the layout is final (``Label by``), ``[]`` when there are none."""
     dr = spec.get("draw") or {}
     mode = str(dr.get("mode", "line"))
     band = str(dr.get("error_style", "bars")) == "band"
-    for i, s in enumerate(list(spec.get("series") or [])):
+    refs = False
+    hidden: List[str] = []
+    cmap, norm, cs = _xy_colour_scale(dr)
+    log_c = norm is not None and type(norm).__name__ == "LogNorm"
+    labels: List[Tuple[float, float, str]] = []
+    all_series = list(spec.get("series") or [])
+    groups = len([s for s in all_series if s.get("x")]) > 1
+    for i, s in enumerate(all_series):
         col = colors[int(s.get("color_index", i)) % len(colors)]
         x = np.asarray(s.get("x", []), dtype=float)
         y = np.asarray(s.get("y", []), dtype=float)
-        label = str(s.get("label", "")) or None
-        if mode == "scatter":
-            ax.scatter(x, y, s=ms ** 2, color=col, label=label, linewidths=0)
+        label = str(s.get("legend") or s.get("label", "")) or None
+        f = s.get("fit")
+        if f and f.get("model") == "langmuir":
+            # the binding curve from its origin (the smallest x on a log axis) to the top x
+            xs = (np.geomspace(f["x0"], f["x1"], 200) if f.get("log_x")
+                  else np.linspace(f["x0"], f["x1"], 200))
+            Y = f["bmax"] * xs / (f["kd"] + xs)
+            if f.get("log_y"):
+                Y = np.where(Y > 0, Y, np.nan)
+            ax.plot(xs, Y, color=col, lw=lw, alpha=0.9, zorder=1)
+        elif f:
+            # the trendline over the series' own x range, straight in the plotted axes
+            xs = (np.geomspace(f["x0"], f["x1"], 64) if f.get("log_x")
+                  else np.linspace(f["x0"], f["x1"], 64))
+            X = np.log10(xs) if f.get("log_x") else xs
+            Y = f["intercept"] + f["slope"] * X
+            ax.plot(xs, 10 ** Y if f.get("log_y") else Y, color=col, lw=lw, alpha=0.9,
+                    zorder=1)
+        ref = s.get("zero_ref")
+        if ref and ref.get("drawable", True):
+            # the x <= 0 rows (a blank): their mean as a dashed horizontal line
+            ax.axhline(float(ref["y"]), color=col, lw=lw * 0.9, ls="--", alpha=0.85,
+                       zorder=1)
+            refs = True
+        elif ref:
+            hidden.append(str(s.get("label", "")) or "all")
+        if not x.size:
+            if label and ref and ref.get("drawable", True):
+                ax.plot([], [], color=col, lw=lw * 0.9, ls="--", label=label)
+            continue
+        if norm is not None:
+            # Colour by: every point's marker carries its own value (a plain line has no
+            # marker to colour, so it gets them too); the series keeps its own marker shape
+            # and, joined, its own line colour
+            if mode != "scatter" and not (f and mode == "line"):
+                ax.plot(x, y, color=col, lw=lw, ls=":" if f else "-", zorder=1)
+            cv = np.asarray([np.nan if v is None else v for v in
+                             (s.get("c") or [None] * x.size)], dtype=float)
+            if log_c:
+                # zero and below have no place on a log scale: drawn as "under" it
+                cv = np.where(np.isfinite(cv) & (cv <= 0), norm.vmin * 0.5, cv)
+            mk = _XY_MARKERS[int(s.get("color_index", i)) % len(_XY_MARKERS)] if groups \
+                else "o"
+            ax.scatter(x, y, c=cv, cmap=cmap, norm=norm, s=(ms * 1.25) ** 2, marker=mk,
+                       edgecolors=fg, linewidths=lw * 0.35, zorder=3, plotnonfinite=True)
+            if label:
+                ax.scatter([], [], marker=mk, color="#9a9a9a", edgecolors=fg,
+                           linewidths=lw * 0.35, label=label)
+        elif mode == "scatter" or (f and mode == "line"):
+            # with a trendline, joining the points would draw a second, competing line
+            ax.scatter(x, y, s=ms ** 2, color=col, label=label, linewidths=0, zorder=2)
         else:
             ax.plot(x, y, color=col, lw=lw, label=label,
-                    marker="o" if mode == "line_markers" else None, ms=ms)
+                    marker="o" if mode == "line_markers" else None, ms=ms,
+                    ls=":" if f else "-")
+        for xv, yv, tv in zip(x.tolist(), y.tolist(), s.get("text") or []):
+            if tv and math.isfinite(xv) and math.isfinite(yv):
+                labels.append((xv, yv, str(tv)))
         err = s.get("err")
         if err is not None and len(err) == len(x):
             e = np.asarray(err, dtype=float)
@@ -783,6 +1175,117 @@ def _draw_xy(ax, spec, colors, lw, ms) -> None:
             else:
                 ax.errorbar(x, y, yerr=e, fmt="none", ecolor=col, elinewidth=lw * 0.8,
                             capsize=ms * 0.8)
+    if refs:
+        ax.plot([], [], color="0.45", lw=lw * 0.9, ls="--", label="dashed: mean at x = 0, not fitted")
+    if hidden:
+        ax.plot([], [], color="none", label=f"x = 0 mean ≤ 0, not drawable on log y: "
+                                            f"{', '.join(hidden)}")
+    for xl in dr.get("x_lines") or ():
+        # a reference the points are read against (2026-10-14: a spheroid's edge): dotted,
+        # in the ink colour, under the points, its words up the line at the top of the axes
+        xv = float(xl["x"])
+        ax.axvline(xv, color=fg, lw=lw * 0.9, ls=(0, (1.5, 2.5)), alpha=0.75, zorder=1)
+        val = f"{xv:.0f}" if abs(xv) >= 100 else f"{xv:.3g}"
+        words = " ".join(w for w in (str(xl.get("label") or ""),
+                                     f"{val} {xl.get('unit') or ''}".strip()) if w)
+        ax.annotate(words, xy=(xv, 1.0), xycoords=("data", "axes fraction"),
+                    xytext=(-3, -4), textcoords="offset points", ha="right", va="top",
+                    rotation=90, fontsize=pt * 0.8, color=fg, alpha=0.85, zorder=4,
+                    annotation_clip=False)
+    if norm is not None and fig is not None and norm.vmin is not None:
+        # the scale is the figure's key, so it is drawn whatever the Legend switch says;
+        # one mappable from the spec, so a frame with no rows still shows the shared scale
+        from matplotlib.cm import ScalarMappable
+        cb = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, pad=0.02,
+                          fraction=0.05, extend=str(cs.get("extend", "neither")))
+        cb.ax.tick_params(labelsize=pt * 0.85, colors=fg)
+        cb.set_label(str(cs.get("label", "")), fontsize=pt, color=fg, family=fam)
+        cb.outline.set_edgecolor(fg)
+        cb.outline.set_linewidth(lw * 0.6)
+        from matplotlib.ticker import FuncFormatter, NullFormatter
+        # the scale's top is a tick of its own, with its value (2026-10-14): on a shared scale
+        # it is the brightest point of ALL the figures, which is what a reader checks first
+        hi = float(norm.vmax) if norm.vmax is not None else None
+        ticks = [float(v) for v in cb.get_ticks()
+                 if norm.vmin is not None and hi is not None and norm.vmin <= v <= hi]
+        if hi is not None:
+            ticks = [v for v in ticks if abs(v - hi) > 0.04 * abs(hi)] + [hi]
+            cb.set_ticks(ticks)
+        if log_c:
+            # 1, 10, 100 rather than 10⁰, 10¹, 10²: the reader compares MFIs, not exponents
+            cb.ax.yaxis.set_minor_formatter(NullFormatter())
+        cb.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.4g}"))
+        for lab in cb.ax.get_yticklabels():
+            lab.set_family(fam)
+    return labels
+
+
+#: where a point's label may go, in points from the point: beside it on the right first
+#: (reads naturally), then the other seven directions; the second ring is the same at a
+#: distance, joined to its point by a thin leader line
+_LABEL_SPOTS = ((6, 0, "left", "center"), (5, 5, "left", "bottom"),
+                (5, -5, "left", "top"), (-6, 0, "right", "center"),
+                (0, 7, "center", "bottom"), (0, -7, "center", "top"),
+                (-5, 5, "right", "bottom"), (-5, -5, "right", "top"))
+
+
+def _place_point_labels(fig, ax, items: Sequence[Tuple[float, float, str]], *, fg: str,
+                        bg: str, fam: str, pt: float, lw: float, ms: float) -> None:
+    """Write each ``(x, y, text)`` beside its point, greedily choosing the first spot of
+    :data:`_LABEL_SPOTS` (then of the same ring at three times the distance, with a leader
+    line) that overlaps no label already placed, no other point and nothing outside the
+    axes; when every spot collides, the least-colliding one. Deterministic: points are
+    taken left to right, so the same rows always give the same picture."""
+    import matplotlib.patheffects as pe
+    renderer = fig.canvas.get_renderer()
+    fs = pt * 0.78
+    xy = np.asarray([(x, y) for x, y, _t in items], dtype=float)
+    disp = ax.transData.transform(xy)
+    r = 0.5 * (ms * 1.25) * fig.dpi / 72.0 + 1.0           # a marker's radius, px
+    marks = [(px - r, py - r, px + r, py + r) for px, py in disp]
+    a = ax.get_window_extent(renderer)
+    # words already on the axes (a reference line's label) are obstacles like any label
+    placed: List[Tuple[float, float, float, float]] = []
+    for t in list(ax.texts):
+        e = t.get_window_extent(renderer)
+        placed.append((e.x0, e.y0, e.x1, e.y1))
+
+    def overlap(b, o) -> float:
+        w = min(b[2], o[2]) - max(b[0], o[0])
+        h = min(b[3], o[3]) - max(b[1], o[1])
+        return w * h if (w > 0 and h > 0) else 0.0
+
+    def outside(b) -> float:
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        return area - overlap(b, (a.x0, a.y0, a.x1, a.y1))
+
+    spots = [(dx, dy, ha, va, False) for dx, dy, ha, va in _LABEL_SPOTS] + \
+            [(dx * 3, dy * 3, ha, va, True) for dx, dy, ha, va in _LABEL_SPOTS]
+    halo = [pe.withStroke(linewidth=2.2, foreground=bg)]
+    for k in sorted(range(len(items)), key=lambda j: (disp[j][0], -disp[j][1])):
+        x, y, text = items[k]
+        best = None
+        for dx, dy, ha, va, far in spots:
+            t = ax.annotate(text, (x, y), xytext=(dx, dy), textcoords="offset points",
+                            ha=ha, va=va, fontsize=fs, color=fg, family=fam, zorder=5,
+                            annotation_clip=False, path_effects=halo)
+            e = t.get_window_extent(renderer)
+            b = (e.x0, e.y0, e.x1, e.y1)
+            t.remove()
+            cost = sum(overlap(b, o) for o in placed) + \
+                sum(overlap(b, m) for j, m in enumerate(marks) if j != k) + 4.0 * outside(b)
+            if best is None or cost < best[0]:
+                best = (cost, dx, dy, ha, va, far, b)
+            if cost == 0:
+                break
+        _c, dx, dy, ha, va, far, b = best
+        ax.annotate(text, (x, y), xytext=(dx, dy), textcoords="offset points", ha=ha, va=va,
+                    fontsize=fs, color=fg, family=fam, zorder=5, annotation_clip=False,
+                    path_effects=halo,
+                    arrowprops=({"arrowstyle": "-", "color": fg, "lw": lw * 0.4,
+                                 "shrinkA": 0.0, "shrinkB": r * 72.0 / fig.dpi}
+                                if far else None))
+        placed.append(b)
 
 
 def _hist_edges(allv: np.ndarray, n: int, axes: Mapping[str, Any]):
@@ -958,6 +1461,26 @@ def _draw_field(fig, ax, spec, fg, pt, fam, *, style=None, lw=1.0) -> None:
         cb.outline.set_edgecolor(fg)
 
 
+#: below this many decades a log axis is labelled in plain numbers at 1, 2 and 5 of each
+#: decade; matplotlib's default there labels every minor tick in scientific notation, and on
+#: an axis of about one decade (a standard curve's 500-5000) those labels run together
+PLAIN_LOG_DECADES = 2.5
+
+
+def _plain_log_ticks(ax, log_x: bool, log_y: bool) -> None:
+    """Readable ticks on a SHORT log axis (2026-10-13): plain numbers (``500``, ``1000``,
+    ``2000``, ``5000``) at 1, 2 and 5 of each decade instead of overlapping ``3×10³``
+    minor labels. A longer axis keeps matplotlib's decade labels, which read fine there."""
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullLocator
+    plain = FuncFormatter(lambda v, _p: f"{v:g}")
+    for on, axis, (lo, hi) in ((log_x, ax.xaxis, ax.get_xlim()), (log_y, ax.yaxis, ax.get_ylim())):
+        if not on or not (lo > 0 and hi > lo) or math.log10(hi / lo) >= PLAIN_LOG_DECADES:
+            continue
+        axis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+        axis.set_major_formatter(plain)
+        axis.set_minor_locator(NullLocator())
+
+
 def _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw) -> None:
     """Axes, labels, ticks, spines, grid and legend — the same on every kind of figure."""
     a = spec.get("axes") or {}
@@ -971,12 +1494,16 @@ def _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw) -> None:
         ax.set_xlim(left=xl, right=xh)
     if yl is not None or yh is not None:
         ax.set_ylim(bottom=yl, top=yh)
+    _plain_log_ticks(ax, bool(a.get("log_x")), bool(a.get("log_y")))
     if a.get("title"):
         ax.set_title(str(a["title"]), fontsize=pt * 1.15, color=fg, family=fam)
     ax.set_xlabel(str(a.get("x_label", "")), fontsize=pt, color=fg, family=fam)
     ax.set_ylabel(str(a.get("y_label", "")), fontsize=pt, color=fg, family=fam)
-    ax.tick_params(labelsize=pt * 0.9, colors=fg, width=lw * 0.6)
-    for lab in ax.get_xticklabels() + ax.get_yticklabels():
+    # `which="both"`: a log axis spanning about one decade labels its MINOR ticks, and those
+    # kept matplotlib's default size — larger than the majors, overlapping each other
+    ax.tick_params(which="both", labelsize=pt * 0.9, colors=fg, width=lw * 0.6)
+    for lab in (ax.get_xticklabels() + ax.get_yticklabels()
+                + ax.get_xticklabels(minor=True) + ax.get_yticklabels(minor=True)):
         lab.set_family(fam)
     for side, sp in ax.spines.items():
         sp.set_color(fg)
@@ -994,7 +1521,8 @@ def _finish(fig, ax, spec, style, kind, series, fg, grid, fam, pt, lw) -> None:
     if style.get("legend") and kind not in ("heatmap", "field") and \
             not (kind == "distribution" and str((spec.get("draw") or {}).get("mode"))
                  in ("box", "violin")) and \
-            1 <= len([s for s in series if str(s.get("label", ""))]) <= LEGEND_MAX:
+            1 <= len([s for s in series if str(s.get("legend") or s.get("label", ""))]) \
+            <= LEGEND_MAX:
         leg = ax.legend(frameon=False, prop={"family": fam, "size": pt * 0.9})
         for txt in leg.get_texts():
             txt.set_color(fg)
@@ -1246,6 +1774,8 @@ def view_metadata(src: Mapping[str, Any], axes: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if src.get("dt_s") is not None:
         out["dt_s"] = src["dt_s"]
+    if src.get("utc_offset_s") is not None:
+        out["utc_offset_s"] = src["utc_offset_s"]      # the zone of the UTC frame clock
     n_t = int(getattr(axes, "t", 1) or 1)
     n_m = int(getattr(axes, "m", 1) or 1)
     for key in PER_TIME_KEYS:
@@ -1309,6 +1839,16 @@ def _figure_env(env, params: Mapping[str, Any], modes: Mapping[str, str], *,
         h, w = picture_pixels(params or {}, modes or {})
     except Exception:                                   # noqa: BLE001 — total by contract
         h, w = picture_pixels({}, {})
+    if str((modes or {}).get("per", "all")) == "column":
+        # one figure per value of a column (plot.xy, 2026-10-14): how many is in the DATA,
+        # which an edit-time pass has not read — so T is unknown, never guessed; and there is
+        # no clock, the figures are not frames of anything
+        md0: Dict[str, Any] = {
+            "bit_depth": 8,
+            "channel_names": list(PICTURE_METADATA["channel_names"]),
+            "channel_colors": [list(c) for c in PICTURE_METADATA["channel_colors"]]}
+        return replace(env, axes=picture_axes(h, w, 1), metadata=md0,
+                       unknown_axes=frozenset({"t"}), layers=())
     per = str((modes or {}).get("per", "all")) == "frame"
     md: Dict[str, Any] = {
         "bit_depth": 8,
@@ -1326,6 +1866,8 @@ def _figure_env(env, params: Mapping[str, Any], modes: Mapping[str, str], *,
             vals = src.get(key)
             if isinstance(vals, (list, tuple)) and len(vals) >= t_in:
                 md[key] = list(vals)[:t_in]
+        if src.get("utc_offset_s") is not None:
+            md["utc_offset_s"] = src["utc_offset_s"]
         # one figure per frame of the input: its T, and a T it cannot know yet stays
         # unknown rather than guessed
         t_in = getattr(env.axes, "t", 1) or 1

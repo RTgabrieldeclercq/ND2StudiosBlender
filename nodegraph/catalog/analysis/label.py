@@ -11,7 +11,8 @@ from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.parallel import fold_units
-from nodegraph.registry import DimMode, Granularity, InDataset, InInt, InString, OutDataset
+from nodegraph.registry import (DimMode, Granularity, InDataset, InInt, InString, Mode,
+                                OutDataset)
 from nodegraph.spill import dense_output
 from nodegraph.structure import StructureTable, label_components
 
@@ -23,11 +24,19 @@ from nodegraph.catalog._shared.progress import _parallel_progress
 def _compute_label(ctx: EvalContext) -> Dataset:
     """Connected-components label a mask into Label regions + a label raster. 2D
     labels each plane (4/8-conn); 3D labels the volume (6/26-conn). Region ids are
-    global-unique; per-region attributes are stored as Label-domain layers."""
+    global-unique; per-region attributes are stored as Label-domain layers.
+
+    ``regions = whole`` (2026-10-13) makes each plane's (2D) / volume's (3D) foreground ONE
+    region however it is cut up — a background mask that objects split into pockets is still
+    one background row per frame, which is what a per-frame Table Join needs (it refuses a
+    frame with two). ``connectivity`` is not read there."""
     ds = ctx.inputs[0]
     ax = ds.axes
     is_3d = ctx.granularity is Granularity.WHOLE_VOLUME
-    conn = int(ctx.params.get("connectivity", 26 if is_3d else 8))
+    whole = str((ctx.params.get("__modes__", {}) or {}).get("regions", "components")) == "whole"
+    conn = 26 if is_3d else 8
+    if not whole:
+        conn = int(ctx.params.get("connectivity", conn))
     # the one raster on the wire, whatever it is called (`_resolve_layer`)
     mask_layer, _note = _resolve_layer(
         _voxel_layers(ds), ctx.layer("mask"), node="connected components", socket="mask",
@@ -85,9 +94,9 @@ def _compute_label(ctx: EvalContext) -> Dataset:
         b, m, t, z, c = unit
         if z is None:
             return label_components(mask6[_pre(b) + (m, t, slice(None), c)], conn,
-                                    m=m, t=t, c=c, b=_bcol(b))
+                                    m=m, t=t, c=c, b=_bcol(b), whole=whole)
         return label_components(mask6[_pre(b) + (m, t, z, c)], conn,
-                                m=m, t=t, c=c, z_index=z, b=_bcol(b))
+                                m=m, t=t, c=c, z_index=z, b=_bcol(b), whole=whole)
 
     def _fold(_i, unit, res):
         nonlocal offset
@@ -132,6 +141,7 @@ register_node(
                      "blob; threshold it first. Naming a layer that is not present is an "
                      "error, and the picker offers the layers actually arriving on the wire."),
             InInt("connectivity", "Connectivity", field=False,    # default per dim
+                  available_in={"regions": frozenset({"components"})},
                   description=
                   "Which neighbours count as touching, so it decides whether two "
                   "diagonally-adjacent foreground voxels are ONE object or two. In 2D: 4 = "
@@ -149,9 +159,23 @@ register_node(
                      "table with one row per region. Ids are globally unique across every "
                      "(m,t,z,c), so a downstream measurement can join on id without "
                      "collisions. Downstream nodes select the result by this name.")],
-    outputs=[OutDataset()], modes=[DimMode()],
+    outputs=[OutDataset()],
+    modes=[DimMode(),
+           Mode("regions", ["components", "whole"], default="components", label="Regions",
+                description="What one region is: each connected blob of the mask, or all of "
+                            "a frame's mask at once.",
+                choice_docs={
+                    "components": "Each connected blob is its own region (Connectivity "
+                                  "decides what touches) — objects to count, measure and "
+                                  "track. The default, and every saved graph's behaviour.",
+                    "whole": "All of a plane's (2D) or volume's (3D) mask is ONE region, "
+                             "however it is cut up — a background mask that objects split "
+                             "into pockets still measures as one background per frame, "
+                             "which a per-frame Table Join needs. Connectivity is not read.",
+                })],
     granularity={"2D": Granularity.WHOLE_PLANE, "3D": Granularity.WHOLE_VOLUME},
     kernel_axes={"2D": frozenset({"y", "x"}), "3D": frozenset({"z", "y", "x"})},
-    description="Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn); "
+    description="Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn) — or, "
+                "with Regions = whole, all of each frame's mask as one region; "
                 "connectivity defaults to 8 (2D) / 26 (3D), overridable.",
 )

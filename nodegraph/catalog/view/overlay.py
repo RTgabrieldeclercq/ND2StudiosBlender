@@ -608,7 +608,9 @@ register_node(
                         "files that share no field (adjacent regions of a well, other wells), "
                         "which would otherwise draw nothing. The primary is drawn onto it as a "
                         "source with its own LUT; chain further union Overlays and the canvas "
-                        "grows to hold every file. The output is that canvas (one blank field), "
+                        "grows to hold every file. In the Viewer every file then keeps its OWN "
+                        "M, T and Z strips (no file follows another's clock or focus), and Play "
+                        "all steps them together. The output is that canvas (one blank field), "
                         "not the primary, so measure on a branch before the Overlay. Display "
                         "only — refused under `resample`.",
                 })],

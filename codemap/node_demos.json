@@ -1016,6 +1016,27 @@
         "Stacks several tables with matching columns into one — frames of a series, or the same measurement on several files."
       ]
     },
+    "table.unique_objects": {
+      "kind": "table",
+      "phantom": "plate_mosaic",
+      "prelude": [
+        "labels2d",
+        {
+          "op": "analysis.measure",
+          "params": {
+            "flip_x": false
+          }
+        }
+      ],
+      "fixed_params": {
+        "keep_first": 1
+      },
+      "features": [
+        "Links the rows of a table that sit at the same stage position into one object_uid, so a cell or bead imaged by two overlapping positions is counted once.",
+        "Numbers each object's sightings in acquisition order (t, then m); Keep first N drops the later ones into a new table.",
+        "Shown: nuclei of a 2×2 overlapping stage raster (built with +x = stage +x, hence Measure's Flip X off); keep_first 1 keeps each nucleus once."
+      ]
+    },
     "table.join": {
       "kind": "table",
       "phantom": "cells2d",

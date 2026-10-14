@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 137,
+    "nodes": 138,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 940,
-    "outputs": 144,
+    "inputs": 960,
+    "outputs": 145,
     "gui_ops_included": true
   },
   "stages": {
@@ -239,6 +239,7 @@
         "table.aggregate",
         "table.concat",
         "table.join",
+        "table.unique_objects",
         "track.link",
         "track.objects"
       ]
@@ -631,7 +632,7 @@
         {
           "op": "analysis.label",
           "label": "Connected Components",
-          "summary": "Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn); connectivity defaults to 8 (2D) / 26 (3D), overridable."
+          "summary": "Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn) — or, with Regions = whole, all of each frame's mask as one region; connectivity defaults to 8 (2D) / 26 (3D), overridable."
         },
         {
           "op": "analysis.multiotsu",
@@ -831,8 +832,8 @@
     "table_synthesis": {
       "label": "Table synthesis",
       "stage": "quantify",
-      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, and Table Aggregate summarises a column per group (mean, sem, count, ...).",
-      "count": 3,
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N.",
+      "count": 4,
       "ops": [
         {
           "op": "table.aggregate",
@@ -848,6 +849,11 @@
           "op": "table.join",
           "label": "Table Join",
           "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame or track — left or inner — as a new joined table."
+        },
+        {
+          "op": "table.unique_objects",
+          "label": "Unique Objects",
+          "summary": "Find the rows of a Label or Point table that are the same physical object seen from overlapping fields or in later frames: each gets an `object_uid` and a `sighting` number in acquisition order, and Keep first drops the later sightings into a new table."
         }
       ]
     },
@@ -1133,7 +1139,7 @@
         {
           "op": "plot.xy",
           "label": "Plot XY",
-          "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars — drawn as a true-colour picture the Viewer shows and Export Figure writes."
+          "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars and fitted with a trendline (straight in the plotted axes, so log-log fits a power law) — drawn as a true-colour picture the Viewer shows and Export Figure writes."
         }
       ]
     },
@@ -1284,7 +1290,8 @@
     "table": [
       "table.aggregate",
       "table.concat",
-      "table.join"
+      "table.join",
+      "table.unique_objects"
     ],
     "transform": [
       "transform.grow_points",
@@ -4186,8 +4193,8 @@
       ],
       "module": "nodegraph/catalog/analysis/label.py",
       "gui_only": false,
-      "summary": "Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn); connectivity defaults to 8 (2D) / 26 (3D), overridable.",
-      "overview": "Connected-components label a mask into Label regions + a label raster. 2D labels each plane (4/8-conn); 3D labels the volume (6/26-conn). Region ids are global-unique; per-region attributes are stored as Label-domain layers.",
+      "summary": "Label a mask into connected regions (2D 4/8-conn vs 3D 6/18/26-conn) — or, with Regions = whole, all of each frame's mask as one region; connectivity defaults to 8 (2D) / 26 (3D), overridable.",
+      "overview": "Connected-components label a mask into Label regions + a label raster. 2D labels each plane (4/8-conn); 3D labels the volume (6/26-conn). Region ids are global-unique; per-region attributes are stored as Label-domain layers. ``regions = whole`` (2026-10-13) makes each plane's (2D) / volume's (3D) foreground ONE region however it is cut up — a background mask that objects split into pockets is still one background row per frame, which is what a per-frame Table Join needs (it refuses a frame with two). ``connectivity`` is not read there.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -4239,6 +4246,20 @@
             "2D": "Plane by plane. The operation runs independently on every (Y,X) plane of every z, timepoint, channel and position, so nothing crosses a plane boundary: a feature spanning three planes is seen as three unrelated 2D features. Cheapest, tiles, ignores the Z spacing entirely, and the only sane choice for data that is a single plane or has very coarse Z steps.",
             "3D": "The whole (Z,Y,X) volume at once, using the file's real Z spacing, so a feature spanning planes stays ONE feature and measurements come out as volumes rather than per-slice areas. Needs the volume resident and is the slower, more memory-hungry side; it greys out when the incoming data has z == 1."
           }
+        },
+        {
+          "name": "regions",
+          "label": "Regions",
+          "choices": [
+            "components",
+            "whole"
+          ],
+          "default": "components",
+          "description": "What one region is: each connected blob of the mask, or all of a frame's mask at once.",
+          "choice_docs": {
+            "components": "Each connected blob is its own region (Connectivity decides what touches) — objects to count, measure and track. The default, and every saved graph's behaviour.",
+            "whole": "All of a plane's (2D) or volume's (3D) mask is ONE region, however it is cut up — a background mask that objects split into pockets still measures as one background per frame, which a per-frame Table Join needs. Connectivity is not read."
+          }
         }
       ],
       "inputs": [
@@ -4265,6 +4286,11 @@
           "type": "int",
           "role": "parameter",
           "is_field": false,
+          "available_in": {
+            "regions": [
+              "components"
+            ]
+          },
           "description": "Which neighbours count as touching, so it decides whether two diagonally-adjacent foreground voxels are ONE object or two. In 2D: 4 = edge-sharing only (splits diagonal chains), 8 = edges + corners. In 3D: 6 = faces only, 18 = faces + edges, 26 = faces + edges + corners. Higher merges more aggressively, which reduces object COUNT and increases individual areas — the usual cause of two nearly-touching cells being reported as one. 0 or unset takes the default: 8 in 2D, 26 in 3D."
         },
         {
@@ -4297,6 +4323,7 @@
       "trained_params": false,
       "kernel_doc": "",
       "params_read": [
+        "__modes__",
         "connectivity",
         "mask",
         "name"
@@ -4378,6 +4405,24 @@
           "description": ""
         },
         {
+          "name": "flip_x",
+          "label": "Flip X",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Whether the image's +x runs along stage −x when the `stage_x_um` column places each row on the microscope. ON (the default) is this scope's handedness and Stitch's, Overlay's and Merge's default — so one object seen from two overlapping fields gets ONE stage position. Changes only `stage_x_um`; every local and intensity column is unaffected."
+        },
+        {
+          "name": "flip_y",
+          "label": "Flip Y",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "Whether the image's +y runs along stage −y for `stage_y_um`. OFF (the default) matches Stitch and Overlay. Changes only `stage_y_um`."
+        },
+        {
           "name": "labels",
           "label": "Label layer",
           "type": "string",
@@ -4425,7 +4470,8 @@
             "min",
             "sum",
             "median",
-            "count"
+            "count",
+            "std"
           ],
           "choice_docs": {
             "count": "→ `area`: the number of voxels in the region — a raw COUNT, not a physical area, so it changes with binning and resolution. For µm² / µm³ use Object Metrics, or scale by pixel_size_um yourself.",
@@ -4433,9 +4479,10 @@
             "mean": "→ `mean_intensity`: the region's average voxel value. The size-independent measure of how bright a cell is, and the column downstream nodes look for by default; always computed even when unticked.",
             "median": "→ `median_intensity`: the region's middle value. Like `mean` but unmoved by a few saturated voxels or a punctum, so it reports the cell's bulk level rather than its brightest structure.",
             "min": "→ `min_intensity`: the region's dimmest single voxel. Mostly a diagnostic — on a mask that leaked into background it reads near the noise floor, which is how you catch an over-generous threshold.",
+            "std": "→ `std_intensity`: the sample standard deviation (n − 1) of the region's voxel values, NaN for a one-voxel region — the spread WITHIN an object. With `count` it lets Plot XY pool every voxel of every object (Error = pooled SD) without a row per voxel.",
             "sum": "→ `total_intensity`: every voxel value added up, so it scales with BOTH brightness and size. The column to use for total protein per cell; useless for comparing cells of different sizes, where `mean` is what you want."
           },
-          "description": "Which statistics to compute, comma-separated, one Label column each: `mean`→mean_intensity, `max`→max_intensity, `min`→min_intensity, `sum`→total_intensity, `median`→median_intensity, `count`→area (the voxel count, NOT a physical area). `mean` is always computed even if omitted, so `mean_intensity` stays available to downstream nodes. Asking for fewer stats writes fewer columns; it does not change any value, since each is computed independently over the same regions."
+          "description": "Which statistics to compute, comma-separated, one Label column each: `mean`→mean_intensity, `max`→max_intensity, `min`→min_intensity, `sum`→total_intensity, `median`→median_intensity, `count`→area (the voxel count, NOT a physical area), `std`→std_intensity. `mean` is always computed even if omitted, so `mean_intensity` stays available to downstream nodes. Asking for fewer stats writes fewer columns; it does not change any value, since each is computed independently over the same regions."
         },
         {
           "name": "shape",
@@ -4487,6 +4534,8 @@
       "kernel_doc": "",
       "params_read": [
         "__modes__",
+        "flip_x",
+        "flip_y",
         "labels",
         "points",
         "shape",
@@ -16310,8 +16359,8 @@
           "default": "ome",
           "description": "Which metadata container the calibration is written into — i.e. which reader is guaranteed to open the file correctly calibrated. The PIXELS are identical in all three; what differs is how much of the envelope survives the trip.",
           "choice_docs": {
-            "ome": "OME-XML in the first IFD: physical XY and Z sizes, frame interval, significant bits, per-channel names and emission wavelengths, and a per-plane stage position and time offset. The only option that can hold several positions in one file, and the only one that carries where the data was on the stage. Read by Fiji (Bio-Formats), QuPath and napari; BigTIFF when needed, so there is no size ceiling. The default, and the one to pick if you are unsure.",
-            "imagej": "An ImageJ hyperstack header — `spacing`, `unit`, `finterval` plus the resolution tags. Fiji opens it natively, instantly, with the Z spacing and frame interval already right and no Bio-Formats import dialog. In exchange it holds ONE position, drops stage positions and channel wavelengths, and cannot exceed 4 GB (a larger export is refused, not silently truncated). Pick it when the destination is Fiji and the stack is modest.",
+            "ome": "OME-XML in the first IFD: physical XY and Z sizes, frame interval, significant bits, per-channel names and emission/excitation wavelengths, a per-plane stage position, each plane's time since frame 0 off the real acquisition clock, the acquisition date and every frame's local time, and the source file's acquisition settings (laser power, gain, detector…) as key/value annotations. The only option that can hold several positions in one file, and the only one that carries where the data was on the stage. Read by Fiji (Bio-Formats), QuPath and napari; BigTIFF when needed, so there is no size ceiling. The default, and the one to pick if you are unsure.",
+            "imagej": "An ImageJ hyperstack header — `spacing`, `unit`, `finterval` plus the resolution tags. Fiji opens it natively, instantly, with the Z spacing and frame interval already right and no Bio-Formats import dialog. Each slice's label carries its frame's acquisition time, and Image ▸ Show Info lists every frame's time and the acquisition settings. In exchange it holds ONE position, drops stage positions and channel wavelengths, and cannot exceed 4 GB (a larger export is refused, not silently truncated). Pick it when the destination is Fiji and the stack is modest.",
             "plain": "A bare TIFF stack: pixels, the XY resolution tags, and nothing else. Nothing to misinterpret, so it is the safe answer for a reader that chokes on OME-XML or an ImageJ header, and for handing an array to code that just wants planes. Z spacing, frame interval, channel identity and stage position are all LOST — do not pick it for data anyone will need to measure in physical units."
           }
         },
@@ -19572,8 +19621,8 @@
       ],
       "module": "nodegraph/catalog/plot/xy.py",
       "gui_only": false,
-      "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars — drawn as a true-colour picture the Viewer shows and Export Figure writes.",
-      "overview": "Draw ``y`` against ``x`` from one structure table, one series per ``group_by`` value. Resolved spec (V4.00 step 7, `build-node-v2`): * reads one table — ``domain`` label | point | track, its name from ``table`` (the only one on the wire when blank) — and its ``x``, ``y`` and optional ``group_by`` columns; * ``error = none`` draws every row; ``sd`` / ``sem`` / ``ci95`` summarise the rows that share an x as mean ± that spread, as bars or a band (``error_style``); * renders through matplotlib's Agg canvas (``_shared/figure``) into a PICTURE dataset — one RGB plane, ``(1, 1, 1, 3, H, W)`` uint8, fresh metadata with no calibration — whose size the style decides and ``figure_frame`` predicts at edit time; * footprint: the whole table at once, no image axes read (``WHOLE_SERIES``, no kernel axes); no 2D/3D lever — a chart has no Z.",
+      "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars and fitted with a trendline (straight in the plotted axes, so log-log fits a power law) — drawn as a true-colour picture the Viewer shows and Export Figure writes.",
+      "overview": "Draw ``y`` against ``x`` from one structure table, one series per ``group_by`` value. Resolved spec (V4.00 step 7, `build-node-v2`): * reads one table — ``domain`` label | point | track, its name from ``table`` (the only one on the wire when blank) — and its ``x``, ``y`` and optional ``group_by`` columns; * ``error = none`` draws every row; ``sd`` / ``sem`` / ``ci95`` summarise the rows that share an x as mean ± that spread, as bars or a band (``error_style``); * renders through matplotlib's Agg canvas (``_shared/figure``) into a PICTURE dataset — one RGB plane, ``(1, 1, 1, 3, H, W)`` uint8, fresh metadata with no calibration — whose size the style decides and ``figure_frame`` predicts at edit time; * footprint: the whole table at once, no image axes read (``WHOLE_SERIES``, no kernel axes); no 2D/3D lever — a chart has no Z. **Trendline and x ≤ 0** (2026-10-13, for a standard curve: concentration on a log x axis, blanks at 0). ``fit = linear`` fits each series a least-squares line IN THE PLOTTED COORDINATES (:func:`~nodegraph.catalog._shared.figure.xy_fit`) — log10 of an axis that is logarithmic — so turning on log x and log y fits a power law and the line is straight on the figure; it is fitted to the points the series draws (the means when ``error`` summarises rows), and its equation and R² join the series' legend entry. ``zero_x = reference_line`` keeps a log-x plot's rows at x <= 0 instead of dropping them: each series' mean there is a dashed horizontal line in its colour, outside the fit. Both default to the old behaviour (``none`` / ``drop``), so a saved graph draws as before. **Langmuir, and a blank on linear axes** (2026-10-13, the same standard curve once its signal was read on linear axes). ``fit = langmuir`` fits each series the one-site binding curve ``y = Bmax·x / (Kd + x)`` in DATA units (:func:`~nodegraph.catalog._shared.figure. xy_langmuir`) on its x > 0 points, Bmax, Kd and R² in the legend. ``zero_x = reference_line`` now acts on a linear x axis too: the x <= 0 rows leave the points and become the dashed line, as on a log axis. A graph saved with ``reference_line`` on a linear x axis therefore draws its blank as a line where it drew points; ``drop`` on a linear axis is unchanged (those rows are ordinary points). **Colour by and Label by** (2026-10-14, for IL-8 capture beads around a spheroid: x the distance from it, y the height, each bead lit by its MFI and labelled with its true 3-D distance). Both read one value per POINT, so both live under ``error = none`` only (hidden otherwise — a summarised point is several rows). ``color_by`` names a numeric column; every marker takes its value on ``colormap`` (``color_scale`` linear | log), with a colour bar labelled ``color_label`` (blank: the column and its unit). The range is ``color_range`` where fixed, else the data's — over EVERY row, so the frames of a per-frame figure share one scale and a colour means the same number in each; values past it (zero and below on a log scale) take the end colours and the bar shows an arrow; a missing value is grey. With Colour by the series keep apart by marker shape, not hue. ``label_by`` names any column printed beside each point — a number rounded to ``label_decimals`` with the column's unit, text as it is — placed after the layout, clear of the other labels and points (``_shared/figure._place_point_labels``). Neither changes a measurement; both default blank, so a saved graph draws as before.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -19644,7 +19693,8 @@
             "none",
             "sd",
             "sem",
-            "ci95"
+            "ci95",
+            "pooled_sd"
           ],
           "default": "none",
           "description": "Whether rows that share an x are summarised, and with what spread.",
@@ -19652,7 +19702,8 @@
             "none": "Draw every row as its own point; nothing is averaged. With many objects per frame this shows the whole population as a cloud.",
             "sd": "Average the rows at each x and show ± one standard deviation — the spread of the population itself, which does not shrink as n grows.",
             "sem": "Average the rows at each x and show ± the standard error of the mean (sd/√n) — how well the mean is known; narrows as n grows.",
-            "ci95": "Average the rows at each x and show the 95 % confidence interval of the mean (Student's t, n-1 degrees of freedom) — wider than sem, the honest bar for comparing two groups."
+            "ci95": "Average the rows at each x and show the 95 % confidence interval of the mean (Student's t, n-1 degrees of freedom) — wider than sem, the honest bar for comparing two groups.",
+            "pooled_sd": "Read each row as a SUMMARY of raw measurements (a bead's pixels: Y their mean, Pool count how many, Pool SD their spread) and pool them: the point is the mean of every pixel at that x and the bar ± the SD of all of them together — exactly what listing every pixel would give. Wider than sd over the row means, because the spread inside each object counts too. Needs Measure's count and std stats."
           }
         },
         {
@@ -19666,6 +19717,7 @@
           "available_in": {
             "error": [
               "ci95",
+              "pooled_sd",
               "sd",
               "sem"
             ]
@@ -19677,17 +19729,97 @@
           }
         },
         {
+          "name": "fit",
+          "label": "Trendline",
+          "choices": [
+            "none",
+            "linear",
+            "langmuir"
+          ],
+          "default": "none",
+          "description": "Whether each series gets a fitted trendline, and which model. Linear is fitted in the PLOTTED coordinates, so it follows Log X / Log Y; Langmuir is fitted in data units whatever the axes. Either reads the plot's points and changes no measurement.",
+          "choice_docs": {
+            "none": "No trendline — the points (and their error bars) only. The default, and what every saved graph from before trendlines draws.",
+            "linear": "A least-squares straight line per series through the points it draws (the means when Error summarises rows), with its equation and R² in the legend: y = b·x + a on linear axes, a power law y = A·x^b when both axes are log. Needs two distinct x values; a series with fewer gets no line.",
+            "langmuir": "A one-site binding curve y = Bmax·x / (Kd + x) per series, least squares in data units on its x > 0 points (the curve passes through the origin, so a blank stays out of it), with Bmax, Kd and R² in the legend. For a saturating standard curve on linear axes; Kd is in x's units. Needs two distinct x > 0."
+          }
+        },
+        {
+          "name": "zero_x",
+          "label": "x ≤ 0 rows",
+          "choices": [
+            "drop",
+            "reference_line"
+          ],
+          "default": "drop",
+          "description": "What happens to rows at x of zero or below — a blank or a zero dose, which a log axis cannot place and a standard curve should not fit through.",
+          "choice_docs": {
+            "drop": "On a log x axis leave them out, as every log axis does; on a linear one they stay ordinary points (and enter the trendline). The default.",
+            "reference_line": "Draw each series' mean at x ≤ 0 as a dashed horizontal line in the series' colour — the blank level of a standard curve — on linear and log x axes alike, and keep those rows out of the points and the trendline."
+          }
+        },
+        {
           "name": "per",
           "label": "Per",
           "choices": [
             "all",
-            "frame"
+            "frame",
+            "column"
           ],
           "default": "all",
-          "description": "One figure of every row, or one figure per frame of the input.",
+          "description": "One figure of every row, one per frame of the input, or one per value of a column.",
           "choice_docs": {
             "all": "One figure of every row, drawn once — the whole experiment in a single picture.",
-            "frame": "One figure per frame of the input, drawn when the frame is shown, on axes every frame shares — scrub or play it in the Viewer, or export it as a movie."
+            "frame": "One figure per frame of the input, drawn when the frame is shown, on axes every frame shares — scrub or play it in the Viewer, or export it as a movie.",
+            "column": "One figure per value of `Per column` — small multiples of conditions, wells or timepoints from different files, which a frame axis cannot hold — on axes every figure shares and ONE colour scale over all their rows. Titled by the value; scrub them in the Viewer or export each with Export Figure's `frame`."
+          }
+        },
+        {
+          "name": "colormap",
+          "label": "Colour map",
+          "choices": [
+            "viridis",
+            "inferno",
+            "magma",
+            "plasma",
+            "cividis",
+            "turbo",
+            "coolwarm"
+          ],
+          "default": "viridis",
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "description": "The colours Colour by's values are drawn in. Only read with Colour by set.",
+          "choice_docs": {
+            "viridis": "Dark purple to yellow, perceptually uniform and readable in greyscale and by colour-blind readers — the safe default.",
+            "inferno": "Black through red and orange to pale yellow — a heat scale where high values glow; its pale top end reads best with the points' dark outline on a white page.",
+            "magma": "Black through purple and pink to pale yellow — like inferno with a cooler middle, perceptually uniform.",
+            "plasma": "Blue through magenta to yellow — perceptually uniform with no near-black end, so low values stay visible as colour.",
+            "cividis": "Blue to yellow, designed to read the same for the common colour-vision deficiencies — for figures that must be accessible.",
+            "turbo": "A rainbow from dark blue through green to dark red — many distinguishable levels, but not perceptually uniform, so equal steps in value do not look equal.",
+            "coolwarm": "Blue through white to red, diverging — for values with a meaningful middle, e.g. a change around zero; a point at the middle is near-white."
+          }
+        },
+        {
+          "name": "color_scale",
+          "label": "Colour scale",
+          "choices": [
+            "linear",
+            "log"
+          ],
+          "default": "linear",
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "description": "How Colour by's values map onto the colour map. Only read with Colour by set.",
+          "choice_docs": {
+            "linear": "Equal steps in value are equal steps in colour — honest for a narrow range; a few bright outliers leave the rest in the bottom colours.",
+            "log": "Equal RATIOS are equal steps in colour, so values spanning decades (a few bright beads among dim ones) all show. Zero and below have no place on it: they take the bottom colour and the bar shows an arrow."
           }
         },
         {
@@ -19810,6 +19942,146 @@
           "column_in_mode": "domain",
           "column_from": "table",
           "description": "Draw one series per distinct value of this column — a `condition` from a Page Output, a track id, a channel. Blank draws every row as one series, with no legend."
+        },
+        {
+          "name": "pool_n",
+          "label": "Pool count",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "area",
+          "available_in": {
+            "error": [
+              "pooled_sd"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "How many raw measurements each row's Y is the mean of — Measure's `area` (its `count` stat), the pixels in each bead. A row with more pixels weighs more in the pooled mean, so a bead cut by the frame edge counts for less than a whole one."
+        },
+        {
+          "name": "pool_sd",
+          "label": "Pool SD",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "error": [
+              "pooled_sd"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The standard deviation of each row's raw measurements — Measure's `std_intensity` (tick its `std` stat), the spread of a bead's own pixels; blank uses `std_intensity` when the table has it. It adds the spread WITHIN each row to the spread between rows, which is what makes the bar the SD of every pixel rather than of the bead means."
+        },
+        {
+          "name": "color_by",
+          "label": "Colour by",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "A numeric column that colours every point on a continuous scale, with a colour bar — the MFI of each bead, say, over its position. Blank colours each series in its own hue. With it the series are told apart by marker shape. Only per-point plots (Error = none) have it; it changes no measurement."
+        },
+        {
+          "name": "color_range",
+          "label": "Colour range",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "description": "Fix the colour scale as 'low, high' (either end may be left blank). Blank stretches it over EVERY row — all frames of a per-frame figure share it, so one colour is one value in each. Values past a fixed end take the end colour and the bar shows an arrow. Fix it to compare two figures by colour. Only read with Colour by set."
+        },
+        {
+          "name": "color_label",
+          "label": "Colour bar label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "description": "The colour bar's title. Blank uses the Colour by column's name and its unit. Only read with Colour by set."
+        },
+        {
+          "name": "label_by",
+          "label": "Label by",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "A column printed as text beside every point — a number with its unit (a distance, an id), or a text column as it is. Labels are placed clear of each other and of the points where there is room; a crowded one moves out on a thin leader line. Blank prints none. Only per-point plots (Error = none) have it."
+        },
+        {
+          "name": "x_lines",
+          "label": "Reference lines (x)",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Vertical dotted reference lines, comma-separated: a number (in X's unit) or a column whose MEDIAN places the line — a column that holds one value beside every row, like a spheroid's radius, lands exactly on it. Each line is labelled with its value and unit, and the X axis widens to show it. Blank draws none. Changes no measurement."
+        },
+        {
+          "name": "x_line_label",
+          "label": "Reference line labels",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Words for each reference line, comma-separated in the same order as the lines ('spheroid edge'). Blank uses the column's name (a typed number gets no words, only its value)."
+        },
+        {
+          "name": "per_by",
+          "label": "Per column",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "per": [
+              "column"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "With Per = column, the column whose values each get a figure — a Table Concat's `condition` (one per input: three timepoints from two files), a well, a position group. Figures follow the order the values first appear and are titled by the value; all share their axes and one colour scale."
+        },
+        {
+          "name": "label_decimals",
+          "label": "Label decimals",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "available_in": {
+            "error": [
+              "none"
+            ]
+          },
+          "description": "How many decimal places a numeric label keeps: 0 prints 1234 µm, 1 prints 1234.5 µm. Rounding only — the table keeps every digit. Only read with Label by set to a numeric column."
         },
         {
           "name": "title",
@@ -20010,21 +20282,31 @@
       "kernel_doc": "",
       "params_read": [
         "__modes__",
+        "color_by",
+        "color_label",
+        "color_range",
         "dpi",
         "font_pt",
         "grid",
         "group_by",
         "height_mm",
+        "label_by",
+        "label_decimals",
         "legend",
         "line_width",
         "log_x",
         "log_y",
         "marker_size",
+        "per_by",
+        "pool_n",
+        "pool_sd",
         "table",
         "title",
         "width_mm",
         "x",
         "x_label",
+        "x_line_label",
+        "x_lines",
         "x_range",
         "y",
         "y_label",
@@ -20602,7 +20884,7 @@
       "module": "nodegraph/catalog/table/concat.py",
       "gui_only": false,
       "summary": "Stack the Label or Point tables of several inputs (pages, conditions, variants) into one table, each row labelled with its condition, its input and its position group, ids kept unique — the table a plot groups by condition.",
-      "overview": "One table out of the same-kind tables of every input, rows labelled with their source. Resolved spec (V4.00 step 9, `build-node-v2`): * ``data`` takes any number of Datasets (the order they were wired in); ``domain`` label | point picks which kind of table; ``table`` names it on EVERY input (blank: each input's only one of that kind); * the output is input 0's Dataset plus the new ``name`` table (default ``combined``): the union of the inputs' columns — a column an input lacks is NaN (numbers) or ``\"\"`` (text) for its rows — plus ``condition`` (the input's ``condition`` metadata, which a Page Output stamps; else that input's entry in ``names``; else ``input_K``), ``input`` (K, the wiring position) and, from each input's OWN per-position metadata, ``group``, ``position_name`` and ``file`` when any input carries them; * ids stay unique: input K's ids are shifted by the largest id of the inputs before it (input 0's ids are unchanged, so it still joins against its own raster and tables); * text columns are numpy unicode (memo- and dock-safe); the 2D/3D kind (``z_kind``) must agree across inputs; a batch is combined only on its own (one input); * no image work: WHOLE_SERIES, nothing read but the tables; no axis or calibration change.",
+      "overview": "One table out of the same-kind tables of every input, rows labelled with their source. Resolved spec (V4.00 step 9, `build-node-v2`): * ``data`` takes any number of Datasets (the order they were wired in); ``domain`` label | point picks which kind of table; ``table`` names it on EVERY input (blank: each input's only one of that kind); * the output is input 0's Dataset plus the new ``name`` table (default ``combined``): the union of the inputs' columns — a column an input lacks is NaN (numbers) or ``\"\"`` (text) for its rows — plus ``condition`` (the input's ``condition`` metadata, which a Page Output stamps; else that input's entry in ``names``; else ``input_K``), ``input`` (K, the wiring position) and, from each input's OWN per-position metadata, ``group``, ``position_name`` and ``file`` when any input carries them; * ids stay unique: input K's ids are shifted by the largest id of the inputs before it (input 0's ids are unchanged, so it still joins against its own raster and tables); * text columns are numpy unicode (memo- and dock-safe); the 2D/3D kind (``z_kind``) must agree across inputs; a batch is combined only on its own (one input); * no image work: WHOLE_SERIES, nothing read but the tables; no axis or calibration change. **A numeric condition** (2026-10-13): when every row's condition reads as a number — ``names = 5000,2500,1000,500,0`` for a standard curve's wells — the table also gets ``condition_value``, the same labels as floats, so a plot can put the condition on an AXIS (``plot.xy`` refuses a text column there). One non-numeric label anywhere and the column is not written: a mixed set is categories, not values. The edit-time column list (:func:`_concat_columns`) applies the same rule to each input's condition.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -20671,7 +20953,7 @@
           "role": "parameter",
           "is_field": false,
           "default": "",
-          "description": "Comma-separated condition labels, one per input in wiring order, used only for an input that carries no `condition` of its own (a Page Output stamps one). Blank entries fall back to input_0, input_1, ... Changes the labels, never a measurement."
+          "description": "Comma-separated condition labels, one per input in wiring order, used only for an input that carries no `condition` of its own (a Page Output stamps one). Blank entries fall back to input_0, input_1, ... Changes the labels, never a measurement. When EVERY label is a number (5000,2500,1000,500,0) the table also gets a numeric `condition_value` column a plot can use as an axis."
         },
         {
           "name": "name",
@@ -20890,6 +21172,165 @@
         "other_table",
         "prefix",
         "table"
+      ]
+    },
+    "table.unique_objects": {
+      "op": "table.unique_objects",
+      "label": "Unique Objects",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/unique_objects.py",
+      "gui_only": false,
+      "summary": "Find the rows of a Label or Point table that are the same physical object seen from overlapping fields or in later frames: each gets an `object_uid` and a `sighting` number in acquisition order, and Keep first drops the later sightings into a new table.",
+      "overview": "Rows of one table that are the SAME physical object — seen from overlapping fields of view, or again in a later frame — get one ``object_uid`` and a ``sighting`` number. Resolved spec (2026-10-13, `build-node-v2`): * reads one table (``domain`` label / point, ``table``); its ``x`` / ``y`` columns (default ``stage_x_um`` / ``stage_y_um``, which Measure writes) place each row; * two rows closer than ``tolerance`` (in the x / y columns' own units — µm for the stage columns) are one object, by single linkage, so a chain of near rows is one object; rows of different batch members ``b`` are never linked; a row with no finite position is an object of its own; x and y only — z does not enter; * rows are put in acquisition order by ``order_by`` (comma columns, default ``t,m``: frame, then position — the order a multipoint time-lapse images them); within an object, rows with the same order key are ONE sighting (one frame saw it, e.g. split into two fragments), and ``sighting`` counts sightings 0, 1, 2, ...; * ``object_uid`` numbers the objects 1..K by their first sighting; ``sightings`` is each object's total, counted BEFORE ``keep_first`` drops any; * ``keep_first`` N > 0 keeps the rows of each object's first N sightings and drops the rest; 0 keeps every row (the columns are still added); * the output is a NEW table ``name`` of the same domain — the input table keeps every row, so its raster and overlays still agree with it; the kept rows keep every column and their ids, in the input's row order; * WHOLE_SERIES, tables only; no axis or calibration change.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "description": "Which kind of table holds the sightings.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table is de-duplicated; it is passed on with the new table added and the input table unchanged."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "Which table of the chosen kind holds the sightings. Blank uses the only one on the wire, and asks when there are several."
+        },
+        {
+          "name": "x",
+          "label": "X",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_x_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column placing each row along x. The default `stage_x_um` (from Measure) is the microscope stage position, the same for one object in every field that sees it. A per-field column like `x_um` would only match rows within one field."
+        },
+        {
+          "name": "y",
+          "label": "Y",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_y_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column placing each row along y — `stage_y_um` by default, for the same reason as X."
+        },
+        {
+          "name": "tolerance",
+          "label": "Tolerance",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 3.0,
+          "description": "How close two rows must be to count as ONE object, in the X / Y columns' units (µm for the stage columns). LARGER merges more — two neighbouring objects closer than this become one. SMALLER splits one object whose two fields disagree by more than this (stage repeatability, a field's own centroid jitter) into two, each with its own sightings. Keep it well under the objects' spacing."
+        },
+        {
+          "name": "order_by",
+          "label": "Order by",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "t,m",
+          "description": "Comma-separated columns that put rows in acquisition order; `t,m` (the default) is frame then position, the order a multipoint time-lapse images them. Rows of one object with the same values here are one sighting. Changes which sightings `Keep first` keeps."
+        },
+        {
+          "name": "keep_first",
+          "label": "Keep first",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "Keep only each object's first N sightings, dropping its later rows from the new table — e.g. 5 keeps the first five exposures of an object a later field imaged again. 0 (the default) keeps every row and only adds the columns. Every kept row's measurements are unchanged; it changes how many rows a summary averages."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "unique",
+          "description": "Name of the new table, of the same kind as the input. The input table is left whole, so its raster and overlays still match it."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_unique_objects",
+      "meta_transform": null,
+      "extra_layers": "_uq_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "keep_first",
+        "name",
+        "order_by",
+        "table",
+        "tolerance",
+        "x",
+        "y"
       ]
     },
     "track.link": {
@@ -25190,7 +25631,7 @@
           "choice_docs": {
             "primary": "The canvas is exactly the primary's field. What the graph measures and what you see cover the same area, so nothing on screen is outside the data being analysed. The default.",
             "context": "Widen the view to include the secondary's extent, drawn as context around the primary's field. For seeing where a high-magnification field sits inside a whole-well overview — the primary's pixels and every measurement are unchanged, only the visible frame grows. Refused under `resample`, which writes a real Dataset.",
-            "union": "ONE canvas over BOTH files' fields, each at its true stage position — for files that share no field (adjacent regions of a well, other wells), which would otherwise draw nothing. The primary is drawn onto it as a source with its own LUT; chain further union Overlays and the canvas grows to hold every file. The output is that canvas (one blank field), not the primary, so measure on a branch before the Overlay. Display only — refused under `resample`."
+            "union": "ONE canvas over BOTH files' fields, each at its true stage position — for files that share no field (adjacent regions of a well, other wells), which would otherwise draw nothing. The primary is drawn onto it as a source with its own LUT; chain further union Overlays and the canvas grows to hold every file. In the Viewer every file then keeps its OWN M, T and Z strips (no file follows another's clock or focus), and Play all steps them together. The output is that canvas (one blank field), not the primary, so measure on a branch before the Overlay. Display only — refused under `resample`."
           }
         }
       ],

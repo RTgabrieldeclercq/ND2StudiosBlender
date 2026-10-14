@@ -609,7 +609,8 @@ class MainWindow(QMainWindow):
         for sig in (self.runner.started, self.runner.finished, self.runner.failed,
                     self.runner.cancelled, self.runner.queued, self.runner.baked,
                     self.runner.fetched, self.runner.fetch_started,
-                    self.runner.ingest_started, self.runner.ingest_finished):
+                    self.runner.ingest_started, self.runner.ingest_finished,
+                    self.runner.queue_changed):
             sig.connect(lambda *_a: self._refresh_queue_ui())
         # (each viewer's own signals are wired where it is made — `_make_viewer`)
         self.runner.preload_progress.connect(self._on_preload_progress)
@@ -766,6 +767,8 @@ class MainWindow(QMainWindow):
             # setting, a pin is a graph edit — the viewer does neither itself
             "overlay_step": part(self._on_overlay_step, viewer=v),
             "overlay_pin": part(self._on_overlay_pin, viewer=v),
+            # a union canvas's per-source M/T/Z strips (2026-10-14): display-only, like a step
+            "overlay_select": part(self._on_overlay_select, viewer=v),
             # What the live surface can hold decides whether a big frame is shown WHOLE at
             # full resolution or off the pyramid (V2.23). The surface knows the number, the
             # runner makes the decision, and neither should know about the other.
@@ -3224,8 +3227,28 @@ class MainWindow(QMainWindow):
             sub = pane.sub() if hasattr(pane, "sub") else 0
             rows = self.runner.overlay_frame_readout(node_id, m, t, sub, z)
             pane.set_overlay_frames(rows, self.runner.overlay_sub_ticks(node_id))
+            pane.set_overlay_field_rects(self.runner.overlay_field_rects(node_id))
         except Exception:  # noqa: BLE001 — a readout must never cost the frame
             pass
+
+    def _sync_overlay_lut_refs(self, pane, node_id: str) -> None:
+        """Hand ``pane`` each overlaid source's OWN plane at the frame it shows — what its
+        overlay channels' histograms and Auto read (2026-10-14) — before the frame is drawn.
+        A lookup of what the worker read beside the composite; never a read here."""
+        try:
+            m, t, z, _c = pane.coords()
+            sub = pane.sub() if hasattr(pane, "sub") else 0
+            pane.set_overlay_lut_refs(self.runner.overlay_lut_refs(node_id, m, t, sub, z),
+                                      node_id)
+        except Exception:  # noqa: BLE001 — a histogram sample must never cost the frame
+            pass
+
+    def _on_overlay_select(self, picks, viewer: Optional[ViewerPanel] = None) -> None:
+        """A union canvas source's own M/T/Z strip moved (or Play all moved several):
+        show each named source at its ``(m, t, z)``. A runner setting, like a stepper —
+        nothing re-runs, nothing is saved."""
+        self.runner.set_source_select(dict(picks or {}))
+        self._on_view_request(viewer)
 
     def _on_overlay_step(self, ovl_id: str, dt: int, dz: int,
                          viewer: Optional[ViewerPanel] = None) -> None:
@@ -5539,7 +5562,8 @@ class MainWindow(QMainWindow):
             # decided for EVERY axis, not just T: a cold Z step through a whole-volume chain
             # is the same 130 s wait, and the first one pays it for the rest of the volume
             v.set_play_pacing(not reads)
-        if axis != "t":
+        # Play all (2026-10-14) plays the primary's T with every source, so it preloads as T
+        if axis not in ("t", "all"):
             return
         if not on:
             if self._preload_viewer in (None, v):      # never another viewer's preload
@@ -5665,6 +5689,7 @@ class MainWindow(QMainWindow):
             # result re-served while its planes follow on the decode lane: a viewer already
             # showing the node KEEPS its frame rather than blanking to "no image"
             keep = not planes and pane.showing()[0] == run_id and pane.has_image()
+            self._sync_overlay_lut_refs(pane, run_id)
             pane.show_result(run_id, planes, axes, seconds, dataset=payload,
                              overlay=self.runner.overlay_channels(run_id),
                              overlay_note=self.runner.overlay_note(run_id),
@@ -5780,8 +5805,14 @@ class MainWindow(QMainWindow):
                 badge = {"running": "RUNNING", "stopping": "STOPPING"}.get(state, state.upper())
                 if kind == "ingest":
                     badge = "INGEST"
-                bits = [f"running {_clock(e['elapsed'])}" if e.get("elapsed") is not None
-                        else ("stopping…" if state == "stopping" else "running")]
+                if state == "stopping" and kind != "bake":
+                    # cancelled, still finishing the step it was on (2026-10-13)
+                    bits = ["cancelled — stopping at its next step"
+                            + (f" (ran {_clock(e['elapsed'])})"
+                               if e.get("elapsed") is not None else "")]
+                else:
+                    bits = [f"running {_clock(e['elapsed'])}" if e.get("elapsed") is not None
+                            else ("stopping…" if state == "stopping" else "running")]
                 step = e.get("step")
                 if step and kind != "ingest":
                     event, rnode, info = step
@@ -5801,7 +5832,9 @@ class MainWindow(QMainWindow):
                          "why_not": "" if e.get("cancellable") else (
                              "An ingest finishes on its own: stopping it half-way would "
                              "leave a torn copy of the file" if kind == "ingest"
-                             else "Already stopping")})
+                             else "Already stopping — a node stops at its next step (a "
+                                  "node boundary or progress tick), and what it already "
+                                  "finished stays cached")})
         return rows
 
     def _queue_names(self, run_id: str) -> Tuple[str, str]:
@@ -5966,6 +5999,7 @@ class MainWindow(QMainWindow):
         for pane, pl in self._route_planes(self._viewers_for(run_id), planes, request):
             if pl is None:
                 continue                  # another viewer's frame of the same node
+            self._sync_overlay_lut_refs(pane, run_id)
             pane.show_planes(run_id, pl, axes, seconds)
             self._sync_overlay_frames(pane, run_id)
         # A COLD frame is decoded off the GUI thread and announces itself as "reading
@@ -6002,11 +6036,13 @@ class MainWindow(QMainWindow):
             self._console_dock.raise_()
 
     def _on_run_failed(self, node_id, trace) -> None:
-        # The Viewer shows the failing line (status) + full trace (tooltip), and the card
-        # that raised keeps its red 'error' state (the engine's error event named it, which
-        # is more precise than the pulled node). The CONSOLE gets the whole trace,
-        # selectable, because the other three are all uncopyable: a status line is truncated
-        # to the window width, a tooltip cannot be selected, and a red card is not text.
+        # The Viewer shows the failing line (status line only — since 2026-10-13 no tooltip
+        # carries the trace: one on the image outlived the failure and popped a stale
+        # traceback over every later result), and the card that raised keeps its red
+        # 'error' state (the engine's error event named it, which is more precise than the
+        # pulled node). The CONSOLE gets the whole trace, selectable, because the others are
+        # uncopyable: a status line is truncated to the window width and a red card is not
+        # text.
         run_id = self._full(node_id)
         pid, nid = split_run_id(run_id)
         for p, sc in list(self._scenes.items()):

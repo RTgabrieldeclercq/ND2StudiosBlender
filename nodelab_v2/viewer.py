@@ -43,7 +43,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass, field as dc_field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1114,6 +1114,10 @@ class ViewerPanel(QWidget):
     #: source's index on screen)`` — "these frames go together". The window writes it into
     #: that Overlay's ``t_pins`` / ``z_pins`` — the viewer never touches the document.
     overlay_pin = Signal(str, str, int, int)
+    #: a union canvas's per-source strips (2026-10-14): ``{source id: (m, t, z)}`` — the frame
+    #: each named source shows, on axes of its OWN. A dict so Play all moves every source in
+    #: ONE request. Display-only; the window hands it to the runner.
+    overlay_select = Signal(object)
     #: a mouse press on the image: the user is working in THIS viewer (V4.00 step 4). The
     #: window makes it the active one — the surface takes no keyboard focus, so following
     #: focus alone would never notice a click on the picture.
@@ -1278,10 +1282,65 @@ class ViewerPanel(QWidget):
         self._sub_step = 1
         self._ovl_frames: List[Dict[str, Any]] = []
         self._src_rows: Dict[str, Dict[str, Any]] = {}
+        #: the strip's shape — (source, independent, n_m, n_t, n_z) per row — so a readout
+        #: that only moves the numbers rewrites them instead of rebuilding the widgets
+        self._src_sig: List[Tuple] = []
+        #: every overlaid source has axes of its own (a union canvas, 2026-10-14): the
+        #: canvas's M/T/Z strips are then hidden — the canvas is a blank backdrop and its
+        #: clock merely its first file's — and each source's row carries M, T and Z
+        self._ovl_independent = False
+        #: the compare pane's half of hiding the canvas strips (:meth:`set_axes_hidden`)
+        self._axes_hidden_cmp = False
+        #: Play all's shared frame counter over the union sources' T axes
+        self._all_k = 0
+        #: ``(node, display channel) -> that source's own plane at the frame on screen``
+        #: (:meth:`set_overlay_lut_refs`) — what an overlay channel's histogram and Auto read
+        self._ovl_lut_refs: Dict[Tuple[str, int], np.ndarray] = {}
+        #: each union source's PICKED field on the canvas image (:meth:`set_overlay_field_rects`)
+        self._ovl_field_rects: List[Dict[str, Any]] = []
         self._src_box = QWidget()
-        self._src_lay = QVBoxLayout(self._src_box)
+        outer = QVBoxLayout(self._src_box)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        # ── Play all (2026-10-14) ─────────────────────────────────────────────────────
+        # Its own button, shown whenever sources are overlaid (on the Overlay or anything
+        # downstream of it): every other ▶ plays exactly its own axis. On a union canvas it
+        # steps every source's T together (one counter; a source with fewer frames holds its
+        # last); on a primary it plays the primary's T with every source's sub-ticks.
+        all_row = QWidget()
+        arow = QHBoxLayout(all_row)
+        arow.setContentsMargins(0, 1, 0, 1)
+        arow.setSpacing(6)
+        all_name = QLabel("ALL")
+        all_name.setProperty("role", "axis")
+        all_btn = QToolButton()
+        all_btn.setCheckable(True)
+        all_btn.setAutoRaise(True)
+        all_btn.setText(self._play_text("all", False))
+        all_btn.toggled.connect(lambda on: self._on_play("all", on))
+        all_val = QLabel("")
+        all_val.setProperty("role", "muted")
+        all_fps = QDoubleSpinBox()
+        all_fps.setRange(0.5, 60.0)
+        all_fps.setValue(8.0)
+        all_fps.setDecimals(0)
+        all_fps.setSingleStep(1.0)
+        all_fps.setSuffix("fps")
+        all_fps.setToolTip("Target playback rate for Play all")
+        all_fps.valueChanged.connect(lambda _v: self._retarget_fps("all"))
+        arow.addWidget(all_name)
+        arow.addWidget(all_btn)
+        arow.addWidget(all_val, 1)
+        arow.addWidget(all_fps)
+        self._play_btns["all"] = all_btn
+        self._fps_spins["all"] = all_fps
+        self._val_lbls["all"] = all_val
+        outer.addWidget(all_row)
+        rows_box = QWidget()
+        self._src_lay = QVBoxLayout(rows_box)
         self._src_lay.setContentsMargins(0, 0, 0, 0)
         self._src_lay.setSpacing(0)
+        outer.addWidget(rows_box)
         self._src_box.hide()
         self._axes_lay.addWidget(self._src_box)
 
@@ -1345,6 +1404,16 @@ class ViewerPanel(QWidget):
                                  "Voxel) overlays — size, opacity, look, colour")
         self._ovl_btn.clicked.connect(self.open_overlay_dialog)
         tools.addWidget(self._ovl_btn)
+        # every acquisition setting of the viewed data's source file (2026-10-13)
+        self._info_btn = QPushButton("Info")
+        self._info_btn.setCursor(Qt.PointingHandCursor)
+        self._info_btn.setToolTip(
+            "Acquisition metadata of the viewed data: its frame times, and everything the "
+            "source file recorded — objective, lasers and their power, detectors and gain, "
+            "pinhole, scan settings, loops, the per-frame recorded data and the raw text")
+        self._info_btn.clicked.connect(self.open_info_dialog)
+        self._info_dialog: Any = None
+        tools.addWidget(self._info_btn)
         self._tools_row = tools
         self._chan_lay.addWidget(self._tools_row)
 
@@ -1732,18 +1801,44 @@ class ViewerPanel(QWidget):
     def set_overlay_frames(self, rows: Sequence[Dict[str, Any]], n_sub: int = 1) -> None:
         """The window's per-source readout (:meth:`EngineRunner.overlay_frame_readout`) and
         how many Play-all ticks one primary frame is split into. Rebuilds the source strip only
-        when the SET of sources changes; otherwise it just rewrites the numbers, which is what
-        happens on every tick of a playback."""
+        when its SHAPE changes (the sources, their kind, their axis sizes); otherwise it just
+        rewrites the numbers, which is what happens on every tick of a playback.
+
+        A row is one of two kinds (2026-10-14). On a UNION canvas (``independent``) every
+        source has axes of its own — an M, T and Z strip each with its own ▶ — and the
+        canvas's own M/T/Z strips are hidden: there is no primary there whose frame the
+        others follow. Otherwise a row is the mapped source it always was: the frame its
+        pairing puts under the primary's cursor, ◀▶ steppers and Pin T / Pin Z."""
         self._n_sub = max(1, int(n_sub or 1))
         if self._t_sub >= self._n_sub:
             self._t_sub = 0
         self._ovl_frames = [dict(r) for r in rows or ()]
-        ids = [str(r["ovl_id"]) for r in self._ovl_frames]
-        if ids != list(self._src_rows):
+        sig = [(str(r["ovl_id"]), bool(r.get("independent")), int(r.get("n_m", 1) or 1),
+                int(r.get("n_t", 1) or 1), int(r.get("n_z", 1) or 1))
+               for r in self._ovl_frames]
+        if sig != self._src_sig:
             self._rebuild_source_strip()
+            self._src_sig = sig
+        self._ovl_independent = bool(self._ovl_frames) and all(
+            r.get("independent") for r in self._ovl_frames)
+        self._sync_axes_box()
         for r in self._ovl_frames:
-            row = self._src_rows.get(str(r["ovl_id"]))
+            oid = str(r["ovl_id"])
+            row = self._src_rows.get(oid)
             if row is None:
+                continue
+            row["name"].setText(str(r.get("label") or oid))
+            if r.get("independent"):
+                for ax in ("m", "t", "z"):
+                    key = f"{oid}|{ax}"
+                    sld = self._sliders.get(key)
+                    if sld is None or r.get(ax) is None:
+                        continue
+                    if sld.value() != int(r[ax]):
+                        sld.blockSignals(True)
+                        sld.setValue(min(max(0, int(r[ax])), sld.maximum()))
+                        sld.blockSignals(False)
+                    self._sync_axis_label(key)
                 continue
             t = "-" if r.get("t") is None else str(r["t"])
             z = "-" if r.get("z") is None else str(r["z"])
@@ -1758,7 +1853,6 @@ class ViewerPanel(QWidget):
                 info += f"  (stepped {dt:+d}t {dz:+d}z — pin to keep)"
             if int(r.get("sub_ticks", 1)) > 1:
                 info += f"  · {int(r['sub_ticks'])}x rate"
-            row["name"].setText(str(r.get("label") or r["ovl_id"]))
             row["info"].setText(info)
             row["z_box"].setVisible(int(r.get("n_z", 1)) > 1)
             row["t_box"].setVisible(int(r.get("n_t", 1)) > 1)
@@ -1766,8 +1860,16 @@ class ViewerPanel(QWidget):
         self._src_box.setVisible(bool(self._ovl_frames)
                                  and (self._detached or not self._compact))
         self._sync_play_tip()
+        self._sync_axis_label("all")
 
     def _rebuild_source_strip(self) -> None:
+        # a source axis is in the shared play dicts while its row exists — and must leave
+        # them with it, or a stale key would keep a dead strip playable
+        if self._playing_axis is not None and "|" in str(self._playing_axis):
+            self._stop_play()
+        for key in [k for k in self._sliders if "|" in k]:
+            for store in (self._sliders, self._val_lbls, self._play_btns, self._fps_spins):
+                store.pop(key, None)
         while self._src_lay.count():
             item = self._src_lay.takeAt(0)
             w = item.widget()
@@ -1776,6 +1878,10 @@ class ViewerPanel(QWidget):
         self._src_rows = {}
         for r in self._ovl_frames:
             oid = str(r["ovl_id"])
+            if r.get("independent"):
+                self._src_rows[oid] = self._source_axes_row(r)
+                self._src_lay.addWidget(self._src_rows[oid]["box"])
+                continue
             box = QWidget()
             h = QHBoxLayout(box)
             h.setContentsMargins(0, 0, 0, 0)
@@ -1834,6 +1940,156 @@ class ViewerPanel(QWidget):
                                    "reset": reset}
         self._sync_pin_enabled()
 
+    def _source_axes_row(self, r: Dict[str, Any]) -> Dict[str, Any]:
+        """One union-canvas source's own axes: its label over an M, T and Z strip — each with
+        its value, its own ▶ and its own rate — for every axis it has more than one of. The
+        strips live in the same dicts as the canvas's, under ``"<source>|<axis>"``, so
+        scrubbing, picking, playing and pacing are the very code the canvas strips run."""
+        oid = str(r["ovl_id"])
+        box = QWidget()
+        grid = QGridLayout(box)
+        grid.setContentsMargins(0, 2, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(1)
+        grid.setColumnStretch(1, 1)
+        name = QLabel(str(r.get("label") or oid))
+        name.setProperty("role", "axis")
+        name.setToolTip("This source's own axes — on a union canvas every file keeps its own "
+                        "M, T and Z. Its label is set on its Overlay node.")
+        grid.addWidget(name, 0, 0, 1, 5)
+        row_i = 1
+        for ax in ("m", "t", "z"):
+            n = int(r.get(f"n_{ax}", 1) or 1)
+            if n <= 1:
+                continue
+            key = f"{oid}|{ax}"
+            lab = QLabel(ax.upper())
+            lab.setProperty("role", "axis")
+            sld = FrameStrip(ax)
+            sld.setRange(0, n - 1)
+            sld.setValue(min(max(0, int(r.get(ax) or 0)), n - 1))
+            sld.setCompact(self._compact and not self._detached)
+            sld.unpicked_note = ("nothing picked — play steps through every frame of this "
+                                 "source")
+            sld.valueChanged.connect(lambda _v, o=oid, k=key: self._on_source_slider(o, k))
+            sld.setToolTip(
+                "This source's field: the LUT histogram and Auto read this field"
+                if ax == "m" else f"This source's {ax.upper()} — no other source moves")
+            val = QLabel("")
+            val.setProperty("role", "muted")
+            val.setMinimumWidth(52 if self._compact and not self._detached else 92)
+            play = QToolButton()
+            play.setText(self._play_text(key, False))
+            play.setCheckable(True)
+            play.setAutoRaise(True)
+            play.setToolTip(f"Play / pause this source's {ax.upper()} — only this axis moves")
+            play.toggled.connect(lambda on, k=key: self._on_play(k, on))
+            fps = QDoubleSpinBox()
+            fps.setRange(0.5, 60.0)
+            fps.setValue(8.0)
+            fps.setDecimals(0)
+            fps.setSingleStep(1.0)
+            fps.setSuffix("fps")
+            fps.setToolTip("Target playback rate")
+            fps.setVisible(self._detached or not self._compact)
+            fps.valueChanged.connect(lambda _v, k=key: self._retarget_fps(k))
+            grid.addWidget(lab, row_i, 0)
+            grid.addWidget(sld, row_i, 1)
+            grid.addWidget(val, row_i, 2)
+            grid.addWidget(play, row_i, 3)
+            grid.addWidget(fps, row_i, 4)
+            self._sliders[key] = sld
+            self._val_lbls[key] = val
+            self._play_btns[key] = play
+            self._fps_spins[key] = fps
+            self._sync_axis_label(key)
+            row_i += 1
+        return {"box": box, "name": name}
+
+    def _source_pick(self, oid: str) -> Tuple[int, int, int]:
+        """``(m, t, z)`` a union source's strips show (its readout for an axis it has one
+        of, which has no strip)."""
+        r = self._row_of(oid) or {}
+        out = []
+        for ax in ("m", "t", "z"):
+            sld = self._sliders.get(f"{oid}|{ax}")
+            out.append(int(sld.value()) if sld is not None else int(r.get(ax) or 0))
+        return out[0], out[1], out[2]
+
+    def _on_source_slider(self, oid: str, key: str) -> None:
+        """A union source's own strip moved: show that source at its new ``(m, t, z)``."""
+        self._sync_axis_label(key)
+        self.overlay_select.emit({oid: self._source_pick(oid)})
+
+    def set_overlay_lut_refs(self, refs: Mapping[int, np.ndarray],
+                             node_id: Optional[str] = None) -> None:
+        """Each overlay channel's SOURCE plane at the frame it shows
+        (:meth:`EngineRunner.overlay_lut_refs`) — its histogram and its Auto read this, not
+        the composite (2026-10-14). Kept per ``(node, channel)``: a channel whose plane has
+        not landed yet keeps the last one it had for that node."""
+        nid = str(node_id) if node_id is not None else str(self._node_id)
+        for ch, plane in (refs or {}).items():
+            if plane is not None:
+                self._ovl_lut_refs[(nid, int(ch))] = plane
+
+    def _ovl_ref(self, node_id: Any, ch: int) -> Optional[np.ndarray]:
+        return self._ovl_lut_refs.get((str(node_id), int(ch)))
+
+    def set_overlay_field_rects(self, rects: Sequence[Mapping[str, Any]]) -> None:
+        """Where each union source's picked field sits on the canvas image
+        (:meth:`EngineRunner.overlay_field_rects`) — outlined in that source's colour, so
+        its M strip moves something you can see. Repaints only when they changed."""
+        new = [dict(r) for r in rects or ()]
+        if new != self._ovl_field_rects:
+            self._ovl_field_rects = new
+            try:
+                self._view.refresh()
+            except Exception:  # noqa: BLE001 — a cosmetic repaint must never raise
+                pass
+
+    def _paint_source_fields(self, p: QPainter) -> None:
+        """Outline each union source's picked field, labelled ``source · M k``. Never drawn
+        smaller than 10 px on screen: at a canvas's fit-to-window zoom a bead field is under
+        one, and an outline you cannot see would make the M strip look broken."""
+        rects = self._ovl_field_rects
+        mp = getattr(self._view, "plane_to_widget", None)
+        if not rects or mp is None or self._ref_plane is None:
+            return
+        H, W = self._ref_plane.shape[:2]
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+        font = p.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.9))
+        p.setFont(font)
+        for r in rects:
+            fy0, fy1, fx0, fx1 = (float(v) for v in r["rect"])
+            a = mp(fx0 * W, fy0 * H)
+            b = mp(fx1 * W, fy1 * H)
+            box = QRectF(a, b).normalized()
+            if box.width() < 10.0 or box.height() < 10.0:
+                c = box.center()
+                box = QRectF(c.x() - max(5.0, box.width() / 2), c.y() - max(5.0, box.height() / 2),
+                             max(10.0, box.width()), max(10.0, box.height()))
+            rgb = self._chan_colors.get(int(r.get("ch", -1)), (255, 200, 0))
+            col = QColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(T.alpha(T.BG, 200), 3.0))
+            p.drawRect(box)
+            p.setPen(QPen(col, 1.5))
+            p.drawRect(box)
+            text = f"{r.get('label', '')} · M {int(r.get('m', 0))}"
+            p.setPen(QPen(T.alpha(T.BG, 220), 1.0))
+            p.drawText(box.bottomLeft() + QPointF(1.0, 13.0), text)
+            p.setPen(QPen(col, 1.0))
+            p.drawText(box.bottomLeft() + QPointF(0.0, 12.0), text)
+        p.restore()
+
+    def _sync_axes_box(self) -> None:
+        """The canvas's own M/T/Z strips: hidden for a compare pane that shares its leader's
+        (:meth:`set_axes_hidden`), and hidden on a union canvas whose every source carries
+        its own axes."""
+        self._axes_box.setVisible(not (self._axes_hidden_cmp or self._ovl_independent))
+
     def _row_of(self, oid: str) -> Optional[Dict[str, Any]]:
         return next((r for r in self._ovl_frames if str(r["ovl_id"]) == oid), None)
 
@@ -1861,20 +2117,30 @@ class ViewerPanel(QWidget):
         preload that is making playback smooth."""
         on = self._playing_axis is None
         for row in self._src_rows.values():
-            row["t_pin"].setEnabled(on)
-            row["z_pin"].setEnabled(on)
+            for k in ("t_pin", "z_pin"):
+                if k in row:
+                    row[k].setEnabled(on)
 
     def _sync_play_tip(self) -> None:
+        """T's ▶ plays T and nothing else (2026-10-14); Play all is its own button, and its
+        tip says what "all" means for what is on screen."""
         btn = self._play_btns.get("t")
-        if btn is None:
-            return
-        if self._n_sub > 1:
-            btn.setToolTip(f"Play all — each primary frame is held for {self._n_sub} ticks so "
-                           f"the fastest overlaid source shows every one of its frames "
-                           f"(loops the picked frames when any are selected)")
-        else:
-            btn.setToolTip("Play / pause the T axis"
+        if btn is not None:
+            btn.setToolTip("Play / pause the T axis — only T moves"
                            " (loops the picked frames when any are selected)")
+        all_btn = self._play_btns.get("all")
+        if all_btn is None:
+            return
+        if self._ovl_independent:
+            all_btn.setToolTip("Play all — every source's T steps together, one frame each "
+                               "tick; a source with fewer frames holds its last")
+        elif self._n_sub > 1:
+            all_btn.setToolTip(f"Play all — the T axis with every overlaid source: each "
+                               f"frame is held for {self._n_sub} ticks so the fastest source "
+                               f"shows every one of its frames")
+        else:
+            all_btn.setToolTip("Play all — the T axis with every overlaid source following "
+                               "its pairing")
 
     def axes(self):
         """The axes of the last delivered payload, or ``None`` before the first pull —
@@ -1901,7 +2167,8 @@ class ViewerPanel(QWidget):
         """Drop (or restore) the whole M/T/Z cursor row. The compare pane hides its own
         row while the two panes' metadata matches — one set of sliders then moves both —
         and gets it back the moment the panes diverge."""
-        self._axes_box.setVisible(not bool(on))
+        self._axes_hidden_cmp = bool(on)
+        self._sync_axes_box()
 
     # ── solo-frame scope ───────────────────────────────────────────────────────
     def set_solo(self, totals: Optional[Tuple[int, int, int]]) -> None:
@@ -2344,6 +2611,17 @@ class ViewerPanel(QWidget):
             self._axes_key = key
             rebuilt = True
         self._axes = axes if axes is not None else self._axes
+        # The frame clock, the channel tooltips and an open Info window are refreshed on
+        # EVERY payload (2026-10-13), not only when the strips rebuild: the rebuild key is
+        # axis sizes plus channel names/emissions, and neither the clock nor a channel's
+        # acquisition settings is in it - a Timeseries Builder re-ordered under the same
+        # axes kept the previous order's frame times on the T strip's hover.
+        if axes is not None and dataset is not None:
+            if not rebuilt:
+                self._apply_frame_times(dataset)
+            self._refresh_channel_tips(axes, dataset)
+            if self._info_dialog is not None and self._info_dialog.isVisible():
+                self.open_info_dialog()
         # `bit_depth` is refreshed UNCONDITIONALLY, not only inside `_rebuild_channels`.
         # That rebuild is gated on the key above — axis sizes plus channel names/emissions —
         # and the declared intensity scale is in neither, so two payloads that differ ONLY in
@@ -2582,20 +2860,33 @@ class ViewerPanel(QWidget):
                 # which is metadata — and nothing at all about how either is displayed.
                 #
                 # So: whatever the user has set on THIS channel wins (it is theirs to tune,
-                # in the overlay's own channel strip), else a window taken once from one of
-                # the source file's OWN whole planes. Never recomputed per frame, so it
-                # cannot pulse while scrubbing.
-                seed = src.get("clim")
-                clims[ch] = (self._clim.get(self._lut_key(node_id, ch))
-                             or (tuple(seed) if seed else None)
-                             or self._clim_for(node_id, ch, pl))
-                self._clim.setdefault(self._lut_key(node_id, ch), clims[ch])
+                # in the overlay's own channel strip), else a window pooled once over the
+                # source file's OWN fields (`EngineRunner._source_lut`). Never recomputed per
+                # frame while Auto is off, so it cannot pulse while scrubbing.
+                #
+                # Auto (2026-10-14) scales EVERY image of the overlay: with it on, an overlay
+                # channel's window is re-taken each frame like a primary channel's — from its
+                # SOURCE's own plane at the field and frame that source shows (`ref`, the
+                # field its M strip picked on a union canvas), never from the composite.
+                ckey = self._lut_key(node_id, ch)
+                ref = self._ovl_ref(node_id, ch)
                 # The histogram extent comes from the SOURCE's significant depth, not the
                 # primary's: `self._bit_depth` describes the viewed file, and an overlay
                 # channel is not from it. A 12-bit overlay under a 16-bit primary would
                 # otherwise get a slider spanning 65535 for data that stops at 4095.
-                self._drange.setdefault(self._lut_key(node_id, ch),
-                                        self._range_for_depth(src.get("bit_depth"), pl))
+                self._drange.setdefault(ckey, self._range_for_depth(
+                    src.get("bit_depth"), ref if ref is not None else pl))
+                if self._auto_on and ref is not None and not getattr(self, "_picture", False):
+                    clims[ch] = self._auto_clim(ref)
+                    self._clim[ckey] = clims[ch]
+                    self._clim_user.discard(ckey)
+                    continue
+                seed = src.get("clim")
+                clims[ch] = (self._clim.get(ckey)
+                             or (tuple(seed) if seed else None)
+                             or (self._auto_clim(ref) if ref is not None else None)
+                             or self._clim_for(node_id, ch, pl))
+                self._clim.setdefault(ckey, clims[ch])
                 continue
             if self._auto_on and not getattr(self, "_picture", False):
                 lohi = self._auto_clim(pl)
@@ -2893,20 +3184,26 @@ class ViewerPanel(QWidget):
         s = self._timestamp
         if not s or self._axes is None:
             return ""
-        from nodegraph.placement import SECONDS_PER_DAY, elapsed_text, jd_to_datetime_text
+        from nodegraph.placement import (
+            SECONDS_PER_DAY, elapsed_text, jd_to_datetime_text, utc_offset_of)
         md = getattr(self._dataset, "metadata", None) or {}
         _m, t, _z, _c = self._payload_coords()
         total = max(1, int(self._axes.t))
         t = max(0, min(int(t), total - 1))
         mode = str(s.get("mode") or "elapsed")
+        # EXACTLY one entry per frame (2026-10-13; was `>=`): a longer list is some other
+        # frames' clock — a T pin used to leave the source's full clock on a 2-frame seed,
+        # and indexing it by the payload's t showed another frame's time
         jd = md.get("frame_time_jd")
-        jd = list(jd) if isinstance(jd, (list, tuple)) and len(jd) >= total else None
+        jd = list(jd) if isinstance(jd, (list, tuple)) and len(jd) == total else None
 
         def clock_text() -> str:
             fd = md.get("frame_datetime")
-            if isinstance(fd, (list, tuple)) and len(fd) > t and fd[t]:
+            if isinstance(fd, (list, tuple)) and len(fd) == total and fd[t]:
                 return str(fd[t])
-            return jd_to_datetime_text(jd[t]) if jd is not None else ""
+            # the clock is UTC; the file's own zone makes it the microscope's local time
+            return (jd_to_datetime_text(jd[t], utc_offset_of(md)) if jd is not None
+                    else "")
 
         def elapsed() -> str:
             if jd is not None:
@@ -3160,6 +3457,14 @@ class ViewerPanel(QWidget):
         for ch, hst in self._hists.items():
             ckey = self._lut_key(self._node_id, ch)
             pl = self._planes.get(ch)
+            # an overlay channel's histogram is its SOURCE's plane at the field and frame
+            # that source shows (2026-10-14) — the composite is that field as a speck on a
+            # canvas, a histogram of zeros
+            ref = (self._ovl_ref(self._node_id, ch)
+                   if (getattr(self, "_overlay_src", None) or {}).get(ch) is not None
+                   else None)
+            if ref is not None:
+                pl = ref
             if ckey not in self._drange and pl is not None:
                 self._drange[ckey] = self._display_range(pl)
             dmin, dmax = self._drange.get(ckey, (0.0, 1.0))
@@ -3293,8 +3598,12 @@ class ViewerPanel(QWidget):
         last = [ln for ln in trace.strip().splitlines() if ln.strip()][-1]
         stale = (" · SHOWING THE PREVIOUS RESULT — the image and the M/T/Z ranges below "
                  "are the last successful pull's, not this graph's" if self._planes else "")
-        self._set_status(f"{_short(node_id)} FAILED — {last}{stale}", error=True)
-        self._view.setToolTip(trace)
+        self._set_status(f"{_short(node_id)} FAILED — {last}{stale} · the full trace is "
+                         f"in the Console", error=True)
+        # No tooltip carries the trace (2026-10-13). It used to be set on the IMAGE and was
+        # never cleared, so after one failed pull every long hover over the picture — on
+        # any later, successful result too — popped up a stale traceback. The status line
+        # names the failure; the Console has the whole trace, selectable.
 
     def show_running(self, node_id: str) -> None:
         self._set_status(f"pulling {_short(node_id)}…")
@@ -3339,6 +3648,56 @@ class ViewerPanel(QWidget):
         self._apply_frame_times(dataset)
         self._rebuild_channels(axes, dataset)
 
+    def _channel_tip(self, i: int, nc: int, md: Any) -> str:
+        """Channel ``i``'s toggle tooltip: its name and emission, then every acquisition
+        setting the file recorded for THAT channel (laser line and power, detector, gain,
+        offset, pinhole, emission range… — `nodelab_v2.acquisition_view`), then what
+        clicking does. An overlay channel is another file's, so it says that instead."""
+        from nodelab_v2.acquisition_view import channel_tooltip
+        md = md or {}
+        emis = md.get("channel_emission_nm") or []
+        name = self._chan_names[i] if i < len(self._chan_names) else f"Ch{i + 1}"
+        if i >= nc:
+            return channel_tooltip({}, i, name, hint=(
+                "the OVERLAY source, placed by stage position; display only, no downstream "
+                "node sees it — click to toggle in the composite, RIGHT-CLICK to set its "
+                "colour"))
+        return channel_tooltip(md, i, name,
+                               emission_nm=emis[i] if i < len(emis) else None,
+                               hint="click to toggle in the composite, RIGHT-CLICK to set "
+                                    "its colour")
+
+    def _refresh_channel_tips(self, axes, dataset) -> None:
+        """Re-point every channel toggle's tooltip at THIS payload. Separate from
+        :meth:`_rebuild_channels`, whose rebuild is skipped when the channel names and
+        emissions are unchanged — two files with the same channels but different laser
+        power would otherwise show the first file's settings."""
+        nc = int(getattr(axes, "c", 1) or 1)
+        md = getattr(dataset, "metadata", {}) or {}
+        for i, btn in list(self._chan_btns.items()):
+            try:
+                btn.setToolTip(self._channel_tip(i, nc, md))
+            except RuntimeError:          # a button deleted under a pending rebuild
+                continue
+
+    def open_info_dialog(self) -> None:
+        """Open (or refresh and raise) the Info window for the payload on screen."""
+        from nodelab_v2.acquisition_dialog import AcquisitionDialog
+        if self._info_dialog is None:
+            self._info_dialog = AcquisitionDialog(self)
+            btn = self._info_btn
+            if btn.isVisible():
+                self._info_dialog.move(btn.mapToGlobal(QPoint(0, btn.height() + 6)))
+        md = getattr(self._dataset, "metadata", None) or {}
+        node = _short(self._node_id) if self._node_id else "nothing pulled yet"
+        src = md.get(SOURCE_FILE_KEY)
+        if isinstance(src, (list, tuple)):
+            src = src[0] if src else ""
+        title = f"Viewing {node}" + (f" · source file {src}" if src else "")
+        self._info_dialog.load(title, md, self._axes)
+        self._info_dialog.show()
+        self._info_dialog.raise_()
+
     def _apply_frame_times(self, dataset) -> None:
         """Give the T strip the payload's acquisition clock (2026-10-12), so hovering a
         frame says when it was taken (frame 0 = 0), how long after the frame before, and the
@@ -3369,14 +3728,27 @@ class ViewerPanel(QWidget):
 
     def _sync_axis_label(self, ax: str, suffix: str = "") -> None:
         """The ``value/max`` readout beside a strip, with ``·N`` when N frames are picked
-        — the picks scope the run, so their count belongs where the axis is read."""
-        sld = self._sliders[ax]
+        — the picks scope the run, so their count belongs where the axis is read. Play all
+        has no strip of its own: its readout is the frame it is on."""
+        lbl = self._val_lbls.get(ax)
+        if lbl is None:
+            return
+        if ax == "all":
+            if self._ovl_independent:
+                n = max([int(r.get("n_t", 1) or 1) for r in self._ovl_frames] or [1])
+                lbl.setText((f"t {self._all_k}/{n - 1}" if n > 1 else "") + suffix)
+            else:
+                lbl.setText(suffix.lstrip(" ·"))
+            return
+        sld = self._sliders.get(ax)
+        if sld is None:
+            return
         picked = len(sld.selection())
         sub = (f" ·{self._t_sub + 1}/{self._n_sub}"
                if ax == "t" and getattr(self, "_n_sub", 1) > 1 and
-               (self._t_sub or self._playing_axis == "t") else "")
-        self._val_lbls[ax].setText(f"{sld.value()}/{sld.maximum()}"
-                                   + (f" ·{picked}" if picked else "") + sub + suffix)
+               (self._t_sub or self._playing_axis == "all") else "")
+        lbl.setText(f"{sld.value()}/{sld.maximum()}"
+                    + (f" ·{picked}" if picked else "") + sub + suffix)
 
     def _apply_cursor_ranges(self, axes) -> None:
         """Range/enable the M/T/Z strips for ``axes``. Under the solo-frame scope every
@@ -3482,14 +3854,7 @@ class ViewerPanel(QWidget):
             btn.setCheckable(True)
             btn.setChecked(i in self._active_channels)
             btn.setCursor(Qt.PointingHandCursor)
-            em = emis[i] if i < len(emis) else None
-            btn.setToolTip(f"{self._chan_names[i]}"
-                           + (f" · {em:.0f} nm" if isinstance(em, (int, float)) else "")
-                           + (" — the OVERLAY source, placed by stage position; "
-                              "display only, no downstream node sees it"
-                              if i >= nc else "")
-                           + " — click to toggle in the composite, "
-                             "RIGHT-CLICK to set its colour")
+            btn.setToolTip(self._channel_tip(i, nc, md))
             btn.clicked.connect(lambda _c, idx=i: self._on_channel_toggle(idx))
             # right-click → the colour menu (presets / picker / back to emission colour)
             btn.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -3715,7 +4080,7 @@ class ViewerPanel(QWidget):
 
     def _interval_ms(self, ax: str) -> int:
         fps = max(0.5, self._fps_spins[ax].value())
-        if ax == "t" and self._n_sub > 1:
+        if ax == "all" and self._n_sub > 1 and not self._ovl_independent:
             # Play all: the fps spinner stays the PRIMARY's rate; the tick runs n_sub times
             # faster so the fastest source shows each of its own frames
             rate = fps * self._n_sub
@@ -3724,21 +4089,51 @@ class ViewerPanel(QWidget):
         self._sub_step = 1
         return int(max(1.0, 1000.0 / fps))
 
+    @staticmethod
+    def _play_text(ax: str, playing: bool) -> str:
+        """A play button's face: ▶ / ⏸, named for Play all."""
+        icon = "⏸" if playing else "▶"
+        return f"{icon} Play all" if ax == "all" else icon
+
+    def _playable(self, ax: str) -> bool:
+        """Whether ``ax`` has anything to play — a strip with more than one frame, or for
+        Play all a T to step on some source (a union canvas) or on the primary."""
+        if ax == "all":
+            if self._ovl_independent:
+                return any(int(r.get("n_t", 1) or 1) > 1 for r in self._ovl_frames)
+            sld = self._sliders.get("t")
+            return bool(self._ovl_frames) and (
+                (sld is not None and sld.maximum() >= 1) or self._n_sub > 1)
+        sld = self._sliders.get(ax)
+        return sld is not None and sld.maximum() >= 1
+
     def _on_play(self, ax: str, on: bool) -> None:
+        """Play / pause ONE axis (2026-10-14: "playing an axis should only play that
+        axis"): the canvas's M, T or Z, one union source's own axis (``"<source>|<axis>"``),
+        or ``"all"``. One at a time — starting one stops whichever was playing."""
+        btn = self._play_btns.get(ax)
+        if btn is None:
+            return
         if on:
-            if self._sliders[ax].maximum() < 1:
-                self._play_btns[ax].setChecked(False)
+            if not self._playable(ax):
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
                 return
-            # one axis at a time
-            for other in _AXES:
-                if other != ax and self._play_btns[other].isChecked():
-                    self._play_btns[other].blockSignals(True)
-                    self._play_btns[other].setChecked(False)
-                    self._play_btns[other].setText("▶")
-                    self._play_btns[other].blockSignals(False)
+            for other, ob in list(self._play_btns.items()):
+                if other != ax and ob.isChecked():
+                    ob.blockSignals(True)
+                    ob.setChecked(False)
+                    ob.setText(self._play_text(other, False))
+                    ob.blockSignals(False)
+            if self._playing_axis is not None and self._playing_axis != ax:
+                self._stop_play()
             self._playing_axis = ax
+            if ax == "all" and self._ovl_independent:
+                self._all_k = max([int(r.get("t") or 0) for r in self._ovl_frames
+                                   if r.get("independent")] or [0])
             self._sync_pin_enabled()
-            self._play_btns[ax].setText("⏸")
+            btn.setText(self._play_text(ax, True))
             self._last_frame_t = None
             self._fps_ema = None
             self._gated = False
@@ -3752,7 +4147,7 @@ class ViewerPanel(QWidget):
         else:
             if self._playing_axis == ax:
                 self._stop_play()
-            self._play_btns[ax].setText("▶")
+            btn.setText(self._play_text(ax, False))
             self.playing.emit(False, ax)
 
     def set_play_gate(self, on: bool, note: str = "") -> None:
@@ -3768,7 +4163,9 @@ class ViewerPanel(QWidget):
             self._play_timer.stop()
             if note:
                 self._set_status(note)
-        elif self._playing_axis is not None and self._play_btns[self._playing_axis].isChecked():
+        elif self._playing_axis is not None and \
+                self._play_btns.get(self._playing_axis) is not None and \
+                self._play_btns[self._playing_axis].isChecked():
             self._last_frame_t = None            # do not charge the wait to the frame rate
             self._fps_ema = None
             self._play_timer.start(self._interval_ms(self._playing_axis))
@@ -3812,11 +4209,12 @@ class ViewerPanel(QWidget):
             self._t_sub = 0
             self.request_changed.emit()
         if ax is not None:
-            btn = self._play_btns[ax]
-            btn.blockSignals(True)
-            btn.setChecked(False)
-            btn.setText("▶")
-            btn.blockSignals(False)
+            btn = self._play_btns.get(ax)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.setText(self._play_text(ax, False))
+                btn.blockSignals(False)
             self._sync_axis_label(ax)
             # detail was held off for the whole run (:meth:`_request_detail`) — sharpen
             # the frame playback parked on, exactly as a settled scrub would
@@ -3852,18 +4250,27 @@ class ViewerPanel(QWidget):
             self._sync_axis_label(
                 ax, f" · computing {time.perf_counter() - self._awaiting_since:.0f}s")
             return
-        if ax == "t" and self._n_sub > 1 and self._t_sub + self._sub_step < self._n_sub:
-            # Play all: stay on this primary frame and advance the sub-tick, so a faster
-            # overlaid source shows its next frame. The slider does not move, so the request
-            # is emitted here (`_on_slider` will not fire).
-            self._t_sub += self._sub_step
-            self._awaiting_frame = True
-            self._awaiting_since = time.perf_counter()
-            self._sync_axis_label(ax)
-            self.request_changed.emit()
-            return
+        if ax == "all":
+            if self._ovl_independent:
+                self._tick_all_sources()
+                return
+            # Play all on a primary: the T axis with every source, holding each primary frame
+            # for its sub-ticks so a faster overlaid source shows its next frame
+            if self._n_sub > 1 and self._t_sub + self._sub_step < self._n_sub:
+                # the slider does not move, so the request is emitted here (`_on_slider`
+                # will not fire)
+                self._t_sub += self._sub_step
+                self._awaiting_frame = True
+                self._awaiting_since = time.perf_counter()
+                self._sync_axis_label("t")
+                self.request_changed.emit()
+                return
+            ax = "t"
         self._t_sub = 0
-        sld = self._sliders[ax]
+        sld = self._sliders.get(ax)
+        if sld is None:
+            self._stop_play()
+            return
         picks = sld.selection()
         if picks:
             cur = sld.value()
@@ -3878,6 +4285,35 @@ class ViewerPanel(QWidget):
         self._awaiting_since = time.perf_counter()
         sld.setValue(nxt)          # → _on_slider → request_changed → request_plane (fast)
 
+    def _tick_all_sources(self) -> None:
+        """One Play-all tick on a union canvas: every source with a T steps to the shared
+        frame ``k`` (a source with fewer frames holds its last), in ONE request."""
+        rows = [r for r in self._ovl_frames if r.get("independent")]
+        n = max([int(r.get("n_t", 1) or 1) for r in rows] or [1])
+        if n <= 1:
+            self._stop_play()
+            return
+        self._all_k = (int(self._all_k) + 1) % n
+        picks: Dict[str, Tuple[int, int, int]] = {}
+        for r in rows:
+            oid = str(r["ovl_id"])
+            nt = int(r.get("n_t", 1) or 1)
+            if nt <= 1:
+                continue
+            t_new = min(self._all_k, nt - 1)
+            sld = self._sliders.get(f"{oid}|t")
+            if sld is not None:
+                sld.blockSignals(True)
+                sld.setValue(t_new)
+                sld.blockSignals(False)
+                self._sync_axis_label(f"{oid}|t")
+            m, _t, z = self._source_pick(oid)
+            picks[oid] = (m, t_new, z)
+        self._sync_axis_label("all")
+        self._awaiting_frame = True
+        self._awaiting_since = time.perf_counter()
+        self.overlay_select.emit(picks)
+
     def _measure_fps(self) -> None:
         if self._playing_axis is None:
             return
@@ -3886,7 +4322,8 @@ class ViewerPanel(QWidget):
             dt = now - self._last_frame_t
             if dt > 0:
                 inst = 1.0 / dt
-                if self._playing_axis == "t" and self._n_sub > 1:
+                if self._playing_axis == "all" and self._n_sub > 1 and \
+                        not self._ovl_independent:
                     # a delivery per TICK; the readout is the primary's frame rate
                     inst *= self._sub_step / float(self._n_sub)
                 self._fps_ema = inst if self._fps_ema is None else \
@@ -4013,6 +4450,7 @@ class ViewerPanel(QWidget):
         self._paint_timestamp(p)              # …and its timestamp
         self._paint_region(p)                 # the troubleshooting box, under the pick
         self._paint_region_map(p)             # where that window sits in the full field
+        self._paint_source_fields(p)          # each union source's picked field (its M)
         self._paint_pick(p)                   # the armed gesture rides ON TOP of everything
 
     # ── parameter picking (V2.16) ─────────────────────────────────────────────
@@ -4371,12 +4809,23 @@ class ViewerPanel(QWidget):
         Off the image (the letterbox margin, or a split pane's gap) clears the line rather
         than freezing the last value: a stale coordinate that keeps sitting there reads as
         a live one."""
-        pt = self._pick_plane_pt(wpt)
-        if pt is None or self._ref_plane is None:
-            self._clear_hover()
-            return
-        self._hover_pt = pt
-        self._hover_lbl.setText(self._hover_text(pt))
+        # A hover must never raise (2026-10-13): this runs inside the surface's event filter,
+        # so an exception would print a traceback on EVERY mouse move over the image. A
+        # reading that cannot be made just clears the line.
+        try:
+            pt = self._pick_plane_pt(wpt)
+            if pt is None or self._ref_plane is None:
+                self._clear_hover()
+                return
+            # pick space puts a pixel's EDGE on the integer; the readout speaks the node's
+            # own coordinates, which put its CENTRE there (OverlayFrame.img_pt is the other
+            # direction of the same half pixel)
+            pt = (pt[0] - 0.5, pt[1] - 0.5)
+            self._hover_pt = pt
+            self._hover_lbl.setText(self._hover_text(pt))
+        except Exception:                         # noqa: BLE001 — a readout, not a result
+            self._hover_pt = None
+            self._hover_lbl.setText("")
 
     def _sample(self, plane: Optional[np.ndarray],
                 pt: Tuple[float, float]) -> Optional[float]:
@@ -4385,12 +4834,13 @@ class ViewerPanel(QWidget):
         The plane is scaled to the node's axes rather than assumed 1:1 — a display plane
         arrives stride-decimated when the volume is larger than the render budget, and the
         raw plane is decimated by the same rule, so both land on the right texel through
-        the same conversion."""
+        the same conversion. ``pt`` puts a pixel's centre on the integer, so the texel is
+        ``floor((pt + 0.5) · scale)`` — the same pixel :meth:`_hover_text` names."""
         if plane is None or self._axes is None:
             return None
         H, W = plane.shape[:2]
-        px = int(round(pt[0] * W / max(1, self._axes.x)))
-        py = int(round(pt[1] * H / max(1, self._axes.y)))
+        px = int(np.floor((pt[0] + 0.5) * W / max(1, self._axes.x)))
+        py = int(np.floor((pt[1] + 0.5) * H / max(1, self._axes.y)))
         if not (0 <= px < W and 0 <= py < H):
             return None
         return float(plane[py, px])
@@ -4417,7 +4867,11 @@ class ViewerPanel(QWidget):
             return None
 
     def _hover_text(self, pt: Tuple[float, float]) -> str:
-        """The readout line for a point in the node's full-resolution pixel space.
+        """The readout line for a point in the node's full-resolution pixel space — the
+        coordinates its tables use, a pixel's CENTRE on the integer (:meth:`_on_hover`
+        converts the pointer). The pixel named is the nearest centre, and it is the pixel
+        :meth:`_sample` reads: they used to disagree (``int`` here, ``round`` there), so the
+        right half of pixel 3 said "x 3" beside pixel 4's value.
 
         The stage coordinate is offered ONLY when the raw probe is available, because that
         callback's contract is exactly the guarantee this arithmetic needs: the viewed node
@@ -4431,7 +4885,7 @@ class ViewerPanel(QWidget):
         centre of the frame. If a stitched montage from this scope comes out mirrored in
         Y, that is the sign to flip here — the file does not state the handedness."""
         m, t, z, _c = self.coords()
-        parts = [f"x {int(pt[0])}, y {int(pt[1])} px"]
+        parts = [f"x {int(np.floor(pt[0] + 0.5))}, y {int(np.floor(pt[1] + 0.5))} px"]
 
         md = getattr(self._dataset, "metadata", None) or {}
         psize = md.get("pixel_size_um")
@@ -4499,7 +4953,11 @@ class ViewerPanel(QWidget):
         return W / max(1, ax.x), H / max(1, ax.y)
 
     def _pick_plane_pt(self, wpt: QPointF) -> Optional[Tuple[float, float]]:
-        """A widget point → ``(x, y)`` in the node's own full-resolution pixel space."""
+        """A widget point → ``(x, y)`` in the node's own full-resolution pixel space, with a
+        pixel's EDGE on the integer (pixel ``i`` spans ``[i, i+1)``) — the convention the
+        crop rectangle's floor/ceil to slice bounds is written for. Tables put the CENTRE
+        on the integer; :meth:`_on_hover` converts, and a probe reading the pixel under a
+        pick takes the floor."""
         w2p = getattr(self._view, "widget_to_plane", None)
         if w2p is None or self._ref_plane is None:
             return None
@@ -4531,7 +4989,9 @@ class ViewerPanel(QWidget):
         if plane is None:
             return None
         sx, sy = self._disp_scale()
-        px, py = int(round(pt[0] * sx)), int(round(pt[1] * sy))
+        # a pick point puts the pixel's EDGE on the integer, so the pixel under it is the
+        # floor — `round` read the neighbour whenever the click was in a pixel's far half
+        px, py = int(np.floor(pt[0] * sx)), int(np.floor(pt[1] * sy))
         H, W = plane.shape[:2]
         if not (0 <= px < W and 0 <= py < H):
             return None
@@ -4670,7 +5130,7 @@ class ViewerPanel(QWidget):
         if vals is None:
             return None
         m, t, z, c = self._payload_coords()
-        px, py = int(round(pt[0])), int(round(pt[1]))
+        px, py = int(np.floor(pt[0])), int(np.floor(pt[1]))      # edge-on-integer: floor
         try:
             plane = vals[m, t, z, c]
             H, W = plane.shape[:2]

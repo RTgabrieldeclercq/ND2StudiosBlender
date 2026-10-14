@@ -1736,6 +1736,39 @@ def main(argv) -> int:
     _ok(f"O4: overlay sizes are SCREEN px — 4× zoom kept the ink bounded "
         f"({ink_out}→{ink_in}, not 16×) and the glyph identical")
 
+    # O4b: a point lands on the CENTRE of the pixel it names (2026-10-14). A structure
+    # coordinate puts a pixel's centre on the integer and the displayed plane puts its edge
+    # there; the renderer drew `x * sx`, so a centroid sat half a pixel up-left of the disc
+    # grown from it. At 10× the marker's ink and its region's fill must share one centre.
+    def _ink_centre(st, fr):
+        img = _QImg(240, 240, _QImg.Format_ARGB32)
+        img.fill(_QCol(0, 0, 0))
+        p = _QPnt(img)
+        _OV.OverlayRenderer().paint(p, st, fr)
+        p.end()
+        arr = np.frombuffer(img.constBits(), np.uint8).reshape(240, 240, 4)
+        ys, xs = np.nonzero(arr[..., :3].max(axis=2) > 40)
+        return float(ys.mean()), float(xs.mean())
+
+    _lab5 = np.zeros((24, 24), np.int32)
+    _lab5[8:13, 11:16] = 1                         # 5×5 region: centroid y 10, x 13
+    _map10 = lambda x, y: _QPt(x * 10.0, y * 10.0)
+    _st_lab, _st_pt = _OV.OverlaySettings(), _OV.OverlaySettings()
+    _st_lab.labels.style, _st_lab.labels.fill_opacity = "fill", 100
+    _st_pt.labels.enabled = False
+    _st_pt.points.shape = "circle"
+    _c_lab = _ink_centre(_st_lab, _OV.OverlayFrame(map_pt=_map10, plane_wh=(24, 24),
+                                                   label_plane=_lab5))
+    _c_pt = _ink_centre(_st_pt, _OV.OverlayFrame(map_pt=_map10, plane_wh=(24, 24),
+                                                 points=[_OV.PointMark(10.0, 13.0, 1, 0)]))
+    # rows 80..129 / columns 110..159 — ink is counted by widget-pixel INDEX, hence the .5
+    assert abs(_c_lab[0] - 104.5) < 0.25 and abs(_c_lab[1] - 134.5) < 0.25, _c_lab
+    assert abs(_c_pt[0] - _c_lab[0]) < 1.0 and abs(_c_pt[1] - _c_lab[1]) < 1.0, \
+        f"the centroid marker is off its region's centre: marker {_c_pt}, region {_c_lab}"
+    _ok(f"O4b: a point at its region's centroid draws on the region's centre "
+        f"(marker {_c_pt[1]:.1f},{_c_pt[0]:.1f} vs fill {_c_lab[1]:.1f},{_c_lab[0]:.1f} "
+        f"at 10×) — pixel centre on the integer, not its corner")
+
     # O5: the requested point look — a golden star with a bright centre pixel and a
     # brightness gradient down each arm
     ren = _OV.OverlayRenderer()
@@ -3764,7 +3797,10 @@ def main(argv) -> int:
     # offset arithmetic cannot hide a sign error or an off-by-half-a-field
     _mid = win.viewer._hover_text((_cx, _cy))
     assert "stage 1024.0, -2000.0" in _mid, f"stage centre is wrong: {_mid!r}"
-    assert "x 119, y 99 px" in _mid, _mid
+    # the exact centre (119.5, 99.5) is the corner shared by four pixels; the readout names
+    # the one whose value it prints (nearest centre, half up) — it used to say "x 119, y 99"
+    # beside pixel (120, 100)'s value, which `_v0` below has always read
+    assert "x 120, y 100 px" in _mid, _mid
     _plane0 = win.viewer._planes[sorted(win.viewer._planes)[0]]
     _v0 = _plane0[int(round(_cy)), int(round(_cx))]
     assert f"{int(_v0)}" in _mid, f"the pixel value {_v0} is missing from {_mid!r}"
@@ -5806,7 +5842,7 @@ def main(argv) -> int:
     # real runner, re-request the viewed node (which overlays nothing) and have the window
     # hand the strip an empty readout mid-assertion. The window half (pin -> params) is
     # driven directly below.
-    _o11_sigs = ("request_changed", "overlay_step", "overlay_pin")
+    _o11_sigs = ("request_changed", "overlay_step", "overlay_pin", "overlay_select")
     for _sig in _o11_sigs:            # the window's own slots on THIS viewer (V4.00 step 4)
         getattr(vw, _sig).disconnect(win._viewer_slot(vw, _sig))
     vw._sliders["t"].blockSignals(True)
@@ -5827,7 +5863,11 @@ def main(argv) -> int:
     assert row["name"].text() == "GFP 20x", row["name"].text()
     assert "t 4/11" in row["info"].text() and "z 1/2" in row["info"].text() \
         and "3x rate" in row["info"].text(), row["info"].text()
-    assert "Play all" in vw._play_btns["t"].toolTip()
+    # Play all is its OWN button (2026-10-14); T's ▶ plays T and nothing else
+    assert "only T moves" in vw._play_btns["t"].toolTip(), vw._play_btns["t"].toolTip()
+    assert "3 ticks" in vw._play_btns["all"].toolTip(), vw._play_btns["all"].toolTip()
+    assert not vw._src_box.isHidden() and not vw._axes_box.isHidden(), \
+        "mapped sources: the primary keeps its strips, and the Play all row shows"
     got_step, got_pin, reqs = [], [], []
     vw.overlay_step.connect(lambda *a: got_step.append(a))
     vw.overlay_pin.connect(lambda *a: got_pin.append(a))
@@ -5839,8 +5879,18 @@ def main(argv) -> int:
     vw._pin_source("OVA", "z")
     assert got_pin == [("OVA", "t", 0, 4), ("OVA", "z", 2, 1)], got_pin
 
-    # Play all: three ticks per primary frame -- the slider moves on the third
+    # T's own ▶ steps T only: a new primary frame each tick, no sub-ticks
     vw._playing_axis = "t"             # what `_on_play` sets, minus the timer and preload
+    vw._play_paced = False
+    vw._sub_step = 1
+    seen = []
+    for _ in range(3):
+        vw._tick_play()
+        seen.append((vw._sliders["t"].value(), vw.sub()))
+    assert seen == [(1, 0), (2, 0), (0, 0)], seen
+    vw._stop_play()
+    # Play all: three ticks per primary frame -- the slider moves on the third
+    vw._playing_axis = "all"
     vw._sync_pin_enabled()
     vw._play_paced = False
     vw._sub_step = 1
@@ -5854,14 +5904,56 @@ def main(argv) -> int:
     vw._t_sub = 1
     vw._stop_play()
     assert vw.sub() == 0 and vw._src_rows["OVA"]["t_pin"].isEnabled()
-    # the tick rate: n_sub x the fps, capped, with several sub-ticks per tick past the cap
+    # the tick rate: Play all runs n_sub x its fps, capped, with several sub-ticks per tick
+    # past the cap; T's own ▶ runs at its own fps whatever the sources' rates
+    vw._fps_spins["all"].setValue(8.0)
+    assert vw._interval_ms("all") == int(1000.0 / 24.0) and vw._sub_step == 1
     vw._fps_spins["t"].setValue(8.0)
-    assert vw._interval_ms("t") == int(1000.0 / 24.0) and vw._sub_step == 1
+    assert vw._interval_ms("t") == int(1000.0 / 8.0)
     vw.set_overlay_frames(rows, 16)
-    vw._fps_spins["t"].setValue(30.0)
-    vw._interval_ms("t")
+    vw._fps_spins["all"].setValue(30.0)
+    vw._interval_ms("all")
     assert vw._sub_step == 8, vw._sub_step            # 480 ticks/s -> 8 per 60 Hz tick
     vw.set_overlay_frames(rows, 3)
+
+    # a UNION canvas (2026-10-14): every source has axes of its own, the canvas's are hidden
+    urows = [{"ovl_id": "U#primary", "sec_id": "SPH", "label": "spheroid", "independent": True,
+              "m": 0, "n_m": 4, "t": 0, "n_t": 1, "z": 4, "n_z": 9},
+             {"ovl_id": "U", "sec_id": "BEADS", "label": "beads", "independent": True,
+              "m": 0, "n_m": 24, "t": 0, "n_t": 2, "z": 0, "n_z": 1}]
+    vw.set_overlay_frames(urows, 1)
+    app.processEvents()
+    assert vw._axes_box.isHidden(), "a union canvas hides its own M/T/Z strips"
+    assert sorted(k for k in vw._sliders if "|" in k) == \
+        ["U#primary|m", "U#primary|z", "U|m", "U|t"], sorted(vw._sliders)
+    assert vw._sliders["U#primary|z"].value() == 4 and vw._sliders["U|m"].maximum() == 23
+    picks = []
+    vw.overlay_select.connect(lambda d: picks.append(dict(d)))
+    vw._sliders["U|m"].setValue(15)
+    assert picks[-1] == {"U": (15, 0, 0)}, picks
+    vw._sliders["U#primary|z"].setValue(2)
+    assert picks[-1] == {"U#primary": (0, 0, 2)}, "only that source's frame moves"
+    # one axis plays alone: the beads' T, and no other strip moves
+    vw._playing_axis = "U|t"
+    vw._tick_play()
+    assert vw._sliders["U|t"].value() == 1 and picks[-1] == {"U": (15, 1, 0)}, picks[-1]
+    assert vw._sliders["U#primary|z"].value() == 2 and vw._sliders["U|m"].value() == 15
+    vw._stop_play()
+    # Play all steps every source's T on one counter (a one-frame source holds)
+    vw._playing_axis = "all"
+    vw._all_k = 1
+    vw._tick_play()
+    assert picks[-1] == {"U": (15, 0, 0)} and vw._val_lbls["all"].text() == "t 0/1", \
+        (picks[-1], vw._val_lbls["all"].text())
+    vw._stop_play()
+    assert "every source's T" in vw._play_btns["all"].toolTip()
+    vw.set_overlay_field_rects([{"ovl_id": "U", "label": "beads", "ch": 0, "m": 15,
+                                 "rect": (0.4, 0.41, 0.2, 0.21)}])
+    assert vw._ovl_field_rects and vw._ovl_field_rects[0]["m"] == 15
+    vw.set_overlay_field_rects([])
+    vw.set_overlay_frames(rows, 3)
+    assert not vw._axes_box.isHidden() and not any("|" in k for k in vw._sliders), \
+        "back to a mapped overlay: the canvas strips return and the source strips go"
     for _sig in _o11_sigs:
         getattr(vw, _sig).connect(win._viewer_slot(vw, _sig))
 
@@ -5917,7 +6009,10 @@ def main(argv) -> int:
     _ok("O11 experiment overlay (2026-09-30): the source strip shows each overlaid file by "
         "its label with the frame/plane it is showing and its rate; the ◀▶ steppers emit an "
         "absolute display-only offset and Pin T / Pin Z emit (primary, source-on-screen); "
-        "Play all holds each primary frame for n ticks (slider 0,0,1,1,1,2 over six ticks) "
+        "T's own ▶ steps T only and Play all (its own button) holds each primary frame "
+        "for n ticks (slider 0,0,1,1,1,2 over six ticks); on a union canvas every source "
+        "gets its own M/T/Z strips (the canvas's hide), one strip moves one source, one ▶ "
+        "plays one axis and Play all steps every source's T on one counter; "
         "at n x the fps, several sub-ticks per tick past 60 Hz, pins are disabled while "
         "playing and stopping parks on sub-tick 0; the window writes pins as canonical "
         "sorted later-wins JSON through the pinning edit path and the inspector removes "
@@ -9744,6 +9839,29 @@ def main(argv) -> int:
     assert _run21["title"] == "Gamma" and _run21["page"] and "running 1:05" in \
         _run21["detail"] and "computing Gamma (3/8)" in _run21["detail"], _run21
     assert "#1 in line" in _wait21["detail"], _wait21
+    # (2026-10-13) the list KEEPS its rows: a refresh tick updates them in place — the same
+    # buttons, still shown, the list still as tall as its rows. It used to rebuild every row
+    # on every 500 ms tick: the new rows were hidden when measured, so the list collapsed to
+    # 2 px half a second after opening, and a click straddling a tick hit a deleted button.
+    _btn21 = _pop21.rows[1]["_widgets"][1]
+    _h21 = _pop21._scroll.height()
+    assert _h21 > 40, _h21
+    for _tick21 in range(3):
+        _pop21.refresh()
+        app.processEvents()
+    assert _pop21.rows[1]["_widgets"][1] is _btn21, "a kept row keeps its Cancel button"
+    assert _pop21._scroll.height() == _h21 and _btn21.isVisible(), \
+        (_pop21._scroll.height(), _h21)
+    # a REAL click on it goes through Qt's popup mouse path (press + release on the button)
+    from PySide6.QtTest import QTest as _QT21
+    from PySide6.QtCore import Qt as _Qt21
+    _seen21: list = []
+    _orig21 = win.cancel_queue_entry
+    win.cancel_queue_entry = lambda row: (_seen21.append(row["node"]), True)[1]
+    _QT21.mouseClick(_btn21, _Qt21.LeftButton)
+    app.processEvents()
+    win.cancel_queue_entry = _orig21
+    assert _seen21 == [_rq("qC")] and _pop21.isVisible(), _seen21
     # Show goes to the node: its card selected on the canvas
     win.show_queue_entry(_wait21)
     assert [i.node_id for i in win.scene.selectedItems() if hasattr(i, "node_id")] == ["qC"]
@@ -9781,10 +9899,24 @@ def main(argv) -> int:
     _pop21._cancel(_pop21.rows[1])
     assert _r21.queue_depth() == 0 and _cn21 == [_rq("qC")], (_cn21, _r21.queued_nodes())
     assert [r["badge"] for r in _pop21.rows] == ["RUNNING"] and _vb21.text() == "Node queue · 1"
+    # the line shrank: the list was rebuilt, and the row left is still shown at full height
+    assert _pop21._scroll.height() > 20 and _pop21.rows[0]["_widgets"][1].isVisible(), \
+        _pop21._scroll.height()
     # Cancel the RUNNING one: no longer live, its job latched to stop at the next node
     _pop21._cancel(_pop21.rows[0])
     assert _job21.cancelled and 9100 not in _r21._runs and _cn21[-1] == _rq("qB"), _cn21
-    assert not _pop21.rows and _pop21.empty.isVisible() and _vb21.text() == "Node queue"
+    # ...but until the worker reaches that boundary it still holds the slot, so it is
+    # listed as STOPPING — not cancellable again, and not silently gone (2026-10-13)
+    assert [r["badge"] for r in _pop21.rows] == ["STOPPING"], _pop21.rows
+    assert not _pop21.rows[0]["cancellable"] and "next step" in _pop21.rows[0]["detail"], \
+        _pop21.rows[0]
+    assert _vb21.text() == "Node queue · 1" and _r21.cancel_all() == 0
+    # the worker unwinds and the slot frees: `queue_changed` clears the list and the count
+    _r21._active = None
+    _r21._start_next()
+    app.processEvents()
+    assert not _pop21.rows and _pop21.empty.isVisible() and _vb21.text() == "Node queue", \
+        (_pop21.rows, _vb21.text())
     # an ingest is listed but cannot be cancelled, and says why
     _r21._ingesting[_rq("qL")] = "key"
     _pop21.refresh()
@@ -9800,8 +9932,10 @@ def main(argv) -> int:
     win._refresh_queue_ui()
     _ok("NQ1 the Node queue button counts what runs and waits; its list names each node and "
         "page, how long the running one has gone and which node it is computing, each "
-        "waiting one's place in line; Show selects the node, Cancel takes a waiting one out "
-        "of line and stops the running one; an ingest says why it cannot be cancelled; "
+        "waiting one's place in line; refresh ticks keep the rows (same buttons, same "
+        "height) and a real click on Cancel lands; Show selects the node, Cancel takes a "
+        "waiting one out of line and stops the running one, which shows STOPPING until its "
+        "slot frees; an ingest says why it cannot be cancelled; "
         "while a run holds the slot, a node that already ran is served at once — even after "
         "an edit elsewhere on its page — and its frames decode for playback beside the slot; "
         "an edit inside its own cone makes it queue")
@@ -9877,6 +10011,63 @@ def main(argv) -> int:
         "series (6 frames from two 3-frame files, not 3); picking rebuilt frames 1 and 4 "
         "delivers file 1's frame 1 and file 2's frame 1, cut after the builder in the run "
         "graph only; with no picks the cursor's own rebuilt frame runs")
+
+    # ── ACQ: the acquisition record in the Viewer, and no traceback on hover (2026-10-13) ──
+    from nodegraph.placement import jd_to_datetime_text as _jdt
+    _vq = win.viewer
+    _qax = AxisSizes(m=1, t=3, z=1, c=2, y=16, x=16)
+    _qjd = [2461320.63017394 + _k * 1960.0 / 86400.0 for _k in range(3)]
+    _qmd = {"channel_names": ["p53-GFP", "ERK-mRuby2"], "channel_emission_nm": [499.0, 571.0],
+            "channel_acquisition": [
+                [["Laser 488 nm", "Enabled, Power 3.0, Laser Port Standard"], ["Gain", "50.0"]],
+                [["Laser 561 nm", "Enabled, Power 20.0, Laser Port Standard"], ["Gain", "40.0"]]],
+            "acquisition_info": [["Optics", [["Objective", "PLAN APO 10x"]]]],
+            "acquisition_text": {"capturing": "AX\nConfiguration:\n\tDwell Time: 0.8 usec"},
+            "frame_time_jd": _qjd, "frame_datetime": [_jdt(_v, -25200) for _v in _qjd],
+            "utc_offset_s": -25200, "utc_offset_source": "file"}
+    _qpl = {0: np.zeros((16, 16), np.uint16), 1: np.zeros((16, 16), np.uint16)}
+
+    def _qds(md):
+        return _DS2(axes=_qax, metadata=md).with_image(
+            ArrayProvider(np.zeros((1, 3, 1, 2, 16, 16), np.uint16)))
+
+    _vq.show_error("ACQ_BROKEN", "Traceback (most recent call last):\n  File \"x\"\n"
+                                 "ValueError: boom")
+    app.processEvents()
+    assert _vq._view.toolTip() == "", "a failed pull must not put a traceback on the image"
+    assert "Console" in _vq._status.text(), _vq._status.text()
+    _vq.show_result("ACQ", _qpl, _qax, 0.01, dataset=_qds(_qmd))
+    app.processEvents()
+    assert _vq._view.toolTip() == "", "and nothing appears on a later, good result"
+    _tip0, _tip1 = _vq._chan_btns[0].toolTip(), _vq._chan_btns[1].toolTip()
+    assert "Laser 488 nm" in _tip0 and "Power 3.0" in _tip0 and "561" not in _tip0, _tip0
+    assert "Laser 561 nm" in _tip1 and "Gain" in _tip1, _tip1
+    # same channel names, different settings: the strip does not rebuild, the tips still move
+    _qmd2 = dict(_qmd, channel_acquisition=[[["Laser 488 nm", "Enabled, Power 9.0"]],
+                                            [["Laser 561 nm", "Enabled, Power 1.0"]]])
+    _vq.show_result("ACQ", _qpl, _qax, 0.01, dataset=_qds(_qmd2))
+    app.processEvents()
+    assert "Power 9.0" in _vq._chan_btns[0].toolTip(), _vq._chan_btns[0].toolTip()
+    _vq.open_info_dialog()
+    app.processEvents()
+    _dlg = _vq._info_dialog
+    assert _dlg is not None and _dlg.isVisible()
+    _tops = [_dlg._tree.topLevelItem(_i).text(0)
+             for _i in range(_dlg._tree.topLevelItemCount())]
+    assert _tops[0] == "This series — time" and "Channel 1: p53-GFP" in _tops, _tops
+    assert "Source file — Optics" in _tops, _tops
+    _first = _dlg._tree.topLevelItem(0)
+    _rows = {_first.child(_i).text(0): _first.child(_i).text(1)
+             for _i in range(_first.childCount())}
+    assert _rows["First frame"].startswith("2026-10-06 20:07:27.028"), _rows
+    assert "UTC-07:00" in _rows["First frame"] and _rows["Frames (T)"] == "3", _rows
+    assert "Dwell Time" in _dlg._raw.toPlainText(), _dlg._raw.toPlainText()
+    assert "Power 9.0" in _dlg._text, "Copy all carries the channel rows"
+    _dlg.close()
+    _ok("ACQ acquisition record: a failed pull leaves NO tooltip on the image (the trace is in "
+        "the Console), each channel toggle's tooltip lists its own laser/gain rows and follows "
+        "a new payload even when the channel names do not change, and Info opens the series' "
+        "local frame times, the source file's sections, every channel and the raw text")
 
     # the analysis lanes (2026-10-09): a spawned process pool keeps a management thread and
     # its worker processes alive; tear them down before os._exit rather than under it, the

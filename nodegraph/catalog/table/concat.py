@@ -38,6 +38,13 @@ def _compute_table_concat(ctx: EvalContext) -> Dataset:
     * text columns are numpy unicode (memo- and dock-safe); the 2D/3D kind (``z_kind``) must
       agree across inputs; a batch is combined only on its own (one input);
     * no image work: WHOLE_SERIES, nothing read but the tables; no axis or calibration change.
+
+    **A numeric condition** (2026-10-13): when every row's condition reads as a number —
+    ``names = 5000,2500,1000,500,0`` for a standard curve's wells — the table also gets
+    ``condition_value``, the same labels as floats, so a plot can put the condition on an
+    AXIS (``plot.xy`` refuses a text column there). One non-numeric label anywhere and the
+    column is not written: a mixed set is categories, not values. The edit-time column list
+    (:func:`_concat_columns`) applies the same rule to each input's condition.
     """
     files: Tuple[Dataset, ...] = tuple(ctx.input("data") or ())
     if not files:
@@ -117,6 +124,9 @@ def _compute_table_concat(ctx: EvalContext) -> Dataset:
 
     out[TB.CONDITION_COLUMN] = per_input(TB.CONDITION_COLUMN,
                                          lambda k, cols, n: [conds[k]] * n)
+    values = TB.numeric_labels(out[TB.CONDITION_COLUMN].tolist())
+    if values is not None and TB.CONDITION_VALUE_COLUMN not in out:
+        out[TB.CONDITION_VALUE_COLUMN] = np.asarray(values, dtype=float)
     out[TB.INPUT_COLUMN] = np.concatenate(
         [np.full(n, k, dtype=np.int64) for k, n in enumerate(sizes)]) if sizes \
         else np.zeros(0, np.int64)
@@ -176,6 +186,15 @@ def _concat_columns(params: Mapping[str, Any], modes: Mapping[str, Any],
             layer = want or (known[0] if len(known) == 1 else "")
             cols += [c for d, lyr, c in incoming or () if d is dom and lyr == layer]
         cols += [TB.CONDITION_COLUMN, TB.INPUT_COLUMN]
+        # the numeric condition, by the compute's rule: each input's own `condition`
+        # metadata, else its entry in `names`, else input_K — all numbers, or no column
+        raw = TB.param_text(params, "names")
+        names = [x.strip() for x in raw.split(",")] if raw else []
+        conds = [str((getattr(env, "metadata", None) or {}).get(CONDITION_KEY) or "").strip()
+                 or (names[k] if k < len(names) and names[k] else f"input_{k}")
+                 for k, env in enumerate(envs)]
+        if conds and TB.numeric_labels(conds) is not None:
+            cols.append(TB.CONDITION_VALUE_COLUMN)
         if envs and all(TB.envelope_has(env, "frame_time_jd") for env in envs):
             cols += [TB.TIME_COLUMN, TB.CLOCK_COLUMN]
         cols += [col for key, col in TB.PER_M_COLUMNS
@@ -205,7 +224,10 @@ register_node(
                  description="Comma-separated condition labels, one per input in wiring "
                              "order, used only for an input that carries no `condition` of "
                              "its own (a Page Output stamps one). Blank entries fall back to "
-                             "input_0, input_1, ... Changes the labels, never a measurement."),
+                             "input_0, input_1, ... Changes the labels, never a measurement. "
+                             "When EVERY label is a number (5000,2500,1000,500,0) the table "
+                             "also gets a numeric `condition_value` column a plot can use as "
+                             "an axis."),
         InString("name", "Name", field=False, default=_DEFAULT_NAME,
                  description="Name of the combined table this node writes on the output. The "
                              "inputs' own tables are left as they are; reusing an existing "

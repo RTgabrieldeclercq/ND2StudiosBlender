@@ -11510,7 +11510,10 @@ def test_measure_stage_position() -> None:
         assert a is not None, f"missing Point column {name!r}"
         return np.asarray(a.values, dtype=float)
 
-    want_sx = box_x0[mm] + xx * 0.5
+    # DEFAULT_FLIP (2026-10-13): image +x runs along stage -x, +y along stage +y — the
+    # Stitch / Overlay handedness, measured on the lab's AX confocal
+    box_x1 = box_x0 + ext_w
+    want_sx = box_x1[mm] - xx * 0.5
     want_sy = box_y0[mm] + yy * 0.5
     want_sz = np.array([stage_z(int(mm[i]), zz[i]) for i in range(n)])
     assert np.allclose(col_pt("stage_x_um"), want_sx), (col_pt("stage_x_um"), want_sx)
@@ -11520,6 +11523,13 @@ def test_measure_stage_position() -> None:
     # ROW's own z, not broadcast once per field
     assert col_pt("stage_z_um")[0] != col_pt("stage_z_um")[1]
     assert col_pt("stage_x_um")[0] == col_pt("stage_x_um")[1]
+    # Flip X off places the row unflipped — the pre-2026-10-13 column
+    _, out_nf = run([("S", "io.stageseed", {}),
+                     ("Q", "analysis.measure", {"modes": {"target": "point"},
+                                                 "params": {"flip_x": False}})],
+                    [("S", "Q")], "Q", seed=ds_pt)
+    assert np.allclose(np.asarray(out_nf.get(D.POINT, "stage_x_um", layer="blobs").values,
+                                  float), box_x0[mm] + xx * 0.5)
 
     # ── 2. LABEL branch: local x_um/y_um/z_um (new) + stage_* ───────────────────
     raster6 = np.zeros((M, 1, Z, 1, Y, X), dtype=np.int64)
@@ -11545,7 +11555,7 @@ def test_measure_stage_position() -> None:
     assert np.allclose(col_lab("x_um"), lab_cols["x"] * 0.5), col_lab("x_um")
     assert np.allclose(col_lab("y_um"), lab_cols["y"] * 0.5), col_lab("y_um")
     assert np.allclose(col_lab("z_um"), lab_cols["z"] * 2.0), col_lab("z_um")
-    lab_sx = np.array([box_x0[0] + 6.0 * 0.5, box_x0[1] + 8.0 * 0.5])
+    lab_sx = np.array([box_x1[0] - 6.0 * 0.5, box_x1[1] - 8.0 * 0.5])
     lab_sy = np.array([box_y0[0] + 4.0 * 0.5, box_y0[1] + 5.0 * 0.5])
     lab_sz = np.array([stage_z(0, 1.0), stage_z(1, 2.0)])
     assert np.allclose(col_lab("stage_x_um"), lab_sx), (col_lab("stage_x_um"), lab_sx)
@@ -17860,7 +17870,10 @@ def test_checkpoint_dock() -> None:
 #: The lab's real WellA3 pair, as numbers. Both files' geometry is reproduced here exactly
 #: — extents, pixel sizes, stage logs, focus logs, Julian timestamps — so the placement
 #: maths is gated on the acquisition it was designed for without needing a 40 GB ND2 in the
-#: test environment. Read from the files on 2026-07-31 via `read_nd2_metadata_extended`.
+#: test environment. Read from the files on 2026-07-31 via `read_nd2_metadata_extended`;
+#: the Julian timestamps re-read 2026-10-13 off each file's raw frame-0 stamp, after the SDK's
+#: per-frame value was found to add frame 0's offset into the NIS job twice (787.5 s on the
+#: 640 file, 1994.8 s on the GFP one) — see `nodelab_v2.nd2_acquisition`.
 _W3_PRIMARY_XY = [(-14088.6, -29462.8), (-14382.4, -29462.9), (-14382.3, -29169.1),
                   (-14088.5, -29168.9), (-11580.8, -19689.0), (-11874.6, -19688.8),
                   (-11874.8, -19394.9), (-11581.0, -19394.8), (-11368.9, -24369.9),
@@ -17892,8 +17905,11 @@ def test_overlay_placement() -> None:
       source tile would show three-quarters of a field and a black corner;
     * the montage's tiles do not abut to the micron (a 0.18 µm seam), so an exact-coverage
       test calls five of twelve fields defective;
-    * the two files' RELATIVE clocks start 1207.3 s apart, so only the absolute Julian one
-      can report how far apart paired frames really are;
+    * the two files were written by ONE NIS job, so their relative clocks share an origin
+      and start 1207.3 s apart — and the absolute Julian clock must agree (it did not until
+      2026-10-13: the SDK's per-frame value doubled the gap to 2414.6 s, which would put the
+      GFP sweep inside the 640's NEXT sweep; the 640 sweep really ends at 1983.5 s and the
+      GFP one starts at 1994.8 s);
     * ``stagePositionUm.z`` is constant down a stack, so placing the GFP plane in the 640
       stack needs the ZStackLoop anchoring, not just the focus.
 
@@ -17907,14 +17923,14 @@ def test_overlay_placement() -> None:
         "pixel_size_um": _W3_PRIMARY_PS, "z_step_um": 0.288, "bit_depth": 12,
         "stage_xy_um": _W3_PRIMARY_XY, "stage_z_um": _W3_PRIMARY_Z,
         "z_home_index": 0, "z_bottom_to_top": True,
-        "frame_time_jd": [2461249.623022976 + i * (1421.9 / 86400.0) for i in range(16)],
+        "frame_time_jd": [2461249.6139087384 + i * (1421.9 / 86400.0) for i in range(16)],
     }
     pri_ax = AxisSizes(m=12, t=16, z=210, c=1, y=1024, x=1024)
     sec_md = {
         "pixel_size_um": _W3_SECOND_PS, "bit_depth": 12,
         "stage_xy_um": _w3_secondary_xy(),
         "stage_z_um": [5999.74 + 1.7 * i for i in range(49)],
-        "frame_time_jd": [2461249.650969694 + i * (1417.8 / 86400.0) for i in range(16)],
+        "frame_time_jd": [2461249.627882095 + i * (1417.8 / 86400.0) for i in range(16)],
     }
     sec_ax = AxisSizes(m=49, t=16, z=1, c=1, y=1024, x=1024)
 
@@ -17936,12 +17952,15 @@ def test_overlay_placement() -> None:
     # ── absolute clock: index pairing, honest error ───────────────────────────────
     pairs = pair_timepoints(pri_md, 16, sec_md, 16)
     assert all(j == t for t, j, _ in pairs)
-    assert abs(pairs[0][2] - 2414.6) < 2.0, pairs[0]        # GFP[0] is 2415 s after 640[0]
+    assert abs(pairs[0][2] - 1207.3) < 2.0, pairs[0]        # GFP[0] is 1207 s after 640[0]
     # Nearest-in-time runs the OTHER way round: the GFP frame is the SECONDARY, and
-    # GFP[0] is nearest to 640[2], so the shift that would chase the clock is -2 (primary
-    # t pairs with secondary t-2) — which is exactly why nearest-time is not the default.
-    shifted = pair_timepoints(pri_md, 16, sec_md, 16, shift=-2)
-    assert abs(shifted[2][2] + 429.0) < 5.0, shifted[2]     # and the nearest one is EARLIER
+    # GFP[0] (+1207.3 s) is nearer 640[1] (+1421.9 s) than 640[0], so the shift that would
+    # chase the clock is -1 (primary t pairs with secondary t-1) — pairing each GFP sweep
+    # with the 640 stack acquired AFTER it, the opposite of what the job did (each cycle ran
+    # the 640 stacks, then the GFP sweep), which is exactly why nearest-time is not the
+    # default.
+    shifted = pair_timepoints(pri_md, 16, sec_md, 16, shift=-1)
+    assert abs(shifted[1][2] + 214.6) < 5.0, shifted[1]     # and the nearest one is EARLIER
     assert shifted[0][1] is None and shifted[0][2] is None   # shift walks off the start
     off_end = plan_placement(pri_md, pri_ax, sec_md, sec_ax, t_shift=2)
     assert any("no secondary frame" in w for w in off_end.warnings), off_end.warnings
@@ -17958,8 +17977,8 @@ def test_overlay_placement() -> None:
     held = pair_timepoints(pri_md, 16, still_md, 1)
     assert [j for _, j, _ in held] == [0] * 16, held
     # the readout still says how far the primary has travelled from the still
-    assert abs(held[0][2] - 2414.6) < 2.0, held[0]
-    assert abs(held[15][2] - (2414.6 - 15 * 1421.9)) < 5.0, held[15]
+    assert abs(held[0][2] - 1207.3) < 2.0, held[0]
+    assert abs(held[15][2] - (1207.3 - 15 * 1421.9)) < 5.0, held[15]
     # a still ignores t_shift rather than being shifted off its only frame
     assert [j for _, j, _ in pair_timepoints(pri_md, 16, still_md, 1, shift=5)] == [0] * 16
     # a SHORT secondary is NOT broadcast — three frames is a genuine mismatch
@@ -18078,7 +18097,7 @@ def test_overlay_placement() -> None:
     entry = {
         "tiles": [[m, [[j, f] for j, f in plan.tiles[m]]] for m in sorted(plan.tiles)],
         "offset_um": [0.0, 0.0, 0.0], "flip_x": True, "flip_y": False,
-        "t_pairs": [[t, t, 2414.6] for t in range(16)]}
+        "t_pairs": [[t, t, 1207.3] for t in range(16)]}
     # a reader that ignores the window it is offered: the whole tile, which is what every
     # in-memory reader hands back and the contract compose_secondary_plane keeps supporting
     tile_of = lambda j, _want=None: np.full((64, 64), float(j), dtype=np.float32)
@@ -18200,8 +18219,8 @@ def test_overlay_placement() -> None:
     _ok("overlay placement (V2.19): the real WellA3 pair placed by stage µm — 12 primary "
         "fields resolve to 1/2/4 GFP tiles (m10 draws four), 5.985x pixel ratio reported, "
         "the 0.18 µm montage seam NOT called a hole, index t-pairing carries the absolute "
-        "+2415 s from the shared Julian clock (chasing it would need shift=-2, nearest at "
-        "-429 s, which walks off the start), a single plane places inside a 210-slice "
+        "+1207.3 s from the shared Julian clock (chasing it would need shift=-1, nearest at "
+        "-214.6 s, which walks off the start), a single plane places inside a 210-slice "
         "stack via the ZStackLoop "
         "anchoring and an unanchored stack REFUSES, a nudge re-selects tiles; the primary "
         "passes through with the same provider/axes/calibration, overlays chain to 3 "
@@ -33591,6 +33610,1057 @@ def test_lattice_tables_elided_batch() -> None:
         "T; builder → Stabilize → the Spreadsheet's tables carry every rebuilt frame's drift")
 
 
+#: The lab's CRC_TF_ELISA ``CRC_1_T1..T5`` JOBS series as numbers (read 2026-10-13): each
+#: file's raw frame-0 stamp (``dTimeAbsolute``, UTC Julian day) and the ``relativeTimeMs``
+#: of position 0 / plane 0 at every timepoint — the job-relative clock. The run began at
+#: 2026-10-06 19:47:21.215 local (the JOBS folder's own name) and the PC is UTC-7.
+_CRC1_STAMPS = {
+    "CRC_1_T1.nd2": (2461320.63017394, [1205813.1, 11005041.5, 20805729.9, 30613583.0,
+                                        40417162.3, 50194424.4, 59955624.1, 69745482.0]),
+    "CRC_1_T2.nd2": (2461320.65279192, [3160007.5, 12967539.4, 22762389.3, 32572758.0,
+                                        42374798.0, 52139978.3, 61910498.8, 71704873.1]),
+    "CRC_1_T3.nd2": (2461320.67533994, [5108156.5, 14930288.7, 24723403.5, 34540073.7,
+                                        44330809.1, 54085446.7, 63865485.4, 73664089.6]),
+    "CRC_1_T4.nd2": (2461320.69811433, [7075863.6, 16888663.8, 26686930.8, 36497768.2,
+                                        46282859.6, 56041518.2, 65825334.6]),
+    "CRC_1_T5.nd2": (2461320.72081583, [9037273.7, 18847974.3, 28653581.2, 38460287.4,
+                                        48236085.5, 57995326.5, 67787807.9]),
+}
+_CRC1_DIR = r"G:\McGhee Lab\CRC_TF_ELISA\20261006_194721_215"
+
+#: The NIS ``text_info["capturing"]`` block of those files, verbatim (three channels).
+_CRC1_CAPTURING = (
+    "AX\nConfiguration:\n\tDetector mode: Multi-Channel\n\tScanner: Galvano Unidirectional\n"
+    "\tScan Mode: Band\n\tResolution: 2048 x 2048\n\tDwell Time: 0.8 usec\n"
+    "\t\tp53-GFP, ERK-mRuby2, H2B-iRFP670\nComponents:\nComponent p53-GFP:\n\tDetector: 2\n"
+    "\tEmission Range: 499 nm - 551 nm\n\tGain: 50.0\n\tOffset: 0\n\tPinhole Size: 37.5 µm\n"
+    "\tFirst DM: 405/488/561/640 (Position 1)\n\tLaser 488 nm:\n\t\tEnabled\n\t\tPower: 3.0\n"
+    "\t\tLaser Port: Standard\n\nComponent ERK-mRuby2:\n\tDetector: 4\n"
+    "\tEmission Range: 571 nm - 625 nm\n\tGain: 40.0\n\tOffset: 0\n\tPinhole Size: 37.5 µm\n"
+    "\tFirst DM: 405/488/561/640 (Position 1)\n\tLaser 561 nm:\n\t\tEnabled\n\t\tPower: 20.0\n"
+    "\t\tLaser Port: Standard\n\nComponent H2B-iRFP670:\n\tDetector: 3\n"
+    "\tEmission Range: 655 nm - 850 nm\n\tGain: 75.0\n\tOffset: 0\n\tPinhole Size: 37.5 µm\n"
+    "\tFirst DM: 405/488/561/640 (Position 1)\n\tLaser 640 nm:\n\t\tEnabled\n\t\tPower: 10.0\n"
+    "\t\tLaser Port: Standard\n\nScan Area:\n\tZoom: 1.00\n\tOffset X: 0.00\n\tOffset Y: 0.00\n"
+    "\tRotation: 0.00\n\nMisc:\n\tDetector Port: Standard\n\tImage Mode: Normal\n"
+    "\tIR Filter Position: Out\n")
+
+
+def test_nd2_true_clock() -> None:
+    """The ND2 acquisition clock, rebuilt from the file's ONE absolute stamp (2026-10-13).
+
+    An ND2 stores frame 0's Julian day (UTC) and each frame's ``relativeTimeMs``, whose
+    origin is the start of the RUN — for an NIS JOBS run writing several files, the job
+    start, shared by all of them. ``nd2`` builds each frame's Julian day as ``jd0 + rel``,
+    adding frame 0's own offset into the job twice. On the lab's ``CRC_1_T1..T5`` series
+    (one job, five files, acquired round robin: T1 t0, T2 t0 … T5 t0, T1 t1 …) that made
+    the Timeseries Builder play true frames 0,1,2,5,3,6,4,7,10,8,… — the monolayer
+    "twitching" back in time — and on the WellA3 pair it doubled a 1207.3 s gap.
+
+    1. the composition and the zone: ``frame_jd = jd0 + (rel - rel0)``; the file's local
+       ``date`` against its last frame gives UTC-7, an unmatchable date falls back to this
+       computer; ``jd_to_datetime_text`` applies the offset.
+    2. the CRC_1 series as the files' own numbers, through the REAL Builder: the SDK's
+       composition reproduces the twitch, the corrected clock plays T1..T5 round robin.
+    3. the stopped run's partial last frame cropped out — AFTER the Builder (output frame
+       37) or BEFORE it (T3's t7) — leaves 37 frames in true order, each with its right
+       local time, and Export TIFF writes those same times (OME and ImageJ).
+    4. a troubleshooting T pin subsets the seed's clock with its frames.
+    5. the acquisition record: the NIS settings text parses into per-channel rows (laser
+       line and power, gain, detector…); a channel tap keeps its own channel's rows; the
+       Viewer's channel tooltip and Info window show them.
+    6. the real files, when this machine can see them: the reader produces (2)'s clock,
+       UTC-7 read from the file itself, and the record.
+    """
+    import os
+    import re
+    import shutil
+    import tempfile
+    from types import SimpleNamespace as NS
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, channel_subset,
+                                    chain_members, chain_frame_order)
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import jd_to_datetime_text
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import nd2_acquisition as ACQ
+    from nodelab_v2.acquisition_view import (channel_tooltip, info_sections,
+                                             series_time_rows)
+    from nodelab_v2.runner import pinned_seed_metadata
+
+    AZ = -7 * 3600
+    names = list(_CRC1_STAMPS)
+
+    # ── 1. composition and zone ─────────────────────────────────────────────────
+    jd0, rels = _CRC1_STAMPS["CRC_1_T1.nd2"]
+    stamp = (jd0, rels[0])
+    assert ACQ.frame_jd(stamp, rels[0]) == jd0
+    assert abs((ACQ.frame_jd(stamp, rels[1]) - jd0) * 86400 - (rels[1] - rels[0]) / 1000) < 1e-3
+    assert jd_to_datetime_text(jd0, AZ) == "2026-10-06 20:07:27.028", jd_to_datetime_text(jd0, AZ)
+    assert jd_to_datetime_text(jd0) == "2026-10-07 03:07:27.028", "offset 0 is UTC"
+    # the run's start = frame 0 less its relative time = the JOBS folder name, to the ms
+    start = jd_to_datetime_text(jd0 - rels[0] / 86_400_000, AZ)
+    assert start == "2026-10-06 19:47:21.215", start
+    # T1's last acquired frame (70558852.2 ms) against its own `date` (local, at close)
+    last = ACQ.frame_jd(stamp, 70558852.2)
+    assert ACQ.utc_offset("10/7/2026  3:23:20 PM", [last, jd0]) == (AZ, "file")
+    assert ACQ.utc_offset("10/7/2026  3:23:20 PM", [last])[1] == "file"
+    off, src = ACQ.utc_offset("1/1/2000  1:02:03 AM", [last])
+    assert src == "this computer" and isinstance(off, int), (off, src)
+    assert ACQ.offset_text(AZ) == "UTC-07:00" and ACQ.offset_text(19800) == "UTC+05:30"
+
+    # ── 2. the series through the real Builder ──────────────────────────────────
+    def clock(name, sdk=False):
+        j0, rs = _CRC1_STAMPS[name]
+        return [j0 + (r if sdk else r - rs[0]) / 86_400_000 for r in rs]
+
+    def card(fid, name, jd, cut_t=None):
+        t = len(jd)
+        a = np.zeros((1, t, 1, 1, 4, 4), dtype=np.uint16)
+        for i in range(t):
+            a[0, i] = 10 * fid + i                    # value = (file, own frame)
+        md = {"pixel_size_um": 0.86, SOURCE_FILE_KEY: [name], "frame_time_jd": list(jd),
+              "frame_datetime": [jd_to_datetime_text(v, AZ) for v in jd],
+              "utc_offset_s": AZ, "dt_s": 9800.0}
+        return Dataset(axes=AxisSizes(m=1, t=t, z=1, c=1, y=4, x=4),
+                       metadata=md).with_image(ArrayProvider(a))
+
+    def run(seeds, *, crop_after=None, crop_before=None, export=None, model="ome"):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
+        nodes["C"] = NodeInstance("C", "util.timeseries")      # T, time: the defaults
+        edges = []
+        for i in range(len(seeds)):
+            sock = "data" if i == 0 else f"file_{i + 1}"
+            if crop_before is not None and crop_before[0] == i:
+                nodes["K0"] = NodeInstance("K0", "util.crop", modes={"region": "frames"},
+                                           params={"frames": crop_before[1]})
+                edges += [Edge(f"L{i}", "K0", "image", "data"), Edge("K0", "C", "out", sock)]
+            else:
+                edges.append(Edge(f"L{i}", "C", "image", sock))
+        pull = "C"
+        if crop_after is not None:
+            nodes["K"] = NodeInstance("K", "util.crop", modes={"region": "frames"},
+                                      params={"frames": crop_after})
+            edges.append(Edge("C", "K", "out", "data"))
+            pull = "K"
+        if export is not None:
+            nodes["W"] = NodeInstance("W", "io.write_tiff", params={"path": export},
+                                      modes={"model": model})
+            edges.append(Edge(pull, "W", "out", "data"))
+            pull = "W"
+        g = Graph(nodes=nodes, edges=edges)
+        eng = Engine(g, computes=COMPUTES, seeds={f"L{i}": d for i, d in enumerate(seeds)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(seeds)})
+        return eng, eng.pull(pull), pull
+
+    def frames(ds):
+        return [int(ds.image.get_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0])
+                for t in range(int(ds.axes.t))]
+
+    round_robin = [10 * (k % 5 + 1) + k // 5 for k in range(38)]
+    true_rank = {v: i for i, v in enumerate(round_robin)}
+
+    # the SDK's composition: the twitch, through the real node
+    sdk = [card(i + 1, n, clock(n, sdk=True)) for i, n in enumerate(names)]
+    _e, out_sdk, _p = run(sdk)
+    got = [true_rank[v] for v in frames(out_sdk)]
+    assert got[:12] == [0, 1, 2, 5, 3, 6, 4, 7, 10, 8, 11, 9], got[:12]
+    assert sum(b < a for a, b in zip(got, got[1:])) == 14, "14 steps back in time"
+
+    # the corrected clock: round robin, every step forward, ~32.7 min apart
+    seeds = [card(i + 1, n, clock(n)) for i, n in enumerate(names)]
+    eng, out, _p = run(seeds)
+    assert out.axes.t == 38 and frames(out) == round_robin, frames(out)
+    jd = out.metadata["frame_time_jd"]
+    steps = [(b - a) * 86400 for a, b in zip(jd, jd[1:])]
+    assert all(1940 < s < 1975 for s in steps), (min(steps), max(steps))
+    assert abs(out.metadata["dt_s"] - 1960) < 15, out.metadata["dt_s"]
+    assert out.metadata["frame_datetime"][0] == "2026-10-06 20:07:27.028"
+    assert out.metadata["frame_datetime"][5].startswith("2026-10-06 22:50:46"), \
+        "output frame 5 is T1's second timepoint"
+    assert out.metadata["utc_offset_s"] == AZ
+    note = out.metadata["__chain__"]
+    assert note["interleaved"] and "2026-10-06 20:07:27.028 → 2026-10-07 16:15:05" in note["note"], \
+        note["note"]
+    assert note["first_frame"][0] == "2026-10-06 20:07:27.028", note["first_frame"]
+    # the chain's file-level ORDER under the same five clocks
+    mems, _n, prob = chain_members([(d.metadata, d.axes) for d in seeds], "t", order="time")
+    assert prob is None and chain_frame_order(mems, "t", "time") is not None
+
+    # ── 3. the partial last frame cropped out, after or before the Builder ───────
+    want_jd = jd[:37]
+    for how in ("after", "before"):
+        kw = ({"crop_after": "t0-36"} if how == "after" else {"crop_before": (2, "t0-6")})
+        eng_c, out_c, pull = run([card(i + 1, n, clock(n)) for i, n in enumerate(names)], **kw)
+        assert out_c.axes.t == 37 and frames(out_c) == round_robin[:37], (how, frames(out_c))
+        assert out_c.metadata["frame_time_jd"] == want_jd, how
+        fd = out_c.metadata["frame_datetime"]
+        assert len(fd) == 37 and fd[0] == "2026-10-06 20:07:27.028", (how, fd[0])
+        assert fd[36].startswith("2026-10-07 15:42:26"), (how, fd[36])    # T2's t7
+        assert eng_c.env(pull).metadata.get("frame_time_jd") == want_jd, \
+            f"{how}: the edit-time envelope carries the same clock as the pull"
+        assert abs(out_c.metadata["dt_s"] - 1960) < 15, (how, out_c.metadata.get("dt_s"))
+        rows = dict(series_time_rows(out_c.metadata, 37))
+        assert rows["Frames (T)"] == "37" and rows["First frame"].startswith(
+            "2026-10-06 20:07:27.028") and "UTC-07:00" in rows["First frame"], rows
+        assert rows["Last frame"].startswith("2026-10-07 15:42:26"), rows
+
+    # ...and the export writes exactly those times
+    try:
+        import tifffile
+    except Exception:  # noqa: BLE001
+        tifffile = None
+    tmp = tempfile.mkdtemp(prefix="nd2sb_clock_")
+    try:
+        if tifffile is not None:
+            p_ome = os.path.join(tmp, "crc.ome.tif")
+            run([card(i + 1, n, clock(n)) for i, n in enumerate(names)],
+                crop_after="t0-36", export=p_ome)
+            with tifffile.TiffFile(p_ome) as tf:
+                xml = tf.ome_metadata
+            assert ("<AcquisitionDate>2026-10-06T20:07:27.028-07:00</AcquisitionDate>"
+                    in xml), xml[:600]
+            dts = [float(v) for v in re.findall(r'DeltaT="([0-9.eE+-]+)"', xml)]
+            secs = [(v - want_jd[0]) * 86400 for v in want_jd]
+            assert len(dts) == 37 and all(abs(a - b) < 1e-3 for a, b in zip(dts, secs)), \
+                (len(dts), dts[:3], secs[:3])
+            assert 'K="t0036">2026-10-07 15:42:26' in xml, "every frame's local time"
+            p_ij = os.path.join(tmp, "crc_ij.tif")
+            run([card(i + 1, n, clock(n)) for i, n in enumerate(names)],
+                crop_after="t0-36", export=p_ij, model="imagej")
+            with tifffile.TiffFile(p_ij) as tf:
+                ij = tf.imagej_metadata
+            labels = list(ij.get("Labels") or [])
+            assert len(labels) == 37 and "2026-10-06 20:07:27.028" in labels[0], labels[:2]
+            assert "2026-10-07 15:42:26" in labels[36], labels[36]
+            assert "Frame times (UTC-07:00" in str(ij.get("Info") or ""), ij.get("Info")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── 4. a T pin subsets the clock with the frames ─────────────────────────────
+    disp = {"frame_time_jd": [1.0, 2.0, 3.0, 4.0], "frame_datetime": ["a", "b", "c", "d"],
+            "stage_xy_um": [(0.0, 0.0), (1.0, 1.0)]}
+    md_p = pinned_seed_metadata({}, disp, ((1,), (1, 3), None, None), 2, 4)
+    assert md_p["frame_time_jd"] == [2.0, 4.0] and md_p["frame_datetime"] == ["b", "d"], md_p
+    assert md_p["stage_xy_um"] == [(1.0, 1.0)], md_p
+    assert pinned_seed_metadata({}, disp, None, 2, 4)["frame_time_jd"] == [1.0, 2.0, 3.0, 4.0]
+    short = pinned_seed_metadata({}, {"frame_time_jd": [1.0, 2.0]}, (None, (3,), None, None), 1, 4)
+    assert "frame_time_jd" not in short, "a list too short to subset is dropped, not padded"
+
+    # ── 5. the acquisition record ────────────────────────────────────────────────
+    chans = [NS(channel=NS(name=n, excitationLambdaNm=ex, emissionLambdaNm=em,
+                           color=NS(r=r, g=g, b=b)),
+                microscope=NS(modalityFlags=["fluorescence", "laserScanConfocal"],
+                              objectiveName="PLAN APO 10x", objectiveMagnification=10.0,
+                              objectiveNumericalAperture=0.45, immersionRefractiveIndex=1.0,
+                              zoomMagnification=4.0, projectiveMagnification=None,
+                              pinholeDiameterUm=37.48),
+                volume=NS(axesCalibration=(0.859, 0.859, 15.0)))
+             for n, ex, em, (r, g, b) in (("p53-GFP", 488.0, 499.0, (54, 255, 0)),
+                                          ("ERK-mRuby2", 561.0, 571.0, (255, 0, 255)),
+                                          ("H2B-iRFP670", 640.0, 655.0, (165, 0, 0)))]
+    ev = {"Time [s]": [1205.8, 1211.8], "T Index": [0, 0],
+          "p53-GFP - Gain [%]": [50.0, 50.0], "p53-GFP - Laser Power [%]": [3.0, 3.0],
+          "ERK-mRuby2 - Gain [%]": [40.0, 40.0], "ERK-mRuby2 - Laser Power [%]": [20.0, 20.0],
+          "H2B-iRFP670 - Gain [%]": [75.0, 75.0],
+          "H2B-iRFP670 - Laser Power [%]": [10.0, 10.0],
+          "PFS Offset": [7827, 7636], "X Coord [µm]": [43356.7, 41773.0]}
+    fake = NS(text_info={"capturing": _CRC1_CAPTURING, "date": "10/7/2026  3:23:20 PM",
+                         "optics": "PLAN APO 10x", "description": "Camera Name: AX\n"},
+              metadata=NS(channels=chans), events=lambda orient="list": ev,
+              custom_data={"AppInfo_V1_0": {"SWNameString": "NIS-Elements AR",
+                                            "VersionString": "6.02.01"}},
+              experiment=[], sizes={"T": 8, "P": 40, "Z": 3, "C": 3, "Y": 2048, "X": 2048},
+              attributes=NS(bitsPerComponentSignificant=12, compressionType=None),
+              dtype="uint16")
+    rec = ACQ.acquisition_record(fake, channel_names=[c.channel.name for c in chans],
+                                 frame_jd_first=jd0, frame_jd_last=last, utc_offset_s=AZ,
+                                 utc_offset_source="file", stamp=stamp)
+    per = rec["channel_acquisition"]
+    assert len(per) == 3
+    gfp = dict((k, v) for k, v in per[0])
+    assert gfp["Laser 488 nm"] == "Enabled, Power 3.0, Laser Port Standard", gfp
+    assert gfp["Gain"] == "50.0" and gfp["Detector"] == "2" and gfp["Offset"] == "0", gfp
+    assert gfp["Emission Range"] == "499 nm - 551 nm" and gfp["Pinhole Size"] == "37.5 µm"
+    assert gfp["Laser Power (recorded)"] == "3 %" and gfp["Gain (recorded)"] == "50 %", gfp
+    assert gfp["Excitation"] == "488 nm" and gfp["Display colour"] == "#36ff00", gfp
+    erk = dict((k, v) for k, v in per[1])
+    assert erk["Laser 561 nm"].startswith("Enabled, Power 20.0") and erk["Gain"] == "40.0", erk
+    sec = dict((t, dict((k, v) for k, v in rows)) for t, rows in rec["acquisition_info"])
+    assert sec["Acquisition settings"]["Configuration › Dwell Time"] == "0.8 usec", sec
+    assert sec["Time"]["First frame"] == "2026-10-06 20:07:27 (UTC-07:00)", sec["Time"]
+    assert sec["Time"]["Last frame"] == "2026-10-07 15:23:20 (UTC-07:00)", sec["Time"]
+    assert sec["Time"]["Run started"].startswith("2026-10-06 19:47:21"), sec["Time"]
+    assert sec["Recorded data (per frame)"]["PFS Offset"].startswith("7636 – 7827"), sec
+    assert "p53-GFP - Gain" not in sec["Recorded data (per frame)"], \
+        "a channel's recorded data is listed under the channel, not the file"
+    assert sec["File"]["Software"] == "NIS-Elements AR 6.02.01", sec["File"]
+    # a channel tap keeps ITS channel's rows (PER_CHANNEL_KEYS)
+    md_c = {"channel_names": [c.channel.name for c in chans], "channel_acquisition": per}
+    tap = channel_subset(md_c, [1])
+    assert tap["channel_names"] == ["ERK-mRuby2"] and tap["channel_acquisition"] == [per[1]]
+    tip = channel_tooltip(tap, 0, "ERK-mRuby2", emission_nm=571.0, hint="click")
+    assert "ERK-mRuby2 · 571 nm" in tip and "Laser 561 nm" in tip and "Power 20.0" in tip, tip
+    assert "Laser 488 nm" not in tip, "another channel's laser never leaks into the tip"
+    md_i = dict(out.metadata, **md_c, acquisition_info=rec["acquisition_info"])
+    titles = [t for t, _r in info_sections(md_i, AxisSizes(m=1, t=38, z=1, c=3, y=4, x=4))]
+    assert titles[0] == "This series — time" and titles[1] == "This series — files", titles
+    assert "Source file (the series' first file) — Time" in titles, titles
+    assert titles[-3:] == ["Channel 1: p53-GFP", "Channel 2: ERK-mRuby2",
+                           "Channel 3: H2B-iRFP670"], titles
+
+    # ── 6. the real files ────────────────────────────────────────────────────────
+    paths = [os.path.join(_CRC1_DIR, n) for n in names]
+    if all(os.path.exists(p) for p in paths):
+        from nodelab_v2.nd2_meta import read_nd2_metadata_extended
+        for n, p in zip(names, paths):
+            md = read_nd2_metadata_extended(p)
+            assert md["utc_offset_s"] == AZ and md["utc_offset_source"] == "file", \
+                (n, md.get("utc_offset_s"), md.get("utc_offset_source"))
+            got = md["frame_time_jd"]
+            assert len(got) == len(clock(n)) and all(
+                abs(a - b) * 86400 < 0.005 for a, b in zip(got, clock(n))), n
+            assert md["frame_datetime"][0][:19] == jd_to_datetime_text(clock(n)[0], AZ)[:19], n
+            assert md["channel_acquisition"] and md["acquisition_info"], n
+        md1 = read_nd2_metadata_extended(paths[0])
+        assert md1["acquisition_start"] == "2026-10-06 20:07:27", md1["acquisition_start"]
+        assert dict(md1["channel_acquisition"][0])["Laser Power (recorded)"] == "3 %"
+        real = "the real CRC_1 files read to that clock, UTC-7 from their own dates"
+    else:
+        real = "real CRC_1 files not on this machine — their numbers are pinned above"
+
+    _ok("ND2 true clock (2026-10-13): frame k = frame 0's UTC stamp + (rel[k] - rel[0]); "
+        "the SDK's jd0 + rel reproduces the CRC_1 twitch through the real Builder (true "
+        "frames 0,1,2,5,3,6,4,7,…, 14 steps back) and the corrected clock plays T1..T5 "
+        "round robin 32.7 min apart; the run start lands on the JOBS folder's 19:47:21.215; "
+        "the file's own local date gives UTC-7; cropping the stopped run's partial frame "
+        "after OR before the Builder leaves 37 frames in true order with local times, and "
+        "OME/ImageJ exports write those same times; a T pin subsets the seed's clock; the "
+        "NIS settings parse into per-channel laser/gain/detector rows that follow a channel "
+        f"tap into the Viewer's tooltip and Info window; {real}")
+
+
+def test_standard_curve_trendline() -> None:
+    """A standard curve end to end (2026-10-13): Table Concat's numeric ``condition_value``
+    and Plot XY's ``fit`` / ``zero_x``.
+
+    1. ``xy_fit`` fits IN THE PLOTTED COORDINATES: an exact power law on log-log axes comes
+       back as its own A and b with R² = 1; an exact line on linear axes as its slope and
+       intercept; fewer than two distinct x gives no fit.
+    2. ``xy_zero_refs`` averages EVERY blank row — a background-subtracted blank scatters
+       around 0 — and marks a mean <= 0 not drawable on a log y axis rather than averaging
+       only the positive rows (the bug that drew a config-2 blank at +5 when it was -2).
+    3. Table Concat writes ``condition_value`` only when every condition is a number, and
+       its edit-time column list says so too.
+    4. Plot XY through the Engine: the trendline per series matches ``xy_fit`` on the
+       means it draws, the blank becomes each series' reference and is NOT in the fit, the
+       defaults (``none`` / ``drop``) leave the old figure unchanged, and the new modes fold
+       into the recipe hash.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.registry import NODES
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # 1. the fit
+    xs = np.array([500.0, 1000.0, 2500.0, 5000.0])
+    f = FIG.xy_fit(xs, 3.0 * xs ** 0.8, log_x=True, log_y=True)
+    assert abs(f["slope"] - 0.8) < 1e-9 and abs(10 ** f["intercept"] - 3.0) < 1e-9, f
+    assert abs(f["r2"] - 1.0) < 1e-12 and "x^0.800" in f["text"], f
+    g = FIG.xy_fit(xs, 2.0 * xs + 5.0)
+    assert abs(g["slope"] - 2.0) < 1e-9 and abs(g["intercept"] - 5.0) < 1e-6, g
+    assert FIG.xy_fit([1.0, 1.0], [2.0, 3.0]) is None, "one distinct x fixes no line"
+    assert FIG.xy_fit([0.0, 10.0], [1.0, 2.0], log_x=True) is None, "x = 0 is off a log axis"
+
+    # 2. the blank level
+    refs = FIG.xy_zero_refs([0, 0, 0, 500], [-2.0, 1.0, -1.0, 9.0], ["a", "a", "a", "a"],
+                            log_y=True)
+    assert abs(refs["a"]["y"] + 2.0 / 3.0) < 1e-12 and refs["a"]["n"] == 3, refs
+    assert refs["a"]["drawable"] is False, "a mean <= 0 is not drawn on a log y axis"
+    assert FIG.xy_zero_refs([0], [-1.0])[""]["drawable"] is True, "linear y draws it"
+
+    # 3 + 4. wells → concat → plot
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4)
+
+    def well(level, n=4):
+        sig = np.concatenate([[level * (1.0 - 0.3 * tt) + d for d in (-1.0, 0.0, 1.0, 0.0)]
+                              for tt in (0, 1)])
+        rows = {"id": np.arange(1, 2 * n + 1), "m": np.zeros(2 * n, int),
+                "t": np.repeat([0, 1], n), "c": np.zeros(2 * n, int), "z": np.zeros(2 * n),
+                "y": np.zeros(2 * n), "x": np.zeros(2 * n), "sig": sig}
+        ds = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+            ArrayProvider(np.zeros((1, 2, 1, 1, 4, 4))))
+        return ds.with_structure(StructureTable(Domain.LABEL, rows, layer="beads"))
+
+    seeds = {"A": well(3.0 * 5000 ** 0.8), "B": well(3.0 * 1000 ** 0.8),
+             "C": well(3.0 * 500 ** 0.8), "Z": well(0.0)}
+
+    def run(names, plot_modes=None, plot=True):
+        nodes = {k: NodeInstance(k, "io.load") for k in seeds}
+        nodes["K"] = NodeInstance("K", "table.concat",
+                                  params={"names": names, "name": "curve"})
+        edges = [Edge(k, "K", "image", "data") for k in seeds]
+        if plot:
+            nodes["P"] = NodeInstance("P", "plot.xy", modes=dict(
+                {"error": "sem", "kind": "scatter"}, **(plot_modes or {})),
+                params={"table": "curve", "x": "condition_value", "y": "sig",
+                        "group_by": "t", "log_x": True, "log_y": True})
+            edges.append(Edge("K", "P", "out", "data"))
+        return Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds=seeds,
+                      meta_seeds={k: MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                  for k, d in seeds.items()})
+
+    eng = run("5000,1000,500,0", {"fit": "linear", "zero_x": "reference_line"})
+    k = eng.pull("K")
+    cols = {a.name: np.asarray(a.values) for a in k.layers_on(Domain.LABEL) if a.layer == "curve"}
+    assert sorted(np.unique(cols["condition_value"]).tolist()) == [0.0, 500.0, 1000.0, 5000.0]
+    assert cols["condition_value"].dtype.kind == "f" and cols["condition"].dtype.kind == "U"
+    declared = {c for _d, lyr, c in NODES.get("table.concat").adds_columns(
+        {"names": "5000,1000,500,0", "name": "curve"}, {"domain": "label"}, (),
+        [(None, eng.env(n)) for n in "ABCZ"]) if lyr == "curve"}
+    assert "condition_value" in declared, declared
+    k2 = run("high,1000,500,0", plot=False).pull("K")
+    assert not any(a.name == "condition_value" for a in k2.layers_on(Domain.LABEL)), \
+        "one text label makes the conditions categories: no numeric column"
+
+    spec = eng.pull("P").metadata["figure_spec"]
+    series = {s["label"]: s for s in spec["series"]}
+    assert sorted(series) == ["0", "1"], sorted(series)
+    for lab, s in series.items():
+        assert s["x"] == [500.0, 1000.0, 5000.0], s["x"]        # blanks are not points
+        ref = FIG.xy_fit(s["x"], s["y"], log_x=True, log_y=True)
+        assert abs(s["fit"]["slope"] - ref["slope"]) < 1e-12 and s["fit"]["r2"] > 0.999, s["fit"]
+        assert abs(s["fit"]["slope"] - 0.8) < 1e-6, s["fit"]
+        assert s["zero_ref"]["n"] == 4 and abs(s["zero_ref"]["y"]) < 1e-12 and \
+            s["zero_ref"]["drawable"] is False, s["zero_ref"]
+        assert s["legend"].startswith(f"{lab} — y = ") and "R² = " in s["legend"], s["legend"]
+    plain = run("5000,1000,500,0").pull("P").metadata["figure_spec"]
+    assert not any("fit" in s or "zero_ref" in s for s in plain["series"]), \
+        "the defaults draw exactly the old figure"
+    e2 = run("5000,1000,500,0")
+    e2.pull("P")
+    assert e2.entry("P").recipe_hash != eng.entry("P").recipe_hash, "fit/zero_x key the memo"
+    _ok("standard curve (2026-10-13): xy_fit fits in the plotted coordinates (a power law on "
+        "log-log is its own A and b, R² 1); the x <= 0 reference averages every blank row and "
+        "marks a mean <= 0 undrawable on log y; Table Concat writes condition_value only for "
+        "all-numeric conditions and declares it at edit time; Plot XY fits each series' means, "
+        "keeps the blank out of the fit as its reference, defaults to the old figure, and keys "
+        "the memo on the new modes")
+
+
+
+def test_pooled_pixel_spread() -> None:
+    """Error bars over every PIXEL of every object, not over the object means (2026-10-13).
+
+    1. The Voxel->Label bridge's ``std`` is each region's sample SD (n - 1), NaN for a
+       one-voxel region, equal to numpy's on the region's own voxels; Measure writes it as
+       ``std_intensity`` and declares it at edit time.
+    2. ``pooled_stats`` on (mean, count, SD) per object IS the mean and n - 1 SD of the
+       pooled raw values — checked against literally concatenating them — and skips a row
+       it cannot pool.
+    3. Plot XY ``error = pooled_sd`` through the Engine: each point is the pixel-weighted
+       mean at its x and its bar the SD of all those pixels (not the SD of the means,
+       which ``sd`` keeps), ``n_pooled`` counts the pixels, the blank reference is pixel-weighted too,
+       a missing Pool SD column is refused by name, and the mode keys the memo.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.bridges import voxel_to_label
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # 1. the bridge
+    lab = np.zeros((1, 1, 1, 1, 6, 6), dtype=np.int64)
+    lab[..., 0:2, 0:3] = 1
+    lab[..., 4:6, 2:6] = 2
+    lab[..., 3, 0] = 3
+    val = (np.arange(36, dtype=float).reshape(lab.shape) * 7.0) % 23.0
+    ids, sd = voxel_to_label(val, lab, "std")
+    want = [np.std(val[lab == k], ddof=1) for k in (1, 2)]
+    assert ids.tolist() == [1, 2, 3] and np.allclose(sd[:2], want, atol=1e-12), (sd, want)
+    assert np.isnan(sd[2]), "one voxel has no sample SD"
+    cols = {c for _d, _l, c in NODES.get("analysis.measure").adds_columns(
+        {"labels": "labels", "stats": "mean,count,std"}, {"target": "label"}, ())}
+    assert "std_intensity" in cols, cols
+
+    # 2. the pooling identity
+    objs = [np.array([10.0, 12.0, 14.0]), np.array([20.0, 21.0]), np.array([30.0]),
+            np.array([5.0, 9.0, 13.0, 17.0])]
+    allv = np.concatenate(objs)
+    m, s, n = FIG.pooled_stats([o.mean() for o in objs], [o.size for o in objs],
+                               [o.std(ddof=1) if o.size > 1 else np.nan for o in objs])
+    assert n == allv.size and abs(m - allv.mean()) < 1e-12, (m, allv.mean())
+    assert abs(s - allv.std(ddof=1)) < 1e-12, (s, allv.std(ddof=1))
+    m2, _s2, n2 = FIG.pooled_stats([1.0, 2.0], [3, 4], [np.nan, 1.0])
+    assert n2 == 4 and m2 == 2.0, "a multi-pixel row with no SD cannot be pooled"
+
+    # 3. Plot XY through the Engine: two "wells" (x = 100, 0) of three beads each
+    beads = {100.0: [np.array([50.0, 60.0, 70.0, 80.0]), np.array([90.0, 95.0]),
+                     np.array([40.0, 44.0, 48.0])],
+             0.0: [np.array([1.0, 3.0]), np.array([-2.0, 0.0, 2.0, 4.0]), np.array([5.0])]}
+    rows = [(xv, b) for xv, bl in beads.items() for b in bl]
+    k = len(rows)
+    tab = {"id": np.arange(1, k + 1), "m": np.zeros(k, int), "t": np.zeros(k, int),
+           "c": np.zeros(k, int), "z": np.zeros(k), "y": np.zeros(k), "x": np.zeros(k),
+           "conc": np.array([r[0] for r in rows]),
+           "sig": np.array([r[1].mean() for r in rows]),
+           "area": np.array([r[1].size for r in rows]),
+           "std_intensity": np.array([r[1].std(ddof=1) if r[1].size > 1 else np.nan
+                                      for r in rows])}
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, tab, layer="beads"))
+
+    def plot(modes, params=None):
+        p = {"table": "beads", "x": "conc", "y": "sig", **(params or {})}
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "P": NodeInstance("P", "plot.xy", modes=modes, params=p)},
+                  edges=[Edge("S", "P", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)})
+        return e, e.pull("P").metadata["figure_spec"]["series"]
+
+    e_p, ser = plot({"error": "pooled_sd", "zero_x": "reference_line"})
+    px100 = np.concatenate(beads[100.0])
+    assert ser[0]["x"] == [100.0], ser[0]["x"]
+    assert abs(ser[0]["y"][0] - px100.mean()) < 1e-12, (ser[0]["y"], px100.mean())
+    assert abs(ser[0]["err"][0] - px100.std(ddof=1)) < 1e-12, ser[0]["err"]
+    assert ser[0]["n_pooled"] == [px100.size], ser[0]["n_pooled"]
+    sd_means = np.std([b.mean() for b in beads[100.0]], ddof=1)
+    px0 = np.concatenate(beads[0.0])
+    assert abs(ser[0]["zero_ref"]["y"] - px0.mean()) < 1e-12, ser[0]["zero_ref"]
+    e_s, ser_sd = plot({"error": "sd", "zero_x": "reference_line"})
+    assert abs(ser_sd[0]["err"][0] - sd_means) < 1e-12, "sd stays the SD of the means"
+    assert e_p.entry("P").recipe_hash != e_s.entry("P").recipe_hash, "error keys the memo"
+    try:
+        plot({"error": "pooled_sd"}, {"pool_sd": "nope"})
+    except Exception as ex:                            # noqa: BLE001 — the refusal itself
+        assert "nope" in str(ex), ex
+    else:
+        raise AssertionError("pooled_sd accepted a missing Pool SD column")
+    _ok("pooled pixel spread (2026-10-13): the bridge's std is each region's n-1 SD (NaN "
+        "for one voxel) and Measure declares std_intensity; pooled_stats on (mean, count, "
+        "SD) equals the mean and SD of the concatenated pixels; Plot XY pooled_sd plots the "
+        "pixel-weighted mean with the SD of every pixel (sd keeps the SD of the means), "
+        "counts the pixels, weighs the blank by pixels too, refuses a missing column and "
+        "keys the memo")
+
+
+def test_unique_objects_langmuir() -> None:
+    """One bead seen from several overlapping positions, and the curve it feeds (2026-10-13).
+
+    1. ``table.unique_objects`` links rows whose stage positions agree within the tolerance
+       (single linkage) into one ``object_uid``, numbers each object's sightings in
+       ``order_by`` order (``t,m``) with rows of ONE frame sharing a sighting, counts
+       ``sightings`` before ``keep_first`` drops the later ones into a NEW table, leaves the
+       input table whole, gives a row with no position an object of its own, and refuses a
+       missing position column or a Name equal to the table it reads. Its edit-time columns
+       announce the three new ones.
+    2. Connected Components ``regions = whole``: a background that two objects cut into
+       pockets is ONE region per frame (what a per-frame Table Join needs), area = the whole
+       foreground, centroid = the foreground's; ``components`` is unchanged and the mode keys
+       the memo.
+    3. Plot XY ``fit = langmuir`` recovers an exact Bmax and Kd in data units with R² = 1,
+       on log axes too; ``zero_x = reference_line`` now takes x <= 0 rows out of the points
+       and the fit on a LINEAR x axis as well, while ``drop`` keeps them as points there.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable, label_components
+
+    # 1. unique objects ------------------------------------------------------------------
+    #    A at (100, 200): t0 m0, t0 m1 (0.6 um off), t1 m0, t1 m1, t2 m0
+    #    B at (110, 200): t0 m1 as TWO fragments 0.8 um apart (one sighting), t2 m1
+    #    C: no stage position
+    rows = [  # (t, m, sx, sy)
+        (0, 0, 100.0, 200.0), (0, 1, 100.6, 200.0), (1, 0, 100.1, 200.1),
+        (1, 1, 100.5, 199.9), (2, 0, 100.0, 199.8),
+        (0, 1, 110.0, 200.0), (0, 1, 110.8, 200.0), (2, 1, 110.2, 200.1),
+        (1, 0, float("nan"), float("nan")),
+    ]
+    n = len(rows)
+    tab = {"id": np.arange(1, n + 1), "m": np.array([r[1] for r in rows]),
+           "t": np.array([r[0] for r in rows]), "c": np.zeros(n, int), "z": np.zeros(n),
+           "y": np.zeros(n), "x": np.zeros(n),
+           "stage_x_um": np.array([r[2] for r in rows]),
+           "stage_y_um": np.array([r[3] for r in rows]),
+           "sig": np.arange(n, dtype=float)}
+    ax = AxisSizes(m=2, t=3, z=1, c=1, y=4, x=4)
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((2, 3, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, tab, layer="beads"))
+
+    def uq(params):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "U": NodeInstance("U", "table.unique_objects", params=params)},
+                  edges=[Edge("S", "U", "image", "data")])
+        return Engine(g, computes=COMPUTES, seeds={"S": seed},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)})
+
+    eng = uq({"table": "beads", "tolerance": 3.0})
+    out = eng.pull("U")
+    got = {a.name: np.asarray(a.values) for a in out.layers_on(Domain.LABEL)
+           if a.layer == "unique"}
+    whole = {a.name: np.asarray(a.values) for a in out.layers_on(Domain.LABEL)
+             if a.layer == "beads"}
+    assert len(whole["id"]) == n and "object_uid" not in whole, "the input table is untouched"
+    assert len(got["id"]) == n, "keep_first 0 keeps every row"
+    uid, s, tot = got["object_uid"], got["sighting"], got["sightings"]
+    assert uid[:5].tolist() == [1] * 5 and s[:5].tolist() == [0, 1, 2, 3, 4], (uid, s)
+    assert set(tot[:5].tolist()) == {5}, tot
+    # B: first seen at (t0, m1) — after A's (t0, m0), before A's (t0, m1)? no: uids follow
+    # first sightings in (t, m) order, and A's first is (0, 0), B's first (0, 1)
+    assert uid[5] == uid[6] == uid[7] == 2, uid
+    assert s[5] == s[6] == 0 and s[7] == 1 and set(tot[5:8].tolist()) == {2}, (s, tot)
+    assert uid[8] == 3 and s[8] == 0 and tot[8] == 1, "no position: an object of its own"
+    tight = uq({"table": "beads", "tolerance": 0.1}).pull("U")
+    tu = {a.name: np.asarray(a.values) for a in tight.layers_on(Domain.LABEL)
+          if a.layer == "unique"}["object_uid"]
+    assert len(set(tu[:5].tolist())) > 1, "a tolerance below the rows' 0.14-0.6 um offsets splits A"
+    kept = uq({"table": "beads", "tolerance": 3.0, "keep_first": 2, "name": "first2"}).pull("U")
+    k2 = {a.name: np.asarray(a.values) for a in kept.layers_on(Domain.LABEL)
+          if a.layer == "first2"}
+    assert k2["sig"].tolist() == [0.0, 1.0, 5.0, 6.0, 7.0, 8.0], k2["sig"]
+    assert k2["sightings"].tolist() == [5, 5, 2, 2, 2, 1], "sightings counts before the cut"
+    rev = uq({"table": "beads", "tolerance": 3.0, "keep_first": 1,
+              "order_by": "m,t"}).pull("U")
+    rs = {a.name: np.asarray(a.values) for a in rev.layers_on(Domain.LABEL)
+          if a.layer == "unique"}["sig"]
+    assert rs.tolist() == [0.0, 5.0, 6.0, 8.0], rs        # m before t: (0,0) still first
+    for bad, frag in (({"table": "beads", "x": "nope"}, "nope"),
+                      ({"table": "beads", "name": "beads"}, "Name")):
+        try:
+            uq(bad).pull("U")
+        except Exception as ex:                        # noqa: BLE001 — the refusal itself
+            assert frag in str(ex), ex
+        else:
+            raise AssertionError(f"Unique Objects accepted {bad}")
+    declared = {c for _d, lyr, c in NODES.get("table.unique_objects").adds_columns(
+        {"table": "beads"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "stage_x_um"), (Domain.LABEL, "beads", "sig")))
+        if lyr == "unique"}
+    assert {"object_uid", "sighting", "sightings", "stage_x_um"} <= declared, declared
+
+    # 2. Connected Components, regions = whole -------------------------------------------
+    m2 = np.ones((8, 8), int)
+    m2[:, 3] = 0                                         # a wall: two pockets
+    _l, t8 = label_components(m2, 8)
+    lw, tw = label_components(m2, 8, whole=True)
+    assert t8.n == 2 and tw.n == 1 and int(tw.columns["area"][0]) == int(m2.sum()), tw.columns
+    yy, xx = np.nonzero(m2)
+    assert abs(tw.columns["x"][0] - xx.mean()) < 1e-12 and set(np.unique(lw)) == {0, 1}
+    assert label_components(np.zeros((4, 4)), 8, whole=True)[1].n == 0
+    mask6 = np.broadcast_to(m2, (1, 2, 1, 1, 8, 8)).astype(np.uint8).copy()
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=8, x=8)
+    ds2 = Dataset(axes=ax2, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 2, 1, 1, 8, 8)))).with_layer(Domain.VOXEL, "bg", mask6)
+
+    def cc(modes):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "L": NodeInstance("L", "analysis.label", modes=modes,
+                                           params={"mask": "bg", "name": "bgr"})},
+                  edges=[Edge("S", "L", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds2},
+                   meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=ds2.metadata)})
+        r = e.pull("L")
+        return e, {a.name: np.asarray(a.values) for a in r.layers_on(Domain.LABEL)
+                   if a.layer == "bgr"}
+    e_c, comp = cc({})
+    e_w, wh = cc({"regions": "whole"})
+    assert len(comp["id"]) == 4 and len(wh["id"]) == 2, (comp["id"], wh["id"])
+    assert wh["t"].tolist() == [0, 1] and set(wh["area"].tolist()) == {int(m2.sum())}
+    assert e_c.entry("L").recipe_hash != e_w.entry("L").recipe_hash, "regions keys the memo"
+
+    # 3. Langmuir and the blank on a linear axis -----------------------------------------
+    xs = np.array([500.0, 1000.0, 2500.0, 5000.0])
+    ys = 3000.0 * xs / (1800.0 + xs)
+    f = FIG.xy_langmuir(xs, ys)
+    assert abs(f["bmax"] - 3000.0) < 1e-6 and abs(f["kd"] - 1800.0) < 1e-6, f
+    assert abs(f["r2"] - 1.0) < 1e-12 and f["x0"] == 0.0 and "Kd = 1800" in f["text"], f
+    fl = FIG.xy_langmuir(xs, ys, log_x=True, log_y=True)
+    assert abs(fl["kd"] - 1800.0) < 1e-6 and fl["x0"] == 500.0, "data units on any axes"
+    assert FIG.xy_langmuir([0.0, 500.0], [1.0, 2.0]) is None, "one x > 0 fixes no curve"
+    x_all = np.concatenate([xs, [0.0, 0.0]])
+    y_all = np.concatenate([ys, [2.0, -4.0]])
+    ser = FIG.xy_series(x_all, y_all, None, "sem")
+    FIG.decorate_xy(ser, x_all, y_all, None, fit="langmuir", zero_x="reference_line")
+    assert ser[0]["x"] == xs.tolist() and len(ser[0]["err"]) == 4, ser[0]
+    assert ser[0]["zero_ref"]["y"] == -1.0 and ser[0]["zero_ref"]["drawable"] is True
+    assert abs(ser[0]["fit"]["kd"] - 1800.0) < 1e-6, "the blank is not in the curve"
+    kept0 = FIG.xy_series(x_all, y_all, None, "sem")
+    FIG.decorate_xy(kept0, x_all, y_all, None, fit="langmuir", zero_x="drop")
+    assert kept0[0]["x"][0] == 0.0 and "zero_ref" not in kept0[0], \
+        "drop on a linear axis keeps x = 0 as a point, as before"
+    _ok("unique objects + langmuir (2026-10-13): rows within the tolerance are one object "
+        "with sightings numbered in t,m order (one frame = one sighting), keep_first cuts "
+        "into a new table with totals counted first, no-position rows stand alone, bad "
+        "columns/names refused, columns announced; Connected Components regions=whole is "
+        "one region per frame and keys the memo; Langmuir recovers Bmax/Kd in data units "
+        "and the linear-axis blank leaves the points and the fit")
+
+
+def test_bead_distance_plot() -> None:
+    """Capture beads around a spheroid (2026-10-14): a mosaic's stage Z, and Plot XY's
+    Colour by / Label by.
+
+    1. ``analysis.measure`` after a Stitch: the per-position focus log (``stage_z_um``) is
+       gone, ``origin_um`` still holds the stack's lowest focus, and ``stage_z_um`` comes
+       from it — slice k at z0 + k·step bottom-to-top, z1 - k·step top-to-bottom, z0 for a
+       one-plane field — where it used to be NaN.
+    2. The figure helpers: ``point_text`` rounds with the unit and leaves a missing value
+       unlabelled; ``color_limits`` spans the data (positive values only on a log scale) and
+       honours a fixed end; ``xy_series`` carries each point's colour and label through the
+       x sort, and ``decorate_xy``'s x <= 0 filter keeps them aligned.
+    3. Plot XY through the Engine, per frame: one colour range over EVERY row (both frames
+       share it), the bar's arrow when a value falls under it, a frame's colours and labels
+       are that frame's rows, the options fold into the recipe hash, and under a summarising
+       Error they are not read at all.
+    4. Label placement: five points crowded together get five labels, no two overlapping.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # 1. stage Z after a stitch ----------------------------------------------------------
+    Z, Y, X = 3, 8, 10
+    rows_n = 3
+    ptab = StructureTable(D.POINT, {
+        "id": np.arange(1, rows_n + 1, dtype=np.int64), "m": np.zeros(rows_n, np.int64),
+        "t": np.zeros(rows_n, np.int64), "c": np.zeros(rows_n, np.int64),
+        "z": np.array([0.0, 1.5, 2.0]), "y": np.array([1.0, 2.0, 3.0]),
+        "x": np.array([4.0, 5.0, 6.0])}, layer="blobs", z_kind="plane_index")
+
+    def stage_z(meta, nz):
+        ax = AxisSizes(m=1, t=1, z=nz, c=1, y=Y, x=X)
+        ds = (Dataset(axes=ax, metadata=meta)
+              .with_image(ArrayProvider(np.zeros((1, 1, nz, 1, Y, X))))
+              .with_structure(ptab))
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "Q": NodeInstance("Q", "analysis.measure",
+                                           modes={"target": "point"})},
+                  edges=[Edge("S", "Q", "image", "data")])
+        out = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                     meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull("Q")
+        return (np.asarray(out.get(D.POINT, "stage_z_um", layer="blobs").values, float),
+                np.asarray(out.get(D.POINT, "stage_x_um", layer="blobs").values, float))
+
+    mosaic = {"pixel_size_um": 0.5, "z_step_um": 15.0, "z_home_index": 4,
+              "origin_um": [[5062.68, -11007.0, -11693.0]]}       # a stitch's metadata
+    sz, sx = stage_z(mosaic, Z)
+    assert np.allclose(sz, 5062.68 + 15.0 * np.array([0.0, 1.5, 2.0])), sz
+    assert np.allclose(sx, -11693.0 + X * 0.5 - np.array([4.0, 5.0, 6.0]) * 0.5), sx
+    sz_down, _ = stage_z(dict(mosaic, z_bottom_to_top=False), Z)
+    assert np.allclose(sz_down, 5062.68 + 30.0 - 15.0 * np.array([0.0, 1.5, 2.0])), sz_down
+    sz_one, _ = stage_z(mosaic, 1)
+    assert np.allclose(sz_one, 5062.68), sz_one
+    logged = dict(mosaic, stage_z_um=[5126.3], z_home_index=4)  # the log still wins
+    sz_log, _ = stage_z(logged, Z)
+    assert np.allclose(sz_log, 5126.3 + 15.0 * (np.array([0.0, 1.5, 2.0]) - 4)), sz_log
+
+    # 2. the helpers ---------------------------------------------------------------------
+    assert FIG.point_text([1234.4, np.nan, "a", None, 2.25], decimals=0, unit="µm") == \
+        ["1234 µm", "", "a", "", "2 µm"]
+    assert FIG.point_text([3.14159], decimals=2) == ["3.14"]
+    assert FIG.color_limits([-1.0, 0.5, 10.0, np.nan], scale="log") == [0.5, 10.0]
+    assert FIG.color_limits([-1.0, 0.5, 10.0]) == [-1.0, 10.0]
+    assert FIG.color_limits([1.0, 9.0], [None, 5.0]) == [1.0, 5.0]
+    assert FIG.color_limits([], scale="log") == [None, None]
+    ser = FIG.xy_series([3.0, 1.0, 0.0, 2.0], [30.0, 10.0, 0.0, 20.0], None, "none",
+                        color=[0.3, 0.1, 0.0, 0.2], text=["c", "a", "z", "b"])
+    assert ser[0]["x"] == [0.0, 1.0, 2.0, 3.0] and ser[0]["c"] == [0.0, 0.1, 0.2, 0.3] and \
+        ser[0]["text"] == ["z", "a", "b", "c"], ser
+    FIG.decorate_xy(ser, [3.0, 1.0, 0.0, 2.0], [30.0, 10.0, 0.0, 20.0], None,
+                    zero_x="reference_line")
+    assert ser[0]["x"] == [1.0, 2.0, 3.0] and ser[0]["c"] == [0.1, 0.2, 0.3] and \
+        ser[0]["text"] == ["a", "b", "c"], "the x <= 0 row leaves colour and label too"
+    summ = FIG.xy_series([1.0, 1.0], [2.0, 4.0], None, "sd", color=[1.0, 2.0], text=["p", "q"])
+    assert "c" not in summ[0] and "text" not in summ[0], "a summarised point has neither"
+
+    # 3. Plot XY per frame ---------------------------------------------------------------
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4)
+    n = 6
+    cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.array([0, 0, 0, 1, 1, 1]),
+            "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+            "dist_um": np.array([100.0, 200.0, 300.0, 101.0, 201.0, 301.0]),
+            "height_um": np.array([10.0, 20.0, 30.0, 10.0, 20.0, 30.0]),
+            "mfi": np.array([500.0, 50.0, -2.0, 800.0, 80.0, 5.0])}
+    seed = Dataset(axes=ax2, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 2, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, cols, layer="beads"))
+
+    def plot(params, modes):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "P": NodeInstance("P", "plot.xy", params=dict(
+                             {"table": "beads", "x": "dist_um", "y": "height_um"}, **params),
+                             modes=dict({"kind": "scatter", "per": "frame"}, **modes))},
+                  edges=[Edge("S", "P", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=seed.metadata)})
+        return e, e.pull("P")
+
+    lit = {"color_by": "mfi", "label_by": "dist_um", "label_decimals": 0}
+    e1, p1 = plot(lit, {"color_scale": "log", "colormap": "inferno"})
+    spec = p1.metadata["figure_spec"]
+    cs = spec["draw"]["color"]
+    assert cs["range"] == [5.0, 800.0], cs          # every frame's rows; -2 is off a log scale
+    assert cs["extend"] == "min" and cs["colormap"] == "inferno" and cs["scale"] == "log", cs
+    assert cs["label"] == "mfi", cs                 # no unit recorded: the bare name
+    assert spec["rows"]["lab"] == ["100 µm", "200 µm", "300 µm", "101 µm", "201 µm",
+                                   "301 µm"], spec["rows"]["lab"]
+    f1 = FIG.frame_spec(spec, 1)
+    assert f1["series"][0]["c"] == [800.0, 80.0, 5.0] and \
+        f1["series"][0]["text"] == ["101 µm", "201 µm", "301 µm"], f1["series"]
+    assert f1["draw"]["color"]["range"] == [5.0, 800.0], "frames share one scale"
+    rgb = FIG.render_rgb(spec)
+    assert rgb.shape[0] == p1.axes.y and rgb.shape[1] == p1.axes.x, (rgb.shape, p1.axes)
+    e0, p0 = plot({}, {})
+    assert "color" not in p0.metadata["figure_spec"]["draw"], "blank Colour by: no scale"
+    assert e0.entry("P").recipe_hash != e1.entry("P").recipe_hash
+    _e, ps = plot(lit, {"error": "sd"})
+    assert "color" not in ps.metadata["figure_spec"]["draw"] and \
+        ps.metadata["figure_spec"]["rows"]["lab"] is None, \
+        "under a summarising Error the per-point options are not read"
+
+    # 4. crowded labels do not overlap ---------------------------------------------------
+    crowd = {"kind": "xy", "per": "all",
+             "series": [{"label": "", "x": [1.0, 1.02, 1.04, 1.01, 1.03],
+                         "y": [1.0, 1.01, 1.0, 0.99, 1.02], "err": None, "n": 5,
+                         "c": [1.0, 2.0, 3.0, 4.0, 5.0],
+                         "text": ["1001 µm", "1002 µm", "1003 µm", "1004 µm", "1005 µm"]}],
+             "draw": {"mode": "scatter",
+                      "color": {"colormap": "viridis", "scale": "linear",
+                                "range": [1.0, 5.0], "label": "v", "extend": "neither"}},
+             "axes": {"title": "", "x_label": "x", "y_label": "y", "x_range": [0.0, 2.0],
+                      "y_range": [0.0, 2.0]},
+             "style": dict(FIG.STYLE_PRESETS["paper"])}
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(crowd)
+        r = fig.canvas.get_renderer()
+        boxes = [t.get_window_extent(r) for t in fig.axes[0].texts]
+    assert len(boxes) == 5, len(boxes)
+    for i in range(5):
+        for j in range(i + 1, 5):
+            assert not boxes[i].overlaps(boxes[j]), (i, j, boxes[i], boxes[j])
+    _ok("bead distance plot (2026-10-14): Measure places a stitched mosaic's rows in Z from "
+        "origin_um (bottom-to-top, top-to-bottom, one plane) where it gave NaN, and the "
+        "focus log still wins where it exists; Plot XY's Colour by spans every frame's rows "
+        "(positive only on log, arrow when a value falls under), colours and labels ride "
+        "the x sort and the x <= 0 filter, per frame each frame shows its own rows, the "
+        "options key the memo and go unread under a summarising Error; five crowded labels "
+        "are placed without overlap")
+
+
+def test_overlay_union_axes() -> None:
+    """A union canvas's sources each on axes of their own (2026-10-14).
+
+    1. ``tiles_covering`` judges a sliver against the SMALLER box: a 64 µm field lying wholly
+       inside an 8.8 mm canvas is kept (it was dropped as 0.0055 % of the canvas, so the bead
+       overlay drew nothing), while a big tile grazing a field's corner is still dropped.
+    2. ``field_rect01`` is where ``compose_secondary_plane`` paints the field — plain and on a
+       mirrored canvas.
+    3. The runner: a chain of union Overlays on a canvas is ``independent``; there each source
+       shows its OWN ``(m, t, z)`` (default: field 0, frame 0, its home plane), the readout
+       reports it, a selection keys apart like a stepper, and each source's LUT reference is
+       its own field's plane at that frame. A non-canvas primary is never independent.
+    4. ``_source_lut`` pools its window over the source's fields: a dim field 0 no longer
+       sets a window every bright field saturates.
+    """
+    from types import SimpleNamespace
+    import threading
+    from collections import OrderedDict
+    from nodegraph.placement import (compose_secondary_plane, field_box, field_rect01,
+                                     tiles_covering)
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.runner import (EngineRunner, _default_source_frame, _independent_overlay,
+                                   _key_sub, _plane_key)
+
+    # 1. slivers --------------------------------------------------------------------------
+    canvas_md = {"pixel_size_um": 1.0, "origin_um": [[0.0, 0.0, 0.0]],
+                 "stage_layout_source": "canvas"}
+    cax = AxisSizes(m=1, t=1, z=1, c=1, y=8800, x=8800)
+    small_md = {"pixel_size_um": 1.0, "stage_xy_um": [(4000.0, 3000.0), (100.0, 9000.0)]}
+    sax = AxisSizes(m=2, t=2, z=1, c=1, y=64, x=64)
+    hits = tiles_covering(canvas_md, cax, 0, small_md, sax)
+    assert [h[0] for h in hits] == [0], hits          # field 1 is off the canvas
+    assert abs(hits[0][1] - 64.0 * 64.0 / 8800.0 ** 2) < 1e-12, "fraction is still OF the field"
+    field_md = {"pixel_size_um": 1.0, "stage_xy_um": [(50.0, 50.0)]}
+    fax = AxisSizes(m=1, t=1, z=1, c=1, y=100, x=100)
+    big_md = {"pixel_size_um": 1.0, "stage_xy_um": [(2099.6, 2099.6)]}  # grazes 0.4 x 0.4 µm
+    bax = AxisSizes(m=1, t=1, z=1, c=1, y=4000, x=4000)
+    assert tiles_covering(field_md, fax, 0, big_md, bax) == [], "a corner graze is a sliver"
+
+    # 2. the outline is where the composite paints ----------------------------------------
+    entry = {"placed_by": "stage", "flip_x": False, "flip_y": False,
+             "offset_um": [0.0, 0.0, 0.0], "tiles": [[0, [[0, hits[0][1]]]]]}
+    for flip in (None, [False, False], [True, True]):
+        pmd = dict(canvas_md)
+        if flip is not None:
+            pmd["canvas_flip"] = flip
+        shape = (880, 880)
+        got = compose_secondary_plane(entry, shape, pmd, cax, 0, small_md, sax,
+                                      lambda j, want: np.ones((64, 64), np.float32))
+        ys, xs = np.nonzero(got)
+        fy0, fy1, fx0, fx1 = field_rect01(entry, pmd, cax, 0, small_md, sax, 0)
+        assert abs(ys.min() - fy0 * shape[0]) <= 1 and abs(ys.max() + 1 - fy1 * shape[0]) <= 1 \
+            and abs(xs.min() - fx0 * shape[1]) <= 1 and abs(xs.max() + 1 - fx1 * shape[1]) <= 1, \
+            (flip, (ys.min(), ys.max(), xs.min(), xs.max()), (fy0, fy1, fx0, fx1))
+    assert field_rect01({"placed_by": "index"}, canvas_md, cax, 0, small_md, sax, 0) is None
+
+    # 3. the runner -------------------------------------------------------------------------
+    def node(op, canvas):
+        return SimpleNamespace(op_key=op, modes={"canvas": canvas}, params={})
+    recs = {"OV": node("view.overlay", "union"), "OP": node("view.overlay", "primary")}
+    srcs = [{"ovl_id": "OV#primary"}, {"ovl_id": "OV"}]
+    assert _independent_overlay(recs.get, srcs, canvas_md) is True
+    assert _independent_overlay(recs.get, srcs, {"pixel_size_um": 1.0}) is False, \
+        "a field primary pairs its sources"
+    assert _independent_overlay(recs.get, [{"ovl_id": "OP"}], canvas_md) is False, \
+        "an ordinary Overlay onto a view.canvas keeps the paired model"
+    # a source: 3 fields x 2 frames x 5 planes, value = 1000*m + 100*t + 10*z + 1
+    vol = np.zeros((3, 2, 5, 1, 8, 8), np.uint16)
+    for m in range(3):
+        for t in range(2):
+            for z in range(5):
+                vol[m, t, z, 0] = 1000 * m + 100 * t + 10 * z + 1
+    sec_ax = AxisSizes(m=3, t=2, z=5, c=1, y=8, x=8)
+    src = {"ovl_id": "OV", "sec_id": "B", "as_channel": False, "n": 1, "base_c": 1,
+           "sec_axes": sec_ax, "sec_md": {"z_home_index": 3}, "sec_provider": ArrayProvider(vol),
+           "entry": {"tiles": [[0, [[0, 0.5], [1, 0.2], [2, 0.1]]]], "sub_ticks": 1}}
+    assert _default_source_frame(src) == (0, 0, 3), "home plane, not the bottom slice"
+    assert _default_source_frame(dict(src, sec_md={})) == (0, 0, 2), "else the middle one"
+    ctx = {"node": "V", "sources": [src], "pri_md": dict(canvas_md), "pri_axes": cax,
+           "dropped": 0, "independent": True}
+    r = SimpleNamespace(_overlay_ctxs={"V": ctx}, _src_override={}, _src_select={},
+                        _ovr_gen=0, _lut_refs=OrderedDict(), _lut_ref_lock=threading.Lock(),
+                        _source=SimpleNamespace(record=lambda rid: None, active="",
+                                                document_of=lambda pid: None))
+    r._rid = lambda nid: nid
+    for name in ("_source_frame", "_lut_ref_frame", "_stash_lut_refs", "overlay_lut_refs",
+                 "overlay_sub_ticks", "overlay_frame_readout", "set_source_select",
+                 "source_label", "_source_label_of", "_pins_of"):
+        setattr(r, name, (lambda f: lambda *a, **k: f(r, *a, **k))(getattr(EngineRunner, name)))
+    t_sec, zw = r._source_frame(src, ctx, 0, 0, 1, 0, None, 0, {}, {})
+    assert (t_sec, zw) == (0, [(3, 1.0)]), (t_sec, zw)
+    ro = r.overlay_frame_readout("V", 0, 0, 0, 0)
+    assert ro[0]["independent"] and (ro[0]["m"], ro[0]["t"], ro[0]["z"]) == (0, 0, 3), ro
+    assert (ro[0]["n_m"], ro[0]["n_t"], ro[0]["n_z"]) == (3, 2, 5), ro
+    r.set_source_select({"OV": (2, 1, 4)})
+    assert r._ovr_gen == 1 and r._src_select == {"OV": (2, 1, 4)}
+    r.set_source_select({"OV": (2, 1, 4)})
+    assert r._ovr_gen == 1, "an unchanged pick re-keys nothing"
+    assert _key_sub(_plane_key("V", None, 0, 0, 0, 1, 64, 0, r._ovr_gen)) == (0, 1)
+    t_sec, zw = r._source_frame(src, ctx, 0, 0, 1, 0, None, 0, {}, dict(r._src_select))
+    assert (t_sec, zw) == (1, [(4, 1.0)]), "its own frame and plane, not the canvas cursor's"
+    ro = r.overlay_frame_readout("V", 0, 0, 0, 0)
+    assert (ro[0]["m"], ro[0]["t"], ro[0]["z"]) == (2, 1, 4), ro
+    frame = r._lut_ref_frame(src, ctx, 0, t_sec, zw, dict(r._src_select))
+    assert frame == ("B", 2, 1, 4), frame
+    r._stash_lut_refs(src, frame)
+    refs = r.overlay_lut_refs("V", 0, 0, 0, 0)
+    assert list(refs) == [1] and int(refs[1].max()) == 2000 + 100 + 40 + 1, refs
+    # a mapped (paired) source's reference is the field covering most of the primary's
+    ctx_m = dict(ctx, independent=False)
+    assert r._lut_ref_frame(src, ctx_m, 0, 0, [(1, 0.25), (2, 0.75)], {}) == ("B", 0, 0, 2)
+
+    # 4. the pooled default window -----------------------------------------------------------
+    pool = np.full((4, 1, 1, 1, 32, 32), 50, np.uint16)
+    pool[1:, 0, 0, 0, 8:24, 8:24] = 3000              # field 0 is blank; 1..3 hold a bright bead
+    r2 = SimpleNamespace(_src_lut_cache={})
+    lut = EngineRunner._source_lut(r2, "P", SimpleNamespace(
+        image=ArrayProvider(pool), metadata={"bit_depth": 12}))
+    assert lut[0]["clim"][1] > 2000, lut          # field 0 alone gave (50, 51)
+    _ok("overlay union axes (2026-10-14): a small field wholly inside a big canvas is no "
+        "sliver (kept) while a corner graze still is; field_rect01 is where the composite "
+        "paints, plain and mirrored; a chain of union Overlays on a canvas is independent "
+        "(a field primary or an ordinary Overlay on a canvas is not); each source shows its "
+        "own (m, t, z) - default field 0, frame 0, home plane - which the readout reports, "
+        "keys apart like a stepper, and whose own field plane is its LUT reference; the "
+        "default window is pooled over the source's fields")
+
+
+def test_plot_per_column_and_lines() -> None:
+    """Plot XY's per-column figures and reference lines (2026-10-14: three timepoints from
+    two files on ONE colour scale, a spheroid's edge as a dotted line).
+
+    1. ``per = column`` makes one figure per distinct value of ``per_by``, in first-seen
+       order, titled by the value; every figure shares the axes and ONE colour range over all
+       rows, so the scale's top is the brightest row of any figure; each figure shows only its
+       rows. The edit-time picture leaves T unknown (the count is in the data) and refuses a
+       blank ``per_by`` at run time with a fix.
+    2. ``x_lines`` takes a number or a column (its median) — a constant column lands on its
+       value — with its label and unit; the open X range widens to show the line.
+    3. The colour bar's top is a tick of its own, labelled with the value.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.registry import NODES
+
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    n = 6
+    cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.zeros(n, int),
+            "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+            "tp": np.array(["late", "late", "early", "early", "mid", "mid"]),
+            "dist_um": np.array([800.0, 900.0, 1000.0, 1100.0, 1200.0, 1300.0]),
+            "h_um": np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+            "edge_um": np.full(n, 557.8),
+            "mfi": np.array([5.0, 50.0, 2.0, 918.7, 20.0, 300.0])}
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, cols, layer="b"))
+
+    def plot(params, modes):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "P": NodeInstance("P", "plot.xy", params=dict(
+                             {"table": "b", "x": "dist_um", "y": "h_um"}, **params),
+                             modes=dict({"kind": "scatter"}, **modes))},
+                  edges=[Edge("S", "P", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)})
+        return e, e.pull("P")
+
+    e, p = plot({"per_by": "tp", "color_by": "mfi", "color_range": "1,",
+                 "x_lines": "edge_um, 1250", "x_line_label": "spheroid edge"},
+                {"per": "column", "color_scale": "log"})
+    spec = p.metadata["figure_spec"]
+    assert p.axes.t == 3 and spec["frame_labels"] == ["late", "early", "mid"], spec["frame_labels"]
+    assert spec["draw"]["color"]["range"] == [1.0, 918.7], spec["draw"]["color"]
+    f1 = FIG.frame_spec(spec, 1)
+    assert f1["series"][0]["c"] == [2.0, 918.7] and f1["axes"]["title"].endswith("early"), f1
+    assert f1["axes"]["x_range"] == spec["axes"]["x_range"], "the figures share their axes"
+    lines = spec["draw"]["x_lines"]
+    assert [round(l["x"], 1) for l in lines] == [557.8, 1250.0], lines
+    assert lines[0]["label"] == "spheroid edge" and lines[0]["unit"] == "µm", lines
+    assert lines[1]["label"] == "" and lines[1]["unit"] == "µm", "a number: no words"
+    assert spec["axes"]["x_range"][0] < 557.8, "the open range widens to show the line"
+    env = e.env("P")
+    assert "t" in set(env.unknown_axes or ()), "how many figures is in the data: T unknown"
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(f1)
+        words = [t.get_text() for t in fig.axes[0].texts]
+        cb = fig.axes[1]
+        tops = [t.get_text() for t in cb.get_yticklabels()]
+    assert any(w.startswith("spheroid edge 558") for w in words), words
+    assert "918.7" in tops, tops
+    try:
+        plot({"color_by": "mfi"}, {"per": "column"})
+        raise AssertionError("a blank Per column must be refused")
+    except Exception as exc:  # noqa: BLE001 — the engine wraps the refusal
+        assert "Per column" in str(exc), exc
+    assert "column" in next(m for m in NODES.get("plot.xy").modes if m.name == "per").choices
+    _ok("plot per column + reference lines (2026-10-14): one figure per value of a column in "
+        "first-seen order, titled by it, sharing axes and ONE colour range over every row "
+        "(top = the brightest of all, ticked and labelled on the bar), each showing its own "
+        "rows; T unknown at edit time; a blank Per column refused; reference lines at a "
+        "column's median or a number, labelled with value and unit, the open X range widened "
+        "to show them")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -33817,6 +34887,13 @@ def main() -> int:
     test_cone_signature()
     test_solo_scope_plan()
     test_lattice_tables_elided_batch()
+    test_nd2_true_clock()
+    test_standard_curve_trendline()
+    test_unique_objects_langmuir()
+    test_pooled_pixel_spread()
+    test_bead_distance_plot()
+    test_overlay_union_axes()
+    test_plot_per_column_and_lines()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

@@ -1170,6 +1170,14 @@ class OverlayFrame:
     ``plane_to_widget``); ``sy``/``sx`` scale *structure* coordinates (full-resolution
     image pixels, as the axes report them) into displayed-plane pixels, which is how a
     decimated display plane still lands the geometry in the right place.
+
+    **The two spaces disagree about where a pixel is, by half a pixel.** A structure
+    coordinate puts a pixel's CENTRE on the integer (a centroid is a mean of voxel indices,
+    a grown disc is centred on one), while the displayed plane puts its EDGE there — pixel
+    ``i`` is drawn over ``[i, i+1)``. Every structure coordinate therefore goes through
+    :meth:`img_pt`, never ``map_pt(x * sx, y * sy)``: that shortcut drew every point,
+    track, vector and id half a pixel up-left of the pixel it names, which showed as a
+    centroid marker sitting off the centre of the disc grown from it (2026-10-14).
     """
     map_pt: Callable[[float, float], QPointF]
     plane_wh: Tuple[int, int]                       # displayed plane (w, h)
@@ -1215,6 +1223,13 @@ class OverlayFrame:
     diff_a: Optional[np.ndarray] = None
     diff_b: Optional[np.ndarray] = None
     current_t: int = 0
+
+    def img_pt(self, x: float, y: float) -> QPointF:
+        """A *structure* coordinate (full-resolution image pixels, pixel centre on the
+        integer) → widget pixels. The ``+ 0.5`` moves a centre onto the displayed plane's
+        edge-on-the-integer grid; it is applied before the decimation scale because it is
+        half a FULL-resolution pixel."""
+        return self.map_pt((x + 0.5) * self.sx, (y + 0.5) * self.sy)
 
 
 #: Above this many boundary segments (after collinear runs are merged) the label outline is
@@ -1418,8 +1433,8 @@ class OverlayRenderer:
         p.setRenderHint(QPainter.Antialiasing, True)
         head_px = max(2.0, float(s.head_px))
         for k in range(len(tails)):
-            a = frame.map_pt(tails[k][1] * frame.sx, tails[k][0] * frame.sy)
-            b = frame.map_pt(heads[k][1] * frame.sx, heads[k][0] * frame.sy)
+            a = frame.img_pt(tails[k][1], tails[k][0])
+            b = frame.img_pt(heads[k][1], heads[k][0])
             if s.color_mode == "magnitude" and hi > 0:
                 r, g, bl = lut[int(min(255, max(0, mag[k] / hi * 255)))]
                 col = QColor(int(r), int(g), int(bl), _alpha(s.opacity))
@@ -1460,16 +1475,15 @@ class OverlayRenderer:
             levels = np.linspace(lo, hi, max(2, int(s.levels)) + 2)[1:-1]
             self._paint_contours(
                 p, grid, levels, cmap, lo, hi,
-                lambda r, c: frame.map_pt((x0 + (c + 0.5) * dx) * frame.sx,
-                                          (y0 + (r + 0.5) * dy) * frame.sy),
+                lambda r, c: frame.img_pt(x0 + (c + 0.5) * dx, y0 + (r + 0.5) * dy),
                 float(s.width), 100)
         else:
             rgba = np.ascontiguousarray(scalar_rgba(
                 grid, cmap=cmap, lo=lo, hi=hi, center_zero=bool(s.center_zero),
                 alpha_mode="flat", opacity=max(0.0, min(1.0, s.opacity / 100.0))))
             img = QImage(rgba.data, nx, ny, 4 * nx, QImage.Format_RGBA8888).copy()
-            tl = frame.map_pt(x0 * frame.sx, y0 * frame.sy)
-            br = frame.map_pt(x1 * frame.sx, y1 * frame.sy)
+            tl = frame.img_pt(x0, y0)
+            br = frame.img_pt(x1, y1)
             p.save()
             p.setRenderHint(QPainter.SmoothPixmapTransform, s.style == "smooth")
             p.drawImage(QRectF(tl, br), img)
@@ -1494,8 +1508,8 @@ class OverlayRenderer:
                 h = abs(val) * k
                 dx, dy = np.cos(ang) * h, np.sin(ang) * h
                 path = paths[val > 0]
-                path.moveTo(frame.map_pt((x - dx) * frame.sx, (y - dy) * frame.sy))
-                path.lineTo(frame.map_pt((x + dx) * frame.sx, (y + dy) * frame.sy))
+                path.moveTo(frame.img_pt(x - dx, y - dy))
+                path.lineTo(frame.img_pt(x + dx, y + dy))
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
         for tension, col in ((True, QColor(235, 70, 55, 235)), (False, QColor(70, 120, 240, 235))):
@@ -1514,9 +1528,9 @@ class OverlayRenderer:
             a = np.asarray(line, dtype=float)
             if a.ndim != 2 or len(a) < 2:
                 continue
-            path.moveTo(frame.map_pt(a[0, 1] * frame.sx, a[0, 0] * frame.sy))
+            path.moveTo(frame.img_pt(a[0, 1], a[0, 0]))
             for yy, xx in a[1:]:
-                path.lineTo(frame.map_pt(xx * frame.sx, yy * frame.sy))
+                path.lineTo(frame.img_pt(xx, yy))
         pen = QPen(qcolor(s.color, s.opacity), max(0.3, float(s.width)))
         pen.setCosmetic(True)
         p.save()
@@ -1618,14 +1632,14 @@ class OverlayRenderer:
             col = QColor(*DIFF_COLORS[key], _alpha(s.opacity))
             p.setPen(QPen(col, float(s.width)))
             p.setBrush(Qt.NoBrush)
-            w = frame.map_pt(pt[1] * frame.sx, pt[0] * frame.sy)
+            w = frame.img_pt(pt[1], pt[0])
             p.drawEllipse(w, r, r)
             return w
 
         for i, j in pairs:
             wa = ring(a[i], "matched")
             if s.show_links:
-                wb = frame.map_pt(b[j][1] * frame.sx, b[j][0] * frame.sy)
+                wb = frame.img_pt(b[j][1], b[j][0])
                 p.drawLine(wa, wb)
         for i in only_a:
             ring(a[i], "only_a")
@@ -1663,8 +1677,8 @@ class OverlayRenderer:
             p.setPen(pen)
             path = QPainterPath()
             for y0, y1, x0, x1, _l in g[levels == lv]:
-                a = frame.map_pt(x0 * frame.sx, y0 * frame.sy)
-                b = frame.map_pt(x1 * frame.sx, y1 * frame.sy)
+                a = frame.img_pt(x0, y0)
+                b = frame.img_pt(x1, y1)
                 path.addRect(QRectF(a, b).normalized())
             p.drawPath(path)
         p.restore()
@@ -1683,9 +1697,9 @@ class OverlayRenderer:
                 rad = float(s.vertex_px)
                 if rad > 0:
                     for y, x in sec.verts:
-                        p.drawEllipse(frame.map_pt(x * frame.sx, y * frame.sy), rad, rad)
+                        p.drawEllipse(frame.img_pt(x, y), rad, rad)
                 continue
-            polys = [QPolygonF([frame.map_pt(x * frame.sx, y * frame.sy)
+            polys = [QPolygonF([frame.img_pt(x, y)
                                 for y, x in loop]) for loop in sec.loops]
             if s.style == "surface" and s.fill_opacity > 0:
                 fill = self.mesh_color(s, sec.object_id, s.fill_opacity)
@@ -1943,9 +1957,12 @@ class OverlayRenderer:
             return
         mp = frame.map_pt
         o, ex, ey = mp(0.0, 0.0), mp(1.0, 0.0), mp(0.0, 1.0)
-        # affine map (see _paint_label_outline), applied to every centroid at once
-        wx = o.x() + (cxs * lsx) * (ex.x() - o.x()) + (cys * lsy) * (ey.x() - o.x())
-        wy = o.y() + (cxs * lsx) * (ex.y() - o.y()) + (cys * lsy) * (ey.y() - o.y())
+        # affine map (see _paint_label_outline), applied to every centroid at once. The
+        # centroids are means of pixel INDICES (centre on the integer) and the outline is
+        # drawn on pixel edges, so each is moved half a label pixel — see OverlayFrame.img_pt
+        cxs, cys = (cxs + 0.5) * lsx, (cys + 0.5) * lsy
+        wx = o.x() + cxs * (ex.x() - o.x()) + cys * (ey.x() - o.x())
+        wy = o.y() + cxs * (ex.y() - o.y()) + cys * (ey.y() - o.y())
         view = QRectF(p.viewport())
         if not view.isValid() or view.isEmpty():
             view = p.clipBoundingRect()
@@ -2085,7 +2102,7 @@ class OverlayRenderer:
         for mark in frame.points:
             col = self._point_color(s, mark)
             pm, size = self.glyph(s, col, dpr)
-            centre = frame.map_pt(mark.x * frame.sx, mark.y * frame.sy)
+            centre = frame.img_pt(mark.x, mark.y)
             p.drawPixmap(QPointF(centre.x() - size / 2.0, centre.y() - size / 2.0), pm)
 
     def glyph(self, s: PointsOverlay, col: QColor, dpr: float) -> Tuple[QPixmap, float]:
@@ -2164,7 +2181,7 @@ class OverlayRenderer:
         p.setRenderHint(QPainter.Antialiasing, True)
         for tr in frame.tracks:
             keep = self._trail_mask(s, tr, frame.current_t)
-            verts = [frame.map_pt(x * frame.sx, y * frame.sy)
+            verts = [frame.img_pt(x, y)
                      for i, (y, x) in enumerate(tr.path) if keep[i]]
             if not verts:
                 continue

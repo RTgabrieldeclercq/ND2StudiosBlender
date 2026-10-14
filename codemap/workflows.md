@@ -194,6 +194,16 @@ anchors: sym:nodelab_v2.runner.EngineRunner, file:nodelab_v2/ingest.py
    `frame_datetime` (2026-10-02; the Viewer's timestamp overlay and the Timeseries Builder
    read it), `stage_layout_source`, `acquisition_start`, and the per-M `position_name` —
    each best-effort, and dropped whole rather than padded when the file carries it short.
+   **The clock is UTC and rebuilt from frame 0's raw stamp** (2026-10-13,
+   `nodelab_v2.nd2_acquisition.frame_jd`): `relativeTimeMs` runs from the start of the NIS
+   *run* — shared by every file of a JOBS run — and the SDK's per-frame
+   `absoluteJulianDayNumber` adds frame 0's offset into it twice, which interleaved the
+   CRC_1_T1..T5 series out of order. `frame_datetime` and `acquisition_start` are LOCAL
+   time through the file's own `utc_offset_s` (read off its `date`; `placement.UTC_OFFSET_KEY`).
+   Beside them, `ingest.ACQUISITION_KEYS` carries the full acquisition record — sections in
+   `acquisition_info`, per-channel rows in `channel_acquisition` (laser line and power, gain,
+   detector, pinhole…; a `metadata.PER_CHANNEL_KEYS` member so a tap keeps its own rows),
+   raw text in `acquisition_text` — for the Viewer's channel tooltips and Info window.
    The per-channel **names and native colours** ride the source envelope too
    (`ingest.channel_display_seed`, V4.00 step 11g — the one function the file-pick seed and
    the runner's resolved envelope both go through), so a stream downstream of a channel tap

@@ -1012,26 +1012,39 @@ class DemoSession:
         eng = headless_engine(g, seeds=seeds, meta_seeds=metas, memo=self.memo,
                               tiles=self.tiles)
         payload = eng.pull("demo")
-        res = self._extract(payload, {**self.recipe.fixed_params, **params})
+        res = self._extract(payload, {**self.recipe.fixed_params, **params},
+                            {**self.spec.default_state(), **self.recipe.fixed_modes, **modes})
         res.elapsed_s = time.perf_counter() - t0
         return res
 
     # ── extraction ───────────────────────────────────────────────────────────
-    def _written_layers(self, params: Mapping[str, Any]) -> Tuple[str, ...]:
+    def _written_layers(self, params: Mapping[str, Any],
+                        modes: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
+        """The layers the node names as its output: every ``layer_out`` socket's value, then
+        what its ``extra_layers`` hook announces — the only way a table node (Aggregate,
+        Join, Concat, Unique Objects) names its table, which otherwise lost to the larger
+        input table in :func:`demo_rows` (2026-10-13)."""
         names: List[str] = []
         for s in self.spec.inputs:
             if getattr(s, "layer_out", ()):
                 v = params.get(s.name, s.default)
                 if isinstance(v, str) and v:
                     names.append(v)
+        extra = getattr(self.spec, "extra_layers", None)
+        if extra is not None:
+            try:
+                names.extend(str(n) for _d, n in (extra(params, dict(modes or {})) or ()) if n)
+            except Exception:                           # noqa: BLE001 — the hook is total
+                pass
         return tuple(dict.fromkeys(names))
 
-    def _extract(self, payload: Any, params: Mapping[str, Any]) -> DemoResult:
+    def _extract(self, payload: Any, params: Mapping[str, Any],
+                 modes: Optional[Mapping[str, str]] = None) -> DemoResult:
         ph = self.phantom
         t, z, c = self.view_coords()
         before = np.asarray(ph.array[0, t, z, c], dtype=float)
         res = DemoResult(before=before, axes_before=ph.axes, view=(t, z, c))
-        res.written = self._written_layers(params)
+        res.written = self._written_layers(params, modes)
         if not isinstance(payload, Dataset):
             res.value = payload
             res.note = f"output: {type(payload).__name__}"

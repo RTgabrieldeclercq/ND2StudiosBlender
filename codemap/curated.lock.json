@@ -441,10 +441,10 @@
  },
  "WF-07": {
   "anchors": {
-   "file:nodelab_v2/ingest.py": "67ac07263bf79ab44516eeaaea92b2f0",
+   "file:nodelab_v2/ingest.py": "4f4db9bb62f2a2e9e53ee6f79722ec39",
    "sym:nodelab_v2.runner.EngineRunner": "133a342d1f8a3391b2398f98b13ba846"
   },
-  "blessed": "2026-10-06",
+  "blessed": "2026-10-13",
   "file": "codemap/workflows.md"
  },
  "WF-08": {

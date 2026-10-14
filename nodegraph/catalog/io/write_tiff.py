@@ -229,10 +229,18 @@ def _compute_write_tiff(ctx: EvalContext) -> Dataset:
     na = ctx.calib("objective_na")
     mag = ctx.calib("objective_magnification")
     ch_names = ctx.meta("channel_names")
+    # The acquisition CLOCK and record ride the PAYLOAD, not the edit-time envelope (the
+    # reader's display dict lands only on the seed Dataset), so they are read off `ds` the
+    # way plot.timeseries reads them. Both feed `meta_per_m`, which the stamp digests, so a
+    # changed clock rewrites the file rather than leaving a stale one "already exported".
+    clock = _export_clock(ds.metadata, ax.t)
+    acq = _export_acquisition(ds.metadata, ax.c, ch_names)
+    ex = _per_channel((ds.metadata or {}).get("channel_excitation_nm"), ax.c)
 
     meta_per_m = [_ome_metadata(model, ax, m, px=px, zs=zs, dt_s=dt_s, emis=emis,
                                 bits=bits, dtype=dt, origin=origin, na=na, mag=mag,
-                                ch_names=ch_names, layer=layer, split=split)
+                                ch_names=ch_names, layer=layer, split=split,
+                                clock=clock, acq=acq, ex=ex)
                   for m in range(ax.m)]
 
     # ── target files ──────────────────────────────────────────────────────────
@@ -437,8 +445,77 @@ def _read_stamp(path: str) -> str:
         return ""
 
 
+def _export_clock(md: Any, n_t: int) -> Optional[Dict[str, Any]]:
+    """The series' per-frame acquisition clock as it is written into a TIFF — the SAME
+    times the Viewer shows (2026-10-13) — or ``None`` when the payload has no full clock.
+
+    ``seconds``: each frame's time since frame 0, from ``frame_time_jd`` (the real gaps: an
+    interleaved Timeseries Builder series is not ``t x dt_s``). ``text``: each frame's LOCAL
+    date and time, ``frame_datetime`` verbatim when it covers the axis. ``start_iso``: frame
+    0 as ISO 8601 with the file's UTC offset, OME's ``AcquisitionDate``. A clock that does
+    not cover the T axis exactly (a node narrowed T without it) is not written at all."""
+    from nodegraph.placement import (elapsed_text, frame_seconds, jd_to_datetime_text,
+                                     utc_offset_of)
+    md = md or {}
+    jd = md.get("frame_time_jd")
+    secs = frame_seconds(jd, int(n_t))
+    if secs is None:
+        return None
+    off = utc_offset_of(md)
+    fd = md.get("frame_datetime")
+    if isinstance(fd, (list, tuple)) and len(fd) == int(n_t) and all(fd):
+        text = [str(v) for v in fd]
+    else:
+        text = [jd_to_datetime_text(v, off) for v in jd]
+    sign = "+" if off >= 0 else "-"
+    zone = f"{sign}{abs(off) // 3600:02d}:{(abs(off) % 3600) // 60:02d}"
+    span = max(secs) - min(secs) if secs else 0.0
+    return {"seconds": [round(float(v), 6) for v in secs], "text": text,
+            "elapsed": [elapsed_text(v, span) for v in secs],
+            "start_iso": jd_to_datetime_text(jd[0], off).replace(" ", "T") + zone,
+            "zone": f"UTC{zone}"}
+
+
+def _per_channel(vals: Any, n_c: int) -> Optional[List[Any]]:
+    """A per-channel list when it covers EVERY channel with a value, else ``None`` — OME's
+    channel fields are positional, so a gap would shift every later channel's value."""
+    if isinstance(vals, (list, tuple)) and len(vals) >= n_c and \
+            all(v is not None for v in vals[:n_c]):
+        return list(vals[:n_c])
+    return None
+
+
+def _export_acquisition(md: Any, n_c: int, ch_names: Any) -> Dict[str, str]:
+    """The file's acquisition record (``acquisition_info`` sections, then each channel's
+    ``channel_acquisition`` rows) as one flat ``{"Section › label": value}`` map — what the
+    Viewer's metadata window shows, written as key/value pairs any reader can list."""
+    md = md or {}
+    out: Dict[str, str] = {}
+    for sec in md.get("acquisition_info") or []:
+        try:
+            title, rows = sec
+            for k, v in rows:
+                out[f"{title} › {k}"] = str(v)
+        except (TypeError, ValueError):
+            continue
+    rows_c = md.get("channel_acquisition")
+    names = list(ch_names or [])
+    if isinstance(rows_c, (list, tuple)) and len(rows_c) == int(n_c):
+        for c, rows in enumerate(rows_c):
+            nm = str(names[c]) if c < len(names) and names[c] else f"Ch{c + 1}"
+            for row in rows or []:
+                try:
+                    k, v = row
+                except (TypeError, ValueError):
+                    continue
+                out[f"Channel {nm} › {k}"] = str(v)
+    return out
+
+
 def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtype,
-                  origin, na, mag, ch_names, layer: str, split: bool) -> dict:
+                  origin, na, mag, ch_names, layer: str, split: bool,
+                  clock: Optional[Dict[str, Any]] = None,
+                  acq: Optional[Dict[str, str]] = None, ex: Any = None) -> dict:
     """The metadata block for one position, transcribed from the envelope.
 
     **Every value here is the envelope's own, unrounded and un-re-derived.** That is the
@@ -458,6 +535,14 @@ def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtyp
     tifffile builds (they belong to OME's ``Instrument``, which its writer does not emit), so
     rather than drop them they go into the ``Description`` free-text field alongside the
     provenance line. Present and readable beats structured and absent.
+
+    **The clock** (2026-10-13) is written exactly as the app shows it (:func:`_export_clock`):
+    OME gets ``AcquisitionDate`` (frame 0, local time with its UTC offset), a per-plane
+    ``DeltaT`` from the real per-frame clock — not ``t x dt_s``, which an interleaved
+    Timeseries Builder series or a frame-cropped one is not — and every frame's local date
+    and time as a ``MapAnnotation``. ImageJ gets the same times as each slice's label and in
+    the ``Info`` text (Image ▸ Show Info). The acquisition record (laser power, gain,
+    detector, pinhole…) goes into a second ``MapAnnotation`` / the ``Info`` text.
     """
     if model == "imagej":
         # ImageJ's own vocabulary, which is what makes Fiji open the stack calibrated
@@ -472,6 +557,14 @@ def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtyp
             md["finterval"] = float(dt_s)
         if ax.c > 1:
             md["mode"] = "composite"
+        if clock is not None:
+            # one label per SLICE, in the TZC order the planes are written
+            md["Labels"] = [f"t{t} · {clock['text'][t]} · +{clock['elapsed'][t]}"
+                            for t, _z, _c in itertools.product(
+                                range(ax.t), range(ax.z), range(ax.c))]
+        info = _info_text(clock, acq)
+        if info:
+            md["Info"] = info
         return md
 
     md = {"axes": "TZCYX"}
@@ -485,6 +578,8 @@ def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtyp
         md.update(PhysicalSizeZ=float(zs), PhysicalSizeZUnit="µm")
     if dt_s:
         md.update(TimeIncrement=float(dt_s), TimeIncrementUnit="s")
+    if clock is not None:
+        md["AcquisitionDate"] = clock["start_iso"]
     # SignificantBits is the SENSOR's depth, not the container's — a 12-bit ND2 stored in
     # uint16 must say 12, or every reader's auto-contrast stretches against 65535 and the
     # image looks black. Integer data only: it means nothing for a float payload, which by
@@ -501,6 +596,12 @@ def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtyp
     if len(ems) >= ax.c and all(e is not None for e in ems[:ax.c]):
         chan["EmissionWavelength"] = [float(ems[c]) for c in range(ax.c)]
         chan["EmissionWavelengthUnit"] = ["nm"] * ax.c
+    if ex is not None:
+        try:
+            chan["ExcitationWavelength"] = [float(ex[c]) for c in range(ax.c)]
+            chan["ExcitationWavelengthUnit"] = ["nm"] * ax.c
+        except (TypeError, ValueError):
+            chan.pop("ExcitationWavelength", None)
     if chan:
         md["Channel"] = chan
 
@@ -520,7 +621,12 @@ def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtyp
                                      range(ax.t), range(ax.z), range(ax.c))]
         for k in ("PositionXUnit", "PositionYUnit", "PositionZUnit"):
             plane_md[k] = ["µm"] * n
-    if dt_s:
+    if clock is not None:
+        # each plane's time since frame 0 off the ACQUISITION clock — the real gaps
+        plane_md["DeltaT"] = [clock["seconds"][t] for t, _z, _c in itertools.product(
+            range(ax.t), range(ax.z), range(ax.c))]
+        plane_md["DeltaTUnit"] = ["s"] * n
+    elif dt_s:
         plane_md["DeltaT"] = [float(dt_s) * t for t, _z, _c in itertools.product(
             range(ax.t), range(ax.z), range(ax.c))]
         plane_md["DeltaTUnit"] = ["s"] * n
@@ -537,7 +643,34 @@ def _ome_metadata(model: str, ax: Any, m: int, *, px, zs, dt_s, emis, bits, dtyp
     md["Description"] = " · ".join(notes)
     if ax.m > 1 and not split:
         md["Name"] = f"position {m}"
+    maps = []
+    if clock is not None:
+        maps.append({"Namespace": "nd2studios.org/frame-times",
+                     "Description": f"each frame's local acquisition time ({clock['zone']}) "
+                                    f"and seconds since frame 0",
+                     "Value": {f"t{t:04d}": f"{clock['text'][t]} {clock['zone']} · "
+                                            f"+{clock['seconds'][t]:.3f} s"
+                               for t in range(ax.t)}})
+    if acq:
+        maps.append({"Namespace": "nd2studios.org/acquisition",
+                     "Description": "acquisition settings recorded in the source file",
+                     "Value": dict(acq)})
+    if maps:
+        md["MapAnnotation"] = maps
     return md
+
+
+def _info_text(clock: Optional[Dict[str, Any]], acq: Optional[Dict[str, str]]) -> str:
+    """The ImageJ ``Info`` text: the acquisition record, then every frame's time."""
+    lines: List[str] = []
+    if acq:
+        lines.append("Acquisition settings (from the source file)")
+        lines.extend(f"  {k}: {v}" for k, v in acq.items())
+    if clock is not None:
+        lines.append(f"Frame times ({clock['zone']}, seconds since frame 0)")
+        lines.extend(f"  t{t}: {txt}  +{sec:.3f} s"
+                     for t, (txt, sec) in enumerate(zip(clock["text"], clock["seconds"])))
+    return "\n".join(lines)
 
 
 def _origin_of(origin: Any, m: int) -> Optional[Tuple[float, float, float]]:
@@ -627,8 +760,11 @@ register_node(
              choice_docs={
                  "ome":
                      "OME-XML in the first IFD: physical XY and Z sizes, frame interval, "
-                     "significant bits, per-channel names and emission wavelengths, and a "
-                     "per-plane stage position and time offset. The only option that can "
+                     "significant bits, per-channel names and emission/excitation "
+                     "wavelengths, a per-plane stage position, each plane's time since "
+                     "frame 0 off the real acquisition clock, the acquisition date and every "
+                     "frame's local time, and the source file's acquisition settings (laser "
+                     "power, gain, detector…) as key/value annotations. The only option that can "
                      "hold several positions in one file, and the only one that carries "
                      "where the data was on the stage. Read by Fiji (Bio-Formats), QuPath "
                      "and napari; BigTIFF when needed, so there is no size ceiling. The "
@@ -636,7 +772,9 @@ register_node(
                  "imagej":
                      "An ImageJ hyperstack header — `spacing`, `unit`, `finterval` plus the "
                      "resolution tags. Fiji opens it natively, instantly, with the Z spacing "
-                     "and frame interval already right and no Bio-Formats import dialog. In "
+                     "and frame interval already right and no Bio-Formats import dialog. "
+                     "Each slice's label carries its frame's acquisition time, and Image ▸ "
+                     "Show Info lists every frame's time and the acquisition settings. In "
                      "exchange it holds ONE position, drops stage positions and channel "
                      "wavelengths, and cannot exceed 4 GB (a larger export is refused, not "
                      "silently truncated). Pick it when the destination is Fiji and the "

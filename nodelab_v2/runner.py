@@ -69,7 +69,7 @@ from nodegraph.graph import Graph
 from nodegraph.memo import Memo
 from nodegraph.metadata import (
     MetaEnvelope, PER_POSITION_KEYS, SOURCE_CLOCK_KEY, SOURCE_FILE_KEY, SOURCE_PATH_KEY,
-    position_subset, shift_origin_um, stamp_source_file)
+    position_subset, shift_origin_um, stamp_source_file, time_subset)
 from nodegraph.parallel import (
     memo_bytes, plane_cache_bytes, ram_budget, store_dir, tile_cache_bytes)
 from nodegraph.provider import (
@@ -865,6 +865,44 @@ def _key_sub(key: tuple) -> Tuple[int, int]:
     return tuple(key[7]) if len(key) > 7 else (0, 0)
 
 
+#: the longest side of an overlay source's LUT reference plane (:meth:`EngineRunner.
+#: overlay_lut_refs`) — a histogram and a 1 / 99.5 % window need a sample, not the field
+LUT_REF_DIM = 256
+
+
+def _default_source_frame(src: Mapping[str, Any]) -> Tuple[int, int, int]:
+    """``(m, t, z)`` a union canvas's source shows before its own strips are touched: its
+    first field and timepoint, at its stack's HOME plane — the focus the acquisition named as
+    the stack's own (``z_home_index``), not its bottom slice — or the middle one without it."""
+    nz = int(getattr(src.get("sec_axes"), "z", 1) or 1)
+    try:
+        home = int((src.get("sec_md") or {}).get("z_home_index"))
+    except (TypeError, ValueError):
+        home = -1
+    return 0, 0, home if 0 <= home < nz else nz // 2
+
+
+def _independent_overlay(graph_record, sources: Sequence[Mapping[str, Any]],
+                         pri_md: Mapping[str, Any]) -> bool:
+    """Whether a chain's overlaid sources each get their OWN M/T/Z (2026-10-14): the viewed
+    payload is an experiment canvas and every Overlay in the chain is ``canvas=union``. A
+    union canvas has no primary — each file is drawn as a source of its own — so mapping
+    one file's frame from another's is the wrong model there: the canvas's clock is merely
+    its first file's, and a second file's other timepoints were reachable only through the
+    ◀▶ stepper. A canvas from ``view.canvas`` with ordinary Overlays keeps the paired model
+    (the files there ARE paired against input 0's clock, through pins and rates)."""
+    from nodegraph.catalog._shared.canvas import is_canvas
+    real = [s for s in sources if not s.get("as_channel")]
+    if not real or not is_canvas(pri_md):
+        return False
+    for s in real:
+        node = graph_record(str(s.get("ovl_id") or "").partition("#")[0])
+        if node is None or node.op_key != "view.overlay" or \
+                dict(node.modes or {}).get("canvas") != "union":
+            return False
+    return True
+
+
 def render_plane(provider: Any, m: int, t: int, z: int, c: int,
                  *, max_dim: int = MAX_DISPLAY_DIM) -> np.ndarray:
     """A display plane at ``(m,t,z,c)``: picks the finest pyramid level that fits
@@ -959,6 +997,35 @@ _UNSET = object()
 #: :meth:`EngineRunner.raw_plane`. A sentinel string rather than a node id so it can
 #: never collide with one.
 _RAW_TAG = "\x00raw"
+
+
+def pinned_seed_metadata(env_md: Dict[str, Any], disp: Dict[str, Any], spin: Any,
+                         full_m: int, full_t: int) -> Dict[str, Any]:
+    """A source seed's payload metadata: its envelope plus the file's display dict, with a
+    troubleshooting pin's subset applied to the MERGED result.
+
+    The display dict carries per-M keys (the stage log, point names) and — since the
+    placement vocabulary — per-T keys (``frame_time_jd`` / ``frame_datetime``, a bundle's
+    per-file clock) at the source's FULL length, and it is merged after
+    :func:`_pin_frames` has already cut the envelope. So the merge would put the un-subset
+    lists back: re-applying the position subset is the original fix, and the per-T subset
+    (2026-10-13) the same fix one axis over — without it a T pin left the seed with 8
+    timestamps for 2 frames, the Viewer's overlay read another frame's time, and a
+    Timeseries Builder below refused the clock as the wrong length and fell back to block
+    order. A list too short to subset is dropped, never padded."""
+    md = dict(env_md)
+    md.update(disp or {})
+    if spin is None:
+        return md
+    changes = position_subset(md, _picked(
+        spin[0] if spin[0] is not None else range(full_m), full_m))
+    if spin[1] is not None:
+        changes.update(time_subset(md, _picked(spin[1], full_t)))
+    md.update({k: v for k, v in changes.items() if v is not None})
+    for k, v in changes.items():
+        if v is None:
+            md.pop(k, None)
+    return md
 
 
 def _pin_frames(provider: Any, env: MetaEnvelope, pin: Pin) -> Tuple[Any, MetaEnvelope]:
@@ -1700,6 +1767,10 @@ class EngineRunner(QObject):
     #: an edit landed inside its cone (:meth:`invalidate`), or the node/graph went away.
     #: A card must be able to leave the running state on this path too, or it spins forever.
     cancelled = Signal(str)
+    #: the pull slot went IDLE with nothing waiting (2026-10-13) — the one change of the
+    #: Node queue no other signal reports: a cancelled run that finally unwinds frees the
+    #: slot silently (its packet is stale), so the canvas button kept counting it
+    queue_changed = Signal()
 
     _done = Signal(object)                       # internal cross-thread delivery
     _detail_done = Signal(object)                # internal: _DetailJob → GUI thread
@@ -1846,6 +1917,18 @@ class EngineRunner(QObject):
         #: every change, so they can never be served for the un-overridden frame.
         self._src_override: Dict[str, Tuple[int, int]] = {}
         self._ovr_gen: int = 0
+        #: overlay source id → ``(m, t, z)``: the frame a source of a UNION canvas shows,
+        #: chosen on its own M/T/Z strips (2026-10-14). On a union canvas every file is a
+        #: source of its own and none is "the primary", so no source's frame is mapped from
+        #: another's — each has its own axes. Display-only, keyed by ``_ovr_gen`` exactly as
+        #: the steppers are; a source not in here shows :func:`_default_source_frame`.
+        self._src_select: Dict[str, Tuple[int, int, int]] = {}
+        #: ``(source node, m, t, z, channel)`` → that source field's own plane (≤
+        #: :data:`LUT_REF_DIM` px), read by the worker beside every composite — what an
+        #: overlay channel's histogram and Auto read instead of the composite (a speck of the
+        #: field on a blank canvas). LRU, bounded, guarded: warm jobs write it concurrently.
+        self._lut_refs: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self._lut_ref_lock = threading.Lock()
         #: what one texture axis may be, from the live surface (:meth:`set_display_limits`).
         self._texture_limit: int = DEFAULT_TEXTURE_LIMIT
         self._prefetch_gen = 0
@@ -2264,7 +2347,8 @@ class EngineRunner(QObject):
                 region=(ly0 / lax.y, ly1 / lax.y, lx0 / lax.x, lx1 / lax.x),
                 # detail is requested at REST (playback holds it off), so sub-tick 0 — but
                 # the stepper override and Z index must match the overview underneath it
-                z_index=z, override=dict(self._src_override))
+                z_index=z, override=dict(self._src_override),
+                select=dict(getattr(self, '_src_select', {})))
             # the caller asked for a channel set; an overlay channel whose toggle is off is
             # not in it, and the patch must not put back what the overview leaves out
             want = {int(ch) for ch in (channels or ()) if int(ch) >= int(axes.c)}
@@ -2369,7 +2453,9 @@ class EngineRunner(QObject):
           Movie Editor needs), ``"bake"`` (a Dock writing its checkpoint) or ``"ingest"``
           (a source file being copied into its store — several run at once, beside the
           pull slot);
-        * ``state`` — ``"running"``, ``"stopping"`` (a bake asked to stop) or ``"queued"``;
+        * ``state`` — ``"running"``, ``"stopping"`` (a bake asked to stop, or a pull or
+          fetch that was cancelled but is still finishing the step it was on — the engine
+          only stops at a node boundary or a progress tick; 2026-10-13) or ``"queued"``;
         * ``position`` — ``0`` while running, else its place in line (1 = next);
         * ``elapsed`` — seconds since it started, while running;
         * ``step`` — ``(event, run node id, info)`` it last reported, while running;
@@ -2379,7 +2465,21 @@ class EngineRunner(QObject):
         act = self._active
         if self._busy and act is not None:
             bake = act.bake is not None
-            if (act.epoch in self._bakes) if bake else (act.epoch in self._runs):
+            if not bake and act.epoch not in self._runs and getattr(act, "cancelled", False):
+                # Cancelled — by the queue or by an edit in its cone — but the worker has
+                # not reached its next stop point yet, and the slot is still held. Listed
+                # rather than dropped: until it unwinds nothing behind it can start, and a
+                # list that showed the waiting job as next-but-not-starting read as a
+                # cancel that did nothing.
+                t0 = self._run_t0.get(act.epoch)
+                out.append({
+                    "node": act.node_id,
+                    "kind": "fetch" if act.epoch in self._fetches else "pull",
+                    "state": "stopping", "position": 0,
+                    "elapsed": (time.monotonic() - t0) if t0 is not None else None,
+                    "step": self._run_step.get(act.epoch),
+                    "cancellable": False})
+            elif (act.epoch in self._bakes) if bake else (act.epoch in self._runs):
                 t0 = self._run_t0.get(act.epoch)
                 out.append({
                     "node": act.node_id,
@@ -2758,6 +2858,10 @@ class EngineRunner(QObject):
         else:
             for key in [k for k in self._src_lut_cache if self._page_of_run(k) in reach]:
                 self._src_lut_cache.pop(key, None)
+        with self._lut_ref_lock:
+            for key in [k for k in self._lut_refs
+                        if reach is None or self._page_of_run(str(k[0])) in reach]:
+                self._lut_refs.pop(key, None)
         if reach is None:
             self._planes.clear()
         else:
@@ -3007,7 +3111,7 @@ class EngineRunner(QObject):
                                dtype=dtype)
         out: List[Tuple[tuple, int, int, int, int]] = []
         seen: set = set()
-        ovr = self._ovr_gen if self._src_override else 0
+        ovr = self._ovr_gen if (self._src_override or getattr(self, '_src_select', None)) else 0
         for ch in wanted:
             is_ovl = ch >= int(axes.c)
             if is_ovl:
@@ -3199,12 +3303,18 @@ class EngineRunner(QObject):
             budget -= n
         if not sources:
             return None
+        try:
+            independent = _independent_overlay(self._source.record, sources, payload.metadata)
+        except Exception:  # noqa: BLE001 — a display question must never cost the overlay
+            independent = False
         return {"node": node_id, "sources": sources, "dropped": dropped,
-                "pri_md": dict(payload.metadata), "pri_axes": payload.axes}
+                "pri_md": dict(payload.metadata), "pri_axes": payload.axes,
+                "independent": independent}
 
     def _compose_overlay(self, node_id: str, out_shape, m: int, t: int, z_um,
                          *, region=None, t_sub: int = 0, z_index: Optional[int] = None,
-                         override: Optional[Dict[str, Tuple[int, int]]] = None
+                         override: Optional[Dict[str, Tuple[int, int]]] = None,
+                         select: Optional[Dict[str, Tuple[int, int, int]]] = None
                          ) -> Dict[int, np.ndarray]:
         """``{channel_index: composed plane}`` for the overlay on ``node_id``, or ``{}``.
 
@@ -3231,7 +3341,12 @@ class EngineRunner(QObject):
         in index form need. ``override`` is the Viewer's display-only per-source ``(dt, dz)``
         stepper offset. Z is sampled through the node's own :func:`z_pick` — the same slice
         choice and weights the ``resample`` bake uses — so ``linear`` blends here exactly as it
-        does there."""
+        does there.
+
+        ``select`` is the union canvas's per-source ``(m, t, z)`` (:attr:`_src_select`), a
+        snapshot taken with the keys like ``override``. Each composite also leaves every
+        source's LUT reference plane in :attr:`_lut_refs` (:meth:`_stash_lut_refs`), so the
+        Viewer's histograms describe the field the user picked, not the canvas."""
         from nodelab_v2.overlay_compose import compose_secondary_plane
         ctx = self._overlay_ctxs.get(node_id)
         if not ctx or ctx["node"] != node_id:
@@ -3250,7 +3365,7 @@ class EngineRunner(QObject):
                 entry = src["entry"]
                 sec_ax = src["sec_axes"]
                 frame = self._source_frame(src, ctx, t, int(t_sub), n_sub, pri_k, z_um,
-                                           m, override)
+                                           m, override, select)
                 if frame is None:
                     continue
                 t_sec, z_weights = frame
@@ -3278,18 +3393,111 @@ class EngineRunner(QObject):
                         out[int(src["base_c"]) + k] = blended
             except Exception:  # noqa: BLE001 — the image must survive a bad overlay
                 continue
+            try:
+                # after the composite, and apart from it: a reference plane that cannot be
+                # read costs the histogram its sample, never the picture its layer
+                self._stash_lut_refs(src, self._lut_ref_frame(src, ctx, m, t_sec, z_weights,
+                                                              select))
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    def _lut_ref_frame(self, src: Dict[str, Any], ctx: Dict[str, Any], m: int, t_sec: int,
+                       z_weights, select=None) -> Tuple[str, int, int, int]:
+        """``(source node, field, t, z)`` of ``src``'s LUT reference plane: the field its
+        own M strip picked on a union canvas, else the field that covers most of the
+        primary's field ``m``; the frame and dominant plane the composite drew."""
+        sax = src["sec_axes"]
+        if ctx.get("independent") and not src.get("as_channel"):
+            m_ref = ((select or {}).get(str(src.get("ovl_id")))
+                     or _default_source_frame(src))[0]
+        else:
+            tiles = dict((int(a), b) for a, b in (src["entry"].get("tiles") or ()))
+            hits = tiles.get(int(m)) or ()
+            m_ref = int(hits[0][0]) if hits else 0
+        m_ref = min(max(0, int(m_ref)), int(getattr(sax, "m", 1) or 1) - 1)
+        z_ref = int(max(z_weights, key=lambda p: p[1])[0]) if z_weights else 0
+        return str(src["sec_id"]), m_ref, int(t_sec), z_ref
+
+    def _stash_lut_refs(self, src: Dict[str, Any], frame: Tuple[str, int, int, int]) -> None:
+        """Read ``src``'s field at ``frame`` once per channel into :attr:`_lut_refs`, at
+        most :data:`LUT_REF_DIM` px a side — worker thread, beside the composite it
+        describes, so the Viewer never reads a source on the GUI thread."""
+        cache = getattr(self, "_lut_refs", None)
+        lock = getattr(self, "_lut_ref_lock", None)
+        if cache is None or lock is None:
+            return
+        sid, m_ref, t_ref, z_ref = frame
+        for k in range(int(src["n"])):
+            key = (sid, m_ref, t_ref, z_ref, k)
+            with lock:
+                if key in cache:
+                    cache.move_to_end(key)
+                    continue
+            try:
+                plane, _lv = render_plane_native(src["sec_provider"], m_ref, t_ref, z_ref, k,
+                                                 max_dim=LUT_REF_DIM)
+            except Exception:  # noqa: BLE001 — no sample is better than a wrong one
+                continue
+            with lock:
+                cache[key] = np.asarray(plane)
+                while len(cache) > 512:
+                    cache.popitem(last=False)
+
+    def overlay_lut_refs(self, node_id: str, m: int, t: int, sub: int,
+                         z: int) -> Dict[int, np.ndarray]:
+        """``{display channel: that source's own plane}`` for the frame each source shows at
+        the cursor — what the Viewer's overlay histograms and Auto read (2026-10-14). They
+        used to read the COMPOSITE, which on a union canvas is a 64 µm bead field as a speck on
+        an 8.8 mm blank: a histogram of zeros. GUI thread: a lookup of what the composite's
+        worker read (:meth:`_stash_lut_refs`); a channel whose plane has not landed yet is
+        left out, and the Viewer keeps its last one."""
+        node_id = self._rid(node_id)
+        ctx = self._overlay_ctxs.get(node_id)
+        if not ctx or ctx.get("node") != node_id:
+            return {}
+        n_sub = self.overlay_sub_ticks(node_id)
+        z_um = _z_um_of(ctx["pri_md"], ctx["pri_axes"], int(m), z)
+        select = dict(self._src_select)
+        out: Dict[int, np.ndarray] = {}
+        for src in ctx.get("sources", ()):
+            try:
+                fr = self._source_frame(src, ctx, t, sub, n_sub, int(z), z_um, int(m),
+                                        dict(self._src_override), select)
+                if fr is None:
+                    continue
+                sid, m_ref, t_ref, z_ref = self._lut_ref_frame(src, ctx, m, fr[0], fr[1],
+                                                               select)
+                with self._lut_ref_lock:
+                    for k in range(int(src["n"])):
+                        plane = self._lut_refs.get((sid, m_ref, t_ref, z_ref, k))
+                        if plane is not None:
+                            out[int(src["base_c"]) + k] = plane
+            except Exception:  # noqa: BLE001 — a histogram sample must never cost the frame
+                continue
         return out
 
     def _source_frame(self, src: Dict[str, Any], ctx: Dict[str, Any], t: int, t_sub: int,
                       n_sub: int, pri_k: int, z_um, m: int,
-                      override: Optional[Dict[str, Tuple[int, int]]] = None):
+                      override: Optional[Dict[str, Tuple[int, int]]] = None,
+                      select: Optional[Dict[str, Tuple[int, int, int]]] = None):
         """``(t_sec, [(z_sec, weight)])`` this source shows at primary ``(t, sub, z)``, or
         ``None`` where it has no frame. The ONE resolution the compositor and the Play-all
-        readout share, so the numbers under the strip are the frame on screen."""
+        readout share, so the numbers under the strip are the frame on screen.
+
+        On a union canvas (``ctx["independent"]``) the source's frame is its OWN —
+        ``select``'s ``(m, t, z)`` for it, else :func:`_default_source_frame` — one acquired
+        plane, independent of the canvas cursor and of every other source."""
         from nodegraph.catalog._shared.placement_entry import z_pick
         from nodegraph.placement import paired_t_frac
         entry = src["entry"]
         sec_ax = src["sec_axes"]
+        if ctx.get("independent") and not src.get("as_channel"):
+            _sm, st, sz = (select or {}).get(str(src.get("ovl_id"))) \
+                or _default_source_frame(src)
+            nt = int(getattr(sec_ax, "t", 1) or 1)
+            nz = int(getattr(sec_ax, "z", 1) or 1)
+            return min(max(0, int(st)), nt - 1), [(min(max(0, int(sz)), nz - 1), 1.0)]
         t_sec = paired_t_frac(entry, int(t), int(t_sub), int(n_sub))
         if t_sec is None:
             return None
@@ -3533,12 +3741,23 @@ class EngineRunner(QObject):
         prov = getattr(sec, "image", None)
         ax = getattr(prov, "axes", None)
         depth = (sec.metadata or {}).get("bit_depth") if hasattr(sec, "metadata") else None
+        # POOLED over the source's fields (2026-10-14), up to 16 evenly spaced: one field is
+        # not the file. The bead series' field 0 is its dimmest bead, and a window taken from
+        # it alone (43-77 counts) saturated every bright bead on the canvas. Capped because a
+        # COMPUTED source pays a whole plane per field, once, when the overlay resolves.
+        n_m = int(getattr(ax, "m", 1) or 1)
+        fields = sorted({int(round(i * (n_m - 1) / 15.0)) for i in range(16)}) \
+            if n_m > 16 else list(range(n_m))
+        per = max(64, 1024 // max(1, int(np.sqrt(len(fields)))))
         for k in range(min(int(getattr(ax, "c", 1) or 1), MAX_OVERLAY_CHANNELS)):
             lohi = None
             try:
-                plane, _lv = render_plane_native(
-                    prov, 0, 0, int(getattr(ax, "z", 1) or 1) // 2, k, max_dim=1024)
-                finite = np.asarray(plane, dtype=float)
+                parts = []
+                for j in fields:
+                    plane, _lv = render_plane_native(
+                        prov, j, 0, int(getattr(ax, "z", 1) or 1) // 2, k, max_dim=per)
+                    parts.append(np.asarray(plane, dtype=float).ravel())
+                finite = np.concatenate(parts) if parts else np.zeros(0)
                 finite = finite[np.isfinite(finite)]
                 if finite.size:
                     lo = float(np.percentile(finite, 1.0))
@@ -3575,7 +3794,8 @@ class EngineRunner(QObject):
             z_um = _z_um_of(ctx["pri_md"], ctx["pri_axes"], m, z)
             got = self._compose_overlay(node_id, tuple(shape), m, t, z_um, t_sub=sub,
                                         z_index=z,
-                                        override=dict(self._src_override) if ovr else {})
+                                        override=dict(self._src_override) if ovr else {},
+                                        select=dict(getattr(self, '_src_select', {})) if ovr else {})
             for c_k, arr in got.items():
                 if arr is not None:
                     self._planes.put(key[:5] + (int(c_k),) + key[6:], arr)
@@ -3630,6 +3850,8 @@ class EngineRunner(QObject):
             return []
         n_sub = self.overlay_sub_ticks(node_id)
         z_um = _z_um_of(ctx["pri_md"], ctx["pri_axes"], int(m), z)
+        independent = bool(ctx.get("independent"))
+        select = dict(getattr(self, "_src_select", {}) or {})
         out: List[Dict[str, Any]] = []
         for i, src in enumerate(ctx.get("sources", ())):
             if src.get("as_channel"):
@@ -3637,9 +3859,22 @@ class EngineRunner(QObject):
             entry, sax = src["entry"], src["sec_axes"]
             try:
                 fr = self._source_frame(src, ctx, t, sub, n_sub, int(z), z_um, int(m),
-                                        dict(self._src_override))
+                                        dict(self._src_override), select)
             except Exception:  # noqa: BLE001 — a readout must never cost the view
                 fr = None
+            if independent:
+                # a union canvas: the source's OWN axes, read straight back off its selection
+                sm, st, sz = select.get(str(src["ovl_id"])) or _default_source_frame(src)
+                out.append({
+                    "ovl_id": src["ovl_id"], "sec_id": src["sec_id"],
+                    "label": self.source_label(src, i), "independent": True,
+                    "m": min(max(0, int(sm)), int(getattr(sax, "m", 1) or 1) - 1),
+                    "n_m": int(getattr(sax, "m", 1) or 1),
+                    "t": None if fr is None else fr[0], "n_t": int(getattr(sax, "t", 1) or 1),
+                    "z": None if fr is None else int(fr[1][0][0]),
+                    "n_z": int(getattr(sax, "z", 1) or 1),
+                    "t_pinned": False, "z_pinned": False, "offset": (0, 0), "sub_ticks": 1})
+                continue
             tz = (None, None) if fr is None else (
                 fr[0], int(max(fr[1], key=lambda p: p[1])[0]))
             pins_t = {int(r[0]) for r in (self._pins_of(src["ovl_id"], "t_pins"))}
@@ -3756,9 +3991,55 @@ class EngineRunner(QObject):
             self._src_override[key] = new
         self._ovr_gen += 1
 
+    def overlay_field_rects(self, node_id: str) -> List[Dict[str, Any]]:
+        """On a union canvas, where each source's PICKED field (its M strip) sits on the
+        canvas image: ``[{ovl_id, label, ch, m, n_m, rect}]``, ``rect`` a fractional
+        ``(fy0, fy1, fx0, fx1)`` (:func:`~nodegraph.placement.field_rect01`, the compositor's
+        own geometry). What makes the M strip visible on the picture: a 64 µm bead field is a
+        pixel of an 8.8 mm canvas, so moving it would otherwise change only the histogram.
+        ``[]`` anywhere else — a mapped source's field is the primary's own."""
+        node_id = self._rid(node_id)
+        ctx = self._overlay_ctxs.get(node_id)
+        if not ctx or ctx.get("node") != node_id or not ctx.get("independent"):
+            return []
+        from nodegraph.placement import field_rect01
+        select = dict(self._src_select)
+        out: List[Dict[str, Any]] = []
+        for i, src in enumerate(ctx.get("sources", ())):
+            if src.get("as_channel"):
+                continue
+            n_m = int(getattr(src["sec_axes"], "m", 1) or 1)
+            m_sel = (select.get(str(src["ovl_id"])) or _default_source_frame(src))[0]
+            m_sel = min(max(0, int(m_sel)), n_m - 1)
+            try:
+                rect = field_rect01(src["entry"], ctx["pri_md"], ctx["pri_axes"], 0,
+                                    src["sec_md"], src["sec_axes"], m_sel)
+            except Exception:  # noqa: BLE001 — an outline is cosmetic; never cost the view
+                rect = None
+            if rect is not None:
+                out.append({"ovl_id": src["ovl_id"], "label": self.source_label(src, i),
+                            "ch": int(src["base_c"]), "m": m_sel, "n_m": n_m, "rect": rect})
+        return out
+
+    def set_source_select(self, picks: Mapping[str, Tuple[int, int, int]]) -> None:
+        """Show each named union-canvas source at its own ``(m, t, z)`` — the Viewer's
+        per-source strips (2026-10-14), several at once so Play all moves every source in ONE
+        request. Display-only, like the steppers: nothing re-runs, and the planes composed
+        under it are keyed by a new :attr:`_ovr_gen`."""
+        changed = False
+        for ovl_id, mtz in (picks or {}).items():
+            key = self._rid(str(ovl_id))
+            new = tuple(int(v) for v in mtz)[:3]
+            if self._src_select.get(key) != new:
+                self._src_select[key] = new
+                changed = True
+        if changed:
+            self._ovr_gen += 1
+
     def clear_source_overrides(self) -> None:
-        if self._src_override:
+        if self._src_override or self._src_select:
             self._src_override.clear()
+            self._src_select.clear()
             self._ovr_gen += 1
 
     def overlay_style(self, node_id: str) -> Dict[int, Tuple[int, float, float]]:
@@ -3857,9 +4138,10 @@ class EngineRunner(QObject):
         octx["display_shape"] = tuple(ref.shape[:2])
         # The override snapshot is taken ONCE, with the keys: a stepper moved while this runs
         # must not compose one frame's pixels under another generation's key.
-        ovr = self._ovr_gen if self._src_override else 0
+        ovr = self._ovr_gen if (self._src_override or getattr(self, '_src_select', None)) else 0
         composed = self._compose_overlay(node_id, ref.shape[:2], m, t, z_um, t_sub=sub,
-                                         z_index=z, override=dict(self._src_override))
+                                         z_index=z, override=dict(self._src_override),
+                                         select=dict(getattr(self, '_src_select', {})))
         keys = {a[4]: a[0] for a in ovl_addrs}
         for ch, plane in composed.items():
             key = keys.get(ch)
@@ -4075,7 +4357,7 @@ class EngineRunner(QObject):
         # primary plane is shared by all of them. The frame UNDER the cursor is warmed too,
         # since its later sub-ticks are exactly what the next few ticks show.
         n_sub = self.overlay_sub_ticks(node_id)
-        ovr = self._ovr_gen if self._src_override else 0
+        ovr = self._ovr_gen if (self._src_override or getattr(self, '_src_select', None)) else 0
         self._prefetch_gen += 1
         gen = self._prefetch_gen
         jobs: List[Tuple[tuple, int, int, int, int]] = []
@@ -4177,7 +4459,7 @@ class EngineRunner(QObject):
                                provider=prov, dtype=view.dtype)
         nt = max(1, int(axes.t))
         n_sub = self.overlay_sub_ticks(node_id)
-        ovr = self._ovr_gen if self._src_override else 0
+        ovr = self._ovr_gen if (self._src_override or getattr(self, '_src_select', None)) else 0
         per_frame = (self._frame_bytes(axes, max(1, len(prim)), provider=prov,
                                        dtype=view.dtype)
                      + (self._overlay_frame_bytes(node_id, axes, provider=prov,
@@ -4790,6 +5072,7 @@ class EngineRunner(QObject):
                 continue
             self._submit(nid, None, None, fetch=True)
             return
+        self.queue_changed.emit()             # idle: nothing left to start
 
     def _pull_id(self, node_id: str, graph: Graph, composed: Any = None) -> str:
         """Which id in the RUN graph serves ``node_id``.
@@ -4953,27 +5236,16 @@ class EngineRunner(QObject):
         meta_seeds: Dict[str, MetaEnvelope] = {}
         for nid, cfg in job.sources.items():
             prov, env = self._resolve_source(nid, cfg, epoch=job.epoch)
-            full_m = int(env.axes.m)
+            full_m, full_t = int(env.axes.m), int(env.axes.t)
             spin = source_pin(job.pin, job.whole.get(nid, ()))
             if spin is not None:
                 prov, env = _pin_frames(prov, env, spin)
-            # The FULL display dict (excitation, bit depth, the stage keys) rides on the seed
-            # Dataset only; the engine meta-seed keeps to the calibration schema plus the
-            # per-channel names/colours (`ingest.channel_display_seed`, V4.00 step 11g).
+            # The FULL display dict (excitation, bit depth, the stage keys, the clock) rides
+            # on the seed Dataset only; the engine meta-seed keeps to the calibration schema
+            # plus the per-channel names/colours (`ingest.channel_display_seed`, V4.00 step
+            # 11g). Merged by `pinned_seed_metadata`, which re-applies a pin's subset.
             disp = self._channel_display.get(self._node_source_key.get(nid), {})
-            md = dict(env.metadata); md.update(disp)
-            # ...and the display dict carries the per-M STAGE keys too (`ingest.STAGE_KEYS`
-            # is documented as riding "alongside the channel display keys"), at FULL length.
-            # So this merge lands after `_pin_frames` and would put the un-subset list back
-            # — re-apply the subset to the merged result, or the pin's fix is undone one
-            # line later.
-            if spin is not None:
-                changes = position_subset(md, _picked(
-                    spin[0] if spin[0] is not None else range(full_m), full_m))
-                md.update({k: v for k, v in changes.items() if v is not None})
-                for k, v in changes.items():
-                    if v is None:
-                        md.pop(k, None)
+            md = pinned_seed_metadata(env.metadata, disp, spin, full_m, full_t)
             seeds[nid] = Dataset(axes=env.axes, metadata=md).with_image(prov)
             meta_seeds[nid] = env
         # Docked nodes are sources too (V2.18): the seed both satisfies the engine's

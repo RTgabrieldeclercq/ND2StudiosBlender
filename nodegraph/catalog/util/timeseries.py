@@ -86,7 +86,7 @@ from nodegraph.metadata import (
     CHAIN_ORDERS, chain_frame_order, chain_grow as _meta_chain_grow, chain_member_clock,
     chain_members, chain_order_used, chain_position_spread, chain_position_tolerance,
     chained_metadata)
-from nodegraph.placement import jd_to_datetime_text
+from nodegraph.placement import jd_to_datetime_text, utc_offset_of
 from nodegraph.provider import AxisRespreadProvider, FrameRemapProvider
 from nodegraph.registry import Granularity, InDataset, Mode, OutDataset
 
@@ -246,14 +246,17 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
     names = [mm.name for mm in members]
     used = chain_order_used(members, order)
     clocks = [chain_member_clock(mm) for mm in members]
+    # each file's first frame in that file's LOCAL time (2026-10-13: the clock is UTC)
+    first_local = [jd_to_datetime_text(c, utc_offset_of(mm.metadata)) if c is not None
+                   else "" for c, mm in zip(clocks, members)]
     if perm is not None:
         # Which file each output frame came from, by its index into `files` -- once
         # frames interleave, the file order alone no longer says what plays when.
         block = [j for j, mm in enumerate(members) for _ in range(mm.extent(axis))]
         frame_file = [block[i] for i in perm]
-        jd = changes.get("frame_time_jd") or []
-        span = (f", {jd_to_datetime_text(jd[0])} → {jd_to_datetime_text(jd[-1])}"
-                if jd else "")
+        # the reader's own LOCAL text for the first and last frame (each file's zone)
+        dtt = changes.get("frame_datetime") or []
+        span = (f", {dtt[0]} → {dtt[-1]}" if dtt and dtt[0] and dtt[-1] else "")
         note = (f"{total} frames from {k} files, each placed by its own acquisition "
                 f"clock — the files interleave{span}")
         if "dt_s" in changes and changes["dt_s"] is None:
@@ -262,7 +265,7 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
     elif used == "time":
         frame_file = None
         note = (f"{k} files in acquisition-clock order"
-                + (f", {jd_to_datetime_text(clocks[0])} → {jd_to_datetime_text(clocks[-1])}"
+                + (f", {first_local[0]} → {first_local[-1]}"
                    if clocks and clocks[0] is not None and clocks[-1] is not None else ""))
     else:
         frame_file = None
@@ -276,7 +279,7 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
         # result here depends on, so it is stated rather than inferable.
         "order": used,
         "interleaved": perm is not None,
-        "first_frame": [jd_to_datetime_text(c) if c is not None else "" for c in clocks],
+        "first_frame": first_local,
         "note": note,
     }
     if frame_file is not None:

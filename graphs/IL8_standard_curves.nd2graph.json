@@ -1,0 +1,3247 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 5,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "PTS",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEAD",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGM",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEADPX",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGM",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEAD",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CHC",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "PLOT",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CURVE",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEADPX",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "SUB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "J",
+              "src_socket": "out"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L0",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L2",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L4",
+              "src_socket": "image"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "MB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "MBG",
+              "src_socket": "out"
+            },
+            {
+              "dst": "GROW",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "PTS",
+              "src_socket": "out"
+            },
+            {
+              "dst": "UQ",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "SUB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHC",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA1",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA5",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "BEAD",
+              "modes": {
+                "method": "single"
+              },
+              "op_key": "analysis.histogram_threshold",
+              "params": {
+                "__locked__": [
+                  "high",
+                  "min_area"
+                ],
+                "__title__": "Bead: Cy5 > 500",
+                "high": 500.0,
+                "min_area": 0.0
+              }
+            },
+            {
+              "id": "BEADPX",
+              "modes": {
+                "op": "union"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Bead pixels = Cy5 mask \u222a discs",
+                "a": "mask",
+                "b": "grown",
+                "name": "bead_pixels"
+              }
+            },
+            {
+              "id": "BGM",
+              "modes": {
+                "op": "invert"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Background = frame \u2212 bead pixels",
+                "a": "bead_pixels",
+                "name": "background"
+              }
+            },
+            {
+              "id": "BGR",
+              "modes": {
+                "regions": "whole"
+              },
+              "op_key": "analysis.label",
+              "params": {
+                "__title__": "Background region (one per frame)",
+                "mask": "background",
+                "name": "background"
+              }
+            },
+            {
+              "id": "CHC",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__locked__": [
+                  "channels"
+                ],
+                "__title__": "Cy5 (bead detection)",
+                "channels": "1"
+              }
+            },
+            {
+              "id": "CHR",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__title__": "R-PE (measured)",
+                "channels": "0"
+              }
+            },
+            {
+              "id": "CURVE",
+              "modes": {},
+              "op_key": "table.concat",
+              "params": {
+                "__title__": "Beads by IL-8 concentration (pg/mL)",
+                "name": "standard_curve",
+                "names": "5000,2500,1000,500,0",
+                "table": "beads"
+              }
+            },
+            {
+              "id": "GROW",
+              "modes": {},
+              "op_key": "transform.grow_points",
+              "params": {
+                "__locked__": [
+                  "radius"
+                ],
+                "__title__": "5 \u00b5m disc per bead (measured region)",
+                "radius": 5.0
+              }
+            },
+            {
+              "id": "J",
+              "modes": {
+                "domain": "label",
+                "how": "left",
+                "on": "m_t",
+                "other_domain": "label"
+              },
+              "op_key": "table.join",
+              "params": {
+                "__title__": "Each bead + its frame's background",
+                "name": "bead_corrected",
+                "other_table": "background",
+                "prefix": "bg_",
+                "table": "grown"
+              }
+            },
+            {
+              "id": "L0",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 0 \u2014 Count00000_ChannelR-PE,Cy5_Seq0002.nd2",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_153228_769\\Count00000_ChannelR-PE,Cy5_Seq0002.nd2"
+              }
+            },
+            {
+              "id": "L1",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 1 \u2014 Count00001_ChannelR-PE,Cy5_Seq0003.nd2",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_153228_769\\Count00001_ChannelR-PE,Cy5_Seq0003.nd2"
+              }
+            },
+            {
+              "id": "L2",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 2 \u2014 Count00002_ChannelR-PE,Cy5_Seq0004.nd2",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_153228_769\\Count00002_ChannelR-PE,Cy5_Seq0004.nd2"
+              }
+            },
+            {
+              "id": "L3",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 3 \u2014 Count00003_ChannelR-PE,Cy5_Seq0005.nd2",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_153228_769\\Count00003_ChannelR-PE,Cy5_Seq0005.nd2"
+              }
+            },
+            {
+              "id": "L4",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 4 \u2014 Count00004_ChannelR-PE,Cy5_Seq0006.nd2",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_153228_769\\Count00004_ChannelR-PE,Cy5_Seq0006.nd2"
+              }
+            },
+            {
+              "id": "MB",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure bead disc (R-PE) + centroid",
+                "labels": "grown",
+                "stats": "mean,median,max,sum,count,std"
+              }
+            },
+            {
+              "id": "MBG",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure background (R-PE)",
+                "labels": "background",
+                "stats": "mean,median,count"
+              }
+            },
+            {
+              "id": "PLOT",
+              "modes": {
+                "detail": "custom",
+                "domain": "label",
+                "error": "pooled_sd",
+                "fit": "langmuir",
+                "kind": "scatter",
+                "style": "paper",
+                "zero_x": "reference_line"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "__title__": "Standard curve: Langmuir per imaging occurrence",
+                "group_by": "sighting",
+                "height_mm": 125.0,
+                "log_x": false,
+                "log_y": false,
+                "pool_n": "area",
+                "pool_sd": "std_intensity",
+                "table": "standard_curve",
+                "title": "Config 1: gain 35, 561 nm 40 %, pinhole 18.3 \u00b5m \u2014 lines = imaging (0 = first)",
+                "width_mm": 180.0,
+                "x": "condition_value",
+                "x_label": "IL-8 (pg/mL)",
+                "y": "rpe_bgsub",
+                "y_label": "R-PE bead mean \u2212 background (counts)",
+                "y_range": "0, 4095"
+              }
+            },
+            {
+              "id": "PTS",
+              "modes": {},
+              "op_key": "transform.label_to_points",
+              "params": {
+                "__title__": "Bead centroids"
+              }
+            },
+            {
+              "id": "SUB",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "op_key": "math.values",
+              "params": {
+                "__title__": "R-PE: bead mean \u2212 background",
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "rpe_bgsub",
+                "table": "bead_corrected"
+              }
+            },
+            {
+              "id": "T",
+              "modes": {
+                "merge_axis": "T"
+              },
+              "op_key": "util.merge",
+              "params": {
+                "__title__": "Counts 0-4 onto T (photobleaching series)"
+              }
+            },
+            {
+              "id": "UQ",
+              "modes": {},
+              "op_key": "table.unique_objects",
+              "params": {
+                "__title__": "One bead across positions: first 5 imagings",
+                "keep_first": 5,
+                "name": "beads",
+                "table": "bead_corrected",
+                "tolerance": 5.0
+              }
+            },
+            {
+              "id": "WA1",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A1: 5000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G1"
+              }
+            },
+            {
+              "id": "WA2",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A2: 2500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G2"
+              }
+            },
+            {
+              "id": "WA3",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A3: 1000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G3"
+              }
+            },
+            {
+              "id": "WA4",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A4: 500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G4"
+              }
+            },
+            {
+              "id": "WA5",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A5: 0 pg/mL IL-8 (blank)",
+                "gap_factor": 109.614,
+                "group": "G5"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "Config 1 \u2014 gain 35, 561 nm 40 %, pinhole 18.3 \u00b5m",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "BEAD": {
+              "collapsed": false,
+              "muted": false,
+              "x": 910.0,
+              "y": 150.0
+            },
+            "BEADPX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": -80.0
+            },
+            "BGM": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2070.0,
+              "y": -80.0
+            },
+            "BGR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2360.0,
+              "y": -80.0
+            },
+            "CHC": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": 150.0
+            },
+            "CHR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": -250.0
+            },
+            "CURVE": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": 0.0
+            },
+            "GROW": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1490.0,
+              "y": 150.0
+            },
+            "J": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2940.0,
+              "y": 150.0
+            },
+            "L0": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -400.0
+            },
+            "L1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -230.0
+            },
+            "L2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -60.0
+            },
+            "L3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 110.0
+            },
+            "L4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 280.0
+            },
+            "MB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": 250.0
+            },
+            "MBG": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2650.0,
+              "y": -80.0
+            },
+            "PLOT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4390.0,
+              "y": 0.0
+            },
+            "PTS": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 150.0
+            },
+            "SUB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3230.0,
+              "y": 150.0
+            },
+            "T": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 0.0
+            },
+            "UQ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3520.0,
+              "y": 150.0
+            },
+            "WA1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -400.0
+            },
+            "WA2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -230.0
+            },
+            "WA3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -60.0
+            },
+            "WA4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 110.0
+            },
+            "WA5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 280.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "PTS",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEAD",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGM",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEADPX",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGM",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEAD",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CHC",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "PLOT",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CURVE",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHC",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "FIRST",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "FIRST",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEADPX",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "SUB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "J",
+              "src_socket": "out"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L0",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L2",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L4",
+              "src_socket": "image"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "MB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "MBG",
+              "src_socket": "out"
+            },
+            {
+              "dst": "GROW",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "PTS",
+              "src_socket": "out"
+            },
+            {
+              "dst": "UQ",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "SUB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "FIRST",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA1",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA5",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "BEAD",
+              "modes": {
+                "method": "single"
+              },
+              "op_key": "analysis.histogram_threshold",
+              "params": {
+                "__locked__": [
+                  "high",
+                  "min_area"
+                ],
+                "__title__": "Bead: Cy5 > 500",
+                "high": 500.0,
+                "min_area": 0.0
+              }
+            },
+            {
+              "id": "BEADPX",
+              "modes": {
+                "op": "union"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Bead pixels = Cy5 mask \u222a discs",
+                "a": "mask",
+                "b": "grown",
+                "name": "bead_pixels"
+              }
+            },
+            {
+              "id": "BGM",
+              "modes": {
+                "op": "invert"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Background = frame \u2212 bead pixels",
+                "a": "bead_pixels",
+                "name": "background"
+              }
+            },
+            {
+              "id": "BGR",
+              "modes": {
+                "regions": "whole"
+              },
+              "op_key": "analysis.label",
+              "params": {
+                "__title__": "Background region (one per frame)",
+                "mask": "background",
+                "name": "background"
+              }
+            },
+            {
+              "id": "CHC",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__locked__": [
+                  "channels"
+                ],
+                "__title__": "Cy5 (bead detection)",
+                "channels": "1"
+              }
+            },
+            {
+              "id": "CHR",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__title__": "R-PE (measured)",
+                "channels": "0"
+              }
+            },
+            {
+              "id": "CURVE",
+              "modes": {},
+              "op_key": "table.concat",
+              "params": {
+                "__title__": "Beads by IL-8 concentration (pg/mL)",
+                "name": "standard_curve",
+                "names": "5000,2500,1000,500,0",
+                "table": "beads"
+              }
+            },
+            {
+              "id": "FIRST",
+              "modes": {
+                "region": "frames"
+              },
+              "op_key": "util.crop",
+              "params": {
+                "__title__": "Each well's own file only (385 of 732 positions)",
+                "frames": "m0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,276,277,278,279,280,281,282,283,284,285,286,287,288,289,290,291,292,293,294,295,296,297,298,299,300,301,538,539,540,541,542,543,544,545,546,547,548,549,550,551,552,553,554,555,556,557,558,559,560,561,562,563,564,565,566,567,568,569,570,571,572,573,574,575,576,577,578,579,580,581,582,628,629,630,631,632,633,634,635,636,637,638,639,640,641,642,643,644,645,646,647,648,649,650,651,652,653,654,655,656,657,658,659,660,694,695,696,697,698,699,700,701,702,703,704,705,706,707,708,709,710,711,712,713,714,715,716,717,718,719,720,721,722,723,724,725,726,727,728,729,730,731"
+              }
+            },
+            {
+              "id": "GROW",
+              "modes": {},
+              "op_key": "transform.grow_points",
+              "params": {
+                "__locked__": [
+                  "radius"
+                ],
+                "__title__": "5 \u00b5m disc per bead (measured region)",
+                "radius": 5.0
+              }
+            },
+            {
+              "id": "J",
+              "modes": {
+                "domain": "label",
+                "how": "left",
+                "on": "m_t",
+                "other_domain": "label"
+              },
+              "op_key": "table.join",
+              "params": {
+                "__title__": "Each bead + its frame's background",
+                "name": "bead_corrected",
+                "other_table": "background",
+                "prefix": "bg_",
+                "table": "grown"
+              }
+            },
+            {
+              "id": "L0",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 0 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00000_ChannelR-PE,Cy5_Seq0002.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00000_ChannelR-PE,Cy5_Seq0002.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00000_ChannelR-PE,Cy5_Seq0023.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00000_ChannelR-PE,Cy5_Seq0044.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00000_ChannelR-PE,Cy5_Seq0065.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00000_ChannelR-PE,Cy5_Seq0086.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L1",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 1 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00001_ChannelR-PE,Cy5_Seq0003.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00001_ChannelR-PE,Cy5_Seq0003.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00001_ChannelR-PE,Cy5_Seq0024.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00001_ChannelR-PE,Cy5_Seq0045.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00001_ChannelR-PE,Cy5_Seq0066.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00001_ChannelR-PE,Cy5_Seq0087.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L2",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 2 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00002_ChannelR-PE,Cy5_Seq0004.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00002_ChannelR-PE,Cy5_Seq0004.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00002_ChannelR-PE,Cy5_Seq0025.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00002_ChannelR-PE,Cy5_Seq0046.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00002_ChannelR-PE,Cy5_Seq0067.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00002_ChannelR-PE,Cy5_Seq0088.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L3",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 3 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00003_ChannelR-PE,Cy5_Seq0005.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00003_ChannelR-PE,Cy5_Seq0005.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00003_ChannelR-PE,Cy5_Seq0026.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00003_ChannelR-PE,Cy5_Seq0047.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00003_ChannelR-PE,Cy5_Seq0068.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00003_ChannelR-PE,Cy5_Seq0089.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L4",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 4 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00004_ChannelR-PE,Cy5_Seq0006.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00004_ChannelR-PE,Cy5_Seq0006.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00004_ChannelR-PE,Cy5_Seq0027.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00004_ChannelR-PE,Cy5_Seq0048.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00004_ChannelR-PE,Cy5_Seq0069.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00004_ChannelR-PE,Cy5_Seq0090.nd2"
+                ]
+              }
+            },
+            {
+              "id": "MB",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure bead disc (R-PE) + centroid",
+                "labels": "grown",
+                "stats": "mean,median,max,sum,count,std"
+              }
+            },
+            {
+              "id": "MBG",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure background (R-PE)",
+                "labels": "background",
+                "stats": "mean,median,count"
+              }
+            },
+            {
+              "id": "PLOT",
+              "modes": {
+                "detail": "custom",
+                "domain": "label",
+                "error": "pooled_sd",
+                "fit": "langmuir",
+                "kind": "scatter",
+                "style": "paper",
+                "zero_x": "reference_line"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "__title__": "Standard curve: Langmuir per imaging occurrence",
+                "group_by": "sighting",
+                "height_mm": 125.0,
+                "log_x": false,
+                "log_y": false,
+                "pool_n": "area",
+                "pool_sd": "std_intensity",
+                "table": "standard_curve",
+                "title": "Config 2: gain 1, 561 nm 2.5 %, pinhole 99 \u00b5m \u2014 lines = imaging (0 = first)",
+                "width_mm": 180.0,
+                "x": "condition_value",
+                "x_label": "IL-8 (pg/mL)",
+                "y": "rpe_bgsub",
+                "y_label": "R-PE bead mean \u2212 background (counts)",
+                "y_range": "0, 4095"
+              }
+            },
+            {
+              "id": "PTS",
+              "modes": {},
+              "op_key": "transform.label_to_points",
+              "params": {
+                "__title__": "Bead centroids"
+              }
+            },
+            {
+              "id": "SUB",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "op_key": "math.values",
+              "params": {
+                "__title__": "R-PE: bead mean \u2212 background",
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "rpe_bgsub",
+                "table": "bead_corrected"
+              }
+            },
+            {
+              "id": "T",
+              "modes": {
+                "merge_axis": "T"
+              },
+              "op_key": "util.merge",
+              "params": {
+                "__title__": "Counts 0-4 onto T (photobleaching series)"
+              }
+            },
+            {
+              "id": "UQ",
+              "modes": {},
+              "op_key": "table.unique_objects",
+              "params": {
+                "__title__": "One bead across positions: first 5 imagings",
+                "keep_first": 5,
+                "name": "beads",
+                "table": "bead_corrected",
+                "tolerance": 5.0
+              }
+            },
+            {
+              "id": "WA1",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A1: 5000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G1"
+              }
+            },
+            {
+              "id": "WA2",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A2: 2500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G2"
+              }
+            },
+            {
+              "id": "WA3",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A3: 1000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G3"
+              }
+            },
+            {
+              "id": "WA4",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A4: 500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G4"
+              }
+            },
+            {
+              "id": "WA5",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A5: 0 pg/mL IL-8 (blank)",
+                "gap_factor": 109.614,
+                "group": "G5"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg2",
+        "kind": "free",
+        "master": null,
+        "name": "Config 2 \u2014 gain 1, 561 nm 2.5 %, pinhole 99 \u00b5m",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "BEAD": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 150.0
+            },
+            "BEADPX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2070.0,
+              "y": -80.0
+            },
+            "BGM": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2360.0,
+              "y": -80.0
+            },
+            "BGR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2650.0,
+              "y": -80.0
+            },
+            "CHC": {
+              "collapsed": false,
+              "muted": false,
+              "x": 910.0,
+              "y": 150.0
+            },
+            "CHR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 910.0,
+              "y": -250.0
+            },
+            "CURVE": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4390.0,
+              "y": 0.0
+            },
+            "FIRST": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": 0.0
+            },
+            "GROW": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": 150.0
+            },
+            "J": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3230.0,
+              "y": 150.0
+            },
+            "L0": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -400.0
+            },
+            "L1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -230.0
+            },
+            "L2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -60.0
+            },
+            "L3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 110.0
+            },
+            "L4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 280.0
+            },
+            "MB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2070.0,
+              "y": 250.0
+            },
+            "MBG": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2940.0,
+              "y": -80.0
+            },
+            "PLOT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4680.0,
+              "y": 0.0
+            },
+            "PTS": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1490.0,
+              "y": 150.0
+            },
+            "SUB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3520.0,
+              "y": 150.0
+            },
+            "T": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 0.0
+            },
+            "UQ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 150.0
+            },
+            "WA1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": -400.0
+            },
+            "WA2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": -230.0
+            },
+            "WA3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": -60.0
+            },
+            "WA4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": 110.0
+            },
+            "WA5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": 280.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "PTS",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEAD",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGM",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEADPX",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGM",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEAD",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CHC",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "PLOT",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CURVE",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEADPX",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "SUB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "J",
+              "src_socket": "out"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L0",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L2",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L4",
+              "src_socket": "image"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "MB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "MBG",
+              "src_socket": "out"
+            },
+            {
+              "dst": "GROW",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "PTS",
+              "src_socket": "out"
+            },
+            {
+              "dst": "UQ",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "SUB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHC",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA1",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA5",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "BEAD",
+              "modes": {
+                "method": "single"
+              },
+              "op_key": "analysis.histogram_threshold",
+              "params": {
+                "__locked__": [
+                  "high",
+                  "min_area"
+                ],
+                "__title__": "Bead: Cy5 > 500",
+                "high": 500.0,
+                "min_area": 0.0
+              }
+            },
+            {
+              "id": "BEADPX",
+              "modes": {
+                "op": "union"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Bead pixels = Cy5 mask \u222a discs",
+                "a": "mask",
+                "b": "grown",
+                "name": "bead_pixels"
+              }
+            },
+            {
+              "id": "BGM",
+              "modes": {
+                "op": "invert"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Background = frame \u2212 bead pixels",
+                "a": "bead_pixels",
+                "name": "background"
+              }
+            },
+            {
+              "id": "BGR",
+              "modes": {
+                "regions": "whole"
+              },
+              "op_key": "analysis.label",
+              "params": {
+                "__title__": "Background region (one per frame)",
+                "mask": "background",
+                "name": "background"
+              }
+            },
+            {
+              "id": "CHC",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__locked__": [
+                  "channels"
+                ],
+                "__title__": "Cy5 (bead detection)",
+                "channels": "1"
+              }
+            },
+            {
+              "id": "CHR",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__title__": "R-PE (measured)",
+                "channels": "0"
+              }
+            },
+            {
+              "id": "CURVE",
+              "modes": {},
+              "op_key": "table.concat",
+              "params": {
+                "__title__": "Beads by IL-8 concentration (pg/mL)",
+                "name": "standard_curve",
+                "names": "5000,2500,1000,500,0",
+                "table": "beads"
+              }
+            },
+            {
+              "id": "GROW",
+              "modes": {},
+              "op_key": "transform.grow_points",
+              "params": {
+                "__locked__": [
+                  "radius"
+                ],
+                "__title__": "5 \u00b5m disc per bead (measured region)",
+                "radius": 5.0
+              }
+            },
+            {
+              "id": "J",
+              "modes": {
+                "domain": "label",
+                "how": "left",
+                "on": "m_t",
+                "other_domain": "label"
+              },
+              "op_key": "table.join",
+              "params": {
+                "__title__": "Each bead + its frame's background",
+                "name": "bead_corrected",
+                "other_table": "background",
+                "prefix": "bg_",
+                "table": "grown"
+              }
+            },
+            {
+              "id": "L0",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 0 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00000_ChannelR-PE,Cy5_Seq0009.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00000_ChannelR-PE,Cy5_Seq0009.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00000_ChannelR-PE,Cy5_Seq0030.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00000_ChannelR-PE,Cy5_Seq0051.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00000_ChannelR-PE,Cy5_Seq0072.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00000_ChannelR-PE,Cy5_Seq0093.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L1",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 1 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00001_ChannelR-PE,Cy5_Seq0010.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00001_ChannelR-PE,Cy5_Seq0010.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00001_ChannelR-PE,Cy5_Seq0031.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00001_ChannelR-PE,Cy5_Seq0052.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00001_ChannelR-PE,Cy5_Seq0073.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00001_ChannelR-PE,Cy5_Seq0094.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L2",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 2 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00002_ChannelR-PE,Cy5_Seq0011.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00002_ChannelR-PE,Cy5_Seq0011.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00002_ChannelR-PE,Cy5_Seq0032.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00002_ChannelR-PE,Cy5_Seq0053.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00002_ChannelR-PE,Cy5_Seq0074.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00002_ChannelR-PE,Cy5_Seq0095.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L3",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 3 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00003_ChannelR-PE,Cy5_Seq0012.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00003_ChannelR-PE,Cy5_Seq0012.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00003_ChannelR-PE,Cy5_Seq0033.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00003_ChannelR-PE,Cy5_Seq0054.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00003_ChannelR-PE,Cy5_Seq0075.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00003_ChannelR-PE,Cy5_Seq0096.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L4",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 4 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00004_ChannelR-PE,Cy5_Seq0013.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00004_ChannelR-PE,Cy5_Seq0013.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00004_ChannelR-PE,Cy5_Seq0034.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00004_ChannelR-PE,Cy5_Seq0055.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00004_ChannelR-PE,Cy5_Seq0076.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00004_ChannelR-PE,Cy5_Seq0097.nd2"
+                ]
+              }
+            },
+            {
+              "id": "MB",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure bead disc (R-PE) + centroid",
+                "labels": "grown",
+                "stats": "mean,median,max,sum,count,std"
+              }
+            },
+            {
+              "id": "MBG",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure background (R-PE)",
+                "labels": "background",
+                "stats": "mean,median,count"
+              }
+            },
+            {
+              "id": "PLOT",
+              "modes": {
+                "detail": "custom",
+                "domain": "label",
+                "error": "pooled_sd",
+                "fit": "langmuir",
+                "kind": "scatter",
+                "style": "paper",
+                "zero_x": "reference_line"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "__title__": "Standard curve: Langmuir per imaging occurrence",
+                "group_by": "sighting",
+                "height_mm": 125.0,
+                "log_x": false,
+                "log_y": false,
+                "pool_n": "area",
+                "pool_sd": "std_intensity",
+                "table": "standard_curve",
+                "title": "Config 3: gain 5, 561 nm 10 %, pinhole 36.7 \u00b5m \u2014 lines = imaging (0 = first)",
+                "width_mm": 180.0,
+                "x": "condition_value",
+                "x_label": "IL-8 (pg/mL)",
+                "y": "rpe_bgsub",
+                "y_label": "R-PE bead mean \u2212 background (counts)",
+                "y_range": "0, 4095"
+              }
+            },
+            {
+              "id": "PTS",
+              "modes": {},
+              "op_key": "transform.label_to_points",
+              "params": {
+                "__title__": "Bead centroids"
+              }
+            },
+            {
+              "id": "SUB",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "op_key": "math.values",
+              "params": {
+                "__title__": "R-PE: bead mean \u2212 background",
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "rpe_bgsub",
+                "table": "bead_corrected"
+              }
+            },
+            {
+              "id": "T",
+              "modes": {
+                "merge_axis": "T"
+              },
+              "op_key": "util.merge",
+              "params": {
+                "__title__": "Counts 0-4 onto T (photobleaching series)"
+              }
+            },
+            {
+              "id": "UQ",
+              "modes": {},
+              "op_key": "table.unique_objects",
+              "params": {
+                "__title__": "One bead across positions: first 5 imagings",
+                "keep_first": 5,
+                "name": "beads",
+                "table": "bead_corrected",
+                "tolerance": 5.0
+              }
+            },
+            {
+              "id": "WA1",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A1: 5000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G1"
+              }
+            },
+            {
+              "id": "WA2",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A2: 2500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G2"
+              }
+            },
+            {
+              "id": "WA3",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A3: 1000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G3"
+              }
+            },
+            {
+              "id": "WA4",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A4: 500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G4"
+              }
+            },
+            {
+              "id": "WA5",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A5: 0 pg/mL IL-8 (blank)",
+                "gap_factor": 109.614,
+                "group": "G5"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg3",
+        "kind": "free",
+        "master": null,
+        "name": "Config 3 \u2014 gain 5, 561 nm 10 %, pinhole 36.7 \u00b5m",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "BEAD": {
+              "collapsed": false,
+              "muted": false,
+              "x": 910.0,
+              "y": 150.0
+            },
+            "BEADPX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": -80.0
+            },
+            "BGM": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2070.0,
+              "y": -80.0
+            },
+            "BGR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2360.0,
+              "y": -80.0
+            },
+            "CHC": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": 150.0
+            },
+            "CHR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": -250.0
+            },
+            "CURVE": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": 0.0
+            },
+            "GROW": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1490.0,
+              "y": 150.0
+            },
+            "J": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2940.0,
+              "y": 150.0
+            },
+            "L0": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -400.0
+            },
+            "L1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -230.0
+            },
+            "L2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -60.0
+            },
+            "L3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 110.0
+            },
+            "L4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 280.0
+            },
+            "MB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": 250.0
+            },
+            "MBG": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2650.0,
+              "y": -80.0
+            },
+            "PLOT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4390.0,
+              "y": 0.0
+            },
+            "PTS": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 150.0
+            },
+            "SUB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3230.0,
+              "y": 150.0
+            },
+            "T": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 0.0
+            },
+            "UQ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3520.0,
+              "y": 150.0
+            },
+            "WA1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -400.0
+            },
+            "WA2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -230.0
+            },
+            "WA3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -60.0
+            },
+            "WA4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 110.0
+            },
+            "WA5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 280.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "PTS",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEAD",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGM",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BEADPX",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BGR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGM",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "BGR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEAD",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CHC",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MBG",
+              "dst_socket": "raw",
+              "kind": "forward",
+              "src": "CHR",
+              "src_socket": "out"
+            },
+            {
+              "dst": "PLOT",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "CURVE",
+              "src_socket": "out"
+            },
+            {
+              "dst": "BEADPX",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "MB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "GROW",
+              "src_socket": "out"
+            },
+            {
+              "dst": "SUB",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "J",
+              "src_socket": "out"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L0",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L2",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "T",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L4",
+              "src_socket": "image"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "MB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "J",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "MBG",
+              "src_socket": "out"
+            },
+            {
+              "dst": "GROW",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "PTS",
+              "src_socket": "out"
+            },
+            {
+              "dst": "UQ",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "SUB",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHC",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CHR",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "T",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA1",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "WA5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "UQ",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "CURVE",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "WA5",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "BEAD",
+              "modes": {
+                "method": "single"
+              },
+              "op_key": "analysis.histogram_threshold",
+              "params": {
+                "__locked__": [
+                  "high",
+                  "min_area"
+                ],
+                "__title__": "Bead: Cy5 > 500",
+                "high": 500.0,
+                "min_area": 0.0
+              }
+            },
+            {
+              "id": "BEADPX",
+              "modes": {
+                "op": "union"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Bead pixels = Cy5 mask \u222a discs",
+                "a": "mask",
+                "b": "grown",
+                "name": "bead_pixels"
+              }
+            },
+            {
+              "id": "BGM",
+              "modes": {
+                "op": "invert"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Background = frame \u2212 bead pixels",
+                "a": "bead_pixels",
+                "name": "background"
+              }
+            },
+            {
+              "id": "BGR",
+              "modes": {
+                "regions": "whole"
+              },
+              "op_key": "analysis.label",
+              "params": {
+                "__title__": "Background region (one per frame)",
+                "mask": "background",
+                "name": "background"
+              }
+            },
+            {
+              "id": "CHC",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__locked__": [
+                  "channels"
+                ],
+                "__title__": "Cy5 (bead detection)",
+                "channels": "1"
+              }
+            },
+            {
+              "id": "CHR",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__title__": "R-PE (measured)",
+                "channels": "0"
+              }
+            },
+            {
+              "id": "CURVE",
+              "modes": {},
+              "op_key": "table.concat",
+              "params": {
+                "__title__": "Beads by IL-8 concentration (pg/mL)",
+                "name": "standard_curve",
+                "names": "5000,2500,1000,500,0",
+                "table": "beads"
+              }
+            },
+            {
+              "id": "GROW",
+              "modes": {},
+              "op_key": "transform.grow_points",
+              "params": {
+                "__locked__": [
+                  "radius"
+                ],
+                "__title__": "5 \u00b5m disc per bead (measured region)",
+                "radius": 5.0
+              }
+            },
+            {
+              "id": "J",
+              "modes": {
+                "domain": "label",
+                "how": "left",
+                "on": "m_t",
+                "other_domain": "label"
+              },
+              "op_key": "table.join",
+              "params": {
+                "__title__": "Each bead + its frame's background",
+                "name": "bead_corrected",
+                "other_table": "background",
+                "prefix": "bg_",
+                "table": "grown"
+              }
+            },
+            {
+              "id": "L0",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 0 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00000_ChannelR-PE,Cy5_Seq0016.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00000_ChannelR-PE,Cy5_Seq0016.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00000_ChannelR-PE,Cy5_Seq0037.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00000_ChannelR-PE,Cy5_Seq0058.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00000_ChannelR-PE,Cy5_Seq0079.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00000_ChannelR-PE,Cy5_Seq0100.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L1",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 1 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00001_ChannelR-PE,Cy5_Seq0017.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00001_ChannelR-PE,Cy5_Seq0017.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00001_ChannelR-PE,Cy5_Seq0038.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00001_ChannelR-PE,Cy5_Seq0059.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00001_ChannelR-PE,Cy5_Seq0080.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00001_ChannelR-PE,Cy5_Seq0101.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L2",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 2 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00002_ChannelR-PE,Cy5_Seq0018.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00002_ChannelR-PE,Cy5_Seq0018.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00002_ChannelR-PE,Cy5_Seq0039.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00002_ChannelR-PE,Cy5_Seq0060.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00002_ChannelR-PE,Cy5_Seq0081.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00002_ChannelR-PE,Cy5_Seq0102.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L3",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 3 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00003_ChannelR-PE,Cy5_Seq0019.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00003_ChannelR-PE,Cy5_Seq0019.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00003_ChannelR-PE,Cy5_Seq0040.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00003_ChannelR-PE,Cy5_Seq0061.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00003_ChannelR-PE,Cy5_Seq0082.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00003_ChannelR-PE,Cy5_Seq0103.nd2"
+                ]
+              }
+            },
+            {
+              "id": "L4",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count 4 \u2014 5 well files",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00004_ChannelR-PE,Cy5_Seq0020.nd2",
+                "paths": [
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA1_Count00004_ChannelR-PE,Cy5_Seq0020.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA2_Count00004_ChannelR-PE,Cy5_Seq0041.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA3_Count00004_ChannelR-PE,Cy5_Seq0062.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA4_Count00004_ChannelR-PE,Cy5_Seq0083.nd2",
+                  "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL-8 Standard Curves\\20261012_181456_725\\WellA5_Count00004_ChannelR-PE,Cy5_Seq0104.nd2"
+                ]
+              }
+            },
+            {
+              "id": "MB",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure bead disc (R-PE) + centroid",
+                "labels": "grown",
+                "stats": "mean,median,max,sum,count,std"
+              }
+            },
+            {
+              "id": "MBG",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure background (R-PE)",
+                "labels": "background",
+                "stats": "mean,median,count"
+              }
+            },
+            {
+              "id": "PLOT",
+              "modes": {
+                "detail": "custom",
+                "domain": "label",
+                "error": "pooled_sd",
+                "fit": "langmuir",
+                "kind": "scatter",
+                "style": "paper",
+                "zero_x": "reference_line"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "__title__": "Standard curve: Langmuir per imaging occurrence",
+                "group_by": "sighting",
+                "height_mm": 125.0,
+                "log_x": false,
+                "log_y": false,
+                "pool_n": "area",
+                "pool_sd": "std_intensity",
+                "table": "standard_curve",
+                "title": "Config 4: gain 5, 561 nm 15 %, pinhole 36.7 \u00b5m \u2014 lines = imaging (0 = first)",
+                "width_mm": 180.0,
+                "x": "condition_value",
+                "x_label": "IL-8 (pg/mL)",
+                "y": "rpe_bgsub",
+                "y_label": "R-PE bead mean \u2212 background (counts)",
+                "y_range": "0, 4095"
+              }
+            },
+            {
+              "id": "PTS",
+              "modes": {},
+              "op_key": "transform.label_to_points",
+              "params": {
+                "__title__": "Bead centroids"
+              }
+            },
+            {
+              "id": "SUB",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "op_key": "math.values",
+              "params": {
+                "__title__": "R-PE: bead mean \u2212 background",
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "rpe_bgsub",
+                "table": "bead_corrected"
+              }
+            },
+            {
+              "id": "T",
+              "modes": {
+                "merge_axis": "T"
+              },
+              "op_key": "util.merge",
+              "params": {
+                "__title__": "Counts 0-4 onto T (photobleaching series)"
+              }
+            },
+            {
+              "id": "UQ",
+              "modes": {},
+              "op_key": "table.unique_objects",
+              "params": {
+                "__title__": "One bead across positions: first 5 imagings",
+                "keep_first": 5,
+                "name": "beads",
+                "table": "bead_corrected",
+                "tolerance": 5.0
+              }
+            },
+            {
+              "id": "WA1",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A1: 5000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G1"
+              }
+            },
+            {
+              "id": "WA2",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A2: 2500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G2"
+              }
+            },
+            {
+              "id": "WA3",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A3: 1000 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G3"
+              }
+            },
+            {
+              "id": "WA4",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A4: 500 pg/mL IL-8",
+                "gap_factor": 109.614,
+                "group": "G4"
+              }
+            },
+            {
+              "id": "WA5",
+              "modes": {},
+              "op_key": "util.select_group",
+              "params": {
+                "__title__": "Well A5: 0 pg/mL IL-8 (blank)",
+                "gap_factor": 109.614,
+                "group": "G5"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg4",
+        "kind": "free",
+        "master": null,
+        "name": "Config 4 \u2014 gain 5, 561 nm 15 %, pinhole 36.7 \u00b5m",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "BEAD": {
+              "collapsed": false,
+              "muted": false,
+              "x": 910.0,
+              "y": 150.0
+            },
+            "BEADPX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": -80.0
+            },
+            "BGM": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2070.0,
+              "y": -80.0
+            },
+            "BGR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2360.0,
+              "y": -80.0
+            },
+            "CHC": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": 150.0
+            },
+            "CHR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 620.0,
+              "y": -250.0
+            },
+            "CURVE": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4100.0,
+              "y": 0.0
+            },
+            "GROW": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1490.0,
+              "y": 150.0
+            },
+            "J": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2940.0,
+              "y": 150.0
+            },
+            "L0": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -400.0
+            },
+            "L1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -230.0
+            },
+            "L2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": -60.0
+            },
+            "L3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 110.0
+            },
+            "L4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 280.0
+            },
+            "MB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1780.0,
+              "y": 250.0
+            },
+            "MBG": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2650.0,
+              "y": -80.0
+            },
+            "PLOT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4390.0,
+              "y": 0.0
+            },
+            "PTS": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 150.0
+            },
+            "SUB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3230.0,
+              "y": 150.0
+            },
+            "T": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 0.0
+            },
+            "UQ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3520.0,
+              "y": 150.0
+            },
+            "WA1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -400.0
+            },
+            "WA2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -230.0
+            },
+            "WA3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": -60.0
+            },
+            "WA4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 110.0
+            },
+            "WA5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3810.0,
+              "y": 280.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

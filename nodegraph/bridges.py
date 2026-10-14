@@ -34,7 +34,7 @@ from nodegraph.structure import TrackMembership
 
 # ── grouping helper (Voxel/Point → Label reductions) ──────────────────────────
 
-_GROUP_REDUCERS = ("mean", "sum", "count", "max", "min", "median")
+_GROUP_REDUCERS = ("mean", "sum", "count", "max", "min", "median", "std")
 
 
 def _group_reduce(labels: np.ndarray, values: np.ndarray, reducer: str, *,
@@ -128,6 +128,15 @@ def _group_reduce(labels: np.ndarray, values: np.ndarray, reducer: str, *,
             out = sums / np.maximum(counts, 1)
         if reducer != "count":
             out = np.where(empty, np.nan, out)
+        return ids.astype(np.int64), out
+    if reducer == "std":
+        # the SAMPLE standard deviation (n - 1) of each region's finite values, NaN under
+        # two (2026-10-13) — two passes, mean first, so a bright region with a small spread
+        # does not lose it to cancellation in sum(x^2) - sum(x)^2 / n
+        sums = np.bincount(idx, weights=values, minlength=ids.size)
+        mean = sums / np.maximum(counts, 1)
+        ss = np.bincount(idx, weights=(values - mean[idx]) ** 2, minlength=ids.size)
+        out = np.where(counts > 1, np.sqrt(ss / np.maximum(counts - 1, 1)), np.nan)
         return ids.astype(np.int64), out
     if empty.any():
         # a segment reduction cannot express an empty segment — compute over the groups

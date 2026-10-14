@@ -11,7 +11,7 @@ from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain
 from nodegraph.engine import EvalContext
 from nodegraph.parallel import map_units
-from nodegraph.registry import Granularity, InDataset, InString, Mode, OutDataset
+from nodegraph.registry import InBool, Granularity, InDataset, InString, Mode, OutDataset
 from nodegraph.structure import COORD_COLUMNS, StructureTable
 
 from nodegraph.catalog._base import register_node
@@ -31,6 +31,7 @@ from nodegraph.catalog._shared.raw_measure import _InRaw, _intensity_provider
 _MEASURE_COLUMNS = {
     "mean": "mean_intensity", "max": "max_intensity", "min": "min_intensity",
     "sum": "total_intensity", "median": "median_intensity", "count": "area",
+    "std": "std_intensity",
 }
 def _layers_measure(params, modes):
     """`analysis.measure` has no output-name socket: it attaches its statistic columns to
@@ -128,7 +129,8 @@ def _measure_shape_columns(raster6: np.ndarray, names: Sequence[str], *,
                             out[p][int(lid)] = float(val)
     return out
 def _stage_position_columns(ds: Dataset, m: np.ndarray, x_um: np.ndarray, y_um: np.ndarray,
-                            z_index: np.ndarray) -> Dict[str, np.ndarray]:
+                            z_index: np.ndarray, flip: Tuple[bool, bool] = (True, False)
+                            ) -> Dict[str, np.ndarray]:
     """``stage_x_um``/``stage_y_um``/``stage_z_um`` — each row's LOCAL ``x_um``/``y_um``
     (this field's own physical position) plus its multipoint's absolute corner
     (:func:`nodegraph.placement.field_box`), and its absolute focus
@@ -145,7 +147,24 @@ def _stage_position_columns(ds: Dataset, m: np.ndarray, x_um: np.ndarray, y_um: 
 
     NaN wherever the field cannot be placed (no ``pixel_size_um``, no stage log at all, or —
     for Z only — no focus-log anchoring on a multi-slice stack): never a guessed 0, which is
-    a legal position, matching the rule :mod:`nodegraph.placement` itself follows."""
+    a legal position, matching the rule :mod:`nodegraph.placement` itself follows.
+
+    **Handedness** (``flip``, 2026-10-13): whether the image's +x runs along stage −x and its
+    +y along stage −y — :data:`nodegraph.placement.DEFAULT_FLIP`, the Stitch / Overlay /
+    Merge default. Until this the row was always placed as ``corner + x_um``, i.e. unflipped,
+    so on this scope every stage x was MIRRORED inside its field (up to ± half a field): one
+    bead seen from two overlapping fields got two stage positions. Measured on the IL-8 bead
+    data: with +x → −x, 1189 cross-field bead pairs coincide within 3 µm (median 0.74 µm);
+    unflipped, 58.
+
+    **Z after a Stitch** (2026-10-14). A mosaic is ONE field made of many, so Stitch drops
+    the per-position focus log (``stage_z_um``) and :func:`z_um_of_slice` has nothing to
+    anchor — every stitched row's ``stage_z_um`` came out NaN although ``origin_um``, the
+    transform-maintained corner :func:`field_box` already places X/Y from, still carries the
+    stack's lowest focus (``box.z0``; ``box.z1`` its highest). So when the log cannot place
+    the field and the box can, slice ``k`` sits ``k`` steps above ``z0`` — below ``z1`` on a
+    top-to-bottom stack — and a one-plane field sits at ``z0``. Seen on a 2×2 GFP spheroid
+    mosaic whose 3-D centroid had X/Y and no Z."""
     from nodegraph.placement import field_box, z_um_of_slice
     md, axes = ds.metadata, ds.axes
     mi = np.asarray(m, dtype=np.int64)
@@ -161,10 +180,20 @@ def _stage_position_columns(ds: Dataset, m: np.ndarray, x_um: np.ndarray, y_um: 
         mask = mi == mv
         box = field_box(md, axes, mv)
         if box is not None:
-            sx[mask] = box.x0 + x_um[mask]
-            sy[mask] = box.y0 + y_um[mask]
+            sx[mask] = (box.x1 - x_um[mask]) if flip[0] else (box.x0 + x_um[mask])
+            sy[mask] = (box.y1 - y_um[mask]) if flip[1] else (box.y0 + y_um[mask])
         z0 = z_um_of_slice(md, axes, mv, 0.0)
         if z0 is None:
+            if box is None or box.z0 is None:
+                continue
+            if axes.z <= 1:
+                sz[mask] = box.z0
+                continue
+            step = (box.z1 - box.z0) / (axes.z - 1) if box.z1 is not None else 0.0
+            if not step > 0:
+                continue
+            up = bool(md.get("z_bottom_to_top", True))
+            sz[mask] = (box.z0 + step * zk[mask]) if up else (box.z1 - step * zk[mask])
             continue
         if axes.z <= 1:
             sz[mask] = z0
@@ -174,7 +203,8 @@ def _stage_position_columns(ds: Dataset, m: np.ndarray, x_um: np.ndarray, y_um: 
             sz[mask] = z0 + (z1 - z0) * zk[mask]
     return {"stage_x_um": sx, "stage_y_um": sy, "stage_z_um": sz}
 def _label_position_columns(ds: Dataset, layer: str, row_ids: np.ndarray, *,
-                            px: float, zs: float) -> Dict[str, np.ndarray]:
+                            px: float, zs: float, flip: Tuple[bool, bool] = (True, False)
+                            ) -> Dict[str, np.ndarray]:
     """Local ``x_um``/``y_um``/``z_um`` and absolute ``stage_x_um``/``stage_y_um``/
     ``stage_z_um`` for ``row_ids`` (measure's own ``id`` order), from the region centroid
     columns the label/segment node already wrote (invariant ``m``/``z``/``y``/``x``,
@@ -197,8 +227,16 @@ def _label_position_columns(ds: Dataset, layer: str, row_ids: np.ndarray, *,
     y_px = np.array([y_by_id.get(int(i), np.nan) for i in row_ids], dtype=float)
     x_px = np.array([x_by_id.get(int(i), np.nan) for i in row_ids], dtype=float)
     out = {"z_um": z_px * zs, "y_um": y_px * px, "x_um": x_px * px}
-    out.update(_stage_position_columns(ds, m, out["x_um"], out["y_um"], z_px))
+    out.update(_stage_position_columns(ds, m, out["x_um"], out["y_um"], z_px, flip=flip))
     return out
+def _flip(ctx: EvalContext) -> Tuple[bool, bool]:
+    """The ``flip_x`` / ``flip_y`` handedness for the stage columns (defaults
+    :data:`nodegraph.placement.DEFAULT_FLIP`, the same as Stitch's and Overlay's)."""
+    from nodegraph.placement import DEFAULT_FLIP
+    return (bool(ctx.params.get("flip_x", DEFAULT_FLIP[0])),
+            bool(ctx.params.get("flip_y", DEFAULT_FLIP[1])))
+
+
 def _compute_measure(ctx: EvalContext) -> Dataset:
     """Measure the image over the members of a structure table → columns on that table.
 
@@ -362,7 +400,8 @@ def _measure_points(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
         "z_um": zf * zs, "y_um": yf * px, "x_um": xf * px,
         "mean_intensity": vals,
     }
-    out.update(_stage_position_columns(ds, mm, out["x_um"], out["y_um"], zf))
+    out.update(_stage_position_columns(ds, mm, out["x_um"], out["y_um"], zf,
+                                       flip=_flip(ctx)))
     # Re-emits the SAME Point layer with the new columns, so its z_kind provenance (§7b)
     # must be carried forward rather than clobbered with the StructureTable default
     # ("subpixel"), which would tell every downstream node this 2D cloud was volumetric.
@@ -462,7 +501,8 @@ def _measure_labels(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
     # runs unconditionally).
     px = ctx.calib("pixel_size_um") or 0.1
     zs = (ctx.calib("z_step_um") or 0.5) if ax.z > 1 else 0.0
-    cols.update(_label_position_columns(ds, layer, cols["id"], px=px, zs=zs))
+    cols.update(_label_position_columns(ds, layer, cols["id"], px=px, zs=zs,
+                                        flip=_flip(ctx)))
     return ds.with_structure(StructureTable(Domain.LABEL, cols, layer=layer, z_kind=zk))
 
 def _columns_measure(params, modes, incoming):
@@ -540,6 +580,17 @@ register_node(
                         "reduce over or fit an ellipse to.",
                 })],
     inputs=[InDataset(), _InRaw(),
+            InBool("flip_x", "Flip X", field=False, default=True,
+                   description="Whether the image's +x runs along stage −x when the "
+                               "`stage_x_um` column places each row on the microscope. ON "
+                               "(the default) is this scope's handedness and Stitch's, "
+                               "Overlay's and Merge's default — so one object seen from two "
+                               "overlapping fields gets ONE stage position. Changes only "
+                               "`stage_x_um`; every local and intensity column is unaffected."),
+            InBool("flip_y", "Flip Y", field=False, default=False,
+                   description="Whether the image's +y runs along stage −y for `stage_y_um`. "
+                               "OFF (the default) matches Stitch and Overlay. Changes only "
+                               "`stage_y_um`."),
             InString("labels", "Label layer", field=False, default="labels",
                      layer_in=Domain.VOXEL,
                      available_in={"target": frozenset({"label"})},
@@ -574,7 +625,8 @@ register_node(
                      "Which statistics to compute, comma-separated, one Label column each: "
                      "`mean`→mean_intensity, `max`→max_intensity, `min`→min_intensity, "
                      "`sum`→total_intensity, `median`→median_intensity, `count`→area (the "
-                     "voxel count, NOT a physical area). `mean` is always computed even if "
+                     "voxel count, NOT a physical area), `std`→std_intensity. `mean` is "
+                     "always computed even if "
                      "omitted, so `mean_intensity` stays available to downstream nodes. "
                      "Asking for fewer stats writes fewer columns; it does not change any "
                      "value, since each is computed independently over the same regions.",
@@ -609,6 +661,12 @@ register_node(
                              "not a physical area, so it changes with binning and resolution. "
                              "For µm² / µm³ use Object Metrics, or scale by pixel_size_um "
                              "yourself.",
+                         "std":
+                             "→ `std_intensity`: the sample standard deviation (n − 1) of "
+                             "the region's voxel values, NaN for a one-voxel region — the "
+                             "spread WITHIN an object. With `count` it lets Plot XY pool "
+                             "every voxel of every object (Error = pooled SD) without a "
+                             "row per voxel.",
                      }),
             InString("shape", "Shape metrics", field=False, default="",
                      vocab=tuple(_MEASURE_SHAPE),

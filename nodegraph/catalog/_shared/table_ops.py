@@ -48,6 +48,25 @@ PER_M_COLUMNS: Tuple[Tuple[str, str], ...] = (
 #: The column naming each row's experimental condition, and the one naming its input.
 CONDITION_COLUMN = CONDITION_KEY
 INPUT_COLUMN = "input"
+#: Table Concat's NUMERIC twin of ``condition`` (2026-10-13): written only when every row's
+#: condition reads as a number — a concentration, a dose, a temperature — so a plot can put
+#: the condition on an axis (``plot.xy`` refuses a text column there, by design).
+CONDITION_VALUE_COLUMN = "condition_value"
+
+
+def numeric_labels(labels) -> "Optional[List[float]]":
+    """``labels`` as floats when EVERY one reads as a finite number (``"5000"``, ``"0"``,
+    ``"2.5e3"``), else ``None`` — one text label among numbers is a category, not a value."""
+    out = []
+    for v in labels:
+        try:
+            f = float(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(f):
+            return None
+        out.append(f)
+    return out
 #: Each row's time in seconds since its OWN input's first frame (from that input's per-frame
 #: clock): after a concatenation the inputs may have been imaged at different intervals,
 #: and the Dataset passed on carries input 0's clock only.

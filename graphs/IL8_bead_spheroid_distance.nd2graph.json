@@ -1,0 +1,2206 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "src": "LS",
+              "src_socket": "image",
+              "dst": "ST",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "ST",
+              "src_socket": "out",
+              "dst": "SG",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SG",
+              "src_socket": "out",
+              "dst": "SM",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SM",
+              "src_socket": "out",
+              "dst": "SL",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SL",
+              "src_socket": "out",
+              "dst": "SMe",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "ST",
+              "src_socket": "out",
+              "dst": "SMe",
+              "dst_socket": "raw",
+              "kind": "forward"
+            },
+            {
+              "src": "SMe",
+              "src_socket": "out",
+              "dst": "RX",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RX",
+              "src_socket": "out",
+              "dst": "RY",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RY",
+              "src_socket": "out",
+              "dst": "RZ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SG",
+              "src_socket": "out",
+              "dst": "ZP",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "ZP",
+              "src_socket": "out",
+              "dst": "FT",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "FT",
+              "src_socket": "out",
+              "dst": "RA",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RA",
+              "src_socket": "out",
+              "dst": "RPI",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RPI",
+              "src_socket": "out",
+              "dst": "RAD",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "LB",
+              "src_socket": "image",
+              "dst": "CROP",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CROP",
+              "src_socket": "out",
+              "dst": "CHC",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CROP",
+              "src_socket": "out",
+              "dst": "CHR",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CHC",
+              "src_socket": "out",
+              "dst": "BEAD",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BEAD",
+              "src_socket": "out",
+              "dst": "PTS",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "PTS",
+              "src_socket": "out",
+              "dst": "GROW",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "GROW",
+              "src_socket": "out",
+              "dst": "BEADPX",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BEADPX",
+              "src_socket": "out",
+              "dst": "BGM",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BGM",
+              "src_socket": "out",
+              "dst": "BGR",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BGR",
+              "src_socket": "out",
+              "dst": "MBG",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CHR",
+              "src_socket": "out",
+              "dst": "MBG",
+              "dst_socket": "raw",
+              "kind": "forward"
+            },
+            {
+              "src": "GROW",
+              "src_socket": "out",
+              "dst": "MB",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CHR",
+              "src_socket": "out",
+              "dst": "MB",
+              "dst_socket": "raw",
+              "kind": "forward"
+            },
+            {
+              "src": "MB",
+              "src_socket": "out",
+              "dst": "J",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "MBG",
+              "src_socket": "out",
+              "dst": "J",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "J",
+              "src_socket": "out",
+              "dst": "SUB",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SUB",
+              "src_socket": "out",
+              "dst": "UQ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "LB2",
+              "src_socket": "image",
+              "dst": "CROP2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CROP2",
+              "src_socket": "out",
+              "dst": "CHC2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CROP2",
+              "src_socket": "out",
+              "dst": "CHR2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CHC2",
+              "src_socket": "out",
+              "dst": "BEAD2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BEAD2",
+              "src_socket": "out",
+              "dst": "PTS2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "PTS2",
+              "src_socket": "out",
+              "dst": "GROW2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "GROW2",
+              "src_socket": "out",
+              "dst": "BEADPX2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BEADPX2",
+              "src_socket": "out",
+              "dst": "BGM2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BGM2",
+              "src_socket": "out",
+              "dst": "BGR2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "BGR2",
+              "src_socket": "out",
+              "dst": "MBG2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CHR2",
+              "src_socket": "out",
+              "dst": "MBG2",
+              "dst_socket": "raw",
+              "kind": "forward"
+            },
+            {
+              "src": "GROW2",
+              "src_socket": "out",
+              "dst": "MB2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CHR2",
+              "src_socket": "out",
+              "dst": "MB2",
+              "dst_socket": "raw",
+              "kind": "forward"
+            },
+            {
+              "src": "MB2",
+              "src_socket": "out",
+              "dst": "J2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "MBG2",
+              "src_socket": "out",
+              "dst": "J2",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "J2",
+              "src_socket": "out",
+              "dst": "SUB2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SUB2",
+              "src_socket": "out",
+              "dst": "UQ2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "UQ",
+              "src_socket": "out",
+              "dst": "SEL0",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "UQ",
+              "src_socket": "out",
+              "dst": "SEL1",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "UQ2",
+              "src_socket": "out",
+              "dst": "RJ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SEL0",
+              "src_socket": "out",
+              "dst": "RJ",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "RJ",
+              "src_socket": "out",
+              "dst": "RDX",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RDX",
+              "src_socket": "out",
+              "dst": "RMX",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RMX",
+              "src_socket": "out",
+              "dst": "RDY",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RDY",
+              "src_socket": "out",
+              "dst": "RMY",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RMY",
+              "src_socket": "out",
+              "dst": "RDZ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RDZ",
+              "src_socket": "out",
+              "dst": "RMZ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RMZ",
+              "src_socket": "out",
+              "dst": "RGX",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RGX",
+              "src_socket": "out",
+              "dst": "RGY",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RGY",
+              "src_socket": "out",
+              "dst": "RGZ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SEL0",
+              "src_socket": "out",
+              "dst": "CAT",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "SEL1",
+              "src_socket": "out",
+              "dst": "CAT",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RGZ",
+              "src_socket": "out",
+              "dst": "CAT",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "CAT",
+              "src_socket": "out",
+              "dst": "DX",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RZ",
+              "src_socket": "out",
+              "dst": "DX",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "DX",
+              "src_socket": "out",
+              "dst": "DY",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RZ",
+              "src_socket": "out",
+              "dst": "DY",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "DY",
+              "src_socket": "out",
+              "dst": "DZ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RZ",
+              "src_socket": "out",
+              "dst": "DZ",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "DZ",
+              "src_socket": "out",
+              "dst": "DX2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "DX2",
+              "src_socket": "out",
+              "dst": "DY2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "DY2",
+              "src_socket": "out",
+              "dst": "DZ2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "DZ2",
+              "src_socket": "out",
+              "dst": "RXY2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RXY2",
+              "src_socket": "out",
+              "dst": "DXY",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "DXY",
+              "src_socket": "out",
+              "dst": "R2",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "R2",
+              "src_socket": "out",
+              "dst": "D3",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "D3",
+              "src_socket": "out",
+              "dst": "ZA",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "ZA",
+              "src_socket": "out",
+              "dst": "EZ",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "EZ",
+              "src_socket": "out",
+              "dst": "EDGE",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "RAD",
+              "src_socket": "out",
+              "dst": "EDGE",
+              "dst_socket": "other",
+              "kind": "forward"
+            },
+            {
+              "src": "EDGE",
+              "src_socket": "out",
+              "dst": "FE",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "FE",
+              "src_socket": "out",
+              "dst": "PLOT",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "PLOT",
+              "src_socket": "out",
+              "dst": "WF0",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "PLOT",
+              "src_socket": "out",
+              "dst": "WF1",
+              "dst_socket": "data",
+              "kind": "forward"
+            },
+            {
+              "src": "PLOT",
+              "src_socket": "out",
+              "dst": "WF2",
+              "dst_socket": "data",
+              "kind": "forward"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "LS",
+              "op_key": "io.load",
+              "modes": {
+                "access": "direct"
+              },
+              "params": {
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\WellB4_ChannelGFP_Seq0001.nd2",
+                "__title__": "Spheroids: WellB4 GFP (4 tiles x 9 z, 15 um step)"
+              }
+            },
+            {
+              "id": "ST",
+              "op_key": "util.stitch",
+              "modes": {
+                "layout": "stage",
+                "blend": "max"
+              },
+              "params": {
+                "flip_x": true,
+                "flip_y": false,
+                "__title__": "Stitch the 2x2 tiles (stage log)"
+              }
+            },
+            {
+              "id": "SG",
+              "op_key": "enhance.gaussian",
+              "modes": {
+                "dim": "2D"
+              },
+              "params": {
+                "sigma": 10.0,
+                "__title__": "Smooth 10 um: cells merge into one mass"
+              }
+            },
+            {
+              "id": "SM",
+              "op_key": "analysis.threshold",
+              "modes": {
+                "method": "fixed"
+              },
+              "params": {
+                "threshold": 100.0,
+                "name": "spheroid_mask",
+                "__title__": "Generous GFP threshold: > 100 (background max 57)"
+              }
+            },
+            {
+              "id": "SL",
+              "op_key": "analysis.label",
+              "modes": {
+                "dim": "3D",
+                "regions": "whole"
+              },
+              "params": {
+                "mask": "spheroid_mask",
+                "name": "spheroid",
+                "__title__": "Whole GFP mass = one 3D region"
+              }
+            },
+            {
+              "id": "SMe",
+              "op_key": "analysis.measure",
+              "modes": {
+                "target": "label"
+              },
+              "params": {
+                "labels": "spheroid",
+                "stats": "mean,count",
+                "flip_x": true,
+                "flip_y": false,
+                "__title__": "Spheroid centroid (stage um)"
+              }
+            },
+            {
+              "id": "RX",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "mean"
+              },
+              "params": {
+                "source": "stage_x_um",
+                "name": "spheroid_x_um",
+                "table": "spheroid",
+                "__title__": "Point source X"
+              }
+            },
+            {
+              "id": "RY",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "mean"
+              },
+              "params": {
+                "source": "stage_y_um",
+                "name": "spheroid_y_um",
+                "table": "spheroid",
+                "__title__": "Point source Y"
+              }
+            },
+            {
+              "id": "RZ",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "mean"
+              },
+              "params": {
+                "source": "stage_z_um",
+                "name": "spheroid_z_um",
+                "table": "spheroid",
+                "__title__": "Point source Z"
+              }
+            },
+            {
+              "id": "ZP",
+              "op_key": "util.zproject",
+              "modes": {
+                "method": "max"
+              },
+              "params": {
+                "__title__": "Footprint: max over Z of the smoothed GFP"
+              }
+            },
+            {
+              "id": "FT",
+              "op_key": "analysis.histogram_threshold",
+              "modes": {
+                "method": "single"
+              },
+              "params": {
+                "high": 100.0,
+                "min_area": 0.0,
+                "name": "footprint",
+                "__title__": "Footprint: > 100 (same cut)"
+              }
+            },
+            {
+              "id": "RA",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "sum"
+              },
+              "params": {
+                "source": "area_um2",
+                "name": "spheroid_area_um2",
+                "table": "footprint",
+                "__title__": "Footprint area (um2)"
+              }
+            },
+            {
+              "id": "RPI",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "global",
+                "op": "divide"
+              },
+              "params": {
+                "a": "spheroid_area_um2",
+                "value": 3.141592653589793,
+                "name": "spheroid_area_over_pi_um2",
+                "__title__": "area / pi"
+              }
+            },
+            {
+              "id": "RAD",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "global",
+                "op": "sqrt"
+              },
+              "params": {
+                "a": "spheroid_area_over_pi_um2",
+                "name": "spheroid_radius_um",
+                "__title__": "Spheroid radius = sqrt(area / pi) (equivalent circle)"
+              }
+            },
+            {
+              "id": "LB",
+              "op_key": "io.load",
+              "modes": {
+                "access": "direct"
+              },
+              "params": {
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\ChannelR-PE,Cy5_Seq0004.nd2",
+                "__title__": "Beads T1+T2: R-PE + Cy5 Seq0004 (03:15, 07:36)"
+              }
+            },
+            {
+              "id": "CROP",
+              "op_key": "util.crop",
+              "modes": {
+                "region": "frames"
+              },
+              "params": {
+                "frames": "m0-19,21-23",
+                "__title__": "Drop field B4_0020 (Seq0004: 17.5 um out of focus, re-taken as B4_0021)"
+              }
+            },
+            {
+              "id": "CHC",
+              "op_key": "channel.select",
+              "modes": {},
+              "params": {
+                "channels": "1",
+                "__locked__": [
+                  "channels"
+                ],
+                "__title__": "Cy5 (bead detection)"
+              }
+            },
+            {
+              "id": "CHR",
+              "op_key": "channel.select",
+              "modes": {},
+              "params": {
+                "channels": "0",
+                "__title__": "R-PE (measured)"
+              }
+            },
+            {
+              "id": "BEAD",
+              "op_key": "analysis.histogram_threshold",
+              "modes": {
+                "method": "single"
+              },
+              "params": {
+                "high": 120.0,
+                "min_area": 10.0,
+                "__locked__": [
+                  "high",
+                  "min_area"
+                ],
+                "__title__": "Bead: Cy5 > 120 and >= 10 um2 (background max 75; defocused blobs fragment)"
+              }
+            },
+            {
+              "id": "PTS",
+              "op_key": "transform.label_to_points",
+              "modes": {},
+              "params": {
+                "__title__": "Bead centroids"
+              }
+            },
+            {
+              "id": "GROW",
+              "op_key": "transform.grow_points",
+              "modes": {},
+              "params": {
+                "radius": 5.0,
+                "__locked__": [
+                  "radius"
+                ],
+                "__title__": "5 um disc per bead (measured region)"
+              }
+            },
+            {
+              "id": "BEADPX",
+              "op_key": "math.mask",
+              "modes": {
+                "op": "union"
+              },
+              "params": {
+                "a": "mask",
+                "b": "grown",
+                "name": "bead_pixels",
+                "__title__": "Bead pixels = Cy5 mask + discs"
+              }
+            },
+            {
+              "id": "BGM",
+              "op_key": "math.mask",
+              "modes": {
+                "op": "invert"
+              },
+              "params": {
+                "a": "bead_pixels",
+                "name": "background",
+                "__title__": "Background = frame - bead pixels"
+              }
+            },
+            {
+              "id": "BGR",
+              "op_key": "analysis.label",
+              "modes": {
+                "regions": "whole"
+              },
+              "params": {
+                "mask": "background",
+                "name": "background",
+                "__title__": "Background region (one per frame)"
+              }
+            },
+            {
+              "id": "MBG",
+              "op_key": "analysis.measure",
+              "modes": {
+                "target": "label"
+              },
+              "params": {
+                "labels": "background",
+                "stats": "mean,median,count",
+                "__title__": "Measure background (R-PE)"
+              }
+            },
+            {
+              "id": "MB",
+              "op_key": "analysis.measure",
+              "modes": {
+                "target": "label"
+              },
+              "params": {
+                "labels": "grown",
+                "stats": "mean,median,max,sum,count,std",
+                "__title__": "Measure bead disc (R-PE) + stage position"
+              }
+            },
+            {
+              "id": "J",
+              "op_key": "table.join",
+              "modes": {
+                "domain": "label",
+                "other_domain": "label",
+                "on": "m_t",
+                "how": "left"
+              },
+              "params": {
+                "table": "grown",
+                "other_table": "background",
+                "prefix": "bg_",
+                "name": "bead_corrected",
+                "__title__": "Each bead + its frame's background"
+              }
+            },
+            {
+              "id": "SUB",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "rpe_bgsub",
+                "table": "bead_corrected",
+                "__title__": "MFI: R-PE bead mean - background"
+              }
+            },
+            {
+              "id": "UQ",
+              "op_key": "table.unique_objects",
+              "modes": {
+                "domain": "label"
+              },
+              "params": {
+                "table": "bead_corrected",
+                "tolerance": 10.0,
+                "order_by": "m",
+                "keep_first": 1,
+                "name": "beads",
+                "__title__": "One row per bead per timepoint: its first (least bleached) field"
+              }
+            },
+            {
+              "id": "LB2",
+              "op_key": "io.load",
+              "modes": {
+                "access": "direct"
+              },
+              "params": {
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\ChannelR-PE,Cy5_Seq0002.nd2",
+                "__title__": "Beads T3: R-PE + Cy5 Seq0002 (11:46)"
+              }
+            },
+            {
+              "id": "CROP2",
+              "op_key": "util.crop",
+              "modes": {
+                "region": "frames"
+              },
+              "params": {
+                "frames": "m0-19,21-23",
+                "__title__": "Drop field B4_0020 (Seq0004: 17.5 um out of focus, re-taken as B4_0021)"
+              }
+            },
+            {
+              "id": "CHC2",
+              "op_key": "channel.select",
+              "modes": {},
+              "params": {
+                "channels": "1",
+                "__locked__": [
+                  "channels"
+                ],
+                "__title__": "Cy5 (bead detection)"
+              }
+            },
+            {
+              "id": "CHR2",
+              "op_key": "channel.select",
+              "modes": {},
+              "params": {
+                "channels": "0",
+                "__title__": "R-PE (measured)"
+              }
+            },
+            {
+              "id": "BEAD2",
+              "op_key": "analysis.histogram_threshold",
+              "modes": {
+                "method": "single"
+              },
+              "params": {
+                "high": 120.0,
+                "min_area": 10.0,
+                "__locked__": [
+                  "high",
+                  "min_area"
+                ],
+                "__title__": "Bead: Cy5 > 120 and >= 10 um2 (background max 75; defocused blobs fragment)"
+              }
+            },
+            {
+              "id": "PTS2",
+              "op_key": "transform.label_to_points",
+              "modes": {},
+              "params": {
+                "__title__": "Bead centroids"
+              }
+            },
+            {
+              "id": "GROW2",
+              "op_key": "transform.grow_points",
+              "modes": {},
+              "params": {
+                "radius": 5.0,
+                "__locked__": [
+                  "radius"
+                ],
+                "__title__": "5 um disc per bead (measured region)"
+              }
+            },
+            {
+              "id": "BEADPX2",
+              "op_key": "math.mask",
+              "modes": {
+                "op": "union"
+              },
+              "params": {
+                "a": "mask",
+                "b": "grown",
+                "name": "bead_pixels",
+                "__title__": "Bead pixels = Cy5 mask + discs"
+              }
+            },
+            {
+              "id": "BGM2",
+              "op_key": "math.mask",
+              "modes": {
+                "op": "invert"
+              },
+              "params": {
+                "a": "bead_pixels",
+                "name": "background",
+                "__title__": "Background = frame - bead pixels"
+              }
+            },
+            {
+              "id": "BGR2",
+              "op_key": "analysis.label",
+              "modes": {
+                "regions": "whole"
+              },
+              "params": {
+                "mask": "background",
+                "name": "background",
+                "__title__": "Background region (one per frame)"
+              }
+            },
+            {
+              "id": "MBG2",
+              "op_key": "analysis.measure",
+              "modes": {
+                "target": "label"
+              },
+              "params": {
+                "labels": "background",
+                "stats": "mean,median,count",
+                "__title__": "Measure background (R-PE)"
+              }
+            },
+            {
+              "id": "MB2",
+              "op_key": "analysis.measure",
+              "modes": {
+                "target": "label"
+              },
+              "params": {
+                "labels": "grown",
+                "stats": "mean,median,max,sum,count,std",
+                "__title__": "Measure bead disc (R-PE) + stage position"
+              }
+            },
+            {
+              "id": "J2",
+              "op_key": "table.join",
+              "modes": {
+                "domain": "label",
+                "other_domain": "label",
+                "on": "m_t",
+                "how": "left"
+              },
+              "params": {
+                "table": "grown",
+                "other_table": "background",
+                "prefix": "bg_",
+                "name": "bead_corrected",
+                "__title__": "Each bead + its frame's background"
+              }
+            },
+            {
+              "id": "SUB2",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "rpe_bgsub",
+                "table": "bead_corrected",
+                "__title__": "MFI: R-PE bead mean - background"
+              }
+            },
+            {
+              "id": "UQ2",
+              "op_key": "table.unique_objects",
+              "modes": {
+                "domain": "label"
+              },
+              "params": {
+                "table": "bead_corrected",
+                "tolerance": 10.0,
+                "order_by": "m",
+                "keep_first": 1,
+                "name": "beads",
+                "__title__": "One row per bead per timepoint: its first (least bleached) field"
+              }
+            },
+            {
+              "id": "SEL0",
+              "op_key": "util.select_frame",
+              "modes": {},
+              "params": {
+                "frame": 0,
+                "__title__": "T1 (03:15)"
+              }
+            },
+            {
+              "id": "SEL1",
+              "op_key": "util.select_frame",
+              "modes": {},
+              "params": {
+                "frame": 1,
+                "__title__": "T2 (07:36)"
+              }
+            },
+            {
+              "id": "RJ",
+              "op_key": "table.join",
+              "modes": {
+                "domain": "label",
+                "other_domain": "label",
+                "on": "m_t",
+                "how": "left"
+              },
+              "params": {
+                "table": "beads",
+                "other_table": "beads",
+                "prefix": "ref_",
+                "name": "bead_pairs",
+                "__title__": "Pair each T3 bead with its T1 sighting (same field)"
+              }
+            },
+            {
+              "id": "RDX",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_x_um",
+                "b": "ref_stage_x_um",
+                "name": "shift_x_um",
+                "table": "bead_pairs",
+                "__title__": "T3 - T1 stage X per bead"
+              }
+            },
+            {
+              "id": "RMX",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "median"
+              },
+              "params": {
+                "source": "shift_x_um",
+                "name": "run_shift_x_um",
+                "table": "bead_pairs",
+                "__title__": "Run shift X (median)"
+              }
+            },
+            {
+              "id": "RDY",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_y_um",
+                "b": "ref_stage_y_um",
+                "name": "shift_y_um",
+                "table": "bead_pairs",
+                "__title__": "T3 - T1 stage Y per bead"
+              }
+            },
+            {
+              "id": "RMY",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "median"
+              },
+              "params": {
+                "source": "shift_y_um",
+                "name": "run_shift_y_um",
+                "table": "bead_pairs",
+                "__title__": "Run shift Y (median)"
+              }
+            },
+            {
+              "id": "RDZ",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_z_um",
+                "b": "ref_stage_z_um",
+                "name": "shift_z_um",
+                "table": "bead_pairs",
+                "__title__": "T3 - T1 stage Z per bead"
+              }
+            },
+            {
+              "id": "RMZ",
+              "op_key": "analysis.reduce_scalar",
+              "modes": {
+                "domain": "label",
+                "reducer": "median"
+              },
+              "params": {
+                "source": "shift_z_um",
+                "name": "run_shift_z_um",
+                "table": "bead_pairs",
+                "__title__": "Run shift Z (median)"
+              }
+            },
+            {
+              "id": "RGX",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_x_um",
+                "b": "run_shift_x_um",
+                "name": "stage_x_um",
+                "table": "beads",
+                "__title__": "T3 stage X into the T1 frame"
+              }
+            },
+            {
+              "id": "RGY",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_y_um",
+                "b": "run_shift_y_um",
+                "name": "stage_y_um",
+                "table": "beads",
+                "__title__": "T3 stage Y into the T1 frame"
+              }
+            },
+            {
+              "id": "RGZ",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_z_um",
+                "b": "run_shift_z_um",
+                "name": "stage_z_um",
+                "table": "beads",
+                "__title__": "T3 stage Z into the T1 frame"
+              }
+            },
+            {
+              "id": "CAT",
+              "op_key": "table.concat",
+              "modes": {
+                "domain": "label"
+              },
+              "params": {
+                "table": "beads",
+                "names": "T1 \u00b7 03:15,T2 \u00b7 07:36 (+4.3 h),T3 \u00b7 11:46 (+8.5 h)",
+                "name": "beads_all",
+                "__title__": "Three timepoints, one table"
+              }
+            },
+            {
+              "id": "DX",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_x_um",
+                "b": "spheroid_x_um",
+                "name": "dx_um",
+                "table": "beads_all",
+                "__title__": "dx = bead x - source x"
+              }
+            },
+            {
+              "id": "DY",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_y_um",
+                "b": "spheroid_y_um",
+                "name": "dy_um",
+                "table": "beads_all",
+                "__title__": "dy = bead y - source y"
+              }
+            },
+            {
+              "id": "DZ",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_z_um",
+                "b": "spheroid_z_um",
+                "name": "dz_um",
+                "table": "beads_all",
+                "__title__": "dz = bead z - source z"
+              }
+            },
+            {
+              "id": "DX2",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "power"
+              },
+              "params": {
+                "a": "dx_um",
+                "value": 2.0,
+                "name": "dx2_um2",
+                "table": "beads_all",
+                "__title__": "dx^2"
+              }
+            },
+            {
+              "id": "DY2",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "power"
+              },
+              "params": {
+                "a": "dy_um",
+                "value": 2.0,
+                "name": "dy2_um2",
+                "table": "beads_all",
+                "__title__": "dy^2"
+              }
+            },
+            {
+              "id": "DZ2",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "power"
+              },
+              "params": {
+                "a": "dz_um",
+                "value": 2.0,
+                "name": "dz2_um2",
+                "table": "beads_all",
+                "__title__": "dz^2"
+              }
+            },
+            {
+              "id": "RXY2",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "add"
+              },
+              "params": {
+                "a": "dx2_um2",
+                "b": "dy2_um2",
+                "name": "rxy2_um2",
+                "table": "beads_all",
+                "__title__": "dx^2 + dy^2"
+              }
+            },
+            {
+              "id": "DXY",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "sqrt"
+              },
+              "params": {
+                "a": "rxy2_um2",
+                "name": "xy_distance_um",
+                "table": "beads_all",
+                "__title__": "XY distance from source"
+              }
+            },
+            {
+              "id": "R2",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "add"
+              },
+              "params": {
+                "a": "rxy2_um2",
+                "b": "dz2_um2",
+                "name": "r2_um2",
+                "table": "beads_all",
+                "__title__": "dx^2 + dy^2 + dz^2"
+              }
+            },
+            {
+              "id": "D3",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "sqrt"
+              },
+              "params": {
+                "a": "r2_um2",
+                "name": "distance_um",
+                "table": "beads_all",
+                "__title__": "True (3D) distance from source"
+              }
+            },
+            {
+              "id": "ZA",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "stage_z_um",
+                "value": 5022.0,
+                "value_unit": "um",
+                "name": "z_above_5022_um",
+                "table": "beads_all",
+                "__title__": "Z above 5022 um"
+              }
+            },
+            {
+              "id": "EZ",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "multiply"
+              },
+              "params": {
+                "a": "xy_distance_um",
+                "value": 0.0,
+                "name": "zero_um",
+                "table": "beads_all",
+                "__title__": "0 um beside every bead"
+              }
+            },
+            {
+              "id": "EDGE",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "add"
+              },
+              "params": {
+                "a": "zero_um",
+                "b": "spheroid_radius_um",
+                "name": "spheroid_edge_um",
+                "table": "beads_all",
+                "__title__": "Spheroid edge (its radius) beside every bead"
+              }
+            },
+            {
+              "id": "FE",
+              "op_key": "math.values",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "params": {
+                "a": "xy_distance_um",
+                "b": "spheroid_edge_um",
+                "name": "xy_from_edge_um",
+                "table": "beads_all",
+                "__title__": "XY distance from the spheroid edge"
+              }
+            },
+            {
+              "id": "PLOT",
+              "op_key": "plot.xy",
+              "modes": {
+                "domain": "label",
+                "kind": "scatter",
+                "per": "column",
+                "style": "paper",
+                "detail": "custom",
+                "colormap": "inferno",
+                "color_scale": "log"
+              },
+              "params": {
+                "table": "beads_all",
+                "x": "xy_distance_um",
+                "y": "z_above_5022_um",
+                "x_label": "XY distance from spheroid centroid (\u00b5m)",
+                "y_label": "Height above Z = 5022 \u00b5m (\u00b5m)",
+                "x_range": "0,",
+                "y_range": "0,",
+                "title": "IL-8 capture beads around the WellB4 spheroid",
+                "width_mm": 180.0,
+                "height_mm": 130.0,
+                "color_by": "rpe_bgsub",
+                "color_range": "1,",
+                "color_label": "MFI (R-PE, background-subtracted) \u2014 one scale, T1\u2013T3",
+                "label_by": "distance_um",
+                "label_decimals": 0,
+                "x_lines": "spheroid_edge_um",
+                "x_line_label": "spheroid edge",
+                "per_by": "condition",
+                "__title__": "Beads: XY distance vs height, coloured by MFI, per timepoint"
+              }
+            },
+            {
+              "id": "WF0",
+              "op_key": "io.write_figure",
+              "modes": {
+                "format": "png",
+                "existing": "overwrite"
+              },
+              "params": {
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL8_bead_spheroid_figures\\bead_mfi_vs_distance_T1.png",
+                "frame": 0,
+                "dpi": 300,
+                "__title__": "Export T1"
+              }
+            },
+            {
+              "id": "WF1",
+              "op_key": "io.write_figure",
+              "modes": {
+                "format": "png",
+                "existing": "overwrite"
+              },
+              "params": {
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL8_bead_spheroid_figures\\bead_mfi_vs_distance_T2.png",
+                "frame": 1,
+                "dpi": 300,
+                "__title__": "Export T2"
+              }
+            },
+            {
+              "id": "WF2",
+              "op_key": "io.write_figure",
+              "modes": {
+                "format": "png",
+                "existing": "overwrite"
+              },
+              "params": {
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\IL8_bead_spheroid_figures\\bead_mfi_vs_distance_T3.png",
+                "frame": 2,
+                "dpi": 300,
+                "__title__": "Export T3"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "IL-8 beads vs spheroid distance",
+        "ui": {
+          "frames": {
+            "f1": {
+              "color": null,
+              "title": "Point source: centroid of a generous GFP spheroid mask; edge: its footprint's equivalent radius",
+              "members": [
+                "LS",
+                "ST",
+                "SG",
+                "SM",
+                "SL",
+                "SMe",
+                "RX",
+                "RY",
+                "RZ",
+                "ZP",
+                "FT",
+                "RA",
+                "RPI",
+                "RAD"
+              ]
+            },
+            "f2": {
+              "color": null,
+              "title": "Bead MFI, Seq0004 (T1, T2): IL-8 standard curve Config 1 chain (Cy5 detects, R-PE minus frame background)",
+              "members": [
+                "LB",
+                "CROP",
+                "CHC",
+                "CHR",
+                "BEAD",
+                "PTS",
+                "GROW",
+                "BEADPX",
+                "BGM",
+                "BGR",
+                "MBG",
+                "MB",
+                "J",
+                "SUB",
+                "UQ",
+                "SEL0",
+                "SEL1"
+              ]
+            },
+            "f3": {
+              "color": null,
+              "title": "Bead MFI, Seq0002 (T3) \u2014 same chain, then registered into the T1 stage frame by the median bead shift",
+              "members": [
+                "LB2",
+                "CROP2",
+                "CHC2",
+                "CHR2",
+                "BEAD2",
+                "PTS2",
+                "GROW2",
+                "BEADPX2",
+                "BGM2",
+                "BGR2",
+                "MBG2",
+                "MB2",
+                "J2",
+                "SUB2",
+                "UQ2",
+                "RJ",
+                "RDX",
+                "RMX",
+                "RDY",
+                "RMY",
+                "RDZ",
+                "RMZ",
+                "RGX",
+                "RGY",
+                "RGZ"
+              ]
+            },
+            "f4": {
+              "color": null,
+              "title": "Distance from the point source (stage um), three timepoints",
+              "members": [
+                "CAT",
+                "DX",
+                "DY",
+                "DZ",
+                "DX2",
+                "DY2",
+                "DZ2",
+                "RXY2",
+                "DXY",
+                "R2",
+                "D3",
+                "ZA",
+                "EZ",
+                "EDGE",
+                "FE"
+              ]
+            },
+            "f5": {
+              "color": null,
+              "title": "One figure per timepoint, one MFI scale",
+              "members": [
+                "PLOT",
+                "WF0",
+                "WF1",
+                "WF2"
+              ]
+            }
+          },
+          "nodes": {
+            "LS": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": -1000.0
+            },
+            "ST": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": -1000.0
+            },
+            "SG": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": -1000.0
+            },
+            "SM": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": -1000.0
+            },
+            "SL": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": -1000.0
+            },
+            "SMe": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": -1000.0
+            },
+            "RX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": -1000.0
+            },
+            "RY": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2100.0,
+              "y": -1000.0
+            },
+            "RZ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2400.0,
+              "y": -1000.0
+            },
+            "ZP": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": -740.0
+            },
+            "FT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": -740.0
+            },
+            "RA": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": -740.0
+            },
+            "RPI": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": -740.0
+            },
+            "RAD": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2100.0,
+              "y": -740.0
+            },
+            "LB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 0.0
+            },
+            "CROP": {
+              "collapsed": false,
+              "muted": false,
+              "x": 150.0,
+              "y": 300.0
+            },
+            "CHC": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": -120.0
+            },
+            "CHR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": 160.0
+            },
+            "BEAD": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": -120.0
+            },
+            "PTS": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": -120.0
+            },
+            "GROW": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": -120.0
+            },
+            "BEADPX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": -260.0
+            },
+            "BGM": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": -260.0
+            },
+            "BGR": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2100.0,
+              "y": -260.0
+            },
+            "MBG": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2400.0,
+              "y": -260.0
+            },
+            "MB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 60.0
+            },
+            "J": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2700.0,
+              "y": 60.0
+            },
+            "SUB": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3000.0,
+              "y": 60.0
+            },
+            "UQ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3300.0,
+              "y": 60.0
+            },
+            "LB2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 0.0,
+              "y": 900.0
+            },
+            "CROP2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 150.0,
+              "y": 1200.0
+            },
+            "CHC2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": 780.0
+            },
+            "CHR2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 300.0,
+              "y": 1060.0
+            },
+            "BEAD2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 780.0
+            },
+            "PTS2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": 780.0
+            },
+            "GROW2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1200.0,
+              "y": 780.0
+            },
+            "BEADPX2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 640.0
+            },
+            "BGM2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1800.0,
+              "y": 640.0
+            },
+            "BGR2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2100.0,
+              "y": 640.0
+            },
+            "MBG2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2400.0,
+              "y": 640.0
+            },
+            "MB2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 960.0
+            },
+            "J2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2700.0,
+              "y": 960.0
+            },
+            "SUB2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3000.0,
+              "y": 960.0
+            },
+            "UQ2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3300.0,
+              "y": 960.0
+            },
+            "SEL0": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3600.0,
+              "y": -80.0
+            },
+            "SEL1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3600.0,
+              "y": 160.0
+            },
+            "RJ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3600.0,
+              "y": 960.0
+            },
+            "RDX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3900.0,
+              "y": 960.0
+            },
+            "RMX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 3900.0,
+              "y": 1200.0
+            },
+            "RDY": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4200.0,
+              "y": 960.0
+            },
+            "RMY": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4200.0,
+              "y": 1200.0
+            },
+            "RDZ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4500.0,
+              "y": 960.0
+            },
+            "RMZ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4500.0,
+              "y": 1200.0
+            },
+            "RGX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 4800.0,
+              "y": 1200.0
+            },
+            "RGY": {
+              "collapsed": false,
+              "muted": false,
+              "x": 5100.0,
+              "y": 1200.0
+            },
+            "RGZ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 5400.0,
+              "y": 1200.0
+            },
+            "CAT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 5800.0,
+              "y": 400.0
+            },
+            "DX": {
+              "collapsed": false,
+              "muted": false,
+              "x": 6100.0,
+              "y": 400.0
+            },
+            "DY": {
+              "collapsed": false,
+              "muted": false,
+              "x": 6400.0,
+              "y": 400.0
+            },
+            "DZ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 6700.0,
+              "y": 400.0
+            },
+            "DX2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7000.0,
+              "y": 400.0
+            },
+            "DY2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7300.0,
+              "y": 400.0
+            },
+            "DZ2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7600.0,
+              "y": 400.0
+            },
+            "RXY2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7900.0,
+              "y": 400.0
+            },
+            "DXY": {
+              "collapsed": false,
+              "muted": false,
+              "x": 6100.0,
+              "y": 660.0
+            },
+            "R2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 6400.0,
+              "y": 660.0
+            },
+            "D3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 6700.0,
+              "y": 660.0
+            },
+            "ZA": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7000.0,
+              "y": 660.0
+            },
+            "EZ": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7300.0,
+              "y": 660.0
+            },
+            "EDGE": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7600.0,
+              "y": 660.0
+            },
+            "FE": {
+              "collapsed": false,
+              "muted": false,
+              "x": 7900.0,
+              "y": 660.0
+            },
+            "PLOT": {
+              "collapsed": false,
+              "muted": false,
+              "x": 8200.0,
+              "y": 660.0
+            },
+            "WF0": {
+              "collapsed": false,
+              "muted": false,
+              "x": 8500.0,
+              "y": 460.0
+            },
+            "WF1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 8500.0,
+              "y": 660.0
+            },
+            "WF2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 8500.0,
+              "y": 860.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

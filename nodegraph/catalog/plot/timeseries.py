@@ -53,7 +53,8 @@ def _compute_plot_timeseries(ctx: EvalContext) -> Dataset:
     md = ds.metadata or {}
     dt = ctx.calib("dt_s")
     times, xl, xkind = FIG.frame_times(frames, frame_time_jd=md.get("frame_time_jd"),
-                                       dt_s=dt, mode=str(modes.get("time", "elapsed")))
+                                       dt_s=dt, mode=str(modes.get("time", "elapsed")),
+                                       utc_offset_s=md.get("utc_offset_s"))
     x = np.array([times[int(i)] if np.isfinite(i) and 0 <= int(i) < len(times) else np.nan
                   for i in tcol], dtype=float)
     if str(modes.get("time", "elapsed")) == "elapsed" and \
@@ -69,7 +70,9 @@ def _compute_plot_timeseries(ctx: EvalContext) -> Dataset:
     elif str(modes.get("time", "elapsed")) == "clock" and \
             str(modes.get("per", "all")) != "frame" and "time_jd" in cols:
         # the same, for wall-clock time: each row's own input's clock
-        x = np.asarray(cols["time_jd"], dtype=float) - 2440587.5    # JD of 1970-01-01
+        # JD of 1970-01-01, in the microscope's local time like the frame-clock branch
+        x = (np.asarray(cols["time_jd"], dtype=float) - 2440587.5
+             + FIG._offset_days(md.get("utc_offset_s")))
         xl, xkind = "clock time", "clock"
     error = str(modes.get("error", "sem"))
     log_y = bool(ctx.params.get("log_y", False))

@@ -50,11 +50,12 @@ import numpy as np
 __all__ = [
     "FieldBox", "SECONDS_PER_DAY", "field_box", "z_um_of_slice", "lateral_extent_um",
     "overlap_fraction", "axis_map", "translate", "ALIGN_KEY", "tiles_covering", "pair_timepoints",
-    "PlacementPlan", "plan_placement", "compose_secondary_plane", "paired_t",
+    "PlacementPlan", "plan_placement", "compose_secondary_plane", "field_rect01", "paired_t",
     "context_extent", "sub_field_box", "source_window",
     "secondary_z_index", "ZGrid", "merge_z_grid", "Z_GRID_BLOWUP",
     "paired_t_frac", "map_t", "secondary_z_weights", "plan_time", "frame_interval_s",
     "frame_seconds", "frame_timing", "frame_timing_lines",
+    "UTC_OFFSET_KEY", "utc_offset_of", "jd_to_datetime_text",
     "snap_rate", "parse_pins", "pins_json", "nudge_delta_um", "RATE_SNAP_TOL",
     "SUB_TICK_CAP", "union_canvas", "CANVAS_MAX_PX", "CANVAS_MAX_Z", "canvas_flip",
     "canvas_mapping",
@@ -65,28 +66,45 @@ __all__ = [
 #: days, so every time difference this module reports goes through here.
 SECONDS_PER_DAY = 86400.0
 
-#: The Julian day of the Unix epoch (1970-01-01 00:00:00). ``frame_time_jd`` is NIS's
-#: ``absoluteJulianDayNumber``: the microscope PC's wall clock, written as a Julian day with
-#: no time-zone marker, so it is converted back to a wall-clock reading and NOT shifted.
+#: The Julian day of the Unix epoch (1970-01-01 00:00:00 UTC). ``frame_time_jd`` is in UTC:
+#: NIS stamps frame 0 with a UTC Julian day (proved 2026-10-13 on the lab's files, whose
+#: local ``date`` and JOBS folder name sit exactly 7 h behind it, Arizona being UTC-7). The
+#: local wall clock is that plus the file's ``utc_offset_s`` (``nodelab_v2.nd2_acquisition``).
 JD_UNIX_EPOCH = 2440587.5
 
+#: The metadata key carrying the microscope PC's UTC offset in seconds east (-25200 for
+#: Arizona). Scalar, so it rides every node untouched; a reader without it means UTC.
+UTC_OFFSET_KEY = "utc_offset_s"
 
-def jd_to_datetime_text(jd: Any) -> str:
+
+def utc_offset_of(md: Any) -> int:
+    """``md[UTC_OFFSET_KEY]`` as whole seconds, ``0`` (UTC) when absent or unreadable."""
+    try:
+        return int((md or {}).get(UTC_OFFSET_KEY) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def jd_to_datetime_text(jd: Any, utc_offset_s: Any = 0) -> str:
     """A Julian day → ``YYYY-MM-DD HH:MM:SS.mmm`` (2026-10-02), the per-frame timestamp the
     ND2 reader stores beside ``frame_time_jd`` as ``frame_datetime`` and the Viewer's
     timestamp overlay shows in its ``clock`` mode. Milliseconds are kept because a fast
-    acquisition has several frames a second; the wall clock is reported as the microscope
-    wrote it (no time-zone conversion — there is nothing in the file to convert from).
-    ``""`` for anything that is not a finite number."""
+    acquisition has several frames a second.
+
+    ``utc_offset_s`` (seconds east of UTC, the file's :data:`UTC_OFFSET_KEY`) turns the UTC
+    Julian day into the microscope's LOCAL wall clock (2026-10-13). Until then the UTC day
+    was printed as if it were local, which in the lab read 7 h ahead. ``""`` for anything
+    that is not a finite number."""
     import math
     from datetime import datetime, timedelta
     try:
         v = float(jd)
+        off = float(utc_offset_s or 0)
     except (TypeError, ValueError):
         return ""
-    if not math.isfinite(v):
+    if not (math.isfinite(v) and math.isfinite(off)):
         return ""
-    secs = (v - JD_UNIX_EPOCH) * SECONDS_PER_DAY
+    secs = (v - JD_UNIX_EPOCH) * SECONDS_PER_DAY + off
     try:
         dt = datetime(1970, 1, 1) + timedelta(seconds=secs)
     except (OverflowError, ValueError):
@@ -793,6 +811,38 @@ def merge_z_grid(dst_md: Mapping[str, Any], dst_axes: Any,
     return ZGrid(z0, step, n), warnings, refusals
 
 
+def field_rect01(entry: Dict[str, Any], pri_md: Dict[str, Any], pri_axes: Any, pri_m: int,
+                 sec_md: Dict[str, Any], sec_axes: Any, sec_m: int
+                 ) -> Optional[Tuple[float, float, float, float]]:
+    """Where secondary field ``sec_m`` lands on primary field ``pri_m``'s image, as a
+    fractional ``(fy0, fy1, fx0, fx1)`` of that image — the rect :func:`compose_secondary_plane`
+    paints it into, by the same µm boxes, nudge and canvas mirroring (2026-10-14: the Viewer
+    outlines a union canvas source's PICKED field, which on an 8.8 mm canvas is otherwise a
+    pixel). ``None`` for an index placement (no boxes to map) or an unplaceable field."""
+    placed_by = str(entry.get("placed_by", "stage"))
+    if placed_by == "index":
+        return None
+    if placed_by == "centre":
+        pri_box, sec_box = _centred_box(pri_md, pri_axes), _centred_box(sec_md, sec_axes)
+    else:
+        pri_box, sec_box = field_box(pri_md, pri_axes, pri_m), field_box(sec_md, sec_axes,
+                                                                         sec_m)
+    if pri_box is None or sec_box is None:
+        return None
+    hy, wx = pri_box.y1 - pri_box.y0, pri_box.x1 - pri_box.x0
+    if not (hy > 0 and wx > 0):
+        return None
+    _dz, dy, dx = (float(v) for v in (entry.get("offset_um") or (0.0, 0.0, 0.0)))
+    fy0, fy1 = (sec_box.y0 + dy - pri_box.y0) / hy, (sec_box.y1 + dy - pri_box.y0) / hy
+    fx0, fx1 = (sec_box.x0 + dx - pri_box.x0) / wx, (sec_box.x1 + dx - pri_box.x0) / wx
+    cfx, cfy, _ix, _iy = canvas_mapping(pri_md)
+    if cfy:
+        fy0, fy1 = 1.0 - fy1, 1.0 - fy0
+    if cfx:
+        fx0, fx1 = 1.0 - fx1, 1.0 - fx0
+    return float(fy0), float(fy1), float(fx0), float(fx1)
+
+
 def compose_secondary_plane(entry: Dict[str, Any],
                             out_shape: Tuple[int, int],
                             pri_md: Dict[str, Any], pri_axes: Any, pri_m: int,
@@ -1005,8 +1055,13 @@ def tiles_covering(dst_md: Mapping[str, Any], dst_axes: Any, m: int,
     ``m=10`` draws from **four** (85 / 8 / 6 / 1 %). A design that assumed one source tile
     would silently show three-quarters of a field and a black corner.
 
-    ``min_fraction`` drops slivers — a tile contributing 0.001% of the field costs a full
-    read to change nothing.
+    ``min_fraction`` drops slivers — a big tile that grazes a field's corner costs a full read
+    to change nothing. A sliver is judged against the SMALLER of the two boxes (2026-10-14):
+    the fraction returned is still of ``dst``'s field (what coverage sums), but the cut asks
+    how much of either box the overlap is. Judged against the field alone, every small tile
+    on a large field was a "sliver" — on a union canvas 8.8 mm wide each 64 µm bead field is
+    0.0055 % of it, so all 24 were dropped and the bead overlay drew nothing at all — while a
+    tile lying wholly inside the field is the opposite of a sliver.
     """
     dst_box = field_box(dst_md, dst_axes, m)
     if dst_box is None:
@@ -1021,7 +1076,10 @@ def tiles_covering(dst_md: Mapping[str, Any], dst_axes: Any, m: int,
         if dz or dy or dx:
             src_box = translate(src_box, dz, dy, dx)
         frac = overlap_fraction(dst_box, src_box)
-        if frac >= min_fraction:
+        if frac <= 0.0:
+            continue
+        of_smaller = max(frac, overlap_fraction(src_box, dst_box))
+        if of_smaller >= min_fraction:
             hits.append((j, frac))
     hits.sort(key=lambda h: -h[1])
     return hits

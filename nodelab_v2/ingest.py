@@ -273,13 +273,15 @@ STAGE_KEYS = ("stage_xy_um", "stage_z_um")
 #:
 #: * ``z_home_index`` / ``z_bottom_to_top`` — which slice ``stage_z_um`` names, and the
 #:   stack's direction. Without them a stack has a focus but no way to place slice *k*.
-#: * ``frame_time_jd`` — per-T absolute Julian day, the only cross-file clock
-#:   (``frame_timestamps_s`` is relative to each file's own origin; on the WellA3 pair
-#:   those origins differ by 1207.3 s).
+#: * ``frame_time_jd`` — per-T absolute Julian day (UTC), the clock every file can be
+#:   compared on. ``frame_timestamps_s`` is relative to the start of the RUN that wrote the
+#:   file — shared by the files of one NIS job (the WellA3 pair's start 1207.3 s apart on
+#:   it, which is the real gap) but not across runs. Rebuilt from frame 0's raw stamp since
+#:   2026-10-13; the SDK's own per-frame value double-counts that offset.
 #: * ``stage_layout_source`` — how the position log was obtained, or ``"missing"``.
-#: * ``acquisition_start`` — the human date string, for readouts only.
-#: * ``frame_datetime`` — per-T ``YYYY-MM-DD HH:MM:SS.mmm`` wall-clock text, the readable
-#:   twin of ``frame_time_jd`` (2026-10-02): the Viewer's timestamp overlay and the
+#: * ``acquisition_start`` — the first frame's LOCAL date and time, for readouts only.
+#: * ``frame_datetime`` — per-T ``YYYY-MM-DD HH:MM:SS.mmm`` LOCAL wall-clock text, the
+#:   readable twin of ``frame_time_jd`` (2026-10-02): the Viewer's timestamp overlay and the
 #:   Timeseries Builder's order note show it, and it moves with T in lockstep.
 #:
 #: Same status as :data:`STAGE_KEYS`: non-calibration provenance riding the payload
@@ -291,6 +293,23 @@ PLACEMENT_KEYS = ("z_home_index", "z_bottom_to_top", "frame_time_jd", "frame_dat
                   # per point group). Carried like the rest of the placement vocabulary:
                   # best-effort, and dropped whole rather than padded when it is short.
                   "position_name")
+
+#: The file's full acquisition record (2026-10-13), produced by
+#: :func:`nodelab_v2.nd2_acquisition.acquisition_record` and shown by the Viewer — the
+#: channel tooltips and the acquisition-metadata window:
+#:
+#: * ``utc_offset_s`` / ``utc_offset_source`` — the microscope PC's zone, which turns the UTC
+#:   ``frame_time_jd`` into local wall-clock text (:data:`nodegraph.placement.UTC_OFFSET_KEY`);
+#: * ``acquisition_info`` — ``[[section, [[label, value], …]], …]`` for the file;
+#: * ``channel_acquisition`` — one ``[[label, value], …]`` list PER CHANNEL (laser line and
+#:   power, detector, gain, offset, pinhole, emission range…), a member of
+#:   :data:`nodegraph.metadata.PER_CHANNEL_KEYS` so a channel tap keeps the right rows;
+#: * ``acquisition_text`` — the raw ``text_info`` blocks, so nothing the SDK exposes hides
+#:   behind the parse.
+#:
+#: Display provenance like the rest of this dict: never calibration, never read by a compute.
+ACQUISITION_KEYS = ("utc_offset_s", "utc_offset_source", "acquisition_info",
+                    "channel_acquisition", "acquisition_text")
 
 
 def _nd2_bit_depth(path: str) -> Any:
@@ -355,7 +374,7 @@ def read_channel_display(path: str) -> Dict[str, Any]:
     # **0** on the WellA3 640 stack (nominal focus names slice 0) and `z_bottom_to_top` is a
     # bool — a truthiness filter would drop exactly the two values that anchor a stack, and
     # the loss would look identical to a file that never carried them.
-    for k in PLACEMENT_KEYS:
+    for k in PLACEMENT_KEYS + ACQUISITION_KEYS:
         v = md.get(k)
         if v is None or v == [] or v == "":
             continue

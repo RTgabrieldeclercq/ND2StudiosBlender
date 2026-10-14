@@ -1173,6 +1173,10 @@ def group_picks(metadata: Mapping[str, Any], axes: Any, raw: Any,
 PER_CHANNEL_KEYS: Tuple[str, ...] = (
     "channel_emission_nm", "channel_names",
     "channel_excitation_nm", "channel_colors",
+    # each channel's acquisition settings as display rows — laser line and power, detector,
+    # gain, pinhole… (2026-10-13, `nodelab_v2.nd2_acquisition`); the Viewer's channel
+    # tooltip reads row c, so it must follow the channel like the name does
+    "channel_acquisition",
 )
 
 
@@ -2164,10 +2168,13 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
         # source, since the bundle's `frame_time_jd` is its first file's alone.
         clocks = [chain_member_frame_clock(mm) for mm in members]
         if all(c is not None for c in clocks):
-            from nodegraph.placement import jd_to_datetime_text
+            from nodegraph.placement import jd_to_datetime_text, utc_offset_of
             jd = [v for c in clocks for v in c]
             out["frame_time_jd"] = jd
-            out["frame_datetime"] = [jd_to_datetime_text(v) for v in jd]
+            # each frame in its own file's LOCAL time (the UTC clock plus that file's zone,
+            # 2026-10-13) — the same text the reader wrote for it before the chain
+            out["frame_datetime"] = [jd_to_datetime_text(v, utc_offset_of(mm.metadata))
+                                     for mm, c in zip(members, clocks) for v in c]
         if any(SOURCE_CLOCK_KEY in mm.metadata for mm in members):
             out[SOURCE_CLOCK_KEY] = None
         perm = chain_frame_order(members, axis, order)
